@@ -70,7 +70,9 @@ tree, then click **>_ Shell** at the top right. In the shell (paste with Ctrl+Sh
 ip -4 -br addr show vmbr0     # e.g. 192.168.1.10/24 -> your network is 192.168.1.x, prefix /24
 ip -4 route show default      # e.g. "default via 192.168.1.1" -> your router
 pct list; qm list             # IDs already in use
-ping -c 3 192.168.1.50        # must show 100% packet loss (= the address is free)
+ping -c 3 192.168.1.50; ip neigh show 192.168.1.50
+# Free only if ping shows 100% packet loss AND ip neigh prints nothing, FAILED or INCOMPLETE.
+# A line with "lladdr" means a device uses the address (many devices ignore ping).
 ```
 
 Choose an address **outside your router's DHCP range**: check the router's LAN/DHCP settings.
@@ -98,32 +100,42 @@ It picks the `local-lvm` storage automatically, or on ZFS installs the first sto
 containers. Use `--storage` / `--bridge` if yours differ (`pvesm status --content rootdir` lists
 storages).
 
-**Success** ends like this:
+**Success** looks like this:
 
 ```
 KloudIT Recon gateway is running.
   Open: https://192.168.1.50:8443
   Setup token (first login): AbCdEf...
+    (stays valid until the admin account is created; also in /var/lib/kloudit-recon/setup-token.txt)
   Ports: TCP 8443 (HTTPS) and UDP 8443 (HTTP/3 + WebTransport + host tunnels)
+  Logs:  journalctl -u recon-gateway -f
+
+Done. Container 210 runs the gateway (pct enter 210 for a shell; it has no root password).
+  From this node:  logs  pct exec 210 -- journalctl -u recon-gateway -n 50
+                   setup token again  pct exec 210 -- cat /var/lib/kloudit-recon/setup-token.txt
+  Upgrade later from a newer gateway-linux-amd64 folder: ./create-lxc.sh --upgrade 210
 ```
 
-The setup token stays valid until you create the admin account. You can read it again with
-`pct exec 210 -- cat /var/lib/kloudit-recon/setup-token.txt`.
+The installer's own lines (`Logs:` and the token path) describe the inside of the container. From
+the Proxmox shell, use the `pct exec` commands that follow them.
+
+The setup token stays valid until you create the admin account.
 
 | If it stops with… | Do this |
 |---|---|
 | `storage 'local' cannot hold container templates` | Datacenter → Storage → local → Edit → tick *Container template* |
 | `no network/DNS after 60 s` | Wrong bridge or address. Run `pct stop 210; pct destroy 210`, then try again with the right `--bridge` / `--ip` |
 | `container 210 already exists` | Pick another `--ctid`, or remove the old one (`pct stop 210; pct destroy 210`) |
-| `the gateway did not start` | The log is printed above the error. `address already in use` means try `--port 9443` |
+| `the gateway did not start (…)` | The gateway's log is printed above, and the reason is in the brackets. Fix it, remove the half-made container (`pct stop 210; pct destroy 210`) and run `create-lxc.sh` again. Add `--port 9443` only if the log says `address already in use`. |
 
 ## 5. First login (in a browser on the gaming PC)
 
 1. Open **`https://192.168.1.50:8443`**. Type the `https://`.
 2. The browser warns that the connection isn't private. This is expected: the gateway uses its
-   own certificate authority. Click **Advanced → Continue**.
-3. Enter the setup token, choose a username and a password (at least 10 characters), then sign
-   in.
+   own certificate authority. Click **Advanced**, then **Proceed to 192.168.1.50 (unsafe)**
+   (Edge: **Continue to 192.168.1.50 (unsafe)**).
+3. Enter the setup token and an admin username (pre-filled with `admin`). Type a password of at
+   least 10 characters twice, then click **Create account**. You're signed in straight away.
 4. Click **Account** and turn on **two-factor authentication** with an authenticator app.
 5. Optional: to get rid of the warning, click **download ca.crt** on the dashboard. On Windows,
    double-click it, then choose **Install Certificate → Local Machine → Place all certificates
@@ -157,8 +169,10 @@ Anyone with physical access to the PC then gets your desktop. Decide whether tha
 
 ## 7. Install the agent and pair the PC
 
-1. In the dashboard (still on the gaming PC), click **+ Add a PC**, name it, and click **Copy**
-   on the first command.
+1. In the dashboard (still on the gaming PC), click **+ Add a PC**, type a name, and click
+   **Create pairing code**. Then click **Copy** under the first command. The code is shown
+   only once. If you close the dialog too early, use **Manage → Re-pair** on the PC's card
+   for a new one.
 2. Open **PowerShell as administrator**: Start → type *PowerShell* → **Run as administrator**,
    still signed in as the user who plays.
 3. Run:
@@ -186,14 +200,19 @@ gamepads:   ViGEmBus available
 ==> Agent is running and connected to the gateway.
 ```
 
-The dashboard dialog then says **"<name> is connected ✓"**.
+The dashboard dialog shows **"<name> is connected ✓"** and closes itself a second later. The
+PC's card then shows **Online**.
 
 | If you see… | Do this |
 |---|---|
 | `NVENC needs a newer NVIDIA driver` / `No GPU encoder works` | Update the graphics driver, then `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`. The `unusable:` lines say why each GPU encoder failed. |
 | `Network '…' is set to Public` | Run the `Set-NetConnectionProfile` command it prints (see step 6). |
 | `has not reached the gateway yet` | Check `Test-NetConnection 192.168.1.50 -Port 8443` (TCP). The agent itself needs **UDP** 8443, which third-party firewalls or VPN clients can block. Also check that the pairing code was created while browsing via `https://192.168.1.50:8443`. |
-| `recon-host.exe not found next to this script` | You're in the wrong folder. `cd` to `host-windows-amd64` first. |
+| `The gateway rejected this PC's pairing code` | The code was replaced (Re-pair) or the PC was removed. Use **Manage → Re-pair** on its card and run the command shown. |
+| `The argument '.\install-host.ps1' to the -File parameter does not exist` | You're in the wrong folder. Run `cd "$env:USERPROFILE\Downloads\recon\host-windows-amd64"` first. |
+| `Run this script from an elevated PowerShell` | Open PowerShell with **Run as administrator** and run the command again. |
+| `The pairing code must be the recon1:... text` | Paste the whole copied command, or only the `recon1:…` code between the quotes after `-PairingCode`. |
+| `recon-host.exe not found next to this script` | The folder is incomplete. Extract the host zip again (step 1). |
 | `winget not found` | Update *App Installer* from the Microsoft Store, or install ViGEmBus from <https://github.com/nefarius/ViGEmBus/releases>. |
 
 The agent writes its log to `%APPDATA%\KlouditRecon\host.log`.
@@ -229,18 +248,21 @@ On the **Proxmox node** shell:
    ```bash
    curl -fsSL https://tailscale.com/install.sh | sh
    echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-tailscale.conf && sysctl -p /etc/sysctl.d/99-tailscale.conf
-   tailscale up --advertise-routes=192.168.1.0/24
+   tailscale up --advertise-routes=192.168.1.0/24 --accept-dns=false
    ```
 
+   `--accept-dns=false` matters on Proxmox. Without it, the node's Tailscale DNS setting is
+   copied into your containers, where it doesn't work.
 3. Open the login link it prints and sign in.
-4. In the Tailscale admin console → **Machines** → your node → **Edit route settings**, approve
-   the route. Also choose **Disable key expiry** for the node.
+4. In the Tailscale admin console → **Machines**, click your node → **Subnets** → **Edit**, tick
+   `192.168.1.0/24` and save. From the node's **⋯** menu, also choose **Disable key expiry**.
 
 On the **laptop**, install Tailscale and sign in with the same account. Linux also needs
-`tailscale up --accept-routes`. Then open the same `https://192.168.1.50:8443` from anywhere.
+`sudo tailscale set --accept-routes`. Then open the same `https://192.168.1.50:8443` from
+anywhere.
 
-Test it before you leave: turn off Wi-Fi on the laptop, use your phone's hotspot, and start a
-stream.
+Test it before you leave: disconnect the laptop from your home Wi-Fi, connect it to your phone's
+hotspot instead, and start a stream.
 
 **Alternative: port forwarding.** Forward **TCP and UDP 8443** on your router to
 `192.168.1.50`. Then:
@@ -270,12 +292,26 @@ After waking, the PC shows as online only once Windows has signed in (see step 6
 
 ## Upgrading
 
-- **Gateway**: copy the new tarball to the node and extract it (step 4), then run
-  `./create-lxc.sh --upgrade 210` in the new `gateway-linux-amd64` folder. Settings and accounts
-  are kept.
-- **PC**: extract the new host zip, then run the same installer command **without**
-  `-PairingCode` from the new `host-windows-amd64` folder in an administrator PowerShell. The
-  pairing is kept. Add `-UpdateFFmpeg` to also fetch a newer FFmpeg.
+File names change with every build, so remove the old download first. Otherwise the commands
+pick up the old files.
+
+1. **On the PC**, in a new PowerShell window:
+
+   ```powershell
+   Remove-Item -Recurse -Force "$env:USERPROFILE\Downloads\recon", "$env:USERPROFILE\Downloads\kloudit-recon-binaries.zip" -ErrorAction SilentlyContinue
+   ```
+
+   Then download and extract the new build (step 1).
+2. **Gateway**:
+   1. On the node, remove the old files: `cd /root && rm -rf gateway-linux-amd64 kloudit-recon-*-gateway-linux-amd64.tar.gz SHA256SUMS`.
+   2. Copy the new tarball over (step 2).
+   3. Run the step 4 commands up to `cd gateway-linux-amd64`.
+   4. Run `./create-lxc.sh --upgrade 210` instead of the `--ctid` command. It prints the version
+      it installs. Settings and accounts are kept.
+3. **PC agent**: in an administrator PowerShell, from the new `host-windows-amd64` folder, run
+   the installer command **without** `-PairingCode`:
+   `powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -InstallViGEm`. The pairing is
+   kept. Add `-UpdateFFmpeg` to also fetch a newer FFmpeg.
 
 ## Uninstalling
 

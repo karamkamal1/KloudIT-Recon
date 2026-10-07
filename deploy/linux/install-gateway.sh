@@ -81,19 +81,24 @@ systemctl daemon-reload
 systemctl enable recon-gateway.service
 systemctl restart recon-gateway.service
 
+# The gateway logs "gateway listening" once both its TCP and UDP sockets are bound.
 listening() {
-  if command -v ss >/dev/null; then ss -Hltn "sport = :$PORT" | grep -q .; else [[ -f /var/lib/kloudit-recon/state.json ]]; fi
+  local pid; pid=$(systemctl show -p MainPID --value recon-gateway.service)
+  [[ "$pid" -gt 0 ]] && journalctl _SYSTEMD_UNIT=recon-gateway.service _PID="$pid" -o cat --no-pager 2>/dev/null | grep 'gateway listening' >/dev/null
 }
 echo "==> waiting for the gateway"
 for _ in $(seq 1 40); do
-  systemctl is-active --quiet recon-gateway.service && listening && break
+  listening && break
   sleep 0.5
 done
-if ! systemctl is-active --quiet recon-gateway.service || ! listening; then
-  journalctl -u recon-gateway.service -n 25 --no-pager || true
+if ! listening; then
+  log=$(journalctl -u recon-gateway.service -n 50 --no-pager 2>/dev/null || true)
+  tail -n 25 <<<"$log"
   hint="see the log above"
-  if journalctl -u recon-gateway.service -n 50 --no-pager 2>/dev/null | grep -q '226/NAMESPACE'; then
+  if grep -q '226/NAMESPACE' <<<"$log"; then
     hint="systemd sandboxing is blocked: on Proxmox enable nesting for this container (pct set <CTID> --features nesting=1 && pct reboot <CTID>)"
+  elif grep -q 'address already in use' <<<"$log"; then
+    hint="port $PORT is used by another program (ss -ltnup 'sport = :$PORT'); re-run with --port <free port>"
   elif ! /opt/kloudit-recon/recon-gateway version >/dev/null 2>&1; then
     hint="the binary does not run here: use the $(dpkg --print-architecture 2>/dev/null || uname -m) bundle"
   fi

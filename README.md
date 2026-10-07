@@ -178,8 +178,8 @@ create your admin account, then enable 2FA under **Account**.
 ### 3. Add your gaming PC
 
 Open the dashboard **from the gaming PC** using the gateway's LAN IP (the pairing code
-remembers the address you browse with). Click **+ Add a PC**, give it a name, and click
-**Copy**. Then, signed in to Windows as the user who plays, open **PowerShell as
+remembers the address you browse with). Click **+ Add a PC**, give it a name, click
+**Create pairing code**, then click **Copy**. Then, signed in to Windows as the user who plays, open **PowerShell as
 administrator**, `cd` into the unzipped `host-windows-amd64` folder and paste the copied command:
 
 ```powershell
@@ -187,7 +187,7 @@ powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -PairingCode "recon1
 ```
 
 The installer:
-- downloads FFmpeg (an FFmpeg 8 release build, SHA-256 verified)
+- downloads FFmpeg (an FFmpeg 8.1+ release build, SHA-256 verified)
 - pairs the agent with your gateway
 - registers a hidden **logon task** with highest privileges, so input reaches elevated games
 - opens UDP 47998 for the direct path on Private networks only (it warns if your network is
@@ -195,7 +195,7 @@ The installer:
 - installs ViGEmBus for controller support (`-InstallViGEm`)
 - starts the agent and checks that it reaches the gateway, and warns if no GPU encoder works
 
-The pairing dialog in the dashboard turns green when the PC connects.
+The PC's card in the dashboard shows **Online** when the agent connects.
 
 ### 4. Play
 
@@ -279,10 +279,9 @@ The new password (at least 10 characters) is read from stdin.
 | `directAddr` | auto | Address to advertise for the direct path |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
-| `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8+ recommended) |
+| `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 
-Edit `host.json` with Notepad (it must stay UTF-8 without a byte-order mark), then restart the
-agent: `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`.
+Edit `host.json` with Notepad, then restart the agent: `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`.
 
 Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the detected encoders
 (and why any GPU encoder is unusable), capture backends, monitors and gamepad support. Flags go

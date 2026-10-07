@@ -170,9 +170,7 @@ func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 	cmd := quietCmd(ctx, ffmpeg, args...)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		// FFmpeg prints the cause (e.g. the minimum driver version) before
-		// several generic lines, so keep enough of them.
-		return fmt.Errorf("%v: %s", err, lastLines(stderr.String(), 6))
+		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
 	}
 	return nil
 }
@@ -473,10 +471,19 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 
 // ---------------------------------------------------------------------------
 
-func lastLines(s string, n int) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
+// causeLines returns FFmpeg's first error lines: the encoder prints its reason
+// (e.g. the minimum driver version) before a series of generic lines starting
+// with "Error while opening encoder".
+func causeLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(strings.ReplaceAll(s, "\r", "")), "\n")
+	for i, l := range lines {
+		if i > 0 && strings.Contains(l, "Error while opening encoder") {
+			lines = lines[:i]
+			break
+		}
+	}
 	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+		lines = lines[:n]
 	}
 	return strings.Join(lines, " | ")
 }

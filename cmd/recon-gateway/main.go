@@ -129,6 +129,7 @@ func userCmd(dataDir string, args []string) {
 			os.Exit(1)
 		}
 		admin := len(args) > 2 && args[2] == "-admin"
+		first := store.UserCount() == 0 // before UpdateUser, which holds the store lock
 		err = store.UpdateUser(name, func(u *gateway.User, exists bool) error {
 			if args[0] == "add" && exists {
 				return fmt.Errorf("user %s exists", name)
@@ -138,7 +139,7 @@ func userCmd(dataDir string, args []string) {
 			}
 			u.PasswordHash = hash
 			if args[0] == "add" {
-				u.Admin = admin || store.UserCount() == 0
+				u.Admin = admin || first
 				u.Created = time.Now().UTC()
 			}
 			return nil

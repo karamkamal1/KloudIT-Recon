@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -53,10 +54,14 @@ type Agent struct {
 	tunnelMu  sync.Mutex
 	directRot *tlsutil.Rotating
 
-	pairMu  sync.RWMutex
-	pairing pairing
-	cfgMod  time.Time // config file mtime at the last (re)load
+	pairMu   sync.RWMutex
+	pairing  pairing
+	reloadMu sync.Mutex // serialises reloadPairing
+	cfgMod   time.Time  // config file mtime at the last (re)load, guarded by reloadMu
 }
+
+// errRepaired ends a gateway connection after the config file changed to a new pairing.
+var errRepaired = errors.New("pairing changed")
 
 // pairing is the gateway identity from the config file. `recon-host pair`
 // rewrites the file, and the running agent adopts the change without a restart.
@@ -78,6 +83,8 @@ func (a *Agent) reloadPairing() bool {
 	if a.cfg.path == "" {
 		return false
 	}
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
 	fi, err := os.Stat(a.cfg.path)
 	if err != nil || fi.ModTime().Equal(a.cfgMod) {
 		return false
@@ -270,7 +277,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	errc := make(chan error, 2)
 	if a.cfg.DirectPort > 0 {
-		go func() { errc <- a.runDirect(ctx) }()
+		// Created before the gateway tunnel starts, which advertises its hashes.
+		rot, err := tlsutil.NewRotating([]string{"recon-host"}, 13*24*time.Hour, 5*24*time.Hour)
+		if err != nil {
+			return err
+		}
+		a.directRot = rot
+		go func() { errc <- a.runDirect(ctx, rot) }()
 	}
 	go func() { errc <- a.runGateway(ctx) }()
 	select {
@@ -308,6 +321,11 @@ func (a *Agent) runGateway(ctx context.Context) error {
 		err := a.gatewayOnce(ctx)
 		if ctx.Err() != nil {
 			return nil
+		}
+		if errors.Is(err, errRepaired) {
+			a.log.Info("reconnecting with the new pairing")
+			backoff = time.Second
+			continue
 		}
 		if time.Since(started) > time.Minute {
 			backoff = time.Second
@@ -417,6 +435,27 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		a.tunnelMu.Unlock()
 	}()
 	a.log.Info("connected to gateway", "gateway", p.Gateway, "host", p.Name)
+	// `recon-host pair` may point this PC at another host entry or gateway
+	// while connected: notice it and reconnect.
+	var repaired atomic.Bool
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-t.C:
+				if a.reloadPairing() {
+					repaired.Store(true)
+					conn.CloseWithError(0, "re-paired")
+					return
+				}
+			}
+		}
+	}()
 	a.mu.Lock()
 	streaming := a.active != nil
 	a.mu.Unlock()
@@ -428,6 +467,9 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		_ = st.SetReadDeadline(time.Now().Add(45 * time.Second))
 		b, err := proto.ReadMsg(st, proto.MaxControlMsg)
 		if err != nil {
+			if repaired.Load() {
+				return errRepaired
+			}
 			return err
 		}
 		var m proto.TunnelMsg
@@ -533,12 +575,7 @@ func localMACs(local net.Addr) []string {
 // skipping the gateway hop. Authorised by gateway-signed one-time tickets;
 // the certificate is pinned by hash (no CA needed).
 
-func (a *Agent) runDirect(ctx context.Context) error {
-	rot, err := tlsutil.NewRotating([]string{"recon-host"}, 13*24*time.Hour, 5*24*time.Hour)
-	if err != nil {
-		return err
-	}
-	a.directRot = rot
+func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 	rot.OnRotate(func() { a.sendTunnel(proto.TunnelMsg{T: "direct", Direct: a.directInfo()}) })
 	go rot.Run(ctx.Done())
 

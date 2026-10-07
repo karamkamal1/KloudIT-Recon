@@ -256,6 +256,7 @@ body.stream { background: #000; overflow: hidden; user-select: none; -webkit-use
 
 @media (max-width: 640px) {
   .container { padding: 18px; }
-  .topbar { padding: 12px 16px; }
+  .topbar { padding: 12px 16px; flex-wrap: wrap; gap: 8px; }
+  .topbar nav { flex-wrap: wrap; }
   .toolbar .title span.name { display: none; }
 }

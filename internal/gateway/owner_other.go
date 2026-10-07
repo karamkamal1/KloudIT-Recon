@@ -2,4 +2,6 @@
 
 package gateway
 
-func keepOwner(path, ref string) {}
+import "os"
+
+func keepOwner(f *os.File, ref string) {}

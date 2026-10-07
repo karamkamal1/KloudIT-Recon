@@ -14,7 +14,7 @@
 set -euo pipefail
 
 BINARY=""; CTID=""; HOSTNAME_="recon"; STORAGE=""; BRIDGE="vmbr0"; IP="dhcp"
-MEMORY=512; CORES=1; DISK=4; PORT=8443; UPGRADE=""; EXTRA=()
+MEMORY=512; CORES=1; DISK=4; UPGRADE=""; EXTRA=()
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { echo "error: $*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
@@ -28,8 +28,7 @@ while [[ $# -gt 0 ]]; do
     --memory) MEMORY="$2"; shift 2 ;;
     --cores) CORES="$2"; shift 2 ;;
     --disk) DISK="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
-    --name|--public-addr) EXTRA+=("$1" "$2"); shift 2 ;;
+    --port|--name|--public-addr) EXTRA+=("$1" "$2"); shift 2 ;;
     --upgrade) UPGRADE="$2"; shift 2 ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) die "unknown argument $1 (see --help)" ;;
@@ -62,14 +61,14 @@ push_and_install() {
 if [[ -n "$UPGRADE" ]]; then
   CTID="$UPGRADE"
   pct status "$CTID" | grep -q running || die "container $CTID is not running (pct start $CTID)"
-  echo "==> upgrading the gateway in container $CTID (settings are kept)"
+  echo "==> upgrading the gateway in container $CTID to $("$BINARY" version) (settings are kept)"
   push_and_install "$CTID" "${EXTRA[@]}"
   exit 0
 fi
 
 if [[ -z "$STORAGE" ]]; then
   # local-lvm on default installs; otherwise the first storage that holds container disks.
-  storages=$(pvesm status --content rootdir 2>/dev/null | awk 'NR > 1 && $3 == "active" {print $1}')
+  storages=$(pvesm status --content rootdir 2>/dev/null | awk 'NR > 1 && $3 == "active" {print $1}' || true)
   if grep -qx local-lvm <<<"$storages"; then STORAGE=local-lvm; else STORAGE=$(head -1 <<<"$storages"); fi
   [[ -n "$STORAGE" ]] || die "no storage for container disks found; pass --storage (see: pvesm status --content rootdir)"
 fi
@@ -92,9 +91,11 @@ echo "==> template $template"
 
 # QUIC wants bigger UDP buffers than the kernel default; containers can't raise
 # the limit themselves, so set it on the node (only ever raised).
-if [[ $(sysctl -n net.core.rmem_max) -lt 7500000 || $(sysctl -n net.core.wmem_max) -lt 7500000 ]]; then
+rmem=$(sysctl -n net.core.rmem_max); wmem=$(sysctl -n net.core.wmem_max)
+if [[ $rmem -lt 7500000 || $wmem -lt 7500000 ]]; then
   echo "==> raising the UDP buffer limit on this node (/etc/sysctl.d/90-kloudit-recon.conf)"
-  printf 'net.core.rmem_max=7500000\nnet.core.wmem_max=7500000\n' > /etc/sysctl.d/90-kloudit-recon.conf
+  printf 'net.core.rmem_max=%s\nnet.core.wmem_max=%s\n' $((rmem > 7500000 ? rmem : 7500000)) $((wmem > 7500000 ? wmem : 7500000)) \
+    > /etc/sysctl.d/90-kloudit-recon.conf
   sysctl -q -p /etc/sysctl.d/90-kloudit-recon.conf || true
 fi
 
@@ -114,10 +115,12 @@ for _ in $(seq 1 60); do
 done
 [[ -n "$ok" ]] || die "container $CTID has no network/DNS after 60 s. Check --bridge/--ip (pct exec $CTID -- ip -4 addr), then remove it with: pct stop $CTID; pct destroy $CTID"
 pct exec "$CTID" -- bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates >/dev/null'
-push_and_install "$CTID" --port "$PORT" "${EXTRA[@]}"
+push_and_install "$CTID" "${EXTRA[@]}"
 
 mac=$(pct config "$CTID" | sed -n 's/^net0:.*hwaddr=\([^,]*\).*/\1/p')
 echo
 echo "Done. Container $CTID runs the gateway (pct enter $CTID for a shell; it has no root password)."
 [[ "$IP" == dhcp ]] && echo "  Reserve its IP in your router's DHCP settings (MAC $mac): paired PCs remember the address."
+echo "  From this node:  logs  pct exec $CTID -- journalctl -u recon-gateway -n 50"
+echo "                   setup token again  pct exec $CTID -- cat /var/lib/kloudit-recon/setup-token.txt"
 echo "  Upgrade later from a newer gateway-linux-amd64 folder: ./create-lxc.sh --upgrade $CTID"

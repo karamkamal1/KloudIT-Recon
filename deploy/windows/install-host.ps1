@@ -22,7 +22,7 @@
 .PARAMETER InstallDir
   Where to install (default: Program Files\KlouditRecon).
 .PARAMETER FFmpegPath
-  Use an existing ffmpeg.exe (FFmpeg 7.1+, 8.0+ recommended for gfxcapture).
+  Use an existing ffmpeg.exe (FFmpeg 7.1+; 8.1+ recommended, older builds lack gfxcapture).
 .PARAMETER DirectPort
   UDP port for direct LAN connections from the browser (0 disables the direct path).
 .PARAMETER UpdateFFmpeg
@@ -85,9 +85,12 @@ if ($PairingCode -and $PairingCode.Trim() -notmatch '^recon1:[A-Za-z0-9_-]+$') {
 # --- Binaries ----------------------------------------------------------------
 Write-Step "Installing agent to $InstallDir"
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Get-Process -Name 'recon-hostw', 'recon-host' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-# An encoder started by the agent can outlive it for a moment.
-Get-Process -Name 'ffmpeg' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+# Stop the agent and any encoder it started (ffmpeg can outlive it for a moment),
+# and wait for them to exit so their files can be replaced.
+$old = @(Get-Process -Name 'recon-hostw', 'recon-host' -ErrorAction SilentlyContinue) +
+    @(Get-Process -Name 'ffmpeg' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir\*" })
+$old | Stop-Process -Force -ErrorAction SilentlyContinue
+$old | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 # Skip files that are already in place (when re-run from the install directory).
 foreach ($f in 'recon-host.exe', 'recon-hostw.exe', 'install-host.ps1', 'uninstall-host.ps1') {
@@ -111,10 +114,10 @@ if ($FFmpegPath) {
             $parts = $l.Trim() -split '\s+'
             if ($parts.Count -eq 2) { $known[$parts[1]] = $parts[0].ToLowerInvariant() }
         }
-        # The oldest FFmpeg 8+ release build: it has GPU capture (ddagrab, gfxcapture) and
-        # works with the widest range of GPU drivers (the nightly "master" build can require
-        # an NVIDIA driver released a few weeks ago).
-        $zipName = $known.Keys | Where-Object { $_ -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-\1\.\2\.zip$' -and [int]$Matches[1] -ge 8 } |
+        # The oldest FFmpeg 8.1+ release build: it has both GPU capture paths (ddagrab and
+        # gfxcapture, new in 8.1) and works with the widest range of GPU drivers (the nightly
+        # "master" build can require an NVIDIA driver released a few weeks ago).
+        $zipName = $known.Keys | Where-Object { $_ -match '^ffmpeg-n(\d+\.\d+)-latest-win64-gpl-\1\.zip$' -and [version]$Matches[1] -ge [version]'8.1' } |
             Sort-Object { [version]($_ -replace '^ffmpeg-n(\d+\.\d+)-.*$', '$1') } | Select-Object -First 1
         if (-not $zipName) { $zipName = 'ffmpeg-master-latest-win64-gpl.zip' }
         $expected = $known[$zipName]
@@ -157,7 +160,9 @@ if (-not $cfg.Contains('gamepad')) { $cfg['gamepad'] = $true }
 # UTF-8 without a byte-order mark (Set-Content -Encoding UTF8 adds one in PowerShell 5.1).
 [IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
 # Owner-only access: the file holds the host token.
-icacls $cfgDir /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+# (SIDs instead of names: "Administrators" is localised on non-English Windows.)
+icacls $cfgDir /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restrict access to $cfgDir (icacls exit code $LASTEXITCODE)." }
 
 $exe = Join-Path $InstallDir 'recon-host.exe'
 $exeW = Join-Path $InstallDir 'recon-hostw.exe'
@@ -203,7 +208,8 @@ if ($InstallViGEm) {
 
 # --- Probe & start -----------------------------------------------------------------
 Write-Step 'Detected capabilities'
-$probe = (& $exe -config $cfgPath probe 2>&1 | Out-String)
+# 'Continue' here: in PowerShell 5.1, stderr output from a native command would otherwise stop the script.
+$probe = & { $ErrorActionPreference = 'Continue'; & $exe -config $cfgPath probe 2>&1 } | ForEach-Object { "$_" } | Out-String
 Write-Host $probe
 if ($probe -match 'minimum required Nvidia driver[^|\r\n]*') {
     Write-Warning "NVENC needs a newer NVIDIA driver ($($Matches[0].Trim())). Update it (NVIDIA App or nvidia.com), then run Stop-ScheduledTask '$TaskName'; Start-ScheduledTask '$TaskName'."
@@ -218,18 +224,25 @@ if (-not $NoStart) {
     Start-ScheduledTask -TaskName $TaskName
     Write-Step 'Starting the agent'
     $state = 'slow'
-    $deadline = (Get-Date).AddSeconds(30)
+    $seen = $false
+    $started = Get-Date
+    $deadline = $started.AddSeconds(30)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         $log = Read-LogSince $logPath $logStart
         if ($log -match 'connected to gateway') { $state = 'connected'; break }
+        if ($log -match 'rejected registration') { $state = 'rejected'; break }
         if (-not $paired -and $log -match 'not paired') { $state = 'unpaired'; break }
-        if (-not (Get-Process -Name 'recon-hostw' -ErrorAction SilentlyContinue) -and (Get-Date) -gt $deadline.AddSeconds(-27)) { $state = 'exited'; break }
+        $running = [bool](Get-Process -Name 'recon-hostw' -ErrorAction SilentlyContinue)
+        if ($running) { $seen = $true }
+        # Exited: it ran and is gone, or never appeared within 15 s.
+        if (-not $running -and ($seen -or (Get-Date) -gt $started.AddSeconds(15))) { $state = 'exited'; break }
     }
     $recent = (($log -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 8) -join "`n"
     switch ($state) {
         'connected' { Write-Step 'Agent is running and connected to the gateway.' }
         'unpaired'  { Write-Step "Agent is running and waiting to be paired: & '$exe' pair <code>" }
+        'rejected'  { Write-Warning "The gateway rejected this PC's pairing code (the PC was re-paired or removed in the dashboard). Use Manage > Re-pair on its card and run the command it shows." }
         'exited'    { Write-Warning "The agent stopped. Last log lines ($logPath):`n$recent" }
         default     { Write-Warning "The agent is running but has not reached the gateway yet (is UDP to the gateway's port open?). Last log lines ($logPath):`n$recent" }
     }

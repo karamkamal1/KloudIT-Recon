@@ -404,8 +404,11 @@ func (s *Server) pairingCode(r *http.Request, h *Host, token string) string {
 
 func cleanName(n string) (string, error) {
 	n = strings.TrimSpace(n)
-	if n == "" || utf8.RuneCountInString(n) > 64 || strings.ContainsAny(n, "<>\"'`\x00") {
-		return "", fmt.Errorf("invalid name")
+	if n == "" || utf8.RuneCountInString(n) > 64 {
+		return "", fmt.Errorf("the name must be 1 to 64 characters")
+	}
+	if strings.ContainsAny(n, "<>\"`\x00") {
+		return "", fmt.Errorf("the name can't contain < > \" or `")
 	}
 	return n, nil
 }
