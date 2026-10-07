@@ -1,0 +1,125 @@
+package proto
+
+// Control channel messages. Every message is a JSON object with a "t" field.
+
+// Hello is the first control message sent by the client.
+type Hello struct {
+	T        string        `json:"t"` // "hello"
+	V        int           `json:"v"`
+	Ticket   string        `json:"ticket,omitempty"` // required on the direct path only
+	Client   ClientInfo    `json:"client"`
+	Decoders []DecoderInfo `json:"decoders"`
+	Audio    AudioCaps     `json:"audio"`
+	Prefs    Prefs         `json:"prefs"`
+}
+
+type ClientInfo struct {
+	UA     string  `json:"ua"`
+	Width  int     `json:"w"` // screen width in device pixels
+	Height int     `json:"h"` // screen height in device pixels
+	DPR    float64 `json:"dpr"`
+	Hz     float64 `json:"hz"` // measured display refresh rate
+}
+
+// DecoderInfo reports what the browser can decode via WebCodecs.
+type DecoderInfo struct {
+	Family string `json:"family"` // h264 | hevc | av1
+	HW     bool   `json:"hw"`     // hardware decoder available
+}
+
+type AudioCaps struct {
+	Opus bool `json:"opus"`
+	PCM  bool `json:"pcm"`
+}
+
+// Prefs are the user's stream preferences. Zero values mean "host default".
+type Prefs struct {
+	Codec       string `json:"codec,omitempty"`   // auto | h264 | hevc | av1
+	BitrateKbps int    `json:"bitrate,omitempty"` // target video bitrate
+	FPS         int    `json:"fps,omitempty"`
+	Width       int    `json:"width,omitempty"` // 0 = native
+	Height      int    `json:"height,omitempty"`
+	Monitor     int    `json:"monitor"`              // index into Welcome.Monitors
+	Window      string `json:"window,omitempty"`     // capture a single window by title regex (gfxcapture)
+	Audio       *bool  `json:"audio,omitempty"`      // default true
+	AudioCodec  string `json:"audioCodec,omitempty"` // opus | pcm
+	Cursor      string `json:"cursor,omitempty"`     // local | video
+	Quality     string `json:"quality,omitempty"`    // speed | balanced | quality
+}
+
+func (p Prefs) AudioEnabled() bool { return p.Audio == nil || *p.Audio }
+
+// Welcome is the host's reply to Hello.
+type Welcome struct {
+	T        string        `json:"t"` // "welcome"
+	Session  string        `json:"session"`
+	Host     string        `json:"host"`
+	OS       string        `json:"os"`
+	Version  string        `json:"version"`
+	Monitors []MonitorInfo `json:"monitors"`
+	Encoders []string      `json:"encoders"`
+	Features []string      `json:"features"` // cursor, gamepad, audio, text
+	MaxKbps  int           `json:"maxKbps"`
+	MaxFPS   int           `json:"maxFps"`
+}
+
+type MonitorInfo struct {
+	Index   int    `json:"index"`
+	Name    string `json:"name"`
+	Width   int    `json:"w"`
+	Height  int    `json:"h"`
+	X       int    `json:"x"`
+	Y       int    `json:"y"`
+	Primary bool   `json:"primary"`
+	Hz      int    `json:"hz,omitempty"`
+}
+
+// VideoConfig announces a (new) encoder generation. The client must (re)configure
+// its decoder and wait for a key frame of this generation.
+type VideoConfig struct {
+	T           string `json:"t"` // "video"
+	Gen         uint8  `json:"gen"`
+	Family      string `json:"family"`
+	Codec       string `json:"codec"` // WebCodecs codec string, e.g. avc1.640033
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	FPS         int    `json:"fps"`
+	BitrateKbps int    `json:"bitrate"`
+	Encoder     string `json:"encoder"`
+	Capture     string `json:"capture"`
+}
+
+type AudioConfig struct {
+	T          string `json:"t"` // "audio"
+	Codec      string `json:"codec"`
+	SampleRate int    `json:"sampleRate"`
+	Channels   int    `json:"channels"`
+	FrameMs    int    `json:"frameMs"`
+	Enabled    bool   `json:"enabled"`
+}
+
+// CursorShape carries a cursor image (PNG, base64) for local cursor rendering.
+type CursorShape struct {
+	T      string `json:"t"` // "cursor"
+	ID     uint64 `json:"id"`
+	PNG    string `json:"png,omitempty"`
+	HotX   int    `json:"hotX"`
+	HotY   int    `json:"hotY"`
+	Width  int    `json:"w"`
+	Height int    `json:"h"`
+	Hidden bool   `json:"hidden,omitempty"`
+}
+
+type Notice struct {
+	T     string `json:"t"` // "notice"
+	Level string `json:"level"`
+	Msg   string `json:"msg"`
+}
+
+// ClientMsg is the union of client->host control messages after Hello.
+type ClientMsg struct {
+	T       string `json:"t"` // settings | keyframe | congestion | bye
+	Prefs   *Prefs `json:"prefs,omitempty"`
+	DelayMs int    `json:"delayMs,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+}

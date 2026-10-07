@@ -1,0 +1,8 @@
+/dist/
+/data/
+*.exe
+*.test
+*.out
+/test/e2e/node_modules/
+/test/e2e/results/
+.DS_Store

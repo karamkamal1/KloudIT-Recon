@@ -1,0 +1,160 @@
+//go:build windows
+
+package platform
+
+import (
+	"sort"
+	"sync"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+var (
+	user32                            = windows.NewLazySystemDLL("user32.dll")
+	procEnumDisplayMonitors           = user32.NewProc("EnumDisplayMonitors")
+	procGetMonitorInfoW               = user32.NewProc("GetMonitorInfoW")
+	procEnumDisplaySettingsW          = user32.NewProc("EnumDisplaySettingsW")
+	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
+	procSetProcessDPIAware            = user32.NewProc("SetProcessDPIAware")
+	dxgi                              = windows.NewLazySystemDLL("dxgi.dll")
+	procCreateDXGIFactory1            = dxgi.NewProc("CreateDXGIFactory1")
+	iidIDXGIFactory1                  = windows.GUID{Data1: 0x770aae78, Data2: 0xf26f, Data3: 0x4dba, Data4: [8]byte{0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}}
+)
+
+// EnableDPIAwareness makes all coordinates (monitors, cursor, SendInput) physical
+// pixels, matching what the capture API sees. Call once at startup.
+func EnableDPIAwareness() {
+	const perMonitorAwareV2 = ^uintptr(3) // (DPI_AWARENESS_CONTEXT)-4
+	if procSetProcessDpiAwarenessContext.Find() == nil {
+		if r, _, _ := procSetProcessDpiAwarenessContext.Call(perMonitorAwareV2); r != 0 {
+			return
+		}
+	}
+	if procSetProcessDPIAware.Find() == nil {
+		procSetProcessDPIAware.Call()
+	}
+}
+
+type monitorInfoEx struct {
+	cbSize    uint32
+	rcMonitor windows.Rect
+	rcWork    windows.Rect
+	dwFlags   uint32
+	szDevice  [32]uint16
+}
+
+var (
+	enumMu   sync.Mutex
+	enumAcc  []Monitor
+	enumProc = syscall.NewCallback(func(hmon, hdc, rect, data uintptr) uintptr {
+		var mi monitorInfoEx
+		mi.cbSize = uint32(unsafe.Sizeof(mi))
+		if r, _, _ := procGetMonitorInfoW.Call(hmon, uintptr(unsafe.Pointer(&mi))); r == 0 {
+			return 1
+		}
+		enumAcc = append(enumAcc, Monitor{
+			Name:       windows.UTF16ToString(mi.szDevice[:]),
+			X:          int(mi.rcMonitor.Left),
+			Y:          int(mi.rcMonitor.Top),
+			W:          int(mi.rcMonitor.Right - mi.rcMonitor.Left),
+			H:          int(mi.rcMonitor.Bottom - mi.rcMonitor.Top),
+			Primary:    mi.dwFlags&1 != 0,
+			HMonitor:   uint64(hmon),
+			DXGIOutput: -1,
+			Hz:         refreshRate(mi.szDevice[:]),
+		})
+		return 1
+	})
+)
+
+// Monitors lists displays, primary first.
+func Monitors() ([]Monitor, error) {
+	enumMu.Lock()
+	enumAcc = nil
+	r, _, err := procEnumDisplayMonitors.Call(0, 0, enumProc, 0)
+	mons := enumAcc
+	enumAcc = nil
+	enumMu.Unlock()
+	if r == 0 {
+		return nil, err
+	}
+	// Map HMONITOR -> DXGI output index on adapter 0 (what ddagrab enumerates).
+	for idx, hmon := range dxgiOutputs() {
+		for i := range mons {
+			if mons[i].HMonitor == hmon {
+				mons[i].DXGIOutput = idx
+			}
+		}
+	}
+	sort.SliceStable(mons, func(i, j int) bool {
+		if mons[i].Primary != mons[j].Primary {
+			return mons[i].Primary
+		}
+		return mons[i].X < mons[j].X
+	})
+	for i := range mons {
+		mons[i].Index = i
+	}
+	return mons, nil
+}
+
+func refreshRate(device []uint16) int {
+	var dm [220]byte
+	*(*uint16)(unsafe.Pointer(&dm[68])) = 220 // dmSize
+	const enumCurrentSettings = ^uintptr(0)   // (DWORD)-1
+	if r, _, _ := procEnumDisplaySettingsW.Call(uintptr(unsafe.Pointer(&device[0])), enumCurrentSettings, uintptr(unsafe.Pointer(&dm[0]))); r == 0 {
+		return 0
+	}
+	return int(*(*uint32)(unsafe.Pointer(&dm[184]))) // dmDisplayFrequency
+}
+
+type comObj struct{ vtbl *[64]uintptr }
+
+func (o *comObj) call(slot int, args ...uintptr) uintptr {
+	all := append([]uintptr{uintptr(unsafe.Pointer(o))}, args...)
+	r, _, _ := syscall.SyscallN(o.vtbl[slot], all...)
+	return r
+}
+func (o *comObj) release() { o.call(2) }
+
+type dxgiOutputDesc struct {
+	deviceName [32]uint16
+	desktop    windows.Rect
+	attached   int32
+	rotation   uint32
+	monitor    uintptr
+}
+
+// dxgiOutputs returns the HMONITOR of each output of adapter 0, in order.
+func dxgiOutputs() []uint64 {
+	if procCreateDXGIFactory1.Find() != nil {
+		return nil
+	}
+	var factory *comObj
+	if r, _, _ := procCreateDXGIFactory1.Call(uintptr(unsafe.Pointer(&iidIDXGIFactory1)), uintptr(unsafe.Pointer(&factory))); int32(r) < 0 || factory == nil {
+		return nil
+	}
+	defer factory.release()
+	var adapter *comObj
+	if r := factory.call(12 /*EnumAdapters1*/, 0, uintptr(unsafe.Pointer(&adapter))); int32(r) < 0 || adapter == nil {
+		return nil
+	}
+	defer adapter.release()
+	var out []uint64
+	for i := uintptr(0); i < 16; i++ {
+		var output *comObj
+		if r := adapter.call(7 /*EnumOutputs*/, i, uintptr(unsafe.Pointer(&output))); int32(r) < 0 || output == nil {
+			break
+		}
+		var desc dxgiOutputDesc
+		if r := output.call(7 /*GetDesc*/, uintptr(unsafe.Pointer(&desc))); int32(r) >= 0 {
+			out = append(out, uint64(desc.monitor))
+		} else {
+			out = append(out, 0)
+		}
+		output.release()
+	}
+	return out
+}
