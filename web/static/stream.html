@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Streaming · KloudIT Recon</title>
+  <link rel="icon" href="/img/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#000000">
+  <link rel="stylesheet" href="/css/app.css">
+  <link rel="modulepreload" href="/js/stream-worker.js">
+  <link rel="modulepreload" href="/js/protocol.js">
+  <script type="module" src="/js/stream.js"></script>
+</head>
+<body class="stream">
+  <div id="stage">
+    <canvas id="screen" tabindex="0" aria-label="Remote screen"></canvas>
+    <img id="remote-cursor" alt="">
+  </div>
+
+  <div class="peek" id="peek"></div>
+  <div class="toolbar hide" id="toolbar" role="toolbar" aria-label="Stream controls">
+    <div class="title"><span class="dot on" id="conn-dot"></span><span class="name" id="host-name">…</span></div>
+    <span class="pill" id="latency" title="Stream latency: from the frame leaving the host encoder until it is drawn on this screen">— ms</span>
+    <div class="sep"></div>
+    <button class="btn-icon" id="btn-mouse" title="Mouse mode: desktop / game (Ctrl+Alt+Shift+M)"></button>
+    <button class="btn-icon" id="btn-fullscreen" title="Fullscreen + keyboard lock (Ctrl+Alt+Shift+F)"></button>
+    <button class="btn-icon" id="btn-stats" title="Performance overlay (Ctrl+Alt+Shift+S)"></button>
+    <button class="btn-icon" id="btn-paste" title="Type text on the host (Ctrl+Alt+Shift+V)"></button>
+    <button class="btn-icon" id="btn-settings" title="Stream settings (Ctrl+Alt+Shift+O)"></button>
+    <div class="sep"></div>
+    <button class="btn-icon" id="btn-disconnect" title="Disconnect (Ctrl+Alt+Shift+Q)"></button>
+  </div>
+
+  <div class="stats hidden" id="stats"></div>
+
+  <aside class="drawer" id="drawer" aria-label="Settings"></aside>
+
+  <div class="splash" id="splash">
+    <div class="card splash-card">
+      <img class="brand-mark" src="/img/icon.svg" alt="">
+      <h1 id="splash-title">Ready to stream</h1>
+      <p id="splash-sub">Checking your browser…</p>
+      <div class="badges" id="splash-caps"></div>
+      <button class="btn-primary hidden" id="btn-start">▶&nbsp; Start streaming</button>
+      <div class="spinner hidden" id="spinner"></div>
+      <div class="shortcuts">
+        <span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">Shift</span> +
+        <span class="kbd">M</span> mouse mode · <span class="kbd">F</span> fullscreen · <span class="kbd">S</span> stats ·
+        <span class="kbd">O</span> settings · <span class="kbd">V</span> paste · <span class="kbd">Q</span> quit
+      </div>
+      <p class="hint"><a href="/">← Back to machines</a></p>
+    </div>
+  </div>
+  <div id="modal-root"></div>
+</body>
+</html>

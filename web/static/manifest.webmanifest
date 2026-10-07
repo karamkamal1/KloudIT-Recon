@@ -1,0 +1,10 @@
+{
+  "name": "KloudIT Recon",
+  "short_name": "Recon",
+  "description": "Ultra-low-latency game streaming from your PC to any browser",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07090f",
+  "theme_color": "#07090f",
+  "icons": [{ "src": "/img/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

@@ -1,1 +1,37 @@
-<!doctype html><title>x</title>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KloudIT Recon</title>
+  <link rel="icon" href="/img/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#07090f">
+  <link rel="stylesheet" href="/css/app.css">
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body class="page">
+  <header class="topbar">
+    <div class="brand"><img class="brand-mark" src="/img/icon.svg" alt=""> KloudIT Recon <small id="version"></small></div>
+    <nav>
+      <button class="btn-ghost btn-sm hidden" id="nav-users">Users</button>
+      <button class="btn-ghost btn-sm hidden" id="nav-audit">Audit log</button>
+      <button class="btn-ghost btn-sm" id="nav-account">Account</button>
+      <button class="btn-sm" id="nav-logout">Sign out</button>
+    </nav>
+  </header>
+  <main class="container">
+    <div class="section-head">
+      <div>
+        <h2>Your machines</h2>
+        <p>Pick a PC and start streaming — direct path when you are on the same network, encrypted relay everywhere else.</p>
+      </div>
+      <button class="btn-primary hidden" id="add-host">+ Add a PC</button>
+    </div>
+    <div class="hosts" id="hosts"><div class="empty">Loading…</div></div>
+    <div class="card caps" id="caps"><span class="title">This browser</span></div>
+    <p class="hint" id="ca-hint"></p>
+  </main>
+  <div id="modal-root"></div>
+</body>
+</html>

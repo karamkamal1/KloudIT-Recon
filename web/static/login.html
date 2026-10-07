@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · KloudIT Recon</title>
+  <link rel="icon" href="/img/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#07090f">
+  <link rel="stylesheet" href="/css/app.css">
+  <script type="module" src="/js/login.js"></script>
+</head>
+<body class="page">
+  <main class="auth-wrap">
+    <div class="card auth-card">
+      <div class="brand"><img class="brand-mark" src="/img/icon.svg" alt=""> KloudIT Recon</div>
+
+      <form id="login-form" class="hidden" autocomplete="on">
+        <h1>Welcome back</h1>
+        <p class="sub">Sign in to stream your PC.</p>
+        <label for="username">Username</label>
+        <input id="username" type="text" autocomplete="username" required autofocus>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+        <button class="btn-primary" type="submit">Sign in</button>
+        <div class="form-error" id="login-error" role="alert"></div>
+      </form>
+
+      <form id="totp-form" class="hidden" autocomplete="off">
+        <h1>Two-factor code</h1>
+        <p class="sub">Enter the 6-digit code from your authenticator app.</p>
+        <label for="totp">Code</label>
+        <input id="totp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+        <button class="btn-primary" type="submit">Verify</button>
+        <div class="form-error" id="totp-error" role="alert"></div>
+      </form>
+
+      <form id="setup-form" class="hidden" autocomplete="off">
+        <h1>Set up your gateway</h1>
+        <p class="sub">Create the administrator account. The one-time setup token is printed in the gateway log and saved to <code>data/setup-token.txt</code>.</p>
+        <label for="setup-token">Setup token</label>
+        <input id="setup-token" type="text" required>
+        <label for="setup-user">Admin username</label>
+        <input id="setup-user" type="text" autocomplete="username" value="admin" required>
+        <label for="setup-pass">Password (10+ characters)</label>
+        <input id="setup-pass" type="password" autocomplete="new-password" minlength="10" required>
+        <label for="setup-pass2">Repeat password</label>
+        <input id="setup-pass2" type="password" autocomplete="new-password" minlength="10" required>
+        <button class="btn-primary" type="submit">Create account</button>
+        <div class="form-error" id="setup-error" role="alert"></div>
+      </form>
+      <div class="auth-foot" id="foot"></div>
+    </div>
+  </main>
+</body>
+</html>
