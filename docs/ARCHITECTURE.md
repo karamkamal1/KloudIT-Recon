@@ -139,6 +139,17 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
   drops the backlog, lowers the bitrate by 25 % and restarts with a key frame (rate-limited to
   once every 2 s). The browser also reports sustained growth in one-way delay
   (`{"t":"congestion"}`) before queues get deep.
+- **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
+  `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
+  (see `third_party/README.md`). Host config `congestion` picks it for the direct path and the
+  relay data connection (host → gateway; the gateway → browser leg of a relay session always
+  uses NewReno): `reno` (default, quic-go's NewReno) or `media` (`internal/transport/cc`):
+  pacing = 1.2 × the session's send rate (encoder bitrate + audio bitrate + 200 kbit/s for
+  headers and small datagrams; re-applied with every frame, since a path migration replaces
+  the controller), window = pacing × (min RTT + 2 frame intervals), no window cut on a single
+  loss (losses are counted for the application's rate controller); only persistent congestion
+  (RFC 9002: lost packets whose send times span more than 3 × PTO with no ACK in between)
+  collapses the window to two packets.
 
 Codec negotiation: the browser reports per family whether it can decode with hardware
 (`VideoDecoder.isConfigSupported` with `prefer-hardware`). The host picks the first family with

@@ -1,0 +1,85 @@
+# third_party
+
+## quic-go
+
+`quic-go/` is [quic-go](https://github.com/quic-go/quic-go) at the release named in
+`quic-go/NOTICE`, with `quic-go.patch` applied. The root `go.mod` uses it through
+
+```
+replace github.com/quic-go/quic-go => ./third_party/quic-go
+```
+
+so webtransport-go and http3 build against it too. It keeps its own `go.mod`, which makes it a
+separate module: `go vet ./...` and `go test ./...` at the repository root do not descend into it.
+
+### What the patch adds
+
+quic-go hard-codes NewReno (`internal/ackhandler/sent_packet_handler.go`). One loss cuts the
+window by 30 %, so on Wi-Fi or WAN paths with random loss the send rate falls below the video
+bitrate. The patch adds one hook and changes nothing when it is unused:
+
+- `quic.Config.Congestion func(congestion.RTTStats, congestion.ByteCount) congestion.CongestionControl`:
+  creates the controller of each path (again after a path migration). nil keeps NewReno.
+- Package `github.com/quic-go/quic-go/congestion`: the `CongestionControl` interface (the
+  methods of quic-go's internal `SendAlgorithmWithDebugInfos`), a read-only `RTTStats` view
+  (min / smoothed / latest RTT, mean deviation, PTO) and the `ByteCount`, `PacketNumber`, `Time`
+  types.
+- `(*quic.Conn).CongestionControl()`: the controller instance of the current path, so the
+  application can steer it (here: `transport.MediaControl` sets the media controller's target
+  bitrate).
+- `ConnectionStats` loss counters keep working with a custom controller.
+- A unit test for the factory (`internal/ackhandler/congestion_factory_test.go`).
+
+The application side is `internal/transport` (`WithCongestion`, `MediaControl`) and the media
+controller in `internal/transport/cc`.
+
+### Updating to a new quic-go release
+
+```bash
+third_party/update-quic-go.sh latest          # or a version, e.g. v0.64.0
+```
+
+The script downloads the current and the new release through the Go module proxy, commits the
+current release + `quic-go.patch` in a scratch git repository and cherry-picks that commit onto
+the new release (a 3-way merge, like `git rebase`). On success it replaces `quic-go/`, refreshes
+`quic-go.patch` and `quic-go/NOTICE`, sets the quic-go version in `go.mod` and runs
+`go mod tidy`. On a conflict it prints the conflicting hunks and changes nothing.
+
+Then run the tests and commit `third_party/`, `go.mod` and `go.sum` together:
+
+```bash
+go vet ./... && GOOS=windows go vet ./... && go test ./...
+(cd third_party/quic-go && go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/... && go test -run TestConfig .)
+third_party/update-quic-go.sh --check
+```
+
+(`go test .` in `quic-go/` also works; its IPv6 tests fail on machines without IPv6, with or
+without the patch.)
+
+If the patch no longer applies, port it by hand:
+
+1. Replace `quic-go/` with the new release (`go mod download -json github.com/quic-go/quic-go@vX.Y.Z`
+   prints its source directory; copy it, keep `NOTICE`, and `chmod -R u+w` the copy).
+2. Re-apply the changes listed above; `quic-go.patch` shows the old version of each hunk.
+3. Set `Version:` and `Commit:` in `quic-go/NOTICE`, then run `third_party/update-quic-go.sh --diff`
+   to regenerate the patch, `go mod edit -require=github.com/quic-go/quic-go@vX.Y.Z && go mod tidy`,
+   and the tests above.
+
+### Changing the patch
+
+Edit the files in `quic-go/`, then run `third_party/update-quic-go.sh --diff` to regenerate
+`quic-go.patch` (the diff against the pristine release) and `--check` to confirm the tree and the
+patch agree. Keep the patch to the hook: it is re-applied on every upstream release.
+
+### CI
+
+`.github/workflows/quic-go-upstream.yml`:
+
+- weekly (and on demand, with an optional version): rebases the patch onto the latest quic-go
+  release and runs the vet, the Go tests and the upstream tests of the patched packages. It fails
+  when the patch no longer applies or the tests fail; the refreshed patch is uploaded as an
+  artifact. Nothing is committed: update by hand with the procedure above.
+- on pushes and pull requests that touch `third_party/`: `update-quic-go.sh --check` plus the
+  upstream tests of the patched packages.
+
+The script needs bash, git, tar, diff and Go.

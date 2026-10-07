@@ -49,11 +49,14 @@ helper-test: helper
 	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
 		$(WINE) ./encoder.test.exe -test.v -test.count=1
 
+# third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests
+# of the packages third_party/quic-go.patch changes.
 test:
 	$(GO) vet ./...
 	GOOS=windows $(GO) vet ./...
 	$(GO) test ./...
 	python3 -m unittest discover -s tools/latency-rig/test
+	cd third_party/quic-go && $(GO) test ./internal/ackhandler/... ./internal/congestion/... ./congestion/...
 
 e2e: build
 	node test/e2e/browser.mjs

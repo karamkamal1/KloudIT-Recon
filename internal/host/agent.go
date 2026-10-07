@@ -501,7 +501,7 @@ func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	p := a.pair()
-	conn, err := quic.DialAddr(dctx, p.Gateway, a.tlsFor(p, proto.ALPNHostData), transport.QUICConfig())
+	conn, err := quic.DialAddr(dctx, p.Gateway, a.tlsFor(p, proto.ALPNHostData), transport.QUICConfig(transport.WithCongestion(a.cfg.congestion())))
 	if err != nil {
 		a.log.Warn("data connection failed", "err", err)
 		return
@@ -587,7 +587,9 @@ func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 			Addr:       fmt.Sprintf(":%d", a.cfg.DirectPort),
 			TLSConfig:  http3.ConfigureTLSConfig(&tls.Config{GetCertificate: rot.GetCertificate, MinVersion: tls.VersionTLS13}),
 			Handler:    mux,
-			QUICConfig: transport.QUICConfig(),
+			QUICConfig: transport.QUICConfig(transport.WithCongestion(a.cfg.congestion())),
+			// Lets each session reach its connection's congestion controller.
+			ConnContext: transport.WithQUICConn,
 		},
 		// Any origin may open the session, but the first control message must
 		// carry a gateway-signed ticket bound to that same origin.
@@ -606,13 +608,14 @@ func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 			a.log.Debug("direct upgrade failed", "err", err)
 			return
 		}
-		a.HandleConn(transport.FromWebTransport(sess), SessionMeta{Path: "direct", RequireTicket: true, Origin: r.Header.Get("Origin")})
+		c := transport.FromWebTransportOver(sess, transport.QUICConnFromContext(r.Context()))
+		a.HandleConn(c, SessionMeta{Path: "direct", RequireTicket: true, Origin: r.Header.Get("Origin")})
 	})
 	go func() {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort)
+	a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort, "congestion", a.cfg.congestion())
 	if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
 		a.log.Warn("direct endpoint stopped (relay still works)", "err", err)
 	}

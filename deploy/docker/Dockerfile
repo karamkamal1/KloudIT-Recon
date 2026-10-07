@@ -3,6 +3,8 @@
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+# go.mod replaces quic-go with the patched copy in third_party/quic-go.
+COPY third_party/quic-go/go.mod third_party/quic-go/go.sum third_party/quic-go/
 RUN go mod download
 COPY . .
 ARG VERSION=docker

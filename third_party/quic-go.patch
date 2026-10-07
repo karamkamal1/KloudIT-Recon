@@ -1,0 +1,360 @@
+diff --git a/config.go b/config.go
+index 74c2054..fdc4421 100644
+--- a/config.go
++++ b/config.go
+@@ -123,6 +123,7 @@ func populateConfig(config *Config) *Config {
+ 		InitialPacketSize:                initialPacketSize,
+ 		DisablePathMTUDiscovery:          config.DisablePathMTUDiscovery,
+ 		EnableStreamResetPartialDelivery: config.EnableStreamResetPartialDelivery,
++		Congestion:                       config.Congestion,
+ 		Allow0RTT:                        config.Allow0RTT,
+ 		Tracer:                           config.Tracer,
+ 	}
+diff --git a/config_test.go b/config_test.go
+index 0d71974..8c906fa 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -86,7 +86,7 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
+ 		}
+ 
+ 		switch fn := typ.Field(i).Name; fn {
+-		case "GetConfigForClient", "RequireAddressValidation", "GetLogWriter", "AllowConnectionWindowIncrease", "Tracer":
++		case "GetConfigForClient", "RequireAddressValidation", "GetLogWriter", "AllowConnectionWindowIncrease", "Tracer", "Congestion":
+ 			// Can't compare functions.
+ 		case "Versions":
+ 			f.Set(reflect.ValueOf([]Version{1, 2, 3}))
+diff --git a/congestion.go b/congestion.go
+new file mode 100644
+index 0000000..60a3dcd
+--- /dev/null
++++ b/congestion.go
+@@ -0,0 +1,46 @@
++package quic
++
++import (
++	"github.com/quic-go/quic-go/congestion"
++	"github.com/quic-go/quic-go/internal/ackhandler"
++	internalcongestion "github.com/quic-go/quic-go/internal/congestion"
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/internal/utils"
++)
++
++// CongestionControl returns the congestion controller that Config.Congestion
++// created for the connection's current path, or nil if the connection uses the
++// default controller. A path migration replaces the controller, so call this
++// again instead of keeping the result.
++func (c *Conn) CongestionControl() congestion.CongestionControl {
++	if cc := c.congestionControl.Load(); cc != nil {
++		return *cc
++	}
++	return nil
++}
++
++// congestionFactory adapts Config.Congestion for the sent packet handler.
++func (c *Conn) congestionFactory() ackhandler.CongestionFactory {
++	newCC := c.config.Congestion
++	if newCC == nil {
++		return nil
++	}
++	return func(rttStats *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) internalcongestion.SendAlgorithmWithDebugInfos {
++		cc := newCC(rttStats, initialMaxDatagramSize)
++		c.congestionControl.Store(&cc)
++		return lossCounter{CongestionControl: cc, stats: &c.connStats}
++	}
++}
++
++// lossCounter maintains the loss counters of ConnectionStats, as the default
++// controller does.
++type lossCounter struct {
++	congestion.CongestionControl
++	stats *utils.ConnectionStats
++}
++
++func (l lossCounter) OnCongestionEvent(pn congestion.PacketNumber, lostBytes, priorInFlight congestion.ByteCount) {
++	l.stats.PacketsLost.Add(1)
++	l.stats.BytesLost.Add(uint64(lostBytes))
++	l.CongestionControl.OnCongestionEvent(pn, lostBytes, priorInFlight)
++}
+diff --git a/congestion/interface.go b/congestion/interface.go
+new file mode 100644
+index 0000000..3a61afb
+--- /dev/null
++++ b/congestion/interface.go
+@@ -0,0 +1,55 @@
++// Package congestion lets an application replace the congestion controller of
++// a connection (see Config.Congestion and Conn.CongestionControl).
++package congestion
++
++import (
++	"time"
++
++	"github.com/quic-go/quic-go/internal/monotime"
++	"github.com/quic-go/quic-go/internal/protocol"
++)
++
++type (
++	// A ByteCount is a number of bytes.
++	ByteCount = protocol.ByteCount
++	// A PacketNumber is a QUIC packet number.
++	PacketNumber = protocol.PacketNumber
++	// A Time is an instant in monotonic time, as used by the send path.
++	Time = monotime.Time
++)
++
++// Now returns the current monotonic time.
++func Now() Time { return monotime.Now() }
++
++// RTTStats is a read-only view of the connection's RTT estimator.
++// Before the first RTT sample, the RTTs report the initial RTT.
++type RTTStats interface {
++	MinRTT() time.Duration
++	SmoothedRTT() time.Duration
++	LatestRTT() time.Duration
++	MeanDeviation() time.Duration
++	// PTO is the probe timeout (RFC 9002, section 6.2.1).
++	PTO(includeMaxAckDelay bool) time.Duration
++}
++
++// CongestionControl is a congestion controller. It has the same semantics as
++// quic-go's built-in NewReno controller (internal/congestion): all methods are
++// called from the connection's run loop and must not block.
++type CongestionControl interface {
++	// TimeUntilSend returns when the next packet may be sent (pacing);
++	// the zero Time means now.
++	TimeUntilSend(bytesInFlight ByteCount) Time
++	HasPacingBudget(now Time) bool
++	OnPacketSent(sentTime Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount, isRetransmittable bool)
++	CanSend(bytesInFlight ByteCount) bool
++	MaybeExitSlowStart()
++	OnPacketAcked(number PacketNumber, ackedBytes ByteCount, priorInFlight ByteCount, eventTime Time)
++	// OnCongestionEvent is called for every lost packet, and with
++	// lostBytes == 0 for an ECN congestion-experienced mark.
++	OnCongestionEvent(number PacketNumber, lostBytes ByteCount, priorInFlight ByteCount)
++	OnRetransmissionTimeout(packetsRetransmitted bool)
++	SetMaxDatagramSize(ByteCount)
++	InSlowStart() bool
++	InRecovery() bool
++	GetCongestionWindow() ByteCount
++}
+diff --git a/connection.go b/connection.go
+index a1f327b..3318685 100644
+--- a/connection.go
++++ b/connection.go
+@@ -14,6 +14,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/quic-go/quic-go/congestion"
+ 	"github.com/quic-go/quic-go/internal/ackhandler"
+ 	"github.com/quic-go/quic-go/internal/handshake"
+ 	"github.com/quic-go/quic-go/internal/monotime"
+@@ -150,6 +151,8 @@ type Conn struct {
+ 	rttStats  *utils.RTTStats
+ 	connStats utils.ConnectionStats
+ 
++	congestionControl atomic.Pointer[congestion.CongestionControl] // nil: NewReno
++
+ 	cryptoStreamManager   *cryptoStreamManager
+ 	sentPacketHandler     ackhandler.SentPacketHandler
+ 	receivedPacketHandler ackhandler.ReceivedPacketHandler
+@@ -320,6 +323,7 @@ var newConnection = func(
+ 		s.perspective,
+ 		s.qlogger,
+ 		s.logger,
++		s.congestionFactory(),
+ 	)
+ 	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+ 	statelessResetToken := statelessResetter.GetStatelessResetToken(srcConnID)
+@@ -449,6 +453,7 @@ var newClientConnection = func(
+ 		s.perspective,
+ 		s.qlogger,
+ 		s.logger,
++		s.congestionFactory(),
+ 	)
+ 	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+ 	oneRTTStream := newCryptoStream()
+diff --git a/interface.go b/interface.go
+index ad2bb99..c47c5fb 100644
+--- a/interface.go
++++ b/interface.go
+@@ -8,6 +8,7 @@ import (
+ 	"slices"
+ 	"time"
+ 
++	"github.com/quic-go/quic-go/congestion"
+ 	"github.com/quic-go/quic-go/internal/handshake"
+ 	"github.com/quic-go/quic-go/internal/protocol"
+ 	"github.com/quic-go/quic-go/qlogwriter"
+@@ -181,6 +182,10 @@ type Config struct {
+ 	// Enable QUIC Stream Resets with Partial Delivery.
+ 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-09.
+ 	EnableStreamResetPartialDelivery bool
++	// Congestion creates the congestion controller of each path of a connection
++	// (again after a path migration); it must not return nil. If Congestion is
++	// nil, NewReno is used.
++	Congestion func(rttStats congestion.RTTStats, initialMaxDatagramSize congestion.ByteCount) congestion.CongestionControl
+ 
+ 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
+ }
+diff --git a/internal/ackhandler/congestion_factory_test.go b/internal/ackhandler/congestion_factory_test.go
+new file mode 100644
+index 0000000..a18a049
+--- /dev/null
++++ b/internal/ackhandler/congestion_factory_test.go
+@@ -0,0 +1,67 @@
++package ackhandler
++
++import (
++	"testing"
++
++	"github.com/quic-go/quic-go/internal/congestion"
++	"github.com/quic-go/quic-go/internal/mocks"
++	"github.com/quic-go/quic-go/internal/monotime"
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/internal/utils"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++)
++
++func TestSentPacketHandlerCongestionFactory(t *testing.T) {
++	mockCtrl := gomock.NewController(t)
++	rttStats := utils.NewRTTStats()
++	var created []*mocks.MockSendAlgorithmWithDebugInfos
++	factory := func(r *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos {
++		require.Same(t, rttStats, r)
++		require.Equal(t, protocol.ByteCount(1234), initialMaxDatagramSize)
++		cong := mocks.NewMockSendAlgorithmWithDebugInfos(mockCtrl)
++		created = append(created, cong)
++		return cong
++	}
++	sph := NewSentPacketHandler(
++		0,
++		1234,
++		rttStats,
++		&utils.ConnectionStats{},
++		false,
++		false,
++		nil,
++		protocol.PerspectiveClient,
++		nil,
++		utils.DefaultLogger,
++		factory,
++	)
++	require.Len(t, created, 1)
++	created[0].EXPECT().TimeUntilSend(gomock.Any()).Return(monotime.Time(42))
++	require.Equal(t, monotime.Time(42), sph.TimeUntilSend())
++
++	// a path migration creates a new controller
++	sph.MigratedPath(monotime.Now(), 1234)
++	require.Len(t, created, 2)
++	created[1].EXPECT().TimeUntilSend(gomock.Any()).Return(monotime.Time(43))
++	require.Equal(t, monotime.Time(43), sph.TimeUntilSend())
++}
++
++func TestSentPacketHandlerNilCongestionFactory(t *testing.T) {
++	sph := NewSentPacketHandler(
++		0,
++		1200,
++		utils.NewRTTStats(),
++		&utils.ConnectionStats{},
++		false,
++		false,
++		nil,
++		protocol.PerspectiveClient,
++		nil,
++		utils.DefaultLogger,
++		nil, // NewReno
++	)
++	require.NotNil(t, sph.(*sentPacketHandler).congestion)
++	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
++}
+diff --git a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
+index 9b539ea..9c90cef 100644
+--- a/internal/ackhandler/sent_packet_handler.go
++++ b/internal/ackhandler/sent_packet_handler.go
+@@ -89,9 +89,10 @@ type sentPacketHandler struct {
+ 
+ 	bytesInFlight protocol.ByteCount
+ 
+-	congestion congestion.SendAlgorithmWithDebugInfos
+-	rttStats   *utils.RTTStats
+-	connStats  *utils.ConnectionStats
++	congestion    congestion.SendAlgorithmWithDebugInfos
++	newCongestion CongestionFactory // nil: NewReno
++	rttStats      *utils.RTTStats
++	connStats     *utils.ConnectionStats
+ 
+ 	// The number of times a PTO has been sent without receiving an ack.
+ 	ptoCount uint32
+@@ -115,8 +116,12 @@ type sentPacketHandler struct {
+ 
+ var _ SentPacketHandler = &sentPacketHandler{}
+ 
++// A CongestionFactory creates the congestion controller of a path.
++type CongestionFactory func(rttStats *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos
++
+ // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
+ // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
++// newCongestion optionally replaces the default congestion controller (NewReno); a nil factory is ignored.
+ func NewSentPacketHandler(
+ 	initialPN protocol.PacketNumber,
+ 	initialMaxDatagramSize protocol.ByteCount,
+@@ -128,16 +133,8 @@ func NewSentPacketHandler(
+ 	pers protocol.Perspective,
+ 	qlogger qlogwriter.Recorder,
+ 	logger utils.Logger,
++	newCongestion ...CongestionFactory,
+ ) SentPacketHandler {
+-	congestion := congestion.NewCubicSender(
+-		congestion.DefaultClock{},
+-		rttStats,
+-		connStats,
+-		initialMaxDatagramSize,
+-		true, // use Reno
+-		qlogger,
+-	)
+-
+ 	h := &sentPacketHandler{
+ 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
+ 		peerAddressValidated:           pers == protocol.PerspectiveClient || clientAddressValidated,
+@@ -147,12 +144,15 @@ func NewSentPacketHandler(
+ 		lostPackets:                    *newLostPacketTracker(64),
+ 		rttStats:                       rttStats,
+ 		connStats:                      connStats,
+-		congestion:                     congestion,
+ 		ignorePacketsBelow:             ignorePacketsBelow,
+ 		perspective:                    pers,
+ 		qlogger:                        qlogger,
+ 		logger:                         logger,
+ 	}
++	if len(newCongestion) > 0 {
++		h.newCongestion = newCongestion[0]
++	}
++	h.congestion = h.newCongestionController(initialMaxDatagramSize)
+ 	if enableECN {
+ 		h.enableECN = true
+ 		h.ecnTracker = newECNTracker(logger, qlogger)
+@@ -1131,7 +1131,15 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
+ 	for pn := range h.appDataPackets.history.PathProbes() {
+ 		h.appDataPackets.history.RemovePathProbe(pn)
+ 	}
+-	h.congestion = congestion.NewCubicSender(
++	h.congestion = h.newCongestionController(initialMaxDatagramSize)
++	h.setLossDetectionTimer(now)
++}
++
++func (h *sentPacketHandler) newCongestionController(initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos {
++	if h.newCongestion != nil {
++		return h.newCongestion(h.rttStats, initialMaxDatagramSize)
++	}
++	return congestion.NewCubicSender(
+ 		congestion.DefaultClock{},
+ 		h.rttStats,
+ 		h.connStats,
+@@ -1139,5 +1147,4 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
+ 		true, // use Reno
+ 		h.qlogger,
+ 	)
+-	h.setLossDetectionTimer(now)
+ }

@@ -65,6 +65,9 @@ type Session struct {
 	tried    map[string]bool
 	triedMu  sync.Mutex
 
+	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
+	audioKbps atomic.Int64             // audio bitrate while audio runs
+
 	rel      input.RelTracker
 	absGate  input.SeqGate
 	padGates [4]input.SeqGate
@@ -481,7 +484,51 @@ func (s *Session) startVideo(urgent bool, reason string) error {
 	if reason != "" {
 		s.log.Info("restarting video", "reason", reason, "urgent", urgent)
 	}
+	s.setCongestionTarget(p)
 	return s.video.Start(p, urgent)
+}
+
+// ccOverheadKbps is the media congestion controller's allowance for packet and
+// stream headers and the cursor and input datagrams, on top of the video and
+// audio bitrates.
+const ccOverheadKbps = 200
+
+// ccTarget is what the session sends besides audio and overhead.
+type ccTarget struct {
+	videoKbps     int64
+	frameInterval time.Duration
+}
+
+// setCongestionTarget hands the encoder's bitrate and frame rate to the media
+// congestion controller (host config "congestion": "media"), which paces at
+// 1.2 × (video + audio + ccOverheadKbps). A no-op with reno.
+func (s *Session) setCongestionTarget(p media.Params) {
+	if p.FPS <= 0 {
+		return
+	}
+	s.ccTarget.Store(&ccTarget{videoKbps: int64(p.BitrateKbps), frameInterval: time.Second / time.Duration(p.FPS)})
+	if kbps := s.applyCongestionTarget(); kbps > 0 {
+		s.log.Debug("media congestion control", "target_kbps", kbps, "video_kbps", p.BitrateKbps, "fps", p.FPS)
+	}
+}
+
+// applyCongestionTarget sets the target on the media controller of the
+// connection's current path and returns it in kbit/s (0: reno). A path
+// migration, also the client's NAT rebinding, replaces the controller with one
+// at the defaults, so frameSender re-applies the target for every frame; that
+// also picks up audio starting or stopping.
+func (s *Session) applyCongestionTarget() int64 {
+	t := s.ccTarget.Load()
+	if t == nil {
+		return 0
+	}
+	m := transport.MediaControl(s.c)
+	if m == nil {
+		return 0
+	}
+	kbps := t.videoKbps + s.audioKbps.Load() + ccOverheadKbps
+	m.SetTarget(kbps*1000, t.frameInterval)
+	return kbps
 }
 
 func (s *Session) videoEvents() {
@@ -595,6 +642,7 @@ func (s *Session) frameSender() {
 			return
 		case f = <-s.frameQ:
 		}
+		s.applyCongestionTarget()
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 		st, err := s.c.OpenUniStreamSync(ctx)
 		cancel()
@@ -678,13 +726,16 @@ func (s *Session) startAudio() {
 	if err != nil {
 		s.log.Warn("audio start failed", "err", err)
 		s.audio = nil
+		return
 	}
+	s.audioKbps.Store(int64(s.audio.Kbps()))
 }
 
 func (s *Session) stopAudio() {
 	if s.audio != nil {
 		s.audio.Stop()
 		s.audio = nil
+		s.audioKbps.Store(0)
 	}
 }
 
