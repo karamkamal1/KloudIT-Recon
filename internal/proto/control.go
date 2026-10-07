@@ -100,6 +100,28 @@ type VideoConfig struct {
 	BitrateKbps int    `json:"bitrate"`
 	Encoder     string `json:"encoder"`
 	Capture     string `json:"capture"`
+	// Crop, set when the coded picture is larger than Width x Height
+	// (omitted otherwise): the decoder outputs CodedWidth x CodedHeight, of
+	// which the right CropRight columns and bottom CropBottom rows are
+	// padding, and the client shows only the top-left Width x Height. An
+	// encoder that codes in blocks pads (AV1 on RDNA3 codes 1920x1080 as
+	// 1920x1082) and AV1 has no cropping window. Clients that ignore these
+	// fields show the padding; Width and Height keep their meaning.
+	CodedWidth  int `json:"codedWidth,omitempty"`
+	CodedHeight int `json:"codedHeight,omitempty"`
+	CropRight   int `json:"cropRight,omitempty"`
+	CropBottom  int `json:"cropBottom,omitempty"`
+}
+
+// SetCrop announces the padding of a coded picture of codedW x codedH whose
+// visible part is w x h (no crop fields when it has none).
+func (c *VideoConfig) SetCrop(w, h, codedW, codedH int) {
+	c.Width, c.Height = w, h
+	c.CodedWidth, c.CodedHeight, c.CropRight, c.CropBottom = 0, 0, 0, 0
+	if codedW > w || codedH > h {
+		c.CodedWidth, c.CodedHeight = max(codedW, w), max(codedH, h)
+		c.CropRight, c.CropBottom = c.CodedWidth-w, c.CodedHeight-h
+	}
 }
 
 type AudioConfig struct {

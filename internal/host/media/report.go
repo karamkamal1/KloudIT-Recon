@@ -35,6 +35,10 @@ func (c *Caps) WriteReport(w io.Writer, sample Params) {
 		} else {
 			fmt.Fprintf(w, "            %s\n", commandLine("ffmpeg", args))
 		}
+		if a := c.Alignment(e.Name); a.W > 1 || a.H > 1 {
+			fmt.Fprintf(w, "            pads: coded %dx%d as %dx%d; sessions at sizes that are not multiples of %dx%d use HEVC or H.264\n",
+				a.ProbeW, a.ProbeH, a.CodedW, a.CodedH, a.W, a.H)
+		}
 	}
 	rejected := make([]string, 0, len(c.Rejected))
 	for name := range c.Rejected {

@@ -281,13 +281,17 @@ class Canvas2DRenderer {
     this.name = 'canvas2d-desync';
   }
   // req: latency probe sample; the corner is read back after the draw from a clone.
-  draw(frame, req) {
+  // vis: the part of the frame to show (P.visibleArea).
+  draw(frame, req, vis) {
     if (req) req.clone = frame.clone();
-    if (this.c.width !== frame.displayWidth || this.c.height !== frame.displayHeight) {
-      this.c.width = frame.displayWidth;
-      this.c.height = frame.displayHeight;
+    const w = Math.round(vis.w);
+    const h = Math.round(vis.h);
+    if (this.c.width !== w || this.c.height !== h) {
+      this.c.width = w;
+      this.c.height = h;
     }
-    this.ctx.drawImage(frame, 0, 0);
+    if (vis.fx < 1 || vis.fy < 1) this.ctx.drawImage(frame, 0, 0, vis.w, vis.h, 0, 0, w, h); // padding cropped
+    else this.ctx.drawImage(frame, 0, 0);
     frame.close();
   }
 }
@@ -295,12 +299,13 @@ class Canvas2DRenderer {
 const WGSL = `
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var tex: texture_external;
+@group(0) @binding(2) var<uniform> crop: vec4f; // xy: visible share of the frame (VideoConfig crop)
 struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
   var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
   var o: VOut;
   o.pos = vec4f(p[i], 0.0, 1.0);
-  o.uv = vec2f((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5);
+  o.uv = vec2f((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5) * crop.xy;
   return o;
 }
 @fragment fn fs(v: VOut) -> @location(0) vec4f {
@@ -342,11 +347,16 @@ class WebGPURenderer {
     const src = new OffscreenCanvas(16, 16);
     src.getContext('2d').fillRect(0, 0, 16, 16);
     const vf = new VideoFrame(src, { timestamp: 0 });
+    const crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     try {
       device.pushErrorScope('validation');
       const { pipeline, sampler } = pipelineFor;
       const ext = device.importExternalTexture({ source: vf });
-      const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: sampler }, { binding: 1, resource: ext }] });
+      device.queue.writeBuffer(crop, 0, new Float32Array([1, 1, 0, 0]));
+      const bg = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: crop } }],
+      });
       const enc = device.createCommandEncoder();
       const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
       pass.setPipeline(pipeline);
@@ -359,6 +369,7 @@ class WebGPURenderer {
       if (err) throw new Error(err.message);
     } finally {
       vf.close();
+      crop.destroy();
     }
   }
 
@@ -388,6 +399,8 @@ class WebGPURenderer {
     });
     const r = new WebGPURenderer();
     Object.assign(r, { c, device, ctx, pipeline, sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }), prev: null, name: 'webgpu-zero-copy' });
+    r.crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    r.cropXY = [0, 0];
     try {
       device.pushErrorScope('validation');
       const pm = device.createShaderModule({ code: PROBE_WGSL });
@@ -407,15 +420,22 @@ class WebGPURenderer {
     }
     return r;
   }
-  draw(frame, req) {
-    if (this.c.width !== frame.displayWidth || this.c.height !== frame.displayHeight) {
-      this.c.width = frame.displayWidth;
-      this.c.height = frame.displayHeight;
+  draw(frame, req, vis) {
+    const w = Math.round(vis.w);
+    const h = Math.round(vis.h);
+    if (this.c.width !== w || this.c.height !== h) {
+      this.c.width = w;
+      this.c.height = h;
+    }
+    if (this.cropXY[0] !== vis.fx || this.cropXY[1] !== vis.fy) {
+      // Texture coordinates span the visible part only (VideoConfig crop).
+      this.cropXY = [vis.fx, vis.fy];
+      this.device.queue.writeBuffer(this.crop, 0, new Float32Array([vis.fx, vis.fy, 0, 0]));
     }
     const ext = this.device.importExternalTexture({ source: frame });
     const bg = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }],
+      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.crop } }],
     });
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({
@@ -488,7 +508,7 @@ async function configureDecoder(cfg) {
     try { video.decoder.close(); } catch {}
   }
   video.inflight.clear();
-  const base = { codec: cfg.codec, optimizeForLatency: true, codedWidth: cfg.width, codedHeight: cfg.height };
+  const base = { codec: cfg.codec, optimizeForLatency: true, codedWidth: cfg.codedWidth || cfg.width, codedHeight: cfg.codedHeight || cfg.height };
   const wantHW = prefs.decoder !== 'software';
   let config = { ...base, hardwareAcceleration: wantHW ? 'prefer-hardware' : 'prefer-software' };
   let support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
@@ -662,14 +682,21 @@ function onDecoded(frame) {
   const meta = video.inflight.get(frame.timestamp);
   video.inflight.delete(frame.timestamp);
   const decoded = now();
-  const size = `${frame.displayWidth}x${frame.displayHeight}`;
+  // Padding the host announced (VideoConfig crop) is not shown.
+  const vr = frame.visibleRect;
+  const vis = P.visibleArea(video.cfg, vr ? vr.width : frame.displayWidth, vr ? vr.height : frame.displayHeight, frame.displayWidth, frame.displayHeight);
+  const size = `${Math.round(vis.w)}x${Math.round(vis.h)}`;
   if (size !== video.lastSize) {
     video.lastSize = size;
-    post('resolution', { w: frame.displayWidth, h: frame.displayHeight });
+    post('resolution', { w: Math.round(vis.w), h: Math.round(vis.h) });
+    const c = video.cfg;
+    if (c?.cropRight || c?.cropBottom) {
+      post('log', { text: `padded picture: coded ${c.codedWidth}x${c.codedHeight} announced, decoder output ${vr?.width}x${vr?.height} (display ${frame.displayWidth}x${frame.displayHeight}), showing ${size}` });
+    }
   }
-  const req = probeStart(frame, meta);
+  const req = probeStart(frame, meta, vis);
   try {
-    renderer.draw(frame, req);
+    renderer.draw(frame, req, vis);
   } catch (e) {
     frame.close();
     post('log', { text: `render error: ${e.message}` });
@@ -839,13 +866,14 @@ function updateProbeMode() {
   post('log', { text: `latency probe: ${mode}${mode === 'off' && prefs.latencyProbe ? ' (host sends no wall-clock offset)' : ''}` });
 }
 
-// Decide whether this frame is sampled; returns the request the renderer fills.
-function probeStart(frame, meta) {
+// Decide whether this frame is sampled; returns the request the renderer
+// fills. vis: the part of the frame shown (the barcode is in its corner).
+function probeStart(frame, meta, vis) {
   if (probe.mode === 'off' || !meta || clock.offset === null) return null;
   if (++probe.count % PROBE_EVERY !== 0) return null;
   if (probe.inflight >= 2) { probe.skipped++; return null; }
-  const cell = probe.mode === 'seq' ? P.BARCODE_CELL : frame.displayWidth / P.BARCODE_WALLCLOCK_CELLS;
-  if (P.BARCODE_COLS * cell > frame.displayWidth || P.BARCODE_ROWS * cell > frame.displayHeight) { probe.skipped++; return null; }
+  const cell = probe.mode === 'seq' ? P.BARCODE_CELL : vis.w / P.BARCODE_WALLCLOCK_CELLS;
+  if (P.BARCODE_COLS * cell > vis.w || P.BARCODE_ROWS * cell > vis.h) { probe.skipped++; return null; }
   return { mode: probe.mode, epoch: probe.epoch, cell, meta, offset: clock.offset, wallOffsetUs: probe.wallOffsetUs, clone: null, luma: null };
 }
 

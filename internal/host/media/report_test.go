@@ -80,6 +80,8 @@ func TestParseFFmpegOutput(t *testing.T) {
 // usable encoder the exact command line BuildArgs builds for the sample.
 func TestWriteReport(t *testing.T) {
 	c := caps81(t)
+	// What the probe measures on RDNA3 (step 1.7).
+	c.SetAlignment("av1_amf", Alignment{W: 64, H: 16, ProbeW: 1920, ProbeH: 1080, CodedW: 1920, CodedH: 1082})
 	sample := Params{Source: Source{Backend: "ddagrab"}, FPS: 60, BitrateKbps: 30000, Quality: "balanced", CaptureClock: true}
 	var buf bytes.Buffer
 	c.WriteReport(&buf, sample)
@@ -112,6 +114,12 @@ func TestWriteReport(t *testing.T) {
 			t.Fatalf("%s: command line %q\nparses as %q\nwant %q", e.Name, lines[1], got, args)
 		}
 		lines = lines[2:]
+		if e.Name == "av1_amf" {
+			if len(lines) == 0 || lines[0] != "            pads: coded 1920x1080 as 1920x1082; sessions at sizes that are not multiples of 64x16 use HEVC or H.264" {
+				t.Fatalf("av1_amf: no padding line: %q", lines)
+			}
+			lines = lines[1:]
+		}
 	}
 	if !slices.Equal(lines, []string{"unusable:   av1_qsv      exit status 0xb1b4b1ab: Error creating a MFX session: -9."}) {
 		t.Fatalf("report tail %q", lines)

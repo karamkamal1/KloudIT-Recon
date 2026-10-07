@@ -3,6 +3,7 @@ package codec
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -214,4 +215,214 @@ func TestAV1SVT(t *testing.T) {
 		t.Fatalf("svt-av1: params=%v codec=%q", p.hasParamSets(d), p.Codec)
 	}
 	t.Logf("codec=%s", p.Codec)
+}
+
+// bitWriter writes the AV1 sequence headers of TestAV1SequenceHeader.
+type bitWriter struct {
+	b []byte
+	n int // bits written
+}
+
+func (w *bitWriter) put(v uint32, bits int) {
+	for i := bits - 1; i >= 0; i-- {
+		if w.n%8 == 0 {
+			w.b = append(w.b, 0)
+		}
+		if v>>uint(i)&1 == 1 {
+			w.b[len(w.b)-1] |= 0x80 >> uint(w.n%8)
+		}
+		w.n++
+	}
+}
+
+func (w *bitWriter) flag(b bool) {
+	if b {
+		w.put(1, 1)
+	} else {
+		w.put(0, 1)
+	}
+}
+
+// av1Seq describes a sequence header (AV1 spec 5.5); seqHeader writes it.
+type av1Seq struct {
+	profile       uint32
+	reduced       bool
+	timing, model bool // timing_info, decoder_model_info
+	displayDelay  bool // initial_display_delay_present_flag
+	levels        []uint32
+	w, h          uint32
+	wBits, hBits  int
+	frameIDs      bool
+	orderHint     bool
+	chooseSCT     bool
+	highBitDepth  bool
+	twelveBit     bool
+}
+
+func (s av1Seq) header() []byte {
+	w := &bitWriter{}
+	w.put(s.profile, 3)
+	w.put(0, 1) // still_picture
+	w.flag(s.reduced)
+	if s.reduced {
+		w.put(s.levels[0], 5)
+	} else {
+		w.flag(s.timing)
+		if s.timing {
+			w.put(1, 32)    // num_units_in_display_tick
+			w.put(60, 32)   // time_scale
+			w.put(1, 1)     // equal_picture_interval
+			w.put(0b010, 3) // num_ticks_per_picture_minus_1 = 1 (uvlc)
+			w.flag(s.model) // decoder_model_info_present_flag
+			if s.model {
+				w.put(23, 5) // buffer_delay_length_minus_1: 24-bit delays
+				w.put(1, 32) // num_units_in_decoding_tick
+				w.put(31, 5) // buffer_removal_time_length_minus_1
+				w.put(31, 5) // frame_presentation_time_length_minus_1
+			}
+		}
+		w.flag(s.displayDelay)
+		w.put(uint32(len(s.levels)-1), 5)
+		for i, l := range s.levels {
+			w.put(uint32(0x101+i), 12) // operating_point_idc
+			w.put(l, 5)
+			if l > 7 {
+				w.flag(l >= 12) // seq_tier: high from level 6.0 on, main below
+			}
+			if s.model {
+				w.put(1, 1)         // decoder_model_present_for_this_op
+				w.put(0x123456, 24) // decoder_buffer_delay
+				w.put(0x654321, 24) // encoder_buffer_delay
+				w.put(1, 1)         // low_delay_mode_flag
+			}
+			if s.displayDelay {
+				w.put(1, 1) // initial_display_delay_present_for_this_op
+				w.put(9, 4)
+			}
+		}
+	}
+	w.put(uint32(s.wBits-1), 4)
+	w.put(uint32(s.hBits-1), 4)
+	w.put(s.w-1, s.wBits)
+	w.put(s.h-1, s.hBits)
+	if !s.reduced {
+		w.flag(s.frameIDs)
+	}
+	if s.frameIDs {
+		w.put(13, 4)
+		w.put(2, 3)
+	}
+	w.put(0b011, 3) // use_128x128_superblock, enable_filter_intra, enable_intra_edge_filter
+	if !s.reduced {
+		w.put(0b1010, 4) // interintra, masked compound, warped motion, dual filter
+		w.flag(s.orderHint)
+		if s.orderHint {
+			w.put(0b11, 2) // jnt_comp, ref_frame_mvs
+		}
+		w.flag(s.chooseSCT)
+		if !s.chooseSCT {
+			w.put(1, 1) // seq_force_screen_content_tools
+		}
+		w.put(0, 1) // seq_choose_integer_mv
+		w.put(1, 1) // seq_force_integer_mv
+		if s.orderHint {
+			w.put(6, 3) // order_hint_bits_minus_1
+		}
+	}
+	w.put(0b011, 3) // enable_superres, enable_cdef, enable_restoration
+	w.flag(s.highBitDepth)
+	if s.profile == 2 && s.highBitDepth {
+		w.flag(s.twelveBit)
+	}
+	// The rest of color_config, film_grain_params_present, trailing bits:
+	// not parsed, only there so the header looks complete.
+	w.put(0, 12)
+	return w.b
+}
+
+// TestAV1SequenceHeader parses crafted sequence headers that reach every
+// branch before the frame size and bit depth, among them the 1920x1082 an
+// RDNA3 GPU codes 1920x1080 as.
+func TestAV1SequenceHeader(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		seq   av1Seq
+		codec string
+	}{
+		{"rdna3 1080p", av1Seq{levels: []uint32{8}, w: 1920, h: 1082, wBits: 11, hBits: 11}, "av01.0.08M.08"},
+		{"reduced still picture header", av1Seq{reduced: true, levels: []uint32{5}, w: 1280, h: 720, wBits: 16, hBits: 16}, "av01.0.05M.08"},
+		{"timing, decoder model, display delay, two operating points, frame ids", av1Seq{
+			timing: true, model: true, displayDelay: true, levels: []uint32{12, 9}, w: 3456, h: 1440, wBits: 12, hBits: 11,
+			frameIDs: true, orderHint: true, highBitDepth: true}, "av01.0.12H.10"},
+		{"timing without decoder model", av1Seq{timing: true, levels: []uint32{13}, w: 2560, h: 1440, wBits: 12, hBits: 11, chooseSCT: true},
+			"av01.0.13H.08"},
+		{"profile 2 twelve bit 8K", av1Seq{profile: 2, levels: []uint32{16}, w: 7680, h: 4320, wBits: 13, hBits: 13, orderHint: true,
+			highBitDepth: true, twelveBit: true}, "av01.2.16H.12"},
+		{"one pixel", av1Seq{levels: []uint32{0}, w: 1, h: 1, wBits: 1, hBits: 1}, "av01.0.00M.08"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			hdr := c.seq.header()
+			h, err := ParseAV1SequenceHeader(hdr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.MaxWidth != int(c.seq.w) || h.MaxHeight != int(c.seq.h) || h.CodecString() != c.codec {
+				t.Fatalf("got %dx%d %s, want %dx%d %s", h.MaxWidth, h.MaxHeight, h.CodecString(), c.seq.w, c.seq.h, c.codec)
+			}
+			// As OBUs: a temporal delimiter, then the sequence header with
+			// an extension byte and a size field.
+			obus := append([]byte{0x12, 0x00, obuSequenceHeader<<3 | 0x06, 0x00, byte(len(hdr))}, hdr...)
+			p := NewParams(AV1, obus)
+			if p.Codec != c.codec || p.CodedWidth != int(c.seq.w) || p.CodedHeight != int(c.seq.h) {
+				t.Fatalf("params: %s %dx%d", p.Codec, p.CodedWidth, p.CodedHeight)
+			}
+			if w, h, ok := AV1FrameSize(obus); !ok || w != int(c.seq.w) || h != int(c.seq.h) {
+				t.Fatalf("AV1FrameSize: %dx%d %v", w, h, ok)
+			}
+			// Cut before the bit depth: an error, never a guess.
+			if _, err := ParseAV1SequenceHeader(hdr[:len(hdr)-3]); err == nil {
+				t.Fatal("truncated header parsed")
+			}
+		})
+	}
+	if _, _, ok := AV1FrameSize([]byte{0x12, 0x00}); ok {
+		t.Fatal("frame size without a sequence header")
+	}
+}
+
+// TestAV1CodedSizeSVT reads the frame size from real SVT-AV1 streams (the
+// extradata and the key frame) and compares it with ffprobe's: 1920x1080,
+// and the 1920x1082 an RDNA3 GPU codes 1080p as (padded here by a filter).
+func TestAV1CodedSizeSVT(t *testing.T) {
+	for _, c := range []struct {
+		vf   string
+		w, h int
+	}{{"null", 1920, 1080}, {"pad=iw:ih+2", 1920, 1082}, {"pad=iw+16:ih", 1936, 1080}} {
+		pkts := encodeNUT(t, "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30", "-frames:v", "3", "-vf", c.vf,
+			"-pix_fmt", "yuv420p", "-c:v", "libsvtav1", "-preset", "12")
+		st := streamsByTest[t.Name()][0]
+		p := NewParams(AV1, st.Extradata)
+		if p.CodedWidth != c.w || p.CodedHeight != c.h {
+			t.Fatalf("%s: extradata %dx%d, want %dx%d", c.vf, p.CodedWidth, p.CodedHeight, c.w, c.h)
+		}
+		p = NewParams(AV1, nil)
+		p.PrepareKeyFrame(pkts[0].Data)
+		if p.CodedWidth != c.w || p.CodedHeight != c.h || !strings.HasPrefix(p.Codec, "av01.0.") {
+			t.Fatalf("%s: key frame %s %dx%d", c.vf, p.Codec, p.CodedWidth, p.CodedHeight)
+		}
+		// ffprobe reads the same stream as low-overhead OBUs.
+		var es bytes.Buffer
+		for _, pk := range pkts {
+			es.Write(pk.Data)
+		}
+		cmd := exec.Command("ffprobe", "-v", "error", "-f", "obu", "-show_entries", "stream=width,height", "-of", "csv=p=0", "-")
+		cmd.Stdin = &es
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("ffprobe: %v", err)
+		}
+		if got := strings.TrimSpace(string(out)); got != fmt.Sprintf("%d,%d", c.w, c.h) {
+			t.Fatalf("%s: ffprobe says %s, want %dx%d", c.vf, got, c.w, c.h)
+		}
+	}
 }

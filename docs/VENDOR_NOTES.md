@@ -667,3 +667,142 @@ Hardware checks:
   load (Task Manager). Hover the toolbar's latency pill: "End-to-end latency (capture→draw)".
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with the `hevc_nvenc`,
   `h264_nvenc` and (RTX 40 and newer) `av1_nvenc` lines; all three must write 600 frames.
+
+## 1.7 AV1 alignment guard (A7)
+
+What changed: the probe encodes three black 1920×1080 frames with every working hardware AV1
+encoder (`av1_amf`, and vendor-neutrally `av1_nvenc`, `av1_qsv`, `av1_vaapi`) into NUT and reads
+the coded frame size from the AV1 sequence header (`max_frame_width/height_minus_1`, parsed by
+`internal/codec`). A larger size means the encoder pads: the encoder gets an alignment of 64×16
+(the documented RDNA3 value), or coarser if the measured padding needs it (`media.Alignment`;
+`recon-host probe` prints a `pads:` line under the encoder, host.log `encoder pads the coded
+picture`). The session computes the encoded picture size (`Params.OutputSize`: monitor size for
+ddagrab, the forced size for gfxcapture, FFmpeg's aspect-preserving scale for x11grab, unknown for
+a captured window) and, when the chosen encoder would pad it, uses HEVC, else H.264, with the
+notice "AV1 on this GPU needs 64x16-aligned sizes; using HEVC" (once per change). That also
+applies when the client asks for AV1. An encoder forced in host.json (`"encoder": "av1_amf"`) is
+kept. Whenever a padded picture is streamed (forced encoder, nothing else decodable, window
+capture), the video config carries `codedWidth`, `codedHeight`, `cropRight`, `cropBottom` (from
+the sequence header compared with the NUT size). The client then draws only the top-left
+`width`×`height`: 2D `drawImage` with a source rectangle, WebGPU with scaled texture
+coordinates. The canvas, the mouse mapping and the overlay use the visible size, and the overlay's
+Video row adds "(coded W×H, cropped)". Clients that ignore the new fields behave as before.
+
+Why the sequence header and not the NUT stream header (the guide suggested
+`Streams()[0].Width/Height`). Checked against FFmpeg release/8.1:
+
+- `libavcodec/amfenc_av1.c` `amf_encode_init_av1`: the encoder is initialised with
+  `avctx->width/height`. After `Init()` it reads `Av1WidthAlignmentFactor` /
+  `Av1HeightAlignmentFactor` from the driver and falls back to 64 / 16 ("assume older driver and
+  Navi3x"). It computes `crop_right = 64 - (width & 63)` and `crop_bottom = 16 - (height & 15)`,
+  then maps `crop_bottom == 8` to 2 ("special processing for crop_bottom equal to 8 in
+  hardware"). So 1920×1080 is coded as 1920×1082 and 3440×1440 as 3456×1440. The crop is stored
+  only as `AV_PKT_DATA_FRAME_CROPPING` in `avctx->coded_side_data`, which is stream-level side
+  data, not attached to packets. `-align` defaults to `none`
+  (`AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS`). `64x16` rejects 1080p, and `1080p`
+  allows it but still codes 1082 rows. Step 1.1 passes no `-align`.
+- `libavformat/nutenc.c`: the stream header writes `par->width/height`, the configured size,
+  and the extradata, no stream side data. Packet side data is only written for NUT version > 3
+  (then of any type, unknown ones as `UserData…-SD-<type>`), and `-f nut` without syncpoint
+  flags writes version 3. The crop is not on packets anyway: av1_amf keeps it in the stream-level
+  `coded_side_data`. NUT therefore says 1920×1080 and the padding is visible only in the
+  bitstream.
+- AV1 has no cropping window (H.264/HEVC SPS do, and their decoders apply it), so a decoder
+  outputs the frame size from the sequence/frame header. `render_size` is only a hint.
+  Streaming encoders do not use `frame_size_override_flag`, so the sequence header's maximum
+  size is the coded size. If a header ever announces a larger maximum, the client still crops
+  only what the decoder actually outputs beyond the visible size (`visibleArea`).
+
+Verified in the sandbox:
+
+- verified (sandbox): sequence-header parsing. `internal/codec` `TestAV1SequenceHeader` uses
+  crafted headers that reach every branch before the frame size and bit depth: reduced still
+  picture header; timing info with and without decoder model; initial display delay; two
+  operating points with tier; frame ids; order hint; screen content tools; 1×1 to 7680×4320;
+  profile 2 at 12 bit; and 1920×1082. Truncated headers are rejected. `TestAV1CodedSizeSVT`
+  reads real SVT-AV1 streams at 1920×1080, 1920×1082 and 1936×1080 (padding added by a filter)
+  from the extradata and from the key frame, and compares each with `ffprobe -f obu`.
+- verified (sandbox): probe path. `internal/host/media` `TestProbeAlignment` runs
+  `probeAlignment` with libsvtav1 (1920×1080, no alignment), then the same command line with its
+  output padded to 1920×1082: it reads 1082 and derives 64×16. `TestAlignment` checks which
+  sizes pad at 64×16: 2560×1440, 3840×2160, 1280×720 and 2560×1600 do not; 1920×1080 and
+  3440×1440 do. `TestOutputSize` checks the x11grab size against a real FFmpeg `scale` for
+  seven native/requested pairs (a variant without FFmpeg's rounding to multiples of 2 fails it).
+  `TestVideoCrop` checks the video config from the Video manager for the test source with
+  `TestPad` 16 (H.264 and AV1): 640×360 with `codedHeight` 376 and `cropBottom` 16.
+  `TestWriteReport` checks the `pads:` line.
+- verified (sandbox): encoder choice. `internal/host` `TestAlignmentGuard` covers AV1 asked for
+  at 1920×1080 and 3440×1440 (HEVC plus the exact notice), at 2560×1440, 3840×2160 and 1280×720
+  (AV1, no notice), and auto with AV1 as the only hardware decoder (HEVC). Without HEVC in the
+  browser it picks H.264 ("…; using H.264"). With only AV1, or `av1_amf` forced in host.json,
+  AV1 stays without a notice. A restart at the same size does not repeat the notice, and
+  1920×1080 → 1280×720 → 1920×1080 notifies twice.
+- verified (sandbox): protocol. `internal/proto` `TestVideoConfigCrop` checks `SetCrop`, JSON
+  field omission without padding and clearing for a later unpadded generation. It also runs
+  `protocol.js` `visibleArea` in node on the configs Go produces, including a decoder that
+  already crops and a display size that differs from the decoded size.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`: 66 of 66 checks passed in a quiet
+  run; later runs of the final code, with other jobs loading the shared CPU, passed every crop
+  check and failed only fps checks, the known momentary decode dips). The host pads the
+  960×540 test pattern with 16 white rows (`"testPad": 16`) and the video config announces them.
+  In all four scenarios (direct, relay, WebSocket, "WebGPU renderer") the client shows 960×540:
+  the bottom rows on screen are the pattern's yellow and blue bars, not white. The worker logs
+  "padded picture: coded 960x556 announced, decoder output 960x556 …", so Chrome's decoder
+  outputs the padding rows (software AV1, libsvtav1 stream). A unit check in the same file runs
+  the worker's own `Canvas2DRenderer` and `WebGPURenderer` (source cut out of
+  `stream-worker.js`) on a padded 64×40 frame. The output is exactly the visible area, with no
+  padding pixels, for a bottom crop and for a right + bottom crop; the unmodified renderers fail
+  it (canvas 64×40, white rows).
+- Finding, not changed here: the E2E "WebGPU renderer" scenario draws with the 2D renderer in
+  this sandbox. In headless Chromium, SwiftShader WebGPU rejects
+  `device.queue.onSubmittedWorkDone()` with "A valid external Instance reference no longer
+  exists.", so the app's WebGPU self-test fails and it falls back (also before this step). A
+  headed Chromium on Xvfb runs WebGPU, so the renderer crop check runs WebGPU there.
+- verified (sandbox, Wine + FFmpeg 8.1.3 Windows build): the exact probe command line
+  (`-f lavfi -i color=c=black:s=1920x1080:r=30 -frames:v 3 -pix_fmt yuv420p -c:v av1_amf -f nut
+  -write_index 0 pipe:1`) is accepted up to "DLL amfrt64.dll failed to open". The av1_nvenc
+  line reaches "Cannot load nvcuda.dll". The control `-header_insertion_mode idr` is refused at
+  option parsing. The Windows test binary passes `TestOutputSize` (FFmpeg 8.1's scale),
+  `TestProbeAlignment` (SVT-AV1 4.2), `TestVideoCrop` and `TestWriteReport` under Wine.
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified (acceptance T9). Needs step 1.1 merged: without it,
+  `av1_amf` sessions fail on `-header_insertion_mode idr` (A3), although the probe, which uses
+  no rate options, works. Test:
+  1. Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`. Under
+     `encoder: av1_amf` look for `pads: coded 1920x1080 as 1920x1082; sessions at sizes that are
+     not multiples of 64x16 use HEVC or H.264`. Record the coded size. 1920×1082 is expected;
+     1920×1088 would also be handled. Restart the agent; host.log shows `encoder pads the coded
+     picture encoder=av1_amf probe=1920x1080 coded=1920x1082 alignment=64x16`.
+  2. Desktop at 1920×1080 (Windows display settings). In Chrome, open the stream settings
+     (Ctrl+Alt+Shift+O), set Codec AV1 and Resolution Native, and connect. Pass: a toast "AV1 on
+     this GPU needs 64x16-aligned sizes; using HEVC"; the overlay (Ctrl+Alt+Shift+S) shows
+     `Video 1920×1080 HEVC`; host.log has `coded-size alignment notice=…` and `encoder ready …
+     codec=hev1…`. One toast per connection (a reconnect shows it again); none on key-frame,
+     pause/resume or congestion restarts at the same size.
+  3. Desktop at 2560×1440 (or a 1440p monitor), Codec AV1, Resolution Native. Pass: no toast;
+     overlay `Video 2560×1440 AV1`; host.log `encoder ready … codec=av01…` with `av1_amf`. The
+     picture has no green or grey line at the bottom edge. On a 1440p monitor also pick
+     Resolution 1920×1080 (gfxcapture scales to exactly 1920×1080). Pass: the HEVC toast again.
+  4. Crop path and the A7 VERIFY (codedHeight vs displayHeight in Chrome): set
+     `"encoder": "av1_amf"` in host.json (a host-forced encoder is kept), restart the agent and
+     stream the 1920×1080 desktop. Pass: no toast; host.log `coded picture is padded, client
+     crops … coded=1920x1082 crop_right=0 crop_bottom=2`; overlay `Video 1920×1080 AV1 (coded
+     1920×1082, cropped)`. The DevTools console shows `[recon] padded picture: coded 1920x1082
+     announced, decoder output W×H (display W×H), showing 1920x1080`: record W×H, which is what
+     Chrome's hardware AV1 decoder outputs. Check both renderers (Settings → Renderer). Drag a
+     window to the bottom screen edge: its last row is visible and there are no extra rows below
+     it. Repeat on a 3440×1440 desktop (expect `coded=3456x1440 crop_right=16`). Remove the
+     `encoder` key afterwards.
+- AMD RDNA4 (RX 9000): unverified (no RDNA4 host). RDNA4 relaxes the alignment: AMF reports
+  `AMF_VIDEO_ENCODER_AV1_CAP_WIDTH/HEIGHT_ALIGNMENT_FACTOR`, which FFmpeg 8.1 reads as
+  `Av1WidthAlignmentFactor`/`Av1HeightAlignmentFactor`, and adds an `8X2_ONLY` alignment mode.
+  The probe then measures 1920×1080 and the guard never triggers. Test: `recon-host.exe probe`
+  shows no `pads:` line under `av1_amf`. AV1 at 1920×1080 and 3440×1440 streams AV1 without a
+  toast and without padding rows. Record the driver version.
+- NVIDIA: unverified (no NVIDIA host available). Expected: NVENC pads internally and signals
+  1920×1080 in the sequence header. Test on an RTX 40/50 host: `recon-host.exe probe` shows no
+  `pads:` line under `av1_nvenc`. Codec AV1 at a 1920×1080 desktop streams AV1 (overlay `Video
+  1920×1080 AV1`, no toast). If a `pads:` line does appear, record it: the guard then applies
+  to NVIDIA as well, by capability.

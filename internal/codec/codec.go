@@ -228,8 +228,21 @@ func SplitOBUs(b []byte) ([]obu, error) {
 	return out, nil
 }
 
-// AV1CodecString derives "av01.P.LLT.DD" from a sequence header OBU payload.
-func AV1CodecString(seqHdr []byte) (string, error) {
+// AV1SequenceHeader holds the sequence header fields the host uses.
+type AV1SequenceHeader struct {
+	Profile, Level, Tier, BitDepth int
+	// MaxWidth and MaxHeight are max_frame_width/height_minus_1 + 1: the
+	// size of every frame unless its header overrides it
+	// (frame_size_override_flag), which streaming encoders do not do. AV1
+	// has no cropping window: an encoder that codes in blocks (RDNA3: 64x16)
+	// writes the padded size here and decoders output the padding rows.
+	MaxWidth, MaxHeight int
+}
+
+// ParseAV1SequenceHeader parses a sequence header OBU payload up to its
+// color_config bit depth.
+func ParseAV1SequenceHeader(seqHdr []byte) (AV1SequenceHeader, error) {
+	var h AV1SequenceHeader
 	br := &bitReader{b: seqHdr}
 	profile := br.u(3)
 	br.u(1) // still_picture
@@ -281,11 +294,11 @@ func AV1CodecString(seqHdr []byte) (string, error) {
 			}
 		}
 	}
-	// Skip to color_config to find the bit depth.
 	wBits := br.u(4) + 1
 	hBits := br.u(4) + 1
-	br.u(wBits)
-	br.u(hBits)
+	h.MaxWidth = int(br.u(wBits)) + 1
+	h.MaxHeight = int(br.u(hBits)) + 1
+	// Skip to color_config to find the bit depth.
 	frameIDs := uint32(0)
 	if reduced == 0 {
 		frameIDs = br.u(1)
@@ -335,13 +348,46 @@ func AV1CodecString(seqHdr []byte) (string, error) {
 		depth = 10
 	}
 	if br.err {
-		return "", errors.New("codec: truncated AV1 sequence header")
+		return h, errors.New("codec: truncated AV1 sequence header")
 	}
+	h.Profile, h.Level, h.Tier, h.BitDepth = int(profile), int(level), int(tier), depth
+	return h, nil
+}
+
+// CodecString returns the WebCodecs codec string "av01.P.LLT.DD".
+func (h AV1SequenceHeader) CodecString() string {
 	t := 'M'
-	if tier == 1 {
+	if h.Tier == 1 {
 		t = 'H'
 	}
-	return fmt.Sprintf("av01.%d.%02d%c.%02d", profile, level, t, depth), nil
+	return fmt.Sprintf("av01.%d.%02d%c.%02d", h.Profile, h.Level, t, h.BitDepth)
+}
+
+// AV1CodecString derives "av01.P.LLT.DD" from a sequence header OBU payload.
+func AV1CodecString(seqHdr []byte) (string, error) {
+	h, err := ParseAV1SequenceHeader(seqHdr)
+	if err != nil {
+		return "", err
+	}
+	return h.CodecString(), nil
+}
+
+// AV1FrameSize returns the frame size of the first sequence header in a
+// low-overhead AV1 bitstream (a temporal unit, or sequence header OBUs as
+// extradata).
+func AV1FrameSize(data []byte) (w, h int, ok bool) {
+	obus, err := SplitOBUs(data)
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, o := range obus {
+		if o.typ == obuSequenceHeader {
+			if sh, err := ParseAV1SequenceHeader(o.body); err == nil {
+				return sh.MaxWidth, sh.MaxHeight, true
+			}
+		}
+	}
+	return 0, 0, false
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +397,11 @@ func AV1CodecString(seqHdr []byte) (string, error) {
 type Params struct {
 	Family string
 	Codec  string
-	sets   []byte // Annex-B parameter sets (H.264/HEVC) or OBUs (AV1)
+	// CodedWidth and CodedHeight are the frame size of the AV1 sequence
+	// header (0 for H.264/HEVC, whose decoders apply the SPS cropping
+	// window themselves).
+	CodedWidth, CodedHeight int
+	sets                    []byte // Annex-B parameter sets (H.264/HEVC) or OBUs (AV1)
 }
 
 // NewParams seeds the parameter cache from container extradata (may be empty).
@@ -486,8 +536,9 @@ func (p *Params) updateCodec(data []byte) bool {
 		}
 		for _, o := range obus {
 			if o.typ == obuSequenceHeader {
-				if s, err := AV1CodecString(o.body); err == nil {
-					p.Codec = s
+				if h, err := ParseAV1SequenceHeader(o.body); err == nil {
+					p.Codec = h.CodecString()
+					p.CodedWidth, p.CodedHeight = h.MaxWidth, h.MaxHeight
 					return true
 				}
 			}

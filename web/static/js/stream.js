@@ -623,7 +623,7 @@ function onStats(st) {
     el('hr'),
     row('Frame rate', `${st.fps.toFixed(1)} fps`),
     row('Bitrate', `${st.mbps.toFixed(1)} Mbps`),
-    row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}`),
+    row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}${v.cropRight || v.cropBottom ? ` (coded ${v.codedWidth}×${v.codedHeight}, cropped)` : ''}`),
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),

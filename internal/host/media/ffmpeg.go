@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/codec"
+	"github.com/karamkamal1/kloudit-recon/internal/nut"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -46,6 +48,22 @@ type Caps struct {
 
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
+
+	align map[string]Alignment // encoders that pad the coded picture
+}
+
+// Alignment is the coded-size alignment of an encoder that pads pictures to
+// a block size: the picture it codes is w x h rounded up to multiples of W x
+// H (or larger), and the padding rows and columns reach the decoder's output
+// unless the codec can signal a crop. AV1 cannot: RDNA3's AV1 encoder codes
+// 1920x1080 as 1920x1082 (AMF docs: 64x16 alignment) and FFmpeg's av1_amf
+// reports the crop only as stream side data (AV_PKT_DATA_FRAME_CROPPING),
+// which NUT does not carry.
+type Alignment struct {
+	W, H int
+	// ProbeW x ProbeH is the picture the probe encoded and CodedW x CodedH
+	// the size the bitstream coded it at.
+	ProbeW, ProbeH, CodedW, CodedH int
 }
 
 // candidate encoders in preference order within a family.
@@ -99,7 +117,8 @@ func quietCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 
 // Probe inspects the ffmpeg build and test-encodes with every candidate encoder.
 func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) {
-	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{}}
+	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{},
+		align: map[string]Alignment{}}
 	out, err := quietCmd(ctx, ffmpeg, "-hide_banner", "-version").Output()
 	if err != nil {
 		return nil, fmt.Errorf("running ffmpeg: %w", err)
@@ -156,9 +175,25 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			defer wg.Done()
 			opts := encoderOptions(ctx, ffmpeg, e.Name)
 			err := testEncode(ctx, ffmpeg, e)
+			var al Alignment
+			var alErr error
+			if err == nil && e.HW && e.Family == "av1" {
+				al, alErr = probeAlignment(ctx, ffmpeg, e)
+				if alErr != nil && log != nil {
+					log.Info("coded size probe failed, assuming no padding", "encoder", e.Name, "err", alErr)
+				}
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			c.options[e.Name] = opts
+			if al.W > 1 || al.H > 1 {
+				c.align[e.Name] = al
+				if log != nil {
+					log.Info("encoder pads the coded picture", "encoder", e.Name,
+						"probe", fmt.Sprintf("%dx%d", al.ProbeW, al.ProbeH), "coded", fmt.Sprintf("%dx%d", al.CodedW, al.CodedH),
+						"alignment", fmt.Sprintf("%dx%d", al.W, al.H))
+				}
+			}
 			if err == nil {
 				ok[e.Name] = true
 			} else {
@@ -184,17 +219,7 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
-	if e.Vendor == "vaapi" {
-		args = append(args, "-vaapi_device", vaapiDevice())
-	}
-	args = append(args, "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30", "-frames:v", "3")
-	if e.Vendor == "vaapi" {
-		args = append(args, "-vf", "format=nv12,hwupload")
-	} else {
-		args = append(args, "-pix_fmt", "yuv420p")
-	}
-	args = append(args, "-c:v", e.Name, "-f", "null", "-")
+	args := append(blackFramesArgs(e, 640, 360), "-f", "null", "-")
 	var stderr bytes.Buffer
 	cmd := quietCmd(ctx, ffmpeg, args...)
 	cmd.Stderr = &stderr
@@ -202,6 +227,86 @@ func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
 	}
 	return nil
+}
+
+// blackFramesArgs returns the arguments that encode three black w x h frames
+// with e, without the output.
+func blackFramesArgs(e EncoderInfo, w, h int) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
+	if e.Vendor == "vaapi" {
+		args = append(args, "-vaapi_device", vaapiDevice())
+	}
+	args = append(args, "-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=30", w, h), "-frames:v", "3")
+	if e.Vendor == "vaapi" {
+		args = append(args, "-vf", "format=nv12,hwupload")
+	} else {
+		args = append(args, "-pix_fmt", "yuv420p")
+	}
+	return append(args, "-c:v", e.Name)
+}
+
+// alignProbeW x alignProbeH is the picture probeAlignment encodes: the most
+// common desktop size, and one that RDNA3's AV1 encoder pads.
+const alignProbeW, alignProbeH = 1920, 1080
+
+// probeAlignment encodes three black 1920x1080 frames with an AV1 encoder and
+// reads the coded size from the sequence header: the NUT stream header only
+// repeats the configured size. An encoder that codes the picture larger pads
+// it; the result is then the documented RDNA3 alignment of 64x16, or a
+// coarser one if the measured padding needs it. W, H = 1, 1: no padding.
+func probeAlignment(ctx context.Context, ffmpeg string, e EncoderInfo) (Alignment, error) {
+	cw, ch, err := codedSize(ctx, ffmpeg, blackFramesArgs(e, alignProbeW, alignProbeH))
+	if err != nil {
+		return Alignment{W: 1, H: 1}, err
+	}
+	a := Alignment{W: 1, H: 1, ProbeW: alignProbeW, ProbeH: alignProbeH, CodedW: cw, CodedH: ch}
+	if cw != alignProbeW || ch != alignProbeH {
+		a.W, a.H = alignmentFor(alignProbeW, cw, 64), alignmentFor(alignProbeH, ch, 16)
+	}
+	return a, nil
+}
+
+// alignmentFor returns the smallest power-of-two multiple of def whose
+// rounding up of n reaches the measured coded size (RDNA3 special-cases
+// 1080 rows: coded as 1082, not 1088, which def covers).
+func alignmentFor(n, coded, def int) int {
+	a := def
+	for a < 1<<16 && (n+a-1)/a*a < coded {
+		a *= 2
+	}
+	return a
+}
+
+// codedSize runs ffmpeg with args (input and encoder, see blackFramesArgs)
+// into NUT and returns the coded frame size of the AV1 stream it writes.
+func codedSize(ctx context.Context, ffmpeg string, args []string) (int, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	cmd := quietCmd(ctx, ffmpeg, append(args, "-f", "nut", "-write_index", "0", "pipe:1")...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return 0, 0, fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
+	}
+	d := nut.NewDemuxer(&stdout, proto.MaxFrameSize)
+	for {
+		pkt, err := d.ReadPacket()
+		if err != nil {
+			break
+		}
+		st := d.Streams()[pkt.Stream]
+		if st == nil || st.Class != nut.ClassVideo {
+			continue
+		}
+		// The sequence header is in the extradata, the key frame, or both.
+		if w, h, ok := codec.AV1FrameSize(st.Extradata); ok {
+			return w, h, nil
+		}
+		if w, h, ok := codec.AV1FrameSize(pkt.Data); ok {
+			return w, h, nil
+		}
+	}
+	return 0, 0, errors.New("no AV1 sequence header in the encoder output")
 }
 
 // testCaptureClock runs the exact capture-clock filter and encoder time base
@@ -316,6 +421,31 @@ func (c *Caps) HasOption(enc, opt string) bool {
 	return c.options[enc][opt]
 }
 
+// Alignment returns the coded-size alignment the probe measured for an
+// encoder (W, H = 1, 1: it codes any size as is).
+func (c *Caps) Alignment(enc string) Alignment {
+	if a, ok := c.align[enc]; ok {
+		return a
+	}
+	return Alignment{W: 1, H: 1}
+}
+
+// SetAlignment records an encoder's coded-size alignment (the probe does;
+// tests, and an encoder backend that knows its alignment factors).
+func (c *Caps) SetAlignment(enc string, a Alignment) {
+	if c.align == nil {
+		c.align = map[string]Alignment{}
+	}
+	c.align[enc] = a
+}
+
+// Pads reports whether an encoder pads a w x h picture: w or h is not a
+// multiple of its alignment. An unknown size (0) is not checked.
+func (c *Caps) Pads(enc string, w, h int) bool {
+	a := c.Alignment(enc)
+	return w > 0 && h > 0 && (a.W > 1 && w%a.W != 0 || a.H > 1 && h%a.H != 0)
+}
+
 // ---------------------------------------------------------------------------
 // Argument construction
 
@@ -327,7 +457,7 @@ type Source struct {
 	Window   string // gfxcapture window title regex (optional)
 	Display  string // x11grab display, e.g. ":0.0"
 	X, Y     int    // x11grab offset
-	NativeW  int    // native size of the captured surface (x11grab/test)
+	NativeW  int    // native size of the captured surface (x11grab/test; ddagrab and gfxcapture: the monitor's, informational)
 	NativeH  int
 }
 
@@ -349,6 +479,43 @@ type Params struct {
 	// Barcode draws the frame barcode of each frame's index (= Frame.Seq) into
 	// the top-left corner (BarcodeFilter; test source only).
 	Barcode bool
+	// TestPad adds that many rows of white below the test pattern and
+	// announces them as padding to crop (VideoConfig cropBottom), as for an
+	// encoder that pads the coded picture (AV1 on RDNA3). Test source only:
+	// tests of the client's crop path without such a GPU.
+	TestPad int
+}
+
+// OutputSize returns the size of the picture BuildArgs hands the encoder
+// for p, or 0, 0 when only the capture knows it (a window).
+func (p Params) OutputSize() (w, h int) {
+	switch p.Source.Backend {
+	case "test":
+		w, h = p.Source.NativeW, p.Source.NativeH
+		if w == 0 {
+			w, h = 1280, 720
+		}
+		return w, h + p.TestPad
+	case "x11grab":
+		w, h = p.Source.NativeW, p.Source.NativeH
+		if p.Width > 0 && p.Height > 0 && w > 0 && h > 0 {
+			// scale=W:H:force_original_aspect_ratio=decrease:force_divisible_by=2,
+			// as libavfilter/scale_eval.c computes it (av_rescale rounds to
+			// the nearest multiple of 2, then down).
+			rescale := func(a, b, c int) int { return (a*b + c/2) / c }
+			fw, fh := min(p.Width, rescale(p.Height, w, h*2)*2), min(p.Height, rescale(p.Width, h, w*2)*2)
+			return fw &^ 1, fh &^ 1
+		}
+		return w, h
+	case "gfxcapture":
+		if p.Width > 0 && p.Height > 0 {
+			return p.Width, p.Height // width/height force the frame size
+		}
+		if p.Source.Window != "" {
+			return 0, 0
+		}
+	}
+	return p.Source.NativeW, p.Source.NativeH
 }
 
 // CaptureClockFilter sets each frame's pts to the wall clock (av_gettime())
@@ -476,6 +643,9 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		// The test pattern is generated at the output size: cells stay
 		// BarcodeCell pixels in the encoded picture.
 		chain += "," + BarcodeFilter(proto.BarcodeCell)
+	}
+	if p.TestPad > 0 && p.Source.Backend == "test" {
+		chain += fmt.Sprintf(",pad=w=iw:h=ih+%d:x=0:y=0:color=white", p.TestPad)
 	}
 
 	// Convert into what the encoder accepts.

@@ -42,9 +42,13 @@ type Config struct {
 	AudioKbps   int  `json:"audioKbps"`
 	Gamepad     bool `json:"gamepad"`
 
-	TestWidth  int    `json:"testWidth,omitempty"`
-	TestHeight int    `json:"testHeight,omitempty"`
-	LogLevel   string `json:"logLevel,omitempty"`
+	TestWidth  int `json:"testWidth,omitempty"`
+	TestHeight int `json:"testHeight,omitempty"`
+	// TestPad: rows of padding below the test pattern that clients must crop
+	// (VideoConfig cropBottom), as an encoder that pads the coded picture
+	// produces; the browser E2E checks the client's crop with it.
+	TestPad  int    `json:"testPad,omitempty"`
+	LogLevel string `json:"logLevel,omitempty"`
 
 	path string // file it was loaded from; the agent re-reads it to pick up a new pairing
 }

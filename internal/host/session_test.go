@@ -1,9 +1,11 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
@@ -156,5 +159,118 @@ func TestMediaTargetSurvivesMigration(t *testing.T) {
 	}
 	if got := transport.MediaControl(s.c).TargetBitrate(); got != want {
 		t.Fatalf("target after migration = %d bit/s, want %d", got, want)
+	}
+}
+
+// ctrlRecorder is a control stream that keeps what the host writes.
+type ctrlRecorder struct{ bytes.Buffer }
+
+func (*ctrlRecorder) Read([]byte) (int, error)         { return 0, io.EOF }
+func (*ctrlRecorder) Close() error                     { return nil }
+func (*ctrlRecorder) CancelRead()                      {}
+func (*ctrlRecorder) CancelWrite()                     {}
+func (*ctrlRecorder) SetReadDeadline(time.Time) error  { return nil }
+func (*ctrlRecorder) SetWriteDeadline(time.Time) error { return nil }
+
+// notices returns the texts of the notices written so far.
+func (r *ctrlRecorder) notices(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for r.Len() > 0 {
+		b, err := proto.ReadMsg(&r.Buffer, proto.MaxControlMsg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n proto.Notice
+		json.Unmarshal(b, &n)
+		if n.T == "notice" {
+			out = append(out, n.Msg)
+		}
+	}
+	return out
+}
+
+// TestAlignmentGuard checks the encoder choice for an encoder that pads the
+// coded picture (step 1.7): AV1 on RDNA3 (probed alignment 64x16) gives way
+// to HEVC at 1920x1080, asked for by the client or chosen automatically,
+// with one notice; at aligned sizes AV1 stays. Without HEVC end-to-end H.264
+// takes over; with nothing else, or forced in the host config, AV1 stays
+// (the client crops).
+func TestAlignmentGuard(t *testing.T) {
+	caps := &media.Caps{Encoders: []media.EncoderInfo{
+		{Name: "av1_amf", Family: "av1", Vendor: "amd", HW: true},
+		{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+		{Name: "h264_amf", Family: "h264", Vendor: "amd", HW: true},
+		{Name: "libx264", Family: "h264", Vendor: "software"},
+	}}
+	caps.SetAlignment("av1_amf", media.Alignment{W: 64, H: 16, ProbeW: 1920, ProbeH: 1080, CodedW: 1920, CodedH: 1082})
+	all := []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc", HW: true}, {Family: "h264", HW: true}}
+	newSession := func(w, h int, decoders []proto.DecoderInfo, forced string) (*Session, *ctrlRecorder) {
+		cfg := &Config{Capture: "test", TestWidth: w, TestHeight: h, Encoder: forced}
+		cfg.Defaults()
+		rec := &ctrlRecorder{}
+		return &Session{
+			a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+			hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: decoders},
+			ctrl:  rec, tried: map[string]bool{},
+			log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}, rec
+	}
+	av1 := proto.Prefs{Codec: "av1"}
+	const notice = "AV1 on this GPU needs 64x16-aligned sizes; using HEVC"
+	for _, c := range []struct {
+		name     string
+		w, h     int
+		decoders []proto.DecoderInfo
+		prefs    proto.Prefs
+		forced   string
+		want     string
+		notice   string
+	}{
+		{"forced AV1 at 1920x1080", 1920, 1080, all, av1, "", "hevc_amf", notice},
+		// An encoder forced in host.json is kept (VideoConfig announces the crop).
+		{"host forces av1_amf at 1920x1080", 1920, 1080, all, proto.Prefs{}, "av1_amf", "av1_amf", ""},
+		{"forced AV1 at 2560x1440", 2560, 1440, all, av1, "", "av1_amf", ""},
+		{"forced AV1 at 3840x2160", 3840, 2160, all, av1, "", "av1_amf", ""},
+		{"forced AV1 at 1280x720", 1280, 720, all, av1, "", "av1_amf", ""},
+		{"forced AV1 at 3440x1440", 3440, 1440, all, av1, "", "hevc_amf", notice},
+		{"auto, AV1 the only hardware decoder", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc"}, {Family: "h264"}},
+			proto.Prefs{}, "", "hevc_amf", notice},
+		{"no HEVC in the browser", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "h264", HW: true}}, av1, "", "h264_amf",
+			"AV1 on this GPU needs 64x16-aligned sizes; using H.264"},
+		{"only AV1 in the browser", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}}, av1, "", "av1_amf", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, rec := newSession(c.w, c.h, c.decoders, c.forced)
+			p, err := s.buildParams(c.prefs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := rec.notices(t)
+			if p.Encoder.Name != c.want || (c.notice == "") != (len(got) == 0) || (c.notice != "" && (len(got) != 1 || got[0] != c.notice)) {
+				t.Fatalf("encoder %s, notices %q; want %s, %q", p.Encoder.Name, got, c.want, c.notice)
+			}
+			// Restarts at the same size do not repeat the notice.
+			if p, _ = s.buildParams(c.prefs); p.Encoder.Name != c.want || len(rec.notices(t)) != 0 {
+				t.Fatalf("restart: encoder %s or a repeated notice", p.Encoder.Name)
+			}
+		})
+	}
+
+	// A session that switches to an aligned size gets AV1 back, and the
+	// notice again when it returns to 1920x1080.
+	s, rec := newSession(2560, 1440, all, "")
+	for i, sz := range [][2]int{{1920, 1080}, {1280, 720}, {1920, 1080}} {
+		p, err := s.buildParams(proto.Prefs{Codec: "av1", Width: sz[0], Height: sz[1]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, notices := "av1_amf", 0
+		if sz[0] == 1920 {
+			want, notices = "hevc_amf", 1
+		}
+		if p.Encoder.Name != want || len(rec.notices(t)) != notices {
+			t.Fatalf("step %d %dx%d: encoder %s", i, sz[0], sz[1], p.Encoder.Name)
+		}
 	}
 }

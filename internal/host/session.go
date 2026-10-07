@@ -47,10 +47,11 @@ type Session struct {
 	ctrlMu sync.Mutex
 	ctrl   transport.BidiStream
 
-	hello   proto.Hello
-	prefsMu sync.Mutex // guards prefs and monitor
-	prefs   proto.Prefs
-	monitor platform.Monitor
+	hello       proto.Hello
+	prefsMu     sync.Mutex // guards prefs, monitor and alignNotice
+	prefs       proto.Prefs
+	monitor     platform.Monitor
+	alignNotice string // last coded-size alignment notice, sent once
 
 	video    *media.Video
 	audio    *media.Audio
@@ -310,18 +311,77 @@ func (s *Session) currentPrefs() proto.Prefs {
 }
 
 // chooseEncoder negotiates the codec between the browser's decoders and the
-// host's encoders.
-func (s *Session) chooseEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
+// host's encoders for a w x h picture (0, 0: size unknown). An encoder that
+// would pad that size (Caps.Pads; AV1 on RDNA3 at 1920x1080) gives way to
+// HEVC, else H.264, also when the client asks for its codec; notice tells
+// the user why ("" when nothing changed). An encoder forced in the host
+// config is kept: its padding is announced for the client to crop.
+func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, notice string, err error) {
+	e, err = s.negotiateEncoder(prefs)
 	caps := s.a.caps
+	if err != nil || !caps.Pads(e.Name, w, h) {
+		return e, "", err
+	}
+	if e.Name == s.a.cfg.Encoder {
+		s.log.Debug("forced encoder pads this size, the client crops", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h))
+		return e, "", nil
+	}
+	// Hardware encoders first, HEVC before H.264.
+	for _, hwOnly := range []bool{true, false} {
+		for _, fam := range []string{"hevc", "h264"} {
+			if alt, ok := s.pickEncoder(fam, hwOnly, func(c media.EncoderInfo) bool { return !caps.Pads(c.Name, w, h) }); ok {
+				a := caps.Alignment(e.Name)
+				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
+					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
+				return alt, fmt.Sprintf("%s on this GPU needs %dx%d-aligned sizes; using %s",
+					familyNames[e.Family], a.W, a.H, familyNames[alt.Family]), nil
+			}
+		}
+	}
+	// Nothing else works end-to-end: keep it, VideoConfig announces the crop.
+	return e, "", nil
+}
+
+// familyNames are the codec families as users know them.
+var familyNames = map[string]string{"h264": "H.264", "hevc": "HEVC", "av1": "AV1"}
+
+// clientDecoders returns the browser's decoders by family.
+func (s *Session) clientDecoders() map[string]proto.DecoderInfo {
 	client := map[string]proto.DecoderInfo{}
 	for _, d := range s.hello.Decoders {
 		client[d.Family] = d
 	}
-	usable := func(e media.EncoderInfo) bool {
-		s.triedMu.Lock()
-		defer s.triedMu.Unlock()
-		return !s.tried[e.Name]
+	return client
+}
+
+// usableEncoder reports whether an encoder has not been excluded after
+// failing in this session.
+func (s *Session) usableEncoder(e media.EncoderInfo) bool {
+	s.triedMu.Lock()
+	defer s.triedMu.Unlock()
+	return !s.tried[e.Name]
+}
+
+// pickEncoder returns the host's preferred usable encoder of a family the
+// browser decodes (only hardware encoders if hwOnly) that also passes ok.
+func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo) bool) (media.EncoderInfo, bool) {
+	if _, dec := s.clientDecoders()[fam]; !dec {
+		return media.EncoderInfo{}, false
 	}
+	for _, e := range s.a.caps.Encoders {
+		if e.Family == fam && (!hwOnly || e.HW) && s.usableEncoder(e) && (ok == nil || ok(e)) {
+			return e, true
+		}
+	}
+	return media.EncoderInfo{}, false
+}
+
+// negotiateEncoder picks the encoder by configuration, preference and the
+// browser's decoders.
+func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
+	caps := s.a.caps
+	client := s.clientDecoders()
+	usable := s.usableEncoder
 	if s.a.cfg.Encoder != "" {
 		for _, e := range caps.Encoders {
 			if e.Name == s.a.cfg.Encoder {
@@ -331,17 +391,7 @@ func (s *Session) chooseEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
 			}
 		}
 	}
-	pick := func(fam string, hwOnly bool) (media.EncoderInfo, bool) {
-		if _, ok := client[fam]; !ok {
-			return media.EncoderInfo{}, false
-		}
-		for _, e := range caps.Encoders {
-			if e.Family == fam && (!hwOnly || e.HW) && usable(e) {
-				return e, true
-			}
-		}
-		return media.EncoderInfo{}, false
-	}
+	pick := func(fam string, hwOnly bool) (media.EncoderInfo, bool) { return s.pickEncoder(fam, hwOnly, nil) }
 	if prefs.Codec != "" && prefs.Codec != "auto" {
 		if e, ok := pick(prefs.Codec, false); ok {
 			return e, nil
@@ -371,10 +421,6 @@ func (s *Session) chooseEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
 
 func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	cfg := s.a.cfg
-	enc, err := s.chooseEncoder(prefs)
-	if err != nil {
-		return media.Params{}, err
-	}
 	mons := s.a.monitors()
 	mon := mons[0]
 	if prefs.Monitor >= 0 && prefs.Monitor < len(mons) {
@@ -409,7 +455,6 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		kbps = 500
 	}
 	p := media.Params{
-		Encoder:     enc,
 		FPS:         fps,
 		BitrateKbps: kbps,
 		Quality:     prefs.Quality,
@@ -428,22 +473,39 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		if w > 0 && h > 0 {
 			p.Source.NativeW, p.Source.NativeH = w&^1, h&^1
 		}
+		p.TestPad = cfg.TestPad
 	case "x11grab":
 		p.Source = media.Source{Backend: "x11grab", Display: cfg.X11Display, X: mon.X, Y: mon.Y, NativeW: mon.W, NativeH: mon.H}
 		p.Width, p.Height = w, h
 	case "gfxcapture":
-		p.Source = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window}
+		p.Source = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window, NativeW: mon.W, NativeH: mon.H}
 		p.Width, p.Height = w, h
 	case "ddagrab":
 		out := mon.DXGIOutput
 		if out < 0 {
 			out = mon.Index
 		}
-		p.Source = media.Source{Backend: "ddagrab", Output: out}
+		p.Source = media.Source{Backend: "ddagrab", Output: out, NativeW: mon.W, NativeH: mon.H}
 	}
 	// The test pattern carries each frame's Seq as a barcode (welcome feature
 	// barcode-seq): the client checks the picture it draws against the header.
 	p.Barcode = backend == "test" && s.a.caps.CanDrawBarcode()
+
+	outW, outH := p.OutputSize()
+	enc, notice, err := s.chooseEncoder(prefs, outW, outH)
+	if err != nil {
+		return media.Params{}, err
+	}
+	p.Encoder = enc
+	// Once per change: buildParams runs again for every restart.
+	s.prefsMu.Lock()
+	repeat := notice == s.alignNotice
+	s.alignNotice = notice
+	s.prefsMu.Unlock()
+	if notice != "" && !repeat {
+		s.log.Info("coded-size alignment", "notice", notice, "size", fmt.Sprintf("%dx%d", outW, outH), "encoder", enc.Name)
+		s.notice("info", notice)
+	}
 	return p, nil
 }
 

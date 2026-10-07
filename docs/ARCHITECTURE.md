@@ -131,7 +131,10 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
   "infinite" GOP (IDR only on start or request), forced IDR, NVENC `-tune ull -zerolatency 1
   -delay 0`. Encoder options are filtered against `ffmpeg -h encoder=…`, so any FFmpeg build works.
 - **Probing:** at startup every candidate encoder test-encodes a few frames. The best working
-  one per codec family is used, with hardware preferred.
+  one per codec family is used, with hardware preferred. Hardware AV1 encoders also encode three
+  black 1920×1080 frames, and the frame size in the AV1 sequence header tells whether they pad
+  the coded picture: RDNA3 codes 1080p as 1920×1082 (64×16 alignment; NUT's stream header only
+  repeats the configured size, and FFmpeg reports the crop as side data NUT drops).
 - **Overlapped restarts:** a settings change starts generation *n+1* while *n* keeps streaming.
   The switch happens on *n+1*'s first key frame. Urgent restarts (key frame needed after loss,
   congestion back-off) kill *n* immediately instead.
@@ -154,6 +157,13 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
 Codec negotiation: the browser reports per family whether it can decode with hardware
 (`VideoDecoder.isConfigSupported` with `prefer-hardware`). The host picks the first family with
 hardware on both ends, in the order HEVC → AV1 → H.264, then any hardware encoder, then software.
+An encoder that would pad the session's picture size (probed alignment, above) gives way to HEVC,
+else H.264, with a notice ("AV1 on this GPU needs 64x16-aligned sizes; using HEVC"), also when
+the client asks for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded
+picture is streamed anyway (a host-forced encoder, nothing else decodes, or a size only the
+capture knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom`
+and the client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle;
+WebGPU: scaled texture coordinates).
 
 ## The browser pipeline
 
