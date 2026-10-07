@@ -156,6 +156,12 @@ public:
     // src describes the initialized capture (device, size); the backend fills
     // in (what it wants submitted) and out. Called again after a failed start.
     virtual Status init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) = 0;
+    // The start failed after init() succeeded (stream.cpp: the colour
+    // conversion could not be set up, say): release everything init() created
+    // now, while the capture is still alive. An encoder may live on the
+    // capture's own context (AMF on AMD Direct Capture's AMFContext), and the
+    // capture is destroyed next. No thread has run; init() may follow again.
+    virtual void release() {}
     // Capture thread. Must not block on the output side. Error code
     // "encoder_busy" (non-fatal): the frame was not taken (the encoder is
     // behind); the pipeline drops it without using up its frame id.

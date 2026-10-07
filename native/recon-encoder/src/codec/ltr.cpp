@@ -133,7 +133,7 @@ bool LtrTracker::output(uint64_t frameId, const Output& o, const Plan& planned, 
         if (inflight_.front().frameId == frameId) markedAt = inflight_.front().at;
         inflight_.pop_front();
     }
-    if (o.key) {
+    if (o.key || o.clearsSlots) {
         for (Slot& s : slots_) s = Slot{};
     }
     if (o.markedSlot >= 0 && o.markedSlot < cfg_.slots) slots_[size_t(o.markedSlot)] = Slot{frameId, false, markedAt};

@@ -17,7 +17,11 @@
 //   refFloor = F. None (or a key frame was submitted after F): an IDR.
 // - A key frame clears every slot ("When we encode a key frame or switch frame,
 //   all saved LTR slots will be cleared", AMF_Video_Encode_HEVC_API.md 2.2.8),
-//   so a key frame is never marked; the frame after it is.
+//   so a key frame is never marked; the frame after it is. So does an AV1
+//   switch frame (Output::clearsSlots): the AMF backend turns their insertion
+//   off, but one the encoder makes anyway must not leave the tracker believing
+//   the slots still hold ACKed LTRs ("Referring to a LTR frame not existing in
+//   LTR slot will generate an Intra only frame", AMF_Video_Encode_AV1_API.md).
 //
 // What a slot holds is taken from the encoder's output (AMF
 // OUTPUT_MARKED_LTR_INDEX), not from the request, so a mark the encoder moved
@@ -57,6 +61,7 @@ public:
         bool intra = false;    // intra coded (key or intra-only): references nothing
         int markedSlot = -1;   // slot it was stored in, -1 = none
         uint32_t refMask = 0;  // LTR slots it referenced
+        bool clearsSlots = false;  // not a key frame, but the encoder emptied every slot (AV1 switch frame)
     };
 
     struct Stats {

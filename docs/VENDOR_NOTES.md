@@ -346,6 +346,24 @@ Verified in the sandbox (Linux, no GPU, no Windows):
   `--self-test-encoder`, `TestHelperIntegrationEncodeTest`. `go test ./internal/host/encoder`
   (Linux) passes with the new message encodings (`ack`, start knobs) and `started` decoding.
 
+- Review fixes (sandbox): every source still builds without warnings (mingw GCC) and
+  passes the strict clang syntax check, the new property names and enum values
+  (`AMF_VIDEO_ENCODER_AV1_SWITCH_FRAME_INSERTION_MODE_NONE`, `..._OUTPUT_FRAME_TYPE_SWITCH`,
+  `..._INTRA_REFRESH_MODE__DISABLED`) checked against the vendored v1.5.3 headers.
+  `--self-test-encoder` (Wine) has the new case "an AV1 switch frame clears the slots"
+  (the same run without the switch frame recovers from frame 18, with it every slot is
+  empty and a loss needs an IDR); ignoring the new `clearsSlots` flag in the tracker makes
+  exactly that case fail. `xvfb-run -a make helper-test` passes (38 pass, 4 skip: the new
+  `HelperIntegrationAMFFailedStart` skips without the AMF backend); the mock backend now
+  refuses an `init()` after a start that failed after `init()` unless `release()` came in
+  between, and `TestHelperIntegrationMock` starts once with a barcode on the synthetic
+  source (fails after the encoder init: "the barcode needs the GPU colour conversion")
+  before its real start; with the `release()` call removed from stream.cpp that start fails
+  with "init() again without release()". The Go client decodes the new caps field
+  `assumed` (`go test ./internal/host/encoder`). Nothing of the AMF runtime behaviour below
+  (intra refresh defaults, read-backs, switch frames, zero-copy formats, the idle output
+  thread) can run here: no `amfrt64.dll` under Wine.
+
 Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
 `recon-encoder.exe`; `--log-level=debug` adds the AMF trace and the probe time; every
 `--encode-test` prints a summary and the ffprobe / ffmpeg commands to check its file):
@@ -355,7 +373,11 @@ Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
   4096x2176 for H.264, 7680x4320 for HEVC, 8192x4352 for AV1), `hwInstances` (Navi 31 has two
   VCN 4.0 engines: expect 2), `queryTimeout` true, `roi` importance, `tenBit` true for hevc
   and av1, `maxLtr` (2 for h264), `alignW`/`alignH` 64/16 for av1, `recovery` ltr,
-  `liveBitrate` seamless; caps.log has `amf probe: N ms` (expect < 300 ms).
+  `liveBitrate` seamless, `intraRefresh` true for all three (now detected by set and read
+  back on the probe encoder: record any codec where it is false); `assumed` is
+  `["maxLtr","liveBitrate"]` for h264 and hevc and `["roi","liveBitrate"]` for av1, plus
+  `"alignW","alignH"` for av1 if the driver has no `Av1WidthAlignmentFactor` (record which);
+  caps.log has `amf probe: N ms` (expect < 300 ms).
 - NVIDIA: unverified (no NVIDIA host available). Test: `recon-encoder.exe --print-caps
   --backend=amf` on an NVIDIA-only host reports `backend` `none` and `unavailable.amf` "AMF
   runtime (amfrt64.dll) not found in System32" (the AMF backend is AMD-only; NVENC is 3.4).
@@ -417,15 +439,20 @@ Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
   AV1 accepts ROI too (no "per-frame property not accepted: Av1ROIData").
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only; NVENC emphasis maps are 3.4).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (encoder instance, GUIDE 3.3 VERIFY): with
-  `hwInstances` 2, `--instance=1` starts and encodes; `--instance=2` fails with
+  `hwInstances` 2, `--instance=1` starts and encodes, started `encoderInstance` is 1 (now
+  read back from the encoder; `INSTANCE_INDEX` > 0 is required, so a driver that refuses it
+  fails the start with `init_failed` "... rejected HevcEncoderInstance") and the log has no
+  "asked for encoder instance" warning; `--instance=2` fails with
   "unsupported ... the GPU has 2". With Adrenalin Instant Replay recording, compare
   submit->output p95 of `--instance=0` and `--instance=1` (the engine Adrenalin does not use
   should be faster).
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (intra refresh without LTR): H.264 and HEVC
   `--intra-refresh=60 --frames=600`: only one key frame (frame 1); ffprobe shows P frames
-  only; `ffplay` shows the refresh band sweeping once per second; with `--ltr-slots=2` the
-  start fails with "intra refresh does not work with user LTR".
+  only; `ffplay` shows the refresh band sweeping once per second; started
+  `intraRefreshFrames` is the cycle read back from the encoder (60 at 1080p; a rounded
+  value is logged as "asked for 60 frames ..., the encoder runs N"); with `--ltr-slots=2`
+  the start fails with "intra refresh does not work with user LTR".
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (through recon-host's client):
   `$env:RECON_HELPER_EXE=...; $env:RECON_HELPER_ENCODE_TEST="--backend=amf --codec=hevc
@@ -444,4 +471,58 @@ Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
 - AMD RDNA3 (RX 7900 XT): unverified. Test (driver reset during encode): start
   `--encode-test` with `--frames=10000`, run `dxcap -forcetdr`: the helper reports the fatal
   `device_lost` (or `encode_failed` after 10 failed calls) within a second and exits; no hang.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (intra refresh off by default, review fix): H.264
+  `--encode-test=h264.h264 --codec=h264 --capture=synthetic-gpu --width=1920 --height=1080
+  --kbps=10000 --rc=cbr --frames=600` (no `--intra-refresh`): started `intraRefreshFrames` 0
+  and no "intra refresh: asked for 0" warning (the encoder read back
+  `IntraRefreshMBsNumberPerSlot` 0; ULTRA_LOW_LATENCY's default is 255); `ffplay h264.h264`
+  shows no refresh band; `ffprobe -show_frames -select_streams v h264.h264` P-frame
+  `pkt_size` has no periodic component (no repeating pattern with the cycle 8160 / 255 = 32
+  frames of a 1080p band sweep). Compare an AMF build of the previous commit if one is at
+  hand: its P frames show the 32-frame pattern. Repeat with HEVC and AV1 (both off by
+  default; started 0).
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (zero-copy surface formats, review fix): with
+  an HDR desktop (Windows HDR on), `--capture=amd-direct --codec=hevc --frames=300` at the
+  desktop size: the log says "AMD Direct Capture surface format 11 is not 8-bit BGRA/RGBA:
+  converting to NV12" and started `zeroCopy` is false; colours look right in `ffplay`.
+  With SDR, start the same run and switch HDR on during it: the helper ends with the fatal
+  `capture_failed` "the AMD Direct Capture surfaces are now AMF format ..."; a second run
+  (the new format) converts to NV12. Then a fullscreen game with a 10-bit swap chain
+  (R10G10B10A2) and one with an sRGB swap chain (`DXGI_FORMAT_B8G8R8A8_UNORM_SRGB`; most
+  UE4/UE5 titles in exclusive or independent-flip fullscreen): record whether AMD Direct
+  Capture hands out those surfaces (log line with "DXGI format 24" / "91"), and that the
+  helper then ends with that `capture_failed` instead of `encode_failed` or wrong colours;
+  `--zero-copy=0` streams the same game with correct colours.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD Direct Capture is AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (idle output thread, review fix):
+  `HelperIntegrationAMDDirect`-style run through recon-host or `--encode-test
+  --capture=dda --frames=3000` on a static desktop (idle repeats only every 100 ms): Process
+  Explorer, recon-encoder.exe, Threads tab: no thread above ~1 % of a core (the output
+  thread waits for a submission instead of calling `QueryOutput` in a loop); the log has no
+  "QUERY_TIMEOUT 5 ms ... polled" line (if it has one, record the value read back:
+  `started.queryTimeoutMs` is then 0 or that value). Submit->output p95 must stay as in the
+  "blocking QueryOutput" check above.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (a start that fails after the encoder init,
+  review fix): `$env:RECON_HELPER_EXE=...; go test -count=1 -v -run
+  HelperIntegrationAMFFailedStart ./internal/host/encoder`: for amd-direct and dda the start
+  with a barcode outside the 640x360 picture fails with `bad_message` after the AMF encoder
+  was initialized, and the next start in the same helper encodes (first frame a key frame,
+  id 1); no crash, no "AMF_RESULT" error lines from `Terminate` in the log.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same test skips with "no AMF
+  backend" (the NVENC backend gets the same `release()` hook in 3.4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 switch frames, review fix): AV1
+  `--ltr-slots=2 --frames=1200 --at=300:loss --at=900:loss --kbps=20000`: the log has no
+  "made a switch frame" warning and no "properties not accepted ... Av1SwitchFrameInsertionMode";
+  `ffprobe -show_frames av1.ivf` lists no switch frames (frame type S); both losses recover
+  from an LTR (no IDR, no intra-only recovery frame: the recovery frame's size is a P-frame
+  size, not a key-frame size).
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 alignment read after Init, review fix): the
+  AV1 1920x1080 check above also logs nothing about "the initialized encoder needs" (the
+  pre-Init caps and the initialized encoder agree on 64x16); if the log has "reports 1x1
+  alignment (caps: 64x16)" on a newer driver or RDNA4, record it: the padding is then not
+  needed and `alignW/alignH` in caps should come from the post-Init value.
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).

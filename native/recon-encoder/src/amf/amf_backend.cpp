@@ -136,6 +136,37 @@ struct CodecDetails {
 
 bool hasFormat(const CodecDetails& d, int f) { return std::find(d.inputFormats.begin(), d.inputFormats.end(), f) != d.inputFormats.end(); }
 
+// Zero-copy input is 8-bit UNORM BGRA / RGBA only. The AMD Streaming SDK sends
+// sRGB and R10G10B10A2 capture surfaces through its VideoConverter instead
+// ("EFC is not supported for sRGB formats, force use of VideoConverter",
+// VideoEncodeEngine::IsFormatSupported, which checks the D3D11 texture format
+// of every input surface), and an FP16 surface (HDR desktop) would be encoded
+// as 8-bit BT.709 without the scRGB -> sRGB step of the NV12 converter.
+bool zeroCopyFormat(int amfFormat) { return amfFormat == amf::AMF_SURFACE_BGRA || amfFormat == amf::AMF_SURFACE_RGBA; }
+
+// The texture behind a zero-copy surface: an sRGB-typed (game swap chain),
+// 10-bit or FP16 one is refused although AMF may call it BGRA. 8-bit TYPELESS
+// passes, as in the Streaming SDK (its check lists only the sRGB and 10-bit types).
+bool zeroCopyTexture(amf::AMFPlane* plane, DXGI_FORMAT& format) {
+    format = DXGI_FORMAT_UNKNOWN;
+    auto* tex = static_cast<ID3D11Texture2D*>(plane->GetNative());
+    if (!tex) return false;
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    format = d.Format;
+    switch (d.Format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // What GetCaps says about one codec on this GPU (AMF_Video_Encode_*_API.md
 // table A-3; the AMF EncoderLatency sample reads NUM_OF_HW_INSTANCES the same way).
 CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
@@ -168,9 +199,11 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
     else d.maxRefs = P.maxRefsLimit;
     getProp(caps.GetPtr(), P.capMaxBitrate, d.maxBitrate);
     // AV1 has no ROI cap; "For some reason there's no specific CAP for AV1, but
-    // should always be supported" (OBS texture-amf.cpp).
+    // should always be supported" (OBS texture-amf.cpp). Reported, but marked
+    // as assumed.
     const bool roi = P.capRoi ? getProp(caps.GetPtr(), P.capRoi, b) && b : P.roiData != nullptr;
     c.roi = roi ? "importance" : "none";
+    if (!P.capRoi && P.roiData) c.assumed.push_back("roi");
     if (P.capQueryTimeout && getProp(caps.GetPtr(), P.capQueryTimeout, b)) {
         c.queryTimeout = b;
     } else {
@@ -186,22 +219,39 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
     // 0..16 shared with the short-term references (one stays short-term).
     c.maxLtr = P.docMaxLtr;
     if (P.capMaxLtr && getProp(caps.GetPtr(), P.capMaxLtr, v)) c.maxLtr = int(std::clamp<amf_int64>(v, 0, P.docMaxLtr));
+    else c.assumed.push_back("maxLtr");
     if (P.codec == Codec::Hevc) c.maxLtr = std::min(c.maxLtr, std::max(0, d.maxRefs - 1));
     c.recovery = c.maxLtr >= 2 ? "ltr" : "none";  // the A/B slot policy needs two slots (codec/ltr.hpp)
     if (P.capAlignW) {
         // RDNA3 codes AV1 in 64x16 multiples; RDNA4 relaxes it. FFmpeg's
         // amfenc_av1.c reads the factors from the encoder and assumes 64x16
         // ("older driver and Navi3x") when they are missing.
+        // init() reads them again from the initialized encoder, where FFmpeg
+        // reads them.
         amf_int64 w = 0, h = 0;
-        const bool gotW = getProp(caps.GetPtr(), P.capAlignW, w) || getProp(enc, P.capAlignW, w);
-        const bool gotH = getProp(caps.GetPtr(), P.capAlignH, h) || getProp(enc, P.capAlignH, h);
-        c.alignW = int(gotW && w > 0 ? w : 64);
-        c.alignH = int(gotH && h > 0 ? h : 16);
+        const bool gotW = (getProp(caps.GetPtr(), P.capAlignW, w) || getProp(enc, P.capAlignW, w)) && w > 0;
+        const bool gotH = (getProp(caps.GetPtr(), P.capAlignH, h) || getProp(enc, P.capAlignH, h)) && h > 0;
+        c.alignW = int(gotW ? w : 64);
+        c.alignH = int(gotH ? h : 16);
+        if (!gotW || !gotH) c.assumed.insert(c.assumed.end(), {"alignW", "alignH"});
     }
     c.forceIdr = true;
-    c.intraRefresh = true;          // without user LTR and SVC (AMF docs: MAX_LTR_FRAMES remarks)
     c.liveBitrate = "seamless";     // AMD Streaming SDK UpdateBitrate: SetProperty, no flush; 3.6 qualifies it
+    c.assumed.push_back("liveBitrate");
     c.yuv444 = false;
+    // Intra refresh (without user LTR and SVC: AMF docs, MAX_LTR_FRAMES
+    // remarks): reported only when this encoder takes the property and reads
+    // it back, after USAGE and MAX_NUM_REFRAMES as a start sets them (H.264's
+    // "IntraRefreshNumMBsPerSlot ... available only when MaxOfReferenceFrames
+    // is greater than 1"; FFmpeg checks QUERY_TIMEOUT the same way). Last: the
+    // USAGE resets the other properties of this never-initialized probe encoder.
+    if (const wchar_t* prop = P.intraRefreshPerSlot ? P.intraRefreshPerSlot : P.intraRefreshMode) {
+        const amf_int64 want = P.intraRefreshPerSlot ? 1 : P.intraRefreshContinuous;
+        amf_int64 got = -1;
+        enc->SetProperty(P.usage, P.usageUltraLowLatency);
+        enc->SetProperty(P.maxRefs, amf_int64(kDefaultRefs));
+        c.intraRefresh = enc->SetProperty(prop, want) == AMF_OK && getProp(enc, prop, got) && got == want;
+    }
     d.available = c.maxW > 0 && c.maxH > 0;
     if (!d.available) d.reason = "the encoder reports no input size range";
     return d;
@@ -328,6 +378,9 @@ public:
     Status setRoi(const std::vector<RoiRect>& rects) override;
     Status ack(uint64_t frameId) override;
     void shutdown() override;
+    // Releases everything of a stream: the destructor, a start after a failed
+    // one, and stream.cpp when the start fails after init().
+    void release() override;
 
     // AMFSurfaceObserver: AMF is done with a wrapped pool texture.
     void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface* surface) override;
@@ -345,10 +398,12 @@ private:
         amf::AMFSurface* nativeSurface = nullptr;  // zero-copy: the capture's surface (not referenced)
     };
 
-    void release();
     Status validate(const StartParams& p);
     Status createAndConfigure(amf_int64 usage);
+    Status initEncoder();
     void applyDynamic(PropSetter& s);
+    amf_int64 intraRefreshBlocks() const;
+    int readIntraRefresh();
     void readExtradata();
     Status applyRate(const RateParams& r, bool& idr);
     Status roiSurface(const RoiMap& m, amf::AMFSurfacePtr& out);
@@ -440,8 +495,8 @@ void AmfEncoder::warnOnce(const std::string& key, const std::string& text) {
 }
 
 void AmfEncoder::release() {
-    // Releases everything of a previous stream (destructor, or a start after a
-    // failed one). The threads that used it have been joined (Backend contract).
+    // The threads that used the stream have been joined, or never ran
+    // (Backend contract).
     if (enc_) enc_->Terminate();  // releases the surfaces still queued (OnSurfaceDataRelease)
     enc_ = nullptr;
     roiMap_ = nullptr;
@@ -483,7 +538,9 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     PropSetter s(enc_);
     // "AMF_VIDEO_ENCODER_USAGE needs to be set before the rest" (AMF EncoderLatency sample).
     s.setInt(P_->usage, usage, true);
-    s.setInt(P_->instanceIndex, std::max(0, p.encoderInstance));
+    // Required when a particular engine was asked for: a driver that refuses
+    // it must not leave the start reporting that engine.
+    s.setInt(P_->instanceIndex, std::max(0, p.encoderInstance), p.encoderInstance > 0);
     s.set(P_->frameSize, AMFConstructSize(amf_int32(codedW_), amf_int32(codedH_)), true);
     s.set(P_->frameRate, AMFConstructRate(amf_uint32(fps_), 1));
     s.setInt(P_->profile, P_->profileValue);
@@ -512,8 +569,13 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
         s.setInt(P_->maxTemporalLayers, p.svcLayers, true);
         s.setInt(P_->numTemporalLayers, p.svcLayers, true);
     }
-    if (queryTimeoutMs_) s.setInt(P_->queryTimeout, queryTimeoutMs_);
+    if (queryTimeoutMs_) s.setInt(P_->queryTimeout, queryTimeoutMs_);  // read back after Init
     s.setInt(P_->inputQueueSize, kInputQueueSize);
+    // AV1 switch frames clear every LTR slot ("When we encode a key frame or
+    // switch frame, all save LTR slots will be cleared", AMF_Video_Encode_AV1_API.md
+    // 2.2.7), and their insertion "depends on USAGE": off. receive() still
+    // treats one as clearing the slots.
+    if (P_->switchFrameMode) s.setInt(P_->switchFrameMode, P_->switchFrameNone);
     if (P_->alignmentMode && det_.caps.alignW == 64 && det_.caps.alignH == 16) {
         // We pad to 64x16 ourselves (InputSpec::content*), so the strict mode
         // holds and nothing is padded or cropped behind our back.
@@ -550,16 +612,48 @@ void AmfEncoder::applyDynamic(PropSetter& s) {
     s.setBool(P_->enforceHrd, false);  // A6: Sunshine warns HRD can cause artifacts
     s.setBool(P_->fillerData, false);
     s.setBool(P_->skipFrame, false);   // A5: ULL turns rate-control frame skipping on
-    if (start_.intraRefreshFrames > 0) {
-        if (P_->intraRefreshPerSlot) {
-            const uint32_t b = P_->intraRefreshBlock;
-            const amf_int64 blocks = amf_int64((codedW_ + b - 1) / b) * ((codedH_ + b - 1) / b);
-            s.setInt(P_->intraRefreshPerSlot, (blocks + start_.intraRefreshFrames - 1) / start_.intraRefreshFrames);
-        } else {
-            s.setInt(P_->intraRefreshMode, P_->intraRefreshContinuous);
-            s.setInt(P_->intraRefreshStripes, start_.intraRefreshFrames);
-        }
+    // Intra refresh: the requested cycle, else explicitly off. H.264's
+    // ULTRA_LOW_LATENCY and LOW_LATENCY usages default
+    // INTRA_REFRESH_NUM_MBS_PER_SLOT to 255 (AMF_Video_Encode_API.md: "Ultra low
+    // latency: 255, Low latency: 255"), a refresh band in every stream without
+    // LTR. Required when asked for; "off" is best effort (with user LTR the
+    // property is not available, "NumOfLTR is 0" only, and intra refresh does not
+    // run then anyway). init() reads back what the encoder runs.
+    const int frames = start_.intraRefreshFrames;
+    if (P_->intraRefreshPerSlot) {
+        const amf_int64 perSlot = frames > 0 ? (intraRefreshBlocks() + frames - 1) / frames : 0;
+        s.setInt(P_->intraRefreshPerSlot, perSlot, frames > 0);
+    } else if (P_->intraRefreshMode && frames > 0) {
+        s.setInt(P_->intraRefreshMode, P_->intraRefreshContinuous, true);
+        s.setInt(P_->intraRefreshStripes, frames, true);
+    } else if (P_->intraRefreshMode) {
+        s.setInt(P_->intraRefreshMode, P_->intraRefreshDisabled);
     }
+}
+
+// Blocks per frame in intra refresh units (H.264 16x16 MBs, HEVC 64x64 CTBs).
+amf_int64 AmfEncoder::intraRefreshBlocks() const {
+    const uint32_t b = std::max(1u, P_->intraRefreshBlock);
+    return amf_int64((codedW_ + b - 1) / b) * amf_int64((codedH_ + b - 1) / b);
+}
+
+// The intra refresh cycle the initialized encoder runs, in frames (0 = off),
+// read from its properties rather than taken from the request.
+int AmfEncoder::readIntraRefresh() {
+    // "With user control of LTR, Intra-refresh features are not supported";
+    // "Intra-refresh feature is not supported with SVC" (AMF encoder docs).
+    if (start_.ltrSlots > 0 || start_.svcLayers > 1) return 0;
+    amf_int64 v = 0;
+    if (P_->intraRefreshPerSlot) {
+        if (!getProp(enc_.GetPtr(), P_->intraRefreshPerSlot, v)) return start_.intraRefreshFrames;  // set (required when asked for)
+        return v > 0 ? int((intraRefreshBlocks() + v - 1) / v) : 0;
+    }
+    if (!P_->intraRefreshMode) return 0;
+    if (!getProp(enc_.GetPtr(), P_->intraRefreshMode, v)) return start_.intraRefreshFrames;
+    if (v == P_->intraRefreshDisabled) return 0;
+    amf_int64 stripes = 0;
+    if (getProp(enc_.GetPtr(), P_->intraRefreshStripes, stripes) && stripes > 0) return int(stripes);
+    return std::max(1, start_.intraRefreshFrames);  // on, cycle unknown
 }
 
 void AmfEncoder::readExtradata() {
@@ -574,6 +668,30 @@ void AmfEncoder::readExtradata() {
     }
     std::lock_guard<std::mutex> lock(extraMu_);
     extradata_ = std::move(out);
+}
+
+// createAndConfigure + Init(inputFormat_, coded size), with the H.264
+// LOW_LATENCY fallback. On failure enc_ may be left for release().
+Status AmfEncoder::initEncoder() {
+    usage_ = P_->usageUltraLowLatency;
+    Status s = createAndConfigure(usage_);
+    AMF_RESULT r = s.ok ? enc_->Init(inputFormat_, amf_int32(codedW_), amf_int32(codedH_)) : AMF_FAIL;
+    if (s.ok && r != AMF_OK && codec_ == Codec::H264) {
+        // AMF issue #410: ULTRA_LOW_LATENCY H.264 fails to initialize on some
+        // drivers/GPUs; Sunshine retries h264_amf with LOW_LATENCY usage.
+        logf(LogLevel::Warn, "amf: h264 Init with ULTRA_LOW_LATENCY usage failed (%s), retrying with LOW_LATENCY (AMF #410)",
+             resultText(r).c_str());
+        enc_->Terminate();
+        usage_ = P_->usageLowLatency;
+        s = createAndConfigure(usage_);
+        r = s.ok ? enc_->Init(inputFormat_, amf_int32(codedW_), amf_int32(codedH_)) : AMF_FAIL;
+    }
+    if (!s.ok) return s;
+    if (r != AMF_OK) {
+        return Status::Error("init_failed", amfError("AMF " + std::string(codecName(codec_)) + " Init(" + std::to_string(codedW_) +
+                                                         "x" + std::to_string(codedH_) + ")", r));
+    }
+    return Status::Ok();
 }
 
 // Checks a start against the encoder's caps (det_) and sets the coded size.
@@ -597,6 +715,9 @@ Status AmfEncoder::validate(const StartParams& p) {
     }
     if (p.intraRefreshFrames > 0 && (p.ltrSlots > 0 || p.svcLayers > 1)) {
         return Status::Error("unsupported", "intra refresh does not work with user LTR or SVC (AMF MAX_LTR_FRAMES remarks)");
+    }
+    if (p.intraRefreshFrames > 0 && !cc.intraRefresh) {
+        return Status::Error("unsupported", "the " + p.codec + " encoder does not take the intra refresh property (caps intraRefresh false)");
     }
     if (p.encoderInstance >= cc.hwInstances) {
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) + ": the GPU has " +
@@ -679,32 +800,51 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     flushMode_ = (p.liveBitrate.empty() ? cc.liveBitrate : p.liveBitrate) == "flush";
     queryTimeoutMs_ = cc.queryTimeout ? kQueryTimeoutMs : 0;
 
-    // Zero-copy: AMD Direct Capture surfaces straight into the encoder when
-    // nothing has to be done to them (same size, upright, no barcode, no
-    // padding) and the encoder takes their format; else the NV12 conversion.
-    zeroCopy_ = src.amfContext && p.zeroCopy && !p.barcode.enabled && width_ == src.width && height_ == src.height &&
-                codedW_ == width_ && codedH_ == height_ && src.rotation == 0 && src.amfFormat != 0 &&
-                hasFormat(det_, src.amfFormat);
-    inputFormat_ = zeroCopy_ ? amf::AMF_SURFACE_FORMAT(src.amfFormat) : amf::AMF_SURFACE_NV12;
-
-    usage_ = P_->usageUltraLowLatency;
-    Status s = createAndConfigure(usage_);
-    r = s.ok ? enc_->Init(inputFormat_, amf_int32(codedW_), amf_int32(codedH_)) : AMF_FAIL;
-    if (s.ok && r != AMF_OK && codec == Codec::H264) {
-        // AMF issue #410: ULTRA_LOW_LATENCY H.264 fails to initialize on some
-        // drivers/GPUs; Sunshine retries h264_amf with LOW_LATENCY usage.
-        logf(LogLevel::Warn, "amf: h264 Init with ULTRA_LOW_LATENCY usage failed (%s), retrying with LOW_LATENCY (AMF #410)",
-             resultText(r).c_str());
+    for (int pass = 0;; ++pass) {
+        // Zero-copy: AMD Direct Capture surfaces straight into the encoder
+        // when nothing has to be done to them (same size, upright, no barcode,
+        // no padding) and they are 8-bit UNORM BGRA / RGBA the encoder takes
+        // (zeroCopyFormat; submit() checks every surface again); else the NV12
+        // conversion.
+        zeroCopy_ = src.amfContext && p.zeroCopy && !p.barcode.enabled && width_ == src.width && height_ == src.height &&
+                    codedW_ == width_ && codedH_ == height_ && src.rotation == 0 && zeroCopyFormat(src.amfFormat) &&
+                    hasFormat(det_, src.amfFormat);
+        inputFormat_ = zeroCopy_ ? amf::AMF_SURFACE_FORMAT(src.amfFormat) : amf::AMF_SURFACE_NV12;
+        if (pass == 0 && src.amfContext && p.zeroCopy && src.amfFormat && !zeroCopyFormat(src.amfFormat)) {
+            logf(LogLevel::Info, "amf: AMD Direct Capture surface format %d is not 8-bit BGRA/RGBA: converting to NV12", src.amfFormat);
+        }
+        Status s = initEncoder();
+        if (!s.ok) {
+            release();
+            return s;
+        }
+        if (pass > 0 || !P_->capAlignW) break;
+        // AV1: the alignment the initialized encoder reports. FFmpeg's
+        // amfenc_av1.c reads Av1Width/HeightAlignmentFactor here, after Init
+        // ("assume older driver and Navi3x" = 64x16 when they are missing).
+        amf_int64 aw = 0, ah = 0;
+        if (!getProp(enc_.GetPtr(), P_->capAlignW, aw) || !getProp(enc_.GetPtr(), P_->capAlignH, ah) || aw <= 0 || ah <= 0) break;
+        if (codedW_ % uint32_t(aw) == 0 && codedH_ % uint32_t(ah) == 0) {
+            if (aw != det_.caps.alignW || ah != det_.caps.alignH) {
+                logf(LogLevel::Info, "amf: av1: the initialized encoder reports %lldx%lld alignment (caps: %dx%d); coded %ux%u fits it",
+                     static_cast<long long>(aw), static_cast<long long>(ah), det_.caps.alignW, det_.caps.alignH, codedW_, codedH_);
+            }
+            break;
+        }
+        // The encoder would pad and crop on its own, and started would report
+        // the wrong coded size: once more at the size it needs.
+        logf(LogLevel::Warn, "amf: av1: the initialized encoder needs %lldx%lld-aligned sizes, not %dx%d as its caps said: "
+                             "re-initializing at the aligned size",
+             static_cast<long long>(aw), static_cast<long long>(ah), det_.caps.alignW, det_.caps.alignH);
         enc_->Terminate();
-        usage_ = P_->usageLowLatency;
-        s = createAndConfigure(usage_);
-        r = s.ok ? enc_->Init(inputFormat_, amf_int32(codedW_), amf_int32(codedH_)) : AMF_FAIL;
-    }
-    if (!s.ok || r != AMF_OK) {
-        release();
-        if (!s.ok) return s;
-        return Status::Error("init_failed", amfError("AMF " + p.codec + " Init(" + std::to_string(codedW_) + "x" +
-                                                         std::to_string(codedH_) + ")", r));
+        enc_ = nullptr;
+        det_.caps.alignW = int(aw);
+        det_.caps.alignH = int(ah);
+        Status v = validate(p);
+        if (!v.ok) {
+            release();
+            return v;
+        }
     }
     {
         PropSetter after(enc_);
@@ -714,6 +854,32 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
         }
     }
     readExtradata();
+
+    // What the encoder took, read back, for started (the non-required
+    // properties only log a rejection).
+    if (queryTimeoutMs_) {
+        amf_int64 t = 0;
+        const bool got = getProp(enc_.GetPtr(), P_->queryTimeout, t);
+        if (!got || t != queryTimeoutMs_) {
+            logf(LogLevel::Info, "amf: QUERY_TIMEOUT %d ms %s: %s", queryTimeoutMs_,
+                 got ? ("reads " + std::to_string(t)).c_str() : "cannot be read back",
+                 got && t > 0 ? "using it" : "QueryOutput is polled every 1 ms");
+            queryTimeoutMs_ = got && t > 0 ? int(std::min<amf_int64>(t, 1000)) : 0;
+        }
+    }
+    int instance = std::max(0, p.encoderInstance);
+    {
+        amf_int64 v = 0;
+        if (getProp(enc_.GetPtr(), P_->instanceIndex, v) && v != instance) {
+            logf(LogLevel::Warn, "amf: asked for encoder instance %d, the encoder reads %lld", instance, static_cast<long long>(v));
+            instance = int(v);
+        }
+    }
+    const int intraRefresh = readIntraRefresh();
+    if (intraRefresh != p.intraRefreshFrames) {
+        logf(intraRefresh > 0 && p.intraRefreshFrames > 0 ? LogLevel::Info : LogLevel::Warn,
+             "amf: intra refresh: asked for %d frames (0 = off), the encoder runs %d", p.intraRefreshFrames, intraRefresh);
+    }
     if (p.ltrSlots > 0) {
         amf_int64 granted = 0;
         if (getProp(enc_.GetPtr(), P_->maxLtr, granted) && granted != p.ltrSlots) {
@@ -759,11 +925,11 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     out.usage = usage_ == P_->usageUltraLowLatency ? "ultra_low_latency" : "low_latency";
     out.ltrSlots = p.ltrSlots;
     out.ltrInterval = p.ltrSlots ? lc.interval : 0;
-    out.encoderInstance = std::max(0, p.encoderInstance);
+    out.encoderInstance = instance;
     out.hwInstances = cc.hwInstances;
     out.queryTimeoutMs = queryTimeoutMs_;
     out.zeroCopy = zeroCopy_;
-    out.intraRefreshFrames = p.intraRefreshFrames;
+    out.intraRefreshFrames = intraRefresh;
     logf(LogLevel::Info,
          "amf: %s %ux%u (coded %ux%u) %d fps %d kbps %s vbv %.2f frames, usage %s, preset %s, instance %d/%d, LTR %d (every %d), "
          "query timeout %d ms, live bitrate %s, input %s, runtime %s",
@@ -921,6 +1087,22 @@ Status AmfEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
                                      "): zero-copy encoding cannot scale or rotate; restart the helper (or start with zeroCopy false)",
                                  true);
         }
+        // The format, every frame: the encoder was initialized with the one
+        // the capture reported at its start, and the capture re-initializes
+        // itself after a mode change or an HDR switch. An sRGB-typed texture
+        // (a game's swap chain) is BGRA to AMF but not to the encoder's input
+        // (Streaming SDK VideoEncodeEngine::IsFormatSupported).
+        DXGI_FORMAT texFormat = DXGI_FORMAT_UNKNOWN;
+        const amf::AMF_SURFACE_FORMAT capFormat = cap->GetFormat();
+        if (capFormat != inputFormat_ || !zeroCopyTexture(plane, texFormat)) {
+            return Status::Error("capture_failed",
+                                 "the AMD Direct Capture surfaces are now AMF format " + std::to_string(int(capFormat)) + ", DXGI format " +
+                                     std::to_string(int(texFormat)) + " (the encoder was initialized with AMF format " +
+                                     std::to_string(int(inputFormat_)) +
+                                     "): zero-copy encoding takes 8-bit BGRA/RGBA only (no sRGB, 10-bit or FP16); restart the "
+                                     "helper, with zeroCopy false if this happens again",
+                                 true);
+        }
         if (frame.captured->amfDcc) {
             // DCC-compressed surfaces cannot go to the encoder as they are
             // (AMF_Display_Capture_API.md): encode a copy.
@@ -989,6 +1171,7 @@ Status AmfEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
         std::lock_guard<std::mutex> lock(flightMu_);
         flight_.push_back(f);  // before SubmitInput: the output can come back at once
     }
+    flightCv_.notify_all();  // the output thread waits for frames in flight (receive)
     for (int attempt = 0;; ++attempt) {
         {
             std::shared_lock<std::shared_mutex> shared(componentMu_);
@@ -1024,7 +1207,26 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     amf::AMFDataPtr data;
     for (;;) {
         if (stopped_ || !enc_) return Next::Stopped;
+        {
+            // Nothing in the encoder: wait for a submission instead of querying.
+            // QueryOutput answers AMF_REPEAT when "the output queue is empty"
+            // (AMF API reference), and nothing says QUERY_TIMEOUT makes it wait
+            // then: FFmpeg's amfenc.c only waits in QueryOutput while frames are
+            // queued, the AMF samples' PollingThread sleeps 1 ms after every
+            // empty query. Idle (before the first frame, a static desktop) this
+            // thread sleeps.
+            std::unique_lock<std::mutex> lock(flightMu_);
+            if (flight_.empty()) {
+                const int64_t now = qpcNow();
+                if (now >= deadline) return Next::Timeout;
+                flightCv_.wait_for(lock, std::chrono::microseconds((deadline - now) * 1000000 / freq_),
+                                   [this] { return !flight_.empty() || stopped_; });
+                if (stopped_) return Next::Stopped;
+                if (flight_.empty()) return Next::Timeout;
+            }
+        }
         AMF_RESULT r;
+        const int64_t before = qpcNow();
         {
             std::shared_lock<std::shared_mutex> shared(componentMu_);
             r = enc_->QueryOutput(&data);
@@ -1034,9 +1236,12 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         if (r == AMF_REPEAT || r == AMF_OK || r == AMF_NEED_MORE_INPUT) {
             queryErrors_ = 0;
             if (now >= deadline) return Next::Timeout;
-            // With QUERY_TIMEOUT the call itself waited; else poll every 1 ms
-            // (FFmpeg amfenc.c av_usleep(1000); the AMF samples amf_sleep(1)).
-            if (!queryTimeoutMs_ && !timer_.sleepUntil(std::min(deadline, now + freq_ / 1000), stopEvent_)) return Next::Stopped;
+            // A call that waited out QUERY_TIMEOUT (at least half of it) goes
+            // again at once; one that came back sooner (no timeout in effect,
+            // or an early return) is followed by the 1 ms poll sleep (FFmpeg
+            // amfenc.c av_usleep(1000); the AMF samples amf_sleep(1)).
+            const bool waited = queryTimeoutMs_ > 0 && now - before >= int64_t(queryTimeoutMs_) * freq_ / 2000;
+            if (!waited && !timer_.sleepUntil(std::min(deadline, now + freq_ / 1000), stopEvent_)) return Next::Stopped;
             continue;
         }
         if (r == AMF_EOF) {
@@ -1094,6 +1299,10 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     o.intra = o.key || type == P_->outIntra;
     o.markedSlot = int(marked);
     o.refMask = uint32_t(refMask);
+    // An AV1 switch frame clears the LTR slots like a key frame, but it is not
+    // a decoder entry point: not flagged KEY in the ring.
+    o.clearsSlots = P_->outSwitch >= 0 && type == P_->outSwitch;
+    if (o.clearsSlots) warnOnce("switch", "the AV1 encoder made a switch frame (its LTR slots are cleared) although switch frames are off");
     const bool recoveryOk = ltr_.output(f.frameId, o, f.plan, qpcNow());
     if (f.plan.recovery && !recoveryOk) {
         // The encoder did not code the recovery frame from its LTR: it still
@@ -1183,6 +1392,10 @@ Status AmfEncoder::ack(uint64_t frameId) {
 void AmfEncoder::shutdown() {
     stopped_ = true;
     if (stopEvent_) SetEvent(stopEvent_);
+    {
+        // A waiter between its predicate check and the wait must not miss this.
+        std::lock_guard<std::mutex> lock(flightMu_);
+    }
     flightCv_.notify_all();
 }
 

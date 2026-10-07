@@ -24,6 +24,7 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
 
     InputSpec in;
     s = choice.backend->init(p, src, in, st);
+    const bool encoderReady = s.ok;
     std::unique_ptr<d3d::Nv12Converter> conv;
     if (s.ok && in.format == InputSpec::Format::Nv12) {
         if (!src.device) {
@@ -50,6 +51,10 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
         s = Status::Error("unsupported", "the barcode needs the GPU colour conversion (a GPU capture)");
     }
     if (!s.ok) {
+        // The encoder goes first: it may be initialized on the capture's
+        // AMFContext, which the capture's destructor terminates.
+        if (encoderReady) choice.backend->release();
+        conv.reset();
         capture->shutdown();
         return s;
     }

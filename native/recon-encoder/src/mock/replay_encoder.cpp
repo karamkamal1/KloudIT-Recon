@@ -84,6 +84,12 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
         in.height = uint32_t(p.height ? p.height : int(src.height)) & ~1u;
     }
     std::lock_guard<std::mutex> lock(mu_);
+    if (initialized_) {
+        // Only a start that failed after init() leads here (a running stream
+        // answers already_started): stream.cpp must have called release().
+        return Status::Error("init_failed", "mock: init() again without release() after a failed start (Backend contract)");
+    }
+    initialized_ = true;
     pos_ = 0;
     idrPending_ = false;
     stopped_ = false;
@@ -96,6 +102,12 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     out.kbps = p.kbps;
     out.liveBitrate = "seamless";  // recorded only: the canned stream does not change
     return Status::Ok();
+}
+
+void ReplayEncoder::release() {
+    std::lock_guard<std::mutex> lock(mu_);
+    initialized_ = false;
+    queue_.clear();
 }
 
 Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {

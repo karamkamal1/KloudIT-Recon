@@ -37,6 +37,7 @@ struct SimEncoder {
     explicit SimEncoder(LtrTracker& tracker, int pipelineDelay = 1) : t(tracker), delay(pipelineDelay) {}
     LtrTracker& t;
     int delay = 1;
+    uint64_t switchAt = 0;  // this frame comes out as an AV1 switch frame (made by the encoder on its own)
     std::vector<std::pair<uint64_t, LtrTracker::Plan>> queue;
     std::vector<std::pair<uint64_t, LtrTracker::Plan>> out;  // what came out, in order
 
@@ -52,6 +53,7 @@ struct SimEncoder {
             o.intra = plan.idr;
             o.markedSlot = plan.markSlot;
             o.refMask = plan.refMask;
+            o.clearsSlots = fid == switchAt;
             const bool ok = t.output(fid, o, plan, now);
             if (recoveryOk) recoveryOk->push_back(ok);
             out.emplace_back(fid, plan);
@@ -197,6 +199,34 @@ void testLtr() {
         for (const auto& v : t.slots()) expect(v.frameId == 0 || v.frameId > 20, name, "slot still holds " + std::to_string(v.frameId));
         // A loss from before the key frame cannot use an LTR from before it.
         expect(!t.recover(19, std::nullopt), name, "recovery from an LTR older than the last key frame");
+        std::printf("  %-44s ok\n", name);
+    }
+
+    name = "an AV1 switch frame clears the slots";
+    {
+        // Frame 20 comes out as a switch frame the encoder inserted on its own:
+        // the ACKed LTRs before it are gone, so a loss at 21 needs an IDR.
+        // The same run without the switch frame recovers from frame 18.
+        for (const uint64_t sw : {uint64_t(0), uint64_t(20)}) {
+            LtrTracker t;
+            t.reset({2, 4, 1000});
+            SimEncoder enc(t);
+            enc.switchAt = sw;
+            for (uint64_t id = 1; id <= 21; ++id) {
+                enc.frame(id, int64_t(id), id == 1);
+                for (const auto& [fid, p] : enc.out) {
+                    if (p.markSlot >= 0 && fid + 1 == id) t.ack(fid);
+                }
+            }
+            bool empty = true;
+            for (const auto& v : t.slots()) empty = empty && v.frameId == 0;
+            if (sw) {
+                expect(empty, name, "a slot survived the switch frame");
+                expect(!t.recover(21, std::nullopt), name, "recovery from an LTR the switch frame cleared");
+            } else {
+                expect(!empty && t.recover(21, std::nullopt), name, "no LTR recovery without the switch frame");
+            }
+        }
         std::printf("  %-44s ok\n", name);
     }
 

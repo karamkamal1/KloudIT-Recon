@@ -46,14 +46,16 @@ func TestDecodeCaps(t *testing.T) {
 	arch2 := `{"t":"caps","v":1,"vendor":"amd","adapterLuid":"0:1234","hagsEnabled":true,"backend":"amf",
 		"codecs":{"hevc":{"maxW":7680,"maxH":4320,"tenBit":true,"yuv444":false,"forceIdr":true,"recovery":"ltr","maxLtr":4,
 		"intraRefresh":true,"liveBitrate":"seamless","maxTemporalLayers":4,"roi":"importance","sliceOutput":false,
-		"hwInstances":2,"queryTimeout":true},"av1":{"alignW":64,"alignH":16}},"capture":["dda","amd-direct","wgc"]}`
+		"hwInstances":2,"queryTimeout":true},"av1":{"alignW":64,"alignH":16,"roi":"importance",
+		"assumed":["roi","liveBitrate"]}},"capture":["dda","amd-direct","wgc"]}`
 	m, err = decodeMessage([]byte(arch2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	c = m.(*Caps)
 	if c.Codecs["hevc"].MaxLTR != 4 || c.Codecs["hevc"].Recovery != "ltr" || c.Codecs["av1"].AlignW != 64 ||
-		c.HAGSEnabled == nil || !*c.HAGSEnabled {
+		c.HAGSEnabled == nil || !*c.HAGSEnabled || c.Codecs["hevc"].IsAssumed("roi") || !c.Codecs["av1"].IsAssumed("roi") ||
+		c.Codecs["av1"].IsAssumed("alignW") {
 		t.Fatalf("arch-2 caps %+v", c)
 	}
 	if (&Caps{Backend: "none"}).Usable() || (&Caps{Backend: "amf"}).Usable() {

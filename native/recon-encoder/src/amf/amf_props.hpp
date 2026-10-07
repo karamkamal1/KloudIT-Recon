@@ -53,6 +53,8 @@ struct AmfCodecProps {
     const wchar_t* queryTimeout = nullptr;
     const wchar_t* inputQueueSize = nullptr;
     const wchar_t* alignmentMode = nullptr;        // AV1
+    const wchar_t* switchFrameMode = nullptr;      // AV1 SWITCH_FRAME_INSERTION_MODE
+    amf_int64 switchFrameNone = 0;
     const wchar_t* colorBitDepth = nullptr;
     const wchar_t* inputColorProfile = nullptr;
     const wchar_t* inputTransfer = nullptr;
@@ -74,7 +76,7 @@ struct AmfCodecProps {
     const wchar_t* intraRefreshPerSlot = nullptr;  // H.264 MBs / HEVC CTBs per slot
     uint32_t intraRefreshBlock = 0;                // their size: 16 / 64
     const wchar_t* intraRefreshMode = nullptr;     // AV1
-    amf_int64 intraRefreshContinuous = 0;
+    amf_int64 intraRefreshContinuous = 0, intraRefreshDisabled = 0;
     const wchar_t* intraRefreshStripes = nullptr;  // AV1
 
     // Per submission (properties of the input surface).
@@ -91,6 +93,7 @@ struct AmfCodecProps {
     // Output buffer properties.
     const wchar_t* outputType = nullptr;
     amf_int64 outKey = 0, outIntra = 0;            // IDR / KEY; I / INTRA_ONLY
+    amf_int64 outSwitch = -1;                      // AV1 SWITCH (clears the LTR slots); -1 = none (H.264 3 is B)
     const wchar_t* outputMarkedLtr = nullptr;
     const wchar_t* outputRefLtr = nullptr;
     const wchar_t* outputTemporalLayer = nullptr;  // H.264, HEVC
@@ -318,6 +321,8 @@ inline const AmfCodecProps& amfAv1Props() {
         c.queryTimeout = AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT;
         c.inputQueueSize = AMF_VIDEO_ENCODER_AV1_INPUT_QUEUE_SIZE;
         c.alignmentMode = AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE;
+        c.switchFrameMode = AMF_VIDEO_ENCODER_AV1_SWITCH_FRAME_INSERTION_MODE;
+        c.switchFrameNone = AMF_VIDEO_ENCODER_AV1_SWITCH_FRAME_INSERTION_MODE_NONE;
         c.colorBitDepth = AMF_VIDEO_ENCODER_AV1_COLOR_BIT_DEPTH;
         c.inputColorProfile = AMF_VIDEO_ENCODER_AV1_INPUT_COLOR_PROFILE;
         c.inputTransfer = AMF_VIDEO_ENCODER_AV1_INPUT_TRANSFER_CHARACTERISTIC;
@@ -336,6 +341,7 @@ inline const AmfCodecProps& amfAv1Props() {
         c.skipFrame = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_SKIP_FRAME;
         c.intraRefreshMode = AMF_VIDEO_ENCODER_AV1_INTRA_REFRESH_MODE;
         c.intraRefreshContinuous = AMF_VIDEO_ENCODER_AV1_INTRA_REFRESH_MODE__CONTINUOUS;
+        c.intraRefreshDisabled = AMF_VIDEO_ENCODER_AV1_INTRA_REFRESH_MODE__DISABLED;
         c.intraRefreshStripes = AMF_VIDEO_ENCODER_AV1_INTRAREFRESH_STRIPES;
         c.forcePictureType = AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE;
         c.pictureNone = AMF_VIDEO_ENCODER_AV1_FORCE_FRAME_TYPE_NONE;
@@ -348,6 +354,7 @@ inline const AmfCodecProps& amfAv1Props() {
         c.outputType = AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE;
         c.outKey = AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE_KEY;
         c.outIntra = AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE_INTRA_ONLY;
+        c.outSwitch = AMF_VIDEO_ENCODER_AV1_OUTPUT_FRAME_TYPE_SWITCH;
         c.outputMarkedLtr = AMF_VIDEO_ENCODER_AV1_OUTPUT_MARKED_LTR_INDEX;
         c.outputRefLtr = AMF_VIDEO_ENCODER_AV1_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD;
         c.extradata = AMF_VIDEO_ENCODER_AV1_EXTRA_DATA;

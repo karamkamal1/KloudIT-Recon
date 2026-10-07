@@ -136,6 +136,10 @@ struct CodecCaps {
     int hwInstances = 1;
     bool queryTimeout = false;
     int alignW = 1, alignH = 1;  // required coded-size alignment (AV1 on RDNA3: 64x16)
+    // Fields above that are documented or default values rather than detected
+    // on this GPU (e.g. AMF AV1 "roi": there is no ROI cap; "liveBitrate" until
+    // step 3.6 measures it). Sent only when not empty.
+    std::vector<std::string> assumed;
 };
 
 // Caps is sent once, right after start-up (GUIDE Arch-2 shape plus diagnostics).

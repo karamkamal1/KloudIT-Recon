@@ -139,6 +139,20 @@ type CodecCaps struct {
 	QueryTimeout      bool   `json:"queryTimeout"`
 	AlignW            int    `json:"alignW"`
 	AlignH            int    `json:"alignH"`
+	// Assumed names the fields above that are documented or default values,
+	// not detected on this GPU (e.g. AMF AV1 "roi", "liveBitrate" until the
+	// step 3.6 qualification); omitted when everything was detected.
+	Assumed []string `json:"assumed,omitempty"`
+}
+
+// IsAssumed reports whether field (its JSON name) was assumed rather than detected.
+func (c CodecCaps) IsAssumed(field string) bool {
+	for _, f := range c.Assumed {
+		if f == field {
+			return true
+		}
+	}
+	return false
 }
 
 // Usable reports whether the helper can encode anything.

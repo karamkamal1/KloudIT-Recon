@@ -207,6 +207,7 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"alignW", cc.alignW},
             {"alignH", cc.alignH},
         };
+        if (!cc.assumed.empty()) codecs[name]["assumed"] = cc.assumed;
     }
     json unavailable = json::object();
     for (const auto& [name, why] : c.unavailable) unavailable[name] = why;

@@ -143,6 +143,14 @@ func TestHelperIntegrationMock(t *testing.T) {
 	if !errors.As(err, &he) || he.Code != "bad_message" {
 		t.Fatalf("start with fps 9999: %v", err)
 	}
+	// A start that fails after the encoder was initialized (a barcode needs the
+	// GPU conversion): the helper must release the encoder (Backend::release,
+	// which the mock checks on its next init), so the start below works.
+	_, err = h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000,
+		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+	if !errors.As(err, &he) || he.Code != "unsupported" || he.Fatal {
+		t.Fatalf("barcode start on the synthetic source: %v", err)
+	}
 
 	st, err := h.Start(StartParams{Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 4000})
 	if err != nil {
@@ -716,6 +724,53 @@ func TestHelperIntegrationDDA(t *testing.T) {
 
 func TestHelperIntegrationAMDDirect(t *testing.T) {
 	captureCheck(t, "amd-direct", StartParams{Width: 640, Height: 360})
+}
+
+// On an AMD host: a start that fails after the AMF encoder was initialized (a
+// barcode that does not fit the picture, found by the colour conversion) must
+// release the encoder before the capture is destroyed: with amd-direct the
+// encoder lives on the capture's AMFContext, with dda it holds a VCN session.
+// The next start in the same helper must then encode. Skips without the AMF
+// backend (Wine, CI, NVIDIA hosts).
+func TestHelperIntegrationAMFFailedStart(t *testing.T) {
+	exe := helperExe(t)
+	ran := 0
+	for _, capture := range []string{"amd-direct", "dda"} {
+		h, err := Launch(Options{Exe: exe, Backend: "amf", LogLevel: "debug",
+			Log: slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		if c := h.Caps(); !c.Usable() || !slices.Contains(c.Capture, capture) {
+			h.Close()
+			t.Logf("AMF backend or %s unavailable here: %v", capture, c.Unavailable)
+			continue
+		}
+		ran++
+		p := StartParams{Capture: capture, Codec: "hevc", Width: 640, Height: 360, FPS: 60, Kbps: 4000}
+		bad := p
+		bad.Barcode = &Barcode{X: 600, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}
+		_, err = h.Start(bad)
+		var he *HelperError
+		if !errors.As(err, &he) || he.Code != "bad_message" || he.Fatal {
+			h.Close()
+			t.Fatalf("%s: start with a barcode outside the picture: %v", capture, err)
+		}
+		st, err := h.Start(p)
+		if err != nil {
+			h.Close()
+			t.Fatalf("%s: start after a start that failed after the encoder init: %v", capture, err)
+		}
+		if f := nextFrame(t, h); !f.Key || f.FrameID != 1 {
+			h.Close()
+			t.Fatalf("%s: first frame %+v", capture, f)
+		}
+		t.Logf("%s: started after the failed start: %+v", capture, st)
+		h.Close()
+	}
+	if ran == 0 {
+		t.Skip("no AMF backend with amd-direct or dda here")
+	}
 }
 
 // Windows.Graphics.Capture of monitor 0 (MSVC builds; the mingw build has no
