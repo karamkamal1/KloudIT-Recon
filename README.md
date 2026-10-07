@@ -125,6 +125,7 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
 
 Protocol and latency details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Security model: [docs/SECURITY.md](docs/SECURITY.md).
+Test network profiles (lan, wifi, wan, capdrop): [docs/NETEM.md](docs/NETEM.md).
 
 ---
 
