@@ -389,6 +389,23 @@ try {
       check("client capture/queue p50 match the host's own measurement (±max(2 ms, 10 %))",
         rows.every((r) => Math.abs(r.client - r.host) <= Math.max(2, 0.1 * r.host)),
         rows.map((r) => `${r.k}: client ${r.client} vs host ${r.host} ms`).join('; '));
+      // The drawer's adaptive bitrate switch reaches the host: a new encoder
+      // generation with fixed-bitrate rate control (AMF: latency-constrained
+      // VBR instead of CBR), and back. Waits for the host's own start line with
+      // the new value: key-frame and congestion restarts also start
+      // generations, with whatever the host's settings are at that moment.
+      const toggleAdaptive = async (want) => {
+        const from = hostProc.log.length;
+        await page.evaluate(() => [...document.querySelectorAll('#drawer label.check')]
+          .find((l) => l.textContent.includes('Adaptive bitrate')).querySelector('input').click());
+        return until(() => (hostProc.log.slice(from).match(/msg="starting encoder"[^\n]*/g) || [])
+          .find((l) => l.includes(` adaptive=${want}`)), 10000, `starting encoder with adaptive=${want}`);
+      };
+      const off = await toggleAdaptive(false).catch((e) => e.message);
+      const on = await toggleAdaptive(true).catch((e) => e.message);
+      check('adaptive bitrate switch restarts the encoder with the setting',
+        /msg="starting encoder".* adaptive=false/.test(off) && /msg="starting encoder".* adaptive=true/.test(on),
+        `off: ${off.replace(/^.*?msg=/, '').slice(0, 160)}; on: ${on.replace(/^.*?msg=/, '').slice(0, 160)}`);
     }
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }

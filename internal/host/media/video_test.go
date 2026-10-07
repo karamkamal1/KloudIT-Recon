@@ -285,3 +285,72 @@ func TestVideoGenerations(t *testing.T) {
 		}
 	}
 }
+
+// TestVideoFailureEvent: a failing generation's error event carries its
+// parameters (the session decides the encoder fallback from them, after the
+// generation is gone from Current) and whether it had gone live.
+func TestVideoFailureEvent(t *testing.T) {
+	caps := probeOrSkip(t)
+	enc, ok := caps.Best("h264")
+	if !ok {
+		t.Skip("no h264 encoder")
+	}
+	start := time.Now()
+	v := NewVideo(caps, nil, func() uint64 { return uint64(time.Since(start).Microseconds()) })
+	defer v.Stop()
+	failure := func(what string) VideoEvent {
+		t.Helper()
+		deadline := time.After(20 * time.Second)
+		for {
+			select {
+			case ev := <-v.Events():
+				if ev.Err != nil {
+					return ev
+				}
+			case <-deadline:
+				t.Fatalf("%s: no failure event", what)
+			}
+		}
+	}
+
+	// Fails to start: FFmpeg does not know the encoder.
+	bad := EncoderInfo{Name: "recon_no_such_encoder", Family: "h264", Vendor: "software"}
+	p := Params{Source: Source{Backend: "test", NativeW: 320, NativeH: 180}, Encoder: bad, FPS: 30, BitrateKbps: 1000}
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	ev := failure("start failure")
+	if ev.Failed == nil || ev.Failed.Encoder.Name != bad.Name || ev.Live {
+		t.Fatalf("start failure: %v: failed %+v live %v, want %s, not live", ev.Err, ev.Failed, ev.Live, bad.Name)
+	}
+	if _, ok := v.Current(); ok {
+		t.Fatal("the failed generation is still current")
+	}
+
+	// Fails while live: the encoder process dies after its first key frame.
+	p.Encoder = enc
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	for live := false; !live; {
+		select {
+		case ev := <-v.Events():
+			if ev.Err != nil {
+				t.Fatal(ev.Err)
+			}
+			live = ev.Config != nil
+		case <-time.After(20 * time.Second):
+			t.Fatal("encoder did not start")
+		}
+	}
+	v.mu.Lock()
+	proc := v.active.cmd.Process
+	v.mu.Unlock()
+	if err := proc.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	ev = failure("live failure")
+	if ev.Failed == nil || ev.Failed.Encoder.Name != enc.Name || !ev.Live {
+		t.Fatalf("live failure: %v: failed %+v live %v, want %s, live", ev.Err, ev.Failed, ev.Live, enc.Name)
+	}
+}

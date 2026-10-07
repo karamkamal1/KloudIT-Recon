@@ -35,7 +35,8 @@ Techniques used (most of them are new to browser-based game streaming):
 - **Zero-copy GPU capture → hardware encode.** DXGI Desktop Duplication (`ddagrab`) or
   Windows.Graphics.Capture (`gfxcapture`, which supports GPU downscaling and per-window
   capture) feeds D3D11 textures straight into NVENC / AMF / QSV. They are tuned for ultra-low
-  latency: CBR with a 1–3-frame VBV, no B-frames, no lookahead, zero-latency mode.
+  latency: CBR with a 1–3-frame VBV, no B-frames, no lookahead, zero-latency mode, and each
+  packet read out as soon as its frame is encoded.
 - **Overlapped encoder restarts.** Changing bitrate, resolution, codec or display starts a new
   encoder *while the old one keeps streaming*, then switches on the new key frame. You get no freeze.
 - **The entire media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`

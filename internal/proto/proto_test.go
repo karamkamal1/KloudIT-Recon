@@ -215,3 +215,17 @@ func TestPairingCode(t *testing.T) {
 		t.Fatal("incomplete code accepted")
 	}
 }
+
+// TestPrefsAdaptive: adaptive bitrate is on unless the client says otherwise
+// (clients before the field always adapted).
+func TestPrefsAdaptive(t *testing.T) {
+	for _, tc := range []struct {
+		json string
+		want bool
+	}{{`{}`, true}, {`{"adaptive":true}`, true}, {`{"adaptive":false}`, false}} {
+		var p Prefs
+		if err := json.Unmarshal([]byte(tc.json), &p); err != nil || p.AdaptiveBitrate() != tc.want {
+			t.Errorf("%s: adaptive %v (%v), want %v", tc.json, p.AdaptiveBitrate(), err, tc.want)
+		}
+	}
+}

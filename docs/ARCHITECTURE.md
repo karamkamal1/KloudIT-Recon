@@ -129,7 +129,11 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
   MP4/Matroska delay each frame until the next one arrives.
 - **Rate control:** CBR, VBV = 1–3 frames (by preset), no B-frames, no lookahead, an
   "infinite" GOP (IDR only on start or request), forced IDR, NVENC `-tune ull -zerolatency 1
-  -delay 0`. Encoder options are filtered against `ffmpeg -h encoder=…`, so any FFmpeg build works.
+  -delay 0`; AMF ultra-low-latency usage with each packet collected in the call that submits its
+  frame (`-async_depth 1 -flags +low_delay`; FFmpeg 8.1 otherwise collects it one frame later),
+  GOP 0, no rate-control frame skipping, HRD off, and latency-constrained VBR instead of CBR
+  while the client's adaptive bitrate is off (`docs/VENDOR_NOTES.md`, 1.1). Encoder options and
+  their named values are filtered against `ffmpeg -h encoder=…`, so any FFmpeg build works.
 - **Probing:** at startup every candidate encoder test-encodes a few frames. The best working
   one per codec family is used, with hardware preferred.
 - **Overlapped restarts:** a settings change starts generation *n+1* while *n* keeps streaming.

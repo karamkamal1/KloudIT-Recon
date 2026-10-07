@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
@@ -41,6 +43,80 @@ func TestVideoHeader(t *testing.T) {
 	_, ext = videoHeader(f, proto.HelloVersionFrameExt, now)
 	if _, ok := ext.Get(proto.ExtCaptureUs); ok {
 		t.Fatal("capture tag sent without a capture stamp")
+	}
+}
+
+// TestEncoderFailureFallback drives the failure handler with the video
+// manager's failure events: the first start failure of h264_amf retries it
+// with the low-latency usage (AMF issue #410) and the next one excludes it,
+// while a generation that fails after going live keeps its usage; an encoder
+// without another usage is excluded when it fails after another failure. The
+// client's adaptive bitrate setting reaches the encoder.
+func TestEncoderFailureFallback(t *testing.T) {
+	caps := &media.Caps{Encoders: []media.EncoderInfo{
+		{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+		{Name: "h264_amf", Family: "h264", Vendor: "amd", HW: true},
+		{Name: "libx264", Family: "h264", Vendor: "software"},
+	}}
+	cfg := &Config{Capture: "test", TestWidth: 1280, TestHeight: 720, DefaultFPS: 60, MaxFPS: 240, DefaultKbps: 20000, MaxKbps: 100000}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the handler's delayed restarts do nothing
+	s := &Session{
+		a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+		hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}, {Family: "hevc", HW: true}}},
+		tried: map[string]bool{}, usage: map[string]string{},
+		ctx: ctx, cancel: cancel,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	next := func(prefs proto.Prefs) media.Params {
+		t.Helper()
+		p, err := s.buildParams(prefs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	fail := func(p media.Params, live bool) {
+		if live {
+			s.failures = 0 // the generation went live (videoEvents on its config)
+		}
+		s.handleEncoderFailure(media.VideoEvent{Err: errors.New("encoder " + p.Encoder.Name + " exited"), Failed: &p, Live: live})
+	}
+	h264 := proto.Prefs{Codec: "h264"}
+	p := next(h264)
+	if p.Encoder.Name != "h264_amf" || p.Usage != "" || !p.Adaptive {
+		t.Fatalf("start: %s usage %q adaptive %v", p.Encoder.Name, p.Usage, p.Adaptive)
+	}
+	fail(p, true)
+	if p = next(h264); p.Encoder.Name != "h264_amf" || p.Usage != "" {
+		t.Fatalf("after a failure while live: %s usage %q, want h264_amf with its usage", p.Encoder.Name, p.Usage)
+	}
+	fail(p, false)
+	if p = next(h264); p.Encoder.Name != "h264_amf" || p.Usage != "lowlatency" {
+		t.Fatalf("after a start failure: %s usage %q, want h264_amf lowlatency", p.Encoder.Name, p.Usage)
+	}
+	fail(p, false)
+	if p = next(h264); p.Encoder.Name != "libx264" || p.Usage != "" {
+		t.Fatalf("after the retry failed: %s usage %q, want libx264", p.Encoder.Name, p.Usage)
+	}
+
+	s.failures = 0
+	auto := proto.Prefs{}
+	if p = next(auto); p.Encoder.Name != "hevc_amf" {
+		t.Fatalf("auto: %s, want hevc_amf", p.Encoder.Name)
+	}
+	fail(p, false)
+	if p = next(auto); p.Encoder.Name != "hevc_amf" || p.Usage != "" {
+		t.Fatalf("after one failure: %s usage %q, want hevc_amf again", p.Encoder.Name, p.Usage)
+	}
+	fail(p, false)
+	if p = next(auto); p.Encoder.Name != "libx264" {
+		t.Fatalf("after two failures: %s, want libx264", p.Encoder.Name)
+	}
+
+	off := false
+	if next(proto.Prefs{Adaptive: &off}).Adaptive {
+		t.Fatal("adaptive bitrate off in the client, on in the encoder parameters")
 	}
 }
 

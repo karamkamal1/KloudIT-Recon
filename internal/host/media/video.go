@@ -41,6 +41,11 @@ type VideoEvent struct {
 	Config *proto.VideoConfig // a new generation starts with the next frame
 	Frame  *Frame
 	Err    error // the active encoder failed
+	// Failed holds, with Err, the failed generation's parameters (the
+	// generation is already gone from Current). Live is set when that
+	// generation had gone live (sent its first key frame) before it failed.
+	Failed *Params
+	Live   bool
 }
 
 // Video manages encoder generations. Restarting (to force a key frame or change
@@ -118,7 +123,7 @@ func (v *Video) Start(p Params, urgent bool) error {
 	pr := &encProc{gen: v.gen, params: p, cmd: cmd, cancel: cancel, stderr: &stderrRing{log: v.log}, started: time.Now(), errDone: make(chan struct{})}
 	if v.log != nil {
 		v.log.Info("starting encoder", "gen", pr.gen, "encoder", p.Encoder.Name, "capture", p.Source.Backend,
-			"fps", p.FPS, "kbps", p.BitrateKbps, "size", fmt.Sprintf("%dx%d", p.Width, p.Height))
+			"fps", p.FPS, "kbps", p.BitrateKbps, "size", fmt.Sprintf("%dx%d", p.Width, p.Height), "adaptive", p.Adaptive)
 		v.log.Debug("ffmpeg args", "args", args)
 	}
 	if err := cmd.Start(); err != nil {
@@ -217,7 +222,8 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 		if err != nil {
 			v.mu.Lock()
 			killed := pr.killed
-			relevant := v.active == pr || v.pending == pr
+			live := v.active == pr
+			relevant := live || v.pending == pr
 			if relevant {
 				if v.active == pr {
 					v.active = nil
@@ -236,7 +242,8 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				if msg == "" {
 					msg = err.Error()
 				}
-				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg)})
+				failed := pr.params
+				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg), Failed: &failed, Live: live})
 			}
 			return
 		}

@@ -62,8 +62,9 @@ type Session struct {
 	curKbps  atomic.Int64
 	videoUp  atomic.Bool
 	failures int
-	tried    map[string]bool
-	triedMu  sync.Mutex
+	tried    map[string]bool   // encoders excluded after failing
+	usage    map[string]string // encoder -> usage it is retried with (media.RetryUsage)
+	triedMu  sync.Mutex        // guards tried and usage
 
 	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
 	audioKbps atomic.Int64             // audio bitrate while audio runs
@@ -93,6 +94,7 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		ctx: ctx, cancel: cancel,
 		frameQ: make(chan *media.Frame, 6),
 		tried:  map[string]bool{},
+		usage:  map[string]string{},
 	}
 	s.log = a.log.With("session", s.id, "path", meta.Path)
 	return s
@@ -413,10 +415,14 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		FPS:         fps,
 		BitrateKbps: kbps,
 		Quality:     prefs.Quality,
+		Adaptive:    prefs.AdaptiveBitrate(),
 		DrawCursor:  cfg.DrawCursor || prefs.Cursor == "video" || !s.a.cursorSupported(),
 		// Capture timestamps only reach clients that parse the frame extension.
 		CaptureClock: s.hello.V >= proto.HelloVersionFrameExt && cfg.CaptureTimestamps != "off" && s.a.caps.CanStampCapture(),
 	}
+	s.triedMu.Lock()
+	p.Usage = s.usage[enc.Name]
+	s.triedMu.Unlock()
 	backend := s.a.backendFor(prefs)
 	w, h := prefs.Width, prefs.Height
 	if w > 0 && h > 0 && (w >= mon.W && h >= mon.H) {
@@ -541,7 +547,7 @@ func (s *Session) videoEvents() {
 		}
 		switch {
 		case ev.Err != nil:
-			s.handleEncoderFailure(ev.Err)
+			s.handleEncoderFailure(ev)
 		case ev.Config != nil:
 			s.failures = 0
 			s.videoUp.Store(true)
@@ -572,14 +578,13 @@ func (s *Session) drainQueue() {
 	}
 }
 
-func (s *Session) handleEncoderFailure(err error) {
+// handleEncoderFailure handles a failure event (ev.Err) of the video manager.
+func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
+	err := ev.Err
 	s.failures++
-	s.log.Warn("encoder failed", "err", err, "attempt", s.failures)
-	if p, ok := s.video.Current(); ok && s.failures >= 2 {
-		// Same encoder failed twice: exclude it and fall back to the next one.
-		s.triedMu.Lock()
-		s.tried[p.Encoder.Name] = true
-		s.triedMu.Unlock()
+	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live)
+	if ev.Failed != nil {
+		s.encoderFailed(*ev.Failed, s.failures, ev.Live)
 	}
 	if s.failures > 6 {
 		s.notice("error", "Video encoder keeps failing: "+err.Error())
@@ -594,6 +599,29 @@ func (s *Session) handleEncoderFailure(err error) {
 			}
 		}
 	})
+}
+
+// encoderFailed decides how the next start treats the encoder of a failed
+// generation (attempt: failures in a row; live: the generation had gone live).
+// An encoder with a fallback usage (media.RetryUsage) that fails to start is
+// retried once with that usage, kept until the video settings change; a live
+// generation that fails (e.g. its capture after a display mode change) had no
+// init problem and keeps its usage. Otherwise a failure after another one
+// excludes the encoder and chooseEncoder falls back to the next.
+func (s *Session) encoderFailed(p media.Params, attempt int, live bool) {
+	name := p.Encoder.Name
+	s.triedMu.Lock()
+	defer s.triedMu.Unlock()
+	if u := media.RetryUsage(p.Encoder); u != "" && !live {
+		if _, retried := s.usage[name]; !retried {
+			s.usage[name] = u
+			s.log.Info("retrying encoder with another usage", "encoder", name, "usage", u)
+			return
+		}
+	}
+	if attempt >= 2 {
+		s.tried[name] = true
+	}
 }
 
 // congestion lowers the bitrate by 25 % and forces a new key frame. It is
@@ -939,10 +967,12 @@ func (s *Session) controlLoop() error {
 			s.curKbps.Store(0) // explicit user choice resets congestion back-off
 			videoChanged := old.Codec != m.Prefs.Codec || old.BitrateKbps != m.Prefs.BitrateKbps || old.FPS != m.Prefs.FPS ||
 				old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.Monitor != m.Prefs.Monitor ||
-				old.Window != m.Prefs.Window || old.Quality != m.Prefs.Quality || old.Cursor != m.Prefs.Cursor
+				old.Window != m.Prefs.Window || old.Quality != m.Prefs.Quality || old.Cursor != m.Prefs.Cursor ||
+				old.AdaptiveBitrate() != m.Prefs.AdaptiveBitrate()
 			if videoChanged {
 				s.triedMu.Lock()
 				s.tried = map[string]bool{}
+				s.usage = map[string]string{}
 				s.triedMu.Unlock()
 				if err := s.startVideo(false, "settings"); err != nil {
 					s.notice("error", "Could not apply settings: "+err.Error())

@@ -89,7 +89,7 @@ Hardware checks:
   "End-to-end (capture→draw)", not "Stream latency (send→draw)", and the host log has no
   "implausible capture timestamp" warning (the AMF encoders keep the µs pts); capture→encoded p50
   is about 1–3 frame intervals (expected about one interval more than necessary until 1.1 sets
-  `async_depth=1`); the `stream stats` lines show the same fps and Mbit/s as a 60 s run with
+  `-async_depth 1 -flags +low_delay`); the `stream stats` lines show the same fps and Mbit/s as a 60 s run with
   `"captureTimestamps": "off"`; capture→encoded values are not quantized to 1 ms or 15.6 ms steps
   (in the browser console post `{type:'stageDump'}` to `__recon.worker`, then inspect
   `__recon.stageDump[i].stages[0]`), which would mean the FFmpeg build's `av_gettime()` uses the
@@ -583,3 +583,182 @@ Not verified (needs real networks):
   then run the four netem profiles above for direct sessions and, on the host → gateway link
   as described above, for relay sessions, and compare with reno.
 - NVIDIA: unverified (no NVIDIA host available). Test: same as AMD on an RTX host.
+
+## 1.1 AMD encoder arguments
+
+The AMF arguments (`encoderArgs`, case `amd`, in `internal/host/media/ffmpeg.go`) for a 60 fps,
+20 Mbit/s session with adaptive bitrate on (the default) and no preset sent by the client:
+
+```
+hevc_amf: -usage ultralowlatency -quality speed -rc cbr -enforce_hrd 0 -filler_data 0 -preanalysis 0
+          -preencode 0 -async_depth 1 -flags +low_delay -forced_idr 1 -skip_frame 0 -latency 1
+          -header_insertion_mode idr -vbaq 1 -b:v 20000k -maxrate 20000k -bufsize 500k -g 0 -bf 0
+av1_amf:  (same up to -forced_idr 1) -skip_frame 0 -latency lowest_latency -header_insertion_mode frame
+          -b:v 20000k -maxrate 20000k -bufsize 500k -g 0 -bf 0
+h264_amf: (same up to -forced_idr 1) -frame_skipping 0 -latency 1 -vbaq 1
+          -b:v 20000k -maxrate 20000k -bufsize 500k -g 0 -bf 0
+```
+
+`-quality` follows the client's encoder preset (the web client sends `balanced` unless changed;
+`speed` is the default only when no preset is sent). `-rc vbr_latency` replaces `cbr` when the
+client turned off "Adaptive bitrate on congestion" (new `adaptive` field in the client's prefs,
+`media.Params.Adaptive`); the host log's `starting encoder` line shows `adaptive=true|false`.
+When h264_amf first fails to start in a session (a generation that never went live), the host
+retries it with `-usage lowlatency` (AMF issue #410, an init failure) and logs `retrying encoder
+with another usage`; a further failure excludes it, and a video settings change resets both.
+
+The probe now also reads the named values of each encoder option from
+`ffmpeg -h encoder=<name>`. An option is passed only where the encoder has it and, if it has
+named values, only with one of them or a number. That keeps `skip_frame` on hevc/av1 only,
+`frame_skipping` on h264 only, `vbaq` off av1 (it has `aq_mode`), and `header_insertion_mode`
+on hevc (`idr`) and av1 (`frame`) but off h264 (it has `header_spacing`); a build that lacks a
+value is not sent it. `-flags +low_delay` is a generic codec option (not in that list) and is
+always passed; the `+` keeps hevc/h264_amf's default `+loop` (their deblocking switch).
+
+Verified in the sandbox:
+
+- verified (sandbox): the arguments above, checked against the real option lists of the FFmpeg
+  8.1 Windows build the installer downloads (`ffmpeg -h encoder=...` for av1/hevc/h264_amf and
+  av1/hevc/h264_nvenc in `internal/host/media/testdata`): `TestParseEncoderHelp`,
+  `TestAMDEncoderArgs` (exact argument sets per encoder, vbr_latency without adaptive bitrate,
+  presets, the lowlatency usage; `-v` prints the full command lines), `TestEncoderArgsAccepted`
+  (every option the host passes to the six hardware encoders, for every preset, adaptive on/off
+  and usage, exists for that encoder and takes the value), `TestNVIDIAEncoderArgs` (the NVENC
+  arguments are unchanged by the value filtering).
+- verified (sandbox): FFmpeg 8.1 (BtbN win64 GPL) under Wine accepts every new AMF command
+  line up to the AMF runtime: `TestAMFArgsAccepted` in the cross-compiled `media.test.exe`
+  (`GOOS=windows go test -c ./internal/host/media`, run with `WINEPATH` set to the FFmpeg `bin`
+  folder) builds the host's command lines for av1_amf, hevc_amf and h264_amf (test source,
+  1280×720, adaptive on and off; h264_amf also with `-usage lowlatency`), runs 5 frames each, and
+  requires that FFmpeg refuses no option. All 8 runs (with `-async_depth 1 -flags +low_delay`)
+  got to `DLL amfrt64.dll failed to open | Failed to create hardware device context (AMF)`. The
+  exact ddagrab command lines of the 3 encoders (printed by `TestAMDEncoderArgs -v`) also pass
+  option parsing under Wine and stop at ddagrab's `Failed to create Direct3D device` (no GPU).
+  Control: with `-flags +low_delayx` the same lines stop at `Unable to parse "flags" option value
+  "low_delayx"` / `Error applying encoder options`, so FFmpeg checks the values before it
+  configures ddagrab or opens the encoder.
+- verified (sandbox), A3: the pre-1.1 av1_amf arguments are refused by FFmpeg 8.1 before the
+  encoder opens, so AV1 on AMD could never start: `Unable to parse "header_insertion_mode" option
+  value "idr" | Error setting option header_insertion_mode to value idr.` then
+  `Error applying encoder options: Invalid argument` (the same test, and the old ddagrab line by
+  hand). The new av1_amf line passes.
+- From the FFmpeg 8.1 sources (not hardware-verified): A1, `-async_depth 1` alone does not
+  help; `-flags +low_delay` is needed too. In `libavcodec/amfenc.c` the output delay is
+  `max(bf, 0) + 1`, or `max(bf, 0)` with the codec flag `AV_CODEC_FLAG_LOW_DELAY` (new in 8.1;
+  8.0 always adds 1). `amf_submit_frame` returns EAGAIN right after `SubmitInput` while
+  `submitted_frame <= encoded_frame + delay`, and `ff_amf_receive_packet` does the same on calls
+  without a new frame ("too soon to poll"). With delay 1, frame N's packet is therefore polled
+  only when frame N+1 is submitted, one frame interval late, whatever `async_depth` is. With the
+  flag it polls in the call that submits N, and it waits there for the packet only while
+  `async_depth` hardware surfaces are queued (`hwsurfaces_in_queue >= async_depth`): with 1 on
+  every frame, with the default 16 not until 16 frames are queued, so the packet would again
+  wait for the next frame. The wait
+  applies only to hardware (D3D11, AMF) input frames such as ddagrab's and gfxcapture's; frames in
+  system memory are not counted. Sunshine sets only `async_depth=1` because it sets
+  `AV_CODEC_FLAG_LOW_DELAY` itself (libavcodec in process).
+  A4, `-g` sets `AMF_VIDEO_ENCODER_HEVC_GOP_SIZE` (with `NUM_GOPS_PER_IDR` = `gops_per_idr`,
+  default 1), `AMF_VIDEO_ENCODER_AV1_GOP_SIZE` and the H.264 `AMF_VIDEO_ENCODER_IDR_PERIOD`; the
+  AMF docs say HEVC GOP size 0 inserts "only the first IDR/CRA (infinite GOP size)", AV1 0 "only
+  inserts the first frame" (its value range says `>0`), H.264 IDR period 0 "turns IDR off".
+- verified (sandbox): session logic (`internal/host` `TestEncoderFailureFallback`, which feeds
+  failure events to the session's handler): h264_amf's first start failure restarts it with
+  usage lowlatency, the next failure excludes it (fallback to the next encoder); a failure after
+  the generation went live (capture lost after hours, e.g. on a display mode change) keeps the
+  usage, since AMF issue #410 is an init failure; hevc_amf is retried once, then excluded; a
+  video settings change clears the usage retry as it clears the exclusions; the client's
+  adaptive setting reaches `Params.Adaptive` (`internal/proto` `TestPrefsAdaptive`: missing
+  field = on, as old clients behave). Browser E2E: switching "Adaptive bitrate on congestion" off
+  and on in the drawer makes the host start an encoder with `adaptive=false`, then
+  `adaptive=true` (the check waits for those host log lines, not for any new generation, since
+  key-frame restarts also start generations).
+- Found while testing: the encoder fallback never excluded a failing encoder. The failure
+  handler looked the failed encoder up with `Video.Current()` after the failed generation had
+  already been removed, so a broken encoder was retried until the session gave up after 7
+  failures. The error event now carries the failed generation's parameters and whether it had
+  gone live: `internal/host/media` `TestVideoFailureEvent` (local FFmpeg) checks both for an
+  encoder FFmpeg does not know (not live) and for an encoder process killed after its first key
+  frame (live).
+
+Hardware checks (FFmpeg path; use `"capture": "ddagrab"` in `%APPDATA%\KlouditRecon\host.json`
+and restart the agent after each edit; `"logLevel": "debug"` adds the `ffmpeg args` line with the
+exact command line of every generation to `host.log`; to run one by hand, copy the list between
+`[` and `]` and quote the `-filter_complex` and `-map` values; the stats overlay is
+Ctrl+Alt+Shift+S):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A1 `-async_depth 1 -flags +low_delay`)
+  `"encoder": "hevc_amf"`, 1920×1080 60 fps, 20 Mbit/s, a game or full-screen video with constant
+  motion, wired LAN client. After 60 s note the overlay's `capture→encoded` p50/p95 row and the
+  host log's `latency stages` lines (`capture` and `host_capture`). Repeat with an agent built
+  from the commit before "Phase 1.1" (same settings and scene). Expect p50 lower by about one
+  frame interval (16.7 ms at 60 fps, 8.3 ms at 120 fps) with 1.1. To confirm that both arguments
+  are needed (FFmpeg source analysis above), also run an agent built from 1.1 with the line
+  `a = append(a, "-flags", "+low_delay")` removed from `encoderArgs`
+  (`internal/host/media/ffmpeg.go`): its p50 should be back at about the pre-1.1 value. Repeat
+  for `h264_amf` and (at 2560×1440) `av1_amf`, where the old build does not start (A3), so only
+  record the absolute values.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A2 AV1 `-latency lowest_latency`) `"encoder":
+  "av1_amf"` at 2560×1440 60 fps, same scene as A1; the debug log's `ffmpeg args` line must
+  contain `-latency lowest_latency -header_insertion_mode frame`. Record `capture→encoded`
+  p50/p95; expect within about 2 ms of hevc_amf at the same size and below one frame interval at
+  p95. To see the mode's effect, run the logged command by hand twice (copy it from the log,
+  replace `pipe:1` by `-t 60 C:\temp\av1.nut`) with `-latency lowest_latency` and with
+  `-latency power_saving_real_time`, and compare the `speed=` FFmpeg prints (higher = more
+  headroom) and the GPU's Video Encode load in Task Manager.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A3 AV1 starts) Stream settings > Codec "AV1" (or
+  `"encoder": "av1_amf"`) with the host display at 2560×1440 (or Resolution "2560×1440", which
+  scales with gfxcapture on a 4K display). Pass: the overlay shows `Video 2560×1440 AV1` and
+  `Encoder av1_amf`, the stream runs 60 s, and `host.log` has no `encoder failed` line. Also, with
+  Go installed on the host: `go test ./internal/host/media -run TestAMFArgsAccepted -v` with the
+  agent's FFmpeg on `PATH` (`$env:PATH = "C:\Program Files\KlouditRecon\ffmpeg\bin;$env:PATH"`);
+  on the AMD GPU every one of the 8 runs must log `encoded` (it really encodes with each argument
+  list), and the old av1 arguments must still be refused.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A4 `-g 0`) first frame and restarts: stream
+  hevc_amf, then change the bitrate in the drawer 3 times and press the drawer's Reconnect once;
+  every `starting encoder` line in `host.log` must be followed by `encoder ready` for the same
+  session and `gen` within about 1 s (a generation only goes live on a key frame, so a missing
+  first IDR shows as a start that never becomes ready). No periodic IDR: with
+  `"logLevel": "debug"` copy one session's `ffmpeg args` line, run it by hand with `pipe:1`
+  replaced by `-t 600 C:\temp\gop.nut` while a game runs, then
+  `ffprobe -v error -select_streams v -show_entries packet=pts_time,size,flags -of csv=p=0 C:\temp\gop.nut > C:\temp\gop.csv`.
+  Pass: exactly one packet has the `K` flag (the first), and no packet is larger than about 3×
+  the median size at a regular period (the old `-g 1000` gave a key frame every 1000 frames,
+  16.7 s at 60 fps). Do it for hevc_amf, h264_amf (where IDR period 0 "turns IDR off": the first
+  packet must still be `K` and the stream must play in the browser) and av1_amf (2560×1440).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A5 `-forced_idr 1`, no rate-control frame
+  skipping) skipped frames under capdrop: hevc_amf at 1920×1080 60 fps, 40 Mbit/s, high-motion
+  scene, relay path, `./netem.sh apply capdrop --ct <gateway CTID> --host <client IP>` (0.4);
+  the host's congestion back-off lowers the bitrate during the 15 Mbit/s step. Pass: the
+  overlay's frame rate and the host's `stream stats` fps stay at 60 except right after a
+  `congestion: lowering bitrate` line (queue drain), and the overlay's `Frames dropped` does not
+  grow outside those moments. Encoder-level check: run the logged command by hand starved to
+  3 Mbit/s (`-b:v 3000k -maxrate 3000k -bufsize 50k`) with `-t 60` on a scene that changes every
+  frame, ffprobe the packets as in A4: expect 3600 packets and none below about 100 bytes; repeat
+  with `-skip_frame 1` (h264_amf: `-frame_skipping 1`) as the positive control, which should show
+  fewer or tiny packets. `forced_idr` only affects frames FFmpeg marks as I (none on this path).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A6 `-rc cbr` with adaptive bitrate,
+  `vbr_latency` without, HRD off) stream hevc_amf 1080p60 at 20 Mbit/s with "Adaptive bitrate on
+  congestion" on, then off (the switch restarts the encoder; `starting encoder ...
+  adaptive=false`, debug args contain `-rc vbr_latency -enforce_hrd 0 -filler_data 0`). In both
+  modes look for pulsing blocking or smearing in fast motion (the HRD artifacts Sunshine warns
+  about) and record the overlay's Mbit/s on a static desktop (vbr_latency should drop well below
+  20, CBR without filler data may too) and in motion (both at or below 20).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (A7 AV1 64×16 alignment, handled by step 1.7) AV1
+  at 1920×1080 (host display 1080p, Codec "AV1"): in Chrome open `chrome://media-internals`, select
+  the stream's player and compare the decoder's coded size with 1920×1080; look for a band of
+  padding rows at the bottom of the picture. Control: 2560×1440 shows no band.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (H.264 usage retry; any AMD GPU)
+  `"encoder": "h264_amf"`. If the ultra low latency usage fails on this GPU/driver, `host.log`
+  shows `encoder failed ... live=false`, then
+  `retrying encoder with another usage encoder=h264_amf usage=lowlatency`, then `encoder ready`;
+  if it works, neither line appears. Record which, with the driver version. A failure while
+  streaming (`encoder failed ... live=true`, e.g. after switching the host display mode) must not
+  be followed by the `retrying encoder with another usage` line.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (step 1.1 acceptance) capture→packet about one frame
+  interval lower at 60 fps (A1); AV1 at 2560×1440 streams (A3); no periodic IDR spikes in
+  10 minutes (A4); no encoder-skipped frames under capdrop (A5); the checks above.
+- NVIDIA: unverified (no NVIDIA host available). Test: (1.1 does not change the NVENC arguments;
+  the new value check only drops values FFmpeg's option list does not name) `"encoder":
+  "hevc_nvenc"`, `"logLevel": "debug"`; the `ffmpeg args` line must contain the same NVENC options
+  as before 1.1 (`-preset p3 -tune ull -rc cbr -multipass disabled -zerolatency 1 -delay 0
+  -rc-lookahead 0 -no-scenecut 1 -forced-idr 1 -strict_gop 1 -spatial-aq 1 -profile main` for the
+  balanced preset) and the stream must start; repeat with h264_nvenc and av1_nvenc (RTX 40+).

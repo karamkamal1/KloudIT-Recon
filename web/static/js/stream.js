@@ -45,6 +45,7 @@ function hostPrefs() {
   return {
     codec: prefs.codec, bitrate: Math.round(prefs.bitrate * 1000), fps: +prefs.fps, width: w, height: h,
     monitor: +prefs.monitor, audio: !!prefs.audio, audioCodec: prefs.audioCodec, cursor: prefs.cursor, quality: prefs.quality,
+    adaptive: prefs.adaptive !== false,
   };
 }
 
@@ -780,7 +781,7 @@ function buildDrawer() {
       field('Resolution', select('resolution', [['native', 'Native (host display)'], ['client', 'Match this screen'], ['2160', '3840×2160'], ['1440', '2560×1440'], ['1080', '1920×1080'], ['900', '1600×900'], ['720', '1280×720']], applyLive), 'Downscaling happens on the GPU (Windows Graphics Capture).'),
       field('Encoder preset', select('quality', [['speed', 'Lowest latency'], ['balanced', 'Balanced'], ['quality', 'Best quality']], applyLive)),
       monOpts.length > 1 ? field('Display', select('monitor', monOpts, applyLive)) : null,
-      check('adaptive', 'Adaptive bitrate on congestion', () => post({ type: 'prefs', prefs: { adaptive: prefs.adaptive } })),
+      check('adaptive', 'Adaptive bitrate on congestion', () => { post({ type: 'prefs', prefs: { adaptive: prefs.adaptive } }); applyLive(); }),
     ),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Input'),
       field('Mouse', select('mouse', [['desktop', 'Desktop — absolute, local cursor'], ['game', 'Game — raw relative (pointer lock)']], updateToolbarState)),

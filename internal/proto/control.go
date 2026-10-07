@@ -45,9 +45,14 @@ type Prefs struct {
 	AudioCodec  string `json:"audioCodec,omitempty"` // opus | pcm
 	Cursor      string `json:"cursor,omitempty"`     // local | video
 	Quality     string `json:"quality,omitempty"`    // speed | balanced | quality
+	Adaptive    *bool  `json:"adaptive,omitempty"`   // adaptive bitrate on congestion, default true
 }
 
 func (p Prefs) AudioEnabled() bool { return p.Audio == nil || *p.Audio }
+
+// AdaptiveBitrate reports whether the client lets the host change the bitrate
+// during the session (clients before the adaptive field always did).
+func (p Prefs) AdaptiveBitrate() bool { return p.Adaptive == nil || *p.Adaptive }
 
 // Welcome is the host's reply to Hello.
 type Welcome struct {

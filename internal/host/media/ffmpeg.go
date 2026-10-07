@@ -39,6 +39,10 @@ type Caps struct {
 	Encoders []EncoderInfo     // usable encoders, best first
 	Rejected map[string]string // encoder built into ffmpeg -> why its test encode failed
 	options  map[string]map[string]bool
+	// optValues holds the named values of the encoder options that have them
+	// (encoder -> option -> names), e.g. av1_amf header_insertion_mode: none,
+	// gop, frame.
+	optValues map[string]map[string]map[string]bool
 
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
@@ -95,7 +99,8 @@ func quietCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 
 // Probe inspects the ffmpeg build and test-encodes with every candidate encoder.
 func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) {
-	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{}}
+	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{},
+		optValues: map[string]map[string]map[string]bool{}}
 	out, err := quietCmd(ctx, ffmpeg, "-hide_banner", "-version").Output()
 	if err != nil {
 		return nil, fmt.Errorf("running ffmpeg: %w", err)
@@ -150,11 +155,11 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 		wg.Add(1)
 		go func(e EncoderInfo) {
 			defer wg.Done()
-			opts := encoderOptions(ctx, ffmpeg, e.Name)
+			opts, vals := encoderOptions(ctx, ffmpeg, e.Name)
 			err := testEncode(ctx, ffmpeg, e)
 			mu.Lock()
 			defer mu.Unlock()
-			c.options[e.Name] = opts
+			c.options[e.Name], c.optValues[e.Name] = opts, vals
 			if err == nil {
 				ok[e.Name] = true
 			} else {
@@ -243,17 +248,37 @@ func testBarcode(ctx context.Context, ffmpeg string) error {
 	return nil
 }
 
-var optLine = regexp.MustCompile(`^\s{1,4}-([A-Za-z0-9_\-]+)\s+<`)
+var (
+	optLine = regexp.MustCompile(`^\s{1,4}-([A-Za-z0-9_\-]+)\s+<`)
+	// constLine is a named value of the option above it, e.g.
+	// "     lowest_latency  3            E..V....... Encoding as fast as possible".
+	constLine = regexp.MustCompile(`^\s{5,}(\S+)\s+\S+\s+[E.][D.][F.][V.]`)
+)
 
-func encoderOptions(ctx context.Context, ffmpeg, enc string) map[string]bool {
+func encoderOptions(ctx context.Context, ffmpeg, enc string) (map[string]bool, map[string]map[string]bool) {
 	out, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-h", "encoder="+enc).Output()
-	m := map[string]bool{}
-	for _, line := range strings.Split(string(out), "\n") {
+	return parseEncoderHelp(string(out))
+}
+
+// parseEncoderHelp reads the private options of an encoder from the output of
+// "ffmpeg -h encoder=<name>", and the named values of those that have them.
+func parseEncoderHelp(help string) (opts map[string]bool, values map[string]map[string]bool) {
+	opts, values = map[string]bool{}, map[string]map[string]bool{}
+	cur := ""
+	for _, line := range strings.Split(strings.ReplaceAll(help, "\r", ""), "\n") {
 		if s := optLine.FindStringSubmatch(line); s != nil {
-			m[s[1]] = true
+			cur = s[1]
+			opts[cur] = true
+		} else if s := constLine.FindStringSubmatch(line); s != nil && cur != "" {
+			if values[cur] == nil {
+				values[cur] = map[string]bool{}
+			}
+			values[cur][s[1]] = true
+		} else {
+			cur = ""
 		}
 	}
-	return m
+	return opts, values
 }
 
 func vaapiDevice() string {
@@ -289,6 +314,18 @@ func (c *Caps) HasOption(enc, opt string) bool {
 	return c.options[enc][opt]
 }
 
+// acceptsValue reports whether an encoder option takes val. An option with
+// named values takes one of them or a number (FFmpeg rejects any other word
+// and the encoder then fails to open), all others any value.
+func (c *Caps) acceptsValue(enc, opt, val string) bool {
+	names := c.optValues[enc][opt]
+	if len(names) == 0 || names[val] {
+		return true
+	}
+	_, err := strconv.ParseFloat(val, 64)
+	return err == nil
+}
+
 // ---------------------------------------------------------------------------
 // Argument construction
 
@@ -314,6 +351,14 @@ type Params struct {
 	BitrateKbps int
 	Quality     string // speed | balanced | quality
 	DrawCursor  bool
+	// Adaptive is set when the rate controller may change the bitrate during
+	// the session (the client's adaptive bitrate is on). AMF then uses CBR
+	// instead of latency-constrained VBR.
+	Adaptive bool
+	// Usage overrides the encoder's usage preset (AMF -usage; "" = the
+	// default, ultra low latency). The session sets it to RetryUsage after a
+	// start failure.
+	Usage string
 	// CaptureClock stamps every frame with its wall-clock capture time: pts
 	// become the wall clock in µs right after the source (CaptureClockFilter)
 	// and the encoder runs at a µs time base (it still gets the frame rate for
@@ -488,13 +533,14 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	if bufKbits < 64 {
 		bufKbits = 64
 	}
-	// Effectively infinite GOP: IDR only at start / on request. AMF rejects
-	// out-of-range values silently (falling back to a ~1 s GOP), and QSV
-	// stores the GOP in 16 bits, so clamp per vendor.
+	// Effectively infinite GOP: IDR only at start / on request. AMF documents
+	// 0 as an infinite GOP (only the first frame is IDR/key) and accepts at
+	// most 1000, which still inserted an IDR every 1000 frames; QSV stores the
+	// GOP in 16 bits. So clamp per vendor.
 	gop := p.FPS * 3600
 	switch e.Vendor {
 	case "amd":
-		gop = 1000
+		gop = 0
 	case "intel":
 		gop = min(gop, 65535)
 	}
@@ -516,8 +562,9 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 	e := p.Encoder
 	var a []string
+	// opt passes an option only where this encoder has it and takes the value.
 	opt := func(name string, vals ...string) {
-		if c.HasOption(e.Name, name) {
+		if c.HasOption(e.Name, name) && (len(vals) != 1 || c.acceptsValue(e.Name, name, vals[0])) {
 			a = append(a, "-"+name)
 			a = append(a, vals...)
 		}
@@ -550,18 +597,52 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 		}
 		a = append(a, common...)
 	case "amd":
-		opt("usage", "ultralowlatency")
+		usage := p.Usage
+		if usage == "" {
+			usage = "ultralowlatency"
+		}
+		opt("usage", usage)
 		q := map[string]string{"speed": "speed", "balanced": "balanced", "quality": "quality"}[p.Quality]
 		if q == "" {
-			q = "balanced"
+			q = "speed"
 		}
 		opt("quality", q)
-		opt("rc", "cbr")
-		opt("enforce_hrd", "1")
+		// CBR when the bitrate may change (the rate controller), else
+		// latency-constrained VBR (Sunshine's default). HRD enforcement can
+		// cause artifacts, filler data wastes bits.
+		rc := "vbr_latency"
+		if p.Adaptive {
+			rc = "cbr"
+		}
+		opt("rc", rc)
+		opt("enforce_hrd", "0")
 		opt("filler_data", "0")
 		opt("preanalysis", "0")
-		opt("latency", "1")
-		opt("header_insertion_mode", "idr")
+		opt("preencode", "0")
+		// Collect each packet in the call that submits its frame. Without
+		// the low-delay codec flag FFmpeg 8.1 polls for a packet only after
+		// the next frame is submitted (one frame interval late); with it, it
+		// waits for the packet once async_depth hardware (D3D11) frames are
+		// queued (default 16). "+" keeps h264/hevc_amf's +loop (deblocking).
+		opt("async_depth", "1")
+		a = append(a, "-flags", "+low_delay")
+		opt("forced_idr", "1")
+		// Rate control must not skip frames (on by default with ultra low
+		// latency); the H.264 encoder calls the option frame_skipping.
+		opt("skip_frame", "0")
+		opt("frame_skipping", "0")
+		if e.Family == "av1" {
+			// latency is an enum on AV1 (1 = power-saving real time) and
+			// its header insertion modes are none|gop|frame. No -align:
+			// FFmpeg's 64x16 mode rejects 1080p even where the GPU needs no
+			// padding (the 1.7 probe handles alignment).
+			opt("latency", "lowest_latency")
+			opt("header_insertion_mode", "frame")
+		} else {
+			opt("latency", "1")
+			opt("header_insertion_mode", "idr")
+			opt("vbaq", "1")
+		}
 		a = append(a, common...)
 	case "intel":
 		preset := map[string]string{"speed": "veryfast", "balanced": "faster", "quality": "medium"}[p.Quality]
@@ -603,6 +684,17 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 		}
 	}
 	return a
+}
+
+// RetryUsage returns the usage (Params.Usage) to retry an encoder with once
+// after it failed, or "" if it has none: AMF's H.264 encoder can fail to
+// initialise with the ultra-low-latency usage on GPUs and drivers where the
+// low-latency usage works (AMF issue #410).
+func RetryUsage(e EncoderInfo) string {
+	if e.Name == "h264_amf" {
+		return "lowlatency"
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
