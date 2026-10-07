@@ -322,6 +322,9 @@ type Params struct {
 	// Barcode draws the frame barcode of each frame's index (= Frame.Seq) into
 	// the top-left corner (BarcodeFilter; test source only).
 	Barcode bool
+	// GPUPriority is the GPU scheduling priority of the FFmpeg process
+	// (GPUPriorityAuto, …; "" = auto; Windows only).
+	GPUPriority string
 }
 
 // CaptureClockFilter sets each frame's pts to the wall clock (av_gettime())

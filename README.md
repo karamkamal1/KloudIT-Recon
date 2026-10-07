@@ -289,6 +289,7 @@ The new password (at least 10 characters) is read from stdin.
 | `congestion` | `reno` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency |
+| `gpuPriority` | `auto` | GPU scheduling priority of the FFmpeg capture/encode process, so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 

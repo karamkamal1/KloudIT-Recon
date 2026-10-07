@@ -85,3 +85,26 @@ func TestConfigCongestion(t *testing.T) {
 		t.Fatal("unknown congestion controller accepted")
 	}
 }
+
+func TestConfigGPUPriority(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load(`{}`)
+	if err != nil || c.gpuPriority() != "auto" {
+		t.Fatalf("default: %v %q", err, c.gpuPriority())
+	}
+	for _, m := range []string{"auto", "high", "realtime", "off"} {
+		if c, err := load(`{"gpuPriority":"` + m + `"}`); err != nil || c.gpuPriority() != m {
+			t.Fatalf("%s: %v", m, err)
+		}
+	}
+	if _, err := load(`{"gpuPriority":"normal"}`); err == nil || !strings.Contains(err.Error(), "gpuPriority") {
+		t.Fatalf("unknown gpuPriority: %v", err)
+	}
+}

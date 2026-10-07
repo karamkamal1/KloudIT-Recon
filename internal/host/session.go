@@ -416,6 +416,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		DrawCursor:  cfg.DrawCursor || prefs.Cursor == "video" || !s.a.cursorSupported(),
 		// Capture timestamps only reach clients that parse the frame extension.
 		CaptureClock: s.hello.V >= proto.HelloVersionFrameExt && cfg.CaptureTimestamps != "off" && s.a.caps.CanStampCapture(),
+		GPUPriority:  cfg.gpuPriority(),
 	}
 	backend := s.a.backendFor(prefs)
 	w, h := prefs.Width, prefs.Height

@@ -583,3 +583,198 @@ Not verified (needs real networks):
   then run the four netem profiles above for direct sessions and, on the host → gateway link
   as described above, for relay sessions, and compare with reno.
 - NVIDIA: unverified (no NVIDIA host available). Test: same as AMD on an RTX host.
+
+## 1.3 GPU scheduling priority, vendor-aware
+
+Every FFmpeg encoder process gets a GPU scheduling priority right after it starts, before FFmpeg
+creates its D3D11 device: gdi32 `D3DKMTSetProcessSchedulingPriorityClass` on a handle opened with
+`PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION`. Host config `gpuPriority`: `auto` (the
+default) asks for REALTIME (5), except HIGH (4) when NVIDIA is in the process and
+hardware-accelerated GPU scheduling (HAGS) is on or unknown; `high`; `realtime` (also for NVIDIA
+with HAGS on); `off`. A refused REALTIME is retried as HIGH. Unless `off`, the agent enables
+`SeIncreaseBasePriorityPrivilege` on its own token at startup. The CPU priority (HIGH) is
+unchanged.
+
+"NVIDIA in the process" means the encoder is NVENC (`EncoderInfo.Vendor` nvidia) or DXGI adapter 0
+is NVIDIA (`DXGI_ADAPTER_DESC1.VendorId` 0x10DE): ddagrab captures on adapter 0 through D3D11
+whatever the encoder, so libx264 or libsvtav1 on an NVIDIA GPU (an AV1 client on RTX 20/30, or the
+libx264 fallback after NVENC failed twice) also gets HIGH, as in Sunshine, which decides on the
+adapter. HAGS is read once at agent startup from the kernel, the way Sunshine reads it:
+`D3DKMTOpenAdapterFromLuid` with adapter 0's `AdapterLuid`,
+`D3DKMTQueryAdapterInfo(KMTQAITYPE_WDDM_2_7_CAPS)` → `HwSchEnabled` (the state in effect, also
+when HAGS is on by default and `HwSchMode` was never written), `D3DKMTCloseAdapter`. Only when
+that fails (no DXGI adapter, an OS before Windows 10 2004, a driver error) does
+`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` `HwSchMode` decide: 2 → on, 1 → off,
+0 or missing → unknown (the OS/driver default, which the registry does not show), and unknown
+counts as on, so NVIDIA gets HIGH. Deviation from GUIDE 1.3, which reads only `HwSchMode` == 2 and
+leaves `D3DKMTQueryAdapterInfo` to the Phase 3 helper: `HwSchMode` alone reads HAGS that is on by
+default as off, so the kernel query is done here already.
+
+Host log: at startup (unless `off`) `gpu adapter 0 adapter=nvidia|amd|intel|other|unknown
+name=… hags=on|off|unknown hags_from=kernel|registry` with `err=` saying why the kernel was not
+asked or did not answer; per encoder generation `gpu priority: realtime|high|failed|off vendor=…
+adapter=… hags=… mode=… gen=…` (vendor = encoder, adapter = adapter 0), with `realtime_refused=`
+(high after a refused REALTIME) or `err=` (failed); INFO the first time and when the outcome
+changes, WARN for failed, DEBUG for a later generation with the same outcome.
+
+Verified in the sandbox:
+
+- verified (sandbox): decision logic (portable `gpuPriorityClass` / `applyGPUPriority`) for every
+  combination of 5 encoder vendors (nvidia, amd, intel, vaapi, software) × 5 adapter 0 vendors
+  (unknown, nvidia, amd, intel, other) × 5 modes (`""`, auto, high, realtime, off) × HAGS
+  off/on/unknown × no refusal / REALTIME refused / both refused: the class asked for first, the
+  REALTIME→HIGH retry, the outcome and the error reported (`internal/host/media`
+  `TestGPUPriority`, which also spells out libx264 on an NVIDIA adapter with HAGS on → HIGH, NVENC
+  with HAGS unknown → HIGH, AMD with HAGS unknown → REALTIME). Each of five mutations of the logic
+  fails the test (HAGS condition dropped, `realtime` override ignored, retry error dropped, retry
+  with REALTIME, refused HIGH not failed), and so does each of these: adapter vendor ignored,
+  encoder vendor ignored, unknown HAGS treated as off, missing `HwSchMode` read as off, `HwSchMode`
+  other than 2 read as off (`TestHwSchModeHAGS`), adapter/HAGS left out of the log's change key.
+  Log line and level per outcome (`TestLogGPUPriority`); config default and validation
+  (`internal/host` `TestConfigGPUPriority`: missing = auto, an unknown value stops the agent from
+  loading the config, like `congestion`).
+- verified (sandbox): Windows code in the cross-compiled `media.test.exe` under Wine 9.0. Wine's
+  gdi32 does not export `D3DKMTSetProcessSchedulingPriorityClass`, so every request on a real
+  child process is refused: REALTIME, then HIGH, outcome `failed` with "Failed to find
+  D3DKMTSetProcessSchedulingPriorityClass procedure in gdi32.dll", for every vendor and mode;
+  `off` makes no call; the child's CPU priority class is HIGH (0x80) in every case; a process that
+  cannot be opened (pid 0) gives `failed` with the OpenProcess error (`TestRaisePriority`).
+  Through `Video.Start` with the FFmpeg 8.1 Windows build (libx264, test source) the host logs
+  `level=WARN msg="gpu priority: failed" vendor=software adapter=nvidia hags=unknown mode=auto
+  gen=1 err=…` (Wine under Xvfb, see below), and the same outcome for generation 2 only at debug
+  level (`TestVideoGPUPriorityLog`, `TestVideoGenerations`). The rest of the Windows media tests
+  pass as before (libsvtav1 still fails on FFmpeg 8.1 for the reason noted in 0.1).
+- verified (sandbox): the call itself, against a stand-in DLL in place of gdi32
+  (`internal/host/media/testdata/fake_d3dkmt.c`, built with mingw-w64, path in
+  `RECON_TEST_D3DKMT_DLL`): `GetProcessId` on the handle the agent passes returns the child's pid
+  (the handle has query access); the NTSTATUS is read from the low 32 bits (the stand-in returns
+  junk in the high 32 bits); the classes asked for and the outcomes match the portable logic for
+  no refusal, REALTIME refused (STATUS_PRIVILEGE_NOT_HELD → HIGH, logged as `realtime_refused`)
+  and both refused (→ failed), for amd and nvidia × auto, high, realtime, off (`TestD3DKMTCall`;
+  the classes for each `HwSchMode` are in the detection item below).
+- verified (sandbox): adapter 0 and HAGS detection under Wine 9.0. Without a display Wine's
+  `CreateDXGIFactory1` fails (DXGI_ERROR_UNSUPPORTED): adapter unknown, `HwSchMode` decides. Under
+  Xvfb Wine's wined3d exposes adapter 0 as "NVIDIA GeForce GTX 470" (VendorId 0x10DE, its fallback
+  card): `platform.PrimaryAdapter` reads it (`DXGI_ADAPTER_DESC1` layout checked: VendorId at 256,
+  AdapterLuid at 296, 312 bytes; `TestPrimaryAdapter`), Wine's own `D3DKMTOpenAdapterFromLuid`
+  opens that LUID and its `D3DKMTQueryAdapterInfo` answers STATUS_NOT_IMPLEMENTED (0xC0000002) for
+  WDDM 2.7 caps, so the startup line reads `gpu adapter 0 adapter=nvidia name="NVIDIA GeForce GTX
+  470" hags=unknown hags_from=registry err="D3DKMTQueryAdapterInfo: NTSTATUS 0xc0000002"`, and
+  with `HwSchMode` 2 / 1 / 0 / missing (`reg add` in a copy of the Wine prefix) hags is on / off /
+  unknown / unknown; amd and software encoders then ask for HIGH with on and unknown (NVIDIA
+  adapter) and REALTIME with off (`TestRaisePriority`, `TestD3DKMTCall`, `TestHAGSRegistry` with
+  `RECON_TEST_HWSCHMODE`). Without a display (adapter unknown) amd asks for REALTIME and nvidia for
+  HIGH with on and unknown.
+- verified (sandbox): the HAGS query itself, against the same stand-in DLL (it also exports
+  `D3DKMTOpenAdapterFromLuid`, `D3DKMTQueryAdapterInfo`, `D3DKMTCloseAdapter`): the LUID is passed
+  as LowPart/HighPart, the handle from the open goes to the query (type 70 =
+  `KMTQAITYPE_WDDM_2_7_CAPS`, 4 bytes) and to the close, only bit 1 (`HwSchEnabled`) decides
+  (caps 0b011 and 0b111 → on, 0b101 "on by default but turned off" and 0b001 → off), a refused open makes no further call and a refused query still closes the adapter
+  (`TestKernelHAGS`). The kernel's answer wins over `HwSchMode`; a refused query or no adapter
+  falls back to it with the reason kept; and under Xvfb the LUID asked for is the one DXGI reported
+  for adapter 0 (`TestDetectGPUHost`).
+- verified (sandbox): `EnableGPUPriorityPrivilege` succeeds under Wine (its token holds the
+  privilege). The non-elevated case (`ERROR_NOT_ALL_ASSIGNED`, read from the last error because
+  `windows.AdjustTokenPrivileges` drops it) is a hardware check.
+- verified (sandbox): the frame-interval jitter snippet below, under node against a simulated
+  `__recon` (60 fps frames with injected 5 ms capture and 8 ms encode-done deviations, stage dumps
+  of the last 10 s): it merges the overlapping dumps without duplicates and reports the injected
+  deviations. Not run on a real stream page. The PowerShell readback below parses and its
+  `Add-Type` definition compiles under pwsh 7 (the call itself needs Windows).
+- Not verifiable here: whether Windows applies the class (Wine has no GPU scheduler), what a real
+  `D3DKMTQueryAdapterInfo(KMTQAITYPE_WDDM_2_7_CAPS)` returns (Wine does not implement it), the
+  effect on capture and encode under GPU load, NVIDIA driver behaviour with REALTIME and HAGS, and
+  whether REALTIME is refused for a non-elevated agent.
+
+How to measure (used by the checks below):
+
+- GPU-bound load: a game or benchmark on the streamed monitor that holds the GPU at about 99 %:
+  uncapped frame rate, vsync off, borderless fullscreen (for example Unigine Superposition
+  1440p Extreme in loop mode, or a game's built-in benchmark looping). Task Manager → Performance
+  → GPU must show 3D at 97 % or more while streaming.
+- Applied class, in an elevated PowerShell while streaming (5 = realtime, 4 = high, 2 = normal):
+
+  ```powershell
+  Add-Type -Namespace K -Name G -MemberDefinition '[DllImport("gdi32.dll")] public static extern int D3DKMTGetProcessSchedulingPriorityClass(IntPtr process, out int cls);'
+  Get-Process ffmpeg | ForEach-Object { $c = 0; $s = [K.G]::D3DKMTGetProcessSchedulingPriorityClass($_.Handle, [ref]$c); "pid $($_.Id): status $s class $c" }
+  ```
+
+- Encode time: the overlay's (Ctrl+Alt+Shift+S) capture→encoded p95, and the host log's
+  `latency stages` lines (`capture`, `host_capture`).
+- Frame-interval jitter: in the stream tab's DevTools console paste the snippet below. It runs
+  for 5 minutes (the argument) and prints capture→encoded p50/p95/p99 and the p50/p95/p99
+  deviation of consecutive capture and encode-done intervals from 1000/fps ms. A frame the client
+  did not draw counts as one long interval.
+
+  ```js
+  (async (min = 5) => {
+    const seen = new Map(), sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (const end = Date.now() + min * 60000; Date.now() < end;) {
+      await sleep(5000);
+      __recon.stageDump = null;
+      __recon.worker.postMessage({ type: 'stageDump' });
+      await sleep(500);
+      for (const x of __recon.stageDump || []) if (x.captureUs && x.encodeDoneUs) seen.set(x.captureUs, x);
+    }
+    const r = [...seen.values()].sort((a, b) => a.captureUs - b.captureUs), iv = 1000 / __recon.videoCfg.fps;
+    const q = (v) => { v = [...v].sort((a, b) => a - b); return [0.5, 0.95, 0.99].map((p) => +v[Math.min(v.length - 1, Math.floor(p * v.length))].toFixed(2)); };
+    const dev = (k) => r.slice(1).map((x, i) => Math.abs((x[k] - r[i][k]) / 1000 - iv));
+    const out = { frames: r.length, fps: __recon.videoCfg.fps, captureToEncodedMs: q(r.map((x) => (x.encodeDoneUs - x.captureUs) / 1000)),
+      captureIntervalJitterMs: q(dev('captureUs')), encodeDoneIntervalJitterMs: q(dev('encodeDoneUs')) };
+    console.log(JSON.stringify(out));
+    return out;
+  })(5);
+  ```
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (applied class): agent started by the logon task
+  (elevated), default config: at startup the host log has `gpu adapter 0 adapter=amd name="AMD
+  Radeon RX 7900 XT" hags=<on|off> hags_from=kernel`, with hags matching Settings → System →
+  Display → Graphics → Change default graphics settings → Hardware-accelerated GPU scheduling
+  (record it; `hags_from=registry` means the kernel query failed: record its `err=`); when a stream
+  starts, `gpu priority: realtime vendor=amd adapter=amd hags=<on|off> mode=auto` and the
+  PowerShell readback shows class 5 for ffmpeg; with
+  `"gpuPriority": "high"` → `high` and class 4; with `"off"` → `gpu priority: off` and class 2
+  (restart the agent after each edit of `host.json`). Then stop the task and run
+  `recon-host.exe run` from a non-elevated PowerShell: record the startup line
+  "SeIncreaseBasePriorityPrivilege not enabled …" and what `gpu priority:` and the readback show
+  (expected `high … realtime_refused=…` and class 4 if the kernel requires the privilege for
+  REALTIME). Test (A/B under GPU load): `"encoder": "hevc_amf"`, `"capture": "ddagrab"`,
+  2560×1440, 60 fps, 30 Mbit/s, Chrome on a wired LAN client, overlay open, the GPU-bound load
+  running. Four 5-minute runs in the order off, auto, off, auto (`"gpuPriority"`; restart the agent
+  between runs, keep the load running): for each record the snippet's output, the overlay's
+  capture→encoded p50/p95/p99, the host log's `stream stats` fps over the run and the game's fps
+  (in-game counter or PresentMon). Pass: with auto, capture→encoded p95 and both interval jitter
+  p95 values are lower than with off in both pairs, and the stream fps is closer to 60; record the
+  game's fps cost. Repeat one off/auto pair with `av1_amf` (2560×1440) and with `h264_amf`.
+  Test (soak): `"gpuPriority": "auto"` (REALTIME), `hevc_amf`, 2560×1440 at 60 fps, the
+  GPU-bound load looping, one stream for 2 hours. Pass: no driver timeout (Event Viewer →
+  Windows Logs → System: no Display event 4101 "amdkmdag stopped responding", no WHEA errors), no
+  `encoder … exited` in the host log, `stream stats` fps steady to the end, the overlay's Frames
+  dropped not growing steadily, and the working set of ffmpeg.exe and recon-host.exe
+  (`Get-Process ffmpeg,recon-host | Select-Object Name,WS`) at 2 hours within about 10 % of the
+  value at 10 minutes. Record the Adrenalin version.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD tests with `hevc_nvenc` (A/B pair
+  also with `h264_nvenc`, and `av1_nvenc` on RTX 40 and newer), once with HAGS on and once with it
+  off (Settings → System → Display → Graphics → Change default graphics settings →
+  Hardware-accelerated GPU scheduling, reboot; `reg query
+  HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v HwSchMode` shows 0x2 on, 0x1 off).
+  Expect at startup `gpu adapter 0 adapter=nvidia name=… hags=on|off hags_from=kernel` matching
+  the toggle; with HAGS on `gpu priority: high vendor=nvidia adapter=nvidia hags=on mode=auto` and
+  class 4, with HAGS off `gpu priority: realtime vendor=nvidia adapter=nvidia hags=off mode=auto`
+  and class 5. Default state: in an elevated prompt `reg delete
+  HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v HwSchMode /f`, reboot (HAGS is now
+  the OS/driver default) and record what the Settings toggle shows: the startup line must have
+  `hags_from=kernel` and hags equal to the toggle (on → `gpu priority: high … hags=on` and class 4;
+  off → `realtime … hags=off` and class 5); `hags=unknown hags_from=registry` means the kernel
+  query failed (record `err=`; auto then gives high). Software encoder on the NVIDIA GPU with HAGS
+  on: `"encoder": "libx264"` (and an AV1 client with `libsvtav1` on RTX 20/30): expect `gpu
+  priority: high vendor=software adapter=nvidia hags=on mode=auto` and class 4. Run the
+  off/auto A/B and the 2-hour soak in both HAGS states (pass criteria as for AMD; driver timeout
+  is Display event 4101 for nvlddmkm, also look for nvlddmkm events 13, 14 and 153). Only after
+  those pass: a 2-hour soak with `"gpuPriority": "realtime"` and HAGS on, the configuration
+  Sunshine avoids because NVENC can freeze or the driver crash (more often in DX12 games or with
+  VRAM nearly full). If it freezes (no new frames, `encoder … exited`, a driver timeout), keep
+  HIGH in auto mode; if it survives, record that with the driver version. Record the driver
+  version for every run.
