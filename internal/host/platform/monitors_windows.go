@@ -158,3 +158,9 @@ func dxgiOutputs() []uint64 {
 	}
 	return out
 }
+
+// RaisePriority gives the agent above-normal CPU priority so input injection
+// and frame forwarding are not starved while a game saturates the CPU.
+func RaisePriority() {
+	_ = windows.SetPriorityClass(windows.CurrentProcess(), windows.ABOVE_NORMAL_PRIORITY_CLASS)
+}

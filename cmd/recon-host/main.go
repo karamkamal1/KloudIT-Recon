@@ -64,7 +64,7 @@ func main() {
 			os.Exit(1)
 		}
 		defer f.Close()
-		out = io.MultiWriter(os.Stderr, f)
+		out = tolerantMulti{f, os.Stderr}
 	}
 	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
 
@@ -143,6 +143,18 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// tolerantMulti writes to every writer, ignoring individual failures. The
+// background (GUI-subsystem) build has no usable stderr, and io.MultiWriter
+// would stop at the first failing writer and never reach the log file.
+type tolerantMulti []io.Writer
+
+func (t tolerantMulti) Write(p []byte) (int, error) {
+	for _, w := range t {
+		_, _ = w.Write(p)
+	}
+	return len(p), nil
 }
 
 func fatal(err error) {

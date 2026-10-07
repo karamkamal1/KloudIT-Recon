@@ -26,3 +26,6 @@ func OpenGamepads() (*Gamepads, error) { return nil, ErrUnsupported }
 func (*Gamepads) Update(int, Pad) error { return ErrUnsupported }
 func (*Gamepads) Unplug(int)            {}
 func (*Gamepads) Close()                {}
+
+// RaisePriority is a no-op outside Windows.
+func RaisePriority() {}

@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install FFmpeg (software encoders for the test host)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Vet (Linux + Windows)
+        run: |
+          go vet ./...
+          GOOS=windows go vet ./...
+      - name: Unit + integration tests
+        run: go test -timeout 10m ./...
+      - name: Build
+        run: make build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Browser end-to-end test (headless Chromium)
+        working-directory: test/e2e
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node browser.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results
+          path: test/e2e/results/
+          if-no-files-found: ignore
+
+  release-binaries:
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build release bundles
+        run: make release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kloudit-recon-binaries
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS

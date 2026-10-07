@@ -88,6 +88,10 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 		return
 	}
 	ip := hostIP(conn.RemoteAddr())
+	if !s.loginIP.Allow("host-auth:" + ip) {
+		conn.CloseWithError(4, "too many attempts")
+		return
+	}
 	h, ok := s.store.GetHost(reg.HostID)
 	if !ok || reg.Token == "" || !auth.EqualHash(h.TokenHash, auth.TokenHash(reg.Token)) {
 		s.audit.Log("host_auth_failed", "", ip, "host id "+trunc(reg.HostID, 40))

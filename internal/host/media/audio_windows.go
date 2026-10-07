@@ -127,7 +127,7 @@ func (WASAPISource) Run(ctx context.Context, sink func([]float32)) error {
 	if err := dev.call(slotActivate, uintptr(unsafe.Pointer(&iidIAudioClient)), clsctxAll, 0, uintptr(unsafe.Pointer(&client))); err != nil {
 		return fmt.Errorf("Activate(IAudioClient): %w", err)
 	}
-	defer client.release()
+	defer func() { client.release() }()
 
 	// Preferred: let the audio engine convert to float32 stereo 48 kHz.
 	want := waveFormatEx{FormatTag: waveFormatIEEEFloat, Channels: 2, SamplesPerSec: 48000, BitsPerSample: 32, BlockAlign: 8, AvgBytesPerSec: 48000 * 8}
@@ -138,7 +138,13 @@ func (WASAPISource) Run(ctx context.Context, sink func([]float32)) error {
 	err := client.call(slotInitialize, sharedMode, streamflagsLoopback|streamflagsAutoConvert|streamflagsSRCDefaultQ,
 		uintptr(hnsBufferDuration), 0, uintptr(unsafe.Pointer(&want)), 0)
 	if err != nil {
-		// Fall back to the engine mix format and convert ourselves.
+		// Fall back to the engine mix format and convert ourselves, on a fresh
+		// IAudioClient (a failed Initialize may leave the old one unusable).
+		client.release()
+		client = nil
+		if err := dev.call(slotActivate, uintptr(unsafe.Pointer(&iidIAudioClient)), clsctxAll, 0, uintptr(unsafe.Pointer(&client))); err != nil {
+			return fmt.Errorf("Activate(IAudioClient): %w", err)
+		}
 		var mix *waveFormatEx
 		if err := client.call(slotGetMixFormat, uintptr(unsafe.Pointer(&mix))); err != nil {
 			return fmt.Errorf("GetMixFormat: %w", err)

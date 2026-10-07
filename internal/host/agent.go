@@ -56,6 +56,7 @@ type Agent struct {
 // NewAgent probes ffmpeg and prepares the input backend.
 func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error) {
 	platform.EnableDPIAwareness()
+	platform.RaisePriority()
 	ff, err := media.FindFFmpeg(cfg.FFmpeg)
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg not found (install FFmpeg 7.1+ or set \"ffmpeg\" in the config): %w", err)

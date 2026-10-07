@@ -1,0 +1,22 @@
+# Host networking gives the gateway real UDP performance for QUIC and lets
+# Wake-on-LAN broadcasts reach the LAN.
+services:
+  recon-gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: kloudit-recon-gateway
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - recon-data:/data
+    environment:
+      RECON_LISTEN: ":8443"
+      # RECON_NAMES: "recon.lan,192.168.1.20"     # extra certificate names
+      # RECON_PUBLIC_ADDR: "192.168.1.20:8443"    # what host agents dial
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+volumes:
+  recon-data:

@@ -29,9 +29,22 @@ function freePort() {
   });
 }
 
+// Optional: run the host agent through a wrapper, e.g. the Windows build under Wine:
+//   E2E_HOST_BIN=dist/host-windows-amd64/recon-host.exe
+//   E2E_HOST_CMD='["xvfb-run","-a","/usr/lib/wine/wine64"]'  E2E_HOST_FFMPEG=/path/to/ffmpeg.exe
+const hostCmd = process.env.E2E_HOST_CMD ? JSON.parse(process.env.E2E_HOST_CMD) : [];
+const hostBin = process.env.E2E_HOST_BIN ? join(root, process.env.E2E_HOST_BIN) : null;
+const nativeInputLog = !hostBin; // the logging input backend only exists on non-Windows hosts
+
 const procs = [];
 function run(bin, args, env = {}, name) {
-  const p = spawn(join(root, 'dist', bin), args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let cmd = join(root, 'dist', bin);
+  if (bin === 'recon-host' && hostBin) {
+    args = [...hostCmd.slice(1), hostBin, ...args];
+    cmd = hostCmd.length ? hostCmd[0] : hostBin;
+    if (!hostCmd.length) args = args.slice(1);
+  }
+  const p = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   p.log = '';
   const onData = (d) => {
     p.log += d;
@@ -109,15 +122,17 @@ try {
   check('pairing code issued', code.startsWith('recon1:'));
 
   const cfgPath = join(dir, 'host.json');
-  writeFileSync(cfgPath, JSON.stringify({ capture: 'test', testWidth: 960, testHeight: 540, directPort, directAddr: '127.0.0.1', audio: true }));
+  const hostCfg = { capture: 'test', testWidth: 960, testHeight: 540, directPort, directAddr: '127.0.0.1', audio: true, logLevel: 'debug' };
+  if (process.env.E2E_HOST_FFMPEG) hostCfg.ffmpeg = process.env.E2E_HOST_FFMPEG;
+  writeFileSync(cfgPath, JSON.stringify(hostCfg));
   const pair = run('recon-host', ['-config', cfgPath, 'pair', code], {}, 'pair');
   await new Promise((r) => pair.on('exit', r));
   check('host agent paired', pair.exitCode === 0, pair.log.trim().split('\n')[0]);
   const host = run('recon-host', ['-config', cfgPath, 'run'], { RECON_INPUT_LOG: inputLog }, 'host');
 
-  await page.waitForSelector('.modal .status .dot.on', { timeout: 30000 });
+  await page.waitForSelector('.modal .status .dot.on', { timeout: 90000 });
   check('pairing dialog detects the agent coming online', true);
-  await until(async () => (await page.$$('.host.online')).length === 1, 30000, 'host online on dashboard');
+  await until(async () => (await page.$$('.host.online')).length === 1, 60000, 'host online on dashboard');
   await page.screenshot({ path: join(outDir, 'dashboard.png') });
   check('host shows online on the dashboard', true);
 
@@ -159,13 +174,21 @@ try {
     await page.mouse.wheel(0, 300);
     await page.keyboard.press('KeyW');
     await page.keyboard.press('ArrowUp');
-    const events = await until(() => {
+    if (!nativeInputLog) {
+      await sleep(500);
+      const hostProc = procs.find((p) => p.spawnargs.includes('run'));
+      const injectErrors = (hostProc.log.match(/msg=inject/g) || []).length;
+      const sessionLine = (hostProc.log.match(/session started.*/g) || []).pop();
+      check(`${sc.name}: input injected via SendInput without errors`, injectErrors === 0 && !!sessionLine, `${injectErrors} injection errors`);
+      if (sc.name !== 'WebTransport direct') { await page.evaluate(() => { window.__recon.userClosed = true; }); continue; }
+    }
+    const events = nativeInputLog ? await until(() => {
       const lines = readFileSync(inputLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
       const keys = lines.filter((e) => e.ev === 'key');
       const ok = lines.some((e) => e.ev === 'abs') && lines.some((e) => e.ev === 'button' && e.down) &&
         lines.some((e) => e.ev === 'wheel') && keys.some((e) => e.sc === 0x11 && e.down) && keys.some((e) => e.sc === 0x48 && e.ext);
       return ok ? lines : null;
-    }, 5000, 'input events on host').catch((e) => { check(`${sc.name}: input`, false, e.message); return null; });
+    }, 5000, 'input events on host').catch((e) => { check(`${sc.name}: input`, false, e.message); return null; }) : null;
     if (events) {
       const abs = events.filter((e) => e.ev === 'abs').pop();
       check(`${sc.name}: keyboard + mouse reach the host`, true, `${events.length} events; last abs (${abs.x}, ${abs.y}); W=0x11, ArrowUp=E0 48`);

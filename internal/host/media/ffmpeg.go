@@ -97,7 +97,7 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	c.Version = strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
-	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "realtime", "testsrc2"} {
+	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2"} {
 		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
 			c.Filters[f] = true
 		}
@@ -320,8 +320,10 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	switch {
 	case gpuFrames && (e.Vendor == "nvidia" || e.Vendor == "amd"):
 		// NVENC and AMF consume D3D11 textures directly: zero copy.
-	case gpuFrames && e.Vendor == "intel":
-		chain += ",hwmap=derive_device=qsv,format=qsv"
+	case gpuFrames && e.Vendor == "intel" && c.Filters["vpp_qsv"]:
+		// QSV turns BGRA input into 4:4:4 HEVC, which browsers cannot decode:
+		// convert to NV12 on the GPU first.
+		chain += ",hwmap=derive_device=qsv,format=qsv,vpp_qsv=format=nv12"
 	case gpuFrames:
 		chain += ",hwdownload,format=bgra,format=yuv420p"
 	case e.Vendor == "vaapi":
