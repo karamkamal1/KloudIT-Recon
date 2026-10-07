@@ -18,7 +18,7 @@ func TestClock(t *testing.T) {
 	if b-a > 200 {
 		t.Fatalf("clock advanced in a %d µs step (coarse timer?)", b-a)
 	}
-	off1 := wallOffset(clock)
+	off1 := WallOffset(clock)
 	t0, c0 := time.Now(), clock()
 	time.Sleep(200 * time.Millisecond)
 	el, dc := time.Since(t0).Microseconds(), int64(clock()-c0)
@@ -26,8 +26,8 @@ func TestClock(t *testing.T) {
 	if d, tol := dc-el, el/20+16000; d < -tol || d > tol {
 		t.Fatalf("clock rate off: %d µs over %d µs", dc, el)
 	}
-	if d := wallOffset(clock) - off1; d < -1000 || d > 1000 {
+	if d := WallOffset(clock) - off1; d < -1000 || d > 1000 {
 		t.Fatalf("wall clock offset moved by %d µs", d)
 	}
-	t.Logf("step %d µs, offset drift over 200 ms %d µs", b-a, wallOffset(clock)-off1)
+	t.Logf("step %d µs, offset drift over 200 ms %d µs", b-a, WallOffset(clock)-off1)
 }

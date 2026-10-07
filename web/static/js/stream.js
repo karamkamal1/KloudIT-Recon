@@ -25,7 +25,7 @@ const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
   audio: true, audioCodec: 'opus', volume: 100, jitterMs: 30,
   renderer: 'canvas2d', decoder: 'hardware', path: 'auto', transport: 'auto',
-  mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false,
+  mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
 const PREF_KEY = 'recon.prefs.v1';
 let prefs = { ...DEFAULTS };
@@ -171,7 +171,7 @@ async function connect() {
   if (port) transfer.push(port);
   w.postMessage({
     type: 'start', canvas: off, endpoints: ep,
-    prefs: { renderer: prefs.renderer, decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive },
+    prefs: { renderer: prefs.renderer, decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
     audioSab: sab, audioPort: port,
@@ -245,6 +245,7 @@ function onWorker(m) {
     case 'stats': onStats(m); break;
     case 'drawn': onDrawnMark(m); break;
     case 'stageDump': S.stageDump = m.recs; break;
+    case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
   }
@@ -587,6 +588,7 @@ const cls = (v, a, b) => (v === null || v === undefined ? '' : v < a ? 'good' : 
 
 function onStats(st) {
   S.lastStats = st;
+  S.probe = st.probe;
   const pill = $('latency');
   if (st.total !== null && st.total !== undefined) {
     pill.textContent = `${Math.round(st.total)} ms`;
@@ -609,8 +611,9 @@ function onStats(st) {
     row('Stream latency (send→draw)', `${fmt(st.total)}  (${fmt(st.totalMin, 0, '')}–${fmt(st.totalMax, 0, '')})`, cls(st.total, 25, 50)),
     row('  round trip', fmt(st.rtt), cls(st.rtt, 15, 40)),
   ];
-  $('stats').replaceChildren(...[
+  $('stats-body').replaceChildren(...[
     ...latencyRows,
+    ...probeRows(st.probe, row, pcts),
     spark,
     el('hr'),
     row('Frame rate', `${st.fps.toFixed(1)} fps`),
@@ -626,6 +629,55 @@ function onStats(st) {
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
+}
+
+// Latency probe (frame barcode) rows: sample counts and capture->drawn
+// measured from the picture (seq: test pattern; wallclock: host test page).
+function probeRows(pr, row, pcts) {
+  if (!pr || pr.mode === 'off') return [];
+  const share = (n) => (pr.sampled ? `${Math.round((100 * n) / pr.sampled)}%` : '—');
+  const label = pr.mode === 'seq' ? 'capture→drawn (barcode)' : 'host screen→drawn (barcode)';
+  const bad = pr.mode === 'seq' ? `mismatched ${pr.mismatched}` : `implausible ${pr.implausible}`;
+  return [
+    el('hr'),
+    row(`Frame barcode (${pr.mode})`, `${pr.sampled} sampled · valid ${share(pr.valid)} · ${bad}`, pr.sampled && pr.valid < 0.9 * pr.sampled ? 'warn' : ''),
+    row(`  ${label}`, pr.latency ? `${pcts(pr.latency)} (n ${pr.latency.n})` : '—'),
+    pr.pageToCapture ? row('  page→capture (stamps)', pcts(pr.pageToCapture)) : null,
+  ];
+}
+
+// Everything the latency probe and the stage stats hold, as one JSON document.
+const probeDumpWait = [];
+function exportLatency() {
+  return new Promise((resolve) => {
+    if (!S.worker) { resolve(null); return; }
+    const done = (m) => resolve(m);
+    probeDumpWait.push(done);
+    post({ type: 'probeDump' });
+    setTimeout(() => {
+      const i = probeDumpWait.indexOf(done);
+      if (i >= 0) { probeDumpWait.splice(i, 1); resolve(null); }
+    }, 2000);
+  }).then((d) => d && {
+    kind: 'kloudit-recon-latency', version: 1, exportedAt: new Date().toISOString(),
+    host: S.welcome ? { name: S.welcome.host, os: S.welcome.os, version: S.welcome.version, features: S.welcome.features } : null,
+    client: { ua: navigator.userAgent, hz: S.hz, dpr: devicePixelRatio, screen: [Math.round(screen.width * devicePixelRatio), Math.round(screen.height * devicePixelRatio)] },
+    connection: S.conn, video: S.videoCfg, probe: d.probe, stages: d.stages,
+  });
+}
+S.exportLatency = exportLatency;
+
+async function downloadLatency() {
+  const data = await exportLatency();
+  S.canvas.focus();
+  if (!data) { toast('No latency data yet.', 'warn'); return; }
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const name = `recon-latency-${(data.host?.name || 'host').replace(/[^\w.-]+/g, '_')}-${data.exportedAt.replace(/[:.]/g, '-')}.json`;
+  const a = el('a', { href: URL.createObjectURL(blob), download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
 function drawSpark(c) {
@@ -740,6 +792,10 @@ function buildDrawer() {
       field('Volume', vol),
       field('Jitter buffer', el('div', { class: 'range-row' }, jitter, jout), 'Lower = less delay, higher = fewer glitches on Wi-Fi.'),
     ),
+    el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Diagnostics'),
+      check('latencyProbe', 'Latency probe (host test page)', () => post({ type: 'prefs', prefs: { latencyProbe: prefs.latencyProbe } })),
+      el('div', { class: 'hint' }, 'Open tools/latency-test/index.html full-screen on the host PC: the overlay then shows host screen→drawn latency read from the picture. The test pattern source is probed automatically. Export from the overlay.'),
+    ),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Pipeline'),
       field('Network path', select('path', [['auto', 'Auto (direct, then relay)'], ['direct', 'Direct to PC only'], ['relay', 'Relay via gateway']], needsReconnect)),
       field('Transport', select('transport', [['auto', 'WebTransport (QUIC), fall back to WebSocket'], ['websocket', 'WebSocket only']], needsReconnect)),
@@ -766,6 +822,7 @@ async function boot() {
   $('btn-paste').onclick = pasteDialog;
   $('btn-settings').onclick = toggleDrawer;
   $('btn-disconnect').onclick = disconnect;
+  $('btn-export-latency').onclick = downloadLatency;
   $('stats').classList.toggle('hidden', !prefs.stats);
   updateToolbarState();
   bindCanvas(S.canvas);

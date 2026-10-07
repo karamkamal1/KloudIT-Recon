@@ -172,6 +172,9 @@ func (s *Session) run() error {
 	if err := s.sendWelcome(); err != nil {
 		return err
 	}
+	if s.hello.V >= proto.HelloVersionFrameExt {
+		go s.wallClockLoop()
+	}
 
 	s.video = media.NewVideo(s.a.caps, s.log, s.a.clock)
 	defer s.video.Stop()
@@ -267,7 +270,31 @@ func (s *Session) sendWelcome() error {
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
+	if s.a.backendFor(s.prefs) == "test" && s.a.caps.CanDrawBarcode() {
+		w.Features = append(w.Features, proto.FeatureBarcodeSeq)
+	}
+	w.WallOffsetUs = media.WallOffset(s.a.clock)
 	return s.sendJSON(w)
+}
+
+// wallClockEvery is how often clients get a fresh wall-clock offset.
+const wallClockEvery = 5 * time.Second
+
+// wallClockLoop keeps the client's wall-clock to host-clock offset current (the
+// latency probe converts the test page's wall-clock barcode with it).
+func (s *Session) wallClockLoop() {
+	t := time.NewTicker(wallClockEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-t.C:
+		}
+		if err := s.sendJSON(proto.Clock{T: "clock", WallOffsetUs: media.WallOffset(s.a.clock)}); errors.Is(err, errClosed) {
+			return
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +438,9 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		}
 		p.Source = media.Source{Backend: "ddagrab", Output: out}
 	}
+	// The test pattern carries each frame's Seq as a barcode (welcome feature
+	// barcode-seq): the client checks the picture it draws against the header.
+	p.Barcode = backend == "test" && s.a.caps.CanDrawBarcode()
 	return p, nil
 }
 

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KloudIT Recon latency test</title>
+<!--
+  Latency test page for the KloudIT Recon latency probe (guide step 0.2).
+
+  Open this file in a browser ON THE HOST PC, on the monitor that is streamed, and make it
+  full-screen (click the page or press F; or start it with
+  chrome.exe --kiosk "file:///C:/path/to/latency-test/index.html"). Every animation frame it
+  draws the host's wall clock (Date.now(), low 16 bits of the milliseconds) as a frame barcode
+  into the top-left corner: 8x3 black/white cells, each 1/96 of the screen width. On the client
+  enable Settings > Diagnostics > "Latency probe (host test page)" and open the overlay
+  (Ctrl+Alt+Shift+S): it reads the barcode from 1 in 30 decoded frames and shows host
+  screen->drawn latency; "Export latency data" saves the histogram as JSON.
+
+  Self-contained on purpose (no imports), so it works from file://. The barcode encoder below is a
+  copy of internal/proto/barcode.go; internal/proto TestBarcodeJS checks that they agree.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #9aa7b8; overflow: hidden; cursor: none; }
+  body { font: 16px/1.5 system-ui, sans-serif; }
+  #bc { position: fixed; left: 0; top: 0; image-rendering: pixelated; }
+  #info { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; max-width: 46em; }
+  #info h1 { font-size: 22px; color: #d7e1f0; margin: 0 0 8px; }
+  #status { font-family: ui-monospace, Consolas, monospace; color: #d7e1f0; }
+  #warn { color: #fbbf24; min-height: 1.5em; }
+  #sweep { position: fixed; bottom: 0; left: 0; width: 4vw; height: 3vh; background: #38e1c6; }
+</style>
+</head>
+<body>
+<canvas id="bc" aria-label="frame barcode"></canvas>
+<div id="info">
+  <h1>KloudIT Recon latency test</h1>
+  <div id="warn"></div>
+  <div id="status"></div>
+  <p>Keep this page full-screen on the streamed monitor with nothing over its top-left corner.
+    Click or press F for full screen, Esc to leave it.</p>
+</div>
+<div id="sweep"></div>
+<script>
+'use strict';
+
+// BEGIN barcode format (copy of internal/proto/barcode.go; TestBarcodeJS checks it)
+const BARCODE_COLS = 8;
+const BARCODE_ROWS = 3;
+const BARCODE_BITS = BARCODE_COLS * BARCODE_ROWS;
+const BARCODE_WALLCLOCK_CELLS = 96;
+
+// CRC-8 (poly 0x07, init 0, xorout 0x55) over the value's two bytes, high byte first.
+function barcodeCRC(v) {
+  let crc = 0;
+  for (const b of [(v >> 8) & 0xff, v & 0xff]) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+  }
+  return crc ^ 0x55;
+}
+
+// The 24 bits drawn for value v; cell k (row-major) shows bit 23 - k, white = 1.
+function barcodeWord(v) {
+  return (v & 0xffff) * 256 + barcodeCRC(v & 0xffff);
+}
+// END barcode format
+
+const canvas = document.getElementById('bc');
+const ctx = canvas.getContext('2d', { alpha: false });
+const status = document.getElementById('status');
+const warn = document.getElementById('warn');
+const sweep = document.getElementById('sweep');
+const state = { frames: 0, value: -1, cellPx: 0, fps: 0, fullscreen: false };
+window.__latencyTest = state; // for automated tests
+
+let geom = '';
+function layout() {
+  // Cells are 1/96 of the monitor width in device pixels, so they keep their
+  // share of the picture when the host scales the capture.
+  const dpr = window.devicePixelRatio || 1;
+  const screenW = Math.round(screen.width * dpr);
+  const cell = screenW / BARCODE_WALLCLOCK_CELLS;
+  const w = Math.ceil(BARCODE_COLS * cell);
+  const h = Math.ceil(BARCODE_ROWS * cell);
+  const key = `${w}x${h}@${dpr}`;
+  if (key !== geom) {
+    geom = key;
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.width = `${w / dpr}px`;
+    canvas.style.height = `${h / dpr}px`;
+  }
+  state.cellPx = cell;
+  // By size: fullscreenElement can be set while the window still has a frame.
+  state.fullscreen = Math.abs(innerWidth - screen.width) <= 1 && Math.abs(innerHeight - screen.height) <= 1;
+  return cell;
+}
+
+function draw(v, cell) {
+  const word = barcodeWord(v);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#fff';
+  for (let k = 0; k < BARCODE_BITS; k++) {
+    if (!(Math.floor(word / 2 ** (BARCODE_BITS - 1 - k)) & 1)) continue;
+    const c = k % BARCODE_COLS;
+    const r = Math.floor(k / BARCODE_COLS);
+    const x0 = Math.round(c * cell);
+    const y0 = Math.round(r * cell);
+    ctx.fillRect(x0, y0, Math.round((c + 1) * cell) - x0, Math.round((r + 1) * cell) - y0);
+  }
+}
+
+let fpsT = 0;
+let fpsN = 0;
+function frame(ts) {
+  const cell = layout();
+  const v = Date.now() % 65536; // the host's wall clock, low 16 bits of the ms
+  draw(v, cell);
+  state.frames++;
+  state.value = v;
+  sweep.style.transform = `translateX(${((ts / 1000) % 2) * 48}vw)`;
+  fpsN++;
+  if (ts - fpsT >= 1000) {
+    state.fps = Math.round((fpsN * 1000) / (ts - fpsT));
+    fpsT = ts;
+    fpsN = 0;
+    status.textContent = `${state.fps} fps · cell ${cell.toFixed(1)} px · barcode ${v}`;
+    warn.textContent = state.fullscreen ? '' : 'Not full screen: the barcode must sit at the top-left corner of the captured monitor.';
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Click and F only enter full screen; Esc leaves it. During a run the client
+// forwards its clicks and keys to the host, and a toggle would drop the page
+// out of full screen (and the barcode off the corner) on the first click.
+function enterFullscreen() {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+}
+document.addEventListener('click', enterFullscreen);
+document.addEventListener('keydown', (e) => { if (e.code === 'KeyF') enterFullscreen(); });
+</script>
+</body>
+</html>

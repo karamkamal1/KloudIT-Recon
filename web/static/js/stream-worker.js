@@ -280,7 +280,9 @@ class Canvas2DRenderer {
     this.ctx = c.getContext('2d', { alpha: false, desynchronized: true });
     this.name = 'canvas2d-desync';
   }
-  draw(frame) {
+  // req: latency probe sample; the corner is read back after the draw from a clone.
+  draw(frame, req) {
+    if (req) req.clone = frame.clone();
     if (this.c.width !== frame.displayWidth || this.c.height !== frame.displayHeight) {
       this.c.width = frame.displayWidth;
       this.c.height = frame.displayHeight;
@@ -303,6 +305,30 @@ struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 }
 @fragment fn fs(v: VOut) -> @location(0) vec4f {
   return textureSampleBaseClampToEdge(tex, samp, v.uv);
+}`;
+
+// Latency probe on the WebGPU path: one texel per barcode cell, the mean of
+// 4x4 samples over the cell's inner half, rendered from the external texture
+// the frame is drawn from; copyTextureToBuffer + mapAsync read the 8x3 texels
+// back without a frame readback or a pipeline stall.
+const PROBE_WGSL = `
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var tex: texture_external;
+@group(0) @binding(2) var<uniform> cell: vec4f; // xy: cell size in texture coordinates
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let c = floor(pos.xy);
+  var acc = vec3f(0.0);
+  for (var j = 0; j < 4; j++) {
+    for (var i = 0; i < 4; i++) {
+      let f = vec2f(0.3125 + f32(i) * 0.125, 0.3125 + f32(j) * 0.125);
+      acc += textureSampleBaseClampToEdge(tex, samp, (c + f) * cell.xy).rgb;
+    }
+  }
+  return vec4f(acc / 16.0, 1.0);
 }`;
 
 class WebGPURenderer {
@@ -362,9 +388,26 @@ class WebGPURenderer {
     });
     const r = new WebGPURenderer();
     Object.assign(r, { c, device, ctx, pipeline, sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }), prev: null, name: 'webgpu-zero-copy' });
+    try {
+      device.pushErrorScope('validation');
+      const pm = device.createShaderModule({ code: PROBE_WGSL });
+      r.probePipeline = device.createRenderPipeline({
+        layout: 'auto', vertex: { module: pm, entryPoint: 'vs' }, fragment: { module: pm, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      const err = await device.popErrorScope();
+      if (err) throw new Error(err.message);
+      r.probeTex = device.createTexture({ size: [P.BARCODE_COLS, P.BARCODE_ROWS], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      r.probeCell = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      // Two readbacks in flight at most (probe.inflight); rows are 256-byte aligned.
+      r.probeBufs = [0, 1].map(() => device.createBuffer({ size: 256 * P.BARCODE_ROWS, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }));
+    } catch (e) {
+      r.probePipeline = null; // the probe falls back to a frame copy
+      post('log', { text: `WebGPU latency probe unavailable (${e.message})` });
+    }
     return r;
   }
-  draw(frame) {
+  draw(frame, req) {
     if (this.c.width !== frame.displayWidth || this.c.height !== frame.displayHeight) {
       this.c.width = frame.displayWidth;
       this.c.height = frame.displayHeight;
@@ -382,10 +425,44 @@ class WebGPURenderer {
     pass.setBindGroup(0, bg);
     pass.draw(3);
     pass.end();
+    const buf = req ? this.probePass(enc, ext, frame, req) : null;
     this.device.queue.submit([enc.finish()]);
+    if (buf) req.luma = this.probeRead(buf);
+    else if (req) req.clone = frame.clone();
     // Keep the frame alive until the next one so the GPU never samples a closed frame.
     if (this.prev) this.prev.close();
     this.prev = frame;
+  }
+  probePass(enc, ext, frame, req) {
+    if (!this.probePipeline || !this.probeBufs.length) return null;
+    const buf = this.probeBufs.pop();
+    this.device.queue.writeBuffer(this.probeCell, 0, new Float32Array([req.cell / frame.displayWidth, req.cell / frame.displayHeight, 0, 0]));
+    const bg = this.device.createBindGroup({
+      layout: this.probePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.probeCell } }],
+    });
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.probeTex.createView(), loadOp: 'clear', storeOp: 'store' }] });
+    pass.setPipeline(this.probePipeline);
+    pass.setBindGroup(0, bg);
+    pass.draw(3);
+    pass.end();
+    enc.copyTextureToBuffer({ texture: this.probeTex }, { buffer: buf, bytesPerRow: 256, rowsPerImage: P.BARCODE_ROWS }, [P.BARCODE_COLS, P.BARCODE_ROWS]);
+    return buf;
+  }
+  async probeRead(buf) {
+    try {
+      await buf.mapAsync(GPUMapMode.READ);
+      const px = new Uint8Array(buf.getMappedRange());
+      const luma = [];
+      for (let k = 0; k < P.BARCODE_BITS; k++) {
+        const o = Math.floor(k / P.BARCODE_COLS) * 256 + (k % P.BARCODE_COLS) * 4;
+        luma.push(0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2]);
+      }
+      return luma;
+    } finally {
+      if (buf.mapState !== 'unmapped') { try { buf.unmap(); } catch {} }
+      this.probeBufs.push(buf);
+    }
   }
 }
 
@@ -590,13 +667,15 @@ function onDecoded(frame) {
     video.lastSize = size;
     post('resolution', { w: frame.displayWidth, h: frame.displayHeight });
   }
+  const req = probeStart(frame, meta);
   try {
-    renderer.draw(frame);
+    renderer.draw(frame, req);
   } catch (e) {
     frame.close();
     post('log', { text: `render error: ${e.message}` });
   }
   const presented = now();
+  if (req) probeSample(req, presented);
   stats.frames++;
   if (firstFrame) {
     firstFrame = false;
@@ -720,6 +799,201 @@ function reportStages(sum) {
   transport.sendControl({ t: 'stages', stages: rows });
 }
 
+// ---------------------------------------------------------------------------
+// Latency probe: the frame barcode (protocol.js) read back from 1 in 30
+// decoded frames, an independent check of the stage stamps.
+//
+//   seq        the host's test pattern carries each frame's seq (welcome
+//              feature barcode-seq). A valid barcode that differs from the
+//              header's seq means the picture drawn is not the frame the
+//              header describes (stale, duplicated or skipped). Latency:
+//              the frame's capture stamp -> drawn.
+//   wallclock  the user enabled the latency probe and the host shows
+//              tools/latency-test/index.html: the barcode is the host's
+//              wall-clock ms (low 16 bits) when the page drew it, converted
+//              with the host's wall-clock offset (welcome, "clock") and the
+//              clock sync. Latency: page drew it -> drawn here, which adds the
+//              host's render, present and capture delay to capture -> drawn.
+//
+// Readback never stalls the decoder: Canvas2D reads a clone of the frame
+// after the draw (VideoFrame.copyTo of the corner, else drawImage into a
+// small canvas), WebGPU renders the cells into 8x3 texels and maps them.
+
+const PROBE_EVERY = 30;
+const PROBE_RANGE = [-100, 5000]; // ms; outside: implausible (clock or barcode wrong)
+const PROBE_MAX_SAMPLES = 36000; // per-sample log for the export (5 h at 2/s)
+const probe = {
+  mode: 'off', features: [], wallOffsetUs: null, epoch: 0, count: 0, inflight: 0, method: '',
+  startedAt: 0, sampled: 0, valid: 0, invalid: 0, mismatched: 0, implausible: 0, skipped: 0, noStamp: 0,
+  hist: new Map(), pageToCapture: new Map(), samples: [], lastError: '', lastInvalid: null,
+};
+
+function updateProbeMode() {
+  const mode = probe.features.includes(P.FEATURE_BARCODE_SEQ) ? 'seq'
+    : prefs.latencyProbe && probe.wallOffsetUs !== null ? 'wallclock' : 'off';
+  if (mode === probe.mode) return;
+  Object.assign(probe, {
+    mode, epoch: probe.epoch + 1, count: 0, method: '', startedAt: now(), sampled: 0, valid: 0, invalid: 0,
+    mismatched: 0, implausible: 0, skipped: 0, noStamp: 0, hist: new Map(), pageToCapture: new Map(), samples: [], lastInvalid: null,
+  });
+  post('log', { text: `latency probe: ${mode}${mode === 'off' && prefs.latencyProbe ? ' (host sends no wall-clock offset)' : ''}` });
+}
+
+// Decide whether this frame is sampled; returns the request the renderer fills.
+function probeStart(frame, meta) {
+  if (probe.mode === 'off' || !meta || clock.offset === null) return null;
+  if (++probe.count % PROBE_EVERY !== 0) return null;
+  if (probe.inflight >= 2) { probe.skipped++; return null; }
+  const cell = probe.mode === 'seq' ? P.BARCODE_CELL : frame.displayWidth / P.BARCODE_WALLCLOCK_CELLS;
+  if (P.BARCODE_COLS * cell > frame.displayWidth || P.BARCODE_ROWS * cell > frame.displayHeight) { probe.skipped++; return null; }
+  return { mode: probe.mode, epoch: probe.epoch, cell, meta, offset: clock.offset, wallOffsetUs: probe.wallOffsetUs, clone: null, luma: null };
+}
+
+function probeSample(req, drawn) {
+  const luma = req.clone ? readCornerLuma(req.clone, req.cell) : req.luma;
+  if (!luma) { probe.skipped++; return; }
+  if (!req.clone) probe.method = 'webgpu';
+  probe.inflight++;
+  luma.then((l) => probeResult(req, drawn, l), (e) => {
+    if (e?.message !== probe.lastError) post('log', { text: `latency probe readback failed: ${e?.message}` });
+    probe.lastError = e?.message;
+    probeResult(req, drawn, null);
+  }).finally(() => { probe.inflight--; });
+}
+
+// Plane 0 of a VideoFrame format: luma for YUV (bytes per sample, shift to 8
+// bits), or RGB channel offsets.
+function plane0(fmt) {
+  if (fmt === 'RGBA' || fmt === 'RGBX') return { px: 4, r: 0, g: 1, b: 2 };
+  if (fmt === 'BGRA' || fmt === 'BGRX') return { px: 4, r: 2, g: 1, b: 0 };
+  if (fmt === 'NV12' || /^I4(20|22|44)A?$/.test(fmt || '')) return { px: 1, shift: 0 };
+  const m = /^I4(20|22|44)A?P(10|12)$/.exec(fmt || '');
+  return m ? { px: 2, shift: +m[2] - 8 } : null;
+}
+
+function lumaFromPixels(buf, offset, stride, f, cell) {
+  const luma = [];
+  for (let k = 0; k < P.BARCODE_BITS; k++) {
+    const [x0, y0, x1, y1] = P.barcodeSampleRect(k, cell);
+    let sum = 0;
+    for (let y = y0; y < y1; y++) {
+      let o = offset + y * stride + x0 * f.px;
+      for (let x = x0; x < x1; x++, o += f.px) {
+        if (f.px === 4) sum += 0.299 * buf[o + f.r] + 0.587 * buf[o + f.g] + 0.114 * buf[o + f.b];
+        else if (f.px === 2) sum += (buf[o] | (buf[o + 1] << 8)) >> f.shift;
+        else sum += buf[o];
+      }
+    }
+    luma.push(sum / ((x1 - x0) * (y1 - y0)));
+  }
+  return luma;
+}
+
+let probeCanvas = null;
+let probeCtx = null;
+
+// Mean luma of the barcode cells of a frame clone (always closed here).
+async function readCornerLuma(frame, cell) {
+  try {
+    const w = Math.min(frame.displayWidth, Math.ceil(P.BARCODE_COLS * cell));
+    const h = Math.min(frame.displayHeight, Math.ceil(P.BARCODE_ROWS * cell));
+    const f = plane0(frame.format);
+    const vr = frame.visibleRect;
+    if (f && vr) {
+      // Only the corner; 4:2:0 / 4:2:2 planes need an even rectangle.
+      const rect = { x: vr.x & ~1, y: vr.y & ~1, width: Math.min(vr.width, (w + 1) & ~1), height: Math.min(vr.height, (h + 1) & ~1) };
+      try {
+        const buf = new Uint8Array(frame.allocationSize({ rect }));
+        const layout = await frame.copyTo(buf, { rect });
+        probe.method = `copyTo ${frame.format}`;
+        return lumaFromPixels(buf, layout[0].offset, layout[0].stride, f, cell);
+      } catch {
+        // e.g. a GPU-backed frame this browser cannot copy: draw it instead
+      }
+    }
+    if (!probeCanvas || probeCanvas.width !== w || probeCanvas.height !== h) {
+      probeCanvas = new OffscreenCanvas(w, h);
+      probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    probeCtx.drawImage(frame, 0, 0, w, h, 0, 0, w, h);
+    probe.method = `canvas ${frame.format || 'opaque'}`;
+    return lumaFromPixels(probeCtx.getImageData(0, 0, w, h).data, 0, w * 4, { px: 4, r: 0, g: 1, b: 2 }, cell);
+  } finally {
+    frame.close();
+  }
+}
+
+const histAdd = (h, ms) => { const b = Math.floor(ms); h.set(b, (h.get(b) || 0) + 1); };
+
+function probeResult(req, drawn, luma) {
+  if (req.epoch !== probe.epoch) return; // mode changed meanwhile
+  probe.sampled++;
+  const v = luma ? P.barcodeDecodeLuma(luma) : null;
+  if (v === null) {
+    probe.invalid++;
+    // For diagnosis: which frame, and the cells as read (null: readback failed).
+    probe.lastInvalid = { gen: req.meta.gen, seq: req.meta.seq, luma: luma && luma.map((l) => Math.round(l)) };
+    return;
+  }
+  probe.valid++;
+  const m = req.meta;
+  const cap = m.ext?.captureUs !== undefined ? m.ext.captureUs / 1000 - req.offset : null; // local ms
+  let ms;
+  let p2c = null;
+  if (req.mode === 'seq') {
+    if (v !== m.seq % 65536) { probe.mismatched++; return; }
+    if (cap === null) { probe.noStamp++; return; }
+    ms = drawn - cap;
+  } else {
+    // The host's wall clock at our draw; the page's ms is the latest one
+    // before it with these low 16 bits (up to 1 s "ahead" allows clock error).
+    const wallNow = drawn + req.offset + req.wallOffsetUs / 1000;
+    const d = wallNow - v;
+    ms = d - 65536 * Math.floor((d + 1000) / 65536) - 0.5; // Date.now() floors: mid-millisecond
+    if (cap !== null) p2c = cap - (drawn - ms);
+  }
+  if (!(ms >= PROBE_RANGE[0] && ms <= PROBE_RANGE[1])) { probe.implausible++; return; }
+  histAdd(probe.hist, ms);
+  if (p2c !== null) histAdd(probe.pageToCapture, p2c);
+  if (probe.samples.length < PROBE_MAX_SAMPLES) {
+    probe.samples.push([+((drawn - probe.startedAt) / 1000).toFixed(3), m.gen, m.seq, v, +ms.toFixed(2), p2c === null ? null : +p2c.toFixed(2)]);
+  }
+}
+
+// Percentiles (1 ms resolution) from a histogram.
+function histSummary(h) {
+  const keys = [...h.keys()].sort((a, b) => a - b);
+  let n = 0;
+  let sum = 0;
+  for (const k of keys) { n += h.get(k); sum += h.get(k) * (k + 0.5); }
+  if (!n) return null;
+  const q = (p) => {
+    const want = Math.min(n - 1, Math.floor(p * n));
+    let c = 0;
+    for (const k of keys) { c += h.get(k); if (c > want) return k; }
+    return keys[keys.length - 1];
+  };
+  return { n, p50: q(0.5), p95: q(0.95), p99: q(0.99), min: keys[0], max: keys[keys.length - 1], mean: +(sum / n).toFixed(2) };
+}
+
+function probeSummary(full) {
+  if (probe.mode === 'off') return { mode: 'off' };
+  const out = {
+    mode: probe.mode, from: probe.mode === 'seq' ? 'capture' : 'page', every: PROBE_EVERY, method: probe.method,
+    durationS: +((now() - probe.startedAt) / 1000).toFixed(1),
+    sampled: probe.sampled, valid: probe.valid, invalid: probe.invalid, mismatched: probe.mismatched,
+    implausible: probe.implausible, skipped: probe.skipped, noStamp: probe.noStamp,
+    latency: histSummary(probe.hist), pageToCapture: histSummary(probe.pageToCapture), lastInvalid: probe.lastInvalid,
+    histogram: Object.fromEntries([...probe.hist.entries()].sort((a, b) => a[0] - b[0])),
+  };
+  if (full) {
+    out.pageToCaptureHistogram = Object.fromEntries([...probe.pageToCapture.entries()].sort((a, b) => a[0] - b[0]));
+    out.sampleFields = ['t_s', 'gen', 'seq', 'barcode', 'latency_ms', 'page_to_capture_ms'];
+    out.samples = probe.samples;
+  }
+  return out;
+}
+
 // Delay-based congestion detection: if one-way delay rises well above its
 // recent minimum for a sustained period, the path is queueing. Ask the host to
 // back off before latency balloons.
@@ -834,7 +1108,13 @@ function onAudioPacket(d) {
 
 function onControl(m) {
   switch (m.t) {
-    case 'welcome': post('welcome', { info: m }); break;
+    case 'welcome':
+      probe.features = m.features || [];
+      probe.wallOffsetUs = m.wallOffsetUs ?? null;
+      updateProbeMode();
+      post('welcome', { info: m });
+      break;
+    case 'clock': if (Number.isFinite(m.wallOffsetUs)) probe.wallOffsetUs = m.wallOffsetUs; updateProbeMode(); break;
     case 'video': onVideoConfig(m); break;
     case 'audio': onAudioConfig(m); break;
     case 'cursor': post('cursor', { shape: m }); break;
@@ -872,6 +1152,7 @@ function postStats() {
   reportStages(stages);
   post('stats', {
     stages,
+    probe: probeSummary(false),
     fps: stats.frames / dt,
     mbps: (stats.bytes * 8) / dt / 1e6,
     rtt: clock.rtt,
@@ -949,7 +1230,8 @@ self.onmessage = (ev) => {
     case 'in': transport?.sendInput(m.b); break;
     case 'dg': transport?.sendDatagram(m.b); break;
     case 'ctl': transport?.sendControl(m.m); break;
-    case 'prefs': prefs = { ...prefs, ...m.prefs }; break;
+    case 'prefs': prefs = { ...prefs, ...m.prefs }; updateProbeMode(); break;
+    case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':

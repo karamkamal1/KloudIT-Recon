@@ -59,7 +59,10 @@ Techniques used (most of them are new to browser-based game streaming):
   adaptive jitter buffer that trims drift.
 - **Live latency readout.** NTP-style clock sync and per-frame host timestamps split every
   frame's *capture → on-screen* latency into capture/encode, host queue, network, transfer,
-  reorder, decode, draw and display, with p50/p95/p99 per stage.
+  reorder, decode, draw and display, with p50/p95/p99 per stage. A **latency probe** checks them
+  from the picture: it reads a frame barcode (the test pattern's frame number, or the wall clock
+  drawn by `tools/latency-test/index.html` on the PC) and builds a capture → drawn histogram you
+  can export as JSON.
 - **Self-protecting under load.** Delay-gradient congestion detection lowers the bitrate before
   queues build up. A decoder backlog gets flushed and resynced from a fresh key frame, so
   latency can't grow without bound.
@@ -226,6 +229,9 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer size.
 - **Network path, transport, renderer and decoder**: these apply on reconnect.
+- **Latency probe** (Diagnostics): open `tools/latency-test/index.html` (in the release zip:
+  `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
+  host screen → drawn latency measured from the picture, and **Export latency data** saves it.
 
 The stream pauses automatically when the tab is hidden, which frees your PC's GPU.
 

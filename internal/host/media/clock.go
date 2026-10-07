@@ -9,10 +9,11 @@ func NewClock() func() uint64 {
 	return func() uint64 { return uint64(monoMicros() - start) }
 }
 
-// wallOffset returns FFmpeg's wall clock (av_gettime(): µs since the Unix
-// epoch, the domain of CaptureClockFilter) minus clock(), from the tightest of a
-// few back-to-back readings.
-func wallOffset(clock func() uint64) int64 {
+// WallOffset returns the wall clock (µs since the Unix epoch: FFmpeg's
+// av_gettime(), the domain of CaptureClockFilter, and the clock behind a
+// browser's Date.now() on the same machine) minus clock(), from the tightest of
+// a few back-to-back readings.
+func WallOffset(clock func() uint64) int64 {
 	best, span := int64(0), uint64(math.MaxUint64)
 	for i := 0; i < 5; i++ {
 		c0 := clock()

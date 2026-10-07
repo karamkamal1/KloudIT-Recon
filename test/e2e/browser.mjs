@@ -1,14 +1,16 @@
 // End-to-end test: real gateway + real host agent + headless Chromium.
 //
 //   node test/e2e/browser.mjs            (after `make build`)
+//   E2E_WALLCLOCK_SECONDS=600 node test/e2e/browser.mjs   (+ a 10-minute latency probe run on the
+//                                        test page; the export lands in results/latency-wallclock.json)
 //
 // Drives the actual UI: first-run setup, pairing a host, connecting, and
 // streaming over direct WebTransport, relayed WebTransport and WebSocket.
 // Verifies decoded video, audio, keyboard/mouse delivery to the host, and
 // reports the measured latencies.
 
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,6 +112,93 @@ async function checkStages(name, st) {
   check(`${name}: stage bookkeeping: per-frame stages sum to end-to-end (structural, ±2 ms)`, n >= 20 && diff <= 2 && ddiff <= 2,
     `${n} frames: mean sum ${(sum / n).toFixed(2)} vs end-to-end ${(e2e / n).toFixed(2)} ms; ${dn} with display est: ${(dsum / dn).toFixed(2)} vs ${(de2e / dn).toFixed(2)} ms`);
   results.push({ stages: name, summary: lat, frames: dump.length });
+}
+
+// Latency probe, seq mode (step 0.2): the test pattern carries each frame's seq
+// as a barcode; the client reads it back from 1 in 30 decoded frames. At least
+// 90 % of the sampled frames must show a valid barcode equal to the frame's seq
+// (the picture drawn is the frame its header describes), and the capture->drawn
+// histogram must have data.
+async function checkProbe(name) {
+  // A loaded machine can stall decoding for a while: give it up to 10 s more for 10 samples.
+  await until(() => page.evaluate(() => window.__recon.probe?.sampled >= 10), 10000, '10 probe samples').catch(() => {});
+  const pr = await page.evaluate(() => window.__recon.probe);
+  const matched = pr ? pr.valid - pr.mismatched : 0;
+  const share = pr?.sampled ? matched / pr.sampled : 0;
+  const hist = pr?.histogram ? Object.values(pr.histogram).reduce((a, b) => a + b, 0) : 0;
+  const l = pr?.latency;
+  check(`${name}: frame barcode = seq on >= 90 % of sampled frames, capture→drawn histogram`,
+    pr?.mode === 'seq' && pr.sampled >= 10 && share >= 0.9 && hist > 0 && l?.n === hist,
+    pr ? `${pr.sampled} sampled (${pr.method}): ${matched} match seq (${(100 * share).toFixed(0)} %), ${pr.invalid} invalid, ${pr.mismatched} mismatched, ` +
+      `${pr.implausible} implausible, ${pr.skipped} skipped; capture→drawn p50/p95/p99 ${l ? `${l.p50}/${l.p95}/${l.p99} ms (n ${l.n})` : '—'}` +
+      `${pr.lastInvalid ? `; last invalid: seq ${pr.lastInvalid.seq}, cells ${pr.lastInvalid.luma}` : ''}` : 'no probe state');
+  results.push({ probe: name, summary: pr });
+  return pr;
+}
+
+let testPage = null; // headed browser showing tools/latency-test (wallclock scenario)
+
+async function checkWallclockProbe() {
+  // An X display with the test page full-screen (kiosk, no automation info bar).
+  const xvfb = spawn('Xvfb', ['-displayfd', '3', '-screen', '0', '1280x720x24', '-nolisten', 'tcp'], { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+  xvfb.log = '';
+  procs.push(xvfb);
+  const disp = await new Promise((res, rej) => {
+    let b = '';
+    xvfb.stdio[3].on('data', (d) => { b += d; if (b.includes('\n')) res(`:${b.trim()}`); });
+    xvfb.on('exit', () => rej(new Error('Xvfb exited')));
+    setTimeout(() => rej(new Error('Xvfb did not start')), 10000);
+  });
+  testPage = await chromium.launchPersistentContext(join(dir, 'testpage-profile'), {
+    headless: false, viewport: null, ignoreDefaultArgs: ['--enable-automation'],
+    env: { ...process.env, DISPLAY: disp }, args: ['--kiosk', '--window-position=0,0', '--window-size=1280,720'],
+  });
+  const tp = testPage.pages()[0] || await testPage.newPage();
+  await tp.goto(`file://${join(root, 'tools', 'latency-test', 'index.html')}`);
+  const lt = await until(() => tp.evaluate(() => (window.__latencyTest.fps > 0 ? window.__latencyTest : null)), 10000, 'latency test page');
+  check('latency test page renders full-screen on the host display', lt.fullscreen, `${disp}: ${lt.fps} fps, cell ${lt.cellPx.toFixed(1)} px`);
+
+  // Restart the host agent on x11grab of that display (same pairing).
+  const cfgPath = join(dir, 'host.json');
+  const hostCfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  const old = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  old.kill('SIGTERM');
+  await new Promise((r) => (old.exitCode !== null ? r() : old.on('exit', r)));
+  writeFileSync(cfgPath, JSON.stringify({ ...hostCfg, capture: 'x11grab', x11Display: disp }));
+  run('recon-host', ['-config', cfgPath, 'run'], { RECON_INPUT_LOG: inputLog }, 'host-x11');
+  await page.goto(`${base}/`);
+  await until(async () => (await page.$$('.host.online')).length === 1, 60000, 'host online after restart');
+
+  // 30 fps: software AV1 decode of the 1280x720 screen has to keep up for 10 minutes on CI machines.
+  await page.evaluate(() => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, latencyProbe: true, bitrate: 8, fps: 30 })));
+  await page.click('.host.online a.btn-primary');
+  await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+  await page.click('#btn-start');
+  await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+  await sleep(6000); // decoder warm-up
+  // E2E_WALLCLOCK_SECONDS=600: a 10-minute run (the wall-clock barcode wraps every 65.5 s).
+  const longRun = +(process.env.E2E_WALLCLOCK_SECONDS || 0);
+  if (longRun) await sleep(longRun * 1000);
+  await until(() => page.evaluate(() => window.__recon.probe?.sampled >= 16), 30000, '16 probe samples').catch(() => {});
+  const exp = await page.evaluate(() => window.__recon.exportLatency());
+  if (exp) writeFileSync(join(outDir, 'latency-wallclock.json'), JSON.stringify(exp, null, 2));
+  const pr = await page.evaluate(() => window.__recon.probe);
+  const st = await page.evaluate(() => window.__recon.lastStats);
+  const cfg = await page.evaluate(() => window.__recon.videoCfg);
+  const l = pr?.latency;
+  const p2c = pr?.pageToCapture;
+  const share = pr?.sampled ? pr.valid / pr.sampled : 0;
+  const e2e = st?.stages?.e2e;
+  check('latency probe (wallclock): test page barcode read back, host screen→drawn histogram',
+    pr?.mode === 'wallclock' && pr.sampled >= 10 && share >= 0.9 && pr.implausible === 0 && l?.n > 0,
+    pr ? `${cfg?.encoder} ${cfg?.capture} ${cfg?.width}x${cfg?.height}, ${pr.durationS} s: ${pr.sampled} sampled (${pr.method}), valid ${(100 * share).toFixed(0)} %, ` +
+      `${pr.implausible} implausible; screen→drawn p50/p95/p99 ${l ? `${l.p50}/${l.p95}/${l.p99} ms` : '—'}` +
+      `${pr.lastInvalid ? `; last invalid: cells ${pr.lastInvalid.luma}` : ''}` : 'no probe state');
+  check('latency probe (wallclock): page→capture from the barcode clock is small and not negative (wall-clock offset + clock sync)',
+    !!p2c && p2c.min >= -3 && p2c.p50 <= 100,
+    p2c ? `page→capture p50/p95 ${p2c.p50}/${p2c.p95} ms, min ${p2c.min} ms (n ${p2c.n}); capture→draw (stamps) p50 ${e2e?.p50} ms vs screen→drawn ${l?.p50} ms` : 'no page→capture samples');
+  results.push({ probe: 'wallclock', summary: pr, stages: st?.stages, cfg });
+  await page.evaluate(() => { window.__recon.userClosed = true; });
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +325,7 @@ try {
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
     await checkStages(sc.name, st);
+    const pr = await checkProbe(sc.name);
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
 
@@ -267,6 +357,14 @@ try {
       check(`${sc.name}: keyboard + mouse reach the host`, true, `${events.length} events; last abs (${abs.x}, ${abs.y}); W=0x11, ArrowUp=E0 48`);
     }
     if (sc.name === 'WebTransport direct') {
+      // Export latency data from the overlay: a JSON download with the histogram.
+      const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 5000 }), page.click('#btn-export-latency')]).catch(() => [null]);
+      const exp = dl ? JSON.parse(readFileSync(await dl.path(), 'utf8')) : null;
+      const expHist = exp?.probe?.histogram ? Object.values(exp.probe.histogram).reduce((a, b) => a + b, 0) : 0;
+      check('overlay "Export latency data" downloads the probe histogram as JSON',
+        exp?.kind === 'kloudit-recon-latency' && exp.probe?.mode === 'seq' && expHist >= (pr?.latency?.n || 1) &&
+          exp.probe.samples?.length === expHist && !!exp.stages?.e2e && exp.video?.encoder === cfg?.encoder,
+        exp ? `${dl.suggestedFilename()}: ${expHist} histogram samples, ${exp.probe.samples?.length} sample rows, stages ${!!exp.stages}` : 'no download');
       await page.mouse.move(640, 5); // reveal toolbar
       await sleep(400);
       await page.screenshot({ path: join(outDir, 'stream.png') });
@@ -295,6 +393,22 @@ try {
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }
 
+  // 3b. Latency probe, wallclock mode -----------------------------------------
+  // The host captures an X display (x11grab) that shows tools/latency-test in a
+  // second, headed Chromium; the client (latency probe enabled) reads the
+  // page's wall-clock barcode back and converts it with the host's wall-clock
+  // offset and the clock sync. page→capture (barcode time vs the frame's
+  // capture stamp) must be small and never negative: a wrong offset or clock
+  // conversion shifts it by the error.
+  const ffmpegBin = process.env.E2E_HOST_FFMPEG || 'ffmpeg';
+  const haveX = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0 &&
+    /x11grab/.test(spawnSync(ffmpegBin, ['-hide_banner', '-devices'], { encoding: 'utf8' }).stdout || '');
+  if (process.env.E2E_WALLCLOCK === '0' || hostBin || !haveX) {
+    console.log('- latency probe wallclock scenario skipped (needs Xvfb, an FFmpeg with x11grab and the native host)');
+  } else {
+    await checkWallclockProbe().catch((e) => check('latency probe (wallclock) scenario', false, e.message));
+  }
+
   // 4. Security spot checks from the browser ---------------------------------
   const anon = await browser.newContext({ ignoreHTTPSErrors: true });
   const ap = await anon.newPage();
@@ -314,8 +428,9 @@ try {
   writeFileSync(join(outDir, 'results.json'), JSON.stringify(results, null, 2));
   const appLogs = await page.evaluate(() => (window.__recon ? window.__recon.logs : [])).catch(() => []);
   writeFileSync(join(outDir, 'console.log'), consoleLines.concat(appLogs).join('\n'));
-  const hostProc = procs.find((p) => p.spawnargs.includes('run'));
-  writeFileSync(join(outDir, 'host.log'), hostProc ? hostProc.log : '');
+  await testPage?.close().catch(() => {});
+  rmSync(join(dir, 'testpage-profile'), { recursive: true, force: true });
+  writeFileSync(join(outDir, 'host.log'), procs.filter((p) => p.spawnargs.includes('run')).map((p) => p.log).join('\n--- host restarted ---\n'));
   writeFileSync(join(outDir, 'gateway.log'), gw.log);
   await browser.close();
   cleanup();

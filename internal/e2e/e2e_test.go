@@ -221,20 +221,25 @@ type result struct {
 	configs, frames, keyframes, audio int
 	extFrames, stamped, badFrames     int  // frames with the header extension, with ordered stage stamps, unparsable
 	welcome, extFeature               bool // welcome received; it advertised the frame header extension
+	barcodeFeature                    bool // welcome advertised the test pattern's frame barcode
+	wallOffsetUs                      int64
 	firstFrameLatency                 time.Duration
 }
 
 // control counts one control message.
 func (r *result) control(m []byte) {
 	var x struct {
-		T        string
-		Features []string
+		T            string
+		Features     []string
+		WallOffsetUs int64
 	}
 	json.Unmarshal(m, &x)
 	switch x.T {
 	case "welcome":
 		r.welcome = true
 		r.extFeature = slices.Contains(x.Features, proto.FeatureFrameExt)
+		r.barcodeFeature = slices.Contains(x.Features, proto.FeatureBarcodeSeq)
+		r.wallOffsetUs = x.WallOffsetUs
 	case "video":
 		r.configs++
 	}
@@ -273,6 +278,14 @@ func checkExt(t *testing.T, r result, v int) {
 	}
 	if r.extFeature != (v >= proto.HelloVersionFrameExt) {
 		t.Fatalf("v%d client: welcome advertises %s = %v", v, proto.FeatureFrameExt, r.extFeature)
+	}
+	// Test source: the frame barcode is drawn for every client; the wall-clock
+	// offset is wall clock minus a host clock that started with the agent.
+	if !r.barcodeFeature {
+		t.Fatalf("v%d client: welcome lacks %s with the test source", v, proto.FeatureBarcodeSeq)
+	}
+	if start := time.UnixMicro(r.wallOffsetUs); time.Since(start) < 0 || time.Since(start) > time.Hour {
+		t.Fatalf("v%d client: implausible wallOffsetUs %d (host clock started %v)", v, r.wallOffsetUs, start)
 	}
 	if v < proto.HelloVersionFrameExt && r.extFrames > 0 {
 		t.Fatalf("v%d client got %d extended frame headers", v, r.extFrames)

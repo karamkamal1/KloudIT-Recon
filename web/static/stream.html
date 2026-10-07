@@ -32,7 +32,10 @@
     <button class="btn-icon" id="btn-disconnect" title="Disconnect (Ctrl+Alt+Shift+Q)"></button>
   </div>
 
-  <div class="stats hidden" id="stats"></div>
+  <div class="stats hidden" id="stats">
+    <div id="stats-body"></div>
+    <div class="stats-actions"><button type="button" id="btn-export-latency" title="Download the latency probe histogram, samples and stage statistics as JSON">Export latency data</button></div>
+  </div>
 
   <aside class="drawer" id="drawer" aria-label="Settings"></aside>
 

@@ -106,3 +106,154 @@ Hardware checks:
   capture→encoded about one frame interval or less, fps/bitrate equal to a
   `"captureTimestamps": "off"` run, no quantized values) plus the 30+ minute single-generation run
   (no "implausible capture timestamp" warning, no steady drift of capture→encoded p50).
+
+## 0.2 In-band frame counter
+
+A frame barcode (16-bit value + CRC-8, 8×3 black/white cells in the top-left corner; format in
+`docs/ARCHITECTURE.md`, "Frame barcode") read back by the client from 1 in 30 decoded frames.
+Sources: the test pattern (`"capture": "test"`) draws each frame's `seq` with FFmpeg `drawbox`
+filters (client mode `seq`); `tools/latency-test/index.html`, opened full-screen on the host,
+draws the host's wall-clock milliseconds every animation frame (client mode `wallclock`, enabled
+with Settings → Diagnostics → Latency probe). The overlay shows the counts and the capture→drawn
+(seq) or host screen→drawn (wallclock) histogram; **Export latency data** saves it as JSON.
+
+### Running the 10-minute latency test (tools/latency-test)
+
+1. On the host PC, open `latency-test\index.html` from the release zip (repository:
+   `tools/latency-test/index.html`) in Chrome or Edge **on the streamed monitor** and make it
+   full-screen (click the page or press F; or start it with
+   `chrome.exe --kiosk "file:///C:/path/to/latency-test/index.html"`). The page shows its fps, the
+   cell size (1/96 of the screen width) and the current barcode value, and warns if it is not
+   full-screen. Nothing may cover the top-left corner (no overlays such as the Xbox Game Bar or
+   the GPU driver's performance overlay there); the mouse pointer is hidden over the page.
+2. Stream the whole monitor at its native resolution or the same aspect ratio (the barcode must
+   stay at the picture's top-left corner; the cell size scales with the picture width).
+3. In the browser client: Settings (Ctrl+Alt+Shift+O) → Diagnostics → **Latency probe (host test
+   page)**; open the overlay (Ctrl+Alt+Shift+S). After a few seconds the overlay shows
+   `Frame barcode (wallclock)` with the sampled count and valid share, `host screen→drawn
+   (barcode)` p50/p95/p99 and `page→capture (stamps)`.
+4. Keep streaming for 10 minutes without changing settings (no window over the test page, the
+   client tab visible), then click **Export latency data** in the overlay. The JSON contains the
+   1 ms histogram, every sample (`t_s, gen, seq, barcode, latency_ms, page_to_capture_ms`), the
+   stage summary (capture→encoded, queue, network, … for the last 10 s), the encoder and the
+   connection. Keep the file with the results below.
+5. What to look for: valid ≥ 90 % of samples and 0 implausible (otherwise the page is not at the
+   top-left corner, not full-screen, covered, or the clocks are off); page→capture p50 of about
+   1–2 refresh intervals (the page's frame time to DDA capture: render, present, capture) and
+   never below −2 ms (a negative value means the wall-clock offset or the clock sync is wrong);
+   host screen→drawn p50 ≈ page→capture p50 + the overlay's capture→draw p50 (the stage stamps
+   and the picture agree); no slow drift of the samples over the 10 minutes (plot
+   `latency_ms` over `t_s`). Repeat with Settings → Renderer = WebGPU (export `method`
+   = `webgpu`) and with the 2D canvas (`copyTo NV12` or `canvas …`).
+
+Verified in the sandbox:
+
+- verified (sandbox): format: CRC-8/I-432-1 (check value 0xA1), round trip of all 65536 values,
+  every 1- and 2-cell error rejected, an all-black or all-white corner rejected, cells that are
+  neither clearly dark (< 96) nor light (> 160) rejected, decoding from a box-blurred luma plane
+  with 16, 13.3 and 20 px cells (`internal/proto` `TestBarcode`). `web/static/js/protocol.js` and
+  the encoder copy in `tools/latency-test/index.html` produce the same 65536 words, sample
+  rectangles, thresholds and decode results as Go (`TestBarcodeJS`, runs both under node; a
+  mutated CRC in the page or a mutated threshold in protocol.js fails it).
+- verified (sandbox): test pattern barcode (FFmpeg `drawbox` chain, one box per cell, timeline
+  expressions on the frame index `n`; CRC bits as sums mod 2 of `gt(bitand(n,2^i),0)`). The
+  probe draws three frames and reads back 0, 1, 2 before the host announces `barcode-seq`.
+  Through the Video manager, every frame decodes (FFmpeg, H.264 Annex B / AV1 in IVF) to a
+  barcode equal to its `Frame.Seq`: 180/180 frames at 4000 and at 500 kbit/s, 960×540 60 fps,
+  libx264 and libsvtav1 on FFmpeg 6.1.1, libx264 on FFmpeg 8.1.3 (BtbN win64 build) under Wine
+  (`internal/host/media` `TestBarcodeFilter`; libsvtav1 on 8.1 fails for the pre-existing reason
+  noted in 0.1). Frame rate and bitrate unchanged (FFmpeg 6.1.1: libx264 61.9 / 60.2 fps,
+  3.06 / 3.19 Mbit/s; libsvtav1 60.7 / 60.6 fps, 4.03 / 4.03 Mbit/s; 8.1.3 under Wine: libx264
+  60.2 / 60.2 fps); capture→encoded p50 4.4 / 4.3 ms under Wine, 3.6 / 4.4 ms and 34 / 37 ms on
+  Linux (run-to-run noise on a shared 4-core machine). Filter cost alone (`ffmpeg -benchmark`,
+  1200 frames of `testsrc2` in `-filter_complex` with vs without the chain, one filter thread,
+  mean of 3 runs): 960×540 0.69 / 0.74 s of CPU (≤ 0.05 ms per frame), 1920×1080 2.72 / 2.88 s
+  (inside the run-to-run spread of 2.6–3.2 s).
+- verified (sandbox): every welcome on every path (direct and relayed WebTransport, v1 and v2
+  clients) lists `barcode-seq` with the test source and carries a plausible `wallOffsetUs`
+  (`internal/e2e` `TestStreamingPaths`); v2 clients get `{"t":"clock"}` refreshes every 5 s
+  (used by the wallclock run below).
+- verified (sandbox): browser E2E, seq mode (`test/e2e/browser.mjs`, headless Chromium, software
+  AV1 decode, 2D canvas renderer: `VideoFrame.copyTo` of the corner of I420 frames): 8 runs × 4
+  scenarios (direct and relayed WebTransport, WebSocket relay, "WebGPU renderer"), 384 sampled
+  frames, 382 with a valid barcode equal to the frame's seq (≥ 91 % in every scenario, 100 % in 30
+  of 32), 0 mismatched, 2 invalid; 2–17 samples per scenario and run (fewer when the overloaded
+  machine stalled decoding); capture→drawn histogram p50 79–403 ms (software AV1 decode on a CPU
+  shared with other jobs). One invalid sample was recorded with its cells: all 24 cells were
+  clean black/white and the value rows read the frame's own seq (103), but one CRC cell still
+  showed the previous frame's content: a 16×16 block of the picture had not been updated
+  (encoded as a skip from the reference at a congestion-reduced bitrate, or concealed by the
+  decoder), which is what the CRC is there to catch. The overlay's "Export latency data"
+  downloads the JSON with the histogram, the samples and the stage summary. Under that load
+  the E2E's steady-playback checks failed in some scenarios with and without this change alike
+  (A/B against the 0.1 tree: baseline 4 and 11 failed checks, this change 5 and 1, all of them
+  fps dips, decoder-backlog recoveries or checks that follow from them; the last two runs of this
+  change failed only fps checks, "steady real-time playback" in both and "video decoding" in the
+  first (6 and 2 checks), at a load average of about 6 from other jobs). The E2E's "WebGPU
+  renderer" scenario falls back to the 2D canvas here (see next item), so it exercises the same
+  readback.
+- verified (sandbox): WebGPU readback, partly. Headless Chromium's SwiftShader WebGPU drops its
+  instance as soon as `importExternalTexture` is called ("Instance dropped in popErrorScope";
+  that is also why the E2E's WebGPU scenario falls back to the 2D canvas), so the external-texture
+  path cannot run here. The probe shader and pipeline with `texture_external` compile and
+  validate without errors; the same shader body with a regular texture (`textureSampleLevel`
+  instead of `textureSampleBaseClampToEdge`), the renderer's own `probePass` / `probeRead`
+  (render to 8×3 `rgba8unorm`, `copyTextureToBuffer` with 256-byte rows, `mapAsync`) decoded 5/5
+  barcodes: 960×540 with 16 px cells, 1280×720 with 13.3 px, 1920×1080 with 20 px, 3840×2160 with
+  40 px (values 4242, 777, 31337, 65535, 0).
+- verified (sandbox): browser E2E, wallclock mode, end to end: Xvfb display with
+  `tools/latency-test/index.html` full-screen in a second (headed, kiosk) Chromium, the host agent
+  restarted on `x11grab` of that display (libsvtav1, 1280×720; 60 fps in three runs, 30 fps in
+  the final version of the test), client with the latency probe enabled. Test page itself:
+  x11grab frames decoded with `BarcodeReadLuma` 120/120 valid, consecutive values 16–17 ms apart.
+  Streamed: 16/16 samples valid in each of the 6 runs that reached the check, 0 implausible; page→capture (barcode wall clock
+  converted with `wallOffsetUs` and the clock sync, against the frame's capture stamp) p50
+  47–56 ms at 60 fps and 28–49 ms at 30 fps, minimum 24–44 ms (Chromium on Xvfb without vsync:
+  render, software compositing and the x11grab timer), never negative; host screen→drawn p50
+  164–323 ms (overloaded machine, software AV1).
+- verified (sandbox): the 10-minute wallclock run (`E2E_WALLCLOCK_SECONDS=600`, same setup at
+  30 fps, WebSocket relay, 2D canvas, `copyTo I420`): 606 s, 606/606 samples valid, 0 implausible,
+  0 skipped; the 16-bit millisecond counter wrapped 10 times without a jump in the latency; host
+  screen→drawn p50/p95/p99 162/187/240 ms (min 130, max 372), page→capture p50/p95/p99 42/52/61 ms
+  (min 10); per-minute p50 155–170 ms with no drift; the stage stamps' capture→draw p50 over the
+  last 10 s was 124 ms, consistent with 162 − 42 ms. The 1 ms histogram had 74 buckets; the export
+  held all 606 samples.
+- Seen in the sandbox, not caused by this step: headless Chromium's renderer crashed (a CHECK,
+  `trap int3` in its main or compositor thread, the same crash site every time) in several long
+  E2E runs on this machine, with this change and in a control run of the unchanged 0.1 tree (no
+  probe code at all), while the machine's root file system was full (100 %, 140–250 MB free, filled
+  by other jobs; Playwright's Chromium keeps its shared memory in /tmp). A crashed tab ends the run
+  with "Target crashed"; if a 10-minute run on real hardware ends like that, check free disk and
+  memory on the client first.
+- Not verifiable here: hardware-decoded (GPU-backed) VideoFrames, where `copyTo` may need a
+  readback or fall back to `drawImage` (the export's `method` says which ran), and the WebGPU
+  external-texture readback; both are hardware checks below.
+- Native helper (Phase 3), requirement: to serve the seq mode the helper must draw
+  `proto.BarcodeWord(uint16(frameId))` (the 16-bit frame id and its CRC-8/I-432-1) as 24 cells,
+  8 per row, most significant bit first, 16×16 px at the top-left corner (white/black at Y
+  235/16 reads correctly), and the host may announce `barcode-seq` only when that frame id is the
+  frame's `seq`. The barcode layout from Phase 3.2 (native track) is not enough on its own: it
+  draws the raw low `bits` of the frame id with no CRC, so with `bits: 24` the client would
+  reject every sample as invalid. The helper has to compute the CRC word itself (or take a value
+  transform) first.
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (seq, hardware encode and decode): in `host.json` set
+  `"capture": "test"`, `"testWidth": 2560, "testHeight": 1440` and in turn `"encoder":
+  "hevc_amf"`, `"av1_amf"`, `"h264_amf"`; stream to Chrome on a client with hardware decode, overlay
+  open, 2D canvas renderer and then WebGPU (Settings → Renderer, reconnect). Look for: overlay
+  `Frame barcode (seq)` valid ≥ 99 % and 0 mismatched after 2 minutes (a mismatch means a frame
+  was shown out of order or twice, or AMF skipped a frame: compare with `skip_frame`/
+  `frame_skipping` in 1.1), the export's `method` (`copyTo NV12` / `canvas …` / `webgpu`), and the
+  capture→drawn p50 within ±2 ms of the overlay's End-to-end (capture→draw) p50. Test (wallclock,
+  the 10-minute run): `"capture": "ddagrab"` (and once `gfxcapture`), encoders `hevc_amf`,
+  `av1_amf` (2560×1440: RDNA3 AV1 alignment, A7), `h264_amf`, 60 fps, wired LAN client; follow
+  "Running the 10-minute latency test" above; record per encoder and renderer: valid share,
+  implausible count, host screen→drawn p50/p95/p99, page→capture p50/p95, the overlay's
+  capture→draw p50, and attach the exported JSON. Expect page→capture ≈ 1–2 refresh intervals with
+  ddagrab (FFmpeg's own timer, B7) and host screen→drawn ≈ page→capture + capture→draw (±2 ms).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same two runs with `hevc_nvenc`,
+  `av1_nvenc` (RTX 40 and newer) and `h264_nvenc` at 1920×1080 and 2560×1440, 60 fps: seq mode
+  valid ≥ 99 %, 0 mismatched, capture→drawn p50 within ±2 ms of capture→draw; the 10-minute
+  wallclock run with ddagrab, recording the same numbers and the exported JSON.

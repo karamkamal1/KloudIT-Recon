@@ -263,7 +263,7 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 		f := &Frame{Gen: pr.gen, Seq: seq, Key: pkt.Key, PtsUs: pts - pts0, EncodeDoneUs: done, Data: data}
 		if pr.params.CaptureClock {
 			if seq == 0 || done-wallOffAt >= wallOffsetEvery {
-				wallOff, wallOffAt = wallOffset(v.clock), done
+				wallOff, wallOffAt = WallOffset(v.clock), done
 			}
 			// pts is the wall-clock capture time (CaptureClockFilter).
 			if c := pts - wallOff; c > 0 && uint64(c) <= done && done-uint64(c) <= maxCaptureToEncoded {

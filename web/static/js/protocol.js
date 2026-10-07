@@ -188,6 +188,64 @@ export function parseFrameHeader(buf) {
   return h;
 }
 
+// ---------------------------------------------------------------------------
+// Frame barcode (mirror of internal/proto/barcode.go): a 16-bit value and its
+// CRC-8 drawn as an 8x3 grid of black/white cells in the picture's top-left
+// corner, row-major, most significant bit first (cell k shows bit 23-k of
+// value << 8 | crc; white = 1). The test pattern draws each frame's seq with
+// 16 px cells; tools/latency-test/index.html draws the host's wall-clock ms
+// with cells of 1/96 of the picture width.
+
+export const BARCODE_COLS = 8;
+export const BARCODE_ROWS = 3;
+export const BARCODE_BITS = BARCODE_COLS * BARCODE_ROWS;
+export const BARCODE_CELL = 16;
+export const BARCODE_WALLCLOCK_CELLS = 96;
+export const BARCODE_DARK = 96; // mean luma below: 0; above BARCODE_LIGHT: 1; between: no barcode
+export const BARCODE_LIGHT = 160;
+export const FEATURE_BARCODE_SEQ = 'barcode-seq';
+
+/** CRC-8 (poly 0x07, init 0, xorout 0x55) over the value's two bytes, high first. */
+export function barcodeCRC(v) {
+  let crc = 0;
+  for (const b of [(v >> 8) & 0xff, v & 0xff]) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+  }
+  return crc ^ 0x55;
+}
+
+/** The 24 bits drawn for value v. */
+export const barcodeWord = (v) => ((v & 0xffff) * 256) + barcodeCRC(v & 0xffff);
+
+/** Value of a word whose CRC checks out, else null. */
+export function barcodeDecode(word) {
+  if (word < 0 || word >= 1 << BARCODE_BITS) return null;
+  const v = word >>> 8;
+  return (word & 0xff) === barcodeCRC(v) ? v : null;
+}
+
+/** Decode the cells' mean luma (row-major, 0-255); null unless every cell is clearly dark or light and the CRC holds. */
+export function barcodeDecodeLuma(luma) {
+  if (luma.length !== BARCODE_BITS) return null;
+  let word = 0;
+  for (let k = 0; k < BARCODE_BITS; k++) {
+    const l = luma[k];
+    if (l > BARCODE_LIGHT) word += 2 ** (BARCODE_BITS - 1 - k);
+    else if (!(l < BARCODE_DARK)) return null;
+  }
+  return barcodeDecode(word);
+}
+
+/** The inner half of cell k (what a reader averages) for cells of `cell` px: [x0, y0, x1, y1), x1/y1 exclusive. */
+export function barcodeSampleRect(k, cell) {
+  const c = k % BARCODE_COLS;
+  const r = Math.floor(k / BARCODE_COLS);
+  const x0 = Math.round((c + 0.25) * cell);
+  const y0 = Math.round((r + 0.25) * cell);
+  return [x0, y0, Math.max(Math.round((c + 0.75) * cell), x0 + 1), Math.max(Math.round((r + 0.75) * cell), y0 + 1)];
+}
+
 /** XInput button bits used by the host's virtual controller. */
 export const XUSB = {
   UP: 0x0001, DOWN: 0x0002, LEFT: 0x0004, RIGHT: 0x0008,

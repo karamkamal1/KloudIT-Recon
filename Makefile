@@ -21,6 +21,7 @@ windows:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/windows/recon-host.exe ./cmd/recon-host
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o $(DIST)/windows/recon-hostw.exe ./cmd/recon-host
 	cp deploy/windows/*.ps1 $(DIST)/windows/
+	mkdir -p $(DIST)/windows/latency-test && cp tools/latency-test/index.html $(DIST)/windows/latency-test/
 
 test:
 	$(GO) vet ./...

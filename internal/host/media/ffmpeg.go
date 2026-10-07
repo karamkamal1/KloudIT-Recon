@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
 // EncoderInfo describes a usable video encoder.
@@ -39,6 +41,7 @@ type Caps struct {
 	options  map[string]map[string]bool
 
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
+	barcode      bool // BarcodeFilter draws readable frame barcodes
 }
 
 // candidate encoders in preference order within a family.
@@ -100,7 +103,7 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	c.Version = strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
-	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts"} {
+	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts", "drawbox"} {
 		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
 			c.Filters[f] = true
 		}
@@ -124,6 +127,19 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	ok := map[string]bool{}
+	if c.Filters["drawbox"] {
+		wg.Add(1)
+		go func() { // alongside the encoder tests: no extra start-up time
+			defer wg.Done()
+			err := testBarcode(ctx, ffmpeg)
+			mu.Lock()
+			c.barcode = err == nil
+			mu.Unlock()
+			if err != nil && log != nil {
+				log.Info("test pattern frame barcode unavailable", "err", err)
+			}
+		}()
+	}
 	for _, cand := range candidates {
 		if !available[cand.Name] {
 			continue
@@ -196,6 +212,33 @@ func testCaptureClock(ctx context.Context, ffmpeg, filter string) error {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
+	}
+	return nil
+}
+
+// testBarcode draws BarcodeFilter on three frames, reads them back as raw luma
+// and checks that they carry frame indexes 0, 1 and 2.
+func testBarcode(ctx context.Context, ffmpeg string) error {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	const w, h, frames = 160, 64, 3
+	var stdout, stderr bytes.Buffer
+	cmd := quietCmd(ctx, ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=gray:s=%dx%d:r=30", w, h), "-frames:v", strconv.Itoa(frames),
+		"-vf", BarcodeFilter(proto.BarcodeCell)+",format=gray", "-f", "rawvideo", "pipe:1")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
+	}
+	b := stdout.Bytes()
+	if len(b) != w*h*frames {
+		return fmt.Errorf("got %d bytes of raw video, want %d", len(b), w*h*frames)
+	}
+	for i := 0; i < frames; i++ {
+		v, ok := proto.BarcodeReadLuma(b[i*w*h:(i+1)*w*h], w, proto.BarcodeCell)
+		if !ok || v != uint16(i) {
+			return fmt.Errorf("frame %d: barcode reads %d (valid %v)", i, v, ok)
+		}
 	}
 	return nil
 }
@@ -276,6 +319,9 @@ type Params struct {
 	// and the encoder runs at a µs time base (it still gets the frame rate for
 	// rate control). Video turns them into Frame.CaptureUs.
 	CaptureClock bool
+	// Barcode draws the frame barcode of each frame's index (= Frame.Seq) into
+	// the top-left corner (BarcodeFilter; test source only).
+	Barcode bool
 }
 
 // CaptureClockFilter sets each frame's pts to the wall clock (av_gettime())
@@ -285,6 +331,43 @@ const CaptureClockFilter = "settb=AVTB,setpts=time(0)*1000000"
 // CanStampCapture reports whether this FFmpeg build ran CaptureClock's filter
 // and encoder time base in the probe.
 func (c *Caps) CanStampCapture() bool { return c.captureClock }
+
+// CanDrawBarcode reports whether BarcodeFilter produced readable barcodes of
+// the frame index in the probe.
+func (c *Caps) CanDrawBarcode() bool { return c.barcode }
+
+// BarcodeFilter returns the filter chain that draws the frame barcode
+// (proto.BarcodeWord) of the frame index n with cells of cell pixels into the
+// top-left corner: a black box, then one white drawbox per cell, enabled while
+// its bit is 1. drawbox's timeline expression sees n (the frame index from 0),
+// which is the frame's Seq within a generation (one packet per frame, no
+// frame drops with -fps_mode passthrough). Cheap per frame: 25 expression
+// evaluations and at most 24 16x16 fills.
+func BarcodeFilter(cell int) string {
+	parts := []string{fmt.Sprintf("drawbox=x=0:y=0:w=%d:h=%d:color=black:t=fill", proto.BarcodeCols*cell, proto.BarcodeRows*cell)}
+	crc0 := proto.BarcodeCRC(0)
+	for k := 0; k < proto.BarcodeBits; k++ {
+		bit := proto.BarcodeCellBit(k)
+		var expr string
+		if bit >= 8 {
+			expr = fmt.Sprintf("bitand(n,%d)", 1<<(bit-8)) // value bit
+		} else {
+			// The CRC is affine in the value bits: crc(v) = crc(0) xor, over the
+			// set bits i of v, crc(1<<i) xor crc(0). A sum mod 2 is the xor.
+			terms := []string{strconv.Itoa(int(crc0 >> bit & 1))}
+			for i := 0; i < 16; i++ {
+				if (proto.BarcodeCRC(1<<i)^crc0)>>bit&1 == 1 {
+					terms = append(terms, fmt.Sprintf("gt(bitand(n,%d),0)", 1<<i))
+				}
+			}
+			expr = "mod(" + strings.Join(terms, "+") + ",2)"
+		}
+		// Quoted: the commas inside the expression must not split the graph.
+		parts = append(parts, fmt.Sprintf("drawbox=x=%d:y=%d:w=%d:h=%d:color=white:t=fill:enable='%s'",
+			k%proto.BarcodeCols*cell, k/proto.BarcodeCols*cell, cell, cell, expr))
+	}
+	return strings.Join(parts, ",")
+}
 
 var safeRegex = regexp.MustCompile(`^[A-Za-z0-9 _.\-()*+?^$|\[\]]{1,128}$`)
 
@@ -361,6 +444,11 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		// Evaluated as the frame leaves the source (after realtime pacing for
 		// the test source), before any conversion or encoding.
 		chain += "," + CaptureClockFilter
+	}
+	if p.Barcode && p.Source.Backend == "test" {
+		// The test pattern is generated at the output size: cells stay
+		// BarcodeCell pixels in the encoded picture.
+		chain += "," + BarcodeFilter(proto.BarcodeCell)
 	}
 
 	// Convert into what the encoder accepts.

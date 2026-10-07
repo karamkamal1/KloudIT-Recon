@@ -209,3 +209,56 @@ clocks. Host-side stages (capture→encoded, host queue) need no conversion at a
 detection and the `0x40` frame ack keep measuring from `encodeDoneUs` (the pre-extension meaning
 of `send_us`, which v1 clients still get in `send_us`), so host queueing still counts as delay
 there.
+
+## Frame barcode (latency probe)
+
+The stage stamps above are only as good as the host's stamps and the clock sync. The **latency
+probe** checks them from the picture itself: a frame barcode in the top-left corner, read back by
+the client from 1 in 30 decoded frames.
+
+**Format** (`internal/proto/barcode.go`, mirrored in `protocol.js`): a 16-bit value and its CRC-8
+(polynomial 0x07, xorout 0x55) form the 24-bit word `value << 8 | crc`, drawn as an 8×3 grid of
+square black/white cells, row-major, most significant bit first (row 0: value bits 15–8, row 1:
+bits 7–0, row 2: the CRC; white = 1). A reader averages the inner half of each cell; every cell
+must be clearly dark (mean luma < 96) or light (> 160) and the CRC must hold, so random picture
+content, a uniform corner and a torn or half-updated barcode read as "no barcode" (the CRC catches
+every 1- and 2-cell error).
+
+| Source | Value | Cell size | Client mode |
+|---|---|---|---|
+| Test pattern (`capture: "test"`) | encoder frame index = frame `seq` (low 16 bits) | 16 px of the encoded picture | `seq`, when the welcome lists `barcode-seq` |
+| `tools/latency-test/index.html` full-screen on the host | host wall clock, ms (low 16 bits) | picture width / 96 | `wallclock`, when the user enables Settings → Diagnostics → Latency probe |
+
+The test pattern's barcode is an FFmpeg chain right after the source and its capture clock: one
+black `drawbox` and one white 16×16 `drawbox` per cell whose timeline expression computes that
+bit from the frame index `n` (CRC bits are affine in the value bits, so each is a sum mod 2 of
+`gt(bitand(n,2^i),0)` terms). No per-pixel `geq`; the probe draws it on three frames and reads them
+back before the host announces it; it costs at most a few hundredths of a millisecond of CPU per
+frame (measurements in `docs/VENDOR_NOTES.md`, 0.2).
+
+**seq mode** compares the barcode with the frame header's `seq`. A mismatch means the picture
+being drawn is not the frame the header describes (stale, duplicated or skipped frame, or wrong
+decoder-output bookkeeping). Matching frames add *capture stamp → drawn* to the histogram.
+
+**wallclock mode** turns the page's milliseconds into host clock and then local time. The welcome
+carries `wallOffsetUs` (the host's wall clock, µs since the Unix epoch, which is what `Date.now()`
+reads in a browser on that PC, minus the host clock), refreshed by a `{"t":"clock","wallOffsetUs":…}`
+message every 5 s (v2 clients), because W32Time slews and steps the wall clock while QPC runs free.
+The client takes the latest wall-clock millisecond with the barcode's low 16 bits before its own
+draw (in host wall-clock terms), adds 0.5 ms (`Date.now()` floors) and records *page drew it →
+drawn*. That includes the host's render, present and capture delay on top of capture → drawn; the
+difference to the frame's capture stamp is reported separately as *page→capture*.
+
+**Readback** never stalls the decoder. With the 2D canvas renderer the client clones the frame
+before the draw and afterwards copies only the corner (`VideoFrame.copyTo` with a rect: plane 0
+of I420/NV12/…, or RGB) or, if the frame cannot be copied, draws the corner into a small
+`OffscreenCanvas`; the clone is closed as soon as the copy resolves. The WebGPU renderer renders
+the cells from the external texture it already imported into an 8×3 texture (one texel per cell,
+the mean of 4×4 samples over the cell's inner half), `copyTextureToBuffer` and `mapAsync`. At most
+two readbacks are in flight.
+
+The overlay shows sampled / valid / mismatched counts and the histogram's p50/p95/p99
+(1 ms buckets over the whole connection), `window.__recon.probe` holds the same summary, and
+**Export latency data** (overlay) downloads a JSON document with the histogram, every sample
+(time, gen, seq, barcode, latency, page→capture), the stage summary, the video configuration and
+the connection.

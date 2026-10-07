@@ -61,6 +61,19 @@ type Welcome struct {
 	Features []string      `json:"features"` // cursor, gamepad, audio, text
 	MaxKbps  int           `json:"maxKbps"`
 	MaxFPS   int           `json:"maxFps"`
+	// WallOffsetUs is the host's wall clock (µs since the Unix epoch: what
+	// Date.now() reads in a browser on the host) minus the host clock (µs).
+	// The latency test page draws the wall clock into the picture; the client
+	// converts it to the host clock with this. Refreshed by Clock messages.
+	WallOffsetUs int64 `json:"wallOffsetUs,omitempty"`
+}
+
+// Clock refreshes Welcome.WallOffsetUs every few seconds (clients with hello
+// v >= 2): the wall clock and the host clock drift apart (on Windows W32Time
+// slews and steps the wall clock, QueryPerformanceCounter is not disciplined).
+type Clock struct {
+	T            string `json:"t"` // "clock"
+	WallOffsetUs int64  `json:"wallOffsetUs"`
 }
 
 type MonitorInfo struct {
