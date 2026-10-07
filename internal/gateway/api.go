@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -109,6 +111,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setupTok = ""
+	_ = os.Remove(filepath.Join(s.cfg.DataDir, "setup-token.txt"))
 	s.audit.Log("setup", req.Username, ip, "admin account created")
 	s.startSession(w, r, req.Username)
 }
@@ -131,7 +134,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if locked, d := s.lockouts.Locked(req.Username); locked {
+	lockKey := req.Username + "|" + ip // per user+IP, so a remote attacker cannot lock the owner out
+	if locked, d := s.lockouts.Locked(lockKey); locked {
 		jsonError(w, http.StatusTooManyRequests, fmt.Sprintf("account temporarily locked, try again in %s", d.Round(time.Second)))
 		return
 	}
@@ -141,7 +145,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		hash = u.PasswordHash
 	}
 	if !s.verifyPassword(hash, req.Password) || !ok {
-		s.lockouts.Fail(req.Username)
+		s.lockouts.Fail(lockKey)
 		s.audit.Log("login_failed", trunc(req.Username, 64), ip, "")
 		time.Sleep(300 * time.Millisecond)
 		jsonError(w, http.StatusUnauthorized, "invalid username or password")
@@ -155,7 +159,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"totpRequired": true, "pending": pending})
 		return
 	}
-	s.lockouts.Success(req.Username)
+	s.lockouts.Success(lockKey)
 	s.startSession(w, r, u.Username)
 }
 
@@ -183,7 +187,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusUnauthorized, "login expired, start again")
 		return
 	}
-	if locked, d := s.lockouts.Locked(pl.user); locked {
+	if locked, d := s.lockouts.Locked(pl.user + "|" + ip); locked {
 		jsonError(w, http.StatusTooManyRequests, fmt.Sprintf("account temporarily locked, try again in %s", d.Round(time.Second)))
 		return
 	}
@@ -200,7 +204,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if !ok {
-		s.lockouts.Fail(pl.user)
+		s.lockouts.Fail(pl.user + "|" + ip)
 		s.audit.Log("totp_failed", pl.user, ip, "")
 		jsonError(w, http.StatusUnauthorized, "invalid code")
 		return
@@ -208,7 +212,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	s.ticketMu.Lock()
 	delete(s.pending, auth.TokenHash(req.Pending))
 	s.ticketMu.Unlock()
-	s.lockouts.Success(pl.user)
+	s.lockouts.Success(pl.user + "|" + ip)
 	s.startSession(w, r, pl.user)
 }
 
@@ -547,9 +551,14 @@ func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *Us
 		})
 		if err == nil {
 			hc.mu.Lock()
-			dh := append([]string(nil), hc.info.Direct.Hashes...)
+			var dh []string
+			if hc.info.Direct != nil {
+				dh = append(dh, hc.info.Direct.Hashes...)
+			}
 			hc.mu.Unlock()
-			resp["direct"] = map[string]any{"url": u, "hashes": dh, "ticket": tok}
+			if len(dh) > 0 {
+				resp["direct"] = map[string]any{"url": u, "hashes": dh, "ticket": tok}
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

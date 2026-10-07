@@ -68,7 +68,8 @@ type Session struct {
 	padGates [4]input.SeqGate
 	padWarn  sync.Once
 
-	stats sessionStats
+	stats  sessionStats
+	onAuth func()
 }
 
 type sessionStats struct {
@@ -103,8 +104,25 @@ func (a *Agent) HandleConn(c transport.Conn, meta SessionMeta) {
 	}
 }
 
+var pendingDirect atomic.Int32
+
 func (s *Session) run() error {
 	defer s.cancel()
+	if s.meta.RequireTicket {
+		// Unauthenticated until the hello's ticket checks out: cap how many
+		// such sessions may wait at once.
+		if pendingDirect.Add(1) > 8 {
+			pendingDirect.Add(-1)
+			return errors.New("too many pending direct sessions")
+		}
+		authed := false
+		defer func() {
+			if !authed {
+				pendingDirect.Add(-1)
+			}
+		}()
+		s.onAuth = func() { authed = true; pendingDirect.Add(-1) }
+	}
 	// Streams arrive in any order; dispatch by their first byte.
 	ctrlCh := make(chan transport.BidiStream, 1)
 	go s.acceptStreams(ctrlCh)
@@ -135,6 +153,9 @@ func (s *Session) run() error {
 			return fmt.Errorf("direct ticket: %w", err)
 		}
 		s.meta.User = user
+		if s.onAuth != nil {
+			s.onAuth()
+		}
 	}
 	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80))
 

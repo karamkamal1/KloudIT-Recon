@@ -431,7 +431,7 @@ function toggleMouseMode() {
 
 function onCursorShape(shape) {
   const cur = S.cursor;
-  if (shape.png) cur.cache.set(shape.id, { url: `data:image/png;base64,${shape.png}`, hotX: shape.hotX, hotY: shape.hotY, w: shape.w, h: shape.h });
+  if (shape.png && /^[A-Za-z0-9+/]+=*$/.test(shape.png) && shape.png.length < 400000) cur.cache.set(shape.id, { url: `data:image/png;base64,${shape.png}`, hotX: shape.hotX, hotY: shape.hotY, w: shape.w, h: shape.h });
   cur.visible = !shape.hidden;
   if (!shape.hidden) cur.current = cur.cache.get(shape.id) || cur.current;
   applyCursor();
