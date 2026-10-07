@@ -1,0 +1,82 @@
+name: quic-go upstream
+
+# third_party/quic-go is quic-go + third_party/quic-go.patch (see third_party/README.md).
+# Weekly: rebase the patch onto the latest quic-go release and run the tests, so a
+# release that breaks the patch makes this workflow fail. On changes to
+# third_party/: check that the vendored tree is the release + the patch.
+on:
+  schedule:
+    - cron: "23 4 * * 1" # Mondays 04:23 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: quic-go version to rebase onto (e.g. v0.64.0)
+        default: latest
+  push:
+    paths: ["third_party/**", ".github/workflows/quic-go-upstream.yml"]
+  pull_request:
+    paths: ["third_party/**", ".github/workflows/quic-go-upstream.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  vendored:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: third_party/quic-go is the release + quic-go.patch
+        run: third_party/update-quic-go.sh --check
+      - name: Upstream tests of the patched packages
+        working-directory: third_party/quic-go
+        run: |
+          go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/...
+          go test -run TestConfig .
+
+  upstream:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install FFmpeg (software encoders for the test host)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Rebase quic-go.patch onto the release
+        env:
+          VERSION: ${{ inputs.version || 'latest' }}
+        run: third_party/update-quic-go.sh "$VERSION"
+      - name: Vet (Linux + Windows)
+        run: |
+          go vet ./...
+          GOOS=windows go vet ./...
+      - name: Unit + integration tests
+        run: go test -timeout 10m ./...
+      - name: Upstream tests of the patched packages
+        working-directory: third_party/quic-go
+        run: |
+          go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/...
+          go test -run TestConfig .
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### quic-go $(sed -n 's/^Version: //p' third_party/quic-go/NOTICE) + quic-go.patch"
+            echo '```'
+            git status --short -- go.mod go.sum third_party | head -n 50
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-go-rebased-patch
+          path: |
+            third_party/quic-go.patch
+            third_party/quic-go/NOTICE
+            go.mod
+            go.sum

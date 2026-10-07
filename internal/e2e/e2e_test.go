@@ -95,7 +95,7 @@ func (e *env) do(method, path string, body any, out any) error {
 	return nil
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not installed")
 	}
@@ -161,6 +161,9 @@ func setup(t *testing.T) *env {
 	cfg.DirectPort = freePort(t)
 	cfg.DirectAddr = "127.0.0.1"
 	cfg.Encoder = "libx264"
+	for _, o := range hostOpts {
+		o(cfg)
+	}
 	agent, err := host.NewAgent(ctx, cfg, log.With("c", "host"))
 	if err != nil {
 		t.Fatal(err)
@@ -515,4 +518,27 @@ func TestStreamingPaths(t *testing.T) {
 			_ = c // cookie attributes are not exposed by the jar; checked via Set-Cookie below
 		}
 	})
+}
+
+// Host config "congestion": "media": the direct server and the relay data
+// connection run the media congestion controller.
+func TestStreamingMediaCongestion(t *testing.T) {
+	e := setup(t, func(c *host.Config) { c.Congestion = transport.CongestionMedia })
+	for _, path := range []string{"relay", "direct"} {
+		t.Run(path, func(t *testing.T) {
+			tk := e.connectInfo()
+			var r result
+			if path == "relay" {
+				r = runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 3*time.Second)
+			} else if tk.Direct != nil {
+				r = runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3*time.Second)
+			} else {
+				t.Fatal("no direct path offered")
+			}
+			t.Logf("%s: %+v", path, r)
+			if !r.welcome || r.frames < 100 || r.keyframes < 1 || r.audio < 100 {
+				t.Fatalf("unexpected result %+v", r)
+			}
+		})
+	}
 }

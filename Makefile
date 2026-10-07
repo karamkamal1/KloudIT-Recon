@@ -22,10 +22,13 @@ windows:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o $(DIST)/windows/recon-hostw.exe ./cmd/recon-host
 	cp deploy/windows/*.ps1 $(DIST)/windows/
 
+# third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests
+# of the packages third_party/quic-go.patch changes.
 test:
 	$(GO) vet ./...
 	GOOS=windows $(GO) vet ./...
 	$(GO) test ./...
+	cd third_party/quic-go && $(GO) test ./internal/ackhandler/... ./internal/congestion/... ./congestion/...
 
 e2e: build
 	node test/e2e/browser.mjs

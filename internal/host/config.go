@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
 
 // Config is persisted as JSON (see DefaultConfigPath).
@@ -27,6 +29,7 @@ type Config struct {
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
+	Congestion string `json:"congestion,omitempty"` // QUIC congestion control of video connections: reno | media ("" = default)
 
 	DefaultKbps int  `json:"defaultKbps"`
 	MaxKbps     int  `json:"maxKbps"`
@@ -110,8 +113,21 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	c.Defaults()
+	if !transport.ValidCongestion(c.Congestion) {
+		return nil, fmt.Errorf("%s: congestion must be %q or %q, not %q", path, transport.CongestionReno, transport.CongestionMedia, c.Congestion)
+	}
 	c.path = path
 	return c, nil
+}
+
+// congestion returns the congestion controller for the direct server and the
+// relay data connections. The default stays empty in the file, so a later
+// release can change it.
+func (c *Config) congestion() string {
+	if c.Congestion == "" {
+		return transport.CongestionReno
+	}
+	return c.Congestion
 }
 
 // Save writes the config with owner-only permissions (it contains the host token).

@@ -1,0 +1,12 @@
+This directory is a modified copy of github.com/quic-go/quic-go (MIT License,
+see LICENSE), used through a replace directive in the repository's go.mod.
+
+Upstream: https://github.com/quic-go/quic-go
+Version: v0.63.0
+Commit: 9d085cc690f7c96451e8ae5659eb0e64671da47a
+
+Modifications: ../quic-go.patch (a pluggable congestion controller:
+quic.Config.Congestion, (*quic.Conn).CongestionControl and the public package
+github.com/quic-go/quic-go/congestion). Edit the files here, then run
+../update-quic-go.sh --diff to refresh the patch; ../update-quic-go.sh <version>
+moves to another upstream release. See ../README.md.

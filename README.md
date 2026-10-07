@@ -277,6 +277,7 @@ The new password (at least 10 characters) is read from stdin.
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
 | `directAddr` | auto | Address to advertise for the direct path |
+| `congestion` | `reno` | QUIC congestion control of the video connections (direct path and relay data connection): `reno` (quic-go default) or `media` (paces at 1.2 × the video bitrate and does not halve its window on a single loss; experimental) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
@@ -330,7 +331,8 @@ Repository layout:
 | `cmd/recon-gateway`, `cmd/recon-host` | The two programs' entry points |
 | `internal/gateway` | Web server, accounts/2FA, API, relay, Wake-on-LAN, TLS |
 | `internal/host` | PC agent: sessions, direct path, gateway tunnel; `media/` (FFmpeg, audio), `input/` (SendInput), `platform/` (monitors, cursor, ViGEm) |
-| `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters, NUT demuxer, codec strings |
+| `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters (`transport/cc`: media congestion controller), NUT demuxer, codec strings |
+| `third_party/quic-go` | quic-go with a pluggable congestion-control hook (`go.mod` replace; see `third_party/README.md`) |
 | `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |
 | `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline) |
 | `deploy/` | Proxmox, Linux, Docker and Windows installers |

@@ -11,6 +11,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/webtransport-go"
+
+	"github.com/karamkamal1/kloudit-recon/internal/transport/cc"
 )
 
 // Error codes used when cancelling streams / closing sessions.
@@ -132,10 +134,20 @@ func (q quicConn) RemoteAddr() net.Addr     { return q.c.RemoteAddr() }
 // ---------------------------------------------------------------------------
 // WebTransport
 
-type wtConn struct{ s *webtransport.Session }
+type wtConn struct {
+	s  *webtransport.Session
+	qc *quic.Conn // carrying connection, if known
+}
 
 // FromWebTransport wraps a WebTransport session.
-func FromWebTransport(s *webtransport.Session) Conn { return wtConn{s} }
+func FromWebTransport(s *webtransport.Session) Conn { return wtConn{s: s} }
+
+// FromWebTransportOver wraps a WebTransport session and remembers the QUIC
+// connection carrying it (QUICConnFromContext), so MediaControl can reach the
+// connection's congestion controller.
+func FromWebTransportOver(s *webtransport.Session, qc *quic.Conn) Conn {
+	return wtConn{s: s, qc: qc}
+}
 
 type wtBidi struct{ s *webtransport.Stream }
 
@@ -199,11 +211,69 @@ func (w wtConn) Close(code uint32, msg string) error {
 func (w wtConn) Context() context.Context { return w.s.Context() }
 func (w wtConn) RemoteAddr() net.Addr     { return w.s.RemoteAddr() }
 
+// Congestion controllers, selected per listener or dialer with WithCongestion
+// (host config "congestion").
+const (
+	CongestionReno  = "reno"  // quic-go's default NewReno
+	CongestionMedia = "media" // cc.Media: paces at the video target bitrate
+)
+
+// ValidCongestion reports whether name selects a congestion controller ("" is reno).
+func ValidCongestion(name string) bool {
+	return name == "" || name == CongestionReno || name == CongestionMedia
+}
+
+// A QUICOption adjusts QUICConfig.
+type QUICOption func(*quic.Config)
+
+// WithCongestion selects the congestion controller (CongestionReno or
+// CongestionMedia; anything else is reno).
+func WithCongestion(name string) QUICOption {
+	return func(c *quic.Config) {
+		c.Congestion = nil
+		if name == CongestionMedia {
+			c.Congestion = cc.MediaFactory
+		}
+	}
+}
+
+// MediaControl returns the media congestion controller of c's current path,
+// or nil if c uses another controller. A path migration replaces the
+// controller, so call it for every update instead of keeping the result.
+func MediaControl(c Conn) *cc.Media {
+	var qc *quic.Conn
+	switch c := c.(type) {
+	case quicConn:
+		qc = c.c
+	case wtConn:
+		qc = c.qc
+	}
+	if qc == nil {
+		return nil
+	}
+	m, _ := qc.CongestionControl().(*cc.Media)
+	return m
+}
+
+type quicConnKey struct{}
+
+// WithQUICConn is an http3.Server ConnContext hook that makes the QUIC
+// connection of a request available through QUICConnFromContext.
+func WithQUICConn(ctx context.Context, c *quic.Conn) context.Context {
+	return context.WithValue(ctx, quicConnKey{}, c)
+}
+
+// QUICConnFromContext returns the QUIC connection stored by WithQUICConn, or nil.
+func QUICConnFromContext(ctx context.Context) *quic.Conn {
+	c, _ := ctx.Value(quicConnKey{}).(*quic.Conn)
+	return c
+}
+
 // QUICConfig returns tuned settings for media connections: large flow-control
 // windows (an IDR frame at high bitrate can be several MB), datagrams and
 // keep-alives.
-func QUICConfig() *quic.Config {
-	return &quic.Config{
+func QUICConfig(opts ...QUICOption) *quic.Config {
+	c := &quic.Config{
 		MaxIdleTimeout:                   20 * time.Second,
 		KeepAlivePeriod:                  5 * time.Second,
 		InitialStreamReceiveWindow:       4 << 20,
@@ -215,4 +285,8 @@ func QUICConfig() *quic.Config {
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true,
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }

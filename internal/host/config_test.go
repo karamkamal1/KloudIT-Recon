@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,5 +55,33 @@ func TestReloadPairing(t *testing.T) {
 	_ = os.Chtimes(p, later, later)
 	if !a.reloadPairing() || a.pair().Token != "tok2" {
 		t.Fatalf("re-pair not picked up: %+v", a.pair())
+	}
+}
+
+func TestConfigCongestion(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load(`{}`)
+	if err != nil || c.congestion() != "reno" {
+		t.Fatalf("default: %v %q", err, c.congestion())
+	}
+	// The default is not written back, so a later release can change it.
+	if err := c.Save(filepath.Join(dir, "saved.json")); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "saved.json")); strings.Contains(string(b), "congestion") {
+		t.Fatalf("default congestion saved: %s", b)
+	}
+	if c, err := load(`{"congestion":"media"}`); err != nil || c.congestion() != "media" {
+		t.Fatalf("media: %v", err)
+	}
+	if _, err := load(`{"congestion":"bbr"}`); err == nil {
+		t.Fatal("unknown congestion controller accepted")
 	}
 }

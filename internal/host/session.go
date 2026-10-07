@@ -444,7 +444,18 @@ func (s *Session) startVideo(urgent bool, reason string) error {
 	if reason != "" {
 		s.log.Info("restarting video", "reason", reason, "urgent", urgent)
 	}
+	s.setCongestionTarget(p)
 	return s.video.Start(p, urgent)
+}
+
+// setCongestionTarget hands the encoder's bitrate and frame rate to the media
+// congestion controller (host config "congestion": "media"), which paces at
+// 1.2 × the bitrate. A no-op with reno.
+func (s *Session) setCongestionTarget(p media.Params) {
+	if m := transport.MediaControl(s.c); m != nil && p.FPS > 0 {
+		m.SetTarget(int64(p.BitrateKbps)*1000, time.Second/time.Duration(p.FPS))
+		s.log.Debug("media congestion control", "target_kbps", p.BitrateKbps, "fps", p.FPS)
+	}
 }
 
 func (s *Session) videoEvents() {
