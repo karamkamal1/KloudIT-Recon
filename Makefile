@@ -27,9 +27,11 @@ test:
 	$(GO) vet ./...
 	GOOS=windows $(GO) vet ./...
 	$(GO) test ./...
+	python3 -m unittest discover -s tools/latency-rig/test
 
 e2e: build
 	node test/e2e/browser.mjs
+	node tools/latency-rig/test/flash_smoke.mjs
 
 release: clean
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/gateway-linux-amd64/recon-gateway ./cmd/recon-gateway

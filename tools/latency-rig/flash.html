@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recon latency flash</title>
+<!--
+  Host test page for the click-to-photon rig (docs/LATENCY_RIG.md).
+  Open it on the HOST in a browser, fullscreen. The whole screen is black and
+  turns white while any mouse button or key is held (mousedown/keydown), black
+  again on release. Self-contained: no network, works from file://.
+
+  Query options:
+    ?mode=canvas  (default) full-screen 2D canvas with desynchronized: true
+                  (low-latency path; falls back to css when unsupported)
+    ?mode=css     change the page background colour instead
+    ?bare=1       skip the instructions overlay
+  window.flashState exposes {mode, white, presses, releases, lastDispatchMs}
+  for automation; nothing is drawn over the flash area while measuring.
+-->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  body.white { background: #fff; }
+  body.measuring { cursor: none; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #help {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #000; color: #ccc; font: 16px/1.5 system-ui, sans-serif; z-index: 1;
+  }
+  #help[hidden] { display: none; }
+  #help div { max-width: 40em; padding: 1em; }
+  #help h1 { font-size: 20px; color: #fff; margin: 0 0 .5em; }
+  #help button { font: inherit; padding: .4em 1.2em; margin-right: .5em; }
+  #help code { color: #fff; }
+</style>
+</head>
+<body>
+<div id="help">
+  <div>
+    <h1>Recon latency flash page</h1>
+    <p>This screen turns <b>white</b> while a mouse button or key is held and
+       <b>black</b> on release. Put the host-monitor sensor on it, start the
+       stream on the client, then press <b>Start</b> (or any key / click
+       outside the buttons). The cursor is hidden while measuring.</p>
+    <p>Mode: <code id="mode"></code>. Use <code>?mode=css</code> or
+       <code>?mode=canvas</code> to switch, <code>?bare=1</code> to skip this text.</p>
+    <p><button id="fs" type="button">Start fullscreen</button>
+       <button id="start" type="button">Start</button></p>
+  </div>
+</div>
+<script>
+'use strict';
+(() => {
+  const params = new URLSearchParams(location.search);
+  const help = document.getElementById('help');
+  const state = { mode: 'css', white: false, presses: 0, releases: 0, lastDispatchMs: null };
+  window.flashState = state;
+
+  let ctx = null;
+  let canvas = null;
+  if (params.get('mode') !== 'css') {
+    canvas = document.createElement('canvas');
+    // desynchronized: the browser may scan out the canvas without waiting for
+    // the compositor (front-buffer / overlay), which shortens the host's own
+    // share of the measurement. alpha: false lets it use an opaque overlay.
+    ctx = canvas.getContext('2d', { desynchronized: true, alpha: false });
+    if (ctx) {
+      document.body.prepend(canvas);
+      const attrs = ctx.getContextAttributes ? ctx.getContextAttributes() : {};
+      state.mode = attrs.desynchronized ? 'canvas-desynchronized' : 'canvas';
+    } else {
+      canvas = null;
+    }
+  }
+  document.getElementById('mode').textContent = state.mode;
+
+  function size() {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(innerWidth * dpr));
+    canvas.height = Math.max(1, Math.round(innerHeight * dpr));
+    paint();
+  }
+
+  function paint() {
+    const color = state.white ? '#fff' : '#000';
+    if (ctx) {
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    document.body.classList.toggle('white', state.white);
+  }
+
+  // Everything held right now ("mouse:0", "key:KeyA", ...): white while non-empty,
+  // so overlapping presses and auto-repeat do not flicker.
+  const held = new Set();
+  function press(id, ev) {
+    if (held.has(id)) return;
+    held.add(id);
+    state.presses++;
+    state.lastDispatchMs = performance.now() - ev.timeStamp;
+    if (!state.white) { state.white = true; paint(); }
+  }
+  function release(id) {
+    if (!held.delete(id)) return;
+    state.releases++;
+    if (held.size === 0 && state.white) { state.white = false; paint(); }
+  }
+  function releaseAll() {
+    held.clear();
+    if (state.white) { state.white = false; paint(); }
+  }
+
+  function start() {
+    if (help.hidden) return;
+    help.hidden = true;
+    document.body.classList.add('measuring');
+    if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {});
+  }
+
+  document.getElementById('fs').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const el = document.documentElement;
+    const req = el.requestFullscreen ? el.requestFullscreen({ navigationUI: 'hide' }) : null;
+    if (req && req.catch) req.catch(() => {});
+    start();
+  });
+  document.getElementById('start').addEventListener('click', (e) => { e.stopPropagation(); start(); });
+
+  const opts = { capture: true, passive: false };
+  const onHelpButton = (ev) => !help.hidden && ev.target instanceof Element && ev.target.closest('button');
+  // Pointer events fire first for mouse, pen and touch; the mouse events are a
+  // fallback for browsers without them (ids dedupe the pair).
+  const down = (ev) => {
+    if (onHelpButton(ev)) return;
+    start();
+    press('mouse:' + (ev.button || 0), ev);
+  };
+  const up = (ev) => release('mouse:' + (ev.button || 0));
+  if (window.PointerEvent) {
+    addEventListener('pointerdown', down, opts);
+    addEventListener('pointerup', up, opts);
+    addEventListener('pointercancel', releaseAll, opts);
+  }
+  addEventListener('mousedown', down, opts);
+  addEventListener('mouseup', up, opts);
+  addEventListener('keydown', (ev) => {
+    if (ev.repeat) return;
+    // Leave the browser's own keys alone so the page can be left again.
+    if (ev.key !== 'Escape' && ev.key !== 'F11') ev.preventDefault();
+    start();
+    press('key:' + (ev.code || ev.key), ev);
+  }, opts);
+  addEventListener('keyup', (ev) => release('key:' + (ev.code || ev.key)), opts);
+  addEventListener('contextmenu', (ev) => ev.preventDefault(), opts);
+  addEventListener('blur', releaseAll);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+  addEventListener('resize', size);
+
+  if (params.get('bare') === '1') start();
+  size();
+  paint();
+})();
+</script>
+</body>
+</html>
