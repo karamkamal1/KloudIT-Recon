@@ -43,6 +43,25 @@ jobs:
           path: test/e2e/results/
           if-no-files-found: ignore
 
+  # Native encoder helper (native/recon-encoder) built with MSVC, and its Go client
+  # tested natively against it. No GPU on the runner: mock backend only.
+  helper-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build recon-encoder.exe (MSVC)
+        run: |
+          cmake -S native/recon-encoder -B build/recon-encoder -A x64
+          cmake --build build/recon-encoder --config Release --parallel
+      - name: Helper integration tests (mock backend)
+        run: |
+          $env:RECON_HELPER_EXE = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
+          & $env:RECON_HELPER_EXE --print-caps
+          go test -count=1 -v ./internal/host/encoder
+
   release-binaries:
     runs-on: ubuntu-24.04
     needs: test
@@ -53,8 +72,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install mingw-w64 (recon-encoder.exe cross build)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mingw-w64 cmake
       - name: Build release bundles
-        run: make release
+        run: make release HELPER_REQUIRED=1
       - uses: actions/upload-artifact@v4
         with:
           name: kloudit-recon-binaries

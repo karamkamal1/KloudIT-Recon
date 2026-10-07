@@ -140,7 +140,8 @@ contains:
 - `kloudit-recon-<version>-host-windows-amd64.zip`: the PC agent and its PowerShell installer
 - `SHA256SUMS`
 
-To build them yourself (needs Go 1.26+, `zip`): `make release`. The output goes to `dist/`.
+To build them yourself (needs Go 1.26+, `zip`; mingw-w64 and cmake for the optional
+`recon-encoder.exe` helper): `make release`. The output goes to `dist/`.
 
 ### 1. Gateway on Proxmox (LXC)
 
@@ -333,6 +334,7 @@ Repository layout:
 | `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters, NUT demuxer, codec strings |
 | `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |
 | `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline) |
+| `native/recon-encoder`, `internal/host/encoder` | Native capture/encode helper (C++, in progress) and its Go client; see `docs/HELPER_PROTOCOL.md` |
 | `deploy/` | Proxmox, Linux, Docker and Windows installers |
 | `test/e2e`, `internal/e2e` | Browser end-to-end test; Go integration test (gateway + agent) |
 
@@ -341,6 +343,8 @@ make test        # go vet (linux + windows) and all Go tests (needs ffmpeg in PA
 make build       # dist/recon-gateway, dist/recon-host (Linux host = test pattern + logged input)
 make e2e         # real gateway + host + headless Chromium (npm i in test/e2e first)
 make release     # all bundles + SHA256SUMS
+make helper      # dist/windows/recon-encoder.exe (needs mingw-w64 + cmake; skipped without them)
+make helper-test # helper integration tests under Wine (WINE=path/to/wine64)
 ```
 
 On Linux the host agent streams a test pattern (`capture: test`) or an X11 display
