@@ -50,8 +50,10 @@ func main() {
 	flag.Var(&names, "name", "extra DNS name or IP for the generated certificate (repeatable)")
 	flag.Var(&proxies, "trust-proxy", "CIDR of a reverse proxy whose X-Forwarded-For is trusted (repeatable)")
 	flag.Parse()
-	if v := os.Getenv("RECON_NAMES"); v != "" {
-		names = append(names, strings.Split(v, ",")...)
+	for _, n := range strings.Split(os.Getenv("RECON_NAMES"), ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			names = append(names, n)
+		}
 	}
 
 	level := slog.LevelInfo

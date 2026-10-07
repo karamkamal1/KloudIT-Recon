@@ -1,0 +1,58 @@
+package host
+
+import (
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestLoadConfigAcceptsBOM(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "host.json")
+	// Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes a byte-order mark.
+	if err := os.WriteFile(p, []byte("\xef\xbb\xbf{\"name\":\"PC\",\"directPort\":1234}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Name != "PC" || c.DirectPort != 1234 {
+		t.Fatalf("got name %q port %d", c.Name, c.DirectPort)
+	}
+}
+
+func TestReloadPairing(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "host.json")
+	c, err := LoadConfig(p) // missing file: unpaired defaults
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{cfg: c, log: slog.New(slog.NewTextHandler(io.Discard, nil)), pairing: pairingOf(c)}
+	if a.reloadPairing() {
+		t.Fatal("no file yet, but reported a change")
+	}
+	c2 := *c
+	c2.Gateway, c2.GatewayPin, c2.HostID, c2.Token = "192.0.2.1:8443", "pin", "h1", "tok"
+	if err := c2.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if !a.reloadPairing() || a.pair().Token != "tok" || a.pair().Gateway != "192.0.2.1:8443" {
+		t.Fatalf("pairing not picked up: %+v", a.pair())
+	}
+	if a.reloadPairing() {
+		t.Fatal("unchanged file reported as a change")
+	}
+	c2.Token = "tok2"
+	if err := c2.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	// Make sure the mtime differs even on coarse-grained filesystems.
+	later := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(p, later, later)
+	if !a.reloadPairing() || a.pair().Token != "tok2" {
+		t.Fatalf("re-pair not picked up: %+v", a.pair())
+	}
+}

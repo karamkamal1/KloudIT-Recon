@@ -141,9 +141,15 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	}
 	s.routes()
 	if store.UserCount() == 0 {
-		s.setupTok = auth.RandomToken(18)
+		// Keep the token across restarts until it is used, so the one the
+		// installer printed stays valid.
 		tokPath := filepath.Join(cfg.DataDir, "setup-token.txt")
-		_ = os.WriteFile(tokPath, []byte(s.setupTok+"\n"), 0o600)
+		if b, err := os.ReadFile(tokPath); err == nil && len(strings.TrimSpace(string(b))) >= 16 {
+			s.setupTok = strings.TrimSpace(string(b))
+		} else {
+			s.setupTok = auth.RandomToken(18)
+			_ = os.WriteFile(tokPath, []byte(s.setupTok+"\n"), 0o600)
+		}
 		log.Warn("FIRST RUN: open the web UI and create the admin account with this setup token",
 			"setup_token", s.setupTok, "also_saved_to", tokPath)
 	}

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -65,6 +66,7 @@ func main() {
 		}
 		defer f.Close()
 		out = tolerantMulti{f, os.Stderr}
+		errOut = out // the background build has no console: errors must reach the log
 	}
 	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
 
@@ -91,7 +93,7 @@ func main() {
 		if err := cfg.Save(*cfgPath); err != nil {
 			fatal(err)
 		}
-		fmt.Printf("Paired as %q with gateway %s.\nConfig saved to %s\nStart the agent with: recon-host run\n", cfg.Name, cfg.Gateway, *cfgPath)
+		fmt.Printf("Paired as %q with gateway %s.\nConfig saved to %s\nA running agent picks this up within a few seconds; otherwise start it (Start-ScheduledTask 'KloudIT Recon Host', or recon-host run).\n", cfg.Name, cfg.Gateway, *cfgPath)
 	case "probe":
 		cfg, err := host.LoadConfig(*cfgPath)
 		if err != nil {
@@ -102,10 +104,21 @@ func main() {
 			fatal(fmt.Errorf("ffmpeg not found: %w", err))
 		}
 		caps, err := media.Probe(context.Background(), ff, log)
+		if caps == nil {
+			fatal(fmt.Errorf("cannot run %s: %w", ff, err))
+		}
 		fmt.Printf("ffmpeg:     %s\n            %s\n", ff, caps.Version)
 		fmt.Printf("capture:    ddagrab=%v gfxcapture=%v\n", caps.Filters["ddagrab"], caps.Filters["gfxcapture"])
 		for _, e := range caps.Encoders {
 			fmt.Printf("encoder:    %-12s %-5s %s\n", e.Name, e.Family, e.Vendor)
+		}
+		rejected := make([]string, 0, len(caps.Rejected))
+		for name := range caps.Rejected {
+			rejected = append(rejected, name)
+		}
+		sort.Strings(rejected)
+		for _, name := range rejected {
+			fmt.Printf("unusable:   %-12s %s\n", name, caps.Rejected[name])
 		}
 		if err != nil {
 			fmt.Println("error:", err)
@@ -157,7 +170,9 @@ func (t tolerantMulti) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+var errOut io.Writer = os.Stderr
+
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "error:", err)
+	fmt.Fprintln(errOut, "error:", err)
 	os.Exit(1)
 }

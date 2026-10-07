@@ -126,57 +126,74 @@ Security model: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Quick start
 
+The full walkthrough, with every command, what success looks like and what to do when a step
+fails, is in **[docs/INSTALL.md](docs/INSTALL.md)**. The short version:
+
 ### 0. Get the binaries
 
-Every push builds release bundles in GitHub Actions (**Actions → ci → Artifacts →
-`kloudit-recon-binaries`**):
+Every push builds release bundles in GitHub Actions. Sign in to GitHub, open **Actions → ci →**
+the newest green run **→ Artifacts → `kloudit-recon-binaries`** (not `e2e-results`). The zip
+contains:
 
-- `kloudit-recon-*-gateway-linux-amd64.tar.gz` (or `-arm64`): the gateway plus install scripts
-- `kloudit-recon-*-host-windows-amd64.zip`: the host agent plus the PowerShell installer
+- `kloudit-recon-<version>-gateway-linux-amd64.tar.gz`: the gateway and its install scripts
+  (Proxmox nodes are amd64; the `-arm64` tarball is for ARM boards)
+- `kloudit-recon-<version>-host-windows-amd64.zip`: the PC agent and its PowerShell installer
+- `SHA256SUMS`
 
 To build them yourself (needs Go 1.26+, `zip`): `make release`. The output goes to `dist/`.
 
 ### 1. Gateway on Proxmox (LXC)
 
-Copy the gateway tarball to your Proxmox node and run this as root:
+Copy the gateway tarball to the Proxmox node **without extracting it on Windows** (that loses
+the execute bits), for example from PowerShell on your PC:
+`scp (Get-Item .\kloudit-recon-*-gateway-linux-amd64.tar.gz).Name root@<proxmox-ip>:/root/`.
+Then, in the node's shell (web UI → your node → **>_ Shell**):
 
 ```bash
-tar xzf kloudit-recon-*-gateway-linux-amd64.tar.gz
-cd gateway-linux-amd64
-./create-lxc.sh --binary ./recon-gateway            # options: --ctid --storage --bridge --ip --port
+cd /root && tar xzf kloudit-recon-*-gateway-linux-amd64.tar.gz && cd gateway-linux-amd64
+./create-lxc.sh --ctid 210 --ip 192.168.1.50/24,gw=192.168.1.1   # a free LAN address; or --ip dhcp
 ```
 
 This creates a small unprivileged Debian 12 container (1 core, 512 MB) with the gateway
-running as a hardened systemd service. It then prints the URL and a **one-time setup token**.
+running as a hardened systemd service. It prints the URL and a **one-time setup token**.
+Use a static IP (or a DHCP reservation): paired PCs remember the gateway's address.
+Other options: `--storage`, `--bridge`, `--port`, `--name`; upgrade later with
+`./create-lxc.sh --upgrade 210` from a newer bundle (settings are kept).
 
 Other ways to install:
 - **Existing LXC/VM** (Debian/Ubuntu): `sudo ./install-gateway.sh --binary ./recon-gateway`
-- **Docker**: `docker compose -f deploy/docker/docker-compose.yml up -d` (host networking, so
-  Wake-on-LAN broadcasts reach your LAN)
+- **Docker** (builds from source): `git clone https://github.com/karamkamal1/KloudIT-Recon.git &&
+  cd KloudIT-Recon && docker compose -f deploy/docker/docker-compose.yml up -d --build` (host
+  networking, so Wake-on-LAN broadcasts reach your LAN). The setup token is in
+  `docker compose -f deploy/docker/docker-compose.yml logs`.
 
 ### 2. First login
 
-Open `https://<gateway-ip>:8443`. The gateway uses its own private CA. Accept the warning once,
-or download **ca.crt** from the dashboard and install it as a trusted root on your devices.
-Then enter the setup token, which is printed by the installer and stored in
-`/var/lib/kloudit-recon/setup-token.txt` until it's used, and create your admin account. Enable
-2FA under **Account**.
+Open `https://<gateway-ip>:8443` (with `https://`). The gateway uses its own private CA: accept
+the warning once, or download **ca.crt** from the dashboard and install it as a trusted root on
+your devices. Enter the setup token (it stays valid until used; it's also in
+`/var/lib/kloudit-recon/setup-token.txt`, e.g. `pct exec 210 -- cat /var/lib/kloudit-recon/setup-token.txt`),
+create your admin account, then enable 2FA under **Account**.
 
 ### 3. Add your gaming PC
 
-In the dashboard, click **+ Add a PC**, give it a name, and copy the pairing command. Then, on the
-PC, run an **elevated PowerShell** in the unzipped host bundle:
+Open the dashboard **from the gaming PC** using the gateway's LAN IP (the pairing code
+remembers the address you browse with). Click **+ Add a PC**, give it a name, and click
+**Copy**. Then, signed in to Windows as the user who plays, open **PowerShell as
+administrator**, `cd` into the unzipped `host-windows-amd64` folder and paste the copied command:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -PairingCode "recon1:..." -InstallViGEm
 ```
 
 The installer:
-- downloads FFmpeg (SHA-256 verified)
+- downloads FFmpeg (an FFmpeg 8 release build, SHA-256 verified)
 - pairs the agent with your gateway
 - registers a hidden **logon task** with highest privileges, so input reaches elevated games
-- opens UDP 47998 for the direct path on Private networks only
+- opens UDP 47998 for the direct path on Private networks only (it warns if your network is
+  set to Public)
 - installs ViGEmBus for controller support (`-InstallViGEm`)
+- starts the agent and checks that it reaches the gateway, and warns if no GPU encoder works
 
 The pairing dialog in the dashboard turns green when the PC connects.
 
@@ -184,7 +201,7 @@ The pairing dialog in the dashboard turns green when the PC connects.
 
 Click **Connect**, then **Start streaming**. Click into the picture, press
 **Ctrl+Alt+Shift+F** for fullscreen with keyboard lock, and **Ctrl+Alt+Shift+M** for game
-(raw mouse) mode.
+(raw mouse) mode. Chrome or Edge give the best experience (keyboard lock, WebTransport).
 
 ---
 
@@ -231,14 +248,24 @@ untouched, so you keep WebTransport and the direct path. Other options:
 |---|---|---|
 | `-listen` (`RECON_LISTEN`) | `:8443` | TCP (HTTPS/WSS) **and** UDP (HTTP/3, WebTransport, host tunnels) |
 | `-data` (`RECON_DATA`) | `./data` | State, keys, audit log (`/var/lib/kloudit-recon` when installed) |
-| `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP) |
+| `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP); the container's IPs and hostname are always included |
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
-| `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | Address the PCs dial (written into pairing codes) |
+| `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
 | `-trust-proxy` | none | CIDR of a reverse proxy whose `X-Forwarded-For` is trusted |
 
-Account recovery, with the gateway stopped:
-`recon-gateway -data /var/lib/kloudit-recon user passwd <name>` (the password is read from stdin)
-or `user reset-2fa <name>`.
+On a Linux/LXC install the settings live in `/etc/kloudit-recon/gateway.env` (one
+`RECON_...=value` per line; `systemctl restart recon-gateway` after editing). Re-running the
+installer keeps them.
+
+Account recovery, as root on the gateway (in Proxmox: `pct enter 210`):
+
+```bash
+systemctl stop recon-gateway
+recon-gateway -data /var/lib/kloudit-recon user passwd <name>     # or: user reset-2fa <name>
+systemctl start recon-gateway
+```
+
+The new password (at least 10 characters) is read from stdin.
 
 **Host** (`%APPDATA%\KlouditRecon\host.json`):
 
@@ -254,11 +281,22 @@ or `user reset-2fa <name>`.
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8+ recommended) |
 
-Run `recon-host.exe probe` to see the detected encoders, capture backends, monitors and gamepad
-support.
+Edit `host.json` with Notepad (it must stay UTF-8 without a byte-order mark), then restart the
+agent: `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`.
+
+Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the detected encoders
+(and why any GPU encoder is unusable), capture backends, monitors and gamepad support. Flags go
+before the command: `recon-host.exe -v probe`.
 
 ## Troubleshooting
 
+- **The PC stays offline.** Look at `%APPDATA%\KlouditRecon\host.log`. `dial ...: timeout`
+  means UDP 8443 from the PC to the gateway is blocked or the pairing code holds an address the PC
+  can't reach (create codes while browsing via the gateway's LAN IP). `rejected registration`
+  means the PC was re-paired: paste the new pairing command.
+- **Video is choppy or latency is high, and the overlay shows a CPU encoder (x264/SVT-AV1).**
+  No GPU encoder works. Run `probe` (above): the `unusable:` lines give the reason, usually an
+  outdated GPU driver. Update it and restart the agent.
 - **The browser always uses WebSocket.** UDP 8443 is blocked between the browser and the
   gateway, or your browser lacks WebTransport. Check your firewall, port forwarding or proxy.
 - **The direct path is never used.** Allow UDP 47998 on the PC (the installer adds a
@@ -273,7 +311,7 @@ support.
   `recon-host.exe probe`.
 - **Choppy audio on Wi-Fi.** Raise the jitter buffer in settings (40–60 ms).
 - **Logs**: the PC writes `%APPDATA%\KlouditRecon\host.log`. On the gateway, run
-  `journalctl -u recon-gateway -f`. The browser's overlay (**Ctrl+Alt+Shift+S**) shows the
+  `journalctl -u recon-gateway -f` (from the Proxmox node: `pct exec 210 -- journalctl -u recon-gateway -n 50`). The browser's overlay (**Ctrl+Alt+Shift+S**) shows the
   active path, codec and latency breakdown.
 
 ## Limitations
@@ -285,6 +323,19 @@ support.
 - HDR streams are tone-mapped to SDR by the capture API.
 
 ## Development
+
+Repository layout:
+
+| Path | Contents |
+|---|---|
+| `cmd/recon-gateway`, `cmd/recon-host` | The two programs' entry points |
+| `internal/gateway` | Web server, accounts/2FA, API, relay, Wake-on-LAN, TLS |
+| `internal/host` | PC agent: sessions, direct path, gateway tunnel; `media/` (FFmpeg, audio), `input/` (SendInput), `platform/` (monitors, cursor, ViGEm) |
+| `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters, NUT demuxer, codec strings |
+| `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |
+| `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline) |
+| `deploy/` | Proxmox, Linux, Docker and Windows installers |
+| `test/e2e`, `internal/e2e` | Browser end-to-end test; Go integration test (gateway + agent) |
 
 ```bash
 make test        # go vet (linux + windows) and all Go tests (needs ffmpeg in PATH)

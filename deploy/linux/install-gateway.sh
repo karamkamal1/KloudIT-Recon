@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Install the KloudIT Recon gateway on Debian/Ubuntu (Proxmox LXC, VM or bare metal).
+# Install or upgrade the KloudIT Recon gateway on Debian/Ubuntu (Proxmox LXC, VM or bare metal).
 #
-#   sudo ./install-gateway.sh [--binary ./recon-gateway] [--port 8443] [--name recon.lan] [--name 203.0.113.7]
+#   sudo ./install-gateway.sh [--binary ./recon-gateway] [--port 8443]
+#                             [--name recon.lan --name 203.0.113.7] [--public-addr 192.168.1.50:8443]
 #
 # Without --binary it uses ./recon-gateway next to this script, or builds from
 # the repository this script lives in (installing a Go toolchain if needed).
+# Re-running it upgrades in place and keeps the settings in /etc/kloudit-recon/gateway.env
+# (options given on the command line replace the stored ones).
 set -euo pipefail
 
 BINARY=""
-PORT=8443
+PORT=""
 NAMES=()
 PUBLIC_ADDR=""
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +23,7 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; shift 2 ;;
     --name) NAMES+=("$2"); shift 2 ;;
     --public-addr) PUBLIC_ADDR="$2"; shift 2 ;;
-    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -56,27 +59,46 @@ install -d -m 0755 /opt/kloudit-recon
 install -m 0755 "$BINARY" /opt/kloudit-recon/recon-gateway
 id recon >/dev/null 2>&1 || useradd --system --home-dir /var/lib/kloudit-recon --shell /usr/sbin/nologin recon
 install -d -o recon -g recon -m 0700 /var/lib/kloudit-recon
+ln -sf /opt/kloudit-recon/recon-gateway /usr/local/bin/recon-gateway
+
+# Settings: update only what was passed, keep everything else (upgrades pass nothing).
 install -d -m 0755 /etc/kloudit-recon
-{
-  echo "RECON_LISTEN=:$PORT"
-  if [[ ${#NAMES[@]} -gt 0 ]]; then (IFS=,; echo "RECON_NAMES=${NAMES[*]}"); fi
-  if [[ -n "$PUBLIC_ADDR" ]]; then echo "RECON_PUBLIC_ADDR=$PUBLIC_ADDR"; fi
-} > /etc/kloudit-recon/gateway.env
-chmod 0644 /etc/kloudit-recon/gateway.env
+envf=/etc/kloudit-recon/gateway.env
+touch "$envf"
+set_kv() { { grep -v "^$1=" "$envf" || true; echo "$1=$2"; } > "$envf.new" && mv "$envf.new" "$envf"; }
+if [[ -n "$PORT" ]] || ! grep -q '^RECON_LISTEN=' "$envf"; then set_kv RECON_LISTEN ":${PORT:-8443}"; fi
+if [[ ${#NAMES[@]} -gt 0 ]]; then set_kv RECON_NAMES "$(IFS=,; echo "${NAMES[*]}")"; fi
+if [[ -n "$PUBLIC_ADDR" ]]; then set_kv RECON_PUBLIC_ADDR "$PUBLIC_ADDR"; fi
+chmod 0644 "$envf"
+PORT=$(sed -n 's/^RECON_LISTEN=.*://p' "$envf" | tail -1)
+echo "==> settings ($envf):"
+sed 's/^/      /' "$envf"
 
 unit="$here/recon-gateway.service"
 [[ -f "$unit" ]] || unit="$here/../linux/recon-gateway.service"
 install -m 0644 "$unit" /etc/systemd/system/recon-gateway.service
 systemctl daemon-reload
-systemctl enable --now recon-gateway.service
+systemctl enable recon-gateway.service
 systemctl restart recon-gateway.service
 
+listening() {
+  if command -v ss >/dev/null; then ss -Hltn "sport = :$PORT" | grep -q .; else [[ -f /var/lib/kloudit-recon/state.json ]]; fi
+}
 echo "==> waiting for the gateway"
-for _ in $(seq 1 30); do
-  [[ -f /var/lib/kloudit-recon/setup-token.txt || -f /var/lib/kloudit-recon/state.json ]] && break
+for _ in $(seq 1 40); do
+  systemctl is-active --quiet recon-gateway.service && listening && break
   sleep 0.5
 done
-systemctl --no-pager --lines=0 status recon-gateway.service || true
+if ! systemctl is-active --quiet recon-gateway.service || ! listening; then
+  journalctl -u recon-gateway.service -n 25 --no-pager || true
+  hint="see the log above"
+  if journalctl -u recon-gateway.service -n 50 --no-pager 2>/dev/null | grep -q '226/NAMESPACE'; then
+    hint="systemd sandboxing is blocked: on Proxmox enable nesting for this container (pct set <CTID> --features nesting=1 && pct reboot <CTID>)"
+  elif ! /opt/kloudit-recon/recon-gateway version >/dev/null 2>&1; then
+    hint="the binary does not run here: use the $(dpkg --print-architecture 2>/dev/null || uname -m) bundle"
+  fi
+  die "the gateway did not start ($hint)"
+fi
 
 ips=$(hostname -I 2>/dev/null || true)
 echo
@@ -84,6 +106,7 @@ echo "KloudIT Recon gateway is running."
 for ip in $ips; do [[ $ip == *:* ]] && continue; echo "  Open: https://$ip:$PORT"; done
 if [[ -f /var/lib/kloudit-recon/setup-token.txt ]]; then
   echo "  Setup token (first login): $(cat /var/lib/kloudit-recon/setup-token.txt)"
+  echo "    (stays valid until the admin account is created; also in /var/lib/kloudit-recon/setup-token.txt)"
 fi
 echo "  Ports: TCP $PORT (HTTPS) and UDP $PORT (HTTP/3 + WebTransport + host tunnels)"
 echo "  Logs:  journalctl -u recon-gateway -f"

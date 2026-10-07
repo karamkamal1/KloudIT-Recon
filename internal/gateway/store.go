@@ -136,6 +136,7 @@ func (s *Store) saveLocked() error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
+	keepOwner(tmp, filepath.Dir(s.path))
 	if err := os.Rename(tmp, s.path); err != nil {
 		return err
 	}

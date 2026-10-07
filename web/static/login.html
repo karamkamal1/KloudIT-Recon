@@ -37,7 +37,7 @@
 
       <form id="setup-form" class="hidden" autocomplete="off">
         <h1>Set up your gateway</h1>
-        <p class="sub">Create the administrator account. The one-time setup token is printed in the gateway log and saved to <code>data/setup-token.txt</code>.</p>
+        <p class="sub">Create the administrator account. The one-time setup token was printed by the installer. It is also in the gateway log and in <code>setup-token.txt</code> in its data directory (Proxmox: <code>pct exec &lt;CTID&gt; -- cat /var/lib/kloudit-recon/setup-token.txt</code>).</p>
         <label for="setup-token">Setup token</label>
         <input id="setup-token" type="text" required>
         <label for="setup-user">Admin username</label>

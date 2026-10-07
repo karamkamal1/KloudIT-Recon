@@ -2,6 +2,7 @@
 package host
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,8 @@ type Config struct {
 	TestWidth  int    `json:"testWidth,omitempty"`
 	TestHeight int    `json:"testHeight,omitempty"`
 	LogLevel   string `json:"logLevel,omitempty"`
+
+	path string // file it was loaded from; the agent re-reads it to pick up a new pairing
 }
 
 // Defaults fills unset fields.
@@ -100,11 +103,14 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if err == nil {
+		// Windows PowerShell 5.1 and some editors save UTF-8 with a byte-order mark.
+		b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
 		if err := json.Unmarshal(b, c); err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", path, err)
 		}
 	}
 	c.Defaults()
+	c.path = path
 	return c, nil
 }
 

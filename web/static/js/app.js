@@ -40,22 +40,23 @@ function modal(title, body, actions = []) {
   return close;
 }
 
-function copyBtn(text) {
+function copyBtn(text, label = 'Copy') {
   return el('button', { class: 'btn-sm', onclick: async (e) => {
     try { await navigator.clipboard.writeText(text); e.target.textContent = 'Copied ✓'; } catch { toast('Copy failed — select the text manually', 'warn'); }
-  } }, 'Copy');
+  } }, label);
 }
 
 function pairingModal(name, code, id) {
-  const cmd = `.\\recon-host.exe pair "${code}"`;
+  const install = `powershell -ExecutionPolicy Bypass -File .\\install-host.ps1 -PairingCode "${code}" -InstallViGEm`;
+  const pairOnly = `& "$env:ProgramFiles\\KlouditRecon\\recon-host.exe" pair "${code}"`;
   const status = el('p', { class: 'status' }, el('span', { class: 'dot' }), 'Waiting for the PC to connect…');
   const close = modal(`Pair “${name}”`, el('div', {},
-    el('p', { class: 'hint' }, 'On the Windows PC (PowerShell, in the folder where you installed the host agent):'),
-    el('ol', { class: 'steps' },
-      el('li', {}, 'Install the agent: run ', el('code', {}, 'install-host.ps1'), ' from the release (installs FFmpeg + a logon task).'),
-      el('li', {}, 'Paste this command:'),
-    ),
-    el('div', { class: 'code-box' }, cmd), el('div', { class: 'modal-actions' }, copyBtn(cmd)),
+    el('p', { class: 'hint' }, 'On the Windows PC, signed in as the user who plays: open PowerShell as administrator, ',
+      el('code', {}, 'cd'), ' into the unzipped ', el('code', {}, 'host-windows-amd64'), ' folder and paste this. It installs FFmpeg, ',
+      'the controller driver and a logon task, pairs, and starts the agent:'),
+    el('div', { class: 'code-box' }, install), el('div', { class: 'modal-actions' }, copyBtn(install), copyBtn(code, 'Copy code only')),
+    el('p', { class: 'hint' }, 'Agent already installed (re-pairing)? Paste this instead; the running agent picks it up:'),
+    el('div', { class: 'code-box' }, pairOnly), el('div', { class: 'modal-actions' }, copyBtn(pairOnly)),
     el('p', { class: 'hint' }, 'The code contains a secret that lets the PC register with this gateway — it is shown once. You can re-pair later to rotate it.'),
     status,
   ));
@@ -148,7 +149,7 @@ function manageHost(h) {
   const name = el('input', { type: 'text', value: h.name, maxlength: '64' });
   modal(`Manage ${h.name}`, el('div', {},
     el('label', {}, 'Name'), name,
-    el('p', { class: 'hint' }, 'Re-pairing issues a new secret and disconnects the current agent until you run the new pairing command.')), [
+    el('p', { class: 'hint' }, 'Re-pairing issues a new secret and disconnects the current agent until you run the new pairing command on the PC.')), [
     { label: 'Remove', danger: true, run: async (close) => {
       if (!confirm(`Remove ${h.name}? The agent will be disconnected.`)) return;
       await api('DELETE', `/api/hosts/${h.id}`); close(); loadHosts();

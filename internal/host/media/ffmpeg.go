@@ -34,7 +34,8 @@ type Caps struct {
 	FFmpeg   string
 	Version  string
 	Filters  map[string]bool
-	Encoders []EncoderInfo // usable encoders, best first
+	Encoders []EncoderInfo     // usable encoders, best first
+	Rejected map[string]string // encoder built into ffmpeg -> why its test encode failed
 	options  map[string]map[string]bool
 }
 
@@ -89,7 +90,7 @@ func quietCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 
 // Probe inspects the ffmpeg build and test-encodes with every candidate encoder.
 func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) {
-	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, options: map[string]map[string]bool{}}
+	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{}}
 	out, err := quietCmd(ctx, ffmpeg, "-hide_banner", "-version").Output()
 	if err != nil {
 		return nil, fmt.Errorf("running ffmpeg: %w", err)
@@ -131,8 +132,11 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			c.options[e.Name] = opts
 			if err == nil {
 				ok[e.Name] = true
-			} else if log != nil {
-				log.Debug("encoder unavailable", "encoder", e.Name, "err", err)
+			} else {
+				c.Rejected[e.Name] = err.Error()
+				if log != nil {
+					log.Debug("encoder unavailable", "encoder", e.Name, "err", err)
+				}
 			}
 		}(cand)
 	}
@@ -166,7 +170,9 @@ func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 	cmd := quietCmd(ctx, ffmpeg, args...)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%v: %s", err, lastLines(stderr.String(), 3))
+		// FFmpeg prints the cause (e.g. the minimum driver version) before
+		// several generic lines, so keep enough of them.
+		return fmt.Errorf("%v: %s", err, lastLines(stderr.String(), 6))
 	}
 	return nil
 }

@@ -252,7 +252,7 @@ func (s *Session) notice(level, msg string) {
 
 func (s *Session) sendWelcome() error {
 	w := proto.Welcome{
-		T: "welcome", Session: s.id, Host: s.a.cfg.Name, OS: runtime.GOOS + "/" + runtime.GOARCH, Version: Version,
+		T: "welcome", Session: s.id, Host: s.a.pair().Name, OS: runtime.GOOS + "/" + runtime.GOARCH, Version: Version,
 		MaxKbps: s.a.cfg.MaxKbps, MaxFPS: s.a.cfg.MaxFPS,
 	}
 	for _, m := range s.a.monitors() {

@@ -86,7 +86,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	if !auth.EqualHash(strings.TrimSpace(req.SetupToken), s.setupTok) {
 		s.audit.Log("setup_failed", req.Username, ip, "bad setup token")
-		jsonError(w, http.StatusForbidden, "invalid setup token (see the gateway log or data/setup-token.txt)")
+		jsonError(w, http.StatusForbidden, "invalid setup token (see the gateway log or setup-token.txt in its data directory)")
 		return
 	}
 	if !usernameRe.MatchString(req.Username) {
@@ -383,8 +383,12 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, u *User, ls
 }
 
 func (s *Server) publicAddr(r *http.Request) string {
-	if s.cfg.PublicAddr != "" {
-		return s.cfg.PublicAddr
+	if a := s.cfg.PublicAddr; a != "" {
+		if _, _, err := net.SplitHostPort(a); err != nil { // no port given: use ours
+			_, port, _ := net.SplitHostPort(s.cfg.Listen)
+			a = net.JoinHostPort(strings.Trim(a, "[]"), port)
+		}
+		return a
 	}
 	host := r.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {

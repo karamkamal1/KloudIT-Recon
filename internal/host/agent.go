@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -51,6 +52,51 @@ type Agent struct {
 	tunnel    transport.BidiStream // control stream to the gateway
 	tunnelMu  sync.Mutex
 	directRot *tlsutil.Rotating
+
+	pairMu  sync.RWMutex
+	pairing pairing
+	cfgMod  time.Time // config file mtime at the last (re)load
+}
+
+// pairing is the gateway identity from the config file. `recon-host pair`
+// rewrites the file, and the running agent adopts the change without a restart.
+type pairing struct{ Gateway, Pin, HostID, Token, Name string }
+
+func pairingOf(c *Config) pairing {
+	return pairing{Gateway: c.Gateway, Pin: c.GatewayPin, HostID: c.HostID, Token: c.Token, Name: c.Name}
+}
+
+func (a *Agent) pair() pairing {
+	a.pairMu.RLock()
+	defer a.pairMu.RUnlock()
+	return a.pairing
+}
+
+// reloadPairing re-reads the config file if it changed since the last check and
+// reports whether the pairing changed.
+func (a *Agent) reloadPairing() bool {
+	if a.cfg.path == "" {
+		return false
+	}
+	fi, err := os.Stat(a.cfg.path)
+	if err != nil || fi.ModTime().Equal(a.cfgMod) {
+		return false
+	}
+	a.cfgMod = fi.ModTime()
+	c, err := LoadConfig(a.cfg.path)
+	if err != nil {
+		a.log.Warn("config reload failed", "err", err)
+		return false
+	}
+	p := pairingOf(c)
+	a.pairMu.Lock()
+	changed := p != a.pairing
+	a.pairing = p
+	a.pairMu.Unlock()
+	if changed {
+		a.log.Info("pairing changed", "gateway", p.Gateway, "host", p.Name)
+	}
+	return changed
 }
 
 // NewAgent probes ffmpeg and prepares the input backend.
@@ -81,6 +127,12 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		inj:         input.NewInjector(be),
 		audioSource: media.DefaultAudioSource(),
 		nonces:      map[string]int64{},
+		pairing:     pairingOf(cfg),
+	}
+	if cfg.path != "" {
+		if fi, err := os.Stat(cfg.path); err == nil {
+			a.cfgMod = fi.ModTime()
+		}
 	}
 	return a, nil
 }
@@ -181,7 +233,7 @@ func (a *Agent) verifyTicket(tok, origin string) (string, error) {
 		return "", err
 	}
 	now := time.Now().Unix()
-	if t.HostID != a.cfg.HostID || now > t.Exp || t.Nonce == "" {
+	if t.HostID != a.pair().HostID || now > t.Exp || t.Nonce == "" {
 		return "", errors.New("ticket expired or for another host")
 	}
 	if !strings.EqualFold(t.Origin, origin) {
@@ -203,8 +255,18 @@ func (a *Agent) verifyTicket(tok, origin string) (string, error) {
 
 // Run serves until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
-	if a.cfg.Gateway == "" {
-		return errors.New("host is not paired: run `recon-host pair <code>` first")
+	if a.pair().Gateway == "" {
+		// Wait instead of exiting: the logon task does not restart an agent that
+		// exits, and `recon-host pair` may run after the agent has started.
+		a.log.Warn("host is not paired yet: run `recon-host pair <code>`; waiting for the pairing", "config", a.cfg.path)
+		for a.pair().Gateway == "" {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+				a.reloadPairing()
+			}
+		}
 	}
 	errc := make(chan error, 2)
 	if a.cfg.DirectPort > 0 {
@@ -228,12 +290,12 @@ func (a *Agent) Run(ctx context.Context) error {
 // ---------------------------------------------------------------------------
 // Gateway tunnel
 
-func (a *Agent) tlsFor(alpn string) *tls.Config {
-	host, _, _ := net.SplitHostPort(a.cfg.Gateway)
+func (a *Agent) tlsFor(p pairing, alpn string) *tls.Config {
+	host, _, _ := net.SplitHostPort(p.Gateway)
 	return &tls.Config{
 		ServerName:            host,
 		InsecureSkipVerify:    true, // chain building skipped; the pin below is the verification
-		VerifyPeerCertificate: tlsutil.PinVerifier(a.cfg.GatewayPin),
+		VerifyPeerCertificate: tlsutil.PinVerifier(p.Pin),
 		NextProtos:            []string{alpn},
 		MinVersion:            tls.VersionTLS13,
 	}
@@ -251,16 +313,34 @@ func (a *Agent) runGateway(ctx context.Context) error {
 			backoff = time.Second
 		}
 		a.log.Warn("gateway connection lost, reconnecting", "err", err, "in", backoff)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
+		if a.waitOrRepair(ctx, backoff) {
+			backoff = time.Second
+		} else if backoff < 30*time.Second {
 			backoff *= 2
 		}
 	}
 	return nil
+}
+
+// waitOrRepair sleeps for d, returning early (true) if the pairing changes, so a
+// re-pair takes effect within seconds instead of after the backoff.
+func (a *Agent) waitOrRepair(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return a.reloadPairing()
+		case <-tick.C:
+			if a.reloadPairing() {
+				return true
+			}
+		}
+	}
 }
 
 func (a *Agent) sendTunnel(m proto.TunnelMsg) {
@@ -282,11 +362,12 @@ func (a *Agent) directInfo() *proto.DirectInfo {
 }
 
 func (a *Agent) gatewayOnce(ctx context.Context) error {
+	p := a.pair()
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	conn, err := quic.DialAddr(dctx, a.cfg.Gateway, a.tlsFor(proto.ALPNHostControl), transport.QUICConfig())
+	conn, err := quic.DialAddr(dctx, p.Gateway, a.tlsFor(p, proto.ALPNHostControl), transport.QUICConfig())
 	cancel()
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", a.cfg.Gateway, err)
+		return fmt.Errorf("dial %s: %w", p.Gateway, err)
 	}
 	defer conn.CloseWithError(0, "bye")
 	st, err := conn.OpenStreamSync(ctx)
@@ -294,9 +375,9 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		return err
 	}
 	reg := proto.TunnelMsg{
-		T: "register", HostID: a.cfg.HostID, Token: a.cfg.Token, Name: a.cfg.Name,
+		T: "register", HostID: p.HostID, Token: p.Token, Name: p.Name,
 		OS: runtime.GOOS + "/" + runtime.GOARCH, Version: Version,
-		MACs: localMACs(conn.LocalAddr()), Direct: a.directInfo(),
+		MACs: localMACs(outboundLocalAddr(conn.RemoteAddr())), Direct: a.directInfo(),
 	}
 	for _, e := range a.caps.Encoders {
 		reg.Encoders = append(reg.Encoders, e.Name)
@@ -335,7 +416,7 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		a.tunnel = nil
 		a.tunnelMu.Unlock()
 	}()
-	a.log.Info("connected to gateway", "gateway", a.cfg.Gateway, "host", a.cfg.Name)
+	a.log.Info("connected to gateway", "gateway", p.Gateway, "host", p.Name)
 	a.mu.Lock()
 	streaming := a.active != nil
 	a.mu.Unlock()
@@ -376,7 +457,8 @@ func (q *quicStreamAdapter) SetWriteDeadline(t time.Time) error { return q.s.Set
 func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	conn, err := quic.DialAddr(dctx, a.cfg.Gateway, a.tlsFor(proto.ALPNHostData), transport.QUICConfig())
+	p := a.pair()
+	conn, err := quic.DialAddr(dctx, p.Gateway, a.tlsFor(p, proto.ALPNHostData), transport.QUICConfig())
 	if err != nil {
 		a.log.Warn("data connection failed", "err", err)
 		return
@@ -386,7 +468,7 @@ func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 		conn.CloseWithError(1, "")
 		return
 	}
-	b, _ := json.Marshal(proto.DataHello{HostID: a.cfg.HostID, SID: m.SID, Nonce: m.Nonce})
+	b, _ := json.Marshal(proto.DataHello{HostID: p.HostID, SID: m.SID, Nonce: m.Nonce})
 	if err := proto.WriteMsg(st, b); err != nil {
 		conn.CloseWithError(1, "")
 		return
@@ -398,6 +480,18 @@ func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 	}
 	st.Close()
 	a.HandleConn(transport.FromQUIC(conn), SessionMeta{Path: "relay", User: m.User})
+}
+
+// outboundLocalAddr returns the source address the OS routes from to reach
+// remote. (quic.DialAddr binds 0.0.0.0, so the connection's LocalAddr is
+// unspecified.) Connecting a UDP socket sends nothing.
+func outboundLocalAddr(remote net.Addr) net.Addr {
+	c, err := net.Dial("udp", remote.String())
+	if err != nil {
+		return nil
+	}
+	defer c.Close()
+	return c.LocalAddr()
 }
 
 // localMACs returns MAC addresses for Wake-on-LAN, the interface used to reach
