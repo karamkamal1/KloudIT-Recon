@@ -94,6 +94,7 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     out.height = kClipHeight;
     out.fps = p.fps;
     out.kbps = p.kbps;
+    out.liveBitrate = "seamless";  // recorded only: the canned stream does not change
     return Status::Ok();
 }
 

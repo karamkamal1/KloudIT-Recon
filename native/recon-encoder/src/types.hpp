@@ -88,6 +88,12 @@ struct StartParams {
     bool hdr = false;
     int ltrSlots = 0;   // long-term reference slots to reserve (ACK-based recovery, 3.5)
     int svcLayers = 1;  // temporal layers
+    // Encoder knobs (optional; defaults are the backend's).
+    std::string liveBitrate;     // "" = the codec's caps liveBitrate | "seamless" | "flush" (step 3.6 tests both)
+    int encoderInstance = -1;    // hardware encoder engine (AMF INSTANCE_INDEX), -1 = backend default
+    int ltrInterval = 0;         // frames between LTR marks, 0 = fps/10 (about 100 ms)
+    int intraRefreshFrames = 0;  // intra refresh cycle in frames, 0 = off (not with ltrSlots or svcLayers > 1)
+    bool zeroCopy = true;        // AMD Direct Capture surfaces go to the AMF encoder unconverted when possible
 };
 
 // RateParams is the "setRate" control message; fps 0 = unchanged.
@@ -165,6 +171,20 @@ struct Started {
     int idleRepeatMs = 0;
     bool barcode = false;
     bool cursorInVideo = false;  // this stream's frames contain the pointer (SourceInfo::cursorInVideo)
+    // The bitstream's frame size when it differs from width x height (AV1 on
+    // RDNA3 is coded in 64x16 multiples: the picture is in the top-left
+    // width x height, the rest is padding to crop). 0 = width / height.
+    int codedWidth = 0, codedHeight = 0;
+    std::string liveBitrate;     // "seamless" | "flush" (how setRate is applied)
+    std::string rateControl;     // what the encoder runs, e.g. "cbr" | "vbr_latency"
+    std::string usage;           // encoder usage, e.g. AMF "ultra_low_latency" (H.264 may fall back to "low_latency")
+    int ltrSlots = 0;            // LTR slots in use (0 = recovery by IDR)
+    int ltrInterval = 0;         // frames between LTR marks
+    int encoderInstance = 0;     // hardware engine used
+    int hwInstances = 1;         // hardware engines the GPU has for this codec
+    int queryTimeoutMs = 0;      // the encoder's blocking output wait (0 = polled)
+    bool zeroCopy = false;       // capture surfaces go to the encoder without the NV12 conversion
+    int intraRefreshFrames = 0;
 };
 
 // CaptureEvent is the helper -> Go "captureChanged" message.
@@ -200,12 +220,13 @@ struct FrameStats {
 
 // ControlMsg is a parsed Go -> helper message; only the fields of its type are set.
 struct ControlMsg {
-    std::string type;  // "start" | "forceIdr" | "recover" | "setRate" | "setRoi" | "shutdown"
+    std::string type;  // "start" | "forceIdr" | "recover" | "setRate" | "setRoi" | "ack" | "shutdown"
     StartParams start;
     uint64_t lostFromFrameId = 0;
     std::optional<uint64_t> ackedLtrFrameId;
     RateParams rate;
     std::vector<RoiRect> rects;
+    uint64_t ackFrameId = 0;  // "ack"
 };
 
 }  // namespace recon

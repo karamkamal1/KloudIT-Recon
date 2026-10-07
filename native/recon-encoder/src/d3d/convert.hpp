@@ -82,9 +82,14 @@ public:
 
     static bool nv12RenderTargets(ID3D11Device* device);
 
-    // width/height: output size, even. poolSize: textures at most (created on demand).
+    // width/height: output size, even. poolSize: textures at most (created on
+    // demand). contentWidth/contentHeight (even, 0 = width/height): the image
+    // is scaled into the top-left content rectangle only and its edge pixels
+    // are repeated into the rest (padding to a coded size the encoder needs,
+    // e.g. AV1 on RDNA3; the clamp sampler does the repeating). The barcode
+    // must fit the content.
     Status init(ID3D11Device* device, uint32_t width, uint32_t height, const BarcodeLayout& barcode, Output output,
-                int poolSize = 6);
+                int poolSize = 6, uint32_t contentWidth = 0, uint32_t contentHeight = 0);
     // Converts src (8-bit BGRA/RGBA, or FP16 scRGB which is clipped to SDR)
     // into a free pool texture. Error "pool_exhausted" (non-fatal) when every
     // pool texture is still reserved by the encoder.
@@ -95,6 +100,8 @@ public:
 
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
+    uint32_t contentWidth() const { return contentW_; }
+    uint32_t contentHeight() const { return contentH_; }
     Output output() const { return output_; }
 
 private:
@@ -130,6 +137,7 @@ private:
     std::vector<SrvEntry> srvCache_;  // most recent first
     size_t poolSize_ = 0;
     uint32_t width_ = 0, height_ = 0;
+    uint32_t contentW_ = 0, contentH_ = 0;
     BarcodeLayout barcode_;
     Output output_ = Output::Nv12;
 };

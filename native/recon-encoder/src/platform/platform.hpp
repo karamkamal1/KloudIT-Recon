@@ -16,6 +16,7 @@ namespace recon {
 enum class LogLevel { Error = 0, Warn = 1, Info = 2, Debug = 3 };
 
 void setLogLevel(LogLevel level);
+LogLevel logLevel();
 bool parseLogLevel(const std::string& s, LogLevel& out);
 void logf(LogLevel level, const char* fmt, ...)
 #if defined(__MINGW32__) && !defined(__clang__)

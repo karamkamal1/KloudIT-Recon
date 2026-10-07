@@ -148,8 +148,13 @@ func TestHelperIntegrationMock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if st.Backend != "mock" || st.Capture != "synthetic" || st.Codec != "h264" || st.Width != 320 || st.Height != 180 {
+	if st.Backend != "mock" || st.Capture != "synthetic" || st.Codec != "h264" || st.Width != 320 || st.Height != 180 ||
+		st.CodedWidth != 320 || st.CodedHeight != 180 || st.CropRight != 0 || st.CropBottom != 0 || st.LiveBitrate != "seamless" {
 		t.Fatalf("started %+v", st)
+	}
+	// ACKs are accepted silently (the mock has no LTR to use them for).
+	if err := h.Ack(1); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000}); !errors.As(err, &he) || he.Code != "already_started" {
 		t.Fatalf("second start: %v", err)
@@ -522,6 +527,12 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--self-test-pacer: %v", err)
 	}
+	// Encoder logic (LTR recovery policy, parameter sets, ROI maps): runs everywhere.
+	out, err = exec.Command(exe, "--self-test-encoder").CombinedOutput()
+	t.Logf("%s", out)
+	if err != nil {
+		t.Fatalf("--self-test-encoder: %v", err)
+	}
 	// GPU colour conversion on WARP. Wine needs an X display for D3D11 and has
 	// no NV12 render targets (the self-test then checks the same shaders on
 	// separate planes); real Windows must pass in NV12 mode.
@@ -536,6 +547,52 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	}
 	if !underWine() && !strings.Contains(string(out), "self-test-convert: ok (mode nv12)") {
 		t.Fatal("conversion not tested on NV12 render targets")
+	}
+}
+
+// The --encode-test mode (the hardware check of an encoder backend without
+// recon-host) through the mock backend: scripted forced IDR, loss and rate
+// changes; the file it writes is the Annex-B stream that came out of the ring.
+// On an AMD host RECON_HELPER_ENCODE_TEST="--backend=amf --codec=hevc ..."
+// runs it against the real encoder instead (docs/VENDOR_NOTES.md 3.3).
+func TestHelperIntegrationEncodeTest(t *testing.T) {
+	exe := helperExe(t)
+	out := t.TempDir() + `\encode-test.h264`
+	args := []string{"--encode-test=" + out, "--backend=mock", "--codec=h264", "--capture=synthetic", "--frames=150",
+		"--at=20:idr", "--at=40:loss", "--at=70:rate=2000", "--at=100:fps=30", "--at=120:roi=0,0,64,64,10"}
+	if extra := os.Getenv("RECON_HELPER_ENCODE_TEST"); extra != "" {
+		args = append([]string{"--encode-test=" + out}, strings.Fields(extra)...)
+	}
+	b, err := exec.Command(exe, args...).CombinedOutput()
+	t.Logf("%s", b)
+	if err != nil {
+		t.Fatalf("--encode-test: %v", err)
+	}
+	for _, want := range []string{"encode-test: ok", "idr requested at 20: key frame", "loss at 40: recovered at"} {
+		if os.Getenv("RECON_HELPER_ENCODE_TEST") == "" && !strings.Contains(string(b), want) {
+			t.Errorf("output lacks %q", want)
+		}
+	}
+	data, err := os.ReadFile(out)
+	if err != nil || len(data) == 0 {
+		t.Fatalf("no bitstream written: %v", err)
+	}
+	if os.Getenv("RECON_HELPER_ENCODE_TEST") != "" {
+		return
+	}
+	// The file starts with the first IDR (SPS, PPS, IDR) and holds the forced
+	// and the loss-recovery IDRs too (the mock recovers by IDR).
+	types := nalTypes(data)
+	idrs := bytes.Count(types, []byte{7}) // every IDR access unit carries one SPS
+	if len(types) < 3 || types[0] != 9 || types[1] != 7 || idrs < 3 {
+		t.Fatalf("bitstream: NAL types start %v, %d IDRs", types[:min(len(types), 6)], idrs)
+	}
+	// Bad options: exit code 2 with the reason.
+	cmd := exec.Command(exe, "--encode-test="+out, "--backend=mock", "--codec=h264", "--fps=9999")
+	b, err = cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 2 || !strings.Contains(string(b), "fps out of range") {
+		t.Fatalf("bad encode test options: %v %s", err, b)
 	}
 }
 

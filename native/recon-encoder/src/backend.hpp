@@ -59,6 +59,7 @@ struct SourceInfo {
     ID3D11Device* device = nullptr;  // the device the textures live on; nullptr for the synthetic source
     AdapterInfo adapter;             // that device's adapter (found = false for the synthetic source)
     void* amfContext = nullptr;      // amf::AMFContext* of AMD Direct Capture surfaces, else nullptr
+    int amfFormat = 0;               // their amf::AMF_SURFACE_FORMAT (AMF_DISPLAYCAPTURE_FORMAT), 0 = unknown
     bool cursorInVideo = false;      // frames contain the mouse pointer
 };
 
@@ -99,6 +100,11 @@ public:
 struct InputSpec {
     enum class Format { Native, Nv12 } format = Format::Native;
     uint32_t width = 0, height = 0;  // encoded size (even)
+    // Nv12: the picture fills only the top-left contentWidth x contentHeight
+    // of the texture (0 = all of it); the converter repeats the edge pixels
+    // into the rest, padding the frame to a coded size the encoder needs (AV1
+    // on RDNA3: multiples of 64x16). The barcode is drawn inside the content.
+    uint32_t contentWidth = 0, contentHeight = 0;
 };
 
 // EncoderFrame is what Backend::submit gets.
@@ -150,7 +156,9 @@ public:
     // src describes the initialized capture (device, size); the backend fills
     // in (what it wants submitted) and out. Called again after a failed start.
     virtual Status init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) = 0;
-    // Capture thread. Must not block on the output side.
+    // Capture thread. Must not block on the output side. Error code
+    // "encoder_busy" (non-fatal): the frame was not taken (the encoder is
+    // behind); the pipeline drops it without using up its frame id.
     virtual Status submit(const EncoderFrame& frame, const SubmitInfo& info) = 0;
     // Output thread: waits up to timeoutMs for the next encoded frame.
     virtual Next receive(EncodedFrame& out, int timeoutMs, Status& err) = 0;
@@ -162,6 +170,12 @@ public:
     virtual Status recover(uint64_t lostFromFrameId, std::optional<uint64_t> ackedLtrFrameId) = 0;
     virtual Status setRate(const RateParams& r) = 0;
     virtual Status setRoi(const std::vector<RoiRect>& rects) = 0;
+    // recon-host's client decoded frameId (the "ack" message): backends with
+    // long-term references use it to choose recovery references.
+    virtual Status ack(uint64_t frameId) {
+        (void)frameId;
+        return Status::Ok();
+    }
     // Unblocks receive() for good (later submit() calls return at once). Safe
     // to call twice and from any thread. Pipeline::stop() calls it BEFORE
     // joining the capture and output threads, which may still be inside

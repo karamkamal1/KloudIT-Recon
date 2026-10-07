@@ -280,3 +280,168 @@ tests also read `RECON_HELPER_SECONDS`, `RECON_HELPER_NV12`, `RECON_HELPER_FPS`,
   one is at hand, `wgc` is unavailable with "cannot keep the mouse pointer out of
   Windows.Graphics.Capture frames".
 - NVIDIA: unverified (no NVIDIA host available). Test: the same WGC pointer check.
+
+## 3.3 AMF encoder backend
+
+The AMF encoder backend of recon-encoder.exe (`native/recon-encoder/src/amf/`): H.264,
+HEVC and AV1 through `amfrt64.dll` (System32 only), caps from `AMFCaps`, every property of
+GUIDE 3.3, NV12 pool textures or AMD Direct Capture surfaces (zero-copy) as input, forced
+IDRs, LTR marks / ACK-based recovery (the new `ack` message), ROI maps, live bitrate in
+`seamless` and `flush` mode, runtime frame rate, AV1 64x16 padding with the crop in
+`started`, the H.264 ULTRA_LOW_LATENCY -> LOW_LATENCY fallback (AMF issue #410), and an
+`--encode-test` mode for checking all of it on a GPU without recon-host. Protocol
+additions (all additive, protocol version stays 1): `ack`; `start` liveBitrate /
+encoderInstance / ltrInterval / intraRefreshFrames / zeroCopy; `started` codedWidth /
+codedHeight / cropRight / cropBottom and the encoder settings; ring slot width/height =
+coded size (docs/HELPER_PROTOCOL.md "AMF encoder backend", "Encode test").
+
+Sources for the choices (cited in the code): AMF_Video_Encode_API.md / _HEVC_API.md /
+_AV1_API.md (property semantics, LTR rules: a key frame clears the slots, a reference to an
+empty slot gives an intra-only frame, KEEP_UNUSED keeps the other slots), the AMF samples
+SimpleEncoder (submit thread + polling thread, AMF_INPUT_FULL handling), EncoderLatency
+(USAGE first, INSTANCE_INDEX from CAP_NUM_OF_HW_INSTANCES, QUERY_TIMEOUT) and SimpleROI
+(GRAY32 host surface), FFmpeg 8.1 amfenc*.c (forced IDR with INSERT_SPS/PPS / INSERT_HEADER
+/ FORCE_INSERT_SEQUENCE_HEADER, dynamic properties after Init, QUERY_TIMEOUT set-and-read-back,
+AV1 alignment factors with the 64x16 default, 1 ms polling, trace console writer off),
+OBS texture-amf.cpp (CreateSurfaceFromDX11Native + AMFSurfaceObserver returning the
+texture, AMF_DX11_1, no ROI cap for AV1, Flush + ReInit for VBR bitrate changes), the AMD
+Streaming SDK GPUEncoderHEVC/AV1.cpp (bitrate changes by SetProperty without a flush,
+LOWLATENCY_MODE, VBV = one frame), Sunshine video.cpp (H.264 LOW_LATENCY fallback for AMF
+#410, peak = target, gops_per_idr 1).
+
+Verified in the sandbox (Linux, no GPU, no Windows):
+- Builds: mingw-w64 GCC 13 `make helper`, no warnings with -Wall -Wextra; every source
+  (the AMF backend included) passes `clang++ --target=x86_64-w64-mingw32 -std=c++20
+  -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Wconversion` without warnings, against
+  the vendored AMF v1.5.3 headers (every property name and enum value is taken from them;
+  `src/amf/amf_props.hpp`). The MSVC build is not verified here (CI job `helper-windows`).
+- The AMF code itself cannot run here: Wine has no `amfrt64.dll`. `--print-caps
+  --backend=amf` under Wine reports `backend none` with `unavailable.amf` = "AMF runtime
+  (amfrt64.dll) not found in System32: Module not found (error 126)", and `--encode-test
+  --backend=amf` exits 2 with the same reason.
+- `--self-test-encoder` (Wine): the LTR policy driven like an encoder that marks and
+  references as asked (marks 2, 8, 14, ... alternating; the slot with the newest ACKed LTR
+  never marked; recovery from the newest ACKed LTR with a one-slot mask and the following
+  frame back on default references; IDR without ACKs, across a key frame and with LTR off;
+  unACKed marks wait for the 1 s ACK timeout; a recovery frame not coded from the LTR is
+  rejected, an intra-only one accepted; recon-host's ackedLtr is used unless a mark is
+  overwriting its slot), parameter-set detection / insertion on the mock clip's real H.264
+  access units and on HEVC and AV1 OBU data (after the AUD / temporal delimiter; multi-byte
+  leb128 sizes; truncated OBUs rejected), ROI importance maps (64x64 and 16x16 blocks,
+  negative weights, overlaps, clipping), 64x16 alignment (1080 -> 1088, 3440 -> 3456).
+  Mutation check: disabling the newest-ACKed-slot protection makes the "lost ACKs never cost
+  the ACKed LTR" case fail.
+- `--self-test-convert` under Wine + Xvfb (mode planar): the new "scaled into 64x16 padding"
+  case (256x128 scaled into 200x90 inside a 256x96 texture: max error 1 against the CPU
+  reference, padding columns and rows the repeated edge, barcode inside the content); the 7
+  earlier cases unchanged.
+- `--encode-test` with the mock backend under Wine (`--codec=h264 --frames=200 --at=20:idr
+  --at=40:loss --at=60:rate=2000 --at=100:loss`): exit 0, key frames at 1, 21, 41, 101 as
+  scripted (the mock recovers by IDR), the written file decodes with `ffmpeg -v error -i
+  FILE -f null -` without a message; bad options exit 2 with the parser's reason.
+- `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64` (without a TMPDIR override:
+  Wine aborts with "free(): invalid pointer" when TMPDIR points into /dev/shm): 38 tests
+  pass, 3 skip (AMD Direct Capture, WGC, LaunchUnsupported); new: `ack` reaches the mock
+  without an error, `started` carries codedWidth/codedHeight/crop/liveBitrate,
+  `--self-test-encoder`, `TestHelperIntegrationEncodeTest`. `go test ./internal/host/encoder`
+  (Linux) passes with the new message encodings (`ack`, start knobs) and `started` decoding.
+
+Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
+`recon-encoder.exe`; `--log-level=debug` adds the AMF trace and the probe time; every
+`--encode-test` prints a summary and the ffprobe / ffmpeg commands to check its file):
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `recon-encoder.exe --print-caps --backend=amf
+  --log-level=debug 2>caps.log`: stdout is one JSON line (no AMF trace on stdout), `backend`
+  `amf`, `vendor` `amd`, codecs `h264`, `hevc` and `av1`; record maxW/maxH (expected around
+  4096x2176 for H.264, 7680x4320 for HEVC, 8192x4352 for AV1), `hwInstances` (Navi 31 has two
+  VCN 4.0 engines: expect 2), `queryTimeout` true, `roi` importance, `tenBit` true for hevc
+  and av1, `maxLtr` (2 for h264), `alignW`/`alignH` 64/16 for av1, `recovery` ltr,
+  `liveBitrate` seamless; caps.log has `amf probe: N ms` (expect < 300 ms).
+- NVIDIA: unverified (no NVIDIA host available). Test: `recon-encoder.exe --print-caps
+  --backend=amf` on an NVIDIA-only host reports `backend` `none` and `unavailable.amf` "AMF
+  runtime (amfrt64.dll) not found in System32" (the AMF backend is AMD-only; NVENC is 3.4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HEVC basics): `recon-encoder.exe
+  --encode-test=hevc.hevc --backend=amf --codec=hevc --capture=synthetic-gpu --width=1920
+  --height=1080 --fps=60 --kbps=20000 --frames=600 --at=120:idr`: exit 0; started has
+  `usage` ultra_low_latency, `queryTimeoutMs` 5, `rateControl` cbr; key frames only at 1 and
+  121 (GOP 0: no periodic IDR; a forced IDR works with GOP 0 = GUIDE A4 VERIFY);
+  submit->output p95 below 4 ms; `ffprobe -show_streams hevc.hevc` says hevc Main, 1920x1080,
+  `color_space=bt709`, `color_range=tv`; `ffmpeg -v error -i hevc.hevc -f null -` prints
+  nothing; `ffplay hevc.hevc` shows the moving test pattern with correct colours.
+- NVIDIA: unverified (no NVIDIA host available). Test: none for this backend (AMD only);
+  `--encode-test --backend=amf` exits 2 with "AMF runtime ... not found".
+- AMD RDNA3 (RX 7900 XT): unverified. Test (H.264 and AMF #410): the same with
+  `--codec=h264 --encode-test=h264.h264`: record whether started `usage` is
+  ultra_low_latency or low_latency (the log says "retrying with LOW_LATENCY (AMF #410)" if
+  ULL failed); ffprobe shows High profile; no decode errors.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 alignment, GUIDE A7): `--codec=av1
+  --encode-test=av1.ivf --width=1920 --height=1080` and again with 2560x1440: 1080p reports
+  `codedHeight` 1088, `cropBottom` 8 (1440p: no crop); `ffprobe -show_streams av1.ivf` shows
+  1920x1088; `ffplay -vf crop=1920:1080:0:0 av1.ivf` shows a clean picture and without the
+  crop the bottom 8 rows repeat the last picture row (no green / garbage band); log: no
+  "properties not accepted" for `Av1AlignmentMode`. Then with the Go client in recon-host
+  (once wired) Chrome must show no padding rows.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (LTR recovery, GUIDE 3.5 VERIFY): for each
+  codec `--ltr-slots=2 --frames=600 --at=200:loss --at=400:loss` (`--ack-delay=2`, and once
+  `--ack-delay=10`): each loss line says "recovered at L+1 ... from an LTR (no IDR)" with a
+  refFloor about 6-12 frames before the loss and a one-bit LTR mask; no "did not reference
+  LTR slot" or "recovery frames are not verified" warning in the log; `ffmpeg -v error -i
+  FILE -f null -` on the written file (which lacks the lost frames) prints nothing for HEVC
+  and AV1 (record any H.264 frame_num-gap messages: H.264 then needs IDR recovery in 3.5).
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only; NVENC
+  invalidation is 3.4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (live bitrate, GUIDE 3.6 preview): HEVC 1440p60
+  with a moving source (`--capture=dda` and a game, or synthetic-gpu scaled up)
+  `--kbps=50000 --frames=900 --at=300:rate=20000 --at=600:rate=50000`, once with `--rc=cbr`
+  and once `--rc=vbr`: lines say "no key frame" and the P-frame bitrate after each change is
+  within about 20 % of the new target; no "setRate: not accepted" warning (VBV changed at
+  run time). With `--live-bitrate=flush` the same lines say a key frame follows and
+  started `liveBitrate` is flush. Repeat for H.264 and AV1.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (frame rate at run time, GUIDE 3.3 VERIFY): HEVC
+  `--fps=60 --at=300:fps=30` (and 120 -> 60 with `--fps=120` at 1440p): "no key frame"
+  (FRAMERATE changes without an IDR), the per-frame size about doubles after the change
+  while the bitrate stays near the target.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (zero-copy AMD Direct Capture): `--capture=amd-direct
+  --codec=hevc --frames=600` at the desktop size: started `zeroCopy` true; the log says
+  whether surfaces are DCC compressed ("each one is copied"); colours in `ffplay` match the
+  same run with `--zero-copy=0` (NV12 conversion; BT.709 limited both); submit->output p95
+  compared with the converter path. Change the desktop resolution during a run: the helper
+  ends with the fatal `capture_failed` "zero-copy encoding cannot scale or rotate".
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD Direct Capture is AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (ROI): HEVC 1080p `--at=100:roi=896,476,128,128,10
+  --at=300:roi=0,0,1920,200,-10 --at=500:roi=off`: no error lines, `ffplay` shows the centre
+  block sharper after frame 100 and the top band softer after 300 at a low `--kbps=4000`;
+  AV1 accepts ROI too (no "per-frame property not accepted: Av1ROIData").
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only; NVENC emphasis maps are 3.4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (encoder instance, GUIDE 3.3 VERIFY): with
+  `hwInstances` 2, `--instance=1` starts and encodes; `--instance=2` fails with
+  "unsupported ... the GPU has 2". With Adrenalin Instant Replay recording, compare
+  submit->output p95 of `--instance=0` and `--instance=1` (the engine Adrenalin does not use
+  should be faster).
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (intra refresh without LTR): H.264 and HEVC
+  `--intra-refresh=60 --frames=600`: only one key frame (frame 1); ffprobe shows P frames
+  only; `ffplay` shows the refresh band sweeping once per second; with `--ltr-slots=2` the
+  start fails with "intra refresh does not work with user LTR".
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (through recon-host's client):
+  `$env:RECON_HELPER_EXE=...; $env:RECON_HELPER_ENCODE_TEST="--backend=amf --codec=hevc
+  --capture=synthetic-gpu --width=1920 --height=1080 --ltr-slots=2 --at=200:loss"; go test
+  -count=1 -v -run HelperIntegrationEncodeTest ./internal/host/encoder` passes; then
+  `HelperIntegrationDDA` with `--backend=auto` (a session with the AMF encoder): frames
+  arrive, `Frame.Key` on the first and forced frames only.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same `go test` run reports the
+  AMF backend unavailable and skips/fails cleanly with the reason (NVENC is 3.4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (blocking QueryOutput vs SubmitInput on another
+  thread): HEVC 4K60 `--capture=synthetic-gpu --width=3840 --height=2160 --frames=1200`:
+  no "encoder is behind" warnings at the speed preset, submit->output p95 well below one
+  frame interval (16.7 ms), and the same with `--quality=quality` recorded (GUIDE 10: move
+  SPEED -> BALANCED only if encode p95 < 50 % of the interval).
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (driver reset during encode): start
+  `--encode-test` with `--frames=10000`, run `dxcap -forcetdr`: the helper reports the fatal
+  `device_lost` (or `encode_failed` after 10 failed calls) within a second and exits; no hang.
+- NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).

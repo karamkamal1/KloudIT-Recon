@@ -317,6 +317,13 @@ func (h *Helper) Recover(lostFrom uint64, ackedLTR *uint64) error {
 	return h.send(recoverMsg{T: "recover", LostFromFrameID: lostFrom, AckedLTRFrameID: ackedLTR})
 }
 
+// Ack reports that the client decoded frame frameID. Backends with long-term
+// references (Caps recovery "ltr") need it to know which LTR frames the client
+// holds: send it at least for every frame with LTRSlot >= 0, as soon as the
+// client's ACK arrives (other frame ids are ignored). Without ACKs, Recover
+// falls back to an IDR unless ackedLTR names a frame.
+func (h *Helper) Ack(frameID uint64) error { return h.send(ackMsg{T: "ack", FrameID: frameID}) }
+
 // SetRate changes the target bitrate (and optionally the VBV size in frame
 // intervals and the frame rate; 0 = unchanged). How seamless this is depends
 // on the codec's Caps liveBitrate.

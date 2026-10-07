@@ -57,11 +57,13 @@ jobs:
         run: |
           cmake -S native/recon-encoder -B build/recon-encoder -A x64
           cmake --build build/recon-encoder --config Release --parallel
-      - name: Self-tests (frame pacing; BGRA to NV12 conversion on WARP)
+      - name: Self-tests (frame pacing; encoder logic; BGRA to NV12 conversion on WARP)
         run: |
           $exe = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
           & $exe --self-test-pacer
           if ($LASTEXITCODE -ne 0) { throw "--self-test-pacer failed ($LASTEXITCODE)" }
+          & $exe --self-test-encoder
+          if ($LASTEXITCODE -ne 0) { throw "--self-test-encoder failed ($LASTEXITCODE)" }
           $out = & $exe --self-test-convert
           $out
           if ($LASTEXITCODE -ne 0) { throw "--self-test-convert failed ($LASTEXITCODE)" }

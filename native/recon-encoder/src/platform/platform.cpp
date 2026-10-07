@@ -23,6 +23,8 @@ std::mutex g_logMu;
 
 void setLogLevel(LogLevel level) { g_logLevel = static_cast<int>(level); }
 
+LogLevel logLevel() { return static_cast<LogLevel>(g_logLevel.load()); }
+
 bool parseLogLevel(const std::string& s, LogLevel& out) {
     if (s == "error") out = LogLevel::Error;
     else if (s == "warn") out = LogLevel::Warn;

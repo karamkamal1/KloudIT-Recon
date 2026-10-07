@@ -19,11 +19,13 @@
 #include "backend.hpp"
 #include "control.hpp"
 #include "d3d/convert.hpp"
+#include "encode_test.hpp"
 #include "pipeline.hpp"
 #include "platform/platform.hpp"
 #include "protocol.hpp"
 #include "ring.hpp"
 #include "selftest.hpp"
+#include "stream.hpp"
 
 using namespace recon;
 
@@ -32,7 +34,8 @@ namespace {
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
     "       recon-encoder --print-caps [--backend=B]\n"
-    "       recon-encoder --self-test-convert | --self-test-pacer\n"
+    "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder\n"
+    "       recon-encoder --encode-test=FILE [--backend=B] [encode test options]\n"
     "       recon-encoder --version\n"
     "\n"
     "Started by recon-host; speaks the protocol in docs/HELPER_PROTOCOL.md on stdin/stdout.\n"
@@ -49,13 +52,25 @@ const char kUsage[] =
     "  --print-caps         print the capabilities JSON and exit\n"
     "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
     "                       the default hardware adapter (exit 0 ok, 1 failed, 77 no device)\n"
-    "  --self-test-pacer    check the frame pacing policy on simulated presents (exit 0 ok, 1 failed)\n";
+    "  --self-test-pacer    check the frame pacing policy on simulated presents (exit 0 ok, 1 failed)\n"
+    "  --self-test-encoder  check the encoder logic: LTR recovery policy, parameter sets, ROI map (exit 0 / 1)\n"
+    "\n"
+    "Encode test: one stream through the real capture, conversion, encoder and ring, without\n"
+    "recon-host; the bitstream goes to FILE (Annex-B for h264/hevc, IVF for av1), a summary to stdout:\n"
+    "  --codec=hevc|h264|av1  --capture=dda|amd-direct|wgc|synthetic-gpu|synthetic  --frames=N (300)\n"
+    "  --width=W --height=H (0 = capture size)  --fps=N (60)  --kbps=N (20000)  --rc=cbr|vbr\n"
+    "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
+    "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
+    "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
+    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n";
 
 struct Args {
     bool printCaps = false;
     bool selfTestConvert = false;
     bool selfTestHardware = false;
     bool selfTestPacer = false;
+    bool selfTestEncoder = false;
+    EncodeTestOptions encodeTest;
     std::string dumpNv12;
     bool version = false;
     bool help = false;
@@ -90,6 +105,10 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
             a.selfTestHardware = val == "hw";
         }
         else if (key == "--self-test-pacer") a.selfTestPacer = true;
+        else if (key == "--self-test-encoder") a.selfTestEncoder = true;
+        else if (key == "--encode-test") ok = !(a.encodeTest.output = val).empty();
+        else if (encodeTestOption(key, val, a.encodeTest, ok)) {
+        }
         else if (key == "--dump-nv12") ok = !(a.dumpNv12 = val).empty();
         else if (key == "--version") a.version = true;
         else if (key == "--help" || key == "-h") a.help = true;
@@ -118,7 +137,12 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         err = "--mock-* options need --backend=mock";
         return false;
     }
-    const bool standalone = a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer;
+    if (a.encodeTest.used && a.encodeTest.output.empty()) {
+        err = "encode test options need --encode-test=FILE";
+        return false;
+    }
+    const bool standalone =
+        a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder || !a.encodeTest.output.empty();
     if (!standalone && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
         err = "--ring-handle, --ring-size and --event-handle are required";
         return false;
@@ -186,93 +210,6 @@ void setDpiAwareness() {
     if (fn) fn(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)));  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 }
 
-std::string joinUnavailable(const Caps& caps);
-
-// Starts capture and encoding for a "start" message. On success the pipeline
-// runs; on failure everything created here is gone again.
-struct StartResult {
-    std::unique_ptr<Capture> capture;
-    std::unique_ptr<Pipeline> pipeline;
-};
-
-Status startStream(const ControlMsg& m, BackendChoice& choice, RingWriter& ring, Reporter& rep, const Args& a,
-                   StartResult& out, Started& st) {
-    const StartParams& p = m.start;
-    if (!choice.backend) return Status::Error("unavailable", "no usable encoder backend: " + joinUnavailable(choice.caps));
-    std::string capName = p.capture;
-    if (capName.empty()) {
-        capName = (p.window || !p.windowTitle.empty()) ? "wgc" : choice.caps.capture.empty() ? "dda" : choice.caps.capture.front();
-    }
-    Status s;
-    std::unique_ptr<Capture> capture = createCapture(capName, s);
-    if (capture) s = capture->init(p);
-    if (!capture || !s.ok) {
-        if (capture) capture->shutdown();
-        return s;
-    }
-    const SourceInfo src = capture->source();
-    if (src.device) st.gpuPriority = applyGpuPriority(p.gpuPriority, src.adapter);
-
-    InputSpec in;
-    s = choice.backend->init(p, src, in, st);
-    std::unique_ptr<d3d::Nv12Converter> conv;
-    if (s.ok && in.format == InputSpec::Format::Nv12) {
-        if (!src.device) {
-            s = Status::Error("unsupported", "the encoder wants NV12 but the capture has no GPU device");
-        } else {
-            auto mode = d3d::Nv12Converter::Output::Nv12;
-            if (!d3d::Nv12Converter::nv12RenderTargets(src.device) && choice.caps.backend == "mock") {
-                mode = d3d::Nv12Converter::Output::Planar;  // the mock reads nothing: still exercise the shaders
-            }
-            conv = std::make_unique<d3d::Nv12Converter>();
-            s = conv->init(src.device, in.width, in.height, p.barcode, mode);
-            if (s.ok) {
-                logf(LogLevel::Info, "converting %ux%u -> %ux%u %s%s", src.width, src.height, in.width, in.height,
-                     mode == d3d::Nv12Converter::Output::Nv12 ? "NV12" : "Y + CbCr planes (no NV12 render targets)",
-                     p.barcode.enabled ? " with barcode" : "");
-            }
-        }
-    } else if (s.ok && p.barcode.enabled) {
-        s = Status::Error("unsupported", "the barcode needs the GPU colour conversion (a GPU capture)");
-    }
-    if (!s.ok) {
-        capture->shutdown();
-        return s;
-    }
-    st.capture = capName;
-    st.captureWidth = int(src.width);
-    st.captureHeight = int(src.height);
-    if (src.adapter.found) {
-        st.adapterLuid = src.adapter.luid;
-        st.adapterName = src.adapter.name;
-        st.vendor = src.adapter.vendor;
-        st.hagsEnabled = src.adapter.hags;
-        st.idleRepeatMs = p.idleRepeatMs;
-    }
-    st.barcode = conv && p.barcode.enabled;
-    st.cursorInVideo = src.cursorInVideo;
-
-    RateParams rate;
-    rate.kbps = p.kbps;
-    rate.vbvFrames = p.vbvFrames;
-    rate.fps = p.fps;
-    PipelineOptions po;
-    po.converter = std::move(conv);
-    po.dumpPath = a.dumpNv12;
-    out.pipeline = std::make_unique<Pipeline>(*choice.backend, *capture, ring, rep, rate, std::move(po));
-    out.capture = std::move(capture);
-    return Status::Ok();
-}
-
-std::string joinUnavailable(const Caps& caps) {
-    std::string out;
-    for (const auto& [name, why] : caps.unavailable) {
-        if (!out.empty()) out += "; ";
-        out += name + ": " + why;
-    }
-    return out;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -295,9 +232,13 @@ int main(int argc, char** argv) {
     }
     setLogLevel(a.logLevel);
     setDpiAwareness();
-    if (a.selfTestConvert || a.selfTestPacer) {
+    if (a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder) {
         int rc = 0;
         if (a.selfTestPacer) rc = runPacerSelfTest();
+        if (a.selfTestEncoder) {
+            const int e = runEncoderSelfTest();
+            if (rc == 0) rc = e;
+        }
         if (a.selfTestConvert) {
             const int c = runConvertSelfTest(a.selfTestHardware);
             if (rc == 0) rc = c;
@@ -307,6 +248,7 @@ int main(int argc, char** argv) {
     }
 
     BackendChoice choice = chooseBackend(a.backend, a.mock);
+    if (!a.encodeTest.output.empty()) return runEncodeTest(a.encodeTest, choice);
     if (a.printCaps) {
         std::printf("%s\n", encodeCaps(choice.caps, qpcFrequency()).c_str());
         return kExitOk;
@@ -377,7 +319,7 @@ int main(int argc, char** argv) {
             }
             StartResult sr;
             Started st;
-            Status ss = startStream(m, choice, ring, rep, a, sr, st);
+            Status ss = startStream(m.start, choice, ring, rep, a.dumpNv12, sr, st);
             if (!ss.ok) {
                 if (ss.fatal) {
                     rep.fatal(ss);
@@ -404,6 +346,7 @@ int main(int argc, char** argv) {
         else if (m.type == "recover") s = choice.backend->recover(m.lostFromFrameId, m.ackedLtrFrameId);
         else if (m.type == "setRate") s = pipeline->setRate(m.rate);
         else if (m.type == "setRoi") s = choice.backend->setRoi(m.rects);
+        else if (m.type == "ack") s = choice.backend->ack(m.ackFrameId);
         if (!s.ok) {
             if (s.fatal) {
                 rep.fatal(s);

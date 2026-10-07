@@ -63,7 +63,7 @@ Status Pipeline::setRate(const RateParams& r) {
 
 void Pipeline::captureLoop() {
     uint64_t nextId = 1;
-    int64_t lastPoolWarn = 0;
+    int64_t lastPoolWarn = 0, lastBusyWarn = 0;
     while (!stop_) {
         CapturedFrame frame;
         Status err;
@@ -123,11 +123,22 @@ void Pipeline::captureLoop() {
             ef.poolIndex = cf.index;
             if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);
         }
-        ++nextId;
         info.submitQpc = qpcNow();
         Status s = enc_.submit(ef, info);
         ef = EncoderFrame{};  // the backend kept its own reference if it needs one
         cap_.release(frame);
+        if (s.code == "encoder_busy") {
+            // The encoder did not take the frame (its input queue is full, or
+            // an idle repeat of an image it is still encoding): drop it without
+            // using up the frame id, so no gap looks like a loss.
+            const int64_t now = qpcNow();
+            if (now - lastBusyWarn > qpcFrequency()) {
+                logf(LogLevel::Warn, "encoder is behind: dropping a captured frame (%s)", s.text.c_str());
+                lastBusyWarn = now;
+            }
+            continue;
+        }
+        ++nextId;
         if (!s.ok) {
             if (s.fatal) {
                 rep_.fatal(s);

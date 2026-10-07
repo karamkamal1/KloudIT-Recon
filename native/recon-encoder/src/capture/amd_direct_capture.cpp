@@ -28,10 +28,10 @@
 // which the helper never calls, so it is a fatal capture_failed.
 //
 // Surfaces reach the encoder through the NV12 converter (it samples the
-// surface's D3D11 texture; DCC is resolved by the shader read). When the AMF
-// encoder (3.3) runs on the same AMFContext (SourceInfo::amfContext), it can
-// take CapturedFrame::amfSurface directly instead, unless amfDcc (DCC surfaces
-// cannot be submitted to the encoder as they are: AMF_Display_Capture_API.md).
+// surface's D3D11 texture; DCC is resolved by the shader read), or, with the
+// AMF encoder on the same AMFContext (SourceInfo::amfContext), as they are
+// ("zero-copy", amf/amf_backend.cpp); DCC surfaces are copied first there
+// (they cannot be submitted to the encoder as they are: AMF_Display_Capture_API.md).
 //
 // VERIFY on hardware (docs/VENDOR_NOTES.md): MONITOR_INDEX = the output's
 // index on its adapter (the doc says "determined by EnumAdapters"), AMF
@@ -170,6 +170,7 @@ Status AmdDirectCapture::initComponent() {
     src_.width = uint32_t(size.width > 0 ? size.width : output_.desc.width);
     src_.height = uint32_t(size.height > 0 ? size.height : output_.desc.height);
     src_.rotation = rotation_;
+    src_.amfFormat = int(format);  // what the AMF encoder is initialized with for zero-copy input (step 3.3)
     logf(LogLevel::Debug, "amd-direct: resolution %dx%d, rotation %d, surface format %lld", size.width, size.height, rotation_,
          static_cast<long long>(format));
     return Status::Ok();

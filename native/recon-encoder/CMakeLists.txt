@@ -33,6 +33,8 @@ embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/testdata/mock_clip.h264 kMockClip
 
 add_executable(recon-encoder
     src/main.cpp
+    src/stream.cpp
+    src/encode_test.cpp
     src/control.cpp
     src/pipeline.cpp
     src/protocol.cpp
@@ -49,6 +51,9 @@ add_executable(recon-encoder
     src/mock/synthetic_capture.cpp
     src/amf/amf_backend.cpp
     src/amf/amf_runtime.cpp
+    src/codec/bitstream.cpp
+    src/codec/ltr.cpp
+    src/codec/selftest.cpp
     src/nvenc/nvenc_backend.cpp
     src/capture/dda_capture.cpp
     src/capture/amd_direct_capture.cpp

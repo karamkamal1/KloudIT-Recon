@@ -1,6 +1,6 @@
-// Real capture methods and encoder backends behind factories. The capture
-// methods are implemented (step 3.2); the AMF (3.3) and NVENC (3.4) encoder
-// backends still only probe for their runtime and report "not available".
+// Real capture methods and encoder backends behind factories: the capture
+// methods (step 3.2) and the AMF encoder (3.3) are implemented; the NVENC
+// backend (3.4) still only probes for its runtime and reports "not available".
 #pragma once
 
 #include <windows.h>
@@ -24,7 +24,9 @@ Fn procAddress(HMODULE m, const char* name) {
     return reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(m, name)));
 }
 
-// Encoders (amf/amf_backend.cpp, nvenc/nvenc_backend.cpp).
+// Encoders (amf/amf_backend.cpp, nvenc/nvenc_backend.cpp). probeAmf creates
+// each AMF encoder once on the first AMD adapter and reads its caps (cached
+// for the process).
 Probe probeAmf();
 std::unique_ptr<Backend> createAmfBackend(Status& err);
 Probe probeNvenc();

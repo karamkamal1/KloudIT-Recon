@@ -75,6 +75,13 @@ func TestDecodeMessages(t *testing.T) {
 		!*s.HAGSEnabled || s.GPUPriority != "realtime" || s.IdleRepeatMs != 100 || !s.Barcode || s.CursorInVideo {
 		t.Fatalf("started (dda): %+v %v", m, err)
 	}
+	// The AMF backend at 1920x1080 AV1 on RDNA3: coded 64x16-aligned, cropped.
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"amf","capture":"dda","codec":"av1","width":1920,"height":1080,"fps":60,"kbps":20000,"codedWidth":1920,"codedHeight":1088,"cropRight":0,"cropBottom":8,"liveBitrate":"seamless","rateControl":"cbr","usage":"ultra_low_latency","ltrSlots":2,"ltrInterval":6,"encoderInstance":0,"hwInstances":2,"queryTimeoutMs":5,"zeroCopy":false,"intraRefreshFrames":0}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.CodedHeight != 1088 || s.CropBottom != 8 || s.CodedWidth != 1920 ||
+		s.LiveBitrate != "seamless" || s.RateControl != "cbr" || s.LTRSlots != 2 || s.LTRInterval != 6 || s.HWInstances != 2 ||
+		s.QueryTimeoutMs != 5 || s.Usage != "ultra_low_latency" {
+		t.Fatalf("started (amf av1): %+v %v", m, err)
+	}
 	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"wgc","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"cursorInVideo":true}`))
 	if s, ok := m.(*Started); err != nil || !ok || !s.CursorInVideo {
 		t.Fatalf("started (wgc with the pointer): %+v %v", m, err)
@@ -104,6 +111,7 @@ func TestDecodeMessages(t *testing.T) {
 // The Go -> helper messages use the field names src/protocol.cpp parses.
 func TestEncodeMessages(t *testing.T) {
 	acked := uint64(40)
+	instance, zeroCopy := 0, false
 	for _, c := range []struct {
 		v    any
 		want string
@@ -117,6 +125,12 @@ func TestEncodeMessages(t *testing.T) {
 			Monitor: 1, HMonitor: 65537, Window: 0x20a3c, WindowTitle: "Game", GPUPriority: "high", IdleRepeatMs: 250,
 			Barcode: &Barcode{X: 0, Y: 8, BlockW: 8, BlockH: 8, Cols: 32, Bits: 32, MSBFirst: true}}},
 			`{"t":"start","monitor":1,"codec":"hevc","fps":60,"kbps":20000,"hmonitor":65537,"adapterLuid":"00000000:0000c3a1","window":133692,"windowTitle":"Game","gpuPriority":"high","idleRepeatMs":250,"barcode":{"x":0,"y":8,"blockW":8,"blockH":8,"cols":32,"bits":32,"msbFirst":true}}`},
+		{startMsg{T: "start", StartParams: StartParams{Codec: "av1", FPS: 60, Kbps: 20000, LTRSlots: 2, LiveBitrate: "flush",
+			EncoderInstance: &instance, LTRInterval: 6, ZeroCopy: &zeroCopy}},
+			`{"t":"start","monitor":0,"codec":"av1","fps":60,"kbps":20000,"ltrSlots":2,"liveBitrate":"flush","encoderInstance":0,"ltrInterval":6,"zeroCopy":false}`},
+		{startMsg{T: "start", StartParams: StartParams{Codec: "h264", FPS: 60, Kbps: 8000, IntraRefreshFrames: 30}},
+			`{"t":"start","monitor":0,"codec":"h264","fps":60,"kbps":8000,"intraRefreshFrames":30}`},
+		{ackMsg{T: "ack", FrameID: 1234}, `{"t":"ack","frameId":1234}`},
 		{simpleMsg{T: "forceIdr"}, `{"t":"forceIdr"}`},
 		{recoverMsg{T: "recover", LostFromFrameID: 42}, `{"t":"recover","lostFromFrameId":42}`},
 		{recoverMsg{T: "recover", LostFromFrameID: 42, AckedLTRFrameID: &acked}, `{"t":"recover","lostFromFrameId":42,"ackedLtrFrameId":40}`},

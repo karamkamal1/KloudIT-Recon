@@ -27,7 +27,7 @@ SamplerState lin : register(s0);
 cbuffer Params : register(b0) {
     float4 xformU;    // s = dot(xformU.xyz, float3(u, v, 1))
     float4 xformV;    // t = dot(xformV.xyz, float3(u, v, 1))
-    float4 lumaSize;  // W, H, 1/W, 1/H of the output
+    float4 lumaSize;  // W, H, 1/W, 1/H of the output's content (the picture without padding)
     float4 coefY;     // dot(rgb, coef.xyz) + coef.w, UNORM8 units / 255
     float4 coefU;
     float4 coefV;
@@ -226,11 +226,19 @@ bool Nv12Converter::nv12RenderTargets(ID3D11Device* device) {
 }
 
 Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height, const BarcodeLayout& barcode,
-                           Output output, int poolSize) {
+                           Output output, int poolSize, uint32_t contentWidth, uint32_t contentHeight) {
     if (!device || width < 2 || height < 2 || (width & 1) || (height & 1) || width > 16384 || height > 16384) {
         return Status::Error("init_failed", "bad conversion size " + std::to_string(width) + "x" + std::to_string(height));
     }
-    if (std::string p = barcodeProblem(barcode, width, height); !p.empty()) return Status::Error("bad_message", p);
+    if (!contentWidth) contentWidth = width;
+    if (!contentHeight) contentHeight = height;
+    if (contentWidth < 2 || contentHeight < 2 || (contentWidth & 1) || (contentHeight & 1) || contentWidth > width ||
+        contentHeight > height) {
+        return Status::Error("init_failed", "bad content size " + std::to_string(contentWidth) + "x" +
+                                                std::to_string(contentHeight) + " in " + std::to_string(width) + "x" +
+                                                std::to_string(height));
+    }
+    if (std::string p = barcodeProblem(barcode, contentWidth, contentHeight); !p.empty()) return Status::Error("bad_message", p);
     if (output == Output::Nv12 && !nv12RenderTargets(device)) {
         return Status::Error("unsupported", "this D3D11 device cannot render to NV12 textures");
     }
@@ -242,6 +250,8 @@ Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height
     }
     width_ = width;
     height_ = height;
+    contentW_ = contentWidth;
+    contentH_ = contentHeight;
     barcode_ = barcode;
     output_ = output;
     poolSize_ = size_t(poolSize < 1 ? 1 : poolSize);
@@ -445,8 +455,10 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
     }
     Constants c{};
     rotationTransform(rotation, c.xformU, c.xformV);
-    c.lumaSize[0] = float(width_), c.lumaSize[1] = float(height_);
-    c.lumaSize[2] = 1.0f / float(width_), c.lumaSize[3] = 1.0f / float(height_);
+    // Output pixels map to the source through the content size: beyond it
+    // (padding) the coordinates pass 1.0 and the clamp sampler repeats the edge.
+    c.lumaSize[0] = float(contentW_), c.lumaSize[1] = float(contentH_);
+    c.lumaSize[2] = 1.0f / float(contentW_), c.lumaSize[3] = 1.0f / float(contentH_);
     const YuvCoefficients k = bt709Limited();
     std::memcpy(c.coefY, k.y, sizeof(c.coefY));
     std::memcpy(c.coefU, k.u, sizeof(c.coefU));

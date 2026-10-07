@@ -51,6 +51,13 @@ type StartParams struct {
 	GPUPriority  string   `json:"gpuPriority,omitempty"`  // auto (default) | high | realtime | off
 	IdleRepeatMs int      `json:"idleRepeatMs,omitempty"` // repeat the last image after this long without a new one (default 100)
 	Barcode      *Barcode `json:"barcode,omitempty"`      // in-band frame-id barcode, nil = off
+
+	// Encoder knobs (optional; zero values keep the backend's defaults).
+	LiveBitrate        string `json:"liveBitrate,omitempty"`        // "" = the codec's Caps LiveBitrate | seamless | flush
+	EncoderInstance    *int   `json:"encoderInstance,omitempty"`    // hardware encoder engine (AMF INSTANCE_INDEX); nil = default
+	LTRInterval        int    `json:"ltrInterval,omitempty"`        // frames between LTR marks; 0 = fps/10
+	IntraRefreshFrames int    `json:"intraRefreshFrames,omitempty"` // intra refresh cycle in frames; 0 = off (not with LTRSlots)
+	ZeroCopy           *bool  `json:"zeroCopy,omitempty"`           // AMD Direct Capture surfaces straight into AMF when possible; nil = true
 }
 
 // Barcode places the frame id as a block barcode into every encoded frame
@@ -158,6 +165,26 @@ type Started struct {
 	// CursorInVideo: this stream's frames contain the mouse pointer (a WGC
 	// session that could not exclude it), so the client must not draw its own.
 	CursorInVideo bool `json:"cursorInVideo"`
+
+	// The bitstream's frame size. AV1 on RDNA3 is coded in 64x16 multiples:
+	// the picture is the top-left Width x Height, CropRight / CropBottom
+	// columns / rows of padding follow (proto.VideoConfig gets the same, GUIDE
+	// 1.7). Older helpers omit them: zero means Width / Height, no crop.
+	CodedWidth  int `json:"codedWidth"`
+	CodedHeight int `json:"codedHeight"`
+	CropRight   int `json:"cropRight"`
+	CropBottom  int `json:"cropBottom"`
+	// What the encoder does (diagnostics and the recovery / rate logic).
+	LiveBitrate        string `json:"liveBitrate"`        // seamless | flush: how SetRate is applied
+	RateControl        string `json:"rateControl"`        // e.g. cbr | vbr_latency
+	Usage              string `json:"usage"`              // e.g. ultra_low_latency (AMF H.264 may fall back to low_latency)
+	LTRSlots           int    `json:"ltrSlots"`           // LTR slots in use; 0 = recovery by IDR
+	LTRInterval        int    `json:"ltrInterval"`        // frames between LTR marks
+	EncoderInstance    int    `json:"encoderInstance"`    // hardware engine used
+	HWInstances        int    `json:"hwInstances"`        // engines the GPU has for this codec
+	QueryTimeoutMs     int    `json:"queryTimeoutMs"`     // blocking output wait, 0 = polled
+	ZeroCopy           bool   `json:"zeroCopy"`           // capture surfaces encoded without the NV12 conversion
+	IntraRefreshFrames int    `json:"intraRefreshFrames"` // intra refresh cycle, 0 = off
 }
 
 // CaptureChanged reports a change of the capture source. Reason "resized":
@@ -241,6 +268,11 @@ type setRateMsg struct {
 	Kbps      int     `json:"kbps"`
 	VBVFrames float64 `json:"vbvFrames,omitempty"`
 	FPS       int     `json:"fps,omitempty"`
+}
+
+type ackMsg struct {
+	T       string `json:"t"` // "ack"
+	FrameID uint64 `json:"frameId"`
 }
 
 type setROIMsg struct {

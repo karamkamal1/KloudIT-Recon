@@ -87,8 +87,10 @@ uint8_t unorm(double v) {
     return uint8_t(std::lround(v * 255.0));
 }
 
-std::vector<uint8_t> reference(const Image& img, uint32_t w, uint32_t h, int rotation, const BarcodeLayout& bc,
-                               uint64_t value) {
+// cw x ch: the content rectangle the image is scaled into (the rest of
+// w x h is padding: the same mapping continued, clamped to the edge).
+std::vector<uint8_t> reference(const Image& img, uint32_t w, uint32_t h, uint32_t cw, uint32_t ch, int rotation,
+                               const BarcodeLayout& bc, uint64_t value) {
     const d3d::YuvCoefficients k = d3d::bt709Limited();
     std::vector<uint8_t> out(size_t(w) * h * 3 / 2);
     for (uint32_t y = 0; y < h; ++y) {
@@ -98,7 +100,7 @@ std::vector<uint8_t> reference(const Image& img, uint32_t w, uint32_t h, int rot
                 out[size_t(y) * w + x] = bit ? 235 : 16;
                 continue;
             }
-            const Rgb c = fetch(img, w, h, rotation, x + 0.5, y + 0.5);
+            const Rgb c = fetch(img, cw, ch, rotation, x + 0.5, y + 0.5);
             out[size_t(y) * w + x] = unorm(k.y[0] * c.r + k.y[1] * c.g + k.y[2] * c.b + k.y[3]);
         }
     }
@@ -114,7 +116,7 @@ std::vector<uint8_t> reference(const Image& img, uint32_t w, uint32_t h, int rot
             const double wts[6][3] = {{-1, 0, 1}, {0, 0, 2}, {1, 0, 1}, {-1, 1, 1}, {0, 1, 2}, {1, 1, 1}};
             Rgb s;
             for (const auto& t : wts) {
-                const Rgb c = fetch(img, w, h, rotation, lx + t[0], ly + t[1]);
+                const Rgb c = fetch(img, cw, ch, rotation, lx + t[0], ly + t[1]);
                 s.r += c.r * t[2], s.g += c.g * t[2], s.b += c.b * t[2];
             }
             s.r /= 8, s.g /= 8, s.b /= 8;
@@ -133,6 +135,7 @@ struct Case {
     uint64_t value;
     int tolerance;         // max |GPU - reference| per sample
     bool noShaderBinding;  // source texture without D3D11_BIND_SHADER_RESOURCE (converter copies it)
+    uint32_t contentW = 0, contentH = 0;  // picture inside outW x outH, the rest padding (0 = no padding)
 };
 
 BarcodeLayout layout(int x, int y, int bw, int bh, int cols, int bits, bool msb) {
@@ -174,7 +177,7 @@ const uint8_t kBarYuv[8][3] = {{235, 128, 128}, {219, 16, 138}, {188, 154, 16}, 
 int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img, const Case& c) {
     Checker chk(c.name);
     d3d::Nv12Converter conv;
-    Status s = conv.init(dev, c.outW, c.outH, c.barcode, mode, 2);
+    Status s = conv.init(dev, c.outW, c.outH, c.barcode, mode, 2, c.contentW, c.contentH);
     if (!s.ok) {
         chk.fail("init: %s", s.text.c_str());
         return chk.failures();
@@ -212,7 +215,8 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
     if (!conv.convert(src.Get(), c.rotation, c.value, f3).ok) chk.fail("released texture not reused");
 
     const uint32_t w = c.outW, h = c.outH;
-    const std::vector<uint8_t> ref = reference(img, w, h, c.rotation, c.barcode, c.value);
+    const uint32_t cw = c.contentW ? c.contentW : w, ch = c.contentH ? c.contentH : h;
+    const std::vector<uint8_t> ref = reference(img, w, h, cw, ch, c.rotation, c.barcode, c.value);
     int maxErr = 0;
     for (size_t i = 0; i < ref.size(); ++i) {
         const int e = std::abs(int(got[i]) - int(ref[i]));
@@ -229,7 +233,7 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
     const uint8_t* uv = got.data() + size_t(w) * h;
     if (c.rotation == 0) {
         for (int b = 0; b < 8; ++b) {
-            const uint32_t x = (uint32_t(b) * 2 + 1) * w / 16 & ~1u, y = h * 3 / 8 & ~1u;
+            const uint32_t x = (uint32_t(b) * 2 + 1) * cw / 16 & ~1u, y = ch * 3 / 8 & ~1u;
             const uint8_t Y = got[size_t(y) * w + x], U = uv[(size_t(y / 2) * (w / 2) + x / 2) * 2],
                           V = uv[(size_t(y / 2) * (w / 2) + x / 2) * 2 + 1];
             if (std::abs(Y - kBarYuv[b][0]) > 1 || std::abs(U - kBarYuv[b][1]) > 1 || std::abs(V - kBarYuv[b][2]) > 1) {
@@ -271,8 +275,21 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
                      static_cast<unsigned long long>(c.value & mask));
         }
     }
-    std::printf("  %-28s %ux%u -> %ux%u rot %3d: %s (max error %d)\n", c.name, img.w, img.h, w, h, c.rotation,
+    // Padding: the last content column / row repeated (the clamp sampler), so
+    // the padded area holds no new detail for the encoder to spend bits on.
+    if (cw < w || ch < h) {
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = cw + 2; x < w; ++x) {
+                if (std::abs(got[size_t(y) * w + x] - got[size_t(y) * w + cw + 1]) > 1) {
+                    chk.fail("padding column %u row %u is not the repeated edge", x, y);
+                    x = w, y = h;
+                }
+            }
+        }
+    }
+    std::printf("  %-28s %ux%u -> %ux%u rot %3d: %s (max error %d)\n", c.name, img.w, img.h, cw, ch, c.rotation,
                 chk.failures() ? "FAIL" : "ok", maxErr);
+    if (cw < w || ch < h) std::printf("  %-28s (padded to %ux%u)\n", "", w, h);
     return chk.failures();
 }
 
@@ -317,6 +334,8 @@ int runConvertSelfTest(bool hardware) {
         {"1:1 rotated 180", 256, 128, 180, BarcodeLayout{}, 0, 1, false},
         {"1:1 rotated 270", 128, 256, 270, BarcodeLayout{}, 0, 1, false},
         {"2:1 upscale", 512, 256, 0, BarcodeLayout{}, 0, 2, false},
+        // AV1 on RDNA3: 200x90 coded as 256x96 (multiples of 64x16).
+        {"scaled into 64x16 padding", 256, 96, 0, layout(8, 64, 4, 4, 16, 16, true), 0xBEEFull, 2, false, 200, 90},
     };
     int failures = 0;
     for (const Case& c : cases) failures += runCase(dev.device.Get(), mode, img, c);

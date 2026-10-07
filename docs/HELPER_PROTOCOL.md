@@ -52,6 +52,8 @@ recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
 recon-encoder.exe --self-test-convert               # GPU colour conversion on WARP (see Self-tests)
 recon-encoder.exe --self-test-pacer                 # frame pacing policy (see Self-tests)
+recon-encoder.exe --self-test-encoder               # LTR recovery policy, parameter sets, ROI maps (see Self-tests)
+recon-encoder.exe --encode-test=FILE [--backend=...] [options]   # one stream to a file (see Encode test)
 recon-encoder.exe --version
 ```
 
@@ -101,9 +103,10 @@ ignored by recon-host.
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1), `rc` (`cbr` \| `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode` | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields. |
+| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8; 0 = recovery by IDR, AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder). |
-| `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: invalidate them; AMF: reference only the LTR slot holding `ackedLtrFrameId`; otherwise an IDR. |
+| `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: invalidate them; AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without one an IDR. |
+| `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
 | `setRate` | `kbps`, `vbvFrames` (0 = unchanged), `fps` (0 = unchanged) | New target. No IDR unless the codec's `liveBitrate` is `flush`. |
 | `setRoi` | `rects`: `[{x, y, w, h, weight}]` (weight -10..10, at most 256) | Replace the regions of interest. |
 | `shutdown` | | Stop and exit (closing stdin does the same). |
@@ -112,6 +115,8 @@ ignored by recon-host.
 {"t":"start","capture":"dda","monitor":0,"codec":"hevc","width":2560,"height":1440,"fps":120,"kbps":60000,"vbvFrames":1,"rc":"cbr","quality":"speed","ltrSlots":2}
 {"t":"start","hmonitor":65537,"codec":"hevc","fps":60,"kbps":20000,"gpuPriority":"auto","idleRepeatMs":100,"barcode":{"x":0,"y":0,"blockW":8,"blockH":8,"cols":16,"bits":32,"msbFirst":true}}
 {"t":"start","capture":"wgc","windowTitle":"Cyberpunk","codec":"hevc","fps":60,"kbps":30000}
+{"t":"start","capture":"dda","codec":"av1","fps":120,"kbps":50000,"ltrSlots":2,"liveBitrate":"flush","encoderInstance":1}
+{"t":"ack","frameId":1200}
 {"t":"recover","lostFromFrameId":1234,"ackedLtrFrameId":1200}
 {"t":"setRate","kbps":35000,"vbvFrames":1.5}
 ```
@@ -131,7 +136,7 @@ ignored by recon-host.
  "outputs":[{"index":0,"adapterIndex":0,"outputIndex":0,"adapterLuid":"00000000:0000c3a1",
    "adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","name":"\\\\.\\DISPLAY1","hmonitor":65537,
    "x":0,"y":0,"width":2560,"height":1440,"rotation":0,"attached":true}],
- "unavailable":{"amf":"AMF runtime 1.5.2.0 found; the AMF encoder backend is not implemented yet (step 3.3)",
+ "unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: ...",
    "nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: ...",
    "amd-direct":"...", "...":"..."},
  "qpcFrequency":10000000}
@@ -166,7 +171,9 @@ ignored by recon-host.
   required it keeps using FFmpeg). `started.cursorInVideo` is the per-stream answer.
 * `outputs`: every DXGI output of every adapter, for `start`'s monitor selection
   (`hmonitor`, or `adapterLuid` + `outputIndex`). `name` is the GDI device name.
-* `unavailable`: every probed backend / capture method that is not usable, with why.
+* `unavailable`: every probed backend / capture method that is not usable, with why. The
+  AMF backend adds `amf-h264` / `amf-hevc` / `amf-av1` for codecs its GPU cannot encode
+  (e.g. AV1 before RDNA3).
 
 `started` reports what the encoder actually does (the mock always produces 320x180):
 
@@ -176,6 +183,30 @@ ignored by recon-host.
  "adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","hagsEnabled":true,"gpuPriority":"realtime",
  "idleRepeatMs":100,"barcode":true,"cursorInVideo":false}
 ```
+
+Since step 3.3 `started` also says what the encoder does (the mock fills the defaults):
+
+```json
+{"codedWidth":1920,"codedHeight":1088,"cropRight":0,"cropBottom":8,"liveBitrate":"seamless",
+ "rateControl":"cbr","usage":"ultra_low_latency","ltrSlots":2,"ltrInterval":6,"encoderInstance":0,
+ "hwInstances":2,"queryTimeoutMs":5,"zeroCopy":false,"intraRefreshFrames":0}
+```
+
+`codedWidth`/`codedHeight`: the frame size in the bitstream. It differs from
+`width`/`height` only where the encoder needs an aligned size: AV1 on RDNA3 is coded in
+multiples of 64x16 (`caps.codecs.av1.alignW/alignH`), so 1920x1080 is coded as 1920x1088;
+the picture is the top-left `width` x `height` and the last `cropRight` columns /
+`cropBottom` rows are padding (the edge pixels repeated) that the client must crop (GUIDE
+1.7, `proto.VideoConfig`). H.264 and HEVC signal their cropping in the SPS, so their coded
+size is the picture size. `liveBitrate`: how `setRate` is applied (`seamless` = new rate
+from the next frame, no IDR; `flush` = forced IDR + encoder flush + re-init, a new `gen`).
+`rateControl`: the encoder's rate-control mode (`cbr`, or `vbr_latency` for AMF's
+LATENCY_CONSTRAINED_VBR). `usage`: the AMF usage (`ultra_low_latency`, or `low_latency`
+after the H.264 fallback of AMF issue #410). `ltrSlots`/`ltrInterval`: LTR recovery in use
+(0 = recovery by IDR). `encoderInstance`/`hwInstances`: the hardware engine used / the
+number of engines. `queryTimeoutMs`: the encoder's blocking output wait (0 = polled every
+1 ms). `zeroCopy`: AMD Direct Capture surfaces are encoded without the NV12 conversion.
+Older helpers omit these fields.
 
 `captureWidth`/`captureHeight` are the source as displayed; `adapterLuid`, `adapterName`,
 `vendor` and `hagsEnabled` describe the adapter capture and encoder run on (empty / `null`
@@ -239,9 +270,10 @@ entry point). `ltrSlot` and `temporalLayer` complete the picture.
 | `unsupported` | no | the backend cannot do what was asked (e.g. codec) |
 | `init_failed` | no | capture or encoder initialisation failed (e.g. `DuplicateOutput` refused) |
 | `no_output` | no | the requested monitor / window does not exist or is not attached to the desktop |
-| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly) |
+| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly; a zero-copy AMD Direct Capture source that changed size or rotation: recon-host restarts the helper, which then follows the new size) |
 | `device_lost` | yes | the D3D11 device was removed (driver reset / TDR), noticed by any capture method or the colour conversion; a new helper starts over |
 | `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped) |
+| `encode_failed` | no / yes | an encoder call failed (AMF `SubmitInput`, `QueryOutput`, surface creation); fatal after 10 failures in a row, on `AMF_EOF`, or when `liveBitrate` `flush` cannot re-initialize the encoder |
 | `mock_error` / `mock_fatal` | no / yes | injected by `--mock-error-at` / `--mock-fatal-at` |
 | `protocol` | yes | control framing broken (message over 1 MiB) |
 | `ring` | yes | the ring could not be attached, or its counters are inconsistent |
@@ -298,8 +330,8 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 | 76 | u32 | `temporalLayer` |
 | 80 | u32 | `refLtrMask`: LTR slots referenced |
 | 84 | u32 | `droppedBefore`: frames dropped right before this one |
-| 88 | u32 | `width` |
-| 92 | u32 | `height` |
+| 88 | u32 | `width`: the coded frame width (`started.codedWidth`) |
+| 92 | u32 | `height`: the coded frame height |
 | 96..127 | | reserved (0) |
 | `payloadOffset` | bytes | bitstream: an Annex-B access unit (H.264/HEVC) or an AV1 temporal unit |
 
@@ -346,8 +378,11 @@ output thread   Backend::receive() -> ring -> stats   (one per encoder)
 
 `Backend` (`src/backend.hpp`): `caps()`, `init(start, source, inputSpec)`, `submit(frame)`, `receive()`,
 `forceIdr()`, `recover(lostFrom, ackedLtr)`, `setRate(kbps, vbvFrames, fps)`,
-`setRoi(rects)`, `shutdown()`. Control calls can run concurrently with `submit` /
-`receive`; backends record them and apply them on the next submitted frame. `Capture`:
+`setRoi(rects)`, `ack(frameId)`, `shutdown()`. Control calls can run concurrently with `submit` /
+`receive`; backends record them and apply them on the next submitted frame. A `submit`
+that answers `encoder_busy` did not take the frame (the encoder is behind, or an idle
+repeat of a surface still being encoded): the pipeline drops the capture without using up
+its frame id, so it does not look like a loss. `Capture`:
 `init`, `source()`, `next(timeout)`, `release`, `takeEvent` (-> `captureChanged`), `setFps`,
 `shutdown`. `shutdown()` of either only
 wakes `receive()` / `next()`: the pipeline calls it before joining the capture and output
@@ -466,6 +501,107 @@ at least 8x8 to survive compression), `cols` and `bits` 1..64. Block k (left to 
 or bit k: luma 235 for 1, 16 for 0, chroma 128. The value is the helper's `frameId`, the
 same id as in stats and the ring. The layout must fit the encoded size, else `bad_message`.
 
+## AMF encoder backend
+
+`--backend=amf` (or `auto` with an AMD adapter first): H.264, HEVC and AV1 on AMD's VCN
+through the AMF runtime the driver installs (`src/amf/amf_backend.cpp`, GUIDE 3.3).
+`amfrt64.dll` is loaded from System32 only (`AMFQueryVersion`, `AMFInit`); AMF's trace goes
+to the helper's log (stderr) with its console writer switched off, since stdout is the
+control channel.
+
+**Caps.** At start-up the helper creates each encoder once on the first AMD adapter and
+reads `AMFCaps`: `maxW`/`maxH` (input width/height range), `hwInstances`
+(`*_CAP_NUM_OF_HW_INSTANCES`), `maxTemporalLayers`, `roi` (`*_CAP_ROI`; AV1 has no such
+cap and is listed as `importance`, as OBS does), `queryTimeout`
+(`*_CAP_QUERY_TIMEOUT_SUPPORT`; AV1: set and read back, as FFmpeg does), `sliceOutput`
+(slice / AV1 tile output), `tenBit` (HEVC Main10 / AV1 with P010 input), `maxLtr` (H.264 2
+and HEVC up to 16 by the docs, AV1 `CAP_MAX_NUM_LTR_FRAMES`), `alignW`/`alignH` (AV1
+`CAP_WIDTH/HEIGHT_ALIGNMENT_FACTOR`, 64x16 when the driver does not say: FFmpeg's
+assumption for RDNA3). `recovery` is `ltr` when at least 2 LTR slots are possible,
+`liveBitrate` starts as `seamless` (the AMD Streaming SDK changes the bitrate without a
+flush; step 3.6 qualifies it per codec and rate-control mode), `forceIdr` and
+`intraRefresh` are true.
+
+**Configuration** (before `Init`; the dynamic ones again after it, as FFmpeg does):
+
+| Property | Value |
+|---|---|
+| `USAGE` (first: it sets every default) | `ULTRA_LOW_LATENCY`; H.264 falls back to `LOW_LATENCY` when `Init` fails (AMF issue #410, Sunshine's fallback) |
+| `INSTANCE_INDEX` | `encoderInstance` (default 0) |
+| `FRAMESIZE` / `FRAMERATE` | coded size / `fps` |
+| `PROFILE` | H.264 High, HEVC Main, AV1 Main (8-bit; HDR is step 3.9) |
+| `LOWLATENCY_MODE` (H.264, HEVC) / AV1 `ENCODING_LATENCY_MODE` | true / `LOWEST_LATENCY` |
+| `QUALITY_PRESET` | `quality`: speed (default) / balanced / quality |
+| `RATE_CONTROL_METHOD` | `CBR` for `rc` `cbr`, else `LATENCY_CONSTRAINED_VBR` |
+| `TARGET_BITRATE` / `PEAK_BITRATE` / `VBV_BUFFER_SIZE` | `kbps`, peak = target, VBV = bitrate / fps x `vbvFrames` |
+| `ENFORCE_HRD`, `FILLER_DATA`, `RATE_CONTROL_SKIP_FRAME`, `PRE_ANALYSIS`, `PREENCODE` | all off |
+| `ENABLE_VBAQ` (H.264, HEVC) / AV1 `AQ_MODE` | on / `CAQ` |
+| `GOP_SIZE` (HEVC, AV1) / H.264 `IDR_PERIOD` | 0: IDR only when forced; HEVC `NUM_GOPS_PER_IDR` 1 |
+| `HEADER_INSERTION_MODE` | HEVC `IDR_ALIGNED`, AV1 `KEY_FRAME_ALIGNED`; H.264 has none: every forced IDR asks for SPS/PPS |
+| `B_PIC_PATTERN` | 0 |
+| `MAX_NUM_REFRAMES` | max(4, `ltrSlots` + 1), at most the cap (AV1 <= 8) |
+| `MAX_LTR_FRAMES` / `LTR_MODE` | `ltrSlots` / `KEEP_UNUSED` when `ltrSlots` > 0; else not set (no user LTR, intra refresh possible) |
+| `MAX_NUM_TEMPORAL_LAYERS`, `NUM_TEMPORAL_LAYERS` | `svcLayers` when > 1 |
+| `QUERY_TIMEOUT` | 5 ms when supported (`started.queryTimeoutMs`), else `QueryOutput` is polled every 1 ms |
+| `INPUT_QUEUE_SIZE` | 2 |
+| AV1 `ALIGNMENT_MODE` | `64X16_ONLY` when the alignment is 64x16 (the helper pads itself, see below), else `NO_RESTRICTIONS` |
+| colour | 8-bit, BT.709 primaries / transfer / matrix, limited range out; NV12 input limited range, RGB input (zero-copy) full range |
+| intra refresh (`intraRefreshFrames` > 0) | H.264 `INTRA_REFRESH_NUM_MBS_PER_SLOT` / HEVC `..._CTBS_PER_SLOT` = blocks / frames; AV1 `INTRA_REFRESH_MODE` continuous + `INTRAREFRESH_STRIPES` |
+
+**AV1 alignment.** When the encoder needs 64x16 multiples (RDNA3), the coded size is the
+requested size rounded up, the colour conversion scales the picture into the top-left
+`width` x `height` of the coded-size NV12 texture and repeats its edge pixels into the
+rest, and `started` reports `codedWidth`/`codedHeight` and the crop. Nothing is padded by
+the encoder behind recon-host's back.
+
+**Input.** Converted NV12 pool textures are wrapped with `CreateSurfaceFromDX11Native`;
+the backend is the `AMFSurfaceObserver` that returns the texture to the pool when AMF
+releases the surface. With `capture` `amd-direct` the encoder runs on the capture's
+`AMFContext`; when nothing has to be done to the image (same size, upright, no barcode,
+no padding) and the encoder accepts the capture format, the capture surfaces themselves
+go to the encoder (`zeroCopy`, the Streaming SDK's path; DCC-compressed surfaces are
+copied first, since they cannot be encoded as they are). A zero-copy source that changes
+size or rotation ends the helper (fatal `capture_failed`); recon-host restarts it.
+
+**Per frame.** `FORCE_PICTURE_TYPE` IDR (AV1 `FORCE_FRAME_TYPE` KEY) plus the parameter
+sets (`INSERT_SPS`+`INSERT_PPS` / `INSERT_HEADER` / `FORCE_INSERT_SEQUENCE_HEADER`) for
+the first frame and every forced IDR; `MARK_CURRENT_WITH_LTR_INDEX` and
+`FORCE_LTR_REFERENCE_BITFIELD` from the LTR policy; `ROI_DATA` while regions are set; the
+frame id as a custom property, which AMF copies to the output buffer. A key frame that
+comes out without parameter sets gets the encoder's extradata inserted, so `KEY` always
+marks a decoder entry point.
+
+**Output.** One output thread: `QueryOutput` (blocking up to `QUERY_TIMEOUT`, else
+polled), then `OUTPUT_DATA_TYPE` (AV1 `OUTPUT_FRAME_TYPE`) gives `key`,
+`OUTPUT_MARKED_LTR_INDEX` the slot's `ltrSlot`, `OUTPUT_REFERENCED_LTR_INDEX_BITFIELD`
+`refLtrMask`, `OUTPUT_TEMPORAL_LAYER` `temporalLayer` (H.264, HEVC). `submitQpc` is taken
+just before `SubmitInput`, `outputQpc` when the buffer came out.
+
+**LTR recovery (GUIDE 3.5; `src/codec/ltr.hpp`).** With `ltrSlots` >= 2, every
+`ltrInterval` frames (default fps/10, about 100 ms) a frame is marked into a slot. The slot
+holding the newest acknowledged (`ack`) LTR is never overwritten until a newer LTR has been
+acknowledged; the others rotate (empty first, then the oldest), and an unacknowledged mark
+is kept for up to 1 s waiting for its `ack`, so a round trip longer than the interval
+cannot starve the acknowledgements. Key frames clear all slots ("When we encode a key frame
+or switch frame, all saved LTR slots will be cleared"), so the frame after a key frame is
+marked. What a slot holds is taken from the encoder's output, not from the request.
+`recover(L)`: the newest acknowledged LTR F < L still held (or recon-host's
+`ackedLtrFrameId`); the next frame gets `FORCE_LTR_REFERENCE_BITFIELD` = 1 << slot(F) and
+goes out with `recovery` and `refFloor` F. If the encoder codes it from anything else (its
+`OUTPUT_REFERENCED_LTR_INDEX_BITFIELD` lacks the slot and it is not intra), it is not
+flagged `recovery` and the next frame is an IDR. No acknowledged LTR: IDR.
+
+**setRate.** `liveBitrate` `seamless`: `TARGET_BITRATE`, `PEAK_BITRATE`,
+`VBV_BUFFER_SIZE` (and `FRAMERATE` for an fps change) are set before the next
+`SubmitInput` ("changes will be flushed to encoder only before the next Submit()"), no IDR.
+`flush`: the frames in the encoder are let out (bounded wait), then `Flush`, the new
+values, `ReInit`, a new `gen`, the LTR slots reset and an IDR (OBS's path for VBR modes).
+
+**setRoi.** A host-memory `AMF_SURFACE_GRAY32` map, one importance (0..10) per 64x64 block
+(H.264: 16x16 macroblock): weight w maps to 5 + w/2, the background is 5, overlapping
+rects take the highest value. A new map surface per change; it is attached to every frame
+until the regions change. Codecs without ROI support answer `unsupported`.
+
 ## Self-tests
 
 Both run without a display or GPU and exit 0 (ok), 1 (failed) or 77 (could not run):
@@ -475,19 +611,55 @@ Both run without a display or GPU and exit 0 (ok), 1 (failed) or 77 (could not r
   5 fps, a present 1 ms after an idle repeat, 1000 Hz bursts): fps cap, newest image wins,
   no image older than one interval, a new image right after a repeat goes out at once,
   repeat timing.
+* `--self-test-encoder`: the encoder-independent logic of the backends: the LTR policy
+  driven like an encoder (marks alternate, the newest acknowledged slot is never
+  overwritten, lost ACKs never cost the acknowledged LTR, recovery from the newest
+  acknowledged LTR, IDR fallback without one or across a key frame, rejected recovery
+  frames, in-flight marks), parameter-set detection and insertion (H.264 on the mock clip,
+  HEVC, AV1 OBUs incl. multi-byte sizes), ROI importance maps and coded-size alignment.
 * `--self-test-convert`: the conversion on a WARP device (default hardware device if WARP
   is missing; 77 if there is no D3D11 device at all) against a CPU reference of the same
   maths (D3D bilinear sampling, BT.709 coefficients): 1:1, 2:1 and 4:3 downscale, 2x
   upscale, rotations 90/180/270, a source the converter must copy first; absolute
   colour-bar values (e.g. red = 63/102/240), the orientation of a 90 degree rotation, the
-  barcode blocks (solid, neutral chroma, decoding to the value, MSB- and LSB-first) and the
-  texture pool (reuse, exhaustion). It prints `mode nv12` when it tested NV12 render
+  barcode blocks (solid, neutral chroma, decoding to the value, MSB- and LSB-first), the
+  texture pool (reuse, exhaustion) and a picture scaled into a padded coded size (the
+  repeated edge in the padding, for AV1's 64x16 alignment). It prints `mode nv12` when it tested NV12 render
   targets and `mode planar` when the device has none (Wine's wined3d) and the same shaders
   were checked on separate R8 / R8G8 textures instead.
 
-CI runs both on windows-latest (`mode nv12` required); the Go integration tests run them
+CI runs them on windows-latest (`mode nv12` required); the Go integration tests run them
 too and drive `synthetic-gpu` through the mock encoder (fps cap, idle repeats, and the
 barcode of a `--dump-nv12` frame decoding to its frame id).
+
+## Encode test
+
+`recon-encoder.exe --encode-test=FILE [--backend=amf|mock|...] [options]` runs one stream
+through the real capture, colour conversion, encoder backend and a frame ring the helper
+creates itself, with no recon-host, and writes the bitstream to FILE (Annex-B for H.264 /
+HEVC, IVF for AV1) and a summary to stdout: the `started` message, submit -> output and
+capture -> output latency (p50 / p95 / max), key frames, recovery frames, LTR marks, and
+one line per scripted event. Exit code 0 = every event handled, 1 = failed, 2 = could not
+start. Options become `start` fields (validated by the same parser): `--codec`,
+`--capture` (`synthetic-gpu` needs no display), `--width`, `--height`, `--fps`, `--kbps`,
+`--rc`, `--quality`, `--vbv`, `--ltr-slots`, `--ltr-interval`, `--live-bitrate`,
+`--instance`, `--zero-copy=0|1`, `--intra-refresh`, `--monitor`, `--hmonitor`; plus
+`--frames=N` (stop after frame id N, default 300), `--ack-delay=N` (a simulated client
+acknowledges every LTR frame N frames after receiving it, default 2) and repeatable
+`--at=N:EVENT` with `idr`, `loss` (frame N and the following are dropped by the simulated
+client until a key frame or a recovery frame from before N arrives; the helper gets
+`recover` at once), `rate=KBPS`, `fps=FPS`, `roi=X,Y,W,H,WEIGHT`, `roi=off`. Because the
+file contains exactly what the simulated client decoded, `ffmpeg -v error -i FILE -f null -`
+checks that an LTR recovery really decodes without the lost frames. Example (an AMD host):
+
+```
+recon-encoder.exe --encode-test=out.hevc --backend=amf --codec=hevc --capture=synthetic-gpu ^
+    --fps=60 --kbps=20000 --ltr-slots=2 --frames=600 --at=120:idr --at=200:loss ^
+    --at=300:rate=8000 --at=400:rate=30000 --at=500:fps=30
+```
+
+The Go integration test `TestHelperIntegrationEncodeTest` runs it with the mock backend;
+`RECON_HELPER_ENCODE_TEST="--backend=amf --codec=hevc ..."` runs it against a real encoder.
 
 ## Mock backend
 

@@ -105,7 +105,9 @@ Status parseStart(const json& j, StartParams& p) {
         !optField(j, "kbps", p.kbps, err) || !optField(j, "vbvFrames", p.vbvFrames, err) ||
         !optField(j, "rc", p.rc, err) || !optField(j, "quality", p.quality, err) ||
         !optField(j, "hdr", p.hdr, err) || !optField(j, "ltrSlots", p.ltrSlots, err) ||
-        !optField(j, "svcLayers", p.svcLayers, err)) {
+        !optField(j, "svcLayers", p.svcLayers, err) || !optField(j, "liveBitrate", p.liveBitrate, err) ||
+        !optField(j, "encoderInstance", p.encoderInstance, err) || !optField(j, "ltrInterval", p.ltrInterval, err) ||
+        !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err)) {
         return bad(err);
     }
     if (p.codec != "h264" && p.codec != "hevc" && p.codec != "av1") return bad("codec must be h264, hevc or av1");
@@ -118,6 +120,12 @@ Status parseStart(const json& j, StartParams& p) {
     if (p.quality != "speed" && p.quality != "balanced" && p.quality != "quality") return bad("unknown quality");
     if (!inRange(p.ltrSlots, 0, 8)) return bad("ltrSlots out of range");
     if (!inRange(p.svcLayers, 1, 4)) return bad("svcLayers out of range");
+    if (!p.liveBitrate.empty() && p.liveBitrate != "seamless" && p.liveBitrate != "flush") {
+        return bad("liveBitrate must be seamless or flush");
+    }
+    if (!inRange(p.encoderInstance, -1, 15)) return bad("encoderInstance out of range (-1..15)");
+    if (!inRange(p.ltrInterval, 0, 1000)) return bad("ltrInterval out of range (0..1000)");
+    if (!inRange(p.intraRefreshFrames, 0, 1000)) return bad("intraRefreshFrames out of range (0..1000)");
     if ((p.window || !p.windowTitle.empty()) && !p.capture.empty() && p.capture != "wgc") {
         return bad("window capture needs capture \"wgc\"");
     }
@@ -133,6 +141,11 @@ Status parseControl(std::string_view text, ControlMsg& m) {
     if (!optField(j, "t", m.type, err)) return bad(err);
     if (m.type == "start") return parseStart(j, m.start);
     if (m.type == "forceIdr" || m.type == "shutdown") return Status::Ok();
+    if (m.type == "ack") {
+        if (!j.contains("frameId")) return bad("ack needs frameId");
+        if (!optField(j, "frameId", m.ackFrameId, err)) return bad(err);
+        return Status::Ok();
+    }
     if (m.type == "recover") {
         if (!j.contains("lostFromFrameId")) return bad("recover needs lostFromFrameId");
         uint64_t acked = 0;
@@ -255,6 +268,20 @@ std::string encodeStarted(const Started& s) {
         {"idleRepeatMs", s.idleRepeatMs},
         {"barcode", s.barcode},
         {"cursorInVideo", s.cursorInVideo},
+        {"codedWidth", s.codedWidth ? s.codedWidth : s.width},
+        {"codedHeight", s.codedHeight ? s.codedHeight : s.height},
+        {"cropRight", s.codedWidth ? s.codedWidth - s.width : 0},
+        {"cropBottom", s.codedHeight ? s.codedHeight - s.height : 0},
+        {"liveBitrate", s.liveBitrate},
+        {"rateControl", s.rateControl},
+        {"usage", s.usage},
+        {"ltrSlots", s.ltrSlots},
+        {"ltrInterval", s.ltrInterval},
+        {"encoderInstance", s.encoderInstance},
+        {"hwInstances", s.hwInstances},
+        {"queryTimeoutMs", s.queryTimeoutMs},
+        {"zeroCopy", s.zeroCopy},
+        {"intraRefreshFrames", s.intraRefreshFrames},
     };
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }

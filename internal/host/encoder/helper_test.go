@@ -200,7 +200,8 @@ func TestHelperStartFramesClose(t *testing.T) {
 	h.Recover(3, &acked)
 	h.SetRate(2500, 1.5, 90)
 	h.SetROI(nil)
-	for _, want := range []string{"forceIdr", "recover", "setRate", "setRoi"} {
+	h.Ack(2)
+	for _, want := range []string{"forceIdr", "recover", "setRate", "setRoi", "ack"} {
 		m := <-f.msgs
 		if m["t"] != want {
 			t.Fatalf("got %v, want %s", m, want)
@@ -217,6 +218,10 @@ func TestHelperStartFramesClose(t *testing.T) {
 		case "setRoi":
 			if rects, ok := m["rects"].([]any); !ok || len(rects) != 0 {
 				t.Fatalf("setRoi %v", m)
+			}
+		case "ack":
+			if m["frameId"] != float64(2) {
+				t.Fatalf("ack %v", m)
 			}
 		}
 	}
