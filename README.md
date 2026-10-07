@@ -70,15 +70,18 @@ Techniques used (most of them are new to browser-based game streaming):
 ## Measured results
 
 The browser end-to-end test (`test/e2e/browser.mjs`) runs the real gateway, the real host agent
-and headless Chromium, and checks video, audio, input delivery and latency on every path. Here is
-the latest run in CI-like conditions: **software** SVT-AV1 encoding and **software** AV1 decoding,
+and headless Chromium, and checks video, audio, input delivery and latency on every path. These
+numbers come from CI-like conditions: **software** SVT-AV1 encoding and **software** AV1 decoding,
 both competing for the same 4-core VM, 960×540 at 60 fps:
 
-| Path | Encoder-out → on screen | Network (one-way) | Decode | RTT | FPS | Click → first frame |
-|---|---|---|---|---|---|---|
-| WebTransport, direct to PC | **21 ms** | 7.9 ms | 9.8 ms | 3.7 ms | 61 | 293 ms |
-| WebTransport via gateway | **25 ms** | 10.2 ms | 10.2 ms | 9.8 ms | 62 | 293 ms |
-| WebSocket via gateway | **21 ms** | 6.4 ms | 10.5 ms | 4.6 ms | 62 | 295 ms |
+| Path | Encoder-out → on screen | Network (one-way) | Decode (software AV1) | FPS | Click → first frame |
+|---|---|---|---|---|---|
+| WebTransport, direct to PC | **17–27 ms** (typ. 20) | 6–10 ms | 8–13 ms | 60 | ~300 ms |
+| WebTransport via gateway | **24–36 ms** (typ. 26) | 9–13 ms | 10–18 ms | 60 | ~300 ms |
+| WebSocket via gateway | **19–46 ms** (typ. 23) | 6–10 ms | 10–30 ms | 60 | ~300 ms |
+
+These are ranges across repeated runs. Decode time dominates the spread because the software decoder
+competes with the software encoder for the same CPU.
 
 These numbers are a worst case. On your PC, NVENC/AMF/QSV encode in a few milliseconds and the
 browser decodes in hardware, with no CPU contention. The overlay shows your live numbers

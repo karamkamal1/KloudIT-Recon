@@ -55,7 +55,8 @@ type Session struct {
 	audio    *media.Audio
 	frameQ   chan *media.Frame
 	paused   atomic.Bool
-	lastKick time.Time
+	lastKick time.Time // last key-frame restart (any reason)
+	lastCong time.Time // last congestion back-off
 	kickMu   sync.Mutex
 	curKbps  atomic.Int64
 	videoUp  atomic.Bool
@@ -515,11 +516,12 @@ func (s *Session) handleEncoderFailure(err error) {
 // rate-limited to once every two seconds.
 func (s *Session) congestion(delayMs int) {
 	s.kickMu.Lock()
-	if time.Since(s.lastKick) < 2*time.Second {
+	if time.Since(s.lastCong) < 2*time.Second {
 		s.kickMu.Unlock()
 		return
 	}
-	s.lastKick = time.Now()
+	s.lastCong = time.Now()
+	s.lastKick = s.lastCong // the restart below also delivers a key frame
 	s.kickMu.Unlock()
 	cur := s.curKbps.Load()
 	next := cur * 3 / 4

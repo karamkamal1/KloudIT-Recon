@@ -36,6 +36,7 @@ const video = {
   lastSize: '',
   lostGen: -1,
   keyRequested: 0,
+  waitSince: 0,
 };
 
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
@@ -433,7 +434,9 @@ function onDecodeError(e) {
   if (video.cfg) configureDecoder(video.cfg).then(() => drainEarly());
 }
 
-function requestKeyframe(reason) {
+// Drop the current generation and wait for a fresh key frame. When send is
+// false the caller asks the host for a restart some other way (congestion).
+function requestKeyframe(reason, send = true) {
   const t = now();
   video.waitingKey = true;
   video.reorder.clear();
@@ -442,10 +445,28 @@ function requestKeyframe(reason) {
   stats.keyRequests++;
   video.lostGen = video.cfg ? video.cfg.gen : -1;
   post('log', { text: `requesting key frame (${reason})` });
-  transport?.sendControl({ t: 'keyframe' });
+  if (send) transport?.sendControl({ t: 'keyframe' });
+}
+
+// Watchdog: if we have been waiting for a key frame (or a new generation) for
+// more than a second, ask again. A request can be dropped by the host's rate
+// limits or lost with a connection hiccup; this guarantees video resumes.
+function videoWatchdog() {
+  if (!transport || !video.cfg) return;
+  const waiting = video.waitingKey || video.lostGen === video.cfg.gen;
+  const t = now();
+  if (!waiting) { video.waitSince = 0; return; }
+  if (!video.waitSince) { video.waitSince = t; return; }
+  if (t - video.waitSince > 1000 && t - video.keyRequested > 1000) {
+    video.keyRequested = t;
+    stats.keyRequests++;
+    post('log', { text: 'still waiting for a key frame, asking again' });
+    transport.sendControl({ t: 'keyframe' });
+  }
 }
 
 async function onVideoConfig(cfg) {
+  video.waitSince = 0;
   video.cfg = cfg;
   video.expectSeq = 0;
   video.waitingKey = true;
@@ -519,7 +540,9 @@ function checkDecoderBacklog() {
   try { d.reset(); } catch {}
   video.inflight.clear();
   configureDecoder(video.cfg).then(() => drainEarly());
-  requestKeyframe('decoder backlog');
+  // One message: the host's congestion response lowers the bitrate *and*
+  // restarts with a key frame.
+  requestKeyframe('decoder backlog', false);
   transport?.sendControl({ t: 'congestion', delayMs: 0 });
   if (!overload.warned) {
     overload.warned = true;
@@ -793,10 +816,12 @@ async function start(msg) {
   });
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
   const pingTimer = setInterval(sendPing, 1000);
+  const watchdogTimer = setInterval(videoWatchdog, 250);
   const statsTimer = setInterval(postStats, 500);
   const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes });
   clearInterval(pingTimer);
   clearInterval(statsTimer);
+  clearInterval(watchdogTimer);
   transport = null;
   // A deliberate "bye" (e.g. another device took over) must not trigger an
   // automatic reconnect, or two clients would keep stealing the session.

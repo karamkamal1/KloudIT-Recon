@@ -353,7 +353,16 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	if bufKbits < 64 {
 		bufKbits = 64
 	}
-	gop := p.FPS * 3600 // effectively infinite: IDR only at start / on request
+	// Effectively infinite GOP: IDR only at start / on request. AMF rejects
+	// out-of-range values silently (falling back to a ~1 s GOP), and QSV
+	// stores the GOP in 16 bits, so clamp per vendor.
+	gop := p.FPS * 3600
+	switch e.Vendor {
+	case "amd":
+		gop = 1000
+	case "intel":
+		gop = min(gop, 65535)
+	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)
 	args = append(args,

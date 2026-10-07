@@ -143,6 +143,27 @@ try {
     { name: 'WebSocket relay', prefs: { path: 'relay', transport: 'websocket' }, expect: ['websocket', 'relay'] },
     { name: 'WebGPU renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu' }, expect: ['webtransport', 'direct'] },
   ];
+  if (process.env.E2E_ROTATE) scenarios.push(scenarios.shift());
+
+  // Unmeasured warm-up stream. On CPU-only CI machines the browser's first
+  // software AV1 decoder instance falls behind for a few seconds (the client
+  // detects this, flushes and recovers); hardware decoding is not affected.
+  await page.goto(`${base}/`);
+  await page.evaluate(() => localStorage.setItem('recon.prefs.v1', JSON.stringify({ path: 'relay' })));
+  await page.click('.host.online a.btn-primary');
+  await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+  await page.click('#btn-start');
+  await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+  await sleep(6000);
+  const warmStart = Date.now();
+  let warm = await page.evaluate(() => window.__recon.lastStats);
+  while ((!warm || warm.fps < 30) && Date.now() - warmStart < 10000) {
+    await sleep(500);
+    warm = await page.evaluate(() => window.__recon.lastStats);
+  }
+  check('warm-up stream (self-heals if the decoder falls behind)', warm && warm.fps >= 30,
+    `${warm?.fps.toFixed(1)} fps, ${warm?.keyRequests} recovery key frames, waited ${((Date.now() - warmStart) / 1000).toFixed(1)} s extra`);
+  await page.evaluate(() => { window.__recon.userClosed = true; });
   for (const sc of scenarios) {
     writeFileSync(inputLog, '');
     await page.goto(`${base}/`);
@@ -157,10 +178,24 @@ try {
     const conn = await page.evaluate(() => window.__recon.conn);
     check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1], `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
 
-    await sleep(3000);
+    // Wait for steady state (software decoders need a moment to warm up on
+    // small CI machines), then measure a fresh stats window.
+    const settleStart = Date.now();
+    const timeline = [];
+    for (let i = 0; i < 16; i++) {
+      await sleep(500);
+      const x = await page.evaluate(() => window.__recon.lastStats);
+      if (x) timeline.push({ t: Date.now() - settleStart, fps: +x.fps.toFixed(1), decode: x.decode && +x.decode.toFixed(1), total: x.total && +x.total.toFixed(1), q: x.queue, mbps: +x.mbps.toFixed(1), keyReq: x.keyRequests });
+    }
+    results.push({ timeline: sc.name, points: timeline });
+    // Steady state = the last 1.5 s of the 8 s window all at real-time rate.
+    const tail = timeline.slice(-3);
+    const avg = tail.reduce((a, p) => a + p.fps, 0) / Math.max(1, tail.length);
+    const steady = tail.length === 3 && avg >= 50; // per-0.5 s samples jitter when frames bunch at a boundary
     const st = await page.evaluate(() => window.__recon.lastStats);
+    check(`${sc.name}: steady real-time playback`, steady, `last 1.5 s: ${tail.map((p) => p.fps).join(' / ')} fps; key requests ${st?.keyRequests}`);
     const cfg = await page.evaluate(() => window.__recon.videoCfg);
-    check(`${sc.name}: video decoding`, st && st.fps > 40, `${st?.fps.toFixed(1)} fps, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}`);
+    check(`${sc.name}: video decoding`, st && st.fps > 45, `${st?.fps.toFixed(1)} fps, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}`);
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
