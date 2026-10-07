@@ -17,11 +17,18 @@ func (f *fakeRTT) PTO(bool) time.Duration       { return f.pto }
 
 const mds = 1200
 
+// newTestMedia returns a controller with a PTO of 50 ms and a fake clock.
 func newTestMedia(minRTT time.Duration) (*Media, *congestion.Time) {
 	m := NewMedia(&fakeRTT{min: minRTT, pto: 50 * time.Millisecond}, mds)
 	now := congestion.Now()
-	m.clock = func() congestion.Time { return now }
 	return m, &now
+}
+
+// rttSample sends packet pn and acknowledges it 10 ms later.
+func rttSample(m *Media, now *congestion.Time, pn congestion.PacketNumber) {
+	m.OnPacketSent(*now, mds, pn, mds, true)
+	*now = now.Add(10 * time.Millisecond)
+	m.OnPacketAcked(pn, mds, mds, *now)
 }
 
 func near(t *testing.T, what string, got congestion.ByteCount, want float64) {
@@ -72,9 +79,13 @@ func TestMediaWindowArithmetic(t *testing.T) {
 func TestMediaLossDoesNotShrinkWindow(t *testing.T) {
 	m, now := newTestMedia(10 * time.Millisecond)
 	w := m.GetCongestionWindow()
-	m.OnPacketSent(*now, mds, 1, mds, true)
+	rttSample(m, now, 0)
 	for pn := congestion.PacketNumber(1); pn <= 50; pn++ {
 		*now = now.Add(time.Millisecond)
+		m.OnPacketSent(*now, mds, pn, mds, true)
+	}
+	*now = now.Add(time.Second) // detected late: send times count
+	for pn := congestion.PacketNumber(1); pn <= 50; pn++ {
 		m.OnCongestionEvent(pn, mds, w)
 	}
 	m.OnCongestionEvent(51, 0, w) // ECN CE
@@ -88,23 +99,26 @@ func TestMediaLossDoesNotShrinkWindow(t *testing.T) {
 }
 
 func TestMediaPersistentCongestion(t *testing.T) {
-	m, now := newTestMedia(10 * time.Millisecond) // PTO 50 ms: persistent after 150 ms
+	m, now := newTestMedia(10 * time.Millisecond) // PTO 50 ms: persistent over 150 ms
 	normal := m.GetCongestionWindow()
+	rttSample(m, now, 0)
 	start := *now
-	m.OnPacketSent(start, mds, 1, mds, true) // into an empty pipe
-	m.OnPacketSent(start, 2*mds, 2, mds, true)
-
-	*now = start.Add(140 * time.Millisecond)
-	m.OnCongestionEvent(1, mds, 2*mds)
-	if m.GetCongestionWindow() != normal {
-		t.Fatal("collapsed before 3 × PTO without an ACK")
+	// An outage: data, then PTO probes 50 and 150 ms later, all lost.
+	for pn, at := range map[congestion.PacketNumber]time.Duration{1: 0, 2: time.Millisecond, 3: 50 * time.Millisecond, 4: 160 * time.Millisecond, 5: 170 * time.Millisecond} {
+		m.OnPacketSent(start.Add(at), mds, pn, mds, true)
 	}
-	*now = start.Add(160 * time.Millisecond)
-	m.OnCongestionEvent(2, mds, 2*mds)
+	*now = start.Add(400 * time.Millisecond)
+	for pn := congestion.PacketNumber(1); pn <= 3; pn++ {
+		m.OnCongestionEvent(pn, mds, 2*mds)
+	}
+	if m.GetCongestionWindow() != normal {
+		t.Fatal("collapsed on losses sent within 3 × PTO")
+	}
+	m.OnCongestionEvent(4, mds, 2*mds)
 	if w := m.GetCongestionWindow(); w != minWindowPackets*mds || !m.InSlowStart() {
 		t.Fatalf("window after persistent congestion = %d, want %d", w, minWindowPackets*mds)
 	}
-	m.OnCongestionEvent(3, mds, 2*mds) // same episode
+	m.OnCongestionEvent(5, mds, 2*mds) // same episode
 	if c := m.Stats().Collapses; c != 1 {
 		t.Fatalf("collapses = %d, want 1", c)
 	}
@@ -129,9 +143,7 @@ func TestMediaPersistentCongestion(t *testing.T) {
 
 func TestMediaIdleIsNotPersistentCongestion(t *testing.T) {
 	m, now := newTestMedia(10 * time.Millisecond)
-	m.OnPacketSent(*now, mds, 1, mds, true)
-	*now = now.Add(10 * time.Millisecond)
-	m.OnPacketAcked(1, mds, mds, *now)
+	rttSample(m, now, 1)
 	*now = now.Add(10 * time.Second) // application idle, nothing in flight
 	m.OnPacketSent(*now, mds, 2, mds, true)
 	m.OnPacketSent(*now, 2*mds, 3, mds, true)
@@ -139,6 +151,44 @@ func TestMediaIdleIsNotPersistentCongestion(t *testing.T) {
 	m.OnCongestionEvent(2, mds, 2*mds)
 	if c := m.Stats().Collapses; c != 0 {
 		t.Fatalf("a loss after an idle period collapsed the window (%d)", c)
+	}
+}
+
+// A short outage is detected only after it ends, one PTO backoff and an RTT
+// later: more than 3 × PTO after the last ACK, but the lost packets were sent
+// within 2 × PTO.
+func TestMediaShortOutageIsNotPersistentCongestion(t *testing.T) {
+	m, now := newTestMedia(10 * time.Millisecond) // PTO 50 ms
+	rttSample(m, now, 1)
+	start := *now
+	m.OnPacketSent(start, mds, 2, mds, true)
+	m.OnPacketSent(start.Add(50*time.Millisecond), mds, 3, mds, true)  // PTO probe, lost
+	m.OnPacketSent(start.Add(100*time.Millisecond), mds, 4, mds, true) // lost
+	*now = start.Add(200 * time.Millisecond)                           // the next probe gets through
+	for pn := congestion.PacketNumber(2); pn <= 4; pn++ {
+		m.OnCongestionEvent(pn, mds, 3*mds)
+	}
+	if c := m.Stats().Collapses; c != 0 || m.InSlowStart() {
+		t.Fatalf("a 2 × PTO outage collapsed the window (%d)", c)
+	}
+
+	// An ACK for a packet sent in between ends the episode.
+	m.OnPacketSent(start.Add(110*time.Millisecond), mds, 5, mds, true)
+	m.OnPacketSent(start.Add(300*time.Millisecond), mds, 6, mds, true)
+	m.OnPacketAcked(5, mds, mds, start.Add(310*time.Millisecond))
+	m.OnCongestionEvent(6, mds, mds)
+	if c := m.Stats().Collapses; c != 0 {
+		t.Fatalf("losses on both sides of an ACK collapsed the window (%d)", c)
+	}
+
+	// Without an RTT sample the PTO is a guess: no brake.
+	m2, now := newTestMedia(10 * time.Millisecond)
+	m2.OnPacketSent(*now, mds, 0, mds, true)
+	m2.OnPacketSent(now.Add(time.Second), mds, 1, mds, true)
+	m2.OnCongestionEvent(0, mds, 2*mds)
+	m2.OnCongestionEvent(1, mds, 2*mds)
+	if c := m2.Stats().Collapses; c != 0 {
+		t.Fatalf("collapsed before the first RTT sample (%d)", c)
 	}
 }
 

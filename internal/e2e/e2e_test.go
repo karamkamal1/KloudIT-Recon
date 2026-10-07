@@ -64,6 +64,69 @@ type env struct {
 	csrf    string
 	hostID  string
 	logPath string
+	logs    *logBuffer // gateway and host log, Debug included
+}
+
+// logBuffer collects log lines for assertions.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+// Len is the current size, for lines(from, ...).
+func (l *logBuffer) Len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Len()
+}
+
+// lines returns the lines logged after offset from that contain all subs.
+func (l *logBuffer) lines(from int, subs ...string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+next:
+	for _, line := range strings.Split(string(l.b.Bytes()[from:]), "\n") {
+		for _, s := range subs {
+			if !strings.Contains(line, s) {
+				continue next
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// teeHandler passes each record to both handlers.
+type teeHandler [2]slog.Handler
+
+func (h teeHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h[0].Enabled(ctx, l) || h[1].Enabled(ctx, l)
+}
+
+func (h teeHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, x := range h {
+		if x.Enabled(ctx, r.Level) {
+			if err := x.Handle(ctx, r.Clone()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (h teeHandler) WithAttrs(as []slog.Attr) slog.Handler {
+	return teeHandler{h[0].WithAttrs(as), h[1].WithAttrs(as)}
+}
+
+func (h teeHandler) WithGroup(name string) slog.Handler {
+	return teeHandler{h[0].WithGroup(name), h[1].WithGroup(name)}
 }
 
 func (e *env) do(method, path string, body any, out any) error {
@@ -101,7 +164,11 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 	}
 	dir := t.TempDir()
 	port := freePort(t)
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logs := &logBuffer{}
+	log := slog.New(teeHandler{
+		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}),
+		slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}),
+	})
 	web := fstest.MapFS{"index.html": {Data: []byte("<!doctype html>")}}
 	gw, err := gateway.New(gateway.Config{Listen: fmt.Sprintf("127.0.0.1:%d", port), DataDir: filepath.Join(dir, "gw"), Web: web}, log.With("c", "gateway"))
 	if err != nil {
@@ -115,7 +182,7 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 		}
 	}()
 	jar, _ := cookiejar.New(nil)
-	e := &env{t: t, base: fmt.Sprintf("https://127.0.0.1:%d", port), client: &http.Client{
+	e := &env{t: t, logs: logs, base: fmt.Sprintf("https://127.0.0.1:%d", port), client: &http.Client{
 		Jar: jar, Timeout: 10 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}}
@@ -207,13 +274,15 @@ func (e *env) connectInfo() tickets {
 	return tk
 }
 
-func hello(ticket string) []byte {
+var defaultPrefs = proto.Prefs{FPS: 60, BitrateKbps: 3000}
+
+func hello(ticket string, prefs proto.Prefs) []byte {
 	b, _ := json.Marshal(proto.Hello{
 		T: "hello", V: 1, Ticket: ticket,
 		Client:   proto.ClientInfo{UA: "go-e2e", Width: 1920, Height: 1080, DPR: 1, Hz: 60},
 		Decoders: []proto.DecoderInfo{{Family: "h264", HW: false}},
 		Audio:    proto.AudioCaps{Opus: true},
-		Prefs:    proto.Prefs{FPS: 60, BitrateKbps: 3000},
+		Prefs:    prefs,
 	})
 	return b
 }
@@ -244,6 +313,11 @@ func pinHashes(hashes []string) *tls.Config {
 
 func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, dur time.Duration) result {
 	t.Helper()
+	return runWTPrefs(t, e, rawURL, hashes, ticket, dur, defaultPrefs)
+}
+
+func runWTPrefs(t *testing.T, e *env, rawURL string, hashes []string, ticket string, dur time.Duration, prefs proto.Prefs) result {
+	t.Helper()
 	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: transport.QUICConfig()}
 	hdr := http.Header{}
 	hdr.Set("Origin", e.base)
@@ -261,7 +335,7 @@ func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, 
 		t.Fatal(err)
 	}
 	ctrl.Write([]byte{proto.StreamKindControl})
-	proto.WriteMsg(ctrl, hello(ticket))
+	proto.WriteMsg(ctrl, hello(ticket, prefs))
 	in, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -397,6 +471,11 @@ func TestStreamingPaths(t *testing.T) {
 		checkInput(t, e.logPath)
 	})
 
+	// Default host config "congestion": reno on both paths.
+	if l := e.logs.lines(0, `msg="media congestion control"`); len(l) > 0 {
+		t.Errorf("reno host set a media congestion target: %s", l[0])
+	}
+
 	t.Run("direct-ticket-replay-rejected", func(t *testing.T) {
 		tk := e.connectInfo()
 		r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, time.Second)
@@ -440,7 +519,7 @@ func TestStreamingPaths(t *testing.T) {
 		defer ws.CloseNow()
 		ws.SetReadLimit(64 << 20)
 		send := func(ch byte, p []byte) { ws.Write(ctx, websocket.MessageBinary, append([]byte{ch}, p...)) }
-		send(proto.WSControl, hello(""))
+		send(proto.WSControl, hello("", defaultPrefs))
 		var frames, audio, configs int
 		sentInput := false
 		end := time.Now().Add(3 * time.Second)
@@ -524,21 +603,40 @@ func TestStreamingPaths(t *testing.T) {
 // connection run the media congestion controller.
 func TestStreamingMediaCongestion(t *testing.T) {
 	e := setup(t, func(c *host.Config) { c.Congestion = transport.CongestionMedia })
+	run := func(t *testing.T, path string, dur time.Duration, prefs proto.Prefs) result {
+		tk := e.connectInfo()
+		if path == "relay" {
+			return runWTPrefs(t, e, tk.Relay.WT, tk.Relay.Hashes, "", dur, prefs)
+		}
+		if tk.Direct == nil {
+			t.Fatal("no direct path offered")
+		}
+		return runWTPrefs(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, dur, prefs)
+	}
 	for _, path := range []string{"relay", "direct"} {
 		t.Run(path, func(t *testing.T) {
-			tk := e.connectInfo()
-			var r result
-			if path == "relay" {
-				r = runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 3*time.Second)
-			} else if tk.Direct != nil {
-				r = runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3*time.Second)
-			} else {
-				t.Fatal("no direct path offered")
-			}
+			from := e.logs.Len()
+			r := run(t, path, 3*time.Second, defaultPrefs)
 			t.Logf("%s: %+v", path, r)
 			if !r.welcome || r.frames < 100 || r.keyframes < 1 || r.audio < 100 {
 				t.Fatalf("unexpected result %+v", r)
 			}
+			if len(e.logs.lines(from, `msg="media congestion control"`, "path="+path)) == 0 {
+				t.Fatal("the session did not set a media congestion target")
+			}
 		})
 	}
+	// The pacer must leave room for audio and packet overhead: at the lowest
+	// bitrates they are a large share of what the session sends.
+	t.Run("low-bitrate", func(t *testing.T) {
+		from := e.logs.Len()
+		r := run(t, "direct", 6*time.Second, proto.Prefs{FPS: 60, BitrateKbps: 600})
+		t.Logf("600 kbit/s: %+v", r)
+		if !r.welcome || r.frames < 200 || r.audio < 200 {
+			t.Fatalf("unexpected result %+v", r)
+		}
+		if l := e.logs.lines(from, `msg="congestion: lowering bitrate"`); len(l) > 0 {
+			t.Fatalf("back-off on a lossless link: %s", l[0])
+		}
+	})
 }

@@ -64,6 +64,14 @@ func (a *Audio) FrameMs() int {
 
 func (a *Audio) Codec() string { return a.cfg.Codec }
 
+// Kbps is the audio payload bitrate.
+func (a *Audio) Kbps() int {
+	if a.cfg.Codec == "pcm" {
+		return audioRate * audioChannels * 16 / 1000
+	}
+	return a.cfg.BitrateKbps
+}
+
 // Start begins capture; every packet is passed to send as a complete datagram.
 // Capture is restarted automatically (e.g. when the default device changes).
 func (a *Audio) Start(send func([]byte)) error {

@@ -277,7 +277,7 @@ The new password (at least 10 characters) is read from stdin.
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
 | `directAddr` | auto | Address to advertise for the direct path |
-| `congestion` | `reno` | QUIC congestion control of the video connections (direct path and relay data connection): `reno` (quic-go default) or `media` (paces at 1.2 × the video bitrate and does not halve its window on a single loss; experimental) |
+| `congestion` | `reno` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
