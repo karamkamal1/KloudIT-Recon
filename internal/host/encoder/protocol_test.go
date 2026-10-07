@@ -70,10 +70,14 @@ func TestDecodeMessages(t *testing.T) {
 	if s, ok := m.(*Stats); err != nil || !ok || s.FrameID != 7 || !s.Dropped || s.Reason != "ringFull" || s.LTRSlot != -1 || s.VBVFrames != 1.5 || s.RingDropped != 3 {
 		t.Fatalf("stats: %+v %v", m, err)
 	}
-	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"dda","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"captureWidth":2560,"captureHeight":1440,"adapterLuid":"00000000:0000c3a1","adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","hagsEnabled":true,"gpuPriority":"realtime","idleRepeatMs":100,"barcode":true}`))
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"dda","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"captureWidth":2560,"captureHeight":1440,"adapterLuid":"00000000:0000c3a1","adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","hagsEnabled":true,"gpuPriority":"realtime","idleRepeatMs":100,"barcode":true,"cursorInVideo":false}`))
 	if s, ok := m.(*Started); err != nil || !ok || s.CaptureWidth != 2560 || s.Vendor != "amd" || s.HAGSEnabled == nil ||
-		!*s.HAGSEnabled || s.GPUPriority != "realtime" || s.IdleRepeatMs != 100 || !s.Barcode {
+		!*s.HAGSEnabled || s.GPUPriority != "realtime" || s.IdleRepeatMs != 100 || !s.Barcode || s.CursorInVideo {
 		t.Fatalf("started (dda): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"wgc","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"cursorInVideo":true}`))
+	if s, ok := m.(*Started); err != nil || !ok || !s.CursorInVideo {
+		t.Fatalf("started (wgc with the pointer): %+v %v", m, err)
 	}
 	m, err = decodeMessage([]byte(`{"t":"stats","frameId":8,"gen":0,"dropped":false,"key":false,"recovery":false,"repeat":true,"dirtyPct":0,"bytes":40,"presentQpc":0,"captureQpc":2,"submitQpc":3,"outputQpc":4,"ltrSlot":-1,"temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1,"fps":60,"ringDropped":0}`))
 	if s, ok := m.(*Stats); err != nil || !ok || !s.Repeat || s.DirtyPct != 0 || s.PresentQPC != 0 {

@@ -3,8 +3,8 @@
 // Policy (docs/HELPER_PROTOCOL.md "Frame pacing"):
 //  1. Capture follows presents: an image is taken when the desktop or the game
 //     presents, never on a timer of our own (GUIDE B7).
-//  2. Never more than `fps` frames per second: output slots are one frame
-//     interval apart and every delivered frame uses one (the next slot is
+//  2. Never more than `fps` new images per second: output slots are one frame
+//     interval apart and every delivered new image uses one (the next slot is
 //     max(slot, now) + interval). A frame may go out up to a quarter interval
 //     before its slot, so present jitter around a matching refresh rate adds no
 //     delay, while the long-run rate still cannot exceed `fps`.
@@ -16,6 +16,14 @@
 //     and again every idleRepeatMs, so the encoder's rate control, the network
 //     path and the browser's stall detection never see a silent stream, and a
 //     static desktop keeps sharpening. Repeats are flagged (stats "repeat").
+//     A repeat takes no output slot: the first new image after it goes out at
+//     once. That image is the latency-critical one (the first change after an
+//     idle period: a click or a keystroke on a static desktop); holding it for
+//     the slot a repeat used would cost up to 3/4 of an interval. Sunshine
+//     likewise re-encodes the last image for its minimum fps without gating
+//     the next captured frame on it. Repeats only come after
+//     max(idleRepeatMs, one interval) without any delivery, so they cannot
+//     raise the long-run rate above `fps` either.
 #pragma once
 
 #include <cstdint>
@@ -33,7 +41,8 @@ public:
     void setFps(int fps);
     // havePending: a new image is waiting; haveLast: an image was delivered before.
     Decision decide(int64_t now, bool havePending, bool haveLast) const;
-    void delivered(int64_t now);
+    // An image went out at `now`; repeat: an idle re-submit (takes no slot).
+    void delivered(int64_t now, bool repeat);
 
     int64_t period() const { return period_; }
 

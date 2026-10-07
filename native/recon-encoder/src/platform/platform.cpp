@@ -117,6 +117,44 @@ bool PreciseTimer::sleepUntil(int64_t deadline, HANDLE wake) {
     }
 }
 
+namespace {
+
+using TimePeriodFn = UINT(WINAPI*)(UINT);  // timeBeginPeriod / timeEndPeriod (MMRESULT is a UINT)
+
+TimePeriodFn winmmFunction(const char* name) {
+    static const HMODULE winmm = [] {
+        std::string err;
+        HMODULE m = loadSystemLibrary(L"winmm.dll", err);  // kept loaded
+        if (!m) logf(LogLevel::Warn, "winmm.dll: %s (timer resolution stays at the system default)", err.c_str());
+        return m;
+    }();
+    return winmm ? reinterpret_cast<TimePeriodFn>(reinterpret_cast<void*>(GetProcAddress(winmm, name))) : nullptr;
+}
+
+}  // namespace
+
+TimerResolution::TimerResolution() {
+    const TimePeriodFn begin = winmmFunction("timeBeginPeriod");
+    if (!begin) return;
+    // As amf_increase_timer_precision (AMF ThreadWindows.cpp) and FFmpeg
+    // vsrc_amf.c: the finest period the system accepts, from 1 ms up
+    // (TIMERR_NOCANDO = 97 for a period out of range).
+    for (unsigned p = 1; p <= 16; ++p) {
+        const UINT r = begin(p);
+        if (r == 0) {  // TIMERR_NOERROR
+            period_ = p;
+            return;
+        }
+        if (r != 97) break;
+    }
+    logf(LogLevel::Warn, "timeBeginPeriod failed: waits keep the default timer resolution (~15.6 ms)");
+}
+
+TimerResolution::~TimerResolution() {
+    if (!period_) return;
+    if (const TimePeriodFn end = winmmFunction("timeEndPeriod")) end(period_);
+}
+
 std::string vendorName(uint32_t vendorId) {
     switch (vendorId) {
     case 0x1002: return "amd";

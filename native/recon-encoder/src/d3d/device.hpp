@@ -55,4 +55,14 @@ struct Device {
 // (self-test). The debug layer is only requested in debug builds.
 Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp = false);
 
+// True when the device was removed (driver reset / TDR, driver update, GPU
+// gone: ID3D11Device::GetDeviceRemovedReason fails); out is then the fatal
+// "device_lost" error, its text starting with `what`. A removed device and
+// every object created on it must be recreated ("Handle device removed
+// scenarios in Direct3D 11"); here that is a new helper, which recon-host
+// starts on the fatal error. Captures and the conversion call this whenever a
+// D3D11 / DXGI / AMF call fails (and while no frames arrive), so a removed
+// device never turns into endless retries or repeated non-fatal errors.
+bool deviceRemoved(ID3D11Device* device, const std::string& what, Status& out);
+
 }  // namespace recon::d3d

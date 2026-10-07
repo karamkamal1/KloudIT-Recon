@@ -56,6 +56,30 @@ private:
     int64_t freq_ = 0;
 };
 
+// TimerResolution raises the system timer resolution to 1 ms for this process
+// while it exists (timeBeginPeriod / timeEndPeriod from System32's winmm.dll,
+// loaded at run time). Since Windows 10 2004 a process that has not asked for
+// it gets the default tick of about 15.6 ms, so a Sleep(1), a wait timeout or
+// an AcquireNextFrame timeout can last that long ("For processes which have
+// not called this function, Windows does not guarantee a higher resolution
+// than the default system resolution", timeBeginPeriod docs). The AMD
+// Streaming SDK (amf_increase_timer_precision in RemoteDesktopServer.cpp),
+// FFmpeg vsrc_amf.c and Sunshine (misc.cpp streaming_will_start) do the same
+// while they capture. The helper owns no window, so the Windows 11 rule that
+// ignores the request for occluded window-owning processes does not apply.
+class TimerResolution {
+public:
+    TimerResolution();
+    ~TimerResolution();
+    TimerResolution(const TimerResolution&) = delete;
+    TimerResolution& operator=(const TimerResolution&) = delete;
+
+    unsigned periodMs() const { return period_; }  // 0 = not raised
+
+private:
+    unsigned period_ = 0;
+};
+
 // --- DLL loading -------------------------------------------------------------------
 
 // Loads a DLL from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), never from the

@@ -74,7 +74,7 @@ Status GpuTestCapture::init(const StartParams& p) {
     const int64_t freq = qpcFrequency();
     presentPeriod_ = freq / std::min(240, 2 * p.fps);
     start_ = nextPresent_ = qpcNow();
-    startPacing(p);
+    startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
 

@@ -1,7 +1,10 @@
 // PacedCapture: the common next() of the present-driven captures (DDA, AMD
 // Direct Capture, WGC). Subclasses only wait for and keep images; when an
 // image goes out, how often, and when the last one is repeated is decided here
-// by FramePacer (capture/pacer.hpp).
+// by FramePacer (capture/pacer.hpp). It also raises the timer resolution while
+// the capture exists (TimerResolution) and turns a removed D3D11 device into
+// the fatal device_lost while no frames arrive (a removed device stops
+// presents and frame events without failing every capture API).
 #pragma once
 
 #include <deque>
@@ -39,8 +42,9 @@ protected:
     // Fills texture, rotation, size (and AMF surface) of the current image.
     virtual void describe(CapturedFrame& out) = 0;
 
-    // Called by init(): resets the pacer for the stream's fps and repeat interval.
-    void startPacing(const StartParams& p);
+    // Called by init(): resets the pacer for the stream's fps and repeat
+    // interval; device is the capture's D3D11 device (checked for removal).
+    void startPacing(const StartParams& p, ID3D11Device* device);
     void postEvent(CaptureEvent ev);
     bool stopping() const { return WaitForSingleObject(stop_, 0) == WAIT_OBJECT_0; }
     HANDLE stopEvent() const { return stop_; }
@@ -48,7 +52,13 @@ protected:
     bool sleepUntil(int64_t deadlineQpc) { return timer_.sleepUntil(deadlineQpc, stop_); }
 
 private:
+    // A removed device_ (only checked when no new image comes: before a
+    // repeat and when next() times out, i.e. at most every idleRepeatMs).
+    bool deviceLost(Status& err);
+
+    TimerResolution timerResolution_;  // 1 ms ticks for every wait of the capture thread
     PreciseTimer timer_;
+    ID3D11Device* device_ = nullptr;
     HANDLE stop_ = nullptr;  // manual-reset
     std::mutex mu_;          // pacer_ (setFps from the control thread), events_
     FramePacer pacer_;

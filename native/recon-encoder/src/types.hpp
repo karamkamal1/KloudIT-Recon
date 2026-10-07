@@ -143,8 +143,10 @@ struct Caps {
     std::optional<bool> hagsEnabled;
     std::map<std::string, CodecCaps> codecs;
     std::vector<std::string> capture;  // usable capture backends, default first
-    // The captured video contains the mouse pointer. DDA and AMD Direct
-    // Capture frames never do (recon-host draws the cursor on the client).
+    // The captured video contains the mouse pointer. Frames of every listed
+    // capture method are without it (DDA and AMD Direct Capture never include
+    // it; WGC is only listed where it can exclude it), so recon-host draws the
+    // cursor on the client. Started::cursorInVideo is the per-stream answer.
     bool cursorInVideo = false;
     std::vector<OutputDesc> outputs;
     // Backends and capture methods that were probed and are not usable, with
@@ -162,6 +164,7 @@ struct Started {
     std::string gpuPriority;  // "realtime" | "high" | "failed" | "off" | "" (no GPU)
     int idleRepeatMs = 0;
     bool barcode = false;
+    bool cursorInVideo = false;  // this stream's frames contain the pointer (SourceInfo::cursorInVideo)
 };
 
 // CaptureEvent is the helper -> Go "captureChanged" message.

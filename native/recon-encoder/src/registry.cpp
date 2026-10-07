@@ -61,7 +61,9 @@ BackendChoice chooseBackend(const std::string& name, const MockOptions& mock) {
         }
     }
     // DDA and AMD Direct Capture frames never contain the pointer, and WGC is
-    // configured without it: recon-host draws the cursor on the client.
+    // only listed where it can be configured without it (probeWgcCapture):
+    // recon-host draws the cursor on the client. started.cursorInVideo reports
+    // a stream that could not exclude it after all.
     out.caps.cursorInVideo = false;
     out.caps.outputs = d3d::enumerateOutputs();
     return out;

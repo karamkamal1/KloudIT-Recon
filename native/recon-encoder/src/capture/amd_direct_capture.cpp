@@ -8,7 +8,10 @@
 //   factory->CreateComponent(context, AMFDisplayCapture);
 //   MONITOR_INDEX, MODE = WAIT_FOR_PRESENT, FRAMERATE = (0, 1) (follow the
 //   flips of the game or DWM), ENABLE_DIRTY_RECTS = true, DUPLICATEOUTPUT = true;
-//   Init(AMF_SURFACE_UNKNOWN, 0, 0); poll QueryOutput, sleeping >= 1 ms on AMF_REPEAT.
+//   Init(AMF_SURFACE_UNKNOWN, 0, 0); poll QueryOutput, sleeping >= 1 ms on AMF_REPEAT
+//   (PacedCapture raises the timer resolution to 1 ms for this, as the
+//   Streaming SDK's amf_increase_timer_precision() does; the sleep itself is
+//   the high-resolution waitable timer, and the stop event ends it).
 // Per surface: FRAME_FLIP_TIMESTAMP (QPC) is presentQpc, DIRTY_RECTS (an
 // AMFBuffer of AMFRect) gives dirtyPct, DisplayCaptureDCC says whether the
 // surface is DCC compressed.
@@ -18,6 +21,11 @@
 // may otherwise overwrite a surface it handed out while it is still in use
 // (the Streaming SDK enables it whenever a surface goes to the encoder
 // directly, AVStreamer.cpp). The copy costs the component < 1 ms per frame.
+//
+// Errors: QueryOutput failing (mode change, display gone) re-initializes the
+// component every 250 ms while the last image is repeated, unless the D3D11
+// device was removed (fatal device_lost). AMF_EOF only follows a Drain(),
+// which the helper never calls, so it is a fatal capture_failed.
 //
 // Surfaces reach the encoder through the NV12 converter (it samples the
 // surface's D3D11 texture; DCC is resolved by the shader read). When the AMF
@@ -46,6 +54,8 @@
 namespace recon {
 
 namespace {
+
+using d3d::ComPtr;
 
 constexpr int kRetryMs = 250;
 
@@ -132,7 +142,7 @@ Status AmdDirectCapture::init(const StartParams& p) {
     }
     logf(LogLevel::Info, "amd-direct: %s (monitor index %d) on %s, AMF runtime %s", output_.desc.name.c_str(),
          output_.desc.outputIndex, output_.adapterInfo.name.c_str(), rt.versionText.c_str());
-    startPacing(p);
+    startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
 
@@ -195,6 +205,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             comp_->Terminate();
             Status s = initComponent();
             if (!s.ok) {
+                if (d3d::deviceRemoved(dev_.device.Get(), "amd-direct: " + s.text, err)) return Next::Error;
                 nextRetry_ = qpcNow() + int64_t(kRetryMs) * freq / 1000;
                 continue;
             }
@@ -209,11 +220,19 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         now = qpcNow();
         if (r == AMF_REPEAT || (r == AMF_OK && !data)) {
             if (now >= deadline) return Next::Timeout;
-            Sleep(1);  // "sleep for at least 1 ms" on AMF_REPEAT (AMF_Display_Capture_API.md 2.3)
+            // "the polling thread should be put to sleep for at least 1 ms"
+            // (AMF_Display_Capture_API.md 2.3). Sleep(1) would last a whole
+            // ~15.6 ms tick without a raised timer resolution.
+            if (!sleepUntil(now + freq / 1000)) return Next::Stopped;
             continue;
         }
         if (r != AMF_OK) {
-            if (r == AMF_EOF) return Next::Stopped;
+            if (r == AMF_EOF) {
+                // EOF only follows Drain() (AMF_Display_Capture_API.md 2.4), which we never call.
+                err = Status::Error("capture_failed", "AMD Direct Capture ended (AMF_EOF without a Drain)", true);
+                return Next::Error;
+            }
+            if (d3d::deviceRemoved(dev_.device.Get(), amfError("amd-direct: QueryOutput", r), err)) return Next::Error;
             broken_ = true;
             nextRetry_ = now + int64_t(kRetryMs) * freq / 1000;
             CaptureEvent ev;
@@ -282,13 +301,68 @@ void AmdDirectCapture::describe(CapturedFrame& out) {
 
 }  // namespace
 
+namespace {
+
+// Whether the driver has the AMFDisplayCapture component: "The new display
+// capture API is not available in legacy drivers" (AMF_Display_Capture_API.md
+// 1), so amfrt64.dll loading proves nothing. Creates the component the way
+// init() and the Streaming SDK (RemoteDesktopServerWin.cpp InitVideoCapture)
+// do: an AMFContext on a D3D11 device of the AMD adapter, then
+// CreateComponent(AMFDisplayCapture); everything is released at once. A plain
+// device: no GPU priority or frame latency settings for a probe.
+Probe probeComponent(const AmfRuntime& rt, uint64_t hmonitor) {
+    d3d::OutputRef out;
+    if (!d3d::outputForMonitor(hmonitor, out).ok) return {false, "the AMD output went away while probing"};
+    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    ComPtr<ID3D11Device> device;
+    D3D_FEATURE_LEVEL level{};
+    auto create = [&](const D3D_FEATURE_LEVEL* lv, UINT n) {
+        return D3D11CreateDevice(out.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, lv, n,
+                                 D3D11_SDK_VERSION, device.ReleaseAndGetAddressOf(), &level, nullptr);
+    };
+    HRESULT hr = create(levels, 2);
+    if (hr == E_INVALIDARG) hr = create(levels + 1, 1);  // runtimes that do not know 11_1
+    if (FAILED(hr)) return {false, "D3D11CreateDevice on " + out.adapterInfo.name + " failed: " + d3d::hrText(hr)};
+    amf::AMFContextPtr ctx;
+    AMF_RESULT r = rt.factory->CreateContext(&ctx);
+    if (r != AMF_OK) return {false, amfError("AMFFactory::CreateContext", r)};
+    r = ctx->InitDX11(device.Get(), level >= D3D_FEATURE_LEVEL_11_1 ? amf::AMF_DX11_1 : amf::AMF_DX11_0);
+    Probe p{true, {}};
+    if (r != AMF_OK) {
+        p = {false, amfError("AMFContext::InitDX11", r)};
+    } else {
+        amf::AMFComponentPtr comp;
+        r = rt.factory->CreateComponent(ctx, AMFDisplayCapture, &comp);
+        if (r != AMF_OK || !comp) {
+            p = {false, amfError("creating AMFDisplayCapture", r) + ": this driver has no AMD Direct Capture (AMF runtime " +
+                            rt.versionText + ")"};
+        }
+        comp = nullptr;  // never initialized: nothing to Terminate
+    }
+    ctx->Terminate();
+    return p;
+}
+
+}  // namespace
+
 Probe probeAmdDirectCapture() {
-    bool amd = false;
-    for (const OutputDesc& o : d3d::enumerateOutputs()) amd = amd || (o.attached && o.vendor == "amd");
-    if (!amd) return {false, "no display output on an AMD adapter"};
-    const AmfRuntime& rt = amfRuntime();
-    if (!rt.factory) return {false, rt.error};
-    return {true, "AMF runtime " + rt.versionText + " (opt-in: capture \"amd-direct\")"};
+    // Once per process: it creates a device and an AMF context (tens of ms).
+    static const Probe probe = [] {
+        uint64_t hmonitor = 0;
+        for (const OutputDesc& o : d3d::enumerateOutputs()) {
+            if (o.attached && o.vendor == "amd" && !hmonitor) hmonitor = o.hmonitor;
+        }
+        if (!hmonitor) return Probe{false, "no display output on an AMD adapter"};
+        const AmfRuntime& rt = amfRuntime();
+        if (!rt.factory) return Probe{false, rt.error};
+        const int64_t t0 = qpcNow();
+        Probe p = probeComponent(rt, hmonitor);
+        logf(LogLevel::Debug, "amd-direct probe: %s in %lld ms", p.available ? "usable" : p.reason.c_str(),
+             static_cast<long long>((qpcNow() - t0) * 1000 / qpcFrequency()));
+        if (p.available) p.reason = "AMF runtime " + rt.versionText + " (opt-in: capture \"amd-direct\")";
+        return p;
+    }();
+    return probe;
 }
 
 std::unique_ptr<Capture> createAmdDirectCapture(Status& err) {

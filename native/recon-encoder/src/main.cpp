@@ -250,6 +250,7 @@ Status startStream(const ControlMsg& m, BackendChoice& choice, RingWriter& ring,
         st.idleRepeatMs = p.idleRepeatMs;
     }
     st.barcode = conv && p.barcode.enabled;
+    st.cursorInVideo = src.cursorInVideo;
 
     RateParams rate;
     rate.kbps = p.kbps;

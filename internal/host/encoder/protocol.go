@@ -155,6 +155,9 @@ type Started struct {
 	GPUPriority   string `json:"gpuPriority"` // realtime | high | failed | off | "" (no GPU)
 	IdleRepeatMs  int    `json:"idleRepeatMs"`
 	Barcode       bool   `json:"barcode"`
+	// CursorInVideo: this stream's frames contain the mouse pointer (a WGC
+	// session that could not exclude it), so the client must not draw its own.
+	CursorInVideo bool `json:"cursorInVideo"`
 }
 
 // CaptureChanged reports a change of the capture source. Reason "resized":

@@ -37,8 +37,8 @@ FramePacer::Decision FramePacer::decide(int64_t now, bool havePending, bool have
     return {Decision::Wait, std::numeric_limits<int64_t>::max()};
 }
 
-void FramePacer::delivered(int64_t now) {
-    nextDue_ = std::max(nextDue_, now) + period_;
+void FramePacer::delivered(int64_t now, bool repeat) {
+    if (!repeat) nextDue_ = std::max(nextDue_, now) + period_;  // repeats take no slot (policy 4)
     lastDelivered_ = now;
 }
 
@@ -66,14 +66,14 @@ std::vector<Delivery> simulate(const std::vector<int64_t>& presents, int fps, in
         const auto d = p.decide(t, pending, haveLast);
         if (d.kind == FramePacer::Decision::DeliverPending) {
             out.push_back({t, pendingPresent, false});
-            p.delivered(t);
+            p.delivered(t, false);
             pending = false;
             haveLast = true;
             continue;
         }
         if (d.kind == FramePacer::Decision::DeliverRepeat) {
             out.push_back({t, 0, true});
-            p.delivered(t);
+            p.delivered(t, true);
             continue;
         }
         const int64_t nextPresent = next < presents.size() ? presents[next] : std::numeric_limits<int64_t>::max();
@@ -114,30 +114,40 @@ void expect(bool ok, const char* name, const char* what) {
     }
 }
 
-// Common properties: in any stretch of time no more frames than fps allows
-// (plus the one frame the early allowance can add), every delivered image is
-// the newest one presented at that time, a delivered image is never older
-// than one frame interval.
+// Common properties: in any stretch of time no more new images than fps
+// allows (plus the one frame the early allowance can add), new images at
+// least 3/4 of an interval apart, a repeat only after max(idle, interval)
+// without any delivery, every delivered image the newest one presented at that
+// time and never older than one frame interval. (A new image right after a
+// repeat is allowed: repeats take no slot.)
 void common(const char* name, const std::vector<int64_t>& presents, const std::vector<Delivery>& d, int fps,
-            int64_t duration) {
+            int64_t duration, int idleMs = 100) {
     const int64_t period = (1000000 + fps - 1) / fps, early = period / 4;
+    const int64_t idle = std::max<int64_t>(int64_t(idleMs) * 1000, period);
     size_t n = 0;
-    int64_t minGap = std::numeric_limits<int64_t>::max();
+    int64_t minGap = std::numeric_limits<int64_t>::max(), lastNew = -1;
     for (size_t i = 0; i < d.size(); ++i) {
-        if (d[i].at <= duration) ++n;
-        if (i) minGap = std::min(minGap, d[i].at - d[i - 1].at);
-        if (!d[i].repeat) {
-            const auto it = std::upper_bound(presents.begin(), presents.end(), d[i].at);
-            const int64_t newest = *(it - 1);
-            expect(d[i].present == newest, name, "delivered an image while a newer one was waiting");
-            expect(d[i].at - d[i].present <= period, name, "delivered image older than one frame interval");
+        if (d[i].repeat) {
+            if (i) expect(d[i].at - d[i - 1].at >= idle, name, "repeat sooner than the idle interval");
+            continue;
         }
+        if (d[i].at <= duration) ++n;
+        if (lastNew >= 0) minGap = std::min(minGap, d[i].at - lastNew);
+        lastNew = d[i].at;
+        const auto it = std::upper_bound(presents.begin(), presents.end(), d[i].at);
+        const int64_t newest = *(it - 1);
+        expect(d[i].present == newest, name, "delivered an image while a newer one was waiting");
+        expect(d[i].at - d[i].present <= period, name, "delivered image older than one frame interval");
     }
-    expect(int64_t(n) <= (duration + early) / period + 1, name, "more frames than fps allows");
-    if (d.size() > 1) expect(minGap >= period - period / 4, name, "frames closer than 3/4 of a frame interval");
+    expect(int64_t(n) <= (duration + early) / period + 1, name, "more new images than fps allows");
+    if (minGap != std::numeric_limits<int64_t>::max()) {
+        expect(minGap >= period - period / 4, name, "new images closer than 3/4 of a frame interval");
+    } else {
+        minGap = 0;
+    }
     std::printf("  %-36s %zu frames (%zu repeats), min gap %lld us\n", name, d.size(),
                 size_t(std::count_if(d.begin(), d.end(), [](const Delivery& x) { return x.repeat; })),
-                static_cast<long long>(d.size() > 1 ? minGap : 0));
+                static_cast<long long>(minGap));
 }
 
 }  // namespace
@@ -198,6 +208,23 @@ int runPacerSelfTest() {
         auto d = simulate(pr, 5, 100, 3 * sec);
         common(name, pr, d, 5, 3 * sec);
         for (size_t i = 1; i < d.size(); ++i) expect(d[i].at - d[i - 1].at >= 200000, name, "faster than 5 fps");
+    }
+    {
+        // The first change after an idle period (a click on a static desktop)
+        // must not wait for the slot an idle repeat would have used.
+        const char* name = "present 1 ms after an idle repeat";
+        auto pr = steady(60, 0, sec / 2);
+        const int64_t lastPresent = pr.back();
+        pr.push_back(lastPresent + 100000 + 1000);  // the first repeat comes 100 ms after the last image
+        auto d = simulate(pr, 60, 100, sec);
+        common(name, pr, d, 60, sec);
+        bool sawRepeat = false, ok = false;
+        for (const auto& x : d) {
+            if (x.repeat) sawRepeat = true;
+            else if (sawRepeat && x.present == pr.back()) ok = x.at == x.present;
+        }
+        expect(sawRepeat, name, "no idle repeat before the late present");
+        expect(ok, name, "the present after a repeat was not delivered at once");
     }
     {
         const char* name = "1000 Hz burst at 60 fps";

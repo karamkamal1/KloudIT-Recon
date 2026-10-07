@@ -590,6 +590,9 @@ func captureCheck(t *testing.T, capture string, p StartParams) {
 	if st.Capture != capture || st.CaptureWidth <= 0 || st.AdapterLUID == "" || st.GPUPriority == "" || st.IdleRepeatMs != 100 {
 		t.Fatalf("started %+v", st)
 	}
+	if st.CursorInVideo {
+		t.Fatalf("%s frames contain the mouse pointer although caps list it (cursorInVideo false)", capture)
+	}
 	// A static desktop still yields frames: idle repeats every 100 ms.
 	var frames []*Frame
 	for i := 0; i < 5; i++ {
@@ -629,9 +632,11 @@ func captureCheck(t *testing.T, capture string, p StartParams) {
 }
 
 // maxPerSecond is the most frames submitted to the encoder within any one
-// second. The pacer allows one frame above the fps in a window (a frame may
-// use its slot a quarter interval early: --self-test-pacer checks the exact
-// bound); submit times also carry the conversion time, so callers allow fps+2.
+// second. The pacer allows one new image above the fps in a window (a frame
+// may use its slot a quarter interval early), and an idle repeat takes no slot,
+// so the first new image after a pause can follow it at once
+// (--self-test-pacer checks the exact bounds); submit times also carry the
+// conversion time, so callers allow fps+2.
 func maxPerSecond(frames []*Frame, qpc int64) int {
 	best := 0
 	for i, f := range frames {

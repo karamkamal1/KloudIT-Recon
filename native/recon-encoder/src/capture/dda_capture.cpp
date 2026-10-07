@@ -20,11 +20,27 @@
 // duplication every 250 ms until it works again; meanwhile the last image is
 // repeated, recon-host gets captureChanged "lost" / "restored", and a new size
 // or rotation gives "resized" (the stream keeps its encoded size, scaled).
+// A removed device (driver reset / TDR) is the fatal device_lost instead:
+// nothing created on it works again (a TDR also changes the mode, so it
+// usually shows up as DXGI_ERROR_ACCESS_LOST first, and then as a failing
+// DuplicateOutput).
+//
+// AcquireNextFrame holds the device's lock while it waits (Sunshine
+// display_base.cpp: "The D3D11 device is protected by an unfair lock that is
+// held the entire time that IDXGIOutputDuplication::AcquireNextFrame() is
+// running"), and the encoder shares this device (GUIDE 3.3/3.4; 3.4 warns not
+// to run AcquireNextFrame and NVENC's Lock/UnlockBitstream from conflicting
+// threads). So each wait is a short slice (kAcquireSliceMs) followed by a short
+// sleep outside the call (kLockGapUs), in which the encoder's threads get the
+// lock: they wait at most a slice instead of up to a frame interval (or 100 ms
+// on an idle desktop), and a present is seen at most kLockGapUs late.
+// docs/VENDOR_NOTES.md 3.2 has the VERIFY item (encoder output latency).
 #include <dxgi1_5.h>
 
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <vector>
 
 #include "capture/paced_capture.hpp"
 #include "d3d/device.hpp"
@@ -37,15 +53,33 @@ namespace {
 using d3d::ComPtr;
 
 constexpr int kRetryMs = 250;
+constexpr UINT kAcquireSliceMs = 2;  // longest single AcquireNextFrame wait (holds the device lock)
+constexpr int kLockGapUs = 500;      // pause between slices, outside the device lock
 
-// Sunshine misc.cpp syncThreadDesktop(): duplicate the desktop that currently
-// receives input (needed when running as SYSTEM across desktop switches;
-// harmless otherwise).
+// Puts the calling thread on the desktop that currently receives input, as
+// Sunshine misc.cpp syncThreadDesktop() does before duplicating (needed when
+// running as SYSTEM across desktop switches; harmless otherwise). Sunshine
+// closes the handle right after SetThreadDesktop, which fails ("The
+// CloseDesktop function will fail if any thread in the calling process is
+// using the specified desktop handle", CloseDesktop docs), so it leaks one
+// handle per call (on every re-duplication: mode change, access lost, return
+// from the lock screen). Here the handles stay listed while a thread is on
+// them and are closed by a later call once no thread uses them any more (the
+// calling thread's previous one): at most one open handle per thread that
+// duplicated, however often the duplication is redone.
 void syncThreadDesktop() {
-    HDESK desk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (!desk) return;
-    SetThreadDesktop(desk);
-    CloseDesktop(desk);
+    static std::mutex mu;
+    static std::vector<HDESK> handles;
+    HDESK input = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+    if (!input) return;
+    if (!SetThreadDesktop(input)) {
+        CloseDesktop(input);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    // CloseDesktop fails, and the handle stays listed, while a thread uses it.
+    std::erase_if(handles, [](HDESK h) { return CloseDesktop(h) != FALSE; });
+    handles.push_back(input);
 }
 
 class DdaCapture : public PacedCapture {
@@ -118,7 +152,7 @@ Status DdaCapture::init(const StartParams& p) {
     }
     logf(LogLevel::Info, "dda: %s on %s (%s), %ux%u rotation %d, feature level %x", output_.desc.name.c_str(),
          output_.adapterInfo.name.c_str(), output_.adapterInfo.luid.c_str(), dispW_, dispH_, rotation_, unsigned(dev_.level));
-    startPacing(p);
+    startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
 
@@ -225,7 +259,11 @@ Status DdaCapture::copyIn(ID3D11Texture2D* tex) {
         nd.Usage = D3D11_USAGE_DEFAULT;
         nd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         const HRESULT hr = dev_.device->CreateTexture2D(&nd, nullptr, slots_[slot].ReleaseAndGetAddressOf());
-        if (FAILED(hr)) return Status::Error("capture_failed", "creating a capture texture failed: " + d3d::hrText(hr), true);
+        if (FAILED(hr)) {
+            Status lost;
+            if (d3d::deviceRemoved(dev_.device.Get(), "creating a capture texture", lost)) return lost;
+            return Status::Error("capture_failed", "creating a capture texture failed: " + d3d::hrText(hr), true);
+        }
     }
     dev_.context->CopyResource(slots_[slot].Get(), tex);
     info_[slot].rotation = rotation_;
@@ -279,6 +317,9 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             }
             Status s = reacquire();
             if (!s.ok) {
+                // A removed device cannot duplicate anything again: fatal now
+                // rather than retrying every kRetryMs for good.
+                if (d3d::deviceRemoved(dev_.device.Get(), "dda: " + s.text, err)) return Next::Error;
                 if (!lost_) lose(s.text);
                 nextRetry_ = qpcNow() + int64_t(kRetryMs) * freq / 1000;
                 logf(LogLevel::Debug, "dda: %s", s.text.c_str());
@@ -289,26 +330,26 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         releaseHeld();
         DXGI_OUTDUPL_FRAME_INFO fi{};
         ComPtr<IDXGIResource> res;
-        const HRESULT hr = dup_->AcquireNextFrame(UINT(left), &fi, res.GetAddressOf());
+        // A short slice: AcquireNextFrame holds the device lock while it waits (top of file).
+        const HRESULT hr = dup_->AcquireNextFrame(std::min(UINT(left), kAcquireSliceMs), &fi, res.GetAddressOf());
         now = qpcNow();
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            // AcquireNextFrame holds the device's (unfair) lock while it waits;
-            // after a long idle wait leave it alone briefly so the encoder's
-            // threads are not starved (Sunshine display_base.cpp, capture()).
-            if (left >= 50) Sleep(1);
-            return Next::Timeout;
+            if (now >= deadline) return Next::Timeout;
+            // Outside the call the lock is free: the encoder's threads, woken
+            // when it was released, take it now (an unfair lock would let an
+            // immediate re-entry starve them, as Sunshine observed).
+            if (!sleepUntil(now + int64_t(kLockGapUs) * freq / 1000000)) return Next::Stopped;
+            continue;
         }
         if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED || hr == E_ACCESSDENIED ||
             hr == static_cast<HRESULT>(WAIT_ABANDONED) || hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_SESSION_DISCONNECTED) {
+            if (d3d::deviceRemoved(dev_.device.Get(), "AcquireNextFrame: " + d3d::hrText(hr), err)) return Next::Error;
             lose("AcquireNextFrame: " + d3d::hrText(hr));
             continue;
         }
         if (FAILED(hr)) {
-            const HRESULT removed = dev_.device->GetDeviceRemovedReason();
-            err = Status::Error(FAILED(removed) ? "device_lost" : "capture_failed",
-                                "AcquireNextFrame failed: " + d3d::hrText(hr) +
-                                    (FAILED(removed) ? ", device removed: " + d3d::hrText(removed) : ""),
-                                true);
+            if (d3d::deviceRemoved(dev_.device.Get(), "AcquireNextFrame failed: " + d3d::hrText(hr), err)) return Next::Error;
+            err = Status::Error("capture_failed", "AcquireNextFrame failed: " + d3d::hrText(hr), true);
             return Next::Error;
         }
         held_ = true;

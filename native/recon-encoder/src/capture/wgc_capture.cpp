@@ -9,11 +9,20 @@
 // of two textures of our own and closes it at once, so WGC always has a free
 // buffer (the same pending / current scheme as DDA). SystemRelativeTime (100 ns
 // units on the QPC time base) becomes presentQpc (VERIFY against
-// QueryPerformanceCounter on hardware). The cursor is excluded where the OS
-// allows it (IsCursorCaptureEnabled, Windows 10 2004+), the yellow border is
-// turned off where allowed (IsBorderRequired, Windows 11), and
+// QueryPerformanceCounter on hardware). The cursor is excluded
+// (IsCursorCaptureEnabled, Windows 10 2004+; without it WGC is reported
+// unavailable, since caps promise frames without the pointer, and a session
+// that still cannot exclude it reports started.cursorInVideo), the yellow
+// border is turned off where allowed (IsBorderRequired, Windows 11), and
 // MinUpdateInterval lets WGC deliver faster than its 60 Hz default
 // (Windows 11 24H2; Sunshine display_wgc.cpp sets 4 ms).
+//
+// The event handlers run on thread-pool threads and can still be running, or
+// start, after they were revoked (revoking does not wait for a handler already
+// invoked). So they never capture `this`: they hold the small shared state they
+// use by shared_ptr ("Safely accessing the this pointer with an event-handling
+// delegate", Strong and weak references in C++/WinRT), and the last owner
+// closes its event.
 #include "probes.hpp"
 
 #if __has_include(<winrt/Windows.Graphics.Capture.h>) && __has_include(<winrt/Windows.Graphics.DirectX.Direct3D11.h>)
@@ -28,6 +37,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <memory>
 #include <mutex>
 
 #include <winrt/Windows.Foundation.h>
@@ -73,6 +83,10 @@ bool propertyPresent(const wchar_t* type, const wchar_t* prop) {
     }
 }
 
+// Whether the SDK the helper is built with projects IsCursorCaptureEnabled.
+template <typename S>
+constexpr bool kSdkCursorCapture = requires(S& s) { s.IsCursorCaptureEnabled(false); };
+
 // Session properties newer than some Windows SDKs: set only when the SDK the
 // helper is built with projects them (requires-expression on a dependent
 // type), and only when the running Windows has them (propertyPresent).
@@ -99,6 +113,47 @@ bool setMinUpdateInterval(S& s, winrt::Windows::Foundation::TimeSpan t) {
         return true;
     }
     return false;
+}
+
+const wchar_t kSessionType[] = L"Windows.Graphics.Capture.GraphicsCaptureSession";
+
+// Shared between the capture and the WGC event handlers (see the top of the file).
+struct WgcShared {
+    std::mutex mu;
+    wgc::Direct3D11CaptureFrame produced{nullptr};  // newest frame not taken by the capture thread yet
+    bool closed = false;                            // the window or monitor went away
+    HANDLE event = nullptr;                         // auto-reset: a frame arrived, the item closed, or shutdown
+
+    WgcShared() { event = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+    ~WgcShared() {
+        try {
+            if (produced) produced.Close();
+        } catch (const winrt::hresult_error&) {
+        }
+        if (event) CloseHandle(event);
+    }
+    WgcShared(const WgcShared&) = delete;
+    WgcShared& operator=(const WgcShared&) = delete;
+};
+
+// FrameArrived (thread pool): keep only the newest frame.
+void onFrame(WgcShared& st, const wgc::Direct3D11CaptureFramePool& pool) {
+    wgc::Direct3D11CaptureFrame frame{nullptr};
+    try {
+        frame = pool.TryGetNextFrame();
+    } catch (const winrt::hresult_error&) {
+        return;  // e.g. the pool was closed meanwhile
+    }
+    if (!frame) return;
+    std::lock_guard<std::mutex> lock(st.mu);
+    if (st.produced) {
+        try {
+            st.produced.Close();  // newest wins; the old buffer goes back to WGC
+        } catch (const winrt::hresult_error&) {
+        }
+    }
+    st.produced = frame;
+    SetEvent(st.event);
 }
 
 struct TitleSearch {
@@ -132,7 +187,7 @@ public:
     }
     void shutdown() override {
         PacedCapture::shutdown();
-        if (frameEvent_) SetEvent(frameEvent_);
+        if (shared_->event) SetEvent(shared_->event);
     }
 
 protected:
@@ -146,8 +201,8 @@ protected:
 
 private:
     Status start(HWND window, HMONITOR monitor, int fps);
-    void onFrame(const wgc::Direct3D11CaptureFramePool& pool);
 
+    std::shared_ptr<WgcShared> shared_ = std::make_shared<WgcShared>();
     d3d::OutputRef output_;
     d3d::Device dev_;
     wd3d::IDirect3DDevice rtDevice_{nullptr};
@@ -156,10 +211,7 @@ private:
     wgc::GraphicsCaptureSession session_{nullptr};
     winrt::event_token frameToken_{}, closedToken_{};
     winrt::Windows::Graphics::SizeInt32 poolSize_{};
-    HANDLE frameEvent_ = nullptr;  // auto-reset
-    std::mutex frameMu_;
-    wgc::Direct3D11CaptureFrame produced_{nullptr};
-    bool closed_ = false;  // the window went away
+    bool cursorInVideo_ = false;  // the session could not exclude the pointer
     bool lostPosted_ = false;
     ComPtr<ID3D11Texture2D> slots_[2];
     std::pair<uint32_t, uint32_t> sizes_[2];
@@ -176,12 +228,14 @@ WgcCapture::~WgcCapture() {
         if (pool_) pool_.Close();
     } catch (const winrt::hresult_error&) {
     }
-    {
-        std::lock_guard<std::mutex> lock(frameMu_);
-        if (produced_) produced_.Close();
-        produced_ = nullptr;
+    // A handler still running keeps shared_ alive; the frame it may store is
+    // closed with it (WgcShared's destructor).
+    std::lock_guard<std::mutex> lock(shared_->mu);
+    try {
+        if (shared_->produced) shared_->produced.Close();
+    } catch (const winrt::hresult_error&) {
     }
-    if (frameEvent_) CloseHandle(frameEvent_);
+    shared_->produced = nullptr;
 }
 
 Status WgcCapture::init(const StartParams& p) {
@@ -208,8 +262,7 @@ Status WgcCapture::init(const StartParams& p) {
     if (!st.ok) return st;
     st = d3d::createDevice(output_.adapter.Get(), dev_);
     if (!st.ok) return st;
-    frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!frameEvent_) return Status::Error("init_failed", "CreateEvent failed");
+    if (!shared_->event) return Status::Error("init_failed", "CreateEvent failed");
     st = start(window, reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(output_.desc.hmonitor)), p.fps);
     if (!st.ok) return st;
     {
@@ -218,10 +271,11 @@ Status WgcCapture::init(const StartParams& p) {
         src_.adapter = output_.adapterInfo;
         src_.width = uint32_t(poolSize_.Width);
         src_.height = uint32_t(poolSize_.Height);
+        src_.cursorInVideo = cursorInVideo_;
     }
     logf(LogLevel::Info, "wgc: capturing %s %dx%d on %s", window ? "a window" : output_.desc.name.c_str(), poolSize_.Width,
          poolSize_.Height, output_.adapterInfo.name.c_str());
-    startPacing(p);
+    startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
 
@@ -255,30 +309,34 @@ Status WgcCapture::start(HWND window, HMONITOR monitor, int fps) {
         pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
             rtDevice_, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, poolSize_);
         session_ = pool_.CreateCaptureSession(item_);
-        frameToken_ = pool_.FrameArrived([this](const wgc::Direct3D11CaptureFramePool& sender, const winrt::Windows::Foundation::IInspectable&) {
-            onFrame(sender);
+        frameToken_ = pool_.FrameArrived(
+            [st = shared_](const wgc::Direct3D11CaptureFramePool& sender, const winrt::Windows::Foundation::IInspectable&) {
+                onFrame(*st, sender);
+            });
+        closedToken_ = item_.Closed([st = shared_](const wgc::GraphicsCaptureItem&, const winrt::Windows::Foundation::IInspectable&) {
+            std::lock_guard<std::mutex> lock(st->mu);
+            st->closed = true;
+            SetEvent(st->event);
         });
-        closedToken_ = item_.Closed([this](const wgc::GraphicsCaptureItem&, const winrt::Windows::Foundation::IInspectable&) {
-            std::lock_guard<std::mutex> lock(frameMu_);
-            closed_ = true;
-            SetEvent(frameEvent_);
-        });
-        const wchar_t* sessionType = L"Windows.Graphics.Capture.GraphicsCaptureSession";
         try {
-            if (!propertyPresent(sessionType, L"IsCursorCaptureEnabled") || !setCursorCapture(session_, false)) {
+            // The probe only lists WGC where this exists; should it still
+            // fail, started.cursorInVideo tells recon-host.
+            if (!propertyPresent(kSessionType, L"IsCursorCaptureEnabled") || !setCursorCapture(session_, false)) {
+                cursorInVideo_ = true;
                 logf(LogLevel::Warn, "wgc: this Windows cannot exclude the cursor from the capture");
             }
         } catch (const winrt::hresult_error& e) {
+            cursorInVideo_ = true;
             logf(LogLevel::Warn, "wgc: cannot exclude the cursor: %s", hresultText(e).c_str());
         }
         try {
-            if (propertyPresent(sessionType, L"IsBorderRequired")) setBorderRequired(session_, false);
+            if (propertyPresent(kSessionType, L"IsBorderRequired")) setBorderRequired(session_, false);
         } catch (const winrt::hresult_error& e) {
             logf(LogLevel::Warn, "wgc: cannot turn the capture border off: %s", hresultText(e).c_str());
         }
         try {
             const int64_t ticks = std::min<int64_t>(40000, 10000000 / (2 * int64_t(fps)));  // <= 4 ms, < half a frame
-            if (!propertyPresent(sessionType, L"MinUpdateInterval") ||
+            if (!propertyPresent(kSessionType, L"MinUpdateInterval") ||
                 !setMinUpdateInterval(session_, winrt::Windows::Foundation::TimeSpan(ticks))) {
                 logf(LogLevel::Info, "wgc: MinUpdateInterval not available (Windows 11 24H2+): capture may be limited to 60 Hz");
             }
@@ -292,31 +350,17 @@ Status WgcCapture::start(HWND window, HMONITOR monitor, int fps) {
     return Status::Ok();
 }
 
-void WgcCapture::onFrame(const wgc::Direct3D11CaptureFramePool& pool) {
-    wgc::Direct3D11CaptureFrame frame{nullptr};
-    try {
-        frame = pool.TryGetNextFrame();
-    } catch (const winrt::hresult_error&) {
-        return;
-    }
-    if (!frame) return;
-    std::lock_guard<std::mutex> lock(frameMu_);
-    if (produced_) produced_.Close();  // newest wins; the old buffer goes back to WGC
-    produced_ = frame;
-    SetEvent(frameEvent_);
-}
-
 Next WgcCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
-    const HANDLE handles[] = {stopEvent(), frameEvent_};
+    const HANDLE handles[] = {stopEvent(), shared_->event};
     const DWORD w = WaitForMultipleObjects(2, handles, FALSE, DWORD(timeoutMs));
     if (stopping()) return Next::Stopped;
-    if (w == WAIT_TIMEOUT) return Next::Timeout;
+    if (w == WAIT_TIMEOUT) return Next::Timeout;  // PacedCapture checks for a removed device meanwhile
     wgc::Direct3D11CaptureFrame frame{nullptr};
     {
-        std::lock_guard<std::mutex> lock(frameMu_);
-        frame = produced_;
-        produced_ = nullptr;
-        if (closed_ && !lostPosted_) {
+        std::lock_guard<std::mutex> lock(shared_->mu);
+        frame = shared_->produced;
+        shared_->produced = nullptr;
+        if (shared_->closed && !lostPosted_) {
             lostPosted_ = true;
             CaptureEvent ev;
             ev.reason = "lost";
@@ -336,6 +380,7 @@ Next WgcCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         if (SUCCEEDED(hr)) hr = access->GetInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex.GetAddressOf()));
         if (FAILED(hr)) {
             frame.Close();
+            if (d3d::deviceRemoved(dev_.device.Get(), "wgc: frame texture", err)) return Next::Error;
             err = Status::Error("capture_failed", "WGC frame without a D3D11 texture: " + d3d::hrText(hr), true);
             return Next::Error;
         }
@@ -360,6 +405,7 @@ Next WgcCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             hr = dev_.device->CreateTexture2D(&nd, nullptr, slots_[slot].ReleaseAndGetAddressOf());
             if (FAILED(hr)) {
                 frame.Close();
+                if (d3d::deviceRemoved(dev_.device.Get(), "wgc: creating a capture texture", err)) return Next::Error;
                 err = Status::Error("capture_failed", "creating a capture texture failed: " + d3d::hrText(hr), true);
                 return Next::Error;
             }
@@ -387,7 +433,8 @@ Next WgcCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             src_.height = uint32_t(content.Height);
         }
     } catch (const winrt::hresult_error& e) {
-        err = Status::Error("capture_failed", "Windows.Graphics.Capture: " + hresultText(e));
+        if (d3d::deviceRemoved(dev_.device.Get(), "Windows.Graphics.Capture: " + hresultText(e), err)) return Next::Error;
+        err = Status::Error("capture_failed", "Windows.Graphics.Capture: " + hresultText(e), true);
         return Next::Error;
     }
     return Next::Frame;
@@ -405,7 +452,17 @@ Probe probeWgcCapture() {
     } catch (const winrt::hresult_error& e) {
         return {false, "Windows.Graphics.Capture: " + hresultText(e)};
     }
-    return {true, "monitors and windows (capture \"wgc\")"};
+    // caps promise frames without the pointer (cursorInVideo false): without
+    // IsCursorCaptureEnabled WGC frames contain it, and the client would draw
+    // a second one.
+    if constexpr (!kSdkCursorCapture<wgc::GraphicsCaptureSession>) {
+        return {false, "this build's Windows SDK has no GraphicsCaptureSession.IsCursorCaptureEnabled (frames would contain the pointer)"};
+    } else {
+        if (!propertyPresent(kSessionType, L"IsCursorCaptureEnabled")) {
+            return {false, "this Windows cannot keep the mouse pointer out of Windows.Graphics.Capture frames (needs Windows 10 2004 or later)"};
+        }
+        return {true, "monitors and windows (capture \"wgc\")"};
+    }
 }
 
 std::unique_ptr<Capture> createWgcCapture(Status& err) {

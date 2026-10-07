@@ -10,6 +10,14 @@
 // until the encoder has read the texture and the capture thread never writes
 // into a frame that is still being encoded.
 //
+// The device is shared with the capture and the encoder's threads (AMF, NVENC,
+// AMD Direct Capture call into it from their own threads), so a conversion runs
+// with the device's critical section held (ID3D10Multithread::Enter / Leave:
+// "used ... when there is a series of graphics commands that must happen in
+// order"), and it sets or clears every pipeline stage its draws depend on
+// instead of trusting state left on the shared immediate context. A failure on
+// a removed device is the fatal device_lost.
+//
 // Shaders are compiled at run time with D3DCompile from d3dcompiler_47.dll
 // (System32 on every Windows 10/11; loaded dynamically) rather than embedded
 // as bytecode: this sandbox has no fxc, and the same source then builds with
@@ -17,6 +25,7 @@
 // milliseconds once per stream start.
 #pragma once
 
+#include <d3d10.h>  // ID3D10Multithread
 #include <d3d11.h>
 #include <wrl/client.h>
 
@@ -109,6 +118,7 @@ private:
 
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> ctx_;
+    ComPtr<ID3D10Multithread> mt_;  // the device's critical section (null if not exposed)
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> psY_, psUV_;
     ComPtr<ID3D11SamplerState> sampler_;

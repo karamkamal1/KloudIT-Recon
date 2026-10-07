@@ -203,4 +203,12 @@ Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp) {
     return Status::Ok();
 }
 
+bool deviceRemoved(ID3D11Device* device, const std::string& what, Status& out) {
+    if (!device) return false;
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    if (SUCCEEDED(reason)) return false;
+    out = Status::Error("device_lost", what + ": the D3D11 device was removed: " + hrText(reason), true);
+    return true;
+}
+
 }  // namespace recon::d3d

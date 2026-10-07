@@ -135,6 +135,23 @@ Verified in the sandbox (Linux, no GPU, no Windows):
 - Barcode format: step 0.2 is not committed on the main branch yet, so the helper draws a
   generic block barcode from a layout in `start` (position, block size, columns, bit count,
   bit order); the client side must pass the layout matching 0.2's decoder (integration note).
+- Review fixes (sandbox): both compilers build every source without warnings, the
+  C++/WinRT capture included (GCC link and clang syntax check against the generated
+  Windows SDK 10.0.26100 headers; a static_assert confirmed the SDK-projection test for
+  `IsCursorCaptureEnabled` is true for `GraphicsCaptureSession` and false for a type without
+  it). `--self-test-pacer` gained "present 1 ms after an idle repeat" (delivered at its
+  present time, 0 ms instead of 11.5 ms at 60 fps); restoring the old rule (repeats
+  advance the slot) makes exactly that case fail. Under Wine + Xvfb `make helper-test` passes
+  with the converter holding the device lock (Wine exposes `ID3D10Multithread`, no warning)
+  and clearing HS/DS/stream output/predication: `TestHelperIntegrationGPUPipeline` (8 runs)
+  79-84 frames in 3.5 s, 10-11 idle repeats, at most 30-31 in a second at 30 fps (limit
+  fps+2; a new image may now follow a repeat at once), the barcode of frame 30 decodes;
+  `--self-test-convert` ok (mode planar). Wine accepts `timeBeginPeriod(1)`. The desktop-handle bookkeeping of `syncThreadDesktop`, copied
+  into a test program under Wine: `CloseDesktop` on the handle in use fails (as documented),
+  20 calls on one thread leave one handle open, a second thread adds one. Not reachable
+  here: a removed device (WARP / wined3d cannot be removed), DDA reacquire and slicing (Wine's
+  `DuplicateOutput` is E_NOTIMPL), AMD Direct Capture and WGC at run time (no AMD adapter;
+  WGC "not supported" in Wine): all below.
 
 Hardware / real Windows checks (run in an elevated PowerShell on the host, with Go and the
 repository; `$env:RECON_HELPER_EXE` = path of the CI-built recon-encoder.exe; the capture
@@ -213,3 +230,53 @@ tests also read `RECON_HELPER_SECONDS`, `RECON_HELPER_NV12`, `RECON_HELPER_FPS`,
   has the output's `adapterLuid`).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same on an Optimus laptop (the
   internal panel is usually on the iGPU: DDA must use the iGPU adapter for it).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (removed device): install the Windows "Graphics
+  Tools" optional feature, start `HelperIntegrationDDA` with `RECON_HELPER_SECONDS=60`, then
+  run `dxcap -forcetdr` in an elevated prompt: within about 0.3 s the helper reports the fatal
+  `device_lost` (log `fatal: device_lost: ...: the D3D11 device was removed: 0x887A0005` or
+  `...0006/0007`) and exits with code 3; the test fails with that error, and there is no
+  series of `capture lost` / 250 ms retries or of non-fatal `encode_failed` errors. Repeat
+  with `HelperIntegrationAMDDirect` and (MSVC build) `HelperIntegrationWGC`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same `dxcap -forcetdr` runs
+  (DDA and WGC): fatal `device_lost`, exit code 3, no retry loop.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (timer resolution): `HelperIntegrationAMDDirect`
+  with `RECON_HELPER_FPS=144`, `RECON_HELPER_SECONDS=30` and a game at 144 Hz: more than 64
+  frames per second in the log (a ~15.6 ms `Sleep(1)` would cap it near 64), present->capture
+  p95 a few ms at most; during the run `powercfg /energy /duration 10` (elevated) lists
+  recon-encoder.exe under "Platform Timer Resolution: Outstanding Timer Request" with a
+  requested period of 10000 (1 ms).
+- NVIDIA: unverified (no NVIDIA host available). Test: `powercfg /energy /duration 10` during a
+  `HelperIntegrationDDA` run lists recon-encoder.exe with a 1 ms timer request.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (encoder output latency with DDA idle waits;
+  VERIFY before 3.3 builds on the shared device): once the AMF backend exists, stream DDA at
+  60 fps from a 60 Hz desktop where only a clock with seconds changes, then with a game
+  running, and log submit->output (`outputQpc - submitQpc`) p50/p95 from stats: p95 must be
+  the same in both cases and well below one frame interval (AcquireNextFrame now waits in
+  2 ms slices with 0.5 ms pauses, so an encoder thread waits <= 2 ms for the device lock).
+  If p95 still shows waits of a slice or more that follow the capture's waits, give DDA its
+  own D3D11 device and pass frames through a shared texture with a keyed mutex (Sunshine's
+  design) and record it here. Present->capture p95 must not grow by more than ~0.5 ms
+  against the 3.2 numbers above.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same comparison with the NVENC
+  backend (GUIDE 3.4: AcquireNextFrame and Lock/UnlockBitstream on conflicting threads).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (desktop handles): during a 120 s
+  `HelperIntegrationDDA` run lock the screen and log back in 10 times and open 10 UAC
+  prompts; `(Get-Process recon-encoder).HandleCount` (or Process Explorer, type Desktop)
+  stays flat: at most two Desktop handles, where it used to grow by one per re-duplication.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same Win+L / UAC handle count check.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (amd-direct probe): `recon-encoder.exe --print-caps
+  --backend=mock --log-level=debug` with a current Adrenalin lists `amd-direct` in `capture`
+  and logs `amd-direct probe: usable in N ms` (N expected well below 100); on a driver without
+  AMD Direct Capture (an older Adrenalin, or a legacy-driver GPU) `unavailable.amd-direct`
+  says `creating AMFDisplayCapture failed (AMF_RESULT ...): this driver has no AMD Direct
+  Capture`.
+- NVIDIA: unverified (no NVIDIA host available). Test: `--print-caps` on an NVIDIA-only host
+  reports `amd-direct` unavailable ("no display output on an AMD adapter") without creating
+  any device (no AMF log lines).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (WGC pointer): MSVC build on Windows 11:
+  `--print-caps` lists `wgc`; `HelperIntegrationWGC` passes (it now fails if
+  `started.cursorInVideo` is true) and the `RECON_HELPER_NV12` dump shows no pointer while
+  the mouse moves over the captured area. On Windows 10 older than 2004 (build < 19041), if
+  one is at hand, `wgc` is unavailable with "cannot keep the mouse pointer out of
+  Windows.Graphics.Capture frames".
+- NVIDIA: unverified (no NVIDIA host available). Test: the same WGC pointer check.

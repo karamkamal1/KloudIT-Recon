@@ -74,6 +74,9 @@ void Pipeline::captureLoop() {
         case Next::Timeout:
             continue;
         case Next::Stopped:
+            // Only stop() may end capture: anything else would leave a
+            // started helper without frames and without an error.
+            if (!stop_) rep_.fatal(Status::Error("capture_failed", std::string("capture ") + cap_.name() + " ended unexpectedly", true));
             return;
         case Next::Error:
             if (err.fatal) {
@@ -143,6 +146,7 @@ void Pipeline::outputLoop() {
         case Next::Timeout:
             continue;
         case Next::Stopped:
+            if (!stop_) rep_.fatal(Status::Error("encode_failed", std::string("encoder ") + enc_.name() + " stopped unexpectedly", true));
             return;
         case Next::Error:
             if (err.fatal) {

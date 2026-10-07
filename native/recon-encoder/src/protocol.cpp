@@ -254,6 +254,7 @@ std::string encodeStarted(const Started& s) {
         {"gpuPriority", s.gpuPriority},
         {"idleRepeatMs", s.idleRepeatMs},
         {"barcode", s.barcode},
+        {"cursorInVideo", s.cursorInVideo},
     };
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }

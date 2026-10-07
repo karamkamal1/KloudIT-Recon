@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "d3d/device.hpp"
+
 namespace recon {
 
 PacedCapture::PacedCapture() { stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
@@ -10,11 +12,15 @@ PacedCapture::~PacedCapture() {
     if (stop_) CloseHandle(stop_);
 }
 
-void PacedCapture::startPacing(const StartParams& p) {
+void PacedCapture::startPacing(const StartParams& p, ID3D11Device* device) {
     std::lock_guard<std::mutex> lock(mu_);
     pacer_.reset(qpcFrequency(), p.fps, p.idleRepeatMs, qpcNow());
     pending_ = haveLast_ = false;
+    device_ = device;
+    if (timerResolution_.periodMs() > 1) logf(LogLevel::Info, "timer resolution: %u ms", timerResolution_.periodMs());
 }
+
+bool PacedCapture::deviceLost(Status& err) { return d3d::deviceRemoved(device_, std::string("capture ") + name(), err); }
 
 void PacedCapture::setFps(int fps) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -85,10 +91,13 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             pending_ = false;
             haveLast_ = true;
             std::lock_guard<std::mutex> lock(mu_);
-            pacer_.delivered(qpcNow());
+            pacer_.delivered(qpcNow(), false);
             return Next::Frame;
         }
         if (d.kind == FramePacer::Decision::DeliverRepeat) {
+            // Nothing new for idleRepeatMs: also the moment to notice a removed
+            // device, which stops presents (WGC) without failing a call.
+            if (deviceLost(err)) return Next::Error;
             out = CapturedFrame{};
             describe(out);
             out.index = index_++;
@@ -96,10 +105,10 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             out.captureQpc = now;
             out.dirtyPct = 0;
             std::lock_guard<std::mutex> lock(mu_);
-            pacer_.delivered(now);
+            pacer_.delivered(now, true);
             return Next::Frame;
         }
-        if (now >= deadline) return Next::Timeout;
+        if (now >= deadline) return deviceLost(err) ? Next::Error : Next::Timeout;
         const int64_t until = std::min(d.until, deadline);
         if (pending_) {
             // Only the slot is missing: sleep precisely, without sitting in

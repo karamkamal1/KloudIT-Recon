@@ -110,6 +110,31 @@ Status compile(const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
     return Status::Ok();
 }
 
+// Holds the device's critical section for a series of immediate-context calls
+// (other threads' calls on the device wait meanwhile). Reentrant: every
+// single call takes it again internally with multithread protection on.
+class DeviceLock {
+public:
+    explicit DeviceLock(ID3D10Multithread* mt) : mt_(mt) {
+        if (mt_) mt_->Enter();
+    }
+    ~DeviceLock() {
+        if (mt_) mt_->Leave();
+    }
+    DeviceLock(const DeviceLock&) = delete;
+    DeviceLock& operator=(const DeviceLock&) = delete;
+
+private:
+    ID3D10Multithread* mt_;
+};
+
+// A failed D3D11 call: device_lost (fatal) if the device was removed, else `code`.
+Status failure(ID3D11Device* device, const char* code, const std::string& text) {
+    Status s;
+    if (deviceRemoved(device, text, s)) return s;
+    return Status::Error(code, text);
+}
+
 // SRV format for a source texture format; linear = scRGB.
 bool srvFormat(DXGI_FORMAT f, DXGI_FORMAT& out, bool& linear) {
     linear = false;
@@ -211,6 +236,10 @@ Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height
     }
     device_ = device;
     device_->GetImmediateContext(ctx_.ReleaseAndGetAddressOf());
+    if (FAILED(device_->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(mt_.ReleaseAndGetAddressOf())))) {
+        mt_.Reset();
+        logf(LogLevel::Warn, "the D3D11 device exposes no ID3D10Multithread: conversions run without the device lock");
+    }
     width_ = width;
     height_ = height;
     barcode_ = barcode;
@@ -279,7 +308,7 @@ Status Nv12Converter::createSlot(Slot& s) {
             td.BindFlags = D3D11_BIND_RENDER_TARGET;
             hr = device_->CreateTexture2D(&td, nullptr, s.nv12.ReleaseAndGetAddressOf());
         }
-        if (FAILED(hr)) return Status::Error("init_failed", "creating an NV12 texture failed: " + hrText(hr));
+        if (FAILED(hr)) return failure(device_.Get(), "init_failed", "creating an NV12 texture failed: " + hrText(hr));
         // The plane is picked by the view format (luma R8, chroma R8G8), as
         // Sunshine's display_vram.cpp does for its NV12 encoder textures.
         rd.Format = DXGI_FORMAT_R8_UNORM;
@@ -288,7 +317,7 @@ Status Nv12Converter::createSlot(Slot& s) {
             rd.Format = DXGI_FORMAT_R8G8_UNORM;
             hr = device_->CreateRenderTargetView(s.nv12.Get(), &rd, s.rtvUV.ReleaseAndGetAddressOf());
         }
-        if (FAILED(hr)) return Status::Error("init_failed", "NV12 plane render target views failed: " + hrText(hr));
+        if (FAILED(hr)) return failure(device_.Get(), "init_failed", "NV12 plane render target views failed: " + hrText(hr));
         return Status::Ok();
     }
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -302,7 +331,7 @@ Status Nv12Converter::createSlot(Slot& s) {
     }
     if (SUCCEEDED(hr)) hr = device_->CreateRenderTargetView(s.y.Get(), nullptr, s.rtvY.ReleaseAndGetAddressOf());
     if (SUCCEEDED(hr)) hr = device_->CreateRenderTargetView(s.uv.Get(), nullptr, s.rtvUV.ReleaseAndGetAddressOf());
-    if (FAILED(hr)) return Status::Error("init_failed", "creating the plane textures failed: " + hrText(hr));
+    if (FAILED(hr)) return failure(device_.Get(), "init_failed", "creating the plane textures failed: " + hrText(hr));
     return Status::Ok();
 }
 
@@ -347,7 +376,7 @@ Status Nv12Converter::sourceView(ID3D11Texture2D* src, SrvEntry*& out) {
         cd.Usage = D3D11_USAGE_DEFAULT;
         cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         const HRESULT hr = device_->CreateTexture2D(&cd, nullptr, e.copy.ReleaseAndGetAddressOf());
-        if (FAILED(hr)) return Status::Error("init_failed", "creating a copy of the capture texture failed: " + hrText(hr));
+        if (FAILED(hr)) return failure(device_.Get(), "init_failed", "creating a copy of the capture texture failed: " + hrText(hr));
         viewed = e.copy.Get();
     }
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
@@ -355,7 +384,7 @@ Status Nv12Converter::sourceView(ID3D11Texture2D* src, SrvEntry*& out) {
     sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     sd.Texture2D.MipLevels = 1;
     const HRESULT hr = device_->CreateShaderResourceView(viewed, &sd, e.srv.ReleaseAndGetAddressOf());
-    if (FAILED(hr)) return Status::Error("init_failed", "CreateShaderResourceView on the capture texture failed: " + hrText(hr));
+    if (FAILED(hr)) return failure(device_.Get(), "init_failed", "CreateShaderResourceView on the capture texture failed: " + hrText(hr));
     srvCache_.insert(srvCache_.begin(), std::move(e));
     if (srvCache_.size() > 8) srvCache_.pop_back();
     out = &srvCache_.front();
@@ -385,6 +414,9 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
         std::lock_guard<std::mutex> lock(pool->mu);
         pool->busy[size_t(index)] = false;
     };
+    // From here on the device lock is held (lock order: device, then pool:
+    // an encoder thread may release a frame while it holds the device lock).
+    const DeviceLock deviceLock(mt_.Get());
     if (size_t(index) == slots_.size()) {
         slots_.emplace_back();
         Status s = createSlot(slots_.back());
@@ -409,7 +441,7 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
     HRESULT hr = ctx_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
     if (FAILED(hr)) {
         release();
-        return Status::Error("encode_failed", "mapping the constant buffer failed: " + hrText(hr));
+        return failure(device_.Get(), "encode_failed", "mapping the constant buffer failed: " + hrText(hr));
     }
     Constants c{};
     rotationTransform(rotation, c.xformU, c.xformV);
@@ -432,11 +464,19 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
     std::memcpy(m.pData, &c, sizeof(c));
     ctx_->Unmap(cb_.Get(), 0);
 
+    // Every stage the draws depend on, set or cleared: the immediate context
+    // is shared, so other components may have left anything bound (a hull
+    // shader would make the TRIANGLELIST draws invalid, a predicate could skip
+    // them, stream-output targets would capture them).
+    ctx_->SetPredication(nullptr, FALSE);
     ctx_->IASetInputLayout(nullptr);
     ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx_->VSSetShader(vs_.Get(), nullptr, 0);
+    ctx_->HSSetShader(nullptr, nullptr, 0);
+    ctx_->DSSetShader(nullptr, nullptr, 0);
     ctx_->GSSetShader(nullptr, nullptr, 0);
-    ctx_->RSSetState(rasterizer_.Get());
+    ctx_->SOSetTargets(0, nullptr, nullptr);
+    ctx_->RSSetState(rasterizer_.Get());  // no scissor test, no culling
     ctx_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     ctx_->OMSetDepthStencilState(nullptr, 0);
     ID3D11Buffer* cbs[] = {cb_.Get()};
@@ -484,6 +524,7 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
 }
 
 Status Nv12Converter::readback(const ConvertedFrame& f, std::vector<uint8_t>& out) {
+    const DeviceLock deviceLock(mt_.Get());
     const uint32_t w = width_, h = height_;
     out.assign(size_t(w) * h * 3 / 2, 0);
     auto staging = [&](ID3D11Texture2D* like, ComPtr<ID3D11Texture2D>& st) -> HRESULT {

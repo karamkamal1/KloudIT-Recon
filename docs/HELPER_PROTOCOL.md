@@ -154,11 +154,16 @@ ignored by recon-host.
   Phase 3.6 qualification results in docs/VENDOR_NOTES.md overwrite them.
 * `capture`: usable capture methods, default first (the mock: `synthetic`, then the real
   methods that probed usable; DDA before AMD Direct Capture, which is opt-in). The probes
-  are cheap (output enumeration, runtime DLLs); `start` can still fail, e.g. DDA in a
-  session without a desktop. `synthetic-gpu` is a test source and never listed.
+  are cheap (output enumeration, runtime DLLs), except `amd-direct` on a host with an AMD
+  output and the AMF runtime: it creates the `AMFDisplayCapture` component once (a D3D11
+  device and an AMF context, released at once), because legacy drivers load AMF but have
+  no AMD Direct Capture. `wgc` is listed only where Windows can keep the pointer out of
+  its frames (`IsCursorCaptureEnabled`, Windows 10 2004+). `start` can still fail, e.g.
+  DDA in a session without a desktop. `synthetic-gpu` is a test source and never listed.
 * `cursorInVideo`: whether frames contain the mouse pointer. Always `false`: DDA and AMD
-  Direct Capture frames never include it and WGC is configured without it; recon-host
-  draws the cursor on the client (with `drawCursor` required it keeps using FFmpeg).
+  Direct Capture frames never include it and WGC is only listed where it can be
+  configured without it; recon-host draws the cursor on the client (with `drawCursor`
+  required it keeps using FFmpeg). `started.cursorInVideo` is the per-stream answer.
 * `outputs`: every DXGI output of every adapter, for `start`'s monitor selection
   (`hmonitor`, or `adapterLuid` + `outputIndex`). `name` is the GDI device name.
 * `unavailable`: every probed backend / capture method that is not usable, with why.
@@ -169,14 +174,16 @@ ignored by recon-host.
 {"t":"started","backend":"mock","capture":"dda","codec":"h264","width":320,"height":180,"fps":60,
  "kbps":4000,"captureWidth":2560,"captureHeight":1440,"adapterLuid":"00000000:0000c3a1",
  "adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","hagsEnabled":true,"gpuPriority":"realtime",
- "idleRepeatMs":100,"barcode":true}
+ "idleRepeatMs":100,"barcode":true,"cursorInVideo":false}
 ```
 
 `captureWidth`/`captureHeight` are the source as displayed; `adapterLuid`, `adapterName`,
 `vendor` and `hagsEnabled` describe the adapter capture and encoder run on (empty / `null`
 for `synthetic`); `gpuPriority` is the process GPU scheduling priority that was applied:
 `realtime` | `high` | `failed` | `off` (`""` without a GPU capture); `idleRepeatMs` is 0
-for `synthetic`; `barcode` whether the frame-id barcode is drawn.
+for `synthetic`; `barcode` whether the frame-id barcode is drawn; `cursorInVideo` whether
+this stream's frames contain the mouse pointer after all (a WGC session that could not
+exclude it): recon-host must then not draw its own cursor. Older helpers omit it (false).
 
 `stats`, one per frame, **including frames the helper dropped**:
 
@@ -232,8 +239,8 @@ entry point). `ltrSlot` and `temporalLayer` complete the picture.
 | `unsupported` | no | the backend cannot do what was asked (e.g. codec) |
 | `init_failed` | no | capture or encoder initialisation failed (e.g. `DuplicateOutput` refused) |
 | `no_output` | no | the requested monitor / window does not exist or is not attached to the desktop |
-| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory) |
-| `device_lost` | yes | the D3D11 device was removed (driver reset / TDR); a new helper starts over |
+| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly) |
+| `device_lost` | yes | the D3D11 device was removed (driver reset / TDR), noticed by any capture method or the colour conversion; a new helper starts over |
 | `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped) |
 | `mock_error` / `mock_fatal` | no / yes | injected by `--mock-error-at` / `--mock-fatal-at` |
 | `protocol` | yes | control framing broken (message over 1 MiB) |
@@ -354,7 +361,7 @@ after both threads have been joined.
 |---|---|---|---|
 | `dda` | DXGI Desktop Duplication (default, any vendor) | the output's adapter | `IDXGIOutput5::DuplicateOutput1` (B8G8R8A8; FP16 for HDR in step 3.9), `IDXGIOutput1::DuplicateOutput` before Windows 10 1703 |
 | `amd-direct` | AMD Direct Capture (`AMFDisplayCapture`), AMD adapters only, opt-in | the output's adapter, wrapped in an `AMFContext` | `WAIT_FOR_PRESENT`, framerate (0,1), dirty rects, `DUPLICATEOUTPUT`; monitor index = the output's index on its adapter (VERIFY) |
-| `wgc` | Windows.Graphics.Capture: a monitor or a window | the monitor's adapter | MSVC build only (C++/WinRT); cursor and border off where Windows allows it |
+| `wgc` | Windows.Graphics.Capture: a monitor or a window | the monitor's adapter | MSVC build only (C++/WinRT); cursor off (listed only where Windows allows it), border off where allowed |
 | `synthetic` | timer-driven frame counter, no image | none | mock tests |
 | `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path |
 
@@ -382,8 +389,24 @@ the first frame of a duplication, so a static desktop still yields an image.
 `DXGI_ERROR_ACCESS_LOST`, `E_ACCESSDENIED` (secure desktop) and a stale DXGI factory
 (`IsCurrent` false: mode, HDR or output changes) recreate the duplication, re-finding the
 output by its GDI name on the same adapter, every 250 ms until it works (`captureChanged`
-`lost` / `restored` / `resized`). A removed device is fatal (`device_lost`). While
-streaming, the capture thread keeps the display awake (`ES_DISPLAY_REQUIRED`).
+`lost` / `restored` / `resized`). A removed device (driver reset / TDR) is fatal
+(`device_lost`) instead, on every path: a TDR changes the mode, so it usually shows up as
+`DXGI_ERROR_ACCESS_LOST` first and then as a failing `DuplicateOutput`. `AcquireNextFrame`
+holds the device's lock while it waits (Sunshine display_base.cpp), and the encoder uses
+the same device, so the helper waits in slices of at most 2 ms with 0.5 ms pauses outside
+the call: an encoder thread that needs the device waits at most a slice, and a present is
+noticed at most 0.5 ms late. While streaming, the capture thread keeps the display awake
+(`ES_DISPLAY_REQUIRED`).
+
+All GPU captures: while a capture exists the helper raises the system timer resolution
+to 1 ms (`timeBeginPeriod`; since Windows 10 2004 a process that does not ask gets ~15.6 ms
+ticks, so 1 ms sleeps and short wait timeouts would last that long). AMD Direct Capture
+polls `QueryOutput` with 1 ms high-resolution timer sleeps (`AMF_REPEAT`); a failing
+`QueryOutput` re-initializes the component every 250 ms (`lost` / `restored`) unless the
+device was removed (`device_lost`). WGC's frame handlers run on thread-pool threads and
+hold only shared state, never the capture object, so they can safely outlive it. While no
+new image arrives, every capture checks the device for removal (at least every 100 ms),
+since a removed device can also just stop presents.
 
 ### GPU priority
 
@@ -400,17 +423,21 @@ a log line `gpu priority: realtime|high|failed|off (vendor, hags on|off|unknown)
 GPU captures follow presents (DDA `AcquireNextFrame`, AMD `WAIT_FOR_PRESENT`, WGC frame
 events); there is no capture timer. The policy (`src/capture/pacer.hpp`):
 
-1. Never more than `fps` frames per second: output slots are one frame interval apart and
-   each delivered frame uses one. A frame may use its slot up to a quarter interval early,
-   so present jitter at a matching refresh rate adds no delay; over any stretch of time at
-   most one frame more than `fps` allows.
+1. Never more than `fps` new images per second: output slots are one frame interval apart
+   and each delivered new image uses one. A frame may use its slot up to a quarter interval
+   early, so present jitter at a matching refresh rate adds no delay; over any stretch of
+   time at most one new image more than `fps` allows.
 2. Presents faster than `fps`: the newest image wins and goes out when its slot opens;
    older ones are dropped before they are converted or encoded.
 3. Nothing new for `idleRepeatMs` (default 100 ms, 20..2000; Sunshine's default minimum is
    10 fps): the last image is submitted again, and again every `idleRepeatMs`, flagged
    `repeat` (stats, slot flag). This keeps the encoder's rate control, the transport and
    the client's stall detection fed on a static desktop or a paused game, and lets static
-   content sharpen. Repeats are tiny P frames.
+   content sharpen. Repeats are tiny P frames. A repeat takes no output slot: the first new
+   image after it (the first change after an idle period, e.g. a click on a static
+   desktop: the frame whose latency matters most) goes out at once instead of waiting up
+   to 3/4 of an interval. Repeats come only after `max(idleRepeatMs, one interval)`
+   without any delivery, so the long-run rate stays within `fps`.
 
 `setRate` with an `fps` changes the slot interval at once.
 
@@ -422,7 +449,11 @@ With `InputSpec::Nv12` every GPU frame goes through one D3D11 pixel-shader pass 
 luma column, between the two luma rows; Sunshine's 6-tap filter), bilinear scaling to the
 encoded size, rotation for rotated displays (the texture-to-display rotation of
 `DXGI_OUTDUPL_DESC::Rotation`), FP16 scRGB sources clipped to SDR until step 3.9. The
-render target views select the NV12 planes by format (R8 luma, R8G8 chroma). Shaders are
+render target views select the NV12 planes by format (R8 luma, R8G8 chroma). The device is
+shared with the capture and the encoder's threads, so each conversion holds the device's
+critical section (`ID3D10Multithread::Enter`/`Leave`) and sets or clears every pipeline
+stage its draws depend on (HS/DS/GS, stream output, predication) rather than trusting the
+shared immediate context's state. Shaders are
 compiled at start with `D3DCompile` from System32's `d3dcompiler_47.dll` (no build-time
 shader compiler needed; a few milliseconds). An odd capture size is encoded at the next
 smaller even size when `width`/`height` are 0.
@@ -441,7 +472,8 @@ Both run without a display or GPU and exit 0 (ok), 1 (failed) or 77 (could not r
 
 * `--self-test-pacer`: the frame pacing policy against simulated present patterns
   (144 Hz at 120 fps, 60 Hz with 1 ms jitter, 59.94 Hz, 30 Hz at 60 fps, idle repeats,
-  5 fps, 1000 Hz bursts): fps cap, newest image wins, no image older than one interval,
+  5 fps, a present 1 ms after an idle repeat, 1000 Hz bursts): fps cap, newest image wins,
+  no image older than one interval, a new image right after a repeat goes out at once,
   repeat timing.
 * `--self-test-convert`: the conversion on a WARP device (default hardware device if WARP
   is missing; 77 if there is no D3D11 device at all) against a CPU reference of the same
