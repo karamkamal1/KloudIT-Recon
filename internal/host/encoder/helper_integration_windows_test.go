@@ -8,6 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -100,15 +104,22 @@ func TestHelperIntegrationMock(t *testing.T) {
 	h264 := c.Codecs["h264"]
 	if c.V != ProtocolVersion || c.Backend != "mock" || c.Vendor != "mock" || !c.Usable() || len(c.Codecs) != 1 ||
 		!h264.ForceIDR || h264.Recovery != "none" || h264.LiveBitrate != "seamless" || h264.MaxW != 320 ||
-		len(c.Capture) != 1 || c.Capture[0] != "synthetic" || c.QPCFrequency <= 0 {
+		len(c.Capture) < 1 || c.Capture[0] != "synthetic" || c.QPCFrequency <= 0 || c.CursorInVideo {
 		t.Fatalf("caps %+v", c)
 	}
-	for _, n := range []string{"amf", "nvenc", "dda", "amd-direct", "wgc"} {
+	for _, n := range []string{"amf", "nvenc"} {
 		if c.Unavailable[n] == "" {
 			t.Errorf("caps do not say why %s is unavailable: %v", n, c.Unavailable)
 		}
 	}
-	t.Logf("unavailable: %v", c.Unavailable)
+	// Every real capture method is either usable (listed after "synthetic") or
+	// unavailable with a reason, never both.
+	for _, n := range []string{"dda", "amd-direct", "wgc"} {
+		if slices.Contains(c.Capture, n) == (c.Unavailable[n] != "") {
+			t.Errorf("capture %s: listed %v, unavailable %q", n, slices.Contains(c.Capture, n), c.Unavailable[n])
+		}
+	}
+	t.Logf("capture: %v, unavailable: %v, outputs: %+v", c.Capture, c.Unavailable, c.Outputs)
 
 	// Before start, and bad requests: non-fatal errors, the helper keeps running.
 	if err := h.ForceIDR(); err != nil {
@@ -495,5 +506,220 @@ func TestHelperIntegrationCommandLine(t *testing.T) {
 	}
 	if err := exec.Command(exe, "--print-caps", "--backend=amf", "--mock-fatal-at=3").Run(); !errors.As(err, &ee) || ee.ExitCode() != 2 {
 		t.Fatalf("mock option without the mock backend: %v", err)
+	}
+}
+
+// underWine reports whether the test runs under Wine (ntdll exports wine_get_version).
+func underWine() bool {
+	return syscall.NewLazyDLL("ntdll.dll").NewProc("wine_get_version").Find() == nil
+}
+
+func TestHelperIntegrationSelfTests(t *testing.T) {
+	exe := helperExe(t)
+	// Frame pacing policy: pure logic, runs everywhere.
+	out, err := exec.Command(exe, "--self-test-pacer").CombinedOutput()
+	t.Logf("%s", out)
+	if err != nil {
+		t.Fatalf("--self-test-pacer: %v", err)
+	}
+	// GPU colour conversion on WARP. Wine needs an X display for D3D11 and has
+	// no NV12 render targets (the self-test then checks the same shaders on
+	// separate planes); real Windows must pass in NV12 mode.
+	out, err = exec.Command(exe, "--self-test-convert").CombinedOutput()
+	t.Logf("%s", out)
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 77 && underWine() {
+		t.Skip("no D3D11 device under Wine (needs an X display)")
+	}
+	if err != nil {
+		t.Fatalf("--self-test-convert: %v", err)
+	}
+	if !underWine() && !strings.Contains(string(out), "self-test-convert: ok (mode nv12)") {
+		t.Fatal("conversion not tested on NV12 render targets")
+	}
+}
+
+// captureCheck starts a real capture method through the mock encoder: capture,
+// pacing and the NV12 conversion run for real, the canned clip comes out.
+// Where the method cannot work (Wine has no DuplicateOutput, a CI service
+// session may have no desktop) start must fail cleanly and the helper must
+// still start another capture. On a real host, RECON_HELPER_SECONDS=N reads
+// frames for N seconds and logs the frame rate, idle repeats and the
+// present -> capture latency; RECON_HELPER_NV12=file writes converted frame 30
+// (view with ffplay -f rawvideo -pixel_format nv12 -video_size WxH file);
+// RECON_HELPER_FPS, RECON_HELPER_HMONITOR (decimal or 0x hex),
+// RECON_HELPER_WINDOW_TITLE (wgc) and RECON_HELPER_GPU_PRIORITY override the
+// start parameters.
+func captureCheck(t *testing.T, capture string, p StartParams) {
+	if v, _ := strconv.Atoi(os.Getenv("RECON_HELPER_FPS")); v > 0 {
+		p.FPS = v
+	}
+	if v, err := strconv.ParseUint(os.Getenv("RECON_HELPER_HMONITOR"), 0, 64); err == nil {
+		p.HMonitor = v
+	}
+	if v := os.Getenv("RECON_HELPER_WINDOW_TITLE"); v != "" && capture == "wgc" {
+		p.WindowTitle = v
+	}
+	p.GPUPriority = os.Getenv("RECON_HELPER_GPU_PRIORITY")
+	var extra []string
+	if f := os.Getenv("RECON_HELPER_NV12"); f != "" {
+		extra = append(extra, "--dump-nv12="+f)
+	}
+	h := launchMock(t, extra...)
+	if !slices.Contains(h.Caps().Capture, capture) {
+		t.Skipf("%s unavailable here: %s", capture, h.Caps().Unavailable[capture])
+	}
+	p.Capture, p.Codec, p.Kbps = capture, "h264", 4000
+	if p.FPS == 0 {
+		p.FPS = 60
+	}
+	st, err := h.Start(p)
+	if err != nil {
+		var he *HelperError
+		if !errors.As(err, &he) || he.Fatal || !slices.Contains([]string{"init_failed", "no_output", "unavailable", "unsupported"}, he.Code) {
+			t.Fatalf("%s start: %v", capture, err)
+		}
+		t.Logf("%s start failed cleanly: %v", capture, err)
+		if _, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000}); err != nil {
+			t.Fatalf("synthetic start after a failed %s start: %v", capture, err)
+		}
+		nextFrame(t, h)
+		return
+	}
+	t.Logf("%s started: %+v", capture, st)
+	if st.Capture != capture || st.CaptureWidth <= 0 || st.AdapterLUID == "" || st.GPUPriority == "" || st.IdleRepeatMs != 100 {
+		t.Fatalf("started %+v", st)
+	}
+	// A static desktop still yields frames: idle repeats every 100 ms.
+	var frames []*Frame
+	for i := 0; i < 5; i++ {
+		frames = append(frames, nextFrame(t, h))
+	}
+	if secs, _ := strconv.Atoi(os.Getenv("RECON_HELPER_SECONDS")); secs > 0 {
+		for end := time.Now().Add(time.Duration(secs) * time.Second); time.Now().Before(end); {
+			frames = append(frames, nextFrame(t, h))
+		}
+	}
+	qpc := h.QPCFrequency()
+	repeats, maxInSecond := 0, 0
+	var lat []float64
+	for i, f := range frames {
+		if f.FrameID != uint64(i+1) {
+			t.Fatalf("frame %d has id %d", i+1, f.FrameID)
+		}
+		if f.Repeat {
+			repeats++
+		} else if f.PresentQPC > 0 {
+			lat = append(lat, float64(f.CaptureQPC-f.PresentQPC)*1000/float64(qpc))
+		}
+	}
+	maxInSecond = maxPerSecond(frames, qpc)
+	slices.Sort(lat)
+	pct := func(q float64) float64 {
+		if len(lat) == 0 {
+			return 0
+		}
+		return lat[int(q*float64(len(lat)-1))]
+	}
+	t.Logf("%s: %d frames, %d idle repeats, at most %d in one second (fps %d); present->capture p50 %.2f ms, p95 %.2f ms (%d frames with a present time)",
+		capture, len(frames), repeats, maxInSecond, p.FPS, pct(0.5), pct(0.95), len(lat))
+	if maxInSecond > p.FPS+2 {
+		t.Fatalf("%d frames in one second at %d fps", maxInSecond, p.FPS)
+	}
+}
+
+// maxPerSecond is the most frames submitted to the encoder within any one
+// second. The pacer allows one frame above the fps in a window (a frame may
+// use its slot a quarter interval early: --self-test-pacer checks the exact
+// bound); submit times also carry the conversion time, so callers allow fps+2.
+func maxPerSecond(frames []*Frame, qpc int64) int {
+	best := 0
+	for i, f := range frames {
+		n := 0
+		for _, g := range frames[i:] {
+			if g.SubmitQPC-f.SubmitQPC >= qpc {
+				break
+			}
+			n++
+		}
+		best = max(best, n)
+	}
+	return best
+}
+
+func TestHelperIntegrationDDA(t *testing.T) {
+	captureCheck(t, "dda", StartParams{Width: 640, Height: 360,
+		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+}
+
+func TestHelperIntegrationAMDDirect(t *testing.T) {
+	captureCheck(t, "amd-direct", StartParams{Width: 640, Height: 360})
+}
+
+// Windows.Graphics.Capture of monitor 0 (MSVC builds; the mingw build has no
+// C++/WinRT and reports wgc unavailable).
+func TestHelperIntegrationWGC(t *testing.T) {
+	captureCheck(t, "wgc", StartParams{Width: 640, Height: 360})
+}
+
+// The present-driven capture path end to end on the GPU test source: a
+// simulated game presents at twice the stream's fps for 1 s, then pauses
+// 0.6 s. Frames must be capped at the fps, repeats must fill the pauses
+// every 100 ms, and the frame dumped after conversion must carry its frame
+// id in the barcode.
+func TestHelperIntegrationGPUPipeline(t *testing.T) {
+	dump := t.TempDir() + `\frame30.nv12`
+	h := launchMock(t, "--dump-nv12="+dump)
+	const w, hgt, fps = 320, 180, 30
+	_, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000,
+		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+	var he *HelperError
+	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+		t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+	}
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	var frames []*Frame
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		frames = append(frames, nextFrame(t, h))
+	}
+	qpc := h.QPCFrequency()
+	repeats, maxInSecond := 0, 0
+	for i, f := range frames {
+		if f.FrameID != uint64(i+1) {
+			t.Fatalf("frame %d has id %d", i+1, f.FrameID)
+		}
+		if f.Repeat != (f.PresentQPC == 0) {
+			t.Fatalf("frame %d: repeat %v with presentQpc %d", f.FrameID, f.Repeat, f.PresentQPC)
+		}
+		if f.Repeat {
+			repeats++
+		}
+	}
+	maxInSecond = maxPerSecond(frames, qpc)
+	t.Logf("%d frames in 3.5 s, %d idle repeats, at most %d in one second", len(frames), repeats, maxInSecond)
+	if maxInSecond > fps+2 || maxInSecond < fps*8/10 {
+		t.Fatalf("%d frames in one second at %d fps", maxInSecond, fps)
+	}
+	if repeats < 6 {
+		t.Fatalf("only %d idle repeats in two 0.6 s pauses", repeats)
+	}
+
+	// The converted frame 30: the barcode in its top-left corner reads 30.
+	b, err := os.ReadFile(dump)
+	if err != nil || len(b) != w*hgt*3/2 {
+		t.Fatalf("dump: %d bytes, %v", len(b), err)
+	}
+	var id uint32
+	for k := 0; k < 32; k++ {
+		x, y := (k%16)*8+4, (k/16)*8+4
+		if b[y*w+x] > 126 {
+			id |= 1 << (31 - k)
+		}
+	}
+	if id != 30 {
+		t.Fatalf("barcode of the dumped frame reads %d, want 30", id)
 	}
 }

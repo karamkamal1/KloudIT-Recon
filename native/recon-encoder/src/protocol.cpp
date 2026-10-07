@@ -6,6 +6,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "platform/platform.hpp"
+
 namespace recon {
 
 using json = nlohmann::ordered_json;  // keeps "t" first in every message
@@ -57,8 +59,46 @@ bool inRange(int v, int lo, int hi) { return v >= lo && v <= hi; }
 
 Status bad(std::string text) { return Status::Error("bad_message", std::move(text)); }
 
+Status parseBarcode(const json& j, BarcodeLayout& b) {
+    if (!j.is_object()) return bad("barcode must be an object");
+    std::string err;
+    if (!optField(j, "x", b.x, err) || !optField(j, "y", b.y, err) || !optField(j, "blockW", b.blockW, err) ||
+        !optField(j, "blockH", b.blockH, err) || !optField(j, "cols", b.cols, err) || !optField(j, "bits", b.bits, err) ||
+        !optField(j, "msbFirst", b.msbFirst, err)) {
+        return bad("barcode: " + err);
+    }
+    // Even positions and sizes: every block covers whole 4:2:0 chroma samples.
+    if (!inRange(b.x, 0, 16384) || !inRange(b.y, 0, 16384) || (b.x & 1) || (b.y & 1)) return bad("barcode x/y must be even, 0..16384");
+    if (!inRange(b.blockW, 2, 256) || !inRange(b.blockH, 2, 256) || (b.blockW & 1) || (b.blockH & 1)) {
+        return bad("barcode blockW/blockH must be even, 2..256");
+    }
+    if (!inRange(b.cols, 1, 64) || !inRange(b.bits, 1, 64)) return bad("barcode cols and bits must be 1..64");
+    b.enabled = true;
+    return Status::Ok();
+}
+
 Status parseStart(const json& j, StartParams& p) {
     std::string err;
+    if (!optField(j, "hmonitor", p.hmonitor, err) || !optField(j, "adapterLuid", p.adapterLuid, err) ||
+        !optField(j, "window", p.window, err) || !optField(j, "windowTitle", p.windowTitle, err) ||
+        !optField(j, "gpuPriority", p.gpuPriority, err) || !optField(j, "idleRepeatMs", p.idleRepeatMs, err)) {
+        return bad(err);
+    }
+    if (auto it = j.find("barcode"); it != j.end() && !it->is_null()) {
+        Status bs = parseBarcode(*it, p.barcode);
+        if (!bs.ok) return bs;
+    }
+    if (p.gpuPriority.empty()) p.gpuPriority = "auto";
+    if (p.gpuPriority != "auto" && p.gpuPriority != "high" && p.gpuPriority != "realtime" && p.gpuPriority != "off") {
+        return bad("gpuPriority must be auto, high, realtime or off");
+    }
+    if (p.idleRepeatMs == 0) p.idleRepeatMs = 100;
+    if (!inRange(p.idleRepeatMs, 20, 2000)) return bad("idleRepeatMs out of range (20..2000)");
+    if (p.windowTitle.size() > 512) return bad("windowTitle too long");
+    if (!p.adapterLuid.empty()) {
+        LUID l;
+        if (!parseLuid(p.adapterLuid, l)) return bad("adapterLuid must look like 0000abcd:00001234");
+    }
     if (!optField(j, "capture", p.capture, err) || !optField(j, "monitor", p.monitor, err) ||
         !optField(j, "codec", p.codec, err) || !optField(j, "width", p.width, err) ||
         !optField(j, "height", p.height, err) || !optField(j, "fps", p.fps, err) ||
@@ -78,6 +118,9 @@ Status parseStart(const json& j, StartParams& p) {
     if (p.quality != "speed" && p.quality != "balanced" && p.quality != "quality") return bad("unknown quality");
     if (!inRange(p.ltrSlots, 0, 8)) return bad("ltrSlots out of range");
     if (!inRange(p.svcLayers, 1, 4)) return bad("svcLayers out of range");
+    if ((p.window || !p.windowTitle.empty()) && !p.capture.empty() && p.capture != "wgc") {
+        return bad("window capture needs capture \"wgc\"");
+    }
     return Status::Ok();
 }
 
@@ -154,6 +197,25 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
     }
     json unavailable = json::object();
     for (const auto& [name, why] : c.unavailable) unavailable[name] = why;
+    json outputs = json::array();
+    for (const OutputDesc& o : c.outputs) {
+        outputs.push_back({
+            {"index", o.index},
+            {"adapterIndex", o.adapterIndex},
+            {"outputIndex", o.outputIndex},
+            {"adapterLuid", o.adapterLuid},
+            {"adapterName", o.adapterName},
+            {"vendor", o.vendor},
+            {"name", o.name},
+            {"hmonitor", o.hmonitor},
+            {"x", o.x},
+            {"y", o.y},
+            {"width", o.width},
+            {"height", o.height},
+            {"rotation", o.rotation},
+            {"attached", o.attached},
+        });
+    }
     json j = {
         {"t", "caps"},
         {"v", kProtocolVersion},
@@ -165,6 +227,8 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
         {"hagsEnabled", c.hagsEnabled ? json(*c.hagsEnabled) : json(nullptr)},
         {"codecs", codecs},
         {"capture", c.capture},
+        {"cursorInVideo", c.cursorInVideo},
+        {"outputs", outputs},
         {"unavailable", unavailable},
         {"qpcFrequency", qpcFrequency},
     };
@@ -173,10 +237,31 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
 
 std::string encodeStarted(const Started& s) {
     json j = {
-        {"t", "started"}, {"backend", s.backend}, {"capture", s.capture}, {"codec", s.codec},
-        {"width", s.width}, {"height", s.height}, {"fps", s.fps}, {"kbps", s.kbps},
+        {"t", "started"},
+        {"backend", s.backend},
+        {"capture", s.capture},
+        {"codec", s.codec},
+        {"width", s.width},
+        {"height", s.height},
+        {"fps", s.fps},
+        {"kbps", s.kbps},
+        {"captureWidth", s.captureWidth},
+        {"captureHeight", s.captureHeight},
+        {"adapterLuid", s.adapterLuid},
+        {"adapterName", s.adapterName},
+        {"vendor", s.vendor},
+        {"hagsEnabled", s.hagsEnabled ? json(*s.hagsEnabled) : json(nullptr)},
+        {"gpuPriority", s.gpuPriority},
+        {"idleRepeatMs", s.idleRepeatMs},
+        {"barcode", s.barcode},
     };
-    return j.dump();
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+std::string encodeCaptureEvent(const CaptureEvent& e) {
+    json j = {{"t", "captureChanged"}, {"reason", e.reason}, {"width", e.width},
+              {"height", e.height}, {"rotation", e.rotation}, {"text", e.text}};
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 std::string encodeStats(const FrameStats& s) {
@@ -187,6 +272,8 @@ std::string encodeStats(const FrameStats& s) {
         {"dropped", s.dropped},
         {"key", s.key},
         {"recovery", s.recovery},
+        {"repeat", s.repeat},
+        {"dirtyPct", s.dirtyPct},
         {"bytes", s.bytes},
         {"presentQpc", s.presentQpc},
         {"captureQpc", s.captureQpc},

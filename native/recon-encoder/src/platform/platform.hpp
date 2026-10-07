@@ -1,10 +1,12 @@
 // Small Win32 helpers: logging to stderr, QPC, system DLL loading, a precise
-// waitable timer and primary-adapter detection.
+// waitable timer, adapter description and GPU scheduling (HAGS detection, GPU
+// priority).
 #pragma once
 
 #include <windows.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace recon {
@@ -63,6 +65,7 @@ HMODULE loadSystemLibrary(const wchar_t* name, std::string& err);
 
 std::string win32ErrorText(DWORD code);
 std::string toUtf8(const wchar_t* s);
+std::wstring fromUtf8(const std::string& s);
 
 // --- Adapter -----------------------------------------------------------------------
 
@@ -71,11 +74,38 @@ struct AdapterInfo {
     uint32_t vendorId = 0;
     std::string vendor = "other";  // "amd" | "nvidia" | "intel" | "other"
     std::string luid;              // "%08x:%08x" (HighPart:LowPart)
+    LUID luidValue{};
     std::string name;
+    std::optional<bool> hags;  // hardware-accelerated GPU scheduling (queryHags), nullopt = unknown
 };
 
-// Describes DXGI adapter 0 (the adapter of the primary display on most systems).
-// Step 3.2 replaces this with the adapter that owns the captured output.
+std::string vendorName(uint32_t vendorId);
+std::string luidString(const LUID& luid);
+bool parseLuid(const std::string& s, LUID& out);
+// Fills an AdapterInfo from DXGI_ADAPTER_DESC1 fields (and queries HAGS).
+AdapterInfo describeAdapter(uint32_t vendorId, const LUID& luid, const wchar_t* description);
+
+// Describes DXGI adapter 0 (the adapter of the primary display on most
+// systems), for caps. The capture reports the adapter it actually uses.
 AdapterInfo primaryAdapter();
+
+// --- GPU scheduling (gdi32 D3DKMT* entry points, loaded at run time) -------------
+
+// Whether hardware-accelerated GPU scheduling is enabled on the adapter:
+// D3DKMTQueryAdapterInfo(KMTQAITYPE_WDDM_2_7_CAPS).HwSchEnabled. nullopt if the
+// query is not available (Windows < 10 2004, Wine) or fails.
+std::optional<bool> queryHags(const LUID& adapter);
+
+// Enables SeIncreaseBasePriorityPrivilege on the process token (held by
+// elevated administrators; IDXGIDevice::SetGPUThreadPriority and a REALTIME GPU
+// priority need it). Returns false if the token does not hold it.
+bool enableIncreaseBasePriority();
+
+// Sets this process's GPU scheduling priority class (GUIDE 1.3):
+// mode "off" leaves it alone; otherwise REALTIME, except HIGH when mode is
+// "high" or when mode is "auto" on NVIDIA with HAGS on or unknown; a refused
+// REALTIME is retried as HIGH. Enables SeIncreaseBasePriorityPrivilege first.
+// Returns "realtime" | "high" | "failed" | "off" and logs the outcome.
+std::string applyGpuPriority(const std::string& mode, const AdapterInfo& adapter);
 
 }  // namespace recon

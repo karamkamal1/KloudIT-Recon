@@ -101,6 +101,7 @@ type Helper struct {
 
 	frames   chan *Frame
 	stats    chan Stats
+	captures chan CaptureChanged
 	errs     chan error
 	ctrlDone chan struct{} // closed when the control reader ended
 	done     chan struct{} // closed when the process has exited and its messages were read
@@ -128,6 +129,7 @@ func newHelper(opt Options, c conn) (*Helper, error) {
 		stopW:    make(chan struct{}),
 		frames:   make(chan *Frame, 4),
 		stats:    make(chan Stats, 64),
+		captures: make(chan CaptureChanged, 16),
 		errs:     make(chan error, 16),
 		ctrlDone: make(chan struct{}),
 		done:     make(chan struct{}),
@@ -190,6 +192,10 @@ func (h *Helper) Frames() <-chan *Frame { return h.frames }
 // Stats delivers the per-frame reports, including dropped frames. Best
 // effort: reports are discarded while nobody reads them.
 func (h *Helper) Stats() <-chan Stats { return h.stats }
+
+// CaptureChanges delivers source changes (resized, lost, restored). Best
+// effort, like Stats.
+func (h *Helper) CaptureChanges() <-chan CaptureChanged { return h.captures }
 
 // Errors delivers *HelperError values (and transport errors), except a
 // non-fatal error answering Start, which Start returns. A fatal error is
@@ -417,6 +423,13 @@ func (h *Helper) controlLoop(capsCh chan<- *Caps) {
 		case *Stats:
 			select {
 			case h.stats <- *m:
+			default:
+			}
+		case *CaptureChanged:
+			h.log.Info("encoder helper: capture changed", "reason", m.Reason, "width", m.Width, "height", m.Height,
+				"rotation", m.Rotation, "text", m.Text)
+			select {
+			case h.captures <- *m:
 			default:
 			}
 		case *HelperError:

@@ -17,19 +17,52 @@
 #include <string>
 #include <vector>
 
+#include "platform/platform.hpp"
 #include "types.hpp"
+
+struct ID3D11Device;
+struct ID3D11Texture2D;
 
 namespace recon {
 
 // --- Capture ---------------------------------------------------------------------
 
+// CapturedFrame is one image from the capture. GPU captures hand out a D3D11
+// texture on SourceInfo::device; it stays valid until Capture::release().
 struct CapturedFrame {
     uint64_t index = 0;      // capture counter
-    int64_t presentQpc = 0;  // when the content was presented (DDA LastPresentTime, AMD flip timestamp); 0 = unknown
-    int64_t captureQpc = 0;  // when the capture API returned the frame
-    uint32_t width = 0, height = 0;
-    void* texture = nullptr;  // ID3D11Texture2D* for GPU captures, nullptr for the synthetic source
+    int64_t presentQpc = 0;  // when the content was presented (DDA LastPresentTime, AMD flip timestamp); 0 = unknown / repeat
+    int64_t captureQpc = 0;  // when the capture API returned the frame (for a repeat: when it was re-submitted)
+    uint32_t width = 0, height = 0;  // as displayed (after rotation)
+    // Idle re-submit of the previous image: nothing new was presented for
+    // StartParams::idleRepeatMs (see the pacing policy in capture/pacer.hpp).
+    bool repeat = false;
+    int dirtyPct = -1;  // share of the image that changed since the previous frame (dirty rects), -1 = unknown
+
+    ID3D11Texture2D* texture = nullptr;  // nullptr for the synthetic source
+    // Clockwise rotation (0/90/180/270) from the texture to the displayed
+    // image (DXGI_OUTDUPL_DESC::Rotation): the converter rotates while it scales.
+    int rotation = 0;
+    // AMD Direct Capture: the amf::AMFSurface* the texture belongs to (a
+    // reference held by the capture until release()). An AMF encoder on the
+    // same AMFContext can take it directly (step 3.3), unless amfDcc: surfaces
+    // with Delta Color Compression cannot go to the encoder as they are
+    // (AMF_Display_Capture_API.md) and must be converted or copied first.
+    void* amfSurface = nullptr;
+    bool amfDcc = false;
 };
+
+// SourceInfo describes what a capture produces (valid after Capture::init).
+struct SourceInfo {
+    uint32_t width = 0, height = 0;  // as displayed
+    int rotation = 0;
+    ID3D11Device* device = nullptr;  // the device the textures live on; nullptr for the synthetic source
+    AdapterInfo adapter;             // that device's adapter (found = false for the synthetic source)
+    void* amfContext = nullptr;      // amf::AMFContext* of AMD Direct Capture surfaces, else nullptr
+    bool cursorInVideo = false;      // frames contain the mouse pointer
+};
+
+// CaptureEvent (types.hpp) reports a source change, loss or recovery to recon-host.
 
 enum class Next { Frame, Timeout, Stopped, Error };
 
@@ -38,12 +71,16 @@ public:
     virtual ~Capture() = default;
     virtual const char* name() const = 0;
     virtual Status init(const StartParams& p) = 0;
-    // Waits up to timeoutMs for the next frame (paced by the source: presents
-    // for DDA/AMD Direct Capture, a timer for the synthetic source).
+    virtual SourceInfo source() const = 0;
+    // Waits up to timeoutMs for the next frame. GPU captures follow presents
+    // and pace them to the requested fps (capture/pacer.hpp); the synthetic
+    // source runs on a timer.
     virtual Next next(CapturedFrame& out, int timeoutMs, Status& err) = 0;
     // The pipeline is done with the frame (called right after Backend::submit,
-    // which must take its own reference / copy of the texture).
+    // which must take its own reference / copy of anything it keeps).
     virtual void release(CapturedFrame&) {}
+    // Pops a pending source event (resized, lost, restored). Capture thread only.
+    virtual bool takeEvent(CaptureEvent&) { return false; }
     virtual void setFps(int fps) { (void)fps; }
     // Unblocks next() for good. Safe to call from any thread. Like
     // Backend::shutdown it must not free what next() / release() use: capture
@@ -53,10 +90,35 @@ public:
 
 // --- Encoder ---------------------------------------------------------------------
 
+// InputSpec is what an encoder backend wants from the pipeline (Backend::init
+// fills it). With Nv12 the pipeline converts every GPU frame (BT.709 limited
+// range, 4:2:0, scaled to width x height, optional barcode) into a pooled NV12
+// texture on the capture device (d3d/convert.hpp); Native passes the capture's
+// own image (the synthetic source, or AMD Direct Capture surfaces to an AMF
+// encoder on the same context, step 3.3).
+struct InputSpec {
+    enum class Format { Native, Nv12 } format = Format::Native;
+    uint32_t width = 0, height = 0;  // encoded size (even)
+};
+
+// EncoderFrame is what Backend::submit gets.
+struct EncoderFrame {
+    const CapturedFrame* captured = nullptr;
+    // InputSpec::Nv12: the converted frame, DXGI_FORMAT_NV12 on the capture
+    // device. It stays reserved for the encoder as long as a copy of `hold`
+    // exists: keep one until the encoder no longer reads the texture (AMF:
+    // AMFSurfaceObserver::OnSurfaceDataRelease; NVENC: after the frame's output).
+    ID3D11Texture2D* nv12 = nullptr;
+    std::shared_ptr<void> hold;
+    int poolIndex = -1;  // stable per texture (e.g. for NvEncRegisterResource caching)
+};
+
 // SubmitInfo travels with a frame through the encoder.
 struct SubmitInfo {
     uint64_t frameId = 0;
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0;
+    bool repeat = false;
+    int dirtyPct = -1;
 };
 
 // EncodedFrame is one access unit / temporal unit. data stays valid until
@@ -85,9 +147,11 @@ public:
     // Capabilities, valid before init(). Also lists the capture methods this
     // backend can encode from (Caps::capture, default first).
     virtual Caps caps() = 0;
-    virtual Status init(const StartParams& p, Started& out) = 0;
+    // src describes the initialized capture (device, size); the backend fills
+    // in (what it wants submitted) and out. Called again after a failed start.
+    virtual Status init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) = 0;
     // Capture thread. Must not block on the output side.
-    virtual Status submit(const CapturedFrame& frame, const SubmitInfo& info) = 0;
+    virtual Status submit(const EncoderFrame& frame, const SubmitInfo& info) = 0;
     // Output thread: waits up to timeoutMs for the next encoded frame.
     virtual Next receive(EncodedFrame& out, int timeoutMs, Status& err) = 0;
     virtual void releaseOutput(EncodedFrame&) {}
@@ -124,7 +188,7 @@ struct BackendChoice {
 // every real backend and capture method for the caps' "unavailable" list.
 BackendChoice chooseBackend(const std::string& name, const MockOptions& mock);
 
-// Creates the capture method `name` ("synthetic" | "dda" | "amd-direct" | "wgc").
+// Creates the capture method `name` ("synthetic" | "dda" | "amd-direct" | "wgc" | "synthetic-gpu").
 std::unique_ptr<Capture> createCapture(const std::string& name, Status& err);
 
 }  // namespace recon

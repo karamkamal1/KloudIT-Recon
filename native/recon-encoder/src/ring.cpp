@@ -93,6 +93,7 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (f.key) flags |= kFlagKey;
     if (f.recovery) flags |= kFlagRecovery;
     if (droppedPending_) flags |= kFlagDroppedBefore;
+    if (f.info.repeat) flags |= kFlagRepeat;
     store<uint64_t>(s + kSlotSeq, written_);
     store<uint64_t>(s + kSlotFrameId, f.info.frameId);
     store<uint32_t>(s + kSlotFlags, flags);

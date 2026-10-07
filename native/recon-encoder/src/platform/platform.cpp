@@ -71,6 +71,15 @@ std::string toUtf8(const wchar_t* s) {
     return out;
 }
 
+std::wstring fromUtf8(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring out(size_t(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), out.data(), n);
+    return out;
+}
+
 HMODULE loadSystemLibrary(const wchar_t* name, std::string& err) {
     HMODULE m = LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!m) err = win32ErrorText(GetLastError());
@@ -108,6 +117,59 @@ bool PreciseTimer::sleepUntil(int64_t deadline, HANDLE wake) {
     }
 }
 
+std::string vendorName(uint32_t vendorId) {
+    switch (vendorId) {
+    case 0x1002: return "amd";
+    case 0x10DE: return "nvidia";
+    case 0x8086: return "intel";
+    default: return "other";
+    }
+}
+
+std::string luidString(const LUID& luid) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%08lx:%08lx", static_cast<unsigned long>(luid.HighPart),
+                  static_cast<unsigned long>(luid.LowPart));
+    return buf;
+}
+
+bool parseLuid(const std::string& s, LUID& out) {
+    const size_t colon = s.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= s.size() || colon > 8 || s.size() - colon - 1 > 8) {
+        return false;
+    }
+    auto hex = [](const std::string& h, unsigned long& v) {
+        if (h.empty()) return false;
+        v = 0;
+        for (char c : h) {
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else return false;
+            v = v * 16 + static_cast<unsigned long>(d);
+        }
+        return true;
+    };
+    unsigned long hi = 0, lo = 0;
+    if (!hex(s.substr(0, colon), hi) || !hex(s.substr(colon + 1), lo)) return false;
+    out.HighPart = static_cast<LONG>(hi);
+    out.LowPart = static_cast<DWORD>(lo);
+    return true;
+}
+
+AdapterInfo describeAdapter(uint32_t vendorId, const LUID& luid, const wchar_t* description) {
+    AdapterInfo info;
+    info.found = true;
+    info.vendorId = vendorId;
+    info.vendor = vendorName(vendorId);
+    info.luidValue = luid;
+    info.luid = luidString(luid);
+    info.name = toUtf8(description);
+    info.hags = queryHags(luid);
+    return info;
+}
+
 AdapterInfo primaryAdapter() {
     AdapterInfo info;
     IDXGIFactory1* factory = nullptr;
@@ -115,21 +177,7 @@ AdapterInfo primaryAdapter() {
     IDXGIAdapter1* adapter = nullptr;
     if (SUCCEEDED(factory->EnumAdapters1(0, &adapter))) {
         DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
-            info.found = true;
-            info.vendorId = desc.VendorId;
-            switch (desc.VendorId) {
-            case 0x1002: info.vendor = "amd"; break;
-            case 0x10DE: info.vendor = "nvidia"; break;
-            case 0x8086: info.vendor = "intel"; break;
-            default: info.vendor = "other"; break;
-            }
-            char luid[32];
-            std::snprintf(luid, sizeof(luid), "%08lx:%08lx", static_cast<unsigned long>(desc.AdapterLuid.HighPart),
-                          static_cast<unsigned long>(desc.AdapterLuid.LowPart));
-            info.luid = luid;
-            info.name = toUtf8(desc.Description);
-        }
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) info = describeAdapter(desc.VendorId, desc.AdapterLuid, desc.Description);
         adapter->Release();
     }
     factory->Release();

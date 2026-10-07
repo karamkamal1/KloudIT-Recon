@@ -62,6 +62,9 @@ func (w *testWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	if f.Recovery {
 		flags |= FlagRecovery
 	}
+	if f.Repeat {
+		flags |= FlagRepeat
+	}
 	if w.droppedPending > 0 {
 		flags |= FlagDroppedBefore
 	}
@@ -150,13 +153,14 @@ func TestRingRoundTrip(t *testing.T) {
 		{FrameID: 1, Key: true, LTRSlot: -1, Width: 320, Height: 180, PresentQPC: 10, CaptureQPC: 11, SubmitQPC: 12, OutputQPC: 13, Data: []byte{0, 0, 0, 1, 0x65}},
 		{FrameID: 2, Recovery: true, RefFloor: 1, LTRSlot: 1, TemporalLayer: 1, RefLTRMask: 2, Gen: 3, Width: 320, Height: 180, Data: bytes.Repeat([]byte{7}, 1000)},
 		{FrameID: 3, LTRSlot: -1, Data: nil},
+		{FrameID: 4, LTRSlot: -1, Repeat: true, Data: []byte{0, 0, 0, 1, 0x41}},
 	}
 	for _, f := range want {
 		if !w.write(f) {
 			t.Fatal("write dropped")
 		}
 	}
-	if n, err := r.Pending(); n != 3 || err != nil {
+	if n, err := r.Pending(); n != 4 || err != nil {
 		t.Fatalf("pending %d %v", n, err)
 	}
 	for i, wf := range want {
@@ -170,7 +174,7 @@ func TestRingRoundTrip(t *testing.T) {
 		if wf.Data == nil {
 			wf.Data = []byte{}
 		}
-		if f.FrameID != wf.FrameID || f.Key != wf.Key || f.Recovery != wf.Recovery || f.RefFloor != wf.RefFloor ||
+		if f.FrameID != wf.FrameID || f.Key != wf.Key || f.Recovery != wf.Recovery || f.Repeat != wf.Repeat || f.RefFloor != wf.RefFloor ||
 			f.LTRSlot != wf.LTRSlot || f.TemporalLayer != wf.TemporalLayer || f.RefLTRMask != wf.RefLTRMask ||
 			f.Gen != wf.Gen || f.Width != wf.Width || f.Height != wf.Height || f.PresentQPC != wf.PresentQPC ||
 			f.CaptureQPC != wf.CaptureQPC || f.SubmitQPC != wf.SubmitQPC || f.OutputQPC != wf.OutputQPC ||
@@ -179,7 +183,7 @@ func TestRingRoundTrip(t *testing.T) {
 		}
 	}
 	// The slot was released and the data copied: overwriting it does not change the frame.
-	if got := atomic.LoadUint64(w.counter(offReadCount)); got != 3 {
+	if got := atomic.LoadUint64(w.counter(offReadCount)); got != 4 {
 		t.Fatalf("readCount %d", got)
 	}
 }

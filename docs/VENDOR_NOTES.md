@@ -81,3 +81,135 @@ Hardware / real Windows checks:
   recon-host from Task Manager during a session; recon-encoder.exe exits by itself within
   a second and Process Explorer shows no named section or event of either process; a
   suspended recon-encoder.exe is killed about 2 s after the session ends.
+
+## 3.2 Capture
+
+DXGI Desktop Duplication (default), AMD Direct Capture (opt-in), Windows.Graphics.Capture
+(MSVC build), the shared frame pacing, GPU priority and HAGS detection, and the BGRA ->
+NV12 shader conversion with the in-band frame-id barcode, all in recon-encoder.exe.
+Protocol additions (start monitor/window selection, gpuPriority, idleRepeatMs, barcode;
+caps outputs/cursorInVideo/hagsEnabled; started adapter/priority; stats repeat/dirtyPct;
+captureChanged; slot flag REPEAT): docs/HELPER_PROTOCOL.md. The encoders that consume the
+NV12 frames come in 3.3 (AMF) and 3.4 (NVENC); until then the mock encoder runs every
+capture method end to end (capture, pacing, conversion; the canned clip comes out).
+
+Verified in the sandbox (Linux, no GPU, no Windows):
+- Builds: mingw-w64 GCC 13 (`make helper`, no warnings with -Wall -Wextra); every source
+  passes `clang++ --target=x86_64-w64-mingw32 -std=c++20 -fsyntax-only -Wall -Wextra
+  -Wpedantic -Wshadow -Wconversion` without warnings. The Windows.Graphics.Capture code
+  (C++/WinRT) was compiled with mingw GCC and syntax-checked with clang against C++/WinRT
+  headers generated locally from the Windows SDK contract metadata (cppwinrt 2.0.240405.15
+  built from source, Microsoft.Windows.SDK.Contracts 10.0.26100.1742), and that build ran
+  under Wine (WGC reports "not supported" there). The MSVC build is not verified here: CI
+  job `helper-windows` builds it, requires its caps not to say "no C++/WinRT headers", runs
+  both self-tests (conversion in NV12 mode on WARP) and the Go integration tests.
+- `--self-test-pacer` (Wine): the pacing policy on simulated presents: 144 Hz at 120 fps ->
+  1201 frames in 10 s (exactly 120 fps), never an older image while a newer one waits;
+  60 Hz with +-1 ms jitter at 60 fps -> every present delivered at once; 59.94 Hz -> all
+  600 delivered at once; idle -> repeats exactly every 100 ms after the last image; 5 fps ->
+  repeats every 200 ms; 1000 Hz bursts capped.
+- `--self-test-convert` under Wine 9.0 with Xvfb + Mesa llvmpipe (`D3D_DRIVER_TYPE_WARP`
+  maps to wined3d there; HLSL compiled by Wine's d3dcompiler_47 / vkd3d-shader): all 7
+  cases pass against the CPU reference (max error 0 at 1:1 and for the rotations, 1 when
+  scaling), colour bars at their BT.709 limited-range values, barcode blocks decode (MSB
+  and LSB first, 64-bit value). wined3d has no NV12 render targets, so this ran in the
+  planar mode (same shaders, separate R8/R8G8 targets); the NV12 plane views themselves run
+  on WARP in CI. Mutation check: moving the chroma siting by half a pixel and flipping the
+  barcode bit order makes all 7 cases fail.
+- Go integration tests under Wine (`xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`
+  equivalent; headless the D3D11 parts skip): `TestHelperIntegrationGPUPipeline` drives the
+  `synthetic-gpu` source (a simulated 60 Hz game at 30 fps, pausing 0.6 s every 1.6 s)
+  through PacedCapture, the converter with its texture pool and the mock encoder: 84
+  frames in 3.5 s, at most 31 in any second, 10 idle repeats in the two pauses (100 ms
+  apart, presentQpc 0, ring flag REPEAT), and the `--dump-nv12` frame's barcode decodes to
+  its frame id 30. `TestHelperIntegrationDDA`: Wine lists one output (Xvfb), DDA probes
+  usable, `DuplicateOutput1` returns E_NOTIMPL, start fails with a non-fatal `init_failed`
+  and the same helper then starts the synthetic capture. Caps under Wine: `outputs` from
+  DXGI (llvmpipe shows up as a fake "NVIDIA GeForce GTX 470", so the NVIDIA priority
+  rule ran: HAGS unknown -> HIGH requested), `hagsEnabled` null (no D3DKMT HAGS query in
+  Wine), GPU priority `failed`
+  (D3DKMTSetProcessSchedulingPriorityClass missing).
+- Go unit tests (`go test -race ./internal/host/encoder`): new caps / started / stats /
+  captureChanged decoding, start encoding with every new field, ring REPEAT flag, capture
+  changes and repeats through the client (fake helper).
+- Barcode format: step 0.2 is not committed on the main branch yet, so the helper draws a
+  generic block barcode from a layout in `start` (position, block size, columns, bit count,
+  bit order); the client side must pass the layout matching 0.2's decoder (integration note).
+
+Hardware / real Windows checks (run in an elevated PowerShell on the host, with Go and the
+repository; `$env:RECON_HELPER_EXE` = path of the CI-built recon-encoder.exe; the capture
+tests also read `RECON_HELPER_SECONDS`, `RECON_HELPER_NV12`, `RECON_HELPER_FPS`,
+`RECON_HELPER_HMONITOR`, `RECON_HELPER_WINDOW_TITLE` and `RECON_HELPER_GPU_PRIORITY`, see
+`captureCheck` in internal/host/encoder/helper_integration_windows_test.go):
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `recon-encoder.exe --print-caps --backend=mock`:
+  `adapterLuid`/`adapterName` are the Radeon's, `outputs` lists every monitor with that
+  `adapterLuid` and correct `x/y/width/height/rotation`; `hagsEnabled` matches Settings >
+  System > Display > Graphics > "Hardware-accelerated GPU scheduling" (toggle it, reboot,
+  check again); `capture` is `["synthetic","dda","amd-direct","wgc"]`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same `--print-caps`: outputs on
+  the GeForce's LUID, `hagsEnabled` matching the HAGS setting (both states), `amd-direct`
+  unavailable ("no display output on an AMD adapter").
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `recon-encoder.exe --self-test-convert=hw` (the
+  Radeon instead of WARP): prints `mode nv12` and `ok`, max errors <= 1 (<= 2 when scaling).
+- NVIDIA: unverified (no NVIDIA host available). Test: `recon-encoder.exe --self-test-convert=hw`
+  prints `mode nv12` and `ok` on the GeForce.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `$env:RECON_HELPER_SECONDS=30;
+  $env:RECON_HELPER_NV12="$env:TEMP\dda.nv12"; go test -count=1 -v -run HelperIntegrationDDA
+  ./internal/host/encoder` with a game running borderless at 144 Hz (the test streams at
+  60 fps, 640x360): the log line shows at most 61 frames in one second, present->capture
+  p95 below ~2 ms, and the helper log `gpu priority: realtime (amd, hags on|off)`
+  (non-elevated: `high` or `failed`). Then with a static desktop: idle repeats every
+  100 ms. View the dump with `ffplay -f rawvideo -pixel_format nv12 -video_size 640x360
+  %TEMP%\dda.nv12`: correct colours (no red/blue swap, no green/magenta tint), sharp text
+  edges without colour fringes, and the barcode blocks in the top-left corner.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same `HelperIntegrationDDA` run
+  with HAGS on and off: `gpu priority: high (nvidia, hags on)` with HAGS on,
+  `realtime (nvidia, hags off)` with it off; frame cap, latency and dump as for AMD.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: during a 60 s `HelperIntegrationDDA` run
+  (`RECON_HELPER_SECONDS=60`): change the resolution in Settings (helper log
+  `capture resized ... was WxH` and the stream continues, scaled), press Win+L and log back
+  in, and open a UAC prompt (`capture lost ... DXGI_ERROR_ACCESS_LOST / E_ACCESSDENIED`,
+  idle repeats keep the frame ids running, then `capture restored`), start a game in
+  exclusive full screen and alt-tab out (lost/restored or seamless; no fatal error), rotate
+  the display to portrait (`resized` with rotation 90/270; the dump shows the desktop
+  upright). No test may end with a fatal error.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same resolution / Win+L / UAC /
+  exclusive full screen / rotation sequence during a 60 s `HelperIntegrationDDA` run.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `go test -count=1 -v -run HelperIntegrationAMDDirect
+  ./internal/host/encoder` with `RECON_HELPER_SECONDS=30` and a 144 Hz game: frames arrive,
+  present->capture latency is logged from AMF_DISPLAYCAPTURE_FRAME_FLIP_TIMESTAMP (must be
+  small and positive: QPC units), at most 61 frames per second; compare its p95 with the
+  DDA run (Phase 0 decides the default). With two monitors set `RECON_HELPER_HMONITOR` to
+  the second one's `hmonitor` from `--print-caps` and `RECON_HELPER_NV12`, and check the
+  dump shows that monitor (AMF_DISPLAYCAPTURE_MONITOR_INDEX = the
+  output's index on its adapter). Check the helper log for the AMF surface format, whether
+  surfaces are DCC compressed, no "capture texture is an array" warning, behaviour with an
+  HDR desktop (FP16 surfaces are clipped to SDR) and with an IddCx virtual display
+  (expected: unavailable or failing; use DDA).
+- NVIDIA: unverified (no NVIDIA host available). Test: `HelperIntegrationAMDDirect` must
+  skip ("no display output on an AMD adapter").
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `go test -count=1 -v -run HelperIntegrationWGC
+  ./internal/host/encoder` (monitor capture, MSVC build): frames arrive, no yellow capture
+  border on Windows 11, no mouse pointer in the dump, present->capture latency small and
+  positive (SystemRelativeTime taken as 100 ns QPC units), more than 60 frames per second
+  possible on Windows 11 24H2 (MinUpdateInterval) with a 120 Hz game and
+  `RECON_HELPER_FPS=120`. Window capture: `RECON_HELPER_WINDOW_TITLE=<part of a game
+  window's title>`, `RECON_HELPER_SECONDS=30`; resize the window (`capture resized` in the
+  log), close it (`capture lost`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same `HelperIntegrationWGC` run
+  and window capture on an NVIDIA host.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with a GPU-bound load at 99 % (e.g. a game
+  uncapped, or FurMark windowed) run `HelperIntegrationDDA` with `RECON_HELPER_SECONDS=30`
+  twice, elevated: once as is (log `gpu priority: realtime`), once with
+  `RECON_HELPER_GPU_PRIORITY=off`; with the priority the frame count per second stays at
+  the fps and present->capture p95 stays low, without it they degrade (Phase 0 repeats this
+  with an encoder in step 3.3).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same comparison with HAGS on
+  (expect `high`) and off (expect `realtime`); a 2 h soak without an encoder freeze once
+  the NVENC backend (3.4) exists.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: hybrid / multi-GPU host (iGPU + Radeon, a
+  monitor on each): `HelperIntegrationDDA` with `RECON_HELPER_HMONITOR` set to each
+  monitor's `hmonitor` creates the device on that monitor's adapter (the logged `started`
+  has the output's `adapterLuid`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same on an Optimus laptop (the
+  internal panel is usually on the iGPU: DDA must use the iGPU adapter for it).

@@ -6,6 +6,28 @@ namespace recon {
 
 namespace {
 constexpr int kPollMs = 100;  // how often the threads look at the stop flag when idle
+constexpr uint64_t kDumpFrameId = 30;
+}
+
+void Pipeline::dump(const d3d::ConvertedFrame& f, uint64_t frameId) {
+    dumped_ = true;
+    std::vector<uint8_t> data;
+    Status s = opt_.converter->readback(f, data);
+    HANDLE file = s.ok ? CreateFileW(fromUtf8(opt_.dumpPath).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                     FILE_ATTRIBUTE_NORMAL, nullptr)
+                       : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        const bool ok = WriteFile(file, data.data(), DWORD(data.size()), &wrote, nullptr) && wrote == data.size();
+        CloseHandle(file);
+        if (ok) {
+            logf(LogLevel::Info, "dumped frame %llu (%ux%u NV12) to %s", static_cast<unsigned long long>(frameId),
+                 opt_.converter->width(), opt_.converter->height(), opt_.dumpPath.c_str());
+            return;
+        }
+    }
+    logf(LogLevel::Warn, "could not dump frame %llu to %s: %s", static_cast<unsigned long long>(frameId), opt_.dumpPath.c_str(),
+         s.ok ? "write failed" : s.text.c_str());
 }
 
 void Pipeline::start() {
@@ -41,10 +63,14 @@ Status Pipeline::setRate(const RateParams& r) {
 
 void Pipeline::captureLoop() {
     uint64_t nextId = 1;
+    int64_t lastPoolWarn = 0;
     while (!stop_) {
         CapturedFrame frame;
         Status err;
-        switch (cap_.next(frame, kPollMs, err)) {
+        const Next r = cap_.next(frame, kPollMs, err);
+        CaptureEvent ev;
+        while (cap_.takeEvent(ev)) rep_.captureChanged(ev);
+        switch (r) {
         case Next::Timeout:
             continue;
         case Next::Stopped:
@@ -60,11 +86,44 @@ void Pipeline::captureLoop() {
             break;
         }
         SubmitInfo info;
-        info.frameId = nextId++;
+        info.frameId = nextId;
         info.presentQpc = frame.presentQpc;
         info.captureQpc = frame.captureQpc;
+        info.repeat = frame.repeat;
+        info.dirtyPct = frame.dirtyPct;
+        EncoderFrame ef;
+        ef.captured = &frame;
+        if (opt_.converter && frame.texture) {
+            d3d::ConvertedFrame cf;
+            Status cs = opt_.converter->convert(frame.texture, frame.rotation, info.frameId, cf);
+            if (!cs.ok) {
+                cap_.release(frame);
+                if (cs.code == "pool_exhausted") {
+                    // The encoder still holds every converted frame: drop this
+                    // capture before it gets a frame id (never wait for the encoder).
+                    const int64_t now = qpcNow();
+                    if (now - lastPoolWarn > qpcFrequency()) {
+                        logf(LogLevel::Warn, "encoder is behind: dropping captured frames before encoding");
+                        lastPoolWarn = now;
+                    }
+                    continue;
+                }
+                if (cs.fatal) {
+                    rep_.fatal(cs);
+                    return;
+                }
+                rep_.error(cs, "");
+                continue;
+            }
+            ef.nv12 = cf.nv12;
+            ef.hold = cf.hold;
+            ef.poolIndex = cf.index;
+            if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);
+        }
+        ++nextId;
         info.submitQpc = qpcNow();
-        Status s = enc_.submit(frame, info);
+        Status s = enc_.submit(ef, info);
+        ef = EncoderFrame{};  // the backend kept its own reference if it needs one
         cap_.release(frame);
         if (!s.ok) {
             if (s.fatal) {
@@ -110,6 +169,8 @@ void Pipeline::outputLoop() {
         st.dropReason = wr == WriteResult::Full ? "ringFull" : wr == WriteResult::TooLarge ? "tooLarge" : "";
         st.key = f.key;
         st.recovery = f.recovery;
+        st.repeat = f.info.repeat;
+        st.dirtyPct = f.info.dirtyPct;
         st.bytes = f.size;
         st.presentQpc = f.info.presentQpc;
         st.captureQpc = f.info.captureQpc;

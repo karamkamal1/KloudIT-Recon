@@ -6,6 +6,8 @@ channel and reads encoded frames from a shared-memory ring. The Go side is
 `internal/host/encoder`. This document is the contract between the two; the version
 number covers both the control messages and the ring layout. Any incompatible change
 bumps it (`caps.v`, `ring.version`), and recon-host refuses a helper with another version.
+Additive changes keep it: new optional fields, new helper-to-Go message types (recon-host
+ignores unknown types) and new slot flag bits (step 3.2 added all three).
 
 ## Lifecycle
 
@@ -46,7 +48,10 @@ fatal error, `4` the threads did not stop within 500 ms of deciding to exit (wat
 recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
                   [--backend=auto|amf|nvenc|mock] [--log-level=error|warn|info|debug]
                   [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
+                  [--dump-nv12=PATH]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
+recon-encoder.exe --self-test-convert               # GPU colour conversion on WARP (see Self-tests)
+recon-encoder.exe --self-test-pacer                 # frame pacing policy (see Self-tests)
 recon-encoder.exe --version
 ```
 
@@ -60,6 +65,9 @@ recon-encoder.exe --version
 * `--mock-error-at` / `--mock-fatal-at`: test fault injection (mock backend only): a
   non-fatal `mock_error` / a fatal `mock_fatal` when that frame id is submitted.
   `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
+* `--dump-nv12`: writes the converted frame with id 30 (the first converted one from 30
+  on) to PATH as raw NV12 at the encoded size (Y plane, then interleaved CbCr), e.g. for
+  `ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 PATH`. Diagnostics.
 
 Logs go to stderr as `level: message` lines; recon-host forwards them to its log.
 
@@ -93,7 +101,7 @@ ignored by recon-host.
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic`; empty = backend default), `monitor` (DXGI output index), `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1), `rc` (`cbr` \| `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8), `svcLayers` (1-4) | Start capture + encode. Once per helper: a second `start` is `already_started`. |
+| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1), `rc` (`cbr` \| `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode` | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields. |
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: invalidate them; AMF: reference only the LTR slot holding `ackedLtrFrameId`; otherwise an IDR. |
 | `setRate` | `kbps`, `vbvFrames` (0 = unchanged), `fps` (0 = unchanged) | New target. No IDR unless the codec's `liveBitrate` is `flush`. |
@@ -102,6 +110,8 @@ ignored by recon-host.
 
 ```json
 {"t":"start","capture":"dda","monitor":0,"codec":"hevc","width":2560,"height":1440,"fps":120,"kbps":60000,"vbvFrames":1,"rc":"cbr","quality":"speed","ltrSlots":2}
+{"t":"start","hmonitor":65537,"codec":"hevc","fps":60,"kbps":20000,"gpuPriority":"auto","idleRepeatMs":100,"barcode":{"x":0,"y":0,"blockW":8,"blockH":8,"cols":16,"bits":32,"msbFirst":true}}
+{"t":"start","capture":"wgc","windowTitle":"Cyberpunk","codec":"hevc","fps":60,"kbps":30000}
 {"t":"recover","lostFromFrameId":1234,"ackedLtrFrameId":1200}
 {"t":"setRate","kbps":35000,"vbvFrames":1.5}
 ```
@@ -117,37 +127,69 @@ ignored by recon-host.
    "recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless",
    "maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":1,
    "queryTimeout":false,"alignW":1,"alignH":1}},
- "capture":["synthetic"],
- "unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: ...",
+ "capture":["synthetic","dda","wgc"],"cursorInVideo":false,
+ "outputs":[{"index":0,"adapterIndex":0,"outputIndex":0,"adapterLuid":"00000000:0000c3a1",
+   "adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","name":"\\\\.\\DISPLAY1","hmonitor":65537,
+   "x":0,"y":0,"width":2560,"height":1440,"rotation":0,"attached":true}],
+ "unavailable":{"amf":"AMF runtime 1.5.2.0 found; the AMF encoder backend is not implemented yet (step 3.3)",
    "nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: ...",
-   "dda":"desktop duplication capture is not implemented yet (step 3.2)", "...":"..."},
+   "amd-direct":"...", "...":"..."},
  "qpcFrequency":10000000}
 ```
 
 * `backend`: `amf` | `nvenc` | `mock` | `none` (nothing usable: `codecs` is empty and
   `start` fails with `unavailable`; recon-host uses the FFmpeg path).
 * `vendor`: `amd` | `nvidia` | `intel` | `other` | `mock`.
-* `hagsEnabled`: hardware-accelerated GPU scheduling on the adapter, `true` / `false`, or
-  `null` when not detected. **Always `null` for now:** detection (D3DKMTQueryAdapterInfo)
-  comes with capture in step 3.2. Consumers must treat `null` as unknown, never as off
-  (GUIDE 1.3: NVIDIA must not get REALTIME GPU priority with HAGS on).
+* `adapterLuid` / `adapterName` / `hagsEnabled`: DXGI adapter 0 (the primary display's
+  adapter on most systems; the mock reports it too); `started` reports the adapter
+  actually used.
+* `hagsEnabled`: hardware-accelerated GPU scheduling on the adapter,
+  `D3DKMTQueryAdapterInfo(KMTQAITYPE_WDDM_2_7_CAPS).HwSchEnabled`: `true` / `false`, or
+  `null` when it cannot be queried (before Windows 10 2004, Wine). Consumers must treat
+  `null` as unknown, never as off (GUIDE 1.3: NVIDIA must not get REALTIME GPU priority
+  with HAGS on; the helper itself uses HIGH on NVIDIA when HAGS is on or unknown).
 * `codecs.<codec>`: `recovery` `ltr` | `invalidate` | `none`; `liveBitrate` `seamless` |
   `flush` | `restart`; `roi` `importance` | `emphasis` | `none`; `alignW`/`alignH` the
   coded-size alignment (AV1 on RDNA3: 64x16). Values start as vendor defaults; the
   Phase 3.6 qualification results in docs/VENDOR_NOTES.md overwrite them.
-* `capture`: usable capture methods, default first.
+* `capture`: usable capture methods, default first (the mock: `synthetic`, then the real
+  methods that probed usable; DDA before AMD Direct Capture, which is opt-in). The probes
+  are cheap (output enumeration, runtime DLLs); `start` can still fail, e.g. DDA in a
+  session without a desktop. `synthetic-gpu` is a test source and never listed.
+* `cursorInVideo`: whether frames contain the mouse pointer. Always `false`: DDA and AMD
+  Direct Capture frames never include it and WGC is configured without it; recon-host
+  draws the cursor on the client (with `drawCursor` required it keeps using FFmpeg).
+* `outputs`: every DXGI output of every adapter, for `start`'s monitor selection
+  (`hmonitor`, or `adapterLuid` + `outputIndex`). `name` is the GDI device name.
 * `unavailable`: every probed backend / capture method that is not usable, with why.
 
-`started`: `{"t":"started","backend":"mock","capture":"synthetic","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000}`
-reports what the encoder actually does (the mock always produces 320x180).
+`started` reports what the encoder actually does (the mock always produces 320x180):
+
+```json
+{"t":"started","backend":"mock","capture":"dda","codec":"h264","width":320,"height":180,"fps":60,
+ "kbps":4000,"captureWidth":2560,"captureHeight":1440,"adapterLuid":"00000000:0000c3a1",
+ "adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","hagsEnabled":true,"gpuPriority":"realtime",
+ "idleRepeatMs":100,"barcode":true}
+```
+
+`captureWidth`/`captureHeight` are the source as displayed; `adapterLuid`, `adapterName`,
+`vendor` and `hagsEnabled` describe the adapter capture and encoder run on (empty / `null`
+for `synthetic`); `gpuPriority` is the process GPU scheduling priority that was applied:
+`realtime` | `high` | `failed` | `off` (`""` without a GPU capture); `idleRepeatMs` is 0
+for `synthetic`; `barcode` whether the frame-id barcode is drawn.
 
 `stats`, one per frame, **including frames the helper dropped**:
 
 ```json
-{"t":"stats","frameId":42,"gen":0,"dropped":false,"key":false,"recovery":false,"bytes":512,
- "presentQpc":123,"captureQpc":124,"submitQpc":125,"outputQpc":130,"ltrSlot":-1,
- "temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1.0,"fps":60,"ringDropped":0}
+{"t":"stats","frameId":42,"gen":0,"dropped":false,"key":false,"recovery":false,"repeat":false,
+ "dirtyPct":12,"bytes":512,"presentQpc":123,"captureQpc":124,"submitQpc":125,"outputQpc":130,
+ "ltrSlot":-1,"temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1.0,"fps":60,"ringDropped":0}
 ```
+
+`repeat`: an idle re-submit of the previous image (see "Frame pacing"); its `presentQpc`
+is 0. `dirtyPct`: the share of the image the capture reported as changed since the
+previous frame (DDA move + dirty rects, AMD Direct Capture dirty rects; overlaps count
+twice, capped at 100), 0 for repeats, -1 when unknown (synthetic, WGC).
 
 `dropped` frames add `"reason"`: `ringFull` (recon-host did not keep up) or `tooLarge`
 (bigger than a slot). `recovery` frames add `"refFloor"`. `kbps`/`vbvFrames`/`fps` are
@@ -165,6 +207,18 @@ frames); the backends are configured without B frames (GUIDE 3.3/3.4), so every 
 without `key` is reported as a P frame (a non-IDR intra frame too: it is not a decoder
 entry point). `ltrSlot` and `temporalLayer` complete the picture.
 
+`captureChanged`, when the capture source changes:
+
+```json
+{"t":"captureChanged","reason":"resized","width":1920,"height":1080,"rotation":0,"text":"was 2560x1440 rotation 0"}
+```
+
+| `reason` | Meaning | Helper meanwhile |
+|---|---|---|
+| `resized` | the source has a new size or rotation (mode change, rotated display, resized window) | keeps the encoded size and scales the new source into it; recon-host restarts the helper if it wants the new native size |
+| `lost` | capture is not possible right now (`DXGI_ERROR_ACCESS_LOST` during a mode or full-screen switch, secure desktop, output or window gone); `text` says why | repeats the last image every `idleRepeatMs`, retries every 250 ms |
+| `restored` | capture works again | |
+
 `error`: `{"t":"error","code":"unsupported","text":"...","fatal":false,"re":"start"}`.
 `re` names the request that caused it, if any. After a fatal error the helper exits
 (code 3); recon-host restarts it.
@@ -176,7 +230,10 @@ entry point). `ltrSlot` and `temporalLayer` complete the picture.
 | `already_started` | no | second `start` |
 | `unavailable` | no | no usable encoder backend, or the capture method is not available |
 | `unsupported` | no | the backend cannot do what was asked (e.g. codec) |
-| `init_failed` | no | capture or encoder initialisation failed |
+| `init_failed` | no | capture or encoder initialisation failed (e.g. `DuplicateOutput` refused) |
+| `no_output` | no | the requested monitor / window does not exist or is not attached to the desktop |
+| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory) |
+| `device_lost` | yes | the D3D11 device was removed (driver reset / TDR); a new helper starts over |
 | `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped) |
 | `mock_error` / `mock_fatal` | no / yes | injected by `--mock-error-at` / `--mock-fatal-at` |
 | `protocol` | yes | control framing broken (message over 1 MiB) |
@@ -221,7 +278,7 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 |---|---|---|
 | 0 | u64 | `seq`: the write index `n` this slot was written at |
 | 8 | u64 | `frameId`: helper frame counter, from 1, +1 per captured frame |
-| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0) |
+| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0) |
 | 20 | u32 | `gen`: encoder generation inside this helper (bumped on an in-helper re-init) |
 | 24 | u32 | `payloadOffset` from the slot start (>= 128) |
 | 28 | u32 | `payloadSize` in bytes |
@@ -276,19 +333,129 @@ no "slot released" event: the helper looks at `readCount` when it writes and nev
 ```
 main thread     control loop: parse, dispatch to the pipeline / backend
 stdin reader    framing -> queue for the main thread
-capture thread  Capture::next() -> Backend::submit()
+capture thread  Capture::next() -> NV12 conversion -> Backend::submit()
 output thread   Backend::receive() -> ring -> stats   (one per encoder)
 ```
 
-`Backend` (`src/backend.hpp`): `caps()`, `init(start)`, `submit(frame)`, `receive()`,
+`Backend` (`src/backend.hpp`): `caps()`, `init(start, source, inputSpec)`, `submit(frame)`, `receive()`,
 `forceIdr()`, `recover(lostFrom, ackedLtr)`, `setRate(kbps, vbvFrames, fps)`,
 `setRoi(rects)`, `shutdown()`. Control calls can run concurrently with `submit` /
 `receive`; backends record them and apply them on the next submitted frame. `Capture`:
-`init`, `next(timeout)`, `release`, `setFps`, `shutdown`. `shutdown()` of either only
+`init`, `source()`, `next(timeout)`, `release`, `takeEvent` (-> `captureChanged`), `setFps`,
+`shutdown`. `shutdown()` of either only
 wakes `receive()` / `next()`: the pipeline calls it before joining the capture and output
 threads, which may still be inside `submit()` / `receive()` or hold an encoded frame, so it
 must not free anything. Encoder and capture resources are released by the destructors,
 after both threads have been joined.
+
+## Capture
+
+| `capture` | What | Device | Notes |
+|---|---|---|---|
+| `dda` | DXGI Desktop Duplication (default, any vendor) | the output's adapter | `IDXGIOutput5::DuplicateOutput1` (B8G8R8A8; FP16 for HDR in step 3.9), `IDXGIOutput1::DuplicateOutput` before Windows 10 1703 |
+| `amd-direct` | AMD Direct Capture (`AMFDisplayCapture`), AMD adapters only, opt-in | the output's adapter, wrapped in an `AMFContext` | `WAIT_FOR_PRESENT`, framerate (0,1), dirty rects, `DUPLICATEOUTPUT`; monitor index = the output's index on its adapter (VERIFY) |
+| `wgc` | Windows.Graphics.Capture: a monitor or a window | the monitor's adapter | MSVC build only (C++/WinRT); cursor and border off where Windows allows it |
+| `synthetic` | timer-driven frame counter, no image | none | mock tests |
+| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path |
+
+Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
+`hmonitor` (the HMONITOR recon-host already has for each monitor); `adapterLuid` (as in
+caps, `"%08x:%08x"` HighPart:LowPart) + `monitor` = output index on that adapter;
+`monitor` alone = output index on DXGI adapter 0 (what ddagrab's `output_idx` means).
+The output must be attached to the desktop, else `no_output`. The D3D11 device is created
+on the adapter that owns the output (DDA requires it; the encoder uses the same device),
+with BGRA support, multithread protection, `IDXGIDevice::SetGPUThreadPriority(7)`,
+`IDXGIDevice1::SetMaximumFrameLatency(1)`; the debug layer only in debug builds. The helper
+process is per-monitor DPI aware (v2), as `DuplicateOutput1` and physical-pixel desktop
+coordinates need.
+
+Window capture (`wgc`): `window` (a top-level HWND) or `windowTitle` (the first visible
+top-level window whose title contains it, case-insensitive); the device is created on the
+adapter of the monitor showing the window. `window`/`windowTitle` with another `capture`
+is `bad_message`.
+
+DDA specifics: each new image is copied on the GPU into one of two textures of the
+helper right away; the duplication frame is released just before the next
+`AcquireNextFrame` (the `ReleaseFrame` documentation's recommendation; Sunshine does the
+same). Frames whose `LastPresentTime` is 0 (only the pointer moved) are skipped, except
+the first frame of a duplication, so a static desktop still yields an image.
+`DXGI_ERROR_ACCESS_LOST`, `E_ACCESSDENIED` (secure desktop) and a stale DXGI factory
+(`IsCurrent` false: mode, HDR or output changes) recreate the duplication, re-finding the
+output by its GDI name on the same adapter, every 250 ms until it works (`captureChanged`
+`lost` / `restored` / `resized`). A removed device is fatal (`device_lost`). While
+streaming, the capture thread keeps the display awake (`ES_DISPLAY_REQUIRED`).
+
+### GPU priority
+
+At `start`, with a GPU capture, the helper sets its own process GPU scheduling priority
+(`D3DKMTSetProcessSchedulingPriorityClass`, GUIDE 1.3), after enabling
+`SeIncreaseBasePriorityPrivilege` (held when recon-host runs elevated). `gpuPriority`:
+`auto` (default) = REALTIME, except HIGH on NVIDIA when HAGS is on or unknown (NVIDIA
+encoder hangs with REALTIME + HAGS, Sunshine); `realtime` / `high` force one; `off`
+leaves it. A refused REALTIME is retried as HIGH. The result is `started.gpuPriority` and
+a log line `gpu priority: realtime|high|failed|off (vendor, hags on|off|unknown)`.
+
+### Frame pacing
+
+GPU captures follow presents (DDA `AcquireNextFrame`, AMD `WAIT_FOR_PRESENT`, WGC frame
+events); there is no capture timer. The policy (`src/capture/pacer.hpp`):
+
+1. Never more than `fps` frames per second: output slots are one frame interval apart and
+   each delivered frame uses one. A frame may use its slot up to a quarter interval early,
+   so present jitter at a matching refresh rate adds no delay; over any stretch of time at
+   most one frame more than `fps` allows.
+2. Presents faster than `fps`: the newest image wins and goes out when its slot opens;
+   older ones are dropped before they are converted or encoded.
+3. Nothing new for `idleRepeatMs` (default 100 ms, 20..2000; Sunshine's default minimum is
+   10 fps): the last image is submitted again, and again every `idleRepeatMs`, flagged
+   `repeat` (stats, slot flag). This keeps the encoder's rate control, the transport and
+   the client's stall detection fed on a static desktop or a paused game, and lets static
+   content sharpen. Repeats are tiny P frames.
+
+`setRate` with an `fps` changes the slot interval at once.
+
+### Colour conversion
+
+With `InputSpec::Nv12` every GPU frame goes through one D3D11 pixel-shader pass per plane
+(`src/d3d/convert.cpp`) into an NV12 texture: BT.709 limited range (Y 16..235, CbCr
+16..240), 4:2:0 with chroma sited like `chroma_sample_loc_type` 0 (co-sited with the even
+luma column, between the two luma rows; Sunshine's 6-tap filter), bilinear scaling to the
+encoded size, rotation for rotated displays (the texture-to-display rotation of
+`DXGI_OUTDUPL_DESC::Rotation`), FP16 scRGB sources clipped to SDR until step 3.9. The
+render target views select the NV12 planes by format (R8 luma, R8G8 chroma). Shaders are
+compiled at start with `D3DCompile` from System32's `d3dcompiler_47.dll` (no build-time
+shader compiler needed; a few milliseconds). An odd capture size is encoded at the next
+smaller even size when `width`/`height` are 0.
+
+`barcode` draws the frame id into every frame in the same pass (GUIDE 0.2):
+`{"x","y","blockW","blockH","cols","bits","msbFirst"}`, all in output pixels after scaling;
+x, y, blockW, blockH even (whole chroma samples), blocks 2..256 pixels (GUIDE 0.2 wants
+at least 8x8 to survive compression), `cols` and `bits` 1..64. Block k (left to right,
+`cols` per row, top to bottom) shows bit `bits-1-k` of the frame id (`msbFirst`, default)
+or bit k: luma 235 for 1, 16 for 0, chroma 128. The value is the helper's `frameId`, the
+same id as in stats and the ring. The layout must fit the encoded size, else `bad_message`.
+
+## Self-tests
+
+Both run without a display or GPU and exit 0 (ok), 1 (failed) or 77 (could not run):
+
+* `--self-test-pacer`: the frame pacing policy against simulated present patterns
+  (144 Hz at 120 fps, 60 Hz with 1 ms jitter, 59.94 Hz, 30 Hz at 60 fps, idle repeats,
+  5 fps, 1000 Hz bursts): fps cap, newest image wins, no image older than one interval,
+  repeat timing.
+* `--self-test-convert`: the conversion on a WARP device (default hardware device if WARP
+  is missing; 77 if there is no D3D11 device at all) against a CPU reference of the same
+  maths (D3D bilinear sampling, BT.709 coefficients): 1:1, 2:1 and 4:3 downscale, 2x
+  upscale, rotations 90/180/270, a source the converter must copy first; absolute
+  colour-bar values (e.g. red = 63/102/240), the orientation of a 90 degree rotation, the
+  barcode blocks (solid, neutral chroma, decoding to the value, MSB- and LSB-first) and the
+  texture pool (reuse, exhaustion). It prints `mode nv12` when it tested NV12 render
+  targets and `mode planar` when the device has none (Wine's wined3d) and the same shaders
+  were checked on separate R8 / R8G8 textures instead.
+
+CI runs both on windows-latest (`mode nv12` required); the Go integration tests run them
+too and drive `synthetic-gpu` through the mock encoder (fps cap, idle repeats, and the
+barcode of a `--dump-nv12` frame decoding to its frame id).
 
 ## Mock backend
 
@@ -299,14 +466,23 @@ frames, Constrained Baseline, access unit delimiters; regenerate with
 `testdata/gen-mock-clip.sh`), compiled into the executable. It loops the clip;
 `forceIdr` and `recover` (no LTR) jump back to the IDR; `setRate` is recorded and shows
 in the stats but cannot change the canned bitstream. Caps: vendor `mock`, `h264` only,
-recovery `none`, liveBitrate `seamless`.
+recovery `none`, liveBitrate `seamless`. With a GPU capture (`dda`, `amd-direct`, `wgc`,
+`synthetic-gpu`) the mock asks for NV12 input, so capture, pacing, GPU priority and the
+colour conversion run for real on a host without an encoder backend (the converted frames
+are ignored; `--dump-nv12` shows one). On a device without NV12 render targets it falls
+back to the planar test mode.
 
 ## Building and testing
 
 ```
-make helper        # mingw-w64 cross build -> dist/windows/recon-encoder.exe
+make helper        # mingw-w64 cross build -> dist/windows/recon-encoder.exe (no WGC)
 make helper-test WINE=wine64   # Go integration tests under Wine against that build
+xvfb-run -a make helper-test WINE=wine64   # plus the D3D11 parts (Mesa llvmpipe)
 ```
+
+Releases ship the MSVC build from CI (job `helper-windows` uploads it, `release-binaries`
+puts it into the Windows bundle with `make release HELPER_EXE=...`); the mingw build
+stays for local builds and Wine tests.
 
 On Windows (MSVC, as CI does):
 

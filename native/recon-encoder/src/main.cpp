@@ -18,10 +18,12 @@
 
 #include "backend.hpp"
 #include "control.hpp"
+#include "d3d/convert.hpp"
 #include "pipeline.hpp"
 #include "platform/platform.hpp"
 #include "protocol.hpp"
 #include "ring.hpp"
+#include "selftest.hpp"
 
 using namespace recon;
 
@@ -30,6 +32,7 @@ namespace {
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
     "       recon-encoder --print-caps [--backend=B]\n"
+    "       recon-encoder --self-test-convert | --self-test-pacer\n"
     "       recon-encoder --version\n"
     "\n"
     "Started by recon-host; speaks the protocol in docs/HELPER_PROTOCOL.md on stdin/stdout.\n"
@@ -42,10 +45,18 @@ const char kUsage[] =
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
     "  --mock-hang-at=N     mock only: never return from submitting frame N (a call stuck in the driver)\n"
-    "  --print-caps         print the capabilities JSON and exit\n";
+    "  --dump-nv12=PATH     write converted frame 30 (raw NV12, encoded size) to PATH\n"
+    "  --print-caps         print the capabilities JSON and exit\n"
+    "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
+    "                       the default hardware adapter (exit 0 ok, 1 failed, 77 no device)\n"
+    "  --self-test-pacer    check the frame pacing policy on simulated presents (exit 0 ok, 1 failed)\n";
 
 struct Args {
     bool printCaps = false;
+    bool selfTestConvert = false;
+    bool selfTestHardware = false;
+    bool selfTestPacer = false;
+    std::string dumpNv12;
     bool version = false;
     bool help = false;
     std::string backend = "auto";
@@ -73,6 +84,13 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         }
         bool ok = true;
         if (key == "--print-caps") a.printCaps = true;
+        else if (key == "--self-test-convert") {
+            a.selfTestConvert = true;
+            ok = val.empty() || val == "warp" || val == "hw";
+            a.selfTestHardware = val == "hw";
+        }
+        else if (key == "--self-test-pacer") a.selfTestPacer = true;
+        else if (key == "--dump-nv12") ok = !(a.dumpNv12 = val).empty();
         else if (key == "--version") a.version = true;
         else if (key == "--help" || key == "-h") a.help = true;
         else if (key == "--backend") a.backend = val;
@@ -100,7 +118,8 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         err = "--mock-* options need --backend=mock";
         return false;
     }
-    if (!a.printCaps && !a.version && !a.help && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
+    const bool standalone = a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer;
+    if (!standalone && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
         err = "--ring-handle, --ring-size and --event-handle are required";
         return false;
     }
@@ -138,6 +157,7 @@ public:
         logf(LogLevel::Warn, "%s: %s", s.code.c_str(), s.text.c_str());
         c_.send(encodeError(s, re));
     }
+    void captureChanged(const CaptureEvent& ev) override { c_.send(encodeCaptureEvent(ev)); }
     void fatal(const Status& s) override {
         if (!fatal_.exchange(true)) {
             logf(LogLevel::Error, "fatal: %s: %s", s.code.c_str(), s.text.c_str());
@@ -154,6 +174,94 @@ private:
     ControlChannel& c_;
     std::atomic<bool> fatal_{false};
 };
+
+// Desktop coordinates in physical pixels, and IDXGIOutput5::DuplicateOutput1
+// needs a per-monitor DPI aware process (Sunshine display_base.cpp sets the
+// same before display init). user32 entry point of Windows 10 1703+.
+void setDpiAwareness() {
+    using Fn = BOOL(WINAPI*)(HANDLE);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto fn = user32 ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")))
+                     : nullptr;
+    if (fn) fn(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)));  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+}
+
+std::string joinUnavailable(const Caps& caps);
+
+// Starts capture and encoding for a "start" message. On success the pipeline
+// runs; on failure everything created here is gone again.
+struct StartResult {
+    std::unique_ptr<Capture> capture;
+    std::unique_ptr<Pipeline> pipeline;
+};
+
+Status startStream(const ControlMsg& m, BackendChoice& choice, RingWriter& ring, Reporter& rep, const Args& a,
+                   StartResult& out, Started& st) {
+    const StartParams& p = m.start;
+    if (!choice.backend) return Status::Error("unavailable", "no usable encoder backend: " + joinUnavailable(choice.caps));
+    std::string capName = p.capture;
+    if (capName.empty()) {
+        capName = (p.window || !p.windowTitle.empty()) ? "wgc" : choice.caps.capture.empty() ? "dda" : choice.caps.capture.front();
+    }
+    Status s;
+    std::unique_ptr<Capture> capture = createCapture(capName, s);
+    if (capture) s = capture->init(p);
+    if (!capture || !s.ok) {
+        if (capture) capture->shutdown();
+        return s;
+    }
+    const SourceInfo src = capture->source();
+    if (src.device) st.gpuPriority = applyGpuPriority(p.gpuPriority, src.adapter);
+
+    InputSpec in;
+    s = choice.backend->init(p, src, in, st);
+    std::unique_ptr<d3d::Nv12Converter> conv;
+    if (s.ok && in.format == InputSpec::Format::Nv12) {
+        if (!src.device) {
+            s = Status::Error("unsupported", "the encoder wants NV12 but the capture has no GPU device");
+        } else {
+            auto mode = d3d::Nv12Converter::Output::Nv12;
+            if (!d3d::Nv12Converter::nv12RenderTargets(src.device) && choice.caps.backend == "mock") {
+                mode = d3d::Nv12Converter::Output::Planar;  // the mock reads nothing: still exercise the shaders
+            }
+            conv = std::make_unique<d3d::Nv12Converter>();
+            s = conv->init(src.device, in.width, in.height, p.barcode, mode);
+            if (s.ok) {
+                logf(LogLevel::Info, "converting %ux%u -> %ux%u %s%s", src.width, src.height, in.width, in.height,
+                     mode == d3d::Nv12Converter::Output::Nv12 ? "NV12" : "Y + CbCr planes (no NV12 render targets)",
+                     p.barcode.enabled ? " with barcode" : "");
+            }
+        }
+    } else if (s.ok && p.barcode.enabled) {
+        s = Status::Error("unsupported", "the barcode needs the GPU colour conversion (a GPU capture)");
+    }
+    if (!s.ok) {
+        capture->shutdown();
+        return s;
+    }
+    st.capture = capName;
+    st.captureWidth = int(src.width);
+    st.captureHeight = int(src.height);
+    if (src.adapter.found) {
+        st.adapterLuid = src.adapter.luid;
+        st.adapterName = src.adapter.name;
+        st.vendor = src.adapter.vendor;
+        st.hagsEnabled = src.adapter.hags;
+        st.idleRepeatMs = p.idleRepeatMs;
+    }
+    st.barcode = conv && p.barcode.enabled;
+
+    RateParams rate;
+    rate.kbps = p.kbps;
+    rate.vbvFrames = p.vbvFrames;
+    rate.fps = p.fps;
+    PipelineOptions po;
+    po.converter = std::move(conv);
+    po.dumpPath = a.dumpNv12;
+    out.pipeline = std::make_unique<Pipeline>(*choice.backend, *capture, ring, rep, rate, std::move(po));
+    out.capture = std::move(capture);
+    return Status::Ok();
+}
 
 std::string joinUnavailable(const Caps& caps) {
     std::string out;
@@ -185,6 +293,17 @@ int main(int argc, char** argv) {
         return kExitOk;
     }
     setLogLevel(a.logLevel);
+    setDpiAwareness();
+    if (a.selfTestConvert || a.selfTestPacer) {
+        int rc = 0;
+        if (a.selfTestPacer) rc = runPacerSelfTest();
+        if (a.selfTestConvert) {
+            const int c = runConvertSelfTest(a.selfTestHardware);
+            if (rc == 0) rc = c;
+        }
+        std::fflush(stdout);
+        return rc;
+    }
 
     BackendChoice choice = chooseBackend(a.backend, a.mock);
     if (a.printCaps) {
@@ -255,43 +374,24 @@ int main(int argc, char** argv) {
                 rep.error(Status::Error("already_started", "the helper encodes one stream; restart it to change"), m.type);
                 continue;
             }
-            if (!choice.backend) {
-                rep.error(Status::Error("unavailable", "no usable encoder backend: " + joinUnavailable(choice.caps)), m.type);
-                continue;
-            }
-            std::string capName = m.start.capture;
-            if (capName.empty()) capName = choice.caps.capture.empty() ? "dda" : choice.caps.capture.front();
-            Status cs;
-            capture = createCapture(capName, cs);
-            if (capture) cs = capture->init(m.start);
-            if (!capture || !cs.ok) {
-                capture.reset();
-                rep.error(cs, m.type);
-                continue;
-            }
+            StartResult sr;
             Started st;
-            Status es = choice.backend->init(m.start, st);
-            if (!es.ok) {
-                capture->shutdown();
-                capture.reset();
-                if (es.fatal) {
-                    rep.fatal(es);
+            Status ss = startStream(m, choice, ring, rep, a, sr, st);
+            if (!ss.ok) {
+                if (ss.fatal) {
+                    rep.fatal(ss);
                     exitCode = kExitFatal;
                     break;
                 }
-                rep.error(es, m.type);
+                rep.error(ss, m.type);
                 continue;
             }
-            st.capture = capName;
+            capture = std::move(sr.capture);
+            pipeline = std::move(sr.pipeline);
             control->send(encodeStarted(st));
-            RateParams rate;
-            rate.kbps = m.start.kbps;
-            rate.vbvFrames = m.start.vbvFrames;
-            rate.fps = m.start.fps;
-            pipeline = std::make_unique<Pipeline>(*choice.backend, *capture, ring, rep, rate);
             pipeline->start();
-            logf(LogLevel::Info, "started: %s %dx%d@%d %d kbps, capture %s", st.codec.c_str(), st.width, st.height,
-                 st.fps, st.kbps, capName.c_str());
+            logf(LogLevel::Info, "started: %s %dx%d@%d %d kbps, capture %s %dx%d", st.codec.c_str(), st.width, st.height,
+                 st.fps, st.kbps, st.capture.c_str(), st.captureWidth, st.captureHeight);
             continue;
         }
         if (!pipeline) {

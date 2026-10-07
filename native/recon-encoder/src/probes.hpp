@@ -1,6 +1,6 @@
-// Real capture methods and encoder backends. In this skeleton (step 3.1) they
-// only probe for their runtime and report "not available"; steps 3.2 (capture),
-// 3.3 (AMF) and 3.4 (NVENC) implement them behind the same factories.
+// Real capture methods and encoder backends behind factories. The capture
+// methods are implemented (step 3.2); the AMF (3.3) and NVENC (3.4) encoder
+// backends still only probe for their runtime and report "not available".
 #pragma once
 
 #include <windows.h>
@@ -37,5 +37,7 @@ Probe probeAmdDirectCapture();
 std::unique_ptr<Capture> createAmdDirectCapture(Status& err);
 Probe probeWgcCapture();
 std::unique_ptr<Capture> createWgcCapture(Status& err);
+// Test source: a simulated game presenting into a D3D11 texture (capture/test_capture.cpp).
+std::unique_ptr<Capture> createGpuTestCapture(Status& err);
 
 }  // namespace recon

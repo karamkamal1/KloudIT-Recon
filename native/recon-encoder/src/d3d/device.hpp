@@ -1,0 +1,58 @@
+// DXGI output selection and the D3D11 device that capture, colour conversion
+// and the encoder share (GUIDE 3.2).
+#pragma once
+
+#include <d3d11.h>
+#include <dxgi1_5.h>
+#include <wrl/client.h>
+
+#include <string>
+#include <vector>
+
+#include "platform/platform.hpp"
+#include "types.hpp"
+
+namespace recon::d3d {
+
+using Microsoft::WRL::ComPtr;
+
+// "0x887A0026 (DXGI_ERROR_ACCESS_LOST)" for the codes capture runs into.
+std::string hrText(HRESULT hr);
+
+// DXGI_MODE_ROTATION -> clockwise degrees (0, 90, 180, 270).
+int rotationDegrees(DXGI_MODE_ROTATION r);
+
+// Every output of every adapter, in DXGI order (caps "outputs").
+std::vector<OutputDesc> enumerateOutputs();
+
+struct OutputRef {
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<IDXGIOutput> output;
+    AdapterInfo adapterInfo;
+    OutputDesc desc;
+    std::wstring deviceName;  // DXGI_OUTPUT_DESC::DeviceName, stable across mode changes
+};
+
+// Picks the output a start message asks for: hmonitor, else adapterLuid +
+// monitor, else output `monitor` of adapter 0. Error code "no_output".
+Status selectOutput(const StartParams& p, OutputRef& out);
+// Finds the output named deviceName on the adapter (after a mode change).
+Status findOutput(const LUID& adapter, const std::wstring& deviceName, OutputRef& out);
+// The output showing this HMONITOR.
+Status outputForMonitor(uint64_t hmonitor, OutputRef& out);
+
+struct Device {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    D3D_FEATURE_LEVEL level{};
+};
+
+// Creates the D3D11 device on `adapter` (capture must run on the adapter that
+// owns the output, and the encoder uses the same device), with BGRA support,
+// multithread protection (the encoder's threads share it), GPU thread priority
+// 7 and maximum frame latency 1 (Sunshine display_base.cpp). warp = true
+// creates a WARP device and adapter = nullptr the default hardware device
+// (self-test). The debug layer is only requested in debug builds.
+Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp = false);
+
+}  // namespace recon::d3d

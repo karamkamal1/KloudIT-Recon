@@ -44,7 +44,8 @@ jobs:
           if-no-files-found: ignore
 
   # Native encoder helper (native/recon-encoder) built with MSVC, and its Go client
-  # tested natively against it. No GPU on the runner: mock backend only.
+  # tested natively against it. No GPU on the runner: mock backend, WARP for the
+  # GPU colour conversion. This build is the one the release bundle ships.
   helper-windows:
     runs-on: windows-latest
     steps:
@@ -56,15 +57,31 @@ jobs:
         run: |
           cmake -S native/recon-encoder -B build/recon-encoder -A x64
           cmake --build build/recon-encoder --config Release --parallel
+      - name: Self-tests (frame pacing; BGRA to NV12 conversion on WARP)
+        run: |
+          $exe = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
+          & $exe --self-test-pacer
+          if ($LASTEXITCODE -ne 0) { throw "--self-test-pacer failed ($LASTEXITCODE)" }
+          $out = & $exe --self-test-convert
+          $out
+          if ($LASTEXITCODE -ne 0) { throw "--self-test-convert failed ($LASTEXITCODE)" }
+          if (-not ($out -match 'self-test-convert: ok \(mode nv12\)')) { throw "conversion not tested on NV12 render targets" }
+          $caps = & $exe --print-caps --backend=mock
+          $caps
+          if ($caps -match 'no C\+\+/WinRT headers') { throw "MSVC build without C++/WinRT: Windows.Graphics.Capture missing" }
       - name: Helper integration tests (mock backend)
         run: |
           $env:RECON_HELPER_EXE = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
-          & $env:RECON_HELPER_EXE --print-caps
           go test -count=1 -v ./internal/host/encoder
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recon-encoder-msvc
+          path: build/recon-encoder/bin/recon-encoder.exe
+          if-no-files-found: error
 
   release-binaries:
     runs-on: ubuntu-24.04
-    needs: test
+    needs: [test, helper-windows]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,10 +89,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Install mingw-w64 (recon-encoder.exe cross build)
+      - name: Install mingw-w64 (recon-encoder.exe cross build check)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq mingw-w64 cmake
-      - name: Build release bundles
-        run: make release HELPER_REQUIRED=1
+      - name: mingw-w64 build of the helper (local / test builds; not shipped)
+        run: make helper HELPER_REQUIRED=1
+      - uses: actions/download-artifact@v4
+        with:
+          name: recon-encoder-msvc
+          path: helper-msvc
+      - name: Build release bundles (with the MSVC-built helper)
+        run: make release HELPER_EXE=helper-msvc/recon-encoder.exe
       - uses: actions/upload-artifact@v4
         with:
           name: kloudit-recon-binaries

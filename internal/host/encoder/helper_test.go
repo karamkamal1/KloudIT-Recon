@@ -72,6 +72,8 @@ func (f *fakeHelper) send(v any) {
 		t = "error"
 	case Stats:
 		t = "stats"
+	case CaptureChanged:
+		t = "captureChanged"
 	}
 	if t != "" {
 		var m map[string]any
@@ -231,6 +233,45 @@ func TestHelperStartFramesClose(t *testing.T) {
 	}
 	if err := h.ForceIDR(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("command after close: %v", err)
+	}
+}
+
+// Capture changes and idle repeats reach the caller.
+func TestHelperCaptureChangesAndRepeats(t *testing.T) {
+	h, _, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+		if m["t"] != "start" {
+			return
+		}
+		f.send(Started{Backend: "mock", Capture: "dda", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 4000,
+			CaptureWidth: 2560, CaptureHeight: 1440, Vendor: "amd", GPUPriority: "realtime", IdleRepeatMs: 100})
+		f.publish(&Frame{FrameID: 1, Key: true, LTRSlot: -1, Data: []byte{0, 0, 0, 1, 0x65}})
+		f.send(CaptureChanged{Reason: "lost", Width: 2560, Height: 1440, Text: "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST"})
+		f.publish(&Frame{FrameID: 2, Repeat: true, LTRSlot: -1, Data: []byte{0, 0, 0, 1, 0x41}})
+		f.send(CaptureChanged{Reason: "resized", Width: 1920, Height: 1080})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	st, err := h.Start(StartParams{Capture: "dda", Codec: "h264", FPS: 60, Kbps: 4000, Barcode: &Barcode{BlockW: 8, BlockH: 8, Cols: 8, Bits: 16}})
+	if err != nil || st.CaptureWidth != 2560 || st.GPUPriority != "realtime" {
+		t.Fatalf("start: %+v %v", st, err)
+	}
+	if fr := nextFrame(t, h); fr.Repeat || !fr.Key {
+		t.Fatalf("frame 1 %+v", fr)
+	}
+	if fr := nextFrame(t, h); !fr.Repeat || fr.FrameID != 2 {
+		t.Fatalf("frame 2 %+v", fr)
+	}
+	for _, want := range []string{"lost", "resized"} {
+		select {
+		case ev := <-h.CaptureChanges():
+			if ev.Reason != want {
+				t.Fatalf("capture change %+v, want %s", ev, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("no %s capture change", want)
+		}
 	}
 }
 
