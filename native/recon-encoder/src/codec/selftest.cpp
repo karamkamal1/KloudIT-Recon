@@ -1,9 +1,10 @@
 // recon-encoder --self-test-encoder: the encoder-independent logic of the
 // encoder backends, without a GPU: the LTR recovery policy (codec/ltr.hpp)
-// driven like an encoder that marks and references exactly as asked,
-// parameter-set detection and insertion on real H.264 access units (the mock
-// clip) and on synthetic HEVC / AV1 units, ROI importance maps and the coded
-// size alignment.
+// driven like an encoder that marks and references exactly as asked, the
+// reference-invalidation policy (codec/rfi.hpp), parameter-set detection and
+// insertion on real H.264 access units (the mock clip) and on synthetic HEVC /
+// AV1 units, ROI importance and QP delta maps, the coded size alignment, and
+// the NVENC settings that need no driver (nvenc/nvenc_policy.hpp).
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -11,7 +12,9 @@
 
 #include "codec/bitstream.hpp"
 #include "codec/ltr.hpp"
+#include "codec/rfi.hpp"
 #include "mock/mock.hpp"
+#include "nvenc/nvenc_policy.hpp"
 #include "selftest.hpp"
 
 // Generated from testdata/mock_clip.h264 by cmake/embed.cmake.
@@ -393,13 +396,185 @@ void testRoi() {
     std::printf("  %-44s ok\n", name);
 }
 
+
+// Reference frame invalidation (NVENC recovery), driven like the backend:
+// plan, invalidate, submit.
+struct RfiSim {
+    explicit RfiSim(int dpb) { t.reset(dpb); }
+    RfiTracker t;
+    uint64_t next = 1;
+    std::vector<RfiTracker::Plan> plans;  // by frame id - 1
+    RfiTracker::Plan frame(bool idr = false) {
+        const RfiTracker::Plan p = t.plan(next, idr || next == 1);
+        t.submitted(next, p);
+        plans.push_back(p);
+        ++next;
+        return p;
+    }
+    void until(uint64_t last) {
+        while (next <= last) frame();
+    }
+};
+
+std::string ids(const std::vector<uint64_t>& v) {
+    std::string out;
+    for (uint64_t x : v) out += (out.empty() ? "" : ",") + std::to_string(x);
+    return out;
+}
+
+void testRfi() {
+    const char* name = "invalidation: range, refFloor, DPB window";
+    {
+        RfiSim s(6);
+        s.until(25);
+        s.t.recover(22);
+        RfiTracker::Plan p = s.frame();  // 26
+        expect(p.recovery && !p.idr && p.refFloor == 21 && p.invalidate == std::vector<uint64_t>{22, 23, 24, 25}, name,
+               "loss at 22: refFloor " + std::to_string(p.refFloor) + ", invalidate " + ids(p.invalidate));
+        p = s.frame();  // 27: back to normal
+        expect(!p.recovery && !p.idr && p.invalidate.empty(), name, "frame after the recovery frame");
+        s.until(40);
+        s.t.recover(36);  // 36..40 = 5 frames: 35 still in the 6-frame window
+        p = s.frame();  // 41
+        expect(p.recovery && p.refFloor == 35 && p.invalidate.size() == 5, name, "loss of 5 frames: refFloor " + std::to_string(p.refFloor));
+        s.until(50);
+        s.t.recover(45);  // 45..50 = 6 frames: nothing valid left (Sunshine: "rfi request too large")
+        p = s.frame();  // 51
+        expect(p.idr && !p.recovery && p.invalidate.empty(), name, "loss of the whole DPB: IDR");
+        s.until(55);
+        s.t.recover(51);  // the key frame itself
+        p = s.frame();
+        expect(p.idr, name, "loss of the key frame: IDR");
+        s.until(70);
+        s.t.recover(80);  // never submitted
+        p = s.frame();
+        expect(p.idr, name, "loss of a frame not submitted yet: IDR");
+    }
+    std::printf("  %-44s ok\n", name);
+
+    name = "invalidation: repeated and overlapping losses";
+    {
+        RfiSim s(6);
+        s.until(60);
+        s.t.recover(58);
+        RfiTracker::Plan p = s.frame();  // 61 references 57
+        expect(p.recovery && p.refFloor == 57, name, "first loss");
+        s.t.recover(61);  // the recovery frame lost as well
+        p = s.frame();    // 62: 58..60 stay invalid, so 57 again
+        expect(p.recovery && p.refFloor == 57 && p.invalidate == std::vector<uint64_t>{61}, name,
+               "recovery frame lost: refFloor " + std::to_string(p.refFloor) + ", invalidate " + ids(p.invalidate));
+        // Losses reported between plan and submit: one inside the range the
+        // planned frame invalidates is covered by it; one of the planned
+        // frame itself stays pending and the next frame recovers again.
+        s.until(70);
+        s.t.recover(68);
+        const RfiTracker::Plan q = s.t.plan(71, false);
+        s.t.recover(69);
+        s.t.recover(71);
+        s.t.submitted(71, q);
+        s.plans.push_back(q);
+        ++s.next;
+        expect(q.recovery && q.refFloor == 67 && q.invalidate == std::vector<uint64_t>{68, 69, 70}, name, "loss at 68");
+        expect(s.t.pending(), name, "the loss of the planned frame was dropped");
+        p = s.frame();  // 72: 71 lost too, 68..70 still invalid
+        expect(p.recovery && p.refFloor == 67 && p.invalidate == std::vector<uint64_t>{71} && !s.t.pending(), name,
+               "loss of the planned frame: refFloor " + std::to_string(p.refFloor) + ", invalidate " + ids(p.invalidate));
+        // Only a covered loss arrives meanwhile: nothing stays pending (else
+        // the next frame would invalidate the good recovery frame again).
+        s.until(75);
+        s.t.recover(74);
+        const RfiTracker::Plan q2 = s.t.plan(76, false);
+        s.t.recover(75);
+        s.t.submitted(76, q2);
+        s.plans.push_back(q2);
+        ++s.next;
+        expect(q2.recovery && !s.t.pending(), name, "a loss inside the planned range was not covered");
+        // A failed submit (no submitted()) plans the same recovery again.
+        s.until(80);
+        s.t.recover(78);
+        const RfiTracker::Plan a = s.t.plan(81, false);
+        const RfiTracker::Plan b = s.t.plan(81, false);
+        expect(a.recovery && b.recovery && a.invalidate == b.invalidate && a.refFloor == b.refFloor, name, "plan changed state");
+        // A forced IDR wins and covers the loss.
+        p = s.frame(true);
+        expect(p.idr && !p.recovery && !s.t.pending(), name, "forced IDR over a pending loss");
+        // An unplanned key frame (the encoder made one) covers older losses
+        // and is a new floor.
+        s.until(90);
+        s.t.recover(88);
+        s.t.unplannedKey(89);
+        expect(!s.t.pending(), name, "an unplanned key frame did not cover an older loss");
+        s.until(92);
+        s.t.recover(90);
+        p = s.frame();  // 93: 89 is the key frame, 90.. lost: refFloor 89
+        expect(p.recovery && p.refFloor == 89, name, "unplanned key frame as reference: " + std::to_string(p.refFloor));
+        s.t.recover(89);
+        p = s.frame();
+        expect(p.idr, name, "loss of the unplanned key frame: IDR");
+        const RfiTracker::Stats st = s.t.stats();
+        expect(st.recoveries >= 4 && st.idrFallbacks >= 2, name, "stats");
+    }
+    std::printf("  %-44s ok\n", name);
+}
+
+void testNvencPolicy() {
+    const char* name = "NVENC API version negotiation";
+    using namespace nvenc;
+    const uint32_t built = apiVersion(13, 0);
+    expect(versionProblem(apiVersion(13, 0), built).empty() && versionProblem(apiVersion(13, 2), built).empty() &&
+               versionProblem(apiVersion(14, 0), built).empty(),
+           name, "a newer driver refused");
+    const std::string old = versionProblem(apiVersion(12, 2), built);
+    expect(old.find("12.2") != std::string::npos && old.find("13.0") != std::string::npos && old.find("570.0") != std::string::npos, name,
+           "old driver text: " + old);
+    expect(!versionProblem(0, built).empty() && minimumDriver(apiVersion(12, 0)) == "522.25" && apiVersionText(0xd2) == "13.2", name,
+           "version texts");
+    std::printf("  %-44s ok\n", name);
+
+    name = "NVENC preset by pixel rate";
+    struct P {
+        uint32_t w, h;
+        int fps;
+        const char* q;
+        int want;
+    };
+    const P presets[] = {{1920, 1080, 60, "speed", 4},  {1920, 1080, 240, "speed", 4}, {2560, 1440, 120, "speed", 4},
+                         {2560, 1440, 165, "speed", 3}, {3840, 2160, 60, "speed", 4},  {3840, 2160, 90, "speed", 2},
+                         {3840, 2160, 120, "speed", 1}, {7680, 4320, 60, "speed", 1},  {1920, 1080, 60, "balanced", 5},
+                         {1920, 1080, 60, "quality", 6}, {3840, 2160, 120, "quality", 3}};
+    for (const P& x : presets) {
+        const int got = presetFor(x.w, x.h, x.fps, x.q);
+        expect(got == x.want, name, std::to_string(x.w) + "x" + std::to_string(x.h) + "@" + std::to_string(x.fps) + " " + x.q + ": P" +
+                                        std::to_string(got) + ", expected P" + std::to_string(x.want));
+    }
+    std::printf("  %-44s ok\n", name);
+
+    name = "NVENC rate values and ROI QP delta maps";
+    const Rate r = rateFor(20000, 1.0, 60), r2 = rateFor(50000, 1.5, 120);
+    expect(r.average == 20000000 && r.max == 20000000 && r.vbv == 333333 && r2.vbv == 625000, name, "rate values");
+    expect(qpMapBlock(Codec::H264) == 16 && qpMapBlock(Codec::Hevc) == 32 && qpMapBlock(Codec::Av1) == 64, name, "block sizes");
+    const QpMap hevc = roiQpDeltaMap(Codec::Hevc, 1920, 1080, {RoiRect{100, 100, 64, 64, 10}});
+    size_t nonzero = 0;
+    for (int8_t v : hevc.values) nonzero += v != 0;
+    expect(hevc.cols == 60 && hevc.rows == 34 && nonzero == 9 && hevc.values[3 * 60 + 3] == -10 && hevc.values[5 * 60 + 5] == -10 &&
+               hevc.values[6 * 60 + 6] == 0,
+           name, "hevc map");
+    const QpMap av1 = roiQpDeltaMap(Codec::Av1, 1920, 1080, {RoiRect{0, 0, 64, 64, 5}, RoiRect{0, 0, 128, 64, -3}});
+    expect(av1.cols == 30 && av1.rows == 17 && av1.values[0] == -20 && av1.values[1] == 12, name, "av1 map: highest weight wins");
+    const QpMap h264 = roiQpDeltaMap(Codec::H264, 64, 32, {RoiRect{0, 0, 16, 16, -4}, RoiRect{200, 200, 16, 16, 9}});
+    expect(h264.cols == 4 && h264.rows == 2 && h264.values[0] == 4 && h264.values[1] == 0, name, "h264 map, rect outside");
+    std::printf("  %-44s ok\n", name);
+}
+
 }  // namespace
 
 int runEncoderSelfTest() {
     failures = 0;
     testLtr();
+    testRfi();
     testBitstream();
     testRoi();
+    testNvencPolicy();
     std::printf("self-test-encoder: %s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }

@@ -558,6 +558,39 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	}
 }
 
+// The NVENC backend (native/recon-encoder/src/nvenc) driven by
+// --self-test-nvenc: against the test double of the NVIDIA runtime
+// (native/recon-encoder/test/fake_nvenc.cpp, recon-fake-nvenc.dll in the
+// helper's build directory; RECON_FAKE_NVENC points at it, make helper-test and
+// CI set it), and against the real driver where there is one (an NVIDIA host;
+// elsewhere the helper answers 77 and the subtest skips). Both need a D3D11
+// device: under Wine an X display.
+func TestHelperIntegrationNvenc(t *testing.T) {
+	exe := helperExe(t)
+	run := func(t *testing.T, args ...string) {
+		out, err := exec.Command(exe, args...).CombinedOutput()
+		t.Logf("%s", out)
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 77 {
+			t.Skip("cannot run here (no D3D11 device, or no NVIDIA runtime / adapter)")
+		}
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if !strings.Contains(string(out), "self-test-nvenc: ok") {
+			t.Fatal("no \"self-test-nvenc: ok\" line")
+		}
+	}
+	t.Run("TestDouble", func(t *testing.T) {
+		dll := os.Getenv("RECON_FAKE_NVENC")
+		if dll == "" {
+			t.Skip("set RECON_FAKE_NVENC to recon-fake-nvenc.dll (built next to recon-encoder.exe)")
+		}
+		run(t, "--self-test-nvenc="+dll)
+	})
+	t.Run("Driver", func(t *testing.T) { run(t, "--self-test-nvenc") })
+}
+
 // The --encode-test mode (the hardware check of an encoder backend without
 // recon-host) through the mock backend: scripted forced IDR, loss and rate
 // changes; the file it writes is the Annex-B stream that came out of the ring.

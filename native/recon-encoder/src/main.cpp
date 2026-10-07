@@ -34,7 +34,7 @@ namespace {
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
     "       recon-encoder --print-caps [--backend=B]\n"
-    "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder\n"
+    "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder | --self-test-nvenc[=DLL]\n"
     "       recon-encoder --encode-test=FILE [--backend=B] [encode test options]\n"
     "       recon-encoder --version\n"
     "\n"
@@ -53,7 +53,10 @@ const char kUsage[] =
     "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
     "                       the default hardware adapter (exit 0 ok, 1 failed, 77 no device)\n"
     "  --self-test-pacer    check the frame pacing policy on simulated presents (exit 0 ok, 1 failed)\n"
-    "  --self-test-encoder  check the encoder logic: LTR recovery policy, parameter sets, ROI map (exit 0 / 1)\n"
+    "  --self-test-encoder  check the encoder logic: LTR and invalidation recovery policies, parameter sets, ROI maps,\n"
+    "                       NVENC settings (exit 0 / 1)\n"
+    "  --self-test-nvenc[=DLL]  drive the NVENC backend: against DLL (the test double recon-fake-nvenc.dll, no GPU\n"
+    "                       needed) or, without DLL, the NVIDIA driver (exit 0 ok, 1 failed, 77 no device / runtime)\n"
     "\n"
     "Encode test: one stream through the real capture, conversion, encoder and ring, without\n"
     "recon-host; the bitstream goes to FILE (Annex-B for h264/hevc, IVF for av1), a summary to stdout:\n"
@@ -70,6 +73,8 @@ struct Args {
     bool selfTestHardware = false;
     bool selfTestPacer = false;
     bool selfTestEncoder = false;
+    bool selfTestNvenc = false;
+    std::string selfTestNvencDll;  // --self-test-nvenc=DLL (test double), empty = the driver
     EncodeTestOptions encodeTest;
     std::string dumpNv12;
     bool version = false;
@@ -106,6 +111,10 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         }
         else if (key == "--self-test-pacer") a.selfTestPacer = true;
         else if (key == "--self-test-encoder") a.selfTestEncoder = true;
+        else if (key == "--self-test-nvenc") {
+            a.selfTestNvenc = true;
+            a.selfTestNvencDll = val;
+        }
         else if (key == "--encode-test") ok = !(a.encodeTest.output = val).empty();
         else if (encodeTestOption(key, val, a.encodeTest, ok)) {
         }
@@ -142,7 +151,8 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         return false;
     }
     const bool standalone =
-        a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder || !a.encodeTest.output.empty();
+        a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder || a.selfTestNvenc ||
+        !a.encodeTest.output.empty();
     if (!standalone && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
         err = "--ring-handle, --ring-size and --event-handle are required";
         return false;
@@ -232,6 +242,12 @@ int main(int argc, char** argv) {
     }
     setLogLevel(a.logLevel);
     setDpiAwareness();
+    if (a.selfTestNvenc) {
+        // Alone: it must choose the NVENC runtime before anything loads it.
+        const int rc = runNvencSelfTest(fromUtf8(a.selfTestNvencDll));
+        std::fflush(stdout);
+        return rc;
+    }
     if (a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder) {
         int rc = 0;
         if (a.selfTestPacer) rc = runPacerSelfTest();

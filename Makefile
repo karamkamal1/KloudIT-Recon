@@ -44,12 +44,14 @@ helper:
 		echo "helper: mingw-w64 ($(MINGW_CXX)) or cmake not found, skipping recon-encoder.exe"; \
 	fi
 
-# Helper integration tests (mock backend) under Wine, against the mingw build. Wine's
-# D3D11 needs an X display: run under xvfb-run (Mesa llvmpipe) to include the GPU
-# conversion self-test and the synthetic-gpu pipeline test; headless they skip.
+# Helper integration tests (mock backend, the NVENC backend against its test double
+# recon-fake-nvenc.dll) under Wine, against the mingw build. Wine's D3D11 needs an X
+# display: run under xvfb-run (Mesa llvmpipe) to include the GPU conversion self-test,
+# the synthetic-gpu pipeline test and the NVENC test; headless they skip.
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
+		RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
 		$(WINE) ./encoder.test.exe -test.v -test.count=1
 
 test:

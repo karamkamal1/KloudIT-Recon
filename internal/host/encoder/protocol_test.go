@@ -84,6 +84,17 @@ func TestDecodeMessages(t *testing.T) {
 		s.QueryTimeoutMs != 5 || s.Usage != "ultra_low_latency" {
 		t.Fatalf("started (amf av1): %+v %v", m, err)
 	}
+	// The NVENC backend (step 3.4).
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"nvenc","capture":"dda","codec":"hevc","width":2560,"height":1440,"fps":120,"kbps":60000,"codedWidth":2560,"codedHeight":1440,"cropRight":0,"cropBottom":0,"liveBitrate":"seamless","rateControl":"cbr","usage":"ultra_low_latency","ltrSlots":0,"ltrInterval":0,"encoderInstance":0,"hwInstances":2,"queryTimeoutMs":0,"zeroCopy":false,"intraRefreshFrames":0,"preset":"p4","asyncEncode":true,"refFrames":6}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.Backend != "nvenc" || s.Preset != "p4" || !s.AsyncEncode || s.RefFrames != 6 ||
+		s.LTRSlots != 0 || s.HWInstances != 2 {
+		t.Fatalf("started (nvenc): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"caps","v":1,"backend":"nvenc","vendor":"nvidia","codecs":{"av1":{"maxW":8192,"maxH":8192,"recovery":"invalidate","liveBitrate":"seamless","roi":"emphasis","dynamicResolution":true,"assumed":["liveBitrate","roi"]}}}`))
+	if c, ok := m.(*Caps); err != nil || !ok || !c.Usable() || c.Codecs["av1"].Recovery != "invalidate" || !c.Codecs["av1"].DynamicResolution ||
+		!c.Codecs["av1"].IsAssumed("roi") {
+		t.Fatalf("caps (nvenc): %+v %v", m, err)
+	}
 	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"wgc","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"cursorInVideo":true}`))
 	if s, ok := m.(*Started); err != nil || !ok || !s.CursorInVideo {
 		t.Fatalf("started (wgc with the pointer): %+v %v", m, err)

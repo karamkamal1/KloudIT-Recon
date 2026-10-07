@@ -6,6 +6,7 @@
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -64,5 +65,20 @@ Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp = false);
 // D3D11 / DXGI / AMF call fails (and while no frames arrive), so a removed
 // device never turns into endless retries or repeated non-fatal errors.
 bool deviceRemoved(ID3D11Device* device, const std::string& what, Status& out);
+
+// Keeps the DXGI Desktop Duplication calls of the DDA capture thread
+// (AcquireNextFrame, ReleaseFrame, the frame metadata, DuplicateOutput) and
+// NVENC's NvEncLockBitstream / NvEncUnlockBitstream on the encoder's output
+// thread from running at the same time: "On Windows, when encode device type
+// is DirectX, calling DXGI APIs like IDXGIOutputDuplication::AcquireNextFrame
+// from the primary thread and NvEncLockBitstream / NvEncUnlockBitstream from
+// secondary thread, can lead to suboptimal or undefined behavior. This is
+// because NvEncLockBitstream can internally use the application's DirectX
+// device." (NVENC Video Encoder API programming guide 13.0, 6.3 Threading
+// Model). The DDA capture holds it for one short AcquireNextFrame slice at a
+// time (capture/dda_capture.cpp), so the output thread waits at most a slice,
+// as it already did for the device lock AcquireNextFrame holds. One helper
+// runs one stream: a process-wide lock. Take it before any other lock.
+std::mutex& dxgiGate();
 
 }  // namespace recon::d3d

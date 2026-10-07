@@ -57,13 +57,15 @@ jobs:
         run: |
           cmake -S native/recon-encoder -B build/recon-encoder -A x64
           cmake --build build/recon-encoder --config Release --parallel
-      - name: Self-tests (frame pacing; encoder logic; BGRA to NV12 conversion on WARP)
+      - name: Self-tests (frame pacing; encoder logic; NVENC backend against its test double on WARP; BGRA to NV12 conversion on WARP)
         run: |
           $exe = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
           & $exe --self-test-pacer
           if ($LASTEXITCODE -ne 0) { throw "--self-test-pacer failed ($LASTEXITCODE)" }
           & $exe --self-test-encoder
           if ($LASTEXITCODE -ne 0) { throw "--self-test-encoder failed ($LASTEXITCODE)" }
+          & $exe "--self-test-nvenc=$((Resolve-Path build/recon-encoder/bin/recon-fake-nvenc.dll).Path)"
+          if ($LASTEXITCODE -ne 0) { throw "--self-test-nvenc with the test double failed ($LASTEXITCODE)" }
           $out = & $exe --self-test-convert
           $out
           if ($LASTEXITCODE -ne 0) { throw "--self-test-convert failed ($LASTEXITCODE)" }
@@ -71,9 +73,10 @@ jobs:
           $caps = & $exe --print-caps --backend=mock
           $caps
           if ($caps -match 'no C\+\+/WinRT headers') { throw "MSVC build without C++/WinRT: Windows.Graphics.Capture missing" }
-      - name: Helper integration tests (mock backend)
+      - name: Helper integration tests (mock backend, NVENC test double)
         run: |
           $env:RECON_HELPER_EXE = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
+          $env:RECON_FAKE_NVENC = (Resolve-Path build/recon-encoder/bin/recon-fake-nvenc.dll).Path
           go test -count=1 -v ./internal/host/encoder
       - uses: actions/upload-artifact@v4
         with:

@@ -259,7 +259,7 @@ struct Event {
     // loss outcome
     uint64_t recoveredAt = 0, refFloor = 0, lostFrames = 0;
     uint32_t refMask = 0;
-    bool byLtr = false;
+    bool byLtr = false;  // by a recovery frame (AMF: an LTR reference; NVENC: invalidation, refMask 0), not a key frame
 };
 
 bool parseEvent(const std::string& s, Event& e) {
@@ -534,7 +534,8 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                 ok = false;
             } else {
                 std::printf("encode-test: loss at %llu: recovered at %llu (%llu frames lost) %s refFloor %llu, LTR mask 0x%x\n",
-                            id(e.firedAt), id(e.recoveredAt), id(e.lostFrames), e.byLtr ? "from an LTR (no IDR):" : "by an IDR;",
+                            id(e.firedAt), id(e.recoveredAt), id(e.lostFrames),
+                            !e.byLtr ? "by an IDR;" : e.refMask ? "from an LTR (no IDR):" : "by reference invalidation (no IDR):",
                             id(e.refFloor), e.refMask);
             }
         } else if (e.what == "rate" || e.what == "fps") {

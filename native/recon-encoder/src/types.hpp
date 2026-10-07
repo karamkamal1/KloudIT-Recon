@@ -136,6 +136,10 @@ struct CodecCaps {
     int hwInstances = 1;
     bool queryTimeout = false;
     int alignW = 1, alignH = 1;  // required coded-size alignment (AV1 on RDNA3: 64x16)
+    // The running encoder can change its coded size without a new session
+    // (NVENC NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE; the helper has no control
+    // message for it yet: GUIDE 5 "FPS before resolution").
+    bool dynamicResolution = false;
     // Fields above that are documented or default values rather than detected
     // on this GPU (e.g. AMF AV1 "roi": there is no ROI cap; "liveBitrate" until
     // step 3.6 measures it). Sent only when not empty.
@@ -189,6 +193,9 @@ struct Started {
     int queryTimeoutMs = 0;      // the encoder's blocking output wait (0 = polled)
     bool zeroCopy = false;       // capture surfaces go to the encoder without the NV12 conversion
     int intraRefreshFrames = 0;
+    std::string preset;          // NVENC preset "p1".."p7" ("" for other backends)
+    bool asyncEncode = false;    // NVENC: completion events (async mode), false = polled output (sync mode)
+    int refFrames = 0;           // reference frames the encoder keeps (NVENC DPB size; 0 = not reported)
 };
 
 // CaptureEvent is the helper -> Go "captureChanged" message.

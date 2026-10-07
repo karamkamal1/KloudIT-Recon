@@ -526,3 +526,171 @@ Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
   alignment (caps: 64x16)" on a newer driver or RDNA4, record it: the padding is then not
   needed and `alignW/alignH` in caps should come from the post-Init value.
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
+
+## 3.4 NVENC encoder backend
+
+The NVENC encoder backend of recon-encoder.exe (`native/recon-encoder/src/nvenc/`): H.264,
+HEVC and AV1 through the driver's `nvEncodeAPI64.dll` (System32 only), NVENC API version
+negotiation (built against nv-codec-headers n13.0.19.0 = API 13.0; an older driver is
+reported in `unavailable.nvenc` with the driver to install, 570.0), caps from
+`NvEncGetEncodeCaps`, `NvEncOpenEncodeSessionEx` on the capture's D3D11 device, the GUIDE 3.4
+configuration (ultra-low-latency tuning, preset P4 up to 1440p120 moving toward P1 at 4K120
+by pixel rate, infinite GOP / IDR period, no B frames, CBR with a one-frame VBV,
+`lowDelayKeyFrameScale` 3, spatial AQ, quarter-resolution two-pass, six reference frames with
+one reference per frame, parameter sets on every IDR), async output with one completion event
+per bitstream buffer and the pipeline's output thread (sync polling where the GPU has no
+async mode), NV12 pool textures registered once and mapped per frame, forced IDRs, loss
+recovery by `NvEncInvalidateRefFrames` (`src/codec/rfi.hpp`: every frame from the loss to the
+newest, refFloor = the newest valid frame before the loss, IDR when the six-frame window has
+none), live bitrate / frame rate by `NvEncReconfigureEncoder` (seamless: no reset, no IDR;
+flush: reset + IDR), ROI as QP delta maps, the teardown with EOS. The DDA capture and the
+NVENC output thread now share `d3d::dxgiGate()`, so `AcquireNextFrame` never overlaps
+`NvEncLockBitstream` / `NvEncUnlockBitstream` (NVENC guide 6.3). Protocol additions (additive,
+version stays 1): caps `dynamicResolution`; started `preset`, `asyncEncode`, `refFrames`;
+`liveBitrate` `restart` in started; new self-test `--self-test-nvenc[=DLL]` with a test double
+of the NVENC runtime (`test/fake_nvenc.cpp` -> `recon-fake-nvenc.dll`, never shipped).
+
+Sources for the choices (cited in the code): the vendored nvEncodeAPI.h 13.0 (struct versions,
+every field's documentation: `lowDelayKeyFrameScale`, `qpMapMode` "emphasis ... only H264 ...
+not with AQ", `maxNumRefFrames` "large DPB ... if recent frames are invalidated",
+`NvEncInvalidateRefFrames`, `NvEncReconfigureEncoder` limits, `NvEncGetSequenceParams` on the
+EncodePicture thread, unmap after lock, NvEncDestroyEncoder's flush / release rules), the
+NVENC Video Encoder API programming guide 13.0 (6.1 async mode and "at least 4" buffers, 6.2
+sync mode with `doNotWait`, 6.3 threading model and the DXGI / NvEncLockBitstream warning, 8.4
+reconfigure, reference picture invalidation, 9 recommended settings for game streaming),
+Sunshine src/nvenc/nvenc_base.cpp (RFI over the range up to the last encoded frame, "rfi request
+too large" -> IDR, one reference per frame with a larger DPB, no RFI without multiple
+reference frames, VBV = bitrate / framerate, VUI, repeatSPSPPS / repeatSeqHdr, quarter-res
+two-pass default), FFmpeg 8.1 nvenc.c (driver version check and the minimum driver table,
+D3D11 resource registration, bitrate reconfiguration), OBS obs-nvenc nvenc.c (QP delta map
+ROI with 16/32/64 blocks, `qpMapMode` DELTA always, bitrate reconfiguration with reset + IDR).
+
+Verified in the sandbox (Linux, no GPU, no Windows):
+- Builds: mingw-w64 GCC 13 `make helper` (recon-encoder.exe and recon-fake-nvenc.dll), no
+  warnings with -Wall -Wextra; every new or changed source (nvenc_backend / _policy /
+  _runtime / selftest, codec/rfi, codec/selftest, the test double, dda_capture, device,
+  protocol, main, encode_test, registry, stream) passes `clang++ --target=x86_64-w64-mingw32
+  -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Wconversion` without warnings,
+  against the vendored n13.0.19.0 header (every struct, field, enum and GUID used is taken
+  from it). The MSVC build (including the test double) is not verified here: CI job
+  `helper-windows` builds it and now also runs `--self-test-nvenc` with the test double on WARP.
+- `--self-test-encoder` (Wine): the invalidation policy (loss at 22 of 25: invalidate 22..25,
+  refFloor 21; 5 lost frames still recover, 6 = the whole DPB -> IDR; loss of the key frame,
+  of a frame not submitted -> IDR; the recovery frame lost too -> refFloor stays 57 with
+  58..60 still invalid; losses reported between plan and submit: covered when inside the
+  planned range, kept when they are the planned frame itself; a failed submit replans the
+  same recovery; forced and unplanned key frames cover older losses), the NVENC policy (12.2
+  driver refused with "570.0", 13.0 / 13.2 / 14.0 accepted; presets 1080p60 P4, 1080p240 P4,
+  1440p120 P4, 1440p165 P3, 4K60 P4, 4K90 P2, 4K120 P1, 8K60 P1, balanced +1, quality +2;
+  VBV 20 Mbps@60 = 333333 bits; QP delta maps for 16/32/64 blocks, highest weight wins,
+  clipping). Mutation check: dropping the "covered" rule makes "a loss inside the planned
+  range was not covered" fail.
+- `--self-test-nvenc=recon-fake-nvenc.dll` under Wine 9.0 + Xvfb (wined3d has no NV12
+  textures, so BGRA stand-ins are registered with the test double): 13 sections ok, 5 runs
+  in a row: API version negotiation; caps mapping (8192x8192, invalidate, seamless + assumed,
+  emphasis + assumed, 2 engines, dynamicResolution; without AV1 / multiple refs / live bitrate:
+  `nvenc-av1` "RTX 40", recovery none, liveBitrate restart, 3 engines); HEVC / H.264 / AV1
+  1080p60 streams of 100 frames with key frames exactly at 1, 11 (forceIdr), 41 (loss beyond
+  the DPB), 51 (loss of a key frame), recovery frames 26 / 61 / 62 with refFloor 21 / 57 / 57,
+  the invalidated frames exactly 22-25 and 58-61, every frame predicted from the frame the test
+  expects (the double's DPB model), no intra fallback, init values as in the configuration
+  table, FORCEIDR | OUTPUT_SPSPPS on forced IDRs, two reconfigurations (10 Mbps: reset 0,
+  forceIDR 0, VBV 166667; 30 fps: VBV 333333), QP maps on frames 81-85 only, parameter sets on
+  every key frame, all pool textures released; sync output (polled locks, all with doNotWait);
+  the flush mode (reset 1 + forceIDR 1, key frame and generation 1 after the change, sequence
+  parameters read again); invalidation waiting for frames still in the encoder (8 ms encodes);
+  no invalidation -> IDR; no live bitrate -> `restart`, seamless refused, setRate
+  `unsupported`; a failing NvEncEncodePicture (non-fatal, its texture released, no gap in the
+  other frames); start checks (ltrSlots, size, encoderInstance refused; intra refresh 30 ->
+  period 30 / count 29, 2 SVC layers); presets P4 / P6 / P2 / P1 asked with ULL tuning; after
+  every section no API rule violation and nothing left open (sessions, buffers, events,
+  registrations, mappings). Mutation check (10 deliberate bugs, one at a time): unmapping before
+  the lock, no EOS, `lowDelayKeyFrameScale` 1, a reset on seamless rate changes, locking
+  without waiting for the event, NvEncGetSequenceParams on the init thread, refFloor always
+  L-1, no FORCEIDR on forced IDRs, a two-frame DPB, and no drain before invalidation: each one
+  fails the self-test.
+- `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`: 30 top-level tests pass, 4 skip
+  (AMD Direct Capture, AMF failed start, WGC, LaunchUnsupported); new:
+  `TestHelperIntegrationNvenc/TestDouble` passes, `/Driver` skips (77: no nvEncodeAPI64.dll
+  under Wine). `go test ./internal/host/encoder` (Linux) decodes the new caps / started fields.
+- Under Wine without an NVENC runtime: `--print-caps --backend=nvenc` reports `backend` none
+  with `unavailable.nvenc` "NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module
+  not found (error 126)"; `--encode-test --backend=nvenc` exits 2 with the same reason.
+
+Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-encoder.exe`;
+`--log-level=debug` adds the probe time and per-loss lines):
+- AMD RDNA3 (RX 7900 XT): unverified. Test (the shared DDA path): `go test -v -run
+  HelperIntegrationDDA ./internal/host/encoder` with `RECON_HELPER_SECONDS=30` and the AMF
+  `--encode-test=hevc.hevc --backend=amf --codec=hevc --capture=dda --frames=1800` with a game
+  running: present->capture and submit->output p95 unchanged against the 3.2 / 3.3 numbers
+  (the new `d3d::dxgiGate()` is never contended without NVENC); `--print-caps --backend=nvenc`
+  on the AMD host reports `unavailable.nvenc` "not found in System32" and `--backend=auto`
+  still picks AMF.
+- NVIDIA: unverified (no NVIDIA host available). Test (caps): `recon-encoder.exe --print-caps
+  --backend=nvenc --log-level=debug 2>caps.log`: `backend` nvenc, `vendor` nvidia; codecs h264,
+  hevc and on RTX 40/50 av1 (on RTX 20/30 `unavailable.nvenc-av1` says "RTX 40"); record maxW /
+  maxH (expected 4096 for h264, 8192 for hevc / av1), `tenBit` (hevc / av1 true), `yuv444`
+  (h264 / hevc true), `recovery` invalidate, `maxLtr`, `intraRefresh` true, `liveBitrate`
+  seamless, `maxTemporalLayers`, `sliceOutput`, `hwInstances` (RTX 4080 / 4090: 2; record),
+  `dynamicResolution` true, `assumed` `["liveBitrate","roi"]`; caps.log has "nvenc probe: N ms"
+  (expect < 300 ms).
+- NVIDIA: unverified (no NVIDIA host available). Test (old driver): on a host with a driver
+  older than 570 (or reported by a user), `--print-caps` shows `unavailable.nvenc` "the NVIDIA
+  driver supports NVENC API 12.x, the helper needs 13.0: update the NVIDIA driver to 570.0 or
+  newer" and recon-host falls back to the FFmpeg path.
+- NVIDIA: unverified (no NVIDIA host available). Test (the backend against the driver):
+  `recon-encoder.exe --self-test-nvenc` (no DLL): exit 0, every "stream ..." line ok for each
+  codec the GPU has: key frames exactly at 1, 11, 41, 51 and recovery frames 26, 61, 62 that are
+  not IDRs, i.e. NvEncInvalidateRefFrames recovers without an IDR on real hardware (GUIDE 3.4
+  VERIFY), rate and frame-rate changes without a key frame, the flush mode with one, presets
+  P4 / P6 / P2 / P1 accepted (AV1 4K only on RTX 40+). Also record it with HAGS on and off.
+- NVIDIA: unverified (no NVIDIA host available). Test (HEVC basics, a file checked with
+  ffprobe): `recon-encoder.exe --encode-test=hevc.hevc --backend=nvenc --codec=hevc
+  --capture=synthetic-gpu --width=1920 --height=1080 --fps=60 --kbps=20000 --frames=600
+  --at=120:idr`: exit 0; started has `preset` p4, `usage` ultra_low_latency, `asyncEncode`
+  true, `refFrames` 6, `rateControl` cbr; key frames only at 1 and 121; submit->output p95 below
+  3 ms; `ffprobe -show_streams hevc.hevc` says hevc Main 1920x1080, `color_space=bt709`,
+  `color_range=tv`, `has_b_frames=0`; `ffmpeg -v error -i hevc.hevc -f null -` prints nothing;
+  `ffprobe -show_frames -select_streams v hevc.hevc` packet sizes: the IDRs about 3x the average
+  P frame (lowDelayKeyFrameScale 3; record the ratio). Repeat with `--codec=h264
+  --encode-test=h264.h264` (High profile, CABAC) and `--codec=av1 --encode-test=av1.ivf` (RTX
+  40+; ffprobe av1 Main 1920x1080 with no padding: NVENC needs no 64x16 alignment).
+- NVIDIA: unverified (no NVIDIA host available). Test (RFI, a file decoded without the lost
+  frames): per codec `--frames=600 --at=200:loss --at=400:loss`: each loss line says
+  "recovered at R (N frames lost) by reference invalidation (no IDR): refFloor L-1" with R the
+  next frame submitted after the loss (L+1 .. L+3: frames already in the encoder are dropped by
+  the simulated client), key frames only at 1 (the loss of a recovery frame itself is covered
+  by `--self-test-nvenc`, frames 61 / 62); `ffmpeg -v error -i FILE -f null -` on the written
+  file (which lacks the lost frames)
+  prints nothing for HEVC and AV1 (record any H.264 frame_num-gap or "Could not find ref"
+  messages: a decoder that needs them gets IDR recovery in 3.5); `--log-level=debug` shows
+  "frames L..N invalidated" with N the newest submitted frame. Also record whether a recovery
+  frame's size is a P-frame size (not an intra frame).
+- NVIDIA: unverified (no NVIDIA host available). Test (reconfigure / live bitrate, GUIDE 3.6
+  preview): HEVC 2560x1440@60 with a moving source (`--capture=dda` and a game, or synthetic-gpu
+  scaled up) `--kbps=50000 --frames=900 --at=300:rate=20000 --at=600:rate=50000`: both lines
+  say "no key frame" and the P-frame bitrate within about 20 % of the new target 3 frames after
+  the change; `--at=300:fps=30` the same without a key frame; once more with
+  `--live-bitrate=flush`: a key frame at each change, `gen` increments; no "setRate:
+  NvEncReconfigureEncoder ... failed" in the log.
+- NVIDIA: unverified (no NVIDIA host available). Test (4K120 and the two-pass cost): AV1 and
+  HEVC `--width=3840 --height=2160 --fps=120 --kbps=80000 --capture=synthetic-gpu --frames=1200`:
+  started `preset` p1; submit->output p95 below 8 ms (one frame interval); if not, record it
+  and try `multiPass` disabled at P1 (src/nvenc/nvenc_backend.cpp configure()). On GPUs with two
+  or more NVENC engines compare with a single engine (split-frame encoding is left on auto).
+- NVIDIA: unverified (no NVIDIA host available). Test (DDA + NVENC threads, the dxgiGate):
+  `--encode-test=dda.hevc --backend=nvenc --codec=hevc --capture=dda --fps=120 --frames=3600`
+  with a game at 120+ fps: submit->output p95 within the encode time + 2.5 ms (one 2 ms
+  AcquireNextFrame slice plus the gap), no "NVENC did not finish frame" error, no stalls;
+  then 30 minutes in recon-host with HAGS on (started `gpuPriority` high): no hang, no growth
+  in the helper's private bytes.
+- NVIDIA: unverified (no NVIDIA host available). Test (ROI): `--at=100:roi=900,500,128,128,10
+  --at=300:roi=off` on a 1920x1080 stream: no errors, the frames 100-299 a few percent larger
+  in that region (`ffmpeg -i FILE -vf "crop=128:128:900:500" ...` sharper), then back; with
+  `--codec=h264` too (16x16 blocks).
+- NVIDIA: unverified (no NVIDIA host available). Test (sessions and teardown): start a stream
+  while OBS records with NVENC and Chrome plays a video: the helper starts (or fails with
+  `init_failed` and the "limit of concurrent NVENC sessions" hint); stopping recon-host's
+  stream exits the helper within 500 ms (no watchdog exit code 4); a driver reset during a
+  stream (Win+Ctrl+Shift+B) ends the helper with the fatal `device_lost` and recon-host's
+  restart begins with an IDR.

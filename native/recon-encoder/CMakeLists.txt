@@ -53,8 +53,12 @@ add_executable(recon-encoder
     src/amf/amf_runtime.cpp
     src/codec/bitstream.cpp
     src/codec/ltr.cpp
+    src/codec/rfi.cpp
     src/codec/selftest.cpp
     src/nvenc/nvenc_backend.cpp
+    src/nvenc/nvenc_policy.cpp
+    src/nvenc/nvenc_runtime.cpp
+    src/nvenc/selftest.cpp
     src/capture/dda_capture.cpp
     src/capture/amd_direct_capture.cpp
     src/capture/wgc_capture.cpp
@@ -95,4 +99,20 @@ else()
     target_compile_definitions(recon-encoder PRIVATE __USE_MINGW_ANSI_STDIO=1)
     # Self-contained .exe: no libstdc++ / libgcc / winpthread DLLs next to it.
     target_link_options(recon-encoder PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+# recon-fake-nvenc.dll: a test double of the NVIDIA driver's NVENC runtime
+# (test/fake_nvenc.cpp) for `recon-encoder --self-test-nvenc=DLL`, which loads
+# it by its path. Never shipped or installed: the helper itself loads
+# nvEncodeAPI64.dll from System32 only, and releases bundle recon-encoder.exe alone.
+add_library(recon-fake-nvenc SHARED test/fake_nvenc.cpp test/fake_nvenc.def)
+target_include_directories(recon-fake-nvenc SYSTEM PRIVATE ${THIRD_PARTY}/nv-codec-headers/include)
+target_compile_definitions(recon-fake-nvenc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00)
+set_target_properties(recon-fake-nvenc PROPERTIES PREFIX "" RUNTIME_OUTPUT_DIRECTORY $<1:${CMAKE_BINARY_DIR}/bin>)
+if(MSVC)
+    target_compile_options(recon-fake-nvenc PRIVATE /W4 /permissive- /utf-8 /EHsc)
+else()
+    target_compile_options(recon-fake-nvenc PRIVATE -Wall -Wextra)
+    target_compile_definitions(recon-fake-nvenc PRIVATE __USE_MINGW_ANSI_STDIO=1)
+    target_link_options(recon-fake-nvenc PRIVATE -static -static-libgcc -static-libstdc++)
 endif()

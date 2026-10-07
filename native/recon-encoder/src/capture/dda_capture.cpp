@@ -33,7 +33,10 @@
 // threads). So each wait is a short slice (kAcquireSliceMs) followed by a short
 // sleep outside the call (kLockGapUs), in which the encoder's threads get the
 // lock: they wait at most a slice instead of up to a frame interval (or 100 ms
-// on an idle desktop), and a present is seen at most kLockGapUs late.
+// on an idle desktop), and a present is seen at most kLockGapUs late. Every
+// IDXGIOutputDuplication call also holds d3d::dxgiGate(), which the NVENC
+// output thread takes around NvEncLockBitstream / NvEncUnlockBitstream, so the
+// two never overlap even where NVENC does not go through the device lock.
 // docs/VENDOR_NOTES.md 3.2 has the VERIFY item (encoder output latency).
 #include <dxgi1_5.h>
 
@@ -161,16 +164,19 @@ Status DdaCapture::duplicate() {
     dup_.Reset();
     syncThreadDesktop();
     HRESULT hr;
-    ComPtr<IDXGIOutput5> o5;
-    if (SUCCEEDED(output_.output.As(&o5))) {
-        // B8G8R8A8 only for now: an HDR (FP16) desktop is converted to it by
-        // DXGI. Step 3.9 adds DXGI_FORMAT_R16G16B16A16_FLOAT for HDR streams.
-        const DXGI_FORMAT formats[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
-        hr = o5->DuplicateOutput1(dev_.device.Get(), 0, 1, formats, dup_.GetAddressOf());
-    } else {
-        ComPtr<IDXGIOutput1> o1;  // before Windows 10 1703
-        hr = output_.output.As(&o1);
-        if (SUCCEEDED(hr)) hr = o1->DuplicateOutput(dev_.device.Get(), dup_.GetAddressOf());
+    {
+        std::lock_guard<std::mutex> gate(d3d::dxgiGate());  // not while NVENC locks a bitstream (d3d/device.hpp)
+        ComPtr<IDXGIOutput5> o5;
+        if (SUCCEEDED(output_.output.As(&o5))) {
+            // B8G8R8A8 only for now: an HDR (FP16) desktop is converted to it by
+            // DXGI. Step 3.9 adds DXGI_FORMAT_R16G16B16A16_FLOAT for HDR streams.
+            const DXGI_FORMAT formats[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
+            hr = o5->DuplicateOutput1(dev_.device.Get(), 0, 1, formats, dup_.GetAddressOf());
+        } else {
+            ComPtr<IDXGIOutput1> o1;  // before Windows 10 1703
+            hr = output_.output.As(&o1);
+            if (SUCCEEDED(hr)) hr = o1->DuplicateOutput(dev_.device.Get(), dup_.GetAddressOf());
+        }
     }
     if (FAILED(hr)) {
         dup_.Reset();
@@ -189,7 +195,10 @@ Status DdaCapture::duplicate() {
 }
 
 void DdaCapture::releaseHeld() {
-    if (held_ && dup_) dup_->ReleaseFrame();
+    if (held_ && dup_) {
+        std::lock_guard<std::mutex> gate(d3d::dxgiGate());
+        dup_->ReleaseFrame();
+    }
     held_ = false;
 }
 
@@ -278,6 +287,7 @@ int DdaCapture::dirtyPercent(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint
     meta_.resize(fi.TotalMetadataBufferSize);
     UINT used = 0;
     double area = 0;
+    std::lock_guard<std::mutex> gate(d3d::dxgiGate());
     // Move rects first (their destinations changed), then dirty rects.
     if (FAILED(dup_->GetFrameMoveRects(UINT(meta_.size()), reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(meta_.data()), &used))) {
         return -1;
@@ -330,8 +340,13 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         releaseHeld();
         DXGI_OUTDUPL_FRAME_INFO fi{};
         ComPtr<IDXGIResource> res;
-        // A short slice: AcquireNextFrame holds the device lock while it waits (top of file).
-        const HRESULT hr = dup_->AcquireNextFrame(std::min(UINT(left), kAcquireSliceMs), &fi, res.GetAddressOf());
+        // A short slice: AcquireNextFrame holds the device lock while it waits,
+        // and NVENC must not lock a bitstream meanwhile (top of file).
+        HRESULT hr;
+        {
+            std::lock_guard<std::mutex> gate(d3d::dxgiGate());
+            hr = dup_->AcquireNextFrame(std::min(UINT(left), kAcquireSliceMs), &fi, res.GetAddressOf());
+        }
         now = qpcNow();
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             if (now >= deadline) return Next::Timeout;

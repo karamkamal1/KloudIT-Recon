@@ -206,6 +206,7 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"queryTimeout", cc.queryTimeout},
             {"alignW", cc.alignW},
             {"alignH", cc.alignH},
+            {"dynamicResolution", cc.dynamicResolution},
         };
         if (!cc.assumed.empty()) codecs[name]["assumed"] = cc.assumed;
     }
@@ -283,6 +284,9 @@ std::string encodeStarted(const Started& s) {
         {"queryTimeoutMs", s.queryTimeoutMs},
         {"zeroCopy", s.zeroCopy},
         {"intraRefreshFrames", s.intraRefreshFrames},
+        {"preset", s.preset},
+        {"asyncEncode", s.asyncEncode},
+        {"refFrames", s.refFrames},
     };
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }

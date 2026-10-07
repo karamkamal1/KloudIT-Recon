@@ -1,6 +1,5 @@
 // Real capture methods and encoder backends behind factories: the capture
-// methods (step 3.2) and the AMF encoder (3.3) are implemented; the NVENC
-// backend (3.4) still only probes for its runtime and reports "not available".
+// methods (step 3.2), the AMF encoder (3.3) and the NVENC encoder (3.4).
 #pragma once
 
 #include <windows.h>
@@ -25,12 +24,16 @@ Fn procAddress(HMODULE m, const char* name) {
 }
 
 // Encoders (amf/amf_backend.cpp, nvenc/nvenc_backend.cpp). probeAmf creates
-// each AMF encoder once on the first AMD adapter and reads its caps (cached
-// for the process).
+// each AMF encoder once on the first AMD adapter and reads its caps, probeNvenc
+// opens one NVENC session on the first NVIDIA adapter and reads every codec's
+// caps (both cached for the process).
 Probe probeAmf();
 std::unique_ptr<Backend> createAmfBackend(Status& err);
 Probe probeNvenc();
 std::unique_ptr<Backend> createNvencBackend(Status& err);
+// The NVENC caps from a new probe rather than the cached one (--self-test-nvenc
+// changes its test double's capabilities between probes).
+Caps probeNvencCaps();
 
 // Capture (capture/*.cpp).
 Probe probeDdaCapture();

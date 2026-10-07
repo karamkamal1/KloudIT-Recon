@@ -133,12 +133,15 @@ type CodecCaps struct {
 	IntraRefresh      bool   `json:"intraRefresh"`
 	LiveBitrate       string `json:"liveBitrate"` // seamless | flush | restart
 	MaxTemporalLayers int    `json:"maxTemporalLayers"`
-	ROI               string `json:"roi"` // importance | emphasis | none
+	ROI               string `json:"roi"` // importance (AMF) | emphasis (NVENC QP delta map) | none
 	SliceOutput       bool   `json:"sliceOutput"`
 	HWInstances       int    `json:"hwInstances"`
 	QueryTimeout      bool   `json:"queryTimeout"`
 	AlignW            int    `json:"alignW"`
 	AlignH            int    `json:"alignH"`
+	// DynamicResolution: the running encoder can change its coded size
+	// without a new session (NVENC); no control message uses it yet.
+	DynamicResolution bool `json:"dynamicResolution"`
 	// Assumed names the fields above that are documented or default values,
 	// not detected on this GPU (e.g. AMF AV1 "roi", "liveBitrate" until the
 	// step 3.6 qualification); omitted when everything was detected.
@@ -199,6 +202,12 @@ type Started struct {
 	QueryTimeoutMs     int    `json:"queryTimeoutMs"`     // blocking output wait, 0 = polled
 	ZeroCopy           bool   `json:"zeroCopy"`           // capture surfaces encoded without the NV12 conversion
 	IntraRefreshFrames int    `json:"intraRefreshFrames"` // intra refresh cycle, 0 = off
+	// NVENC (step 3.4; other backends leave them empty): the preset "p1".."p7",
+	// whether the output comes by completion events (async) or by polling, and
+	// the reference frames the encoder keeps (the invalidation window).
+	Preset      string `json:"preset"`
+	AsyncEncode bool   `json:"asyncEncode"`
+	RefFrames   int    `json:"refFrames"`
 }
 
 // CaptureChanged reports a change of the capture source. Reason "resized":
