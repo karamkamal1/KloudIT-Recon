@@ -161,7 +161,7 @@ func (a *Agent) monitors() []platform.Monitor {
 func (a *Agent) cursorSupported() bool { return runtime.GOOS == "windows" && a.cfg.Capture != "test" }
 
 func (a *Agent) features() []string {
-	f := []string{"text", "keyboard", "mouse", proto.FeatureFrameExt}
+	f := []string{"text", "keyboard", "mouse"}
 	if a.cfg.Audio {
 		f = append(f, "audio")
 	}

@@ -31,6 +31,11 @@ type Frame struct {
 // means the pts did not carry the capture clock (the stamp is dropped).
 const maxCaptureToEncoded = 2_000_000 // µs
 
+// wallOffsetEvery is how often the wall-clock to host-clock offset is
+// re-measured: the two clocks drift apart (Windows: QPC vs a wall clock that
+// W32Time slews and steps), and a generation can last a whole session.
+const wallOffsetEvery = 1_000_000 // µs
+
 // VideoEvent is delivered in order on Video.Events().
 type VideoEvent struct {
 	Config *proto.VideoConfig // a new generation starts with the next frame
@@ -65,7 +70,6 @@ type encProc struct {
 	started time.Time
 	killed  bool
 	errDone chan struct{} // closed when stderr is fully consumed
-	wallOff int64         // CaptureClock: wall clock minus host clock (µs)
 }
 
 // NewVideo creates a manager. clock returns the host monotonic time in µs.
@@ -116,9 +120,6 @@ func (v *Video) Start(p Params, urgent bool) error {
 		v.log.Info("starting encoder", "gen", pr.gen, "encoder", p.Encoder.Name, "capture", p.Source.Backend,
 			"fps", p.FPS, "kbps", p.BitrateKbps, "size", fmt.Sprintf("%dx%d", p.Width, p.Height))
 		v.log.Debug("ffmpeg args", "args", args)
-	}
-	if p.CaptureClock {
-		pr.wallOff = wallOffset(v.clock) // per generation: follows wall-clock adjustments
 	}
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -201,6 +202,8 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 	var params *codec.Params
 	var seq uint32
 	var pts0 int64
+	var wallOff int64 // CaptureClock: wall clock minus host clock (µs)
+	var wallOffAt uint64
 	warnedStamp := false
 	defer func() {
 		select {
@@ -259,8 +262,11 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 		}
 		f := &Frame{Gen: pr.gen, Seq: seq, Key: pkt.Key, PtsUs: pts - pts0, EncodeDoneUs: done, Data: data}
 		if pr.params.CaptureClock {
-			// pts is the wall-clock capture time (setpts=RTCTIME).
-			if c := pts - pr.wallOff; c > 0 && uint64(c) <= done && done-uint64(c) <= maxCaptureToEncoded {
+			if seq == 0 || done-wallOffAt >= wallOffsetEvery {
+				wallOff, wallOffAt = wallOffset(v.clock), done
+			}
+			// pts is the wall-clock capture time (CaptureClockFilter).
+			if c := pts - wallOff; c > 0 && uint64(c) <= done && done-uint64(c) <= maxCaptureToEncoded {
 				f.CaptureUs = uint64(c)
 			} else if !warnedStamp && v.log != nil {
 				warnedStamp = true

@@ -25,7 +25,7 @@ type Config struct {
 	Encoder    string `json:"encoder,omitempty"` // force an encoder, e.g. hevc_nvenc
 	DrawCursor bool   `json:"drawCursor"`        // bake the cursor into the video instead of local rendering
 	// CaptureTimestamps "off" stops stamping frames with their capture time
-	// (FFmpeg setpts=RTCTIME + a µs encoder time base); default auto = on.
+	// (FFmpeg setpts=time(0)*1000000 + a µs encoder time base); default auto = on.
 	CaptureTimestamps string `json:"captureTimestamps,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)

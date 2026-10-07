@@ -37,6 +37,8 @@ type Caps struct {
 	Encoders []EncoderInfo     // usable encoders, best first
 	Rejected map[string]string // encoder built into ffmpeg -> why its test encode failed
 	options  map[string]map[string]bool
+
+	captureClock bool // CaptureClockFilter and a µs encoder time base work
 }
 
 // candidate encoders in preference order within a family.
@@ -101,6 +103,13 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts"} {
 		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
 			c.Filters[f] = true
+		}
+	}
+	if c.Filters["settb"] && c.Filters["setpts"] {
+		if err := testCaptureClock(ctx, ffmpeg, CaptureClockFilter); err == nil {
+			c.captureClock = true
+		} else if log != nil {
+			log.Info("capture timestamps unavailable", "err", err)
 		}
 	}
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-encoders").Output()
@@ -168,6 +177,22 @@ func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 	args = append(args, "-c:v", e.Name, "-f", "null", "-")
 	var stderr bytes.Buffer
 	cmd := quietCmd(ctx, ffmpeg, args...)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
+	}
+	return nil
+}
+
+// testCaptureClock runs the exact capture-clock filter and encoder time base
+// BuildArgs uses, so a build that rejects them loses only the capture stamps.
+func testCaptureClock(ctx context.Context, ffmpeg, filter string) error {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	cmd := quietCmd(ctx, ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "color=c=black:s=64x64:r=30", "-frames:v", "1",
+		"-vf", filter, "-enc_time_base", "1:1000000", "-f", "null", "-")
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
@@ -247,14 +272,19 @@ type Params struct {
 	Quality     string // speed | balanced | quality
 	DrawCursor  bool
 	// CaptureClock stamps every frame with its wall-clock capture time: pts
-	// become RTCTIME (µs) right after the source and the encoder runs at a µs
-	// time base (it still gets the frame rate for rate control). Video turns
-	// them into Frame.CaptureUs.
+	// become the wall clock in µs right after the source (CaptureClockFilter)
+	// and the encoder runs at a µs time base (it still gets the frame rate for
+	// rate control). Video turns them into Frame.CaptureUs.
 	CaptureClock bool
 }
 
-// CanStampCapture reports whether this FFmpeg build has the filters CaptureClock needs.
-func (c *Caps) CanStampCapture() bool { return c.Filters["settb"] && c.Filters["setpts"] }
+// CaptureClockFilter sets each frame's pts to the wall clock (av_gettime())
+// in µs. time(0) replaces setpts' deprecated RTCTIME constant.
+const CaptureClockFilter = "settb=AVTB,setpts=time(0)*1000000"
+
+// CanStampCapture reports whether this FFmpeg build ran CaptureClock's filter
+// and encoder time base in the probe.
+func (c *Caps) CanStampCapture() bool { return c.captureClock }
 
 var safeRegex = regexp.MustCompile(`^[A-Za-z0-9 _.\-()*+?^$|\[\]]{1,128}$`)
 
@@ -330,7 +360,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	if p.CaptureClock {
 		// Evaluated as the frame leaves the source (after realtime pacing for
 		// the test source), before any conversion or encoding.
-		chain += ",settb=AVTB,setpts=RTCTIME"
+		chain += "," + CaptureClockFilter
 	}
 
 	// Convert into what the encoder accepts.

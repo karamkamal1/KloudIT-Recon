@@ -279,7 +279,7 @@ The new password (at least 10 characters) is read from stdin.
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
 | `directAddr` | auto | Address to advertise for the direct path |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
-| `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=RTCTIME`); the overlay then shows send→draw latency |
+| `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 

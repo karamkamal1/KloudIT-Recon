@@ -76,8 +76,14 @@ function check(name, ok, detail = '') {
 }
 
 // Per-stage latency (frame header extension + client marks): (a) every stage
-// is reported and non-negative, (b) per frame the stages add up to end-to-end
-// (mean within ±2 ms), recomputed here from the raw timestamps.
+// is reported and non-negative, (b) bookkeeping: per frame the stages add up
+// to end-to-end (mean within ±2 ms), recomputed here from the raw timestamps.
+// (b) holds by construction (each stage is the difference of neighbouring
+// marks of the same frame, so the sum telescopes): it catches a stage that is
+// dropped, counted twice or taken from the wrong marks, not a wrong clock
+// offset or wrong host stamps. The host-log check further down compares the
+// client's capture and queue rows with the host's own measurement; the 0.2
+// frame barcode is the independent reference for end-to-end.
 const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'draw', 'display'];
 async function checkStages(name, st) {
   const lat = st?.stages;
@@ -101,7 +107,7 @@ async function checkStages(name, st) {
   }
   const diff = n ? Math.abs(sum - e2e) / n : Infinity;
   const ddiff = dn ? Math.abs(dsum - de2e) / dn : Infinity;
-  check(`${name}: stages add up to end-to-end (±2 ms)`, n >= 20 && diff <= 2 && ddiff <= 2,
+  check(`${name}: stage bookkeeping: per-frame stages sum to end-to-end (structural, ±2 ms)`, n >= 20 && diff <= 2 && ddiff <= 2,
     `${n} frames: mean sum ${(sum / n).toFixed(2)} vs end-to-end ${(e2e / n).toFixed(2)} ms; ${dn} with display est: ${(dsum / dn).toFixed(2)} vs ${(de2e / dn).toFixed(2)} ms`);
   results.push({ stages: name, summary: lat, frames: dump.length });
 }
@@ -275,6 +281,16 @@ try {
       const hostProc = procs.find((p) => p.spawnargs.includes('run'));
       const line = await until(() => (hostProc.log.match(/msg="latency stages[^\n]*/) || [])[0], 15000, 'stage summary in the host log').catch(() => '');
       check('host logs the client stage summary with encoder and vendor', /encoder=\S+ vendor=\S+/.test(line) && / e2e=/.test(line), line.replace(/^.*?msg=/, '').slice(0, 260));
+      // Reference outside the client's clock sync and stage arithmetic: the host's
+      // own capture->encoded and queue times of the frames the client acknowledged
+      // (the frames it records stages for) in the same 10 s. Equal p50s mean the
+      // stamps reach the client intact and its percentiles are right; they do not
+      // validate the host stamps themselves (the 0.2 barcode does).
+      const p50 = (key) => Number((line.match(new RegExp(` ${key}="([\\d.]+)/`)) || [])[1] ?? NaN);
+      const rows = ['capture', 'queue'].map((k) => ({ k, client: p50(k), host: p50(`host_${k}`) }));
+      check("client capture/queue p50 match the host's own measurement (±max(2 ms, 10 %))",
+        rows.every((r) => Math.abs(r.client - r.host) <= Math.max(2, 0.1 * r.host)),
+        rows.map((r) => `${r.k}: client ${r.client} vs host ${r.host} ms`).join('; '));
     }
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }

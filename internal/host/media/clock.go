@@ -10,7 +10,7 @@ func NewClock() func() uint64 {
 }
 
 // wallOffset returns FFmpeg's wall clock (av_gettime(): µs since the Unix
-// epoch, the domain of setpts=RTCTIME) minus clock(), from the tightest of a
+// epoch, the domain of CaptureClockFilter) minus clock(), from the tightest of a
 // few back-to-back readings.
 func wallOffset(clock func() uint64) int64 {
 	best, span := int64(0), uint64(math.MaxUint64)

@@ -6,7 +6,7 @@ import (
 )
 
 // TestClock checks the host clock's resolution and rate, and that the wall
-// clock offset used for FFmpeg's RTCTIME stamps is stable.
+// clock offset used for FFmpeg's wall-clock stamps is stable.
 func TestClock(t *testing.T) {
 	clock := NewClock()
 	// Resolution: consecutive readings must advance in well under a timer tick.

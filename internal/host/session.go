@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,8 +70,9 @@ type Session struct {
 	padGates [4]input.SeqGate
 	padWarn  sync.Once
 
-	stats  sessionStats
-	onAuth func()
+	stats      sessionStats
+	hostStages hostStages
+	onAuth     func()
 }
 
 type sessionStats struct {
@@ -262,6 +264,9 @@ func (s *Session) sendWelcome() error {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
 	w.Features = s.a.features()
+	if s.hello.V >= proto.HelloVersionFrameExt {
+		w.Features = append(w.Features, proto.FeatureFrameExt)
+	}
 	return s.sendJSON(w)
 }
 
@@ -560,18 +565,6 @@ func (s *Session) frameSender() {
 			return
 		case f = <-s.frameQ:
 		}
-		h := proto.FrameHeader{Type: proto.FrameTypeVideo, Gen: f.Gen, Seq: f.Seq, PtsUs: uint64(f.PtsUs)}
-		if f.Key {
-			h.Flags |= proto.FrameFlagKey
-		}
-		var ext proto.FrameExt
-		if s.hello.V >= proto.HelloVersionFrameExt {
-			h.Flags |= proto.FrameFlagExt
-			ext.Set(proto.ExtEncodeDoneUs, f.EncodeDoneUs)
-			if f.CaptureUs != 0 {
-				ext.Set(proto.ExtCaptureUs, f.CaptureUs)
-			}
-		}
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 		st, err := s.c.OpenUniStreamSync(ctx)
 		cancel()
@@ -582,9 +575,7 @@ func (s *Session) frameSender() {
 			s.log.Debug("open frame stream", "err", err)
 			continue
 		}
-		// SendUs is the moment the frame is handed to the transport, so
-		// encodeDone -> send is the host queue (frame queue + stream credit).
-		h.SendUs = s.a.clock()
+		h, ext := videoHeader(f, s.hello.V, s.a.clock())
 		buf = buf[:proto.FrameHeaderLen]
 		h.Marshal(buf)
 		if h.Flags&proto.FrameFlagExt != 0 {
@@ -599,7 +590,35 @@ func (s *Session) frameSender() {
 		st.Close()
 		s.stats.frames.Add(1)
 		s.stats.bytes.Add(int64(len(buf)))
+		if h.Flags&proto.FrameFlagExt != 0 {
+			s.hostStages.sentFrame(f, h.SendUs)
+		}
 	}
+}
+
+// videoHeader builds a video frame's header, plus the extension for clients
+// that parse it. now is the host clock as the frame goes to the transport.
+func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, proto.FrameExt) {
+	h := proto.FrameHeader{Type: proto.FrameTypeVideo, Gen: f.Gen, Seq: f.Seq, PtsUs: uint64(f.PtsUs)}
+	if f.Key {
+		h.Flags |= proto.FrameFlagKey
+	}
+	var ext proto.FrameExt
+	if helloV < proto.HelloVersionFrameExt {
+		// v1 clients use SendUs as the encoder-out time (congestion detection,
+		// frame acks, latency readout): keep that meaning for them.
+		h.SendUs = f.EncodeDoneUs
+		return h, ext
+	}
+	// SendUs is the moment the frame is handed to the transport, so
+	// encodeDone -> send is the host queue (frame queue + stream credit).
+	h.SendUs = now
+	h.Flags |= proto.FrameFlagExt
+	ext.Set(proto.ExtEncodeDoneUs, f.EncodeDoneUs)
+	if f.CaptureUs != 0 {
+		ext.Set(proto.ExtCaptureUs, f.CaptureUs)
+	}
+	return h, ext
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +724,7 @@ func (s *Session) datagrams() {
 			}
 		case proto.DgFrameAck:
 			if a, ok := proto.ParseFrameAck(d); ok {
+				s.hostStages.acked(a.Gen, a.Seq, s.a.clock())
 				s.stats.acks.Add(1)
 				owd := int64(a.OWDUs)
 				s.stats.owdSum.Add(owd)
@@ -875,12 +895,88 @@ func (s *Session) controlLoop() error {
 	}
 }
 
+// hostStages keeps the host's own capture->encoded and queue times of the
+// frames a v2 client acknowledged in the last 10 s (it acks exactly the frames
+// it records stages for). They are logged next to the client's summary as a
+// reference for its rows that needs no clock sync.
+type hostStages struct {
+	mu   sync.Mutex
+	sent [512]hostStage // recent frames by seq, until acknowledged
+	recs []hostStage    // acknowledged frames, oldest first
+}
+
+type hostStage struct {
+	gen            uint8
+	seq            uint32
+	at             uint64  // host clock when sent, then when acknowledged
+	capture, queue float64 // ms; capture < 0: no capture stamp
+}
+
+const stageWindowUs = 10_000_000
+
+func (h *hostStages) sentFrame(f *media.Frame, sentUs uint64) {
+	r := hostStage{gen: f.Gen, seq: f.Seq, at: sentUs, capture: -1, queue: float64(sentUs-f.EncodeDoneUs) / 1000}
+	if f.CaptureUs != 0 {
+		r.capture = float64(f.EncodeDoneUs-f.CaptureUs) / 1000
+	}
+	h.mu.Lock()
+	h.sent[f.Seq%uint32(len(h.sent))] = r
+	h.mu.Unlock()
+}
+
+func (h *hostStages) acked(gen uint8, seq uint32, now uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r := &h.sent[seq%uint32(len(h.sent))]
+	if r.at == 0 || r.gen != gen || r.seq != seq {
+		return // unknown, already counted or overwritten
+	}
+	a := *r
+	r.at = 0
+	a.at = now
+	h.recs = append(h.recs, a)
+	i := 0
+	for i < len(h.recs) && now-h.recs[i].at > stageWindowUs {
+		i++
+	}
+	h.recs = h.recs[i:]
+}
+
+// summary returns "p50/p95/p99 n=N" (as the client reports them) of the host's
+// capture->encoded and queue times over the 10 s before now; "" if none.
+func (h *hostStages) summary(now uint64) (capture, queue string) {
+	h.mu.Lock()
+	var c, q []float64
+	for _, r := range h.recs {
+		if now-r.at > stageWindowUs {
+			continue
+		}
+		if r.capture >= 0 {
+			c = append(c, r.capture)
+		}
+		q = append(q, r.queue)
+	}
+	h.mu.Unlock()
+	return pctString(c), pctString(q)
+}
+
+// pctString formats percentiles with the client's definition (sorted[floor(p*n)]).
+func pctString(v []float64) string {
+	if len(v) == 0 {
+		return ""
+	}
+	sort.Float64s(v)
+	q := func(p float64) float64 { return v[min(len(v)-1, int(p*float64(len(v))))] }
+	return fmt.Sprintf("%.1f/%.1f/%.1f n=%d", q(0.5), q(0.95), q(0.99), len(v))
+}
+
 // stageNames are the rows a client latency summary may contain.
 var stageNames = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
 	"decode": true, "draw": true, "display": true, "e2e": true}
 
 // logStages records a client's per-stage latency summary next to the encoder
-// that produced the frames, so results can be compared per GPU vendor.
+// that produced the frames, so results can be compared per GPU vendor, and
+// the host's own measurement of its stages (host_capture, host_queue).
 func (s *Session) logStages(rows []proto.StageStat) {
 	p, ok := s.video.Active()
 	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
@@ -897,7 +993,13 @@ func (s *Session) logStages(rows []proto.StageStat) {
 		}
 		args = append(args, r.Name, fmt.Sprintf("%.1f/%.1f/%.1f n=%d", r.P50, r.P95, r.P99, r.N))
 	}
-	s.log.Info("latency stages p50/p95/p99 ms (client, last 10 s)", args...)
+	if c, q := s.hostStages.summary(s.a.clock()); q != "" {
+		if c != "" {
+			args = append(args, "host_capture", c)
+		}
+		args = append(args, "host_queue", q)
+	}
+	s.log.Info("latency stages p50/p95/p99 ms, last 10 s (client; host_*: measured by the host)", args...)
 }
 
 func (s *Session) statsLoop() {

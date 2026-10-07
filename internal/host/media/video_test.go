@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,12 +60,12 @@ func TestBuildArgsEscaping(t *testing.T) {
 	if strings.Contains(joined, "hwdownload") {
 		t.Fatal("NVENC path must stay on the GPU")
 	}
-	if strings.Contains(joined, "RTCTIME") || strings.Contains(joined, "enc_time_base") {
+	if strings.Contains(joined, "setpts") || strings.Contains(joined, "enc_time_base") {
 		t.Fatal("capture clock without CaptureClock")
 	}
 	args, _ = caps.BuildArgs(Params{Source: Source{Backend: "ddagrab", Output: 1}, Encoder: enc, FPS: 144, BitrateKbps: 30000, CaptureClock: true})
 	joined = strings.Join(args, " ")
-	if !strings.Contains(joined, "dup_frames=0,settb=AVTB,setpts=RTCTIME[v]") || !strings.Contains(joined, "-enc_time_base 1:1000000") {
+	if !strings.Contains(joined, "dup_frames=0,settb=AVTB,setpts=time(0)*1000000[v]") || !strings.Contains(joined, "-enc_time_base 1:1000000") {
 		t.Fatalf("capture clock args: %s", joined)
 	}
 }
@@ -75,7 +76,15 @@ func TestBuildArgsEscaping(t *testing.T) {
 func TestCaptureClock(t *testing.T) {
 	caps := probeOrSkip(t)
 	if !caps.CanStampCapture() {
+		if caps.Filters["settb"] && caps.Filters["setpts"] {
+			t.Fatalf("probe rejected %s: %v", CaptureClockFilter, testCaptureClock(context.Background(), caps.FFmpeg, CaptureClockFilter))
+		}
 		t.Skip("ffmpeg lacks settb/setpts")
+	}
+	// The probe must reject an expression this build cannot evaluate (e.g. a
+	// constant a future FFmpeg drops), so only the stamps are lost.
+	if err := testCaptureClock(context.Background(), caps.FFmpeg, "settb=AVTB,setpts=NO_SUCH_CONST"); err == nil {
+		t.Fatal("probe accepted an invalid capture clock expression")
 	}
 	for _, name := range []string{"libx264", "libsvtav1"} {
 		var enc EncoderInfo
@@ -159,6 +168,59 @@ func TestCaptureClock(t *testing.T) {
 				t.Fatalf("implausible capture->encoded p50 %.2f ms", got.p50)
 			}
 		})
+	}
+}
+
+// TestCaptureClockFollowsWallClock steps the host clock 500 ms ahead of the
+// wall clock in the middle of a generation (as a W32Time step or long drift
+// would) and checks that the capture stamps recover once the offset is
+// re-measured instead of staying off by the step for the rest of the generation.
+func TestCaptureClockFollowsWallClock(t *testing.T) {
+	caps := probeOrSkip(t)
+	enc, ok := caps.Best("h264")
+	if !ok || !caps.CanStampCapture() {
+		t.Skip("no h264 encoder or capture clock")
+	}
+	const step = 500_000 // µs
+	base := NewClock()
+	var jump atomic.Uint64
+	v := NewVideo(caps, nil, func() uint64 { return base() + jump.Load() })
+	defer v.Stop()
+	p := Params{Source: Source{Backend: "test", NativeW: 320, NativeH: 180}, Encoder: enc, FPS: 60, BitrateKbps: 1000, CaptureClock: true}
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	var stepped time.Time
+	var after []float64 // capture -> encoded (ms), frames encoded >= 1.5 s after the step
+	deadline := time.After(30 * time.Second)
+	for len(after) < 60 {
+		select {
+		case ev := <-v.Events():
+			if ev.Err != nil {
+				t.Fatal(ev.Err)
+			}
+			f := ev.Frame
+			if f == nil {
+				continue
+			}
+			if f.Seq == 30 {
+				jump.Store(step)
+				stepped = time.Now()
+			}
+			if !stepped.IsZero() && time.Since(stepped) >= 1500*time.Millisecond {
+				if f.CaptureUs == 0 {
+					t.Fatalf("frame %d: no capture stamp", f.Seq)
+				}
+				after = append(after, float64(f.EncodeDoneUs-f.CaptureUs)/1000)
+			}
+		case <-deadline:
+			t.Fatalf("timeout (%d frames after the step)", len(after))
+		}
+	}
+	sort.Float64s(after)
+	t.Logf("capture->encoded after a %d ms host clock step: p50 %.2f max %.2f ms", step/1000, after[len(after)/2], after[len(after)-1])
+	if after[len(after)/2] > step/1000/2 {
+		t.Fatalf("capture stamps still off by the clock step: p50 %.2f ms", after[len(after)/2])
 	}
 }
 

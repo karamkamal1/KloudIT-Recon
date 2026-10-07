@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -218,9 +219,25 @@ func hello(ticket string, v int) []byte {
 // result of a streaming run.
 type result struct {
 	configs, frames, keyframes, audio int
-	extFrames, stamped, badFrames     int // frames with the header extension, with ordered stage stamps, unparsable
-	welcome                           bool
+	extFrames, stamped, badFrames     int  // frames with the header extension, with ordered stage stamps, unparsable
+	welcome, extFeature               bool // welcome received; it advertised the frame header extension
 	firstFrameLatency                 time.Duration
+}
+
+// control counts one control message.
+func (r *result) control(m []byte) {
+	var x struct {
+		T        string
+		Features []string
+	}
+	json.Unmarshal(m, &x)
+	switch x.T {
+	case "welcome":
+		r.welcome = true
+		r.extFeature = slices.Contains(x.Features, proto.FeatureFrameExt)
+	case "video":
+		r.configs++
+	}
 }
 
 // countFrame parses one frame stream and checks its stage timestamps:
@@ -246,12 +263,16 @@ func (r *result) countFrame(b []byte) {
 	}
 }
 
-// checkExt verifies the frame header extension: never sent to v1 clients,
-// on every frame (with capture/encode/send stamps) for v2 clients.
+// checkExt verifies the frame header extension: never sent or advertised to
+// v1 clients, advertised and on every frame (with capture/encode/send stamps)
+// for v2 clients.
 func checkExt(t *testing.T, r result, v int) {
 	t.Helper()
 	if r.badFrames > 0 {
 		t.Fatalf("%d unparsable frames", r.badFrames)
+	}
+	if r.extFeature != (v >= proto.HelloVersionFrameExt) {
+		t.Fatalf("v%d client: welcome advertises %s = %v", v, proto.FeatureFrameExt, r.extFeature)
 	}
 	if v < proto.HelloVersionFrameExt && r.extFrames > 0 {
 		t.Fatalf("v%d client got %d extended frame headers", v, r.extFrames)
@@ -312,15 +333,8 @@ func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, 
 			if err != nil {
 				return
 			}
-			var x struct{ T string }
-			json.Unmarshal(m, &x)
 			mu.Lock()
-			switch x.T {
-			case "welcome":
-				r.welcome = true
-			case "video":
-				r.configs++
-			}
+			r.control(m)
 			mu.Unlock()
 		}
 	}()
@@ -475,7 +489,7 @@ func TestStreamingPaths(t *testing.T) {
 		send := func(ch byte, p []byte) { ws.Write(ctx, websocket.MessageBinary, append([]byte{ch}, p...)) }
 		send(proto.WSControl, hello("", 2))
 		var r result // the gateway relays frames as messages: the extension must arrive untouched
-		var audio, configs int
+		var audio int
 		sentInput := false
 		end := time.Now().Add(3 * time.Second)
 		for time.Now().Before(end) {
@@ -485,9 +499,7 @@ func TestStreamingPaths(t *testing.T) {
 			}
 			switch m[0] {
 			case proto.WSControl:
-				if bytes.Contains(m, []byte(`"t":"video"`)) {
-					configs++
-				}
+				r.control(m[1:])
 			case proto.WSFrame:
 				r.countFrame(m[1:])
 			case proto.WSDatagram:
@@ -502,8 +514,8 @@ func TestStreamingPaths(t *testing.T) {
 				send(proto.WSDatagram, proto.MouseRelDatagram(1, 12, -10))
 			}
 		}
-		t.Logf("websocket: configs=%d frames=%d audio=%d ext=%d", configs, r.frames, audio, r.extFrames)
-		if configs < 1 || r.frames < 100 || audio < 100 {
+		t.Logf("websocket: configs=%d frames=%d audio=%d ext=%d", r.configs, r.frames, audio, r.extFrames)
+		if r.configs < 1 || r.frames < 100 || audio < 100 {
 			t.Fatal("websocket relay did not stream")
 		}
 		checkExt(t, r, 2)

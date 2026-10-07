@@ -46,8 +46,11 @@ extension: u16 ext_len | ext_len bytes of entries "u8 tag | u8 len | value (len 
 ```
 
 `gen` increases every time the encoder restarts, and `seq` restarts at 0 for each generation.
-`pts_us` counts from the generation's first frame. `send_us` is the host clock when the frame is
-handed to the transport (after the frame queue and opening its stream). The payload is an
+`pts_us` counts from the generation's first frame. For v2 clients (`hello.v >= 2`) `send_us` is the
+host clock when the frame is handed to the transport (after the frame queue and opening its
+stream), and the extension carries `encodeDoneUs`. v1 clients keep the old meaning: `send_us` is
+the encoder-out time (= `encodeDoneUs`), which they use for congestion detection, the `0x40`
+frame ack and their latency readout, so host queueing still counts as delay there. The payload is an
 Annex-B access unit (H.264/HEVC) or a temporal unit (AV1). Every key frame carries its parameter
 sets, so it can be decoded independently.
 
@@ -69,18 +72,23 @@ only advances with the timer tick). Readers skip unknown tags (`len` says how fa
 1–8 byte values for known tags; a block that overruns `ext_len` or the frame is rejected.
 
 Compatibility: the host sets bit 7 only for clients whose `hello` has `v >= 2`, and advertises
-`frame-ext` in `welcome.features`. v1 clients get the byte-identical 24-byte header. The gateway
+`frame-ext` in their `welcome.features`. v1 clients get the byte-identical 24-byte header with
+the old `send_us`, and no `frame-ext` feature. The gateway
 never parses frames (QUIC relay: stream splice; WebSocket: one `0x02` message per stream), so the
 extension passes unchanged on every path.
 
 **Capture time on the FFmpeg path.** FFmpeg's command line cannot report when a frame was
-captured, so the host makes the pts carry it: `settb=AVTB,setpts=RTCTIME` right after the source
-(after `realtime` for the test source) sets each frame's pts to the wall clock in µs, and
-`-enc_time_base 1:1000000` keeps that precision through the encoder and NUT. The encoder still
-gets the source frame rate for rate control (libx264 and libsvtav1 on FFmpeg 6.1 and 8.1: same
-bitrate and fps with and without). Per encoder generation the host measures wall clock minus host
-clock and converts each pts into `captureUs`; a stamp that is not 0–2 s before `encodeDoneUs` is
-dropped. Only clients with `v >= 2` get it; `"captureTimestamps": "off"` in `host.json` disables it.
+captured, so the host makes the pts carry it: `settb=AVTB,setpts=time(0)*1000000` right after the
+source (after `realtime` for the test source) sets each frame's pts to the wall clock in µs
+(`av_gettime()`, like setpts' deprecated `RTCTIME`), and `-enc_time_base 1:1000000` keeps that
+precision through the encoder and NUT. The encoder still gets the source frame rate for rate
+control (libx264 and libsvtav1 on FFmpeg 6.1 and 8.1: same bitrate and fps with and without). The
+probe runs this exact filter and time base once; if the FFmpeg build rejects them, frames simply
+carry no capture time. The host measures wall clock minus host clock at the first frame of each
+generation and again every second (on Windows the host clock is QPC while W32Time slews and steps
+the wall clock, and a generation can last a whole session), and converts each pts into
+`captureUs`; a stamp that is not 0–2 s before `encodeDoneUs` is dropped. Only clients with
+`v >= 2` get it; `"captureTimestamps": "off"` in `host.json` disables it.
 
 The client keeps a short **reorder buffer**: per-frame streams can finish out of order after a
 retransmission. A gap lasting longer than 150 ms is treated as a loss and triggers a key-frame
@@ -163,7 +171,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   timestamps off) end-to-end is labelled **stream latency (send→draw)**. Add the display
   estimate and your display's scan-out for glass-to-glass latency. The same numbers are on
   `window.__recon.lastStats.stages`, and every 10 s the client sends them to the host
-  (`{"t":"stages"}`), which logs them next to the encoder name and vendor.
+  (`{"t":"stages"}`), which logs them next to the encoder name and vendor, together with its own
+  capture→encoded and queue times of the frames the client acknowledged (`0x40`) in the same
+  10 s (`host_capture`, `host_queue`).
 
 ## Direct path
 
@@ -197,4 +207,5 @@ minimum-RTT sample, which is least affected by queueing. Every frame's host time
 local time, which gives per-frame one-way delay and stage latencies without synchronised wall
 clocks. Host-side stages (capture→encoded, host queue) need no conversion at all. Congestion
 detection and the `0x40` frame ack keep measuring from `encodeDoneUs` (the pre-extension meaning
-of `send_us`), so host queueing still counts as delay there.
+of `send_us`, which v1 clients still get in `send_us`), so host queueing still counts as delay
+there.

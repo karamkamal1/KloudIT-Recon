@@ -148,7 +148,7 @@ type FrameHeader struct {
 	Gen    uint8  // encoder generation; increments on every encoder (re)start
 	Seq    uint32 // frame sequence number within a generation
 	PtsUs  uint64 // presentation timestamp in microseconds (encoder timeline)
-	SendUs uint64 // host monotonic clock (µs) when the host started sending the frame
+	SendUs uint64 // host clock (µs): handed to the transport (hello v >= 2); v1 clients: encoder out (= ExtEncodeDoneUs)
 }
 
 func (h *FrameHeader) Marshal(b []byte) {
