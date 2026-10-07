@@ -121,7 +121,10 @@ if ($FFmpegPath) {
         # "master" build can require an NVIDIA driver released a few weeks ago).
         $zipName = $known.Keys | Where-Object { $_ -match '^ffmpeg-n(\d+\.\d+)-latest-win64-gpl-\1\.zip$' -and [version]$Matches[1] -ge [version]'8.1' } |
             Sort-Object { [version]($_ -replace '^ffmpeg-n(\d+\.\d+)-.*$', '$1') } | Select-Object -First 1
-        if (-not $zipName) { $zipName = 'ffmpeg-master-latest-win64-gpl.zip' }
+        if (-not $zipName) {
+            Write-Warning 'No FFmpeg 8.1+ release build is listed; falling back to the nightly master build.'
+            $zipName = 'ffmpeg-master-latest-win64-gpl.zip'
+        }
         $expected = $known[$zipName]
         if (-not $expected) { throw 'Could not find the FFmpeg checksum.' }
         Write-Step "Downloading FFmpeg ($zipName, about 200 MB; this can take a few minutes)"

@@ -76,7 +76,7 @@ Verified in the sandbox:
 - Not hardware-specific, found while testing: the FFmpeg 8.1 build's SVT-AV1 rejects the
   software AV1 arguments used on the host (`pred-struct=1` with VBR: "VBR Rate control is
   currently not supported for LOW_DELAY, use CBR mode"). The FFmpeg 6.1 build on Linux accepts
-  them. This only affects the software AV1 fallback on Windows.
+  them. This only affected the software AV1 fallback on Windows; fixed in 1.8 (explicit CBR).
 
 Hardware checks:
 
@@ -161,8 +161,8 @@ Verified in the sandbox:
   Through the Video manager, every frame decodes (FFmpeg, H.264 Annex B / AV1 in IVF) to a
   barcode equal to its `Frame.Seq`: 180/180 frames at 4000 and at 500 kbit/s, 960×540 60 fps,
   libx264 and libsvtav1 on FFmpeg 6.1.1, libx264 on FFmpeg 8.1.3 (BtbN win64 build) under Wine
-  (`internal/host/media` `TestBarcodeFilter`; libsvtav1 on 8.1 fails for the pre-existing reason
-  noted in 0.1). Frame rate and bitrate unchanged (FFmpeg 6.1.1: libx264 61.9 / 60.2 fps,
+  (`internal/host/media` `TestBarcodeFilter`; libsvtav1 on 8.1 failed for the reason in 0.1 until
+  1.8). Frame rate and bitrate unchanged (FFmpeg 6.1.1: libx264 61.9 / 60.2 fps,
   3.06 / 3.19 Mbit/s; libsvtav1 60.7 / 60.6 fps, 4.03 / 4.03 Mbit/s; 8.1.3 under Wine: libx264
   60.2 / 60.2 fps); capture→encoded p50 4.4 / 4.3 ms under Wine, 3.6 / 4.4 ms and 34 / 37 ms on
   Linux (run-to-run noise on a shared 4-core machine). Filter cost alone (`ffmpeg -benchmark`,
@@ -583,3 +583,87 @@ Not verified (needs real networks):
   then run the four netem profiles above for direct sessions and, on the host → gateway link
   as described above, for relay sessions, and compare with reno.
 - NVIDIA: unverified (no NVIDIA host available). Test: same as AMD on an RTX host.
+
+## 1.8 Housekeeping
+
+Verified in the sandbox:
+
+- verified (sandbox): `recon-host probe` prints the `ffmpeg -version` header in full (version,
+  compiler and library lines; not the configure line or the "Exiting with exit code 0" line
+  FFmpeg 8 adds) and, under each usable encoder, the exact command line `BuildArgs` returns for a
+  sample session: the browser client's defaults (60 fps, 30 Mbit/s, balanced) within the host's
+  `maxFps`/`maxKbps`, capture timestamps when the build supports them, ddagrab output 0 on
+  Windows and the 1920×1080 test pattern elsewhere. `internal/host/media` `TestWriteReport`
+  builds the report from the real `-version` and `-h encoder=` output of the FFmpeg 8.1.3 Windows
+  build (`testdata/ffmpeg81-*.txt`: av1/hevc/h264_amf, av1/hevc/h264_nvenc, libx264, libsvtav1;
+  parsed by the same functions as the probe) and checks that every printed command line splits
+  back into exactly the arguments `BuildArgs` returns; `TestCommandLineShells` passes them
+  through `sh` and PowerShell 7 and compares the arguments the program receives (a quoting
+  mutation fails it). Real runs: Linux with FFmpeg 6.1.1, and `recon-host.exe probe` under Wine
+  with FFmpeg 8.1.3 (version lines; libx264, libsvtav1 and libaom-av1 with ddagrab command lines,
+  the AMF/NVENC/QSV encoders under `unusable:` for lack of a GPU). The printed libx264 line run
+  from PowerShell with `pipe:1` replaced by `-frames:v 120 -y test.nut` writes 120 1920×1080
+  H.264 frames (ffprobe). `-t 10` instead of `-frames:v` writes nothing: with capture timestamps
+  the output pts are wall-clock µs. `-stats` in the place of `pipe:1` brings back the `frame=`
+  progress line that `-loglevel warning` hides (FFmpeg 6.1.1 and 8.1.3 under Wine).
+- verified (sandbox): software AV1 fallback on FFmpeg 8.1. FFmpeg's libsvtav1 wrapper asks for
+  VBR unless `-maxrate` equals `-b:v` (`config_enc_params` in libavcodec/libsvtav1.c, the same in
+  6.1 and 8.1). With low-delay prediction (`pred-struct=1`) SVT-AV1 1.7.0 (FFmpeg 6.1.1 on Linux)
+  logs "Low delay mode does not support VBR. Forcing RC mode to CBR"; SVT-AV1 4.2.0 (FFmpeg 8.1.3
+  Windows build) fails with "VBR Rate control is currently not supported for LOW_DELAY, use CBR
+  mode" / "Error setting encoder parameters: bad parameter". The host now passes `rc=2` (CBR) in
+  `-svtav1-params`. `-maxrate` = `-b:v` also selects CBR but SVT-AV1 1.7.0 rejects it ("Max
+  Bitrate must be greater than Target Bitrate"). The exact probe command line (1920×1080 test
+  pattern, 30 Mbit/s, capture clock) with `-frames:v 30` to NUT encodes 30 AV1 frames on both
+  builds (ffprobe), both log "BRC mode … CBR". On Linux the bitstream is byte-identical to the
+  one before the change (120 frames, 960×540, 4 Mbit/s: same MD5), so the browser E2E stream is
+  unchanged. The probe's test encode (3 black frames, no rate options) accepted libsvtav1 before
+  the fix too, so the probe could not catch this.
+- Under Wine, SVT-AV1 4.2 runs at about 10 fps at 960×540 through the Video manager
+  (`TestCaptureClock/libsvtav1` and `TestBarcodeFilter/libsvtav1` fail on frame rate; libx264
+  passes at 60 fps). That is Wine's thread synchronisation, not the encoder: 120 frames take
+  4.0 s user + 9.8 s system CPU (16.6 s wall); with `lp=1` (one thread) 1.5 s user + 0.8 s system
+  (37 fps including start-up); SVT-AV1 1.7.0 on Linux takes 2.3 s user. Real Windows speed: see
+  the hardware check. Also logged by SVT-AV1 4.2: "Preset M12 is mapped to M11" and "Non-RTC M10+
+  are meant for automation tooling usage. Visual artifacts may occur otherwise." `rtc=1` keeps M12
+  and silences that warning on 4.2, but 1.7.0 does not know it (the wrapper logs "Error parsing
+  option rtc: 1." and continues); not changed here.
+- verified (sandbox): gfxcapture is new in FFmpeg 8.1 (libavfilter/allfilters.c registers
+  `ff_vsrc_gfxcapture` in release/8.1, not in release/8.0). The error for a build without it now
+  says "need FFmpeg >= 8.1" (`TestWriteReport`); README and install-host.ps1 already said 8.1.
+- verified (sandbox): install-host.ps1 already pins the oldest ≥ 8.1 release build: its
+  selection code, run in pwsh 7 on BtbN's current `checksums.sha256` (n8.1 and n9.0 listed),
+  picks `ffmpeg-n8.1-latest-win64-gpl-8.1.zip`, and that zip matches the listed SHA-256 (the
+  Windows build used for all Wine checks). Changed: the fallback to the nightly master build, used
+  only if no ≥ 8.1 release build is listed, now prints a warning instead of happening silently.
+- verified (sandbox): latency label. The overlay already labels end-to-end "Stream latency
+  (send→draw)" whenever capture→draw is unavailable (some frame in the 10 s window without
+  capture stamps, e.g. `"captureTimestamps": "off"` or a v1 client, or no stage statistics). The
+  toolbar's latency pill had a fixed tooltip ("from the frame leaving the host encoder"), wrong
+  since Phase 0 made its number capture→draw: it now names the span it shows. The browser E2E
+  checks that it says capture→draw on all four paths.
+- AV1 on AMD with the current arguments: under Wine with FFmpeg 8.1.3, `av1_amf` with the
+  printed options fails before opening the device ("Unable to parse "header_insertion_mode"
+  option value "idr""), with `-header_insertion_mode gop` it gets as far as loading the AMF
+  runtime (A3; step 1.1 changes the AMD arguments).
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: run
+  `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`. Look for: version lines starting
+  `ffmpeg version n8.1`; `hevc_amf`, `h264_amf` and `av1_amf` as `encoder:` lines, each followed
+  by a command line with `ddagrab=output_idx=0:framerate=60` and `-c:v <encoder>`. Open
+  PowerShell in the folder of `ffmpeg.exe`, paste the `hevc_amf` line as `.\ffmpeg ...` with
+  `pipe:1` replaced by `-stats -frames:v 600 -y $env:TEMP\test.nut` and keep the mouse moving or
+  a video playing while it records (ddagrab runs with `dup_frames=0`: an unchanged screen
+  delivers no frames, and `-loglevel warning` hides the progress line unless `-stats` is given);
+  it must exit without an error and
+  `.\ffprobe -v error -count_frames -show_entries stream=codec_name,width,height,nb_read_frames
+  $env:TEMP\test.nut` must show hevc, the monitor's size and 600 frames. Repeat for `h264_amf`
+  and `av1_amf` (if the `av1_amf` line still has `-header_insertion_mode idr`, record the
+  expected parse error, see above). Software AV1: set `"encoder": "libsvtav1"` in host.json,
+  restart the agent, stream 60 s at 1920×1080 60 fps from Chrome: host.log has `encoder ready`
+  with `codec=av01…` and no "VBR Rate control" error; record the `stream stats` fps and the CPU
+  load (Task Manager). Hover the toolbar's latency pill: "End-to-end latency (capture→draw)".
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with the `hevc_nvenc`,
+  `h264_nvenc` and (RTX 40 and newer) `av1_nvenc` lines; all three must write 600 frames.

@@ -3,7 +3,7 @@
 //
 //	recon-host pair <code>   store the pairing code shown by the gateway
 //	recon-host run           connect to the gateway and serve streams
-//	recon-host probe         list usable encoders / capture backends
+//	recon-host probe         show ffmpeg, its encoders and their command lines
 package main
 
 import (
@@ -14,7 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sort"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -30,7 +30,8 @@ func usage() {
 Usage:
   recon-host [flags] pair <pairing-code>   pair this PC with a gateway
   recon-host [flags] run                   run the agent (default)
-  recon-host [flags] probe                 show encoders, capture backends and monitors
+  recon-host [flags] probe                 show ffmpeg, encoders (with their ffmpeg
+                                           command lines), capture backends and monitors
   recon-host version
 
 Flags:
@@ -107,19 +108,7 @@ func main() {
 		if caps == nil {
 			fatal(fmt.Errorf("cannot run %s: %w", ff, err))
 		}
-		fmt.Printf("ffmpeg:     %s\n            %s\n", ff, caps.Version)
-		fmt.Printf("capture:    ddagrab=%v gfxcapture=%v\n", caps.Filters["ddagrab"], caps.Filters["gfxcapture"])
-		for _, e := range caps.Encoders {
-			fmt.Printf("encoder:    %-12s %-5s %s\n", e.Name, e.Family, e.Vendor)
-		}
-		rejected := make([]string, 0, len(caps.Rejected))
-		for name := range caps.Rejected {
-			rejected = append(rejected, name)
-		}
-		sort.Strings(rejected)
-		for _, name := range rejected {
-			fmt.Printf("unusable:   %-12s %s\n", name, caps.Rejected[name])
-		}
+		caps.WriteReport(os.Stdout, probeSample(cfg, caps))
 		if err != nil {
 			fmt.Println("error:", err)
 		}
@@ -156,6 +145,26 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// probeSample is the session "recon-host probe" shows each encoder's ffmpeg
+// command line for: the browser client's defaults (60 fps, 30 Mbit/s,
+// balanced quality) within the host's limits, a client that takes capture
+// timestamps, ddagrab on the first output on Windows and the 1920x1080 test
+// pattern elsewhere.
+func probeSample(cfg *host.Config, caps *media.Caps) media.Params {
+	p := media.Params{
+		Source:       media.Source{Backend: "test", NativeW: 1920, NativeH: 1080},
+		FPS:          min(60, cfg.MaxFPS),
+		BitrateKbps:  min(30000, cfg.MaxKbps),
+		Quality:      "balanced",
+		DrawCursor:   cfg.DrawCursor,
+		CaptureClock: cfg.CaptureTimestamps != "off" && caps.CanStampCapture(),
+	}
+	if runtime.GOOS == "windows" {
+		p.Source = media.Source{Backend: "ddagrab", Output: 0}
+	}
+	return p
 }
 
 // tolerantMulti writes to every writer, ignoring individual failures. The

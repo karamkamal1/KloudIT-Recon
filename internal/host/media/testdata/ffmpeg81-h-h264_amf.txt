@@ -1,0 +1,121 @@
+Encoder h264_amf [AMD AMF H.264 Encoder]:
+    General capabilities: dr1 delay hardware 
+    Threading capabilities: none
+    Supported hardware devices: d3d11va d3d11va dxva2 dxva2 amf amf 
+    Supported pixel formats: nv12 yuv420p d3d11 dxva2_vld p010le amf bgr0 rgb0 bgra argb rgba x2bgr10le rgbaf16le
+h264_amf AVOptions:
+  -usage             <int>        E..V....... Encoder Usage (from -1 to 5) (default -1)
+     transcoding     0            E..V....... Generic Transcoding
+     ultralowlatency 1            E..V....... Ultra low latency usecase
+     lowlatency      2            E..V....... Low latency usecase
+     webcam          3            E..V....... Webcam
+     high_quality    4            E..V....... High quality usecase
+     lowlatency_high_quality 5            E..V....... Low latency yet high quality usecase
+  -profile           <int>        E..V....... Profile (from -1 to 257) (default -1)
+     main            77           E..V....... 
+     high            100          E..V....... 
+     constrained_baseline 256          E..V....... 
+     constrained_high 257          E..V....... 
+  -level             <int>        E..V....... Profile Level (from 0 to 62) (default auto)
+     auto            0            E..V....... 
+     1.0             10           E..V....... 
+     1.1             11           E..V....... 
+     1.2             12           E..V....... 
+     1.3             13           E..V....... 
+     2.0             20           E..V....... 
+     2.1             21           E..V....... 
+     2.2             22           E..V....... 
+     3.0             30           E..V....... 
+     3.1             31           E..V....... 
+     3.2             32           E..V....... 
+     4.0             40           E..V....... 
+     4.1             41           E..V....... 
+     4.2             42           E..V....... 
+     5.0             50           E..V....... 
+     5.1             51           E..V....... 
+     5.2             52           E..V....... 
+     6.0             60           E..V....... 
+     6.1             61           E..V....... 
+     6.2             62           E..V....... 
+  -latency           <boolean>    E..V....... enables low latency mode (default auto)
+  -quality           <int>        E..V....... Set the encoding quality preset (from -1 to 2) (default -1)
+     balanced        0            E..V....... Balanced
+     speed           1            E..V....... Prefer Speed
+     quality         2            E..V....... Prefer Quality
+  -preset            <int>        E..V....... Set the encoding quality preset (from -1 to 2) (default -1)
+     balanced        0            E..V....... Balanced
+     speed           1            E..V....... Prefer Speed
+     quality         2            E..V....... Prefer Quality
+  -rc                <int>        E..V....... Rate Control Method (from -1 to 6) (default -1)
+     cqp             0            E..V....... Constant Quantization Parameter
+     cbr             1            E..V....... Constant Bitrate
+     vbr_peak        2            E..V....... Peak Constrained Variable Bitrate
+     vbr_latency     3            E..V....... Latency Constrained Variable Bitrate
+     qvbr            4            E..V....... Quality Variable Bitrate
+     hqvbr           5            E..V....... High Quality Variable Bitrate
+     hqcbr           6            E..V....... High Quality Constant Bitrate
+  -qvbr_quality_level <int>        E..V....... Sets the QVBR quality level (from -1 to 51) (default -1)
+  -enforce_hrd       <boolean>    E..V....... Enforce HRD (default auto)
+  -filler_data       <boolean>    E..V....... Filler Data Enable (default auto)
+  -vbaq              <boolean>    E..V....... Enable VBAQ (default auto)
+  -frame_skipping    <boolean>    E..V....... Rate Control Based Frame Skip (default auto)
+  -qp_i              <int>        E..V....... Quantization Parameter for I-Frame (from -1 to 51) (default -1)
+  -qp_p              <int>        E..V....... Quantization Parameter for P-Frame (from -1 to 51) (default -1)
+  -qp_b              <int>        E..V....... Quantization Parameter for B-Frame (from -1 to 51) (default -1)
+  -preencode         <boolean>    E..V....... Pre-encode assisted rate control (default auto)
+  -max_au_size       <int>        E..V....... Maximum Access Unit Size for rate control (in bits) (from -1 to INT_MAX) (default -1)
+  -header_spacing    <int>        E..V....... Header Insertion Spacing (from -1 to 1000) (default -1)
+  -async_depth       <int>        E..V....... Set maximum encoding parallelism. Higher values increase output latency. (from 1 to 42) (default 16)
+  -bf_delta_qp       <int>        E..V....... B-Picture Delta QP (from -10 to 10) (default 4)
+  -bf_ref            <boolean>    E..V....... Enable Reference to B-Frames (default true)
+  -bf_ref_delta_qp   <int>        E..V....... Reference B-Picture Delta QP (from -10 to 10) (default 4)
+  -max_b_frames      <int>        E..V....... Maximum number of consecutive B Pictures (from -1 to 3) (default -1)
+  -bf                <int>        E..V....... B Picture Pattern (from -1 to 3) (default -1)
+  -intra_refresh_mb  <int>        E..V....... Intra Refresh MBs Number Per Slot in Macroblocks (from -1 to INT_MAX) (default -1)
+  -coder             <int>        E..V....... Coding Type (from 0 to 2) (default auto)
+     auto            0            E..V....... Automatic
+     cavlc           2            E..V....... Context Adaptive Variable-Length Coding
+     cabac           1            E..V....... Context Adaptive Binary Arithmetic Coding
+  -high_motion_quality_boost_enable <boolean>    E..V....... Enable High motion quality boost mode (default auto)
+  -me_half_pel       <boolean>    E..V....... Enable ME Half Pixel (default auto)
+  -me_quarter_pel    <boolean>    E..V....... Enable ME Quarter Pixel (default auto)
+  -forced_idr        <boolean>    E..V....... Force I frames to be IDR frames (default false)
+  -aud               <boolean>    E..V....... Inserts AU Delimiter NAL unit (default auto)
+  -smart_access_video <boolean>    E..V....... Enable Smart Access Video to enhance  performance by utilizing both APU and dGPU memory access (default auto)
+  -preanalysis       <boolean>    E..V....... Enable preanalysis (default auto)
+  -pa_activity_type  <int>        E..V....... Set the type of activity analysis (from -1 to 1) (default -1)
+     y               0            E..V....... activity y
+     yuv             1            E..V....... activity yuv
+  -pa_scene_change_detection_enable <boolean>    E..V....... Enable scene change detection (default auto)
+  -pa_scene_change_detection_sensitivity <int>        E..V....... Set the sensitivity of scene change detection (from -1 to 2) (default -1)
+     low             0            E..V....... low scene change detection sensitivity
+     medium          1            E..V....... medium scene change detection sensitivity
+     high            2            E..V....... high scene change detection sensitivity
+  -pa_static_scene_detection_enable <boolean>    E..V....... Enable static scene detection (default auto)
+  -pa_static_scene_detection_sensitivity <int>        E..V....... Set the sensitivity of static scene detection (from -1 to 2) (default -1)
+     low             0            E..V....... low static scene detection sensitivity
+     medium          1            E..V....... medium static scene detection sensitivity
+     high            2            E..V....... high static scene detection sensitivity
+  -pa_initial_qp_after_scene_change <int>        E..V....... The QP value that is used immediately after a scene change (from -1 to 51) (default -1)
+  -pa_max_qp_before_force_skip <int>        E..V....... The QP threshold to allow a skip frame (from -1 to 51) (default -1)
+  -pa_caq_strength   <int>        E..V....... Content Adaptive Quantization strength (from -1 to 2) (default -1)
+     low             0            E..V....... low Content Adaptive Quantization strength
+     medium          1            E..V....... medium Content Adaptive Quantization strength
+     high            2            E..V....... high Content Adaptive Quantization strength
+  -pa_frame_sad_enable <boolean>    E..V....... Enable Frame SAD algorithm (default auto)
+  -pa_ltr_enable     <boolean>    E..V....... Enable long term reference frame management (default auto)
+  -pa_lookahead_buffer_depth <int>        E..V....... Sets the PA lookahead buffer size (from -1 to 41) (default -1)
+  -pa_paq_mode       <int>        E..V....... Sets the perceptual adaptive quantization mode (from -1 to 1) (default -1)
+     none            0            E..V....... no perceptual adaptive quantization
+     caq             1            E..V....... caq perceptual adaptive quantization
+  -pa_taq_mode       <int>        E..V....... Sets the temporal adaptive quantization mode (from -1 to 2) (default -1)
+     none            0            E..V....... no temporal adaptive quantization
+     1               1            E..V....... temporal adaptive quantization mode 1
+     2               2            E..V....... temporal adaptive quantization mode 2
+  -pa_high_motion_quality_boost_mode <int>        E..V....... Sets the PA high motion quality boost mode (from -1 to 1) (default -1)
+     none            0            E..V....... no high motion quality boost
+     auto            1            E..V....... auto high motion quality boost
+  -pa_adaptive_mini_gop <boolean>    E..V....... Enable Adaptive MiniGOP (default auto)
+
+
+Exiting with exit code 0

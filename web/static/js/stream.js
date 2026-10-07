@@ -593,6 +593,11 @@ function onStats(st) {
   if (st.total !== null && st.total !== undefined) {
     pill.textContent = `${Math.round(st.total)} ms`;
     pill.className = `pill ${st.total < 25 ? '' : st.total < 50 ? 'mid' : 'high'}`;
+    // Capture->draw needs the host's capture stamps (frame-ext); without them
+    // the number starts when the frame leaves the host.
+    pill.title = st.stages?.from === 'capture'
+      ? 'End-to-end latency (capture→draw): from capture on the host until the frame is drawn on this screen'
+      : 'Stream latency (send→draw): from the frame leaving the host until it is drawn on this screen';
     S.history.push(st.total);
     if (S.history.length > 120) S.history.shift();
   }

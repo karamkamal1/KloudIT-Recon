@@ -40,6 +40,10 @@ type Caps struct {
 	Rejected map[string]string // encoder built into ffmpeg -> why its test encode failed
 	options  map[string]map[string]bool
 
+	// VersionInfo is "ffmpeg -version" without the configure line: version
+	// (= Version), compiler and library versions.
+	VersionInfo []string
+
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
 }
@@ -100,7 +104,7 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	if err != nil {
 		return nil, fmt.Errorf("running ffmpeg: %w", err)
 	}
-	c.Version = strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	c.Version, c.VersionInfo = parseVersion(out)
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
 	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts", "drawbox"} {
@@ -245,8 +249,31 @@ func testBarcode(ctx context.Context, ffmpeg string) error {
 
 var optLine = regexp.MustCompile(`^\s{1,4}-([A-Za-z0-9_\-]+)\s+<`)
 
+// parseVersion returns the first line of "ffmpeg -version" and its lines
+// without the (very long) configure line, blank lines and the "Exiting with
+// exit code" line FFmpeg 8 prints to stdout after -version.
+func parseVersion(out []byte) (first string, info []string) {
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "configuration:") || strings.HasPrefix(line, "Exiting with exit code") {
+			continue
+		}
+		info = append(info, line)
+	}
+	if len(info) > 0 {
+		first = info[0]
+	}
+	return first, info
+}
+
 func encoderOptions(ctx context.Context, ffmpeg, enc string) map[string]bool {
 	out, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-h", "encoder="+enc).Output()
+	return parseEncoderOptions(out)
+}
+
+// parseEncoderOptions returns the private AVOptions listed by
+// "ffmpeg -h encoder=<name>".
+func parseEncoderOptions(out []byte) map[string]bool {
 	m := map[string]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
 		if s := optLine.FindStringSubmatch(line); s != nil {
@@ -405,7 +432,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		gpuFrames = true
 	case "gfxcapture":
 		if !c.Filters["gfxcapture"] {
-			return nil, errors.New("this ffmpeg build lacks the gfxcapture filter (need FFmpeg >= 8.0)")
+			return nil, errors.New("this ffmpeg build lacks the gfxcapture filter (need FFmpeg >= 8.1)")
 		}
 		opts := []string{fmt.Sprintf("max_framerate=%d", p.FPS), "capture_cursor=" + cursor}
 		if p.Source.Window != "" {
@@ -589,7 +616,13 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 			a = append(a, common...)
 		case "libsvtav1":
 			opt("preset", "12")
-			opt("svtav1-params", "pred-struct=1:lookahead=0:scd=0")
+			// rc=2: CBR. FFmpeg's wrapper asks for VBR unless -maxrate equals
+			// -b:v; with low-delay prediction (pred-struct=1) SVT-AV1 1.7
+			// forces CBR with a warning, but 4.x fails ("VBR Rate control is
+			// currently not supported for LOW_DELAY, use CBR mode"). -maxrate
+			// = -b:v fails on 1.7 ("Max Bitrate must be greater than Target
+			// Bitrate"); rc=2 works on both.
+			opt("svtav1-params", "pred-struct=1:lookahead=0:scd=0:rc=2")
 			a = append(a, "-b:v", br, "-g", strconv.Itoa(gop))
 		case "libaom-av1":
 			opt("usage", "realtime")

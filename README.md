@@ -294,9 +294,15 @@ The new password (at least 10 characters) is read from stdin.
 
 Edit `host.json` with Notepad, then restart the agent: `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`.
 
-Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the detected encoders
-(and why any GPU encoder is unusable), capture backends, monitors and gamepad support. Flags go
-before the command: `recon-host.exe -v probe`.
+Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the FFmpeg version, the
+detected encoders (and why any GPU encoder is unusable), capture backends, monitors and gamepad
+support. Under each encoder it prints the exact FFmpeg command line the agent would run for it in
+a 60 fps, 30 Mbit/s session captured with ddagrab from display output 0. To try an encoder by
+hand, open PowerShell in the folder of `ffmpeg.exe` (the `ffmpeg:` line) and paste its line as
+`.\ffmpeg ...` with `pipe:1` replaced by `-stats -frames:v 600 -y $env:TEMP\test.nut`. ddagrab
+only delivers a frame when the screen or the mouse pointer changes, so keep something moving (move
+the mouse, play a video) until the `frame=` counter reaches 600. Flags go before the command:
+`recon-host.exe -v probe`.
 
 ## Troubleshooting
 
