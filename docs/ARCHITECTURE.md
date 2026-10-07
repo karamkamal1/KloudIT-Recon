@@ -40,12 +40,47 @@ Every session, whatever its transport, has four logical channels:
 ### Frame stream
 
 ```
-u8 type(1) | u8 flags(bit0=key) | u8 gen | u8 0 | u32 seq | u64 pts_us | u64 send_us | payload
+u8 type(1) | u8 flags | u8 gen | u8 0 | u32 seq | u64 pts_us | u64 send_us | [extension] | payload
+flags:     bit0 (0x01) key frame, bit7 (0x80) extension present
+extension: u16 ext_len | ext_len bytes of entries "u8 tag | u8 len | value (len bytes, LE)"
 ```
 
 `gen` increases every time the encoder restarts, and `seq` restarts at 0 for each generation.
-The payload is an Annex-B access unit (H.264/HEVC) or a temporal unit (AV1). Every key frame
-carries its parameter sets, so it can be decoded independently.
+`pts_us` counts from the generation's first frame. `send_us` is the host clock when the frame is
+handed to the transport (after the frame queue and opening its stream). The payload is an
+Annex-B access unit (H.264/HEVC) or a temporal unit (AV1). Every key frame carries its parameter
+sets, so it can be decoded independently.
+
+The **extension** carries per-frame stage timestamps and recovery metadata:
+
+| Tag | Field | Type | Meaning |
+|---|---|---|---|
+| 1 | `presentUs` | u64 | game present (native capture helper only) |
+| 2 | `captureUs` | u64 | frame captured (FFmpeg path: see below) |
+| 3 | `encodeSubmitUs` | u64 | frame submitted to the encoder (native helper only) |
+| 4 | `encodeDoneUs` | u64 | encoded frame read from the encoder (NUT packet off the pipe) |
+| 5 | `refFloor` | u32 | oldest frame a recovery frame references |
+| 6 | `ltrSlot` | u8 | long-term reference slot the frame is marked into |
+| 7 | `temporalLayer` | u8 | temporal layer id |
+
+All timestamps, including `send_us` and the pong's host time, are the **host clock**: monotonic
+µs since the agent started (QueryPerformanceCounter on Windows, where Go's own monotonic clock
+only advances with the timer tick). Readers skip unknown tags (`len` says how far) and accept
+1–8 byte values for known tags; a block that overruns `ext_len` or the frame is rejected.
+
+Compatibility: the host sets bit 7 only for clients whose `hello` has `v >= 2`, and advertises
+`frame-ext` in `welcome.features`. v1 clients get the byte-identical 24-byte header. The gateway
+never parses frames (QUIC relay: stream splice; WebSocket: one `0x02` message per stream), so the
+extension passes unchanged on every path.
+
+**Capture time on the FFmpeg path.** FFmpeg's command line cannot report when a frame was
+captured, so the host makes the pts carry it: `settb=AVTB,setpts=RTCTIME` right after the source
+(after `realtime` for the test source) sets each frame's pts to the wall clock in µs, and
+`-enc_time_base 1:1000000` keeps that precision through the encoder and NUT. The encoder still
+gets the source frame rate for rate control (libx264 and libsvtav1 on FFmpeg 6.1 and 8.1: same
+bitrate and fps with and without). Per encoder generation the host measures wall clock minus host
+clock and converts each pts into `captureUs`; a stamp that is not 0–2 s before `encodeDoneUs` is
+dropped. Only clients with `v >= 2` get it; `"captureTimestamps": "off"` in `host.json` disables it.
 
 The client keeps a short **reorder buffer**: per-frame streams can finish out of order after a
 retransmission. A gap lasting longer than 150 ms is treated as a loss and triggers a key-frame
@@ -118,9 +153,17 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
 - If the decoder falls behind (more than max(4, fps/10) frames in flight for 500 ms), it is reset
   and resynchronised from a fresh key frame, and the host is asked to back off. Latency can't grow
   without bound.
-- Displayed **stream latency** = time the frame was drawn − (host send timestamp converted to the
-  local clock). It covers network, reorder, decode and draw. Add the encoder's own time
-  (typically 2–5 ms with NVENC) and your display's scan-out to get true glass-to-glass latency.
+- **Per-stage latency** (overlay, Ctrl+Alt+Shift+S): every frame is split into
+  capture→encoded, host queue (encodeDone→send), network (send→first byte), transfer (first→last
+  byte; 0 over WebSocket, where a frame arrives as one message), reorder/wait (last byte→decode
+  submit), decode, draw and display (est.). The display estimate is the main thread's next
+  `requestAnimationFrame` after the draw, sampled at most every 50 ms, one mark in flight. The
+  overlay shows p50/p95/p99 over the last 10 s per stage and for **end-to-end (capture→draw)**,
+  the per-frame sum of the stages up to draw. Without a capture stamp (old host, capture
+  timestamps off) end-to-end is labelled **stream latency (send→draw)**. Add the display
+  estimate and your display's scan-out for glass-to-glass latency. The same numbers are on
+  `window.__recon.lastStats.stages`, and every 10 s the client sends them to the host
+  (`{"t":"stages"}`), which logs them next to the encoder name and vendor.
 
 ## Direct path
 
@@ -150,5 +193,8 @@ WebSocket clients, the gateway translates channel messages to and from QUIC stre
 
 Pings go out every second, plus a burst of 5 at session start. Each pong carries the host's
 monotonic clock. The client keeps the samples from the last 30 s and uses the offset from the
-minimum-RTT sample, which is least affected by queueing. Every frame's `send_us` converts to local
-time, which gives per-frame one-way delay and total latency without synchronised wall clocks.
+minimum-RTT sample, which is least affected by queueing. Every frame's host timestamps convert to
+local time, which gives per-frame one-way delay and stage latencies without synchronised wall
+clocks. Host-side stages (capture→encoded, host queue) need no conversion at all. Congestion
+detection and the `0x40` frame ack keep measuring from `encodeDoneUs` (the pre-extension meaning
+of `send_us`), so host queueing still counts as delay there.

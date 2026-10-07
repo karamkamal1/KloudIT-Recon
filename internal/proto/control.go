@@ -118,8 +118,21 @@ type Notice struct {
 
 // ClientMsg is the union of client->host control messages after Hello.
 type ClientMsg struct {
-	T       string `json:"t"` // settings | keyframe | congestion | bye
-	Prefs   *Prefs `json:"prefs,omitempty"`
-	DelayMs int    `json:"delayMs,omitempty"`
-	Reason  string `json:"reason,omitempty"`
+	T       string      `json:"t"` // settings | keyframe | congestion | stages | pause | resume | bye
+	Prefs   *Prefs      `json:"prefs,omitempty"`
+	DelayMs int         `json:"delayMs,omitempty"`
+	Reason  string      `json:"reason,omitempty"`
+	Stages  []StageStat `json:"stages,omitempty"` // "stages": the client's latency summary
+}
+
+// StageStat is one row of the per-stage latency summary a v2 client sends
+// every ~10 s ({"t":"stages"}): percentiles in ms over its last ~10 s window.
+// Names: capture, queue, network, transfer, wait, decode, draw, display, e2e.
+type StageStat struct {
+	Name string  `json:"name"`
+	From string  `json:"from,omitempty"` // e2e only: capture | send (where end-to-end starts)
+	N    int     `json:"n"`
+	P50  float64 `json:"p50"`
+	P95  float64 `json:"p95"`
+	P99  float64 `json:"p99"`
 }

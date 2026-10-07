@@ -18,13 +18,18 @@ import (
 
 // Frame is one encoded video frame (an access unit / temporal unit).
 type Frame struct {
-	Gen    uint8
-	Seq    uint32
-	Key    bool
-	PtsUs  int64
-	SendUs uint64 // host clock when the last byte left the encoder
-	Data   []byte
+	Gen          uint8
+	Seq          uint32
+	Key          bool
+	PtsUs        int64  // relative to the generation's first frame
+	CaptureUs    uint64 // host clock when the frame was captured (0 = unknown)
+	EncodeDoneUs uint64 // host clock when the encoded frame was read from the encoder
+	Data         []byte
 }
+
+// maxCaptureToEncoded bounds plausible capture->encoded times; anything else
+// means the pts did not carry the capture clock (the stamp is dropped).
+const maxCaptureToEncoded = 2_000_000 // µs
 
 // VideoEvent is delivered in order on Video.Events().
 type VideoEvent struct {
@@ -60,6 +65,7 @@ type encProc struct {
 	started time.Time
 	killed  bool
 	errDone chan struct{} // closed when stderr is fully consumed
+	wallOff int64         // CaptureClock: wall clock minus host clock (µs)
 }
 
 // NewVideo creates a manager. clock returns the host monotonic time in µs.
@@ -111,6 +117,9 @@ func (v *Video) Start(p Params, urgent bool) error {
 			"fps", p.FPS, "kbps", p.BitrateKbps, "size", fmt.Sprintf("%dx%d", p.Width, p.Height))
 		v.log.Debug("ffmpeg args", "args", args)
 	}
+	if p.CaptureClock {
+		pr.wallOff = wallOffset(v.clock) // per generation: follows wall-clock adjustments
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return fmt.Errorf("starting ffmpeg: %w", err)
@@ -156,6 +165,16 @@ func (v *Video) Suspend() {
 	v.active, v.pending = nil, nil
 }
 
+// Active returns the parameters of the generation currently streaming.
+func (v *Video) Active() (Params, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.active != nil {
+		return v.active.params, true
+	}
+	return Params{}, false
+}
+
 // Current returns the parameters of the active (or starting) generation.
 func (v *Video) Current() (Params, bool) {
 	v.mu.Lock()
@@ -181,6 +200,8 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 	d := nut.NewDemuxer(stdout, proto.MaxFrameSize)
 	var params *codec.Params
 	var seq uint32
+	var pts0 int64
+	warnedStamp := false
 	defer func() {
 		select {
 		case <-pr.errDone:
@@ -227,11 +248,26 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 			}
 			params = codec.NewParams(fam, st.Extradata)
 		}
+		done := v.clock()
 		data := pkt.Data
 		if pkt.Key {
 			data = params.PrepareKeyFrame(data)
 		}
-		f := &Frame{Gen: pr.gen, Seq: seq, Key: pkt.Key, PtsUs: pkt.PtsMicros(st), SendUs: v.clock(), Data: data}
+		pts := pkt.PtsMicros(st)
+		if seq == 0 {
+			pts0 = pts
+		}
+		f := &Frame{Gen: pr.gen, Seq: seq, Key: pkt.Key, PtsUs: pts - pts0, EncodeDoneUs: done, Data: data}
+		if pr.params.CaptureClock {
+			// pts is the wall-clock capture time (setpts=RTCTIME).
+			if c := pts - pr.wallOff; c > 0 && uint64(c) <= done && done-uint64(c) <= maxCaptureToEncoded {
+				f.CaptureUs = uint64(c)
+			} else if !warnedStamp && v.log != nil {
+				warnedStamp = true
+				v.log.Warn("implausible capture timestamp, not reported", "gen", pr.gen, "seq", seq,
+					"capture_to_encoded_us", int64(done)-c)
+			}
+		}
 		seq++
 
 		v.mu.Lock()

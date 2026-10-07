@@ -42,6 +42,9 @@ func TestAgainstFFprobe(t *testing.T) {
 	}{
 		{"h264", []string{"-f", "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "45", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-g", "20"}},
 		{"h264-big", []string{"-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30", "-frames:v", "10", "-c:v", "libx264", "-preset", "ultrafast", "-qp", "1"}},
+		// Wall-clock capture timestamps in µs (the host's stage timestamps): pts
+		// around 1.8e15 must survive syncpoint rescaling without overflow.
+		{"h264-wallclock", []string{"-f", "lavfi", "-i", "testsrc2=s=320x240:r=30", "-vf", "settb=AVTB,setpts=RTCTIME", "-frames:v", "45", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-enc_time_base", "1:1000000", "-fps_mode", "passthrough"}},
 		{"hevc", []string{"-f", "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "30", "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=none:keyint=15:bframes=0"}},
 		{"av1", []string{"-f", "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "20", "-c:v", "libaom-av1", "-usage", "realtime", "-cpu-used", "8", "-g", "10"}},
 		{"opus", []string{"-f", "lavfi", "-i", "sine=f=440:d=1", "-c:a", "libopus", "-b:a", "96k"}},
@@ -114,6 +117,9 @@ func TestAgainstFFprobe(t *testing.T) {
 				}
 				if strconv.FormatInt(p.Pts, 10) != want.Pts.String() {
 					t.Fatalf("pkt %d pts %d want %s", i, p.Pts, want.Pts)
+				}
+				if st := d.Streams()[p.Stream]; tc.name == "h264-wallclock" && (p.PtsMicros(st) != p.Pts || p.Pts < 1e15) {
+					t.Fatalf("pkt %d: %d µs is not a wall-clock time in µs (pts %d, time base %v)", i, p.PtsMicros(st), p.Pts, st.TimeBase)
 				}
 				if p.Key != strings.HasPrefix(want.Flags, "K") {
 					t.Fatalf("pkt %d key %v flags %s", i, p.Key, want.Flags)

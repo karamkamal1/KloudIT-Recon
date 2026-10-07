@@ -122,21 +122,24 @@ class MsgParser {
   }
 }
 
+/** Read a frame stream; also returns when its first bytes arrived. */
 async function readAll(stream) {
   const r = stream.getReader();
   const chunks = [];
   let n = 0;
+  let first = 0;
   for (;;) {
     const { value, done } = await r.read();
     if (done) break;
+    if (!first) first = now();
     chunks.push(value);
     n += value.byteLength;
   }
-  if (chunks.length === 1) return chunks[0];
+  if (chunks.length === 1) return { buf: chunks[0], first };
   const out = new Uint8Array(n);
   let o = 0;
   for (const c of chunks) { out.set(c, o); o += c.byteLength; }
-  return out;
+  return { buf: out, first };
 }
 
 async function openWebTransport(url, hashes, label) {
@@ -191,7 +194,7 @@ async function openWebTransport(url, hashes, label) {
         for (;;) {
           const { value, done } = await r.read();
           if (done) break;
-          readAll(value).then((buf) => h.frame(buf, now())).catch(() => {});
+          readAll(value).then(({ buf, first }) => h.frame(buf, now(), first)).catch(() => {});
         }
       })();
       ctlLoop.catch(() => {});
@@ -237,7 +240,7 @@ async function openWebSocket(url) {
           const body = d.subarray(1);
           switch (d[0]) {
             case P.WS_CONTROL: h.control(JSON.parse(td.decode(body))); break;
-            case P.WS_FRAME: h.frame(body, now()); break;
+            case P.WS_FRAME: h.frame(body, now()); break; // whole message: first byte = last byte
             case P.WS_DATAGRAM: h.datagram(body); break;
           }
         };
@@ -483,15 +486,21 @@ function drainEarly() {
   for (const f of early) onFrame(f);
 }
 
-function onFrameBytes(buf, recv) {
-  if (buf.length < P.FRAME_HEADER_LEN) return;
+function onFrameBytes(buf, recv, first = recv) {
   const h = P.parseFrameHeader(buf);
-  h.data = buf.subarray(P.FRAME_HEADER_LEN);
+  if (!h) return;
+  h.data = buf.subarray(h.headerLen);
   h.recv = recv;
+  h.first = first || recv;
   stats.bytes += buf.length;
-  checkCongestion(recv - hostToLocal(h.sendUs));
+  checkCongestion(recv - hostToLocal(sentUs(h)));
   onFrame(h);
 }
+
+// Hosts before the frame extension stamped sendUs when the frame left the
+// encoder; newer ones stamp the actual send and carry encodeDone separately.
+// Congestion detection and frame acks keep the encoder-based reference.
+const sentUs = (h) => h.ext?.encodeDoneUs ?? h.sendUs;
 
 function onFrame(f) {
   const cfg = video.cfg;
@@ -559,7 +568,9 @@ function decodeFrame(f) {
   }
   const d = video.decoder;
   if (!d || d.state !== 'configured') return;
-  video.inflight.set(f.ptsUs, { recv: f.recv, sendUs: f.sendUs, seq: f.seq, gen: f.gen, t: now() });
+  video.inflight.set(f.ptsUs, {
+    recv: f.recv, first: f.first, sendUs: f.sendUs, ext: f.ext, seq: f.seq, gen: f.gen, t: now(),
+  });
   if (video.inflight.size > 120) video.inflight.delete(video.inflight.keys().next().value);
   try {
     d.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.ptsUs, data: f.data }));
@@ -596,9 +607,8 @@ function onDecoded(frame) {
   stats.decodeSum += decodeMs;
   stats.decodeN++;
   if (clock.offset !== null) {
-    const sent = hostToLocal(meta.sendUs);
-    const owd = meta.recv - sent;
-    const total = presented - sent;
+    const owd = meta.recv - hostToLocal(sentUs(meta));
+    const total = recordStages(meta, decoded, presented);
     stats.owdSum += owd;
     stats.owdN++;
     stats.totalSum += total;
@@ -607,6 +617,107 @@ function onDecoded(frame) {
     stats.totalMax = Math.max(stats.totalMax, total);
     transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, decodeMs * 1000));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Per-stage latency. Host stamps (capture, encodeDone: frame header extension;
+// send: header) are host-clock µs, converted with the clock sync; the client
+// adds first/last byte, decode submit/output, drawn and displayed (estimate:
+// the main thread's next requestAnimationFrame after the draw, sampled).
+//
+//   capture→encodeDone | host queue | network (send→first byte) | transfer |
+//   reorder/wait (last byte→submit) | decode | draw | display (est.)
+//
+// End-to-end runs from capture (or send, when the host cannot stamp the
+// capture) to drawn and is the per-frame sum of the stages in that span; the
+// sampled display estimate comes on top.
+
+const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'draw', 'display'];
+const STAGE_WINDOW_MS = 10000;
+const DISPLAY_SAMPLE_MS = 50; // display marks: ~20/s keeps the main thread's rAF work small
+const lat = { recs: [], pending: null, markId: 0, lastMark: 0, lastReport: now() };
+
+function recordStages(m, decoded, drawn) {
+  const capUs = m.ext?.captureUs;
+  const doneUs = m.ext?.encodeDoneUs;
+  const sendL = hostToLocal(m.sendUs);
+  const s = new Array(STAGES.length).fill(null);
+  if (capUs !== undefined && doneUs !== undefined) s[0] = (doneUs - capUs) / 1000;
+  if (doneUs !== undefined) s[1] = (m.sendUs - doneUs) / 1000;
+  s[2] = m.first - sendL;
+  s[3] = m.recv - m.first;
+  s[4] = m.t - m.recv;
+  s[5] = decoded - m.t;
+  s[6] = drawn - decoded;
+  const fromCapture = s[0] !== null;
+  const rec = {
+    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture,
+    raw: { captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded, drawn },
+  };
+  lat.recs.push(rec);
+  while (lat.recs.length && lat.recs[0].t < drawn - STAGE_WINDOW_MS) lat.recs.shift();
+  // At most one display mark in flight: the main thread answers within a refresh.
+  if (lat.pending && drawn - lat.pending.t > 250) lat.pending = null; // main thread throttled (hidden)
+  if (!lat.pending && drawn - lat.lastMark >= DISPLAY_SAMPLE_MS) {
+    lat.pending = rec;
+    lat.lastMark = drawn;
+    rec.mark = ++lat.markId;
+    post('drawn', { id: rec.mark, t: performance.timeOrigin + drawn });
+  }
+  return rec.e2e;
+}
+
+// Main thread: absolute time of its first requestAnimationFrame after the draw.
+function onDisplayed(id, abs) {
+  const rec = lat.pending;
+  if (!rec || rec.mark !== id) return;
+  lat.pending = null;
+  const shown = abs - performance.timeOrigin;
+  if (shown < rec.t) return;
+  rec.raw.displayed = shown;
+  rec.s[7] = shown - rec.t;
+}
+
+function pct(v) {
+  if (!v.length) return null;
+  const a = Float64Array.from(v).sort();
+  const q = (p) => +a[Math.min(a.length - 1, Math.floor(p * a.length))].toFixed(2);
+  return { p50: q(0.5), p95: q(0.95), p99: q(0.99), n: a.length };
+}
+
+/** Percentiles per stage and end-to-end over the last 10 s. */
+function stageSummary() {
+  const recs = lat.recs;
+  if (!recs.length) return null;
+  // One definition per window: from capture only if every frame had it.
+  const fromCapture = recs.every((r) => r.fromCapture);
+  const first = fromCapture ? 0 : 2;
+  const rows = {};
+  STAGES.forEach((name, i) => { rows[name] = pct(recs.filter((r) => r.s[i] !== null).map((r) => r.s[i])); });
+  let sum = 0;
+  let e2eSum = 0;
+  for (const r of recs) {
+    for (let i = first; i < 7; i++) sum += r.s[i];
+    e2eSum += fromCapture ? r.e2e : r.e2eSend;
+  }
+  return {
+    from: fromCapture ? 'capture' : 'send',
+    e2e: pct(recs.map((r) => (fromCapture ? r.e2e : r.e2eSend))),
+    stages: rows,
+    // Mean per-frame sum of the stages inside end-to-end vs mean end-to-end.
+    check: { n: recs.length, sumMean: sum / recs.length, e2eMean: e2eSum / recs.length },
+  };
+}
+
+// Every 10 s the host logs the summary next to its encoder (results per vendor).
+function reportStages(sum) {
+  const t = now();
+  if (!sum || t - lat.lastReport < 10000 || !transport) return;
+  lat.lastReport = t;
+  const rows = [];
+  for (const name of STAGES) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
+  rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
+  transport.sendControl({ t: 'stages', stages: rows });
 }
 
 // Delay-based congestion detection: if one-way delay rises well above its
@@ -757,7 +868,10 @@ function postStats() {
     const r = Atomics.load(audio.ring.idx, 1);
     audioMs = (((w - r + audio.ring.cap) % audio.ring.cap) / 48);
   }
+  const stages = stageSummary();
+  reportStages(stages);
   post('stats', {
+    stages,
     fps: stats.frames / dt,
     mbps: (stats.bytes * 8) / dt / 1e6,
     rtt: clock.rtt,
@@ -811,7 +925,7 @@ async function start(msg) {
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   transport.sendControl({
-    t: 'hello', v: 1, ticket: conn.ticket,
+    t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
     client: msg.client, decoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
   });
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
@@ -836,6 +950,8 @@ self.onmessage = (ev) => {
     case 'dg': transport?.sendDatagram(m.b); break;
     case 'ctl': transport?.sendControl(m.m); break;
     case 'prefs': prefs = { ...prefs, ...m.prefs }; break;
+    case 'displayed': onDisplayed(m.id, m.t); break;
+    case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
       if (transport) { transport.sendControl({ t: 'bye' }); setTimeout(() => transport?.close(), 50); }
       break;

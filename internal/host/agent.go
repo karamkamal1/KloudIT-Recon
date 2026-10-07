@@ -38,7 +38,7 @@ type Agent struct {
 	cfg         *Config
 	log         *slog.Logger
 	caps        *media.Caps
-	start       time.Time
+	hostClock   func() uint64
 	inj         *input.Injector
 	audioSource media.AudioSource
 
@@ -130,7 +130,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		return nil, err
 	}
 	a := &Agent{
-		cfg: cfg, log: log, caps: caps, start: time.Now(),
+		cfg: cfg, log: log, caps: caps, hostClock: media.NewClock(),
 		inj:         input.NewInjector(be),
 		audioSource: media.DefaultAudioSource(),
 		nonces:      map[string]int64{},
@@ -144,7 +144,8 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 	return a, nil
 }
 
-func (a *Agent) clock() uint64 { return uint64(time.Since(a.start).Microseconds()) }
+// clock is the host clock (µs) shared by frame timestamps and pongs.
+func (a *Agent) clock() uint64 { return a.hostClock() }
 
 func (a *Agent) monitors() []platform.Monitor {
 	mons, err := platform.Monitors()
@@ -160,7 +161,7 @@ func (a *Agent) monitors() []platform.Monitor {
 func (a *Agent) cursorSupported() bool { return runtime.GOOS == "windows" && a.cfg.Capture != "test" }
 
 func (a *Agent) features() []string {
-	f := []string{"text", "keyboard", "mouse"}
+	f := []string{"text", "keyboard", "mouse", proto.FeatureFrameExt}
 	if a.cfg.Audio {
 		f = append(f, "audio")
 	}

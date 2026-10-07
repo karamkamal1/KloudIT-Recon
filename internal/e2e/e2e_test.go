@@ -204,9 +204,9 @@ func (e *env) connectInfo() tickets {
 	return tk
 }
 
-func hello(ticket string) []byte {
+func hello(ticket string, v int) []byte {
 	b, _ := json.Marshal(proto.Hello{
-		T: "hello", V: 1, Ticket: ticket,
+		T: "hello", V: v, Ticket: ticket,
 		Client:   proto.ClientInfo{UA: "go-e2e", Width: 1920, Height: 1080, DPR: 1, Hz: 60},
 		Decoders: []proto.DecoderInfo{{Family: "h264", HW: false}},
 		Audio:    proto.AudioCaps{Opus: true},
@@ -218,8 +218,47 @@ func hello(ticket string) []byte {
 // result of a streaming run.
 type result struct {
 	configs, frames, keyframes, audio int
+	extFrames, stamped, badFrames     int // frames with the header extension, with ordered stage stamps, unparsable
 	welcome                           bool
 	firstFrameLatency                 time.Duration
+}
+
+// countFrame parses one frame stream and checks its stage timestamps:
+// capture <= encodeDone <= send, all in the host clock.
+func (r *result) countFrame(b []byte) {
+	h, ext, _, err := proto.ParseFrame(b)
+	if err != nil {
+		r.badFrames++
+		return
+	}
+	r.frames++
+	if h.Flags&proto.FrameFlagKey != 0 {
+		r.keyframes++
+	}
+	if h.Flags&proto.FrameFlagExt == 0 {
+		return
+	}
+	r.extFrames++
+	capture, ok1 := ext.Get(proto.ExtCaptureUs)
+	done, ok2 := ext.Get(proto.ExtEncodeDoneUs)
+	if ok1 && ok2 && capture > 0 && capture <= done && done <= h.SendUs {
+		r.stamped++
+	}
+}
+
+// checkExt verifies the frame header extension: never sent to v1 clients,
+// on every frame (with capture/encode/send stamps) for v2 clients.
+func checkExt(t *testing.T, r result, v int) {
+	t.Helper()
+	if r.badFrames > 0 {
+		t.Fatalf("%d unparsable frames", r.badFrames)
+	}
+	if v < proto.HelloVersionFrameExt && r.extFrames > 0 {
+		t.Fatalf("v%d client got %d extended frame headers", v, r.extFrames)
+	}
+	if v >= proto.HelloVersionFrameExt && (r.extFrames != r.frames || r.stamped != r.frames) {
+		t.Fatalf("v%d client: %d frames, %d extended, %d with ordered stage stamps", v, r.frames, r.extFrames, r.stamped)
+	}
 }
 
 // pinHashes verifies the server certificate against serverCertificateHashes-style pins.
@@ -239,7 +278,7 @@ func pinHashes(hashes []string) *tls.Config {
 	}
 }
 
-func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, dur time.Duration) result {
+func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration) result {
 	t.Helper()
 	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: transport.QUICConfig()}
 	hdr := http.Header{}
@@ -258,7 +297,7 @@ func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, 
 		t.Fatal(err)
 	}
 	ctrl.Write([]byte{proto.StreamKindControl})
-	proto.WriteMsg(ctrl, hello(ticket))
+	proto.WriteMsg(ctrl, hello(ticket, v))
 	in, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -305,19 +344,14 @@ func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, 
 				return
 			}
 			b, err := io.ReadAll(u)
-			if err != nil || len(b) < proto.FrameHeaderLen {
+			if err != nil {
 				continue
 			}
-			var h proto.FrameHeader
-			h.Unmarshal(b)
 			mu.Lock()
 			if r.frames == 0 {
 				r.firstFrameLatency = time.Since(start)
 			}
-			r.frames++
-			if h.Flags&proto.FrameFlagKey != 0 {
-				r.keyframes++
-			}
+			r.countFrame(b)
 			mu.Unlock()
 		}
 	}()
@@ -372,11 +406,12 @@ func TestStreamingPaths(t *testing.T) {
 	t.Run("webtransport-relay", func(t *testing.T) {
 		os.Truncate(e.logPath, 0)
 		tk := e.connectInfo()
-		r := runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 3*time.Second)
+		r := runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 1, 3*time.Second)
 		t.Logf("relay: %+v", r)
 		if !r.welcome || r.configs < 1 || r.frames < 100 || r.keyframes < 1 || r.audio < 100 {
 			t.Fatalf("unexpected result %+v", r)
 		}
+		checkExt(t, r, 1)
 		checkInput(t, e.logPath)
 	})
 
@@ -386,21 +421,22 @@ func TestStreamingPaths(t *testing.T) {
 		if tk.Direct == nil {
 			t.Fatal("no direct path offered")
 		}
-		r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3*time.Second)
+		r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 3*time.Second)
 		t.Logf("direct: %+v", r)
 		if !r.welcome || r.frames < 100 || r.audio < 100 {
 			t.Fatalf("unexpected result %+v", r)
 		}
+		checkExt(t, r, 2)
 		checkInput(t, e.logPath)
 	})
 
 	t.Run("direct-ticket-replay-rejected", func(t *testing.T) {
 		tk := e.connectInfo()
-		r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, time.Second)
+		r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 1, time.Second)
 		if r.frames == 0 {
 			t.Fatal("first use failed")
 		}
-		r = runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, time.Second)
+		r = runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 1, time.Second)
 		if r.welcome || r.frames > 0 {
 			t.Fatalf("replayed ticket accepted: %+v", r)
 		}
@@ -408,7 +444,7 @@ func TestStreamingPaths(t *testing.T) {
 
 	t.Run("relay-ticket-single-use", func(t *testing.T) {
 		tk := e.connectInfo()
-		_ = runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 500*time.Millisecond)
+		_ = runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 1, 500*time.Millisecond)
 		d := &webtransport.Transport{TLSClientConfig: pinHashes(tk.Relay.Hashes)}
 		hdr := http.Header{}
 		hdr.Set("Origin", e.base)
@@ -437,8 +473,9 @@ func TestStreamingPaths(t *testing.T) {
 		defer ws.CloseNow()
 		ws.SetReadLimit(64 << 20)
 		send := func(ch byte, p []byte) { ws.Write(ctx, websocket.MessageBinary, append([]byte{ch}, p...)) }
-		send(proto.WSControl, hello(""))
-		var frames, audio, configs int
+		send(proto.WSControl, hello("", 2))
+		var r result // the gateway relays frames as messages: the extension must arrive untouched
+		var audio, configs int
 		sentInput := false
 		end := time.Now().Add(3 * time.Second)
 		for time.Now().Before(end) {
@@ -452,23 +489,24 @@ func TestStreamingPaths(t *testing.T) {
 					configs++
 				}
 			case proto.WSFrame:
-				frames++
+				r.countFrame(m[1:])
 			case proto.WSDatagram:
 				if m[1] == proto.DgAudio {
 					audio++
 				}
 			}
-			if frames == 60 && !sentInput {
+			if r.frames == 60 && !sentInput {
 				sentInput = true
 				send(proto.WSInput, proto.KeyEvent(0x1e, false, true))
 				send(proto.WSInput, proto.KeyEvent(0x1e, false, false))
 				send(proto.WSDatagram, proto.MouseRelDatagram(1, 12, -10))
 			}
 		}
-		t.Logf("websocket: configs=%d frames=%d audio=%d", configs, frames, audio)
-		if configs < 1 || frames < 100 || audio < 100 {
+		t.Logf("websocket: configs=%d frames=%d audio=%d ext=%d", configs, r.frames, audio, r.extFrames)
+		if configs < 1 || r.frames < 100 || audio < 100 {
 			t.Fatal("websocket relay did not stream")
 		}
+		checkExt(t, r, 2)
 		checkInput(t, e.logPath)
 	})
 

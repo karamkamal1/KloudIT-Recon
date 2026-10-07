@@ -27,6 +27,17 @@ export const IN_TEXT = 5;
 
 export const FRAME_HEADER_LEN = 24;
 export const FRAME_FLAG_KEY = 1;
+export const FRAME_FLAG_EXT = 0x80; // TLV extension block after the header
+
+// Frame header extension tags. Timestamps are host-clock µs (same clock as sendUs).
+export const EXT_TAGS = {
+  1: 'presentUs', 2: 'captureUs', 3: 'encodeSubmitUs', 4: 'encodeDoneUs',
+  5: 'refFloor', 6: 'ltrSlot', 7: 'temporalLayer',
+};
+
+// Hello version that asks the host for extended frame headers.
+export const HELLO_VERSION = 2;
+export const FEATURE_FRAME_EXT = 'frame-ext';
 
 export const AUDIO_OPUS = 1;
 export const AUDIO_PCM = 2;
@@ -136,17 +147,45 @@ export function frameAck(gen, seq, owdUs, decodeUs) {
   return b;
 }
 
-/** Parse a 24-byte frame header. */
+/**
+ * Parse a frame header: 24 fixed bytes, then (FRAME_FLAG_EXT) u16 extLen and
+ * entries "u8 tag | u8 len | value LE". Unknown tags are skipped. Returns null
+ * for a malformed frame; the payload starts at headerLen.
+ */
 export function parseFrameHeader(buf) {
-  const v = new DataView(buf.buffer, buf.byteOffset, FRAME_HEADER_LEN);
-  return {
+  if (buf.byteLength < FRAME_HEADER_LEN) return null;
+  const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const h = {
     type: buf[0],
     key: (buf[1] & FRAME_FLAG_KEY) !== 0,
     gen: buf[2],
     seq: v.getUint32(4, true),
     ptsUs: Number(v.getBigUint64(8, true)),
     sendUs: Number(v.getBigUint64(16, true)),
+    ext: null,
+    headerLen: FRAME_HEADER_LEN,
   };
+  if (!(buf[1] & FRAME_FLAG_EXT)) return h;
+  if (buf.byteLength < FRAME_HEADER_LEN + 2) return null;
+  const end = FRAME_HEADER_LEN + 2 + v.getUint16(FRAME_HEADER_LEN, true);
+  if (end > buf.byteLength) return null;
+  const ext = {};
+  for (let p = FRAME_HEADER_LEN + 2; p < end;) {
+    if (p + 2 > end || p + 2 + buf[p + 1] > end) return null;
+    const tag = buf[p];
+    const len = buf[p + 1];
+    const name = EXT_TAGS[tag];
+    if (name) {
+      if (len < 1 || len > 8) return null;
+      let x = 0;
+      for (let i = len - 1; i >= 0; i--) x = x * 256 + buf[p + 2 + i];
+      ext[name] = x;
+    }
+    p += 2 + len;
+  }
+  h.ext = ext;
+  h.headerLen = end;
+  return h;
 }
 
 /** XInput button bits used by the host's virtual controller. */

@@ -379,6 +379,8 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		BitrateKbps: kbps,
 		Quality:     prefs.Quality,
 		DrawCursor:  cfg.DrawCursor || prefs.Cursor == "video" || !s.a.cursorSupported(),
+		// Capture timestamps only reach clients that parse the frame extension.
+		CaptureClock: s.hello.V >= proto.HelloVersionFrameExt && cfg.CaptureTimestamps != "off" && s.a.caps.CanStampCapture(),
 	}
 	backend := s.a.backendFor(prefs)
 	w, h := prefs.Width, prefs.Height
@@ -558,13 +560,18 @@ func (s *Session) frameSender() {
 			return
 		case f = <-s.frameQ:
 		}
-		h := proto.FrameHeader{Type: proto.FrameTypeVideo, Gen: f.Gen, Seq: f.Seq, PtsUs: uint64(f.PtsUs), SendUs: f.SendUs}
+		h := proto.FrameHeader{Type: proto.FrameTypeVideo, Gen: f.Gen, Seq: f.Seq, PtsUs: uint64(f.PtsUs)}
 		if f.Key {
 			h.Flags |= proto.FrameFlagKey
 		}
-		buf = buf[:proto.FrameHeaderLen]
-		h.Marshal(buf)
-		buf = append(buf, f.Data...)
+		var ext proto.FrameExt
+		if s.hello.V >= proto.HelloVersionFrameExt {
+			h.Flags |= proto.FrameFlagExt
+			ext.Set(proto.ExtEncodeDoneUs, f.EncodeDoneUs)
+			if f.CaptureUs != 0 {
+				ext.Set(proto.ExtCaptureUs, f.CaptureUs)
+			}
+		}
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 		st, err := s.c.OpenUniStreamSync(ctx)
 		cancel()
@@ -575,6 +582,15 @@ func (s *Session) frameSender() {
 			s.log.Debug("open frame stream", "err", err)
 			continue
 		}
+		// SendUs is the moment the frame is handed to the transport, so
+		// encodeDone -> send is the host queue (frame queue + stream credit).
+		h.SendUs = s.a.clock()
+		buf = buf[:proto.FrameHeaderLen]
+		h.Marshal(buf)
+		if h.Flags&proto.FrameFlagExt != 0 {
+			buf = ext.Append(buf)
+		}
+		buf = append(buf, f.Data...)
 		_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
 		if _, err := st.Write(buf); err != nil {
 			st.CancelWrite()
@@ -837,6 +853,8 @@ func (s *Session) controlLoop() error {
 			}
 		case "keyframe":
 			s.requestKeyframe()
+		case "stages":
+			s.logStages(m.Stages)
 		case "congestion":
 			s.congestion(m.DelayMs)
 		case "pause":
@@ -855,6 +873,31 @@ func (s *Session) controlLoop() error {
 			return errClosed
 		}
 	}
+}
+
+// stageNames are the rows a client latency summary may contain.
+var stageNames = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
+	"decode": true, "draw": true, "display": true, "e2e": true}
+
+// logStages records a client's per-stage latency summary next to the encoder
+// that produced the frames, so results can be compared per GPU vendor.
+func (s *Session) logStages(rows []proto.StageStat) {
+	p, ok := s.video.Active()
+	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
+		return
+	}
+	args := []any{"encoder", p.Encoder.Name, "vendor", p.Encoder.Vendor, "source", p.Source.Backend, "fps", p.FPS,
+		"kbps", p.BitrateKbps}
+	for _, r := range rows {
+		if !stageNames[r.Name] {
+			continue
+		}
+		if r.Name == "e2e" && (r.From == "capture" || r.From == "send") {
+			args = append(args, "e2e_from", r.From)
+		}
+		args = append(args, r.Name, fmt.Sprintf("%.1f/%.1f/%.1f n=%d", r.P50, r.P95, r.P99, r.N))
+	}
+	s.log.Info("latency stages p50/p95/p99 ms (client, last 10 s)", args...)
 }
 
 func (s *Session) statsLoop() {

@@ -243,9 +243,28 @@ function onWorker(m) {
     case 'cursorPos': onCursorPos(m); break;
     case 'notice': toast(m.msg, m.level === 'error' ? 'error' : m.level === 'warn' ? 'warn' : 'info', 6000); break;
     case 'stats': onStats(m); break;
+    case 'drawn': onDrawnMark(m); break;
+    case 'stageDump': S.stageDump = m.recs; break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
   }
+}
+
+// Display estimate for the worker's per-stage latency: the first animation
+// frame that starts after a (sampled) draw. Times are absolute (timeOrigin +
+// now) because the worker's performance clock has a different origin.
+let drawnMark = null;
+function onDrawnMark(m) {
+  const waiting = drawnMark !== null;
+  drawnMark = m; // a newer mark replaces one the (throttled) page never answered
+  if (waiting) return;
+  const tick = (ts) => {
+    const abs = performance.timeOrigin + ts;
+    if (abs < drawnMark.t) { requestAnimationFrame(tick); return; }
+    post({ type: 'displayed', id: drawnMark.id, t: abs });
+    drawnMark = null;
+  };
+  requestAnimationFrame(tick);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +578,10 @@ function toggleStats() {
   updateToolbarState();
 }
 
+const STAGE_LABELS = [
+  ['capture', 'capture→encoded'], ['queue', 'host queue'], ['network', 'network'], ['transfer', 'transfer'],
+  ['wait', 'reorder/wait'], ['decode', 'decode'], ['draw', 'draw'], ['display', '+ display (est.)'],
+];
 const fmt = (v, d = 1, unit = ' ms') => (v === null || v === undefined || !isFinite(v) ? '—' : `${v.toFixed(d)}${unit}`);
 const cls = (v, a, b) => (v === null || v === undefined ? '' : v < a ? 'good' : v < b ? 'warn' : 'bad');
 
@@ -575,11 +598,19 @@ function onStats(st) {
   const v = S.videoCfg || {};
   const row = (k, val, c = '') => el('div', { class: 'row' }, el('span', { class: 'k' }, k), el('span', { class: `v ${c}` }, val));
   const spark = el('canvas', { class: 'spark', width: '240', height: '34' });
-  $('stats').replaceChildren(...[
-    row('Stream latency', `${fmt(st.total)}  (${fmt(st.totalMin, 0, '')}–${fmt(st.totalMax, 0, '')})`, cls(st.total, 25, 50)),
-    row('  network (one-way)', fmt(st.owd), cls(st.owd, 10, 30)),
-    row('  decode', fmt(st.decode), cls(st.decode, 6, 14)),
+  const lat = st.stages;
+  const pcts = (r) => (r ? `${fmt(r.p50, 1, '')} / ${fmt(r.p95, 1, '')} / ${fmt(r.p99, 1, '')}` : '—');
+  const latencyRows = lat ? [
+    row('Latency (ms)', 'p50 / p95 / p99'),
+    row(lat.from === 'capture' ? 'End-to-end (capture→draw)' : 'Stream latency (send→draw)', pcts(lat.e2e), cls(lat.e2e?.p50, 25, 50)),
+    ...STAGE_LABELS.filter(([k]) => lat.stages[k]).map(([k, label]) => row(`  ${label}`, pcts(lat.stages[k]))),
+    row('  round trip (avg)', fmt(st.rtt, 1, ''), cls(st.rtt, 15, 40)),
+  ] : [
+    row('Stream latency (send→draw)', `${fmt(st.total)}  (${fmt(st.totalMin, 0, '')}–${fmt(st.totalMax, 0, '')})`, cls(st.total, 25, 50)),
     row('  round trip', fmt(st.rtt), cls(st.rtt, 15, 40)),
+  ];
+  $('stats').replaceChildren(...[
+    ...latencyRows,
     spark,
     el('hr'),
     row('Frame rate', `${st.fps.toFixed(1)} fps`),

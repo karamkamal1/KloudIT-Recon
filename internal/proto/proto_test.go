@@ -2,6 +2,12 @@ package proto
 
 import (
 	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +37,151 @@ func TestFrameHeader(t *testing.T) {
 	var g FrameHeader
 	if err := g.Unmarshal(b); err != nil || g != h {
 		t.Fatalf("%+v != %+v (%v)", g, h, err)
+	}
+}
+
+// extFrame builds a frame with an extension block: tag 2 as a 6-byte value,
+// an unknown tag 0x42, tag 4 as u64 and tag 6 as u8.
+func extFrame() []byte {
+	h := FrameHeader{Type: FrameTypeVideo, Flags: FrameFlagKey | FrameFlagExt, Gen: 3, Seq: 77, PtsUs: 16667, SendUs: 5_000_123}
+	b := make([]byte, FrameHeaderLen)
+	h.Marshal(b)
+	entries := []byte{
+		ExtCaptureUs, 6, 0x10, 0x20, 0x30, 0x40, 0x50, 0x00,
+		0x42, 3, 9, 9, 9,
+		ExtEncodeDoneUs, 8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x00, 0x00,
+		ExtLTRSlot, 1, 2,
+	}
+	b = append(b, byte(len(entries)), 0)
+	b = append(b, entries...)
+	return append(b, "payload"...)
+}
+
+func TestFrameExt(t *testing.T) {
+	// Round trip.
+	var e FrameExt
+	e.Set(ExtCaptureUs, 1_000_000)
+	e.Set(ExtEncodeDoneUs, 1_004_321)
+	e.Set(ExtRefFloor, 1<<31+5)
+	e.Set(ExtLTRSlot, 1)
+	e.Set(ExtTemporalLayer, 0)
+	h := FrameHeader{Type: FrameTypeVideo, Flags: FrameFlagExt, Gen: 1, Seq: 2, PtsUs: 3, SendUs: 1_005_000}
+	b := make([]byte, FrameHeaderLen)
+	h.Marshal(b)
+	b = e.Append(b)
+	b = append(b, 0xAA, 0xBB)
+	gh, ge, payload, err := ParseFrame(b)
+	if err != nil || gh != h || ge != e || !bytes.Equal(payload, []byte{0xAA, 0xBB}) {
+		t.Fatalf("round trip: %+v %+v %x %v", gh, ge, payload, err)
+	}
+	if v, ok := ge.Get(ExtTemporalLayer); !ok || v != 0 {
+		t.Fatal("zero-valued field lost")
+	}
+	if _, ok := ge.Get(ExtPresentUs); ok {
+		t.Fatal("absent field reported present")
+	}
+	// Without the flag the bytes after the header are payload (v1 framing).
+	h.Flags = FrameFlagKey
+	h.Marshal(b)
+	if _, ge, payload, err := ParseFrame(b); err != nil || !ge.Empty() || len(payload) != len(b)-FrameHeaderLen {
+		t.Fatalf("plain frame: %+v %d %v", ge, len(payload), err)
+	}
+
+	// Unknown tags are skipped, known tags accept narrower widths.
+	_, ge, payload, err = ParseFrame(extFrame())
+	if err != nil || string(payload) != "payload" {
+		t.Fatalf("%x %v", payload, err)
+	}
+	if v, _ := ge.Get(ExtCaptureUs); v != 0x5040302010 {
+		t.Fatalf("capture %x", v)
+	}
+	if v, _ := ge.Get(ExtEncodeDoneUs); v != 0x060504030201 {
+		t.Fatalf("encodeDone %x", v)
+	}
+	if v, ok := ge.Get(ExtLTRSlot); !ok || v != 2 {
+		t.Fatalf("ltr slot %d %v", v, ok)
+	}
+
+	// Malformed blocks are rejected.
+	for name, bad := range malformedExt() {
+		if _, _, _, err := ParseFrame(bad); err == nil {
+			t.Fatalf("%s: malformed extension accepted", name)
+		}
+	}
+}
+
+func malformedExt() map[string][]byte {
+	hdr := func(ext ...byte) []byte {
+		h := FrameHeader{Type: FrameTypeVideo, Flags: FrameFlagExt}
+		b := make([]byte, FrameHeaderLen)
+		h.Marshal(b)
+		return append(b, ext...)
+	}
+	return map[string][]byte{
+		"no length":          hdr(5),
+		"length past end":    hdr(10, 0, ExtLTRSlot, 1, 0),
+		"entry past block":   hdr(3, 0, ExtCaptureUs, 8, 1, 2, 3, 4, 5, 6, 7, 8),
+		"truncated entry":    hdr(1, 0, ExtLTRSlot),
+		"zero-width known":   hdr(2, 0, ExtLTRSlot, 0),
+		"oversized known":    hdr(11, 0, ExtCaptureUs, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+		"short frame header": make([]byte, FrameHeaderLen-1),
+	}
+}
+
+// TestFrameExtJS checks that web/static/js/protocol.js parses the same test
+// vectors identically (needs node).
+func TestFrameExtJS(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	vectors := map[string]string{"good": hex.EncodeToString(extFrame())}
+	for name, b := range malformedExt() {
+		vectors[name] = hex.EncodeToString(b)
+	}
+	in, _ := json.Marshal(vectors)
+	script := `
+const P = await import(process.argv[1]);
+const vec = JSON.parse(process.argv[2]);
+const out = {};
+for (const [name, hex] of Object.entries(vec)) {
+  const b = Uint8Array.from(hex.match(/../g).map((x) => parseInt(x, 16)));
+  const h = P.parseFrameHeader(b);
+  out[name] = h && { ...h, payload: new TextDecoder().decode(b.subarray(h.headerLen)) };
+}
+console.log(JSON.stringify(out));`
+	cmd := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js), string(in))
+	b, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var got map[string]*struct {
+		Type, Gen, Seq, PtsUs, SendUs int
+		Key                           bool
+		HeaderLen                     int
+		Payload                       string
+		Ext                           map[string]float64
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("%v: %s", err, b)
+	}
+	for name := range malformedExt() {
+		if got[name] != nil {
+			t.Fatalf("protocol.js accepted malformed %q: %+v", name, got[name])
+		}
+	}
+	g := got["good"]
+	want := map[string]float64{"captureUs": 0x5040302010, "encodeDoneUs": 0x060504030201, "ltrSlot": 2}
+	if g == nil || g.Type != 1 || !g.Key || g.Gen != 3 || g.Seq != 77 || g.PtsUs != 16667 || g.SendUs != 5_000_123 ||
+		g.Payload != "payload" || len(g.Ext) != len(want) {
+		t.Fatalf("protocol.js parse: %s", strings.TrimSpace(string(b)))
+	}
+	for k, v := range want {
+		if g.Ext[k] != v {
+			t.Fatalf("protocol.js ext %s = %v, want %v", k, g.Ext[k], v)
+		}
 	}
 }
 

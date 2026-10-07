@@ -98,7 +98,7 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	c.Version = strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
-	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2"} {
+	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts"} {
 		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
 			c.Filters[f] = true
 		}
@@ -246,7 +246,15 @@ type Params struct {
 	BitrateKbps int
 	Quality     string // speed | balanced | quality
 	DrawCursor  bool
+	// CaptureClock stamps every frame with its wall-clock capture time: pts
+	// become RTCTIME (µs) right after the source and the encoder runs at a µs
+	// time base (it still gets the frame rate for rate control). Video turns
+	// them into Frame.CaptureUs.
+	CaptureClock bool
 }
+
+// CanStampCapture reports whether this FFmpeg build has the filters CaptureClock needs.
+func (c *Caps) CanStampCapture() bool { return c.Filters["settb"] && c.Filters["setpts"] }
 
 var safeRegex = regexp.MustCompile(`^[A-Za-z0-9 _.\-()*+?^$|\[\]]{1,128}$`)
 
@@ -319,6 +327,11 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unknown capture backend %q", p.Source.Backend)
 	}
+	if p.CaptureClock {
+		// Evaluated as the frame leaves the source (after realtime pacing for
+		// the test source), before any conversion or encoding.
+		chain += ",settb=AVTB,setpts=RTCTIME"
+	}
 
 	// Convert into what the encoder accepts.
 	switch {
@@ -369,6 +382,11 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)
+	if p.CaptureClock {
+		// Keep µs precision through the encoder; its frame rate still comes
+		// from the source (checked: libx264/libsvtav1 bitrate and fps unchanged).
+		args = append(args, "-enc_time_base", "1:1000000")
+	}
 	args = append(args,
 		"-fps_mode", "passthrough",
 		"-an", "-sn", "-dn",

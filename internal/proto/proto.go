@@ -72,7 +72,29 @@ const (
 	FrameHeaderLen      = 24
 	FrameTypeVideo byte = 1
 	FrameFlagKey   byte = 1
+	FrameFlagExt   byte = 0x80 // a TLV extension block follows the header (hello v >= 2)
 )
+
+// Frame header extension tags (FrameFlagExt). Every timestamp is in the host
+// clock domain (µs, the same clock as FrameHeader.SendUs and pongs).
+const (
+	ExtPresentUs      byte = 1 // u64 game present (native capture helper only)
+	ExtCaptureUs      byte = 2 // u64 frame captured
+	ExtEncodeSubmitUs byte = 3 // u64 frame submitted to the encoder (native helper only)
+	ExtEncodeDoneUs   byte = 4 // u64 encoded frame available to the host
+	ExtRefFloor       byte = 5 // u32 oldest frame the decoder may reference (recovery frames)
+	ExtLTRSlot        byte = 6 // u8 long-term reference slot this frame is marked into
+	ExtTemporalLayer  byte = 7 // u8 temporal layer id
+	extMaxTag              = 7
+)
+
+// HelloVersionFrameExt is the first hello version whose clients parse
+// FrameFlagExt; older clients get the plain 24-byte header.
+const HelloVersionFrameExt = 2
+
+// FeatureFrameExt is the Welcome.Features entry announcing the frame header
+// extension (sent to clients with hello v >= HelloVersionFrameExt).
+const FeatureFrameExt = "frame-ext"
 
 // Limits.
 const (
@@ -126,7 +148,7 @@ type FrameHeader struct {
 	Gen    uint8  // encoder generation; increments on every encoder (re)start
 	Seq    uint32 // frame sequence number within a generation
 	PtsUs  uint64 // presentation timestamp in microseconds (encoder timeline)
-	SendUs uint64 // host monotonic clock (µs) when the frame left the encoder
+	SendUs uint64 // host monotonic clock (µs) when the host started sending the frame
 }
 
 func (h *FrameHeader) Marshal(b []byte) {
@@ -151,6 +173,107 @@ func (h *FrameHeader) Unmarshal(b []byte) error {
 	h.PtsUs = binary.LittleEndian.Uint64(b[8:])
 	h.SendUs = binary.LittleEndian.Uint64(b[16:])
 	return nil
+}
+
+// FrameExt holds the optional per-frame fields of the header extension. A field
+// is present when its tag was set; readers skip tags they do not know.
+//
+//	u16 extLen | extLen bytes of entries: u8 tag | u8 len | value (len bytes, LE)
+type FrameExt struct {
+	has  uint16
+	vals [extMaxTag + 1]uint64
+}
+
+var extSize = [extMaxTag + 1]uint8{0, 8, 8, 8, 8, 4, 1, 1}
+
+var ErrBadFrameExt = errors.New("proto: malformed frame header extension")
+
+// Set stores a known tag's value (truncated to the tag's width on the wire).
+func (e *FrameExt) Set(tag byte, v uint64) {
+	if tag == 0 || tag > extMaxTag {
+		return
+	}
+	e.has |= 1 << tag
+	e.vals[tag] = v
+}
+
+// Get returns a tag's value and whether it was present.
+func (e *FrameExt) Get(tag byte) (uint64, bool) {
+	if tag == 0 || tag > extMaxTag || e.has&(1<<tag) == 0 {
+		return 0, false
+	}
+	return e.vals[tag], true
+}
+
+// Empty reports whether no field is set.
+func (e *FrameExt) Empty() bool { return e.has == 0 }
+
+// Append appends the encoded extension block (u16 length + entries) to b.
+func (e *FrameExt) Append(b []byte) []byte {
+	at := len(b)
+	b = append(b, 0, 0)
+	for tag := byte(1); tag <= extMaxTag; tag++ {
+		if e.has&(1<<tag) == 0 {
+			continue
+		}
+		n := extSize[tag]
+		b = append(b, tag, n)
+		for i := uint8(0); i < n; i++ {
+			b = append(b, byte(e.vals[tag]>>(8*i)))
+		}
+	}
+	binary.LittleEndian.PutUint16(b[at:], uint16(len(b)-at-2))
+	return b
+}
+
+// ParseFrameExt decodes an extension block at the start of b and returns the
+// number of bytes it occupies. Unknown tags are skipped; a known tag may use
+// any width from 1 to 8 bytes.
+func ParseFrameExt(b []byte) (FrameExt, int, error) {
+	var e FrameExt
+	if len(b) < 2 {
+		return e, 0, ErrBadFrameExt
+	}
+	n := int(binary.LittleEndian.Uint16(b))
+	if len(b) < 2+n {
+		return e, 0, ErrBadFrameExt
+	}
+	p := b[2 : 2+n]
+	for len(p) > 0 {
+		if len(p) < 2 || len(p) < 2+int(p[1]) {
+			return e, 0, ErrBadFrameExt
+		}
+		tag, l := p[0], int(p[1])
+		if tag >= 1 && tag <= extMaxTag {
+			if l < 1 || l > 8 {
+				return e, 0, ErrBadFrameExt
+			}
+			var v uint64
+			for i := 0; i < l; i++ {
+				v |= uint64(p[2+i]) << (8 * i)
+			}
+			e.Set(tag, v)
+		}
+		p = p[2+l:]
+	}
+	return e, 2 + n, nil
+}
+
+// ParseFrame splits a frame stream into header, extension and payload.
+func ParseFrame(b []byte) (FrameHeader, FrameExt, []byte, error) {
+	var h FrameHeader
+	if err := h.Unmarshal(b); err != nil {
+		return h, FrameExt{}, nil, err
+	}
+	b = b[FrameHeaderLen:]
+	if h.Flags&FrameFlagExt == 0 {
+		return h, FrameExt{}, b, nil
+	}
+	e, n, err := ParseFrameExt(b)
+	if err != nil {
+		return h, e, nil, err
+	}
+	return h, e, b[n:], nil
 }
 
 // AudioPacket builds an audio datagram: type, codec id, u16 seq, u32 pts (48 kHz samples).

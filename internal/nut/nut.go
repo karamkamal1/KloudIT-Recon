@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 )
 
 const (
@@ -86,7 +87,24 @@ func (p *Packet) PtsMicros(s *Stream) int64 {
 	if s.TimeBase.Den == 0 {
 		return 0
 	}
-	return p.Pts * 1_000_000 * s.TimeBase.Num / s.TimeBase.Den
+	return mulDiv(p.Pts, 1_000_000*s.TimeBase.Num, s.TimeBase.Den, false)
+}
+
+// mulDiv returns a*b/c, truncated or (floor) rounded down, without overflowing
+// on large timestamps such as wall-clock microseconds.
+func mulDiv(a, b, c int64, floor bool) int64 {
+	const lim = 1 << 31
+	if a > -lim && a < lim && b > -lim && b < lim {
+		if floor {
+			return floorDiv(a*b, c)
+		}
+		return a * b / c
+	}
+	x := new(big.Int).Mul(big.NewInt(a), big.NewInt(b))
+	if floor {
+		return x.Div(x, big.NewInt(c)).Int64() // Euclidean division: rounds down for c > 0
+	}
+	return x.Quo(x, big.NewInt(c)).Int64()
 }
 
 type frameCode struct {
@@ -433,7 +451,7 @@ func (d *Demuxer) parseSyncpoint(p []byte) error {
 		// rescale ts from tb to the stream time base, rounding down.
 		num := tb.Num * s.TimeBase.Den
 		den := tb.Den * s.TimeBase.Num
-		s.lastPts = floorDiv(ts*num, den)
+		s.lastPts = mulDiv(ts, num, den, true)
 	}
 	return nil
 }

@@ -75,6 +75,37 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? '✔' : '✘'} ${name}${detail ? ' — ' + detail : ''}`);
 }
 
+// Per-stage latency (frame header extension + client marks): (a) every stage
+// is reported and non-negative, (b) per frame the stages add up to end-to-end
+// (mean within ±2 ms), recomputed here from the raw timestamps.
+const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'draw', 'display'];
+async function checkStages(name, st) {
+  const lat = st?.stages;
+  const missing = STAGES.filter((k) => !lat?.stages?.[k]);
+  const negative = STAGES.filter((k) => lat?.stages?.[k] && ['p50', 'p95', 'p99'].some((q) => lat.stages[k][q] < 0));
+  const p = (r) => (r ? `${r.p50}/${r.p95}/${r.p99}` : '—');
+  check(`${name}: per-stage latency (all stages, non-negative)`, !!lat && lat.from === 'capture' && !missing.length && !negative.length && lat.e2e.p50 >= 0,
+    lat ? `${lat.from}→draw ${p(lat.e2e)} ms; ${STAGES.map((k) => `${k} ${p(lat.stages[k])}`).join(', ')}${missing.length ? '; missing ' + missing : ''}${negative.length ? '; negative ' + negative : ''}` : 'no stage stats');
+  const overlay = await page.textContent('#stats').catch(() => '');
+  check(`${name}: overlay shows the stage table`, overlay.includes('End-to-end (capture→draw)') && overlay.includes('host queue') && overlay.includes('display (est.)'));
+
+  await page.evaluate(() => { window.__recon.stageDump = null; window.__recon.worker.postMessage({ type: 'stageDump' }); });
+  const dump = await until(() => page.evaluate(() => window.__recon.stageDump), 3000, 'stage dump').catch(() => []);
+  let n = 0; let sum = 0; let e2e = 0; let dn = 0; let dsum = 0; let de2e = 0;
+  for (const r of dump) {
+    const start = (r.fromCapture ? r.captureUs : r.sendUs) / 1000 - r.offset;
+    let s = 0;
+    for (let i = r.fromCapture ? 0 : 2; i < 7; i++) s += r.stages[i];
+    n++; sum += s; e2e += r.drawn - start;
+    if (r.displayed !== undefined) { dn++; dsum += s + r.stages[7]; de2e += r.displayed - start; }
+  }
+  const diff = n ? Math.abs(sum - e2e) / n : Infinity;
+  const ddiff = dn ? Math.abs(dsum - de2e) / dn : Infinity;
+  check(`${name}: stages add up to end-to-end (±2 ms)`, n >= 20 && diff <= 2 && ddiff <= 2,
+    `${n} frames: mean sum ${(sum / n).toFixed(2)} vs end-to-end ${(e2e / n).toFixed(2)} ms; ${dn} with display est: ${(dsum / dn).toFixed(2)} vs ${(de2e / dn).toFixed(2)} ms`);
+  results.push({ stages: name, summary: lat, frames: dump.length });
+}
+
 // ---------------------------------------------------------------------------
 
 const dir = mkdtempSync(join(tmpdir(), 'recon-e2e-'));
@@ -198,6 +229,7 @@ try {
     check(`${sc.name}: video decoding`, st && st.fps > 45, `${st?.fps.toFixed(1)} fps, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}`);
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
+    await checkStages(sc.name, st);
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
 
@@ -239,6 +271,10 @@ try {
       await sleep(1500);
       const st2 = await page.evaluate(() => window.__recon.lastStats);
       check('live settings change (new encoder generation, stream continues)', st2.fps > 40, `${st2.fps.toFixed(1)} fps after switch`);
+      // The client reports its stage summary every 10 s; the host logs it per encoder/vendor.
+      const hostProc = procs.find((p) => p.spawnargs.includes('run'));
+      const line = await until(() => (hostProc.log.match(/msg="latency stages[^\n]*/) || [])[0], 15000, 'stage summary in the host log').catch(() => '');
+      check('host logs the client stage summary with encoder and vendor', /encoder=\S+ vendor=\S+/.test(line) && / e2e=/.test(line), line.replace(/^.*?msg=/, '').slice(0, 260));
     }
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }

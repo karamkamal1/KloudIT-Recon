@@ -57,8 +57,9 @@ Techniques used (most of them are new to browser-based game streaming):
   (CELT low-delay, 10 ms frames) in pure Go, so the PC needs no extra DLLs. It travels as
   datagrams, through `AudioDecoder`, a **SharedArrayBuffer** ring and an AudioWorklet with an
   adaptive jitter buffer that trims drift.
-- **Live latency readout.** NTP-style clock sync means every frame reports *encoder-out →
-  on-screen* latency, split into network, decode and round-trip time.
+- **Live latency readout.** NTP-style clock sync and per-frame host timestamps split every
+  frame's *capture → on-screen* latency into capture/encode, host queue, network, transfer,
+  reorder, decode, draw and display, with p50/p95/p99 per stage.
 - **Self-protecting under load.** Delay-gradient congestion detection lowers the bitrate before
   queues build up. A decoder backlog gets flushed and resynced from a fresh key frame, so
   latency can't grow without bound.
@@ -278,6 +279,7 @@ The new password (at least 10 characters) is read from stdin.
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
 | `directAddr` | auto | Address to advertise for the direct path |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
+| `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=RTCTIME`); the overlay then shows send→draw latency |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 

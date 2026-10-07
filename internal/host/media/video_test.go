@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,107 @@ func TestBuildArgsEscaping(t *testing.T) {
 	}
 	if strings.Contains(joined, "hwdownload") {
 		t.Fatal("NVENC path must stay on the GPU")
+	}
+	if strings.Contains(joined, "RTCTIME") || strings.Contains(joined, "enc_time_base") {
+		t.Fatal("capture clock without CaptureClock")
+	}
+	args, _ = caps.BuildArgs(Params{Source: Source{Backend: "ddagrab", Output: 1}, Encoder: enc, FPS: 144, BitrateKbps: 30000, CaptureClock: true})
+	joined = strings.Join(args, " ")
+	if !strings.Contains(joined, "dup_frames=0,settb=AVTB,setpts=RTCTIME[v]") || !strings.Contains(joined, "-enc_time_base 1:1000000") {
+		t.Fatalf("capture clock args: %s", joined)
+	}
+}
+
+// TestCaptureClock runs real encoders with CaptureClock and checks that every
+// frame gets a plausible capture time (capture -> encoded a few ms) and that
+// the frame rate and bitrate match a run without it.
+func TestCaptureClock(t *testing.T) {
+	caps := probeOrSkip(t)
+	if !caps.CanStampCapture() {
+		t.Skip("ffmpeg lacks settb/setpts")
+	}
+	for _, name := range []string{"libx264", "libsvtav1"} {
+		var enc EncoderInfo
+		for _, e := range caps.Encoders {
+			if e.Name == name {
+				enc = e
+			}
+		}
+		if enc.Name == "" {
+			t.Logf("%s not available", name)
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			type run struct {
+				fps, mbps     float64
+				p50, p95, max float64 // capture -> encoded, ms
+			}
+			measure := func(stamp bool) run {
+				start := time.Now()
+				clock := NewClock()
+				v := NewVideo(caps, nil, clock)
+				defer v.Stop()
+				p := Params{Source: Source{Backend: "test", NativeW: 960, NativeH: 540}, Encoder: enc, FPS: 60, BitrateKbps: 4000, CaptureClock: stamp}
+				if err := v.Start(p, false); err != nil {
+					t.Fatal(err)
+				}
+				var lat []float64
+				var bytes, n int
+				var first time.Time
+				deadline := time.After(30 * time.Second)
+				for n < 300 {
+					select {
+					case ev := <-v.Events():
+						if ev.Err != nil {
+							t.Fatal(ev.Err)
+						}
+						f := ev.Frame
+						if f == nil {
+							continue
+						}
+						if n == 0 {
+							first = time.Now()
+						}
+						n++
+						if n > 30 { // past encoder start-up
+							bytes += len(f.Data)
+						}
+						if stamp {
+							if f.CaptureUs == 0 || f.CaptureUs > f.EncodeDoneUs {
+								t.Fatalf("frame %d: capture %d encoded %d", f.Seq, f.CaptureUs, f.EncodeDoneUs)
+							}
+							if n > 30 {
+								lat = append(lat, float64(f.EncodeDoneUs-f.CaptureUs)/1000)
+							}
+						} else if f.CaptureUs != 0 {
+							t.Fatal("capture time without CaptureClock")
+						}
+					case <-deadline:
+						t.Fatalf("timeout after %d frames (%v)", n, time.Since(start))
+					}
+				}
+				el := time.Since(first).Seconds()
+				r := run{fps: float64(n-1) / el, mbps: float64(bytes) * 8 / (float64(n-31) / 60) / 1e6}
+				if stamp {
+					sort.Float64s(lat)
+					r.p50, r.p95, r.max = lat[len(lat)/2], lat[len(lat)*95/100], lat[len(lat)-1]
+				}
+				return r
+			}
+			base := measure(false)
+			got := measure(true)
+			t.Logf("%s without: %.1f fps %.2f Mbit/s; with: %.1f fps %.2f Mbit/s, capture->encoded p50 %.2f p95 %.2f max %.2f ms",
+				name, base.fps, base.mbps, got.fps, got.mbps, got.p50, got.p95, got.max)
+			if got.fps < 40 || got.fps > 75 {
+				t.Fatalf("frame rate %.1f with capture clock", got.fps)
+			}
+			if r := got.mbps / base.mbps; r < 0.8 || r > 1.25 {
+				t.Fatalf("bitrate changed: %.2f vs %.2f Mbit/s", got.mbps, base.mbps)
+			}
+			if got.p50 <= 0 || got.p50 > 100 {
+				t.Fatalf("implausible capture->encoded p50 %.2f ms", got.p50)
+			}
+		})
 	}
 }
 
