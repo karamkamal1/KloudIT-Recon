@@ -4,7 +4,7 @@ LDFLAGS  = -s -w -X github.com/karamkamal1/kloudit-recon/internal/gateway.Versio
 GO      ?= go
 DIST     = dist
 
-.PHONY: all build gateway host windows test e2e release clean netem netem-clear netem-status
+.PHONY: all build gateway host windows test e2e release clean netem netem-clear netem-status helper helper-test
 
 all: build
 
@@ -22,6 +22,32 @@ windows:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o $(DIST)/windows/recon-hostw.exe ./cmd/recon-host
 	cp deploy/windows/*.ps1 $(DIST)/windows/
 	mkdir -p $(DIST)/windows/latency-test && cp tools/latency-test/index.html $(DIST)/windows/latency-test/
+
+# Native capture/encode helper recon-encoder.exe (native/recon-encoder), cross-compiled
+# with mingw-w64 (apt-get install mingw-w64 cmake). Skipped when the toolchain is missing,
+# unless HELPER_REQUIRED=1 (CI release builds).
+MINGW_CXX       ?= x86_64-w64-mingw32-g++
+HELPER_BUILD     = $(DIST)/obj/recon-encoder
+HELPER_REQUIRED ?= 0
+WINE            ?= wine
+
+helper:
+	@if command -v $(MINGW_CXX) >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1; then \
+		cmake -S native/recon-encoder -B $(HELPER_BUILD) -DCMAKE_BUILD_TYPE=Release \
+			-DCMAKE_TOOLCHAIN_FILE=$(CURDIR)/native/recon-encoder/cmake/mingw-w64-x86_64.cmake >/dev/null && \
+		cmake --build $(HELPER_BUILD) --parallel && \
+		mkdir -p $(DIST)/windows && cp $(HELPER_BUILD)/bin/recon-encoder.exe $(DIST)/windows/; \
+	elif [ "$(HELPER_REQUIRED)" = 1 ]; then \
+		echo "helper: mingw-w64 ($(MINGW_CXX)) and cmake are required" >&2; exit 1; \
+	else \
+		echo "helper: mingw-w64 ($(MINGW_CXX)) or cmake not found, skipping recon-encoder.exe"; \
+	fi
+
+# Helper integration tests (mock backend) under Wine, against the mingw build.
+helper-test: helper
+	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
+	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
+		$(WINE) ./encoder.test.exe -test.v -test.count=1
 
 test:
 	$(GO) vet ./...
@@ -57,6 +83,7 @@ release: clean
 		tar -C $(DIST) -czf $(DIST)/kloudit-recon-$(VERSION)-$$d.tar.gz $$d; \
 	done
 	$(MAKE) windows
+	$(MAKE) helper
 	cd $(DIST) && mv windows host-windows-amd64 && zip -qr kloudit-recon-$(VERSION)-host-windows-amd64.zip host-windows-amd64
 	cd $(DIST) && sha256sum *.tar.gz *.zip > SHA256SUMS
 

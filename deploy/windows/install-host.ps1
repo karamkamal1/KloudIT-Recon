@@ -3,7 +3,8 @@
   Installs the KloudIT Recon host agent on this Windows PC.
 
 .DESCRIPTION
-  - Copies recon-host.exe / recon-hostw.exe to the install directory
+  - Copies recon-host.exe / recon-hostw.exe to the install directory, plus
+    recon-encoder.exe (the native capture/encode helper) when the bundle has it
   - Downloads FFmpeg (BtbN GPL release build, SHA-256 verified) unless -FFmpegPath is given
   - Optionally pairs with your gateway (-PairingCode)
   - Registers a logon task that runs the agent hidden, with highest privileges
@@ -85,15 +86,16 @@ if ($PairingCode -and $PairingCode.Trim() -notmatch '^recon1:[A-Za-z0-9_-]+$') {
 # --- Binaries ----------------------------------------------------------------
 Write-Step "Installing agent to $InstallDir"
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-# Stop the agent and any encoder it started (ffmpeg can outlive it for a moment),
-# and wait for them to exit so their files can be replaced.
+# Stop the agent and any encoder it started (ffmpeg / recon-encoder can outlive it
+# for a moment), and wait for them to exit so their files can be replaced.
 $old = @(Get-Process -Name 'recon-hostw', 'recon-host' -ErrorAction SilentlyContinue) +
-    @(Get-Process -Name 'ffmpeg' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir\*" })
+    @(Get-Process -Name 'ffmpeg', 'recon-encoder' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir\*" })
 $old | Stop-Process -Force -ErrorAction SilentlyContinue
 $old | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 # Skip files that are already in place (when re-run from the install directory).
-foreach ($f in 'recon-host.exe', 'recon-hostw.exe', 'install-host.ps1', 'uninstall-host.ps1') {
+# recon-encoder.exe is optional: without it the agent uses the FFmpeg path.
+foreach ($f in 'recon-host.exe', 'recon-hostw.exe', 'recon-encoder.exe', 'install-host.ps1', 'uninstall-host.ps1') {
     $p = Join-Path $src $f
     if ((Test-Path $p) -and ((Resolve-Path $p).Path -ne (Join-Path $InstallDir $f))) { Copy-Item $p $InstallDir -Force }
 }
