@@ -22,6 +22,7 @@ constexpr uint32_t kMaxControlMsg = 1u << 20;
 constexpr int kExitOk = 0;
 constexpr int kExitUsage = 2;  // bad arguments or the ring could not be attached
 constexpr int kExitFatal = 3;  // a fatal runtime error was reported
+constexpr int kExitStuck = 4;  // the threads did not stop in time after the helper decided to exit
 
 // Status is the result of an operation that can fail. Non-fatal errors are
 // reported to Go and the helper keeps running; a fatal error ends the helper
@@ -96,7 +97,9 @@ struct Caps {
     std::string vendor = "other";  // "amd" | "nvidia" | "intel" | "other" | "mock"
     std::string adapterLuid;       // "high:low" hex, empty if unknown
     std::string adapterName;
-    bool hagsEnabled = false;
+    // Hardware-accelerated GPU scheduling; nullopt = not detected (sent as
+    // null). Not detected yet: step 3.2 adds D3DKMTQueryAdapterInfo.
+    std::optional<bool> hagsEnabled;
     std::map<std::string, CodecCaps> codecs;
     std::vector<std::string> capture;  // usable capture backends, default first
     // Backends and capture methods that were probed and are not usable, with

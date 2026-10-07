@@ -2,6 +2,7 @@ package encoder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,12 @@ var ErrNotSupported = errors.New("encoder helper: not supported on this platform
 
 // ErrClosed is returned by calls on a helper after Close.
 var ErrClosed = errors.New("encoder helper: closed")
+
+const (
+	ctrlQueueLen   = 32                     // control messages queued for a helper that is not reading them
+	closeGrace     = 2 * time.Second        // Close kills a helper still running after this
+	fatalExitGrace = 500 * time.Millisecond // a helper still running this long after a fatal error is killed
+)
 
 // ExitError reports that the helper process ended without being asked to.
 type ExitError struct{ Code int }
@@ -84,11 +91,13 @@ type Helper struct {
 	c    conn
 	caps Caps
 
-	writeMu sync.Mutex
+	ctrlQ chan []byte   // framed control messages for writeLoop
+	stopW chan struct{} // closed by Close: writeLoop sends shutdown and closes stdin
 
-	mu      sync.Mutex
-	startCh chan startResult // pending Start
-	err     error            // why the helper ended (first fatal error / exit)
+	mu       sync.Mutex
+	startCh  chan startResult // pending Start
+	err      error            // why the helper ended (first fatal error / exit)
+	writeErr error            // why writing to the helper's stdin failed
 
 	frames   chan *Frame
 	stats    chan Stats
@@ -115,6 +124,8 @@ func newHelper(opt Options, c conn) (*Helper, error) {
 		opt:      opt,
 		log:      opt.Log,
 		c:        c,
+		ctrlQ:    make(chan []byte, ctrlQueueLen),
+		stopW:    make(chan struct{}),
 		frames:   make(chan *Frame, 4),
 		stats:    make(chan Stats, 64),
 		errs:     make(chan error, 16),
@@ -126,8 +137,9 @@ func newHelper(opt Options, c conn) (*Helper, error) {
 		h.log = slog.New(slog.DiscardHandler)
 	}
 	capsCh := make(chan *Caps, 1)
-	h.wg.Add(2)
+	h.wg.Add(3)
 	go h.controlLoop(capsCh)
+	go h.writeLoop()
 	go h.waitLoop()
 	if c.logR != nil {
 		h.wg.Add(1)
@@ -204,6 +216,9 @@ func (h *Helper) setErr(err error) {
 	h.mu.Unlock()
 }
 
+// send queues one control message for writeLoop. It never blocks: when the
+// helper stops reading its stdin (suspended, frozen in a debugger) the queue
+// fills and send fails, and Close can still kill the helper.
 func (h *Helper) send(v any) error {
 	if h.closing.Load() {
 		return ErrClosed
@@ -220,9 +235,29 @@ func (h *Helper) send(v any) error {
 	if err != nil {
 		return err
 	}
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
-	return proto.WriteMsg(h.c.ctrlW, b)
+	if len(b) > MaxControlMsg {
+		// The helper would treat it as a fatal protocol error.
+		return fmt.Errorf("encoder helper: control message of %d bytes exceeds the %d byte limit", len(b), MaxControlMsg)
+	}
+	h.mu.Lock()
+	werr := h.writeErr
+	h.mu.Unlock()
+	if werr != nil {
+		return werr
+	}
+	select {
+	case h.ctrlQ <- frameMsg(b):
+		return nil
+	default:
+		return errors.New("encoder helper: control queue full (the helper is not reading)")
+	}
+}
+
+// frameMsg returns b with the control channel's length prefix.
+func frameMsg(b []byte) []byte {
+	var buf bytes.Buffer
+	_ = proto.WriteMsg(&buf, b)
+	return buf.Bytes()
 }
 
 // Start starts capture and encoding and waits for the helper's answer.
@@ -251,6 +286,11 @@ func (h *Helper) Start(p StartParams) (Started, error) {
 		return r.started, r.err
 	case <-h.done:
 		clear()
+		select {
+		case r := <-ch: // answered before it exited
+			return r.started, r.err
+		default:
+		}
 		if err := h.Err(); err != nil {
 			return Started{}, err
 		}
@@ -278,17 +318,21 @@ func (h *Helper) SetRate(kbps int, vbvFrames float64, fps int) error {
 	return h.send(setRateMsg{T: "setRate", Kbps: kbps, VBVFrames: vbvFrames, FPS: fps})
 }
 
-// SetROI replaces the regions of interest (nil clears them).
+// SetROI replaces the regions of interest (nil clears them), at most
+// MaxROIRects.
 func (h *Helper) SetROI(rects []ROIRect) error {
+	if len(rects) > MaxROIRects {
+		return fmt.Errorf("encoder helper: %d ROI rects, at most %d", len(rects), MaxROIRects)
+	}
 	if rects == nil {
 		rects = []ROIRect{}
 	}
 	return h.send(setROIMsg{T: "setRoi", Rects: rects})
 }
 
-// Close asks the helper to exit, kills it if it does not within two seconds,
-// and frees the ring. It returns the helper's terminal error, if it ended on
-// its own before Close.
+// Close asks the helper to exit, kills it if it does not within two seconds
+// (also when it stopped reading its stdin), and frees the ring. It returns the
+// helper's terminal error, if it ended on its own before Close.
 func (h *Helper) Close() error {
 	h.closeOnce.Do(func() {
 		select {
@@ -297,18 +341,17 @@ func (h *Helper) Close() error {
 		default:
 		}
 		h.closing.Store(true)
-		h.writeMu.Lock()
-		_ = proto.WriteMsg(h.c.ctrlW, []byte(`{"t":"shutdown"}`))
-		_ = h.c.ctrlW.Close()
-		h.writeMu.Unlock()
+		close(h.stopW) // writeLoop sends shutdown and closes stdin, unless the helper stopped reading
 		select {
 		case <-h.done:
-		case <-time.After(2 * time.Second):
+		case <-time.After(closeGrace):
 			h.log.Warn("encoder helper did not exit, killing it")
 			_ = h.c.kill()
 			<-h.done
 		}
 		close(h.quit)
+		// wg includes writeLoop: once the helper is gone, a write blocked on
+		// its stdin fails.
 		_ = h.c.ctrlR.Close()
 		if h.c.logR != nil {
 			_ = h.c.logR.Close()
@@ -380,10 +423,63 @@ func (h *Helper) controlLoop(capsCh chan<- *Caps) {
 			if m.Fatal {
 				h.setErr(m)
 				h.replyStart(startResult{err: m})
+				h.killIfRunningAfter(fatalExitGrace)
 			} else if m.Re == "start" && h.replyStart(startResult{err: m}) {
 				continue // Start returns it
 			}
 			h.pushErr(m)
+		}
+	}
+}
+
+// killIfRunningAfter kills the helper if it is still running after d. Used
+// after a fatal error, which the helper follows by exiting: one whose threads
+// are stuck in the driver would otherwise hold its encoder session and delay
+// the caller's restart until Close.
+func (h *Helper) killIfRunningAfter(d time.Duration) {
+	time.AfterFunc(d, func() {
+		select {
+		case <-h.c.exited:
+		default:
+			h.log.Warn("encoder helper still running after its fatal error, killing it")
+			_ = h.c.kill()
+		}
+	})
+}
+
+// writeLoop writes the queued control messages to the helper's stdin; it is
+// the only goroutine that blocks on that pipe. After Close it writes what is
+// still queued and "shutdown", then closes stdin.
+func (h *Helper) writeLoop() {
+	defer h.wg.Done()
+	defer h.c.ctrlW.Close()
+	write := func(b []byte) bool {
+		if _, err := h.c.ctrlW.Write(b); err != nil {
+			h.mu.Lock()
+			h.writeErr = fmt.Errorf("encoder helper: control channel: %w", err)
+			h.mu.Unlock()
+			return false
+		}
+		return true
+	}
+	for {
+		select {
+		case b := <-h.ctrlQ:
+			if !write(b) {
+				return
+			}
+		case <-h.stopW:
+			for {
+				select {
+				case b := <-h.ctrlQ:
+					if !write(b) {
+						return
+					}
+				default:
+					write(frameMsg([]byte(`{"t":"shutdown"}`)))
+					return
+				}
+			}
 		}
 	}
 }

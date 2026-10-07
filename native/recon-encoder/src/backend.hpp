@@ -45,7 +45,9 @@ public:
     // which must take its own reference / copy of the texture).
     virtual void release(CapturedFrame&) {}
     virtual void setFps(int fps) { (void)fps; }
-    // Unblocks next() for good. Safe to call from any thread.
+    // Unblocks next() for good. Safe to call from any thread. Like
+    // Backend::shutdown it must not free what next() / release() use: capture
+    // resources are released by the destructor.
     virtual void shutdown() = 0;
 };
 
@@ -96,7 +98,12 @@ public:
     virtual Status recover(uint64_t lostFromFrameId, std::optional<uint64_t> ackedLtrFrameId) = 0;
     virtual Status setRate(const RateParams& r) = 0;
     virtual Status setRoi(const std::vector<RoiRect>& rects) = 0;
-    // Unblocks receive() and releases encoder resources. Safe to call twice.
+    // Unblocks receive() for good (later submit() calls return at once). Safe
+    // to call twice and from any thread. Pipeline::stop() calls it BEFORE
+    // joining the capture and output threads, which may still be inside
+    // submit() / receive() or hold an EncodedFrame, so it must not free
+    // anything they use: encoder resources are released by the destructor,
+    // which runs only after both threads have been joined.
     virtual void shutdown() = 0;
 };
 
@@ -105,6 +112,7 @@ public:
 struct MockOptions {
     uint64_t errorAt = 0;  // report a non-fatal "mock_error" when this frame id is submitted
     uint64_t fatalAt = 0;  // fail fatally ("mock_fatal") when this frame id is submitted
+    uint64_t hangAt = 0;   // never return from submit() for this frame id (a call stuck in the driver)
 };
 
 struct BackendChoice {

@@ -40,6 +40,9 @@ type StartParams struct {
 	SVCLayers int     `json:"svcLayers,omitempty"` // temporal layers (default 1)
 }
 
+// MaxROIRects is the most regions of interest one SetROI may carry.
+const MaxROIRects = 256
+
 // ROIRect is one region of interest for SetROI.
 type ROIRect struct {
 	X      int `json:"x"`
@@ -57,7 +60,7 @@ type Caps struct {
 	Vendor        string               `json:"vendor"`  // amd | nvidia | intel | other | mock
 	AdapterLUID   string               `json:"adapterLuid"`
 	AdapterName   string               `json:"adapterName"`
-	HAGSEnabled   bool                 `json:"hagsEnabled"`
+	HAGSEnabled   *bool                `json:"hagsEnabled"` // nil = not detected (the helper reports null until step 3.2)
 	Codecs        map[string]CodecCaps `json:"codecs"`
 	Capture       []string             `json:"capture"`     // usable capture methods, default first
 	Unavailable   map[string]string    `json:"unavailable"` // probed backend/capture -> why it is not usable

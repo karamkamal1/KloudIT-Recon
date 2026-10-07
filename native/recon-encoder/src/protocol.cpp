@@ -162,7 +162,7 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
         {"vendor", c.vendor},
         {"adapterLuid", c.adapterLuid},
         {"adapterName", c.adapterName},
-        {"hagsEnabled", c.hagsEnabled},
+        {"hagsEnabled", c.hagsEnabled ? json(*c.hagsEnabled) : json(nullptr)},
         {"codecs", codecs},
         {"capture", c.capture},
         {"unavailable", unavailable},

@@ -92,6 +92,10 @@ Status ReplayEncoder::init(const StartParams& p, Started& out) {
 }
 
 Status ReplayEncoder::submit(const CapturedFrame&, const SubmitInfo& info) {
+    if (opt_.hangAt && info.frameId == opt_.hangAt) {
+        logf(LogLevel::Warn, "mock: hanging in submit at frame %llu", static_cast<unsigned long long>(info.frameId));
+        for (;;) Sleep(INFINITE);
+    }
     if (opt_.fatalAt && info.frameId == opt_.fatalAt) {
         return Status::Error("mock_fatal", "injected fatal error at frame " + std::to_string(info.frameId), true);
     }

@@ -17,7 +17,9 @@ bumps it (`caps.v`, `ring.version`), and recon-host refuses a helper with anothe
    (one per frame) and `error` from the helper; frames through the ring.
 5. recon-host ends the session with `shutdown` and closes the helper's stdin; the helper
    stops its threads and exits with code 0. recon-host kills it if it is still running
-   after 2 s.
+   after 2 s. Control messages go through a bounded queue and a writer goroutine, so a
+   helper that stops reading its stdin (suspended, frozen in a debugger) blocks neither
+   the callers (the call fails once the queue is full) nor this kill.
 
 The helper is **never restarted in normal operation** (key frames, bitrate changes and
 recovery all happen inside the running encoder). When it reports a fatal error or exits,
@@ -25,19 +27,25 @@ recon-host starts a new helper and `start`s it again, which begins with an IDR. 
 first frame of the new helper within ~300 ms of the failure (measured under Wine: about
 170-240 ms from launch to first frame; on Windows it is expected to be lower, see
 docs/VENDOR_NOTES.md). The restart policy lives in the
-caller (the session), not in `internal/host/encoder`.
+caller (the session), not in `internal/host/encoder`; the client only kills a helper that
+is still running 500 ms after reporting a fatal error, so `Done` follows the fatal error
+promptly.
 
-The helper exits on its own when stdin reaches EOF, so it never outlives recon-host.
+The helper exits on its own when stdin reaches EOF, so it never outlives recon-host. Once
+it has decided to exit (fatal error, `shutdown`, stdin EOF or a broken stdout) it must be
+gone within 500 ms: a watchdog thread then terminates the process (exit code 4), so a
+capture or encoder call stuck in the driver cannot keep it, and its GPU encoder session,
+alive. A driver hang therefore costs up to 500 ms before the restart begins.
 
 Exit codes: `0` clean shutdown, `2` bad arguments or ring attach failure, `3` after a
-fatal error.
+fatal error, `4` the threads did not stop within 500 ms of deciding to exit (watchdog).
 
 ## Command line
 
 ```
 recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
                   [--backend=auto|amf|nvenc|mock] [--log-level=error|warn|info|debug]
-                  [--mock-error-at=N] [--mock-fatal-at=N]
+                  [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
 recon-encoder.exe --version
 ```
@@ -51,6 +59,7 @@ recon-encoder.exe --version
   vendors. `mock` is the GPU-free test backend.
 * `--mock-error-at` / `--mock-fatal-at`: test fault injection (mock backend only): a
   non-fatal `mock_error` / a fatal `mock_fatal` when that frame id is submitted.
+  `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
 
 Logs go to stderr as `level: message` lines; recon-host forwards them to its log.
 
@@ -74,9 +83,11 @@ them inheritable only for the duration of `CreateProcess`. No named kernel objec
 Framing (both directions, same as `proto.WriteMsg` / `proto.ReadMsg`): `u32 length`
 (little-endian) followed by that many bytes of UTF-8 JSON, one object per message. The
 `"t"` field is the message type. Messages larger than 1 MiB are a protocol error: the
-helper reports a fatal `protocol` error and exits; recon-host kills the helper. Unknown
-fields are ignored (forward compatibility); unknown message types are a non-fatal
-`bad_message` error on the helper side and are ignored by recon-host.
+helper reports a fatal `protocol` error and exits; recon-host kills the helper. The Go
+client never sends one: such a request fails locally (as does `SetROI` with more than 256
+rects) and the helper keeps running. Unknown fields are ignored (forward compatibility);
+unknown message types are a non-fatal `bad_message` error on the helper side and are
+ignored by recon-host.
 
 ### recon-host to helper
 
@@ -101,7 +112,7 @@ fields are ignored (forward compatibility); unknown message types are a non-fata
 
 ```json
 {"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock",
- "adapterLuid":"","adapterName":"","hagsEnabled":false,
+ "adapterLuid":"","adapterName":"","hagsEnabled":null,
  "codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,
    "recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless",
    "maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":1,
@@ -116,6 +127,10 @@ fields are ignored (forward compatibility); unknown message types are a non-fata
 * `backend`: `amf` | `nvenc` | `mock` | `none` (nothing usable: `codecs` is empty and
   `start` fails with `unavailable`; recon-host uses the FFmpeg path).
 * `vendor`: `amd` | `nvidia` | `intel` | `other` | `mock`.
+* `hagsEnabled`: hardware-accelerated GPU scheduling on the adapter, `true` / `false`, or
+  `null` when not detected. **Always `null` for now:** detection (D3DKMTQueryAdapterInfo)
+  comes with capture in step 3.2. Consumers must treat `null` as unknown, never as off
+  (GUIDE 1.3: NVIDIA must not get REALTIME GPU priority with HAGS on).
 * `codecs.<codec>`: `recovery` `ltr` | `invalidate` | `none`; `liveBitrate` `seamless` |
   `flush` | `restart`; `roi` `importance` | `emphasis` | `none`; `alignW`/`alignH` the
   coded-size alignment (AV1 on RDNA3: 64x16). Values start as vendor defaults; the
@@ -141,6 +156,14 @@ the current target as last set (start or `setRate`). Timestamps are QPC ticks
 capture method cannot tell), `captureQpc` when capture returned it, `submitQpc` when it
 went into the encoder, `outputQpc` when the bitstream came out. Stats are telemetry;
 recon-host may drop them when busy. Loss detection uses the ring (below), not stats.
+
+**Deviation from GUIDE Arch-3 (`ptsQpc`, `type`):** there is no separate `ptsQpc`;
+`captureQpc` is the frame's presentation timestamp on the encoder timeline (always set and
+increasing from frame to frame, unlike `presentQpc`, which can be 0). The frame type is
+`key` (IDR / key frame with parameter sets) plus `recovery` (references only acknowledged
+frames); the backends are configured without B frames (GUIDE 3.3/3.4), so every frame
+without `key` is reported as a P frame (a non-IDR intra frame too: it is not a decoder
+entry point). `ltrSlot` and `temporalLayer` complete the picture.
 
 `error`: `{"t":"error","code":"unsupported","text":"...","fatal":false,"re":"start"}`.
 `re` names the request that caused it, if any. After a fatal error the helper exits
@@ -261,7 +284,11 @@ output thread   Backend::receive() -> ring -> stats   (one per encoder)
 `forceIdr()`, `recover(lostFrom, ackedLtr)`, `setRate(kbps, vbvFrames, fps)`,
 `setRoi(rects)`, `shutdown()`. Control calls can run concurrently with `submit` /
 `receive`; backends record them and apply them on the next submitted frame. `Capture`:
-`init`, `next(timeout)`, `release`, `setFps`, `shutdown`.
+`init`, `next(timeout)`, `release`, `setFps`, `shutdown`. `shutdown()` of either only
+wakes `receive()` / `next()`: the pipeline calls it before joining the capture and output
+threads, which may still be inside `submit()` / `receive()` or hold an encoded frame, so it
+must not free anything. Encoder and capture resources are released by the destructors,
+after both threads have been joined.
 
 ## Mock backend
 

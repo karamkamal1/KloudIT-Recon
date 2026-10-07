@@ -31,7 +31,9 @@ public:
     Pipeline& operator=(const Pipeline&) = delete;
 
     void start();
-    // Stops capture and the encoder and joins both threads. Idempotent.
+    // Wakes capture and the encoder (Capture/Backend::shutdown) and joins both
+    // threads. Idempotent. The caller destroys the backend and the capture,
+    // which releases their resources, only after this.
     void stop();
 
     // setRate is recorded here (it shows up in every stats message) and

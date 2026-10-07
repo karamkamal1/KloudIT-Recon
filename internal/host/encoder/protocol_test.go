@@ -7,7 +7,7 @@ import (
 )
 
 // Exactly what recon-encoder.exe --backend=mock --print-caps prints (under Wine).
-const mockCapsJSON = `{"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock","adapterLuid":"","adapterName":"","hagsEnabled":false,"codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,"recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless","maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":1,"queryTimeout":false,"alignW":1,"alignH":1}},"capture":["synthetic"],"unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module not found (error 126)","dda":"desktop duplication capture is not implemented yet (step 3.2)","amd-direct":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","wgc":"Windows.Graphics.Capture is not implemented yet (step 3.2)"},"qpcFrequency":10000000}`
+const mockCapsJSON = `{"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock","adapterLuid":"","adapterName":"","hagsEnabled":null,"codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,"recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless","maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":1,"queryTimeout":false,"alignW":1,"alignH":1}},"capture":["synthetic"],"unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module not found (error 126)","dda":"desktop duplication capture is not implemented yet (step 3.2)","amd-direct":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","wgc":"Windows.Graphics.Capture is not implemented yet (step 3.2)"},"qpcFrequency":10000000}`
 
 func TestDecodeCaps(t *testing.T) {
 	m, err := decodeMessage([]byte(mockCapsJSON))
@@ -21,7 +21,7 @@ func TestDecodeCaps(t *testing.T) {
 	h := c.Codecs["h264"]
 	if c.V != 1 || c.Backend != "mock" || c.Vendor != "mock" || !c.Usable() || c.QPCFrequency != 10_000_000 ||
 		h.MaxW != 320 || !h.ForceIDR || h.Recovery != "none" || h.LiveBitrate != "seamless" || h.AlignW != 1 ||
-		len(c.Capture) != 1 || c.Capture[0] != "synthetic" || c.Unavailable["dda"] == "" {
+		len(c.Capture) != 1 || c.Capture[0] != "synthetic" || c.Unavailable["dda"] == "" || c.HAGSEnabled != nil {
 		t.Fatalf("caps %+v", c)
 	}
 
@@ -35,7 +35,8 @@ func TestDecodeCaps(t *testing.T) {
 		t.Fatal(err)
 	}
 	c = m.(*Caps)
-	if c.Codecs["hevc"].MaxLTR != 4 || c.Codecs["hevc"].Recovery != "ltr" || c.Codecs["av1"].AlignW != 64 || !c.HAGSEnabled {
+	if c.Codecs["hevc"].MaxLTR != 4 || c.Codecs["hevc"].Recovery != "ltr" || c.Codecs["av1"].AlignW != 64 ||
+		c.HAGSEnabled == nil || !*c.HAGSEnabled {
 		t.Fatalf("arch-2 caps %+v", c)
 	}
 	if (&Caps{Backend: "none"}).Usable() || (&Caps{Backend: "amf"}).Usable() {

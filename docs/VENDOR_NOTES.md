@@ -37,6 +37,18 @@ Verified in the sandbox (Linux, no GPU, no Windows):
   against an in-process fake helper.
 - Under Wine `--backend=auto` finds no DXGI adapter (headless), so `vendor` is `other`
   and `adapterLuid` empty; on Windows it reports DXGI adapter 0.
+- Exit watchdog (review fix): with `--mock-hang-at=5` (submit never returns) the helper
+  terminates itself with exit code 4 about 510 ms after stdin EOF, and `Close` returns
+  after about 610 ms instead of killing at 2 s (`TestHelperIntegrationStuckExit`, Wine).
+  A fatal error the helper does not follow by exiting gets it killed after 500 ms
+  (`TestHelperFatalKillsStuckHelper`).
+- Frozen helper (review fix): with the real helper under Wine stopped by SIGSTOP (as if
+  suspended), 34 back-to-back `SetRate` calls returned "control queue full" within 0.3 ms
+  instead of blocking, and `Close` killed the helper after 2.06 s (manual run). Before
+  the fix `Close` blocked indefinitely (reproduced with the in-process fake helper).
+- Oversized requests (review fix): `SetROI` with more than 256 rects and any control
+  message above 1 MiB fail locally and the helper keeps running
+  (`TestHelperRejectsOversizedRequests`).
 
 Hardware / real Windows checks:
 - AMD RDNA3 (RX 7900 XT): unverified. Test: copy dist/windows/recon-encoder.exe to the
@@ -58,8 +70,14 @@ Hardware / real Windows checks:
   synthetic capture on a high-resolution waitable timer) holds.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same integration test run on
   an NVIDIA host; all pass, `restart to first frame` < 300 ms.
-- Both vendors: unverified. Test: with recon-host running a session on the helper (after
-  the session integration step), kill recon-host from Task Manager; recon-encoder.exe
-  must exit by itself within a second (stdin EOF), and Process Explorer must show no
-  named section or event created by either process (the ring and event are unnamed and
-  only inherited by the helper).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with recon-host running a session on the
+  helper (after the session integration step), kill recon-host from Task Manager;
+  recon-encoder.exe must exit by itself within a second (stdin EOF), and Process
+  Explorer must show no named section or event created by either process (the ring and
+  event are unnamed and only inherited by the helper). Then start a new session, suspend
+  recon-encoder.exe in Process Explorer and end the session: recon-host must not hang and
+  must kill the helper about 2 s later.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same as for AMD: kill
+  recon-host from Task Manager during a session; recon-encoder.exe exits by itself within
+  a second and Process Explorer shows no named section or event of either process; a
+  suspended recon-encoder.exe is killed about 2 s after the session ends.

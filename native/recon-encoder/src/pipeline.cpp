@@ -16,6 +16,7 @@ void Pipeline::start() {
 
 void Pipeline::stop() {
     stop_ = true;
+    // Only wakes the threads; nothing is freed until they have been joined.
     cap_.shutdown();
     enc_.shutdown();
     if (capture_.joinable()) capture_.join();

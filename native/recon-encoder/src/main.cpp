@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #include "backend.hpp"
 #include "control.hpp"
@@ -39,6 +41,7 @@ const char kUsage[] =
     "  --log-level=L        error | warn | info (default) | debug   (logs go to stderr)\n"
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
+    "  --mock-hang-at=N     mock only: never return from submitting frame N (a call stuck in the driver)\n"
     "  --print-caps         print the capabilities JSON and exit\n";
 
 struct Args {
@@ -79,6 +82,7 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         else if (key == "--log-level") ok = parseLogLevel(val, a.logLevel);
         else if (key == "--mock-error-at") ok = parseNumber(val, a.mock.errorAt);
         else if (key == "--mock-fatal-at") ok = parseNumber(val, a.mock.fatalAt);
+        else if (key == "--mock-hang-at") ok = parseNumber(val, a.mock.hangAt);
         else {
             err = "unknown argument " + arg;
             return false;
@@ -92,7 +96,7 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         err = "unknown backend " + a.backend;
         return false;
     }
-    if ((a.mock.errorAt || a.mock.fatalAt) && a.backend != "mock") {
+    if ((a.mock.errorAt || a.mock.fatalAt || a.mock.hangAt) && a.backend != "mock") {
         err = "--mock-* options need --backend=mock";
         return false;
     }
@@ -104,6 +108,27 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
 }
 
 HANDLE toHandle(uint64_t v) { return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(v)); }
+
+// How long the helper may take to stop its threads and release the encoder
+// once it has decided to exit.
+constexpr DWORD kExitWatchdogMs = 500;
+
+// Ends the process (exit code kExitStuck) kExitWatchdogMs after the helper
+// decided to exit (fatal error, shutdown, stdin EOF) unless it has exited by
+// then: a capture or encoder call stuck in the driver must not keep the helper,
+// and its GPU encoder session, alive. recon-host kills a helper that reported a
+// fatal error as well, but after stdin EOF nobody is left to do that.
+void armExitWatchdog(ControlChannel& control) {
+    static std::once_flag once;
+    std::call_once(once, [&control] {
+        std::thread([&control] {
+            Sleep(kExitWatchdogMs);
+            logf(LogLevel::Error, "threads did not stop within %lu ms of exiting, terminating", kExitWatchdogMs);
+            control.flush(200);  // a fatal error must still reach recon-host
+            TerminateProcess(GetCurrentProcess(), static_cast<UINT>(kExitStuck));
+        }).detach();
+    });
+}
 
 class MainReporter : public Reporter {
 public:
@@ -120,6 +145,7 @@ public:
             f.fatal = true;
             c_.send(encodeError(f, ""));
         }
+        armExitWatchdog(c_);
         c_.wake();
     }
     bool fatalRaised() const { return fatal_; }
@@ -169,6 +195,9 @@ int main(int argc, char** argv) {
     // Intentionally never freed: its reader and writer threads can still be
     // blocked in ReadFile / WriteFile while the process exits.
     auto* control = new ControlChannel(GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE));
+    // Armed from the reader thread too: the main thread may be the one stuck
+    // (e.g. in Backend::init) when recon-host goes away.
+    control->onClosed([control] { armExitWatchdog(*control); });
 
     control->start();
 
@@ -284,9 +313,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (pipeline) pipeline->stop();
-    if (choice.backend) choice.backend->shutdown();
-    if (capture) capture->shutdown();
+    armExitWatchdog(*control);
+    if (pipeline) pipeline->stop();  // wakes and joins the threads
+    // Only now release the encoder and the capture (their destructors).
+    pipeline.reset();
+    choice.backend.reset();
+    capture.reset();
     control->flush(2000);  // the last messages (a fatal error) must reach recon-host
     logf(LogLevel::Info, "exiting (%d)", exitCode);
     return exitCode;

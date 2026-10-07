@@ -37,6 +37,12 @@ bool ControlChannel::readFull(void* buf, DWORD n) {
     return true;
 }
 
+void ControlChannel::closed() {
+    std::call_once(closedOnce_, [this] {
+        if (onClosed_) onClosed_();
+    });
+}
+
 void ControlChannel::readLoop() {
     for (;;) {
         uint8_t hdr[4];
@@ -44,9 +50,12 @@ void ControlChannel::readLoop() {
         uint32_t n;
         std::memcpy(&n, hdr, 4);
         if (n > kMaxControlMsg) {
-            std::lock_guard<std::mutex> lock(mu_);
-            protocolError_ = true;
-            cv_.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                protocolError_ = true;
+                cv_.notify_all();
+            }
+            closed();
             return;
         }
         std::string msg(n, '\0');
@@ -55,9 +64,12 @@ void ControlChannel::readLoop() {
         queue_.push_back(std::move(msg));
         cv_.notify_all();
     }
-    std::lock_guard<std::mutex> lock(mu_);
-    eof_ = true;
-    cv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        eof_ = true;
+        cv_.notify_all();
+    }
+    closed();
 }
 
 ControlChannel::Event ControlChannel::next(std::string& msg) {
@@ -126,18 +138,22 @@ void ControlChannel::writeLoop() {
             p += wrote;
             left -= wrote;
         }
-        std::lock_guard<std::mutex> lock(writeMu_);
-        writing_ = false;
-        if (!ok) {
+        {
+            std::lock_guard<std::mutex> lock(writeMu_);
+            writing_ = false;
+            if (ok) {
+                writeCv_.notify_all();
+                continue;
+            }
             broken_ = true;
             outQueue_.clear();
             writeCv_.notify_all();
             std::lock_guard<std::mutex> l2(mu_);
             eof_ = true;  // recon-host is gone: shut down
             cv_.notify_all();
-            return;
         }
-        writeCv_.notify_all();
+        closed();
+        return;
     }
 }
 

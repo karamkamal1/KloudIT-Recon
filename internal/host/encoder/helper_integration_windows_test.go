@@ -363,9 +363,7 @@ func TestHelperIntegrationErrors(t *testing.T) {
 
 	// Broken framing (a length above the limit) is fatal.
 	h2 := launchMock(t)
-	h2.writeMu.Lock()
-	h2.c.ctrlW.Write([]byte{0xff, 0xff, 0xff, 0x7f})
-	h2.writeMu.Unlock()
+	h2.ctrlQ <- []byte{0xff, 0xff, 0xff, 0x7f}
 	if e := waitHelperError(t, h2, "protocol"); !e.Fatal {
 		t.Fatalf("protocol error not fatal: %v", e)
 	}
@@ -386,6 +384,54 @@ func TestHelperIntegrationErrors(t *testing.T) {
 		t.Fatalf("Err() after kill = %v", h.Err())
 	}
 	for range h.Frames() {
+	}
+}
+
+func TestHelperIntegrationStuckExit(t *testing.T) {
+	// A capture/encoder call stuck in the driver (the mock never returns from
+	// submitting frame 5) must not keep the helper alive once it should exit:
+	// its watchdog ends it with code 4 about 500 ms later.
+	const exitStuck = 4
+	stuck := func() *Helper {
+		t.Helper()
+		h := launchMock(t, "--mock-hang-at=5")
+		if _, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000}); err != nil {
+			t.Fatal(err)
+		}
+		for f := range h.Frames() {
+			if f.FrameID == 4 {
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond) // frame 5 is stuck in submit by now
+		return h
+	}
+	var ee *ExitError
+
+	// recon-host went away: stdin EOF, and nobody is left to kill the helper.
+	h := stuck()
+	start := time.Now()
+	h.c.ctrlW.Close() // writeLoop is idle
+	select {
+	case <-h.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper with a stuck thread still running after stdin EOF")
+	}
+	t.Logf("exited %v after stdin EOF", time.Since(start))
+	if !errors.As(h.Err(), &ee) || ee.Code != exitStuck {
+		t.Fatalf("Err() after stdin EOF = %v", h.Err())
+	}
+
+	// Close (shutdown): the helper ends itself well before Close would kill it.
+	h = stuck()
+	start = time.Now()
+	h.Close()
+	if d := time.Since(start); d >= closeGrace {
+		t.Fatalf("Close took %v: the helper did not end itself", d)
+	}
+	t.Logf("Close took %v", time.Since(start))
+	if !errors.As(h.Err(), &ee) || ee.Code != exitStuck {
+		t.Fatalf("Err() after Close = %v", h.Err())
 	}
 }
 

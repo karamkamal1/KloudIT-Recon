@@ -10,6 +10,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -22,6 +23,11 @@ public:
     ~ControlChannel();
     ControlChannel(const ControlChannel&) = delete;
     ControlChannel& operator=(const ControlChannel&) = delete;
+
+    // Called once, on the reader or writer thread, when stdin reaches EOF, the
+    // framing breaks or stdout breaks (recon-host is gone or gave up on us).
+    // Set before start().
+    void onClosed(std::function<void()> f) { onClosed_ = std::move(f); }
 
     // Starts the stdin reader and stdout writer threads.
     void start();
@@ -46,9 +52,12 @@ private:
     void writeLoop();
     bool readFull(void* buf, DWORD n);
     bool enqueue(const std::string& json, bool droppable);
+    void closed();
 
     HANDLE inPipe_;
     HANDLE outPipe_;
+    std::function<void()> onClosed_;
+    std::once_flag closedOnce_;
     std::thread reader_;
     std::thread writer_;
 

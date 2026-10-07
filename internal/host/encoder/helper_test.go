@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -301,6 +302,105 @@ func TestHelperFatal(t *testing.T) {
 	}
 	if _, err := h.Start(StartParams{Codec: "h264"}); err == nil {
 		t.Fatal("start after exit succeeded")
+	}
+}
+
+// A helper that reported a fatal error exits; one that does not (threads stuck
+// in the driver) is killed after a short grace, not only at Close.
+func TestHelperFatalKillsStuckHelper(t *testing.T) {
+	h, f, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+		if m["t"] == "forceIdr" {
+			f.send(HelperError{Code: "encode_failed", Text: "stuck in the driver", Fatal: true}) // and no exit
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	start := time.Now()
+	if err := h.ForceIDR(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-h.Done():
+	case <-time.After(closeGrace):
+		t.Fatal("helper not killed after its fatal error")
+	}
+	if d := time.Since(start); d < fatalExitGrace {
+		t.Fatalf("killed %v after the fatal error, before the grace period", d)
+	}
+	var he *HelperError
+	if err := h.Err(); !errors.As(err, &he) || he.Code != "encode_failed" {
+		t.Fatalf("Err() = %v", err)
+	}
+	if f.code != 1 {
+		t.Fatalf("helper exited with %d, want killed (1)", f.code)
+	}
+}
+
+// A helper that stops reading its stdin (suspended, frozen in a debugger) must
+// stall neither the callers nor Close, which kills it.
+func TestHelperFrozenHelper(t *testing.T) {
+	frozen := make(chan struct{})
+	h, f, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+		if m["t"] == "setRate" {
+			<-frozen // never reads stdin again
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(frozen)
+	start := time.Now()
+	full := false
+	for i := 0; i < 2*ctrlQueueLen && !full; i++ {
+		full = h.SetRate(1000+i, 0, 0) != nil
+	}
+	if !full {
+		t.Fatal("SetRate never reported the full queue")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("SetRate blocked for %v", d)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- h.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(closeGrace + 3*time.Second):
+		t.Fatal("Close blocked on a helper that stopped reading")
+	}
+	<-f.exited
+	if f.code != 1 {
+		t.Fatalf("helper exited with %d, want killed (1)", f.code)
+	}
+	<-f.released
+}
+
+// Requests the helper would treat as a fatal protocol error, or can never
+// accept, fail locally and leave the helper running.
+func TestHelperRejectsOversizedRequests(t *testing.T) {
+	h, f, err := launchFake(t, mockCapsJSON, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if err := h.SetROI(make([]ROIRect, MaxROIRects+1)); err == nil {
+		t.Fatal("SetROI accepted more than MaxROIRects rects")
+	}
+	if err := h.send(simpleMsg{T: strings.Repeat("x", MaxControlMsg)}); err == nil {
+		t.Fatal("send accepted a message above MaxControlMsg")
+	}
+	// Nothing was written (the fake would have quit on an over-long message).
+	if err := h.SetROI(make([]ROIRect, MaxROIRects)); err != nil {
+		t.Fatal(err)
+	}
+	if m := <-f.msgs; m["t"] != "setRoi" || len(m["rects"].([]any)) != MaxROIRects {
+		t.Fatalf("got %v", m["t"])
+	}
+	select {
+	case <-h.Done():
+		t.Fatalf("helper gone: %v", h.Err())
+	default:
 	}
 }
 
