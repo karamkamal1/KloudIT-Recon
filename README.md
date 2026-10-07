@@ -337,9 +337,9 @@ Repository layout:
 | `test/e2e`, `internal/e2e` | Browser end-to-end test; Go integration test (gateway + agent) |
 
 ```bash
-make test        # go vet (linux + windows) and all Go tests (needs ffmpeg in PATH)
+make test        # go vet (linux + windows), all Go tests and the latency rig's Python tests (needs ffmpeg, python3)
 make build       # dist/recon-gateway, dist/recon-host (Linux host = test pattern + logged input)
-make e2e         # real gateway + host + headless Chromium (npm i in test/e2e first)
+make e2e         # real gateway + host + headless Chromium, latency rig flash page (npm i in test/e2e first)
 make release     # all bundles + SHA256SUMS
 ```
 

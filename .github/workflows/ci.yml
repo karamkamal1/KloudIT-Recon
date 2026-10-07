@@ -25,6 +25,8 @@ jobs:
           GOOS=windows go vet ./...
       - name: Unit + integration tests
         run: go test -timeout 10m ./...
+      - name: Latency rig tests (Python)
+        run: python3 -m unittest discover -s tools/latency-rig/test
       - name: Build
         run: make build
       - uses: actions/setup-node@v4
@@ -36,6 +38,8 @@ jobs:
           npm install --no-audit --no-fund
           npx playwright install --with-deps chromium
           node browser.mjs
+      - name: Latency rig flash page (headless Chromium)
+        run: node tools/latency-rig/test/flash_smoke.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
