@@ -2923,6 +2923,19 @@ d437ebc; master at d724496 is the same in these points):
   `vdd_settings.xml.recon-backup`), restarts the device (`DIF_PROPERTYCHANGE` /
   `DICS_PROPCHANGE`), or enables it when it is disabled (`DICS_ENABLE`) and disables it again
   after the session. These need the elevated agent (the logon task runs it elevated).
+  `install-host.ps1` leaves the device disabled after installing it, so enabling it per session
+  is the normal path: a running device keeps its monitor connected between sessions (Windows
+  extends the desktop onto it, and it shifts ddagrab's output indices), and the topology a
+  session restores then includes that monitor. `probe` says so for a running device.
+- Settings folder access: a folder created under `C:\` inherits "Authenticated Users: Modify"
+  from the drive root, and the agent writes into it elevated. The installer makes the folder
+  owned by Administrators with a non-inherited ACL (Administrators and SYSTEM full control,
+  Users read and execute; Users includes the driver's LocalService host). The agent writes
+  (settings, backup, temporary file) only when the folder and those files are not reparse
+  points, are owned by Administrators, SYSTEM or TrustedInstaller, and no ACE (inherit-only
+  ones included) gives anyone else write, delete or permission rights; otherwise the session's
+  virtual display fails with the `icacls` command that fixes it. A missing folder is created
+  with that ACL. `docs/SECURITY.md` (Host-side safety) has the rule.
 - Release 25.7.23, `VirtualDisplayDriver-x86.Driver.Only.zip` (an x64 driver despite the name:
   `[Standard.NTamd64]`): SHA-256 `e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a`,
   `DriverVer = 12/24/2024,11.30.4.434`, catalog signed by SignPath Foundation (GlobalSign GCC R45
@@ -2954,7 +2967,11 @@ pinned by tests.
    never a rotated monitor.
 3. `Decide` (`auto`): yes when a driver is there and the physical monitor cannot show the mode
    1:1 (other size, or fps above its refresh rate), or there is no physical monitor; `on`:
-   always (no driver: the session falls back and says why).
+   always (no driver: the session falls back and says why). Also yes when the monitor the
+   session would capture is the agent's own virtual display (left by the previous session,
+   lingering or still owned; as primary or only display it is the one a session picks first):
+   `Create` then reuses or replaces it, instead of the session capturing it unowned until the
+   linger timer removes it.
 4. `Create`: snapshot the active topology (and write it to `vdisplay-restore.json` next to
    host.json), plug (SudoVDA: REMOVE leftover, SET_RENDER_ADAPTER, ADD; VDD: settings + PnP),
    wait for the monitor (up to 6 s; switched on after 1.5 s if Windows left it off; given its
@@ -2968,9 +2985,12 @@ pinned by tests.
 5. `Close`: after `Linger` (a reconnect with the same mode in that time gets the same display),
    unplug (SudoVDA: REMOVE; VDD: disable only if the session enabled it), wait for the monitor to
    leave, apply the snapshot exactly, else with `SDC_ALLOW_CHANGES`, else Windows' saved layout
-   (`SDC_USE_DATABASE_CURRENT`); the restore never saves. A VDD monitor that stays connected is
-   switched off by applying the snapshot first. `Recover` at agent start replays the journal
-   after a crash.
+   (`SDC_USE_DATABASE_CURRENT`); the restore never saves. The departure is awaited on the target
+   CCD lists, also when the driver reported another adapter LUID (the journal is rewritten with
+   it). A VDD device that was already running before the session stays running: the snapshot
+   (which then includes its monitor) is applied first and the monitor stays as it was; only a
+   device the session enabled is disabled again, before the restore. `Recover` at agent start
+   replays the journal after a crash.
 
 ### Session integration (for the session rewrite)
 
@@ -2979,7 +2999,9 @@ pinned by tests.
   sessions; `vd.Close()` on shutdown.
 - `buildParams` (first generation of a session, and when prefs change size/fps): `req :=
   vdisplay.RequestedMode(hello.Client, prefs, cfg.DefaultFPS, cfg.MaxFPS).Complete(&phys)`;
-  `if use, why := vd.Decide(req, &phys); use { d, err := vd.Create(req) }`. On success capture
+  `if use, why := vd.Decide(req, &phys); use { d, err := vd.Create(req) }`, with `phys` the
+  monitor from `a.monitors()` the session would capture, even when it is the agent's own
+  virtual display (Decide then says yes and Create takes it over). On success capture
   `d.Info().Monitor` (find it in `a.monitors()` with `Info.Find`, or use it as is) instead of
   `mons[prefs.Monitor]`: input target = its rectangle, `mon.Hz` = the virtual refresh (lifts
   the fps cap), FFmpeg backend `ddagrab` with `output_idx` = `Monitor.DXGIOutput` (when it is
@@ -3004,10 +3026,13 @@ pinned by tests.
   differs from CCD's (found as the new target id), a refresh rate Windows will not set
   (accepted at 60 Hz), a failed `SetDisplayConfig` (everything undone, journal removed), the
   restore fallbacks (supplied, `SDC_ALLOW_CHANGES`, database), linger reuse and expiry, a
-  second session with another mode taking over, keepalive loss, VDD's order (restore before
-  unplug, nothing saved), crash recovery from the journal and a corrupt journal, no driver, a
-  broken driver, a failed plug, `Decide` / `RequestedMode` / `ParseMode` tables, stable monitor
-  GUIDs. `go test -race` clean.
+  second session with another mode taking over, `Decide` on the agent's own lingering or owned
+  display (yes, and `Create` reuses it; a matching physical monitor still no), the departure
+  awaited on CCD's target when the driver reports another LUID (the fake's monitor leaves 30 ms
+  after the unplug; the restore comes after it; the journal holds CCD's target), keepalive
+  loss, a VDD device that was already running (restore before unplug, nothing saved), crash
+  recovery from the journal and a corrupt journal, no driver, a broken driver, a failed plug,
+  `Decide` / `RequestedMode` / `ParseMode` tables, stable monitor GUIDs. `go test -race` clean.
 - verified (sandbox): CCD struct layouts (`TestCCDLayout`, sizes and offsets per wingdi.h x64)
   and on real data under Wine 9 (`TestQueryDisplayConfig`; `GOOS=windows go test -c
   ./internal/host/vdisplay`, run with `xvfb-run -a wine64`): the source mode
@@ -3015,6 +3040,14 @@ pinned by tests.
   `DisplayConfigGetDeviceInfo` names the source `\\.\DISPLAY1`, matching `platform.Monitors`.
   Wine 9 rejects `QDC_VIRTUAL_MODE_AWARE` (the test then reads the classic layout) and does not
   implement `DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME`; both exist on Windows 10+.
+- verified (sandbox): the settings folder check (`TestCheckPrivateSD`, Windows build under Wine
+  9): the ACL the agent and installer set (owner Administrators or SYSTEM) is accepted; refused:
+  the ACL a folder made under `C:\` inherits (Authenticated Users Modify), an inherit-only write
+  ACE for Users, a write-DAC ACE for Everyone, a non-administrator or CREATOR OWNER owner, no
+  DACL. `TestCreatePrivateDir` (the folder the agent creates passes its own check) skips under
+  Wine, whose file system here does not keep security descriptors; on Windows it runs. The
+  installer's link check (`Assert-NoVddLinks`) refused a symbolic link in a test folder (pwsh 7
+  on Linux).
 - verified (sandbox): SudoVDA IOCTL codes and the 56/12/16/8/4-byte buffers against the header
   (`TestSudoVDAIoctlCodes`, `TestSudoVDAAddParams`, `TestSudoVDAReplies`).
 - verified (sandbox): the VDD settings parser and editor on the release's own
@@ -3033,11 +3066,27 @@ pinned by tests.
   host bundle folder run `.\install-host.ps1 -InstallVirtualDisplay` (Apollo not installed);
   accept the "SignPath Foundation" prompt. Expect "Virtual Display Driver and nefcon checksums
   verified", nefcon "Device and driver installed successfully", `"virtualDisplay": "auto"` in
-  host.json, Device Manager > Display adapters > "Virtual Display Driver" running, and
-  `recon-host.exe probe` printing `virtual display: vdd device ROOT\DISPLAY\000N running, 35
-  modes, 1 monitor(s) in C:\VirtualDisplayDriver\vdd_settings.xml`. With Apollo installed
+  host.json, "Virtual Display Driver device ROOT\DISPLAY\000N disabled", Device Manager >
+  Display adapters > "Virtual Display Driver" disabled, Settings > System > Display showing only
+  the physical monitor(s), and `recon-host.exe probe` printing `virtual display: vdd device
+  ROOT\DISPLAY\000N disabled (enabled for sessions), 35 modes, 1 monitor(s) in
+  C:\VirtualDisplayDriver\vdd_settings.xml`. `icacls C:\VirtualDisplayDriver` must list only
+  BUILTIN\Administrators:(OI)(CI)(F), NT AUTHORITY\SYSTEM:(OI)(CI)(F) and
+  BUILTIN\Users:(OI)(CI)(RX), none of them "(I)", and `icacls
+  C:\VirtualDisplayDriver\vdd_settings.xml` the same three, inherited. With Apollo installed
   instead: `virtual display: sudovda protocol 0.2.x, watchdog 3 s`. Record both, and whether a
-  reboot was needed (exit code 3010).
+  reboot was needed (exit code 3010; then check the device is disabled after the reboot).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (VDD enabled per session, folder access): during the
+  `recon-host.exe vdisplay -hold` run below, Device Manager shows the device enabled and its
+  monitor is in the "with the virtual display:" list; after "removed and restored in" the device
+  is disabled again and "after:" equals "before:". Also check that the driver still reads its
+  restricted settings (the new mode is offered). Then
+  `icacls C:\VirtualDisplayDriver /grant *S-1-5-11:(OI)(CI)M` (Authenticated Users Modify) and
+  `-mode 3440x1440@100` (a mode not in the file): it must fail with "may change it" and the
+  `icacls` command to fix it, without touching the file, and `probe` must add "new modes cannot
+  be added: ..."; running the installer with `-InstallVirtualDisplay` again restores the access.
+  Last, with the device enabled by hand in Device Manager, `probe` says "running (its monitor
+  stays connected outside sessions: ...)".
 - AMD RDNA3 (RX 7900 XT): unverified. Test (2560x1440@120 above the host monitor's refresh):
   set the physical monitor to 60 Hz, stop the agent (`Stop-ScheduledTask 'KloudIT Recon Host'`),
   run `recon-host.exe vdisplay -mode 2560x1440@120 -layout primary -hold 120s`. Expect "created
@@ -3060,9 +3109,10 @@ pinned by tests.
   windows are back on the physical monitor. Repeat with `-layout only` (the physical monitor
   goes dark during the hold and comes back) and `-layout extend` (nothing moves). Crash case:
   run with `-hold 600s`, end recon-host.exe in Task Manager: SudoVDA removes the monitor within 3
-  s and Windows restores the layout by itself; VDD keeps its monitor; then `recon-host.exe
-  vdisplay -hold 1s` prints "restoring the displays after an unfinished virtual display
-  session" (journal in %TEMP%\kloudit-recon-vdisplay-test) and leaves the original layout.
+  s and Windows restores the layout by itself; VDD keeps its monitor (the device the run enabled
+  stays enabled); then `recon-host.exe vdisplay -hold 1s` prints "restoring the displays after
+  an unfinished virtual display session" (journal in %TEMP%\kloudit-recon-vdisplay-test),
+  disables the VDD device again and leaves the original layout.
   With `-layout only` and VDD, also reboot during the hold: the physical monitor must light up
   at the sign-in screen (nothing saved to the display database).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (games opening on the wrong monitor): with

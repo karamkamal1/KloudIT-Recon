@@ -400,12 +400,36 @@ func (m *Manager) Detect() Status {
 	return Status{Err: ErrNoDriver}
 }
 
-// Decide applies Decide with this manager's policy and driver detection.
+// Decide applies Decide with this manager's policy and driver detection. When
+// phys is the agent's own virtual display (left by the previous session,
+// lingering or still owned, and as primary or only display the monitor a
+// session picks first), the answer is yes: Create then reuses it for the same
+// mode or replaces it. Capturing it without owning it would let the linger
+// timer remove it under the running stream.
 func (m *Manager) Decide(req Mode, phys *platform.Monitor) (bool, string) {
 	if m.opts.Policy != PolicyAuto && m.opts.Policy != PolicyOn {
 		return false, ""
 	}
+	if phys != nil && m.isCurrent(phys.Name) {
+		return true, "the monitor is the previous session's virtual display"
+	}
 	return Decide(m.opts.Policy, m.Detect().Driver != "", req, phys)
+}
+
+// isCurrent reports whether name (a GDI display name) is the agent's virtual
+// display and it is still there.
+func (m *Manager) isCurrent(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if name == "" || m.cur == nil || !strings.EqualFold(m.cur.info.Name, name) {
+		return false
+	}
+	select {
+	case <-m.cur.lost:
+		return false
+	default:
+		return true
+	}
 }
 
 // Display is a session's handle on the virtual display.
@@ -550,6 +574,12 @@ func (m *Manager) configure(mon *monitor) error {
 	t, err := m.waitTarget(mon)
 	if err != nil {
 		return err
+	}
+	if mon.plug.Instance == "" && mon.plug.Target != t {
+		// The driver reported another adapter LUID than CCD lists (findTarget):
+		// waiting for the monitor to depart, here and in Recover, needs CCD's.
+		mon.plug.Target = t
+		_ = m.writeJournal(mon, true)
 	}
 	save := !mon.drv.Persistent() && mon.layout != LayoutOnly
 	for attempt := 0; ; attempt++ {

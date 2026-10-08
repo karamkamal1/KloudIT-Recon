@@ -1,7 +1,9 @@
 package vdisplay
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -180,14 +182,35 @@ func TestClonedMonitorGetsOwnSource(t *testing.T) {
 }
 
 func TestTargetFoundWhenLUIDDiffers(t *testing.T) {
-	m, _, _, _ := rig(t, Options{}, func(d *fakeDriver) { d.reportLUID = LUID{Low: 0xdead} })
+	dir := t.TempDir()
+	m, sys, drv, _ := rig(t, Options{StateDir: dir}, func(d *fakeDriver) {
+		d.reportLUID = LUID{Low: 0xdead}
+		d.departIn = 30 * time.Millisecond
+	})
 	d, err := m.Create(mode1440)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
 	if d.Info().Target.Adapter != virtLUID {
 		t.Fatalf("target %v", d.Info().Target)
+	}
+	// The journal (Recover) and the departure wait use CCD's target.
+	b, err := os.ReadFile(filepath.Join(dir, journalName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var j journal
+	if err := json.Unmarshal(b, &j); err != nil || j.Plug.Target != d.Info().Target {
+		t.Fatalf("journal plug %+v (%v)", j.Plug, err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Restored after the monitor left, not while it was still connected.
+	time.Sleep(60 * time.Millisecond)
+	ev := sys.eventLog()
+	if len(ev) < 2 || ev[len(ev)-1] != "apply" || ev[len(ev)-2] != fmt.Sprintf("depart %v", drv.target) {
+		t.Fatalf("events %v", ev)
 	}
 }
 
@@ -284,6 +307,39 @@ func TestLingerReuse(t *testing.T) {
 	}
 	if st, _ := sys.state(phys.t); !st.active || st.x != 0 {
 		t.Fatalf("physical monitor %+v", st)
+	}
+}
+
+func TestDecideReusesOwnDisplay(t *testing.T) {
+	m, _, drv, phys := rig(t, Options{Linger: time.Hour}, nil)
+	d1, err := m.Create(mode1440)
+	if err != nil {
+		t.Fatal(err)
+	}
+	virt := d1.Info().Monitor // primary: the monitor a reconnecting session picks
+	physMon := platform.Monitor{Name: phys.name, W: 1920, H: 1080, Hz: 60}
+	for _, owned := range []bool{true, false} {
+		if !owned {
+			d1.Close() // lingering
+		}
+		if use, why := m.Decide(mode1440, &virt); !use || why != "the monitor is the previous session's virtual display" {
+			t.Fatalf("owned=%v: decide %v %q", owned, use, why)
+		}
+		// The physical monitor is still judged on its own.
+		if use, _ := m.Decide(Mode{1920, 1080, 60}, &physMon); use {
+			t.Fatalf("owned=%v: a matching physical monitor got a virtual display", owned)
+		}
+	}
+	d2, err := m.Create(mode1440)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, u, _ := drv.count(); p != 1 || u != 0 || d2.Info().Name != virt.Name {
+		t.Fatalf("not reused: plugs %d unplugs %d, %s", p, u, d2.Info().Name)
+	}
+	m.Close()
+	if use, why := m.Decide(mode1440, &virt); use {
+		t.Fatalf("a removed display is still treated as the agent's: %q", why)
 	}
 }
 

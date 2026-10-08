@@ -171,12 +171,53 @@ $nefcon = @{
     Url    = 'https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip'
     Sha256 = 'a15557da24a9efca203158de3b43b0eaf982db231f0194031f1ed428bc13e669'
 }
+# The driver reads its modes from vdd_settings.xml in this folder (VDDPATH), and the elevated agent
+# adds each client's mode to it: only administrators and SYSTEM may change the folder and its
+# files (users, among them the driver's LocalService host, read them). A folder made under C:\
+# would inherit "Authenticated Users: Modify" from the drive root; the agent refuses to edit a
+# folder that non-administrators can change.
+function Get-VddFolder {
+    $p = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver' -Name VDDPATH -ErrorAction SilentlyContinue).VDDPATH
+    if ($p) { $p } else { 'C:\VirtualDisplayDriver' }
+}
+function Assert-NoVddLinks([string]$dir) {
+    $links = @(@(Get-Item -LiteralPath $dir -Force) + @(Get-ChildItem -LiteralPath $dir -Force) |
+        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
+    if ($links) { throw "$($links[0].FullName) is a link (reparse point); remove it and run the installer again." }
+}
+function Protect-VddFolder([string]$dir) {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    Assert-NoVddLinks $dir
+    icacls $dir /setowner '*S-1-5-32-544' | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $dir (icacls exit code $LASTEXITCODE)." }
+    Assert-NoVddLinks $dir # again, now that only administrators can add entries
+    # Files from before: owned by Administrators, only the folder's access.
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Force -File)) {
+        icacls $f.FullName /setowner '*S-1-5-32-544' | Out-Null
+        if ($LASTEXITCODE -eq 0) { icacls $f.FullName /reset | Out-Null }
+        if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $($f.FullName) (icacls exit code $LASTEXITCODE)." }
+    }
+}
 $virtualDisplayReady = $false
 if ($InstallVirtualDisplay) {
     $present = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
         $_.HardwareID -contains 'Root\MttVDD' -or $_.HardwareID -contains 'root\sudomaker\sudovda' })
     if ($present) {
         Write-Step "Virtual display driver already installed: $($present[0].FriendlyName) ($($present[0].InstanceId))"
+        $vddPresent = @($present | Where-Object { $_.HardwareID -contains 'Root\MttVDD' })
+        if ($vddPresent) {
+            $vddDir = Get-VddFolder
+            if (Test-Path -LiteralPath $vddDir) {
+                Protect-VddFolder $vddDir
+                Write-Step "Restricted $vddDir to administrators (users read)"
+            }
+            if ($vddPresent[0].Status -eq 'OK') {
+                Write-Host '    Its device is enabled, so its monitor stays connected between sessions. Disable it in Device Manager > Display adapters to have sessions enable it only while they stream.'
+            }
+        }
         $virtualDisplayReady = $true
     } else {
         Write-Step 'Installing the Virtual Display Driver 25.7.23'
@@ -199,11 +240,10 @@ if ($InstallVirtualDisplay) {
             if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=SignPath Foundation') {
                 throw "The driver catalog's signature is $($sig.Status) ($($sig.SignerCertificate.Subject)), expected a valid SignPath Foundation signature."
             }
-            # The driver reads its modes from C:\VirtualDisplayDriver\vdd_settings.xml; the agent adds
-            # each client's mode to it when needed.
-            $vddDir = 'C:\VirtualDisplayDriver'
-            if (-not (Test-Path (Join-Path $vddDir 'vdd_settings.xml'))) {
-                New-Item -ItemType Directory -Force -Path $vddDir | Out-Null
+            # The driver's settings (modes): the agent adds each client's mode when needed.
+            $vddDir = Get-VddFolder
+            Protect-VddFolder $vddDir
+            if (-not (Test-Path -LiteralPath (Join-Path $vddDir 'vdd_settings.xml'))) {
                 Copy-Item (Join-Path $tmp 'VirtualDisplayDriver\vdd_settings.xml') $vddDir
             }
             Write-Host '    Windows Security may ask whether to install software from "SignPath Foundation": choose Install.'
@@ -214,6 +254,16 @@ if ($InstallVirtualDisplay) {
                 Write-Warning 'The Virtual Display Driver is installed; Windows needs a reboot before it works.'
             } elseif ($code -ne 0) {
                 throw "Installing the Virtual Display Driver failed (nefcon exit code $code)."
+            }
+            # Leave the device disabled: running, it keeps a monitor connected that Windows extends
+            # the desktop onto. A session enables it while it streams and disables it after.
+            foreach ($dev in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\MttVDD' })) {
+                try {
+                    Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
+                    Write-Step "Virtual Display Driver device $($dev.InstanceId) disabled (sessions enable it while they stream)"
+                } catch {
+                    Write-Warning "Could not disable the Virtual Display Driver device $($dev.InstanceId) ($_). Disable it in Device Manager > Display adapters, or its monitor stays connected between sessions."
+                }
             }
             $virtualDisplayReady = $true
         } finally {

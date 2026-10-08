@@ -207,7 +207,8 @@ The installer:
   set to Public)
 - installs ViGEmBus for controller support (`-InstallViGEm`)
 - optionally installs the Virtual Display Driver (`-InstallVirtualDisplay`: pinned release,
-  SHA-256 verified) for streaming a virtual monitor at the client's resolution and frame rate
+  SHA-256 verified) for streaming a virtual monitor at the client's resolution and frame rate;
+  its device stays disabled (no extra monitor) until a session enables it
 - starts the agent and checks that it reaches the gateway, and warns if no GPU encoder works
 
 The PC's card in the dashboard shows **Online** when the agent connects.

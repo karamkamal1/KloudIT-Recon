@@ -75,6 +75,13 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - The host config holding the token is created in the user's profile with owner-only ACLs.
 - The firewall rule for the direct path covers only the Private and Domain profiles and only the
   agent executable.
+- The elevated agent adds client modes to the Virtual Display Driver's settings
+  (`C:\VirtualDisplayDriver\vdd_settings.xml`). The installer gives that folder an explicit,
+  non-inherited ACL owned by Administrators (Administrators and SYSTEM full control, Users read),
+  because a folder created under `C:\` lets every signed-in user modify it. The agent writes
+  there only when the folder and the files it writes are not links (reparse points), are owned by
+  Administrators, SYSTEM or TrustedInstaller, and give no one else write, delete or permission
+  rights; otherwise it refuses and names the `icacls` command that fixes the folder.
 
 ## Gateway hardening (systemd)
 

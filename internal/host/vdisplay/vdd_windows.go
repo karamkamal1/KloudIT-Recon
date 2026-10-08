@@ -118,7 +118,9 @@ func (d *vdd) Detect() (string, error) {
 		return "", err
 	}
 	defer dev.close()
-	state := "running"
+	// install-host.ps1 leaves the device disabled: a running one keeps its
+	// monitor connected (and the desktop extended onto it) between sessions.
+	state := "running (its monitor stays connected outside sessions: disable the device so sessions enable it)"
 	switch {
 	case dev.disabled:
 		state = "disabled (enabled for sessions)"
@@ -132,6 +134,9 @@ func (d *vdd) Detect() (string, error) {
 	if b, err := os.ReadFile(path); err == nil {
 		if s, err := parseVDDSettings(b); err == nil {
 			modes = fmt.Sprintf("%d modes, %d monitor(s) in %s", len(s.Modes), s.Count, path)
+			if err := vddCheckPrivate(filepath.Dir(path), path); err != nil {
+				modes += "; new modes cannot be added: " + err.Error()
+			}
 		} else {
 			modes = err.Error()
 		}
@@ -139,13 +144,19 @@ func (d *vdd) Detect() (string, error) {
 	return fmt.Sprintf("device %s %s, %s", dev.instance, state, modes), nil
 }
 
-// ensureMode makes vdd_settings.xml offer m; changed reports a rewrite.
+// ensureMode makes vdd_settings.xml offer m; changed reports a rewrite. The
+// agent writes only into a folder that non-administrators cannot change
+// (vddCheckPrivate): it runs elevated.
 func (d *vdd) ensureMode(m Mode) (changed bool, err error) {
 	path := vddSettingsPath()
+	dir := filepath.Dir(path)
 	b, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := vddCreateDir(dir); err != nil {
+			return false, err
+		}
+		if err := vddCheckPrivate(dir, path); err != nil {
 			return false, err
 		}
 		d.log.Info("Virtual Display Driver: creating its settings file", "path", path, "mode", m)
@@ -164,15 +175,151 @@ func (d *vdd) ensureMode(m Mode) (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	tmp := path + ".tmp"
+	if err := vddCheckPrivate(dir, path, path+vddBackupSuffix, tmp); err != nil {
+		return false, err
+	}
 	if _, err := os.Stat(path + vddBackupSuffix); errors.Is(err, os.ErrNotExist) {
 		_ = os.WriteFile(path+vddBackupSuffix, b, 0o644)
 	}
 	d.log.Info("Virtual Display Driver: adding the client's mode to its settings", "path", path, "mode", m)
-	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, nb, 0o644); err != nil {
 		return false, err
 	}
 	return true, os.Rename(tmp, path)
+}
+
+// vddDirSDDL is the settings folder's access: administrators and SYSTEM full
+// control, users (also the driver's LocalService host) read, not inherited from
+// the drive root, whose "Authenticated Users: Modify" for new subfolders would
+// let any signed-in user replace the files the elevated agent writes.
+// install-host.ps1 sets the same.
+const vddDirSDDL = "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BU)"
+
+// vddCreateDir creates the settings folder with vddDirSDDL, owned by
+// Administrators (its parent must exist). A folder that exists already is left
+// to vddCheckPrivate.
+func vddCreateDir(dir string) error {
+	sd, err := windows.SecurityDescriptorFromString("O:BA" + vddDirSDDL)
+	if err != nil {
+		return err
+	}
+	p, err := windows.UTF16PtrFromString(dir)
+	if err != nil {
+		return err
+	}
+	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+	if err := windows.CreateDirectory(p, &sa); err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	return nil
+}
+
+// vddCheckPrivate refuses the settings folder (the first path) and the files
+// in it the agent is about to write unless only administrators and the system
+// can change them: no reparse point, owned by Administrators, SYSTEM or
+// TrustedInstaller, and no ACE giving anyone else write, delete or permission
+// rights. A path that does not exist is skipped (the folder's ACL decides who
+// may create it).
+func vddCheckPrivate(paths ...string) error {
+	for _, path := range paths {
+		p, err := windows.UTF16PtrFromString(path)
+		if err != nil {
+			return err
+		}
+		attrs, err := windows.GetFileAttributes(p)
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+			continue
+		}
+		if err == nil && attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			err = errors.New("it is a link (reparse point)")
+		}
+		if err == nil {
+			var sd *windows.SECURITY_DESCRIPTOR
+			sd, err = windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+			if err == nil {
+				err = checkPrivateSD(sd)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w; the agent runs elevated and edits the Virtual Display Driver's settings only in a folder that only administrators can change: run install-host.ps1 -InstallVirtualDisplay again, or elevated: icacls \"%s\" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX",
+				path, err, paths[0])
+		}
+	}
+	return nil
+}
+
+// fileWriteRights are the rights that let a holder change a file or folder,
+// its contents (a folder's FILE_ADD_FILE/FILE_ADD_SUBDIRECTORY are
+// FILE_WRITE_DATA/FILE_APPEND_DATA) or its ACL.
+const fileWriteRights = windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | fileDeleteChild |
+	windows.FILE_WRITE_ATTRIBUTES | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE | windows.GENERIC_ALL
+
+const fileDeleteChild = 0x40 // FILE_DELETE_CHILD
+
+// trustedInstallerSID is NT SERVICE\TrustedInstaller.
+const trustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
+// privilegedSID: Administrators, SYSTEM, TrustedInstaller, or a placeholder
+// for the owner (CREATOR OWNER, OWNER RIGHTS), which must be one of these.
+func privilegedSID(s *windows.SID) bool {
+	return s.IsWellKnown(windows.WinBuiltinAdministratorsSid) || s.IsWellKnown(windows.WinLocalSystemSid) ||
+		s.IsWellKnown(windows.WinCreatorOwnerSid) || s.IsWellKnown(windows.WinCreatorOwnerRightsSid) ||
+		s.String() == trustedInstallerSID
+}
+
+// checkPrivateSD checks a file's or folder's owner and DACL for
+// vddCheckPrivate. Inherit-only ACEs count too: they become the ACL of the
+// files created in a folder.
+func checkPrivateSD(sd *windows.SECURITY_DESCRIPTOR) error {
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil {
+		return fmt.Errorf("no owner (%v)", err)
+	}
+	if owner.IsWellKnown(windows.WinCreatorOwnerSid) || owner.IsWellKnown(windows.WinCreatorOwnerRightsSid) || !privilegedSID(owner) {
+		return fmt.Errorf("owned by %s", sidName(owner))
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		return errors.New("no DACL: everyone has full access")
+	}
+	for i := uint16(0); i < dacl.AceCount; i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(i), &ace); err != nil {
+			return fmt.Errorf("ACE %d: %w", i, err)
+		}
+		switch ace.Header.AceType {
+		case windows.ACCESS_ALLOWED_ACE_TYPE, aceTypeAllowedCallback:
+		case windows.ACCESS_DENIED_ACE_TYPE, aceTypeDeniedObject, aceTypeDeniedCallback, aceTypeDeniedCallbackObject:
+			continue
+		default:
+			return fmt.Errorf("ACE %d has type %d", i, ace.Header.AceType)
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if uint32(ace.Mask)&fileWriteRights != 0 && !privilegedSID(sid) {
+			return fmt.Errorf("%s may change it (access mask %#x)", sidName(sid), uint32(ace.Mask))
+		}
+	}
+	return nil
+}
+
+// ACE types beyond the two x/sys names (winnt.h).
+const (
+	aceTypeDeniedObject         = 6
+	aceTypeAllowedCallback      = 9 // same layout as ACCESS_ALLOWED_ACE up to SidStart
+	aceTypeDeniedCallback       = 10
+	aceTypeDeniedCallbackObject = 12
+)
+
+// sidName is DOMAIN\name, else the SID string.
+func sidName(s *windows.SID) string {
+	if account, domain, _, err := s.LookupAccount(""); err == nil {
+		if domain != "" {
+			return domain + `\` + account
+		}
+		return account
+	}
+	return s.String()
 }
 
 func (d *vdd) Plug(m Mode, _ monitorID, _ LUID) (plug, error) {

@@ -187,8 +187,10 @@ Optional: add `-InstallVirtualDisplay` to also install the Virtual Display Drive
 SHA-256-verified release). It is for streaming a virtual monitor at the browser's resolution
 and frame rate, e.g. 2560x1440 at 120 fps although the PC's monitor is 1080p60 (sessions do
 not use it yet; `recon-host.exe vdisplay`, under Useful commands, tests it). Windows asks once
-whether to install software from "SignPath Foundation": choose **Install**. Skip it if Apollo
-is installed (its SudoVDA driver is used instead).
+whether to install software from "SignPath Foundation": choose **Install**. The installer leaves
+the driver's device disabled, so there is no extra monitor: a session enables it only while it
+streams. It also restricts `C:\VirtualDisplayDriver` to administrators (users can read it).
+Skip it if Apollo is installed (its SudoVDA driver is used instead).
 
 The installer:
 

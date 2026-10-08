@@ -23,6 +23,7 @@ type fakeSys struct {
 	fail      map[uint32]int // Apply flags -> how many more calls with them fail
 	instances map[LUID]string
 	database  map[Target]fakeState // what SDC_USE_DATABASE_CURRENT restores
+	events    []string             // "apply" and "depart <target>", in order
 }
 
 type fakeState struct {
@@ -101,6 +102,7 @@ func (s *fakeSys) unplug(t Target) {
 	for _, o := range s.targets {
 		if o.t == t && o.connected {
 			o.connected, o.active = false, false
+			s.events = append(s.events, fmt.Sprintf("depart %v", t))
 			// Windows applies its database to the remaining displays.
 			for _, p := range s.targets {
 				if st, ok := s.database[p.t]; ok && p.connected {
@@ -170,6 +172,7 @@ func (s *fakeSys) Apply(c Config, flags uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.applies = append(s.applies, flags)
+	s.events = append(s.events, "apply")
 	if s.fail[flags] > 0 {
 		s.fail[flags]--
 		return errFakeApply
@@ -308,6 +311,12 @@ func (s *fakeSys) flags() []uint32 {
 	return append([]uint32(nil), s.applies...)
 }
 
+func (s *fakeSys) eventLog() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.events...)
+}
+
 // fakeDriver plugs monitors into a fakeSys.
 type fakeDriver struct {
 	sys        *fakeSys
@@ -315,12 +324,13 @@ type fakeDriver struct {
 	detectErr  error
 	plugErr    error
 	persistent bool
-	vddLike    bool   // reports the adapter instance instead of the target
-	reportLUID LUID   // adapter LUID it reports (findTarget fallback when it differs)
-	adapter    LUID   // where its monitors appear
-	inactive   bool   // monitors arrive inactive
-	rotation   uint32 // rotation the monitor arrives with
-	cloned     bool   // the monitor arrives duplicating the first display
+	vddLike    bool          // reports the adapter instance instead of the target
+	reportLUID LUID          // adapter LUID it reports (findTarget fallback when it differs)
+	adapter    LUID          // where its monitors appear
+	inactive   bool          // monitors arrive inactive
+	rotation   uint32        // rotation the monitor arrives with
+	cloned     bool          // the monitor arrives duplicating the first display
+	departIn   time.Duration // an unplugged monitor leaves this much later (0: at once)
 	hzs        []float64
 	every      time.Duration
 	pingErr    atomic.Bool
@@ -378,7 +388,9 @@ func (d *fakeDriver) Unplug(p plug) error {
 	t := d.target
 	d.mu.Unlock()
 	d.log("unplug")
-	if p.Departs {
+	if p.Departs && d.departIn > 0 {
+		time.AfterFunc(d.departIn, func() { d.sys.unplug(t) })
+	} else if p.Departs {
 		d.sys.unplug(t)
 	}
 	return nil
