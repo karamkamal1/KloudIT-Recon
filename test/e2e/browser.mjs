@@ -282,7 +282,8 @@ async function lossRun(name, faults, seconds) {
     restarts: restartsByReason(hl),
     keyRequestReasons: keyRequestsByReason(con),
     client: { keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped') },
-    decoderErrors: con.filter((l) => l.includes('decoder error')).length,
+    // The decoder's own error lines, not the key-frame requests they cause.
+    decoderErrors: con.filter((l) => l.includes('decoder error:')).length,
   };
 }
 
@@ -323,9 +324,12 @@ async function checkLossHandling() {
   const k = await lossRun('host-faults', LOSS_FAULTS, 20);
   const kfRestarts = k.restarts['keyframe request (urgent)'] || 0;
   // A late frame that outlasted the gap timeout would show as "frame lost";
-  // every key-frame restart needs a client request with a logged reason.
-  check('late frames (200 ms) cause no key-frame request and no restart',
-    k.delayed >= 5 && !k.keyRequestReasons['frame lost'],
+  // every key-frame restart needs a client request with a logged reason (the
+  // drops, a decoder error, the watchdog). Other restarts (congestion) are
+  // listed, not checked: this CPU-only machine also falls behind on its own.
+  const kRequests = Object.values(k.keyRequestReasons).reduce((a, b) => a + b, 0);
+  check('late frames (200 ms) cause no key-frame request ("frame lost"); every key-frame restart answers a logged request',
+    k.delayed >= 5 && !k.keyRequestReasons['frame lost'] && kfRestarts <= kRequests,
     `${k.delayed} frames delayed 200 ms, ${k.dropped} dropped; client key-frame requests: ${counts(k.keyRequestReasons)}; ` +
       `host restarts: ${counts(k.restarts)}`);
   check('dropped frames are reported ("dropped") and recovered with a key frame (recovery "keyframe")',

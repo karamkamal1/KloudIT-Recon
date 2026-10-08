@@ -481,8 +481,8 @@ func (a *Agent) backendFor(prefs proto.Prefs) string {
 // startVideo starts a new encoder generation. urgent discards the current one
 // immediately (used when the client needs a key frame right away). A
 // congestion back-off (curKbps below the settings' bitrate) stays in effect
-// for every restart until a settings change resets it: a key-frame restart
-// after a loss must not go back to the full bitrate.
+// for every restart until a video settings change resets it: a key-frame
+// restart after a loss must not go back to the full bitrate.
 func (s *Session) startVideo(urgent bool, reason string) error {
 	prefs := s.currentPrefs()
 	p, err := s.buildParams(prefs)
@@ -1083,7 +1083,6 @@ func (s *Session) controlLoop() error {
 			old := s.prefs
 			s.prefs = *m.Prefs
 			s.prefsMu.Unlock()
-			s.curKbps.Store(0) // explicit user choice resets congestion back-off
 			videoChanged := old.Codec != m.Prefs.Codec || old.BitrateKbps != m.Prefs.BitrateKbps || old.FPS != m.Prefs.FPS ||
 				old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.Monitor != m.Prefs.Monitor ||
 				old.Window != m.Prefs.Window || old.Quality != m.Prefs.Quality || old.Cursor != m.Prefs.Cursor ||
@@ -1094,6 +1093,9 @@ func (s *Session) controlLoop() error {
 				s.usage = map[string]string{}
 				clear(s.encFails)
 				s.triedMu.Unlock()
+				// An explicit video choice resets the congestion back-off;
+				// an audio-only change keeps it.
+				s.curKbps.Store(0)
 				if err := s.startVideo(false, "settings"); err != nil {
 					s.notice("error", "Could not apply settings: "+err.Error())
 				}

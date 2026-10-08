@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -436,4 +437,38 @@ func TestQueueOverflowEscalates(t *testing.T) {
 			t.Fatalf("key-frame restart undid the back-off: %s", l)
 		}
 	})
+
+	// A settings message that changes only the audio keeps it too.
+	t.Run("audio settings", func(t *testing.T) {
+		s, logs := session(t)
+		s.curKbps.Store(3000)
+		if err := s.startVideo(false, ""); err != nil {
+			t.Fatal(err)
+		}
+		off := false
+		msg, _ := json.Marshal(proto.ClientMsg{T: "settings", Prefs: &proto.Prefs{Audio: &off}})
+		var in bytes.Buffer
+		if err := proto.WriteMsg(&in, msg); err != nil {
+			t.Fatal(err)
+		}
+		s.ctrl = &scriptedCtrl{r: &in}
+		if err := s.controlLoop(); !errors.Is(err, io.EOF) {
+			t.Fatalf("control loop: %v", err)
+		}
+		if kb := s.curKbps.Load(); kb != 3000 {
+			t.Fatalf("audio-only settings change reset the back-off: target %d kbps, want 3000", kb)
+		}
+		s.requestKeyframe()
+		if l := waitFor(t, logs, `msg="starting encoder" gen=2`); !strings.Contains(l, " kbps=3000 ") {
+			t.Fatalf("key-frame restart after an audio-only settings change undid the back-off: %s", l)
+		}
+	})
 }
+
+// scriptedCtrl hands controlLoop the client messages in r, then io.EOF.
+type scriptedCtrl struct {
+	fakeCtrl
+	r io.Reader
+}
+
+func (c *scriptedCtrl) Read(b []byte) (int, error) { return c.r.Read(b) }
