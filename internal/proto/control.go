@@ -105,6 +105,30 @@ type VideoConfig struct {
 	BitrateKbps int    `json:"bitrate"`
 	Encoder     string `json:"encoder"`
 	Capture     string `json:"capture"`
+	// Recovery is how the client recovers from a confirmed frame loss (a frame
+	// the host reported dropped, or a gap that outlasted the late-frame
+	// timeout): RecoverySkip when the encoder heals the picture by itself
+	// (intra refresh), RecoveryKeyframe (also when empty: hosts before this
+	// field) when the decoder needs a key frame.
+	Recovery string `json:"recovery,omitempty"`
+}
+
+// VideoConfig.Recovery values.
+const (
+	RecoverySkip     = "skip"     // skip the lost frame and keep decoding
+	RecoveryKeyframe = "keyframe" // request a key frame (FFmpeg path: a new encoder generation)
+)
+
+// Dropped tells the client that the host discarded Count frames of
+// generation Gen from FromSeq on, which it will never send (frame queue
+// overflow, or a frame stream that failed or was cancelled). The client
+// treats them as lost at once instead of waiting out its gap timeout: frames
+// travel on reliable streams, so a gap without this message is a late frame.
+type Dropped struct {
+	T       string `json:"t"` // "dropped"
+	Gen     uint8  `json:"gen"`
+	FromSeq uint32 `json:"fromSeq"`
+	Count   int    `json:"count"`
 }
 
 type AudioConfig struct {
@@ -139,9 +163,15 @@ type ClientMsg struct {
 	T       string      `json:"t"` // settings | keyframe | congestion | stages | pause | resume | bye
 	Prefs   *Prefs      `json:"prefs,omitempty"`
 	DelayMs int         `json:"delayMs,omitempty"`
-	Reason  string      `json:"reason,omitempty"`
+	Reason  string      `json:"reason,omitempty"` // "congestion": CongestionDecoder, or "" (one-way delay grew)
 	Stages  []StageStat `json:"stages,omitempty"` // "stages": the client's latency summary
 }
+
+// CongestionDecoder is the reason of a "congestion" message from a client
+// whose decoder fell behind: it flushed the decoder and discards the current
+// generation's frames until a new key frame, so the host restarts at once
+// instead of overlapped.
+const CongestionDecoder = "decoder"
 
 // StageStat is one row of the per-stage latency summary a v2 client sends
 // every ~10 s ({"t":"stages"}): percentiles in ms over its last ~10 s window.

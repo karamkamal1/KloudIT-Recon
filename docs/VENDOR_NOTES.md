@@ -762,3 +762,150 @@ Ctrl+Alt+Shift+S):
   as before 1.1 (`-preset p3 -tune ull -rc cbr -multipass disabled -zerolatency 1 -delay 0
   -rc-lookahead 0 -no-scenecut 1 -forced-idr 1 -strict_gop 1 -spatial-aq 1 -profile main` for the
   balanced preset) and the stream must start; repeat with h264_nvenc and av1_nvenc (RTX 40+).
+
+## 1.4 Stop false loss restarts
+
+What changed (B1, B2):
+
+- The host reports every frame it discards on the control stream:
+  `{"t":"dropped","gen":g,"fromSeq":s,"count":n}` (one message per run of consecutive frames),
+  from the frame-queue overflow (`drainQueue()`, together with the frame that did not fit) and
+  from `frameSender` when a frame's stream cannot be opened or written (the stream is reset).
+  Host log: `msg="frames dropped" … why="queue overflow"` (or `"stream failed"`, `"test fault"`)
+  `gen=… from_seq=… count=…`; the `stream stats` line counts them as `dropped=` per 10 s.
+- The client acts on a report at once. Without one, a gap in the sequence is a late frame (the
+  frames travel on reliable streams) for up to max(250 ms, 4 × the smoothed RTT), was 150 ms, and
+  only then a loss.
+- `VideoConfig.recovery` (`skip` | `keyframe`), set by the host from the encoder arguments it
+  actually passes (`media.Recovery`; the options are filtered against `ffmpeg -h encoder=…`):
+  `skip` only with intra refresh that heals within 2 s, i.e. NVENC `-intra-refresh 1` with `-g` of
+  at most 2 s of frames (FFmpeg makes the GOP infinite and uses `-g` as the refresh period), or
+  h264_amf `-intra_refresh_mb N` with ceil(macroblocks per picture / N) at most 2 s of frames.
+  Everything else is `keyframe`. No encoder runs with intra refresh yet, so today every encoder
+  announces `keyframe` (`encoder ready ... recovery=keyframe` in the host log, "Loss recovery: key
+  frame" in the stats overlay). Step 1.2 has to set `-g` to the refresh period when it turns on
+  `-intra-refresh`; with the session's default `-g` (an hour of frames) the host keeps announcing
+  `keyframe`. On a confirmed loss the client skips the lost frames and decodes on (`skip`) or asks
+  for a key frame (`keyframe`: the restart path as before, now only for confirmed losses). A loss
+  before the generation's first key frame always asks for a key frame, and a decoder error after
+  a skip falls back to reset + key frame.
+- Client congestion reports (`{"t":"congestion"}`, one-way delay growth) restart the encoder
+  overlapped (`startVideo(false, …)`); the host's frame-queue overflow stays urgent. Deviation
+  from the guide: a client whose decoder fell behind flushes it and sends
+  `{"t":"congestion","reason":"decoder"}`, which also restarts urgently, because that client
+  discards the old generation's frames anyway (an overlap would only run two encoders, and on a
+  loaded machine the extra encoder delayed the new key frame until the client's 1 s watchdog
+  asked again). Old clients send no reason and get the overlapped restart.
+- Client fix found on the way: a key-frame request within 400 ms of the previous one was not
+  sent and also did not mark the generation as abandoned, so its later frames buffered up and
+  their gap was taken for a second loss (a second request, often a second restart). The
+  generation is now marked abandoned on every request; only sending is rate-limited.
+- Debug toggle for the decoder check below: in the stream page's DevTools console,
+  `__recon.worker.postMessage({type:'dropTest'})` drops the next delta frame before the decoder
+  (what `skip` does) and after 2 s reports `{ok, decoded, error, codec, hw, gen, seq}` in
+  `__recon.dropTest` and the log (`__recon.logs`, "drop test: …").
+- Test-only hook: `RECON_TEST_FAULTS` (`internal/host/faults.go`, README "Development") makes
+  `frameSender` delay or drop selected frames and can force the announced recovery mode.
+
+Verified in the sandbox:
+
+- verified (sandbox): `internal/host` `TestFrameSenderFaults` (frameSender with the hook over a
+  recording transport: every 3rd frame 80 ms late while the frames after it go out on time; every
+  5th reset after half its bytes and reported, exactly those), `TestReportDropped` (one message
+  per run of consecutive frames per generation, as a queue drain produces them),
+  `TestParseTestFaults`; `internal/host/media` `TestRecovery` (on the FFmpeg 8.1 option lists of
+  the six hardware encoders: today's arguments give `keyframe` everywhere; NVENC
+  `-intra-refresh 1` gives `skip` only with `-g` ≤ 2 s of frames and stays `keyframe` with the
+  session's default `-g`; h264_amf `-intra_refresh_mb` 255/68 at 1080p60 give `skip`, 67 (122
+  frames) and the default -1 give `keyframe`; `-intra-refresh` and `-intra_refresh_mb` are the
+  real option names, and hevc_amf/av1_amf have neither); `internal/proto` `TestLossRecoveryJS`
+  (protocol.js parses the Go-encoded `dropped` message and `recovery` field; malformed reports are
+  rejected, a missing count is 1, hosts without the field mean `keyframe`).
+- verified (sandbox): Go integration test `internal/e2e` `TestStreamingFrameLoss` (real gateway
+  and agent, libx264, direct WebTransport, `RECON_TEST_FAULTS="delay=every:7:120ms,drop=every:20,
+  recovery=skip"`, 4 s): every frame either arrives or is reported dropped, never both; in the
+  first generation exactly every 20th frame is reported; the delayed frames arrive; the forced
+  `skip` reaches the client; a `{"t":"congestion"}` from the client gives one
+  `restarting video reason=congestion urgent=false`. `TestStreamingPaths`: libx264 announces
+  `keyframe` and a clean run has no `dropped` report.
+- verified (sandbox), browser E2E (`test/e2e/browser.mjs`, headless Chromium, libsvtav1 960×540
+  60 fps, software AV1 decode, direct WebTransport for the fault runs; 62 of 62 checks passed in
+  the final run). The sandbox's 4 cores were shared with other agents' builds and E2E runs, so
+  decoder-backlog flushes and the restarts they cause vary a lot from run to run; the numbers
+  below are from the two quietest runs (final run first):
+  - lan (the four normal scenarios on a clean loopback): no key frame requested for a gap
+    (`frame lost`: 0) and no frame dropped by the host. Restarts: 3 settings changes and 5 (7)
+    urgent congestion restarts from decoder-backlog flushes, plus 0 (2) key-frame requests from the
+    client's watchdog after such a flush; none from a gap or a drop.
+  - recovery `keyframe` with `RECON_TEST_FAULTS="delay=every:97:200ms,drop=every:193"` (20 s):
+    12 frames delayed 200 ms, none of them led to a key-frame request (`frame lost`: 0); 6 frames
+    dropped, each reported to the client and answered with a key-frame request (`dropped by
+    host`: 6) and a restart (6 (7) key-frame restarts in all, the extra one from the watchdog);
+    52.0 (51.4) fps mean over the 20 s.
+  - recovery `skip`, forced with `recovery=skip` (20 s): no key-frame request for any drop
+    (`dropped by host` and `frame lost`: 0); 5 of the 6 drops were skipped, the sixth fell into a
+    generation the client had already given up after a decoder-backlog flush (nothing to do). 2
+    (3) skips were followed by a decoder error and the fallback (reset + key frame); 47.8 (47.7)
+    fps mean.
+  - Found: Chrome's software AV1 decoder (dav1d) often rejects the frames after a skipped one.
+    The drop test (3 skips per run on the clean host) was accepted 5 times out of 12 over four
+    runs; the other 7 ended in `decoder error: Decoding error.` on the next frame or a few frames
+    later. An AV1 frame takes its entropy-coding state (CDFs) from its primary reference frame,
+    so a missing reference can make the next frames undecodable, not just blurred; a frame no
+    other frame references (SVT-AV1's top temporal layer) can go missing harmlessly. H.264 and
+    HEVC reset their entropy coding per slice, so there a missing reference should only blur the
+    picture. Playwright's Chromium has no H.264/HEVC decoder, so that is not checked here. For
+    `skip` on AV1 (av1_nvenc with intra refresh after 1.2) this means a decoder error and a key
+    frame after many losses unless the encoder signals frames that do not inherit state; see the
+    NVIDIA check below.
+- Not run: the 0.4 `wifi` profile on loopback in a network namespace. The sandbox kernel has no
+  `sch_netem` (`tc qdisc add dev lo root netem delay 5ms` in `unshare -n`: "Specified qdisc kind
+  is unknown"), and the QEMU VM used for 0.4 is software-emulated, too slow to run the streaming
+  stack and Chromium. The fault hook stands in for the two effects that matter here (late frames
+  on reliable streams, frames the host drops).
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (VERIFY, Chrome hardware decoder accepts a P-frame
+  after a skipped frame, client GPU = the RX 7900 XT, or any RDNA3 client) on the client open
+  `chrome://gpu` and note the Video Acceleration decode rows for H.264, HEVC and AV1. Stream from
+  the host with Stream settings > Codec set in turn to HEVC, AV1 (host display 2560×1440 for
+  av1_amf) and H.264; check the stats overlay (Ctrl+Alt+Shift+S) shows `(HW)` on the Codec row.
+  After 10 s open DevTools on the stream page and run
+  `for (let i = 0; i < 10; i++) setTimeout(() => __recon.worker.postMessage({type:'dropTest'}), i * 3000)`.
+  After 35 s run `__recon.logs.filter((l) => l.includes('drop test'))`. Record per codec how many
+  of the 10 runs say "decoder accepted" and the error text of the others, and whether the
+  picture keeps playing (smearing that stays until the next key frame is expected: the AMF
+  encoders have no intra refresh). Expect H.264 and HEVC to accept all 10. AV1 may reject some,
+  as dav1d did in the sandbox; each rejection must be followed in the log by `requesting key frame
+  (decoder error)` and the picture back within about 1 s. If H.264 or HEVC report a decoder
+  error, the `skip` recovery is unsafe on that decoder: note driver and Chrome versions.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same decoder check as for AMD with an
+  NVIDIA client GPU (RTX 20/30/40/50; AV1 decode needs RTX 30+), 10 drop tests per codec, same
+  records. After 1.2 also with the NVENC host announcing `skip` (`encoder ready ...
+  recovery=skip` in host.log): start the agent for this test only with
+  `$env:RECON_TEST_FAULTS="drop=every:600"` (one drop every 10 s at 60 fps) and check that each
+  drop shows "skipping 1 lost frame(s)" in `__recon.logs`, no key-frame request, and the picture
+  heals within the refresh period; for av1_nvenc record any `decoder error` (the AV1 entropy
+  state issue above).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance, lan) wired client, relay or direct path,
+  no impairment (`./netem.sh clear`), hevc_amf at 1920×1080 60 fps, a game or video with constant
+  motion, 30 minutes without touching the settings. Then in PowerShell on the host:
+  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="restarting video"' | Select-Object -Last 50`
+  and `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="frames dropped"'`.
+  Pass: no `restarting video` line with `reason="keyframe request"` in the 30 minutes, and no
+  `frames dropped` line; the overlay's "Frames dropped" row stays at `0 (host dropped 0) ·
+  skipped 0`, and its `key req` stays 0 unless `__recon.logs` shows a `decoder backlog` or
+  `decoder error` line (record those separately: they are not loss restarts).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance, wifi: restarts drop by at least 80 %)
+  force the relay path (Network path "Relay via gateway"), `./netem.sh apply wifi --ct <gateway
+  CTID> --host <client IP>` on the Proxmox node (0.4), hevc_amf 1080p60 at 20 Mbit/s, 10 minutes
+  with an agent built from the commit before "Phase 1.4" and 10 minutes with this one (same scene).
+  Count `msg="restarting video"` lines with `reason="keyframe request"` in host.log for each
+  (`(Select-String ... -Pattern 'reason="keyframe request"').Count` over the run's time range).
+  Pass: the 1.4 count is at most 20 % of the old one; in the client's `__recon.logs` there should
+  be no `requesting key frame (frame lost)` (with QUIC retransmitting the 1 % loss, frames arrive
+  late, not lost). Repeat with `wan` and record both.
+- NVIDIA: unverified (no NVIDIA host available). Test: the lan and wifi acceptance runs above
+  with hevc_nvenc (and after 1.2, with recovery `skip`, where the wifi run should show no
+  key-frame restarts at all, only "skipping" lines for frames the host dropped).

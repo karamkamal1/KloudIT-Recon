@@ -42,6 +42,27 @@ export const FEATURE_FRAME_EXT = 'frame-ext';
 export const AUDIO_OPUS = 1;
 export const AUDIO_PCM = 2;
 
+// Loss recovery (control messages, mirror of internal/proto/control.go).
+// {"t":"dropped","gen":g,"fromSeq":s,"count":n}: the host discarded n frames
+// of generation g from seq s (queue overflow, failed stream); they never
+// arrive. VideoConfig.recovery: what to do about a confirmed loss.
+export const MSG_DROPPED = 'dropped';
+export const RECOVERY_SKIP = 'skip'; // the encoder heals itself (intra refresh): skip the frame
+export const RECOVERY_KEYFRAME = 'keyframe'; // request a key frame
+// {"t":"congestion","reason":"decoder"}: the decoder fell behind and was flushed (restart at once).
+export const CONGESTION_DECODER = 'decoder';
+const MAX_DROPPED = 1024;
+
+/** The frames a "dropped" message reports: { gen, from, count } (count 1..1024), or null if malformed. */
+export function parseDropped(m) {
+  if (m?.t !== MSG_DROPPED || !Number.isInteger(m.gen) || !Number.isInteger(m.fromSeq) || m.fromSeq < 0) return null;
+  const count = Number.isInteger(m.count) && m.count > 0 ? Math.min(m.count, MAX_DROPPED) : 1;
+  return { gen: m.gen, from: m.fromSeq, count };
+}
+
+/** A VideoConfig's recovery mode; hosts before the field (or unknown values) mean keyframe. */
+export const recoveryOf = (cfg) => (cfg?.recovery === RECOVERY_SKIP ? RECOVERY_SKIP : RECOVERY_KEYFRAME);
+
 const enc = new TextEncoder();
 
 /** Length-prefix a message (u32 LE + payload). */

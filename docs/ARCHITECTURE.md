@@ -91,8 +91,26 @@ the wall clock, and a generation can last a whole session), and converts each pt
 `v >= 2` get it; `"captureTimestamps": "off"` in `host.json` disables it.
 
 The client keeps a short **reorder buffer**: per-frame streams can finish out of order after a
-retransmission. A gap lasting longer than 150 ms is treated as a loss and triggers a key-frame
-request.
+retransmission. Frames travel on reliable streams, so a gap in the sequence is a late frame, not a
+lost one: the frames after it wait up to max(250 ms, 4 × the smoothed RTT). A frame counts as lost
+when the host says so or when the gap outlasts that wait. The host reports every frame it discards
+(frame-queue overflow, or a frame stream that failed or was cancelled) on the control stream with
+`{"t":"dropped","gen":g,"fromSeq":s,"count":n}`, and the client acts on it at once. Old clients
+ignore the message; with an old host the client relies on the gap timeout.
+
+What the client does about a lost frame depends on `recovery` in the `video` message:
+
+- `skip`: the encoder heals the picture by itself with intra refresh, so the client skips the
+  frame and decodes on. The host announces it only when the encoder arguments it actually passes
+  turn intra refresh on with a period of at most 2 s: NVENC `-intra-refresh 1` (FFmpeg then uses
+  `-g` as the refresh period) or AMF H.264 `-intra_refresh_mb N` (macroblocks per frame).
+- `keyframe` (everything else, and hosts before the field): the client asks for a key frame
+  (`{"t":"keyframe"}`), which on the FFmpeg path is a new encoder generation.
+
+A loss before the generation's first key frame always asks for a key frame, and so does a decoder
+error, which is also the fallback when a decoder rejects a frame after a skipped one (an AV1
+frame inherits its entropy-coding state from a reference frame, so a missing reference can make
+the next frames undecodable, not just blurred).
 
 ### Datagrams
 
@@ -137,12 +155,16 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
 - **Probing:** at startup every candidate encoder test-encodes a few frames. The best working
   one per codec family is used, with hardware preferred.
 - **Overlapped restarts:** a settings change starts generation *n+1* while *n* keeps streaming.
-  The switch happens on *n+1*'s first key frame. Urgent restarts (key frame needed after loss,
-  congestion back-off) kill *n* immediately instead.
+  The switch happens on *n+1*'s first key frame. Urgent restarts (a key frame for a confirmed
+  loss or a decoder error, host frame-queue overflow, a client that flushed its decoder) kill *n*
+  immediately instead.
 - **Congestion:** if the per-session frame queue overflows (the network can't keep up), the host
-  drops the backlog, lowers the bitrate by 25 % and restarts with a key frame (rate-limited to
-  once every 2 s). The browser also reports sustained growth in one-way delay
-  (`{"t":"congestion"}`) before queues get deep.
+  drops the backlog (and reports it, `{"t":"dropped"}`), lowers the bitrate by 25 % and restarts
+  with a key frame at once (rate-limited to once every 2 s). The browser also reports sustained
+  growth in one-way delay (`{"t":"congestion"}`) before queues get deep; that back-off restarts
+  overlapped, so the picture keeps moving. A browser whose decoder fell behind flushes it and
+  sends `{"t":"congestion","reason":"decoder"}`, which restarts at once (it discards the old
+  generation anyway).
 - **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
   `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
   (see `third_party/README.md`). Host config `congestion` picks it for the direct path and the

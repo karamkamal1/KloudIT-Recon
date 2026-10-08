@@ -83,6 +83,7 @@ type sessionStats struct {
 	frames, bytes, acks atomic.Int64
 	owdSum              atomic.Int64
 	owdMax              atomic.Int64
+	dropped             atomic.Int64 // frames the host discarded (reportDropped)
 }
 
 var errClosed = errors.New("session closed")
@@ -551,6 +552,11 @@ func (s *Session) videoEvents() {
 		case ev.Config != nil:
 			s.failures = 0
 			s.videoUp.Store(true)
+			if r := s.a.faults.recovery; r != "" {
+				c := *ev.Config
+				c.Recovery = r
+				ev.Config = &c
+			}
 			s.sendJSON(ev.Config)
 		case ev.Frame != nil:
 			if s.paused.Load() {
@@ -559,23 +565,56 @@ func (s *Session) videoEvents() {
 			select {
 			case s.frameQ <- ev.Frame:
 			default:
-				// The network cannot keep up: drop what is queued, cut the
-				// bitrate and restart with a fresh key frame.
-				s.drainQueue()
-				s.congestion(0)
+				// The network cannot keep up: drop what is queued and this
+				// frame (the client is told at once), cut the bitrate and
+				// restart with a fresh key frame right away.
+				s.reportDropped(append(s.drainQueue(), ev.Frame), "queue overflow")
+				s.congestion(0, true)
 			}
 		}
 	}
 }
 
-func (s *Session) drainQueue() {
+// drainQueue discards the queued frames and returns them, oldest first.
+func (s *Session) drainQueue() []*media.Frame {
+	var fs []*media.Frame
 	for {
 		select {
-		case <-s.frameQ:
+		case f := <-s.frameQ:
+			fs = append(fs, f)
 		default:
-			return
+			return fs
 		}
 	}
+}
+
+// reportDropped tells the client about frames it will never get
+// ({"t":"dropped"}, one message per run of consecutive frames of a
+// generation): it acts on the loss at once instead of waiting for them, and
+// knows that any other gap is a late frame. frames are in send order. The
+// messages go out asynchronously so a slow control stream never holds up the
+// frame path.
+func (s *Session) reportDropped(frames []*media.Frame, why string) {
+	var msgs []proto.Dropped
+	for _, f := range frames {
+		if n := len(msgs); n > 0 && msgs[n-1].Gen == f.Gen && msgs[n-1].FromSeq+uint32(msgs[n-1].Count) == f.Seq {
+			msgs[n-1].Count++
+			continue
+		}
+		msgs = append(msgs, proto.Dropped{T: "dropped", Gen: f.Gen, FromSeq: f.Seq, Count: 1})
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	s.stats.dropped.Add(int64(len(frames)))
+	for _, m := range msgs {
+		s.log.Info("frames dropped", "why", why, "gen", m.Gen, "from_seq", m.FromSeq, "count", m.Count)
+	}
+	go func() {
+		for _, m := range msgs {
+			s.sendJSON(m)
+		}
+	}()
 }
 
 // handleEncoderFailure handles a failure event (ev.Err) of the video manager.
@@ -624,9 +663,13 @@ func (s *Session) encoderFailed(p media.Params, attempt int, live bool) {
 	}
 }
 
-// congestion lowers the bitrate by 25 % and forces a new key frame. It is
-// rate-limited to once every two seconds.
-func (s *Session) congestion(delayMs int) {
+// congestion lowers the bitrate by 25 % with a new encoder generation. It is
+// rate-limited to once every two seconds. urgent discards the current
+// generation at once: the host's frame queue overflowed (its frames were
+// dropped), or the client flushed its decoder. Otherwise (the client saw the
+// delay grow) the restart is overlapped: the current generation streams on
+// until the new one's first key frame.
+func (s *Session) congestion(delayMs int, urgent bool) {
 	s.kickMu.Lock()
 	if time.Since(s.lastCong) < 2*time.Second {
 		s.kickMu.Unlock()
@@ -641,13 +684,16 @@ func (s *Session) congestion(delayMs int) {
 		next = 2000
 	}
 	s.curKbps.Store(next)
-	s.log.Warn("congestion: lowering bitrate", "from", cur, "to", next, "delayMs", delayMs)
+	s.log.Warn("congestion: lowering bitrate", "from", cur, "to", next, "delayMs", delayMs, "urgent", urgent)
 	s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(next)/1000))
-	if err := s.startVideo(true, "congestion"); err != nil {
+	if err := s.startVideo(urgent, "congestion"); err != nil {
 		s.log.Warn("restart after congestion failed", "err", err)
 	}
 }
 
+// requestKeyframe restarts the encoder for a client that needs a key frame
+// (a confirmed loss under recovery "keyframe", a decoder error, or its
+// watchdog): the FFmpeg command line cannot force one in a running encoder.
 func (s *Session) requestKeyframe() {
 	s.kickMu.Lock()
 	if time.Since(s.lastKick) < 500*time.Millisecond {
@@ -663,7 +709,8 @@ func (s *Session) requestKeyframe() {
 
 func (s *Session) frameSender() {
 	buf := make([]byte, 0, 1<<20)
-	for {
+	faults := s.a.faults
+	for n := 1; ; n++ {
 		var f *media.Frame
 		select {
 		case <-s.ctx.Done():
@@ -679,6 +726,7 @@ func (s *Session) frameSender() {
 				return
 			}
 			s.log.Debug("open frame stream", "err", err)
+			s.reportDropped([]*media.Frame{f}, "stream failed")
 			continue
 		}
 		h, ext := videoHeader(f, s.hello.V, s.a.clock())
@@ -688,17 +736,40 @@ func (s *Session) frameSender() {
 			buf = ext.Append(buf)
 		}
 		buf = append(buf, f.Data...)
-		_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
-		if _, err := st.Write(buf); err != nil {
+		if drop, delay := faults.at(n); drop {
+			// Test hook: the stream fails mid-frame.
+			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
+			_, _ = st.Write(buf[:len(buf)/2])
 			st.CancelWrite()
+			s.reportDropped([]*media.Frame{f}, "test fault")
+			continue
+		} else if delay > 0 {
+			// Test hook: this frame arrives late, the next ones on time.
+			s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay)
+			late := append([]byte(nil), buf...)
+			time.AfterFunc(delay, func() { s.sendFrame(st, f, h, late) })
 			continue
 		}
-		st.Close()
-		s.stats.frames.Add(1)
-		s.stats.bytes.Add(int64(len(buf)))
-		if h.Flags&proto.FrameFlagExt != 0 {
-			s.hostStages.sentFrame(f, h.SendUs)
+		s.sendFrame(st, f, h, buf)
+	}
+}
+
+// sendFrame writes a frame (header h, encoded as b) to its stream; a frame
+// that cannot be written is reported dropped.
+func (s *Session) sendFrame(st transport.SendStream, f *media.Frame, h proto.FrameHeader, b []byte) {
+	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := st.Write(b); err != nil {
+		st.CancelWrite()
+		if s.ctx.Err() == nil {
+			s.reportDropped([]*media.Frame{f}, "stream failed")
 		}
+		return
+	}
+	st.Close()
+	s.stats.frames.Add(1)
+	s.stats.bytes.Add(int64(len(b)))
+	if h.Flags&proto.FrameFlagExt != 0 {
+		s.hostStages.sentFrame(f, h.SendUs)
 	}
 }
 
@@ -987,7 +1058,9 @@ func (s *Session) controlLoop() error {
 		case "stages":
 			s.logStages(m.Stages)
 		case "congestion":
-			s.congestion(m.DelayMs)
+			// Overlapped: the client keeps decoding the current generation
+			// until the new one is ready, unless it flushed its decoder.
+			s.congestion(m.DelayMs, m.Reason == proto.CongestionDecoder)
 		case "pause":
 			if !s.paused.Swap(true) {
 				s.log.Info("client hidden: pausing video")
@@ -1127,11 +1200,13 @@ func (s *Session) statsLoop() {
 		acks := s.stats.acks.Swap(0)
 		owdSum := s.stats.owdSum.Swap(0)
 		owdMax := s.stats.owdMax.Swap(0)
+		dropped := s.stats.dropped.Swap(0)
 		avg := int64(0)
 		if acks > 0 {
 			avg = owdSum / acks
 		}
 		s.log.Info("stream stats", "fps", float64(frames)/10, "mbps", float64(bytes)*8/10/1e6,
-			"owd_avg_ms", float64(avg)/1000, "owd_max_ms", float64(owdMax)/1000, "kbps_target", s.curKbps.Load())
+			"owd_avg_ms", float64(avg)/1000, "owd_max_ms", float64(owdMax)/1000, "kbps_target", s.curKbps.Load(),
+			"dropped", dropped)
 	}
 }

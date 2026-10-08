@@ -296,6 +296,9 @@ type result struct {
 	barcodeFeature                    bool // welcome advertised the test pattern's frame barcode
 	wallOffsetUs                      int64
 	firstFrameLatency                 time.Duration
+	recovery                          []string           // VideoConfig.Recovery of each config
+	dropped                           []proto.Dropped    // the host's "dropped" reports
+	received                          map[[2]uint32]bool // gen, seq of every complete frame
 }
 
 // control counts one control message.
@@ -304,6 +307,7 @@ func (r *result) control(m []byte) {
 		T            string
 		Features     []string
 		WallOffsetUs int64
+		Recovery     string
 	}
 	json.Unmarshal(m, &x)
 	switch x.T {
@@ -314,6 +318,11 @@ func (r *result) control(m []byte) {
 		r.wallOffsetUs = x.WallOffsetUs
 	case "video":
 		r.configs++
+		r.recovery = append(r.recovery, x.Recovery)
+	case "dropped":
+		var d proto.Dropped
+		json.Unmarshal(m, &d)
+		r.dropped = append(r.dropped, d)
 	}
 }
 
@@ -326,6 +335,10 @@ func (r *result) countFrame(b []byte) {
 		return
 	}
 	r.frames++
+	if r.received == nil {
+		r.received = map[[2]uint32]bool{}
+	}
+	r.received[[2]uint32{uint32(h.Gen), h.Seq}] = true
 	if h.Flags&proto.FrameFlagKey != 0 {
 		r.keyframes++
 	}
@@ -390,6 +403,13 @@ func runWT(t *testing.T, e *env, rawURL string, hashes []string, ticket string, 
 }
 
 func runWTPrefs(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs) result {
+	t.Helper()
+	return runWTCtl(t, e, rawURL, hashes, ticket, v, dur, prefs, nil)
+}
+
+// runWTCtl is runWTPrefs; mid (if set) runs halfway through with the control stream.
+func runWTCtl(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs,
+	mid func(ctrl transport.BidiStream)) result {
 	t.Helper()
 	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: transport.QUICConfig()}
 	hdr := http.Header{}
@@ -467,6 +487,9 @@ func runWTPrefs(t *testing.T, e *env, rawURL string, hashes []string, ticket str
 	// seq 2 intentionally skipped (lost): seq 3 carries the running total.
 	c.SendDatagram(proto.MouseRelDatagram(3, 12, -10))
 	c.SendDatagram(proto.MouseRelDatagram(2, 9, -6)) // late duplicate, must be ignored
+	if mid != nil {
+		mid(ctrl)
+	}
 	time.Sleep(dur / 2)
 	mu.Lock()
 	defer mu.Unlock()
@@ -529,6 +552,10 @@ func TestStreamingPaths(t *testing.T) {
 		t.Logf("direct: %+v", r)
 		if !r.welcome || r.frames < 100 || r.audio < 100 {
 			t.Fatalf("unexpected result %+v", r)
+		}
+		// libx264 has no intra refresh: a lost frame needs a key frame.
+		if len(r.recovery) == 0 || r.recovery[0] != proto.RecoveryKeyframe || len(r.dropped) > 0 {
+			t.Fatalf("recovery %q, %d dropped reports on a clean link", r.recovery, len(r.dropped))
 		}
 		checkExt(t, r, 2)
 		checkInput(t, e.logPath)
@@ -702,4 +729,74 @@ func TestStreamingMediaCongestion(t *testing.T) {
 			t.Fatalf("back-off on a lossless link: %s", l[0])
 		}
 	})
+}
+
+// Host test hook RECON_TEST_FAULTS (guide step 1.4): the frames the host drops
+// are reported to the client ({"t":"dropped"}) and are exactly the frames that
+// never arrive; delayed frames arrive late but complete; the forced recovery
+// mode reaches the client. A client congestion report restarts the encoder
+// overlapped (non-urgent).
+func TestStreamingFrameLoss(t *testing.T) {
+	t.Setenv(host.TestFaultsEnv, "delay=every:7:120ms,drop=every:20,recovery=skip")
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	r := runWTCtl(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 4*time.Second, defaultPrefs, func(ctrl transport.BidiStream) {
+		proto.WriteMsg(ctrl, []byte(`{"t":"congestion","delayMs":80}`))
+	})
+	t.Logf("received %d frames in %d configs, %d dropped reports, recovery %q", r.frames, r.configs, len(r.dropped), r.recovery)
+	if !r.welcome || r.frames < 150 || r.configs < 2 {
+		t.Fatalf("unexpected result %+v", r)
+	}
+	for _, rec := range r.recovery {
+		if rec != proto.RecoverySkip {
+			t.Fatalf("recovery %q, want the forced %q", r.recovery, proto.RecoverySkip)
+		}
+	}
+	// Every frame either arrives or is reported dropped, never both.
+	reported := map[[2]uint32]bool{}
+	for _, d := range r.dropped {
+		if d.Count != 1 {
+			t.Fatalf("report %+v: the hook drops single frames", d)
+		}
+		k := [2]uint32{uint32(d.Gen), d.FromSeq}
+		if reported[k] || r.received[k] {
+			t.Fatalf("frame %v reported dropped twice or received: %+v", k, d)
+		}
+		reported[k] = true
+	}
+	maxSeq := map[uint32]uint32{}
+	for k := range r.received {
+		maxSeq[k[0]] = max(maxSeq[k[0]], k[1])
+	}
+	for gen, last := range maxSeq {
+		for seq := uint32(0); seq+10 <= last; seq++ { // the last frames may still be in flight
+			if k := [2]uint32{gen, seq}; !r.received[k] && !reported[k] {
+				t.Errorf("gen %d seq %d never arrived and was not reported dropped", gen, seq)
+			}
+		}
+	}
+	// The session's frames are counted from 1 in send order (n): in
+	// generation 1, n = seq + 1. Every 20th was dropped, every 7th delayed.
+	late := 0
+	for seq := uint32(0); seq+10 <= maxSeq[1]; seq++ {
+		k, n := [2]uint32{1, seq}, seq+1
+		switch {
+		case n%20 == 0 && !reported[k]:
+			t.Errorf("frame %d (gen 1 seq %d) dropped by the hook but not reported", n, seq)
+		case n%20 != 0 && reported[k]:
+			t.Errorf("frame %d (gen 1 seq %d) reported dropped, the hook did not drop it", n, seq)
+		case n%20 != 0 && n%7 == 0 && r.received[k]:
+			late++
+		}
+	}
+	if len(reported) < 5 || late < 8 {
+		t.Fatalf("%d frames reported dropped, %d delayed frames arrived; want >= 5 and >= 8", len(reported), late)
+	}
+	if l := e.logs.lines(from, `msg="restarting video"`, "reason=congestion", "urgent=false"); len(l) != 1 {
+		t.Fatalf("client congestion report: want one overlapped (non-urgent) restart, log: %q", e.logs.lines(from, `msg="restarting video"`))
+	}
+	if l := e.logs.lines(from, `msg="test fault: delaying frame"`); len(l) < 10 {
+		t.Fatalf("%d delayed frames logged", len(l))
+	}
 }

@@ -41,6 +41,7 @@ type Agent struct {
 	hostClock   func() uint64
 	inj         *input.Injector
 	audioSource media.AudioSource
+	faults      testFaults // TestFaultsEnv: tests only
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -140,6 +141,12 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		if fi, err := os.Stat(cfg.path); err == nil {
 			a.cfgMod = fi.ModTime()
 		}
+	}
+	if v := os.Getenv(TestFaultsEnv); v != "" {
+		if a.faults, err = parseTestFaults(v); err != nil {
+			return nil, fmt.Errorf("%s: %w", TestFaultsEnv, err)
+		}
+		log.Warn("TEST fault injection is on: video frames are delayed and dropped on purpose", TestFaultsEnv, v)
 	}
 	return a, nil
 }

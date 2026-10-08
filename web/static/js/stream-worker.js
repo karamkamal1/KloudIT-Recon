@@ -37,13 +37,14 @@ const video = {
   lostGen: -1,
   keyRequested: 0,
   waitSince: 0,
+  hostDropped: new Set(), // seqs of the current generation the host reported dropped
 };
 
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, totalN: 0,
-  dropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
+  dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
   audioPackets: 0, audioLost: 0,
 };
 
@@ -510,6 +511,7 @@ async function configureDecoder(cfg) {
 
 function onDecodeError(e) {
   post('log', { text: `decoder error: ${e.message}` });
+  if (dropTest.run && !dropTest.run.error) dropTest.run.error = e.message;
   requestKeyframe('decoder error');
   if (video.cfg) configureDecoder(video.cfg).then(() => drainEarly());
 }
@@ -520,10 +522,12 @@ function requestKeyframe(reason, send = true) {
   const t = now();
   video.waitingKey = true;
   video.reorder.clear();
+  // Nothing of this generation is decoded any more, also when the request is
+  // not sent again so soon (its gaps must not count as losses).
+  video.lostGen = video.cfg ? video.cfg.gen : -1;
   if (t - video.keyRequested < 400) return;
   video.keyRequested = t;
   stats.keyRequests++;
-  video.lostGen = video.cfg ? video.cfg.gen : -1;
   post('log', { text: `requesting key frame (${reason})` });
   if (send) transport?.sendControl({ t: 'keyframe' });
 }
@@ -551,6 +555,8 @@ async function onVideoConfig(cfg) {
   video.expectSeq = 0;
   video.waitingKey = true;
   video.reorder.clear();
+  video.hostDropped.clear();
+  video.gapSince = 0;
   video.lostGen = -1;
   post('video', { cfg });
   if (await configureDecoder(cfg)) drainEarly();
@@ -587,19 +593,21 @@ function onFrame(f) {
     return;
   }
   if (f.gen !== cfg.gen || f.gen === video.lostGen) return; // superseded generation
-  if (f.seq < video.expectSeq) return; // duplicate
+  if (f.seq < video.expectSeq) return; // duplicate, or late after its loss was handled
   if (f.seq > video.expectSeq) {
     video.reorder.set(f.seq, f);
     if (!video.gapSince) video.gapSince = now();
-    if (now() - video.gapSince > 150 || video.reorder.size > 30) {
-      stats.dropped += f.seq - video.expectSeq;
-      video.gapSince = 0;
-      requestKeyframe('frame lost');
-    }
+    checkGap();
     return;
   }
   decodeFrame(f);
   video.expectSeq++;
+  decodeInOrder();
+}
+
+// Decode the buffered frames that are next in sequence, then see whether the
+// next one is missing.
+function decodeInOrder() {
   while (video.reorder.has(video.expectSeq)) {
     const n = video.reorder.get(video.expectSeq);
     video.reorder.delete(video.expectSeq);
@@ -607,6 +615,64 @@ function onFrame(f) {
     video.expectSeq++;
   }
   video.gapSince = video.reorder.size ? now() : 0;
+  checkGap();
+}
+
+// Frames travel on reliable streams: a gap in the sequence is a late frame
+// (a retransmission takes a few round trips), not a lost one, until it lasts
+// longer than that. Frames the host dropped are reported ({"t":"dropped"}).
+const gapTimeout = () => Math.max(250, 4 * clock.rtt);
+
+// The next frame in sequence is missing. It is lost when the host reported it
+// dropped (act at once) or when the gap outlasts gapTimeout() (no report: an
+// older host, or a frame lost on the way); until then frames wait in the
+// reorder buffer.
+function checkGap() {
+  const cfg = video.cfg;
+  if (!cfg || cfg.gen === video.lostGen) return;
+  const reported = video.hostDropped.has(video.expectSeq);
+  if (!reported) {
+    if (!video.reorder.size) return;
+    const timeout = gapTimeout();
+    const maxBuffered = Math.max(30, 2 * Math.ceil(((cfg.fps || 60) * timeout) / 1000));
+    if (now() - video.gapSince <= timeout && video.reorder.size <= maxBuffered) return;
+  }
+  frameLost(reported ? 'dropped by host' : 'frame lost');
+}
+
+// A confirmed loss of the frames from expectSeq on: the run the host
+// reported, else everything up to the oldest buffered frame. Recovery "skip"
+// (the encoder heals the picture by itself: intra refresh) continues with the
+// next frame; "keyframe" asks for a key frame (on the FFmpeg path a new
+// encoder generation), as does a loss before this generation's key frame.
+function frameLost(reason) {
+  let to = video.expectSeq;
+  while (video.hostDropped.has(to)) video.hostDropped.delete(to++);
+  if (to === video.expectSeq) to = Math.min(...video.reorder.keys());
+  const missing = to - video.expectSeq;
+  stats.dropped += missing;
+  const skip = P.recoveryOf(video.cfg) === P.RECOVERY_SKIP && !video.waitingKey && video.decoder?.state === 'configured';
+  if (!skip) {
+    video.gapSince = 0;
+    requestKeyframe(reason);
+    return;
+  }
+  stats.skipped += missing;
+  post('log', { text: `skipping ${missing} lost frame(s) from ${video.cfg.gen}/${video.expectSeq} (${reason}); the encoder heals the picture` });
+  video.expectSeq = to;
+  for (const k of video.reorder.keys()) if (k < to) video.reorder.delete(k);
+  decodeInOrder();
+}
+
+// The host discarded frames it will never send: treat them as lost now.
+function onDropped(m) {
+  const d = P.parseDropped(m);
+  if (!d) return;
+  stats.hostDropped += d.count;
+  const cfg = video.cfg;
+  if (!cfg || d.gen !== cfg.gen || d.gen === video.lostGen) return; // other generations are discarded anyway
+  for (let s = Math.max(d.from, video.expectSeq); s < d.from + d.count; s++) video.hostDropped.add(s);
+  if (video.ready) checkGap(); // else drainEarly() gets to it
 }
 
 // If the decoder cannot keep up (slow device, software decode), frames queue
@@ -627,9 +693,10 @@ function checkDecoderBacklog() {
   video.inflight.clear();
   configureDecoder(video.cfg).then(() => drainEarly());
   // One message: the host's congestion response lowers the bitrate *and*
-  // restarts with a key frame.
+  // restarts with a key frame, at once for this reason (other congestion
+  // reports restart overlapped while the old generation streams on).
   requestKeyframe('decoder backlog', false);
-  transport?.sendControl({ t: 'congestion', delayMs: 0 });
+  transport?.sendControl({ t: 'congestion', delayMs: 0, reason: P.CONGESTION_DECODER });
   if (!overload.warned) {
     overload.warned = true;
     post('notice', { level: 'warn', msg: 'This device is not decoding fast enough — lowering bitrate. Try H.264, a lower resolution or frame rate.' });
@@ -645,6 +712,14 @@ function decodeFrame(f) {
   }
   const d = video.decoder;
   if (!d || d.state !== 'configured') return;
+  if (dropTest.armed && !f.key) {
+    // Never decoded: the next frame references one the decoder has not seen.
+    dropTest.armed = false;
+    dropTest.run = { gen: f.gen, seq: f.seq, codec: video.cfg?.codec, encoder: video.cfg?.encoder, hw: video.hw, at: now(), decoded: 0, error: null };
+    post('log', { text: `drop test: skipping frame ${f.gen}/${f.seq} (${video.cfg?.codec}, ${video.hw ? 'hardware' : 'software'} decoder)` });
+    setTimeout(finishDropTest, DROP_TEST_MS);
+    return;
+  }
   video.inflight.set(f.ptsUs, {
     recv: f.recv, first: f.first, sendUs: f.sendUs, ext: f.ext, seq: f.seq, gen: f.gen, t: now(),
   });
@@ -661,6 +736,8 @@ let firstFrame = true;
 function onDecoded(frame) {
   const meta = video.inflight.get(frame.timestamp);
   video.inflight.delete(frame.timestamp);
+  const dt = dropTest.run;
+  if (dt && meta && meta.gen === dt.gen && meta.seq > dt.seq) dt.decoded++;
   const decoded = now();
   const size = `${frame.displayWidth}x${frame.displayHeight}`;
   if (size !== video.lastSize) {
@@ -696,6 +773,25 @@ function onDecoded(frame) {
     stats.totalMax = Math.max(stats.totalMax, total);
     transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, decodeMs * 1000));
   }
+}
+
+// Debug toggle for the decoder check in docs/VENDOR_NOTES.md (1.4): does this
+// browser's decoder accept a P-frame after a skipped frame (what recovery
+// "skip" does)? postMessage({type:'dropTest'}) drops the next delta frame
+// before the decoder; after DROP_TEST_MS the result ({ decoded, error, ... })
+// goes to the main thread (window.__recon.dropTest) and the log. The picture
+// stays damaged until the encoder heals it (intra refresh) or a key frame.
+const DROP_TEST_MS = 2000;
+const dropTest = { armed: false, run: null };
+
+function finishDropTest() {
+  const r = dropTest.run;
+  if (!r) return;
+  dropTest.run = null;
+  const result = { ...r, ms: DROP_TEST_MS, ok: !r.error && r.decoded > 0 };
+  delete result.at;
+  post('log', { text: `drop test: ${result.ok ? 'decoder accepted' : 'decoder did NOT accept'} the frames after the skipped one: ${r.decoded} decoded in ${DROP_TEST_MS} ms${r.error ? `, error: ${r.error}` : ''}` });
+  post('dropTest', { result });
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1212,7 @@ function onControl(m) {
       break;
     case 'clock': if (Number.isFinite(m.wallOffsetUs)) probe.wallOffsetUs = m.wallOffsetUs; updateProbeMode(); break;
     case 'video': onVideoConfig(m); break;
+    case P.MSG_DROPPED: onDropped(m); break;
     case 'audio': onAudioConfig(m); break;
     case 'cursor': post('cursor', { shape: m }); break;
     case 'notice': post('notice', { level: m.level, msg: m.msg }); break;
@@ -1162,6 +1259,8 @@ function postStats() {
     totalMin: isFinite(stats.totalMin) ? stats.totalMin : null,
     totalMax: stats.totalMax || null,
     dropped: stats.dropped,
+    skipped: stats.skipped,
+    hostDropped: stats.hostDropped,
     keyRequests: stats.keyRequests,
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
@@ -1233,6 +1332,7 @@ self.onmessage = (ev) => {
     case 'prefs': prefs = { ...prefs, ...m.prefs }; updateProbeMode(); break;
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;
+    case 'dropTest': if (!dropTest.run) dropTest.armed = true; break;
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
       if (transport) { transport.sendControl({ t: 'bye' }); setTimeout(() => transport?.close(), 50); }

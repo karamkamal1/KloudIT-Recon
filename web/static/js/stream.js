@@ -246,6 +246,7 @@ function onWorker(m) {
     case 'stats': onStats(m); break;
     case 'drawn': onDrawnMark(m); break;
     case 'stageDump': S.stageDump = m.recs; break;
+    case 'dropTest': S.dropTest = m.result; break;
     case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
@@ -622,11 +623,12 @@ function onStats(st) {
     row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}`),
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
+    row('Loss recovery', v.recovery === 'skip' ? 'skip frame (intra refresh)' : 'key frame'),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
     row('Renderer', S.conn ? S.conn.renderer : '—'),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     row('Decoder queue', String(st.queue)),
-    row('Frames dropped', `${st.dropped} · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
+    row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);

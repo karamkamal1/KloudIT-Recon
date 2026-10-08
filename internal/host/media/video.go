@@ -69,6 +69,7 @@ type Video struct {
 type encProc struct {
 	gen     uint8
 	params  Params
+	args    []string // the ffmpeg command line (Recovery reads the encoder options)
 	cmd     *exec.Cmd
 	cancel  context.CancelFunc
 	stderr  *stderrRing
@@ -120,7 +121,7 @@ func (v *Video) Start(p Params, urgent bool) error {
 		cancel()
 		return err
 	}
-	pr := &encProc{gen: v.gen, params: p, cmd: cmd, cancel: cancel, stderr: &stderrRing{log: v.log}, started: time.Now(), errDone: make(chan struct{})}
+	pr := &encProc{gen: v.gen, params: p, args: args, cmd: cmd, cancel: cancel, stderr: &stderrRing{log: v.log}, started: time.Now(), errDone: make(chan struct{})}
 	if v.log != nil {
 		v.log.Info("starting encoder", "gen", pr.gen, "encoder", p.Encoder.Name, "capture", p.Source.Backend,
 			"fps", p.FPS, "kbps", p.BitrateKbps, "size", fmt.Sprintf("%dx%d", p.Width, p.Height), "adaptive", p.Adaptive)
@@ -298,10 +299,11 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				T: "video", Gen: pr.gen, Family: params.Family, Codec: params.Codec,
 				Width: st.Width, Height: st.Height, FPS: pr.params.FPS, BitrateKbps: pr.params.BitrateKbps,
 				Encoder: pr.params.Encoder.Name, Capture: pr.params.Source.Backend,
+				Recovery: Recovery(pr.args, st.Width, st.Height, pr.params.FPS),
 			}
 			if v.log != nil {
 				v.log.Info("encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", st.Width, st.Height),
-					"startup", time.Since(pr.started).Round(time.Millisecond))
+					"startup", time.Since(pr.started).Round(time.Millisecond), "recovery", cfg.Recovery)
 			}
 			v.mu.Unlock()
 			v.emit(VideoEvent{Config: cfg})

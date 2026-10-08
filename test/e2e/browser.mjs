@@ -6,8 +6,9 @@
 //
 // Drives the actual UI: first-run setup, pairing a host, connecting, and
 // streaming over direct WebTransport, relayed WebTransport and WebSocket.
-// Verifies decoded video, audio, keyboard/mouse delivery to the host, and
-// reports the measured latencies.
+// Verifies decoded video, audio, keyboard/mouse delivery to the host, the
+// loss handling (late and dropped frames from the host's fault-injection
+// hook), and reports the measured latencies.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -198,6 +199,160 @@ async function checkWallclockProbe() {
     !!p2c && p2c.min >= -3 && p2c.p50 <= 100,
     p2c ? `page→capture p50/p95 ${p2c.p50}/${p2c.p95} ms, min ${p2c.min} ms (n ${p2c.n}); capture→draw (stamps) p50 ${e2e?.p50} ms vs screen→drawn ${l?.p50} ms` : 'no page→capture samples');
   results.push({ probe: 'wallclock', summary: pr, stages: st?.stages, cfg });
+  await page.evaluate(() => { window.__recon.userClosed = true; });
+}
+
+// ---------------------------------------------------------------------------
+// Loss handling (guide step 1.4). Frames travel on reliable streams, so a gap
+// in the sequence is a late frame unless the host reports the frame dropped
+// ({"t":"dropped"}); only a confirmed loss costs a key frame (recovery
+// "keyframe": an encoder restart on the FFmpeg path) or nothing at all
+// (recovery "skip": the encoder heals the picture with intra refresh). The
+// host's test-only hook RECON_TEST_FAULTS (internal/host/faults.go) delays
+// every 97th frame by 200 ms and drops every 193rd.
+
+const LOSS_FAULTS = 'delay=every:97:200ms,drop=every:193';
+
+// Encoder restarts by reason in a host log ("restarting video" lines).
+function restartsByReason(log) {
+  const out = {};
+  for (const m of log.matchAll(/msg="restarting video".*? reason=("[^"]*"|\S+) urgent=(\w+)/g)) {
+    const k = `${m[1].replaceAll('"', '')}${m[2] === 'true' ? ' (urgent)' : ''}`;
+    out[k] = (out[k] || 0) + 1;
+  }
+  return out;
+}
+
+// The client's key-frame requests by reason, from its console log.
+function keyRequestsByReason(lines) {
+  const out = {};
+  for (const l of lines) {
+    const m = l.match(/requesting key frame \(([^)]*)\)/) || (l.includes('still waiting for a key frame') ? [l, 'watchdog'] : null);
+    if (m) out[m[1]] = (out[m[1]] || 0) + 1;
+  }
+  return out;
+}
+
+const counts = (o) => Object.entries(o).map(([k, v]) => `${k}: ${v}`).join(', ') || 'none';
+
+// Restart the host agent (same pairing and config) with extra environment.
+async function restartHost(env, name) {
+  const old = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  old.kill('SIGTERM');
+  await new Promise((r) => (old.exitCode !== null ? r() : old.on('exit', r)));
+  const p = run('recon-host', ['-config', join(dir, 'host.json'), 'run'], { RECON_INPUT_LOG: inputLog, ...env }, name);
+  await until(() => /msg="connected to gateway"/.test(p.log) && /direct WebTransport endpoint listening/.test(p.log), 60000, `${name} online`);
+  await page.goto(`${base}/`);
+  await until(async () => (await page.$$('.host.online')).length === 1, 60000, 'host online after restart');
+  return p;
+}
+
+async function startStream(prefs) {
+  await page.goto(`${base}/`);
+  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), prefs);
+  await page.click('.host.online a.btn-primary');
+  await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+  await page.click('#btn-start');
+  await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+}
+
+// Stream over direct WebTransport from a host started with faults; measure
+// `seconds` after a warm-up.
+async function lossRun(name, faults, seconds) {
+  const host = await restartHost({ RECON_TEST_FAULTS: faults }, name);
+  await startStream({ path: 'auto', transport: 'auto' });
+  await sleep(4000); // decoder warm-up
+  const st0 = await page.evaluate(() => window.__recon.lastStats);
+  const log0 = host.log.length;
+  const con0 = consoleLines.length;
+  const fps = [];
+  for (const end = Date.now() + seconds * 1000; Date.now() < end;) {
+    await sleep(500);
+    fps.push((await page.evaluate(() => window.__recon.lastStats))?.fps ?? 0);
+  }
+  const st = await page.evaluate(() => window.__recon.lastStats);
+  const cfg = await page.evaluate(() => window.__recon.videoCfg);
+  const hl = host.log.slice(log0);
+  const con = consoleLines.slice(con0);
+  const delta = (k) => (st?.[k] ?? 0) - (st0?.[k] ?? 0);
+  return {
+    name, faults, seconds, cfg, fps: fps.reduce((a, b) => a + b, 0) / Math.max(1, fps.length),
+    delayed: (hl.match(/msg="test fault: delaying frame"/g) || []).length,
+    dropped: (hl.match(/msg="frames dropped".*? why="test fault"/g) || []).length,
+    restarts: restartsByReason(hl),
+    keyRequestReasons: keyRequestsByReason(con),
+    client: { keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped') },
+    decoderErrors: con.filter((l) => l.includes('decoder error')).length,
+  };
+}
+
+async function checkLossHandling() {
+  // The scenarios so far ran on a clean loopback link ("lan"): no gap may
+  // have been taken for a loss. Restarts for other reasons (settings changes,
+  // decoder backlog and congestion on this CPU-only machine) and frames the
+  // host dropped on queue overflow are listed for the record.
+  const lan = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const lanKeys = keyRequestsByReason(consoleLines);
+  check('clean link (lan): no key frame requested for a gap in the sequence (late frames wait)', !lanKeys['frame lost'],
+    `client key-frame requests: ${counts(lanKeys)}; host encoder restarts: ${counts(restartsByReason(lan.log))}; ` +
+      `host frame drops: ${(lan.log.match(/msg="frames dropped"/g) || []).length}`);
+  results.push({ loss: 'lan', restarts: restartsByReason(lan.log), keyRequests: lanKeys });
+
+  // The debug toggle behind the hardware decoder check in VENDOR_NOTES (1.4):
+  // skip one delta frame before the decoder, report whether it errors. Three
+  // runs on the clean host: whether a decoder accepts the next P-frame can
+  // depend on the frame skipped (AV1 frames inherit entropy-coding state from
+  // a reference frame; a non-reference frame can go missing harmlessly).
+  await startStream({ path: 'auto', transport: 'auto' });
+  await sleep(4000);
+  const dts = [];
+  for (let i = 0; i < 3; i++) {
+    await page.evaluate(() => { window.__recon.dropTest = null; window.__recon.worker.postMessage({ type: 'dropTest' }); });
+    const dt = await until(() => page.evaluate(() => window.__recon.dropTest), 8000, 'drop test result').catch(() => null);
+    dts.push(dt);
+    await sleep(1500); // after a decoder error: the key frame it asked for
+  }
+  const dtRows = dts.map((d) => (d ? `${d.gen}/${d.seq}: ${d.ok ? 'accepted' : 'error'} (${d.decoded} decoded${d.error ? `, ${d.error}` : ''})` : 'no result'));
+  check('drop test (debug toggle) reports whether the decoder accepts the frames after a skipped one',
+    dts.every((d) => d && (d.ok || !!d.error)),
+    `${dts[0]?.codec} (${dts[0]?.hw ? 'hardware' : 'software'} decoder): ${dtRows.join('; ')}`);
+  results.push({ loss: 'dropTest', runs: dts });
+  await page.evaluate(() => { window.__recon.userClosed = true; });
+
+  // Recovery "keyframe" (the software encoders have no intra refresh).
+  const k = await lossRun('host-faults', LOSS_FAULTS, 20);
+  const kfRestarts = k.restarts['keyframe request (urgent)'] || 0;
+  // A late frame that outlasted the gap timeout would show as "frame lost";
+  // every key-frame restart needs a client request with a logged reason.
+  check('late frames (200 ms) cause no key-frame request and no restart',
+    k.delayed >= 5 && !k.keyRequestReasons['frame lost'],
+    `${k.delayed} frames delayed 200 ms, ${k.dropped} dropped; client key-frame requests: ${counts(k.keyRequestReasons)}; ` +
+      `host restarts: ${counts(k.restarts)}`);
+  check('dropped frames are reported ("dropped") and recovered with a key frame (recovery "keyframe")',
+    k.cfg?.recovery === 'keyframe' && k.dropped >= 3 && k.client.hostDropped >= k.dropped - 1 &&
+      (k.keyRequestReasons['dropped by host'] || 0) >= 1 && kfRestarts >= 1 && k.fps >= 10,
+    `${k.cfg?.encoder} recovery ${k.cfg?.recovery}: host dropped ${k.dropped}, client told ${k.client.hostDropped}, ` +
+      `key requests ${k.client.keyRequests} (${counts(k.keyRequestReasons)}), key-frame restarts ${kfRestarts}, ${k.fps.toFixed(1)} fps mean over ${k.seconds} s`);
+  await page.evaluate(() => { window.__recon.userClosed = true; });
+
+  // Recovery "skip", forced through the hook: the client skips the dropped
+  // frame and decodes on, without a key-frame request. The software AV1
+  // encoder has no intra refresh, so the picture stays damaged, and Chrome's
+  // AV1 decoder can reject a later frame (entropy-coding state inherited from
+  // the missing reference): then, and only then, the decoder-error fallback
+  // (reset + key frame) runs. A drop that falls into a generation the client
+  // has already given up (decoder backlog or error, waiting for its key
+  // frame) needs nothing at all, so not every report is a skip.
+  const s = await lossRun('host-faults-skip', `${LOSS_FAULTS},recovery=skip`, 20);
+  const skipRestarts = s.restarts['keyframe request (urgent)'] || 0;
+  check('dropped frames skipped (recovery "skip"): no key-frame request for the loss itself, playback continues',
+    s.cfg?.recovery === 'skip' && s.dropped >= 3 && s.client.hostDropped >= s.dropped - 1 && s.client.skipped >= 1 &&
+      !s.keyRequestReasons['dropped by host'] && !s.keyRequestReasons['frame lost'] &&
+      skipRestarts <= (s.keyRequestReasons['decoder error'] || 0) + (s.keyRequestReasons.watchdog || 0) && s.fps >= 10,
+    `${s.cfg?.encoder} recovery ${s.cfg?.recovery}: host dropped ${s.dropped}, client told ${s.client.hostDropped}, skipped ${s.client.skipped}, ` +
+      `decoder errors after a skip ${s.decoderErrors} (fallback: reset + key frame); client key-frame requests: ${counts(s.keyRequestReasons)}; ` +
+      `host restarts: ${counts(s.restarts)}; ${s.fps.toFixed(1)} fps mean over ${s.seconds} s`);
+  results.push({ loss: 'faults', keyframe: k, skip: s });
   await page.evaluate(() => { window.__recon.userClosed = true; });
 }
 
@@ -409,6 +564,9 @@ try {
     }
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }
+
+  // 3a. Loss handling with the host's fault-injection hook --------------------
+  await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
 
   // 3b. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a

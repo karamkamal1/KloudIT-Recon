@@ -697,6 +697,54 @@ func RetryUsage(e EncoderInfo) string {
 	return ""
 }
 
+// maxRefreshSeconds bounds the intra refresh period that counts as healing:
+// a client that skips a lost frame shows a damaged picture until then.
+const maxRefreshSeconds = 2
+
+// Recovery returns how a client recovers from a lost frame of a generation
+// encoded with these encoder arguments at w×h and fps (proto.VideoConfig
+// Recovery). Skipping the frame needs an encoder that heals the picture by
+// itself, with intra refresh that completes within maxRefreshSeconds:
+//   - NVENC -intra-refresh 1: FFmpeg makes the GOP infinite and uses -g as
+//     the refresh period (intraRefreshPeriod = -g, spread over -g - 1 frames),
+//     so -g must be short; the default (an hour of frames) heals nothing.
+//   - AMF H.264 -intra_refresh_mb N > 0: N macroblocks per frame, a period of
+//     ceil(macroblocks per picture / N) frames.
+//
+// The arguments are the ones actually passed (encoderArgs drops options the
+// encoder lacks), so this follows what the encoder can do. Anything else
+// needs a key frame.
+func Recovery(args []string, w, h, fps int) string {
+	val := func(name string) (int, bool) {
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-"+name {
+				switch args[i+1] {
+				case "true":
+					return 1, true
+				case "false":
+					return 0, true
+				}
+				n, err := strconv.Atoi(args[i+1])
+				return n, err == nil
+			}
+		}
+		return 0, false
+	}
+	maxFrames := maxRefreshSeconds * max(fps, 1)
+	if on, ok := val("intra-refresh"); ok && on == 1 {
+		if g, ok := val("g"); ok && g > 0 && g <= maxFrames {
+			return proto.RecoverySkip
+		}
+	}
+	if n, ok := val("intra_refresh_mb"); ok && n > 0 && w > 0 && h > 0 {
+		mbs := ((w + 15) / 16) * ((h + 15) / 16)
+		if (mbs+n-1)/n <= maxFrames {
+			return proto.RecoverySkip
+		}
+	}
+	return proto.RecoveryKeyframe
+}
+
 // ---------------------------------------------------------------------------
 
 // causeLines returns FFmpeg's first error lines: the encoder prints its reason

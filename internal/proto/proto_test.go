@@ -185,6 +185,66 @@ console.log(JSON.stringify(out));`
 	}
 }
 
+// TestLossRecoveryJS checks that protocol.js reads the host's "dropped"
+// message and VideoConfig.Recovery as Go writes them (needs node).
+func TestLossRecoveryJS(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	msg := func(v any) string { b, _ := json.Marshal(v); return string(b) }
+	in := map[string]string{
+		"dropped":  msg(Dropped{T: "dropped", Gen: 200, FromSeq: 4_000_000_000, Count: 3}),
+		"noCount":  `{"t":"dropped","gen":1,"fromSeq":5}`,
+		"tooMany":  msg(Dropped{T: "dropped", Gen: 1, FromSeq: 5, Count: 1 << 20}),
+		"badSeq":   `{"t":"dropped","gen":1,"fromSeq":-1,"count":1}`,
+		"noGen":    `{"t":"dropped","fromSeq":1,"count":1}`,
+		"skip":     msg(VideoConfig{T: "video", Recovery: RecoverySkip}),
+		"keyframe": msg(VideoConfig{T: "video", Recovery: RecoveryKeyframe}),
+		"oldHost":  msg(VideoConfig{T: "video"}),
+	}
+	b, _ := json.Marshal(in)
+	script := `
+const P = await import(process.argv[1]);
+const m = Object.fromEntries(Object.entries(JSON.parse(process.argv[2])).map(([k, v]) => [k, JSON.parse(v)]));
+console.log(JSON.stringify({
+  consts: [P.MSG_DROPPED, P.RECOVERY_SKIP, P.RECOVERY_KEYFRAME, P.CONGESTION_DECODER],
+  dropped: P.parseDropped(m.dropped), noCount: P.parseDropped(m.noCount), tooMany: P.parseDropped(m.tooMany),
+  badSeq: P.parseDropped(m.badSeq), noGen: P.parseDropped(m.noGen),
+  recovery: [P.recoveryOf(m.skip), P.recoveryOf(m.keyframe), P.recoveryOf(m.oldHost), P.recoveryOf(null)],
+}));`
+	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js), string(b)).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	type rng struct{ Gen, From, Count int }
+	var got struct {
+		Consts                                   []string
+		Dropped, NoCount, TooMany, BadSeq, NoGen *rng
+		Recovery                                 []string
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if strings.Join(got.Consts, ",") != "dropped,"+RecoverySkip+","+RecoveryKeyframe+","+CongestionDecoder {
+		t.Errorf("constants %v", got.Consts)
+	}
+	if got.Dropped == nil || *got.Dropped != (rng{200, 4_000_000_000, 3}) {
+		t.Errorf("dropped: %+v", got.Dropped)
+	}
+	if got.NoCount == nil || got.NoCount.Count != 1 || got.TooMany == nil || got.TooMany.Count != 1024 {
+		t.Errorf("count: missing -> %+v, huge -> %+v", got.NoCount, got.TooMany)
+	}
+	if got.BadSeq != nil || got.NoGen != nil {
+		t.Errorf("malformed accepted: %+v %+v", got.BadSeq, got.NoGen)
+	}
+	if strings.Join(got.Recovery, ",") != "skip,keyframe,keyframe,keyframe" {
+		t.Errorf("recoveryOf: %v (skip, keyframe, old host, none)", got.Recovery)
+	}
+}
+
 func TestInputParsing(t *testing.T) {
 	ev, err := ParseInput(KeyEvent(0x48, true, true))
 	if err != nil || ev.Scancode != 0x48 || !ev.Extended || !ev.Down {
