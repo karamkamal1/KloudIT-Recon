@@ -73,6 +73,12 @@ Techniques used (most of them are new to browser-based game streaming):
   (120 → 90 → 60) instead. A decoder backlog gets
   flushed and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
   then climbs back only to 85 % of where the decoder fell behind.
+- **Input and audio first.** The host keeps at most one video frame in flight beyond those in
+  transit for the round trip (two on a LAN; measured by QUIC acknowledgements), so audio, cursor
+  and clock-sync datagrams never queue behind a video backlog on the path; the browser sends
+  input ahead of control and telemetry (WebTransport `sendOrder` and send groups where it has
+  them, else telemetry gives way on the shared datagram queue). See "Send priorities" in
+  `docs/ARCHITECTURE.md`.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
   drops, and the client recovers at once: it skips the frame when the encoder heals the picture
@@ -414,8 +420,10 @@ recovery mode the host announces, `intra-refresh` runs libx264 with periodic int
 NVENC runs, so the host announces `skip` from its real encoder arguments, `ref-recovery` makes the
 FFmpeg pipeline stand in for the native helper's ACK-based recovery (a key frame every few frames,
 sent as a P-frame, and after a loss the next one flagged as the recovery frame; the host announces
-`invalidate`), and `still=after:N` sends only the first N frames of every encoder generation, like
-a desktop that stops changing (`internal/host/faults.go`). Never set it on a real host; the agent
+`invalidate`), `still=after:N` sends only the first N frames of every encoder generation, like
+a desktop that stops changing, and `no-window` sends without the video window of the send
+priorities (docs/ARCHITECTURE.md "Send priorities"), for an A/B measurement
+(`internal/host/faults.go`). Never set it on a real host outside such a measurement; the agent
 logs a warning when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,

@@ -274,6 +274,10 @@ type outFrame struct {
 	deadline time.Duration // from opened (frameDeadline)
 	timer    *time.Timer   // runs checkOut at the deadline; nil: the ladder never cancels it for lateness
 	state    atomic.Int32  // outWriting, then outDone or outCancelled
+	// gone is closed once checkOut has dealt with the frame's cancellation
+	// (its loss or discard recorded): the video window stops holding it
+	// (Session.admit). nil: nothing waits for it.
+	gone chan struct{}
 }
 
 const (
@@ -281,6 +285,13 @@ const (
 	outDone
 	outCancelled // cancelled by the ladder, or its stream failed
 )
+
+// release closes gone (checkOut, once per frame: due hands a frame out once).
+func (of *outFrame) release() {
+	if of.gone != nil {
+		close(of.gone)
+	}
+}
 
 // cancelledFrame is a frame stream the ladder cancelled (due).
 type cancelledFrame struct {

@@ -260,3 +260,67 @@ func TestMediaFactory(t *testing.T) {
 		t.Fatalf("MediaFactory returned %T", cc)
 	}
 }
+
+// Delivery positions (GUIDE 2.7's video window): sent counts ack-eliciting
+// packets, done the acknowledged and lost ones, and catches up with packets
+// quic-go drops from bytes in flight without telling the controller (a lost
+// MTU probe) at the next send; Progress is signalled when done grows.
+func TestMediaDelivery(t *testing.T) {
+	m, now := newTestMedia(10 * time.Millisecond)
+	progressed := func() bool {
+		select {
+		case <-m.Progress():
+			return true
+		default:
+			return false
+		}
+	}
+	check := func(what string, sent, done uint64) {
+		t.Helper()
+		if s, d := m.Delivery(); s != sent || d != done {
+			t.Fatalf("%s: delivery %d/%d, want %d/%d", what, s, d, sent, done)
+		}
+	}
+	inFlight := congestion.ByteCount(0)
+	send := func(pn congestion.PacketNumber, ackEliciting bool) {
+		if ackEliciting {
+			inFlight += mds
+		}
+		m.OnPacketSent(*now, inFlight, pn, mds, ackEliciting)
+	}
+	for pn := congestion.PacketNumber(0); pn < 4; pn++ {
+		send(pn, true)
+	}
+	send(4, false) // an ACK-only packet: not in flight, never acknowledged
+	check("4 packets sent", 4*mds, 0)
+	if progressed() {
+		t.Fatal("progress signalled without an ACK")
+	}
+	m.OnPacketAcked(0, mds, inFlight, *now)
+	inFlight -= mds
+	check("packet 0 acknowledged", 4*mds, mds)
+	if !progressed() || progressed() {
+		t.Fatal("one signal per growth of done, and it never blocks")
+	}
+	m.OnCongestionEvent(1, mds, inFlight) // packet 1 lost
+	inFlight -= mds
+	m.OnPacketAcked(2, mds, inFlight, *now)
+	inFlight -= mds
+	check("1 lost, 2 acknowledged", 4*mds, 3*mds)
+	// Packet 3 was an MTU probe declared lost: quic-go removes it from bytes
+	// in flight without a callback. The next send's bytes in flight tell.
+	inFlight -= mds
+	send(5, true)
+	check("after the lost probe", 5*mds, 4*mds)
+	if !progressed() {
+		t.Fatal("no progress signal for the probe")
+	}
+	// done never passes sent (an ACK of a packet declared lost before).
+	m.OnPacketAcked(1, mds, inFlight, *now)
+	m.OnPacketAcked(5, mds, inFlight, *now)
+	m.OnPacketAcked(3, mds, inFlight, *now)
+	check("spurious acknowledgements", 5*mds, 5*mds)
+	if m.MinRTT() != 10*time.Millisecond {
+		t.Fatalf("MinRTT %v", m.MinRTT())
+	}
+}

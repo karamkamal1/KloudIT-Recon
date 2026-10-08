@@ -76,6 +76,12 @@ type Media struct {
 	ackedPackets, ackedBytes atomic.Uint64
 	lostPackets, lostBytes   atomic.Uint64
 	ecnMarks, collapses      atomic.Uint64
+
+	// Delivery positions (Delivery): ack-eliciting bytes sent, and of those
+	// the bytes acknowledged or declared lost, cumulative; progress is
+	// signalled whenever done grows.
+	sentPos, donePos atomic.Uint64
+	progress         chan struct{}
 }
 
 type sentRecord struct {
@@ -87,7 +93,7 @@ var _ congestion.CongestionControl = (*Media)(nil)
 
 // NewMedia returns a media controller for one path of a connection.
 func NewMedia(rtt congestion.RTTStats, initialMaxDatagramSize congestion.ByteCount) *Media {
-	m := &Media{rtt: rtt, largestAcked: -1}
+	m := &Media{rtt: rtt, largestAcked: -1, progress: make(chan struct{}, 1)}
 	m.targetBitrate.Store(DefaultTargetBitrate)
 	m.frameInterval.Store(int64(DefaultFrameInterval))
 	m.maxDatagramSize.Store(int64(initialMaxDatagramSize))
@@ -149,6 +155,25 @@ func (m *Media) Stats() MediaStats {
 	}
 }
 
+// Delivery returns the connection's delivery positions: sent, the bytes of
+// the ack-eliciting packets sent so far, and done, how many of them have left
+// the network (acknowledged, or declared lost and so queued for a
+// retransmission that counts as sent again). Packets leave in about the order
+// they were sent, so data that was handed to the transport when sent read s
+// has left once done >= s. Both are cumulative over this controller (a path
+// migration starts a new one).
+func (m *Media) Delivery() (sent, done uint64) {
+	done = m.donePos.Load()
+	return m.sentPos.Load(), done
+}
+
+// Progress is signalled (capacity 1, never blocks the connection) whenever
+// done grows: an ACK or a loss.
+func (m *Media) Progress() <-chan struct{} { return m.progress }
+
+// MinRTT is the path's minimum round-trip time (0: no sample yet).
+func (m *Media) MinRTT() time.Duration { return m.rtt.MinRTT() }
+
 // pacingRate is in bytes/s.
 func (m *Media) pacingRate() float64 {
 	return float64(m.targetBitrate.Load()) * PacingGain / 8
@@ -209,12 +234,31 @@ func (m *Media) TimeUntilSend(congestion.ByteCount) congestion.Time {
 	return m.lastSent.Add(max(d, minPacingDelay))
 }
 
-func (m *Media) OnPacketSent(sentTime congestion.Time, _ congestion.ByteCount, pn congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
+func (m *Media) OnPacketSent(sentTime congestion.Time, bytesInFlight congestion.ByteCount, pn congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
 	budget := m.budgetAt(sentTime)
 	m.budget = budget - min(bytes, budget)
 	m.lastSent = sentTime
 	if isRetransmittable {
 		m.sent[pn%sentRingSize] = sentRecord{pn: pn, t: sentTime}
+		m.sentPos.Add(uint64(bytes))
+	}
+	// bytesInFlight is quic-go's own count after this packet: it also drops
+	// packets the controller never hears of (lost MTU probes), so done
+	// catches up with them here.
+	if sent := m.sentPos.Load(); sent >= uint64(bytesInFlight) {
+		m.advance(sent - uint64(bytesInFlight))
+	}
+}
+
+// advance moves the delivery position forward to done (run loop only: the
+// single writer).
+func (m *Media) advance(done uint64) {
+	if done = min(done, m.sentPos.Load()); done > m.donePos.Load() {
+		m.donePos.Store(done)
+		select {
+		case m.progress <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -225,6 +269,7 @@ func (m *Media) OnPacketAcked(pn congestion.PacketNumber, ackedBytes, _ congesti
 	m.largestAcked = max(m.largestAcked, pn)
 	m.ackedPackets.Add(1)
 	m.ackedBytes.Add(uint64(ackedBytes))
+	m.advance(m.donePos.Load() + uint64(ackedBytes))
 	if b := m.brakeWindow.Load(); b > 0 {
 		b += int64(ackedBytes)
 		if congestion.ByteCount(b) >= m.window() {
@@ -243,6 +288,7 @@ func (m *Media) OnCongestionEvent(pn congestion.PacketNumber, lostBytes, _ conge
 	}
 	m.lostPackets.Add(1)
 	m.lostBytes.Add(uint64(lostBytes))
+	m.advance(m.donePos.Load() + uint64(lostBytes))
 	if m.persistentCongestion(pn) {
 		m.collapse()
 	}

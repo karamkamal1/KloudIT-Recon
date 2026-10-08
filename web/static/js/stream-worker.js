@@ -227,6 +227,72 @@ async function readAll(stream) {
   return { buf: out, first };
 }
 
+// Send priorities (GUIDE 2.7). The client sends input (the input stream:
+// keys, buttons, wheel, text; datagrams: mouse motion, gamepads), control (the
+// control stream: key-frame requests, losses, settings) and telemetry
+// (datagrams: frame acks, rate reports, pings). Input outranks control, which
+// outranks telemetry, by WebTransport sendOrder where the browser schedules by
+// it: in one send group (createSendGroup) where it has them, and with separate
+// datagram writables for input and telemetry (datagrams.createWritable). Each
+// is feature-detected (prio, in the stats). Without separate writables input
+// and telemetry datagrams share one queue: while that queue does not move
+// (its oldest telemetry write pending for TELEMETRY_STALL_MS: the browser
+// cannot send) telemetry is dropped instead of queued, so input never waits
+// behind a telemetry backlog (telemetry is lossy by design: rate reports are
+// cumulative, acks and pings are samples). A pending write alone is no
+// backlog: Chromium resolves datagram writes late enough that a cap of two
+// pending writes dropped 3-28 % of the telemetry in the browser E2E, on
+// paths with nothing to wait for. prio.telemetryStallMs is the longest the
+// queue stood still.
+const SEND_ORDER = { input: 1000, control: 100, telemetry: 10 };
+const TELEMETRY_STALL_MS = 50;
+
+async function openSendChannels(wt) {
+  const prio = { sendOrder: false, sendGroup: false, datagramWritables: false, telemetrySent: 0, telemetryDropped: 0, telemetryStallMs: 0 };
+  let group = null;
+  if (typeof wt.createSendGroup === 'function') {
+    try {
+      group = wt.createSendGroup();
+      prio.sendGroup = true;
+    } catch {}
+  }
+  const opts = (sendOrder) => (group ? { sendGroup: group, sendOrder } : { sendOrder });
+  const ctrl = await wt.createBidirectionalStream(opts(SEND_ORDER.control));
+  const input = await wt.createBidirectionalStream(opts(SEND_ORDER.input));
+  // Browsers that schedule by sendOrder hand out a WebTransportSendStream,
+  // which has it as an attribute; older ones a plain WritableStream (and
+  // ignore the option).
+  prio.sendOrder = 'sendOrder' in input.writable;
+  let dgInput = null;
+  let dgTelemetry = null;
+  if (typeof wt.datagrams.createWritable === 'function') {
+    try { dgInput = wt.datagrams.createWritable(opts(SEND_ORDER.input)).getWriter(); } catch {}
+    try { dgTelemetry = wt.datagrams.createWritable(opts(SEND_ORDER.telemetry)).getWriter(); } catch {}
+  }
+  prio.datagramWritables = !!(dgInput && dgTelemetry);
+  dgInput ||= dgTelemetry || wt.datagrams.writable.getWriter();
+  dgTelemetry ||= dgInput;
+  return { ctrl, input, dgInput, dgTelemetry, prio };
+}
+
+/** The send function for telemetry datagrams on writer w (see above). */
+function telemetrySender(w, prio, isClosed) {
+  const pending = []; // start times of the writes not yet resolved, oldest first (they resolve in order)
+  return (b) => {
+    if (isClosed()) return;
+    const t = performance.now();
+    const stall = pending.length ? t - pending[0] : 0; // how long the queue has not moved
+    prio.telemetryStallMs = Math.max(prio.telemetryStallMs, Math.round(stall));
+    if (!prio.datagramWritables && stall > TELEMETRY_STALL_MS) {
+      prio.telemetryDropped++;
+      return;
+    }
+    prio.telemetrySent++;
+    pending.push(t);
+    w.write(b).catch(() => {}).finally(() => { pending.shift(); });
+  };
+}
+
 async function openWebTransport(url, hashes, label) {
   const opts = { requireUnreliable: true, congestionControl: 'low-latency' };
   if (hashes && hashes.length) {
@@ -240,11 +306,9 @@ async function openWebTransport(url, hashes, label) {
     try { wt.close(); } catch {}
     throw e;
   }
-  const ctrl = await wt.createBidirectionalStream({ sendOrder: 100 });
-  const input = await wt.createBidirectionalStream({ sendOrder: 1000 });
+  const { ctrl, input, dgInput, dgTelemetry, prio } = await openSendChannels(wt);
   const cw = ctrl.writable.getWriter();
   const iw = input.writable.getWriter();
-  const dw = wt.datagrams.writable.getWriter();
   const swallow = () => {};
   cw.write(Uint8Array.of(P.KIND_CONTROL)).catch(swallow);
   iw.write(Uint8Array.of(P.KIND_INPUT)).catch(swallow);
@@ -252,9 +316,11 @@ async function openWebTransport(url, hashes, label) {
   return {
     kind: 'webtransport',
     path: label,
+    prio,
     sendControl: (obj) => { if (!closed) cw.write(P.frameMsg(P.jsonBytes(obj))).catch(swallow); },
     sendInput: (b) => { if (!closed) iw.write(P.frameMsg(b)).catch(swallow); },
-    sendDatagram: (b) => { if (!closed) dw.write(b).catch(swallow); },
+    sendInputDatagram: (b) => { if (!closed) dgInput.write(b).catch(swallow); },
+    sendDatagram: telemetrySender(dgTelemetry, prio, () => closed), // acks, rate reports, pings
     close: () => { closed = true; try { wt.close({ closeCode: 0, reason: 'bye' }); } catch {} },
     async run(h) {
       const ctlParser = new MsgParser((m) => h.control(JSON.parse(td.decode(m))));
@@ -316,6 +382,7 @@ async function openWebSocket(url) {
     path: 'relay',
     sendControl: (obj) => send(P.WS_CONTROL, P.jsonBytes(obj)),
     sendInput: (b) => send(P.WS_INPUT, b),
+    sendInputDatagram: (b) => send(P.WS_DATAGRAM, b),
     sendDatagram: (b) => send(P.WS_DATAGRAM, b),
     close: () => { try { ws.close(1000, 'bye'); } catch {} },
     run(h) {
@@ -1555,6 +1622,7 @@ function postStats() {
     queue: video.decoder ? video.decoder.decodeQueueSize : 0,
     hw: video.hw,
     synced: clock.offset !== null,
+    prio: transport?.prio ? { ...transport.prio } : null, // send priorities (WebTransport only)
   });
   Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0 });
 }
@@ -1616,7 +1684,7 @@ self.onmessage = (ev) => {
   switch (m.type) {
     case 'start': start(m).catch((e) => post('closed', { reason: e.message, retry: true })); break;
     case 'in': transport?.sendInput(m.b); break;
-    case 'dg': transport?.sendDatagram(m.b); break;
+    case 'dg': transport?.sendInputDatagram(m.b); break;
     case 'ctl':
       if (m.m?.t === 'pause' || m.m?.t === 'resume') freeze.drawn = 0; // not a freeze
       transport?.sendControl(m.m);

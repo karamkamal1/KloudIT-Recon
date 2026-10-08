@@ -155,6 +155,11 @@ func TestMediaCongestionControlQUIC(t *testing.T) {
 	if s.TargetBitrate != 400_000_000 || s.AckedBytes < size {
 		t.Fatalf("controller stats after %d bytes: %+v", size, s)
 	}
+	// The delivery positions the host's video window reads (GUIDE 2.7):
+	// everything sent left the network, give or take the last ACK.
+	if sent, done := r.m.Delivery(); sent < size || done < size*9/10 || done > sent {
+		t.Fatalf("delivery after %d bytes: sent %d, done %d", size, sent, done)
+	}
 	t.Logf("8 MiB in %v (%.0f Mbit/s), media stats %+v", elapsed.Round(time.Millisecond), float64(size)*8/elapsed.Seconds()/1e6, s)
 }
 

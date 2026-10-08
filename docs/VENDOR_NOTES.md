@@ -3879,3 +3879,202 @@ unless a test says otherwise; overlay Ctrl+Alt+Shift+S; host log
   run with `intraRefresh` like sessions); record whether `seamless` still passes for CBR.
 - NVIDIA: unverified (no NVIDIA host available). Test (T3 and T4): the two AMD tests above with
   hevc_nvenc_helper (and h264, av1 on RTX 40+), same steps and pass criteria.
+
+## 2.7 Send priorities
+
+Vendor-neutral (transport, session and browser client): what needs real hardware is a real
+network's capacity drops and other browsers' WebTransport schedulers. No encoder is involved.
+
+What changed (GUIDE 2.7; docs/ARCHITECTURE.md "Send priorities"):
+
+- **Browser** (`stream-worker.js` `openSendChannels`, `telemetrySender`): input (input stream,
+  mouse and gamepad datagrams) outranks control (control stream), which outranks telemetry (frame
+  acks, rate reports, pings): WebTransport `sendOrder` 1000 / 100 / 10, every stream and datagram
+  writable in one send group (`createSendGroup()`) and input and telemetry on separate datagram
+  writables (`datagrams.createWritable({sendGroup, sendOrder})`), each where the browser has it
+  (feature-detected; a browser that schedules by `sendOrder` hands out a `WebTransportSendStream`
+  with the attribute). Where input and telemetry share one datagram writable, telemetry is dropped
+  instead of queued while that queue does not move (its oldest telemetry write pending for
+  50 ms), so a mouse datagram never waits behind a telemetry backlog. `__recon.lastStats.prio` =
+  `{sendOrder, sendGroup, datagramWritables, telemetrySent, telemetryDropped, telemetryStallMs}`
+  (the longest the shared queue stood still); overlay Transport row `send priority: sendOrder
+  ✓/✗ · send groups ✓/✗ · datagram queues ✓/✗ · telemetry dropped N of M (longest stall … ms)`.
+  WebSocket: one ordered channel, nothing to prioritise (`prio` null).
+- **Host video window** (`internal/host/window.go`, `frameSender`): at most one frame in flight
+  beyond those in transit for the round trip (the frames in flight sent within the last
+  1.25 × min RTT, at most as many as the frame rate sends in that time, rounded up): two on a LAN.
+  A frame is in flight from its write's return until the peer acknowledged everything the
+  connection had sent by then: the media congestion controller's new delivery positions
+  (`cc.Media.Delivery`: ack-eliciting bytes sent; acknowledged or declared lost, resynchronised
+  with quic-go's own bytes in flight at every send, which also covers lost MTU probes the
+  controller never hears of; `Progress()` is signalled on every ACK or loss; `MinRTT()`).
+  frameSender opens the next frame's stream and holds it, nothing written, until the window has
+  room, at most until a quarter of the frame's deadline (2.3's) is left (25 ms of hold at 60 fps;
+  at most 250 ms); `send_us` is re-stamped when it goes. A frame the client would discard while
+  it is held (the client waits for the answer to a loss) is released at once. `stream stats`:
+  `window_held`, `window_max_ms`; a frame-queue overflow during a hold logs `sender=window
+  window_ms=…`. No change to the quic-go fork.
+- **Host pongs**: the datagram loop (input, acks, rate reports) queues pongs for their own
+  goroutine (4 deep, dropped when full) instead of calling quic-go's `SendDatagram`, which blocks
+  while 32 datagrams wait for the congestion window.
+- Test-only hook `RECON_TEST_FAULTS=no-window`: sends without the window, for A/B measurements.
+
+Deviations from the guide's wording, and why:
+
+1. *"In flight"* is measured by QUIC acknowledgements through the media congestion controller,
+   the default (`congestion` `media`). quic-go reports no per-stream acknowledgements
+   (webtransport-go hides the stream; the 2.1 fork carries only the congestion-control hook) and
+   a stream's context ends at `Close`, not at its acknowledgement; "Write returned" alone is what
+   frameSender already had (one frame in the transport at a time: `Write` returns once all but
+   the last packet's worth is packed and sent), and the queue datagrams waited behind was in the
+   network, bounded only by the congestion window. With `reno` there is no window (as before).
+   On the relay paths the window covers the host → gateway leg (the gateway acknowledges) until
+   2.6 makes them one connection.
+2. *"1–2"*: one beyond the frames in transit, which is two on a LAN. A fixed count ignores the
+   round trip (60 fps over 40 ms keeps 3 frames in transit with no queue at all). Counting the
+   frames actually sent within the round trip (not the frame rate's) keeps that allowance at the
+   path's own rate when a capacity drop spaces them out. Exploratory runs with the same harness
+   (20 Mbit/s into 10 Mbit/s over 10 ms, audio one-way p50 ~105 ms without a window): a strict 1
+   (no round-trip allowance) 8 ms but half the throughput (60 of 124 frames in 4 s: every frame
+   waited a round trip for the one before it); 2 beyond the round trip, held until
+   acknowledged, 44 ms; 2 held at most until 2 ms before the deadline, 73 ms (a hold then ends
+   at the deadline more often than at an acknowledgement); the chosen design 36 ms with holds up
+   to 2 ms before the deadline and 40 ms with holds up to a quarter before it (the final one), with
+   the full throughput.
+3. *Interplay with 2.3*: the window never holds a frame once only a quarter of its deadline is
+   left, so it never makes rung 1 cancel a frame; past that point the frame goes to the transport
+   as it did before 2.7, where a write the congestion window holds back is rung 1's as before. The
+   quarter is slack for frameSender being scheduled late: with 2 ms the unit test's held frame was
+   cancelled now and then while the whole test suite loaded the machine. A first version held
+   frames until acknowledged (at most 250 ms) and let rung 1 cancel a held frame at its deadline,
+   nothing of it sent. In the browser E2E (Chromium on a CPU-bound loopback, load 6–10 on 4
+   CPUs) it held 11–24 frames per 10 s for up to 17–144 ms although nothing limited the path
+   (the busy browser acknowledged late), and in the reference-recovery scenario rung 1 cancelled
+   17 frames where the hook delayed 9 (the 8 others held by the window): each a loss and a
+   recovery, which in the software stand-in waits for its next key frame. A late
+   acknowledgement now costs at most the deadline's worth of host queue on a frame. The
+   deadline still counts from the stream's opening, so a hold uses up the frame's time before
+   its write.
+4. *Browser support*: the Chromium in this sandbox (141.0.7390.37) has none of the three: no
+   `createSendGroup`, no `datagrams.createWritable`, streams are plain `WritableStream`s and the
+   options dictionary of `createBidirectionalStream` is not even read (a Proxy saw no property
+   access), so the `{sendOrder}` the client already passed for control and input was a no-op
+   there. In Chromium the client-side priority is therefore telemetry giving way on the shared
+   datagram writable. A first version capped telemetry at 2 pending writes: Chromium resolves
+   datagram writes late enough that it dropped 187 of 659 (28 %) telemetry datagrams on the
+   direct path and 22 of 807 / 24 of 802 on the others, with nothing to wait for; hence the 50 ms
+   stall rule (in the final E2E run 4 of 804, 0 of 801 and 1 of 805, longest stalls 64, 39 and
+   53 ms; at load 7–9 in an earlier run 23 of 771, 81 of 735 and 22 of 798). Firefox has send
+   groups from 155 (bugzilla 2007165); what it and Safari schedule by is a hardware-side check
+   below.
+5. *Added*: the pong goroutine (an input loop that waits to send a pong waits with its input).
+
+Verified in the sandbox:
+
+- verified (sandbox): `internal/host` `TestDatagramLatencyBehindVideo` (the GUIDE's before/after
+  test): a real host session (frameSender, datagram loop answering pings, media congestion
+  controller, 20 Mbit/s at 60 fps from a frame source that keeps the frame queue full) over real
+  quic-go through an in-process bottleneck (5 ms each way, 300 ms drop-tail queue), audio-sized
+  datagrams every 10 ms, client pings every 20 ms, one process clock. 10 Mbit/s (a backlog):
+  audio one-way p50 / p95 105.3 / 107.7 ms without the window, 39.6 / 50.1 ms with it; pong RTT
+  p50 111.5 → 44.5 ms; 95 vs 93 frames received; the window held 91 frames. 50 Mbit/s (no
+  backlog): audio 6.4 vs 6.3 ms, pongs 12.0 vs 12.4 ms, 119 vs 118 frames, 1 held. Asserted:
+  ≤ 60 % of the p50s with a backlog, ≥ 85 % of the frames, and no change (±5 ms, ≥ 95 % of the
+  frames) on the clean path. With the same harness (scratch runs, holds up to 2 ms before the
+  deadline): 40 ms round trip, 10 Mbit/s: audio p50 163 → 63 ms, pongs 184 → 83 ms, 96 vs 93
+  frames; 40 ms, 50 Mbit/s: 21.3 vs 21.2 ms,
+  179 vs 179 frames, 0 held; 2 ms round trip, 10 Mbit/s: 88.5 → 33.1 ms; 2 ms, 50 Mbit/s: 2.1
+  vs 2.2 ms, 179 vs 179 frames (31 frames held, each for about a round trip: back-to-back frames
+  after an encoder burst).
+- verified (sandbox): `TestWindowLimit`, `TestVideoWindow` (a frame just sent is in transit, the
+  next may follow; a frame interval later it is queued and the window is full until it is wholly
+  acknowledged; a longer round trip keeps more in transit; a path migration starts over),
+  `TestFrameSenderWindow` (frameSender with a fake meter, 10 ms min RTT: two frames go out back to
+  back, the third waits with its stream open and nothing written until both are acknowledged, its
+  `send_us` after the release; at 30 fps without acknowledgements it goes out whole 50 ms after
+  its stream opened, before its 67 ms deadline, under `invalidate` with a newer frame queued: no
+  cancellation, no `dropped`, no `Recover`; a held frame the client would discard (a loss
+  before it) is released at once, its stream reset with 0 bytes, `Recover 1/1`; 80 runs in a row
+  and with `-race`), `TestPongDoesNotBlockInput` (the datagram loop reads 20 pings while
+  `SendDatagram` blocks; before the change it stopped at the first), `TestParseTestFaults`
+  (`no-window`); `internal/transport/cc` `TestMediaDelivery` (positions, ACK-only packets,
+  losses, a lost MTU probe caught up at the next send, spurious ACKs, one non-blocking signal per
+  growth); `internal/transport` `TestMediaCongestionControlQUIC` (8 MiB over real quic-go: sent
+  ≥ 8 MiB, done within the last ACK of it).
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, headless Chromium 141, libsvtav1
+  960×540 60 fps, under the shared E2E lock), final code: 87 of 87 checks passed. New checks: per
+  WebTransport scenario the send priorities detected as the browser's API has them (here none)
+  and telemetry dropped only with a stall ≥ 50 ms, at most 15 % (direct 4 of 804, relay 0 of 801,
+  WebGPU 1 of 805); WebSocket without `prio`; the unit-level `openSendChannels` /
+  `telemetrySender` checks with fake WebTransport objects (with the full API: one send group,
+  streams 100 / 1000, datagram writables 1000 / 10, telemetry never dropped; without: one shared
+  writable, telemetry dropped after a 70 ms stall and sent again once it moved, input never
+  dropped). The window held 195 frames over the run (up to 13 ms each), no frame-queue
+  overflow; host queue (encodeDone → send) p50 / p95 0.04–0.05 / 0.47–0.60 ms against 0.04–0.05 /
+  0.41–0.71 ms in a run of the code before 2.7 (HEAD, same machine; that run stopped after the
+  relay scenario when its host went offline on the dashboard, unrelated); `host-faults-ref`: 9 of
+  9 held streams cancelled (none more), 15 recoveries by recovery frame, 0 by key frame. Earlier
+  runs: the first version (deviation 3) 79 of 87 (the reference-recovery checks failed on its
+  extra cancellations, telemetry checks on deviation 4, plus load-related playback checks); the
+  final host code with the 50 ms rule before `telemetryStallMs` and its 15 % check, at load 7–9:
+  80 of 87 (the then 1 % telemetry check three times, playback rate checks twice at 28.6 /
+  46–52 fps, and the reference-recovery drop test: it dropped frame 9/80, which was the recovery
+  frame answering an earlier loss at 68 that the client had already used to end its wait; the
+  host then treated it as a lost answer and reopened its wait from 68, which the stand-in's next
+  recovery frame (`refFloor` 79) does not end, so it discarded frames until the client's watchdog
+  asked for a key frame: an interplay of the drop test with the 2.3 rule for lost answers, not of
+  this step).
+- verified (sandbox): `internal/e2e` (real gateway and host agent, libx264) all streaming tests
+  passed under the shared lock with the final host code (paths, media congestion relay / direct /
+  low bitrate, frame loss, deadline drop, bitrate recovery, stalled acks, rate reports, reno,
+  intra refresh, intra refresh still).
+- verified (sandbox), with a caveat: the 2.2 capdrop harness (`sudo test/netem/capdrop.sh`, 50 →
+  15 → 50 Mbit/s with a 50 ms queue, libx264 1280×720 60 fps, 30 Mbit/s setting; under the
+  shared lock, other agents' jobs running beside it). Final window, two runs: 0 overflows,
+  one-way delay p95 10.1 → 28.3 ms during the dip, back in 4.5 s (pass); and 3 overflows,
+  9.9 → 38.1 ms, back in 13.4 s (fail). With `RECON_TEST_FAULTS=no-window`, two runs: 0
+  overflows, 9.8 → 29.8 ms, 7.0 s; 0 overflows, 11.2 → 36.6 ms, 7.9 s (both pass). The first
+  version: 1 overflow, 10.2 → 52.9 ms, 6.0 s. The window held 66–80 frames per 10 s during the
+  dip (up to 15–25 ms each) and next to none outside it. The failing run's overflows read like
+  the ones 2.2 recorded before this step (`sender=write`, not `window`: 7 frames that came out
+  of FFmpeg within 28–81 ms, the encoder catching up in a burst), and its slow return follows a
+  delay decrease to 0.43 × just as the capacity came back, also seen in 2.2's runs; too few runs
+  to tell whether the window changes the odds (the capdrop queue is 50 ms, so the datagrams'
+  gain is small there; the hardware check below repeats it on a deep buffer).
+
+Hardware checks (host.json `"pipeline": "auto"` with recon-encoder.exe next to recon-host.exe;
+overlay Ctrl+Alt+Shift+S; host log `$env:APPDATA\KlouditRecon\host.log`; `__recon.lastStats` in
+the browser console):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (datagram delay behind a video backlog, A/B): direct
+  path to a Linux client with Chrome (Network path "Direct to PC only"); on the client
+  `sudo ./netem.sh apply capdrop --iface <nic> --port 47998 --rates 50,10,50 --queue-ms 300` (a
+  deep router buffer; docs/NETEM.md); stream hevc_amf_helper at 1920×1080 60 fps, 30 Mbit/s with
+  Settings → Adaptive bitrate off (the rate controller then leaves the backlog in place) and a
+  moving scene; from +20 s to +40 s (the 10 Mbit/s step) note the overlay's `round trip (avg)`
+  (pings are datagrams that queue behind the video) and `__recon.lastStats.rtt` every few
+  seconds, and the host's `stream stats` `window_held` / `window_max_ms`. Then stop recon-host,
+  start it with `$env:RECON_TEST_FAULTS='no-window'; & 'C:\Program Files\KlouditRecon\recon-host.exe' run`
+  and repeat. Pass: the round trip during the step with the window at most 60 % of the one
+  without (sandbox: 45 vs 112 ms on a 10 ms path), `window_held` > 0 during the step only, no more
+  `frame queue overflow` lines than without, and the same received bitrate (overlay Bitrate).
+  Record both round trips, the overflows and `window_max_ms`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (no cost when the path carries the video): the 2.3
+  T3 run (`wifi`, 10 minutes) and a 10-minute `lan` run with the window: `window_held` stays 0 or
+  near it on `lan` (record the largest), freezes and the overlay's capture→drawn p95 as in 2.3,
+  and `telemetry dropped` in the overlay's send priority row ≤ 1 % of the telemetry sent.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (2.2 acceptance with the window): `capdrop` (0.4) on
+  the direct path (netem on the Linux client, `--port 47998`: on the relay paths the window sees
+  only the host → gateway leg) with Adaptive bitrate on: no `frame queue overflow` (lines with
+  `sender=window` say the window held a frame at the time), the one-way delay p95 during the dip
+  under the baseline + 30 ms, the target back within 10 s; compare with the same run under
+  `RECON_TEST_FAULTS=no-window`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the three AMD tests above with
+  hevc_nvenc_helper (and av1_nvenc_helper on RTX 40+), same steps and pass criteria.
+- Browsers (vendor-independent, T10): unverified. Test: stream once each from current Chrome,
+  Edge, Firefox (≥ 155 for send groups) and Safari 26.4 on the direct path and record the
+  overlay's `send priority` row (`sendOrder` / `send groups` / `datagram queues`, and `telemetry
+  dropped N of M` where the datagram queue is shared) and `__recon.lastStats.prio`. Where
+  `sendOrder` shows ✓: saturate the client's upload (`iperf3 -c <server> -t 120` from the client)
+  and compare keyboard/mouse click-to-photon (0.3 rig) with and without the upload; record both
+  medians per browser.

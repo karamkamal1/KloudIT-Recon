@@ -41,6 +41,9 @@ import (
 //	                  gfxcapture send frames only on change); the session
 //	                  discards the encoder's later frames before anything else
 //	                  sees them
+//	no-window         send the frames without the video window (GUIDE 2.7,
+//	                  window.go), as before it: an A/B measurement of the
+//	                  datagrams' delay behind a video backlog
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -60,10 +63,11 @@ type testFaults struct {
 	// (NewAgent: media.Caps.UseTestRecovery).
 	refRecovery bool
 	stillAfter  int // frames of a generation before its source goes still
+	noWindow    bool
 }
 
 func (f testFaults) active() bool {
-	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0
+	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 || f.noWindow
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -130,8 +134,13 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: want still=after:N", rule)
 			}
 			f.stillAfter = n
+		case "no-window":
+			if val != "" {
+				return f, fmt.Errorf("%s: no-window takes no value", rule)
+			}
+			f.noWindow = true
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, no-window)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

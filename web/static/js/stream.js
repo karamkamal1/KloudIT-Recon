@@ -637,6 +637,7 @@ function onStats(st) {
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Loss recovery', recoveryText(v.recovery, st)),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
+    st.prio ? row('  send priority', prioText(st.prio)) : null,
     row('Renderer', S.conn ? S.conn.renderer : '—'),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     row('Decoder queue', String(st.queue)),
@@ -646,6 +647,15 @@ function onStats(st) {
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
+}
+
+// Send priorities (GUIDE 2.7): what this browser schedules by (input before
+// control before telemetry), and the telemetry datagrams that gave way to
+// input on a shared datagram queue.
+function prioText(p) {
+  const yes = (b) => (b ? '✓' : '✗');
+  const shared = p.datagramWritables ? '' : ` · telemetry dropped ${p.telemetryDropped} of ${p.telemetrySent + p.telemetryDropped} (longest stall ${p.telemetryStallMs} ms)`;
+  return `sendOrder ${yes(p.sendOrder)} · send groups ${yes(p.sendGroup)} · datagram queues ${yes(p.datagramWritables)}${shared}`;
 }
 
 // What a lost frame costs in this generation (VideoConfig.recovery): reference

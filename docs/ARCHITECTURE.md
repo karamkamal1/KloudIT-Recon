@@ -216,7 +216,9 @@ running encoder (never from a vendor). Its rungs, cheapest first:
 
 `stream stats` counts the ladder's work every 10 s: `deadline_drops` (rung 1), `discarded` (frames
 not sent while the client waited for a recovery or key frame), `recovered` / `recovered_by_key`
-(rung 2's answers) and `key_frames` (rung 4).
+(rung 2's answers) and `key_frames` (rung 4). Since GUIDE 2.7 a frame can also wait before its
+write: the video window (see "Send priorities") holds it with its stream open, but never past its
+deadline, so rung 1 never cancels a frame because of the window.
 
 ### Datagrams
 
@@ -257,6 +259,65 @@ before a pause can be lost safely.
 
 `1` key (u16 set-1 scancode, flags down|extended) · `2` mouse button · `3` wheel (WHEEL_DELTA
 units, high resolution) · `4` release-all · `5` UTF-8 text (typed as Unicode keystrokes).
+
+### Send priorities
+
+What is small and urgent must not wait behind what is large (GUIDE 2.7).
+
+**Browser → host.** The client sends input (the input stream; mouse and gamepad datagrams),
+control (the control stream) and telemetry (frame acks, rate reports and pings: datagrams).
+Input outranks control, which outranks telemetry: WebTransport `sendOrder` 1000 / 100 / 10, all
+in one send group (`createSendGroup()`) and with a datagram writable of its own for input and for
+telemetry (`datagrams.createWritable({sendOrder})`), where the browser has them. Each is
+feature-detected (`stream-worker.js` `openSendChannels`); the overlay's Transport row shows what
+this browser schedules by (`send priority: sendOrder ✓/✗ · send groups ✓/✗ · datagram queues
+✓/✗`), and `__recon.lastStats.prio` has the same. Chromium 141 has none of them (its streams
+are plain `WritableStream`s and it ignores the options); there input and telemetry datagrams
+share the one `datagrams.writable`, and while that queue does not move (its oldest telemetry
+write pending for 50 ms) telemetry is dropped instead of queued (`telemetry dropped N of M
+(longest stall … ms)`), so a mouse datagram never waits behind a telemetry backlog. Telemetry
+tolerates that: rate reports are cumulative, acks and pings are samples. WebSocket has one
+ordered channel: nothing to prioritise.
+
+**Host → browser.** quic-go packs a queued datagram (audio, cursor position, pong) ahead of
+stream data into its next packet, but that packet still waits for congestion-window space and
+then queues behind the video already in the network. The media congestion controller's window
+(pacing rate × (min RTT + 2 frame intervals)) bounds that queue to about two frames only while
+the path carries the pacing rate; when a capacity drop leaves it below (until the rate controller
+lowers the bitrate) the window holds pacing / capacity times as much. The **video window**
+(`internal/host/window.go`) therefore keeps at most one frame in flight beyond those in transit
+for the round trip: frameSender opens the next frame's stream and waits before writing it until
+fewer than 1 + *t* frames are in flight, where *t* counts the frames in flight that were sent
+within the last 1.25 × min RTT (in transit, not queued), at most the frames the frame rate sends
+in that time, rounded up. On a LAN that makes two frames at most (the frame on the wire and the
+next one): a frame waits for the one two before it to be acknowledged. A frame is *in flight*
+from its write's return (quic-go returns once all but the last packet's worth of the frame is
+packed and sent) until the peer has acknowledged everything the connection sent up to that
+point: the media controller's delivery positions (`cc.Media.Delivery`: ack-eliciting bytes
+sent, and of those the bytes acknowledged or declared lost, resynchronised with quic-go's bytes
+in flight at every send). The backlog stays in the host's frame queue.
+
+The window never makes a frame late: it holds a frame at most until a quarter of the frame's
+deadline is left (the loss-recovery ladder's deadline, max(2 frame intervals, 25 ms) from the
+stream's opening: 25 ms of hold at 60 fps; at most 250 ms), and then the frame goes to the
+transport as before the window, where the congestion window and rung 1 deal with it. A
+receiver that acknowledges late (a busy browser)
+therefore costs at most that much host queue on a frame, never a cancelled frame. A frame the
+client would discard (it waits for the answer to a loss before it) is released at once and its
+stream reset. The frame's `send_us` is when the window let it go (the hold is host queue in the
+overlay). `stream stats` reports `window_held` (frames held in the last 10 s) and
+`window_max_ms`; a frame-queue overflow while frameSender holds a frame logs `sender=window
+window_ms=…`. Measured (`internal/host` `TestDatagramLatencyBehindVideo`: a host session
+streaming 20 Mbit/s into a 10 Mbit/s path with a 10 ms round trip): audio datagrams' one-way
+delay p50 ~105 ms without the window, ~40 ms with it, pongs alike; the same video throughput, and
+on a 50 Mbit/s path no change. Without the media controller (`congestion` `reno`) there is no
+window: the sequential frameSender's one frame in the transport is the only cap, as before. On
+the relay paths it covers the host → gateway leg until GUIDE 2.6.
+
+The host's datagram loop (input, pings, acks, rate reports) never sends itself: quic-go's
+`SendDatagram` blocks while 32 datagrams wait for the congestion window, so pongs go out from
+their own goroutine through a 4-deep queue (a pong that finds it full is dropped; the client's
+clock sync keeps its lowest-RTT sample).
 
 ## The capture → encode pipeline (host)
 

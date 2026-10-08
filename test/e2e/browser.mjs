@@ -290,6 +290,80 @@ return out;
   }
 }
 
+// Send priorities at unit level (GUIDE 2.7): the worker's own
+// openSendChannels and telemetrySender (cut out of stream-worker.js) against
+// fake WebTransport objects: one with the whole priority API (send groups,
+// WebTransportSendStream.sendOrder, datagrams.createWritable), one like this
+// Chromium (none of it). With it, every stream and datagram queue is in one
+// send group with input 1000 > control 100 > telemetry 10, and telemetry
+// has its own queue (never dropped); without, input and telemetry datagrams
+// share the one writable, and while it does not move for 50 ms telemetry is
+// dropped instead of queued, input never.
+async function checkSendPriorities() {
+  const workerSrc = readFileSync(join(root, 'web', 'static', 'js', 'stream-worker.js'), 'utf8');
+  const start = workerSrc.indexOf('// Send priorities (GUIDE 2.7)');
+  const end = workerSrc.indexOf('async function openWebTransport');
+  if (start < 0 || end < 0) throw new Error('send priority code not found in stream-worker.js');
+  const expr = `(async () => {
+${workerSrc.slice(start, end)}
+// A writer whose writes stay pending until flush(): a backed-up queue.
+function fakeWriter(name, log) {
+  const pending = [];
+  return { name, write: (b) => { log.push([name, b[0]]); return new Promise((res) => pending.push(res)); }, flush: () => pending.splice(0).forEach((r) => r()) };
+}
+async function run(full) {
+  const log = [];
+  const made = [];
+  const plain = fakeWriter('datagrams.writable', log);
+  const group = { group: 1 };
+  const wt = {
+    createBidirectionalStream: async (o) => { made.push({ kind: 'stream', ...o }); return { writable: full ? { sendOrder: o.sendOrder } : {} }; },
+    datagrams: { writable: { getWriter: () => plain } },
+  };
+  if (full) {
+    wt.createSendGroup = () => group;
+    wt.datagrams.createWritable = (o) => { made.push({ kind: 'datagrams', ...o }); return { getWriter: () => fakeWriter('datagrams' + o.sendOrder, log) }; };
+  }
+  const ch = await openSendChannels(wt);
+  const telemetry = telemetrySender(ch.dgTelemetry, ch.prio, () => false);
+  telemetry(Uint8Array.of(0x40));
+  telemetry(Uint8Array.of(0x40)); // pending writes alone: no backlog yet
+  await new Promise((r) => setTimeout(r, 70)); // the queue stood still for 70 ms
+  for (let i = 0; i < 3; i++) telemetry(Uint8Array.of(0x40));
+  for (let i = 0; i < 3; i++) ch.dgInput.write(Uint8Array.of(0x21));
+  const before = { ...ch.prio };
+  plain.flush();
+  ch.dgTelemetry.flush();
+  await new Promise((r) => setTimeout(r, 0));
+  telemetry(Uint8Array.of(0x41)); // the queue drained: telemetry goes out again
+  return { made: made.map((m) => ({ kind: m.kind, order: m.sendOrder, grouped: m.sendGroup === group })), prio: before, after: { ...ch.prio }, log };
+}
+return { full: await run(true), none: await run(false) };
+})()`;
+  const ctx2 = await browser.newContext({ ignoreHTTPSErrors: true });
+  try {
+    const p = await ctx2.newPage();
+    await p.goto(`${base}/login`);
+    const r = await p.evaluate(expr);
+    const f = r.full;
+    const order = (kind, n) => f.made.filter((m) => m.kind === kind).map((m) => m.order).join(',') === n;
+    check('send priorities (unit): with the API, input 1000 > control 100 > telemetry 10 in one send group, telemetry on its own datagram queue, never dropped',
+      f.prio.sendOrder && f.prio.sendGroup && f.prio.datagramWritables && f.made.every((m) => m.grouped) &&
+        order('stream', '100,1000') && order('datagrams', '1000,10') &&
+        f.prio.telemetrySent === 5 && f.prio.telemetryDropped === 0 &&
+        f.log.filter(([w, t]) => w === 'datagrams10' && t === 0x40).length === 5 && f.log.filter(([w, t]) => w === 'datagrams1000' && t === 0x21).length === 3,
+      JSON.stringify({ made: f.made, prio: f.prio }));
+    const n = r.none;
+    check('send priorities (unit): without the API, one shared datagram queue: telemetry is dropped while it stands still (50 ms), input never',
+      !n.prio.sendOrder && !n.prio.sendGroup && !n.prio.datagramWritables && n.made.every((m) => m.order !== undefined && !m.grouped) &&
+        n.prio.telemetrySent === 2 && n.prio.telemetryDropped === 3 && n.after.telemetrySent === 3 &&
+        n.log.filter(([, t]) => t === 0x21).length === 3 && n.log.every(([w]) => w === 'datagrams.writable'),
+      JSON.stringify({ prio: n.prio, after: n.after, writes: n.log.length }));
+  } finally {
+    await ctx2.close();
+  }
+}
+
 async function checkWallclockProbe() {
   // An X display with the test page full-screen (kiosk, no automation info bar).
   const disp = await startXvfb();
@@ -777,6 +851,28 @@ try {
     // GUIDE 2.2: the welcome asks for rate reports; the worker sends one
     // every 25 ms on every path (datagrams; WebSocket: channel messages).
     check(`${sc.name}: rate reports to the host's rate controller`, st && st.rateReports > 100, `${st?.rateReports} sent`);
+    // GUIDE 2.7: the send priorities this browser schedules by, detected as
+    // its API has them, and telemetry that gives way to input on a shared
+    // datagram queue only while that queue stands still (Chromium's datagram
+    // writes stall for 50 ms and more now and then on this CPU-bound machine:
+    // at most 15 %, and drops only with such a stall; a first version that
+    // capped pending writes at two dropped 28 %).
+    if (conn.transport === 'webtransport') {
+      const api = await page.evaluate(() => ({
+        sendGroup: 'createSendGroup' in WebTransport.prototype,
+        datagramWritables: typeof WebTransportDatagramDuplexStream !== 'undefined' && 'createWritable' in WebTransportDatagramDuplexStream.prototype,
+        sendOrder: typeof WebTransportSendStream !== 'undefined' && 'sendOrder' in WebTransportSendStream.prototype,
+      }));
+      const p = st?.prio;
+      const total = p ? p.telemetrySent + p.telemetryDropped : 0;
+      check(`${sc.name}: send priorities feature-detected; telemetry gives way to input only while the datagram queue stalls`,
+        !!p && p.sendOrder === api.sendOrder && p.sendGroup === api.sendGroup && p.datagramWritables === api.datagramWritables &&
+          total > 100 && p.telemetryDropped <= total * 0.15 && (p.telemetryDropped === 0 || p.telemetryStallMs > 50),
+        p ? `sendOrder ${p.sendOrder}, send groups ${p.sendGroup}, datagram queues ${p.datagramWritables} (browser API: ${JSON.stringify(api)}); ` +
+          `telemetry ${p.telemetrySent} sent, ${p.telemetryDropped} dropped, longest stall ${p.telemetryStallMs} ms` : 'no prio in the stats');
+    } else {
+      check(`${sc.name}: no send priorities over WebSocket`, st && st.prio === null);
+    }
     await checkStages(sc.name, st);
     await checkCrop(sc.name);
     const pr = await checkProbe(sc.name);
@@ -871,6 +967,7 @@ try {
   // 3b. Renderer crop (unit) ----------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
   await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
+  await checkSendPriorities().catch((e) => check('send priorities (unit)', false, e.message));
 
   // 3c. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a
