@@ -463,6 +463,7 @@ private:
     int queryTimeoutMs_ = 0;
     amf_int64 usage_ = 0;
     int svcLayers_ = 1;  // temporal layers the encoder runs
+    int baseRun_ = 0;    // output thread: consecutive non-key layer-0 frames (SVC)
     int64_t freq_ = 1;
 
     // Current rate (capture thread after init).
@@ -612,10 +613,8 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
         s.setInt(P_->maxLtr, ltr, true);
         s.setInt(P_->ltrMode, P_->ltrKeepUnused, true);
     }
-    if (p.svcLayers > 1) {
-        s.setInt(P_->maxTemporalLayers, p.svcLayers, true);
-        s.setInt(P_->numTemporalLayers, p.svcLayers, true);
-    }
+    // NUM_TEMPORAL_LAYERS is dynamic: applyDynamic (after this maximum).
+    if (p.svcLayers > 1) s.setInt(P_->maxTemporalLayers, p.svcLayers, true);
     if (p.sliceOutput > 0) {
         // Sub-frame output (Phase 5 experiment): every slice / tile comes out
         // as a buffer of its own (OUTPUT_BUFFER_TYPE SLICE.., SLICE_LAST);
@@ -687,6 +686,10 @@ void AmfEncoder::applyDynamic(PropSetter& s) {
     s.setBool(P_->enforceHrd, false);  // A6: Sunshine warns HRD can cause artifacts
     s.setBool(P_->fillerData, false);
     s.setBool(P_->skipFrame, false);   // A5: ULL turns rate-control frame skipping on
+    // Temporal SVC: "NUM_TEMPORAL_LAYERS is a dynamic property and can be
+    // changed at any time during an encoding session" (AMF_Video_Encode_HEVC_API.md),
+    // up to MAX_NUM_TEMPORAL_LAYERS (createAndConfigure, before Init only).
+    if (start_.svcLayers > 1) s.setInt(P_->numTemporalLayers, start_.svcLayers, true);
     // Intra refresh: the requested cycle, else explicitly off. H.264's
     // ULTRA_LOW_LATENCY and LOW_LATENCY usages default
     // INTRA_REFRESH_NUM_MBS_PER_SLOT to 255 (AMF_Video_Encode_API.md: "Ultra low
@@ -1526,6 +1529,13 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
                                   std::to_string(li.temporalId) + " (frame " + std::to_string(f.frameId) + "): using the property");
         }
         if (layer < 0) warnOnce("nolayer", "SVC frames carry no temporal layer (no property, no temporal id): all reported as layer 0");
+        // started.svcLayers is read from the property store, which echoes what
+        // was set even if the encoder never applied it: the frames tell.
+        baseRun_ = layer == 0 && !o.key ? baseRun_ + 1 : 0;
+        if (baseRun_ == 8) {
+            warnOnce("nosvc", "svcLayers " + std::to_string(svcLayers_) +
+                                  ": 8 frames in a row came out in layer 0, the encoder runs no temporal layers");
+        }
         discardable = isDiscardable(o.key, li, svcLayers_, uint32_t(std::max<amf_int64>(0, layer)));
     }
     o.temporalLayer = int(layer);

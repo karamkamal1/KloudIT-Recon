@@ -1,5 +1,6 @@
 #include "pipeline.hpp"
 
+#include "capture/dirty.hpp"
 #include "platform/platform.hpp"
 
 namespace recon {
@@ -65,6 +66,10 @@ Status Pipeline::setRate(const RateParams& r) {
 void Pipeline::captureLoop() {
     uint64_t nextId = 1;
     int64_t lastPoolWarn = 0, lastBusyWarn = 0;
+    // The dirty share of captures dropped before the encoder took them: the
+    // next encoded frame references an older image, so it carries their
+    // changes too (like the pacer's merged deliveries).
+    float droppedDirty = 0;
     while (!stop_) {
         CapturedFrame frame;
         Status err;
@@ -94,7 +99,8 @@ void Pipeline::captureLoop() {
         info.presentQpc = frame.presentQpc;
         info.captureQpc = frame.captureQpc;
         info.repeat = frame.repeat;
-        info.dirty = frame.dirty;
+        info.dirty = mergeDirty(droppedDirty, frame.dirty);
+        droppedDirty = info.dirty;  // until the encoder takes the frame
         EncoderFrame ef;
         ef.captured = &frame;
         if (opt_.converter && frame.texture) {
@@ -140,6 +146,7 @@ void Pipeline::captureLoop() {
             continue;
         }
         ++nextId;
+        if (s.ok) droppedDirty = 0;
         if (!s.ok) {
             if (s.fatal) {
                 rep_.fatal(s);

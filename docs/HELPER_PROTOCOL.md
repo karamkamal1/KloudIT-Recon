@@ -113,7 +113,7 @@ ignored by recon-host.
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: every frame from `lostFromFrameId` to the newest one is invalidated and the next frame references an older one (`ackedLtrFrameId` is not used); AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without a usable reference an IDR. |
 | `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
-| `setRate` | `kbps`, `vbvFrames`, `fps` (each 0 / absent = unchanged; at least one set) | New target. No IDR unless the codec's `liveBitrate` is `flush`. `fps` alone is the Phase 5 "FPS before resolution" change (`kbps` optional since Phase 5; older helpers answer `bad_message` without it). The capture re-paces at once; how the encoder follows says caps `liveFps`. |
+| `setRate` | `kbps`, `vbvFrames`, `fps` (each 0 / absent = unchanged; at least one set) | New target. No IDR unless the codec's `liveBitrate` is `flush`. `fps` alone is the Phase 5 "FPS before resolution" change (`kbps` optional since Phase 5; older helpers answer `bad_message` without it). The capture re-paces at once; how the encoder follows says `started.liveFps` (caps `liveFps` is only the default before a start: a `start` with `liveBitrate` `flush` makes it `flush`). |
 | `setRoi` | `rects`: `[{x, y, w, h, weight}]` (weight -10..10, at most 256) | Replace the regions of interest. |
 | `shutdown` | | Stop and exit (closing stdin does the same). |
 
@@ -176,12 +176,13 @@ ignored by recon-host.
   `start` with `hdr` can make an HDR10 stream with this codec (HEVC and AV1 with 10-bit
   encoding of P010 input and the HDR metadata property; never H.264; see "HDR10"); Phase 5
   (additive, older helpers omit them): `liveFps` (`seamless` | `flush` | `restart`: how a
-  `setRate` fps change is applied, like `liveBitrate`), `instanceSelect` (`start`'s
-  `encoderInstance` picks the hardware engine: AMF `INSTANCE_INDEX`; false for NVENC, which
-  spreads its work over its engines itself), `reencode` (`start`'s `reencodeOversized` works:
-  NVENC `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`); `maxTemporalLayers` and `sliceOutput`
-  are what `svcLayers` and `sliceOutput` may ask for (see "Phase 5 features"). Values start as vendor defaults; the
-  Phase 3.6 qualification results in docs/VENDOR_NOTES.md overwrite them. `assumed`
+  `setRate` fps change is applied by default, like `liveBitrate`; `started.liveFps` says it
+  for the stream), `instanceSelect` (`start`'s `encoderInstance` picks the hardware engine:
+  AMF `INSTANCE_INDEX`; false for NVENC, which spreads its work over its engines itself),
+  `reencode` (`start`'s `reencodeOversized` works: NVENC
+  `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`); `maxTemporalLayers` and `sliceOutput` are what
+  `svcLayers` and `sliceOutput` may ask for (see "Phase 5 features"). Values start as vendor
+  defaults; the Phase 3.6 qualification results in docs/VENDOR_NOTES.md overwrite them. `assumed`
   (optional, additive): the names of the fields above that are documented or default
   values rather than detected on this GPU, e.g. `["roi","liveBitrate"]` for AMF AV1;
   absent when every field was detected (the mock never sends it).
@@ -292,13 +293,15 @@ is 0. `dirty` (Phase 5): the share (0..1) of the image the capture reported as c
 the previous frame: the union of DDA's move-rect destinations and dirty rects, or of AMD
 Direct Capture's dirty rects, each region counted once (`src/capture/dirty.hpp`; more than
 256 rects are summed, an upper bound); images the pacer dropped in between add up (at most
-1); 0 for repeats, -1 when unknown (synthetic, WGC, older helpers). `dirtyPct` is the same
-share in whole percent, rounded up (any change is at least 1; -1 unknown; before Phase 5 it
-was a sum of rect areas, overlaps counted twice). `discardable` (Phase 5): no later frame
-references this one (see "Temporal SVC"; ring flag DISCARDABLE). With `reencodeOversized`, a
-re-encoded frame adds `"reencoded":true,"oversizeBytes":N` (the first encode's size;
-`bytes` is what went out); with `sliceOutput`, `"slices":N,"firstSliceQpc":Q` (the parts it
-came out in and when the first one did).
+1), and so do captures dropped before encoding (the encoder behind: no frame id, no stats);
+0 for repeats (unless such drops came before), -1 when unknown (synthetic, WGC, older
+helpers). `dirtyPct` is the same share in whole percent, rounded up (any change is at least
+1; -1 unknown; before Phase 5 it was a sum of rect areas, overlaps counted twice).
+`discardable` (Phase 5): no later frame references this one (see "Temporal SVC"; ring flag
+DISCARDABLE). With `reencodeOversized`, a re-encoded frame adds
+`"reencoded":true,"oversizeBytes":N` (the first encode's size; `bytes` is what went out); with
+`sliceOutput`, `"slices":N,"firstSliceQpc":Q` (the parts it came out in and when the first
+one did).
 
 `dropped` frames add `"reason"`: `ringFull` (recon-host did not keep up) or `tooLarge`
 (bigger than a slot). `recovery` frames add `"refFloor"`. `kbps`/`vbvFrames`/`fps` are
@@ -504,7 +507,8 @@ DDA specifics: each new image is copied on the GPU into one of two textures of t
 helper right away; the duplication frame is released just before the next
 `AcquireNextFrame` (the `ReleaseFrame` documentation's recommendation; Sunshine does the
 same). Frames whose `LastPresentTime` is 0 (only the pointer moved) are skipped, except
-the first frame of a duplication, so a static desktop still yields an image.
+the first frame of a duplication, so a static desktop still yields an image (its `dirty`
+is 1: after a re-duplication it may differ from the last image everywhere).
 `DXGI_ERROR_ACCESS_LOST`, `E_ACCESSDENIED` (secure desktop) and a stale DXGI factory
 (`IsCurrent` false: mode, HDR or output changes) recreate the duplication, re-finding the
 output by its GDI name on the same adapter, every 250 ms until it works (`captureChanged`
@@ -690,7 +694,7 @@ depends on it).
 | `B_PIC_PATTERN` | 0 |
 | `MAX_NUM_REFRAMES` | max(4, `ltrSlots` + 1), at most the cap (AV1 <= 8) |
 | `MAX_LTR_FRAMES` / `LTR_MODE` | `ltrSlots` / `KEEP_UNUSED` when `ltrSlots` > 0; else not set (no user LTR, intra refresh possible) |
-| `MAX_NUM_TEMPORAL_LAYERS`, `NUM_TEMPORAL_LAYERS` | `svcLayers` when > 1 (H.264: `NUM_TEMPORAL_ENHANCMENT_LAYERS`, the same count); `NUM_TEMPORAL_LAYERS` read back for `started.svcLayers` |
+| `MAX_NUM_TEMPORAL_LAYERS`, `NUM_TEMPORAL_LAYERS` | `svcLayers` when > 1 (H.264: `NUM_TEMPORAL_ENHANCMENT_LAYERS`, the same count); the maximum before `Init` only, `NUM_TEMPORAL_LAYERS` (dynamic) again after `Init` / `ReInit` and read back for `started.svcLayers`; the read-back only echoes the property, so a warning is logged when 8 frames in a row come out in layer 0 |
 | `OUTPUT_MODE`, `SLICES_PER_FRAME` (AV1 `TILES_PER_FRAME`, `TILE_GROUP_OBU` true) | `sliceOutput` > 0 only (Phase 5 experiment): `SLICE` (AV1 `TILE`) and the count, both required; the count is read back for `started.sliceOutput` (AV1 treats it "as suggestion") |
 | `QUERY_TIMEOUT` | 5 ms when supported; read back after `Init` (`started.queryTimeoutMs`, 0 when it did not take: `QueryOutput` is then polled every 1 ms) |
 | `INPUT_QUEUE_SIZE` | 2 |
@@ -767,9 +771,10 @@ With temporal SVC (`svcLayers` > 1) marks and recovery frames go only on base-la
 an enhancement frame would leave the next base frame predicted from the lost base frame
 before it): the tracker predicts each frame's layer from its position after the last key
 frame (with 2 layers the even positions are the base layer), corrects the prediction from
-the encoder's reported layers (an unplanned key frame restarts the pattern), lets a pending
-recovery wait for the next base-layer frame, and rejects (IDR) a recovery frame that came
-out in an enhancement layer.
+the encoder's reported layers (an unplanned key frame restarts the pattern; frames submitted
+before a planned IDR do not correct it, the IDR restarts it), lets a pending recovery wait
+for the next base-layer frame, and rejects (IDR) a recovery frame that came out in an
+enhancement layer.
 
 **setRate.** `liveBitrate` `seamless`: `TARGET_BITRATE`, `PEAK_BITRATE`,
 `VBV_BUFFER_SIZE` (and `FRAMERATE` for an fps change) are set before the next
@@ -814,7 +819,7 @@ with the most video memory), `NvEncGetEncodeGUIDs` and per codec `NvEncGetEncode
 | `liveBitrate` | `seamless` with `SUPPORT_DYN_BITRATE_CHANGE` (marked `assumed` until step 3.6), else `restart` |
 | `maxTemporalLayers` | `NUM_MAX_TEMPORAL_LAYERS` with `SUPPORT_TEMPORAL_SVC`, else 1 |
 | `roi` | `emphasis`, marked `assumed` (QP delta maps; no cap bit exists for them) |
-| `sliceOutput` | `SUPPORT_SUBFRAME_READBACK` |
+| `sliceOutput` | false: no sub-frame output yet (`SUPPORT_SUBFRAME_READBACK` is in the `start` log line, "sub-frame readback cap") |
 | `hwInstances` | `NUM_ENCODER_ENGINES` |
 | `dynamicResolution` | `SUPPORT_DYN_RES_CHANGE` |
 | `hdr10` | HEVC / AV1 with `SUPPORT_10BIT_ENCODE` and `NV_ENC_BUFFER_FORMAT_YUV420_10BIT` (P010) among `NvEncGetInputFormats` |
@@ -959,9 +964,9 @@ forces an IDR (the encoder still stands before the frame the client decodes). St
 
 **Not done yet (hooks).** A resolution change in the running session (`maxEncodeWidth/Height`
 are set; it needs a control message and the converter's new size, then a reconfiguration
-with `forceIDR` 1); sub-frame output (`enableSubFrameWrite` / slice offsets: `start`'s
-`sliceOutput` answers `unsupported` on NVENC although caps `sliceOutput` reports
-`SUPPORT_SUBFRAME_READBACK`); NVENC's own LTR; forcing split-frame encoding.
+with `forceIDR` 1); sub-frame output (`enableSubFrameWrite` / slice offsets: caps
+`sliceOutput` is false on NVENC and `start`'s `sliceOutput` answers `unsupported`; the GPU's
+`SUPPORT_SUBFRAME_READBACK` is only logged); NVENC's own LTR; forcing split-frame encoding.
 
 ## Phase 5 features
 
@@ -1020,7 +1025,8 @@ on, linear in between, the ceiling when the share is unknown.
 once (frame pacing), the encoder from its next frame: AMF `FRAMERATE` (a dynamic property;
 VERIFY that it brings no IDR: the backend logs a key frame right after the change), NVENC
 `NvEncReconfigureEncoder` with the new `frameRateNum` (`resetEncoder` 0, `forceIDR` 0); the
-bitrate stays, so each frame gets more bits. In `flush` mode AMF re-initializes (IDR).
+bitrate stays, so each frame gets more bits. In `flush` mode (`started.liveFps` `flush`)
+AMF re-initializes and NVENC resets the encoder (IDR).
 
 **Dedicated encode engine.** `encoderInstance` selects the VCN engine on AMF
 (`INSTANCE_INDEX`; refused when it is not below `hwInstances`, read back for `started`), so a
@@ -1068,13 +1074,14 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   and AV1 fixed-point codes. Phase 5: the LTR policy with 2 temporal layers driven like AMF
   (marks and recovery frames only on base-layer frames, a pending recovery waiting for the next
   one, a mark the encoder delays to the next base frame, the layer prediction following an
-  unplanned key frame, a recovery frame in an enhancement layer refused), temporal ids and the
-  discardable flag from H.264 (prefix NAL, `nal_ref_idc`), HEVC (`TRAIL_N` / `TRAIL_R` at and
-  below the top layer, an IDR after a VPS) and AV1 units (OBU extension, two-byte sizes), the
-  slice / tile assembler (whole frames, parts without ids, an unfinished frame dropped by the
-  next frame's parts or a whole frame), the AMF importance and NVENC QP delta maps of the
-  cursor / crosshair rects of Go's `FocusROI` (also clipped at a corner) written into a
-  pitched GRAY32 plane, and the re-encode limit, QP offsets and offset maps.
+  unplanned key frame and then a planned IDR with frames in flight, a recovery frame in an
+  enhancement layer refused), temporal ids and the discardable flag from H.264 (prefix NAL,
+  `nal_ref_idc`), HEVC (`TRAIL_N` / `TRAIL_R` at and below the top layer, an IDR after a VPS)
+  and AV1 units (OBU extension, two-byte sizes), the slice / tile assembler (whole frames,
+  parts without ids, an unfinished frame dropped by the next frame's parts or a whole frame),
+  the AMF importance and NVENC QP delta maps of the cursor / crosshair rects of Go's
+  `FocusROI` (also clipped at a corner) written into a pitched GRAY32 plane, and the
+  re-encode limit, QP offsets and offset maps.
 * `--self-test-nvenc=DLL`: the NVENC backend driven the way the pipeline drives it (init
   on one thread, NV12 textures submitted from a capture thread, the output collected on an
   output thread; forced IDRs, losses, rate and frame-rate changes, ROI on and off,
@@ -1166,10 +1173,11 @@ docs/VENDOR_NOTES.md 3.4, never for normal use) and repeatable
 client until a key frame or a recovery frame from before N arrives; the helper gets
 `recover` at once), `rate=KBPS`, `fps=FPS` (a frame-rate change alone; the summary says
 whether a key frame followed), `roi=X,Y,W,H,WEIGHT` (several joined with `+`), `roi=off`. The
-summary adds per-layer frame counts, the dirty share (mean / max), re-encoded frames and the
-sub-frame timing where they apply. Because the
-file contains exactly what the simulated client decoded, `ffmpeg -v error -i FILE -f null -`
-checks that an LTR recovery really decodes without the lost frames. Example (an AMD host):
+summary adds per-layer frame counts, the dirty share (mean / max after frame 1, the first
+image of the duplication), re-encoded frames and the sub-frame timing where they apply.
+Because the file contains exactly what the simulated client decoded,
+`ffmpeg -v error -i FILE -f null -` checks that an LTR recovery really decodes without the
+lost frames. Example (an AMD host):
 
 ```
 recon-encoder.exe --encode-test=out.hevc --backend=amf --codec=hevc --capture=synthetic-gpu ^

@@ -790,9 +790,10 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     Caps caps = probeNvencCaps();
     const CodecCaps& h = caps.codecs["hevc"];
     expect(caps.backend == "nvenc" && caps.vendor == "nvidia" && caps.codecs.size() == 3, name, "backend / codecs");
-    // maxLtr: the slots start's ltrSlots may ask for (none; the double reports 8 LTR frames).
+    // maxLtr: the slots start's ltrSlots may ask for (none; the double reports 8 LTR frames);
+    // sliceOutput likewise (none; the double reports SUPPORT_SUBFRAME_READBACK).
     expect(h.maxW == 8192 && h.maxH == 8192 && h.tenBit && h.yuv444 && h.forceIdr && h.recovery == "invalidate" && h.maxLtr == 0 &&
-               h.intraRefresh && h.liveBitrate == "seamless" && h.maxTemporalLayers == 4 && h.roi == "emphasis" && h.sliceOutput &&
+               h.intraRefresh && h.liveBitrate == "seamless" && h.maxTemporalLayers == 4 && h.roi == "emphasis" && !h.sliceOutput &&
                h.hwInstances == 2 && !h.queryTimeout && h.alignW == 1 && h.alignH == 1 && h.dynamicResolution,
            name, "hevc caps");
     expect(std::find(h.assumed.begin(), h.assumed.end(), "liveBitrate") != h.assumed.end() &&

@@ -2762,9 +2762,10 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   maxH (expected 4096 for h264, 8192 for hevc / av1), `tenBit` (hevc / av1 true), `yuv444`
   (h264 / hevc true), `recovery` invalidate, `maxLtr` 0 (the backend uses no LTR; the start
   log line's "LTR frames cap N (unused)" is the GPU's count: record N), `intraRefresh` true,
-  `liveBitrate` seamless, `maxTemporalLayers`, `sliceOutput`, `hwInstances` (RTX 4080 / 4090: 2; record),
-  `dynamicResolution` true, `assumed` `["liveBitrate","roi"]`; caps.log has "nvenc probe: N ms"
-  (expect < 300 ms).
+  `liveBitrate` seamless, `maxTemporalLayers`, `sliceOutput` false (no sub-frame output yet; the
+  start log line's "sub-frame readback cap N" is the GPU's bit: record N), `hwInstances` (RTX
+  4080 / 4090: 2; record), `dynamicResolution` true, `assumed` `["liveBitrate","roi"]`; caps.log
+  has "nvenc probe: N ms" (expect < 300 ms).
 - NVIDIA: unverified (no NVIDIA host available). Test (old driver): on a host with a driver
   older than 570 (or reported by a user), `--print-caps` shows `unavailable.nvenc` "the NVIDIA
   driver supports NVENC API 12.x, the helper needs 13.0: update the NVIDIA driver to 570.0 or
@@ -3316,18 +3317,20 @@ additive (version stays 1): caps `liveFps`, `instanceSelect`, `reencode`; start
 older helpers).
 
 - (a) Temporal SVC, 2 layers: AMF sets `MAX_NUM_TEMPORAL_LAYERS` before `Init` and
-  `NUM_TEMPORAL_LAYERS` (H.264 `NUM_TEMPORAL_ENHANCMENT_LAYERS`), reads it back for
-  `started.svcLayers`, and re-reads the caps with the maximum set (AV1's LTR count depends on
-  it); intra refresh stays refused with SVC. The LTR policy (`src/codec/ltr.hpp`) plans marks
-  and recovery frames only on base-layer frames (AMF: "only base temporal layer pictures can be
-  coded as LTR"; a recovery frame in the enhancement layer would leave the next base frame
-  predicted from a lost one), predicting the layer from the position after the last key frame
-  and re-synchronizing from the encoder's reported layers; a recovery frame that comes out in
-  layer 1 is refused (IDR). NVENC already configured `enableTemporalSVC` (step 3.4); its
-  `NV_ENC_LOCK_BITSTREAM::temporalId` is now reported. Each frame's layer is checked against
-  the bitstream and gets the `discardable` flag (`src/codec/bitstream.hpp` `layerInfo`: H.264
-  `nal_ref_idc` 0 and the SVC prefix NAL unit, HEVC sub-layer non-reference NAL types at the top
-  layer and `nuh_temporal_id_plus1`, AV1 the OBU extension's `temporal_id`; AV1 has no
+  `NUM_TEMPORAL_LAYERS` (H.264 `NUM_TEMPORAL_ENHANCMENT_LAYERS`; dynamic) before and again after
+  `Init` / `ReInit`, reads it back for `started.svcLayers` (warning "the encoder runs no
+  temporal layers" when 8 frames in a row come out in layer 0), and re-reads the caps with the
+  maximum set (AV1's LTR count depends on it); intra refresh stays refused with SVC. The LTR
+  policy (`src/codec/ltr.hpp`) plans marks and recovery frames only on base-layer frames (AMF:
+  "only base temporal layer pictures can be coded as LTR"; a recovery frame in the enhancement
+  layer would leave the next base frame predicted from a lost one), predicting the layer from
+  the position after the last key frame and re-synchronizing from the encoder's reported layers
+  (not from frames submitted before a planned IDR: it restarts the pattern); a recovery frame
+  that comes out in layer 1 is refused (IDR). NVENC already configured `enableTemporalSVC` (step
+  3.4); its `NV_ENC_LOCK_BITSTREAM::temporalId` is now reported. Each frame's layer is checked
+  against the bitstream and gets the `discardable` flag (`src/codec/bitstream.hpp` `layerInfo`:
+  H.264 `nal_ref_idc` 0 and the SVC prefix NAL unit, HEVC sub-layer non-reference NAL types at
+  the top layer and `nuh_temporal_id_plus1`, AV1 the OBU extension's `temporal_id`; AV1 has no
   reference flag in reach, so its top layer counts as discardable: VERIFY). Go:
   `Frame.Discardable`, `Frame.Droppable()` (discardable, not key, not recovery),
   `Stats.Discardable`.
@@ -3337,8 +3340,10 @@ older helpers).
 - (c) Dirty share: DDA (move-rect destinations + dirty rects) and AMD Direct Capture
   (`DIRTY_RECTS`) now report the union area as a fraction (`src/capture/dirty.hpp`;
   previously a percent with overlaps counted twice) in stats `dirty` / `dirtyPct` and in the
-  ring (`dirtyPpm`, so it survives dropped stats). Go: `Frame.Dirty`, `Stats.Dirty`,
-  `ActivityMeter` (static desktop detection, `SuggestKbps`).
+  ring (`dirtyPpm`, so it survives dropped stats); the first DDA frame of a (re)duplication
+  counts as wholly changed, and captures dropped before encoding (the encoder behind) add
+  their share to the next encoded frame. Go: `Frame.Dirty`, `Stats.Dirty`, `ActivityMeter`
+  (static desktop detection, `SuggestKbps`).
 - (d) FPS before resolution: `setRate` with `fps` alone (Go `SetFPS`, `LowerFPS` /
   `RaiseFPS`); caps `liveFps`. AMF sets `FRAMERATE` before the next `SubmitInput` and moves the
   default LTR interval along; a key frame right after the change is logged ("the frame-rate
@@ -3359,7 +3364,8 @@ older helpers).
   `sliceOutput`): `OUTPUT_MODE` `SLICE` (AV1 `TILE`, `TILE_GROUP_OBU` true) and
   `SLICES_PER_FRAME` / `TILES_PER_FRAME`; the parts (`OUTPUT_BUFFER_TYPE`) are put back
   together (`src/codec/slices.hpp`) and published as whole frames; stats `firstSliceQpc` say
-  when the first part was ready. NVENC answers `unsupported` (not implemented).
+  when the first part was ready. NVENC answers `unsupported` (not implemented) and reports caps
+  `sliceOutput` false (its `SUPPORT_SUBFRAME_READBACK` bit only in the start log line).
 
 Sources: AMF_Video_Encode_API.md / _HEVC_API.md / _AV1_API.md (GPUOpen AMF master, read
 2026-10-08: SVC "NUM_TEMPORAL_LAYERS is a dynamic property ... MAX_NUM_TEMPORAL_LAYERS needs to
@@ -3427,6 +3433,20 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
   TestRingDirtyAndDiscardable incl. an older helper's slot, the Phase 5 decode / encode cases,
   SetFPS without `kbps`). A mock `--encode-test` with `--instance=1 --at=50:fps=30` and a
   three-rect `roi=` event runs clean ("fps 30 at 50: no key frame").
+- verified (sandbox), review fixes: "SVC: planned IDR with frames in flight"
+  (`--self-test-encoder`; an unplanned key frame at an odd position, then a planned IDR with two
+  frames in the encoder: every frame from the IDR on predicted in the encoder's layer, one
+  resync, a later recovery on a base-layer frame accepted) failed before the fix in
+  `src/codec/ltr.cpp` (2 frames in the wrong layer, 3 resyncs) and passes after it;
+  `--self-test-nvenc` checks caps `sliceOutput` false with the double's
+  `SUPPORT_SUBFRAME_READBACK` set; the strict clang syntax check of the changed sources, `make
+  helper` without warnings, `xvfb-run -a make helper-test`, `go vet` (Linux and Windows) and `go
+  test ./...` pass. Not testable here: AMF `NUM_TEMPORAL_LAYERS` after `Init` and the "runs no
+  temporal layers" warning (no AMD GPU; covered by the SVC stream check below), the dirty share
+  of captures dropped before encoding (the mock never runs behind) and of DDA's first frame
+  after a re-duplication (Wine has no `DuplicateOutput`; covered by the DDA dirty-share check
+  below). The encode test's dirty summary now starts after frame 1 (the first image of the
+  duplication, dirty 1), so the idle-desktop check keeps its thresholds.
 - Not run here: anything on AMF (no AMD GPU: SVC, FRAMERATE, INSTANCE_INDEX, slice / tile
   output), the NVIDIA driver, DDA dirty rects (Wine's `DuplicateOutput` answers E_NOTIMPL),
   AMD Direct Capture dirty rects, Chrome decoding a stream with the discardable frames left out.
@@ -3441,11 +3461,11 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
   `recon-encoder.exe --encode-test=svc.hevc --backend=amf --codec=hevc --capture=dda --svc=2
   --fps=60 --kbps=20000 --frames=600` (AV1: `svc.ivf`) on a moving desktop / game. The started
   line has `"svcLayers":2`; the summary "temporal layers: ~300 / ~300 frames in layer 0 / 1,
-  ~300 discardable"; the log has no "OUTPUT_TEMPORAL_LAYER ... but the bitstream says" and no
-  "SVC frames carry no temporal layer". `ffmpeg -v error -i svc.hevc -f null -` and
-  `ffmpeg -v error -i svc.base.hevc -f null -` print nothing (the base-only file plays at
-  30 fps without artifacts: check it in mpv). Record the NAL types:
-  `ffmpeg -i svc.hevc -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E
+  ~300 discardable"; the log has no "OUTPUT_TEMPORAL_LAYER ... but the bitstream says", no
+  "the encoder runs no temporal layers" and no "SVC frames carry no temporal layer".
+  `ffmpeg -v error -i svc.hevc -f null -` and `ffmpeg -v error -i svc.base.hevc -f null -`
+  print nothing (the base-only file plays at 30 fps without artifacts: check it in mpv).
+  Record the NAL types: `ffmpeg -i svc.hevc -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E
   "nal_unit_type|nuh_temporal_id_plus1" | head -40`: layer-1 frames must be `TRAIL_N` (0) with
   `nuh_temporal_id_plus1` 2; if AMF writes `TRAIL_R` the discardable count is 0 (nothing can be
   dropped safely): record it. H.264: `nal_ref_idc` 0 on layer-1 slices. AV1:
@@ -3465,9 +3485,12 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
   and `--codec=h264`.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (dirty share, DDA): `--encode-test=d.hevc
   --backend=amf --codec=hevc --capture=dda --frames=600` on an idle desktop with a blinking
-  caret in Notepad: the summary "dirty share: mean < 0.001, max < 0.002"; repeat while dragging a
-  window: max > 0.05. On a rotated (portrait) display the share must stay in 0..1 (rects are in
-  the unrotated desktop texture).
+  caret in Notepad: the summary "dirty share after frame 1: mean < 0.001, max < 0.002"; repeat
+  while dragging a window: max > 0.05. On a rotated (portrait) display the share must stay in
+  0..1 (rects are in the unrotated desktop texture). Re-duplication: repeat the idle-desktop
+  run pressing Ctrl+Alt+Del and cancelling once (secure desktop: ACCESS_LOST, the duplication is
+  recreated): the summary's dirty max is now 1.000 (the first frame of the new duplication
+  counts as wholly changed) while the mean stays below 0.01.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (dirty share, AMD Direct Capture): the same with
   `--capture=amd-direct`: the summary has a dirty line (not "N frames without dirty
   information"), i.e. the driver delivers `AMF_DISPLAYCAPTURE_DIRTY_RECTS`; record whether a
@@ -3545,7 +3568,8 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
   target with `SuggestKbps(now, target, floor)` through `SetRate` (seamless codecs only); the
   FFmpeg path reports no dirty share (the meter then never lowers anything).
 - FPS before resolution: at the rate controller's bitrate floor `SetFPS(LowerFPS(fps, 30))`
-  where `CodecCaps.LiveFPS == "seamless"` (else it costs an IDR or a restart: skip), and
+  where `Started.LiveFPS == "seamless"` (else it costs an IDR or a restart: skip; not
+  `CodecCaps.LiveFPS`, which a start with `LiveBitrate` "flush" overrides), and
   `RaiseFPS(fps, requested)` once the bitrate has recovered; resolution changes only below the
   lowest step.
 - Dedicated engine: a host config `encoderInstance` = `default` | `dedicated` | `N` ->

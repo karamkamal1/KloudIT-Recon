@@ -335,9 +335,10 @@ func (h *Helper) SetRate(kbps int, vbvFrames float64, fps int) error {
 // under pressure lower the frame rate before the resolution, so each frame
 // gets more bits; LowerFPS gives the steps). The capture paces to it at once
 // and the encoder follows from its next frame; how seamless that is says the
-// codec's CodecCaps.LiveFPS (AMF FRAMERATE: VERIFY no IDR). Helpers older
-// than Phase 5 refuse a setRate without kbps (bad_message): use SetRate with
-// the current bitrate there.
+// stream's Started.LiveFPS (flush when the start asked for LiveBitrate
+// "flush"; CodecCaps.LiveFPS is only the default before a start; AMF
+// FRAMERATE: VERIFY no IDR). Helpers older than Phase 5 refuse a setRate
+// without kbps (bad_message): use SetRate with the current bitrate there.
 func (h *Helper) SetFPS(fps int) error {
 	if fps < 1 || fps > 480 {
 		return fmt.Errorf("encoder helper: fps %d out of range 1..480", fps)

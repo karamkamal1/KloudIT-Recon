@@ -324,8 +324,8 @@ Status DdaCapture::copyIn(ID3D11Texture2D* tex) {
 // The share of the image this frame changed: the union of the move rects'
 // destinations and the dirty rects (GetFrameMoveRects / GetFrameDirtyRects, in
 // the desktop texture's own, unrotated coordinates like w x h), each region
-// counted once (capture/dirty.hpp). 0 when the frame has no metadata (only the
-// first frame of a duplication), -1 when it cannot be read.
+// counted once (capture/dirty.hpp). 0 when the frame has no metadata, -1 when
+// it cannot be read. Not for the first frame of a duplication (acquire).
 float DdaCapture::dirtyShare(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h) {
     if (!fi.TotalMetadataBufferSize || !w || !h) return fi.TotalMetadataBufferSize ? -1.0f : 0.0f;
     meta_.resize(fi.TotalMetadataBufferSize);
@@ -421,6 +421,7 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             if (now >= deadline) return Next::Timeout;
             continue;
         }
+        const bool first = first_;
         first_ = false;
         ComPtr<ID3D11Texture2D> tex;
         if (FAILED(res.As(&tex))) {
@@ -436,7 +437,10 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         tex->GetDesc(&td);
         a.presentQpc = fi.LastPresentTime.QuadPart;
         a.captureQpc = now;
-        a.dirty = dirtyShare(fi, td.Width, td.Height);
+        // The first image of a (re)duplication may differ from the last one
+        // delivered everywhere (ACCESS_LOST, a mode change, the secure
+        // desktop), whatever its metadata says: all of it counts as changed.
+        a.dirty = first ? 1.0f : dirtyShare(fi, td.Width, td.Height);
         return Next::Frame;
     }
 }

@@ -171,10 +171,12 @@ type CodecCaps struct {
 	// input, Main10 / AV1 10-bit, BT.2020 PQ and HDR metadata; step 3.9).
 	HDR10 bool `json:"hdr10"`
 	// Phase 5 (older helpers omit them: "" / false). LiveFPS: how SetFPS (a
-	// frame-rate change) is applied, seamless | flush | restart, like
-	// LiveBitrate. InstanceSelect: StartParams.EncoderInstance picks the
-	// hardware engine (AMF); false: leave it nil (NVENC spreads its work over
-	// its engines). Reencode: StartParams.ReencodeOversized works.
+	// frame-rate change) is applied by default, seamless | flush | restart,
+	// like LiveBitrate (a start with LiveBitrate "flush" makes it flush:
+	// Started.LiveFPS is what the stream does). InstanceSelect:
+	// StartParams.EncoderInstance picks the hardware engine (AMF); false:
+	// leave it nil (NVENC spreads its work over its engines). Reencode:
+	// StartParams.ReencodeOversized works.
 	LiveFPS        string `json:"liveFps"`
 	InstanceSelect bool   `json:"instanceSelect"`
 	Reencode       bool   `json:"reencode"`

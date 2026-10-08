@@ -190,6 +190,7 @@ struct CodecDetails {
     bool nv12 = false;           // NV_ENC_BUFFER_FORMAT_NV12 in NvEncGetInputFormats
     bool p010 = false;           // NV_ENC_BUFFER_FORMAT_YUV420_10BIT (P010) in NvEncGetInputFormats
     int ltrFrames = 0;           // NV_ENC_CAPS_NUM_MAX_LTR_FRAMES (logged; this backend uses no LTR)
+    bool subframeReadback = false;  // NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK (logged; no sub-frame output yet)
 };
 
 // What NvEncGetEncodeCaps says about one codec on an open session.
@@ -239,7 +240,10 @@ CodecDetails readDetails(const NV_ENCODE_API_FUNCTION_LIST& nv, void* enc, Codec
     cc.roi = "emphasis";
     cc.assumed.push_back("roi");
     d.emphasisMap = cap(NV_ENC_CAPS_SUPPORT_EMPHASIS_LEVEL_MAP) != 0;
-    cc.sliceOutput = cap(NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK) != 0;
+    // caps sliceOutput is what start may ask for: nothing until this backend
+    // has sub-frame output; the GPU's bit is in the start log line.
+    d.subframeReadback = cap(NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK) != 0;
+    cc.sliceOutput = false;
     cc.hwInstances = std::max(1, cap(NV_ENC_CAPS_NUM_ENCODER_ENGINES));
     cc.queryTimeout = false;  // AMF only; NVENC signals completion events
     cc.alignW = cc.alignH = 1;
@@ -637,8 +641,8 @@ Status NvencEncoder::validate(const StartParams& p) {
                                                 ")");
     }
     if (p.sliceOutput > 0) {
-        return Status::Error("unsupported", "sliceOutput: the NVENC backend has no sub-frame output yet (caps sliceOutput is the "
-                                            "GPU's NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK; the experiment is AMF's)");
+        return Status::Error("unsupported", "sliceOutput: the NVENC backend has no sub-frame output yet (caps sliceOutput false; "
+                                            "the experiment is AMF's)");
     }
     if (p.reencodeOversized > 0 && !det_.stateAdvance) {
         return Status::Error("unsupported", "reencodeOversized: this encoder cannot encode without advancing its state "
@@ -1007,12 +1011,13 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     logf(LogLevel::Info,
          "nvenc: %s %ux%u %d fps %d kbps %s vbv %.2f frames (%u bits), preset P%d ultra-low-latency, %s output, %d reference frames, "
          "recovery %s, live bitrate %s, two-pass quarter resolution, spatial AQ, key frame scale %u, intra refresh %d, %d engine(s), "
-         "dynamic resolution %s (max %ux%u), emphasis map cap %d, state-advance cap %d, LTR frames cap %d (unused), temporal layers %d, "
-         "re-encode above %.1f average frames (0 = off), %s on %s",
+         "dynamic resolution %s (max %ux%u), emphasis map cap %d, state-advance cap %d, LTR frames cap %d (unused), "
+         "sub-frame readback cap %d (unused), temporal layers %d, re-encode above %.1f average frames (0 = off), %s on %s",
          p.codec.c_str(), width_, height_, fps_, kbps_, out.rateControl.c_str(), vbvFrames_, config_.rcParams.vbvBufferSize, preset_,
          async_ ? "async (events)" : "sync (polled)", refs_, cc.recovery.c_str(), out.liveBitrate.c_str(), nvenc::kKeyFrameScale,
          intraRefresh_, cc.hwInstances, cc.dynamicResolution ? "yes" : "no", init_.maxEncodeWidth, init_.maxEncodeHeight,
-         int(det_.emphasisMap), int(det_.stateAdvance), det_.ltrFrames, out.svcLayers, reencodeFactor_, rt_.versionText.c_str(),
+         int(det_.emphasisMap), int(det_.stateAdvance), det_.ltrFrames, int(det_.subframeReadback), out.svcLayers, reencodeFactor_,
+         rt_.versionText.c_str(),
          src.adapter.found ? src.adapter.name.c_str() : "the capture device");
     if (hdr_) {
         logf(LogLevel::Info, "nvenc: HDR10: %s, P010 input, BT.2020 PQ; mastering display %.0f / %.4f cd/m2, MaxCLL %d, MaxFALL %d",

@@ -583,6 +583,43 @@ void testLtrSvc() {
         expect(t.output(1001, ro, rp, 1001), name, "a base-layer recovery frame was refused");
     }
     std::printf("  %-44s ok\n", name);
+
+    name = "SVC: planned IDR with frames in flight";
+    {
+        // An unplanned key frame at an odd position (frame 4) shifts the
+        // prediction; a planned IDR (frame 9) restarts it while frames planned
+        // under the shift are still in the encoder (two at a time): their
+        // outputs must not shift the prediction after the IDR again.
+        LtrTracker t;
+        LtrTracker::Config c{2, 3, 1000};
+        c.layers = 2;
+        t.reset(c);
+        SvcEncoder enc(t, 2, 2);
+        enc.keyAt = 4;
+        for (uint64_t id = 1; id <= 30; ++id) {
+            enc.frame(id, int64_t(id), id == 1 || id == 9);
+            enc.ackMarks(id, 2);
+        }
+        int wrong = 0;
+        for (const SvcEncoder::Out& x : enc.out) {
+            if (x.id >= 9) wrong += x.plan.layer != x.layer;
+        }
+        expect(wrong == 0, name, std::to_string(wrong) + " frames from the IDR on predicted in the wrong layer");
+        expect(t.stats().layerResyncs == 1, name, std::to_string(t.stats().layerResyncs) + " resyncs, want 1");
+        // Frames 29 and 30 lost: the recovery is planned on a base-layer
+        // frame and accepted (no extra IDR).
+        expect(t.recover(29, std::nullopt), name, "no ACKed LTR to recover from");
+        for (uint64_t id = 31; id <= 34; ++id) enc.frame(id, int64_t(id), false);
+        int recoveries = 0;
+        for (const SvcEncoder::Out& x : enc.out) {
+            if (!x.plan.recovery) continue;
+            ++recoveries;
+            expect(x.layer == 0 && x.ok, name, "recovery frame " + std::to_string(x.id) + " in layer " + std::to_string(x.layer) + " refused");
+        }
+        expect(recoveries == 1 && t.stats().failedRecoveries == 0 && t.stats().idrFallbacks == 0, name,
+               std::to_string(recoveries) + " recoveries, " + std::to_string(t.stats().failedRecoveries) + " failed");
+    }
+    std::printf("  %-44s ok\n", name);
 }
 
 std::vector<uint8_t> bytes(std::initializer_list<int> b) {

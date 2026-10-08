@@ -578,17 +578,21 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                 static_cast<unsigned long long>(recoveries), static_cast<unsigned long long>(marks));
     // Phase 5: temporal layers, dirty share, re-encoded frames, sub-frame output.
     {
-        uint64_t layers[4] = {}, discardable = 0, dirtyKnown = 0, dirtyZero = 0;
+        uint64_t layers[4] = {}, discardable = 0, dirtyKnown = 0, dirtyZero = 0, dirtyUnknown = 0;
         double dirtySum = 0, dirtyMax = 0;
         for (const auto& f : all) {
             layers[std::min<uint32_t>(f.temporalLayer, 3)]++;
             discardable += (f.flags & ring::kFlagDiscardable) != 0;
+            // Frame 1 is the first image of the duplication: wholly new (dirty 1).
+            if (f.frameId <= 1) continue;
             if (f.flags & ring::kFlagDirty) {
                 const double d = double(f.dirtyPpm) / 1e6;
                 ++dirtyKnown;
                 dirtySum += d;
                 dirtyMax = std::max(dirtyMax, d);
                 dirtyZero += f.dirtyPpm == 0;
+            } else {
+                ++dirtyUnknown;
             }
         }
         if (st.svcLayers > 1) {
@@ -600,10 +604,10 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                         basePath.c_str());
         }
         if (dirtyKnown) {
-            std::printf("encode-test: dirty share: mean %.4f, max %.4f, %llu of %llu frames unchanged (%zu frames without dirty "
-                        "information)\n",
+            std::printf("encode-test: dirty share after frame 1: mean %.4f, max %.4f, %llu of %llu frames unchanged (%llu frames "
+                        "without dirty information)\n",
                         dirtySum / double(dirtyKnown), dirtyMax, static_cast<unsigned long long>(dirtyZero),
-                        static_cast<unsigned long long>(dirtyKnown), all.size() - size_t(dirtyKnown));
+                        static_cast<unsigned long long>(dirtyKnown), static_cast<unsigned long long>(dirtyUnknown));
         }
         const TestReporter::Phase5 p5 = rep.phase5();
         if (p.reencodeOversized > 0) {

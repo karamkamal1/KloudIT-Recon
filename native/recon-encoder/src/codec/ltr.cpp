@@ -164,13 +164,16 @@ bool LtrTracker::output(uint64_t frameId, const Output& o, const Plan& planned, 
     }
     // SVC: follow the encoder's layer pattern (a key frame the encoder made
     // on its own restarts it; so would a pattern that starts differently).
+    // A frame submitted before the newest planned IDR belongs to the pattern
+    // that IDR ended: it says nothing about the phase after it.
     bool known = false;
     uint64_t pos = 0;
     while (!positions_.empty() && positions_.front().first <= frameId) {
         if (positions_.front().first == frameId) known = true, pos = positions_.front().second;
         positions_.pop_front();
     }
-    if (cfg_.layers > 1 && known && o.temporalLayer >= 0 && layerAt(pos + phase_, cfg_.layers) != o.temporalLayer) {
+    if (cfg_.layers > 1 && known && frameId >= lastKey_ && o.temporalLayer >= 0 &&
+        layerAt(pos + phase_, cfg_.layers) != o.temporalLayer) {
         const uint64_t period = uint64_t(1) << (cfg_.layers - 1);
         for (uint64_t s = 0; s < period; ++s) {
             if (layerAt(pos + s, cfg_.layers) == o.temporalLayer) {

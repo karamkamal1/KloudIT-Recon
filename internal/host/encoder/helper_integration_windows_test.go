@@ -826,11 +826,6 @@ func TestHelperIntegrationWGC(t *testing.T) {
 	captureCheck(t, "wgc", StartParams{Width: 640, Height: 360})
 }
 
-// The present-driven capture path end to end on the GPU test source: a
-// simulated game presents at twice the stream's fps for 1 s, then pauses
-// 0.6 s. Frames must be capped at the fps, repeats must fill the pauses
-// every 100 ms, and the frame dumped after conversion must carry its frame
-// id in the barcode.
 // Phase 5 through the mock: the engine choice (EncoderInstanceFor
 // "dedicated": engine 1 of the mock's two), the refusals of what the mock
 // cannot do (SVC, re-encode, sub-frame output, a third engine: unsupported,
@@ -903,6 +898,11 @@ func TestHelperIntegrationPhase5(t *testing.T) {
 	}
 }
 
+// The present-driven capture path end to end on the GPU test source: a
+// simulated game presents at twice the stream's fps for 1 s, then pauses
+// 0.6 s. Frames must be capped at the fps, repeats must fill the pauses
+// every 100 ms, and the frame dumped after conversion must carry its frame
+// id in the barcode.
 func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	dump := t.TempDir() + `\frame30.nv12`
 	h := launchMock(t, "--dump-nv12="+dump)
