@@ -221,7 +221,7 @@ func TestAlignmentGuard(t *testing.T) {
 		}, rec
 	}
 	av1 := proto.Prefs{Codec: "av1"}
-	const notice = "AV1 on this GPU needs 64x16-aligned sizes; using HEVC"
+	const notice = "AV1 on this GPU needs 64×16-aligned sizes; using HEVC"
 	for _, c := range []struct {
 		name     string
 		w, h     int
@@ -241,7 +241,7 @@ func TestAlignmentGuard(t *testing.T) {
 		{"auto, AV1 the only hardware decoder", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc"}, {Family: "h264"}},
 			proto.Prefs{}, "", "hevc_amf", notice},
 		{"no HEVC in the browser", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "h264", HW: true}}, av1, "", "h264_amf",
-			"AV1 on this GPU needs 64x16-aligned sizes; using H.264"},
+			"AV1 on this GPU needs 64×16-aligned sizes; using H.264"},
 		{"only AV1 in the browser", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}}, av1, "", "av1_amf", ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {

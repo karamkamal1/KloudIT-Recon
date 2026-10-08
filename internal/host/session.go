@@ -335,7 +335,7 @@ func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInf
 				a := caps.Alignment(e.Name)
 				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
 					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
-				return alt, fmt.Sprintf("%s on this GPU needs %dx%d-aligned sizes; using %s",
+				return alt, fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
 					familyNames[e.Family], a.W, a.H, familyNames[alt.Family]), nil
 			}
 		}

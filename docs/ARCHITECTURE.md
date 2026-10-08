@@ -169,7 +169,7 @@ Codec negotiation: the browser reports per family whether it can decode with har
 (`VideoDecoder.isConfigSupported` with `prefer-hardware`). The host picks the first family with
 hardware on both ends, in the order HEVC → AV1 → H.264, then any hardware encoder, then software.
 An encoder that would pad the session's picture size (probed alignment, above) gives way to HEVC,
-else H.264, with a notice ("AV1 on this GPU needs 64x16-aligned sizes; using HEVC"), also when
+else H.264, with a notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when
 the client asks for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded
 picture is streamed anyway (a host-forced encoder, nothing else decodes, or a size only the
 capture knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom`

@@ -701,7 +701,7 @@ the coded frame size from the AV1 sequence header (`max_frame_width/height_minus
 picture`). The session computes the encoded picture size (`Params.OutputSize`: monitor size for
 ddagrab, the forced size for gfxcapture, FFmpeg's aspect-preserving scale for x11grab, unknown for
 a captured window) and, when the chosen encoder would pad it, uses HEVC, else H.264, with the
-notice "AV1 on this GPU needs 64x16-aligned sizes; using HEVC" (once per change). That also
+notice "AV1 on this GPU needs 64×16-aligned sizes; using HEVC" (once per change). That also
 applies when the client asks for AV1. An encoder forced in host.json (`"encoder": "av1_amf"`) is
 kept. Whenever a padded picture is streamed (forced encoder, nothing else decodable, window
 capture), the video config carries `codedWidth`, `codedHeight`, `cropRight`, `cropBottom` (from
@@ -789,9 +789,9 @@ Verified in the sandbox:
 
 Hardware checks:
 
-- AMD RDNA3 (RX 7900 XT): unverified (acceptance T9). Needs step 1.1 merged: without it,
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance T9; needs step 1.1 merged: without it,
   `av1_amf` sessions fail on `-header_insertion_mode idr` (A3), although the probe, which uses
-  no rate options, works. Test:
+  no rate options, works)
   1. Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`. Under
      `encoder: av1_amf` look for `pads: coded 1920x1080 as 1920x1082; sessions at sizes that are
      not multiples of 64x16 use HEVC or H.264`. Record the coded size. 1920×1082 is expected;
@@ -799,7 +799,7 @@ Hardware checks:
      picture encoder=av1_amf probe=1920x1080 coded=1920x1082 alignment=64x16`.
   2. Desktop at 1920×1080 (Windows display settings). In Chrome, open the stream settings
      (Ctrl+Alt+Shift+O), set Codec AV1 and Resolution Native, and connect. Pass: a toast "AV1 on
-     this GPU needs 64x16-aligned sizes; using HEVC"; the overlay (Ctrl+Alt+Shift+S) shows
+     this GPU needs 64×16-aligned sizes; using HEVC"; the overlay (Ctrl+Alt+Shift+S) shows
      `Video 1920×1080 HEVC`; host.log has `coded-size alignment notice=…` and `encoder ready …
      codec=hev1…`. One toast per connection (a reconnect shows it again); none on key-frame,
      pause/resume or congestion restarts at the same size.
@@ -817,17 +817,17 @@ Hardware checks:
      window to the bottom screen edge: its last row is visible and there are no extra rows below
      it. Repeat on a 3440×1440 desktop (expect `coded=3456x1440 crop_right=16`). Remove the
      `encoder` key afterwards.
-- AMD RDNA4 (RX 9000): unverified (no RDNA4 host). RDNA4 relaxes the alignment: AMF reports
-  `AMF_VIDEO_ENCODER_AV1_CAP_WIDTH/HEIGHT_ALIGNMENT_FACTOR`, which FFmpeg 8.1 reads as
-  `Av1WidthAlignmentFactor`/`Av1HeightAlignmentFactor`, and adds an `8X2_ONLY` alignment mode.
-  The probe then measures 1920×1080 and the guard never triggers. Test: `recon-host.exe probe`
-  shows no `pads:` line under `av1_amf`. AV1 at 1920×1080 and 3440×1440 streams AV1 without a
-  toast and without padding rows. Record the driver version.
-- NVIDIA: unverified (no NVIDIA host available). Expected: NVENC pads internally and signals
-  1920×1080 in the sequence header. Test on an RTX 40/50 host: `recon-host.exe probe` shows no
-  `pads:` line under `av1_nvenc`. Codec AV1 at a 1920×1080 desktop streams AV1 (overlay `Video
-  1920×1080 AV1`, no toast). If a `pads:` line does appear, record it: the guard then applies
-  to NVIDIA as well, by capability.
+- AMD RDNA4 (RX 9000): unverified (no RDNA4 host). Test: `recon-host.exe probe` shows no
+  `pads:` line under `av1_amf`. AV1 at 1920×1080 and 3440×1440 streams AV1 without a toast and
+  without padding rows. Record the driver version. (Expected: RDNA4 relaxes the alignment: AMF
+  reports `AMF_VIDEO_ENCODER_AV1_CAP_WIDTH/HEIGHT_ALIGNMENT_FACTOR`, which FFmpeg 8.1 reads as
+  `Av1WidthAlignmentFactor`/`Av1HeightAlignmentFactor`, and adds an `8X2_ONLY` alignment mode;
+  the probe then measures 1920×1080 and the guard never triggers.)
+- NVIDIA: unverified (no NVIDIA host available). Test: on an RTX 40/50 host,
+  `recon-host.exe probe` shows no `pads:` line under `av1_nvenc`. Codec AV1 at a 1920×1080
+  desktop streams AV1 (overlay `Video 1920×1080 AV1`, no toast). If a `pads:` line does appear,
+  record it: the guard then applies to NVIDIA as well, by capability. (Expected: no `pads:`
+  line; NVENC pads internally and signals 1920×1080 in the sequence header.)
 
 ## 1.6 AMD Direct Capture (experimental)
 
