@@ -3742,3 +3742,194 @@ with libx264 / libsvtav1):
   family went untimed on the first (no "timed 1080p" on its line: the clip came too late).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same four-profile check streaming
   from the NVIDIA host.
+
+## 4.6 Input and audio tweaks
+
+What changed (host session, ViGEmBus layer, audio encoder, browser client; protocol changes are
+backwards compatible: a ping grows by four bytes that hosts before this step ignore, a client
+before it sends 16-byte pings and keeps 10 ms Opus frames, and the rumble datagram `0x23` was
+already defined and played by clients):
+
+- Mouse: kept as it was (guide: "keep"): `pointerrawupdate` where the browser has it, Pointer
+  Lock with `unadjustedMovement` (falling back to plain Pointer Lock), cumulative `0x20`
+  datagrams. New: the overlay's *Input* row (shown in fullscreen or pointer lock only, so the
+  overlay keeps its height) shows whether the pointer is locked and whether the browser granted
+  `unadjustedMovement`, and which Keyboard Lock is on.
+- Keyboard Lock: Chrome, Edge and Opera as before (`navigator.keyboard.lock()` once in element
+  fullscreen; now recorded as `window.__recon.keyboardLock = "keyboard.lock"`, and a refusal is
+  logged). Safari 26.4 has no `navigator.keyboard`: its Keyboard Lock is the fullscreen option
+  of whatwg/fullscreen PR #232, `requestFullscreen({keyboardLock: "browser"})`. Sources (Apple's
+  release notes page itself could not be opened from the sandbox): press coverage of the Safari
+  26.4 release notes ("Keyboard Lock API": Esc no longer leaves fullscreen, released on a tab
+  change or when leaving fullscreen), and a review comment on the PR of 27 March 2026 that links
+  the release notes and says the implemented keyword is "browser", not the PR's "application".
+  Feature detection: the option is passed only when `navigator.keyboard.lock` is missing, as a
+  getter, so the client learns whether the browser read it (browsers ignore dictionary members
+  they do not know); a browser that reads it but refuses the value (TypeError for an unknown
+  enum value, or NotSupportedError) gets fullscreen without it. Which keys Safari reserves is up
+  to Safari; the documented effect is that Esc goes to the page instead of leaving fullscreen.
+- Rumble: the host did NOT send any. `DgRumble` (`0x23`) was defined, the worker posted it and
+  the page played it, but nothing on the host produced it (`gamepad_windows.go` only plugged pads
+  and submitted reports). Now: every plugged virtual pad has a listener that keeps one
+  `IOCTL_XUSB_REQUEST_NOTIFICATION` (0x2AE804: CTL_CODE(FILE_DEVICE_BUS_EXTENDER, 0x801 + 0x200,
+  METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA), 12-byte `XUSB_REQUEST_NOTIFICATION`
+  {Size, SerialNo, LargeMotor, SmallMotor, LedNumber}, from ViGEmClient's `BusShared.h`)
+  pending, as ViGEmClient's `vigem_target_x360_register_notification` does; ViGEmBus completes it
+  when the game calls `XInputSetState`. A pending request on a handle opened for synchronous I/O
+  would block every other request on it, so the bus handle is now opened with
+  `FILE_FLAG_OVERLAPPED` (as ViGEmClient does) and every IOCTL (version check, plug, wait ready,
+  report, unplug) waits on its own OVERLAPPED/event; an unplug stops the listener (flag, the
+  unplug completes the request, `CancelIoEx` until the listener has returned). Each change of the
+  motor speeds goes to the active session (`Agent.rumble`), which sends `0x23` at once, repeats a
+  running state every 100 ms and a stop three times (datagrams can be lost; LED-only
+  notifications change nothing); a pad the client disconnects stops. The client plays each with
+  `vibrationActuator.playEffect("dual-rumble", {duration: 250, strongMagnitude: large/255,
+  weakMagnitude: small/255})` (250 ms: the 100 ms repeats join up and the motors stop within
+  ~250 ms after the repeats end, e.g. when the connection drops) and calls `reset()` on a stop;
+  browsers whose actuator lists `effects` without "dual-rumble" are skipped; Firefox's
+  `hapticActuators[0].pulse()` is the fallback (one motor). Test hook
+  `RECON_TEST_FAULTS=rumble-echo` (tests only): the host plays a client gamepad's triggers back as rumble, also without ViGEmBus.
+- WebHID DualSense gyro: not built (optional in the guide, out of scope for this step and not
+  trivial: it needs a WebHID permission prompt and DualSense input-report parsing on the client,
+  and a host-side sink for motion, which ViGEmBus's Xbox 360 target does not have; a DualShock 4
+  target with its own report format would be needed).
+- Opus frame duration from the measured RTT: clients now append their minimum RTT of the last
+  30 s (u32 µs) to each ping (`proto.PingMinRTT`). The host picks 5 ms frames below 10 ms
+  (LAN: wired well below 1 ms, Wi-Fi a few ms), 10 ms above 20 ms (WAN), keeps the current one
+  in between (no flapping near a bound) and starts every audio stream with 10 ms until a ping
+  reports an RTT (`media.OpusFrameMs`). A change switches the running gopus encoder
+  (`SetFrameSize`) at its next frame boundary (no samples lost or repeated: pts steps stay
+  240/480), is logged (`audio frame size ms=5 client_min_rtt_ms=…`) and announced in a new
+  `audio` config. The client reads each packet's duration from its Opus TOC (RFC 6716 3.1), so it
+  decodes across a switch without reconfiguring, and conceals a loss by the pts gap; the
+  config's `frameMs` is only for display and as a fallback. PCM stays at 5 ms packets. Fixed on
+  the way: after a live audio codec change (Settings → Audio codec) the client dropped the new
+  stream's packets as late until their sequence numbers passed the old stream's (10 s and more);
+  a new stream now resets the sequence, and packets of the old codec are ignored.
+- Jitter buffer (AudioWorklet): *Auto* (new default; existing saved settings keep their slider
+  value for *Fixed*) starts at 20 ms and adapts within 10–60 ms: the deepest drop of the fill
+  level below its mean in a 250 ms window (packet duration, network jitter, the audio device's
+  render bursts; a delay spike shows as one deep drop), the largest of the last 10 s, plus
+  2.5 ms, plus a bias of 10 ms per underrun that decays by 1 ms per second without one. (A first
+  version used half the level's spread, held for 2 s: in the simulation below, with 40 ms spikes
+  every 2 s, it underran at 2, 4, 14 and 26 s, the bias decaying between spikes; the drop below
+  the mean, held for 10 s, underruns at 2 and 4 s only.) A window whose mean level exceeds the
+  target by more than max(3 ms, a quarter of it) drops the excess, at most 5 ms per window,
+  crossfaded over one render quantum (128 samples) instead of a hard cut; far above it (a burst
+  after a stall) it drops to the target at once, as before. *Fixed* uses the slider's size with
+  the same trimming. The worklet reports target, level, underruns and trimmed audio once a
+  second; the overlay's Audio row shows "opus 5 ms · buf level/target auto · underruns N · lost
+  N".
+- Deviation from the guide's wording: "jitter target 10–20 ms on LAN" is what the measurement
+  gives on a clean LAN, not a value set by link type: the target follows the measured drops,
+  which include the audio device's render period (Windows shared mode 10 ms), so a client with a
+  large device buffer sits higher. The LAN/WAN split for Opus uses the client's minimum RTT, which
+  is end to end on every path (direct, relay, WebSocket); the host's own QUIC RTT would only
+  cover the host → gateway leg on the relay path.
+
+Verified in the sandbox (no GPU, no Windows, no controller; Linux host with the test-tone audio
+source):
+
+- verified (sandbox): `go test ./internal/host/media -run 'TestOpusFrameMs|TestAudioFrameSwitch|TestAudioPacketSamplesJS'`:
+  the frame-size rule on 16 cases (unmeasured → 10 ms; 0.3, 4 and 9.9 ms → 5 ms; 10–20 ms keeps
+  the current duration, 20 ms inclusive; above 20 ms → 10 ms); a running encoder switched 10 → 5
+  → 10 ms: every packet's pts follows the previous packet's duration, its Opus TOC says the
+  duration used and gopus decodes it to that many samples; `protocol.js audioPacketSamples`
+  agrees with gopus's TOC table for all 256 TOC bytes and the host's 5/10 ms packets.
+- verified (sandbox): `go test ./internal/host -run 'TestAudioFrame|TestRumble|TestSessionRumble|TestAgentRumble|TestParseTestFaults' -race`:
+  a session starts Opus at 10 ms, a ping without an RTT (16 bytes, or 0) changes nothing, one
+  reporting 0.8 ms switches to 5 ms (new `audio` config, then only 240-sample pts steps), 14–15
+  ms keeps it, 40 ms switches back, 12 ms keeps 10 ms, an audio restart starts with the last
+  RTT's duration, PCM stays 5 ms; rumble: sent at once, repeated every 100 ms while running (4
+  datagrams in 350 ms), the stop three times and then nothing, a disconnecting pad stops, LED-only
+  changes send nothing, only the active session gets it. `go test ./internal/proto -run 'TestPing'`:
+  protocol.js writes the RTT where Go reads it (clamped to u32, negative → 0), a 16-byte ping
+  reads as no RTT and gets the same pong.
+- verified (sandbox, Wine 9.0): `GOOS=windows go test -c ./internal/host/platform` run under
+  `wine64`: `TestViGEmIoctlCodes` (the six IOCTL codes equal CTL_CODE as BusShared.h defines
+  them) and `TestPadListener`, which runs the listener's overlapped request loop against a named
+  pipe instead of the bus (FSCTL_PIPE_LISTEN stays pending like a notification request): no
+  callback while pending, one when the request completes, `end()` cancels a pending request in
+  3.5 ms and the listener returns, a cancelled request reports ERROR_OPERATION_ABORTED. Not
+  covered: ViGEmBus itself (no driver in Wine).
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`), new checks. Audio, first scenario:
+  the host switched the session to 5 ms frames (`audio frame size ms=5
+  client_min_rtt_ms=3.63`; the client's own minimum RTT on loopback 0.66-2.9 ms), the client
+  received 5 ms packets (Opus TOC) and the config said 5 ms; the overlay row read "opus 5 ms ·
+  buf 30/60 ms auto · underruns 12 · lost 0"; every scenario's existing audio check passed
+  (packets flowing, 0 lost). Keyboard Lock: "keyboard.lock" in fullscreen and none after it, on
+  the 2D (headless), WebGL2 and WebGPU (headed, Xvfb) scenarios; Safari's option on the stubbed
+  `requestFullscreen` (entering Chromium's real fullscreen without the option): `{navigationUI:
+  "hide", keyboardLock: "browser"}` → "fullscreen option"; a refused value (TypeError) → a
+  second call without it, no lock, the refusal logged; a browser that ignores the option → no
+  lock; with `navigator.keyboard.lock` → no option passed. Rumble (host hook `rumble-echo`, fake
+  gamepad): 7 effects `dual-rumble` strong 1 / weak 64/255 / 250 ms, median gap 105 ms (91-108),
+  then 3 `reset()` calls after the release and no effect after the first. Jitter buffer (unit, the
+  worklet run in Node on a simulated clock, 10 ms device period): clean LAN → 10 ms target, no
+  underrun, 5 ms trimmed with a crossfade (largest sample step 0.0318 against the tone's own
+  0.0288; the same trim as a hard cut: 0.1317, which the check catches); 40 ms spikes every 2 s
+  → underruns at 2 and 4 s only, target 41-45 ms (peak 59), 10 ms again 30 s after the spikes
+  end; Fixed 30 ms → 30 ms. Sandbox caveat: the machine (4 cores) was shared with other
+  checkouts' test runs at load averages of 6-30 throughout; in the E2E the Auto target went to
+  its 60 ms cap with 12-50 underruns per session. To tell the algorithm from the machine, the
+  real worklet ran in headless Chromium fed by a worker writing 5 ms packets on a timer (no
+  network, no decoding) at load 15: the level still dropped 15-50 ms below its 250 ms window
+  mean (timer and fake-audio-device jitter), so the cap is the jitter this machine produced;
+  the quiet-link behaviour is what the unit check shows. Runs, with the E2E runs of other
+  checkouts serialised on a shared lock: 161 of 166 passed at load 6-9, the failures frame-rate
+  and timing checks of other steps (Smooth pacing x3, the recovery "skip" decoder-error count)
+  and "Export latency data", which this step's first overlay *Input* row had pushed below the
+  1280x720 viewport (fixed: the row shows only in fullscreen or pointer lock); then 165 of 166,
+  the export check passing, the only failure "WebTransport relay: steady real-time playback"
+  (52 / 44 / 52 fps, the momentary dip); re-run once: 163 of 166, every check of this step
+  passing again (rumble: 8 effects, median gap 115 ms, 3 resets), the failures "WebTransport
+  relay: steady real-time playback" and "video decoding" (43 fps of 60) and "bitrate recovery"
+  (a further congestion cut after two raises) while the load average climbed to 26 during the
+  run. Earlier runs at loads of 12-30 failed only frame-rate checks, plus two that stopped at a
+  headed-WebGPU screenshot timeout; two fixes came out of them: a slow `keyboard.lock()` could set the lock state after leaving fullscreen
+  (state now set only while in fullscreen, and read from `document.fullscreenElement`, as
+  `fullscreenchange` reaches a busy page late), and the rumble check waits for the effects
+  instead of fixed sleeps.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (controller rumble on real hardware; nothing in it
+  depends on the GPU): on the host with ViGEmBus installed (`recon-host.exe probe` prints
+  "gamepads: ViGEmBus available"), stream from Chrome on a Windows client with an Xbox controller
+  connected and press a button so the host plugs the virtual pad (host.log has no "Virtual
+  gamepad error"). Then on the host, in a PowerShell window in the signed-in session:
+  `Add-Type -Namespace Recon -Name XInput -MemberDefinition 'public struct Vib { public ushort L; public ushort R; } [DllImport("xinput1_4.dll")] public static extern uint XInputSetState(uint user, ref Vib v);'`,
+  then `$v = New-Object Recon.XInput+Vib; $v.L = 65535; $v.R = 16384; 0..3 | % { [Recon.XInput]::XInputSetState($_, [ref]$v) }; Start-Sleep 2; $v.L = 0; $v.R = 0; 0..3 | % { [Recon.XInput]::XInputSetState($_, [ref]$v) }`
+  (0 = ERROR_SUCCESS for a connected pad, 1167 for an empty slot). Expected: the controller in
+  your hand rumbles hard on the left (large) motor and lightly on the right for about 2 s and
+  stops within ~0.3 s of the second call; the page console's `window.__recon.rumbles` grows by
+  about 20 + 3. Repeat with a game that has force feedback (e.g. a racing game's collisions), with
+  a DualSense on USB and on Bluetooth in Chrome (Chrome drives DualSense rumble through HID),
+  with Edge, and with Safari 26 on a Mac (Gamepad haptics); Firefox has no `vibrationActuator`
+  by default (expected: no rumble, no error). Then disconnect the controller while it rumbles
+  (it must not keep rumbling when reconnected) and end the session while it rumbles (the motors
+  stop within ~0.3 s). Record per browser and controller: rumbles yes/no, stop delay, and
+  whether a long effect pulses (a gap between the 250 ms effects would mean the repeats arrive
+  late: note the client's Wi-Fi/RTT).
+- NVIDIA: unverified (no NVIDIA host available). Test: the rumble test above on the NVIDIA host
+  (the path is the same: ViGEmBus, XInput, the browser; the GPU plays no part).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Opus frames and jitter buffer on real links): with the
+  host wired, stream from a Windows client on wired LAN, then on Wi-Fi, then through the netem
+  `wan` profile (`make netem PROFILE=wan`, docs/NETEM.md), 2 minutes each with music playing on
+  the host. Expected: host.log `audio frame size ... ms=5 client_min_rtt_ms=<10` on LAN and Wi-Fi
+  (no line on `wan`: the stream stays at 10 ms, `client_min_rtt_ms` would be ~40), overlay Audio
+  row "opus 5 ms" / "opus 10 ms". Record the row's level/target and underruns after 2 minutes per
+  link (expected: target 10–20 ms on wired LAN, higher on Wi-Fi, no more than 60 ms anywhere; a
+  few underruns while the target grows, then none on wired LAN), and listen for clicks when the
+  buffer trims (overlay: the target stays while "buf" drops back). Optional: the netem `wifi`
+  profile (5 ms ± 10 ms jitter) should raise the target towards 30–60 ms with underruns stopping
+  after the first seconds.
+- NVIDIA: unverified (no NVIDIA host available). Test: the audio test above streaming from the
+  NVIDIA host (audio is CPU-only, WASAPI loopback + gopus; no GPU dependence expected).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Keyboard Lock): from Chrome or Edge on Windows enter
+  fullscreen (toolbar or Ctrl+Alt+Shift+F): overlay Input row "keyboard lock keyboard.lock";
+  press Alt+Tab, the Win key and Esc briefly: they act on the host (open Notepad on the host to
+  see Esc/Win), holding Esc leaves fullscreen. From Safari 26.4 on macOS: the overlay row reads
+  "keyboard lock fullscreen option"; a short Esc must reach the host (host input: Esc closes an
+  open menu on the host) and not leave fullscreen; record how Safari lets you leave (expected:
+  holding Esc, or its own UI) and which other keys (Cmd+Tab, Cmd+W, Cmd+Q) still go to macOS.
+  On Safari before 26.4 the row reads "keyboard lock off" and Esc leaves fullscreen, as before.
+- NVIDIA: unverified (no NVIDIA host available). Test: the Keyboard Lock test above against the
+  NVIDIA host (client-side only).

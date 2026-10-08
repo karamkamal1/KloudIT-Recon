@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thesyncim/gopus"
@@ -31,13 +32,58 @@ const (
 type AudioConfig struct {
 	Codec       string // opus | pcm
 	BitrateKbps int    // opus only
+	// FrameMs is the Opus frame duration at the start, OpusFrameLAN or
+	// OpusFrameWAN (anything else: OpusFrameWAN); SetFrameMs changes it
+	// while audio runs. PCM packets are always 5 ms.
+	FrameMs int
+}
+
+// Opus frame durations in ms (step 4.6). The host collects a whole frame
+// before it encodes it, and the client's jitter buffer must hold at least one
+// packet, so 5 ms frames take about 10 ms off the audio path compared with
+// 10 ms ones. On a LAN that is a large share of the audio latency. Over a WAN
+// it is a small one, while 5 ms frames double the packet rate (twice the
+// header overhead, a loss pattern of more and shorter gaps) and code less
+// efficiently, so 10 ms frames are used there, and until the link is measured.
+const (
+	OpusFrameLAN = 5
+	OpusFrameWAN = 10
+)
+
+// The minimum round-trip times that mark a link as LAN (below lanMaxRTT) or
+// WAN (above wanMinRTT). In between the frame duration stays as it is, so a
+// link near a bound does not switch back and forth. A wired LAN measures well
+// below 1 ms, Wi-Fi a few ms (the minimum filters out its jitter); a WAN
+// within a city starts around 10 ms.
+const (
+	lanMaxRTT = 10 * time.Millisecond
+	wanMinRTT = 20 * time.Millisecond
+)
+
+// OpusFrameMs returns the Opus frame duration (ms) for a link whose minimum
+// round-trip time measures minRTT, cur being the duration in use
+// (OpusFrameWAN when cur is neither). minRTT <= 0 (not measured) keeps cur.
+func OpusFrameMs(cur int, minRTT time.Duration) int {
+	if cur != OpusFrameLAN {
+		cur = OpusFrameWAN
+	}
+	switch {
+	case minRTT <= 0:
+		return cur
+	case minRTT < lanMaxRTT:
+		return OpusFrameLAN
+	case minRTT > wanMinRTT:
+		return OpusFrameWAN
+	}
+	return cur
 }
 
 // Audio captures, encodes and packetises audio into datagrams.
 type Audio struct {
-	src AudioSource
-	cfg AudioConfig
-	log *slog.Logger
+	src     AudioSource
+	cfg     AudioConfig
+	log     *slog.Logger
+	frameMs atomic.Int32 // Opus frame duration the encoder switches to at its next frame
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -51,15 +97,29 @@ func NewAudio(src AudioSource, cfg AudioConfig, log *slog.Logger) *Audio {
 	if cfg.BitrateKbps <= 0 {
 		cfg.BitrateKbps = 160
 	}
-	return &Audio{src: src, cfg: cfg, log: log}
+	a := &Audio{src: src, cfg: cfg, log: log}
+	a.frameMs.Store(int32(OpusFrameMs(cfg.FrameMs, 0)))
+	return a
 }
 
-// FrameMs is the packet duration.
+// FrameMs is the packet duration: for Opus the one SetFrameMs set last
+// (packets of the new duration follow from the next frame on).
 func (a *Audio) FrameMs() int {
 	if a.cfg.Codec == "pcm" {
 		return 5
 	}
-	return 10
+	return int(a.frameMs.Load())
+}
+
+// SetFrameMs changes the Opus frame duration (OpusFrameLAN or OpusFrameWAN)
+// from the next frame on, while audio runs; Opus packets carry their duration,
+// so the client needs no new configuration to decode them. It reports whether
+// the duration changed (never for PCM or another value).
+func (a *Audio) SetFrameMs(ms int) bool {
+	if a.cfg.Codec == "pcm" || (ms != OpusFrameLAN && ms != OpusFrameWAN) {
+		return false
+	}
+	return a.frameMs.Swap(int32(ms)) != int32(ms)
 }
 
 func (a *Audio) Codec() string { return a.cfg.Codec }
@@ -111,7 +171,22 @@ func (a *Audio) Start(send func([]byte)) error {
 		}
 		sink := func(s []float32) {
 			pcm = append(pcm, s...)
-			for len(pcm) >= frame*audioChannels {
+			for {
+				if enc != nil {
+					if want := audioRate * a.FrameMs() / 1000; want != frame {
+						if err := enc.SetFrameSize(want); err != nil {
+							if a.log != nil {
+								a.log.Warn("opus frame size", "samples", want, "err", err)
+							}
+							a.frameMs.Store(int32(frame * 1000 / audioRate))
+						} else {
+							frame = want
+						}
+					}
+				}
+				if len(pcm) < frame*audioChannels {
+					break
+				}
 				chunk := pcm[:frame*audioChannels]
 				var payload []byte
 				if enc != nil {

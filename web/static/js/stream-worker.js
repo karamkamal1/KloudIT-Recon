@@ -52,7 +52,7 @@ const video = {
   softwareFor: new Set(), // families decoded in software: their hardware decoder held frames back
 };
 
-const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
+const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0 };
 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
@@ -95,7 +95,7 @@ function freezeStall(meta, sent, presented) {
 
 const congestion = { owdHist: [], over: 0, lastSent: 0 };
 
-const audio = { cfg: null, decoder: null, ring: null, port: null, lastSeq: -1, L: null, R: null };
+const audio = { cfg: null, decoder: null, ring: null, port: null, lastSeq: -1, nextPts: 0, samples: 0, L: null, R: null };
 
 // ---------------------------------------------------------------------------
 // Clock synchronisation (NTP-style, keep the minimum-RTT sample)
@@ -110,7 +110,9 @@ function sendPing() {
   const t0 = now();
   clock.pings.set(id, t0);
   if (clock.pings.size > 20) clock.pings.delete(clock.pings.keys().next().value);
-  transport.sendDatagram(P.ping(id, t0));
+  // The minimum RTT of the last 30 s tells the host whether this is a LAN
+  // (5 ms Opus frames) or a WAN (10 ms; step 4.6).
+  transport.sendDatagram(P.ping(id, t0, clock.minRtt));
 }
 
 function onPong(d) {
@@ -128,6 +130,7 @@ function onPong(d) {
   let best = clock.samples[0];
   for (const s of clock.samples) if (s.rtt < best.rtt) best = s;
   clock.offset = best.offset;
+  clock.minRtt = best.rtt;
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,9 +1395,17 @@ function silence(n) {
 }
 
 function onAudioConfig(cfg) {
+  const same = audio.cfg?.enabled && cfg.enabled && audio.cfg.codec === cfg.codec && audio.cfg.sampleRate === cfg.sampleRate &&
+    audio.cfg.channels === cfg.channels;
   audio.cfg = cfg;
-  if (audio.decoder) { try { audio.decoder.close(); } catch {} audio.decoder = null; }
   post('audio', { cfg });
+  // A new frame duration alone (the host follows the RTT, step 4.6) keeps
+  // the decoder: Opus packets carry their duration.
+  if (same && (cfg.codec !== 'opus' || audio.decoder?.state === 'configured')) return;
+  // Anything else is a new audio stream from the host: its sequence numbers
+  // start again from 0.
+  audio.lastSeq = -1;
+  if (audio.decoder) { try { audio.decoder.close(); } catch {} audio.decoder = null; }
   if (!cfg.enabled || cfg.codec !== 'opus') return;
   audio.decoder = new AudioDecoder({
     output: (ad) => {
@@ -1412,18 +1423,28 @@ function onAudioConfig(cfg) {
 
 function onAudioPacket(d) {
   if (!audio.cfg || !audio.cfg.enabled || d.length < 8) return;
+  if ((d[1] === P.AUDIO_OPUS) !== (audio.cfg.codec === 'opus')) return; // a packet of the stream before a codec change
   const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
   const seq = v.getUint16(2, true);
   const pts = v.getUint32(4, true);
   const payload = d.subarray(8);
-  const frameSamples = 48 * audio.cfg.frameMs;
+  // The packet's own duration (Opus TOC, PCM size): the host changes the
+  // Opus frame duration with the RTT (step 4.6).
+  const samples = P.audioPacketSamples(d) || 48 * audio.cfg.frameMs;
   stats.audioPackets++;
   if (audio.lastSeq >= 0) {
     const gap = (seq - audio.lastSeq - 1) & 0xffff;
-    if (gap > 0 && gap < 4) { stats.audioLost += gap; silence(gap * frameSamples); }
-    else if (gap >= 0x8000) return; // late/duplicate
+    if (gap > 0 && gap < 4) {
+      // Silence for what was lost: up to this packet's pts, which also
+      // covers lost packets of another duration.
+      const missing = (pts - audio.nextPts) >>> 0;
+      stats.audioLost += gap;
+      silence(missing > 0 && missing <= gap * 960 ? missing : gap * samples);
+    } else if (gap >= 0x8000) return; // late/duplicate
   }
   audio.lastSeq = seq;
+  audio.nextPts = (pts + samples) >>> 0;
+  audio.samples = samples;
   if (d[1] === P.AUDIO_OPUS && audio.decoder?.state === 'configured') {
     audio.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(pts * 1e6 / 48000), data: payload }));
   } else if (d[1] === P.AUDIO_PCM) {
@@ -1510,6 +1531,8 @@ function postStats() {
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
     audioMs,
+    audioFrameMs: audio.samples ? audio.samples / 48 : null, // the last packet's duration
+    minRtt: clock.minRtt || null,
     // Decoder hygiene (4.1): decodeQueueSize now and its maximum (bound
     // MAX_DECODE_QUEUE), chunks waiting in front of the decoder, decoded
     // frames closed unseen for a newer one (superseded) and chunks dropped

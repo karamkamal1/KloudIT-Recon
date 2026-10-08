@@ -56,13 +56,15 @@ Techniques used (most of them are new to browser-based game streaming):
   `unadjustedMovement` gives raw mouse deltas. Mouse motion travels as unreliable datagrams that
   carry *running totals*, so a lost datagram only delays motion and never drops it. The host
   injects **scancodes** via SendInput, which works with DirectInput and raw-input games. In
-  fullscreen, Keyboard Lock passes Esc, Alt+Tab and the Win key to the PC.
+  fullscreen, Keyboard Lock passes Esc, Alt+Tab and the Win key to the PC (Chrome and Edge; Safari
+  26.4 keeps Esc for the PC through its fullscreen keyboard-lock option).
 - **Zero-latency local cursor.** In desktop mode the host sends its real cursor shapes (arrow,
   I-beam, resize…) and your browser renders them natively, so the pointer never lags.
 - **Lock-free audio.** System audio is captured with WASAPI loopback and encoded as Opus
-  (CELT low-delay, 10 ms frames) in pure Go, so the PC needs no extra DLLs. It travels as
-  datagrams, through `AudioDecoder`, a **SharedArrayBuffer** ring and an AudioWorklet with an
-  adaptive jitter buffer that trims drift.
+  (CELT low-delay) in pure Go, so the PC needs no extra DLLs: 5 ms frames on a LAN, 10 ms over
+  the internet, picked from the measured round-trip time. It travels as datagrams, through
+  `AudioDecoder`, a **SharedArrayBuffer** ring and an AudioWorklet whose jitter buffer adapts to
+  the network (10–20 ms on a LAN, up to 60 ms on a jittery link) and trims drift.
 - **Live latency readout.** NTP-style clock sync and per-frame host timestamps split every
   frame's *capture → on-screen* latency into capture/encode, host queue, network, transfer,
   reorder, decode, draw and display, with p50/p95/p99 per stage. A **latency probe** checks them
@@ -79,7 +81,8 @@ Techniques used (most of them are new to browser-based game streaming):
   drops, and the client recovers at once: it skips the frame when the encoder heals the picture
   with intra refresh (NVENC H.264 and HEVC), otherwise it asks for a key frame.
 - **Virtual Xbox controllers** through the ViGEmBus driver's IOCTL interface (no
-  ViGEmClient.dll), fed by the browser Gamepad API at 250 Hz.
+  ViGEmClient.dll), fed by the browser Gamepad API at 250 Hz, with **rumble**: a game's force
+  feedback comes back to your controller through the Gamepad API's `vibrationActuator`.
 
 ![Streaming with the performance overlay](docs/img/stream.png)
 
@@ -246,7 +249,8 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 - **Frame rate** (up to 240) and **resolution** (native, or downscaled on the GPU).
 - **Encoder preset**: lowest latency / balanced / best quality.
 - **Display**: pick a monitor on multi-monitor PCs.
-- **Audio**: Opus or lossless PCM, plus the jitter buffer size.
+- **Audio**: Opus or lossless PCM, plus the jitter buffer: *Auto* (default, adapts within
+  10–60 ms) or *Fixed* at the size you set.
 - **Network path, transport, renderer and decoder**: these apply on reconnect. Renderer
   *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for about 10 s on
   the first connection in a browser and remembers its pick for that browser version: a path
@@ -361,7 +365,8 @@ command: `recon-host.exe -v probe`.
   not dim the desktop.
 - **No controller.** Install ViGEmBus (`install-host.ps1 -InstallViGEm`), then check
   `recon-host.exe probe`.
-- **Choppy audio on Wi-Fi.** Raise the jitter buffer in settings (40–60 ms).
+- **Choppy audio on Wi-Fi.** The *Auto* jitter buffer grows after each glitch (overlay: Audio
+  row, underruns); if it still crackles, set it to *Fixed* at 40–60 ms.
 - **Logs**: the PC writes `%APPDATA%\KlouditRecon\host.log`. On the gateway, run
   `journalctl -u recon-gateway -f` (from the Proxmox node: `pct exec 210 -- journalctl -u recon-gateway -n 50`). The browser's overlay (**Ctrl+Alt+Shift+S**) shows the
   active path, codec and latency breakdown.

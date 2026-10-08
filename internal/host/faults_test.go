@@ -53,10 +53,14 @@ func TestParseTestFaults(t *testing.T) {
 	if f, err := parseTestFaults("pre-stage-hold"); err != nil || f != (testFaults{preStageHold: true}) || !f.active() {
 		t.Fatalf("pre-stage-hold: %+v %v", f, err)
 	}
+	if f, err := parseTestFaults("rumble-echo"); err != nil || f != (testFaults{rumbleEcho: true}) || !f.active() {
+		t.Fatalf("rumble-echo: %+v %v", f, err)
+	}
 	for _, bad := range []string{"delay=every:97", "delay=every:0:10ms", "delay=every:5:-1ms", "delay=every:5:1h",
 		"drop=every:x", "drop=sometimes:3", "drop=every:3:4", "recovery=maybe", "loss=1%", "intra-refresh=1",
 		"still", "still=60", "still=after:0", "still=after:x", "still=every:60",
-		"rate-period", "rate-period=2", "rate-period=50ms", "rate-period=11s", "rate-period=-1s", "pre-stage-hold=1"} {
+		"rate-period", "rate-period=2", "rate-period=50ms", "rate-period=11s", "rate-period=-1s", "pre-stage-hold=1",
+		"rumble-echo=1"} {
 		if _, err := parseTestFaults(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

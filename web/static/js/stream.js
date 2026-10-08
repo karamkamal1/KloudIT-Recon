@@ -25,7 +25,7 @@ const ICONS = {
 
 const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
-  audio: true, audioCodec: 'opus', volume: 100, jitterMs: 30,
+  audio: true, audioCodec: 'opus', volume: 100, jitterMode: 'auto', jitterMs: 30,
   renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto',
   mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
@@ -86,6 +86,15 @@ const S = {
   abs: { seq: 0, last: null, settle: 0 },
   wheel: { y: 0, x: 0 },
   cursor: { cache: new Map(), current: null, visible: true, pos: null },
+  // The Keyboard Lock in effect: 'keyboard.lock' | 'fullscreen option' |
+  // null. Only while in fullscreen, where both locks act (read from the
+  // document, not from fullscreenchange, which a busy page gets late).
+  kbLock: null,
+  get keyboardLock() { return document.fullscreenElement ? this.kbLock : null; },
+  set keyboardLock(v) { this.kbLock = v; },
+  pointerRaw: null, // the last pointer lock was granted with unadjustedMovement
+  rumbles: 0, // force-feedback datagrams played
+  audioJitter: null, // the jitter buffer's last report (audio-worklet.js)
   hz: 60,
   history: [],
   lastStats: null,
@@ -146,8 +155,10 @@ async function audioChannel() {
   if (!audio.node) {
     await ctx.audioWorklet.addModule('/js/audio-worklet.js');
     audio.node = new AudioWorkletNode(ctx, 'recon-audio', {
-      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { targetMs: prefs.jitterMs },
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { targetMs: prefs.jitterMs, auto: prefs.jitterMode !== 'fixed' },
     });
+    // The jitter buffer's target, level, underruns and drops, once a second.
+    audio.node.port.onmessage = (e) => { if (e.data?.t === 'jitter') S.audioJitter = e.data; };
     audio.gain = ctx.createGain();
     audio.gain.gain.value = prefs.volume / 100;
     audio.node.connect(audio.gain).connect(ctx.destination);
@@ -553,7 +564,9 @@ const locked = () => document.pointerLockElement === S.surface;
 async function lockPointer() {
   try {
     await S.surface.requestPointerLock({ unadjustedMovement: true });
+    S.pointerRaw = true; // as far as the browser says (Firefox and Safari ignore the option)
   } catch {
+    S.pointerRaw = false;
     try { await S.surface.requestPointerLock(); } catch {}
   }
 }
@@ -718,9 +731,30 @@ window.addEventListener('gamepadconnected', (e) => {
   if (!pads.timer) pads.timer = setInterval(padLoop, 4);
 });
 
+// Force feedback (step 4.6): the host forwards a game's motor speeds
+// (ViGEmBus) as DgRumble datagrams and repeats a running state every 100 ms,
+// so each one plays a little longer than that and the motors run on without
+// a gap and stop soon after the repeats do; a stop (0, 0) ends the effect at
+// once. Gamepad Haptics (vibrationActuator.playEffect "dual-rumble": Chrome,
+// Edge, Safari), else Firefox's older hapticActuators[0].pulse (one motor),
+// else nothing.
+const RUMBLE_MS = 250;
+
 function rumble(m) {
   const gp = navigator.getGamepads?.()[m.idx];
-  gp?.vibrationActuator?.playEffect?.('dual-rumble', { duration: 200, strongMagnitude: m.large / 255, weakMagnitude: m.small / 255 }).catch(() => {});
+  if (!gp) return;
+  const strong = m.large / 255;
+  const weak = m.small / 255;
+  const va = gp.vibrationActuator;
+  const quiet = (f) => { try { Promise.resolve(f()).catch(() => {}); } catch {} };
+  S.rumbles++;
+  if (va && typeof va.playEffect === 'function' && (!va.effects || va.effects.includes('dual-rumble'))) {
+    if (!strong && !weak && typeof va.reset === 'function') quiet(() => va.reset());
+    else quiet(() => va.playEffect('dual-rumble', { duration: RUMBLE_MS, strongMagnitude: strong, weakMagnitude: weak }));
+    return;
+  }
+  const ha = gp.hapticActuators?.[0];
+  if (ha && typeof ha.pulse === 'function') quiet(() => ha.pulse(Math.max(strong, weak), strong || weak ? RUMBLE_MS : 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +779,26 @@ function updateToolbarState() {
   $('btn-fullscreen').classList.toggle('on', !!document.fullscreenElement);
 }
 
+// Keyboard Lock in fullscreen (step 4.6): Esc, Alt+Tab, Win, Ctrl+W... go to
+// the host; hold Esc to leave. Chrome, Edge and Opera lock every key with
+// navigator.keyboard.lock() once in fullscreen. Safari 26.4 has no
+// navigator.keyboard; it takes the lock as a fullscreen option,
+// requestFullscreen({ keyboardLock: "browser" }) (whatwg/fullscreen#232,
+// Safari's keyword), which keeps Esc from leaving fullscreen. Feature
+// detection: the option goes only to browsers without navigator.keyboard.lock,
+// as a getter, so the page learns whether the browser read it (a browser
+// ignores dictionary members it does not know); a browser that knows the
+// option but refuses the value gets fullscreen without it. S.keyboardLock
+// says which lock is on (null: none).
+function fullscreenOptions() {
+  const opts = { navigationUI: 'hide' };
+  const probe = { read: false };
+  if (typeof navigator.keyboard?.lock !== 'function') {
+    Object.defineProperty(opts, 'keyboardLock', { enumerable: true, get() { probe.read = true; return 'browser'; } });
+  }
+  return { opts, probe };
+}
+
 async function toggleFullscreen() {
   if (document.fullscreenElement) {
     navigator.keyboard?.unlock?.();
@@ -752,14 +806,34 @@ async function toggleFullscreen() {
     return;
   }
   // Element fullscreen of the player (canvas stage + stream UI), browser UI hidden.
-  await $('player').requestFullscreen({ navigationUI: 'hide' }).catch((e) => S.logs.push(`${new Date().toISOString()} fullscreen refused: ${e.message}`));
+  const player = $('player');
+  const refused = (e) => S.logs.push(`${new Date().toISOString()} fullscreen refused: ${e.message}`);
+  const { opts, probe } = fullscreenOptions();
+  try {
+    await player.requestFullscreen(opts);
+    if (probe.read && document.fullscreenElement !== null) S.keyboardLock = 'fullscreen option';
+  } catch (e) {
+    if (!probe.read || (e.name !== 'TypeError' && e.name !== 'NotSupportedError')) { refused(e); return; }
+    S.logs.push(`${new Date().toISOString()} fullscreen keyboard lock refused (${e.name}: ${e.message}); fullscreen without it`);
+    await player.requestFullscreen({ navigationUI: 'hide' }).catch(refused);
+  }
 }
 
 document.addEventListener('fullscreenchange', async () => {
   if (document.fullscreenElement) {
-    // Keyboard lock: Esc, Alt+Tab, Win, Ctrl+W... go to the host (hold Esc to exit).
-    await navigator.keyboard?.lock?.().catch(() => {});
+    if (typeof navigator.keyboard?.lock === 'function') {
+      const ok = await navigator.keyboard.lock().then(() => true, (e) => {
+        S.logs.push(`${new Date().toISOString()} keyboard lock refused: ${e.message}`);
+        return false;
+      });
+      // Still in fullscreen: the lock may resolve after a quick exit.
+      if (ok && document.fullscreenElement) S.keyboardLock = 'keyboard.lock';
+    }
     if (prefs.mouse === 'game') lockPointer();
+  } else {
+    // Left by any way (hotkey, held Esc, the browser's UI): the lock goes with it.
+    navigator.keyboard?.unlock?.();
+    S.keyboardLock = null;
   }
   updateToolbarState();
 });
@@ -824,13 +898,35 @@ function onStats(st) {
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
     ...presentRows(st, row),
     pacingRow(st.pacing, row),
-    row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
+    inputRow(row),
+    audioRow(st, row),
     ...decoderRows(st, row),
     row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · superseded ${st.superseded ?? 0} (+${st.supersededChunks ?? 0} undecoded) · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
     row('Freezes > 100 ms', st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0', st.freezes ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
+}
+
+// Input (step 4.6), while a lock can be in effect (fullscreen, pointer
+// lock): the Keyboard Lock (Chromium's navigator.keyboard.lock or Safari's
+// fullscreen option) and whether the pointer lock has unadjustedMovement.
+// Not shown otherwise, so the overlay keeps its height (and its export
+// button its place).
+function inputRow(row) {
+  if (!document.fullscreenElement && !locked()) return null;
+  return row('Input', `keyboard lock ${S.keyboardLock || 'off'} · pointer ${locked() ? `locked${S.pointerRaw ? ' (unadjusted)' : ''}` : 'free'}`);
+}
+
+// Audio (step 4.6): codec and packet duration (the host picks Opus 5 ms on
+// a LAN, 10 ms over a WAN, from the RTT), the jitter buffer's level and
+// target (adaptive or fixed), underruns and packets lost.
+function audioRow(st, row) {
+  const c = S.audioCfg;
+  if (!c?.enabled) return row('Audio', 'off');
+  const j = S.audioJitter;
+  const buf = j ? `buf ${fmt(j.levelMs, 0, '')}/${fmt(j.targetMs, 0)} ${j.auto ? 'auto' : 'fixed'} · underruns ${j.underruns}` : `buf ${fmt(st.audioMs, 0)}`;
+  return row('Audio', `${c.codec} ${fmt(st.audioFrameMs ?? c.frameMs, 0)} · ${buf} · lost ${st.audioLost}`, j?.underruns ? 'warn' : '');
 }
 
 // The encoder's bitrate target: below the setting while a congestion
@@ -1049,10 +1145,14 @@ function buildDrawer() {
   bitrate.addEventListener('change', () => { prefs.bitrate = +bitrate.value; savePrefs(); applyLive(); });
   const vol = el('input', { type: 'range', min: '0', max: '150', value: String(prefs.volume) });
   vol.addEventListener('input', () => { prefs.volume = +vol.value; savePrefs(); if (audio.gain) audio.gain.gain.value = prefs.volume / 100; });
-  const jitter = el('input', { type: 'range', min: '10', max: '120', step: '5', value: String(prefs.jitterMs) });
+  const jitter = el('input', { type: 'range', min: '10', max: '120', step: '5', value: String(prefs.jitterMs), disabled: prefs.jitterMode !== 'fixed' });
   const jout = el('output', {}, `${prefs.jitterMs} ms`);
+  const applyJitter = () => {
+    jitter.disabled = prefs.jitterMode !== 'fixed';
+    audio.node?.port.postMessage({ targetMs: prefs.jitterMs, auto: prefs.jitterMode !== 'fixed' });
+  };
   jitter.addEventListener('input', () => { jout.textContent = `${jitter.value} ms`; });
-  jitter.addEventListener('change', () => { prefs.jitterMs = +jitter.value; savePrefs(); audio.node?.port.postMessage({ targetMs: prefs.jitterMs }); });
+  jitter.addEventListener('change', () => { prefs.jitterMs = +jitter.value; savePrefs(); applyJitter(); });
 
   $('drawer').replaceChildren(
     el('h3', {}, 'Stream settings', el('button', { class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
@@ -1073,7 +1173,9 @@ function buildDrawer() {
       check('audio', 'Stream PC audio', applyLive),
       field('Codec', select('audioCodec', [['opus', 'Opus (CELT low-delay)'], ['pcm', 'PCM (lossless, ~1.5 Mbps)']], applyLive)),
       field('Volume', vol),
-      field('Jitter buffer', el('div', { class: 'range-row' }, jitter, jout), 'Lower = less delay, higher = fewer glitches on Wi-Fi.'),
+      field('Jitter buffer', select('jitterMode', [['auto', 'Auto (adapts, 10–60 ms)'], ['fixed', 'Fixed']], applyJitter),
+        'Auto holds what the network needs: 10–20 ms on a LAN, up to 60 ms on a jittery link.'),
+      field('Fixed size', el('div', { class: 'range-row' }, jitter, jout), 'Lower = less delay, higher = fewer glitches on Wi-Fi.'),
     ),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Diagnostics'),
       check('latencyProbe', 'Latency probe (host test page)', () => post({ type: 'prefs', prefs: { latencyProbe: prefs.latencyProbe } })),

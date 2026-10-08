@@ -151,13 +151,41 @@ export function gamepadState(idx, connected, seq, s) {
   return b;
 }
 
-export function ping(id, t0) {
-  const b = new Uint8Array(16);
+/**
+ * A clock-sync ping. Since step 4.6 it carries minRttMs, the smallest RTT of
+ * the recent pings (0: none yet), as u32 µs after t0: the host picks the Opus
+ * frame duration by it (5 ms on a LAN, 10 ms over a WAN). Hosts before it
+ * ignore the extra bytes.
+ */
+export function ping(id, t0, minRttMs = 0) {
+  const b = new Uint8Array(20);
   const v = new DataView(b.buffer);
   b[0] = DG_PING;
   v.setUint32(4, id >>> 0, true);
   v.setFloat64(8, t0, true);
+  v.setUint32(16, Math.max(0, Math.min(4294967295, Math.round(minRttMs * 1000))), true);
   return b;
+}
+
+// Opus frame durations in 48 kHz samples by TOC config (RFC 6716 3.1): SILK
+// 10/20/40/60 ms, Hybrid 10/20 ms, CELT 2.5/5/10/20 ms.
+const OPUS_FRAME = [480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960,
+  120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960];
+
+/**
+ * The samples per channel (48 kHz) an audio datagram carries: from the Opus
+ * packet's TOC byte (its frame duration and count) or the PCM payload size;
+ * 0 when malformed. Opus packets carry their duration, so the host can change
+ * the frame duration without a new configuration (step 4.6).
+ */
+export function audioPacketSamples(d) {
+  if (d.length < 9) return 0;
+  if (d[1] === AUDIO_PCM) return (d.length - 8) >> 2;
+  if (d[1] !== AUDIO_OPUS) return 0;
+  const toc = d[8];
+  const code = toc & 3;
+  const frames = code === 0 ? 1 : code < 3 ? 2 : d.length > 9 ? d[9] & 0x3f : 0;
+  return OPUS_FRAME[toc >> 3] * frames;
 }
 
 export function frameAck(gen, seq, owdUs, decodeUs) {

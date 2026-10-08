@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 )
 
 // ALPN identifiers for the gateway's UDP listener.
@@ -290,6 +291,7 @@ const (
 )
 
 // Pong builds the reply to a ping datagram (echoing id and client time).
+// Bytes after the 16 it echoes (PingMinRTT) are not echoed.
 func Pong(ping []byte, hostNowUs uint64) []byte {
 	if len(ping) < 16 {
 		return nil
@@ -365,7 +367,22 @@ func ParseGamepad(b []byte) (Gamepad, bool) {
 	}, true
 }
 
-// Rumble builds a force-feedback datagram for gamepad idx.
+// PingMinRTT returns the round-trip time a ping reports (clients since step
+// 4.6 append a u32 after t0: the smallest RTT, in µs, of their pings in the
+// last 30 s), or 0: from an older client, or before the client measured one.
+// The host picks the Opus frame duration by it (media.OpusFrameMs). Hosts
+// before it ignore the extra bytes.
+func PingMinRTT(b []byte) time.Duration {
+	if len(b) < 20 || b[0] != DgPing {
+		return 0
+	}
+	return time.Duration(binary.LittleEndian.Uint32(b[16:])) * time.Microsecond
+}
+
+// Rumble builds a force-feedback datagram for gamepad idx: the speeds of its
+// large (low-frequency) and small (high-frequency) motors, 0-255, as a game
+// set them (XInputSetState). The host repeats a running state every 100 ms
+// (the client plays each for a little longer) and a stop three times.
 func Rumble(idx, large, small uint8) []byte {
 	return []byte{DgRumble, idx, large, small}
 }
@@ -476,10 +493,13 @@ func MouseRelDatagram(seq uint32, cx, cy int32) []byte {
 	return b
 }
 
-func PingDatagram(id uint32, t0 float64) []byte {
-	b := make([]byte, 16)
+// PingDatagram builds a ping as clients since step 4.6 send it: with their
+// minimum RTT (PingMinRTT; 0: none measured yet).
+func PingDatagram(id uint32, t0 float64, minRTTUs uint32) []byte {
+	b := make([]byte, 20)
 	b[0] = DgPing
 	binary.LittleEndian.PutUint32(b[4:], id)
 	binary.LittleEndian.PutUint64(b[8:], math.Float64bits(t0))
+	binary.LittleEndian.PutUint32(b[16:], minRTTUs)
 	return b
 }

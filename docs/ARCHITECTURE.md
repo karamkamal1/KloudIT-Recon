@@ -135,12 +135,13 @@ the next frames undecodable, not just blurred).
 
 | Type | Dir | Layout | Notes |
 |---|---|---|---|
-| `0x10` audio | H→C | codec, u16 seq, u32 pts(48 kHz), payload | Opus 10 ms (CELT LD) or PCM s16 5 ms |
+| `0x10` audio | H→C | codec, u16 seq, u32 pts(48 kHz), payload | Opus (CELT LD) 5 ms on a LAN, 10 ms over a WAN (from the ping's RTT; the packets carry their duration), or PCM s16 5 ms |
 | `0x11` cursor pos | H→C | visible, u32 seq, u16 x, u16 y | normalised to the captured display |
 | `0x20` mouse rel | C→H | u32 seq, i32 **cumulative** x, i32 **cumulative** y | loss only delays motion, never drops it |
 | `0x21` mouse abs | C→H | u32 seq, u16 x, u16 y | latest wins |
 | `0x22` gamepad | C→H | idx, connected, u32 seq, XInput state | full snapshot, re-sent every 100 ms |
-| `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, (u64 host µs) | NTP-style clock sync, minimum-RTT sample |
+| `0x23` rumble | H→C | idx, u8 large motor, u8 small motor | force feedback from ViGEmBus; a running state re-sent every 100 ms, a stop 3 times |
+| `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, ping: u32 min RTT µs; pong: u64 host µs | NTP-style clock sync, minimum-RTT sample; the ping's min RTT (since step 4.6; 16-byte pings before) picks the Opus frame |
 | `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | host-side telemetry |
 
 For mouse motion, the client keeps running totals and the host applies `total − last_total`
@@ -419,6 +420,33 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   10 s (`host_capture`, `host_queue`). Hosts announce `stage-hold` in `welcome.features` when
   they take the hold row; to older hosts (at most nine rows) the client reports hold and draw
   as one draw row (decoder output→drawn), as before step 4.4.
+- **Input and audio** (step 4.6). Mouse: `pointerrawupdate` (raw, uncoalesced) with Pointer Lock
+  `unadjustedMovement` (OS acceleration off; falls back to plain Pointer Lock), sent as
+  cumulative totals in `0x20` datagrams. Keyboard Lock in fullscreen: `navigator.keyboard.lock()`
+  where it exists (Chromium); Safari 26.4 has no `navigator.keyboard` and takes the lock as a
+  fullscreen option, `requestFullscreen({keyboardLock: "browser"})` (whatwg/fullscreen#232),
+  passed only to browsers without `navigator.keyboard.lock`, as a getter so the client knows
+  whether the browser read it; a refused value falls back to fullscreen without it. The
+  overlay's Input row (in fullscreen or pointer lock; and `window.__recon.keyboardLock`) names
+  the lock in effect. Gamepads: polled at
+  250 Hz (`0x22`); force feedback comes back as `0x23`: the host keeps one
+  `IOCTL_XUSB_REQUEST_NOTIFICATION` pending per virtual pad (overlapped I/O on the ViGEmBus
+  handle) and forwards each change of the motor speeds to the active session, which repeats a
+  running state every 100 ms and a stop three times (datagrams can be lost); the client plays
+  each with `vibrationActuator.playEffect("dual-rumble")` for 250 ms (so the repeats join up and
+  the motors stop soon after they end) and `reset()` on a stop (Firefox: `hapticActuators[0].pulse`).
+  Audio: the client's pings carry its minimum RTT of the last 30 s; the host picks Opus 5 ms frames
+  below 10 ms (LAN) and 10 ms above 20 ms (WAN), keeps the current one in between and starts with
+  10 ms (`media.OpusFrameMs`), switches the running encoder at its next frame and sends a new
+  `audio` config. The client takes each packet's duration from its Opus TOC (loss concealment
+  by pts), so a switch needs no decoder change. The AudioWorklet's jitter buffer (Settings →
+  Jitter buffer: Auto, or Fixed with the size slider) starts at 20 ms and adapts between 10 and
+  60 ms: the deepest drop of its fill level below the mean of a 250 ms window (packet size,
+  network jitter, the audio device's render bursts; a delay spike is one deep drop), the largest
+  of the last 10 s, plus 2.5 ms, plus 10 ms per underrun (decaying 1 ms/s); a window whose mean
+  level is above the target drops the excess (at most 5 ms per window, crossfaded over one render
+  quantum). The overlay's Audio row shows the
+  packet duration, level/target, underruns and lost packets.
 
 ## Direct path
 
