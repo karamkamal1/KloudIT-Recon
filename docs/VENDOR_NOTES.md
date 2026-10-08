@@ -3244,9 +3244,12 @@ and logs one more field):
   after its output (a `MessageChannel` hop), outputs already waiting by then supersede each other
   and only the newest is drawn.
 - Smooth: the frame waits for the next display refresh and is drawn in the worker's
-  `requestAnimationFrame` callback, so the screen gets at most one new frame per refresh, drawn as
-  the refresh starts. At most one frame waits: a newer output replaces it (the older one is
-  closed unseen and acknowledged as decoded, stats `superseded`, as in Lowest latency). "Drop
+  `requestAnimationFrame` callback, so the screen gets at most one new frame per refresh. The
+  callback runs some time after the refresh starts (below: 0.1-16 ms here), and a desynchronized
+  canvas shows the draw when it happens, so the picture can still change mid-scanout (tearing
+  stays possible); Smooth evens the cadence, it does not align draws to the refresh boundary.
+  At most one frame waits: a newer output replaces it (the older one is closed unseen and
+  acknowledged as decoded, stats `superseded`, as in Lowest latency). "Drop
   anything older than one refresh" (guide wording), as built: a frame is older than one refresh
   when more than 1.25 refresh intervals passed from its decoder output to the start of the
   refresh that would draw it (the callback's timestamp; the quarter refresh of slack covers a
@@ -3258,11 +3261,13 @@ and logs one more field):
   leave an older picture on screen until something changes; and never two drops in a row, so a
   refresh source that is always late cannot starve the screen. Superseding already keeps a
   frame from waiting behind a newer one, so in steady streaming the stale rule only acts when
-  the browser delays its refresh callbacks.
+  the browser delays its refresh callbacks (judged against the refresh interval the ticks show,
+  below, not the page-load measurement).
 - Refresh ticks: the worker's `requestAnimationFrame` (its timestamp is the start of the
   refresh); where a browser has none in workers, the main thread posts its own animation frames'
   start times (`ticks` on/off, only while Smooth needs them); and a watchdog: a frame that got no
-  tick for max(3 refreshes, 100 ms) is drawn (or dropped by the same rule) from a timer, logged
+  tick for max(3 refreshes, 100 ms) is drawn from a timer (never dropped as stale, review fix: no
+  refresh would come sooner for the newer frame either; it is counted late), logged
   once per run of such draws (`frame pacing: no display refresh within 100 ms of a decoded frame;
   drawing from a timer`) and counted (`pacing.counts.timer`, the overlay's *watchdog*). The
   first version used 3 refreshes + 10 ms (60 ms at 60 Hz): on the emulated GPU here the worker's
@@ -3270,9 +3275,28 @@ and logs one more field):
   drew 16 of 84 frames,
   working around the browser's own back-pressure; the watchdog is for a callback that never
   comes, not for a slow one.
-- The refresh interval is the main thread's measurement at page load (`client.hz`), now the
-  median interval of 30 animation frames instead of their mean: in the headed browser here a
-  frame skipped during the measurement made it 39 Hz (25.64 ms) for a 60 Hz display.
+- The refresh interval ("one refresh", review fix) is the one the pacer's ticks show: the
+  shortest of the last 30 intervals between refresh ticks (their timestamps are refresh starts,
+  so each interval is a whole number of refreshes). A stream below the refresh rate gets a tick
+  only every few refreshes, so at most every 250 ms the pacer also asks for the refresh right
+  after a frame's: consecutive refreshes then occur. (Asking for that tick after every frame
+  doubled the worker's refresh requests for a 30 fps stream at 60 Hz, and the headed test
+  browser then drew 18 fps in two of four runs in the window right after Auto's bake-off, where
+  the old pacer drew 24-32 fps in six runs and the same code without the extra ticks 26 and 28
+  fps.) Until 8 intervals are seen it is the main thread's measurement at page load
+  (`client.hz`), now the median interval of 30 animation frames instead of their mean: in the
+  headed browser here a frame skipped during the measurement made it 39 Hz (25.64 ms) for a 60
+  Hz display. The first version used only that measurement, so a page that later refreshes
+  slower than it measured (loaded on a 144 Hz monitor and fullscreened on a 60 Hz one, a browser
+  energy saver or OS low-power mode capping it to 30 fps) classed frames that waited one
+  ordinary refresh as stale and, with a newer chunk in the decoder, dropped every other frame
+  (the review's simulation of the pacer: a 60 fps stream on 60 Hz with a 144 Hz measurement drew
+  59 of 119 frames). With the observed interval the same simulation draws 115 of 119 (the 4
+  drops are among the first 8 frames, before 8 intervals are seen), and 119 of 119 from the
+  right measurement; a 30 fps stream on 60 Hz and a 60 fps stream on 144 Hz both settle on the
+  display's interval (16.67 / 6.94 ms) whatever the measurement, with 4 extra refresh requests
+  per second. The overlay's *Frame pacing* row and `lastStats.pacing.refreshMs` show the
+  interval in use.
 - Phase 0 stage accounting: a new stage **hold** (decoder output → draw start: the frame pacing
   wait; one task in Lowest latency, the wait for the refresh in Smooth) between decode and draw;
   **draw** is now the renderer's draw call (draw start → drawn; before: decoder output → drawn,
@@ -3281,12 +3305,13 @@ and logs one more field):
   *Frame pacing* row (mode; for Smooth the tick source, worker or page `rAF`, the refresh
   interval, and the session's stale, late and watchdog counts). Stage dump (`stageDump`, the
   latency export): per frame `drawStart`, `via` (hop | raf | main | timer), `tick` (the refresh
-  start) and `pacing`. The client's stage report names the mode (`pacing`: latency, smooth, or
-  mixed when it changed in the window); the host logs `pacing=` and the `hold=` row. Hosts
-  announce `stage-hold` in `welcome.features` (`proto.FeatureStageHold`); hosts before this step
-  accept at most nine rows, so the client reports hold and draw to them as one draw row (decoder
-  output → drawn, the old meaning). The bake-off result names the pacing mode it ran in; its
-  draw stage no longer includes the hop (it does not depend on the path).
+  start), `refresh` (the refresh interval Smooth judged the frame by; review fix) and `pacing`.
+  The client's stage report names the mode (`pacing`: latency, smooth, or mixed when it changed
+  in the window); the host logs `pacing=` and the `hold=` row. Hosts announce `stage-hold` in
+  `welcome.features` (`proto.FeatureStageHold`); hosts before this step accept at most nine
+  rows, so the client reports hold and draw to them as one draw row (decoder output → drawn, the
+  old meaning). The bake-off result names the pacing mode it ran in; its draw stage no longer
+  includes the hop (it does not depend on the path).
 
 Found in the sandbox (Chromium 141 from Playwright 1.56, Linux, no GPU):
 
@@ -3365,10 +3390,36 @@ Verified in the sandbox:
 - verified (sandbox): `go test ./...`: `TestLogStagesRenderer` (the host logs `pacing=` for
   latency/smooth/mixed and nothing for other values, the `hold=` row, a ten-row report with
   every stage) and `internal/e2e` (every client's welcome lists `stage-hold`).
-- verified (sandbox, ad hoc, not kept as a test): the new client in Smooth against a host built
-  from the commit before this step (no `stage-hold` in its welcome): the host accepted the
-  report and logged `draw="12.4/15.7/19.2 n=297"` (hold and draw as one row; the client's own
-  overlay had hold p50 7.63 ms and draw p50 4.38 ms) and no `hold=` or `pacing=`.
+- verified (sandbox, ad hoc): the new client in Smooth against a host built from the commit
+  before this step (no `stage-hold` in its welcome): the host accepted the report and logged
+  `draw="12.4/15.7/19.2 n=297"` (hold and draw as one row; the client's own overlay had hold p50
+  7.63 ms and draw p50 4.38 ms) and no `hold=` or `pacing=`. Kept as a test since the review
+  fixes: the host's test hook `RECON_TEST_FAULTS=pre-stage-hold` plays such a host (no
+  `stage-hold` in the welcome; a report is logged only with at most nine rows, none named hold),
+  `TestLogStagesRenderer` checks that the hook logs the merged nine-row report and drops a
+  ten-row one, and the browser E2E streams from a host with the hook in Smooth: the host must log
+  the report, without `hold=`, its draw row with e2e's `n` and a p50 equal to the client's hold +
+  draw p50 from the stage dump (within max(1.5 ms, 15 %)) and at least 1 ms above draw alone.
+- verified (sandbox, review fixes): `go test ./...`, `go vet` (Linux and Windows), `node
+  --check`, and the browser E2E with 152 checks (13 pacer unit checks; the three new ones fail
+  on the previous `pacing.js`: the watchdog dropped a frame as stale, no interval from the
+  ticks, no extra tick). The machine was shared with other checkouts' test runs (load average
+  4-15 during most runs): the best run with the final code passed 150 of 152, failing only the
+  WebTransport relay "steady real-time playback" and "video decoding" fps checks of the Lowest
+  latency scenario (load rising to 6.7), and every check failed in some run passed in others;
+  the failures were real-time fps, loss-recovery and bitrate-recovery checks of the Lowest
+  latency scenarios (step 1.4/1.5 checks, untouched here), and, at load 9-15, WebGPU's starved
+  refreshes (no barcode sampled, the bake-off's draws under 250 from the worker's refresh). In
+  that run: Smooth on the 2D canvas 112 frames (27.9 fps of 60, the worker's refresh 32.9 Hz),
+  all from the worker's refresh, the pacer's refresh 16.67 ms from its ticks, each at the first
+  refresh after its output, every frame over 1.25 refresh counted late (checked per frame
+  against the interval it was judged by); the watchdog window 25 frames from the timer, stale
+  +0, late +3; WebGL2 28.5 fps of 30; WebGPU 17.7 fps of 30 from the worker's refresh; the
+  bake-off in Smooth 328 draws from the worker's refresh, 1 stale; the host with
+  `pre-stage-hold` logged `renderer=canvas2d pacing=smooth`, no hold row, draw p50 17.9 ms n 259
+  = e2e's n, the client's hold + draw p50 17.88 ms (stage dump, 260 frames), draw alone 12.63
+  ms. The fps right after Auto's bake-off (the check's "fps after", at least 20) read 22.0-28.0
+  in six runs with the final code and 18.1 in one at load 10.
 - Not verifiable here: presentation timing on a real GPU and display (front-buffer behaviour of
   a desynchronized canvas drawn in the refresh callback, PresentMon's display intervals),
   refresh rates other than 60 Hz, network jitter on the stream (the E2E runs on the shared
@@ -3382,11 +3433,15 @@ timing of its encoder and capture):
   HEVC 1920×1080 at 60 fps, then at 120 fps, wired LAN, to Chrome on a Windows 11 client with a
   120 Hz display, Renderer *2D canvas*, fullscreen. Open the overlay (Ctrl+Alt+Shift+S) briefly:
   the *Frame pacing* row in Smooth must read `Smooth · each refresh (worker rAF, 8.33 ms)` (the
-  display's interval; 16.67 means the page-load measurement missed, record it). For each mode
-  (*Lowest latency*, then *Smooth*, switched in the drawer while streaming) close the overlay and
-  capture 30 s of PresentMon on the browser:
+  refresh interval the pacer's ticks show, the display's; 16.67 means the browser runs the page
+  at 60 Hz, for example an energy saver: record it). Also move the browser window to a 60 Hz
+  monitor (or turn on the browser's energy saver) while streaming in Smooth: within a second the
+  row must follow (16.67 ms, or 33.33 at 30 fps), and stale must not climb with each frame. For
+  each mode (*Lowest latency*, then *Smooth*, switched in the drawer while streaming) close the
+  overlay and capture 30 s of PresentMon on the browser:
   `.\PresentMon-2.x-x64.exe --process_name chrome.exe --output_file recon-amd-60fps-<mode>.csv --timed 30 --terminate_after_timed`,
-  then `python3 tools/latency-rig/rig.py presentmon recon-amd-60fps-*.csv`. Record per mode the
+  then run `python3 tools/latency-rig/rig.py presentmon` once per capture (it takes one CSV:
+  `recon-amd-60fps-latency.csv`, then `recon-amd-60fps-smooth.csv`). Record per mode the
   `MsBetweenDisplayChange` p50/p95 and the PresentMode shares. Pass: in Smooth at 60 fps the
   display changes every 16.7 ms (p95 at most 17.5 ms, no 8.3/25 ms alternation), at 120 fps
   every 8.3 ms; Lowest latency may alternate. Then reopen the overlay and record the stage rows

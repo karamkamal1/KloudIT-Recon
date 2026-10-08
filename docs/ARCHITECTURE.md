@@ -266,20 +266,27 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
     older ones are closed unseen. A desynchronized canvas bypasses the compositor's double
     buffering where the platform supports it.
   - **Smooth**: a decoded frame waits for the next display refresh (the worker's
-    `requestAnimationFrame`, whose timestamp is the refresh's start) and is drawn there, so the
-    screen gets at most one new frame per refresh, drawn as the refresh starts. It costs up to
-    one refresh of latency. At most one frame waits: a newer output replaces it (the older one
-    is closed unseen). A frame older than one refresh when its refresh comes (more than 1.25
-    refresh intervals from its output to the refresh's start: the refresh came late or was
-    skipped) is dropped when a newer frame is already in the decoder (that one takes the next
-    refresh); otherwise it is drawn late, because it is the newest picture there is (the last
-    frame before a still desktop must not be lost), and never two drops in a row, so a refresh
-    source that is always late cannot starve the screen. Without `requestAnimationFrame` in the
-    worker the main thread posts its animation frames' start times; a frame that gets no tick
-    for max(3 refreshes, 100 ms) is handled from a timer (logged; the overlay counts these
-    *watchdog* draws; long enough not to override the browser's own back-pressure, which
-    delays the callbacks while its compositor or GPU is behind). Both modes work with every presentation path below, and with Auto's
-    bake-off.
+    `requestAnimationFrame`, whose timestamp is the refresh's start) and is drawn in that
+    callback, so the screen gets at most one new frame per refresh. The callback runs some time
+    after the refresh starts, and a desynchronized canvas shows the draw when it happens (it can
+    still change mid-scanout): Smooth evens the cadence, it does not align draws to the refresh
+    boundary. It costs up to one refresh of latency. At most one frame waits: a newer output
+    replaces it (the older one is closed unseen). A frame older than one refresh when its
+    refresh comes (more than 1.25 refresh intervals from its output to the refresh's start: the
+    refresh came late or was skipped) is dropped when a newer frame is already in the decoder
+    (that one takes the next refresh); otherwise it is drawn late, because it is the newest
+    picture there is (the last frame before a still desktop must not be lost), and never two
+    drops in a row, so a refresh source that is always late cannot starve the screen. "One
+    refresh" is the interval the ticks show (the shortest of the last 30 between refresh ticks;
+    at most every 250 ms the refresh after a frame's is ticked too, so consecutive refreshes
+    occur for a stream below the refresh rate), the page-load measurement only until 8 are seen:
+    the page may later refresh slower than it measured (another monitor, a power saver). Without
+    `requestAnimationFrame` in the worker the main thread posts its animation frames' start
+    times; a frame that gets no tick for max(3 refreshes, 100 ms) is drawn from a timer, never
+    dropped as stale (no refresh comes sooner for a newer one either; logged; the overlay counts
+    these *watchdog* draws; long enough not to override the browser's own back-pressure, which
+    delays the callbacks while its compositor or GPU is behind). Both modes work with every
+    presentation path below, and with Auto's bake-off.
 - Presentation (step 4.3): three paths, Settings → Renderer: 2D canvas (desynchronized), WebGL2
   (desynchronized requested; `texImage2D(frame)` into a texture, one triangle), WebGPU
   (`importExternalTexture`, zero copy; WebGPU canvases have no low-latency mode), or **Auto**

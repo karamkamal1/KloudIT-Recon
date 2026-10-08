@@ -287,7 +287,10 @@ func (s *Session) sendWelcome() error {
 	for _, e := range s.a.caps.Encoders {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
-	w.Features = append(s.a.features(), proto.FeatureStageHold)
+	w.Features = s.a.features()
+	if !s.a.faults.preStageHold {
+		w.Features = append(w.Features, proto.FeatureStageHold)
+	}
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
@@ -1511,6 +1514,11 @@ func pctString(v []float64) string {
 var stageNames = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
 	"decode": true, "hold": true, "draw": true, "display": true, "e2e": true}
 
+// stageNamesBeforeHold are the rows hosts before step 4.4 accepted (no hold,
+// at most nine): what the test hook pre-stage-hold (TestFaultsEnv) plays.
+var stageNamesBeforeHold = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
+	"decode": true, "draw": true, "display": true, "e2e": true}
+
 // rendererName accepts the presentation paths a client may name.
 var rendererName = regexp.MustCompile(`^[a-z0-9-]{1,24}$`)
 
@@ -1523,8 +1531,12 @@ var pacingModes = map[string]bool{"latency": true, "smooth": true, "mixed": true
 // the client's presentation path (renderer) and frame pacing mode (pacing)
 // when it names them.
 func (s *Session) logStages(rows []proto.StageStat, renderer, pacing string) {
+	names := stageNames
+	if s.a.faults.preStageHold {
+		names = stageNamesBeforeHold
+	}
 	p, ok := s.video.Active()
-	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
+	if !ok || len(rows) == 0 || len(rows) > len(names) {
 		return
 	}
 	args := []any{"encoder", p.Encoder.Name, "vendor", p.Encoder.Vendor, "source", p.Source.Backend, "fps", p.FPS,
@@ -1536,7 +1548,7 @@ func (s *Session) logStages(rows []proto.StageStat, renderer, pacing string) {
 		args = append(args, "pacing", pacing)
 	}
 	for _, r := range rows {
-		if !stageNames[r.Name] {
+		if !names[r.Name] {
 			continue
 		}
 		if r.Name == "e2e" && (r.From == "capture" || r.From == "send") {

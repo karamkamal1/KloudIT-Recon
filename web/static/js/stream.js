@@ -874,9 +874,9 @@ function presentRows(st, row) {
 
 // Frame pacing (step 4.4): the mode; for Smooth where its refresh ticks come
 // from (the worker's requestAnimationFrame, else this page's), the refresh
-// interval it assumes, and this session's frames dropped stale (older than
-// one refresh, a newer one on its way), drawn late, and drawn from the
-// watchdog timer (no refresh tick came: warn).
+// interval it works with (the one its ticks show), and this session's frames
+// dropped stale (older than one refresh, a newer one on its way), drawn late,
+// and drawn from the watchdog timer (no refresh tick came: warn).
 const TICKS = { raf: 'worker rAF', main: 'page rAF' };
 function pacingRow(pc, row) {
   if (!pc) return null;

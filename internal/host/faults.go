@@ -32,6 +32,10 @@ import (
 //	                  and its minimum time between changes (both 10 s) become
 //	                  D (a Go duration, 100ms to 10s), so a test sees the
 //	                  bitrate recover within seconds
+//	pre-stage-hold    play a host from before step 4.4 to the client's stage
+//	                  reports: no stage-hold in the welcome, and a report is
+//	                  logged only with at most nine rows and without a hold
+//	                  row (stageNamesBeforeHold), as those hosts did
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -49,10 +53,12 @@ type testFaults struct {
 	intraRefresh bool
 	stillAfter   int           // frames of a generation before its source goes still
 	ratePeriod   time.Duration // rateController.period
+	preStageHold bool          // sendWelcome, logStages
 }
 
 func (f testFaults) active() bool {
-	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.stillAfter > 0 || f.ratePeriod > 0
+	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.stillAfter > 0 || f.ratePeriod > 0 ||
+		f.preStageHold
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -120,8 +126,13 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: want rate-period=D, 100ms <= D <= %v", rule, ratePeriod)
 			}
 			f.ratePeriod = d
+		case "pre-stage-hold":
+			if val != "" {
+				return f, fmt.Errorf("%s: pre-stage-hold takes no value", rule)
+			}
+			f.preStageHold = true
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, still, rate-period)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, still, rate-period, pre-stage-hold)", rule)
 		}
 	}
 	return f, nil

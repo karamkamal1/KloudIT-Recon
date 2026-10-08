@@ -253,9 +253,9 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   example after measuring click-to-photon with the latency rig
   ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
 - **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
-  decodes. *Smooth* draws at most one new frame per display refresh, as the refresh starts, for
-  an even cadence; it costs up to one refresh of latency (the overlay's *hold* row) and drops a
-  frame that missed its refresh when a newer one is already decoding.
+  decodes. *Smooth* draws at most one new frame per display refresh, in the refresh's animation
+  frame callback, for an even cadence; it costs up to one refresh of latency (the overlay's
+  *hold* row) and drops a frame that missed its refresh when a newer one is already decoding.
 - **Latency probe** (Diagnostics): open `tools/latency-test/index.html` (in the release zip:
   `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
   host screen → drawn latency measured from the picture, and **Export latency data** saves it.
@@ -406,9 +406,11 @@ drops every 193rd (reported to the client like a real drop); `recovery=skip|keyf
 the recovery mode the host announces, `intra-refresh` runs libx264 with periodic intra
 refresh, as NVENC runs, so the host announces `skip` from its real encoder arguments, and
 `still=after:N` sends only the first N frames of every encoder generation, like a desktop that
-stops changing, and `rate-period=2s` shortens the bitrate controller's 10 s quiet period and rate
-limit so a test sees the bitrate recover within seconds (`internal/host/faults.go`). Never set it
-on a real host; the agent logs a warning when it is set.
+stops changing, `rate-period=2s` shortens the bitrate controller's 10 s quiet period and rate
+limit so a test sees the bitrate recover within seconds, and `pre-stage-hold` takes the client's
+latency reports as a host from before step 4.4 did (no `stage-hold` in the welcome, at most nine
+rows) (`internal/host/faults.go`). Never set it on a real host; the agent logs a warning when it
+is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·

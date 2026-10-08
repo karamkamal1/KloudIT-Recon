@@ -346,7 +346,7 @@ const pres = {
   drawErrors: 0,
   lastError: '',
   failStreak: 0, // draws in a row that failed
-  refreshMs: 1000 / 60, // the display's refresh interval (main thread's measurement)
+  refreshMs: 1000 / 60, // the display's refresh interval (main thread's measurement at page load)
 };
 
 const FAIL_STREAK = 30;
@@ -894,7 +894,7 @@ const pacer = new Pacer({
     if (it.meta) ackFrame(it.meta, it.decoded);
   },
   newerComing: () => video.inflight.size + video.queue.length > 0,
-  refreshMs: () => pres.refreshMs,
+  refreshMs: () => pres.refreshMs, // until its ticks show the interval
   // Read on every request (a browser without it in workers: the main thread's ticks).
   raf: () => (typeof self.requestAnimationFrame === 'function' ? (cb) => self.requestAnimationFrame(cb) : null),
   mainTicks: (on) => post('ticks', { on }),
@@ -928,7 +928,8 @@ function ackFrame(meta, decoded) {
   return owd;
 }
 
-// pace: the pacer's item (via: what started the draw; tick: the refresh's start in Smooth).
+// pace: the pacer's item (via: what started the draw; tick: the refresh's start and
+// refresh: the refresh interval it judged the frame by, in Smooth).
 function drawFrame(frame, meta, decoded, pace) {
   const start = now(); // the hold ends
   // Padding the host announced (VideoConfig crop) is not shown.
@@ -1047,7 +1048,7 @@ function recordStages(m, decoded, start, drawn, pace) {
     t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name, pacing,
     raw: {
       captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded,
-      drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null,
+      drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null, refresh: pace?.refresh ?? null,
     },
   };
   lat.recs.push(rec);
@@ -1527,9 +1528,10 @@ function postStats() {
     // canvas size (device pixels) and the bake-off's progress or result.
     renderer: renderer ? rendererInfo() : null,
     // Frame pacing (4.4): the mode, where Smooth's refresh ticks come from,
-    // the draws per source and Smooth's stale (dropped) and late frames,
-    // this session; the refresh interval it assumes.
-    pacing: { ...pacer.info(), refreshMs: +pres.refreshMs.toFixed(2) },
+    // the refresh interval it works with (its ticks' or the page-load
+    // measurement), the draws per source and Smooth's stale (dropped) and
+    // late frames, this session.
+    pacing: pacer.info(),
     hw: video.hw,
     synced: clock.offset !== null,
   });

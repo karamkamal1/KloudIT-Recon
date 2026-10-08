@@ -833,8 +833,10 @@ async function pacingWindow(ms) {
   const q = (v) => { const a = [...v].sort((x, y) => x - y); return (p) => (a.length ? +a[Math.min(a.length - 1, Math.floor(p * a.length))].toFixed(2) : null); };
   const hold = q(recs.map((r) => r.stages[H]));
   const refresh = s1.st?.pacing?.refreshMs;
-  const wait = recs.filter((r) => r.tick !== null).map((r) => r.tick - r.output);
-  const lateRecs = wait.filter((v) => v > 1.25 * refresh + 0.05).length; // must all be counted late
+  const waited = recs.filter((r) => r.tick !== null);
+  const wait = waited.map((r) => r.tick - r.output);
+  // Over 1.25 of the refresh interval the pacer judged the frame by: must all be counted late.
+  const lateRecs = waited.filter((r) => r.tick - r.output > 1.25 * r.refresh + 0.05).length;
   // Drawn at the first refresh after the decoder's output: no refresh of the
   // worker's started between a frame's output and the refresh (or watchdog
   // timer) that drew it (1 ms of slack each side).
@@ -927,18 +929,54 @@ async function checkPacing(name, rate, fallbacks) {
   results.push({ pacing: name, mode: 'latency', ...lt, recs: lt.recs.length });
 }
 
+// A host from before step 4.4 (the host's test hook pre-stage-hold: its
+// welcome lacks stage-hold, and it logs a stage report only with at most nine
+// rows, none of them hold, as those hosts did). The client, in Smooth (a hold
+// of up to a refresh before each draw), reports hold and draw to it as one
+// draw row: the host logs the report (a separate hold row would make ten rows,
+// and it would log nothing), its draw row covers every frame of the window
+// (n = e2e's n), and its p50 is the client's hold + draw over the same frames
+// (the stage dump right after the report: within max(1.5 ms, 15 %)), not
+// draw alone.
+async function checkPreStageHoldHost() {
+  const host = await restartHost({ RECON_TEST_FAULTS: 'pre-stage-hold' }, 'host-pre-hold');
+  await startStream({ path: 'auto', transport: 'auto', pacing: 'smooth' });
+  // The first report: 10 s after the worker started.
+  const line = await until(() => (host.log.match(/msg="latency stages[^\n]*/) || [])[0], 20000, 'stage line').catch(() => '');
+  await page.evaluate(() => { window.__recon.stageDump = null; window.__recon.worker.postMessage({ type: 'stageDump' }); });
+  const dump = await until(() => page.evaluate(() => window.__recon.stageDump), 3000, 'stage dump').catch(() => []);
+  const features = await page.evaluate(() => window.__recon.welcome?.features || []);
+  const row = (k) => { const m = line.match(new RegExp(` ${k}="([\\d.]+)/[\\d.]+/[\\d.]+ n=(\\d+)"`)); return m ? { p50: +m[1], n: +m[2] } : null; };
+  const H = STAGES.indexOf('hold');
+  const D = STAGES.indexOf('draw');
+  const p50 = (v) => { const a = [...v].sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(0.5 * a.length))] : NaN; };
+  const sum = p50(dump.map((r) => r.stages[H] + r.stages[D]));
+  const drawOnly = p50(dump.map((r) => r.stages[D]));
+  const draw = row('draw');
+  const e2e = row('e2e');
+  check('host before step 4.4 (no stage-hold): the client in Smooth reports hold + draw as one draw row, which the host logs',
+    !features.includes('stage-hold') && !!draw && !!e2e && !/ hold=/.test(line) && / pacing=smooth /.test(line) && draw.n === e2e.n &&
+      dump.length >= 0.8 * draw.n && Math.abs(draw.p50 - sum) <= Math.max(1.5, 0.15 * sum) && sum - drawOnly >= 1,
+    `welcome features ${features.join(',')}; host: ${line ? `${(line.match(/ renderer=\S+ pacing=\S+/) || ['no renderer/pacing'])[0].trim()}, ` +
+      `draw p50 ${draw?.p50} n ${draw?.n}, e2e n ${e2e?.n}, ${/ hold=/.test(line) ? 'a hold row' : 'no hold row'}` : 'no stage line'}; ` +
+      `client's frames (stage dump, ${dump.length}): hold + draw p50 ${sum.toFixed(2)} ms, draw alone ${drawOnly.toFixed(2)} ms`);
+  await page.evaluate(() => { window.__recon.userClosed = true; });
+}
+
 // The frame pacer at unit level (step 4.4, pacing.js) on a fake clock: what
 // it draws and drops, and from which tick, in both modes, at the stale rule's
 // edges (older than one refresh with or without a newer frame in the
 // decoder, never two drops in a row, the quarter refresh of slack), with the
-// main thread's ticks, the watchdog and live mode switches.
+// main thread's ticks, the watchdog (never a stale drop) and live mode
+// switches; the refresh interval taken from the ticks, not a page-load
+// measurement that differs from them.
 async function checkPacerRule() {
   const cases = await page.evaluate(async () => {
     const T = await import('/js/pacing.js');
-    // A pacer on a fake clock (refresh 16 ms): frames offered, one-task hops,
-    // requestAnimationFrame callbacks and watchdog timers run when told; what it
-    // draws and drops is logged.
-    const mk = ({ raf = true } = {}) => {
+    // A pacer on a fake clock (page-load refresh measurement 16 ms unless
+    // given): frames offered, one-task hops, requestAnimationFrame callbacks
+    // and watchdog timers run when told; what it draws and drops is logged.
+    const mk = ({ raf = true, refresh = 16 } = {}) => {
       const ev = [];
       let t = 0;
       let newer = false;
@@ -948,7 +986,7 @@ async function checkPacerRule() {
       const p = new T.Pacer({
         draw: (it) => ev.push(`draw ${it.id} ${it.via}${it.tick === null ? '' : ` @${it.tick}`}`),
         drop: (it, why) => ev.push(`drop ${it.id} ${why}`),
-        newerComing: () => newer, refreshMs: () => 16, raf: () => (raf ? (cb) => rafs.push(cb) : null),
+        newerComing: () => newer, refreshMs: () => refresh, raf: () => (raf ? (cb) => rafs.push(cb) : null),
         mainTicks: (on) => ev.push(`main ticks ${on ? 'on' : 'off'}`), now: () => t, log: (x) => ev.push(`log: ${x}`),
         soon: (fn) => hops.push(fn), timer: (fn, ms) => { const x = { fn, at: t + ms, live: true }; timers.push(x); return () => { x.live = false; }; },
       });
@@ -976,7 +1014,7 @@ async function checkPacerRule() {
       x.frame(1); x.at(5); x.frame(2);
       const requests = x.rafs();
       x.at(16); x.vsync();
-      x.at(32); x.vsync(); // nothing waits: nothing drawn (no request either)
+      x.at(32); x.vsync(); // nothing waits: nothing drawn (the one tick asked for after a draw)
       x.at(40); x.frame(3); x.at(48); x.vsync();
       return { requests };
     });
@@ -1010,6 +1048,29 @@ async function checkPacerRule() {
         x.frame(1); x.at(99); x.at(100); x.at(105); x.frame(2); x.at(112); x.vsync();
         x.at(120); x.frame(3); x.at(220); x.at(230); x.frame(4); x.at(330);
         x.at(340); x.frame(5); x.at(344); x.vsync(); x.at(345); x.frame(6); x.at(445);
+      });
+    run('Smooth: the watchdog\'s timer never drops a frame as stale, a newer one in the decoder or not (no refresh comes sooner for it): drawn late',
+      [WD_LOG, 'draw 1 timer @100', 'stale 0, late 1'], (x) => {
+        x.p.setMode('smooth'); x.newer(true);
+        x.frame(1); x.at(100);
+        x.ev.push(`stale ${x.p.counts.stale}, late ${x.p.counts.late}`);
+      });
+    run('Smooth: "one refresh" is the interval its ticks show (16 ms) once 8 are seen, not the page-load measurement (7 ms): 12 ms old with a newer frame coming is stale before, drawn after',
+      ['main ticks on', 'drop 1 stale', 'draw 2 main @144', 'refresh 7 -> 16, late 0'], (x) => {
+        x.p.setMode('smooth'); x.newer(true);
+        const before = x.p.info().refreshMs;
+        x.at(4); x.frame(1); x.p.tick(16, 'main'); // no interval seen yet: 7 ms
+        for (let ts = 32; ts <= 128; ts += 16) x.p.tick(ts, 'main');
+        x.at(132); x.frame(2); x.p.tick(144, 'main'); // the 8th interval
+        x.ev.push(`refresh ${before} -> ${x.p.info().refreshMs}, late ${x.p.counts.late}`);
+      }, { raf: false, refresh: 7 });
+    run('Smooth: now and then (at most every 250 ms) the refresh after a frame\'s is ticked too, so a stream at half the refresh rate shows the refresh interval (16 ms, not its 32 ms frame interval)',
+      ['20 draws, refresh 16, 3 extra refresh requests in 640 ms'], (x) => {
+        x.p.setMode('smooth');
+        for (let k = 0; k < 20; k++) { x.at(32 * k + 4); x.frame(k); x.at(32 * k + 16); x.vsync(); x.at(32 * k + 32); x.vsync(); }
+        const draws = x.ev.filter((e) => e.startsWith('draw')).length;
+        x.ev.length = 0;
+        x.ev.push(`${draws} draws, refresh ${x.p.info().refreshMs}, ${x.p.rafSeq - 20} extra refresh requests in 640 ms`);
       });
     run('mode switch with a frame waiting: Smooth -> Lowest latency draws it one task later; Lowest latency -> Smooth waits for the refresh',
       ['draw 1 hop', 'draw 2 raf @32'], (x) => {
@@ -1561,6 +1622,7 @@ try {
   // 3b. Loss handling with the host's fault-injection hook --------------------
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
   await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
+  await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

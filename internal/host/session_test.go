@@ -578,7 +578,9 @@ func TestQueueOverflowEscalates(t *testing.T) {
 // 4.3: the draw and display rows depend on it) and its frame pacing mode
 // (step 4.4: hold and display depend on it); a value that is not a plain
 // path name or a known mode, or none (older clients), adds nothing. The hold
-// row is logged, also in a report with every stage (ten rows).
+// row is logged, also in a report with every stage (ten rows). With the test
+// hook pre-stage-hold the host takes reports as hosts before step 4.4 did:
+// the nine rows a client sends them (hold and draw as one draw row), not ten.
 func TestLogStagesRenderer(t *testing.T) {
 	ff, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -625,29 +627,43 @@ func TestLogStagesRenderer(t *testing.T) {
 	for _, n := range []string{"capture", "queue", "network", "transfer", "wait", "decode", "hold", "draw", "display", "e2e"} {
 		all = append(all, proto.StageStat{Name: n, N: 30, P50: 1, P95: 2, P99: 3})
 	}
-	var in bytes.Buffer
-	for _, m := range []proto.ClientMsg{
-		{Stages: rows, Renderer: "webgl2", Pacing: "smooth"},
-		{Stages: rows, Renderer: `x" injected="1`, Pacing: `smooth" injected="1`},
-		{Stages: rows},
-		{Stages: all, Renderer: "canvas2d", Pacing: "mixed"},
-	} {
-		m.T = "stages"
-		b, _ := json.Marshal(m)
-		if err := proto.WriteMsg(&in, b); err != nil {
-			t.Fatal(err)
+	var merged []proto.StageStat // what a client sends a host without stage-hold
+	for _, r := range all {
+		if r.Name == "draw" {
+			r.P50 = 9
+		}
+		if r.Name != "hold" {
+			merged = append(merged, r)
 		}
 	}
-	s.ctrl = &scriptedCtrl{r: &in}
-	if err := s.controlLoop(); !errors.Is(err, io.EOF) {
-		t.Fatalf("control loop: %v", err)
+	report := func(msgs ...proto.ClientMsg) {
+		t.Helper()
+		var in bytes.Buffer
+		for _, m := range msgs {
+			m.T = "stages"
+			b, _ := json.Marshal(m)
+			if err := proto.WriteMsg(&in, b); err != nil {
+				t.Fatal(err)
+			}
+		}
+		s.ctrl = &scriptedCtrl{r: &in}
+		if err := s.controlLoop(); !errors.Is(err, io.EOF) {
+			t.Fatalf("control loop: %v", err)
+		}
 	}
+	report(proto.ClientMsg{Stages: rows, Renderer: "webgl2", Pacing: "smooth"},
+		proto.ClientMsg{Stages: rows, Renderer: `x" injected="1`, Pacing: `smooth" injected="1`},
+		proto.ClientMsg{Stages: rows},
+		proto.ClientMsg{Stages: all, Renderer: "canvas2d", Pacing: "mixed"})
+	s.a.faults.preStageHold = true
+	report(proto.ClientMsg{Stages: all, Pacing: "smooth"}, proto.ClientMsg{Stages: merged, Pacing: "smooth"})
 	l := logs.lines(`msg="latency stages`)
-	if len(l) != 4 || !strings.Contains(l[0], " renderer=webgl2 pacing=smooth ") || !strings.Contains(l[0], `draw="0.4/0.9/1.2 n=40"`) ||
+	if len(l) != 5 || !strings.Contains(l[0], " renderer=webgl2 pacing=smooth ") || !strings.Contains(l[0], `draw="0.4/0.9/1.2 n=40"`) ||
 		!strings.Contains(l[0], `hold="8.1/15.9/16.4 n=40"`) ||
 		strings.Contains(l[1], "renderer=") || strings.Contains(l[1], "pacing=") || strings.Contains(l[1], "injected") ||
 		strings.Contains(l[2], "renderer=") || strings.Contains(l[2], "pacing=") ||
-		!strings.Contains(l[3], " pacing=mixed ") || !strings.Contains(l[3], `hold="1.0/2.0/3.0 n=30"`) || !strings.Contains(l[3], `display="1.0/2.0/3.0 n=30"`) {
+		!strings.Contains(l[3], " pacing=mixed ") || !strings.Contains(l[3], `hold="1.0/2.0/3.0 n=30"`) || !strings.Contains(l[3], `display="1.0/2.0/3.0 n=30"`) ||
+		strings.Contains(l[4], "hold=") || !strings.Contains(l[4], `draw="9.0/2.0/3.0 n=30"`) || !strings.Contains(l[4], `display="1.0/2.0/3.0 n=30"`) {
 		t.Fatalf("stage lines:\n%s", strings.Join(l, "\n"))
 	}
 }
