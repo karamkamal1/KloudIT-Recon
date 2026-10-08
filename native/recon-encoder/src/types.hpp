@@ -61,6 +61,30 @@ struct BarcodeLayout {
     int rows() const { return (bits + cols - 1) / cols; }
 };
 
+// DisplayColor is what DXGI says about an output's colour
+// (IDXGIOutput6::GetDesc1, Windows 10 1703+; the luminance values come from
+// the monitor's EDID or the Windows HDR calibration).
+struct DisplayColor {
+    bool known = false;  // GetDesc1 answered
+    // ColorSpace DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: Windows HDR is on
+    // for this output (the desktop is composed in scRGB FP16).
+    bool hdr = false;
+    int bitsPerColor = 0;
+    double red[2] = {}, green[2] = {}, blue[2] = {}, white[2] = {};  // the panel's primaries, CIE 1931 xy
+    double minLuminance = 0, maxLuminance = 0, maxFullFrameLuminance = 0;  // cd/m2
+};
+
+// HdrMetadata is the HDR10 static metadata of a stream (GUIDE 3.9): the
+// mastering display colour volume (SMPTE ST 2086; HEVC SEI D.2.28, AV1
+// metadata OBU 6.7.4) and the content light level (CTA-861.3; HEVC SEI
+// D.2.35), in plain units. codec/hdr.hpp derives it from the captured
+// output's DisplayColor and converts it to the encoders' fixed-point units.
+struct HdrMetadata {
+    double red[2] = {}, green[2] = {}, blue[2] = {}, white[2] = {};  // CIE 1931 xy
+    double maxLuminance = 0, minLuminance = 0;  // cd/m2
+    int maxCll = 0, maxFall = 0;                // cd/m2, 0 = unknown
+};
+
 // StartParams is the "start" control message.
 struct StartParams {
     std::string capture;  // "dda" | "amd-direct" | "wgc" | "synthetic" | "synthetic-gpu"; empty = backend default
@@ -85,6 +109,9 @@ struct StartParams {
     double vbvFrames = 1.0;     // VBV buffer in frame intervals
     std::string rc = "cbr";     // "cbr" | "vbr" (the backend picks its low-latency flavour)
     std::string quality = "speed";  // "speed" | "balanced" | "quality"
+    // HDR10 (opt-in, GUIDE 3.9): when the captured output is in HDR mode, the
+    // stream is 10-bit BT.2020 PQ with HDR metadata (hevc / av1 with caps
+    // hdr10); an SDR output still gives an SDR stream (Started::hdr false).
     bool hdr = false;
     int ltrSlots = 0;   // long-term reference slots to reserve (ACK-based recovery, 3.5)
     int svcLayers = 1;  // temporal layers
@@ -118,6 +145,7 @@ struct OutputDesc {
     int x = 0, y = 0, width = 0, height = 0;  // desktop coordinates (as displayed, i.e. rotated)
     int rotation = 0;                  // 0 | 90 | 180 | 270
     bool attached = false;             // attached to the desktop
+    DisplayColor color;                // Windows HDR on, luminance (caps: hdr, bitsPerColor, *Luminance)
 };
 
 // CodecCaps is one entry of Caps::codecs (GUIDE Arch-2).
@@ -140,6 +168,10 @@ struct CodecCaps {
     // (NVENC NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE; the helper has no control
     // message for it yet: GUIDE 5 "FPS before resolution").
     bool dynamicResolution = false;
+    // start with hdr can produce HDR10 with this codec: 10-bit 4:2:0 input
+    // (P010), Main10 / AV1 Main 10-bit, BT.2020 PQ signalling and HDR metadata
+    // (GUIDE 3.9; HEVC and AV1 only).
+    bool hdr10 = false;
     // Fields above that are documented or default values rather than detected
     // on this GPU (e.g. AMF AV1 "roi": there is no ROI cap; "liveBitrate" until
     // step 3.6 measures it). Sent only when not empty.
@@ -196,6 +228,12 @@ struct Started {
     std::string preset;          // NVENC preset "p1".."p7" ("" for other backends)
     bool asyncEncode = false;    // NVENC: completion events (async mode), false = polled output (sync mode)
     int refFrames = 0;           // reference frames the encoder is configured to keep (NVENC DPB size; 0 = not reported)
+    // HDR10 (step 3.9): the stream is 10-bit BT.2020 PQ (colorSpace
+    // "bt2020-pq") with hdrMetadata, else 8-bit BT.709 ("bt709").
+    bool hdr = false;
+    int bitDepth = 8;
+    std::string colorSpace = "bt709";
+    std::optional<HdrMetadata> hdrMetadata;
 };
 
 // CaptureEvent is the helper -> Go "captureChanged" message.
@@ -204,8 +242,12 @@ struct CaptureEvent {
     // the old encoded size, scaled; recon-host may restart the helper to
     // follow). "lost": capture is unavailable (secure desktop, output gone, mode
     // switch in progress); the last image is repeated. "restored": capture works again.
+    // "hdr": the output entered or left Windows HDR mode (the stream keeps its
+    // format: an HDR10 stream shows SDR content at 203 cd/m2, an SDR stream
+    // gets DXGI's SDR conversion; recon-host may restart the helper to follow).
     std::string reason;
     int width = 0, height = 0, rotation = 0;  // the source as now displayed (resized/restored)
+    bool hdr = false;                          // the output is in HDR mode now (DDA, AMD Direct Capture)
     std::string text;
 };
 

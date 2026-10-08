@@ -61,6 +61,12 @@ struct SourceInfo {
     void* amfContext = nullptr;      // amf::AMFContext* of AMD Direct Capture surfaces, else nullptr
     int amfFormat = 0;               // their amf::AMF_SURFACE_FORMAT (AMF_DISPLAYCAPTURE_FORMAT), 0 = unknown
     bool cursorInVideo = false;      // frames contain the mouse pointer
+    // HDR frames (GUIDE 3.9): scRGB FP16 of an output in Windows HDR mode.
+    // Only when the start asked for hdr and the capture method can deliver
+    // them (DDA; AMD Direct Capture when its surfaces are RGBA_F16;
+    // synthetic-gpu); the encoder then makes an HDR10 stream.
+    bool hdr = false;
+    DisplayColor display;            // the captured output (HDR metadata), known = false if not asked / no output
 };
 
 // CaptureEvent (types.hpp) reports a source change, loss or recovery to recon-host.
@@ -94,11 +100,12 @@ public:
 // InputSpec is what an encoder backend wants from the pipeline (Backend::init
 // fills it). With Nv12 the pipeline converts every GPU frame (BT.709 limited
 // range, 4:2:0, scaled to width x height, optional barcode) into a pooled NV12
-// texture on the capture device (d3d/convert.hpp); Native passes the capture's
-// own image (the synthetic source, or AMD Direct Capture surfaces to an AMF
-// encoder on the same context, step 3.3).
+// texture on the capture device (d3d/convert.hpp); P010 does the same into
+// 10-bit P010 textures, BT.2020 + SMPTE ST 2084 (PQ) limited range (HDR10,
+// step 3.9); Native passes the capture's own image (the synthetic source, or
+// AMD Direct Capture surfaces to an AMF encoder on the same context, step 3.3).
 struct InputSpec {
-    enum class Format { Native, Nv12 } format = Format::Native;
+    enum class Format { Native, Nv12, P010 } format = Format::Native;
     uint32_t width = 0, height = 0;  // encoded size (even)
     // Nv12: the picture fills only the top-left contentWidth x contentHeight
     // of the texture (0 = all of it); the converter repeats the edge pixels
@@ -110,10 +117,11 @@ struct InputSpec {
 // EncoderFrame is what Backend::submit gets.
 struct EncoderFrame {
     const CapturedFrame* captured = nullptr;
-    // InputSpec::Nv12: the converted frame, DXGI_FORMAT_NV12 on the capture
-    // device. It stays reserved for the encoder as long as a copy of `hold`
-    // exists: keep one until the encoder no longer reads the texture (AMF:
-    // AMFSurfaceObserver::OnSurfaceDataRelease; NVENC: after the frame's output).
+    // InputSpec::Nv12 / P010: the converted frame, DXGI_FORMAT_NV12 (P010 for
+    // InputSpec::P010) on the capture device. It stays reserved for the
+    // encoder as long as a copy of `hold` exists: keep one until the encoder
+    // no longer reads the texture (AMF: AMFSurfaceObserver::OnSurfaceDataRelease;
+    // NVENC: after the frame's output).
     ID3D11Texture2D* nv12 = nullptr;
     std::shared_ptr<void> hold;
     int poolIndex = -1;  // stable per texture (e.g. for NvEncRegisterResource caching)

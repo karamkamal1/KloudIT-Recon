@@ -541,9 +541,11 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--self-test-encoder: %v", err)
 	}
-	// GPU colour conversion on WARP. Wine needs an X display for D3D11 and has
-	// no NV12 render targets (the self-test then checks the same shaders on
-	// separate planes); real Windows must pass in NV12 mode.
+	// GPU colour conversion on WARP (SDR NV12 and HDR10 P010). Wine needs an X
+	// display for D3D11 and has no NV12 / P010 render targets (the self-test
+	// then checks the same shaders on separate planes); real Windows must pass
+	// in NV12 mode (P010 render targets are logged, not required: WARP's are a
+	// VERIFY item, docs/VENDOR_NOTES.md 3.9).
 	out, err = exec.Command(exe, "--self-test-convert").CombinedOutput()
 	t.Logf("%s", out)
 	var ee *exec.ExitError
@@ -553,7 +555,7 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--self-test-convert: %v", err)
 	}
-	if !underWine() && !strings.Contains(string(out), "self-test-convert: ok (mode nv12)") {
+	if !underWine() && !strings.Contains(string(out), "self-test-convert: ok (mode nv12;") {
 		t.Fatal("conversion not tested on NV12 render targets")
 	}
 }
@@ -634,6 +636,18 @@ func TestHelperIntegrationEncodeTest(t *testing.T) {
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) || ee.ExitCode() != 2 || !strings.Contains(string(b), "fps out of range") {
 		t.Fatalf("bad encode test options: %v %s", err, b)
+	}
+	// --hdr (step 3.9) on the GPU test source, which plays an HDR output: the
+	// started line says HDR10 (the hardware check runs it with --backend=amf /
+	// nvenc and --capture=dda on an HDR desktop).
+	b, err = exec.Command(exe, "--encode-test="+out, "--backend=mock", "--codec=h264", "--capture=synthetic-gpu", "--hdr=1",
+		"--frames=10").CombinedOutput()
+	if errors.As(err, &ee) && ee.ExitCode() == 2 && underWine() && strings.Contains(string(b), "D3D11") {
+		t.Logf("--hdr skipped: no D3D11 device under Wine (needs an X display): %s", b)
+		return
+	}
+	if err != nil || !strings.Contains(string(b), `"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq"`) {
+		t.Fatalf("--encode-test --hdr=1: %v %s", err, b)
 	}
 }
 
@@ -821,7 +835,7 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	dump := t.TempDir() + `\frame30.nv12`
 	h := launchMock(t, "--dump-nv12="+dump)
 	const w, hgt, fps = 320, 180, 30
-	_, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000,
+	st, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000,
 		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
 	var he *HelperError
 	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
@@ -829,6 +843,9 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("start: %v", err)
+	}
+	if st.HDR || st.BitDepth != 8 || st.ColorSpace != "bt709" || st.HDRMetadata != nil {
+		t.Fatalf("an SDR stream reports hdr %v, bitDepth %d, colorSpace %q", st.HDR, st.BitDepth, st.ColorSpace)
 	}
 	var frames []*Frame
 	deadline := time.Now().Add(3500 * time.Millisecond)
@@ -871,5 +888,65 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	}
 	if id != 30 {
 		t.Fatalf("barcode of the dumped frame reads %d, want 30", id)
+	}
+}
+
+// HDR10 end to end on the GPU test source (step 3.9): with hdr it plays an
+// output in Windows HDR mode (FP16 scRGB frames, a 1000 cd/m2 panel), the
+// mock asks for P010, and the dumped frame must be P010 with BT.2020 PQ codes:
+// the 10-bit code in the high bits of every 16-bit sample, the barcode at
+// 64 / 940, the source's 1000 cd/m2 patch (top right) at PQ code 723 with
+// neutral chroma.
+func TestHelperIntegrationHDRPipeline(t *testing.T) {
+	dump := t.TempDir() + `\frame30.p010`
+	h := launchMock(t, "--dump-nv12="+dump)
+	const w, hgt, fps = 320, 180, 30
+	st, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000, HDR: true,
+		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+	var he *HelperError
+	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+		t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+	}
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	m := st.HDRMetadata
+	if !st.HDR || st.BitDepth != 10 || st.ColorSpace != "bt2020-pq" || m == nil || m.MaxLuminance != 1000 || m.MinLuminance != 0.005 ||
+		m.MaxCLL != 1000 || m.MaxFALL != 400 || m.DisplayPrimaries[0] != [2]float64{0.708, 0.292} {
+		t.Fatalf("started: hdr %v, bitDepth %d, colorSpace %q, metadata %+v", st.HDR, st.BitDepth, st.ColorSpace, m)
+	}
+	for i := 0; i < 32; i++ {
+		nextFrame(t, h)
+	}
+	b, err := os.ReadFile(dump)
+	if err != nil || len(b) != w*hgt*3 {
+		t.Fatalf("dump: %d bytes (want %d: P010), %v", len(b), w*hgt*3, err)
+	}
+	sample := func(i int) int { return int(b[2*i]) | int(b[2*i+1])<<8 }
+	for i := 0; i < len(b)/2; i++ {
+		if sample(i)&63 != 0 {
+			t.Fatalf("P010 sample %d = %#04x: the low 6 bits are not zero", i, sample(i))
+		}
+	}
+	code := func(i int) int { return sample(i) >> 6 }
+	var id uint32
+	for k := 0; k < 32; k++ {
+		x, y := (k%16)*8+4, (k/16)*8+4
+		v := code(y*w + x)
+		if v != 64 && v != 940 {
+			t.Fatalf("barcode block %d luma %d, want 64 or 940", k, v)
+		}
+		if v == 940 {
+			id |= 1 << (31 - k)
+		}
+	}
+	if id != 30 {
+		t.Fatalf("barcode of the dumped frame reads %d, want 30", id)
+	}
+	// The 1000 cd/m2 patch: Y 723 (64 + 876 x PQ(1000 cd/m2) = 722.6), Cb Cr 512.
+	x, y := 312, 8
+	cb, cr := code(w*hgt+(y/2)*w+x), code(w*hgt+(y/2)*w+x+1)
+	if yy := code(y*w + x); yy < 722 || yy > 724 || cb < 511 || cb > 513 || cr < 511 || cr > 513 {
+		t.Fatalf("1000 cd/m2 patch: YCbCr %d,%d,%d, want 723,512,512", yy, cb, cr)
 	}
 }

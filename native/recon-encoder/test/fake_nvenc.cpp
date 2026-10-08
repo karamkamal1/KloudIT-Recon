@@ -13,7 +13,9 @@
 //   everything released and EOS sent before NvEncDestroyEncoder), parameters
 //   that cannot be reconfigured, resetEncoder without forceIDR,
 //   NvEncGetSequenceParams from another thread than NvEncEncodePicture, a QP
-//   delta map of the wrong size;
+//   delta map of the wrong size, input of another bit depth than the config's
+//   (NV12 for 8 bits, YUV420_10BIT for 10), 10-bit HEVC without the Main10
+//   profile, HDR metadata given to a session that does not write it;
 // - a reference model of the DPB and NvEncInvalidateRefFrames: each P frame
 //   references the newest frame still valid in the DPB (maxNumRefFrames
 //   frames; invalidation also invalidates frames predicted from an invalid
@@ -62,6 +64,7 @@ struct Config {
     int async = 1, rfi = 1, multiRef = 1, dynBitrate = 1, dynRes = 1, svc = 1, maxLayers = 4, ltr = 8, engines = 2;
     int emphasis = 1, tenBit = 1, yuv444 = 1, customVbv = 1, intraRefresh = 1, cabac = 1, subframe = 1, stateAdvance = 1;
     int maxW = 8192, maxH = 8192, minW = 145, minH = 49;
+    int p010 = 1;           // NV_ENC_BUFFER_FORMAT_YUV420_10BIT among the input formats
     int encodeUs = 1500;    // simulated encode time
     uint64_t failEncodeTs = 0;  // NvEncEncodePicture fails (NV_ENC_ERR_GENERIC) for this inputTimeStamp
     int keepRefs = 0;       // > 0: keep at most this many reference frames (DPB and SPS), whatever was asked
@@ -95,6 +98,7 @@ struct Session {
     std::set<HANDLE> events;
     std::set<void*> buffers;
     std::map<void*, void*> regs;     // registered handle -> texture
+    std::map<void*, NV_ENC_BUFFER_FORMAT> regFormats;  // registered handle -> its buffer format
     std::map<void*, void*> mapped;   // mapped handle -> registered handle
     std::deque<Frame> pending;       // submitted, not unlocked yet (submission order)
     std::deque<DpbEntry> dpb;
@@ -204,6 +208,15 @@ Session* session(void* enc) {
         return nullptr;
     }
     return s;
+}
+
+// The input format a session takes: P010 (YUV420_10BIT) for a 10-bit input
+// bit depth, else NV12.
+NV_ENC_BUFFER_FORMAT inputFormat(const Session& s) {
+    const uint32_t depth = s.codec == Codec::Hevc  ? uint32_t(s.config.encodeCodecConfig.hevcConfig.inputBitDepth)
+                           : s.codec == Codec::Av1 ? uint32_t(s.config.encodeCodecConfig.av1Config.inputBitDepth)
+                                                   : uint32_t(s.config.encodeCodecConfig.h264Config.inputBitDepth);
+    return depth == 10 ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
 }
 
 uint32_t dpbSize(const Session& s) {
@@ -415,7 +428,7 @@ NVENCSTATUS NVENCAPI getInputFormatCount(void* enc, GUID codec, uint32_t* n) {
     std::lock_guard<std::mutex> lock(g_mu);
     if (!session(enc)) return NV_ENC_ERR_INVALID_ENCODERDEVICE;
     if (!codecEnabled(codecOf(codec))) return NV_ENC_ERR_UNSUPPORTED_PARAM;
-    *n = 3;
+    *n = g_cfg.p010 ? 3 : 2;
     return NV_ENC_SUCCESS;
 }
 
@@ -425,7 +438,7 @@ NVENCSTATUS NVENCAPI getInputFormats(void* enc, GUID codec, NV_ENC_BUFFER_FORMAT
     if (!codecEnabled(codecOf(codec))) return NV_ENC_ERR_UNSUPPORTED_PARAM;
     const NV_ENC_BUFFER_FORMAT all[] = {NV_ENC_BUFFER_FORMAT_NV12, NV_ENC_BUFFER_FORMAT_ARGB, NV_ENC_BUFFER_FORMAT_YUV420_10BIT};
     uint32_t n = 0;
-    for (; n < 3 && n < size; ++n) f[n] = all[n];
+    for (; n < (g_cfg.p010 ? 3u : 2u) && n < size; ++n) f[n] = all[n];
     *count = n;
     return NV_ENC_SUCCESS;
 }
@@ -494,6 +507,23 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
         violation("emphasis map with AQ or on a codec other than H.264");
     }
     if (cfg.rcParams.vbvBufferSize && !g_cfg.customVbv) violation("custom VBV size without NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE");
+    // Bit depth and HDR metadata (NV_ENC_CONFIG_HEVC / _AV1 inputBitDepth,
+    // outputBitDepth, outputMasteringDisplay, outputMaxCll).
+    uint32_t inDepth = 8, outDepth = 8, hdrSei = 0, cll = 0;
+    if (c == Codec::H264) {
+        inDepth = cfg.encodeCodecConfig.h264Config.inputBitDepth, outDepth = cfg.encodeCodecConfig.h264Config.outputBitDepth;
+    } else if (c == Codec::Hevc) {
+        const NV_ENC_CONFIG_HEVC& h = cfg.encodeCodecConfig.hevcConfig;
+        inDepth = h.inputBitDepth, outDepth = h.outputBitDepth, hdrSei = h.outputMasteringDisplay, cll = h.outputMaxCll;
+    } else {
+        const NV_ENC_CONFIG_AV1& a = cfg.encodeCodecConfig.av1Config;
+        inDepth = a.inputBitDepth, outDepth = a.outputBitDepth, hdrSei = a.outputMasteringDisplay, cll = a.outputMaxCll;
+    }
+    if ((inDepth == 10 || outDepth == 10) && !g_cfg.tenBit) return NV_ENC_ERR_UNSUPPORTED_PARAM;
+    if (inDepth != outDepth) violation("input bit depth %u, output %u (the backend converts in its own shader)", inDepth, outDepth);
+    const bool main10 = !std::memcmp(&cfg.profileGUID, &NV_ENC_HEVC_PROFILE_MAIN10_GUID, sizeof(GUID));
+    if (c == Codec::Hevc && (outDepth == 10) != main10) violation("HEVC output bit depth %u with%s the Main10 profile", outDepth, main10 ? "" : "out");
+    if ((hdrSei || cll) && outDepth != 10) violation("HDR metadata (mastering display %u, MaxCLL %u) in an 8-bit stream", hdrSei, cll);
     s->initialized = true;
     s->init = *ip;
     s->config = cfg;
@@ -513,16 +543,25 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
         const NV_ENC_CONFIG_HEVC& h = cfg.encodeCodecConfig.hevcConfig;
         idrPeriod = h.idrPeriod, refs = h.maxNumRefFramesInDPB, l0 = uint32_t(h.numRefL0), repeat = h.repeatSPSPPS;
         const NV_ENC_CONFIG_HEVC_VUI_PARAMETERS& v = h.hevcVUIParameters;
-        vuiOk = v.videoSignalTypePresentFlag && !v.videoFullRangeFlag && v.colourPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709 &&
-                v.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT709 && v.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        // 8-bit: BT.709; 10-bit (HDR10): BT.2020, PQ, BT.2020 non-constant luminance.
+        vuiOk = v.videoSignalTypePresentFlag && !v.videoFullRangeFlag &&
+                (outDepth == 10 ? v.colourPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT2020 &&
+                                      v.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL &&
+                                      v.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084
+                                : v.colourPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709 && v.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT709 &&
+                                      v.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709);
         irPeriod = h.enableIntraRefresh ? h.intraRefreshPeriod : 0, irCnt = h.intraRefreshCnt;
         layers = h.enableTemporalSVC ? h.numTemporalLayers : 1;
         level = h.level;
     } else {
         const NV_ENC_CONFIG_AV1& a = cfg.encodeCodecConfig.av1Config;
         idrPeriod = a.idrPeriod, refs = a.maxNumRefFramesInDPB, l0 = uint32_t(a.numFwdRefs), repeat = a.repeatSeqHdr;
-        vuiOk = a.colorPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709 && a.matrixCoefficients == NV_ENC_VUI_MATRIX_COEFFS_BT709 &&
-                a.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709 && a.colorRange == 0;
+        vuiOk = a.colorRange == 0 &&
+                (outDepth == 10 ? a.colorPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT2020 &&
+                                      a.matrixCoefficients == NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL &&
+                                      a.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084
+                                : a.colorPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709 && a.matrixCoefficients == NV_ENC_VUI_MATRIX_COEFFS_BT709 &&
+                                      a.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709);
         irPeriod = a.enableIntraRefresh ? a.intraRefreshPeriod : 0, irCnt = a.intraRefreshCnt;
         layers = a.enableTemporalSVC ? a.numTemporalLayers : 1;
         level = a.level;
@@ -530,7 +569,7 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
     const NV_ENC_RC_PARAMS& rc = cfg.rcParams;
     logLine("init codec=%s preset=%d tuning=%d async=%u ptd=%u size=%ux%u maxsize=%ux%u fps=%u/%u gop=%s pint=%d rc=%s avg=%u max=%u "
             "vbv=%u ldkfs=%u aq=%u taq=%u qpmap=%d zrd=%u la=%u mp=%d idr=%s refs=%u l0=%u repeat=%u vui=%u ir=%u/%u layers=%u "
-            "level=%u profile=%s",
+            "level=%u profile=%s bitdepth=%u hdrsei=%u/%u",
             codecName(c), presetNumber(ip->presetGUID), int(ip->tuningInfo), ip->enableEncodeAsync, ip->enablePTD, ip->encodeWidth,
             ip->encodeHeight, ip->maxEncodeWidth, ip->maxEncodeHeight, ip->frameRateNum, ip->frameRateDen,
             cfg.gopLength == NVENC_INFINITE_GOPLENGTH ? "inf" : "finite", cfg.frameIntervalP,
@@ -538,7 +577,10 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
             rc.averageBitRate, rc.maxBitRate, rc.vbvBufferSize, rc.lowDelayKeyFrameScale, rc.enableAQ, rc.enableTemporalAQ,
             int(rc.qpMapMode), rc.zeroReorderDelay, rc.enableLookahead, int(rc.multiPass),
             idrPeriod == NVENC_INFINITE_GOPLENGTH ? "inf" : "finite", refs, l0, repeat, vuiOk, irPeriod, irCnt, layers, level,
-            std::memcmp(&cfg.profileGUID, &NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID, sizeof(GUID)) ? "set" : "auto");
+            main10                                                                      ? "main10"
+            : std::memcmp(&cfg.profileGUID, &NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID, sizeof(GUID)) ? "set"
+                                                                                        : "auto",
+            outDepth, hdrSei, cll);
     return NV_ENC_SUCCESS;
 }
 
@@ -610,7 +652,7 @@ NVENCSTATUS NVENCAPI registerResource(void* enc, NV_ENC_REGISTER_RESOURCE* p) {
         return NV_ENC_ERR_INVALID_VERSION;
     }
     if (p->resourceType != NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX || p->bufferUsage != NV_ENC_INPUT_IMAGE ||
-        p->bufferFormat != NV_ENC_BUFFER_FORMAT_NV12 || p->pitch != 0 || !p->resourceToRegister) {
+        p->bufferFormat != inputFormat(*s) || p->pitch != 0 || !p->resourceToRegister) {
         violation("NvEncRegisterResource: type %d usage %d format %d pitch %u resource %p", int(p->resourceType), int(p->bufferUsage),
                   int(p->bufferFormat), p->pitch, p->resourceToRegister);
         return NV_ENC_ERR_INVALID_PARAM;
@@ -620,6 +662,7 @@ NVENCSTATUS NVENCAPI registerResource(void* enc, NV_ENC_REGISTER_RESOURCE* p) {
     }
     p->registeredResource = newHandle();
     s->regs[p->registeredResource] = p->resourceToRegister;
+    s->regFormats[p->registeredResource] = p->bufferFormat;
     logLine("register %ux%u", p->width, p->height);
     return NV_ENC_SUCCESS;
 }
@@ -635,6 +678,7 @@ NVENCSTATUS NVENCAPI unregisterResource(void* enc, NV_ENC_REGISTERED_PTR r) {
         violation("NvEncUnregisterResource of an unregistered resource");
         return NV_ENC_ERR_RESOURCE_NOT_REGISTERED;
     }
+    s->regFormats.erase(r);
     return NV_ENC_SUCCESS;
 }
 
@@ -654,7 +698,7 @@ NVENCSTATUS NVENCAPI mapInputResource(void* enc, NV_ENC_MAP_INPUT_RESOURCE* p) {
         if (reg == p->registeredResource) violation("NvEncMapInputResource: resource mapped twice (still in use)");
     }
     p->mappedResource = newHandle();
-    p->mappedBufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+    p->mappedBufferFmt = s->regFormats[p->registeredResource];
     s->mapped[p->mappedResource] = p->registeredResource;
     return NV_ENC_SUCCESS;
 }
@@ -730,7 +774,7 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
     if (async && !s->events.count(static_cast<HANDLE>(p->completionEvent))) violation("async mode: completion event not registered");
     if (!async && p->completionEvent) violation("sync mode with a completion event");
     if (p->inputTimeStamp <= s->lastTs) violation("inputTimeStamp %llu not increasing", static_cast<unsigned long long>(p->inputTimeStamp));
-    if (p->inputWidth != s->init.encodeWidth || p->inputHeight != s->init.encodeHeight || p->bufferFmt != NV_ENC_BUFFER_FORMAT_NV12 ||
+    if (p->inputWidth != s->init.encodeWidth || p->inputHeight != s->init.encodeHeight || p->bufferFmt != inputFormat(*s) ||
         p->pictureStruct != NV_ENC_PIC_STRUCT_FRAME) {
         violation("NvEncEncodePicture: input %ux%u format %d structure %d", p->inputWidth, p->inputHeight, int(p->bufferFmt),
                   int(p->pictureStruct));
@@ -745,6 +789,28 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
             qpNonZero += p->qpDeltaMap[i] != 0;
             qpMin = std::min(qpMin, int(p->qpDeltaMap[i]));
         }
+    }
+    // HDR metadata with the picture (HEVC SEI / AV1 metadata OBUs), in the
+    // codec's units: logged as "md=Gx,Gy,Bx,By,Rx,Ry,Wx,Wy,max,min cll=MaxCLL,MaxFALL".
+    const MASTERING_DISPLAY_INFO* md = nullptr;
+    const CONTENT_LIGHT_LEVEL* cll = nullptr;
+    uint32_t wantMd = 0, wantCll = 0;
+    if (s->codec == Codec::Hevc) {
+        md = p->codecPicParams.hevcPicParams.pMasteringDisplay, cll = p->codecPicParams.hevcPicParams.pMaxCll;
+        wantMd = s->config.encodeCodecConfig.hevcConfig.outputMasteringDisplay, wantCll = s->config.encodeCodecConfig.hevcConfig.outputMaxCll;
+    } else if (s->codec == Codec::Av1) {
+        md = p->codecPicParams.av1PicParams.pMasteringDisplay, cll = p->codecPicParams.av1PicParams.pMaxCll;
+        wantMd = s->config.encodeCodecConfig.av1Config.outputMasteringDisplay, wantCll = s->config.encodeCodecConfig.av1Config.outputMaxCll;
+    }
+    if ((md && !wantMd) || (cll && !wantCll)) violation("HDR metadata with a picture of a session configured without it (ignored)");
+    char hdrText[160] = "";
+    if (md || cll) {
+        int n = 0;
+        if (md) {
+            n = std::snprintf(hdrText, sizeof(hdrText), " md=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", md->g.x, md->g.y, md->b.x, md->b.y, md->r.x,
+                              md->r.y, md->whitePoint.x, md->whitePoint.y, md->maxLuma, md->minLuma);
+        }
+        if (cll) std::snprintf(hdrText + n, sizeof(hdrText) - size_t(n), " cll=%u,%u", cll->maxContentLightLevel, cll->maxPicAverageLightLevel);
     }
     if (g_cfg.failEncodeTs && p->inputTimeStamp == g_cfg.failEncodeTs) {
         logLine("encode ts=%llu failed (injected)", static_cast<unsigned long long>(p->inputTimeStamp));
@@ -786,9 +852,9 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
     f.data = bitstream(*s, f, headers);
     ++s->encoded;
     s->history.push_back(f.ts);
-    logLine("encode ts=%llu flags=%u idx=%u type=%s ref=%llu qpmap=%u/%d/%d", static_cast<unsigned long long>(f.ts), p->encodePicFlags,
+    logLine("encode ts=%llu flags=%u idx=%u type=%s ref=%llu qpmap=%u/%d/%d%s", static_cast<unsigned long long>(f.ts), p->encodePicFlags,
             p->frameIdx, f.type == NV_ENC_PIC_TYPE_IDR ? "IDR" : f.type == NV_ENC_PIC_TYPE_I ? "I" : "P",
-            static_cast<unsigned long long>(f.ref), p->qpDeltaMap ? p->qpDeltaMapSize : 0u, qpNonZero, qpMin);
+            static_cast<unsigned long long>(f.ref), p->qpDeltaMap ? p->qpDeltaMapSize : 0u, qpNonZero, qpMin, hdrText);
     if (async) schedule(f.doneAt, f.event);
     s->pending.push_back(std::move(f));
     return NV_ENC_SUCCESS;
@@ -981,7 +1047,7 @@ bool setKey(const std::string& k, const std::string& v) {
         {"tenBit", &g_cfg.tenBit}, {"yuv444", &g_cfg.yuv444}, {"customVbv", &g_cfg.customVbv}, {"intraRefresh", &g_cfg.intraRefresh},
         {"cabac", &g_cfg.cabac}, {"subframe", &g_cfg.subframe}, {"stateAdvance", &g_cfg.stateAdvance}, {"maxW", &g_cfg.maxW},
         {"maxH", &g_cfg.maxH}, {"minW", &g_cfg.minW}, {"minH", &g_cfg.minH}, {"encodeUs", &g_cfg.encodeUs},
-        {"keepRefs", &g_cfg.keepRefs},
+        {"keepRefs", &g_cfg.keepRefs}, {"p010", &g_cfg.p010},
     };
     for (const auto& [name, ptr] : ints) {
         if (k == name) return i(*ptr);

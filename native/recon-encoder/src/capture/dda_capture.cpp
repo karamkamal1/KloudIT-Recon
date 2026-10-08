@@ -20,6 +20,17 @@
 // duplication every 250 ms until it works again; meanwhile the last image is
 // repeated, recon-host gets captureChanged "lost" / "restored", and a new size
 // or rotation gives "resized" (the stream keeps its encoded size, scaled).
+// Turning Windows HDR on or off for the output also recreates the
+// duplication; it gives captureChanged "hdr".
+//
+// HDR10 (GUIDE 3.9): with start's hdr and the output in HDR mode
+// (DXGI_OUTPUT_DESC1 colour space G2084 / BT.2020) at the start, the
+// duplication asks for DXGI_FORMAT_R16G16B16A16_FLOAT first: the desktop as
+// Windows composes it, scRGB FP16 (linear BT.709 primaries, 1.0 = 80 cd/m2,
+// values above 1.0 and below 0), which the colour conversion turns into
+// BT.2020 PQ (P010). B8G8R8A8 stays in the list for when HDR is turned off
+// during the stream (Sunshine's list has the 8-bit formats for that too).
+// Otherwise only B8G8R8A8: DXGI converts an HDR desktop to SDR itself.
 // A removed device (driver reset / TDR) is the fatal device_lost instead:
 // nothing created on it works again (a TDR also changes the mode, so it
 // usually shows up as DXGI_ERROR_ACCESS_LOST first, and then as a failing
@@ -38,10 +49,11 @@
 // output thread takes around NvEncLockBitstream / NvEncUnlockBitstream, so the
 // two never overlap even where NVENC does not go through the device lock.
 // docs/VENDOR_NOTES.md 3.2 has the VERIFY item (encoder output latency).
-#include <dxgi1_5.h>
+#include <dxgi1_6.h>
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <mutex>
 #include <vector>
 
@@ -119,6 +131,8 @@ private:
     int dirtyPercent(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h);
 
     d3d::OutputRef output_;
+    DisplayColor color_;      // the output's colour as of the last duplication
+    bool streamHdr_ = false;  // HDR10 stream: FP16 frames asked for (decided at init, kept)
     d3d::Device dev_;
     ComPtr<IDXGIFactory1> factory_;
     ComPtr<IDXGIOutputDuplication> dup_;
@@ -143,6 +157,8 @@ Status DdaCapture::init(const StartParams& p) {
     s = d3d::createDevice(output_.adapter.Get(), dev_);
     if (!s.ok) return s;
     CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory_.GetAddressOf()));
+    color_ = d3d::displayColor(output_.output.Get());
+    streamHdr_ = p.hdr && color_.hdr;
     s = duplicate();
     if (!s.ok) return s;
     {
@@ -152,9 +168,13 @@ Status DdaCapture::init(const StartParams& p) {
         src_.width = dispW_;
         src_.height = dispH_;
         src_.rotation = rotation_;
+        src_.hdr = streamHdr_;
+        src_.display = color_;
     }
-    logf(LogLevel::Info, "dda: %s on %s (%s), %ux%u rotation %d, feature level %x", output_.desc.name.c_str(),
-         output_.adapterInfo.name.c_str(), output_.adapterInfo.luid.c_str(), dispW_, dispH_, rotation_, unsigned(dev_.level));
+    logf(LogLevel::Info, "dda: %s on %s (%s), %ux%u rotation %d, feature level %x, Windows HDR %s%s", output_.desc.name.c_str(),
+         output_.adapterInfo.name.c_str(), output_.adapterInfo.luid.c_str(), dispW_, dispH_, rotation_, unsigned(dev_.level),
+         !color_.known ? "unknown" : color_.hdr ? "on" : "off",
+         streamHdr_ ? (" (FP16 scRGB capture, " + std::to_string(int(color_.maxLuminance)) + " cd/m2 peak)").c_str() : "");
     startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
@@ -168,10 +188,11 @@ Status DdaCapture::duplicate() {
         std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());  // not while NVENC locks a bitstream (d3d/device.hpp)
         ComPtr<IDXGIOutput5> o5;
         if (SUCCEEDED(output_.output.As(&o5))) {
-            // B8G8R8A8 only for now: an HDR (FP16) desktop is converted to it by
-            // DXGI. Step 3.9 adds DXGI_FORMAT_R16G16B16A16_FLOAT for HDR streams.
-            const DXGI_FORMAT formats[] = {DXGI_FORMAT_B8G8R8A8_UNORM};
-            hr = o5->DuplicateOutput1(dev_.device.Get(), 0, 1, formats, dup_.GetAddressOf());
+            // An HDR10 stream takes the FP16 desktop as it is; B8G8R8A8 for an
+            // SDR desktop (top of file). SDR streams get B8G8R8A8 only.
+            const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM};
+            const UINT first = streamHdr_ ? 0 : 1;
+            hr = o5->DuplicateOutput1(dev_.device.Get(), 0, UINT(std::size(formats)) - first, formats + first, dup_.GetAddressOf());
         } else {
             ComPtr<IDXGIOutput1> o1;  // before Windows 10 1703
             hr = output_.output.As(&o1);
@@ -187,6 +208,7 @@ Status DdaCapture::duplicate() {
     dup_->GetDesc(&dd);
     DXGI_OUTPUT_DESC od{};
     output_.output->GetDesc(&od);
+    color_ = d3d::displayColor(output_.output.Get());
     rotation_ = d3d::rotationDegrees(dd.Rotation);
     dispW_ = uint32_t(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
     dispH_ = uint32_t(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
@@ -211,6 +233,7 @@ void DdaCapture::lose(const std::string& why, bool report) {
         CaptureEvent ev;
         ev.reason = "lost";
         ev.width = int(dispW_), ev.height = int(dispH_), ev.rotation = rotation_;
+        ev.hdr = color_.hdr;
         ev.text = why;
         postEvent(ev);
     }
@@ -230,14 +253,28 @@ Status DdaCapture::reacquire() {
     output_.desc = ref.desc;
     const uint32_t oldW = dispW_, oldH = dispH_;
     const int oldRot = rotation_;
+    const bool oldHdr = color_.hdr;
     s = duplicate();
     if (!s.ok) return s;
     CaptureEvent ev;
     ev.width = int(dispW_), ev.height = int(dispH_), ev.rotation = rotation_;
+    ev.hdr = color_.hdr;
     if (lost_) {
         lost_ = false;
         ev.reason = "restored";
         postEvent(ev);
+    }
+    if (color_.hdr != oldHdr) {
+        // The stream keeps its format (top of file); recon-host may restart
+        // the helper to follow.
+        ev.reason = "hdr";
+        ev.text = std::string("Windows HDR turned ") + (color_.hdr ? "on" : "off") + " for the output; the stream stays " +
+                  (streamHdr_ ? "HDR10" : "SDR");
+        postEvent(ev);
+        logf(LogLevel::Info, "dda: %s", ev.text.c_str());
+        ev.text.clear();
+        std::lock_guard<std::mutex> lock(srcMu_);
+        src_.display = color_;
     }
     if (dispW_ != oldW || dispH_ != oldH || rotation_ != oldRot) {
         ev.reason = "resized";

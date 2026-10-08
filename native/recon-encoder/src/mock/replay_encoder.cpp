@@ -1,6 +1,7 @@
 #include <chrono>
 #include <string>
 
+#include "codec/hdr.hpp"
 #include "mock/mock.hpp"
 
 // Generated from testdata/mock_clip.h264 by cmake/embed.cmake.
@@ -78,8 +79,11 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     if (!clipError_.empty()) return Status::Error("unavailable", clipError_);
     if (p.codec != "h264") return Status::Error("unsupported", "the mock backend only encodes h264, not " + p.codec);
     in = InputSpec{};
+    // HDR10: P010 from an HDR source, so the HDR conversion runs too (the
+    // canned stream stays what it is, like its size).
+    const bool hdr = p.hdr && src.hdr && src.device;
     if (src.device) {
-        in.format = InputSpec::Format::Nv12;
+        in.format = hdr ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
         in.width = uint32_t(p.width ? p.width : int(src.width)) & ~1u;
         in.height = uint32_t(p.height ? p.height : int(src.height)) & ~1u;
     }
@@ -101,6 +105,7 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     out.fps = p.fps;
     out.kbps = p.kbps;
     out.liveBitrate = "seamless";  // recorded only: the canned stream does not change
+    describeColor(out, hdr ? std::optional<HdrMetadata>(hdrMetadataFor(src.display)) : std::nullopt);
     return Status::Ok();
 }
 

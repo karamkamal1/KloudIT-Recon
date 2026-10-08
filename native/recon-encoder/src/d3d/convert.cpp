@@ -20,6 +20,15 @@ namespace {
 // [1 2 1] across the even luma column and its neighbours, [1 1] over the two
 // luma rows, i.e. chroma sited at the even column, halfway down (type 0). At
 // 1:1 every tap hits a texel centre, so the result is exact.
+//
+// HDR10 (P010, step 3.9): each tap is scRGB (linear BT.709 primaries, 1.0 =
+// 80 cd/m2, the FP16 desktop of Windows HDR) turned into BT.2020 and PQ
+// (Sunshine's convert_*_perceptual_quantizer shaders do the same maths), then
+// the BT.2020 non-constant-luminance matrix gives 10-bit limited-range codes.
+// Bilinear sampling interpolates the linear values. The chroma taps are
+// averaged after PQ, like the SDR path averages gamma-encoded values (Sunshine
+// averages linear light before PQ; the difference shows only at sharp
+// high-contrast colour edges).
 const char kShader[] = R"HLSL(
 Texture2D<float4> src : register(t0);
 SamplerState lin : register(s0);
@@ -28,13 +37,15 @@ cbuffer Params : register(b0) {
     float4 xformU;    // s = dot(xformU.xyz, float3(u, v, 1))
     float4 xformV;    // t = dot(xformV.xyz, float3(u, v, 1))
     float4 lumaSize;  // W, H, 1/W, 1/H of the output's content (the picture without padding)
-    float4 coefY;     // dot(rgb, coef.xyz) + coef.w, UNORM8 units / 255
+    float4 coefY;     // dot(rgb, coef.xyz) + coef.w: the code value / its maximum (255, or 1023 for P010)
     float4 coefU;
     float4 coefV;
     uint4 bcRect;     // barcode x0, y0, x1, y1 (exclusive), output pixels
     uint4 bcGrid;     // blockW, blockH, cols, bits
     uint4 bcValue;    // value low, value high, msbFirst, enabled
-    uint4 flags;      // x: source is linear (scRGB FP16)
+    uint4 flags;      // x: source is linear (scRGB FP16); y: HDR10 output (BT.2020 PQ)
+    float4 levels;    // barcode luma 0 / 1, neutral chroma (code / maximum); w: 1023 = 10-bit codes in UNORM16 (P010), 0 = UNORM8
+    float4 nits;      // HDR10: cd/m2 of 1.0 in a linear (scRGB) source, of white in an sRGB source
 };
 
 struct VSOut { float4 pos : SV_Position; };
@@ -50,12 +61,39 @@ float3 linearToSrgb(float3 x) {
     return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
 }
 
+float3 srgbToLinear(float3 x) {
+    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+}
+
+// SMPTE ST 2084 (PQ) inverse EOTF of absolute luminance in cd/m2.
+float3 pq(float3 cdm2) {
+    float3 y = pow(saturate(cdm2 / 10000.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+
 float3 fetch(float2 lumaPos) {
     float3 uv1 = float3(lumaPos * lumaSize.zw, 1.0);
     float2 st = float2(dot(xformU.xyz, uv1), dot(xformV.xyz, uv1));
-    float3 c = saturate(src.SampleLevel(lin, st, 0).rgb);
+    float3 c = src.SampleLevel(lin, st, 0).rgb;
+    if (flags.y != 0) {
+        // HDR10: absolute linear light with BT.709 primaries (scRGB 1.0 =
+        // 80 cd/m2; an sRGB image at SDR reference white), to BT.2020 (ITU-R
+        // BT.2087), then PQ. Colours outside BT.2020 (negative) clip.
+        float3 l = flags.x != 0 ? c * nits.x : srgbToLinear(saturate(c)) * nits.y;
+        float3 wide = float3(dot(float3(0.6274040, 0.3292820, 0.0433136), l),
+                             dot(float3(0.0690970, 0.9195400, 0.0113612), l),
+                             dot(float3(0.0163916, 0.0880132, 0.8955950), l));
+        return pq(max(wide, 0.0));
+    }
+    c = saturate(c);
     if (flags.x != 0) c = linearToSrgb(c);
     return c;
+}
+
+// P010: the 10-bit code in the high bits of the 16-bit word, the low 6 bits
+// zero. UNORM8 (NV12): the target's conversion rounds.
+float quantize(float v) {
+    return levels.w > 0.0 ? round(saturate(v) * levels.w) * (64.0 / 65535.0) : v;
 }
 
 int barcodeBit(uint2 p) {
@@ -69,26 +107,27 @@ int barcodeBit(uint2 p) {
 
 float ps_y(VSOut i) : SV_Target {
     int bit = barcodeBit(uint2(i.pos.xy));
-    if (bit >= 0) return bit != 0 ? 235.0 / 255.0 : 16.0 / 255.0;
-    return dot(coefY.xyz, fetch(i.pos.xy)) + coefY.w;
+    if (bit >= 0) return quantize(bit != 0 ? levels.y : levels.x);
+    return quantize(dot(coefY.xyz, fetch(i.pos.xy)) + coefY.w);
 }
 
 float2 ps_uv(VSOut i) : SV_Target {
     uint2 c = uint2(i.pos.xy);
-    if (barcodeBit(c * 2) >= 0) return float2(128.0 / 255.0, 128.0 / 255.0);
+    if (barcodeBit(c * 2) >= 0) return float2(quantize(levels.z), quantize(levels.z));
     float2 l = float2(c * 2) + 0.5;
     float3 rgb = fetch(l + float2(-1.0, 0.0)) + 2.0 * fetch(l) + fetch(l + float2(1.0, 0.0)) +
                  fetch(l + float2(-1.0, 1.0)) + 2.0 * fetch(l + float2(0.0, 1.0)) + fetch(l + float2(1.0, 1.0));
     rgb *= 0.125;
-    return float2(dot(coefU.xyz, rgb) + coefU.w, dot(coefV.xyz, rgb) + coefV.w);
+    return float2(quantize(dot(coefU.xyz, rgb) + coefU.w), quantize(dot(coefV.xyz, rgb) + coefV.w));
 }
 )HLSL";
 
 struct Constants {
     float xformU[4], xformV[4], lumaSize[4], coefY[4], coefU[4], coefV[4];
     uint32_t bcRect[4], bcGrid[4], bcValue[4], flags[4];
+    float levels[4], nits[4];
 };
-static_assert(sizeof(Constants) == 160, "constant buffer layout");
+static_assert(sizeof(Constants) == 192, "constant buffer layout");
 
 Status compile(const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
     static pD3DCompile fn = [] {
@@ -151,7 +190,7 @@ bool srvFormat(DXGI_FORMAT f, DXGI_FORMAT& out, bool& linear) {
     case DXGI_FORMAT_R16G16B16A16_TYPELESS:
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
         out = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        linear = true;  // scRGB: clipped to SDR here; HDR10 output is step 3.9
+        linear = true;  // scRGB: PQ for HDR10 output, clipped to SDR for NV12
         return true;
     default: return false;
     }
@@ -182,6 +221,21 @@ void rotationTransform(int rotation, float xu[3], float xv[3]) {
     }
 }
 
+YuvCoefficients bt2020Limited10() {
+    // ITU-R BT.2020 non-constant luminance: Kr 0.2627, Kb 0.0593; 10-bit
+    // limited range: Y 64..940, Cb/Cr 64..960 around 512 (BT.2020 table 5,
+    // BT.2100 table 9), in code / 1023.
+    constexpr double kr = 0.2627, kb = 0.0593, kg = 1.0 - kr - kb;
+    constexpr double ys = 876.0 / 1023.0, cs = 896.0 / 1023.0;
+    YuvCoefficients c{};
+    c.y[0] = float(ys * kr), c.y[1] = float(ys * kg), c.y[2] = float(ys * kb), c.y[3] = float(64.0 / 1023.0);
+    c.u[0] = float(cs * -kr / (2 * (1 - kb))), c.u[1] = float(cs * -kg / (2 * (1 - kb))), c.u[2] = float(cs * 0.5);
+    c.u[3] = float(512.0 / 1023.0);
+    c.v[0] = float(cs * 0.5), c.v[1] = float(cs * -kg / (2 * (1 - kr))), c.v[2] = float(cs * -kb / (2 * (1 - kr)));
+    c.v[3] = float(512.0 / 1023.0);
+    return c;
+}
+
 YuvCoefficients bt709Limited() {
     // ITU-R BT.709: Kr 0.2126, Kb 0.0722; 8-bit limited range: Y 16..235,
     // Cb/Cr 16..240 around 128 (ITU-R BT.709-6 table 4).
@@ -194,6 +248,27 @@ YuvCoefficients bt709Limited() {
     c.v[0] = float(cs * 0.5), c.v[1] = float(cs * -kg / (2 * (1 - kr))), c.v[2] = float(cs * -kb / (2 * (1 - kr)));
     c.v[3] = float(128.0 / 255.0);
     return c;
+}
+
+uint16_t toHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t exp = int32_t((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp >= 31) return uint16_t(sign | 0x7c00u);  // too large (or NaN): infinity
+    if (exp <= 0) {                                   // subnormal or zero
+        if (exp < -10) return uint16_t(sign);
+        mant |= 0x800000u;
+        const uint32_t shift = uint32_t(14 - exp), rem = mant & ((1u << shift) - 1), mid = 1u << (shift - 1);
+        uint32_t h = mant >> shift;
+        if (rem > mid || (rem == mid && (h & 1))) ++h;
+        return uint16_t(sign | h);
+    }
+    uint32_t h = (uint32_t(exp) << 10) | (mant >> 13);
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) ++h;  // a carry rounds up into the exponent
+    return uint16_t(sign | h);
 }
 
 int barcodeBit(const BarcodeLayout& b, uint64_t value, uint32_t x, uint32_t y) {
@@ -219,14 +294,14 @@ std::string barcodeProblem(const BarcodeLayout& b, uint32_t width, uint32_t heig
 
 Nv12Converter::~Nv12Converter() = default;
 
-bool Nv12Converter::nv12RenderTargets(ID3D11Device* device) {
+bool Nv12Converter::renderTargets(ID3D11Device* device, Format format) {
     UINT support = 0;
-    return SUCCEEDED(device->CheckFormatSupport(DXGI_FORMAT_NV12, &support)) &&
+    return SUCCEEDED(device->CheckFormatSupport(format == Format::P010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12, &support)) &&
            (support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D);
 }
 
 Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height, const BarcodeLayout& barcode,
-                           Output output, int poolSize, uint32_t contentWidth, uint32_t contentHeight) {
+                           Output output, int poolSize, uint32_t contentWidth, uint32_t contentHeight, Format format) {
     if (!device || width < 2 || height < 2 || (width & 1) || (height & 1) || width > 16384 || height > 16384) {
         return Status::Error("init_failed", "bad conversion size " + std::to_string(width) + "x" + std::to_string(height));
     }
@@ -239,8 +314,9 @@ Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height
                                                 std::to_string(height));
     }
     if (std::string p = barcodeProblem(barcode, contentWidth, contentHeight); !p.empty()) return Status::Error("bad_message", p);
-    if (output == Output::Nv12 && !nv12RenderTargets(device)) {
-        return Status::Error("unsupported", "this D3D11 device cannot render to NV12 textures");
+    if (output == Output::Nv12 && !renderTargets(device, format)) {
+        return Status::Error("unsupported", std::string("this D3D11 device cannot render to ") +
+                                                (format == Format::P010 ? "P010" : "NV12") + " textures");
     }
     device_ = device;
     device_->GetImmediateContext(ctx_.ReleaseAndGetAddressOf());
@@ -254,6 +330,7 @@ Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height
     contentH_ = contentHeight;
     barcode_ = barcode;
     output_ = output;
+    format_ = format;
     poolSize_ = size_t(poolSize < 1 ? 1 : poolSize);
     slots_.clear();
     slots_.reserve(poolSize_);
@@ -308,8 +385,12 @@ Status Nv12Converter::createSlot(Slot& s) {
     HRESULT hr;
     D3D11_RENDER_TARGET_VIEW_DESC rd{};
     rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    const bool p010 = format_ == Format::P010;
+    const DXGI_FORMAT lumaFormat = p010 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    const DXGI_FORMAT chromaFormat = p010 ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
+    const char* name = p010 ? "P010" : "NV12";
     if (output_ == Output::Nv12) {
-        td.Format = DXGI_FORMAT_NV12;
+        td.Format = p010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
         // Shader-resource too, as OBS's texture-amf.cpp creates its AMF input
         // textures; without it if the driver refuses that combination.
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -318,25 +399,26 @@ Status Nv12Converter::createSlot(Slot& s) {
             td.BindFlags = D3D11_BIND_RENDER_TARGET;
             hr = device_->CreateTexture2D(&td, nullptr, s.nv12.ReleaseAndGetAddressOf());
         }
-        if (FAILED(hr)) return failure(device_.Get(), "init_failed", "creating an NV12 texture failed: " + hrText(hr));
-        // The plane is picked by the view format (luma R8, chroma R8G8), as
-        // Sunshine's display_vram.cpp does for its NV12 encoder textures.
-        rd.Format = DXGI_FORMAT_R8_UNORM;
+        if (FAILED(hr)) return failure(device_.Get(), "init_failed", std::string("creating a ") + name + " texture failed: " + hrText(hr));
+        // The plane is picked by the view format (luma R8 / R16, chroma R8G8 /
+        // R16G16), as Sunshine's display_vram.cpp does for its NV12 and P010
+        // encoder textures.
+        rd.Format = lumaFormat;
         hr = device_->CreateRenderTargetView(s.nv12.Get(), &rd, s.rtvY.ReleaseAndGetAddressOf());
         if (SUCCEEDED(hr)) {
-            rd.Format = DXGI_FORMAT_R8G8_UNORM;
+            rd.Format = chromaFormat;
             hr = device_->CreateRenderTargetView(s.nv12.Get(), &rd, s.rtvUV.ReleaseAndGetAddressOf());
         }
-        if (FAILED(hr)) return failure(device_.Get(), "init_failed", "NV12 plane render target views failed: " + hrText(hr));
+        if (FAILED(hr)) return failure(device_.Get(), "init_failed", std::string(name) + " plane render target views failed: " + hrText(hr));
         return Status::Ok();
     }
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
-    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.Format = lumaFormat;
     hr = device_->CreateTexture2D(&td, nullptr, s.y.ReleaseAndGetAddressOf());
     if (SUCCEEDED(hr)) {
         td.Width /= 2;
         td.Height /= 2;
-        td.Format = DXGI_FORMAT_R8G8_UNORM;
+        td.Format = chromaFormat;
         hr = device_->CreateTexture2D(&td, nullptr, s.uv.ReleaseAndGetAddressOf());
     }
     if (SUCCEEDED(hr)) hr = device_->CreateRenderTargetView(s.y.Get(), nullptr, s.rtvY.ReleaseAndGetAddressOf());
@@ -459,7 +541,8 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
     // (padding) the coordinates pass 1.0 and the clamp sampler repeats the edge.
     c.lumaSize[0] = float(contentW_), c.lumaSize[1] = float(contentH_);
     c.lumaSize[2] = 1.0f / float(contentW_), c.lumaSize[3] = 1.0f / float(contentH_);
-    const YuvCoefficients k = bt709Limited();
+    const bool hdr10 = format_ == Format::P010;
+    const YuvCoefficients k = hdr10 ? bt2020Limited10() : bt709Limited();
     std::memcpy(c.coefY, k.y, sizeof(c.coefY));
     std::memcpy(c.coefU, k.u, sizeof(c.coefU));
     std::memcpy(c.coefV, k.v, sizeof(c.coefV));
@@ -473,6 +556,16 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
         c.bcValue[2] = barcode_.msbFirst ? 1 : 0, c.bcValue[3] = 1;
     }
     c.flags[0] = srv->linear ? 1 : 0;
+    c.flags[1] = hdr10 ? 1 : 0;
+    // Barcode blocks: limited-range black and white, neutral chroma (16 / 235
+    // / 128 in 8 bits, 64 / 940 / 512 in 10 bits).
+    const float codeMax = hdr10 ? 1023.0f : 255.0f;
+    c.levels[0] = (hdr10 ? 64.0f : 16.0f) / codeMax;
+    c.levels[1] = (hdr10 ? 940.0f : 235.0f) / codeMax;
+    c.levels[2] = (hdr10 ? 512.0f : 128.0f) / codeMax;
+    c.levels[3] = hdr10 ? 1023.0f : 0.0f;
+    c.nits[0] = float(kScrgbWhiteNits);
+    c.nits[1] = float(kSdrWhiteNits);
     std::memcpy(m.pData, &c, sizeof(c));
     ctx_->Unmap(cb_.Get(), 0);
 
@@ -538,7 +631,8 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
 Status Nv12Converter::readback(const ConvertedFrame& f, std::vector<uint8_t>& out) {
     const DeviceLock deviceLock(mt_.Get());
     const uint32_t w = width_, h = height_;
-    out.assign(size_t(w) * h * 3 / 2, 0);
+    const uint32_t bps = format_ == Format::P010 ? 2 : 1;  // bytes per sample
+    out.assign(size_t(w) * h * 3 / 2 * bps, 0);
     auto staging = [&](ID3D11Texture2D* like, ComPtr<ID3D11Texture2D>& st) -> HRESULT {
         if (st) return S_OK;
         D3D11_TEXTURE2D_DESC td{};
@@ -560,8 +654,8 @@ Status Nv12Converter::readback(const ConvertedFrame& f, std::vector<uint8_t>& ou
         ctx_->CopyResource(stagingA_.Get(), f.nv12);
         hr = ctx_->Map(stagingA_.Get(), 0, D3D11_MAP_READ, 0, &m);
         if (FAILED(hr)) return Status::Error("readback", "Map: " + hrText(hr));
-        copyRows(m, 0, w, h, out.data());
-        copyRows(m, size_t(m.RowPitch) * h, w, h / 2, out.data() + size_t(w) * h);  // chroma follows the luma plane
+        copyRows(m, 0, w * bps, h, out.data());
+        copyRows(m, size_t(m.RowPitch) * h, w * bps, h / 2, out.data() + size_t(w) * h * bps);  // chroma follows the luma plane
         ctx_->Unmap(stagingA_.Get(), 0);
         return Status::Ok();
     }
@@ -572,11 +666,11 @@ Status Nv12Converter::readback(const ConvertedFrame& f, std::vector<uint8_t>& ou
     ctx_->CopyResource(stagingB_.Get(), f.uv);
     hr = ctx_->Map(stagingA_.Get(), 0, D3D11_MAP_READ, 0, &m);
     if (FAILED(hr)) return Status::Error("readback", "Map: " + hrText(hr));
-    copyRows(m, 0, w, h, out.data());
+    copyRows(m, 0, w * bps, h, out.data());
     ctx_->Unmap(stagingA_.Get(), 0);
     hr = ctx_->Map(stagingB_.Get(), 0, D3D11_MAP_READ, 0, &m);
     if (FAILED(hr)) return Status::Error("readback", "Map: " + hrText(hr));
-    copyRows(m, 0, w, h / 2, out.data() + size_t(w) * h);
+    copyRows(m, 0, w * bps, h / 2, out.data() + size_t(w) * h * bps);
     ctx_->Unmap(stagingB_.Get(), 0);
     return Status::Ok();
 }

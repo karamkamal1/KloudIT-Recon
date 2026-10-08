@@ -29,6 +29,14 @@
 // (AMFContext::LockDX11), and holding it across a call that waits for AMF's own
 // threads could deadlock. (FFmpeg's amf_submit_frame_locked takes a plain
 // mutex of its own, not the device lock.)
+//
+// HDR10 (GUIDE 3.9; start hdr from an HDR source): P010 input from the colour
+// conversion (BT.2020 PQ, limited range), COLOR_BIT_DEPTH 10, HEVC
+// PROFILE_MAIN_10 (AV1 Main), input and output colour profile / transfer /
+// primaries BT.2020 / SMPTE 2084 / BT.2020, and INPUT_HDR_METADATA, an
+// AMFBuffer of AMFHDRMetadata (codec/hdr.hpp), which the encoder writes as the
+// mastering display and content light level SEI / metadata OBUs (OBS
+// texture-amf.cpp and FFmpeg amfenc.c set the same properties).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -51,6 +59,7 @@
 #include "amf/amf_props.hpp"
 #include "amf/amf_runtime.hpp"
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "codec/ltr.hpp"
 #include "d3d/device.hpp"
 #include "probes.hpp"
@@ -215,6 +224,8 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
     const bool p010 = hasFormat(d, amf::AMF_SURFACE_P010);
     if (P.codec == Codec::Hevc) c.tenBit = getProp(caps.GetPtr(), P.capMaxProfile, v) && v >= P.profileMain10 && p010;
     else if (P.codec == Codec::Av1) c.tenBit = p010;  // AV1 Main covers 10-bit
+    // HDR10: 10-bit P010 input plus the HDR metadata property (HEVC, AV1).
+    c.hdr10 = c.tenBit && P.inputHdrMetadata && P.codec != Codec::H264;
     // LTR: AV1 reports its maximum; H.264 is documented as 0..2; HEVC as
     // 0..16 shared with the short-term references (one stays short-term).
     c.maxLtr = P.docMaxLtr;
@@ -423,6 +434,8 @@ private:
     uint32_t width_ = 0, height_ = 0, codedW_ = 0, codedH_ = 0;
     amf::AMF_SURFACE_FORMAT inputFormat_ = amf::AMF_SURFACE_NV12;
     bool zeroCopy_ = false;
+    std::optional<HdrMetadata> hdr_;  // HDR10 stream: its metadata
+    amf::AMFBufferPtr hdrBuffer_;     // INPUT_HDR_METADATA
     bool flushMode_ = false;
     int queryTimeoutMs_ = 0;
     amf_int64 usage_ = 0;
@@ -501,6 +514,7 @@ void AmfEncoder::release() {
     enc_ = nullptr;
     roiMap_ = nullptr;
     roiUniform_ = nullptr;
+    hdrBuffer_ = nullptr;
     if (ctx_ && ownContext_) ctx_->Terminate();
     ctx_ = nullptr;
     ownContext_ = false;
@@ -543,7 +557,7 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     s.setInt(P_->instanceIndex, std::max(0, p.encoderInstance), p.encoderInstance > 0);
     s.set(P_->frameSize, AMFConstructSize(amf_int32(codedW_), amf_int32(codedH_)), true);
     s.set(P_->frameRate, AMFConstructRate(amf_uint32(fps_), 1));
-    s.setInt(P_->profile, P_->profileValue);
+    s.setInt(P_->profile, hdr_ ? P_->profile10Value : P_->profileValue, bool(hdr_));
     s.setBool(P_->lowLatencyMode, true);  // "sets high priority queue ... POC mode 2" (Streaming SDK GPUEncoderHEVC.cpp)
     s.setInt(P_->encodingLatencyMode, P_->lowestLatency);
     const amf_int64 preset = p.quality == "quality" ? P_->presetQuality : p.quality == "balanced" ? P_->presetBalanced : P_->presetSpeed;
@@ -583,17 +597,36 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     } else if (P_->alignmentMode) {
         s.setInt(P_->alignmentMode, AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS);
     }
-    // Colour: BT.709 limited range out (what the converter writes, and the VUI
-    // the browser decodes by). RGB input (zero-copy BGRA) is full range.
-    s.setInt(P_->colorBitDepth, AMF_COLOR_BIT_DEPTH_8);
-    if (inputFormat_ == amf::AMF_SURFACE_NV12) s.setInt(P_->inputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
-    s.setInt(P_->inputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
-    s.setInt(P_->inputPrimaries, AMF_COLOR_PRIMARIES_BT709);
-    s.setBool(P_->inputFullRange, inputFormat_ != amf::AMF_SURFACE_NV12);
-    s.setInt(P_->outputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
-    s.setInt(P_->outputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
-    s.setInt(P_->outputPrimaries, AMF_COLOR_PRIMARIES_BT709);
-    s.setBool(P_->outputFullRange, false);
+    if (hdr_) {
+        // HDR10: what the converter writes into P010 (BT.2020 matrix, PQ,
+        // limited range) and the VUI / AV1 colour config the client decodes
+        // by; the bit depth and profile are required (an 8-bit stream would
+        // be wrong, not just worse).
+        s.setInt(P_->colorBitDepth, AMF_COLOR_BIT_DEPTH_10, true);
+        s.setInt(P_->inputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_2020);
+        s.setInt(P_->inputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE2084);
+        s.setInt(P_->inputPrimaries, AMF_COLOR_PRIMARIES_BT2020);
+        s.setBool(P_->inputFullRange, false);
+        s.setInt(P_->outputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_2020);
+        s.setInt(P_->outputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE2084);
+        s.setInt(P_->outputPrimaries, AMF_COLOR_PRIMARIES_BT2020);
+        s.setBool(P_->outputFullRange, false);
+        // Not required: without it the stream is still HDR10 by its VUI,
+        // only without the metadata (logged).
+        if (hdrBuffer_) s.set(P_->inputHdrMetadata, static_cast<amf::AMFInterface*>(hdrBuffer_.GetPtr()));
+    } else {
+        // Colour: BT.709 limited range out (what the converter writes, and the VUI
+        // the browser decodes by). RGB input (zero-copy BGRA) is full range.
+        s.setInt(P_->colorBitDepth, AMF_COLOR_BIT_DEPTH_8);
+        if (inputFormat_ == amf::AMF_SURFACE_NV12) s.setInt(P_->inputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+        s.setInt(P_->inputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+        s.setInt(P_->inputPrimaries, AMF_COLOR_PRIMARIES_BT709);
+        s.setBool(P_->inputFullRange, inputFormat_ != amf::AMF_SURFACE_NV12);
+        s.setInt(P_->outputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+        s.setInt(P_->outputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+        s.setInt(P_->outputPrimaries, AMF_COLOR_PRIMARIES_BT709);
+        s.setBool(P_->outputFullRange, false);
+    }
     applyDynamic(s);
     if (!s.errors.empty()) return Status::Error("init_failed", "AMF " + std::string(codecName(codec_)) + " rejected " + s.errorText());
     if (!s.warnings.empty()) {
@@ -723,6 +756,10 @@ Status AmfEncoder::validate(const StartParams& p) {
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) + ": the GPU has " +
                                                 std::to_string(cc.hwInstances) + " " + p.codec + " encoder(s)");
     }
+    if (hdr_ && !cc.hdr10) {
+        return Status::Error("unsupported", "hdr: the " + p.codec + " encoder cannot make HDR10 here (caps hdr10 false: " +
+                                                (p.codec == "h264" ? "HDR10 needs hevc or av1" : "no 10-bit P010 input") + ")");
+    }
     return Status::Ok();
 }
 
@@ -738,7 +775,6 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
         return Status::Error("unsupported", "AMF cannot encode " + p.codec + " here: " +
                                                 (it == probe.codecs.end() ? probe.reason : it->second.reason));
     }
-    if (p.hdr) return Status::Error("unsupported", "HDR10 encoding comes with step 3.9");
     if (!src.device) {
         return Status::Error("unsupported", "the AMF encoder needs a GPU capture (dda, amd-direct, wgc or synthetic-gpu)");
     }
@@ -758,6 +794,9 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     if (vbvFrames_ < 1.0 || vbvFrames_ > 1.5) {
         logf(LogLevel::Info, "amf: vbvFrames %.2f is outside GUIDE 3.3's 1.0-1.5", vbvFrames_);
     }
+    // HDR10 when asked for and the source is HDR; an SDR source gives an SDR stream.
+    hdr_.reset();
+    if (p.hdr && src.hdr) hdr_ = hdrMetadataFor(src.display);
 
     // The context: AMD Direct Capture's (its surfaces can then be encoded as
     // they are), else one on the capture device.
@@ -799,6 +838,28 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     const CodecCaps& cc = det_.caps;
     flushMode_ = (p.liveBitrate.empty() ? cc.liveBitrate : p.liveBitrate) == "flush";
     queryTimeoutMs_ = cc.queryTimeout ? kQueryTimeoutMs : 0;
+    if (hdr_) {
+        // AMFHDRMetadata: chromaticity "normalized to 50000", luminance
+        // "normalized to 10000" (ColorSpace.h), the HEVC SEI units, for AV1 too
+        // (FFmpeg amfenc.c fills it the same way for every codec).
+        AMF_RESULT hr = ctx_->AllocBuffer(amf::AMF_MEMORY_HOST, sizeof(AMFHDRMetadata), &hdrBuffer_);
+        if (hr == AMF_OK && hdrBuffer_ && hdrBuffer_->GetNative()) {
+            const MasteringCodes mc = masteringCodes(*hdr_, false);
+            AMFHDRMetadata md{};
+            for (int i = 0; i < 2; ++i) {
+                md.redPrimary[i] = mc.red[i], md.greenPrimary[i] = mc.green[i], md.bluePrimary[i] = mc.blue[i];
+                md.whitePoint[i] = mc.white[i];
+            }
+            md.maxMasteringLuminance = mc.maxLuminance;
+            md.minMasteringLuminance = mc.minLuminance;
+            md.maxContentLightLevel = amf_uint16(std::min(hdr_->maxCll, 65535));
+            md.maxFrameAverageLightLevel = amf_uint16(std::min(hdr_->maxFall, 65535));
+            std::memcpy(hdrBuffer_->GetNative(), &md, sizeof(md));
+        } else {
+            hdrBuffer_ = nullptr;
+            logf(LogLevel::Warn, "amf: %s: the HDR10 stream goes without HDR metadata", amfError("AllocBuffer(AMFHDRMetadata)", hr).c_str());
+        }
+    }
 
     for (int pass = 0;; ++pass) {
         // Zero-copy: AMD Direct Capture surfaces straight into the encoder
@@ -808,10 +869,11 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
         // conversion.
         zeroCopy_ = src.amfContext && p.zeroCopy && !p.barcode.enabled && width_ == src.width && height_ == src.height &&
                     codedW_ == width_ && codedH_ == height_ && src.rotation == 0 && zeroCopyFormat(src.amfFormat) &&
-                    hasFormat(det_, src.amfFormat);
-        inputFormat_ = zeroCopy_ ? amf::AMF_SURFACE_FORMAT(src.amfFormat) : amf::AMF_SURFACE_NV12;
+                    hasFormat(det_, src.amfFormat) && !hdr_;
+        inputFormat_ = zeroCopy_ ? amf::AMF_SURFACE_FORMAT(src.amfFormat) : hdr_ ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
         if (pass == 0 && src.amfContext && p.zeroCopy && src.amfFormat && !zeroCopyFormat(src.amfFormat)) {
-            logf(LogLevel::Info, "amf: AMD Direct Capture surface format %d is not 8-bit BGRA/RGBA: converting to NV12", src.amfFormat);
+            logf(LogLevel::Info, "amf: AMD Direct Capture surface format %d is not 8-bit BGRA/RGBA: converting to %s", src.amfFormat,
+                 hdr_ ? "P010" : "NV12");
         }
         Status s = initEncoder();
         if (!s.ok) {
@@ -904,7 +966,7 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
 
     in = InputSpec{};
     if (!zeroCopy_) {
-        in.format = InputSpec::Format::Nv12;
+        in.format = hdr_ ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
         in.width = codedW_;
         in.height = codedH_;
         if (codedW_ != width_ || codedH_ != height_) {
@@ -930,12 +992,22 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     out.queryTimeoutMs = queryTimeoutMs_;
     out.zeroCopy = zeroCopy_;
     out.intraRefreshFrames = intraRefresh;
+    describeColor(out, hdr_);
     logf(LogLevel::Info,
          "amf: %s %ux%u (coded %ux%u) %d fps %d kbps %s vbv %.2f frames, usage %s, preset %s, instance %d/%d, LTR %d (every %d), "
          "query timeout %d ms, live bitrate %s, input %s, runtime %s",
          p.codec.c_str(), width_, height_, codedW_, codedH_, fps_, kbps_, out.rateControl.c_str(), vbvFrames_, out.usage.c_str(),
          p.quality.c_str(), out.encoderInstance, cc.hwInstances, p.ltrSlots, out.ltrInterval, queryTimeoutMs_,
-         out.liveBitrate.c_str(), zeroCopy_ ? "AMD Direct Capture surfaces (zero-copy)" : "NV12", rt.versionText.c_str());
+         out.liveBitrate.c_str(),
+         zeroCopy_                                 ? "AMD Direct Capture surfaces (zero-copy)"
+         : hdr_ && codec_ == Codec::Hevc ? "P010 (HDR10: BT.2020 PQ, Main10)"
+         : hdr_                                    ? "P010 (HDR10: BT.2020 PQ, 10-bit)"
+                                                   : "NV12",
+         rt.versionText.c_str());
+    if (hdr_) {
+        logf(LogLevel::Info, "amf: HDR10 metadata: mastering display %.0f / %.4f cd/m2, MaxCLL %d, MaxFALL %d%s", hdr_->maxLuminance,
+             hdr_->minLuminance, hdr_->maxCll, hdr_->maxFall, hdrBuffer_ ? "" : " (not passed: no buffer)");
+    }
     return Status::Ok();
 }
 

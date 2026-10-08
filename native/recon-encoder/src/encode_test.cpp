@@ -76,6 +76,7 @@ const OptionField kStartOptions[] = {
     {"--live-bitrate", "liveBitrate", Kind::Str},
     {"--instance", "encoderInstance", Kind::Int},
     {"--zero-copy", "zeroCopy", Kind::Bool},
+    {"--hdr", "hdr", Kind::Bool},
     {"--intra-refresh", "intraRefreshFrames", Kind::Int},
     {"--monitor", "monitor", Kind::Int},
     {"--hmonitor", "hmonitor", Kind::Hex},

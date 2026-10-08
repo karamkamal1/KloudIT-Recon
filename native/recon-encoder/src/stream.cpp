@@ -26,24 +26,28 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
     s = choice.backend->init(p, src, in, st);
     const bool encoderReady = s.ok;
     std::unique_ptr<d3d::Nv12Converter> conv;
-    if (s.ok && in.format == InputSpec::Format::Nv12) {
+    if (s.ok && (in.format == InputSpec::Format::Nv12 || in.format == InputSpec::Format::P010)) {
+        using Converter = d3d::Nv12Converter;
+        const auto format = in.format == InputSpec::Format::P010 ? Converter::Format::P010 : Converter::Format::Nv12;
+        const char* formatName = format == Converter::Format::P010 ? "P010" : "NV12";
         if (!src.device) {
-            s = Status::Error("unsupported", "the encoder wants NV12 but the capture has no GPU device");
+            s = Status::Error("unsupported", std::string("the encoder wants ") + formatName + " but the capture has no GPU device");
         } else {
-            auto mode = d3d::Nv12Converter::Output::Nv12;
-            if (!d3d::Nv12Converter::nv12RenderTargets(src.device) && choice.caps.backend == "mock") {
-                mode = d3d::Nv12Converter::Output::Planar;  // the mock reads nothing: still exercise the shaders
+            auto mode = Converter::Output::Nv12;
+            if (!Converter::renderTargets(src.device, format) && choice.caps.backend == "mock") {
+                mode = Converter::Output::Planar;  // the mock reads nothing: still exercise the shaders
             }
-            conv = std::make_unique<d3d::Nv12Converter>();
-            s = conv->init(src.device, in.width, in.height, p.barcode, mode, 6, in.contentWidth, in.contentHeight);
+            conv = std::make_unique<Converter>();
+            s = conv->init(src.device, in.width, in.height, p.barcode, mode, 6, in.contentWidth, in.contentHeight, format);
             if (s.ok) {
                 std::string padded;
                 if (conv->contentWidth() != in.width || conv->contentHeight() != in.height) {
                     padded = " padded to " + std::to_string(in.width) + "x" + std::to_string(in.height);
                 }
-                logf(LogLevel::Info, "converting %ux%u -> %ux%u%s %s%s", src.width, src.height, conv->contentWidth(),
+                logf(LogLevel::Info, "converting %ux%u -> %ux%u%s %s%s%s", src.width, src.height, conv->contentWidth(),
                      conv->contentHeight(), padded.c_str(),
-                     mode == d3d::Nv12Converter::Output::Nv12 ? "NV12" : "Y + CbCr planes (no NV12 render targets)",
+                     mode == Converter::Output::Nv12 ? formatName : "Y + CbCr planes (no NV12 / P010 render targets)",
+                     format == Converter::Format::P010 ? " (HDR10: BT.2020 PQ, 10-bit)" : "",
                      p.barcode.enabled ? " with barcode" : "");
             }
         }
@@ -70,6 +74,14 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
     }
     st.barcode = conv && p.barcode.enabled;
     st.cursorInVideo = src.cursorInVideo;
+    if (p.hdr && !st.hdr) {
+        // Not an error (Sunshine streams SDR from an SDR display too): started.hdr says so.
+        const std::string why = src.hdr                                ? "the encoder made SDR"
+                                : src.display.known && src.display.hdr ? "capture " + capName + " delivers no HDR frames"
+                                : src.display.known                    ? "Windows HDR is off for this output"
+                                                                       : "no HDR information for this source";
+        logf(LogLevel::Info, "hdr was asked for, but the stream is SDR: %s", why.c_str());
+    }
 
     RateParams rate;
     rate.kbps = p.kbps;

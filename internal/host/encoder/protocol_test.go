@@ -95,6 +95,27 @@ func TestDecodeMessages(t *testing.T) {
 		!c.Codecs["av1"].IsAssumed("roi") {
 		t.Fatalf("caps (nvenc): %+v %v", m, err)
 	}
+	// HDR10 (step 3.9): an HEVC Main10 stream with its metadata, and the caps that announce it.
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"amf","capture":"dda","codec":"hevc","width":2560,"height":1440,"fps":120,"kbps":60000,"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq","hdrMetadata":{"displayPrimaries":[[0.708,0.292],[0.17,0.797],[0.131,0.046]],"whitePoint":[0.3127,0.329],"maxLuminance":1000,"minLuminance":0.005,"maxCll":1000,"maxFall":400}}`))
+	if s, ok := m.(*Started); err != nil || !ok || !s.HDR || s.BitDepth != 10 || s.ColorSpace != "bt2020-pq" || s.HDRMetadata == nil ||
+		s.HDRMetadata.DisplayPrimaries[1] != [2]float64{0.17, 0.797} || s.HDRMetadata.WhitePoint[0] != 0.3127 ||
+		s.HDRMetadata.MaxLuminance != 1000 || s.HDRMetadata.MinLuminance != 0.005 || s.HDRMetadata.MaxCLL != 1000 || s.HDRMetadata.MaxFALL != 400 {
+		t.Fatalf("started (hdr10): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"nvenc","capture":"dda","codec":"hevc","width":1920,"height":1080,"fps":60,"kbps":20000,"hdr":false,"bitDepth":8,"colorSpace":"bt709"}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.HDR || s.BitDepth != 8 || s.ColorSpace != "bt709" || s.HDRMetadata != nil {
+		t.Fatalf("started (sdr): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"caps","v":1,"backend":"amf","vendor":"amd","codecs":{"hevc":{"maxW":7680,"maxH":4320,"tenBit":true,"hdr10":true},"h264":{"maxW":4096,"maxH":2160,"hdr10":false}},"outputs":[{"index":0,"name":"\\\\.\\DISPLAY1","width":2560,"height":1440,"attached":true,"hdr":true,"bitsPerColor":10,"minLuminance":0.005,"maxLuminance":1015.5,"maxFullFrameLuminance":400}]}`))
+	if c, ok := m.(*Caps); err != nil || !ok || !c.Codecs["hevc"].HDR10 || c.Codecs["h264"].HDR10 || len(c.Outputs) != 1 || !c.Outputs[0].HDR ||
+		c.Outputs[0].BitsPerColor != 10 || c.Outputs[0].MaxLuminance != 1015.5 || c.Outputs[0].MinLuminance != 0.005 ||
+		c.Outputs[0].MaxFullFrameLuminance != 400 {
+		t.Fatalf("caps (hdr): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"captureChanged","reason":"hdr","width":2560,"height":1440,"rotation":0,"hdr":false,"text":"Windows HDR turned off for the output; the stream stays HDR10"}`))
+	if c, ok := m.(*CaptureChanged); err != nil || !ok || c.Reason != "hdr" || c.HDR || c.Width != 2560 {
+		t.Fatalf("captureChanged (hdr): %+v %v", m, err)
+	}
 	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"wgc","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"cursorInVideo":true}`))
 	if s, ok := m.(*Started); err != nil || !ok || !s.CursorInVideo {
 		t.Fatalf("started (wgc with the pointer): %+v %v", m, err)

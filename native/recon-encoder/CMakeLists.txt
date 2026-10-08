@@ -52,6 +52,7 @@ add_executable(recon-encoder
     src/amf/amf_backend.cpp
     src/amf/amf_runtime.cpp
     src/codec/bitstream.cpp
+    src/codec/hdr.cpp
     src/codec/ltr.cpp
     src/codec/rfi.cpp
     src/codec/selftest.cpp

@@ -3131,3 +3131,172 @@ pinned by tests.
   for the helper command; also the render adapter on a hybrid laptop (Intel iGPU + NVIDIA):
   the capture line's `output_idx` must be on DXGI adapter 0 and `recon-encoder` must report the
   NVIDIA adapter in `started`.
+
+## 3.9 HDR10 in the helper
+
+recon-encoder.exe can make HDR10 streams (opt-in: `start` with `hdr`; helper side and the Go
+client `internal/host/encoder` only, the session does not ask for it yet and the browser side
+is step 4.5). docs/HELPER_PROTOCOL.md "HDR10" is the reference. In short:
+
+- When the captured output is in Windows HDR mode (`IDXGIOutput6::GetDesc1` colour space
+  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`) and `hdr` was asked for, DDA duplicates with
+  `DuplicateOutput1([R16G16B16A16_FLOAT, B8G8R8A8_UNORM])` and gets the desktop as Windows
+  composes it (scRGB FP16); an SDR output (or WGC, which has no HDR path yet) gives an SDR
+  stream with `started.hdr` false, as Sunshine does. AMD Direct Capture is HDR when its
+  surfaces are `AMF_SURFACE_RGBA_F16`.
+- A pixel shader converts scRGB (x 80 cd/m2; an 8-bit source at 203 cd/m2, BT.2408) with the
+  BT.2087 BT.709 -> BT.2020 matrix and the ST 2084 PQ curve into P010 (BT.2020 NCL matrix,
+  10-bit limited range, 10-bit codes in the high bits). GUIDE 3.9's alternative R10G10B10A2
+  input is not used: both encoders take P010, which keeps matrix and chroma siting in the
+  helper's own tested shader.
+- AMF: `COLOR_BIT_DEPTH` 10, HEVC `PROFILE_MAIN_10` / AV1 Main, input and output colour
+  profile / transfer / primaries BT.2020 / SMPTE 2084 / BT.2020, `INPUT_HDR_METADATA`
+  (`AMFHDRMetadata` in an `AMFBuffer`, units x 50000 / x 10000), P010 input, no zero-copy.
+  NVENC: HEVC Main10 / AV1 Main with input and output bit depth 10, `YUV420_10BIT` (P010)
+  input, VUI / AV1 colour config BT.2020 / SMPTE 2084 / BT.2020 NCL, `outputMasteringDisplay`
+  and `outputMaxCll` with `pMasteringDisplay` / `pMaxCll` on every picture (HEVC units x 50000
+  / x 10000, AV1 0.16 / 24.8 / 18.14 fixed point as FFmpeg's nvenc.c converts).
+- Metadata (Sunshine's choice): BT.2020 primaries with D65, the output's DXGI luminance range as
+  the mastering display's, MaxCLL = its peak, MaxFALL = its full-frame luminance; unknown or
+  implausible values (peak outside 80..10000 cd/m2) fall back to a 1000 cd/m2 display.
+- Caps (additive, protocol version stays 1): `codecs.*.hdr10`, `outputs[].hdr`,
+  `bitsPerColor`, `minLuminance`, `maxLuminance`, `maxFullFrameLuminance`; `started.hdr`,
+  `bitDepth`, `colorSpace` (`bt709` | `bt2020-pq`), `hdrMetadata`; `captureChanged` field
+  `hdr` and reason `hdr` (Windows HDR turned on / off during the stream; the stream keeps its
+  format). `start` with `hdr` and a codec without `hdr10` (H.264, a GPU without 10-bit
+  encoding or P010 input) fails with `unsupported`. Encode test option `--hdr=0|1`; the
+  `synthetic-gpu` test source plays an HDR output with `hdr`.
+
+Sources: Sunshine `src/platform/windows/display_base.cpp` (`is_hdr`, `get_hdr_metadata`,
+the FP16 capture format list) and `display_vram.cpp` / `convert_*_perceptual_quantizer*.hlsl`
+(scRGB -> PQ, P010 plane views); FFmpeg `libavcodec/amfenc.c` / `amfenc_hevc.c` (COLOR_BIT_DEPTH,
+the BT.2020 / SMPTE 2084 colour properties, `INPUT_HDR_METADATA` from mastering display side
+data) and `nvenc.c` (`outputMasteringDisplay` / `outputMaxCll`, `pMasteringDisplay` /
+`pMaxCll` per frame, the AV1 fixed-point units); OBS `plugins/obs-ffmpeg/texture-amf.cpp`
+(Main10, P010, `INPUT_HDR_METADATA` for HEVC and AV1); the vendored AMF 1.5.3 headers
+(`ColorSpace.h` `AMFHDRMetadata` units, `VideoEncoderHEVC.h` / `VideoEncoderAV1.h`) and
+nvEncodeAPI.h 13.0 (`MASTERING_DISPLAY_INFO`, `CONTENT_LIGHT_LEVEL`, bit depth fields); ITU-R
+BT.2020, BT.2087, BT.2100 (PQ), BT.2408 (203 cd/m2 HDR reference white), SMPTE ST 2084 / 2086,
+CTA-861.3; HEVC D.2.28 / D.2.35, AV1 6.7.3 / 6.7.4.
+
+### Verified in the sandbox
+
+- verified (sandbox): the conversion (`--self-test-convert` under Wine 9.0 / wined3d on Mesa
+  llvmpipe, `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`; mode planar for NV12 and
+  for P010, since wined3d has no NV12 / P010 render targets, so the same shaders run on
+  R8 / R8G8 and R16 / R16G16 textures): 14 cases ok, the 5 HDR10 ones (FP16 1:1 + barcode,
+  2:1 downscale from a copied source, 90 degree rotation, an 8-bit sRGB source at 203 cd/m2,
+  padding to 64x16) within 1 code of a double-precision CPU reference of the PQ curve and the
+  BT.2087 matrix; absolute codes Y 64 / 490 / 509 / 573 / 723 / 855 / 940 for 0 / 80 / 100 /
+  203 / 1000 / 4000 / 10000+ cd/m2, scRGB primaries at 80 cd/m2 (red 325/448/598), negative
+  colours black, P010 low bits zero, barcode 64 / 940 / 512; plus a new SDR case (an FP16
+  source clipped to SDR). Mutation check: changing one BT.2087 matrix coefficient and
+  truncating instead of rounding made the HDR10 cases fail.
+- verified (sandbox): `--self-test-encoder` "HDR10 metadata and its units": BT.2020 / D65,
+  the display's luminance, the fallbacks, HEVC / AMF codes (red 35400/14600, white
+  15635/16450, 1000 cd/m2 = 10000000, 0.005 cd/m2 = 50) and AV1 codes (red 46399/19137, 1000
+  cd/m2 = 256000, 0.005 = 82).
+- verified (sandbox): `--self-test-nvenc=recon-fake-nvenc.dll`: "HDR10 hevc" and "HDR10 av1"
+  (Main10 / AV1 Main with bit depth 10, the BT.2020 PQ colour description, P010 registered as
+  `YUV420_10BIT`, the metadata codes with each of 30 pictures, forced IDR and a loss, an SDR
+  source giving an 8-bit stream), "HDR10 refusals" (H.264; `tenBit=0`; no P010 input), caps
+  `hdr10`; the test double flags input formats that do not match the bit depth, 10-bit HEVC
+  without Main10 and metadata in 8-bit streams.
+- verified (sandbox): `TestHelperIntegrationHDRPipeline` (Go client, mock backend,
+  `synthetic-gpu` with `hdr`): `started` hdr / bitDepth 10 / bt2020-pq / the 1000 cd/m2
+  panel's metadata; the dumped P010 frame 30 has its barcode reading 30 at codes 64 / 940,
+  all low bits zero, and the 1000 cd/m2 patch at Y 723, CbCr 512. `TestHelperIntegrationEncodeTest`
+  runs `--hdr=1`; `TestDecodeMessages` decodes the new caps / started / captureChanged
+  fields; `TestHelperIntegrationGPUPipeline` checks an SDR stream reports bitDepth 8 / bt709.
+- Not run here: DDA's FP16 duplication (Wine's `DuplicateOutput` answers E_NOTIMPL: the DDA
+  test fails cleanly as before), the AMF HDR10 configuration (no AMD GPU), the MSVC build
+  (CI job `helper-windows`; it now accepts `self-test-convert: ok (mode nv12;` and logs the
+  HDR10 mode).
+
+### Hardware checks
+
+Turn Windows HDR on for the monitor (Settings > System > Display > Use HDR, or Win+Alt+B).
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (caps): `recon-encoder.exe --print-caps
+  --backend=amf`: the monitor's `outputs[]` entry has `"hdr":true`, `bitsPerColor` 10, and
+  `maxLuminance` / `maxFullFrameLuminance` as Windows HDR Calibration or the monitor's EDID
+  states them (compare with Settings > Display > Advanced display "Peak brightness");
+  `codecs.hevc.hdr10` and `codecs.av1.hdr10` true, `codecs.h264.hdr10` false. With HDR off,
+  `"hdr":false`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HEVC HDR10, DDA): play an HDR10 video or game in
+  borderless full screen and run `recon-encoder.exe --encode-test=hdr.hevc --backend=amf
+  --codec=hevc --capture=dda --hdr=1 --fps=60 --kbps=40000 --frames=600`. The started line has
+  `"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq"` and the log "dda: ... Windows HDR on (FP16
+  scRGB capture, N cd/m2 peak)". `ffprobe -v error -show_streams -show_frames -read_intervals
+  %+#2 -of json hdr.hevc`: profile "Main 10", pix_fmt yuv420p10le, color_range tv, color_space
+  bt2020nc, color_transfer smpte2084, color_primaries bt2020, and side data "Mastering display
+  metadata" (max_luminance = the display's peak, min_luminance, primaries 35400/14600 ... as
+  /50000 ratios) and "Content light level metadata" (max_content = peak, max_average =
+  full-frame) on the key frame. If the side data is missing, AMF ignores `INPUT_HDR_METADATA`
+  on this driver: record the Adrenalin version (the stream is still HDR10 by its VUI). Play
+  hdr.hevc on an HDR display (mpv `--vo=gpu-next` with HDR passthrough, or the Windows Films &
+  TV app): highlights above SDR white keep their detail and brightness as on the host,
+  desktop elements (taskbar) look as bright as on the host (the "SDR content brightness"
+  slider is part of the scRGB values).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 HDR10): the same with `--codec=av1`
+  (hdr.ivf): av1 Main, yuv420p10le, smpte2084 / bt2020, the mastering display and content
+  light level metadata; at 1920x1080 still coded 1920x1088 with cropBottom 8.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (P010 render targets and shader accuracy on the GPU):
+  `recon-encoder.exe --self-test-convert=hw` ends with "ok (mode nv12; HDR10 mode p010)" (all
+  HDR10 cases within 1-2 codes). Also on CI's WARP (windows-latest): record whether WARP
+  reports `HDR10 mode p010` or `planar`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (colour accuracy): show a full-screen HDR test
+  pattern with known patches (an HDR10 test video with 100 / 1000 cd/m2 patches, or the
+  Windows HDR Calibration app's screens), encode as above, then `ffmpeg -i hdr.hevc -frames:v 1
+  -vf crop=64:64:X:Y -f rawvideo -pix_fmt yuv420p10le patch.yuv` and read the Y values: a
+  1000 cd/m2 patch (if the display shows it unclipped) ~723, 100 cd/m2 ~509; SDR white
+  (taskbar text) at the "SDR content brightness" level.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HDR toggled during a stream): during an HDR10
+  encode test press Win+Alt+B: the log says "Windows HDR turned off for the output; the stream
+  stays HDR10" (`captureChanged` `hdr` false), frames keep coming (the SDR desktop at
+  203 cd/m2), no fatal error; turn it on again: "turned on", FP16 frames again. Start an SDR
+  stream (`--hdr=0`) on an HDR desktop and toggle: `hdr` events, the SDR picture unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AMD Direct Capture): `--capture=amd-direct --hdr=1`
+  on an HDR desktop: record the log, "amd-direct: ... Windows HDR on (FP16 scRGB capture)" or
+  "the capture surfaces are AMF format N, not RGBA_F16: SDR" (N = 11 RGBA_F16, 13
+  R10G10B10A2); with FP16 the ffprobe checks above apply.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (cost): the encode test's capture -> output p50 /
+  p95 at 3840x2160 120 fps HEVC with `--hdr=1` vs `--hdr=0` on the same HDR desktop (the SDR
+  stream lets DXGI convert): the P010 PQ pass should add well under 1 ms.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (virtual display, 3.7): with HDR enabled on the
+  SudoVDA / VDD monitor, `outputs[].hdr` true and the stream HDR10; record the luminance the
+  virtual EDID reports (an implausible peak falls back to 1000 cd/m2 in `started.hdrMetadata`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (exclusive full-screen HDR game): DDA keeps
+  delivering FP16 frames from an HDR game in exclusive full screen (the flip model may bypass
+  DWM: record whether frames stall or arrive as B8G8R8A8).
+- NVIDIA: unverified (no NVIDIA host available). Test (driver self-test): `recon-encoder.exe
+  --self-test-nvenc` (Windows HDR need not be on): "HDR10 hevc" ok on GTX 10 series and newer
+  (HEVC Main10), "HDR10 av1" ok on RTX 40 / 50 (skipped elsewhere), "self-test-nvenc: ok".
+- NVIDIA: unverified (no NVIDIA host available). Test (HEVC / AV1 HDR10, DDA): the AMD tests
+  above with `--backend=nvenc`; ffprobe must show the mastering display and content light
+  level side data. Record which frames carry them (`-show_frames` over 120 frames: every frame,
+  as the backend passes them with every picture, or key frames only) and the per-frame
+  overhead (about 40 bytes when on every frame); AV1: max_luminance must read the display's
+  peak (checks the 24.8 / 18.14 fixed-point conversion).
+- NVIDIA: unverified (no NVIDIA host available). Test (P010 render targets): `--self-test-convert=hw`
+  ends with "HDR10 mode p010".
+
+### Session integration (for the session rewrite and step 4.5)
+
+internal/host/session.go is unchanged; the Go API is in `internal/host/encoder`:
+
+- Ask for HDR (`StartParams.HDR`) only when the client can present it (step 4.5: an HDR
+  canvas and a decoder for HEVC Main10 / AV1 10-bit, `VideoDecoder.isConfigSupported` with
+  e.g. `hvc1.2.4.L153.B0` / `av01.0.13M.10`), the codec's `CodecCaps.HDR10` is true and the
+  monitor's `Output.HDR` is true. With `HDR10` false the helper refuses the start
+  (`unsupported`): fall back to an SDR start.
+- After `Start`, `Started.HDR` decides the stream's format: true = 10-bit BT.2020 PQ
+  (`BitDepth` 10, `ColorSpace` "bt2020-pq", `HDRMetadata`); the VideoConfig sent to the browser
+  then needs a Main10 / 10-bit codec string (HEVC profile 2, AV1 `.10`), the colour
+  description and the metadata (proto change in step 4.5). False = SDR as before.
+- `CaptureChanged{Reason: "hdr"}`: the output entered or left HDR mode; the stream keeps its
+  format (an HDR10 stream shows SDR content at 203 cd/m2). Restart the helper with the new
+  setting to follow.
+- The in-band barcode (0.2) uses codes 64 / 940 in HDR10 streams, i.e. 16 / 235 after an 8-bit
+  conversion: barcode readers that threshold 8-bit luma at mid-grey work unchanged. The
+  FFmpeg path stays SDR.

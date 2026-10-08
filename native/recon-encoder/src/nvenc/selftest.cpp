@@ -11,7 +11,8 @@
 // - no DLL: the NVIDIA driver (System32's nvEncodeAPI64.dll), the hardware
 //   check of docs/VENDOR_NOTES.md 3.4: key frames exactly where forced, loss
 //   recovery by invalidation without an IDR, rate changes without one, the
-//   flush mode, every codec and preset the GPU has.
+//   flush mode, every codec and preset the GPU has; and of 3.9: HDR10 streams
+//   (P010 input, Main10 / AV1 10-bit, the HDR metadata).
 // Exit code 0 ok, 1 failed, 77 could not run (no D3D11 device, no NVENC runtime
 // or no NVIDIA adapter).
 #include <algorithm>
@@ -28,6 +29,7 @@
 
 #include "backend.hpp"
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "d3d/device.hpp"
 #include "nvenc/nvenc_policy.hpp"
 #include "nvenc/nvenc_runtime.hpp"
@@ -125,7 +127,8 @@ public:
         }
     }
 
-    bool start(const StartParams& p, Started& st, Status& s) {
+    // hdrSource: the source is an output in Windows HDR mode (a 1000 cd/m2 panel).
+    bool start(const StartParams& p, Started& st, Status& s, bool hdrSource = false) {
         backend_ = createNvencBackend(s);
         if (!backend_) return false;
         SourceInfo src;
@@ -133,19 +136,25 @@ public:
         src.height = uint32_t(p.height);
         src.device = device_;
         src.adapter = adapter_;
+        if (hdrSource) {
+            src.hdr = true;
+            src.display.known = src.display.hdr = true;
+            src.display.minLuminance = 0.005, src.display.maxLuminance = 1000, src.display.maxFullFrameLuminance = 400;
+        }
         InputSpec in;
         s = backend_->init(p, src, in, st);
         if (!s.ok) {
             backend_.reset();
             return false;
         }
-        if (in.format != InputSpec::Format::Nv12 || in.width != src.width || in.height != src.height) {
+        const InputSpec::Format want = st.hdr ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
+        if (in.format != want || in.width != src.width || in.height != src.height) {
             s = Status::Error("test", "the backend asked for an unexpected input");
             return false;
         }
-        // Pool textures like the converter's (d3d/convert.cpp): NV12, render
-        // target + shader resource. The test double takes any texture where
-        // the device has no NV12 (Wine).
+        // Pool textures like the converter's (d3d/convert.cpp): NV12 (P010 for
+        // HDR10), render target + shader resource. The test double takes any
+        // texture where the device has no NV12 / P010 (Wine).
         for (int i = 0; i < 6; ++i) {
             D3D11_TEXTURE2D_DESC td{};
             td.Width = in.width;
@@ -153,16 +162,18 @@ public:
             td.MipLevels = td.ArraySize = 1;
             td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_DEFAULT;
-            td.Format = DXGI_FORMAT_NV12;
+            td.Format = st.hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
             td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             ComPtr<ID3D11Texture2D> t;
             HRESULT hr = device_->CreateTexture2D(&td, nullptr, t.GetAddressOf());
             if (FAILED(hr)) {
                 td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 hr = device_->CreateTexture2D(&td, nullptr, t.GetAddressOf());
-                static bool warned = false;
-                if (!warned) std::printf("  (no NV12 textures on this device: BGRA stand-ins for the test double)\n");
-                warned = true;
+                static bool warned[2] = {false, false};
+                if (!warned[st.hdr]) {
+                    std::printf("  (no %s textures on this device: BGRA stand-ins for the test double)\n", st.hdr ? "P010" : "NV12");
+                }
+                warned[st.hdr] = true;
             }
             if (FAILED(hr)) {
                 s = Status::Error("test", "CreateTexture2D: " + d3d::hrText(hr));
@@ -508,6 +519,91 @@ void testStream(Ctx& c, const std::string& codec, uint32_t w, uint32_t h) {
     report(name, before);
 }
 
+// HDR10 (step 3.9): from an HDR source, HEVC Main10 / AV1 10-bit with P010
+// input, the BT.2020 PQ colour description and the HDR metadata with every
+// picture; forced IDRs and a loss still work. The test double also checks
+// the refusals (H.264, no 10-bit encoding, no P010 input) and that an SDR
+// source gives an SDR stream.
+void testHdr(Ctx& c, const std::string& codec) {
+    const std::string name = "HDR10 " + codec;
+    const int before = failures;
+    if (!c.has(codec, 1280, 720) || !c.caps.codecs[codec].hdr10) {
+        std::printf("  %-44s skipped (no HDR10 %s on this GPU)\n", name.c_str(), codec.c_str());
+        return;
+    }
+    Harness hs(c.device, c.adapter);
+    StartParams p;
+    p.codec = codec;
+    p.width = 1280;
+    p.height = 720;
+    p.fps = 60;
+    p.kbps = 20000;
+    p.hdr = true;
+    Started st;
+    Status s;
+    if (!hs.start(p, st, s, true)) {
+        expect(false, name, "start: " + s.code + ": " + s.text);
+        return;
+    }
+    const HdrMetadata& m = st.hdrMetadata ? *st.hdrMetadata : HdrMetadata{};
+    expect(st.hdr && st.bitDepth == 10 && st.colorSpace == "bt2020-pq" && st.hdrMetadata && m.maxLuminance == 1000 && m.minLuminance == 0.005 &&
+               m.maxCll == 1000 && m.maxFall == 400 && m.red[0] == 0.708 && m.white[1] == 0.3290,
+           name, "started: hdr " + std::to_string(st.hdr) + ", bitDepth " + std::to_string(st.bitDepth) + ", " + st.colorSpace);
+    Backend& b = hs.backend();
+    for (uint64_t id = 1; id <= 30; ++id) {
+        expect(hs.submit(id).ok, name, "submit " + std::to_string(id));
+        if (id == 10) b.forceIdr();
+        if (id == 20) {
+            expect(hs.waitFor(20), name, "frame 20 did not come out");
+            b.recover(19, std::nullopt);
+        }
+        Sleep(DWORD(c.delayMs));
+    }
+    expect(hs.waitFor(30), name, "frame 30 did not come out");
+    hs.stop();
+    std::vector<uint64_t> keys;
+    for (const Got& g : hs.got()) {
+        if (g.key) keys.push_back(g.frameId);
+    }
+    expect(hs.got().size() == 30 && keys.size() >= 2 && keys[0] == 1 && keys[1] == 11, name, "keys " + idList(keys));
+    expect(hs.errors().empty(), name, hs.errors().empty() ? "" : "output error: " + hs.errors().front().text);
+    if (c.fake) {
+        const std::string in = c.driver.log("init ").empty() ? "" : c.driver.log("init ").back();
+        expect(field(in, "bitdepth") == "10" && field(in, "hdrsei") == "1/1" && field(in, "vui") == "1" &&
+                   field(in, "profile") == (codec == "hevc" ? "main10" : "set"),
+               name, "init: " + in);
+        // Every picture with the metadata, in the codec's units.
+        const MasteringCodes mc = masteringCodes(m, codec == "av1");
+        char want[128];
+        std::snprintf(want, sizeof(want), "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", mc.green[0], mc.green[1], mc.blue[0], mc.blue[1], mc.red[0],
+                      mc.red[1], mc.white[0], mc.white[1], mc.maxLuminance, mc.minLuminance);
+        const std::vector<std::string> enc = c.driver.log("encode ");
+        expect(enc.size() == 30, name, "encodes: " + std::to_string(enc.size()));
+        for (const std::string& l : enc) {
+            if (field(l, "md") != want || field(l, "cll") != "1000,400") {
+                expect(false, name, "picture without the HDR metadata (want md=" + std::string(want) + " cll=1000,400): " + l);
+                break;
+            }
+        }
+        expectClean(c, name);
+
+        // An SDR source: an SDR stream (8-bit, no metadata), not an error.
+        Harness sdr(c.device, c.adapter);
+        if (sdr.start(p, st, s, false)) {
+            expect(!st.hdr && st.bitDepth == 8 && st.colorSpace == "bt709" && !st.hdrMetadata, name, "SDR source: started hdr");
+            expect(sdr.submit(1).ok && sdr.waitFor(1), name, "SDR source: frame 1");
+            sdr.stop();
+            const std::string in8 = c.driver.log("init ").empty() ? "" : c.driver.log("init ").back();
+            expect(field(in8, "bitdepth") == "8" && field(in8, "hdrsei") == "0/0" && field(in8, "profile") == "set", name, "SDR source: " + in8);
+            expect(!contains(c.driver.encodeLine(1), " md="), name, "SDR source: metadata with a picture");
+        } else {
+            expect(false, name, "SDR source: start: " + s.text);
+        }
+        expectClean(c, name);
+    }
+    report(name, before);
+}
+
 // Output by polling NvEncLockBitstream (no async support), and the flush mode.
 void testModes(Ctx& c) {
     std::string name = "sync output (no async encode support)";
@@ -683,6 +779,7 @@ void testFakeOnly(Ctx& c, HMODULE module) {
                std::find(h.assumed.begin(), h.assumed.end(), "roi") != h.assumed.end(),
            name, "assumed");
     expect(!caps.codecs["av1"].yuv444, name, "av1 yuv444");
+    expect(h.hdr10 && caps.codecs["av1"].hdr10 && !caps.codecs["h264"].hdr10, name, "hdr10: hevc / av1 yes, h264 no");
     c.driver.call("set av1=0 multiRef=0 dynBitrate=0 engines=3 dynRes=0");
     caps = probeNvencCaps();
     bool av1Why = false;
@@ -693,6 +790,30 @@ void testFakeOnly(Ctx& c, HMODULE module) {
                std::find(h2.assumed.begin(), h2.assumed.end(), "liveBitrate") == h2.assumed.end(),
            name, "hevc caps without multiple references / live bitrate");
     c.driver.call("reset");
+    c.driver.call("set p010=0");
+    expect(!probeNvencCaps().codecs["hevc"].hdr10, name, "hdr10 without YUV420_10BIT input");
+    c.driver.call("set p010=1 tenBit=0");
+    caps = probeNvencCaps();
+    expect(!caps.codecs["hevc"].hdr10 && !caps.codecs["hevc"].tenBit, name, "hdr10 without 10-bit encoding");
+    c.driver.call("reset");
+    report(name, before);
+
+    name = "HDR10 refusals";
+    before = failures;
+    for (const auto& [codec, setting] : std::vector<std::pair<std::string, std::string>>{{"h264", ""}, {"hevc", "tenBit=0"}, {"av1", "p010=0"}}) {
+        if (!setting.empty()) c.driver.call("set " + setting);
+        Harness hs(c.device, c.adapter);
+        StartParams p;
+        p.codec = codec;
+        p.width = 640;
+        p.height = 360;
+        p.hdr = true;
+        Started st;
+        Status s;
+        expect(!hs.start(p, st, s, true) && s.code == "unsupported" && contains(s.text, "hdr10"), name,
+               codec + (setting.empty() ? "" : " with " + setting) + ": " + (s.ok ? "started" : s.code + ": " + s.text));
+        c.driver.call("reset");
+    }
     report(name, before);
 
     name = "no invalidation: recovery by IDR";
@@ -975,6 +1096,8 @@ int runNvencSelfTest(const std::wstring& testDouble) {
     testStream(c, "hevc", 1920, 1080);
     testStream(c, "h264", 1920, 1080);
     testStream(c, "av1", 1920, 1080);
+    testHdr(c, "hevc");
+    testHdr(c, "av1");
     testModes(c);
     testPresets(c);
     std::printf("self-test-nvenc: %s\n", failures ? "FAIL" : "ok");

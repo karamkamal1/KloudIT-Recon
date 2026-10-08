@@ -22,10 +22,12 @@ src/nvenc/                NVENC backend (H.264 / HEVC / AV1): nvenc_runtime (nvE
                           loader, API version negotiation), nvenc_policy (preset by pixel rate,
                           rate values, QP delta maps), selftest (--self-test-nvenc)
 src/codec/                encoder-independent logic: LTR and reference-invalidation recovery
-                          policies, parameter sets, ROI maps (--self-test-encoder)
+                          policies, parameter sets, ROI maps, HDR10 metadata (hdr.hpp)
+                          (--self-test-encoder)
 src/capture/              DDA, AMD Direct Capture, WGC (C++/WinRT, MSVC), synthetic-gpu test
                           source; paced_capture + pacer: frame pacing shared by all of them
-src/d3d/                  output selection, D3D11 device, BGRA -> NV12 shader + barcode,
+src/d3d/                  output selection, D3D11 device, output colour (Windows HDR),
+                          BGRA -> NV12 and scRGB -> P010 BT.2020 PQ (HDR10) shaders + barcode,
                           --self-test-convert; dxgiGate (DDA vs NVENC bitstream locks)
 test/fake_nvenc.*         recon-fake-nvenc.dll: a test double of the NVIDIA NVENC runtime for
                           --self-test-nvenc=DLL (checks the API rules; never shipped)

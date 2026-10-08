@@ -42,8 +42,10 @@ private:
 // and it loops back to the IDR. forceIdr (and recover, which has no LTR to use)
 // jumps back to frame 0. setRate is accepted (recon-host sees it in the stats)
 // but cannot change the canned bitstream. With a GPU capture (dda, amd-direct,
-// wgc) it asks for NV12 input, so capture and the colour conversion run for
-// real on a host without an encoder backend; the converted frames are ignored.
+// wgc) it asks for NV12 input (P010 with hdr from an HDR source: started then
+// describes an HDR10 stream although the canned one is 8-bit H.264), so
+// capture and the colour conversion run for real on a host without an encoder
+// backend; the converted frames are ignored.
 // It enforces the init() / release() contract: an init() after a start that
 // failed after init() succeeded fails unless release() was called in between.
 class ReplayEncoder : public Backend {

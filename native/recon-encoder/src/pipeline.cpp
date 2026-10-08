@@ -21,8 +21,9 @@ void Pipeline::dump(const d3d::ConvertedFrame& f, uint64_t frameId) {
         const bool ok = WriteFile(file, data.data(), DWORD(data.size()), &wrote, nullptr) && wrote == data.size();
         CloseHandle(file);
         if (ok) {
-            logf(LogLevel::Info, "dumped frame %llu (%ux%u NV12) to %s", static_cast<unsigned long long>(frameId),
-                 opt_.converter->width(), opt_.converter->height(), opt_.dumpPath.c_str());
+            logf(LogLevel::Info, "dumped frame %llu (%ux%u %s) to %s", static_cast<unsigned long long>(frameId),
+                 opt_.converter->width(), opt_.converter->height(),
+                 opt_.converter->format() == d3d::Nv12Converter::Format::P010 ? "P010" : "NV12", opt_.dumpPath.c_str());
             return;
         }
     }

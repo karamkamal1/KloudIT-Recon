@@ -64,6 +64,11 @@ struct AmfCodecProps {
     const wchar_t* outputPrimaries = nullptr;
     const wchar_t* inputFullRange = nullptr;
     const wchar_t* outputFullRange = nullptr;
+    // HDR10 (step 3.9): AMFBuffer of AMFHDRMetadata (HEVC, AV1; the H.264
+    // encoder has the property too, but this backend makes no 10-bit H.264),
+    // and the profile of a 10-bit stream (HEVC Main10; AV1 Main covers it).
+    const wchar_t* inputHdrMetadata = nullptr;
+    amf_int64 profile10Value = -1;
 
     // Dynamic (any time; applied before the next SubmitInput).
     const wchar_t* frameRate = nullptr;
@@ -243,6 +248,8 @@ inline const AmfCodecProps& amfHevcProps() {
         c.outputPrimaries = AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES;
         c.inputFullRange = AMF_VIDEO_ENCODER_HEVC_INPUT_FULL_RANGE_COLOR;
         c.outputFullRange = AMF_VIDEO_ENCODER_HEVC_OUTPUT_FULL_RANGE_COLOR;
+        c.inputHdrMetadata = AMF_VIDEO_ENCODER_HEVC_INPUT_HDR_METADATA;
+        c.profile10Value = AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN_10;
         c.frameRate = AMF_VIDEO_ENCODER_HEVC_FRAMERATE;
         c.targetBitrate = AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE;
         c.peakBitrate = AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE;
@@ -332,6 +339,8 @@ inline const AmfCodecProps& amfAv1Props() {
         c.outputPrimaries = AMF_VIDEO_ENCODER_AV1_OUTPUT_COLOR_PRIMARIES;
         c.inputFullRange = AMF_VIDEO_ENCODER_AV1_INPUT_FULL_RANGE_COLOR;
         c.outputFullRange = AMF_VIDEO_ENCODER_AV1_OUTPUT_FULL_RANGE_COLOR;
+        c.inputHdrMetadata = AMF_VIDEO_ENCODER_AV1_INPUT_HDR_METADATA;
+        c.profile10Value = AMF_VIDEO_ENCODER_AV1_PROFILE_MAIN;  // "Main": 8 and 10 bit 4:2:0
         c.frameRate = AMF_VIDEO_ENCODER_AV1_FRAMERATE;
         c.targetBitrate = AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE;
         c.peakBitrate = AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE;

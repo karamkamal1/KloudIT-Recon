@@ -30,7 +30,8 @@ struct PipelineOptions {
     // Converts every GPU frame to NV12 before Backend::submit (InputSpec::Nv12).
     std::unique_ptr<d3d::Nv12Converter> converter;
     // --dump-nv12: writes the converted frame with id kDumpFrameId (or the
-    // first one after it) to this file, raw NV12, then logs it.
+    // first one after it) to this file, raw NV12 (P010 in an HDR10 stream),
+    // then logs it.
     std::string dumpPath;
 };
 

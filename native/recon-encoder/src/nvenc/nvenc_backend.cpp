@@ -54,6 +54,15 @@
 // so the blocking lock returns at once; sync mode polls), since
 // NVENC documents the two-thread model but not which other calls may overlap.
 // Lock order: d3d::dxgiGate(), then sessionMu_, then flightMu_ / ctlMu_.
+//
+// HDR10 (GUIDE 3.9; start hdr from an HDR source, HEVC and AV1): P010 input
+// from the colour conversion registered as NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
+// HEVC Main10 / AV1 Main with input and output bit depth 10, BT.2020 / SMPTE
+// 2084 / BT.2020 non-constant-luminance colour description, limited range,
+// and the mastering display colour volume + content light level SEI (HEVC) /
+// metadata OBUs (AV1): outputMasteringDisplay / outputMaxCll in the config,
+// pMasteringDisplay / pMaxCll with every picture (FFmpeg nvenc.c passes them
+// with every frame that carries the metadata; codec/hdr.hpp has the units).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -66,6 +75,7 @@
 #include <set>
 
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "codec/rfi.hpp"
 #include "d3d/device.hpp"
 #include "nvenc/nvenc_policy.hpp"
@@ -96,11 +106,12 @@ const GUID& codecGuid(Codec c) {
     return NV_ENC_CODEC_HEVC_GUID;
 }
 
-// 8-bit 4:2:0 profiles, as the AMF backend uses (HDR / Main10 is step 3.9).
-const GUID& profileGuid(Codec c) {
+// 4:2:0 profiles, as the AMF backend uses: 8-bit, or 10-bit for HDR10 (HEVC
+// Main10; AV1 Main covers 10-bit).
+const GUID& profileGuid(Codec c, bool tenBit) {
     switch (c) {
     case Codec::H264: return NV_ENC_H264_PROFILE_HIGH_GUID;
-    case Codec::Hevc: return NV_ENC_HEVC_PROFILE_MAIN_GUID;
+    case Codec::Hevc: return tenBit ? NV_ENC_HEVC_PROFILE_MAIN10_GUID : NV_ENC_HEVC_PROFILE_MAIN_GUID;
     case Codec::Av1: return NV_ENC_AV1_PROFILE_MAIN_GUID;
     }
     return NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
@@ -166,6 +177,7 @@ struct CodecDetails {
     bool dynBitrate = false;     // NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE
     bool singleSliceIntraRefresh = false;
     bool nv12 = false;           // NV_ENC_BUFFER_FORMAT_NV12 in NvEncGetInputFormats
+    bool p010 = false;           // NV_ENC_BUFFER_FORMAT_YUV420_10BIT (P010) in NvEncGetInputFormats
     int ltrFrames = 0;           // NV_ENC_CAPS_NUM_MAX_LTR_FRAMES (logged; this backend uses no LTR)
 };
 
@@ -231,9 +243,14 @@ CodecDetails readDetails(const NV_ENCODE_API_FUNCTION_LIST& nv, void* enc, Codec
         std::vector<NV_ENC_BUFFER_FORMAT> f(n);
         uint32_t got = 0;
         if (nv.nvEncGetInputFormats(enc, g, f.data(), n, &got) == NV_ENC_SUCCESS) {
-            for (uint32_t i = 0; i < std::min(got, n); ++i) d.nv12 = d.nv12 || f[i] == NV_ENC_BUFFER_FORMAT_NV12;
+            for (uint32_t i = 0; i < std::min(got, n); ++i) {
+                d.nv12 = d.nv12 || f[i] == NV_ENC_BUFFER_FORMAT_NV12;
+                d.p010 = d.p010 || f[i] == NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+            }
         }
     }
+    // HDR10: 10-bit encoding of P010 input with HDR metadata (HEVC, AV1).
+    cc.hdr10 = cc.tenBit && d.p010 && c != Codec::H264;
     d.available = cc.maxW > 0 && cc.maxH > 0 && d.nv12;
     if (!d.available) d.reason = cc.maxW <= 0 || cc.maxH <= 0 ? "the encoder reports no maximum size" : "the encoder takes no NV12 input";
     return d;
@@ -392,6 +409,9 @@ private:
     bool flushMode_ = false;
     int refs_ = nvenc::kDpbFrames;
     int intraRefresh_ = 0;
+    std::optional<HdrMetadata> hdr_;   // HDR10 stream: its metadata
+    MASTERING_DISPLAY_INFO mastering_{};  // passed with every picture of an HDR10 stream
+    CONTENT_LIGHT_LEVEL lightLevel_{};
     int64_t freq_ = 1;
     std::mutex sessionMu_;  // every call on enc_ from the capture and output threads
     std::vector<OutputBuffer> out_;
@@ -568,6 +588,13 @@ Status NvencEncoder::validate(const StartParams& p) {
     if (p.intraRefreshFrames > 0 && !cc.intraRefresh) {
         return Status::Error("unsupported", "the " + p.codec + " encoder has no intra refresh (NV_ENC_CAPS_SUPPORT_INTRA_REFRESH 0)");
     }
+    if (hdr_ && !cc.hdr10) {
+        return Status::Error("unsupported", "hdr: the " + p.codec + " encoder cannot make HDR10 here (caps hdr10 false: " +
+                                                (p.codec == "h264" ? std::string("HDR10 needs hevc or av1")
+                                                 : !cc.tenBit      ? std::string("NV_ENC_CAPS_SUPPORT_10BIT_ENCODE 0")
+                                                                   : std::string("no YUV420_10BIT input")) +
+                                                ")");
+    }
     if (p.encoderInstance > 0) {
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) +
                                                 ": NVENC distributes work over its engines itself (split-frame encoding); "
@@ -581,18 +608,19 @@ Status NvencEncoder::validate(const StartParams& p) {
     return Status::Ok();
 }
 
-void setVui(NV_ENC_CONFIG_H264_VUI_PARAMETERS& v) {
+void setVui(NV_ENC_CONFIG_H264_VUI_PARAMETERS& v, bool hdr10) {
     // BT.709 limited range, chroma_sample_loc_type 0: what the NV12
     // converter writes (d3d/convert.hpp), signalled as Sunshine does
     // (nvenc_base.cpp configure_h264_hevc_metadata); bitstream restrictions
     // let decoders know there is no reordering (max_dec_frame_buffering).
+    // HDR10: BT.2020 primaries, PQ, BT.2020 non-constant luminance (P010).
     v.videoSignalTypePresentFlag = 1;
     v.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
     v.videoFullRangeFlag = 0;
     v.colourDescriptionPresentFlag = 1;
-    v.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-    v.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-    v.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    v.colourPrimaries = hdr10 ? NV_ENC_VUI_COLOR_PRIMARIES_BT2020 : NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    v.transferCharacteristics = hdr10 ? NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084 : NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    v.colourMatrix = hdr10 ? NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL : NV_ENC_VUI_MATRIX_COEFFS_BT709;
     v.chromaSampleLocationFlag = 1;
     v.chromaSampleLocationTop = 0;
     v.chromaSampleLocationBot = 0;
@@ -619,7 +647,7 @@ void NvencEncoder::configureCodec() {
         h.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;  // one reference per frame, the rest kept for invalidation
         h.enableLTR = 0;
         h.inputBitDepth = h.outputBitDepth = NV_ENC_BIT_DEPTH_8;
-        setVui(h.h264VUIParameters);
+        setVui(h.h264VUIParameters, false);
         if (irPeriod) {
             h.enableIntraRefresh = 1;
             h.intraRefreshPeriod = irPeriod;
@@ -648,8 +676,10 @@ void NvencEncoder::configureCodec() {
         h.maxNumRefFramesInDPB = uint32_t(refs_);
         h.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
         h.enableLTR = 0;
-        h.inputBitDepth = h.outputBitDepth = NV_ENC_BIT_DEPTH_8;
-        setVui(h.hevcVUIParameters);
+        h.inputBitDepth = h.outputBitDepth = hdr_ ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+        setVui(h.hevcVUIParameters, bool(hdr_));
+        h.outputMasteringDisplay = hdr_ ? 1 : 0;  // SEI from pMasteringDisplay / pMaxCll (submit)
+        h.outputMaxCll = hdr_ ? 1 : 0;
         if (irPeriod) {
             h.enableIntraRefresh = 1;
             h.intraRefreshPeriod = irPeriod;
@@ -677,10 +707,12 @@ void NvencEncoder::configureCodec() {
         a.numFwdRefs = NV_ENC_NUM_REF_FRAMES_1;
         a.enableLTR = 0;
         a.enableBitstreamPadding = 0;
-        a.inputBitDepth = a.outputBitDepth = NV_ENC_BIT_DEPTH_8;
-        a.colorPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-        a.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-        a.matrixCoefficients = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        a.inputBitDepth = a.outputBitDepth = hdr_ ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+        a.colorPrimaries = hdr_ ? NV_ENC_VUI_COLOR_PRIMARIES_BT2020 : NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        a.transferCharacteristics = hdr_ ? NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084 : NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        a.matrixCoefficients = hdr_ ? NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL : NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        a.outputMasteringDisplay = hdr_ ? 1 : 0;  // metadata OBUs from pMasteringDisplay / pMaxCll (submit)
+        a.outputMaxCll = hdr_ ? 1 : 0;
         a.colorRange = 0;
         a.chromaSamplePosition = 1;  // horizontally co-sited with luma, vertically between: the converter's siting
         if (irPeriod) {
@@ -708,7 +740,7 @@ Status NvencEncoder::configure() {
     if (s != NV_ENC_SUCCESS) return Status::Error("init_failed", nvError("NvEncGetEncodePresetConfigEx(P" + std::to_string(preset_) + ")", s));
     config_ = pc.presetCfg;
     config_.version = NV_ENC_CONFIG_VER;
-    config_.profileGUID = profileGuid(codec_);
+    config_.profileGUID = profileGuid(codec_, bool(hdr_));
     // No B frames, no automatic key frames ("If goplength is set to
     // NVENC_INFINITE_GOPLENGTH frameIntervalP should be set to 1").
     config_.gopLength = NVENC_INFINITE_GOPLENGTH;
@@ -811,7 +843,6 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
         return Status::Error("unsupported", "NVENC cannot encode " + p.codec + " here: " +
                                                 (it == probe.codecs.end() ? probe.reason : it->second.reason));
     }
-    if (p.hdr) return Status::Error("unsupported", "HDR10 encoding comes with step 3.9");
     if (!src.device) return Status::Error("unsupported", "the NVENC encoder needs a GPU capture (dda, wgc or synthetic-gpu)");
     if (src.adapter.found && src.adapter.vendor != "nvidia" && !rt_.testDouble) {
         return Status::Error("unsupported", "the capture runs on " + src.adapter.name + " (" + src.adapter.vendor +
@@ -826,6 +857,24 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     fps_ = p.fps;
     vbvFrames_ = p.vbvFrames;
     device_ = src.device;
+    // HDR10 when asked for and the source is HDR; an SDR source gives an SDR stream.
+    hdr_.reset();
+    mastering_ = {};
+    lightLevel_ = {};
+    if (p.hdr && src.hdr) {
+        hdr_ = hdrMetadataFor(src.display);
+        // HEVC SEI units, or AV1's fixed point (as FFmpeg's nvenc.c converts);
+        // MASTERING_DISPLAY_INFO is in the SEI's G, B, R order by name.
+        const MasteringCodes mc = masteringCodes(*hdr_, codec == Codec::Av1);
+        mastering_.r = {mc.red[0], mc.red[1]};
+        mastering_.g = {mc.green[0], mc.green[1]};
+        mastering_.b = {mc.blue[0], mc.blue[1]};
+        mastering_.whitePoint = {mc.white[0], mc.white[1]};
+        mastering_.maxLuma = mc.maxLuminance;
+        mastering_.minLuma = mc.minLuminance;
+        lightLevel_.maxContentLightLevel = uint16_t(std::min(hdr_->maxCll, 65535));
+        lightLevel_.maxPicAverageLightLevel = uint16_t(std::min(hdr_->maxFall, 65535));
+    }
 
     NVENCSTATUS s = openSession(nv_, device_.Get(), enc_);
     if (s != NV_ENC_SUCCESS) {
@@ -878,7 +927,7 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     gen_ = 0;
 
     in = InputSpec{};
-    in.format = InputSpec::Format::Nv12;
+    in.format = hdr_ ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
     in.width = width_;
     in.height = height_;
     out.backend = name();
@@ -902,6 +951,7 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     out.preset = "p" + std::to_string(preset_);
     out.asyncEncode = async_;
     out.refFrames = refs_;
+    describeColor(out, hdr_);
     logf(LogLevel::Info,
          "nvenc: %s %ux%u %d fps %d kbps %s vbv %.2f frames (%u bits), preset P%d ultra-low-latency, %s output, %d reference frames, "
          "recovery %s, live bitrate %s, two-pass quarter resolution, spatial AQ, key frame scale %u, intra refresh %d, %d engine(s), "
@@ -911,6 +961,10 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
          intraRefresh_, cc.hwInstances, cc.dynamicResolution ? "yes" : "no", init_.maxEncodeWidth, init_.maxEncodeHeight,
          int(det_.emphasisMap), int(det_.stateAdvance), det_.ltrFrames, rt_.versionText.c_str(),
          src.adapter.found ? src.adapter.name.c_str() : "the capture device");
+    if (hdr_) {
+        logf(LogLevel::Info, "nvenc: HDR10: %s, P010 input, BT.2020 PQ; mastering display %.0f / %.4f cd/m2, MaxCLL %d, MaxFALL %d",
+             codec_ == Codec::Hevc ? "Main10" : "AV1 Main 10-bit", hdr_->maxLuminance, hdr_->minLuminance, hdr_->maxCll, hdr_->maxFall);
+    }
     return Status::Ok();
 }
 
@@ -1044,7 +1098,7 @@ Status NvencEncoder::mapInput(ID3D11Texture2D* texture, NV_ENC_INPUT_PTR& mapped
         rr.pitch = 0;  // "For NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX resources, set this to 0"
         rr.subResourceIndex = 0;
         rr.resourceToRegister = texture;
-        rr.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+        rr.bufferFormat = hdr_ ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;  // P010 for HDR10
         rr.bufferUsage = NV_ENC_INPUT_IMAGE;
         {
             std::lock_guard<std::mutex> lock(sessionMu_);
@@ -1165,7 +1219,7 @@ Status NvencEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
     }
 
     NV_ENC_INPUT_PTR mapped = nullptr;
-    NV_ENC_BUFFER_FORMAT format = NV_ENC_BUFFER_FORMAT_NV12;
+    NV_ENC_BUFFER_FORMAT format = hdr_ ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
     if (Status ms = mapInput(frame.nv12, mapped, format); !ms.ok) return ms;
 
     const int slot = nextSlot_;
@@ -1192,6 +1246,13 @@ Status NvencEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
     if (qpMap) {
         pic.qpDeltaMap = const_cast<int8_t*>(qpMap->values.data());
         pic.qpDeltaMapSize = uint32_t(qpMap->values.size());
+    }
+    if (hdr_ && codec_ == Codec::Hevc) {
+        pic.codecPicParams.hevcPicParams.pMasteringDisplay = &mastering_;
+        pic.codecPicParams.hevcPicParams.pMaxCll = &lightLevel_;
+    } else if (hdr_ && codec_ == Codec::Av1) {
+        pic.codecPicParams.av1PicParams.pMasteringDisplay = &mastering_;
+        pic.codecPicParams.av1PicParams.pMaxCll = &lightLevel_;
     }
     NVENCSTATUS s;
     {

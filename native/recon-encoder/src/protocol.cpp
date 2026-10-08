@@ -207,6 +207,7 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"alignW", cc.alignW},
             {"alignH", cc.alignH},
             {"dynamicResolution", cc.dynamicResolution},
+            {"hdr10", cc.hdr10},
         };
         if (!cc.assumed.empty()) codecs[name]["assumed"] = cc.assumed;
     }
@@ -229,6 +230,11 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"height", o.height},
             {"rotation", o.rotation},
             {"attached", o.attached},
+            {"hdr", o.color.hdr},
+            {"bitsPerColor", o.color.bitsPerColor},
+            {"minLuminance", o.color.minLuminance},
+            {"maxLuminance", o.color.maxLuminance},
+            {"maxFullFrameLuminance", o.color.maxFullFrameLuminance},
         });
     }
     json j = {
@@ -287,13 +293,27 @@ std::string encodeStarted(const Started& s) {
         {"preset", s.preset},
         {"asyncEncode", s.asyncEncode},
         {"refFrames", s.refFrames},
+        {"hdr", s.hdr},
+        {"bitDepth", s.bitDepth},
+        {"colorSpace", s.colorSpace},
     };
+    if (s.hdrMetadata) {
+        const HdrMetadata& m = *s.hdrMetadata;
+        j["hdrMetadata"] = {
+            {"displayPrimaries", {{m.red[0], m.red[1]}, {m.green[0], m.green[1]}, {m.blue[0], m.blue[1]}}},
+            {"whitePoint", {m.white[0], m.white[1]}},
+            {"maxLuminance", m.maxLuminance},
+            {"minLuminance", m.minLuminance},
+            {"maxCll", m.maxCll},
+            {"maxFall", m.maxFall},
+        };
+    }
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 std::string encodeCaptureEvent(const CaptureEvent& e) {
-    json j = {{"t", "captureChanged"}, {"reason", e.reason}, {"width", e.width},
-              {"height", e.height}, {"rotation", e.rotation}, {"text", e.text}};
+    json j = {{"t", "captureChanged"}, {"reason", e.reason}, {"width", e.width}, {"height", e.height},
+              {"rotation", e.rotation}, {"hdr", e.hdr}, {"text", e.text}};
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 

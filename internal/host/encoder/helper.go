@@ -434,7 +434,7 @@ func (h *Helper) controlLoop(capsCh chan<- *Caps) {
 			}
 		case *CaptureChanged:
 			h.log.Info("encoder helper: capture changed", "reason", m.Reason, "width", m.Width, "height", m.Height,
-				"rotation", m.Rotation, "text", m.Text)
+				"rotation", m.Rotation, "hdr", m.HDR, "text", m.Text)
 			select {
 			case h.captures <- *m:
 			default:

@@ -48,7 +48,7 @@ const char kUsage[] =
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
     "  --mock-hang-at=N     mock only: never return from submitting frame N (a call stuck in the driver)\n"
-    "  --dump-nv12=PATH     write converted frame 30 (raw NV12, encoded size) to PATH\n"
+    "  --dump-nv12=PATH     write converted frame 30 (raw NV12, P010 in an HDR10 stream; encoded size) to PATH\n"
     "  --print-caps         print the capabilities JSON and exit\n"
     "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
     "                       the default hardware adapter (exit 0 ok, 1 failed, 77 no device)\n"
@@ -64,6 +64,7 @@ const char kUsage[] =
     "  --width=W --height=H (0 = capture size)  --fps=N (60)  --kbps=N (20000)  --rc=cbr|vbr\n"
     "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
     "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
+    "  --hdr=0|1 (HDR10 when the output is in Windows HDR mode; synthetic-gpu plays one)\n"
     "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
     "  --dxgi-gate=0|1 (1)  0: DDA and NVENC's Lock/UnlockBitstream not serialized (docs/VENDOR_NOTES.md 3.4 A/B)\n"
     "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n";

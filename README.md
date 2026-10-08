@@ -353,7 +353,9 @@ command: `recon-host.exe -v probe`.
   reconnect automatically.
 - The Windows secure desktop (lock screen, UAC) can't be captured (see above).
 - No microphone passthrough or host → browser clipboard sync yet (you can type text into the PC).
-- HDR streams are tone-mapped to SDR by the capture API.
+- HDR desktops are streamed as SDR (the capture API converts them). The native encoder
+  helper can already encode HDR10 (10-bit BT.2020 PQ with HDR metadata, HEVC / AV1, opt-in),
+  but the agent does not ask for it yet: browser HDR presentation comes later.
 
 ## Development
 

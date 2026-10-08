@@ -73,7 +73,7 @@ jobs:
           $out = & $exe --self-test-convert
           $out
           if ($LASTEXITCODE -ne 0) { throw "--self-test-convert failed ($LASTEXITCODE)" }
-          if (-not ($out -match 'self-test-convert: ok \(mode nv12\)')) { throw "conversion not tested on NV12 render targets" }
+          if (-not ($out -match 'self-test-convert: ok \(mode nv12;')) { throw "conversion not tested on NV12 render targets" }
           $caps = & $exe --print-caps --backend=mock
           $caps
           if ($caps -match 'no C\+\+/WinRT headers') { throw "MSVC build without C++/WinRT: Windows.Graphics.Capture missing" }

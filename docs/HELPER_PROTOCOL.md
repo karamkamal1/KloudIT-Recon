@@ -7,7 +7,8 @@ channel and reads encoded frames from a shared-memory ring. The Go side is
 number covers both the control messages and the ring layout. Any incompatible change
 bumps it (`caps.v`, `ring.version`), and recon-host refuses a helper with another version.
 Additive changes keep it: new optional fields, new helper-to-Go message types (recon-host
-ignores unknown types) and new slot flag bits (step 3.2 added all three).
+ignores unknown types) and new slot flag bits (step 3.2 added all three; step 3.9 added the
+HDR10 fields and the `captureChanged` reason `hdr`).
 
 ## Lifecycle
 
@@ -71,7 +72,9 @@ recon-encoder.exe --version
   `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
 * `--dump-nv12`: writes the converted frame with id 30 (the first converted one from 30
   on) to PATH as raw NV12 at the encoded size (Y plane, then interleaved CbCr), e.g. for
-  `ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 PATH`. Diagnostics.
+  `ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 PATH`; in an HDR10 stream
+  raw P010 (the same layout with 16-bit little-endian samples, `-pixel_format p010le`).
+  Diagnostics.
 
 Logs go to stderr as `level: message` lines; recon-host forwards them to its log.
 
@@ -105,7 +108,7 @@ ignored by recon-host.
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
+| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr` (HDR10, opt-in: see "HDR10"), `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: every frame from `lostFromFrameId` to the newest one is invalidated and the next frame references an older one (`ackedLtrFrameId` is not used); AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without a usable reference an IDR. |
 | `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
@@ -118,6 +121,7 @@ ignored by recon-host.
 {"t":"start","hmonitor":65537,"codec":"hevc","fps":60,"kbps":20000,"gpuPriority":"auto","idleRepeatMs":100,"barcode":{"x":0,"y":0,"blockW":8,"blockH":8,"cols":16,"bits":32,"msbFirst":true}}
 {"t":"start","capture":"wgc","windowTitle":"Cyberpunk","codec":"hevc","fps":60,"kbps":30000}
 {"t":"start","capture":"dda","codec":"av1","fps":120,"kbps":50000,"ltrSlots":2,"liveBitrate":"flush","encoderInstance":1}
+{"t":"start","capture":"dda","hmonitor":65537,"codec":"hevc","fps":120,"kbps":60000,"hdr":true}
 {"t":"ack","frameId":1200}
 {"t":"recover","lostFromFrameId":1234,"ackedLtrFrameId":1200}
 {"t":"setRate","kbps":35000,"vbvFrames":1.5}
@@ -133,11 +137,12 @@ ignored by recon-host.
  "codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,
    "recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless",
    "maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":1,
-   "queryTimeout":false,"alignW":1,"alignH":1}},
+   "queryTimeout":false,"alignW":1,"alignH":1,"dynamicResolution":false,"hdr10":false}},
  "capture":["synthetic","dda","wgc"],"cursorInVideo":false,
  "outputs":[{"index":0,"adapterIndex":0,"outputIndex":0,"adapterLuid":"00000000:0000c3a1",
    "adapterName":"AMD Radeon RX 7900 XT","vendor":"amd","name":"\\\\.\\DISPLAY1","hmonitor":65537,
-   "x":0,"y":0,"width":2560,"height":1440,"rotation":0,"attached":true}],
+   "x":0,"y":0,"width":2560,"height":1440,"rotation":0,"attached":true,
+   "hdr":true,"bitsPerColor":10,"minLuminance":0.005,"maxLuminance":1015.5,"maxFullFrameLuminance":400}],
  "unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: ...",
    "nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: ...",
    "amd-direct":"...", "...":"..."},
@@ -162,7 +167,9 @@ ignored by recon-host.
   per-block QP offsets) | `none`; `alignW`/`alignH` the coded-size alignment (AV1 on
   RDNA3: 64x16); `dynamicResolution` (additive, step 3.4): the running encoder can change
   its coded size without a new session (NVENC `NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE`; no
-  control message uses it yet, older helpers omit it = false). Values start as vendor defaults; the
+  control message uses it yet, older helpers omit it = false); `hdr10` (additive, step 3.9):
+  `start` with `hdr` can make an HDR10 stream with this codec (HEVC and AV1 with 10-bit
+  encoding of P010 input and the HDR metadata property; never H.264; see "HDR10"). Values start as vendor defaults; the
   Phase 3.6 qualification results in docs/VENDOR_NOTES.md overwrite them. `assumed`
   (optional, additive): the names of the fields above that are documented or default
   values rather than detected on this GPU, e.g. `["roi","liveBitrate"]` for AMF AV1;
@@ -180,7 +187,12 @@ ignored by recon-host.
   configured without it; recon-host draws the cursor on the client (with `drawCursor`
   required it keeps using FFmpeg). `started.cursorInVideo` is the per-stream answer.
 * `outputs`: every DXGI output of every adapter, for `start`'s monitor selection
-  (`hmonitor`, or `adapterLuid` + `outputIndex`). `name` is the GDI device name.
+  (`hmonitor`, or `adapterLuid` + `outputIndex`). `name` is the GDI device name. Since
+  step 3.9 (additive) their colour from `IDXGIOutput6::GetDesc1`: `hdr` (Windows HDR is on
+  for the output: colour space `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`),
+  `bitsPerColor`, and the panel's `minLuminance` / `maxLuminance` /
+  `maxFullFrameLuminance` in cd/m2 (EDID or the Windows HDR calibration); all zero where
+  DXGI cannot tell (Wine, before Windows 10 1703).
 * `unavailable`: every probed backend / capture method that is not usable, with why. The
   AMF backend adds `amf-h264` / `amf-hevc` / `amf-av1` for codecs its GPU cannot encode
   (e.g. AV1 before RDNA3), the NVENC backend `nvenc-h264` / `nvenc-hevc` / `nvenc-av1`
@@ -230,7 +242,20 @@ Older helpers omit these fields. Step 3.4 adds (NVENC; other backends send `""` 
 3840x2160; the backend reads the encoder's SPS before the first frame and, should it keep
 fewer, narrows its window to that and logs a warning). With NVENC,
 `liveBitrate` can also be `restart` (the GPU cannot change the bitrate of a running
-session: `setRate` answers `unsupported`).
+session: `setRate` answers `unsupported`). Step 3.9 adds the stream's colour (every backend):
+`hdr` (an HDR10 stream), `bitDepth` (8 or 10), `colorSpace` (`bt709`: BT.709 primaries,
+transfer and matrix, limited range; `bt2020-pq`: BT.2020 primaries, SMPTE ST 2084 transfer,
+BT.2020 non-constant-luminance matrix, limited range) and, for HDR10 only, `hdrMetadata`:
+
+```json
+{"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq",
+ "hdrMetadata":{"displayPrimaries":[[0.708,0.292],[0.17,0.797],[0.131,0.046]],"whitePoint":[0.3127,0.329],
+   "maxLuminance":1015.5,"minLuminance":0.005,"maxCll":1016,"maxFall":400}}
+```
+
+(primaries red, green, blue and the white point as CIE 1931 xy, luminance in cd/m2, MaxCLL
+/ MaxFALL in cd/m2: what the encoder writes into the stream, see "HDR10"). Older helpers
+omit them: treat that as 8-bit `bt709`.
 
 `captureWidth`/`captureHeight` are the source as displayed; `adapterLuid`, `adapterName`,
 `vendor` and `hagsEnabled` describe the adapter capture and encoder run on (empty / `null`
@@ -272,14 +297,18 @@ entry point). `ltrSlot` and `temporalLayer` complete the picture.
 `captureChanged`, when the capture source changes:
 
 ```json
-{"t":"captureChanged","reason":"resized","width":1920,"height":1080,"rotation":0,"text":"was 2560x1440 rotation 0"}
+{"t":"captureChanged","reason":"resized","width":1920,"height":1080,"rotation":0,"hdr":false,"text":"was 2560x1440 rotation 0"}
 ```
+
+`hdr` (additive, step 3.9): the output is in Windows HDR mode now (DDA; AMD Direct Capture
+reports the state at its start; other captures false).
 
 | `reason` | Meaning | Helper meanwhile |
 |---|---|---|
 | `resized` | the source has a new size or rotation (mode change, rotated display, resized window) | keeps the encoded size and scales the new source into it; recon-host restarts the helper if it wants the new native size |
 | `lost` | capture is not possible right now (`DXGI_ERROR_ACCESS_LOST` during a mode or full-screen switch, secure desktop, output or window gone); `text` says why | repeats the last image every `idleRepeatMs`, retries every 250 ms |
 | `restored` | capture works again | |
+| `hdr` | Windows HDR was turned on or off for the output (DDA; `hdr` says which) | keeps the stream's format: an HDR10 stream shows the SDR desktop at 203 cd/m2, an SDR stream gets DXGI's conversion of the HDR desktop; recon-host restarts the helper if it wants to follow |
 
 `error`: `{"t":"error","code":"unsupported","text":"...","fatal":false,"re":"start"}`.
 `re` names the request that caused it, if any. After a fatal error the helper exits
@@ -426,11 +455,11 @@ after both threads have been joined.
 
 | `capture` | What | Device | Notes |
 |---|---|---|---|
-| `dda` | DXGI Desktop Duplication (default, any vendor) | the output's adapter | `IDXGIOutput5::DuplicateOutput1` (B8G8R8A8; FP16 for HDR in step 3.9), `IDXGIOutput1::DuplicateOutput` before Windows 10 1703 |
+| `dda` | DXGI Desktop Duplication (default, any vendor) | the output's adapter | `IDXGIOutput5::DuplicateOutput1` (B8G8R8A8; R16G16B16A16_FLOAT first for an HDR10 stream, see "HDR10"), `IDXGIOutput1::DuplicateOutput` before Windows 10 1703 |
 | `amd-direct` | AMD Direct Capture (`AMFDisplayCapture`), AMD adapters only, opt-in | the output's adapter, wrapped in an `AMFContext` | `WAIT_FOR_PRESENT`, framerate (0,1), dirty rects, `DUPLICATEOUTPUT`; monitor index = the output's index on its adapter (VERIFY) |
 | `wgc` | Windows.Graphics.Capture: a monitor or a window | the monitor's adapter | MSVC build only (C++/WinRT); cursor off (listed only where Windows allows it), border off where allowed |
 | `synthetic` | timer-driven frame counter, no image | none | mock tests |
-| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path |
+| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path; with `hdr` it plays an output in HDR mode (FP16 scRGB up to 4000 cd/m2, a 1000 cd/m2 patch in the top-right 32x32 corner, a 1000 cd/m2 panel's metadata) |
 
 Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
 `hmonitor` (the HMONITOR recon-host already has for each monitor); `adapterLuid` (as in
@@ -456,7 +485,7 @@ the first frame of a duplication, so a static desktop still yields an image.
 `DXGI_ERROR_ACCESS_LOST`, `E_ACCESSDENIED` (secure desktop) and a stale DXGI factory
 (`IsCurrent` false: mode, HDR or output changes) recreate the duplication, re-finding the
 output by its GDI name on the same adapter, every 250 ms until it works (`captureChanged`
-`lost` / `restored` / `resized`). A removed device (driver reset / TDR) is fatal
+`lost` / `restored` / `resized`, and `hdr` when Windows HDR was turned on or off). A removed device (driver reset / TDR) is fatal
 (`device_lost`) instead, on every path: a TDR changes the mode, so it usually shows up as
 `DXGI_ERROR_ACCESS_LOST` first and then as a failing `DuplicateOutput`. `AcquireNextFrame`
 holds the device's lock while it waits (Sunshine display_base.cpp), and the encoder uses
@@ -515,7 +544,8 @@ With `InputSpec::Nv12` every GPU frame goes through one D3D11 pixel-shader pass 
 16..240), 4:2:0 with chroma sited like `chroma_sample_loc_type` 0 (co-sited with the even
 luma column, between the two luma rows; Sunshine's 6-tap filter), bilinear scaling to the
 encoded size, rotation for rotated displays (the texture-to-display rotation of
-`DXGI_OUTDUPL_DESC::Rotation`), FP16 scRGB sources clipped to SDR until step 3.9. The
+`DXGI_OUTDUPL_DESC::Rotation`), FP16 scRGB sources clipped to SDR (an HDR desktop in an
+SDR stream; HDR10 streams get P010 instead, see "HDR10"). The
 render target views select the NV12 planes by format (R8 luma, R8G8 chroma). The device is
 shared with the capture and the encoder's threads, so each conversion holds the device's
 critical section (`ID3D10Multithread::Enter`/`Leave`) and sets or clears every pipeline
@@ -530,8 +560,63 @@ smaller even size when `width`/`height` are 0.
 x, y, blockW, blockH even (whole chroma samples), blocks 2..256 pixels (GUIDE 0.2 wants
 at least 8x8 to survive compression), `cols` and `bits` 1..64. Block k (left to right,
 `cols` per row, top to bottom) shows bit `bits-1-k` of the frame id (`msbFirst`, default)
-or bit k: luma 235 for 1, 16 for 0, chroma 128. The value is the helper's `frameId`, the
+or bit k: luma 235 for 1, 16 for 0, chroma 128 (in an HDR10 stream the same limited-range
+codes in 10 bits: 940, 64, 512). The value is the helper's `frameId`, the
 same id as in stats and the ring. The layout must fit the encoded size, else `bad_message`.
+
+### HDR10
+
+GUIDE 3.9, opt-in: `start` with `hdr`. The stream is HDR10 when all of these hold, else it is
+SDR (`started.hdr` false, a log line says why; not an error, as in Sunshine):
+
+1. The captured output is in Windows HDR mode at the start: `IDXGIOutput6::GetDesc1`
+   colour space `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (caps `outputs[].hdr`).
+2. The capture method delivers HDR frames: `dda` (always), `amd-direct` when its surfaces
+   are `AMF_SURFACE_RGBA_F16` (VERIFY, docs/VENDOR_NOTES.md 3.9), `synthetic-gpu` (test).
+   `wgc` has no HDR path yet: SDR.
+
+The codec must have caps `hdr10` (HEVC or AV1 with 10-bit encoding of P010 input), else the
+`start` fails with `unsupported`, whatever the output: recon-host checks caps first.
+
+Pipeline:
+
+- **Capture.** DDA duplicates with `DuplicateOutput1([R16G16B16A16_FLOAT, B8G8R8A8_UNORM])`:
+  the desktop as Windows composes it, scRGB FP16 (linear light, BT.709 primaries, 1.0 =
+  80 cd/m2, values above 1 and below 0 for colours outside sRGB); B8G8R8A8 for when HDR is
+  turned off during the stream (Sunshine's format list has both). An SDR stream asks for
+  B8G8R8A8 only, and DXGI converts an HDR desktop to SDR itself.
+- **Conversion** (`InputSpec::P010`, `src/d3d/convert.cpp`): per tap, scRGB x 80 cd/m2 (an
+  8-bit sRGB source: decoded, white at 203 cd/m2, the HDR reference white of ITU-R BT.2408),
+  the BT.709 -> BT.2020 matrix of ITU-R BT.2087, negative values clipped, the SMPTE ST 2084
+  (PQ) inverse EOTF; then the BT.2020 non-constant-luminance matrix into 10-bit limited
+  range (Y 64..940, CbCr 64..960), written to a `DXGI_FORMAT_P010` texture (render target
+  views R16_UNORM / R16G16_UNORM) with the 10-bit code in the high bits and the low 6 bits
+  zero. Siting, scaling, rotation, padding and the barcode as for NV12. Bilinear sampling
+  interpolates linear light; the chroma taps are averaged after PQ (Sunshine averages before
+  PQ; it differs only at sharp high-contrast colour edges). Known values: 100 cd/m2 = PQ
+  0.508 = Y 509, 203 cd/m2 = 573, 1000 cd/m2 = 723, 10000 cd/m2 and above = 940.
+- **Encoders**: AMF `COLOR_BIT_DEPTH` 10, HEVC `PROFILE_MAIN_10` / AV1 Main, P010 input,
+  input and output colour profile / transfer / primaries BT.2020 / SMPTE 2084 / BT.2020,
+  `INPUT_HDR_METADATA`; NVENC HEVC Main10 / AV1 Main with input and output bit depth 10,
+  `NV_ENC_BUFFER_FORMAT_YUV420_10BIT` input, VUI (AV1 colour config) BT.2020 / SMPTE 2084 /
+  BT.2020 NCL, `outputMasteringDisplay` + `outputMaxCll` with `pMasteringDisplay` /
+  `pMaxCll` on every picture. No zero-copy (AMD Direct Capture surfaces) in HDR10 streams.
+  GUIDE 3.9 also names R10G10B10A2 input: both encoders take P010, which keeps the matrix
+  and chroma siting in the helper's own (tested) shader, so R10G10B10A2 is not used.
+- **Metadata** (`src/codec/hdr.hpp`, Sunshine's choice): mastering display primaries BT.2020
+  with a D65 white point (the stream's container; Sunshine found the panel primaries DXGI
+  reports unreliable), the output's `MaxLuminance` / `MinLuminance` as the mastering
+  display's luminance, `MaxLuminance` as MaxCLL and `MaxFullFrameLuminance` as MaxFALL
+  (the content as the host's display showed it: games tone-map to DXGI's MaxLuminance). A
+  peak outside 80..10000 cd/m2 or an unknown one (e.g. some virtual displays) gives a
+  1000 cd/m2 display with black 0. Encoder units: HEVC SEI and AMF's `AMFHDRMetadata`
+  chromaticity x 50000 and luminance x 10000 (0.0001 cd/m2); AV1 (NVENC) chromaticity 0.16,
+  maximum luminance 24.8 and minimum luminance 18.14 fixed point (FFmpeg's `nvenc.c`).
+  `started.hdrMetadata` has the values in plain units for the client (GUIDE 4.5).
+- **Changes during the stream**: the stream keeps the format it started with. Turning HDR
+  off gives `captureChanged` `hdr` (false) and the SDR desktop at 203 cd/m2 in the PQ
+  stream; turning it on in an SDR stream gives `captureChanged` `hdr` (true) and DXGI's SDR
+  conversion. recon-host restarts the helper to switch.
 
 ## AMF encoder backend
 
@@ -546,7 +631,8 @@ reads `AMFCaps`: `maxW`/`maxH` (input width/height range), `hwInstances`
 (`*_CAP_NUM_OF_HW_INSTANCES`), `maxTemporalLayers`, `roi` (`*_CAP_ROI`; AV1 has no such
 cap and is listed as `importance`, as OBS does, marked `assumed`), `queryTimeout`
 (`*_CAP_QUERY_TIMEOUT_SUPPORT`; AV1: set and read back, as FFmpeg does), `sliceOutput`
-(slice / AV1 tile output), `tenBit` (HEVC Main10 / AV1 with P010 input), `maxLtr` (AV1
+(slice / AV1 tile output), `tenBit` (HEVC Main10 / AV1 with P010 input), `hdr10` (`tenBit`
+and the `INPUT_HDR_METADATA` property: HEVC, AV1), `maxLtr` (AV1
 `CAP_MAX_NUM_LTR_FRAMES`; H.264 2 and HEVC up to 16 by the docs, marked `assumed`),
 `alignW`/`alignH` (AV1 `CAP_WIDTH/HEIGHT_ALIGNMENT_FACTOR`; 64x16 when the driver does not
 say, FFmpeg's assumption for RDNA3, marked `assumed`; `start` reads the factors again from
@@ -564,7 +650,7 @@ true.
 | `USAGE` (first: it sets every default) | `ULTRA_LOW_LATENCY`; H.264 falls back to `LOW_LATENCY` when `Init` fails (AMF issue #410, Sunshine's fallback) |
 | `INSTANCE_INDEX` | `encoderInstance` (default 0); required when > 0 (a refusal fails the start), read back for `started` |
 | `FRAMESIZE` / `FRAMERATE` | coded size / `fps` |
-| `PROFILE` | H.264 High, HEVC Main, AV1 Main (8-bit; HDR is step 3.9) |
+| `PROFILE` | H.264 High, HEVC Main, AV1 Main; HDR10: HEVC Main10 (required), AV1 Main |
 | `LOWLATENCY_MODE` (H.264, HEVC) / AV1 `ENCODING_LATENCY_MODE` | true / `LOWEST_LATENCY` |
 | `QUALITY_PRESET` | `quality`: speed (default) / balanced / quality |
 | `RATE_CONTROL_METHOD` | `CBR` for `rc` `cbr`, else `LATENCY_CONSTRAINED_VBR` |
@@ -581,7 +667,8 @@ true.
 | `INPUT_QUEUE_SIZE` | 2 |
 | AV1 `ALIGNMENT_MODE` | `64X16_ONLY` when the alignment is 64x16 (the helper pads itself, see below), else `NO_RESTRICTIONS` |
 | AV1 `SWITCH_FRAME_INSERTION_MODE` | `NONE` (a switch frame clears the LTR slots; the default "depends on USAGE") |
-| colour | 8-bit, BT.709 primaries / transfer / matrix, limited range out; NV12 input limited range, RGB input (zero-copy) full range |
+| colour | 8-bit, BT.709 primaries / transfer / matrix, limited range out; NV12 input limited range, RGB input (zero-copy) full range. HDR10: `COLOR_BIT_DEPTH` 10 (required), input and output colour profile `2020`, transfer `SMPTE2084`, primaries `BT2020`, limited range, P010 input |
+| `INPUT_HDR_METADATA` (HEVC, AV1) | HDR10 only: an `AMFBuffer` of `AMFHDRMetadata` (see "HDR10"); not required (a refusal is logged, the stream stays HDR10 by its VUI) |
 | intra refresh | `intraRefreshFrames` > 0 (required): H.264 `INTRA_REFRESH_NUM_MBS_PER_SLOT` / HEVC `..._CTBS_PER_SLOT` = blocks / frames, AV1 `INTRA_REFRESH_MODE` continuous + `INTRAREFRESH_STRIPES`; 0: explicitly off (per-slot 0, AV1 `DISABLED`), since H.264's ULTRA_LOW_LATENCY / LOW_LATENCY usages default to 255 MBs per slot. `started.intraRefreshFrames` is the cycle read back after `Init` |
 
 **AV1 alignment.** When the encoder needs 64x16 multiples (RDNA3), the coded size is the
@@ -683,6 +770,7 @@ with the most video memory), `NvEncGetEncodeGUIDs` and per codec `NvEncGetEncode
 | `sliceOutput` | `SUPPORT_SUBFRAME_READBACK` |
 | `hwInstances` | `NUM_ENCODER_ENGINES` |
 | `dynamicResolution` | `SUPPORT_DYN_RES_CHANGE` |
+| `hdr10` | HEVC / AV1 with `SUPPORT_10BIT_ENCODE` and `NV_ENC_BUFFER_FORMAT_YUV420_10BIT` (P010) among `NvEncGetInputFormats` |
 | `queryTimeout`, `alignW` / `alignH` | false, 1 x 1 |
 
 Read and logged at `start`: `ASYNC_ENCODE_SUPPORT` (async or sync output),
@@ -697,7 +785,7 @@ among `NvEncGetInputFormats`.
 |---|---|
 | `tuningInfo` | `NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY` |
 | preset | by pixel rate (width x height x fps): P4 up to 2560x1440 at 120 fps, P1 from 3840x2160 at 120 fps on, logarithmically in between (3840x2160@60 P4, @90 P2; 2560x1440@165 P3); `quality` `balanced` / `quality` one / two presets slower (at most P7); `started.preset` |
-| profile | H.264 High, HEVC Main, AV1 Main (8-bit; HDR is step 3.9) |
+| profile | H.264 High, HEVC Main, AV1 Main; HDR10: HEVC Main10, AV1 Main, input and output bit depth 10 |
 | `enablePTD` / `enableEncodeAsync` | 1 / 1 when `ASYNC_ENCODE_SUPPORT`, else 0 (sync mode, polled output) |
 | `gopLength`, `idrPeriod` | `NVENC_INFINITE_GOPLENGTH`: IDRs only when forced |
 | `frameIntervalP` | 1: no B frames |
@@ -711,7 +799,8 @@ among `NvEncGetInputFormats`.
 | `maxNumRefFrames` / `maxNumRefFramesInDPB` | 6, fewer where the level 5.x DPB limit at the coded size is lower: H.264 MaxDpbFrames (A.3.1, MaxDpbMbs 184320) and HEVC MaxDpbSize (A.4.2) less the current picture, so 5 for both at 3840x2160 (Sunshine keeps 5; more would make the driver signal level 6, which many H.264 hardware decoders refuse); AV1 6 at every size; 1 without `SUPPORT_MULTIPLE_REF_FRAMES`. `numRefL0` / AV1 `numFwdRefs` 1: one reference per frame, the rest kept for invalidation; `started.refFrames` |
 | `repeatSPSPPS` / AV1 `repeatSeqHdr` | 1: every IDR carries its parameter sets |
 | slices, level, tier | one slice per picture; level autoselect (AV1 `NV_ENC_LEVEL_AV1_AUTOSELECT`), Main tier |
-| colour | BT.709, limited range, chroma sample location 0 (AV1 `chromaSamplePosition` 1); `bitstreamRestrictionFlag` 1 |
+| colour | BT.709, limited range, chroma sample location 0 (AV1 `chromaSamplePosition` 1); `bitstreamRestrictionFlag` 1. HDR10: BT.2020 primaries, SMPTE 2084, BT.2020 NCL matrix |
+| HDR metadata | HDR10 only (HEVC, AV1): `outputMasteringDisplay` 1, `outputMaxCll` 1; every picture carries `pMasteringDisplay` / `pMaxCll` (FFmpeg passes them with every frame that has the metadata) |
 | H.264 entropy | CABAC where supported |
 | intra refresh | `intraRefreshFrames` N > 0: period N (at least 2), count N-1, single-slice where supported, recovery point SEI |
 | temporal SVC | `svcLayers` > 1: `enableTemporalSVC`, `numTemporalLayers` and the maximum |
@@ -721,7 +810,8 @@ among `NvEncGetInputFormats`.
 Four bitstream buffers ("at least 4 + number of B frames", NVENC guide 6.1), each with
 its own auto-reset completion event registered with the session in async mode.
 
-**Input.** The converter's NV12 pool textures, each registered once
+**Input.** The converter's NV12 pool textures (P010 for HDR10, registered as
+`NV_ENC_BUFFER_FORMAT_YUV420_10BIT`), each registered once
 (`NvEncRegisterResource`, DirectX, pitch 0) and mapped per frame (`NvEncMapInputResource`,
 which also waits for the conversion's GPU work); unmapped after the frame's
 `NvEncLockBitstream` has returned, when the texture goes back to the pool. At most two
@@ -830,7 +920,9 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   units (libx264 / libx265 output and hand-written ones with scaling lists, sub-layers and
   emulation prevention bytes, each checked against FFmpeg's `trace_headers`), the reference
   frames by level (5 at 4K H.264 / HEVC), the invalidation window narrowed to the encoder's,
-  ROI importance maps and coded-size alignment.
+  ROI importance maps and coded-size alignment, the HDR10 metadata (BT.2020 / D65, the
+  display's luminance, the fallbacks for unknown or implausible values) and its HEVC / AMF
+  and AV1 fixed-point codes.
 * `--self-test-nvenc=DLL`: the NVENC backend driven the way the pipeline drives it (init
   on one thread, NV12 textures submitted from a capture thread, the output collected on an
   output thread; forced IDRs, losses, rate and frame-rate changes, ROI on and off,
@@ -850,10 +942,15 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   reference frames than asked (its SPS read back: recovery only within them), caps mapping
   (`maxLtr` 0), API version negotiation (a 12.2 driver refused with the driver
   to install, 13.2 accepted), recovery by IDR without invalidation, `restart` without live
-  bitrate, a failing `NvEncEncodePicture`, the start checks, and that the teardown leaves
+  bitrate, a failing `NvEncEncodePicture`, the start checks, HDR10 (step 3.9: HEVC Main10
+  and AV1 with input / output bit depth 10, the BT.2020 PQ colour description, P010 input
+  registered as `YUV420_10BIT`, the mastering display and MaxCLL codes with every picture,
+  an SDR source giving an 8-bit stream, and the refusals: H.264, no 10-bit encoding, no
+  P010 input; the double flags a bit depth that does not match the input format or the
+  profile, and metadata in an 8-bit stream), and that the teardown leaves
   nothing behind. It needs a D3D11 device (WARP; Wine: an X display). Without `=DLL` it
   runs the same streams against the NVIDIA driver (77 without one): the hardware check of
-  docs/VENDOR_NOTES.md 3.4.
+  docs/VENDOR_NOTES.md 3.4 and 3.9.
 * `--self-test-convert`: the conversion on a WARP device (default hardware device if WARP
   is missing; 77 if there is no D3D11 device at all) against a CPU reference of the same
   maths (D3D bilinear sampling, BT.709 coefficients): 1:1, 2:1 and 4:3 downscale, 2x
@@ -861,15 +958,27 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   colour-bar values (e.g. red = 63/102/240), the orientation of a 90 degree rotation, the
   barcode blocks (solid, neutral chroma, decoding to the value, MSB- and LSB-first), the
   texture pool (reuse, exhaustion) and a picture scaled into a padded coded size (the
-  repeated edge in the padding, for AV1's 64x16 alignment). It prints `mode nv12` when it tested NV12 render
+  repeated edge in the padding, for AV1's 64x16 alignment), an FP16 scRGB source clipped to
+  SDR; and HDR10 (step 3.9) into P010 against a double-precision reference of the PQ curve
+  and the BT.2087 matrix (FP16 sources with grey and colour bars from 0 to 20000 cd/m2,
+  colours outside sRGB and negative ones, pseudo-random values from 0.08 to 10000 cd/m2;
+  1:1, 2:1 downscale from a copied source, a 90 degree rotation, an 8-bit sRGB source at
+  203 cd/m2, padding), every P010 sample's low 6 bits zero, absolute codes (0, 80, 100, 203,
+  1000, 4000, 10000 cd/m2 = Y 64, 490, 509, 573, 723, 855, 940; scRGB red, green, blue at
+  80 cd/m2 = 325/448/598, 450/432/476, 226/650/535) and the barcode at 64 / 940 / 512.
+  Scaled HDR cases use a smooth pattern: texture filtering weights have limited precision
+  (D3D11: 8 fractional bits), and PQ magnifies a weight error between a near-black and a
+  very bright texel into many codes. It prints `mode nv12` when it tested NV12 render
   targets and `mode planar` when the device has none (Wine's wined3d) and the same shaders
-  were checked on separate R8 / R8G8 textures instead.
+  were checked on separate R8 / R8G8 textures instead, and the same for P010 (`HDR10 mode
+  p010` / `HDR10 mode planar`: separate R16 / R16G16 textures).
 
 CI runs them on windows-latest (`mode nv12` required; `--self-test-nvenc` with the test
 double on WARP); the Go integration tests run them too (`TestHelperIntegrationNvenc` with
 `RECON_FAKE_NVENC` pointing at the test double, and against the driver where there is
 one) and drive `synthetic-gpu` through the mock encoder (fps cap, idle repeats, and the
-barcode of a `--dump-nv12` frame decoding to its frame id).
+barcode of a `--dump-nv12` frame decoding to its frame id; with `hdr`, the P010 dump's
+barcode, its 1000 cd/m2 patch at code 723 and `started`'s HDR10 fields).
 
 ## Encode test
 
@@ -882,7 +991,7 @@ one line per scripted event. Exit code 0 = every event handled, 1 = failed, 2 = 
 start. Options become `start` fields (validated by the same parser): `--codec`,
 `--capture` (`synthetic-gpu` needs no display), `--width`, `--height`, `--fps`, `--kbps`,
 `--rc`, `--quality`, `--vbv`, `--ltr-slots`, `--ltr-interval`, `--live-bitrate`,
-`--instance`, `--zero-copy=0|1`, `--intra-refresh`, `--monitor`, `--hmonitor`; plus
+`--instance`, `--zero-copy=0|1`, `--intra-refresh`, `--hdr=0|1`, `--monitor`, `--hmonitor`; plus
 `--frames=N` (stop after frame id N, default 300), `--ack-delay=N` (a simulated client
 acknowledges every LTR frame N frames after receiving it, default 2), `--dxgi-gate=0|1`
 (default 1; 0 switches `d3d::dxgiGate()` off, so DDA's `AcquireNextFrame` and NVENC's
@@ -901,7 +1010,11 @@ recon-encoder.exe --encode-test=out.hevc --backend=amf --codec=hevc --capture=sy
 ```
 
 On an NVIDIA host the same with `--backend=nvenc` (without `--ltr-slots`): a loss line then
-says "by reference invalidation (no IDR)" instead of "from an LTR (no IDR)".
+says "by reference invalidation (no IDR)" instead of "from an LTR (no IDR)". With `--hdr=1`
+(and `--capture=dda` on a desktop in Windows HDR mode, or `synthetic-gpu`) the stream is
+HDR10: `ffprobe -show_streams -show_frames -read_intervals %+#1 FILE` shows `pix_fmt`
+yuv420p10le, `color_transfer` smpte2084, `color_primaries` bt2020 and the mastering display
+/ content light level side data.
 
 The Go integration test `TestHelperIntegrationEncodeTest` runs it with the mock backend;
 `RECON_HELPER_ENCODE_TEST="--backend=amf --codec=hevc ..."` (or `--backend=nvenc ...`) runs it
@@ -916,11 +1029,13 @@ frames, Constrained Baseline, access unit delimiters; regenerate with
 `testdata/gen-mock-clip.sh`), compiled into the executable. It loops the clip;
 `forceIdr` and `recover` (no LTR) jump back to the IDR; `setRate` is recorded and shows
 in the stats but cannot change the canned bitstream. Caps: vendor `mock`, `h264` only,
-recovery `none`, liveBitrate `seamless`. With a GPU capture (`dda`, `amd-direct`, `wgc`,
+recovery `none`, liveBitrate `seamless`, `hdr10` false. With a GPU capture (`dda`, `amd-direct`, `wgc`,
 `synthetic-gpu`) the mock asks for NV12 input, so capture, pacing, GPU priority and the
 colour conversion run for real on a host without an encoder backend (the converted frames
-are ignored; `--dump-nv12` shows one). On a device without NV12 render targets it falls
-back to the planar test mode.
+are ignored; `--dump-nv12` shows one). With `hdr` from an HDR source it asks for P010, so
+the HDR10 conversion runs too, and `started` describes an HDR10 stream (the canned clip stays
+8-bit H.264, as it stays 320x180 whatever size was asked for). On a device without NV12 /
+P010 render targets it falls back to the planar test mode.
 
 ## Building and testing
 

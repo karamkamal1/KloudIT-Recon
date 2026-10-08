@@ -134,14 +134,27 @@ Status AmdDirectCapture::init(const StartParams& p) {
     }
     s = initComponent();
     if (!s.ok) return s;
+    const DisplayColor color = d3d::displayColor(output_.output.Get());
+    bool hdr = false;
     {
         std::lock_guard<std::mutex> lock(srcMu_);
         src_.device = dev_.device.Get();
         src_.adapter = output_.adapterInfo;
         src_.amfContext = ctx_.GetPtr();
+        src_.display = color;
+        // HDR10 (step 3.9) from FP16 scRGB surfaces only, which the colour
+        // conversion takes like DDA's. What the component delivers on an HDR
+        // desktop is a VERIFY item (docs/VENDOR_NOTES.md 3.9); anything else
+        // (8-bit, R10G10B10A2) gives an SDR stream.
+        hdr = src_.hdr = p.hdr && color.hdr && src_.amfFormat == amf::AMF_SURFACE_RGBA_F16;
     }
-    logf(LogLevel::Info, "amd-direct: %s (monitor index %d) on %s, AMF runtime %s", output_.desc.name.c_str(),
-         output_.desc.outputIndex, output_.adapterInfo.name.c_str(), rt.versionText.c_str());
+    if (p.hdr && color.hdr && !hdr) {
+        logf(LogLevel::Info, "amd-direct: Windows HDR is on, but the capture surfaces are AMF format %d, not RGBA_F16: SDR",
+             src_.amfFormat);
+    }
+    logf(LogLevel::Info, "amd-direct: %s (monitor index %d) on %s, AMF runtime %s, Windows HDR %s%s", output_.desc.name.c_str(),
+         output_.desc.outputIndex, output_.adapterInfo.name.c_str(), rt.versionText.c_str(),
+         !color.known ? "unknown" : color.hdr ? "on" : "off", hdr ? " (FP16 scRGB capture)" : "");
     startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
@@ -214,6 +227,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "restored";
             ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
+            ev.hdr = src_.display.hdr;  // as at the start (DDA follows HDR switches)
             postEvent(ev);
         }
         amf::AMFDataPtr data;
@@ -239,6 +253,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "lost";
             ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
+            ev.hdr = src_.display.hdr;  // as at the start (DDA follows HDR switches)
             ev.text = amfError("QueryOutput", r);
             postEvent(ev);
             continue;
@@ -266,6 +281,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "resized";
             ev.width = int(w), ev.height = int(h), ev.rotation = rotation_;
+            ev.hdr = src_.display.hdr;
             ev.text = "was " + std::to_string(lastW_) + "x" + std::to_string(lastH_);
             postEvent(ev);
             std::lock_guard<std::mutex> lock(srcMu_);

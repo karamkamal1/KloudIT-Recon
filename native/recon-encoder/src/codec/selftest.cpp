@@ -5,14 +5,16 @@
 // insertion on real H.264 access units (the mock clip) and on synthetic HEVC /
 // AV1 units, the level and reference frames read from SPS NAL units (x264 /
 // x265 output and hand-written ones), ROI importance and QP delta maps, the
-// coded size alignment, and the NVENC settings that need no driver
-// (nvenc/nvenc_policy.hpp).
+// coded size alignment, the NVENC settings that need no driver
+// (nvenc/nvenc_policy.hpp), and the HDR10 metadata and its encoder units
+// (codec/hdr.hpp).
 #include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "codec/ltr.hpp"
 #include "codec/rfi.hpp"
 #include "mock/mock.hpp"
@@ -681,6 +683,49 @@ void testNvencPolicy() {
     std::printf("  %-44s ok\n", name);
 }
 
+void testHdrMetadata() {
+    const char* name = "HDR10 metadata and its units";
+    DisplayColor d;
+    d.known = d.hdr = true;
+    d.minLuminance = 0.005, d.maxLuminance = 1000, d.maxFullFrameLuminance = 400;
+    d.red[0] = 0.64, d.red[1] = 0.33;  // the panel's (sRGB-like) primaries are not used
+    HdrMetadata m = hdrMetadataFor(d);
+    expect(m.red[0] == 0.708 && m.red[1] == 0.292 && m.green[0] == 0.170 && m.green[1] == 0.797 && m.blue[0] == 0.131 &&
+               m.blue[1] == 0.046 && m.white[0] == 0.3127 && m.white[1] == 0.3290,
+           name, "primaries: not BT.2020 / D65");
+    expect(m.maxLuminance == 1000 && m.minLuminance == 0.005 && m.maxCll == 1000 && m.maxFall == 400, name, "luminance from the display");
+    // Unknown, implausible or inconsistent values: a 1000 cd/m2 display.
+    const HdrMetadata unknown = hdrMetadataFor(DisplayColor{});
+    expect(unknown.maxLuminance == kDefaultHdrPeak && unknown.minLuminance == 0 && unknown.maxCll == 1000 && unknown.maxFall == 1000, name,
+           "unknown display");
+    d.maxLuminance = 50;
+    expect(hdrMetadataFor(d).maxLuminance == kDefaultHdrPeak, name, "peak below 80 cd/m2 accepted");
+    d.maxLuminance = 20000;
+    expect(hdrMetadataFor(d).maxLuminance == kDefaultHdrPeak, name, "peak above 10000 cd/m2 accepted");
+    d.maxLuminance = 600, d.maxFullFrameLuminance = 800, d.minLuminance = 7;
+    m = hdrMetadataFor(d);
+    expect(m.maxCll == 600 && m.maxFall == 600 && m.minLuminance == 0, name, "full-frame above peak / black level above 5 cd/m2");
+    // HEVC SEI (and AMF): chromaticity x 50000, luminance x 10000; AV1: 0.16,
+    // 24.8 and 18.14 fixed point.
+    d.maxLuminance = 1000, d.maxFullFrameLuminance = 400, d.minLuminance = 0.005;
+    m = hdrMetadataFor(d);
+    const MasteringCodes h = masteringCodes(m, false), a = masteringCodes(m, true);
+    expect(h.red[0] == 35400 && h.red[1] == 14600 && h.green[0] == 8500 && h.green[1] == 39850 && h.blue[0] == 6550 && h.blue[1] == 2300 &&
+               h.white[0] == 15635 && h.white[1] == 16450 && h.maxLuminance == 10000000 && h.minLuminance == 50,
+           name, "HEVC units");
+    expect(a.red[0] == 46399 && a.red[1] == 19137 && a.green[0] == 11141 && a.green[1] == 52232 && a.blue[0] == 8585 && a.blue[1] == 3015 &&
+               a.white[0] == 20493 && a.white[1] == 21561 && a.maxLuminance == 256000 && a.minLuminance == 82,
+           name, "AV1 units");
+    m.white[0] = 1.5;  // out of range: clamped
+    expect(masteringCodes(m, false).white[0] == 50000 && masteringCodes(m, true).white[0] == 65535, name, "clamping");
+    Started st;
+    describeColor(st, m);
+    expect(st.hdr && st.bitDepth == 10 && st.colorSpace == "bt2020-pq" && st.hdrMetadata, name, "started (HDR10)");
+    describeColor(st, std::nullopt);
+    expect(!st.hdr && st.bitDepth == 8 && st.colorSpace == "bt709" && !st.hdrMetadata, name, "started (SDR)");
+    std::printf("  %-44s ok\n", name);
+}
+
 }  // namespace
 
 int runEncoderSelfTest() {
@@ -690,6 +735,7 @@ int runEncoderSelfTest() {
     testBitstream();
     testRoi();
     testNvencPolicy();
+    testHdrMetadata();
     std::printf("self-test-encoder: %s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }
