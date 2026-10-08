@@ -5826,3 +5826,205 @@ with libx264 / libsvtav1):
   family went untimed on the first (no "timed 1080p" on its line: the clip came too late).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same four-profile check streaming
   from the NVIDIA host.
+
+## Phase 5 Client-side upscaling (FSR1)
+
+What changed (browser client; the host logs one more field):
+
+- `web/static/js/fsr1.js`: AMD FidelityFX Super Resolution 1.0 ported to WGSL from
+  `ffx_fsr1.h` ("v1.20210629", GPUOpen-Effects/FidelityFX-FSR commit `a21ffb8f`, MIT; the
+  notice is at the top of the file, the credit in `third_party/README.md`): EASU (`FsrEasuF`,
+  the 32-bit version: 12 taps, edge direction and length from the four 2×2 quads' luma, the
+  anisotropic Lanczos-2 approximation, clamped to the nearest 2×2 min/max) into an
+  `rgba8unorm` texture of the output size, then RCAS (`FsrRcasF`: the limiter, at most
+  `FSR_RCAS_LIMIT`, times 2^−sharpness; `FSR_RCAS_DENOISE` as a uniform) onto the canvas at the
+  letterboxed rectangle: fragment passes of one triangle each like the rest of the WebGPU
+  renderer (after the input copy, below; the canvas cannot be a storage texture without
+  `bgra8unorm-storage`, and a fragment pass writes the canvas directly). Both run on the decoded picture as it is
+  (gamma-encoded, which FSR 1 expects). The approximations (`APrxLoRcpF1`, `APrxMedRcpF1`,
+  `APrxLoRsqF1`) are bit for bit. Differences from the header, none in the math: loads instead
+  of gathers (WGSL has no gather on `texture_external`), taps clamped to the video's visible
+  area (encoder padding must not bleed in; FSR clamps to the texture), and RCAS's limiter sides
+  that cannot clip (0·∞ and 0/0 in the header, which relies on the GPU's NaN-dropping `max`)
+  dropped explicitly, because WGSL may assume there are no NaNs.
+- Input: by default (`FSR.input = "copy"`) the frame's visible area is first copied from the
+  external texture into an `rgba8unorm` texture of its size (one YUV→RGB load per input pixel)
+  and EASU loads its 12 taps from that; `"external"` loads them from the external texture (12
+  conversions per output pixel, one pass less). Diagnostics only:
+  `fsrInput: "external"` in `recon.prefs.v1` (see the hardware check).
+- `renderers.js`: `setUpscale` / `upscaleInfo` / `upscaled` on every renderer; the WebGPU
+  renderer runs FSR when the setting and the scale call for it and its pipelines are ready.
+  Created once: two uniform buffers and the pass and bind-group descriptors (with the
+  renderer), the pipelines of the input variant in use (when FSR is first needed, with
+  `createRenderPipelineAsync`; the bilinear path draws until they are ready, a renderer that
+  never enlarges compiles nothing); the intermediate and the copy texture on size changes;
+  uniforms written only when their values change. Per frame: the external texture's bind
+  group (WebGPU requires it), the command encoder, the canvas view. The device requests
+  `timestamp-query` where the adapter has it: once FSR has drawn, every 100 ms one draw is
+  timed (two readbacks in flight at most): FSR's passes (and the copy pass alone) or the plain
+  pass; a session that never upscales times nothing. Zero-length samples are kept in every
+  ring: a browser that quantizes timestamps (Chrome: 100 µs without
+  `--enable-webgpu-developer-features`) reads a pass shorter than that as 0 or 100 µs, and only
+  with the zeros the overlay's mean over many samples is unbiased (dropping them made a
+  tens-of-µs plain pass read about 0.1 ms).
+- Setting *Pipeline → Upscaling*: Auto (default; FSR above 1.05×, WebGPU only), Off, FSR 1
+  (above 1×); *FSR sharpness* 0–2 stops (default 0.2) and *sharpen noise less* (RCAS denoise),
+  saved in `recon.prefs.v1` and applied live. Never when the picture is shown at its size or
+  smaller. With the 2D canvas or WebGL2 the hint and the overlay say FSR needs WebGPU and the
+  picture is scaled bilinearly (no WebGL2 port). Renderer *Auto* prefers a desynchronized
+  context, which WebGPU cannot report, so where the 2D canvas is desynchronized (Chrome; both
+  E2E bake-offs here) it never picks WebGPU and Upscaling Auto has no effect: the README and,
+  while Renderer Auto draws with another path, the setting's hint say to choose Renderer
+  *WebGPU*.
+- Overlay (WebGPU renderer; other paths only when *FSR 1* is chosen, as a warning): *Upscaling*
+  (`Auto: FSR 1 · 960×540 → 1920×1080 (2×) · sharpness 0.2`, or `bilinear · … · <why>`) and,
+  once FSR has drawn, *GPU (timestamp-query, mean)* FSR / copy / plain, or without timestamps
+  *draw stage (CPU, p50)* with and without FSR. The draw stage includes the passes'
+  encoding and submission, so the stage bookkeeping still adds up; the latency probe reads the
+  frame's own texture, not the canvas. The stage report to the host carries
+  `upscale: fsr | off | mixed`, logged as `upscale=` (`TestLogStagesRenderer`).
+
+Found in the sandbox (Chromium 141 from Playwright 1.56 on Xvfb, WebGPU on SwiftShader, the
+only adapter here: no GPU, no lavapipe; `timestamp-query` available). SwiftShader emulates the
+GPU on a 4-core CPU shared with other jobs (load average 8–19 during these numbers), so its
+times say nothing about a GPU's cost, only about relative work:
+
+- GPU time per frame (timestamp-query, one frame in flight, a 960×540 I420 frame like the
+  software decoder's): plain path into 960×540 37–58 ms, into 1920×1080 144–152 ms; FSR with
+  input "copy" into 1920×1080 424–455 ms, of which the copy 38 ms; FSR with input "external"
+  into 1920×1080 740–790 ms (12 external-texture loads per output pixel, each a YUV→RGB
+  conversion); "copy" into 1440×810 264 ms, into 1200×675 115 ms. "copy" became the default:
+  the copy pass costs about a tenth of FSR here, and it replaces twelve conversions per output
+  pixel by one per input pixel, which should hold on real GPUs too (the hardware check below
+  compares both).
+- So the 960×540 test stream cannot be upscaled into a 1920×1080 canvas in real time here:
+  tried in the E2E (headed page at DPR 2.5, 30 fps), it drew 8–22 fps of 30 and a page
+  screenshot timed out after 30 s while SwiftShader worked through the backlog. The E2E's
+  streaming scenario therefore runs the same 2× at a quarter of the pixels (the stream at
+  480×270, asked for live, on the headed page's 960×540 canvas, 15 fps), and the
+  960×540 → 1920×1080 geometry is checked frame by frame at unit level.
+- On the ramp of the test picture FSR 1 is not linear: EASU's Lanczos-like kernel leans to the
+  texels (2×: 42.36 / 46.64 where linear interpolation gives 42.75 / 46.25) and RCAS sharpens
+  that alternation into small steps (up to 3 levels from bilinear at 0.2 stops). The CPU
+  reference does the same; it is FSR 1's behaviour, not a port error.
+- RCAS amplifies a 1-level rounding difference of the 8-bit intermediate by up to
+  1 / (1 + 4·lobe) (about 2.9× at 0.2 stops): GPU and CPU reference agree exactly at 2× and
+  within 4 levels (mean 0.09) at 1.5×, where EASU alone agrees within 1 level.
+
+Verified in the sandbox:
+
+- verified (sandbox): shader correctness, E2E `checkUpscaleUnit` (headed Chromium on Xvfb,
+  WebGPU on SwiftShader): the renderer's own FSR passes on a 64×40 picture (an anti-aliased
+  diagonal edge between dark blue and orange, a 1-px white line on dark grey, a grey ramp)
+  against `fsrReference` in `test/e2e/browser.mjs`, a CPU port written from `ffx_fsr1.h` in the
+  header's own structure (gather4 at normalised positions, the bczz/ijfe/klhg/zzon quads,
+  `FsrEasuCon`'s constants), not from the WGSL. The plain path at 1× returns the source exactly
+  (the reference's input). EASU alone (RCAS at 20 stops) at 1.5×, external and copy input:
+  within 1 level (mean 0.02). EASU + RCAS: 2× external and copy, 0.2 stops: identical (0
+  levels); 1.5× 0.2 stops: at most 4 levels, mean 0.09; 1.5× copy, 1 stop, denoise: at most 2,
+  mean 0.03. A frame with 8 white padding rows that the video config crops: identical to the
+  reference of the visible 64×40, no white in the bottom row (taps clamped to the crop). The
+  960×540 → 1920×1080 geometry with Auto: FSR active, identical to the reference at 600
+  sampled pixels. Against bilinear (the same renderer, Off): the edge's 10–90 % rise 1.06 vs
+  1.66 input pixels at 2× and 1.07 vs 1.67 at 1.5×, its steepest step 0.53 vs 0.31 and 0.60 vs
+  0.44 of the edge's contrast per output pixel; 4616 (2×) and 2578 (1.5×) output pixels three
+  input pixels from anything else all exactly at their flat value (no ringing); the ramp
+  within 3 levels of bilinear, no reversal over 1 level. The plan: FSR 1 at 1× and shown
+  smaller → bilinear ("not enlarged"), Auto at 1.03× → bilinear, at 1.09× → FSR, FSR 1 at
+  1.03× → FSR. Placement and sizes (added with the review fixes), each against the reference
+  of its own rectangle, worked out by hand in the test, with every pixel outside it black:
+  64×40 into 200×80 (bars left and right, picture at x 36) and, external input, into 128×120
+  (bars top and bottom, y 20): identical; 63×37 into 101×59 (100×59, a 1-px bar): at most 1
+  level; 63×37 into 157×99, external input (157×92 at y 3): identical; a 80×40 frame whose 16
+  right columns are white padding the video config crops, external and copy input: identical
+  to the visible 64×40's reference (taps clamped to the crop on both inputs); 128×80, then
+  resized to 200×90 and redrawn from the same frame (144×90 at x 28, the intermediate texture
+  re-created): at most 4 levels, mean 0.06. Each of these fails when RCAS ignores the letterbox
+  offset, the external input clamps to the texture instead of the crop, or the intermediate is
+  not re-created on a size change (tried on a scratch copy).
+- verified (sandbox): streaming, E2E scenario "WebGPU upscaling (FSR)" (headed page, canvas
+  960×540 device pixels, upscaling Auto, the test stream asked for at 480×270 and 15 fps; see
+  above why not 960×540 → 1920×1080): the overlay reads `Auto: FSR 1 · 480×270 → 960×540 (2×)
+  · sharpness 0.2`, input copy; 16 / 14 / 16 fps of 15; per-stage latency with the stage
+  bookkeeping (129 frames, sum = end-to-end to 0.00 ms), crop (bottom rows show the colour bars,
+  not the padding), canvas = box, decoder hygiene (0 leaked), the frame barcode 10/10 = seq by
+  `webgpu readback` (read from the frame's texture, so upscaling does not touch it), audio and
+  input as in every scenario; the host's stage line carries `renderer=webgpu pacing=latency
+  upscale=fsr`; Upscaling Off from the drawer applies live (`Off: bilinear · 480×270 →
+  960×540`, 14–16 fps, saved in `recon.prefs.v1`). Draw stage (CPU, encoding and submitting the
+  passes) with FSR p50 0.62 ms, p95 3.9 ms (n 300) vs plain p50 0.45 ms, p95 1.9 ms (n 73); GPU
+  time on SwiftShader (timestamp-query) FSR 52.8 ms mean, of which the copy 5.2 ms, vs plain
+  17.1 ms.
+- verified (sandbox): host log field, Go test `TestLogStagesRenderer`: `upscale=fsr` is logged,
+  an injected or empty value is not; the E2E's other scenarios log `upscale=off`.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`), 182 of 182 checks passed (load
+  average 5–6), the existing renderer scenarios and unit checks among them with the changed
+  WebGPU renderer (pass descriptors cached, the plain WebGPU scenario at 1× never compiles FSR
+  nor times draws; WebGPU 29–31 fps of 30, barcode 10/10, fullscreen and the bake-off as
+  before; the 2D canvas's overlay keeps its rows, so *Export latency data* stays reachable in
+  the 1280×720 page). Runs while other jobs loaded the 4-core machine to a load average of
+  15–28 failed the known real-time checks in most scenarios, and twice a page screenshot timed
+  out in the plain WebGPU scenario (the headed browser's compositor starved on SwiftShader).
+  `gofmt -l`, `go vet ./...`, `GOOS=windows go vet ./...`, `go test ./...` (the Go integration
+  test `internal/e2e` failed once at load ~21 and passed when run again), `node --check` on the
+  changed JS.
+- Not verifiable here: any GPU's cost (SwiftShader emulates on the CPU), how FSR looks on
+  real content on a real display, and click-to-photon. The hardware checks follow.
+
+Hardware checks (FSR runs on the client's GPU: the client GPU's vendor matters here, the
+host's only through the codec; each check below names its client):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (pass cost, timestamp-query; client: a Windows 11
+  PC whose display GPU is an RDNA3 Radeon, e.g. the RX 7900 XT PC itself as the client of
+  another Recon host, a 3840×2160 display at 100 % scaling, current Adrenalin, Chrome stable
+  started with `--enable-webgpu-developer-features` so the timestamps are not quantized to
+  100 µs): in Recon's settings set Renderer *WebGPU*, Reconnect, Resolution *1920×1080*, go
+  fullscreen (Ctrl+Alt+Shift+F) and open the overlay (Ctrl+Alt+Shift+S): *Renderer → context*
+  must show canvas 3840×2160 and *Upscaling* `Auto: FSR 1 · 1920×1080 → 3840×2160 (2×) ·
+  sharpness 0.2`. After 30 s of a moving picture (a game or a video on the host) record the
+  *GPU (timestamp-query, mean)* row (FSR, copy, n ≥ 100) and, from the DevTools console,
+  `JSON.stringify(__recon.lastStats.renderer.upscale.gpu)`; set Upscaling *Off* and after 30 s
+  record the plain value. Repeat with Resolution *2560×1440* (`… → 3840×2160 (1.5×)`). Then the
+  other input: in the console
+  `localStorage.setItem('recon.prefs.v1', JSON.stringify({...JSON.parse(localStorage.getItem('recon.prefs.v1')), fsrInput: 'external'}))`,
+  Reconnect, Upscaling *Auto*, record FSR again at both resolutions (no copy part), then set
+  `fsrInput` back to `'copy'`. Also note the latency table's *draw* row with Auto and with Off.
+  Pass: FSR (copy included) ≤ 1.0 ms at 1080p → 4K and at 1440p → 4K (expected a few tenths
+  of a millisecond); if "external" is cheaper by more than 0.1 ms on both vendors' clients,
+  make it the default (`FSR.input` in `web/static/js/fsr1.js`).
+- NVIDIA: unverified (no NVIDIA host available). Test (client with a GeForce RTX 30 or 40
+  GPU): the same pass-cost procedure in Chrome with `--enable-webgpu-developer-features`,
+  1080p → 4K and 1440p → 4K, copy and external input, Off for the plain value; same pass rule.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (visual, text and a game scene; the RDNA3 client
+  above, 4K display, stream at 1920×1080): (1) text: on the host open Notepad with a paragraph
+  in Consolas 10 pt and Segoe UI 9 pt, and a web page with small print; on the client take a
+  screenshot (Win+Shift+S, full screen) with Upscaling *Off*, *Auto* (0.2 stops), sharpness
+  0 and 1 stop, and compare them at 200 % zoom: look for crisper stems and diagonals with
+  FSR, no bright or dark halo around black-on-white text (RCAS's limiter), no colour fringes on
+  ClearType text (it is sub-pixel coloured on the host: if FSR sharpens the fringes visibly,
+  note it and compare with ClearType off on the host), no stair steps on thin diagonal lines.
+  (2) game: a 3D game in borderless fullscreen at 1920×1080 on the host, a scene with
+  foliage, thin geometry (fences, wires) and HUD text: compare Off and Auto in motion and in
+  screenshots: sharper edges and HUD text, no added shimmer or crawling on foliage and thin
+  lines while the camera moves, film grain or noise not visibly boosted (try *sharpen noise
+  less* on and off). Record the verdicts with the screenshots; if sharpness 0.2 halos or
+  shimmers, find the lowest sharpness (highest stops) that does not and record it as the
+  candidate default.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same text and game comparison on a
+  client with a GeForce GPU (FSR's output does not depend on the GPU beyond rounding, so expect
+  the same verdict; look for differences in the video decode, e.g. chroma, that FSR would
+  sharpen).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (click-to-photon, FSR on vs off; the latency rig of
+  step 0.3, docs/LATENCY_RIG.md, its photodiode on the RDNA3 client's 4K display, 120 Hz if the
+  display has it, wired LAN, HEVC 1920×1080 at 120 fps, Renderer *WebGPU*, fullscreen, overlay
+  closed): with Upscaling *Auto* (FSR 1, check the overlay before closing it) run
+  `python3 tools/latency-rig/rig.py measure --port COM5 --host-sensor --label recon-hevc-1080p120-on-4k-webgpu-fsr-amd --samples 100`,
+  then Upscaling *Off* and `--label recon-hevc-1080p120-on-4k-webgpu-off-amd`, interleaving
+  100-sample blocks until each label has ≥ 200 samples; then
+  `python3 tools/latency-rig/rig.py analyze results/*.csv --baseline recon-hevc-1080p120-on-4k-webgpu-off-amd --strict --json results/summary-p5-fsr-amd.json`
+  and paste the table here. Pass: the median click → client difference is within 1 ms (the
+  passes cost GPU time, not a refresh); a difference of about a refresh means FSR made a frame
+  miss its present: record the pass cost from the first check next to it.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same click-to-photon comparison on a
+  client with a GeForce GPU (labels ending in `-nvidia`), streaming from the RX 7900 XT host or
+  an NVIDIA host when there is one.

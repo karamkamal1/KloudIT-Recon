@@ -256,6 +256,10 @@ type ClientMsg struct {
 	// frames (latency | smooth, or mixed when it changed; step 4.4): the hold
 	// and display rows depend on it. Empty from clients before it.
 	Pacing string `json:"pacing,omitempty"`
+	// Upscale ("stages"): whether the client upscaled the window's frames
+	// with FSR 1 (fsr | off, or mixed when it changed; Phase 5): the draw and
+	// display rows depend on it. Empty from clients before it.
+	Upscale string `json:"upscale,omitempty"`
 }
 
 // MsgLost is the type of the message ({"t":"lost","gen":g,"fromSeq":s}) in

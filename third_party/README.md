@@ -1,5 +1,24 @@
 # third_party
 
+Third-party code in this repository: `quic-go/` below (Go, vendored with a patch), the
+headers in `native/third_party/` (see its README), and one port:
+
+## FidelityFX Super Resolution 1.0 (ported to WGSL)
+
+`web/static/js/fsr1.js` (client-side upscaling on the WebGPU renderer, Phase 5) is a port of
+EASU and RCAS from AMD's FidelityFX Super Resolution 1.0 to WGSL:
+[GPUOpen-Effects/FidelityFX-FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR),
+`ffx-fsr/ffx_fsr1.h` ("v1.20210629") and the approximations it uses from `ffx-fsr/ffx_a.h`, at
+commit `a21ffb8f6c13233ba336352bdff293894c706575` (the repository's `master`; tag `v1.0` is
+`a3b53ee03ce1b23280a6d1dd7dacbb0a3f6ed9c1`). MIT license, Copyright (c) 2021 Advanced Micro
+Devices, Inc.: the full notice is at the top of `fsr1.js` and above `fsrReference` in
+`test/e2e/browser.mjs`, a second, test-only port of the same header (the CPU reference the
+E2E checks the shaders against). Nothing is vendored: the header itself is not in the
+repository. What the port
+changes (loads instead of gathers, taps clamped to the video's visible area, RCAS's NaN cases
+made explicit) is listed in the file's header comment. To follow an upstream change, diff
+`ffx_fsr1.h` at the new commit against the one above and carry the change into both ports.
+
 ## quic-go
 
 `quic-go/` is [quic-go](https://github.com/quic-go/quic-go) at the release named in

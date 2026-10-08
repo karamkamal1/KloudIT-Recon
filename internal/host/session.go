@@ -2047,7 +2047,7 @@ func (s *Session) controlLoop() error {
 			// under reference recovery: it waits for the recovery frame.
 			s.loss(lossConfirmed, m.Gen, m.FromSeq, "client")
 		case "stages":
-			s.logStages(m.Stages, m.Renderer, m.Pacing)
+			s.logStages(m.Stages, m.Renderer, m.Pacing, m.Upscale)
 		case "congestion":
 			// Overlapped: the client keeps decoding the current generation
 			// until the new one is ready, unless it flushed its decoder: then
@@ -2173,12 +2173,15 @@ var rendererName = regexp.MustCompile(`^[a-z0-9-]{1,24}$`)
 // pacingModes are the frame pacing modes a client may name (step 4.4).
 var pacingModes = map[string]bool{"latency": true, "smooth": true, "mixed": true}
 
+// upscaleModes are the client-side upscaling states a client may name (Phase 5).
+var upscaleModes = map[string]bool{"fsr": true, "off": true, "mixed": true}
+
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
 // the host's own measurement of its stages (host_capture, host_queue), with
-// the client's presentation path (renderer) and frame pacing mode (pacing)
-// when it names them.
-func (s *Session) logStages(rows []proto.StageStat, renderer, pacing string) {
+// the client's presentation path (renderer), frame pacing mode (pacing) and
+// upscaling (upscale) when it names them.
+func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale string) {
 	names := stageNames
 	if s.a.faults.preStageHold {
 		names = stageNamesBeforeHold
@@ -2194,6 +2197,9 @@ func (s *Session) logStages(rows []proto.StageStat, renderer, pacing string) {
 	}
 	if pacingModes[pacing] {
 		args = append(args, "pacing", pacing)
+	}
+	if upscaleModes[upscale] {
+		args = append(args, "upscale", upscale)
 	}
 	for _, r := range rows {
 		if !names[r.Name] {

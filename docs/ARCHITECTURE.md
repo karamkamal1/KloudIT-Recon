@@ -534,7 +534,8 @@ worker:  WebTransport.incomingUnidirectionalStreams ─► readAll ─► reorde
                                           canvas2d  getContext('2d', {desynchronized:true}).drawImage
                                           webgl2    getContext('webgl2', {desynchronized:true}),
                                                     texImage2D(frame) + one triangle (after a self-test)
-                                          webgpu    importExternalTexture (zero copy, after a self-test)
+                                          webgpu    importExternalTexture (zero copy, after a self-test);
+                                                    shown larger: FSR 1, EASU + RCAS (fsr1.js)
 main:    pointerrawupdate / keys / gamepads ──postMessage──► worker ──► input stream / datagrams
 audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─► AudioWorklet (adaptive jitter buffer)
 ```
@@ -608,9 +609,40 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   the pick; Settings → *Measure renderers again* clears it. The click-to-photon rig (step 0.3)
   and PresentMon decide on real clients, and a path chosen in Settings overrides Auto. The
   client's stage report to the host names the path that drew the window's frames
-  (`renderer`; `bakeoff` for a window with several) and the frame pacing mode (`pacing`:
-  `latency`, `smooth`, or `mixed` when it changed in the window), so the host log keeps the
-  hold, draw and display rows per renderer and mode.
+  (`renderer`; `bakeoff` for a window with several), the frame pacing mode (`pacing`:
+  `latency`, `smooth`, or `mixed` when it changed in the window) and whether FSR upscaled the
+  frames (`upscale`: `fsr`, `off` or `mixed`), so the host log keeps the hold, draw and display
+  rows per renderer and mode.
+- **Client-side upscaling** (Phase 5, `fsr1.js`; Settings → Pipeline → *Upscaling*, applied
+  live): a picture shown larger than it streams (in device pixels, after the video config's
+  crop: 1080p or 1440p on a 4K screen, a lower streaming resolution) is upscaled by the
+  WebGPU renderer with a WGSL port of AMD FidelityFX Super Resolution 1.0 (`ffx_fsr1.h`, MIT):
+  **EASU** (edge-adaptive spatial upsampling: 12 taps around each output pixel's input texel,
+  edge direction and length from the luma of the four 2×2 quads, an anisotropic Lanczos-2
+  approximation clamped to the nearest 2×2 min/max, so it does not ring) renders into an
+  `rgba8unorm` texture of the output size, then **RCAS** (robust contrast-adaptive sharpening:
+  a 5-tap cross whose negative lobe is the largest that clips nothing, at most 0.1875, times
+  2^−sharpness; optional denoise) draws it onto the canvas at the letterboxed rectangle. Both
+  run on the decoded video as it is (non-linear, as FSR 1 expects; no linearisation). Input: by
+  default the frame's visible area is first copied from the external texture into an
+  `rgba8unorm` texture of its size (one YUV→RGB load per input pixel instead of twelve per
+  output pixel; `"external"` loads the taps from the external texture, a diagnostics choice);
+  taps are clamped to the visible area so encoder padding never bleeds in. *Auto* (default)
+  upscales above 1.05×, *FSR 1* above 1×, *Off* never; a picture shown at its size or smaller
+  always takes the plain path, and the 2D canvas and WebGL2 always scale bilinearly (the
+  setting and the overlay say FSR needs WebGPU; Renderer *Auto* keeps a desynchronized 2D
+  canvas, so where there is one, as in Chrome, FSR needs Renderer *WebGPU* chosen). Uniform buffers and pass descriptors are
+  created once with the renderer, the pipelines once when FSR is first needed (only the input
+  variant's; compiled asynchronously, the bilinear path draws until they are ready), the
+  intermediate and the copy texture on size changes, uniforms written when they change; per frame only the external texture's bind group, the encoder and the
+  canvas view. The passes are encoded and submitted inside the draw call, so the *draw* stage
+  covers them and the stages still add up to end-to-end. With the WebGPU renderer the
+  overlay's *Upscaling* row shows input → output, scale and sharpness or why it is off, and
+  once FSR has drawn, the GPU time of the passes (timestamp-query where the adapter has it,
+  sampled every 100 ms from then on: FSR, the copy among it, and the plain pass when it drew;
+  else the draw stage's p50 with and without FSR). The latency
+  probe reads the barcode from the frame's own texture, not from the canvas, so upscaling does
+  not touch it. The bake-off measures WebGPU with the upscaling setting in effect.
 - Decoder hygiene: `prefer-hardware` + `optimizeForLatency`; `flush()` is never called while
   streaming (it waits for every output and makes the next chunk a key frame; recovery resets and
   reconfigures instead). At most 2 chunks wait inside the decoder (`decodeQueueSize`); later ones
