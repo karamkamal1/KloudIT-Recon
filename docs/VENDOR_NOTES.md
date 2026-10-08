@@ -592,8 +592,8 @@ creates its D3D11 device: gdi32 `D3DKMTSetProcessSchedulingPriorityClass` on a h
 default) asks for REALTIME (5), except HIGH (4) when NVIDIA is in the process and
 hardware-accelerated GPU scheduling (HAGS) is on or unknown; `high`; `realtime` (also for NVIDIA
 with HAGS on); `off`. A refused REALTIME is retried as HIGH. Unless `off`, the agent enables
-`SeIncreaseBasePriorityPrivilege` on its own token at startup. The CPU priority (HIGH) is
-unchanged.
+`SeIncreaseBasePriorityPrivilege` on its own token at startup; with `off` it neither detects
+adapter 0 and HAGS nor calls any D3DKMT function. The CPU priority (HIGH) is unchanged.
 
 "NVIDIA in the process" means the encoder is NVENC (`EncoderInfo.Vendor` nvidia) or DXGI adapter 0
 is NVIDIA (`DXGI_ADAPTER_DESC1.VendorId` 0x10DE): ddagrab captures on adapter 0 through D3D11
@@ -613,9 +613,10 @@ default as off, so the kernel query is done here already.
 Host log: at startup (unless `off`) `gpu adapter 0 adapter=nvidia|amd|intel|other|unknown
 name=… hags=on|off|unknown hags_from=kernel|registry` with `err=` saying why the kernel was not
 asked or did not answer; per encoder generation `gpu priority: realtime|high|failed|off vendor=…
-adapter=… hags=… mode=… gen=…` (vendor = encoder, adapter = adapter 0), with `realtime_refused=`
-(high after a refused REALTIME) or `err=` (failed); INFO the first time and when the outcome
-changes, WARN for failed, DEBUG for a later generation with the same outcome.
+adapter=… hags=… mode=… gen=…` (vendor = encoder, adapter = adapter 0; `off` has only vendor, mode
+and gen), with `realtime_refused=` (high after a refused REALTIME) or `err=` (failed); INFO the
+first time and when the outcome changes, WARN for failed, DEBUG for a later generation with the
+same outcome.
 
 Verified in the sandbox:
 
@@ -637,8 +638,9 @@ Verified in the sandbox:
   gdi32 does not export `D3DKMTSetProcessSchedulingPriorityClass`, so every request on a real
   child process is refused: REALTIME, then HIGH, outcome `failed` with "Failed to find
   D3DKMTSetProcessSchedulingPriorityClass procedure in gdi32.dll", for every vendor and mode;
-  `off` makes no call; the child's CPU priority class is HIGH (0x80) in every case; a process that
-  cannot be opened (pid 0) gives `failed` with the OpenProcess error (`TestRaisePriority`).
+  `off` makes no call and detects nothing (the test fails if adapter 0 or HAGS is detected); the
+  child's CPU priority class is HIGH (0x80) in every case; a process that cannot be opened (pid 0)
+  gives `failed` with the OpenProcess error (`TestRaisePriority`).
   Through `Video.Start` with the FFmpeg 8.1 Windows build (libx264, test source) the host logs
   `level=WARN msg="gpu priority: failed" vendor=software adapter=nvidia hags=unknown mode=auto
   gen=1 err=…` (Wine under Xvfb, see below), and the same outcome for generation 2 only at debug

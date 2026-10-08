@@ -33,7 +33,8 @@ func TestPriorityChildProcess(t *testing.T) {
 
 // TestRaisePriority sets CPU and GPU priority on a real child process.
 // Without D3DKMTSetProcessSchedulingPriorityClass in gdi32 (Wine) every set is
-// refused: REALTIME, then HIGH, and the result is failed.
+// refused: REALTIME, then HIGH, and the result is failed. Mode off detects
+// nothing (adapter 0, HAGS) and makes no call.
 func TestRaisePriority(t *testing.T) {
 	have := procD3DKMTSetProcessSchedulingPriorityClass.Find() == nil
 	mode, regErr := readHwSchMode()
@@ -48,7 +49,12 @@ func TestRaisePriority(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
+		detect := gpuHostInfo
+		if tc.mode == "off" {
+			gpuHostInfo = func() gpuHost { t.Error("mode off: adapter 0 and HAGS detected"); return detect() }
+		}
 		got, host, err := raisePriority(cmd, tc.vendor, tc.mode)
+		gpuHostInfo = detect
 		var cpu uint32
 		if h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(cmd.Process.Pid)); err == nil {
 			cpu, _ = windows.GetPriorityClass(h)
@@ -63,8 +69,8 @@ func TestRaisePriority(t *testing.T) {
 		class, on := gpuPriorityClass(tc.vendor, tc.mode, host)
 		switch {
 		case !on:
-			if got != "off" || err != nil {
-				t.Errorf("mode off: %s %v", got, err)
+			if got != "off" || err != nil || host != (gpuHost{}) {
+				t.Errorf("mode off: %s %v %v", got, err, host)
 			}
 		case !have:
 			if got != "failed" || err == nil || !strings.Contains(err.Error(), "D3DKMTSetProcessSchedulingPriorityClass") {

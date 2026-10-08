@@ -51,14 +51,14 @@ func raisePriority(cmd *exec.Cmd, vendor, gpuMode string) (gpu string, host gpuH
 // setGPUPriority sets the GPU scheduling priority class of process pid with
 // D3DKMTSetProcessSchedulingPriorityClass (applyGPUPriority: REALTIME, HIGH
 // for NVIDIA with HAGS on or unknown in auto mode, a refused REALTIME retried
-// as HIGH).
+// as HIGH). Mode off returns before anything is detected or called.
 // It runs right after the process starts, before FFmpeg creates its D3D11
 // device for capture and encode.
 func setGPUPriority(pid int, vendor, mode string) (string, gpuHost, error) {
-	host := gpuHostInfo()
 	if mode == GPUPriorityOff {
-		return gpuGotOff, host, nil
+		return gpuGotOff, gpuHost{}, nil
 	}
+	host := gpuHostInfo()
 	h, err := windows.OpenProcess(windows.PROCESS_SET_INFORMATION|windows.PROCESS_QUERY_INFORMATION, false, uint32(pid))
 	if err != nil {
 		return gpuGotFailed, host, fmt.Errorf("OpenProcess: %w", err)

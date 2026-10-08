@@ -145,8 +145,9 @@ func applyGPUPriority(vendor, mode string, host gpuHost, set func(class uint32) 
 
 // logGPUPriority logs what an encoder process got, as "gpu priority:
 // realtime|high|failed|off" with the encoder vendor, adapter 0's vendor, HAGS
-// and the mode. Every generation is a new process that gets it again: an
-// unchanged outcome is logged at debug level. Called with v.mu held.
+// and the mode (off: without adapter and HAGS, which are not detected). Every
+// generation is a new process that gets it again: an unchanged outcome is
+// logged at debug level. Called with v.mu held.
 func (v *Video) logGPUPriority(gen uint8, vendor, mode, got string, host gpuHost, err error) {
 	if v.log == nil || got == "" {
 		return
@@ -156,6 +157,9 @@ func (v *Video) logGPUPriority(gen uint8, vendor, mode, got string, host gpuHost
 	}
 	adapter := orUnknown(host.adapter)
 	args := []any{"vendor", vendor, "adapter", adapter, "hags", host.hags, "mode", mode, "gen", gen}
+	if got == gpuGotOff {
+		args = []any{"vendor", vendor, "mode", mode, "gen", gen}
+	}
 	switch {
 	case err != nil && got == gpuGotHigh:
 		args = append(args, "realtime_refused", err)

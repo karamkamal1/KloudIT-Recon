@@ -155,7 +155,7 @@ func TestLogGPUPriority(t *testing.T) {
 		{"amd", "auto", "failed", amd, refused, `level=WARN msg="gpu priority: failed" vendor=amd adapter=amd hags=off mode=auto gen=1 err=refused`},
 		{"amd", "auto", "failed", amd, refused, `level=DEBUG msg="gpu priority: failed" vendor=amd adapter=amd hags=off mode=auto gen=1 err=refused`},
 		{"software", "auto", "realtime", gpuHost{hags: hagsOn}, nil, `level=INFO msg="gpu priority: realtime" vendor=software adapter=unknown hags=on mode=auto gen=1`},
-		{"amd", "off", "off", amd, nil, `level=INFO msg="gpu priority: off" vendor=amd adapter=amd hags=off mode=off gen=1`},
+		{"amd", "off", "off", gpuHost{}, nil, `level=INFO msg="gpu priority: off" vendor=amd mode=off gen=1`},
 		{"amd", "auto", "", gpuHost{}, nil, ``}, // not Windows: nothing to log
 	}
 	for i, s := range steps {
