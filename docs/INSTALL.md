@@ -183,6 +183,13 @@ Anyone with physical access to the PC then gets your desktop. Decide whether tha
    powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -PairingCode "recon1:..." -InstallViGEm
    ```
 
+Optional: add `-InstallVirtualDisplay` to also install the Virtual Display Driver (a pinned,
+SHA-256-verified release). It is for streaming a virtual monitor at the browser's resolution
+and frame rate, e.g. 2560x1440 at 120 fps although the PC's monitor is 1080p60 (sessions do
+not use it yet; `recon-host.exe vdisplay`, under Useful commands, tests it). Windows asks once
+whether to install software from "SignPath Foundation": choose **Install**. Skip it if Apollo
+is installed (its SudoVDA driver is used instead).
+
 The installer:
 
 1. Copies the agent to `C:\Program Files\KlouditRecon`.
@@ -317,7 +324,8 @@ pick up the old files.
 
 - **PC**, in an administrator PowerShell:
   `powershell -ExecutionPolicy Bypass -File "$env:ProgramFiles\KlouditRecon\uninstall-host.ps1"`.
-  Add `-KeepConfig` to keep the pairing.
+  Add `-KeepConfig` to keep the pairing, `-RemoveVirtualDisplay` to also remove the Virtual
+  Display Driver.
 - **Gateway**: `pct stop 210 && pct destroy 210` on the Proxmox node.
 
 ## Useful commands
@@ -330,4 +338,5 @@ pick up the old files.
 | PC | `Get-Content "$env:APPDATA\KlouditRecon\host.log" -Tail 30` | Agent log |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), monitors, controllers |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" vdisplay -mode 2560x1440@120 -hold 30s` | Create a virtual display for 30 s and restore the displays (stop the agent first) |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" pair "recon1:..."` | Re-pair. The running agent picks up the new code within seconds. |

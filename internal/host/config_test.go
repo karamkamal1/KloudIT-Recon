@@ -108,3 +108,35 @@ func TestConfigGPUPriority(t *testing.T) {
 		t.Fatalf("unknown gpuPriority: %v", err)
 	}
 }
+
+func TestConfigVirtualDisplay(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load(`{"hostId":"h1"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := c.virtualDisplayOptions(); o.Policy != "off" || o.Layout != "primary" || o.StateDir != dir || o.MonitorID != "h1" {
+		t.Fatalf("defaults: %+v", o)
+	}
+	for _, p := range []string{"off", "auto", "on"} {
+		for _, l := range []string{"primary", "extend", "only"} {
+			c, err := load(`{"virtualDisplay":"` + p + `","virtualDisplayLayout":"` + l + `"}`)
+			if err != nil || c.virtualDisplayOptions().Policy != p || c.virtualDisplayOptions().Layout != l {
+				t.Fatalf("%s/%s: %v", p, l, err)
+			}
+		}
+	}
+	if _, err := load(`{"virtualDisplay":"yes"}`); err == nil || !strings.Contains(err.Error(), "virtualDisplay") {
+		t.Fatalf("unknown virtualDisplay: %v", err)
+	}
+	if _, err := load(`{"virtualDisplayLayout":"mirror"}`); err == nil || !strings.Contains(err.Error(), "virtualDisplayLayout") {
+		t.Fatalf("unknown virtualDisplayLayout: %v", err)
+	}
+}

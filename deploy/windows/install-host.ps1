@@ -12,6 +12,8 @@
   - Opens the direct-path UDP port in Windows Firewall (Private/Domain only,
     scoped to the agent executable)
   - Optionally installs the ViGEmBus driver for virtual Xbox controllers
+  - Optionally installs the Virtual Display Driver (pinned release, SHA-256 verified) so
+    sessions can stream a virtual monitor at the client's resolution and frame rate
 
   Run from an elevated PowerShell in the folder containing the binaries (the
   unzipped bundle, or the install directory to re-pair or update settings):
@@ -30,6 +32,15 @@
   Download FFmpeg again even if it is already installed.
 .PARAMETER InstallViGEm
   Install the ViGEmBus driver with winget (virtual Xbox controllers).
+.PARAMETER InstallVirtualDisplay
+  Install the Virtual Display Driver (github.com/VirtualDrivers/Virtual-Display-Driver
+  release 25.7.23, an IddCx driver signed by SignPath Foundation) with nefcon v1.14.0, both
+  pinned by SHA-256, and set "virtualDisplay": "auto" in host.json unless it is set already,
+  for streaming a virtual monitor at the client's resolution and frame rate when the physical
+  monitor cannot show them (docs/VENDOR_NOTES.md, 3.7; sessions do not use it yet, test it
+  with recon-host.exe vdisplay). Windows asks once whether to trust the publisher
+  "SignPath Foundation". Skipped when the Virtual Display Driver or SudoVDA (installed by
+  Apollo) is already present.
 .PARAMETER NoStart
   Do not start the agent after installing.
 #>
@@ -41,6 +52,7 @@ param(
     [ValidateRange(0, 65535)][int]$DirectPort = 47998,
     [switch]$UpdateFFmpeg,
     [switch]$InstallViGEm,
+    [switch]$InstallVirtualDisplay,
     [switch]$NoStart
 )
 
@@ -148,6 +160,68 @@ if ($FFmpegPath) {
 }
 Write-Step "FFmpeg: $ffmpeg"
 
+# --- Virtual display driver (optional) -------------------------------------------
+# Pinned downloads: the Virtual Display Driver's driver-only package and nefcon (devcon-style
+# root device installer, the tool the driver's own silent installer uses).
+$vdd = @{
+    Url    = 'https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip'
+    Sha256 = 'e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a'
+}
+$nefcon = @{
+    Url    = 'https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip'
+    Sha256 = 'a15557da24a9efca203158de3b43b0eaf982db231f0194031f1ed428bc13e669'
+}
+$virtualDisplayReady = $false
+if ($InstallVirtualDisplay) {
+    $present = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
+        $_.HardwareID -contains 'Root\MttVDD' -or $_.HardwareID -contains 'root\sudomaker\sudovda' })
+    if ($present) {
+        Write-Step "Virtual display driver already installed: $($present[0].FriendlyName) ($($present[0].InstanceId))"
+        $virtualDisplayReady = $true
+    } else {
+        Write-Step 'Installing the Virtual Display Driver 25.7.23'
+        $tmp = Join-Path $env:TEMP ("recon-vdd-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        try {
+            foreach ($d in $vdd, $nefcon) {
+                $zip = Join-Path $tmp ([IO.Path]::GetFileName($d.Url))
+                Invoke-WebRequest -UseBasicParsing -Uri $d.Url -OutFile $zip
+                $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+                if ($actual -ne $d.Sha256) { throw "Checksum mismatch for $($d.Url) (expected $($d.Sha256), got $actual)." }
+                Expand-Archive -Path $zip -DestinationPath $tmp -Force
+            }
+            Write-Step 'Virtual Display Driver and nefcon checksums verified'
+            $inf = Join-Path $tmp 'VirtualDisplayDriver\MttVDD.inf'
+            $cat = Join-Path $tmp 'VirtualDisplayDriver\mttvdd.cat'
+            $nefconc = Join-Path $tmp 'x64\nefconc.exe'
+            foreach ($f in $inf, $cat, $nefconc) { if (-not (Test-Path $f)) { throw "Unexpected archive layout: $f is missing." } }
+            $sig = Get-AuthenticodeSignature -FilePath $cat
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=SignPath Foundation') {
+                throw "The driver catalog's signature is $($sig.Status) ($($sig.SignerCertificate.Subject)), expected a valid SignPath Foundation signature."
+            }
+            # The driver reads its modes from C:\VirtualDisplayDriver\vdd_settings.xml; the agent adds
+            # each client's mode to it when needed.
+            $vddDir = 'C:\VirtualDisplayDriver'
+            if (-not (Test-Path (Join-Path $vddDir 'vdd_settings.xml'))) {
+                New-Item -ItemType Directory -Force -Path $vddDir | Out-Null
+                Copy-Item (Join-Path $tmp 'VirtualDisplayDriver\vdd_settings.xml') $vddDir
+            }
+            Write-Host '    Windows Security may ask whether to install software from "SignPath Foundation": choose Install.'
+            $out = & { $ErrorActionPreference = 'Continue'; & $nefconc install $inf 'Root\MttVDD' 2>&1 } | ForEach-Object { "$_" } | Out-String
+            $code = $LASTEXITCODE
+            Write-Host $out.Trim()
+            if ($code -eq 3010) {
+                Write-Warning 'The Virtual Display Driver is installed; Windows needs a reboot before it works.'
+            } elseif ($code -ne 0) {
+                throw "Installing the Virtual Display Driver failed (nefcon exit code $code)."
+            }
+            $virtualDisplayReady = $true
+        } finally {
+            Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # --- Configuration (per user: the agent runs in your interactive session) ----
 $cfgDir = Join-Path $env:APPDATA 'KlouditRecon'
 $cfgPath = Join-Path $cfgDir 'host.json'
@@ -162,6 +236,7 @@ $cfg['ffmpeg'] = $ffmpeg
 $cfg['directPort'] = $DirectPort
 if (-not $cfg.Contains('audio')) { $cfg['audio'] = $true }
 if (-not $cfg.Contains('gamepad')) { $cfg['gamepad'] = $true }
+if ($virtualDisplayReady -and -not $cfg.Contains('virtualDisplay')) { $cfg['virtualDisplay'] = 'auto' }
 # UTF-8 without a byte-order mark (Set-Content -Encoding UTF8 adds one in PowerShell 5.1).
 [IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
 # Owner-only access: the file holds the host token.

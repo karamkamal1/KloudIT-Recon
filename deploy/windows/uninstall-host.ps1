@@ -3,11 +3,15 @@
   Removes the KloudIT Recon host agent (task, firewall rule and files).
 .PARAMETER KeepConfig
   Keep %APPDATA%\KlouditRecon (pairing and settings).
+.PARAMETER RemoveVirtualDisplay
+  Also remove the Virtual Display Driver (its device and driver package), as installed by
+  install-host.ps1 -InstallVirtualDisplay. SudoVDA (Apollo's driver) is left alone.
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir = (Join-Path $env:ProgramFiles 'KlouditRecon'),
-    [switch]$KeepConfig
+    [switch]$KeepConfig,
+    [switch]$RemoveVirtualDisplay
 )
 $ErrorActionPreference = 'Stop'
 
@@ -22,6 +26,17 @@ Get-NetFirewallRule -DisplayName 'KloudIT Recon host (direct path)' -ErrorAction
 Get-Process -Name 'recon-hostw', 'recon-host' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Get-Process -Name 'ffmpeg', 'recon-encoder' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
+if ($RemoveVirtualDisplay) {
+    # pnputil /remove-device needs Windows 10 2004 or later.
+    foreach ($dev in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\MttVDD' })) {
+        pnputil /remove-device $dev.InstanceId | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not remove device $($dev.InstanceId) (pnputil exit code $LASTEXITCODE)." }
+    }
+    foreach ($drv in @(Get-WindowsDriver -Online -ErrorAction SilentlyContinue | Where-Object { $_.OriginalFileName -like '*\mttvdd.inf' })) {
+        pnputil /delete-driver $drv.Driver /uninstall /force | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete driver package $($drv.Driver) (pnputil exit code $LASTEXITCODE)." }
+    }
+}
 if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
 if (-not $KeepConfig) {
     $cfgDir = Join-Path $env:APPDATA 'KlouditRecon'

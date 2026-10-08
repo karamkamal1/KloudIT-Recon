@@ -2851,3 +2851,233 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   stream exits the helper within 500 ms (no watchdog exit code 4); a driver reset during a
   stream (Win+Ctrl+Shift+B) ends the helper with the fatal `device_lost` and recon-host's
   restart begins with an IDR.
+
+## 3.7 Virtual display matched to the client
+
+`internal/host/vdisplay` gives a session a virtual monitor through an installed IddCx (indirect
+display) driver: a monitor at the client's resolution and the stream's frame rate (e.g.
+2560x1440@120 on a host whose physical monitor is a 1080p60 one), optionally the primary or the
+only display, never rotated, captured with Desktop Duplication, and the previous display
+topology restored when the session ends. Host config `virtualDisplay` (`off` default, `auto`,
+`on`) and `virtualDisplayLayout` (`primary` default, `extend`, `only`); installer switch
+`-InstallVirtualDisplay`; test command `recon-host vdisplay`. The package is self-contained:
+the session (`internal/host/session.go`, being rewritten in another track) does not call it
+yet; "Session integration" below is the contract for that.
+
+### Driver research
+
+**SudoVDA** (SudoMaker/SudoVDA at a4b09fa, 2025-04-15; the copy Apollo ships is
+ClassicOldSong/Apollo at adc5c5a, 2026-05-21, `third-party/sudovda/`):
+
+- Control: `DeviceIoControl` on the device interface `{e5bcc234-1e0c-418a-a0d4-ef8b7501414d}`
+  (`Common/Include/sudovda-ioctl.h`, protocol 0.2.1; Apollo's copy is byte-identical).
+  `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800.., METHOD_BUFFERED, FILE_ANY_ACCESS)`: ADD 0x222000,
+  REMOVE 0x222004, SET_RENDER_ADAPTER 0x222008, GET_WATCHDOG 0x22200c, PING 0x222220,
+  GET_PROTOCOL_VERSION 0x2223fc. ADD takes `{UINT Width, Height, RefreshRate; GUID
+  MonitorGuid; CHAR DeviceName[14], SerialNumber[14]}` (56 bytes) and returns `{LUID
+  AdapterLuid; UINT TargetId}` from `IddCxMonitorArrival`.
+- Driver behaviour (`Virtual Display Driver (HDR)/SudoVDA/Driver.cpp`, `SudoVDAIoDeviceControl`):
+  ADD with a GUID that exists returns that monitor unchanged (so the agent REMOVEs its GUID
+  first); RefreshRate below 1000 is hertz, else millihertz (the agent sends millihertz); the
+  requested mode becomes the EDID's preferred mode, plus scaled variants and a default list;
+  REMOVE answers `STATUS_NOT_FOUND` for an unknown GUID; SET_RENDER_ADAPTER calls
+  `IddCxAdapterSetRenderAdapter`. The watchdog (`LoadSettings`, `RunWatchdog`): timeout from
+  `HKLM\SOFTWARE\SudoMaker\SudoVDA\watchdog` (default 3 s, 0 = off), counted down once a second
+  while monitors exist, reset by every IOCTL except GET_WATCHDOG; at 0 every virtual monitor
+  departs. The agent pings every timeout/3 (Apollo's `startPingThread`) and reports the
+  display lost after 4 failed pings in a row; a crashed agent's monitor is gone within the
+  timeout.
+- Compatibility (`sudovda.h` `isProtocolCompatible`): same major version, driver minor >= the
+  client's (0.2). Access: `SudoVDA.inf` sets `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)`, so a
+  non-elevated process may open it. Hardware id `root\sudomaker\sudovda`.
+- Render adapter: Microsoft's `IddCxAdapterSetRenderAdapter` page says the OS re-creates
+  existing swapchains on the new adapter when it changes, so drivers should set it before
+  adding monitors (Windows 10 1903+). The agent sends DXGI adapter 0's LUID before each ADD
+  (`Options.RenderAdapter`), so the virtual output should be enumerated on adapter 0, where
+  ddagrab's `output_idx` and the encoders are (VERIFY below).
+- Distribution: the SudoVDA repository has no releases or tags. Apollo's installer ships it
+  (`src_assets/windows/drivers/sudovda/install.bat`) signed with a self-signed certificate
+  (`CN=sudovda@su.mk`, code signing) that it adds to the machine's Root and TrustedPublisher
+  stores, then `nefconc --create-device-node` / `--install-driver`. Adding a third-party root
+  certificate is not something an installer switch should do silently, so the agent's
+  installer does not install SudoVDA; the agent uses it when Apollo put it there.
+
+**Virtual Display Driver** ("VDD", VirtualDrivers/Virtual-Display-Driver, tag 25.7.23 at
+d437ebc; master at d724496 is the same in these points):
+
+- `MttVDD.inf`: hardware id `Root\MttVDD`, class Display. `Driver.cpp`: on adapter init it
+  creates `<monitors><count>` monitors (`FinishInit` -> `CreateMonitor`) and never calls
+  `IddCxMonitorDeparture`: monitors exist exactly while the device runs.
+- Modes come from `vdd_settings.xml` in `HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver\VDDPATH`
+  (default `C:\VirtualDisplayDriver`): every `<resolution>` (width, height, refresh_rate) and
+  every resolution at every `<global><g_refresh_rate>` (`loadSettings`; the parser keys on the
+  last opened element's name, so the agent's parser does the same). `loadSettings` runs only
+  in `EvtDriverDeviceAdd`, i.e. when the device starts.
+- The named pipe `\\.\pipe\MTTVirtualDisplayPipe` (`D:(A;;GA;;;WD)`, one UTF-16 command per
+  connection: `RELOAD_DRIVER`, `SETDISPLAYCOUNT n`, `SETGPU "name"`, `PING`, `GETSETTINGS`, ...)
+  cannot apply new modes: `ReloadDriver(HANDLE hPipe)` passes the pipe handle to
+  `WdfObjectGet_IndirectDeviceContextWrapper` (a WDF object is expected) and only re-runs
+  `InitAdapter`, which does not re-read the settings. So the agent controls VDD through PnP
+  instead: it adds the client's mode to `vdd_settings.xml` when missing (a `<resolution>` entry
+  before `</resolutions>`, the rest of the file unchanged, the original kept once as
+  `vdd_settings.xml.recon-backup`), restarts the device (`DIF_PROPERTYCHANGE` /
+  `DICS_PROPCHANGE`), or enables it when it is disabled (`DICS_ENABLE`) and disables it again
+  after the session. These need the elevated agent (the logon task runs it elevated).
+- Release 25.7.23, `VirtualDisplayDriver-x86.Driver.Only.zip` (an x64 driver despite the name:
+  `[Standard.NTamd64]`): SHA-256 `e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a`,
+  `DriverVer = 12/24/2024,11.30.4.434`, catalog signed by SignPath Foundation (GlobalSign GCC R45
+  CodeSigning CA 2020), so it installs without test signing. Its own unattended installer
+  (`Community Scripts/silent-install.ps1`) runs nefcon v1.14.0 `install MttVDD.inf Root\MttVDD`
+  and imports the catalog's certificates into TrustedPublisher; the agent's installer runs the
+  same nefcon command but leaves the trust decision to the Windows Security prompt.
+- nefcon (nefarius/nefcon, MIT) v1.14.0, `nefcon_v1.14.0.zip` SHA-256
+  `a15557da24a9efca203158de3b43b0eaf982db231f0194031f1ed428bc13e669`: `nefconc install <inf> <hwid>`
+  is devcon's install (create the root device node, then `UpdateDriverForPlugAndPlayDevices`),
+  exit code 3010 when a reboot is needed (`src/NefConUtil.cpp`).
+
+**Display topology** (CCD): the agent follows Sunshine's libdisplaydevice (LizardByte, at
+b9b8653): always `QDC_VIRTUAL_MODE_AWARE` / `SDC_VIRTUAL_MODE_AWARE` (16-bit mode indices);
+primary = source mode at (0, 0), made primary by shifting every source mode
+(`setAsPrimary`); a mode change sets the source mode size and the path's refresh rate, clears
+the target and desktop mode indices, and applies with `SDC_ALLOW_CHANGES` first, then strictly
+(`setDisplayModes`); refresh rates compare within 0.9 Hz; a display is switched on by building
+paths from `QDC_ALL_PATHS` with a free source id each (`makePathsForNewTopology`). The Go
+mirrors of `DISPLAYCONFIG_PATH_INFO` (72 bytes) and `DISPLAYCONFIG_MODE_INFO` (64 bytes) are
+pinned by tests.
+
+### How a session's virtual display works
+
+1. `Detect`: SudoVDA first (any mode on demand, crash watchdog), then VDD.
+2. `RequestedMode`: the client's prefs width/height, else its screen in device pixels (hello
+   `client.w/h`), rounded down to even, clamped to 640x360-7680x4320; refresh = the stream's fps
+   (prefs fps or `defaultFps`, at most `maxFps`, 24-500). A portrait client gets a tall mode,
+   never a rotated monitor.
+3. `Decide` (`auto`): yes when a driver is there and the physical monitor cannot show the mode
+   1:1 (other size, or fps above its refresh rate), or there is no physical monitor; `on`:
+   always (no driver: the session falls back and says why).
+4. `Create`: snapshot the active topology (and write it to `vdisplay-restore.json` next to
+   host.json), plug (SudoVDA: REMOVE leftover, SET_RENDER_ADAPTER, ADD; VDD: settings + PnP),
+   wait for the monitor (up to 6 s; switched on after 1.5 s if Windows left it off; given its
+   own source if Windows duplicates it), apply the mode and layout (rotation identity), check
+   the result, find the GDI monitor (HMONITOR, DXGI output). Only the refresh rate may differ
+   from the request (warned; the stream then runs at most at it); anything else undoes it all.
+   Layout `primary` and `extend` are saved to the display database for SudoVDA (its monitor
+   exists only while the agent holds it); never for `only` or VDD (a persistent VDD monitor saved
+   as primary would be primary after a reboot, before the agent runs; `only` would leave the
+   physical monitors dark).
+5. `Close`: after `Linger` (a reconnect with the same mode in that time gets the same display),
+   unplug (SudoVDA: REMOVE; VDD: disable only if the session enabled it), wait for the monitor to
+   leave, apply the snapshot exactly, else with `SDC_ALLOW_CHANGES`, else Windows' saved layout
+   (`SDC_USE_DATABASE_CURRENT`); the restore never saves. A VDD monitor that stays connected is
+   switched off by applying the snapshot first. `Recover` at agent start replays the journal
+   after a crash.
+
+### Session integration (for the session rewrite)
+
+- Agent start: `vd := vdisplay.New(cfg.virtualDisplayOptions())` plus `RenderAdapter` =
+  `platform.PrimaryAdapter().LUID`, `Linger` = 5 s, `Log`; `vd.Recover()` once before serving
+  sessions; `vd.Close()` on shutdown.
+- `buildParams` (first generation of a session, and when prefs change size/fps): `req :=
+  vdisplay.RequestedMode(hello.Client, prefs, cfg.DefaultFPS, cfg.MaxFPS).Complete(&phys)`;
+  `if use, why := vd.Decide(req, &phys); use { d, err := vd.Create(req) }`. On success capture
+  `d.Info().Monitor` (find it in `a.monitors()` with `Info.Find`, or use it as is) instead of
+  `mons[prefs.Monitor]`: input target = its rectangle, `mon.Hz` = the virtual refresh (lifts
+  the fps cap), FFmpeg backend `ddagrab` with `output_idx` = `Monitor.DXGIOutput` (when it is
+  -1 the output is not on adapter 0: use the helper, or `gfxcapture` with its HMONITOR), helper
+  `capture: "dda"` with `hmonitor` = `Monitor.HMonitor`; never AMD Direct Capture
+  (`amfCaptureBlocker` should return "monitor N is a virtual display") and never
+  `gfxcapture` scaling (the monitor already has the client's size). On error: log, one notice
+  ("Virtual display unavailable: …; streaming the monitor"), capture the physical monitor.
+- Session end: `d.Close()`. `d.Lost()` closing (SudoVDA stopped answering): restart the video on
+  the physical monitor with a notice.
+- The welcome's monitor list is sent before the display exists; send the virtual display as the
+  selected monitor in the `video` config or re-send the list if the client shows it.
+
+### Verified in the sandbox
+
+- verified (sandbox): manager logic against a simulated CCD and driver
+  (`internal/host/vdisplay/fake_test.go`; Linux and Windows/Wine): primary (physical monitor
+  moved to (-1920, 0), layout saved for SudoVDA, journal while it exists, exact restore without
+  saving, journal removed), extend, only (physical off, never saved, back on after), a monitor
+  arriving rotated 90 degrees (identity, 2560x1440 not swapped), a 1080x2400 portrait client, a
+  monitor arriving off (switched on), a duplicated monitor (own source), a driver LUID that
+  differs from CCD's (found as the new target id), a refresh rate Windows will not set
+  (accepted at 60 Hz), a failed `SetDisplayConfig` (everything undone, journal removed), the
+  restore fallbacks (supplied, `SDC_ALLOW_CHANGES`, database), linger reuse and expiry, a
+  second session with another mode taking over, keepalive loss, VDD's order (restore before
+  unplug, nothing saved), crash recovery from the journal and a corrupt journal, no driver, a
+  broken driver, a failed plug, `Decide` / `RequestedMode` / `ParseMode` tables, stable monitor
+  GUIDs. `go test -race` clean.
+- verified (sandbox): CCD struct layouts (`TestCCDLayout`, sizes and offsets per wingdi.h x64)
+  and on real data under Wine 9 (`TestQueryDisplayConfig`; `GOOS=windows go test -c
+  ./internal/host/vdisplay`, run with `xvfb-run -a wine64`): the source mode
+  decodes as 1920x1080 at (0, 0), the target mode as 1920x1080, rotation identity, and
+  `DisplayConfigGetDeviceInfo` names the source `\\.\DISPLAY1`, matching `platform.Monitors`.
+  Wine 9 rejects `QDC_VIRTUAL_MODE_AWARE` (the test then reads the classic layout) and does not
+  implement `DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME`; both exist on Windows 10+.
+- verified (sandbox): SudoVDA IOCTL codes and the 56/12/16/8/4-byte buffers against the header
+  (`TestSudoVDAIoctlCodes`, `TestSudoVDAAddParams`, `TestSudoVDAReplies`).
+- verified (sandbox): the VDD settings parser and editor on the release's own
+  `vdd_settings.xml`: 35 modes (5 resolutions + 5 x 6 global rates, as the driver counts),
+  2560x1440@120 present, 3440x1440@120 added as one 5-line entry with the rest of the file
+  unchanged (42 modes after).
+- verified (sandbox): both pinned downloads (SHA-256 above, `sha256sum` and the installer's own
+  PowerShell loop in pwsh 7), the archive layout the installer expects, and the catalog signer
+  (`openssl pkcs7 -print_certs`: SignPath Foundation). Both scripts parse (pwsh parser).
+- verified (sandbox): `recon-host vdisplay` under Wine with no driver prints `driver: none (no
+  virtual display driver installed ...)` and exits 1; `probe` prints a `virtual display:` line.
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (driver install): in an elevated PowerShell in the
+  host bundle folder run `.\install-host.ps1 -InstallVirtualDisplay` (Apollo not installed);
+  accept the "SignPath Foundation" prompt. Expect "Virtual Display Driver and nefcon checksums
+  verified", nefcon "Device and driver installed successfully", `"virtualDisplay": "auto"` in
+  host.json, Device Manager > Display adapters > "Virtual Display Driver" running, and
+  `recon-host.exe probe` printing `virtual display: vdd device ROOT\DISPLAY\000N running, 35
+  modes, 1 monitor(s) in C:\VirtualDisplayDriver\vdd_settings.xml`. With Apollo installed
+  instead: `virtual display: sudovda protocol 0.2.x, watchdog 3 s`. Record both, and whether a
+  reboot was needed (exit code 3010).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (2560x1440@120 above the host monitor's refresh):
+  set the physical monitor to 60 Hz, stop the agent (`Stop-ScheduledTask 'KloudIT Recon Host'`),
+  run `recon-host.exe vdisplay -mode 2560x1440@120 -layout primary -hold 120s`. Expect "created
+  in" under 2 s (SudoVDA) or 5 s (VDD, first run adds the mode and restarts the device), the
+  new monitor primary at (0,0) 2560x1440@120Hz, the physical one left of it, and a capture line
+  with `output_idx` >= 0 (VERIFY: DXGI lists the IddCx output on adapter 0, the render adapter;
+  record the value and adapter). While it holds, from a second PowerShell, move a browser with
+  a moving test page (e.g. tools/latency-test, or a 120 Hz UFO test) onto it (Win+Shift+Left/
+  Right) and run `ffmpeg -f lavfi -i ddagrab=output_idx=N:framerate=120 -t 10 -f null -`:
+  about 1200 frames, `fps=120`. Then the helper: `recon-encoder.exe --encode-test=v.hevc
+  --backend=amf --codec=hevc --capture=dda --hmonitor=0x... --fps=120 --kbps=50000
+  --frames=1200`: `started` with captureWidth 2560, captureHeight 1440, capture -> output p95
+  below one frame interval (8.3 ms), `ffmpeg -v error -i v.hevc -f null -` silent. Also try
+  `--capture=amd-direct --hmonitor=0x...`: expected to fail (AMD Direct Capture reads the
+  GPU's display engine, which does not scan out an IddCx monitor); record the error, which
+  confirms DDA is required.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (restore on disconnect): after the hold above the
+  command prints "removed and restored in" and an "after:" list identical to "before:" (names,
+  sizes, positions, primary, Hz); Settings > System > Display shows the original arrangement and
+  windows are back on the physical monitor. Repeat with `-layout only` (the physical monitor
+  goes dark during the hold and comes back) and `-layout extend` (nothing moves). Crash case:
+  run with `-hold 600s`, end recon-host.exe in Task Manager: SudoVDA removes the monitor within 3
+  s and Windows restores the layout by itself; VDD keeps its monitor; then `recon-host.exe
+  vdisplay -hold 1s` prints "restoring the displays after an unfinished virtual display
+  session" (journal in %TEMP%\kloudit-recon-vdisplay-test) and leaves the original layout.
+  With `-layout only` and VDD, also reboot during the hold: the physical monitor must light up
+  at the sign-in screen (nothing saved to the display database).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (games opening on the wrong monitor): with
+  `-layout primary` start two games during the hold (one borderless, one exclusive fullscreen,
+  ideally one that remembers its monitor, e.g. a Unity title): both should open on the virtual
+  display; a game that remembers the physical monitor needs its in-game display setting once.
+  With `-layout only` every game must open on the virtual display. Record each game and layout.
+  Note the DPI scale Windows picks for the new monitor (Settings > Display > Scale) and
+  whether it persists across runs (stable monitor identity).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (other client sizes, VDD): `-mode 3440x1440@120`
+  and `-mode 1080x2400@60`: the first run adds the mode to vdd_settings.xml (backup
+  `vdd_settings.xml.recon-backup` appears once) and restarts the device; the monitor is
+  3440x1440 / 1080x2400 with rotation 0 (Settings > Display: orientation Landscape / Portrait
+  without "(flipped)", the panel not rotated).
+- NVIDIA: unverified (no NVIDIA host available). Test: all of the above with `--backend=nvenc`
+  for the helper command; also the render adapter on a hybrid laptop (Intel iGPU + NVIDIA):
+  the capture line's `output_idx` must be on DXGI adapter 0 and `recon-encoder` must report the
+  NVIDIA adapter in `started`.
