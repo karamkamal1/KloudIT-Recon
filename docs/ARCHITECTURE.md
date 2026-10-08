@@ -389,7 +389,8 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   taps are clamped to the visible area so encoder padding never bleeds in. *Auto* (default)
   upscales above 1.05×, *FSR 1* above 1×, *Off* never; a picture shown at its size or smaller
   always takes the plain path, and the 2D canvas and WebGL2 always scale bilinearly (the
-  setting and the overlay say FSR needs WebGPU). Uniform buffers and pass descriptors are
+  setting and the overlay say FSR needs WebGPU; Renderer *Auto* keeps a desynchronized 2D
+  canvas, so where there is one, as in Chrome, FSR needs Renderer *WebGPU* chosen). Uniform buffers and pass descriptors are
   created once with the renderer, the pipelines once when FSR is first needed (only the input
   variant's; compiled asynchronously, the bilinear path draws until they are ready), the
   intermediate and the copy texture on size changes, uniforms written when they change; per frame only the external texture's bind group, the encoder and the

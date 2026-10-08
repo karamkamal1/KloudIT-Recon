@@ -1075,7 +1075,11 @@ function upscaleHint() {
   const how = 'Applies at once. Auto: FSR 1 (AMD FidelityFX Super Resolution: edge-adaptive upsampling, then sharpening) when the picture is ' +
     `shown more than ${Math.round((FSR.autoMin - 1) * 100)} % larger than it streams (e.g. 1080p on a 4K screen), bilinear otherwise; ` +
     'never when it is shown at its size or smaller. The overlay shows the sizes and the GPU cost.';
-  return r && r !== 'webgpu' ? `FSR needs the WebGPU renderer: this connection draws with ${LABELS[r] || r} and scales bilinearly. ${how}` : how;
+  if (!r || r === 'webgpu') return how;
+  // Renderer Auto never picks WebGPU where the 2D canvas is desynchronized
+  // (renderers.js pickPath; WebGPU cannot report it): say so.
+  const auto = prefs.renderer === 'auto' ? ' (Renderer Auto keeps the desynchronized 2D canvas wherever the browser has one, e.g. Chrome)' : '';
+  return `FSR needs the WebGPU renderer: this connection draws with ${LABELS[r] || r} and scales bilinearly. Choose Renderer WebGPU above and Reconnect${auto}. ${how}`;
 }
 
 function buildDrawer() {

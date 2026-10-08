@@ -3778,12 +3778,20 @@ What changed (browser client; the host logs one more field):
   group (WebGPU requires it), the command encoder, the canvas view. The device requests
   `timestamp-query` where the adapter has it: once FSR has drawn, every 100 ms one draw is
   timed (two readbacks in flight at most): FSR's passes (and the copy pass alone) or the plain
-  pass; a session that never upscales times nothing.
+  pass; a session that never upscales times nothing. Zero-length samples are kept in every
+  ring: a browser that quantizes timestamps (Chrome: 100 µs without
+  `--enable-webgpu-developer-features`) reads a pass shorter than that as 0 or 100 µs, and only
+  with the zeros the overlay's mean over many samples is unbiased (dropping them made a
+  tens-of-µs plain pass read about 0.1 ms).
 - Setting *Pipeline → Upscaling*: Auto (default; FSR above 1.05×, WebGPU only), Off, FSR 1
   (above 1×); *FSR sharpness* 0–2 stops (default 0.2) and *sharpen noise less* (RCAS denoise),
   saved in `recon.prefs.v1` and applied live. Never when the picture is shown at its size or
   smaller. With the 2D canvas or WebGL2 the hint and the overlay say FSR needs WebGPU and the
-  picture is scaled bilinearly (no WebGL2 port).
+  picture is scaled bilinearly (no WebGL2 port). Renderer *Auto* prefers a desynchronized
+  context, which WebGPU cannot report, so where the 2D canvas is desynchronized (Chrome; both
+  E2E bake-offs here) it never picks WebGPU and Upscaling Auto has no effect: the README and,
+  while Renderer Auto draws with another path, the setting's hint say to choose Renderer
+  *WebGPU*.
 - Overlay (WebGPU renderer; other paths only when *FSR 1* is chosen, as a warning): *Upscaling*
   (`Auto: FSR 1 · 960×540 → 1920×1080 (2×) · sharpness 0.2`, or `bilinear · … · <why>`) and,
   once FSR has drawn, *GPU (timestamp-query, mean)* FSR / copy / plain, or without timestamps
@@ -3839,7 +3847,17 @@ Verified in the sandbox:
   input pixels from anything else all exactly at their flat value (no ringing); the ramp
   within 3 levels of bilinear, no reversal over 1 level. The plan: FSR 1 at 1× and shown
   smaller → bilinear ("not enlarged"), Auto at 1.03× → bilinear, at 1.09× → FSR, FSR 1 at
-  1.03× → FSR.
+  1.03× → FSR. Placement and sizes (added with the review fixes), each against the reference
+  of its own rectangle, worked out by hand in the test, with every pixel outside it black:
+  64×40 into 200×80 (bars left and right, picture at x 36) and, external input, into 128×120
+  (bars top and bottom, y 20): identical; 63×37 into 101×59 (100×59, a 1-px bar): at most 1
+  level; 63×37 into 157×99, external input (157×92 at y 3): identical; a 80×40 frame whose 16
+  right columns are white padding the video config crops, external and copy input: identical
+  to the visible 64×40's reference (taps clamped to the crop on both inputs); 128×80, then
+  resized to 200×90 and redrawn from the same frame (144×90 at x 28, the intermediate texture
+  re-created): at most 4 levels, mean 0.06. Each of these fails when RCAS ignores the letterbox
+  offset, the external input clamps to the texture instead of the crop, or the intermediate is
+  not re-created on a size change (tried on a scratch copy).
 - verified (sandbox): streaming, E2E scenario "WebGPU upscaling (FSR)" (headed page, canvas
   960×540 device pixels, upscaling Auto, the test stream asked for at 480×270 and 15 fps; see
   above why not 960×540 → 1920×1080): the overlay reads `Auto: FSR 1 · 480×270 → 960×540 (2×)

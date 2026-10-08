@@ -52,7 +52,9 @@ Techniques used (most of them are new to browser-based game streaming):
   on a 4K screen, or a lower resolution picked to save bandwidth) is upscaled on your GPU by
   AMD FidelityFX Super Resolution 1.0 (edge-adaptive upsampling, then contrast-adaptive
   sharpening), ported to WebGPU shaders, instead of a blurry bilinear stretch: three short
-  GPU passes per frame, timed in the overlay.
+  GPU passes per frame, timed in the overlay. It needs the WebGPU renderer: choose Renderer
+  *WebGPU* in Settings → Pipeline, because Renderer *Auto* keeps the desynchronized 2D canvas
+  wherever the browser has one (e.g. Chrome), and the 2D canvas scales bilinearly.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
@@ -268,7 +270,9 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   *FSR sharpness* runs from 0 (sharpest) to 2 stops (default 0.2); *sharpen noise less* turns on
   RCAS's denoise. A picture shown at its size or smaller is never upscaled. FSR needs the WebGPU
   renderer: with the 2D canvas or WebGL2 the setting says so and the picture is scaled
-  bilinearly. The overlay shows *Upscaling* (input → output size, sharpness) and the passes' GPU
+  bilinearly. Renderer *Auto* prefers a desynchronized context, which WebGPU cannot report, so
+  it keeps the 2D canvas where that is desynchronized (e.g. Chrome): choose Renderer *WebGPU*
+  for FSR. The overlay shows *Upscaling* (input → output size, sharpness) and the passes' GPU
   time.
 - **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
   decodes. *Smooth* draws at most one new frame per display refresh, in the refresh's animation

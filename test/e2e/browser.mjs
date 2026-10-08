@@ -912,8 +912,15 @@ return { out, keep };
 // flat areas (3 input pixels from anything else) keep their value within a
 // level (no ringing: RCAS's limiter and EASU's min/max clamp), the ramp stays
 // a ramp. Then the streaming geometry the sandbox cannot run in real time
-// (960x540 into 1920x1080, Auto) at 600 sampled pixels. And the plan: FSR
-// never draws a picture shown at its size or smaller, Auto only above 1.05x.
+// (960x540 into 1920x1080, Auto) at 600 sampled pixels. Then placement and
+// sizes, each against the reference of its own rectangle (computed here, not
+// taken from the renderer) with the bars around it black: bars left and right
+// and top and bottom (RCAS's letterbox offset), an odd input into odd outputs
+// (63x37 into 101x59 and 157x99), a frame with 16 white columns the video
+// config crops on the right (external and copy input: the clamp of either),
+// and a resize followed by a redraw of the same frame (the intermediate
+// texture re-created). And the plan: FSR never draws a picture shown at its
+// size or smaller, Auto only above 1.05x.
 // n output pixels spread over a w x h picture (a fixed sequence).
 function fsrSamples(w, h, n) {
   let s = 12345;
@@ -921,9 +928,11 @@ function fsrSamples(w, h, n) {
   return Array.from({ length: n }, () => [Math.floor(rnd() * w), Math.floor(rnd() * h)]);
 }
 
-function fsrPattern(w, h, pad = 0) {
-  const px = new Uint8ClampedArray(w * (h + pad) * 4).fill(255);
-  const set = (x, y, c) => { const o = (y * w + x) * 4; px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; };
+// pad white rows below, padRight white columns to the right (encoder padding).
+function fsrPattern(w, h, pad = 0, padRight = 0) {
+  const stride = w + padRight;
+  const px = new Uint8ClampedArray(stride * (h + pad) * 4).fill(255);
+  const set = (x, y, c) => { const o = (y * stride + x) * 4; px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; };
   const blue = [20, 30, 90];
   const orange = [230, 140, 40];
   for (let y = 0; y < h; y++) {
@@ -1187,7 +1196,10 @@ async function checkUpscaleUnit(haveX) {
   const W = 64;
   const H = 40;
   const PAD = 8;
+  const PADR = 16;
+  const ODD = [63, 37];
   const plain = fsrPattern(W, H);
+  const odd = fsrPattern(ODD[0], ODD[1]);
   const cases = [
     { name: '1x plain', box: [64, 40], up: { mode: 'off' } },
     { name: '2x', box: [128, 80], up: { mode: 'fsr', sharpness: 0.2, input: 'external' } },
@@ -1208,6 +1220,17 @@ async function checkUpscaleUnit(haveX) {
     // The streaming geometry the sandbox cannot run in real time: a 960x540
     // frame (the pattern tiled) into a 1920x1080 canvas, Auto, at sampled pixels.
     { name: '960x540 -> 1920x1080 auto', box: [1920, 1080], up: { mode: 'auto' }, big: [960, 540], sample: fsrSamples(1920, 1080, 600) },
+    // Placement and sizes: rect is where the picture must go ([x, y, w, h],
+    // the letterbox worked out by hand), frame the source (plain 64x40 if unset).
+    { name: '2x pillarboxed', box: [200, 80], up: { mode: 'fsr' }, rect: [36, 0, 128, 80] },
+    { name: '2x letterboxed external', box: [128, 120], up: { mode: 'fsr', input: 'external' }, rect: [0, 20, 128, 80] },
+    { name: '63x37 -> 101x59', box: [101, 59], up: { mode: 'fsr' }, frame: 'odd', rect: [0, 0, 100, 59] },
+    { name: '63x37 -> 157x99 external', box: [157, 99], up: { mode: 'fsr', input: 'external' }, frame: 'odd', rect: [0, 3, 157, 92] },
+    { name: '2x right crop external', box: [128, 80], up: { mode: 'fsr', input: 'external' }, frame: 'right', rect: [0, 0, 128, 80],
+      cfg: { width: W, height: H, codedWidth: W + PADR, codedHeight: H, cropRight: PADR } },
+    { name: '2x right crop copy', box: [128, 80], up: { mode: 'fsr', input: 'copy' }, frame: 'right', rect: [0, 0, 128, 80],
+      cfg: { width: W, height: H, codedWidth: W + PADR, codedHeight: H, cropRight: PADR } },
+    { name: '2x resized to 200x90 and redrawn', box: [128, 80], up: { mode: 'fsr' }, resize: [200, 90], rect: [28, 0, 144, 90] },
   ];
   const disp = await startXvfb();
   const b = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: disp }, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
@@ -1218,16 +1241,17 @@ async function checkUpscaleUnit(haveX) {
     await p.goto(`${base}/login`);
     // Evaluated through the DevTools protocol (the page's CSP does not apply);
     // the modules come from the gateway like in the app.
-    res = await p.evaluate(async ({ W, H, PAD, px, cases }) => {
+    res = await p.evaluate(async ({ W, H, PAD, frames, cases }) => {
       const P = await import('/js/protocol.js');
       const R = await import('/js/renderers.js');
-      const frameOf = (pad, big) => {
-        const c = new OffscreenCanvas(W, H + pad);
-        c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(pad ? px.padded : px.plain), W, H + pad), 0, 0);
-        if (!big) return new VideoFrame(c, { timestamp: 0 });
-        const t = new OffscreenCanvas(big[0], big[1]); // the pattern tiled
+      const frameOf = (k) => {
+        const f = frames[k.frame || (k.pad ? 'padded' : 'plain')];
+        const c = new OffscreenCanvas(f.w, f.h);
+        c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(f.px), f.w, f.h), 0, 0);
+        if (!k.big) return new VideoFrame(c, { timestamp: 0 });
+        const t = new OffscreenCanvas(k.big[0], k.big[1]); // the pattern tiled
         const g = t.getContext('2d');
-        for (let y = 0; y < big[1]; y += H) for (let x = 0; x < big[0]; x += W) g.drawImage(c, x, y);
+        for (let y = 0; y < k.big[1]; y += H) for (let x = 0; x < k.big[0]; x += W) g.drawImage(c, x, y);
         return new VideoFrame(t, { timestamp: 0 });
       };
       const out = [];
@@ -1238,17 +1262,23 @@ async function checkUpscaleUnit(haveX) {
           const ready = await r.fsrReady;
           if (k.stops !== undefined) r.up = { ...r.up, sharpness: k.stops }; // past the settings' range: RCAS ~ identity
           r.resize(k.box[0], k.box[1]);
-          const frame = frameOf(k.pad ? PAD : 0, k.big);
-          const cfg = k.pad ? { width: W, height: H, codedWidth: W, codedHeight: H + PAD, cropBottom: PAD } : null;
+          const frame = frameOf(k);
+          const cfg = k.cfg || (k.pad ? { width: W, height: H, codedWidth: W, codedHeight: H + PAD, cropBottom: PAD } : null);
           r.draw(frame, null, P.visibleArea(cfg, frame.visibleRect.width, frame.visibleRect.height, frame.displayWidth, frame.displayHeight));
           await r.device.queue.onSubmittedWorkDone();
+          if (k.resize) {
+            // A new box (fullscreen, a window resize): the last frame drawn again.
+            r.resize(k.resize[0], k.resize[1]);
+            r.redraw();
+            await r.device.queue.onSubmittedWorkDone();
+          }
           const bmp = canvas.transferToImageBitmap();
           const g = new OffscreenCanvas(bmp.width, bmp.height).getContext('2d');
           g.drawImage(bmp, 0, 0);
           const data = k.plan === undefined ? g.getImageData(0, 0, bmp.width, bmp.height).data : null;
           out.push({ name: k.name, w: bmp.width, h: bmp.height, px: data && !k.sample ? Array.from(data) : null,
             sampled: data && k.sample ? k.sample.map(([x, y]) => Array.from(data.subarray((y * bmp.width + x) * 4, (y * bmp.width + x) * 4 + 3))) : null,
-            ready, error: r.fsrError, upscaled: r.upscaled, info: r.upscaleInfo() });
+            ready, error: r.fsrError, upscaled: r.upscaled, info: r.upscaleInfo(), rect: r.rect && [r.rect.x, r.rect.y, r.rect.w, r.rect.h] });
           r.prev?.close();
           r.prev = null;
           r.destroy();
@@ -1257,7 +1287,14 @@ async function checkUpscaleUnit(haveX) {
         }
       }
       return out;
-    }, { W, H, PAD, px: { plain: Array.from(plain), padded: Array.from(fsrPattern(W, H, PAD)) }, cases });
+    }, {
+      W, H, PAD, cases, frames: {
+        plain: { w: W, h: H, px: Array.from(plain) },
+        padded: { w: W, h: H + PAD, px: Array.from(fsrPattern(W, H, PAD)) },
+        right: { w: W + PADR, h: H, px: Array.from(fsrPattern(W, H, 0, PADR)) },
+        odd: { w: ODD[0], h: ODD[1], px: Array.from(odd) },
+      },
+    });
   } finally {
     await ctx2.close();
     await b.close();
@@ -1294,7 +1331,7 @@ async function checkUpscaleUnit(haveX) {
   const easu = cases.filter((k) => k.stops !== undefined).map(compare);
   check('FSR 1 shader (unit): EASU alone matches the CPU reference of ffx_fsr1.h within 1 level (1.5x, external and copy input)',
     srcDiff === 0 && easu.every((x) => x.upscaled && x.max <= 1), `1x plain path vs source: max ${srcDiff}; ${easu.map(txt).join('; ')}`);
-  const full = cases.filter((k) => k.up.mode === 'fsr' && k.stops === undefined && k.plan === undefined && !k.pad).map(compare);
+  const full = cases.filter((k) => k.up.mode === 'fsr' && k.stops === undefined && k.plan === undefined && !k.pad && !k.rect).map(compare);
   check('FSR 1 shader (unit): EASU + RCAS match the CPU reference at 2x and 1.5x (external and copy input, 0.2 and 1 stop, denoise) within 5 levels',
     srcDiff === 0 && full.every((x) => x.upscaled && x.max <= 5 && x.mean <= 0.25), full.map(txt).join('; '));
   const pad = compare(cases.find((k) => k.pad));
@@ -1336,11 +1373,55 @@ async function checkUpscaleUnit(haveX) {
   check('FSR 1 shader (unit): Auto upscales a 960x540 frame into a 1920x1080 canvas with FSR 1, matching the CPU reference within 5 levels at 600 sampled pixels',
     !!big && !big.error && big.upscaled && big.info.in?.join('x') === '960x540' && big.info.out?.join('x') === '1920x1080' && bigMax <= 5,
     big?.error || `${big.upscaled ? 'FSR' : `bilinear (${big.info.why})`} ${big.info.in?.join('x')} -> ${big.info.out?.join('x')}, ${big.info.input} input; max difference ${bigMax} levels`);
+  // Placement and sizes: the expected rectangle against the reference of the
+  // visible source at that size, every pixel outside it black.
+  const srcOf = (px, w, h) => {
+    const a = new Float64Array(w * h * 3);
+    for (let i = 0; i < w * h; i++) for (let c = 0; c < 3; c++) a[i * 3 + c] = px[i * 4 + c] / 255;
+    return a;
+  };
+  const oddSrc = srcOf(odd, ODD[0], ODD[1]);
+  const placed = (k) => {
+    const r = by(k.name);
+    if (!r?.px) return { name: k.name, error: r?.error || 'no result' };
+    const [sw, sh] = k.frame === 'odd' ? ODD : [W, H];
+    const [x0, y0, rw, rh] = k.rect;
+    const ref = fsrReference(k.frame === 'odd' ? oddSrc : src, sw, sh, rw, rh, k.up.sharpness ?? 0.2, !!k.up.denoise);
+    let max = 0;
+    let sum = 0;
+    let worst = '';
+    let bars = 0;
+    for (let y = 0; y < r.h; y++) {
+      for (let x = 0; x < r.w; x++) {
+        const o = (y * r.w + x) * 4;
+        if (x < x0 || x >= x0 + rw || y < y0 || y >= y0 + rh) {
+          if (r.px[o] || r.px[o + 1] || r.px[o + 2]) bars++;
+          continue;
+        }
+        const v = ref.at(x - x0, y - y0);
+        for (let c = 0; c < 3; c++) {
+          const want = Math.round(Math.min(1, Math.max(0, v[c])) * 255);
+          const d = Math.abs(r.px[o + c] - want);
+          sum += d;
+          if (d > max) { max = d; worst = `(${x},${y}) ${'rgb'[c]} ${r.px[o + c]} vs ${want}`; }
+        }
+      }
+    }
+    const box = k.resize || k.box;
+    const ok = r.upscaled && r.w === box[0] && r.h === box[1] && r.rect?.join(',') === k.rect.join(',') && max <= 5 && bars === 0;
+    return { name: k.name, ok, w: r.w, h: r.h, rect: r.rect, max, mean: sum / (rw * rh * 3), worst, bars, upscaled: r.upscaled, input: r.info?.input };
+  };
+  const geo = cases.filter((k) => k.rect).map(placed);
+  check('FSR 1 shader (unit): letterboxed (bars left/right, top/bottom), odd sizes (63x37 -> 101x59, 157x99), a right crop (external and copy input) and a resize redrawn: ' +
+    'the picture lands in its rectangle, matches the CPU reference there within 5 levels, the bars stay black',
+    geo.every((x) => x.ok),
+    geo.map((x) => (x.error ? `${x.name}: ${x.error}` : `${x.name}: ${x.upscaled ? 'FSR' : 'bilinear'} (${x.input}) canvas ${x.w}x${x.h}, rect ${x.rect?.join(',')}, ` +
+      `max ${x.max}, mean ${x.mean.toFixed(3)}${x.max ? ` (worst ${x.worst})` : ''}, non-black bar pixels ${x.bars}`)).join('; '));
   const plans = cases.filter((k) => k.plan !== undefined).map((k) => ({ k, r: by(k.name) }));
   check('FSR 1 (unit): never upscales a picture shown at its size or smaller; Auto only above 1.05x, FSR above 1x; the renderer reports why',
     plans.every(({ k, r }) => r && !r.error && r.upscaled === k.plan && r.info.active === k.plan && (k.plan || !!r.info.why)),
     plans.map(({ k, r }) => `${k.name}: ${r?.error || `${r.upscaled ? 'FSR' : `bilinear (${r.info.why})`}, ${r.info.in?.join('x')} -> ${r.info.out?.join('x')}`}`).join('; '));
-  results.push({ upscaleUnit: { srcDiff, easu, full, pad, bigMax, metrics: Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v && { width: v.width, step: v.step, flat: v.flat, flatMax: v.flatMax }])) } });
+  results.push({ upscaleUnit: { srcDiff, easu, full, pad, geo, bigMax, metrics: Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v && { width: v.width, step: v.step, flat: v.flat, flatMax: v.flatMax }])) } });
 }
 
 // Auto's pick at unit level (step 4.3, renderers.js pickPath) on made-up

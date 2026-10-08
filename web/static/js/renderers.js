@@ -877,8 +877,9 @@ export class WebGPURenderer extends Renderer {
   // samples go to the FSR or the plain ring (input "copy": also the copy pass
   // alone, the cost the copy adds). Timestamps: 0 the first pass starts, 1 the last pass
   // (RCAS or the plain pass) ends, 2 the copy pass ends. Browsers may
-  // quantize them (Chrome: 100 µs without its WebGPU developer features):
-  // the mean over many samples is what the overlay shows.
+  // quantize them (Chrome: 100 µs without its WebGPU developer features), so
+  // a short pass often reads 0: zero-length samples are kept (in every ring),
+  // which keeps the mean the overlay shows unbiased over many samples.
   initTimestamps() {
     this.gpuFsr = new Samples(100);
     this.gpuCopy = new Samples(100);
@@ -916,10 +917,13 @@ export class WebGPURenderer extends Renderer {
     try {
       await buf.mapAsync(GPUMapMode.READ);
       const v = new BigUint64Array(buf.getMappedRange(), 0, 3);
+      // An invalid pair (end before start, or absurdly long) gives no sample.
       const ns = Number(v[1] - v[0]);
-      if (ns > 0 && ns < 1e9) (kind === 'plain' ? this.gpuPlain : this.gpuFsr).push(ns / 1e6);
       const copyNs = Number(v[2] - v[0]);
-      if (kind === 'copy' && copyNs >= 0 && copyNs <= ns) this.gpuCopy.push(copyNs / 1e6);
+      if (ns >= 0 && ns < 1e9) {
+        (kind === 'plain' ? this.gpuPlain : this.gpuFsr).push(ns / 1e6);
+        if (kind === 'copy' && copyNs >= 0 && copyNs <= ns) this.gpuCopy.push(copyNs / 1e6);
+      }
     } catch {
       // device lost or destroyed: no sample
     } finally {
