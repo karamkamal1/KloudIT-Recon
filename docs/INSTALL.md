@@ -192,6 +192,13 @@ the driver's device disabled, so there is no extra monitor: a session enables it
 streams. It also restricts `C:\VirtualDisplayDriver` to administrators (users can read it).
 Skip it if Apollo is installed (its SudoVDA driver is used instead).
 
+Optional, for Intel graphics: add `-InstallLibavcodec` to also download FFmpeg's LGPL shared
+libraries (BtbN's FFmpeg 8.1 LGPL shared build, about 80 MB, SHA-256 verified) into
+`C:\Program Files\KlouditRecon\ffmpeg-lgpl`. The native encoder helper uses them to encode
+with Intel Quick Sync Video on GPUs that have no AMD AMF or NVIDIA NVENC encoder (see
+`docs/HELPER_PROTOCOL.md`, "libavcodec encoder backend"); without them the helper reports
+that backend unavailable. The FFmpeg command-line path keeps using the GPL `ffmpeg.exe`.
+
 The installer:
 
 1. Copies the agent to `C:\Program Files\KlouditRecon`.

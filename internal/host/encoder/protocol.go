@@ -107,7 +107,7 @@ type ROIRect struct {
 type Caps struct {
 	V             int                  `json:"v"`
 	HelperVersion string               `json:"helperVersion"`
-	Backend       string               `json:"backend"` // amf | nvenc | mock | none
+	Backend       string               `json:"backend"` // amf | nvenc | lavc | mock | none
 	Vendor        string               `json:"vendor"`  // amd | nvidia | intel | other | mock
 	AdapterLUID   string               `json:"adapterLuid"`
 	AdapterName   string               `json:"adapterName"`
@@ -201,7 +201,10 @@ func (c *Caps) Usable() bool { return c.Backend != "none" && c.Backend != "" && 
 
 // Started answers a successful Start with what the encoder actually does.
 type Started struct {
-	Backend       string `json:"backend"`
+	Backend string `json:"backend"`
+	// Encoder is the FFmpeg encoder of the libavcodec backend (h264_qsv,
+	// hevc_qsv, av1_qsv; step 3.8), "" for the others and older helpers.
+	Encoder       string `json:"encoder"`
 	Capture       string `json:"capture"`
 	Codec         string `json:"codec"`
 	Width         int    `json:"width"`

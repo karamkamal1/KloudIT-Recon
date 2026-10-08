@@ -3579,3 +3579,173 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
   (`StartParams.ReencodeOversized` where `CodecCaps.Reencode`, `StartParams.SliceOutput` where
   the backend supports it) and log `Stats.Reencoded` / `OversizeBytes` and
   `OutputQPC - FirstSliceQPC` for the overlay; off by default.
+
+## 3.8 libavcodec fallback backend (Intel Quick Sync Video)
+
+recon-encoder.exe has a third encoder backend, `lavc` (`native/recon-encoder/src/lavc/`), for
+GPUs without an AMF or NVENC backend: Intel Quick Sync Video through FFmpeg's `h264_qsv`,
+`hevc_qsv` and `av1_qsv`, with FFmpeg's shared DLLs loaded at run time (never required).
+docs/HELPER_PROTOCOL.md "libavcodec encoder backend" is the reference. In short:
+
+- Runtime: `avutil-60.dll` + `avcodec-62.dll` (+ `swresample-6.dll`) of an FFmpeg 8.x shared
+  build, from `--ffmpeg-dir` (Go: `encoder.Options.FFmpegDir`) or `ffmpeg-lgpl\` next to the
+  helper, then the helper's directory; loaded by full path with
+  `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`; majors 62 / 60 required
+  (the vendored FFmpeg 8.1 headers' struct layouts). Missing: `unavailable.lavc` says where it
+  looked and that `install-host.ps1 -InstallLibavcodec` provides them.
+- Licensing: `-InstallLibavcodec` downloads BtbN's LGPL shared build
+  (`ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip`, the oldest 8.x release build listed,
+  SHA-256 checked against the release's `checksums.sha256` like the FFmpeg download) and keeps
+  only `avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll` and `LICENSE.txt` (LGPL v3; libvpl,
+  which QSV needs, is MIT and built into `avcodec-62.dll`). The GPL static `ffmpeg.exe` stays the
+  FFmpeg command-line path; the helper never loads it. The helper links nothing of FFmpeg
+  (`native/third_party/ffmpeg`: 30 public headers, LGPL 2.1+).
+- Input: the converter's NV12 textures mapped into QSV surfaces without a copy (a D3D11VA device
+  context on the capture's device, a derived QSV device, dynamic D3D11 and QSV frame pools,
+  `av_hwframe_map`), 16x16-aligned textures with the picture's edge repeated into the padding;
+  fallback (encoder does not open that way, or `zeroCopy` false): read back into system memory.
+- Settings (Sunshine's quicksync encoder): `async_depth` 1, `low_delay_brc` 1, look-ahead off,
+  no B frames, `forced_idr` 1, `low_power` 1 with a retry at 0, `adaptive_i` 0, GOP 65535 (the
+  longest QSV takes), `rc` cbr = VBR with the peak at the target (`CBR_WITH_VBR`), no VBV size
+  (`NO_RC_BUF_LIMIT`). Forced IDR = `AVFrame.pict_type` I + `AV_FRAME_FLAG_KEY`.
+- Caps: recovery `none` (a loss costs an IDR), `maxLtr` 0, no ROI / SVC / intra refresh / HDR10;
+  `liveBitrate` and `liveFps` `flush` (`assumed`). **Live bitrate in FFmpeg 8.1** (checked in
+  `libavcodec/qsvenc.c`, release/8.1): `update_parameters` notices a changed `bit_rate`,
+  `rc_max_rate`, `rc_buffer_size` or `framerate` on the open encoder, drains it and calls
+  `MFXVideoENCODE_Reset`; it passes no `mfxExtEncoderResetOption`, so whether the runtime starts
+  a new sequence (IDR) is up to the runtime. So the bitrate does change in the running encoder
+  (not `restart`, as GUIDE 3.8 assumed), but whether that costs an IDR is runtime behaviour:
+  the backend forces one in `flush` mode (the default, deterministic), and `start`'s
+  `liveBitrate` `seamless` leaves it out so the hardware check below can measure the runtime.
+- Selection: `--backend=lavc`; `auto` tries it first when adapter 0 is Intel, else after AMF
+  and NVENC. When another backend is chosen, `unavailable.lavc` comes from a light probe (DLLs
+  and an Intel adapter; no QSV encoder opened), so helper restarts on AMD / NVIDIA hosts with
+  an Intel iGPU stay fast.
+- Protocol (additive, version stays 1): caps `backend` `lavc`, `unavailable.lavc` /
+  `lavc-h264` / `lavc-hevc` / `lavc-av1`; `started.encoder` (`hevc_qsv`, ...), with
+  `rateControl` `vbr_capped` / `vbr`, `usage` `low_power` / `default`, `preset`, `zeroCopy`.
+  Go: `Options.FFmpegDir`, `Started.Encoder`.
+
+Sources: FFmpeg release/8.1 `libavcodec/qsvenc.c` (`update_parameters`, `update_bitrate`,
+`update_frame_rate`, `encode_frame`'s `MFX_FRAMETYPE_IDR` for `pict_type` I with `forced_idr`,
+`select_rc_mode`, `ff_qsv_enc_init`'s IOPattern for hw frames), `qsvenc_h264.c` /
+`qsvenc_hevc.c` / `qsvenc_av1.c` / `qsvenc.h` (options), `libavcodec/qsv.c`
+(`ff_qsv_init_session_frames`, `qsv_frame_get_hdl` for dynamic pools), `libavutil/hwcontext_qsv.c`
+(`qsv_dynamic_frames_derive_to`, `qsv_dynamic_pool_map_to`, `qsv_init_surface`'s 16-pixel
+alignment), `libavutil/hwcontext_d3d11va.c` (dynamic pools, `d3d11va_device_init`),
+`libavutil/hwcontext.c` (`av_hwframe_map`, `ff_hwframe_map_create`); Sunshine `src/video.cpp`
+(the `quicksync` encoder: options, `CBR_WITH_VBR`, `NO_RC_BUF_LIMIT`, the `low_power` fallback,
+the GOP); oneVPL `mfxExtEncoderResetOption::StartNewSequence`.
+
+### Verified in the sandbox
+
+- verified (sandbox): dynamic loading, frame submission, forced IDRs, rate changes and the
+  output path end to end with BtbN's FFmpeg 8.1 GPL shared build (n8.1.3-14-g330caae0c1,
+  libavcodec 62.28.103) under Wine 9.0: `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64
+  FFMPEG_DIR=<its bin>` runs `TestHelperIntegrationLavc` with `--lavc-test-encoder=libx264`:
+  no DLLs in `FFmpegDir` = caps `none` with `unavailable.lavc` naming `avcodec-62.dll` and start
+  `unavailable`; caps `lavc` (h264: recovery none, liveBitrate / liveFps flush assumed, maxLtr 0);
+  refusals (hevc without an encoder, ltrSlots, hdr, intraRefreshFrames: `unsupported`); start
+  (`started.encoder` libx264, flush, bt709); key frame 1 with SPS / PPS / IDR; no unasked key
+  frame in the next 10; `forceIdr` -> key frame at once; `setRate` (flush) -> key frame of a new
+  gen; `recover` -> key frame; `SetFPS` (flush) -> key frame of a new gen; `setRoi` ->
+  `unsupported`; the whole stream decodes cleanly with the build's ffmpeg.exe; `seamless`: 20
+  frames after a rate change without a key frame and in gen 0; `synthetic-gpu` with the barcode:
+  the converter's frames read back (Wine has no NV12 render targets: the planar Y / CbCr path),
+  45 frames encoded, decoded by ffmpeg.exe and every decoded frame's barcode = its frame id. Every
+  other helper test still passes (also headless, where the GPU subtest skips).
+- verified (sandbox): the encode test through the backend: `recon-encoder.exe
+  --encode-test=x264.h264 --backend=lavc --ffmpeg-dir=<bin> --lavc-test-encoder=libx264
+  --codec=h264 --capture=synthetic --frames=150 --at=20:idr --at=40:loss --at=70:rate=2000
+  --at=100:fps=30`: "encode-test: ok", key frames 1 21 41 71 101, the loss "recovered at 41 by
+  an IDR"; the file decodes cleanly (`ffmpeg -v error -i x264.h264 -f null -` on Linux) with
+  color_range tv, bt709, chroma_location left. libsvtav1 (`--lavc-test-encoder=libx264,libsvtav1`)
+  reports `unavailable.lavc-av1` ("Invalid argument": it takes no NV12), as intended.
+- verified (sandbox): mutation checks: without `pict_type` I the Flush subtest fails ("forceIdr:
+  no key frame within 10 frames"); without the parameter-set insertion (libx264 with
+  `AV_CODEC_FLAG_GLOBAL_HEADER` keeps SPS / PPS out of the stream) it fails ("key frame 1
+  without SPS / PPS / IDR") and the GPU subtest's decode fails ("non-existing PPS 0").
+- verified (sandbox): the LGPL shared build (`fab88c80...` = BtbN's published SHA-256) loads
+  under Wine ("LGPL version 3 or later") and the QSV probe answers "no Intel adapter" (Wine's
+  adapter reports vendor NVIDIA; overriding Wine's `VideoPciVendorID` did not change DXGI's
+  VendorId, so the QSV code beyond adapter selection did not run).
+- verified (sandbox): install-host.ps1 parses (pwsh 7); its `Get-BtbNChecksums` /
+  `Select-BtbNBuild` / `Expand-BtbNBuild` functions, run against BtbN's live `checksums.sha256`,
+  pick `ffmpeg-n8.1-latest-win64-gpl-8.1.zip` (FFmpeg path, unchanged choice) and
+  `ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip`, accept the real archive (avcodec-62, avutil-60,
+  swresample-6 found) and refuse a wrong hash; with only a 9.0 build listed the libraries are
+  not selected (the helper needs 8.x). The CI step that fetches the GPL shared build for the
+  Windows job was dry-run the same way (checksum check, `RECON_FFMPEG_DIR`; tampered file refused).
+- Not run here: anything on Quick Sync (no Intel GPU, no QSV runtime under Wine): the probe on
+  an Intel adapter, the zero-copy mapping, the readback fallback into a QSV session, the
+  low_power retry, AV1 / HEVC output, rate changes on the runtime; the MSVC build (CI job
+  `helper-windows`, which now also runs `TestHelperIntegrationLavc` with the GPL shared build).
+
+### Hardware checks
+
+On an Intel host (12th gen Core or newer with Iris Xe / UHD 7xx, or an Arc card; Arc and Core
+Ultra for AV1), after `install-host.ps1 -InstallLibavcodec` and a current Intel graphics driver:
+
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (install): `C:\Program
+  Files\KlouditRecon\ffmpeg-lgpl` holds `avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll`,
+  `LICENSE.txt`; running the installer again does not download again, `-UpdateFFmpeg` does.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (caps): `recon-encoder.exe
+  --print-caps --backend=auto --log-level=debug`: `"backend":"lavc","vendor":"intel"`, codecs
+  `h264` and `hevc` (and `av1` on Arc / Core Ultra; elsewhere `unavailable.lavc-av1` with
+  FFmpeg's error); the log says "lavc: libavcodec 62... LGPL version 3 or later" and the probe
+  time ("lavc probe: N ms", record it). A "without low_power" line names a GPU without VDENC for
+  that codec: record which.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (zero copy, HEVC):
+  `recon-encoder.exe --encode-test=out.hevc --backend=lavc --codec=hevc --capture=dda --fps=60
+  --kbps=20000 --frames=600 --at=120:idr --at=200:loss --at=300:rate=8000 --at=400:rate=30000
+  --at=500:fps=30`. The started line has `"encoder":"hevc_qsv","zeroCopy":true,"usage":"low_power"`
+  (if `zeroCopy` is false the log says why: "cannot take the converter's textures (...)"; record
+  the driver / runtime); "encode-test: ok", key frames at 1, 121, the loss frame, 301, 401, 501
+  (flush); submit->output p50 below 5 ms at 1080p60 (record p50 / p95; compare with
+  `--zero-copy=0`, the readback path, which should be slower); `ffmpeg -v error -i out.hevc -f
+  null -` prints nothing; `ffprobe -show_streams out.hevc`: 1920x1080 (not 1088: the crop in the
+  SPS), color_range tv, bt709; the P-frame bitrate lines follow 8000 / 30000 kbps. The same with
+  `--codec=h264` (High profile, `max_dec_frame_buffering` 1 in the VUI: `ffmpeg -bsf:v
+  trace_headers`).
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (live bitrate without the
+  forced IDR): the zero-copy test with `--live-bitrate=seamless`: the rate lines say "no key
+  frame" if the runtime resets without a new sequence; then the bitrate follows within a few
+  frames and caps `liveBitrate` / `liveFps` can become `seamless` for QSV (step 3.6's
+  qualification records it per codec). "key frame N follows" means the runtime starts a new
+  sequence on `MFXVideoENCODE_Reset`: keep `flush`.
+- Intel (Arc / Core Ultra): unverified (no Intel host available). Test (AV1): the zero-copy test
+  with `--codec=av1 --encode-test=out.ivf`: decodes cleanly; `ffprobe -show_streams out.ivf`
+  reports 1920x1080 (VERIFY: the AV1 frame size comes from the surface's CropW / CropH, not
+  the 16-aligned 1088), key frames as above.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (hybrid laptop, Intel iGPU +
+  NVIDIA dGPU): `--print-caps` picks `lavc` when adapter 0 is the iGPU; a `start` on an output of
+  the NVIDIA GPU is refused ("Quick Sync Video encodes on an Intel adapter"); record which
+  backend `auto` should prefer there.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (soak): a 30-minute
+  `--encode-test` (`--frames=108000`) with `--at=` IDRs every 600 frames: no "encoder is behind"
+  warnings (the mapped textures go back to the converter's pool), the helper's private bytes
+  (Task Manager / `Get-Process recon-encoder`) flat after the first minute.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with `-InstallLibavcodec` done, `recon-encoder.exe
+  --print-caps --log-level=debug` still says `"backend":"amf"` and `unavailable.lavc` "no Intel
+  adapter ..." (with an Intel iGPU enabled: no `lavc` entry and no "lavc probe" line: the light
+  probe opened nothing); the caps come as fast as without the libraries.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD test with `"backend":"nvenc"`.
+
+### Session integration (for the session rewrite)
+
+The pipeline selection of step 3.1b is not in this worktree's base, so `internal/host/session.go`
+is unchanged; the Go API is `internal/host/encoder`:
+
+- No session change is needed for the backend to be used: `Launch` with `Backend` "auto" picks
+  `lavc` on an Intel primary adapter when the libraries are installed (default directory next
+  to the helper); `Caps.Usable()` then holds and the 3.1b selection (helper when the caps
+  handshake succeeds, else FFmpeg) applies unchanged. `Options.FFmpegDir` only for a host.json
+  override (e.g. `"helperFFmpegDir"`); leave it empty normally.
+- Behaviour from caps, not vendor names: `CodecCaps.Recovery` "none" -> a confirmed loss is
+  `ForceIDR` (or `Recover`, which does the same); `LiveBitrate` / `Started.LiveBitrate` "flush"
+  -> rate changes cost an IDR: change less often (as 3.6's flush handling); `ROI` "none" -> no
+  `SetROI`; `MaxLTR` 0 -> `LTRSlots` 0; `HDR10` false -> no `HDR`.
+- Log `Started.Encoder`, `Usage` and `ZeroCopy` with the session start (an Intel host without
+  zero copy reads frames back: a few ms more latency).
+- The FFmpeg command-line path (GPL `ffmpeg.exe`, hevc_qsv through `hwmap`) stays the fallback
+  when the helper is not usable.

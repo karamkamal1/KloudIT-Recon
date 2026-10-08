@@ -62,6 +62,8 @@ add_executable(recon-encoder
     src/nvenc/nvenc_policy.cpp
     src/nvenc/nvenc_runtime.cpp
     src/nvenc/selftest.cpp
+    src/lavc/lavc_backend.cpp
+    src/lavc/lavc_runtime.cpp
     src/capture/dda_capture.cpp
     src/capture/amd_direct_capture.cpp
     src/capture/wgc_capture.cpp
@@ -73,6 +75,7 @@ target_include_directories(recon-encoder SYSTEM PRIVATE
     ${THIRD_PARTY}/amf/include
     ${THIRD_PARTY}/nv-codec-headers/include
     ${THIRD_PARTY}/nlohmann/include
+    ${THIRD_PARTY}/ffmpeg/include
 )
 target_compile_definitions(recon-encoder PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00

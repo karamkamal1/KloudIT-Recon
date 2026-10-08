@@ -71,6 +71,9 @@ func Launch(opt Options) (*Helper, error) {
 		"--backend=" + opt.Backend,
 		"--log-level=" + opt.LogLevel,
 	}
+	if opt.FFmpegDir != "" {
+		args = append(args, "--ffmpeg-dir="+opt.FFmpegDir)
+	}
 	args = append(args, opt.Args...)
 	cmd := exec.Command(opt.Exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{

@@ -6,6 +6,7 @@
 // The protocol is specified in docs/HELPER_PROTOCOL.md.
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include "control.hpp"
 #include "d3d/convert.hpp"
 #include "encode_test.hpp"
+#include "lavc/lavc_runtime.hpp"
 #include "pipeline.hpp"
 #include "platform/platform.hpp"
 #include "protocol.hpp"
@@ -33,7 +35,7 @@ namespace {
 
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
-    "       recon-encoder --print-caps [--backend=B]\n"
+    "       recon-encoder --print-caps [--backend=B] [--ffmpeg-dir=DIR]\n"
     "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder | --self-test-nvenc[=DLL]\n"
     "       recon-encoder --encode-test=FILE [--backend=B] [encode test options]\n"
     "       recon-encoder --version\n"
@@ -43,7 +45,11 @@ const char kUsage[] =
     "  --ring-handle=H      inherited handle of the frame ring file mapping (0x... or decimal)\n"
     "  --ring-size=N        size of the mapping in bytes\n"
     "  --event-handle=H     inherited handle of the auto-reset frame-ready event\n"
-    "  --backend=B          auto (default) | amf | nvenc | mock\n"
+    "  --backend=B          auto (default) | amf | nvenc | lavc | mock\n"
+    "  --ffmpeg-dir=DIR     lavc: load avcodec-62.dll / avutil-60.dll (FFmpeg 8.x shared build) from DIR only\n"
+    "                       (default: ffmpeg-lgpl\\ next to the helper, then the helper's directory)\n"
+    "  --lavc-test-encoder=NAME[,NAME]  test only, needs --backend=lavc: drive these libavcodec encoders (e.g.\n"
+    "                       libx264 of a GPL shared build) instead of Quick Sync Video, on system-memory frames\n"
     "  --log-level=L        error | warn | info (default) | debug   (logs go to stderr)\n"
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
@@ -88,6 +94,7 @@ struct Args {
     uint64_t ringHandle = 0, ringSize = 0, eventHandle = 0;
     LogLevel logLevel = LogLevel::Info;
     MockOptions mock;
+    LavcOptions lavc;
 };
 
 bool parseNumber(const std::string& s, uint64_t& out) {
@@ -127,6 +134,16 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         else if (key == "--version") a.version = true;
         else if (key == "--help" || key == "-h") a.help = true;
         else if (key == "--backend") a.backend = val;
+        else if (key == "--ffmpeg-dir") ok = !(a.lavc.dir = fromUtf8(val)).empty();
+        else if (key == "--lavc-test-encoder") {
+            size_t from = 0;
+            while (from <= val.size()) {
+                const size_t comma = std::min(val.find(',', from), val.size());
+                if (comma > from) a.lavc.testEncoders.push_back(val.substr(from, comma - from));
+                from = comma + 1;
+            }
+            ok = !a.lavc.testEncoders.empty();
+        }
         else if (key == "--ring-handle") ok = parseNumber(val, a.ringHandle) && a.ringHandle != 0;
         else if (key == "--ring-size") ok = parseNumber(val, a.ringSize);
         else if (key == "--event-handle") ok = parseNumber(val, a.eventHandle) && a.eventHandle != 0;
@@ -143,12 +160,16 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
             return false;
         }
     }
-    if (a.backend != "auto" && a.backend != "amf" && a.backend != "nvenc" && a.backend != "mock") {
+    if (a.backend != "auto" && a.backend != "amf" && a.backend != "nvenc" && a.backend != "lavc" && a.backend != "mock") {
         err = "unknown backend " + a.backend;
         return false;
     }
     if ((a.mock.errorAt || a.mock.fatalAt || a.mock.hangAt) && a.backend != "mock") {
         err = "--mock-* options need --backend=mock";
+        return false;
+    }
+    if (!a.lavc.testEncoders.empty() && a.backend != "lavc") {
+        err = "--lavc-test-encoder needs --backend=lavc";
         return false;
     }
     if (a.encodeTest.used && a.encodeTest.output.empty()) {
@@ -268,6 +289,7 @@ int main(int argc, char** argv) {
         return rc;
     }
 
+    setLavcOptions(a.lavc);
     BackendChoice choice = chooseBackend(a.backend, a.mock);
     if (!a.encodeTest.output.empty()) return runEncodeTest(a.encodeTest, choice);
     if (a.printCaps) {

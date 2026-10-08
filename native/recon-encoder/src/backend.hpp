@@ -114,6 +114,11 @@ struct InputSpec {
     // into the rest, padding the frame to a coded size the encoder needs (AV1
     // on RDNA3: multiples of 64x16). The barcode is drawn inside the content.
     uint32_t contentWidth = 0, contentHeight = 0;
+    // Nv12: the backend reads the converted frames on the CPU (the libavcodec
+    // backend's system-memory path), so on a device without NV12 render
+    // targets (Wine) the converter may hand out separate Y and CbCr textures
+    // instead (EncoderFrame::y / uv).
+    bool planarOk = false;
 };
 
 // EncoderFrame is what Backend::submit gets.
@@ -125,6 +130,10 @@ struct EncoderFrame {
     // no longer reads the texture (AMF: AMFSurfaceObserver::OnSurfaceDataRelease;
     // NVENC: after the frame's output).
     ID3D11Texture2D* nv12 = nullptr;
+    // InputSpec::planarOk on a device without NV12 render targets: nv12 is
+    // null and the frame is an R8 luma texture plus an R8G8 chroma texture.
+    ID3D11Texture2D* y = nullptr;
+    ID3D11Texture2D* uv = nullptr;
     std::shared_ptr<void> hold;
     int poolIndex = -1;  // stable per texture (e.g. for NvEncRegisterResource caching)
 };
@@ -219,7 +228,7 @@ struct BackendChoice {
     Caps caps;                         // always filled (with "unavailable" reasons)
 };
 
-// Selects the encoder backend ("auto" | "mock" | "amf" | "nvenc") and probes
+// Selects the encoder backend ("auto" | "mock" | "amf" | "nvenc" | "lavc") and probes
 // every real backend and capture method for the caps' "unavailable" list.
 BackendChoice chooseBackend(const std::string& name, const MockOptions& mock);
 

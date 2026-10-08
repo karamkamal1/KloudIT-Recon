@@ -34,8 +34,10 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
             s = Status::Error("unsupported", std::string("the encoder wants ") + formatName + " but the capture has no GPU device");
         } else {
             auto mode = Converter::Output::Nv12;
-            if (!Converter::renderTargets(src.device, format) && choice.caps.backend == "mock") {
-                mode = Converter::Output::Planar;  // the mock reads nothing: still exercise the shaders
+            if (!Converter::renderTargets(src.device, format) && (choice.caps.backend == "mock" || in.planarOk)) {
+                // The mock reads nothing (still exercise the shaders); a
+                // backend reading the frames on the CPU takes the planes.
+                mode = Converter::Output::Planar;
             }
             conv = std::make_unique<Converter>();
             s = conv->init(src.device, in.width, in.height, p.barcode, mode, 6, in.contentWidth, in.contentHeight, format);

@@ -234,6 +234,7 @@ struct Caps {
 // Started answers a successful "start".
 struct Started {
     std::string backend, capture, codec;
+    std::string encoder;  // libavcodec backend: the FFmpeg encoder ("hevc_qsv"); "" for the others
     int width = 0, height = 0, fps = 0, kbps = 0;
     int captureWidth = 0, captureHeight = 0;  // what the capture delivers (as displayed)
     std::string adapterLuid, adapterName, vendor;  // the capture/encode adapter ("" for synthetic)

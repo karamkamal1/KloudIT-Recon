@@ -9,7 +9,8 @@ bumps it (`caps.v`, `ring.version`), and recon-host refuses a helper with anothe
 Additive changes keep it: new optional fields, new helper-to-Go message types (recon-host
 ignores unknown types) and new slot flag bits (step 3.2 added all three; step 3.9 added the
 HDR10 fields and the `captureChanged` reason `hdr`; Phase 5 added the fields of "Phase 5
-features", two slot flags and the slot's `dirtyPpm` in formerly reserved bytes).
+features", two slot flags and the slot's `dirtyPpm` in formerly reserved bytes; step 3.8 the
+`lavc` backend and `started.encoder`).
 
 ## Lifecycle
 
@@ -48,7 +49,8 @@ fatal error, `4` the threads did not stop within 500 ms of deciding to exit (wat
 
 ```
 recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
-                  [--backend=auto|amf|nvenc|mock] [--log-level=error|warn|info|debug]
+                  [--backend=auto|amf|nvenc|lavc|mock] [--log-level=error|warn|info|debug]
+                  [--ffmpeg-dir=DIR] [--lavc-test-encoder=NAME[,NAME]]
                   [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
                   [--dump-nv12=PATH]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
@@ -66,8 +68,20 @@ recon-encoder.exe --version
 * `--backend`: `auto` probes the primary adapter's vendor first (AMF on AMD, NVENC on
   NVIDIA), loading `amfrt64.dll` / `nvEncodeAPI64.dll` dynamically from System32 only
   (`LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`), so one binary serves both
-  vendors. `mock` is the GPU-free test backend. (`--self-test-nvenc=DLL` is the only
-  place a DLL is loaded by path: the NVENC test double, for that self-test alone.)
+  vendors. `lavc` is the libavcodec fallback (Intel Quick Sync Video, step 3.8; see
+  "libavcodec encoder backend"): `auto` tries it last, or first when adapter 0 is Intel.
+  `mock` is the GPU-free test backend. (Besides the libavcodec backend's FFmpeg DLLs, below,
+  `--self-test-nvenc=DLL` is the only place a DLL is loaded by path: the NVENC test double,
+  for that self-test alone.)
+* `--ffmpeg-dir=DIR` (step 3.8): the libavcodec backend loads `avutil-60.dll` and
+  `avcodec-62.dll` (FFmpeg 8.x shared build; `swresample-6.dll` next to them) from DIR only.
+  Default: `ffmpeg-lgpl\` next to the helper (where `install-host.ps1 -InstallLibavcodec`
+  puts them), then the helper's own directory. Without them the backend is unavailable
+  (`unavailable.lavc` says where it looked); the helper never needs them otherwise.
+* `--lavc-test-encoder=NAME[,NAME]` (test only, needs `--backend=lavc`): the libavcodec
+  backend drives these encoders (e.g. `libx264` of BtbN's GPL shared build) instead of the
+  Quick Sync ones, on system-memory frames, through the same code path (Wine tests;
+  docs/VENDOR_NOTES.md 3.8).
 * `--mock-error-at` / `--mock-fatal-at`: test fault injection (mock backend only): a
   non-fatal `mock_error` / a fatal `mock_fatal` when that frame id is submitted.
   `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
@@ -154,7 +168,7 @@ ignored by recon-host.
  "qpcFrequency":10000000}
 ```
 
-* `backend`: `amf` | `nvenc` | `mock` | `none` (nothing usable: `codecs` is empty and
+* `backend`: `amf` | `nvenc` | `lavc` | `mock` | `none` (nothing usable: `codecs` is empty and
   `start` fails with `unavailable`; recon-host uses the FFmpeg path).
 * `vendor`: `amd` | `nvidia` | `intel` | `other` | `mock`.
 * `adapterLuid` / `adapterName` / `hagsEnabled`: DXGI adapter 0 (the primary display's
@@ -208,7 +222,9 @@ ignored by recon-host.
 * `unavailable`: every probed backend / capture method that is not usable, with why. The
   AMF backend adds `amf-h264` / `amf-hevc` / `amf-av1` for codecs its GPU cannot encode
   (e.g. AV1 before RDNA3), the NVENC backend `nvenc-h264` / `nvenc-hevc` / `nvenc-av1`
-  (e.g. AV1 before the GeForce RTX 40 series). An NVIDIA driver too old for the helper's
+  (e.g. AV1 before the GeForce RTX 40 series), the libavcodec backend `lavc-h264` /
+  `lavc-hevc` / `lavc-av1` (the Quick Sync encoder did not open on this GPU, with FFmpeg's
+  error). An NVIDIA driver too old for the helper's
   NVENC API shows as `unavailable.nvenc` "the NVIDIA driver supports NVENC API 12.2, the
   helper needs 13.0: update the NVIDIA driver to 570.0 or newer".
 
@@ -270,6 +286,14 @@ BT.2020 non-constant-luminance matrix, limited range) and, for HDR10 only, `hdrM
 (primaries red, green, blue and the white point as CIE 1931 xy, luminance in cd/m2, MaxCLL
 / MaxFALL in cd/m2: what the encoder writes into the stream, see "HDR10"). Older helpers
 omit them: treat that as 8-bit `bt709`.
+
+Step 3.8 adds `encoder` (additive; older helpers omit it): the FFmpeg encoder of the
+libavcodec backend (`h264_qsv`, `hevc_qsv`, `av1_qsv`; `libx264` with
+`--lavc-test-encoder`), `""` for the other backends. That backend also fills `rateControl`
+(`vbr_capped` for `rc` `cbr`: VBR with the peak at the target, see below; `vbr`), `usage`
+(`low_power`: Quick Sync's VDENC; `default` after the low-power fallback), `preset` (the QSV
+preset, `veryfast` / `medium` / `slow`) and `zeroCopy` (the converter's textures are mapped
+into QSV surfaces; false: read back into system memory).
 
 `captureWidth`/`captureHeight` are the source as displayed; `adapterLuid`, `adapterName`,
 `vendor` and `hagsEnabled` describe the adapter capture and encoder run on (empty / `null`
@@ -968,6 +992,104 @@ with `forceIDR` 1); sub-frame output (`enableSubFrameWrite` / slice offsets: cap
 `sliceOutput` is false on NVENC and `start`'s `sliceOutput` answers `unsupported`; the GPU's
 `SUPPORT_SUBFRAME_READBACK` is only logged); NVENC's own LTR; forcing split-frame encoding.
 
+## libavcodec encoder backend
+
+`--backend=lavc` (or `auto` when adapter 0 is Intel, else after AMF and NVENC): GUIDE 3.8's
+fallback for GPUs without an AMF or NVENC backend, Intel Quick Sync Video through FFmpeg's
+`h264_qsv`, `hevc_qsv` and `av1_qsv` (oneVPL: libvpl, MIT, is built into BtbN's
+`avcodec-62.dll`), in `src/lavc/`. Recovery is an IDR; no LTR, SVC, ROI, intra refresh, HDR10,
+sub-frame output or re-encoding (`start` answers `unsupported`, `setRoi` too).
+
+**Runtime** (`src/lavc/lavc_runtime.cpp`). FFmpeg's shared DLLs are loaded at run time,
+never linked (the helper compiles against FFmpeg 8.1's public headers in
+`native/third_party/ffmpeg`): `avutil-60.dll`, then `avcodec-62.dll`, each by its full path
+with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32` (their dependencies
+come from the same directory or System32), from `--ffmpeg-dir` or the default directories
+(see "Command line"). The libraries' major versions must be 62 / 60 (FFmpeg 8.x: the struct
+layouts compiled in); `avcodec_license()` is logged. FFmpeg's log goes to the helper's log
+(its errors as warnings, warnings as info, the rest at debug). Licensing: install-host.ps1's
+`-InstallLibavcodec` installs BtbN's **LGPL** shared build (`ffmpeg-n8.1-latest-win64-lgpl-
+shared-8.1.zip`, SHA-256 verified like the FFmpeg download) into `ffmpeg-lgpl\`; the GPL
+static `ffmpeg.exe` stays the FFmpeg command-line path, and the helper never loads it.
+
+**Caps.** Adapter 0 if it is Intel, else the Intel adapter with the most video memory (an
+Arc card next to an iGPU); no Intel adapter: `unavailable.lavc`. Each encoder is opened once
+at 1280x720 on a QSV session derived from a D3D11 device on that adapter (low power, then
+without); the ones that open are the codecs, the others go to `unavailable.lavc-<codec>`.
+libavcodec has no capability query, so the codec entries are documented or default values:
+
+| caps field | Value |
+|---|---|
+| `maxW` / `maxH` | 4096 x 4096 (H.264), 8192 x 8192 (HEVC, AV1): Intel's documented limits since Ice Lake / Arc, marked `assumed` |
+| `forceIdr`, `recovery`, `maxLtr` | true, `none`, 0 |
+| `liveBitrate`, `liveFps` | `flush` (`assumed`, below) |
+| `intraRefresh`, `roi`, `maxTemporalLayers`, `sliceOutput`, `hdr10`, `tenBit`, `instanceSelect`, `reencode` | false, `none`, 1, false, false, false, false, false |
+| `hwInstances`, `alignW` / `alignH` | 1, 1 x 1 (QSV pads to 16 x 16 itself; H.264 / HEVC crop in the SPS) |
+
+When another backend is chosen, `unavailable.lavc` comes from a light probe (DLLs and an
+Intel adapter, no encoder opened), so a helper restart on an AMD / NVIDIA host with an Intel
+iGPU does not open Quick Sync encoders.
+
+**Input.** With a GPU capture the encoder takes the converter's NV12 textures **without a
+copy**: a D3D11VA device context wraps the capture's `ID3D11Device` (FFmpeg's D3D11 lock is
+the device's `ID3D10Multithread` critical section, which the converter holds), a QSV device
+is derived from it (the QSV session runs on the capture's adapter: `start` refuses a capture
+on a non-Intel adapter), and a QSV frames context with a dynamic surface pool is derived from
+a D3D11 frames context with a dynamic pool (`initial_pool_size` 0; FFmpeg 7.0+ with a oneVPL
+2.x runtime). `av_hwframe_map` then turns any D3D11 texture into a QSV surface whose MemId
+names the texture itself (`hwcontext_qsv.c` `qsv_dynamic_pool_map_to`). The converter renders
+into 16 x 16 aligned textures (the QSV surface size; the picture's edge is repeated into the
+padding, the surface's crop is the picture), and a texture stays reserved until libavcodec
+drops the mapped frame (qsvenc releases it once the encoder has unlocked the surface). If the
+encoder does not open that way (an older runtime without dynamic surfaces), or `start`'s
+`zeroCopy` is false, the frames are read back into system memory instead (a staging texture;
+qsvenc uploads them; `started.zeroCopy` false), still on a QSV session on the capture's
+device. The synthetic capture gets a moving test pattern drawn on the CPU.
+
+**Settings** (as Sunshine's `quicksync` encoder, `video.cpp`): `async_depth` 1,
+`low_delay_brc` 1, look-ahead off (`look_ahead` 0, `look_ahead_depth` 0), no B frames,
+`forced_idr` 1, `low_power` 1 (VDENC; retried with 0, which older GPUs need: `started.usage`),
+`adaptive_i` 0 (no I frames on scene changes), recovery-point and picture-timing SEI off,
+H.264 High with `max_dec_frame_buffering` 1, `preset` `veryfast` / `medium` / `slow` for
+`quality` `speed` / `balanced` / `quality`, GOP 65535 (QSV's `GopPicSize` is 16-bit: the
+longest it takes, one periodic key frame every 18 minutes at 60 fps; key frames otherwise
+come on demand), closed GOPs, BT.709 limited range with left chroma siting in the VUI, the
+parameter sets also as extradata (`AV_CODEC_FLAG_GLOBAL_HEADER`; a key frame without them
+gets them inserted, as with AMF and NVENC). Rate control: `rc` `cbr` is VBR with the peak at
+the target (`rc_max_rate` = target, `bit_rate` 1 bit/s below it, which makes qsvenc choose
+VBR: `low_delay_brc` works in VBR; Sunshine's `CBR_WITH_VBR`) and `rc` `vbr` VBR with the
+peak at 1.5 x the target; no VBV size is set (Sunshine's `NO_RC_BUF_LIMIT`: the encoder's
+own HRD buffer, so `vbvFrames` is not applied).
+
+**Forced IDR** (`forceIdr`, `recover`): `AVFrame.pict_type` = `AV_PICTURE_TYPE_I` with
+`AV_FRAME_FLAG_KEY`; with `forced_idr` 1 qsvenc makes it `MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF
+| MFX_FRAMETYPE_IDR` (an AV1 key frame). A forced frame that comes out without the key flag
+is logged as a warning.
+
+**setRate.** FFmpeg 8.1's qsvenc (`update_parameters`) notices a changed `bit_rate`,
+`rc_max_rate`, `rc_buffer_size` or `framerate` of the open encoder on the next frame, drains
+the encoder and calls `MFXVideoENCODE_Reset` with the new values. So the bitrate *can* change
+in the running encoder, but FFmpeg passes no `mfxExtEncoderResetOption`, so whether the
+runtime starts a new sequence (an IDR) is the runtime's choice. Caps `liveBitrate` and
+`liveFps` are therefore `flush`, marked `assumed`: the frame that carries the new rate is a
+forced IDR of a new `gen`, the same on every runtime. `start` with `liveBitrate` `seamless`
+leaves the forced IDR out (the step 3.6 qualification: the stats' `key` flag then shows
+whether the runtime made one anyway). Neither restarts the helper.
+
+**Threads.** `submit()` (capture thread) maps the texture (or reads it back) and queues the
+frame, one at most (`encoder_busy` otherwise); the backend's encoder thread applies forced
+IDRs and rate changes and calls `avcodec_send_frame` / `avcodec_receive_packet` (the only
+thread on the codec context; `async_depth` 1 makes each encode synchronous there), and
+queues the packets for `receive()` (output thread). An encode error is a non-fatal
+`encode_failed`, fatal after 10 in a row; a removed D3D11 device is the fatal `device_lost`.
+
+**Test path** (`--lavc-test-encoder=libx264`): the same backend drives a software encoder
+from an FFmpeg shared build that has one (BtbN's GPL shared build) on system-memory frames:
+the GPU captures' converted frames read back (also as separate Y / CbCr textures where the
+device has no NV12 render targets, Wine), the synthetic capture's test pattern otherwise;
+`preset` `ultrafast`, `tune` `zerolatency`, `forced-idr` 1, `scenecut` 0. It never runs in
+production (the installed LGPL build has no libx264).
+
 ## Phase 5 features
 
 GUIDE 9's differentiators, helper and Go client side (`internal/host/encoder`); the session
@@ -1237,4 +1359,10 @@ go test -v ./internal/host/encoder
 ```
 
 Without `RECON_HELPER_EXE` the integration tests skip; the protocol, ring and client
-tests run everywhere with `go test ./...`.
+tests run everywhere with `go test ./...`. `make helper-test FFMPEG_DIR=<bin directory of
+an FFmpeg 8.x shared build with libx264>` (`RECON_FFMPEG_DIR` for `go test`) adds the
+libavcodec backend's stream checks (`TestHelperIntegrationLavc`; without it only its
+"unavailable" case runs; CI's `helper-windows` job downloads BtbN's GPL shared 8.1 build,
+SHA-256 verified, for it). The same through the encode test:
+`recon-encoder.exe --encode-test=out.h264 --backend=lavc --lavc-test-encoder=libx264
+--ffmpeg-dir=DIR --codec=h264 --capture=synthetic --at=20:idr --at=40:loss --at=70:rate=2000`.

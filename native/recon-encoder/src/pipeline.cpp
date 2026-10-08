@@ -126,6 +126,8 @@ void Pipeline::captureLoop() {
                 continue;
             }
             ef.nv12 = cf.nv12;
+            ef.y = cf.nv12 ? nullptr : cf.y;
+            ef.uv = cf.nv12 ? nullptr : cf.uv;
             ef.hold = cf.hold;
             ef.poolIndex = cf.index;
             if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);

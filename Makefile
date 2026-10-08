@@ -49,10 +49,14 @@ helper:
 # recon-fake-nvenc.dll) under Wine, against the mingw build. Wine's D3D11 needs an X
 # display: run under xvfb-run (Mesa llvmpipe) to include the GPU conversion self-test,
 # the synthetic-gpu pipeline test and the NVENC test; headless they skip.
+# FFMPEG_DIR=<bin directory of an FFmpeg 8.x shared build with libx264> (BtbN
+# ffmpeg-n8.1-latest-win64-gpl-shared-8.1) adds the libavcodec backend's stream tests.
+FFMPEG_DIR ?=
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
 		RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
+		$(if $(FFMPEG_DIR),RECON_FFMPEG_DIR='Z:$(subst /,\,$(abspath $(FFMPEG_DIR)))') \
 		$(WINE) ./encoder.test.exe -test.v -test.count=1
 
 # third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests

@@ -6,6 +6,8 @@
   - Copies recon-host.exe / recon-hostw.exe to the install directory, plus
     recon-encoder.exe (the native capture/encode helper) when the bundle has it
   - Downloads FFmpeg (BtbN GPL release build, SHA-256 verified) unless -FFmpegPath is given
+  - Optionally downloads FFmpeg's LGPL shared libraries for the encoder helper's libavcodec
+    backend (Intel Quick Sync Video), SHA-256 verified (-InstallLibavcodec)
   - Optionally pairs with your gateway (-PairingCode)
   - Registers a logon task that runs the agent hidden, with highest privileges
     (needed to send input to elevated games/launchers), restarting on failure
@@ -29,7 +31,16 @@
 .PARAMETER DirectPort
   UDP port for direct LAN connections from the browser (0 disables the direct path).
 .PARAMETER UpdateFFmpeg
-  Download FFmpeg again even if it is already installed.
+  Download FFmpeg again even if it is already installed (with -InstallLibavcodec: its libraries too).
+.PARAMETER InstallLibavcodec
+  Download BtbN's FFmpeg 8.1 LGPL shared build (ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip,
+  SHA-256 verified like the FFmpeg download) and put avcodec-62.dll, avutil-60.dll and
+  swresample-6.dll with its LICENSE.txt into <InstallDir>\ffmpeg-lgpl, where recon-encoder.exe
+  loads them for its libavcodec backend: hardware encoding with Intel Quick Sync Video
+  (h264_qsv, hevc_qsv, av1_qsv) on GPUs without an AMF or NVENC backend (docs/VENDOR_NOTES.md,
+  3.8). LGPL (libvpl, which Quick Sync needs, is MIT and built into avcodec-62.dll); the GPL
+  ffmpeg.exe above stays the FFmpeg command-line path and is never loaded by the helper.
+  About 80 MB to download, 95 MB installed.
 .PARAMETER InstallViGEm
   Install the ViGEmBus driver with winget (virtual Xbox controllers).
 .PARAMETER InstallVirtualDisplay
@@ -51,6 +62,7 @@ param(
     [string]$FFmpegPath,
     [ValidateRange(0, 65535)][int]$DirectPort = 47998,
     [switch]$UpdateFFmpeg,
+    [switch]$InstallLibavcodec,
     [switch]$InstallViGEm,
     [switch]$InstallVirtualDisplay,
     [switch]$NoStart
@@ -64,6 +76,40 @@ $TaskName = 'KloudIT Recon Host'
 $RuleName = 'KloudIT Recon host (direct path)'
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
+
+# BtbN's FFmpeg builds (https://github.com/BtbN/FFmpeg-Builds, release "latest"): file name ->
+# SHA-256 from the release's checksums.sha256.
+$BtbNBase = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
+function Get-BtbNChecksums {
+    $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$BtbNBase/checksums.sha256").Content
+    if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+    $known = @{}
+    foreach ($l in ($sums -split "`n")) {
+        $parts = $l.Trim() -split '\s+'
+        if ($parts.Count -eq 2) { $known[$parts[1]] = $parts[0].ToLowerInvariant() }
+    }
+    $known
+}
+# The oldest release build of a flavour (gpl, lgpl-shared, ...) from FFmpeg 8.1 on (and before
+# $below, when given).
+function Select-BtbNBuild($known, [string]$flavour, [string]$below = '') {
+    $known.Keys | Where-Object { $_ -match "^ffmpeg-n(\d+\.\d+)-latest-win64-$flavour-\1\.zip$" -and
+        [version]$Matches[1] -ge [version]'8.1' -and (-not $below -or [version]$Matches[1] -lt [version]$below) } |
+        Sort-Object { [version]($_ -replace '^ffmpeg-n(\d+\.\d+)-.*$', '$1') } | Select-Object -First 1
+}
+# Downloads a BtbN build into $tmp, checks its SHA-256 and unpacks it there; returns the
+# archive's top directory.
+function Expand-BtbNBuild([string]$zipName, [string]$expected, [string]$tmp) {
+    $zip = Join-Path $tmp $zipName
+    Invoke-WebRequest -UseBasicParsing -Uri "$BtbNBase/$zipName" -OutFile $zip
+    $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+    if ($expected -ne $actual) { throw "Checksum mismatch for $zipName (expected $expected, got $actual)." }
+    Write-Step "$zipName checksum verified"
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    $inner = Get-ChildItem -Path $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'bin') } | Select-Object -First 1
+    if (-not $inner) { throw "Unexpected archive layout in $zipName." }
+    $inner.FullName
+}
 
 # Reads what the agent appended to its log since offset $from (the agent keeps
 # the file open, so share it).
@@ -120,19 +166,11 @@ if ($FFmpegPath) {
     $ffDir = Join-Path $InstallDir 'ffmpeg'
     $ffmpeg = Join-Path $ffDir 'bin\ffmpeg.exe'
     if ($UpdateFFmpeg -or -not (Test-Path $ffmpeg)) {
-        $base = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
-        $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$base/checksums.sha256").Content
-        if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
-        $known = @{}
-        foreach ($l in ($sums -split "`n")) {
-            $parts = $l.Trim() -split '\s+'
-            if ($parts.Count -eq 2) { $known[$parts[1]] = $parts[0].ToLowerInvariant() }
-        }
+        $known = Get-BtbNChecksums
         # The oldest FFmpeg 8.1+ release build: it has both GPU capture paths (ddagrab and
         # gfxcapture, new in 8.1) and works with the widest range of GPU drivers (the nightly
         # "master" build can require an NVIDIA driver released a few weeks ago).
-        $zipName = $known.Keys | Where-Object { $_ -match '^ffmpeg-n(\d+\.\d+)-latest-win64-gpl-\1\.zip$' -and [version]$Matches[1] -ge [version]'8.1' } |
-            Sort-Object { [version]($_ -replace '^ffmpeg-n(\d+\.\d+)-.*$', '$1') } | Select-Object -First 1
+        $zipName = Select-BtbNBuild $known 'gpl'
         if (-not $zipName) {
             Write-Warning 'No FFmpeg 8.1+ release build is listed; falling back to the nightly master build.'
             $zipName = 'ffmpeg-master-latest-win64-gpl.zip'
@@ -143,22 +181,47 @@ if ($FFmpegPath) {
         $tmp = Join-Path $env:TEMP ("recon-ffmpeg-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $tmp | Out-Null
         try {
-            $zip = Join-Path $tmp $zipName
-            Invoke-WebRequest -UseBasicParsing -Uri "$base/$zipName" -OutFile $zip
-            $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-            if ($expected -ne $actual) { throw "FFmpeg checksum mismatch (expected $expected, got $actual)." }
-            Write-Step 'FFmpeg checksum verified'
-            Expand-Archive -Path $zip -DestinationPath $tmp -Force
-            $inner = Get-ChildItem -Path $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'bin\ffmpeg.exe') } | Select-Object -First 1
-            if (-not $inner) { throw 'Unexpected FFmpeg archive layout.' }
+            $inner = Expand-BtbNBuild $zipName $expected $tmp
+            if (-not (Test-Path (Join-Path $inner 'bin\ffmpeg.exe'))) { throw 'Unexpected FFmpeg archive layout.' }
             if (Test-Path $ffDir) { Remove-Item -Recurse -Force $ffDir }
-            Copy-Item $inner.FullName $ffDir -Recurse  # Move-Item can't cross drives in PowerShell 5.1
+            Copy-Item $inner $ffDir -Recurse  # Move-Item can't cross drives in PowerShell 5.1
         } finally {
             Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
         }
     }
 }
 Write-Step "FFmpeg: $ffmpeg"
+
+# --- libavcodec for the encoder helper (optional) ---------------------------------
+# recon-encoder.exe's libavcodec backend (Intel Quick Sync Video, GUIDE 3.8) loads FFmpeg's
+# shared libraries at run time from ffmpeg-lgpl\ next to it; without them it reports the
+# backend unavailable. The LGPL shared build: libvpl (MIT) is built into avcodec-62.dll.
+if ($InstallLibavcodec) {
+    $libDir = Join-Path $InstallDir 'ffmpeg-lgpl'
+    if ($UpdateFFmpeg -or -not (Test-Path (Join-Path $libDir 'avcodec-62.dll'))) {
+        $known = Get-BtbNChecksums
+        # FFmpeg 8.x only: the helper is built for libavcodec 62 / libavutil 60 (no master fallback).
+        $zipName = Select-BtbNBuild $known 'lgpl-shared' '9.0'
+        if (-not $zipName) { throw 'No FFmpeg 8.x LGPL shared release build is listed by BtbN/FFmpeg-Builds.' }
+        Write-Step "Downloading FFmpeg's libraries ($zipName, about 80 MB)"
+        $tmp = Join-Path $env:TEMP ("recon-libav-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        try {
+            $inner = Expand-BtbNBuild $zipName $known[$zipName] $tmp
+            $dlls = @(Get-ChildItem -Path (Join-Path $inner 'bin') -File | Where-Object { $_.Name -match '^(avcodec|avutil|swresample)-\d+\.dll$' })
+            if (-not ($dlls | Where-Object { $_.Name -eq 'avcodec-62.dll' }) -or -not ($dlls | Where-Object { $_.Name -eq 'avutil-60.dll' })) {
+                throw "$zipName has no avcodec-62.dll / avutil-60.dll (FFmpeg 8.x)."
+            }
+            if (Test-Path $libDir) { Remove-Item -Recurse -Force $libDir }
+            New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+            $dlls | Copy-Item -Destination $libDir
+            Copy-Item (Join-Path $inner 'LICENSE.txt') $libDir -ErrorAction SilentlyContinue
+        } finally {
+            Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Step "libavcodec for the encoder helper: $libDir"
+}
 
 # --- Virtual display driver (optional) -------------------------------------------
 # Pinned downloads: the Virtual Display Driver's driver-only package and nefcon (devcon-style

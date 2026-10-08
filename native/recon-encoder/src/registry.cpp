@@ -16,14 +16,17 @@ BackendChoice chooseBackend(const std::string& name, const MockOptions& mock) {
         if (out.caps.backend == "mock") out.backend = std::move(b);
     } else {
         // Real backends. "auto" tries the primary adapter's vendor first, so one
-        // binary runs on either vendor (the runtimes are loaded dynamically).
+        // binary runs on either vendor (the runtimes are loaded dynamically);
+        // the libavcodec fallback (Intel Quick Sync Video) comes last, except
+        // on an Intel primary adapter.
         std::vector<std::string> order;
-        if (name == "amf" || name == "nvenc") order = {name};
-        else if (adapter.vendor == "nvidia") order = {"nvenc", "amf"};
-        else order = {"amf", "nvenc"};
+        if (name == "amf" || name == "nvenc" || name == "lavc") order = {name};
+        else if (adapter.vendor == "nvidia") order = {"nvenc", "amf", "lavc"};
+        else if (adapter.vendor == "intel") order = {"lavc", "nvenc", "amf"};
+        else order = {"amf", "nvenc", "lavc"};
         for (const auto& n : order) {
             Status err;
-            auto b = n == "amf" ? createAmfBackend(err) : createNvencBackend(err);
+            auto b = n == "amf" ? createAmfBackend(err) : n == "nvenc" ? createNvencBackend(err) : createLavcBackend(err);
             if (b) {
                 out.caps = b->caps();
                 out.backend = std::move(b);
@@ -47,6 +50,7 @@ BackendChoice chooseBackend(const std::string& name, const MockOptions& mock) {
     const std::pair<const char*, Probe> probes[] = {
         {"amf", chosen == "amf" ? Probe{true, {}} : probeAmf()},
         {"nvenc", chosen == "nvenc" ? Probe{true, {}} : probeNvenc()},
+        {"lavc", chosen == "lavc" ? Probe{true, {}} : probeLavc()},
         {"dda", probeDdaCapture()},
         {"amd-direct", probeAmdDirectCapture()},
         {"wgc", probeWgcCapture()},
@@ -55,7 +59,7 @@ BackendChoice chooseBackend(const std::string& name, const MockOptions& mock) {
         const std::string probed = n;
         if (!p.available) {
             out.caps.unavailable.emplace_back(probed, p.reason);
-        } else if (out.backend && probed != "amf" && probed != "nvenc" &&
+        } else if (out.backend && probed != "amf" && probed != "nvenc" && probed != "lavc" &&
                    std::find(out.caps.capture.begin(), out.caps.capture.end(), probed) == out.caps.capture.end()) {
             out.caps.capture.push_back(probed);
         }

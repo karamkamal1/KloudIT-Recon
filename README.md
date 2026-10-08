@@ -209,6 +209,9 @@ The installer:
 - optionally installs the Virtual Display Driver (`-InstallVirtualDisplay`: pinned release,
   SHA-256 verified) for streaming a virtual monitor at the client's resolution and frame rate;
   its device stays disabled (no extra monitor) until a session enables it
+- optionally downloads FFmpeg's LGPL shared libraries (`-InstallLibavcodec`: BtbN's FFmpeg 8.1
+  LGPL shared build, SHA-256 verified) into `ffmpeg-lgpl\` for the native encoder helper's
+  Intel Quick Sync backend; the GPL `ffmpeg.exe` stays the FFmpeg command-line path
 - starts the agent and checks that it reaches the gateway, and warns if no GPU encoder works
 
 The PC's card in the dashboard shows **Online** when the agent connects.

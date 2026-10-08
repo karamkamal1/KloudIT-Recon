@@ -66,8 +66,14 @@ func TestDecodeCaps(t *testing.T) {
 
 func TestDecodeMessages(t *testing.T) {
 	m, err := decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"synthetic","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000}`))
-	if s, ok := m.(*Started); err != nil || !ok || s.Width != 320 || s.Capture != "synthetic" {
+	if s, ok := m.(*Started); err != nil || !ok || s.Width != 320 || s.Capture != "synthetic" || s.Encoder != "" {
 		t.Fatalf("started: %+v %v", m, err)
+	}
+	// The libavcodec backend (step 3.8) names its FFmpeg encoder.
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"lavc","encoder":"hevc_qsv","capture":"dda","codec":"hevc","width":1920,"height":1080,"fps":60,"kbps":20000,"liveBitrate":"flush","rateControl":"vbr_capped","usage":"low_power","preset":"veryfast","zeroCopy":true}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.Backend != "lavc" || s.Encoder != "hevc_qsv" || !s.ZeroCopy ||
+		s.LiveBitrate != "flush" || s.RateControl != "vbr_capped" || s.Usage != "low_power" || s.Preset != "veryfast" {
+		t.Fatalf("started (lavc): %+v %v", m, err)
 	}
 	m, err = decodeMessage([]byte(`{"t":"stats","frameId":7,"gen":0,"dropped":true,"key":false,"recovery":false,"bytes":512,"presentQpc":1,"captureQpc":2,"submitQpc":3,"outputQpc":4,"ltrSlot":-1,"temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1.5,"fps":60,"ringDropped":3,"reason":"ringFull"}`))
 	if s, ok := m.(*Stats); err != nil || !ok || s.FrameID != 7 || !s.Dropped || s.Reason != "ringFull" || s.LTRSlot != -1 || s.VBVFrames != 1.5 || s.RingDropped != 3 {

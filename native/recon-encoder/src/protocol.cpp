@@ -272,6 +272,7 @@ std::string encodeStarted(const Started& s) {
     json j = {
         {"t", "started"},
         {"backend", s.backend},
+        {"encoder", s.encoder},
         {"capture", s.capture},
         {"codec", s.codec},
         {"width", s.width},

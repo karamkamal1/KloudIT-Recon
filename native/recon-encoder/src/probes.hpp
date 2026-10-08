@@ -1,5 +1,6 @@
 // Real capture methods and encoder backends behind factories: the capture
-// methods (step 3.2), the AMF encoder (3.3) and the NVENC encoder (3.4).
+// methods (step 3.2), the AMF encoder (3.3), the NVENC encoder (3.4) and the
+// libavcodec fallback (3.8, Intel Quick Sync Video).
 #pragma once
 
 #include <windows.h>
@@ -34,6 +35,13 @@ std::unique_ptr<Backend> createNvencBackend(Status& err);
 // The NVENC caps from a new probe rather than the cached one (--self-test-nvenc
 // changes its test double's capabilities between probes).
 Caps probeNvencCaps();
+// The libavcodec backend (lavc/lavc_backend.cpp; FFmpeg's DLLs from
+// lavc/lavc_runtime.hpp's directory). createLavcBackend probes once per
+// process: each QSV encoder opened on the Intel adapter (or the
+// --lavc-test-encoder encoders); probeLavc only checks the DLLs and that there
+// is an Intel adapter (it runs when another backend was chosen).
+Probe probeLavc();
+std::unique_ptr<Backend> createLavcBackend(Status& err);
 
 // Capture (capture/*.cpp).
 Probe probeDdaCapture();

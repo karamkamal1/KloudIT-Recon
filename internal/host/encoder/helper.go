@@ -37,7 +37,7 @@ func (e *ExitError) Error() string { return fmt.Sprintf("encoder helper exited w
 // Options configures Launch.
 type Options struct {
 	Exe          string        // path to recon-encoder.exe (absolute: next to recon-host.exe)
-	Backend      string        // auto (default) | amf | nvenc | mock
+	Backend      string        // auto (default) | amf | nvenc | lavc | mock
 	Slots        int           // ring slots (default DefaultSlots)
 	SlotSize     int           // bytes per slot, header included (default DefaultSlotSize)
 	LogLevel     string        // helper log level: error | warn | info (default) | debug
@@ -45,6 +45,13 @@ type Options struct {
 	Log          *slog.Logger  // receives the helper's stderr; nil discards it
 	CapsTimeout  time.Duration // how long Launch waits for caps (default 10 s)
 	StartTimeout time.Duration // how long Start waits for "started" (default 10 s)
+	// FFmpegDir is where the libavcodec backend (Intel Quick Sync Video, GUIDE
+	// 3.8) loads FFmpeg 8.x's shared DLLs from (avcodec-62.dll, avutil-60.dll,
+	// swresample-6.dll; install-host.ps1 -InstallLibavcodec puts BtbN's LGPL
+	// build into ffmpeg-lgpl\ next to the helper). "" = the helper's default:
+	// that ffmpeg-lgpl\ directory, then its own. Never the GPL ffmpeg.exe of
+	// the FFmpeg path (a static build without DLLs).
+	FFmpegDir string
 }
 
 func (o Options) withDefaults() Options {
