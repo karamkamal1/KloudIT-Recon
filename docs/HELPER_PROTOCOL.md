@@ -560,7 +560,8 @@ after both threads have been joined.
 | `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s; with `motion` (step 3.6) it presents without pauses and every 640x360 image is new: an 8 px checkerboard with a ramp scrolling 12 px right and 5 px down per present under full-frame noise (+-40 per channel), which no tested bitrate can carry at 1080p, so the encoder's rate control always sets the frame sizes | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path; the live-bitrate qualification's source; with `hdr` it plays an output in HDR mode (FP16 scRGB up to 4000 cd/m2, a 1000 cd/m2 patch in the top-right 32x32 corner, a 1000 cd/m2 panel's metadata; not with `motion`) |
 
 Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
-`hmonitor` (the HMONITOR recon-host already has for each monitor); `adapterLuid` (as in
+`hmonitor` (the HMONITOR recon-host already has for each monitor; a session's virtual display,
+GUIDE 3.7, is captured with `dda` by it, never `amd-direct`); `adapterLuid` (as in
 caps, `"%08x:%08x"` HighPart:LowPart) + `monitor` = output index on that adapter;
 `monitor` alone = output index on DXGI adapter 0 (what ddagrab's `output_idx` means).
 The output must be attached to the desktop, else `no_output`. The D3D11 device is created

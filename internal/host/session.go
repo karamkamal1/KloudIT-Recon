@@ -23,6 +23,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
+	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 	"github.com/karamkamal1/kloudit-recon/internal/transport/cc"
@@ -69,6 +70,18 @@ type Session struct {
 	// (VideoEvent.CursorInVideo), read by cursorLoop without the pipeline's lock.
 	cursorInVideo atomic.Bool
 	resizeTimer   *time.Timer // a capture size change waiting to settle (captureChanged)
+
+	// The session's virtual display (GUIDE 3.7, virtualdisplay.go): vd, nil
+	// without one, created for mode vdMode; vdOff says why the session may
+	// not have one any more (it lost one), vdWhy is the last decision not to
+	// use one (logged once). vdMu also serialises creating and replacing it,
+	// which takes seconds: buildParams waits for that rather than capturing
+	// a display on its way out.
+	vdMu   sync.Mutex
+	vd     *vdisplay.Display
+	vdMode vdisplay.Mode
+	vdOff  string
+	vdWhy  string
 
 	audio    *media.Audio
 	frameQ   chan *media.Frame
@@ -236,13 +249,20 @@ func (s *Session) run() error {
 	defer s.releasePads()
 
 	s.prefs = s.hello.Prefs
+	// A virtual display first: the pipeline captures it (the helper's caps
+	// list its output) and the welcome lists it. Released (removed after the
+	// linger) once the video has stopped.
+	vdNotice := s.openVirtualDisplay(s.prefs)
+	defer s.closeVirtualDisplay()
 	pipeNotice := s.openPipeline() // the helper's encoders are in the welcome
 	defer func() { s.vid().Stop() }()
 	if err := s.sendWelcome(); err != nil {
 		return err
 	}
-	if pipeNotice != "" {
-		s.notice("warn", pipeNotice)
+	for _, n := range []string{vdNotice, pipeNotice} {
+		if n != "" {
+			s.notice("warn", n)
+		}
 	}
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		go s.wallClockLoop()
@@ -331,9 +351,7 @@ func (s *Session) sendWelcome() error {
 		T: "welcome", Session: s.id, Host: s.a.pair().Name, OS: runtime.GOOS + "/" + runtime.GOARCH, Version: Version,
 		MaxKbps: s.a.cfg.MaxKbps, MaxFPS: s.a.cfg.MaxFPS,
 	}
-	for _, m := range s.a.monitors() {
-		w.Monitors = append(w.Monitors, proto.MonitorInfo{Index: m.Index, Name: m.Name, Width: m.W, Height: m.H, X: m.X, Y: m.Y, Primary: m.Primary, Hz: m.Hz})
-	}
+	w.Monitors = s.welcomeMonitors()
 	for _, e := range s.encoders() {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
@@ -507,10 +525,10 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e 
 // sessionParams is the encoder-independent part of buildParams for prefs on
 // monitor mon: frame rate and bitrate within the host's limits, cursor,
 // capture timestamps (frameExt: the client parses the frame extension) and
-// the capture source of backendFor(prefs), which it also returns.
-func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, frameExt bool) (media.Params, string) {
+// the FFmpeg capture source of backend (backendFor, or the session's
+// captureBackend).
+func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, backend string, frameExt bool) media.Params {
 	cfg := a.cfg
-	backend := a.backendFor(prefs)
 	fps := prefs.FPS
 	if fps <= 0 {
 		fps = cfg.DefaultFPS
@@ -572,7 +590,7 @@ func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, frameExt 
 	// The test pattern carries each frame's Seq as a barcode (welcome feature
 	// barcode-seq): the client checks the picture it draws against the header.
 	p.Barcode = backend == "test" && a.caps.CanDrawBarcode()
-	return p, backend
+	return p
 }
 
 // monitorFor returns the monitor a session with prefs captures: the one it
@@ -585,15 +603,21 @@ func (a *Agent) monitorFor(prefs proto.Prefs) platform.Monitor {
 	return mons[0]
 }
 
+// buildParams builds the next generation's parameters for prefs: the monitor
+// it captures (the session's virtual display, else the one prefs name; input
+// and the cursor map to its rectangle), the pipeline (leaving the helper when
+// it cannot serve them) and the encoder.
 func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
-	mon := s.a.monitorFor(prefs)
+	mon, vd := s.captureMonitor(prefs)
+	virt := vd != nil
 	s.prefsMu.Lock()
 	s.monitor = mon
 	s.prefsMu.Unlock()
 	s.a.inj.SetTarget(input.Rect{X: mon.X, Y: mon.Y, W: mon.W, H: mon.H})
 
+	backend := s.captureBackend(prefs, mon, virt)
 	// Capture timestamps only reach clients that parse the frame extension.
-	p, backend := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
+	p := s.a.sessionParams(prefs, mon, backend, s.hello.V >= proto.HelloVersionFrameExt)
 	if helper, _, c := s.onHelper(); helper {
 		why := s.helperBlocker(prefs, p.DrawCursor, &c)
 		if why == "" {
@@ -616,7 +640,16 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	case enc.Helper:
 		s.helperSource(&p, prefs, mon)
 	case backend == "amf":
-		s.useAMFCapture(&p, mon)
+		s.useAMFCapture(&p, mon, virt)
+	}
+	if virt && !enc.Helper && p.Source.Backend == "ddagrab" && mon.DXGIOutput < 0 {
+		// On FFmpeg (the helper gave up) without gfxcapture: ddagrab's
+		// output_idx counts the outputs of DXGI adapter 0 only.
+		const why = "FFmpeg cannot capture it: it is not an output of DXGI adapter 0"
+		if s.takeVirtualDisplay(vd, why) {
+			go s.removeVirtualDisplay(vd, why)
+		}
+		return s.buildParams(prefs)
 	}
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
@@ -651,7 +684,9 @@ func ProbeSample(cfg *Config, caps *media.Caps) func(media.EncoderInfo) media.Pa
 }
 
 func (a *Agent) probeSample(mon platform.Monitor) func(media.EncoderInfo) media.Params {
-	p, backend := a.sessionParams(proto.Prefs{FPS: 60, BitrateKbps: 30000, Quality: "balanced", Cursor: "local"}, mon, true)
+	prefs := proto.Prefs{FPS: 60, BitrateKbps: 30000, Quality: "balanced", Cursor: "local"}
+	backend := a.backendFor(prefs)
+	p := a.sessionParams(prefs, mon, backend, true)
 	return func(enc media.EncoderInfo) media.Params {
 		q := p
 		q.Encoder = enc
@@ -663,11 +698,16 @@ func (a *Agent) probeSample(mon platform.Monitor) func(media.EncoderInfo) media.
 }
 
 // useAMFCapture switches p from ddagrab to AMD Direct Capture of the same
-// monitor (capture "amf", experimental) unless amfCaptureBlocker or an
+// monitor (capture "amf", experimental) unless amfCaptureBlocker, the monitor
+// being the session's virtual display (virt: AMD Direct Capture reads the
+// GPU's own display outputs, which never scan out an IddCx monitor) or an
 // earlier failure in this session rules it out; then p stays on ddagrab and
 // the reason is logged once per change.
-func (s *Session) useAMFCapture(p *media.Params, mon platform.Monitor) {
+func (s *Session) useAMFCapture(p *media.Params, mon platform.Monitor, virt bool) {
 	why := s.a.amfCaptureBlocker(p.Encoder, p.DrawCursor, mon)
+	if virt {
+		why = fmt.Sprintf("monitor %s is a virtual display, which AMD Direct Capture cannot capture", mon.Name)
+	}
 	if why == "" && s.amfFailed.Load() {
 		why = "it failed earlier in this session"
 	}
@@ -2002,7 +2042,13 @@ func (s *Session) controlLoop() error {
 				// An explicit video choice resets the congestion back-off;
 				// an audio-only change keeps it.
 				s.rate.reset()
-				if err := s.startVideo(false, "settings"); err != nil {
+				// A virtual display follows the client's size and frame
+				// rate: a new one is a new capture, started at once.
+				urgent := false
+				if old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.FPS != m.Prefs.FPS || old.Monitor != m.Prefs.Monitor {
+					urgent = s.updateVirtualDisplay(*m.Prefs)
+				}
+				if err := s.startVideo(urgent, "settings"); err != nil {
 					s.notice("error", "Could not apply settings: "+err.Error())
 				}
 			}

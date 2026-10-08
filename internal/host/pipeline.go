@@ -209,7 +209,7 @@ func (k helperSkips) String() string {
 // tried: its reason is returned) was passed over.
 func (s *Session) chooseHelper(prefs proto.Prefs, drawCursor bool, skipped helperSkips) (*encoder.Helper, string) {
 	cfg := s.a.cfg
-	mon := s.a.monitorFor(prefs)
+	mon, _ := s.captureMonitor(prefs) // the session's virtual display, if any
 	tried := map[string]bool{}
 	unavailable := map[string]string{} // over every launch
 	choice := ""                       // why the first launch was not of an earlier backend, for the log
@@ -391,7 +391,7 @@ func (s *Session) helperFits(prefs proto.Prefs, drawCursor bool, mon platform.Mo
 	s.helperEncs, s.helperCaps = media.HelperEncoders(*c), *c
 	encs := s.helperEncs
 	s.pipeMu.Unlock()
-	p, _ := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
+	p := s.a.sessionParams(prefs, mon, s.captureBackend(prefs, mon, s.onVirtualDisplay()), s.hello.V >= proto.HelloVersionFrameExt)
 	w, h := p.OutputSize()
 	if e, _, err := s.negotiateEncoder(prefs, w, h, false); err != nil || !e.Helper {
 		return fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", e.Name, encoderNames(encs)), true
@@ -479,9 +479,10 @@ func (s *Session) leaveHelper(reason string) {
 // encoder named in host.json), and with the helper's caps the video carrying
 // the cursor (drawCursor; the helper's captures leave it out: cursorInVideo
 // false) and the capture methods it lacks (window capture without WGC, AMD
-// Direct Capture, DDA).
+// Direct Capture, DDA; the session's capture: DDA for a virtual display).
 func (s *Session) helperBlocker(prefs proto.Prefs, drawCursor bool, c *encoder.Caps) string {
 	cfg := s.a.cfg
+	capture := s.capture()
 	switch {
 	case cfg.Capture == "x11grab":
 		return `capture "x11grab" is FFmpeg's`
@@ -506,11 +507,11 @@ func (s *Session) helperBlocker(prefs proto.Prefs, drawCursor bool, c *encoder.C
 		return "" // the helper's synthetic source: no cursor, no capture method to probe
 	case drawCursor && !c.CursorInVideo:
 		return "the video must carry the cursor, which the helper's captures leave out"
-	case (prefs.Window != "" || cfg.Capture == "gfxcapture") && !has("wgc"):
+	case (prefs.Window != "" || capture == "gfxcapture") && !has("wgc"):
 		return lacks("wgc")
-	case prefs.Window == "" && cfg.Capture == "amf" && !has("amd-direct"):
+	case prefs.Window == "" && capture == "amf" && !has("amd-direct"):
 		return lacks("amd-direct")
-	case prefs.Window == "" && cfg.Capture != "amf" && cfg.Capture != "gfxcapture" && !has("dda"):
+	case prefs.Window == "" && capture != "amf" && capture != "gfxcapture" && !has("dda"):
 		return lacks("dda")
 	}
 	return ""
@@ -518,8 +519,9 @@ func (s *Session) helperBlocker(prefs proto.Prefs, drawCursor bool, c *encoder.C
 
 // helperSource points p (from sessionParams) at what the native helper
 // captures for monitor mon: a window (WGC) when the client asks for one, AMD
-// Direct Capture or WGC when the host config asks for them, the helper's
-// synthetic GPU source with the frame barcode for the test pattern, else DDA.
+// Direct Capture or WGC when the host config asks for them (not AMD Direct
+// Capture for a virtual display: Session.capture), the helper's synthetic GPU
+// source with the frame barcode for the test pattern, else DDA.
 // A monitor is scaled to the largest even size within the client's that has
 // the monitor's aspect ratio (the helper scales any capture, FFmpeg needs
 // gfxcapture to scale; the helper stretches the source to the size it is
@@ -543,9 +545,9 @@ func (s *Session) helperSource(p *media.Params, prefs proto.Prefs, mon platform.
 	case prefs.Window != "":
 		src = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window, NativeW: mon.W, NativeH: mon.H}
 		w, h = 0, 0
-	case s.a.cfg.Capture == "gfxcapture":
+	case s.capture() == "gfxcapture":
 		src.Backend = "gfxcapture"
-	case s.a.cfg.Capture == "amf":
+	case s.capture() == "amf":
 		src.Backend = "amf"
 	}
 	if w > 0 && h > 0 && mon.W > 0 && mon.H > 0 {

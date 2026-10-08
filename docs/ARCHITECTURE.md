@@ -548,6 +548,47 @@ new one starts with an IDR as a new generation; further replacements before one 
 continues on FFmpeg with a notice. Helpers that fail before going live within 3 s of a
 `device_lost` (a driver reset) do not count.
 
+### Virtual displays (GUIDE 3.7)
+
+With host config `virtualDisplay` `on`, or `auto` when the monitor the session would capture
+cannot show the client's mode 1:1 (another size, or a frame rate above its refresh rate), a
+session streams a monitor created for its client through an installed IddCx driver (SudoVDA or
+the Virtual Display Driver; `internal/host/vdisplay`, session side in
+`internal/host/virtualdisplay.go`):
+
+- **Mode.** The size the client streams at (prefs `width`/`height`), else its screen in device
+  pixels (hello `client.w`/`h`), rounded down to even; the stream's frame rate (prefs `fps`, else
+  `defaultFps`, at most `maxFps`) as refresh rate. The client's hello already carries all of it;
+  its measured refresh rate (`client.hz`) is not used: the monitor refreshes as fast as the
+  stream runs.
+- **When.** The session creates it as it starts, after taking over from an older session and
+  before its pipeline (the helper's caps then list the display's output) and welcome (which lists
+  the display alone, `virtual: true`: the session captures nothing else, and the client offers no
+  display choice for one monitor). A settings change of the size or frame rate replaces it: the
+  video is suspended, `Create` removes the old display and adds one at the new mode, and the next
+  generation starts at once. A session without one decides again on such a change.
+- **Capture.** Exactly that display, 1:1 (the prefs size equals the display's, so nothing scales):
+  FFmpeg's `ddagrab` with its DXGI output index (`gfxcapture` of its HMONITOR when it is not an
+  output of DXGI adapter 0, the render adapter the agent gives the driver, or when the host
+  config asks for `gfxcapture`), the helper's `dda` by HMONITOR. Never AMD Direct Capture (the
+  GPU's display engine never scans out an IddCx monitor): capture `amf` falls back to DDA for it.
+  The fps cap is the display's refresh rate, so 120 fps on a 60 Hz host monitor works. Absolute
+  mouse input and the client-side cursor map to the display's desktop rectangle (looked up in
+  the monitor list for every generation).
+- **Restore.** When the session ends the display is released: after `virtualDisplayLinger`
+  (10 s) it is removed and the topology from before it restored, unless a reconnecting client
+  took it over (same mode: the same display, nothing rearranged; another mode: replaced). A
+  display whose driver stops answering (SudoVDA's watchdog removes it), or that Windows no longer
+  lists, is removed at once and the session goes on with the physical monitor (notice) without
+  creating another. Agent shutdown (`Run` returning) removes it; after a crash or power loss the
+  next agent start replays the restore journal (`vdisplay-restore.json` next to host.json) before
+  any session. One virtual display exists at a time: a new session that takes over a running
+  one reuses or replaces it, and the replaced session's end leaves it alone.
+- **Not used** for the test pattern, x11grab and window captures. Decisions are logged once per
+  session or change (`virtual display not used reason=...`, `streaming a virtual display ...`,
+  `virtual display changed ...`); a failure is also a notice ("Virtual display unavailable: ...;
+  streaming the monitor.").
+
 ## The browser pipeline
 
 ```

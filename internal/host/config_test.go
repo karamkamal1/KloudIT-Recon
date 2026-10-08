@@ -167,6 +167,20 @@ func TestConfigVirtualDisplay(t *testing.T) {
 	if _, err := load(`{"virtualDisplayLayout":"mirror"}`); err == nil || !strings.Contains(err.Error(), "virtualDisplayLayout") {
 		t.Fatalf("unknown virtualDisplayLayout: %v", err)
 	}
+	// virtualDisplayLinger: seconds, 10 by default, 0 = restore at once.
+	if o := c.virtualDisplayOptions(); o.Linger != 10*time.Second {
+		t.Fatalf("default linger %v", o.Linger)
+	}
+	for in, want := range map[string]time.Duration{"0": 0, "30": 30 * time.Second, "600": 10 * time.Minute} {
+		if c, err := load(`{"virtualDisplayLinger":` + in + `}`); err != nil || c.virtualDisplayOptions().Linger != want {
+			t.Fatalf("linger %s: %v", in, err)
+		}
+	}
+	for _, in := range []string{"-1", "601"} {
+		if _, err := load(`{"virtualDisplayLinger":` + in + `}`); err == nil || !strings.Contains(err.Error(), "virtualDisplayLinger") {
+			t.Fatalf("linger %s accepted: %v", in, err)
+		}
+	}
 }
 
 // TestConfigLibavcodec: host config helperLibavcodec (auto | off) and

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
@@ -59,6 +60,12 @@ type Config struct {
 	// VirtualDisplayLayout places the virtual monitor: primary | extend | only
 	// ("" = primary).
 	VirtualDisplayLayout string `json:"virtualDisplayLayout,omitempty"`
+	// VirtualDisplayLinger is how many seconds a session's virtual display
+	// stays after the session ends, so that a client reconnecting with the
+	// same mode gets it back without the desktop being rearranged twice
+	// (unset = defaultVirtualDisplayLinger; 0 = the displays are restored at
+	// once; at most 600).
+	VirtualDisplayLinger *int `json:"virtualDisplayLinger,omitempty"`
 	// AV1 is when the automatic codec choice uses AV1 (step 4.2): AV1Fallback
 	// ("" = default) only where HEVC does not work end-to-end, AV1Faster also
 	// instead of HEVC for clients that decode AV1 clearly faster (enable it
@@ -184,6 +191,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: virtualDisplayLayout must be %q, %q or %q, not %q", path,
 			vdisplay.LayoutPrimary, vdisplay.LayoutExtend, vdisplay.LayoutOnly, c.VirtualDisplayLayout)
 	}
+	if l := c.VirtualDisplayLinger; l != nil && (*l < 0 || *l > 600) {
+		return nil, fmt.Errorf("%s: virtualDisplayLinger must be 0-600 seconds, not %d", path, *l)
+	}
 	c.path = path
 	return c, nil
 }
@@ -261,11 +271,21 @@ func (c *Config) gpuPriority() string {
 	return c.GPUPriority
 }
 
-// virtualDisplayOptions are the vdisplay.Options of this config: policy and
-// layout, the restore journal next to the config file, and the host id as the
-// virtual monitor's identity. The caller adds RenderAdapter, Linger and Log.
+// defaultVirtualDisplayLinger is how long a session's virtual display stays
+// for a reconnecting client by default: a page reload, or a client that
+// retries after a lost connection (its first retries come within 5 s).
+const defaultVirtualDisplayLinger = 10 * time.Second
+
+// virtualDisplayOptions are the vdisplay.Options of this config: policy,
+// layout and linger, the restore journal next to the config file, and the
+// host id as the virtual monitor's identity. The caller adds RenderAdapter and
+// Log.
 func (c *Config) virtualDisplayOptions() vdisplay.Options {
-	o := vdisplay.Options{Policy: c.VirtualDisplay, Layout: c.VirtualDisplayLayout, MonitorID: c.HostID}
+	o := vdisplay.Options{Policy: c.VirtualDisplay, Layout: c.VirtualDisplayLayout, MonitorID: c.HostID,
+		Linger: defaultVirtualDisplayLinger}
+	if l := c.VirtualDisplayLinger; l != nil {
+		o.Linger = time.Duration(*l) * time.Second
+	}
 	if o.Policy == "" {
 		o.Policy = vdisplay.PolicyOff
 	}

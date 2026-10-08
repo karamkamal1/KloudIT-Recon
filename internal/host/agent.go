@@ -26,6 +26,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
+	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -55,6 +56,9 @@ type Agent struct {
 	lavcMissing   string
 	// listMonitors replaces the system's monitors in monitors() (tests).
 	listMonitors func() []platform.Monitor
+	// vd creates sessions' virtual displays (GUIDE 3.7, virtualdisplay.go);
+	// nil: none (tests).
+	vd *vdisplay.Manager
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -170,6 +174,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 	}
 	a.setupHelper()
+	a.setupVirtualDisplays(newVirtualDisplays(a.virtualDisplayOptions()))
 	if v := os.Getenv(TestFaultsEnv); v != "" {
 		if a.faults, err = parseTestFaults(v); err != nil {
 			return nil, fmt.Errorf("%s: %w", TestFaultsEnv, err)
@@ -310,8 +315,10 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 	return t.User, nil
 }
 
-// Run serves until ctx is cancelled.
+// Run serves until ctx is cancelled. When it returns, a virtual display a
+// session created is removed and the displays restored.
 func (a *Agent) Run(ctx context.Context) error {
+	defer a.closeVirtualDisplays()
 	if a.pair().Gateway == "" {
 		// Wait instead of exiting: the logon task does not restart an agent that
 		// exits, and `recon-host pair` may run after the agent has started.

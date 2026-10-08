@@ -308,6 +308,23 @@ func TestLingerReuse(t *testing.T) {
 	if st, _ := sys.state(phys.t); !st.active || st.x != 0 {
 		t.Fatalf("physical monitor %+v", st)
 	}
+	// Remove does not linger.
+	d3, err := m.Create(mode1440)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d3.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := sys.state(drv.target); ok {
+		t.Fatal("a removed display lingers")
+	}
+	if st, _ := sys.state(phys.t); !st.active || st.x != 0 {
+		t.Fatalf("physical monitor after Remove %+v", st)
+	}
+	if err := d3.Close(); err != nil { // nothing left to release
+		t.Fatal(err)
+	}
 }
 
 func TestDecideReusesOwnDisplay(t *testing.T) {
@@ -399,6 +416,32 @@ func TestKeepaliveLost(t *testing.T) {
 	defer d2.Close()
 	if p, _, _ := drv.count(); p != 2 {
 		t.Fatalf("plugs %d", p)
+	}
+}
+
+// TestLostDisplayNotKept: a display the driver stopped answering for is
+// removed and the topology restored when the session releases it, without
+// the linger kept for reconnects.
+func TestLostDisplayNotKept(t *testing.T) {
+	m, sys, drv, phys := rig(t, Options{Linger: time.Hour}, func(d *fakeDriver) { d.every = 2 * time.Millisecond })
+	d, err := m.Create(mode1440)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv.pingErr.Store(true)
+	select {
+	case <-d.Lost():
+	case <-time.After(2 * time.Second):
+		t.Fatal("not reported lost")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, u, _ := drv.count(); u != 1 {
+		t.Fatalf("unplugs %d: a lost display lingers", u)
+	}
+	if st, _ := sys.state(phys.t); !st.active || st.x != 0 {
+		t.Fatalf("physical monitor %+v", st)
 	}
 }
 
