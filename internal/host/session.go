@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"regexp"
 	"runtime"
 	"sort"
 	"sync"
@@ -51,9 +52,10 @@ type Session struct {
 	ctrl   transport.BidiStream
 
 	hello       proto.Hello
-	prefsMu     sync.Mutex // guards prefs, monitor, alignNotice and amfFallback
+	prefsMu     sync.Mutex // guards prefs, monitor, codecWhy, alignNotice and amfFallback
 	prefs       proto.Prefs
 	monitor     platform.Monitor
+	codecWhy    string // last codec choice and its reason, logged once
 	alignNotice string // last coded-size alignment notice, sent once
 	amfFallback string // why the last generation did not use capture "amf", logged once
 	amfFailed   atomic.Bool
@@ -224,7 +226,8 @@ func (s *Session) run() error {
 			s.onAuth()
 		}
 	}
-	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80))
+	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80),
+		"decoders", decoderSummary(s.hello.Decoders))
 
 	// One active session per host: a new connection takes over.
 	s.a.setActive(s)
@@ -335,6 +338,9 @@ func (s *Session) sendWelcome() error {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
 	w.Features = append(s.a.features(), proto.FeatureRateReport)
+	if !s.a.faults.preStageHold {
+		w.Features = append(w.Features, proto.FeatureStageHold)
+	}
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
@@ -377,20 +383,21 @@ func (s *Session) currentPrefs() proto.Prefs {
 }
 
 // chooseEncoder negotiates the codec between the browser's decoders and the
-// host's encoders for a w x h picture (0, 0: size unknown). An encoder that
-// would pad that size (Caps.Pads; AV1 on RDNA3 at 1920x1080) gives way to
-// HEVC, else H.264, also when the client asks for its codec; notice tells
-// the user why ("" when nothing changed). An encoder forced in the host
-// config is kept: its padding is announced for the client to crop.
-func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, notice string, err error) {
-	e, err = s.negotiateEncoder(prefs, true)
+// host's encoders for a w x h picture (0, 0: size unknown); why says how
+// (negotiateEncoder). An encoder that would pad that size (Caps.Pads; AV1 on
+// RDNA3 at 1920x1080) gives way to HEVC, else H.264, also when the client
+// asks for its codec; notice tells the user why ("" when nothing changed). An
+// encoder forced in the host config is kept: its padding is announced for the
+// client to crop.
+func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, why, notice string, err error) {
+	e, why, err = s.negotiateEncoder(prefs, w, h, true)
 	caps := s.a.caps
 	if err != nil || !caps.Pads(e.Name, w, h) {
-		return e, "", err
+		return e, why, "", err
 	}
 	if e.Name == s.a.cfg.Encoder {
 		s.log.Debug("forced encoder pads this size, the client crops", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h))
-		return e, "", nil
+		return e, why, "", nil
 	}
 	// Hardware encoders first, HEVC before H.264.
 	for _, hwOnly := range []bool{true, false} {
@@ -399,13 +406,13 @@ func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInf
 				a := caps.Alignment(e.Name)
 				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
 					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
-				return alt, fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
+				return alt, why + "; " + e.Name + " pads this size", fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
 					familyNames[e.Family], a.W, a.H, familyNames[alt.Family]), nil
 			}
 		}
 	}
 	// Nothing else works end-to-end: keep it, VideoConfig announces the crop.
-	return e, "", nil
+	return e, why, "", nil
 }
 
 // familyNames are the codec families as users know them.
@@ -444,48 +451,57 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 }
 
 // negotiateEncoder picks the encoder by configuration, preference and the
-// browser's decoders; notify: tell the user when the codec they asked for is
-// not available.
-func (s *Session) negotiateEncoder(prefs proto.Prefs, notify bool) (media.EncoderInfo, error) {
+// browser's decoders, for a w x h picture (0, 0: unknown); why says how, for
+// the log; notify: tell the user when the codec they asked for is not
+// available. Automatically: the first tier of autoTiers with a family both
+// ends can use, the family in it by chooseFamily (codec.go: HEVC by default, a
+// family the client decodes clearly faster instead), with software encoding
+// the first in its order. The encoders are the session's (encoders: the
+// native helper's first while the session runs on it).
+func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e media.EncoderInfo, why string, err error) {
+	caps := s.a.caps
 	client := s.clientDecoders()
 	usable := s.usableEncoder
 	if s.a.cfg.Encoder != "" {
 		for _, e := range s.encoders() {
 			if e.Name == s.a.cfg.Encoder {
 				if _, ok := client[e.Family]; ok && usable(e) {
-					return e, nil
+					return e, "forced in the host config", nil
 				}
 			}
 		}
 	}
-	pick := func(fam string, hwOnly bool) (media.EncoderInfo, bool) { return s.pickEncoder(fam, hwOnly, nil) }
 	if prefs.Codec != "" && prefs.Codec != "auto" {
-		if e, ok := pick(prefs.Codec, false); ok {
-			return e, nil
+		if e, ok := s.pickEncoder(prefs.Codec, false, nil); ok {
+			return e, "the client's codec setting", nil
 		}
 		if notify {
 			s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
 		}
 	}
-	// Hardware encode + hardware decode first: HEVC, then AV1, then H.264.
-	for _, fam := range []string{"hevc", "av1", "h264"} {
-		if d, ok := client[fam]; ok && d.HW {
-			if e, ok := pick(fam, true); ok {
-				return e, nil
+	policy := s.a.cfg.av1()
+	for _, tier := range autoTiers {
+		var cands []codecCandidate
+		for _, fam := range tier.order {
+			d, ok := client[fam]
+			if !ok || tier.hwDec && !d.HW {
+				continue
+			}
+			if e, ok := s.pickEncoder(fam, tier.hwEnc, nil); ok {
+				cands = append(cands, codecCandidate{enc: e, dec: d, pads: caps.Pads(e.Name, w, h)})
 			}
 		}
-	}
-	for _, fam := range []string{"h264", "hevc", "av1"} {
-		if e, ok := pick(fam, true); ok {
-			return e, nil
+		if len(cands) > 0 {
+			// Software encoding keeps its order: the host's CPU cost, which
+			// the client's decode times do not tell.
+			c, why := cands[0], "first choice"
+			if tier.hwEnc {
+				c, why = chooseFamily(cands, policy, w, h)
+			}
+			return c.enc, "auto, " + tier.name + ": " + why, nil
 		}
 	}
-	for _, fam := range []string{"h264", "av1", "hevc"} {
-		if e, ok := pick(fam, false); ok {
-			return e, nil
-		}
-	}
-	return media.EncoderInfo{}, errors.New("no codec is supported by both this browser and the host")
+	return media.EncoderInfo{}, "", errors.New("no codec is supported by both this browser and the host")
 }
 
 // sessionParams is the encoder-independent part of buildParams for prefs on
@@ -578,7 +594,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		}
 	}
 	outW, outH := p.OutputSize()
-	enc, notice, err := s.chooseEncoder(prefs, outW, outH)
+	enc, why, notice, err := s.chooseEncoder(prefs, outW, outH)
 	if err != nil {
 		return media.Params{}, err
 	}
@@ -597,9 +613,16 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	s.triedMu.Unlock()
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()
+	choice := enc.Name + " " + why
+	newChoice := choice != s.codecWhy
+	s.codecWhy = choice
 	repeat := notice == s.alignNotice
 	s.alignNotice = notice
 	s.prefsMu.Unlock()
+	if newChoice {
+		s.log.Info("codec choice", "encoder", enc.Name, "family", enc.Family, "reason", why,
+			"size", fmt.Sprintf("%dx%d", outW, outH), "av1", s.a.cfg.av1(), "decoders", decoderSummary(s.hello.Decoders))
+	}
 	if notice != "" && !repeat {
 		s.log.Info("coded-size alignment", "notice", notice, "size", fmt.Sprintf("%dx%d", outW, outH), "encoder", enc.Name)
 		s.notice("info", notice)
@@ -1984,7 +2007,7 @@ func (s *Session) controlLoop() error {
 			// under reference recovery: it waits for the recovery frame.
 			s.loss(lossConfirmed, m.Gen, m.FromSeq, "client")
 		case "stages":
-			s.logStages(m.Stages)
+			s.logStages(m.Stages, m.Renderer, m.Pacing)
 		case "congestion":
 			// Overlapped: the client keeps decoding the current generation
 			// until the new one is ready, unless it flushed its decoder: then
@@ -2013,9 +2036,11 @@ func (s *Session) controlLoop() error {
 }
 
 // hostStages keeps the host's own capture->encoded and queue times of the
-// frames a v2 client acknowledged in the last 10 s (it acks exactly the frames
-// it records stages for). They are logged next to the client's summary as a
-// reference for its rows that needs no clock sync.
+// frames a v2 client acknowledged in the last 10 s. They are logged next to
+// the client's summary as a reference for its rows that needs no clock sync.
+// The client acks every frame it decoded; it records stages only for the
+// frames it drew, so the few outputs it closed unseen for a newer one
+// (superseded, 4.1) are in these rows but not in its own.
 type hostStages struct {
 	mu   sync.Mutex
 	sent [512]hostStage // recent frames by seq, until acknowledged
@@ -2089,22 +2114,49 @@ func pctString(v []float64) string {
 
 // stageNames are the rows a client latency summary may contain: present,
 // submit and encode split capture->encoded where the native helper stamps
-// present and encoder submit times.
+// present and encoder submit times; hold is the frame pacing wait (step 4.4,
+// to hosts that announce FeatureStageHold).
 var stageNames = map[string]bool{"present": true, "capture": true, "submit": true, "encode": true, "queue": true, "network": true,
-	"transfer": true, "wait": true, "decode": true, "draw": true, "display": true, "e2e": true}
+	"transfer": true, "wait": true, "decode": true, "hold": true, "draw": true, "display": true, "e2e": true}
+
+// stageNamesBeforeHold are the rows hosts before step 4.4 accepted (no hold),
+// as the hosts before step 3.1b had them (no present, submit and encode
+// either, at most nine): what the test hook pre-stage-hold (TestFaultsEnv)
+// plays, the strictest host without stage-hold a client meets (hosts from
+// 3.1b on took twelve).
+var stageNamesBeforeHold = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
+	"decode": true, "draw": true, "display": true, "e2e": true}
+
+// rendererName accepts the presentation paths a client may name.
+var rendererName = regexp.MustCompile(`^[a-z0-9-]{1,24}$`)
+
+// pacingModes are the frame pacing modes a client may name (step 4.4).
+var pacingModes = map[string]bool{"latency": true, "smooth": true, "mixed": true}
 
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
-// the host's own measurement of its stages (host_capture, host_queue).
-func (s *Session) logStages(rows []proto.StageStat) {
+// the host's own measurement of its stages (host_capture, host_queue), with
+// the client's presentation path (renderer) and frame pacing mode (pacing)
+// when it names them.
+func (s *Session) logStages(rows []proto.StageStat, renderer, pacing string) {
+	names := stageNames
+	if s.a.faults.preStageHold {
+		names = stageNamesBeforeHold
+	}
 	p, ok := s.vid().Active()
-	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
+	if !ok || len(rows) == 0 || len(rows) > len(names) {
 		return
 	}
 	args := []any{"encoder", p.Encoder.Name, "vendor", p.Encoder.Vendor, "source", p.Source.Backend, "fps", p.FPS,
 		"kbps", p.BitrateKbps}
+	if rendererName.MatchString(renderer) {
+		args = append(args, "renderer", renderer)
+	}
+	if pacingModes[pacing] {
+		args = append(args, "pacing", pacing)
+	}
 	for _, r := range rows {
-		if !stageNames[r.Name] {
+		if !names[r.Name] {
 			continue
 		}
 		if r.Name == "e2e" && (r.From == "capture" || r.From == "send") {

@@ -3,11 +3,17 @@
 // input handling) can delay a frame.
 //
 //   WebTransport (per-frame QUIC streams + datagrams) or WebSocket fallback
-//     -> reorder by sequence -> VideoDecoder (optimizeForLatency)
-//     -> immediate draw on a desynchronized 2D canvas or WebGPU external texture
+//     -> reorder by sequence -> VideoDecoder (optimizeForLatency, at most 2 queued)
+//     -> frame pacing (pacing.js): draw on decode (Lowest latency) or at the
+//        next display refresh (Smooth)
+//     -> desynchronized 2D canvas, WebGL2 texture upload or WebGPU external
+//        texture (renderers.js), on a canvas sized to device pixels
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
+import { runSelfTests, helloDecoder } from './decoder-selftest.js';
+import { createRenderer, LABELS, PATHS, PICK, pickPath, withTimeout } from './renderers.js';
+import { Pacer } from './pacing.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -19,8 +25,8 @@ const now = () => performance.now();
 let transport = null;
 let prefs = {};
 let byeReason = '';
-let renderer = null;
-let canvas = null;
+let hostFeatures = []; // welcome.features
+let renderer = null; // the active presentation path (see Presentation)
 
 const video = {
   cfg: null,
@@ -46,6 +52,12 @@ const video = {
   recover: null,
   recoveredAt: null,
   refRejected: new Set(),
+  queue: [], // chunks waiting for room in the decoder (feedDecoder)
+  submitted: 0, // chunks submitted to this decoder
+  queueMax: 0, // highest decodeQueueSize after a decode() this session
+  waitingMax: 0, // most chunks waiting in video.queue at once this session
+  selfTest: [], // decoder self-test per family (decoder-selftest.js)
+  softwareFor: new Set(), // families decoded in software: their hardware decoder held frames back
 };
 
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
@@ -54,7 +66,7 @@ const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
   recovered: 0, recoveredByKey: 0, recoveryDiscarded: 0, recoveryRejected: 0, keyFrames: 0,
-  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0,
+  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, supersededChunks: 0, lagMin: Infinity,
 };
 
 // Freezes: the picture stood still more than FREEZE_MS longer than the
@@ -117,7 +129,10 @@ function sendRateReport() {
   fb.sent++;
   transport.sendDatagram(P.rateReport({
     flags, gen: Math.max(0, fb.gen), timeMs: now(), lastSeq: fb.lastSeq, frames: fb.frames, bytes: fb.bytes,
-    owdP50Us: p50 * 1000, owdMaxUs: max * 1000, lost: fb.lost, audio: fb.audio, decodeQueue: video.inflight.size,
+    owdP50Us: p50 * 1000, owdMaxUs: max * 1000, lost: fb.lost, audio: fb.audio,
+    // The decoder's backlog: chunks in the decoder and waiting in front of it
+    // (MAX_DECODE_QUEUE), as checkDecoderBacklog counts it.
+    decodeQueue: video.inflight.size + video.queue.length,
   }));
 }
 
@@ -177,14 +192,6 @@ function b64(s) {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
-}
-
-function withTimeout(p, ms, what) {
-  let t;
-  return Promise.race([
-    p.finally(() => clearTimeout(t)),
-    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out`)), ms); }),
-  ]);
 }
 
 /** Incremental parser for u32-length-prefixed messages on a byte stream. */
@@ -398,229 +405,239 @@ async function connect(ep) {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Presentation (guide step 4.3; the paths are in renderers.js). The main
+// thread hands over one canvas per path the session may use (msg.canvases,
+// in order) and how to choose (msg.present.mode):
+//
+//   setting   the user picked a path: its canvas only (2D on it if that path
+//             does not work here)
+//   auto      renderer "auto" with a stored result for this browser/OS: the
+//             winner's canvas (2D on it if the winner no longer works)
+//   bakeoff   renderer "auto" without one: a canvas per path; the paths that
+//             work take turns on the live stream, their draw and display
+//             stages (Phase 0) are measured, Auto's pick (pickPath) stays
+//             and the main thread stores it (localStorage) with the numbers
+//
+// A path Auto picked that then fails FAIL_STREAK draws in a row (a lost
+// context, frames that do not upload) is given up: the main thread forgets
+// it and reconnects with the 2D canvas ('presentFailed'; a canvas keeps its
+// context type). A path picked in the settings stays (errors in the overlay).
+//
+// The main thread shows the active renderer's canvas ('renderer', posted
+// after the renderer's first frame), removes the canvases of paths that are
+// gone ('gone'), and reports the canvas box in device pixels ('resize'):
+// every renderer sizes its canvas to it, so the compositor never scales the
+// picture.
 
-class Canvas2DRenderer {
-  constructor(c) {
-    this.c = c;
-    this.ctx = c.getContext('2d', { alpha: false, desynchronized: true });
-    this.name = 'canvas2d-desync';
-  }
-  // req: latency probe sample; the corner is read back after the draw from a clone.
-  // vis: the part of the frame to show (P.visibleArea).
-  draw(frame, req, vis) {
-    if (req) req.clone = frame.clone();
-    const w = Math.round(vis.w);
-    const h = Math.round(vis.h);
-    if (this.c.width !== w || this.c.height !== h) {
-      this.c.width = w;
-      this.c.height = h;
-    }
-    if (vis.fx < 1 || vis.fy < 1) this.ctx.drawImage(frame, 0, 0, vis.w, vis.h, 0, 0, w, h); // padding cropped
-    else this.ctx.drawImage(frame, 0, 0);
-    frame.close();
-  }
-}
+const pres = {
+  mode: 'setting',
+  list: [], // renderers, each on its own canvas (r.slot: the path the canvas was made for)
+  errors: {}, // path -> why it does not work here
+  box: null, // [w, h] device pixels of the canvas box
+  next: null, // the renderer that takes over before the next draw
+  retire: [], // renderers dropped once the next one has drawn
+  announce: false, // post 'renderer' after the next draw
+  bake: null,
+  drawErrors: 0,
+  lastError: '',
+  failStreak: 0, // draws in a row that failed
+  refreshMs: 1000 / 60, // the display's refresh interval (main thread's measurement at page load)
+};
 
-const WGSL = `
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex: texture_external;
-@group(0) @binding(2) var<uniform> crop: vec4f; // xy: visible share of the frame (VideoConfig crop)
-struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
-@vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
-  var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
-  var o: VOut;
-  o.pos = vec4f(p[i], 0.0, 1.0);
-  o.uv = vec2f((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5) * crop.xy;
-  return o;
-}
-@fragment fn fs(v: VOut) -> @location(0) vec4f {
-  return textureSampleBaseClampToEdge(tex, samp, v.uv);
-}`;
+const FAIL_STREAK = 30;
 
-// Latency probe on the WebGPU path: one texel per barcode cell, the mean of
-// 4x4 samples over the cell's inner half, rendered from the external texture
-// the frame is drawn from; copyTextureToBuffer + mapAsync read the 8x3 texels
-// back without a frame readback or a pipeline stall.
-const PROBE_WGSL = `
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex: texture_external;
-@group(0) @binding(2) var<uniform> cell: vec4f; // xy: cell size in texture coordinates
-@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
-  var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
-  return vec4f(p[i], 0.0, 1.0);
-}
-@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let c = floor(pos.xy);
-  var acc = vec3f(0.0);
-  for (var j = 0; j < 4; j++) {
-    for (var i = 0; i < 4; i++) {
-      let f = vec2f(0.3125 + f32(i) * 0.125, 0.3125 + f32(j) * 0.125);
-      acc += textureSampleBaseClampToEdge(tex, samp, (c + f) * cell.xy).rgb;
-    }
-  }
-  return vec4f(acc / 16.0, 1.0);
-}`;
-
-class WebGPURenderer {
-  // Runs the full import -> draw -> submit path on a scratch canvas first: a
-  // canvas cannot switch context types, so the real one is only claimed once
-  // WebGPU demonstrably works on this device/driver.
-  static async selfTest(device, format, pipelineFor) {
-    const scratch = new OffscreenCanvas(16, 16);
-    const ctx = scratch.getContext('webgpu');
-    ctx.configure({ device, format, alphaMode: 'opaque' });
-    const src = new OffscreenCanvas(16, 16);
-    src.getContext('2d').fillRect(0, 0, 16, 16);
-    const vf = new VideoFrame(src, { timestamp: 0 });
-    const crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+async function setupRenderers(msg) {
+  pres.mode = msg.present?.mode || 'setting';
+  if (msg.box?.w > 0 && msg.box?.h > 0) pres.box = [msg.box.w, msg.box.h];
+  if (msg.client?.hz > 0) pres.refreshMs = 1000 / msg.client.hz;
+  const log = (text) => post('log', { text });
+  for (const [slot, c] of Object.entries(msg.canvases || {})) {
+    let r = null;
     try {
-      device.pushErrorScope('validation');
-      const { pipeline, sampler } = pipelineFor;
-      const ext = device.importExternalTexture({ source: vf });
-      device.queue.writeBuffer(crop, 0, new Float32Array([1, 1, 0, 0]));
-      const bg = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [{ binding: 0, resource: sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: crop } }],
-      });
-      const enc = device.createCommandEncoder();
-      const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bg);
-      pass.draw(3);
-      pass.end();
-      device.queue.submit([enc.finish()]);
-      await withTimeout(device.queue.onSubmittedWorkDone(), 1500, 'WebGPU self-test');
-      const err = await device.popErrorScope();
-      if (err) throw new Error(err.message);
-    } finally {
-      vf.close();
-      crop.destroy();
-    }
-  }
-
-  static async create(c) {
-    if (!self.navigator.gpu) throw new Error('WebGPU unavailable');
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) throw new Error('no WebGPU adapter');
-    const device = await adapter.requestDevice();
-    const formatProbe = navigator.gpu.getPreferredCanvasFormat();
-    {
-      const m = device.createShaderModule({ code: WGSL });
-      const pl = device.createRenderPipeline({
-        layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: formatProbe }] },
-        primitive: { topology: 'triangle-list' },
-      });
-      await WebGPURenderer.selfTest(device, formatProbe, { pipeline: pl, sampler: device.createSampler() });
-    }
-    const ctx = c.getContext('webgpu');
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    ctx.configure({ device, format, alphaMode: 'opaque' });
-    const module = device.createShaderModule({ code: WGSL });
-    const pipeline = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module, entryPoint: 'vs' },
-      fragment: { module, entryPoint: 'fs', targets: [{ format }] },
-      primitive: { topology: 'triangle-list' },
-    });
-    const r = new WebGPURenderer();
-    Object.assign(r, { c, device, ctx, pipeline, sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }), prev: null, name: 'webgpu-zero-copy' });
-    r.crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    r.cropXY = [0, 0];
-    try {
-      device.pushErrorScope('validation');
-      const pm = device.createShaderModule({ code: PROBE_WGSL });
-      r.probePipeline = device.createRenderPipeline({
-        layout: 'auto', vertex: { module: pm, entryPoint: 'vs' }, fragment: { module: pm, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
-        primitive: { topology: 'triangle-list' },
-      });
-      const err = await device.popErrorScope();
-      if (err) throw new Error(err.message);
-      r.probeTex = device.createTexture({ size: [P.BARCODE_COLS, P.BARCODE_ROWS], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-      r.probeCell = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      // Two readbacks in flight at most (probe.inflight); rows are 256-byte aligned.
-      r.probeBufs = [0, 1].map(() => device.createBuffer({ size: 256 * P.BARCODE_ROWS, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }));
+      r = await createRenderer(slot, c, { log });
     } catch (e) {
-      r.probePipeline = null; // the probe falls back to a frame copy
-      post('log', { text: `WebGPU latency probe unavailable (${e.message})` });
-    }
-    return r;
-  }
-  draw(frame, req, vis) {
-    const w = Math.round(vis.w);
-    const h = Math.round(vis.h);
-    if (this.c.width !== w || this.c.height !== h) {
-      this.c.width = w;
-      this.c.height = h;
-    }
-    if (this.cropXY[0] !== vis.fx || this.cropXY[1] !== vis.fy) {
-      // Texture coordinates span the visible part only (VideoConfig crop).
-      this.cropXY = [vis.fx, vis.fy];
-      this.device.queue.writeBuffer(this.crop, 0, new Float32Array([vis.fx, vis.fy, 0, 0]));
-    }
-    const ext = this.device.importExternalTexture({ source: frame });
-    const bg = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.crop } }],
-    });
-    const enc = this.device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-    });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, bg);
-    pass.draw(3);
-    pass.end();
-    const buf = req ? this.probePass(enc, ext, frame, req) : null;
-    this.device.queue.submit([enc.finish()]);
-    if (buf) req.luma = this.probeRead(buf);
-    else if (req) req.clone = frame.clone();
-    // Keep the frame alive until the next one so the GPU never samples a closed frame.
-    if (this.prev) this.prev.close();
-    this.prev = frame;
-  }
-  probePass(enc, ext, frame, req) {
-    if (!this.probePipeline || !this.probeBufs.length) return null;
-    const buf = this.probeBufs.pop();
-    this.device.queue.writeBuffer(this.probeCell, 0, new Float32Array([req.cell / frame.displayWidth, req.cell / frame.displayHeight, 0, 0]));
-    const bg = this.device.createBindGroup({
-      layout: this.probePipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.probeCell } }],
-    });
-    const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.probeTex.createView(), loadOp: 'clear', storeOp: 'store' }] });
-    pass.setPipeline(this.probePipeline);
-    pass.setBindGroup(0, bg);
-    pass.draw(3);
-    pass.end();
-    enc.copyTextureToBuffer({ texture: this.probeTex }, { buffer: buf, bytesPerRow: 256, rowsPerImage: P.BARCODE_ROWS }, [P.BARCODE_COLS, P.BARCODE_ROWS]);
-    return buf;
-  }
-  async probeRead(buf) {
-    try {
-      await buf.mapAsync(GPUMapMode.READ);
-      const px = new Uint8Array(buf.getMappedRange());
-      const luma = [];
-      for (let k = 0; k < P.BARCODE_BITS; k++) {
-        const o = Math.floor(k / P.BARCODE_COLS) * 256 + (k % P.BARCODE_COLS) * 4;
-        luma.push(0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2]);
+      pres.errors[slot] = e.message;
+      log(`${LABELS[slot] || slot} renderer unavailable (${e.message})`);
+      if (pres.mode !== 'bakeoff' && slot !== 'canvas2d') {
+        log('using the low-latency 2D canvas instead');
+        r = await createRenderer('canvas2d', c, { log }).catch(() => null); // the canvas may be claimed already
       }
-      return luma;
-    } finally {
-      if (buf.mapState !== 'unmapped') { try { buf.unmap(); } catch {} }
-      this.probeBufs.push(buf);
     }
+    if (!r) {
+      post('gone', { slot });
+      continue;
+    }
+    r.slot = slot;
+    if (pres.box) r.resize(...pres.box);
+    pres.list.push(r);
+  }
+  renderer = pres.list[0];
+  if (!renderer) throw new Error('no renderer works in this browser');
+  pres.announce = true;
+  if (pres.mode === 'bakeoff') {
+    const order = pres.list.map((r) => r.name);
+    const per = (v) => Object.fromEntries(order.map((p) => [p, v()]));
+    pres.bake = {
+      order, slot: 0, t0: 0, slotStart: 0, lastT: 0, recs: per(() => Array.from({ length: BAKE.rounds }, () => [])), dur: per(() => 0), errors: per(() => 0),
+      done: false, result: null,
+    };
+    post('log', { text: `presentation bake-off: ${order.join(', ')}` });
   }
 }
 
-async function makeRenderer() {
-  if (prefs.renderer === 'webgpu') {
-    try {
-      return await WebGPURenderer.create(canvas);
-    } catch (e) {
-      post('log', { text: `WebGPU renderer unavailable (${e.message}); using low-latency 2D canvas` });
-    }
+function rendererInfo() {
+  const r = renderer;
+  return {
+    name: r.name, slot: r.slot, mode: pres.mode, desynchronized: r.desynchronized, gpu: r.gpu, canvas: r.canvasSize(),
+    errors: pres.errors, drawErrors: pres.drawErrors, bake: bakeState(),
+  };
+}
+
+// The next renderer takes over before a draw; it is announced after it.
+function switchRenderer() {
+  const r = pres.next;
+  pres.next = null;
+  if (!r || r === renderer) return;
+  renderer.idle();
+  renderer = r;
+  pres.announce = true;
+  pres.failStreak = 0;
+}
+
+function announceRenderer() {
+  pres.announce = false;
+  post('renderer', { info: rendererInfo() });
+  if (pres.retire.length) post('log', { text: `presentation: ${renderer.name} draws; ${pres.retire.map((r) => r.name).join(', ')} released` });
+  for (const r of pres.retire) {
+    try { r.destroy(); } catch {}
+    post('gone', { slot: r.slot });
   }
-  return new Canvas2DRenderer(canvas);
+  pres.retire = [];
+}
+
+function renderError(e) {
+  pres.drawErrors++;
+  if (e.message !== pres.lastError) post('log', { text: `render error (${renderer.name}): ${e.message}` });
+  pres.lastError = e.message;
+}
+
+// After every draw: Auto gives up on a path it picked once FAIL_STREAK draws
+// in a row failed (see Presentation above).
+function drawResult(ok) {
+  pres.failStreak = ok ? 0 : pres.failStreak + 1;
+  if (pres.failStreak !== FAIL_STREAK || renderer.name === 'canvas2d') return;
+  if (pres.mode !== 'auto' && !(pres.mode === 'bakeoff' && pres.bake?.done)) return;
+  post('log', { text: `presentation: ${renderer.name} failed ${FAIL_STREAK} draws in a row (${pres.lastError}); reconnecting with the 2D canvas` });
+  post('presentFailed', { path: renderer.name, reason: pres.lastError });
+}
+
+function onResize(w, h) {
+  if (!(w > 0 && h > 0)) return;
+  pres.box = [w, h];
+  for (const r of pres.list) r.resize(w, h);
+  try {
+    renderer?.redraw(); // WebGL2 / WebGPU still hold the last picture; 2D resizes with the next frame
+  } catch (e) {
+    renderError(e);
+  }
+}
+
+// Presentation bake-off: after BAKE.warmupMs of streaming (decoder warm-up)
+// the paths take turns, A B C C B A (no path always measured first),
+// BAKE.slotMs of drawn frames each (the first BAKE.skipMs after a switch do
+// not count). Meanwhile display marks are taken as often as the main thread
+// answers them. Per path: the draw and display stages (p50, p95, mean), the
+// draw p50 per round, the frames per second it drew and its failed draws
+// (they count for nothing else); renderers.js pickPath() picks from them.
+// The main thread keeps everything off the canvas while this runs. The
+// result names the frame pacing mode(s) it ran in (step 4.4; the draw stage
+// does not depend on it, the display stage does, alike for every path).
+const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250 };
+
+const baking = () => !!pres.bake && !pres.bake.done;
+
+// Slot i's path: forward in even rounds, backward in odd ones.
+function bakePath(b, i) {
+  const n = b.order.length;
+  const k = i % n;
+  return b.order[Math.floor(i / n) % 2 ? n - 1 - k : k];
+}
+
+// After each draw at time t, with its stage record (null: the draw failed).
+// A slot's time runs from its first frame; the frame rate counts the time
+// between counted frames (gaps capped at 100 ms, so a pause does not count).
+function bakeTick(t, rec) {
+  const b = pres.bake;
+  if (!b || b.done) return;
+  const path = renderer.name;
+  if (!rec && path in b.errors) b.errors[path]++;
+  const gap = Math.min(t - b.lastT, 100);
+  b.lastT = t;
+  if (!b.t0) b.t0 = t;
+  if (t - b.t0 < BAKE.warmupMs) return;
+  if (!b.slotStart) b.slotStart = t;
+  if (rec && t - b.slotStart >= BAKE.skipMs && b.recs[path]) {
+    b.recs[path][Math.floor(b.slot / b.order.length)].push(rec);
+    b.dur[path] += gap;
+  }
+  if (t - b.slotStart < BAKE.slotMs) return;
+  b.slotStart = 0;
+  if (++b.slot >= b.order.length * BAKE.rounds) {
+    bakeFinish();
+    return;
+  }
+  pres.next = pres.list.find((r) => r.name === bakePath(b, b.slot));
+}
+
+function bakeStat(v) {
+  const s = pct(v);
+  return s ? { p50: s.p50, p95: s.p95, mean: +(v.reduce((a, x) => a + x, 0) / v.length).toFixed(2), n: s.n } : { n: 0 };
+}
+
+function bakeFinish() {
+  const b = pres.bake;
+  b.done = true;
+  const results = {};
+  for (const path of PATHS) {
+    const r = pres.list.find((x) => x.name === path);
+    if (!r) {
+      results[path] = { error: pres.errors[path] || 'not tried' };
+      continue;
+    }
+    const recs = b.recs[path].flat();
+    const draw = recs.map((x) => x.s[ST.draw]);
+    const display = recs.filter((x) => x.s[ST.display] !== null).map((x) => x.s[ST.display]);
+    results[path] = {
+      desynchronized: r.desynchronized, gpu: r.gpu, draw: bakeStat(draw), display: bakeStat(display),
+      drawRounds: b.recs[path].map((v) => pct(v.map((x) => x.s[ST.draw]))?.p50 ?? null),
+      fps: b.dur[path] ? +((1000 * recs.length) / b.dur[path]).toFixed(1) : 0, errors: b.errors[path], lost: !!r.lost,
+    };
+  }
+  const pick = pickPath(results, pres.refreshMs);
+  for (const [p, why] of Object.entries(pick.out)) results[p].out = why;
+  const winner = pick.winner;
+  const pacing = pacingOf(PATHS.flatMap((p) => b.recs[p]?.flat() || []));
+  b.result = { winner, why: pick.why, results, pacing, rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs } };
+  const txt = (p) => {
+    const x = results[p];
+    return x.error ? `${p} unavailable` : `${p} draw p50 ${x.draw.p50 ?? '—'} ms (rounds ${x.drawRounds.join('/')}), display p50 ${x.display.p50 ?? '—'} ms, ${x.fps} fps${x.out ? ` (${x.out})` : ''}`;
+  };
+  post('log', { text: `presentation bake-off (frame pacing ${pacing}): ${winner ? `${winner} (${pick.why})` : 'inconclusive'}; ${PATHS.map(txt).join('; ')}` });
+  post('bakeoff', { result: b.result });
+  // The winner stays (inconclusive: the first path); the others go once it has drawn.
+  const keep = pres.list.find((r) => r.name === winner) || pres.list[0];
+  pres.next = keep;
+  pres.retire = pres.list.filter((r) => r !== keep);
+  pres.list = [keep];
+  pres.announce = true;
+}
+
+function bakeState() {
+  const b = pres.bake;
+  if (!b) return null;
+  if (b.done) return { done: true, ...b.result };
+  const warming = !b.t0 || now() - b.t0 < BAKE.warmupMs;
+  return { done: false, warming, path: renderer?.name, slot: b.slot + 1, slots: b.order.length * BAKE.rounds, order: b.order };
 }
 
 // ---------------------------------------------------------------------------
@@ -628,14 +645,23 @@ async function makeRenderer() {
 
 const isNewerGen = (a, b) => { const d = (a - b) & 0xff; return d > 0 && d < 128; };
 
+// Decoder hygiene (guide step 4.1): prefer-hardware + optimizeForLatency;
+// flush() is never called while streaming (it waits for every output and
+// makes the next chunk a key frame): the backlog recovery and decoder errors
+// reset and reconfigure instead. A family whose hardware decoder held frames
+// back in the startup self-test decodes in software when that passed.
 async function configureDecoder(cfg) {
   video.ready = false;
   if (video.decoder && video.decoder.state !== 'closed') {
     try { video.decoder.close(); } catch {}
   }
   video.inflight.clear();
+  video.queue = [];
+  video.submitted = 0;
   const base = { codec: cfg.codec, optimizeForLatency: true, codedWidth: cfg.codedWidth || cfg.width, codedHeight: cfg.codedHeight || cfg.height };
-  const wantHW = prefs.decoder !== 'software';
+  const avoidHW = video.softwareFor.has(cfg.family);
+  const wantHW = prefs.decoder !== 'software' && !avoidHW;
+  if (avoidHW && prefs.decoder !== 'software') post('log', { text: `${cfg.codec}: decoding in software, the hardware decoder held frames back in the self-test` });
   let config = { ...base, hardwareAcceleration: wantHW ? 'prefer-hardware' : 'prefer-software' };
   let support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
   video.hw = wantHW && support.supported;
@@ -649,6 +675,7 @@ async function configureDecoder(cfg) {
   }
   if (cfg !== video.cfg) return false; // superseded while awaiting
   video.decoder = new VideoDecoder({ output: onDecoded, error: onDecodeError });
+  video.decoder.ondequeue = feedDecoder; // room in the decoder (browsers without the event: see feedDecoder)
   video.decoder.configure(config);
   video.ready = true;
   return true;
@@ -692,6 +719,7 @@ function requestKeyframe(reason, send = true) {
 // more than a second, ask again. A request can be dropped by the host's rate
 // limits or lost with a connection hiccup; this guarantees video resumes.
 function videoWatchdog() {
+  feedDecoder();
   if (!transport || !video.cfg) return;
   const t = now();
   if (video.recover && t - video.recover.since > recoveryWait()) {
@@ -921,14 +949,20 @@ function onDropped(m) {
 }
 
 // If the decoder cannot keep up (slow device, software decode), frames queue
-// and latency grows without bound. Detect a sustained backlog, drop it, and
-// restart from a fresh key frame (and ask the host to back off).
+// and latency grows without bound. Detect a sustained backlog (chunks in the
+// decoder and waiting in front of it), drop it, and restart from a fresh key
+// frame (and ask the host to back off). Software decoding chosen only because
+// the hardware decoder held frames back goes back to hardware: a frame or
+// two held back costs less than a decoder that cannot keep up. That restart
+// asks for a key frame only: the client's own choice fell behind (the
+// self-test's clip is 640x360), not the device, so the host keeps its
+// bitrate and sets no decoder cap, and there is no overload notice.
 const overload = { since: 0, warned: false };
 function checkDecoderBacklog() {
   const d = video.decoder;
   if (!d || d.state !== 'configured') return false;
   const fps = video.cfg?.fps || 60;
-  const backlog = video.inflight.size;
+  const backlog = video.inflight.size + video.queue.length;
   if (backlog <= Math.max(4, fps / 10)) { overload.since = 0; return false; }
   const t = now();
   if (!overload.since) overload.since = t;
@@ -936,7 +970,13 @@ function checkDecoderBacklog() {
   overload.since = 0;
   try { d.reset(); } catch {}
   video.inflight.clear();
+  const toHW = video.softwareFor.delete(video.cfg.family);
   configureDecoder(video.cfg).then(() => drainEarly());
+  if (toHW) {
+    post('log', { text: 'software decoder fell behind: back to the hardware decoder (it holds frames back)' });
+    requestKeyframe('software decoder backlog');
+    return true;
+  }
   // One message: the host's congestion response lowers the bitrate *and*
   // restarts with a key frame, at once for this reason (other congestion
   // reports restart overlapped while the old generation streams on).
@@ -981,25 +1021,126 @@ function decodeFrame(f) {
     if (ref) awaitRecovery(f.seq, false, 'drop test');
     return;
   }
-  video.inflight.set(f.ptsUs, {
-    recv: f.recv, first: f.first, sendUs: f.sendUs, ext: f.ext, seq: f.seq, gen: f.gen, t: now(),
-  });
-  if (video.inflight.size > 120) video.inflight.delete(video.inflight.keys().next().value);
-  try {
-    d.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.ptsUs, data: f.data }));
-  } catch (e) {
-    onDecodeError(e);
+  if (f.key && video.queue.length) {
+    // Decoding the frames before a key frame would only delay it: nothing
+    // after it refers to them (never decoded: not acknowledged).
+    stats.supersededChunks += video.queue.length;
+    video.queue = [];
+  }
+  video.queue.push(f);
+  feedDecoder();
+  video.waitingMax = Math.max(video.waitingMax, video.queue.length);
+}
+
+// At most MAX_DECODE_QUEUE chunks wait inside the decoder (decodeQueueSize:
+// submitted, not yet taken by the codec); later ones wait in video.queue,
+// where the client can still act on them (a key frame supersedes them, the
+// backlog recovery drops them), until the decoder has room: its 'dequeue'
+// event, an output, the next frame or the watchdog (browsers without the
+// event).
+const MAX_DECODE_QUEUE = 2;
+
+function feedDecoder() {
+  const d = video.decoder;
+  while (video.queue.length && d?.state === 'configured' && d.decodeQueueSize < MAX_DECODE_QUEUE) {
+    const f = video.queue.shift();
+    video.inflight.set(f.ptsUs, {
+      recv: f.recv, first: f.first, sendUs: f.sendUs, ext: f.ext, seq: f.seq, gen: f.gen, t: now(), n: video.submitted++,
+    });
+    if (video.inflight.size > 120) video.inflight.delete(video.inflight.keys().next().value);
+    try {
+      d.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.ptsUs, data: f.data }));
+      video.queueMax = Math.max(video.queueMax, d.decodeQueueSize);
+    } catch (e) {
+      onDecodeError(e);
+      return;
+    }
   }
 }
 
 let firstFrame = true;
 
+// Every VideoFrame the worker holds (decoder outputs, probe clones) until it
+// is closed. An open frame pins one of the decoder's output buffers, and a
+// hardware decoder whose pool runs dry stalls (w3c/webcodecs#680), so each is
+// closed as soon as it is drawn (the WebGPU renderer keeps exactly one,
+// this.prev, until the next draw). Counted from the frames themselves (a
+// closed frame has a coded width of 0), not from the code that closes them:
+// frames.max is the most open at once; a frame still open after
+// FRAME_LEAK_LIMIT newer ones is a leak: closed here and counted.
+const FRAME_LEAK_LIMIT = 16;
+const frames = { open: new Set(), max: 0, leaked: 0 };
+
+function openFrames() {
+  for (const f of frames.open) if (!f.codedWidth) frames.open.delete(f);
+  for (const f of frames.open) {
+    if (frames.open.size <= FRAME_LEAK_LIMIT) break;
+    frames.open.delete(f);
+    f.close();
+    if (!frames.leaked++) post('log', { text: 'VideoFrame leak: a frame was never closed (closed now)' });
+  }
+  return frames.open.size;
+}
+
+function trackFrame(f) {
+  frames.open.add(f);
+  frames.max = Math.max(frames.max, openFrames());
+}
+
+// Frame pacing (step 4.4, pacing.js; prefs.pacing, applied live). Lowest
+// latency draws on decode, one task after the output: outputs already queued
+// behind it (a burst after a stall or a backlog, a decoder that releases
+// frames together) supersede it, and only the newest is drawn. Smooth draws
+// at the next display refresh (the worker's requestAnimationFrame), one frame
+// waiting at most, a newer output replacing it. Frames dropped either way are
+// closed unseen and acknowledged as decoded (stats.superseded; Smooth's stale
+// frames: pacer.counts.stale). The wait is the "hold" stage.
+const pacer = new Pacer({
+  draw: (it) => drawFrame(it.frame, it.meta, it.decoded, it),
+  drop: (it, why) => {
+    it.frame.close();
+    if (why === 'superseded') stats.superseded++;
+    if (it.meta) ackFrame(it.meta, it.decoded);
+  },
+  newerComing: () => video.inflight.size + video.queue.length > 0,
+  refreshMs: () => pres.refreshMs, // until its ticks show the interval
+  // Read on every request (a browser without it in workers: the main thread's ticks).
+  raf: () => (typeof self.requestAnimationFrame === 'function' ? (cb) => self.requestAnimationFrame(cb) : null),
+  mainTicks: (on) => post('ticks', { on }),
+  now,
+  log: (text) => post('log', { text }),
+});
+
 function onDecoded(frame) {
+  trackFrame(frame);
   const meta = video.inflight.get(frame.timestamp);
   video.inflight.delete(frame.timestamp);
   const dt = dropTest.run;
   if (dt && meta && meta.gen === dt.gen && meta.seq > dt.seq) dt.decoded++;
   const decoded = now();
+  if (meta) {
+    // Output lag: chunks submitted after this one before it came out (a
+    // decoder that holds frames back never gets below its hold).
+    stats.lagMin = Math.min(stats.lagMin, video.submitted - meta.n - 1);
+    stats.decodeSum += decoded - meta.t;
+    stats.decodeN++;
+  }
+  feedDecoder();
+  pacer.offer({ frame, meta, decoded });
+}
+
+// Frame acknowledgement (0x40): one-way delay and decode time of a decoded frame.
+function ackFrame(meta, decoded) {
+  if (clock.offset === null) return null;
+  const owd = meta.recv - hostToLocal(sentUs(meta));
+  transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, (decoded - meta.t) * 1000));
+  return owd;
+}
+
+// pace: the pacer's item (via: what started the draw; tick: the refresh's start and
+// refresh: the refresh interval it judged the frame by, in Smooth).
+function drawFrame(frame, meta, decoded, pace) {
+  const start = now(); // the hold ends
   // Padding the host announced (VideoConfig crop) is not shown.
   const vr = frame.visibleRect;
   const vis = P.visibleArea(video.cfg, vr ? vr.width : frame.displayWidth, vr ? vr.height : frame.displayHeight, frame.displayWidth, frame.displayHeight);
@@ -1012,14 +1153,18 @@ function onDecoded(frame) {
       post('log', { text: `padded picture: coded ${c.codedWidth}x${c.codedHeight} announced, decoder output ${vr?.width}x${vr?.height} (display ${frame.displayWidth}x${frame.displayHeight}), showing ${size}` });
     }
   }
+  if (pres.next) switchRenderer();
   const req = probeStart(frame, meta, vis);
+  let drew = true;
   try {
     renderer.draw(frame, req, vis);
   } catch (e) {
+    drew = false;
     frame.close();
-    post('log', { text: `render error: ${e.message}` });
+    renderError(e);
   }
   const presented = now();
+  if (req?.clone) trackFrame(req.clone);
   if (req) probeSample(req, presented);
   stats.frames++;
   if (meta) {
@@ -1036,22 +1181,20 @@ function onDecoded(frame) {
     firstFrame = false;
     post('firstFrame', { renderer: renderer.name });
   }
-  if (!meta) return;
-  const decodeMs = decoded - meta.t;
-  stats.decodeSum += decodeMs;
-  stats.decodeN++;
-  if (clock.offset !== null) {
-    const owd = meta.recv - hostToLocal(sentUs(meta));
-    const rec = recordStages(meta, decoded, presented);
-    stats.owdSum += owd;
-    stats.owdN++;
-    stats.totalSum += rec.e2e;
-    stats.sendSum += rec.e2eSend;
-    stats.totalN++;
-    stats.totalMin = Math.min(stats.totalMin, rec.e2e);
-    stats.totalMax = Math.max(stats.totalMax, rec.e2e);
-    transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, decodeMs * 1000));
-  }
+  if (pres.announce) announceRenderer();
+  drawResult(drew);
+  if (!meta || clock.offset === null) return;
+  stats.owdSum += ackFrame(meta, decoded);
+  stats.owdN++;
+  // A failed draw put nothing on screen: no stage record (draw, display, e2e).
+  const rec = drew ? recordStages(meta, decoded, start, presented, pace) : null;
+  bakeTick(presented, rec);
+  if (!rec) return;
+  stats.totalSum += rec.e2e;
+  stats.sendSum += rec.e2eSend;
+  stats.totalN++;
+  stats.totalMin = Math.min(stats.totalMin, rec.e2e);
+  stats.totalMax = Math.max(stats.totalMax, rec.e2e);
 }
 
 // Debug toggle for the decoder checks in docs/VENDOR_NOTES.md (1.4, 3.5): does
@@ -1085,17 +1228,21 @@ function finishDropTest() {
 // ---------------------------------------------------------------------------
 // Per-stage latency. Host stamps (capture, encodeDone: frame header extension;
 // send: header) are host-clock µs, converted with the clock sync; the client
-// adds first/last byte, decode submit/output, drawn and displayed (estimate:
-// the main thread's next requestAnimationFrame after the draw, sampled).
+// adds first/last byte, decode submit/output, draw start, drawn and displayed
+// (estimate: the main thread's next requestAnimationFrame after the draw,
+// sampled).
 //
 //   capture→encodeDone | host queue | network (send→first byte) | transfer |
-//   reorder/wait (last byte→submit) | decode | draw | display (est.)
+//   reorder/wait (last byte→submit) | decode | hold (output→draw start: the
+//   frame pacing wait, step 4.4) | draw | display (est.)
 //
 // End-to-end runs from capture (or send, when the host cannot stamp the
 // capture) to drawn and is the per-frame sum of the stages in that span; the
-// sampled display estimate comes on top.
+// sampled display estimate comes on top. Hosts without the welcome feature
+// stage-hold get hold and draw as one draw row (decoder output → drawn).
 
-const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'draw', 'display'];
+const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'hold', 'draw', 'display'];
+const ST = Object.fromEntries(STAGES.map((name, i) => [name, i]));
 // Frames of the native encoder helper also carry the game's present and the
 // encoder submit time: present->capture (before end-to-end starts), and
 // capture->encoded split into capture->submit and encode. Not in the sum.
@@ -1104,7 +1251,7 @@ const STAGE_WINDOW_MS = 10000;
 const DISPLAY_SAMPLE_MS = 50; // display marks: ~20/s keeps the main thread's rAF work small
 const lat = { recs: [], pending: null, markId: 0, lastMark: 0, lastReport: now() };
 
-function recordStages(m, decoded, drawn) {
+function recordStages(m, decoded, start, drawn, pace) {
   const capUs = m.ext?.captureUs;
   const doneUs = m.ext?.encodeDoneUs;
   const presUs = m.ext?.presentUs;
@@ -1122,20 +1269,24 @@ function recordStages(m, decoded, drawn) {
   s[3] = m.recv - m.first;
   s[4] = m.t - m.recv;
   s[5] = decoded - m.t;
-  s[6] = drawn - decoded;
+  s[ST.hold] = start - decoded;
+  s[ST.draw] = drawn - start;
   const fromCapture = s[0] !== null;
+  const pacing = pace?.via === 'hop' ? 'latency' : 'smooth';
   const rec = {
-    t: drawn, s, d, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture,
+    t: drawn, s, d, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name, pacing,
     raw: {
       presentUs: presUs, captureUs: capUs, encodeSubmitUs: subUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset,
-      first: m.first, last: m.recv, submit: m.t, output: decoded, drawn,
+      first: m.first, last: m.recv, submit: m.t, output: decoded,
+      drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null, refresh: pace?.refresh ?? null,
     },
   };
   lat.recs.push(rec);
   while (lat.recs.length && lat.recs[0].t < drawn - STAGE_WINDOW_MS) lat.recs.shift();
-  // At most one display mark in flight: the main thread answers within a refresh.
+  // At most one display mark in flight: the main thread answers within a
+  // refresh. The presentation bake-off takes one whenever it can.
   if (lat.pending && drawn - lat.pending.t > 250) lat.pending = null; // main thread throttled (hidden)
-  if (!lat.pending && drawn - lat.lastMark >= DISPLAY_SAMPLE_MS) {
+  if (!lat.pending && drawn - lat.lastMark >= (baking() ? 0 : DISPLAY_SAMPLE_MS)) {
     lat.pending = rec;
     lat.lastMark = drawn;
     rec.mark = ++lat.markId;
@@ -1152,7 +1303,7 @@ function onDisplayed(id, abs) {
   const shown = abs - performance.timeOrigin;
   if (shown < rec.t) return;
   rec.raw.displayed = shown;
-  rec.s[7] = shown - rec.t;
+  rec.s[ST.display] = shown - rec.t;
 }
 
 function pct(v) {
@@ -1178,7 +1329,7 @@ function stageSummary() {
   let sum = 0;
   let e2eSum = 0;
   for (const r of recs) {
-    for (let i = first; i < 7; i++) sum += r.s[i];
+    for (let i = first; i < ST.display; i++) sum += r.s[i];
     e2eSum += fromCapture ? r.e2e : r.e2eSend;
   }
   return {
@@ -1190,15 +1341,30 @@ function stageSummary() {
   };
 }
 
+// The frame pacing mode the records were drawn in: latency, smooth, or mixed
+// (the setting changed meanwhile); null without records.
+function pacingOf(recs) {
+  const modes = new Set(recs.map((r) => r.pacing));
+  return modes.size > 1 ? 'mixed' : modes.size ? [...modes][0] : null;
+}
+
 // Every 10 s the host logs the summary next to its encoder (results per vendor).
 function reportStages(sum) {
   const t = now();
   if (!sum || t - lat.lastReport < 10000 || !transport) return;
   lat.lastReport = t;
+  // Hosts before step 4.4 take no hold row (at most 9 rows before step 3.1b,
+  // 12 since): hold and draw as one draw row there.
+  const hold = hostFeatures.includes(P.FEATURE_STAGE_HOLD);
+  const stages = hold ? sum.stages : { ...sum.stages, hold: null, draw: pct(lat.recs.map((r) => r.s[ST.hold] + r.s[ST.draw])) };
   const rows = [];
-  for (const name of [...STAGES, ...DETAIL_STAGES]) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
+  for (const name of [...STAGES, ...DETAIL_STAGES]) if (stages[name]) rows.push({ name, ...stages[name] });
   rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
-  transport.sendControl({ t: 'stages', stages: rows });
+  // The presentation path that drew the window's frames (draw and display
+  // depend on it); "bakeoff" for a window with several (the bake-off). The
+  // frame pacing mode (hold and display depend on it).
+  const paths = new Set(lat.recs.map((r) => r.path));
+  transport.sendControl({ t: 'stages', stages: rows, renderer: paths.size === 1 ? [...paths][0] : 'bakeoff', pacing: pacingOf(lat.recs) });
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,9 +1383,11 @@ function reportStages(sum) {
 //              clock sync. Latency: page drew it -> drawn here, which adds the
 //              host's render, present and capture delay to capture -> drawn.
 //
-// Readback never stalls the decoder: Canvas2D reads a clone of the frame
-// after the draw (VideoFrame.copyTo of the corner, else drawImage into a
-// small canvas), WebGPU renders the cells into 8x3 texels and maps them.
+// Readback never stalls the decoder: the 2D renderer hands over a clone of
+// the frame, read after the draw (VideoFrame.copyTo of the corner, else
+// drawImage into a small canvas); WebGL2 and WebGPU render the cells from the
+// texture the frame was drawn from into 8x3 texels and read those back
+// asynchronously (renderers.js).
 
 const PROBE_EVERY = 30;
 const PROBE_RANGE = [-100, 5000]; // ms; outside: implausible (clock or barcode wrong)
@@ -1249,13 +1417,13 @@ function probeStart(frame, meta, vis) {
   if (probe.inflight >= 2) { probe.skipped++; return null; }
   const cell = probe.mode === 'seq' ? P.BARCODE_CELL : vis.w / P.BARCODE_WALLCLOCK_CELLS;
   if (P.BARCODE_COLS * cell > vis.w || P.BARCODE_ROWS * cell > vis.h) { probe.skipped++; return null; }
-  return { mode: probe.mode, epoch: probe.epoch, cell, meta, offset: clock.offset, wallOffsetUs: probe.wallOffsetUs, clone: null, luma: null };
+  return { mode: probe.mode, epoch: probe.epoch, cell, meta, offset: clock.offset, wallOffsetUs: probe.wallOffsetUs, clone: null, luma: null, via: renderer.name };
 }
 
 function probeSample(req, drawn) {
   const luma = req.clone ? readCornerLuma(req.clone, req.cell) : req.luma;
   if (!luma) { probe.skipped++; return; }
-  if (!req.clone) probe.method = 'webgpu';
+  if (!req.clone) probe.method = `${req.via} readback`;
   probe.inflight++;
   luma.then((l) => probeResult(req, drawn, l), (e) => {
     if (e?.message !== probe.lastError) post('log', { text: `latency probe readback failed: ${e?.message}` });
@@ -1514,8 +1682,9 @@ function onAudioPacket(d) {
 function onControl(m) {
   switch (m.t) {
     case 'welcome':
-      probe.features = m.features || [];
-      fb.on = probe.features.includes(P.FEATURE_RATE_REPORT);
+      hostFeatures = m.features || [];
+      probe.features = hostFeatures;
+      fb.on = hostFeatures.includes(P.FEATURE_RATE_REPORT);
       if (fb.on && !fb.timer) fb.timer = setInterval(sendRateReport, RATE_REPORT_MS);
       probe.wallOffsetUs = m.wallOffsetUs ?? null;
       updateProbeMode();
@@ -1593,11 +1762,32 @@ function postStats() {
     audioLost: stats.audioLost,
     audioMs,
     rateReports: fb.on ? fb.sent : null, // rate reports sent so far (null: the host does not want them)
+    // Decoder hygiene (4.1): decodeQueueSize now and its maximum (bound
+    // MAX_DECODE_QUEUE), chunks waiting in front of the decoder, decoded
+    // frames closed unseen for a newer one (superseded) and chunks dropped
+    // undecoded in front of the decoder for a key frame (supersededChunks),
+    // the smallest output lag in this period (frames), the VideoFrames open
+    // now / at most / leaked.
     queue: video.decoder ? video.decoder.decodeQueueSize : 0,
+    queueMax: video.queueMax,
+    waiting: video.queue.length,
+    waitingMax: video.waitingMax,
+    superseded: stats.superseded,
+    supersededChunks: stats.supersededChunks,
+    outputLag: isFinite(stats.lagMin) ? stats.lagMin : null,
+    videoFrames: { open: openFrames(), max: frames.max, leaked: frames.leaked },
+    // Presentation (4.3): the active path, what its context reports, the
+    // canvas size (device pixels) and the bake-off's progress or result.
+    renderer: renderer ? rendererInfo() : null,
+    // Frame pacing (4.4): the mode, where Smooth's refresh ticks come from,
+    // the refresh interval it works with (its ticks' or the page-load
+    // measurement), the draws per source and Smooth's stale (dropped) and
+    // late frames, this session.
+    pacing: pacer.info(),
     hw: video.hw,
     synced: clock.offset !== null,
   });
-  Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0 });
+  Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0, lagMin: Infinity });
 }
 
 async function probeDecoders() {
@@ -1613,14 +1803,42 @@ async function probeDecoders() {
   return out;
 }
 
+// Startup decoder self-test (decoder-selftest.js): results for the overlay
+// (main thread: decoderTest) and the log; families whose hardware decoder
+// holds frames back go to the host as without a hardware decoder (it prefers
+// a family the browser decodes in hardware) and decode in software when that
+// passed. Each family's decode time on the 1080p timing clip goes to the host
+// too (timing), which picks the codec family by it (step 4.2). The hello
+// waits for all of it: its duration goes to the overlay and the log. Returns
+// the hello's decoders.
+async function selfTestDecoders(decoders) {
+  let tests = [];
+  const t0 = performance.now();
+  try {
+    tests = await runSelfTests(decoders, prefs.decoder !== 'software');
+  } catch (e) {
+    post('log', { text: `decoder self-test failed: ${e.message}` });
+  }
+  const ms = Math.round(performance.now() - t0);
+  video.selfTest = tests;
+  for (const t of tests) {
+    if (t.software) video.softwareFor.add(t.family);
+    post('log', { text: `decoder self-test: ${t.text}` });
+  }
+  post('log', { text: `decoder self-test took ${ms} ms` });
+  post('decoderTest', { tests, ms });
+  return decoders.map((d) => helloDecoder(d, tests.find((t) => t.family === d.family)));
+}
+
 async function start(msg) {
   prefs = msg.prefs || {};
-  canvas = msg.canvas;
+  pacer.setMode(prefs.pacing);
   if (msg.audioSab) audio.ring = new RingWriter(msg.audioSab);
   if (msg.audioPort) audio.port = msg.audioPort;
-  renderer = await makeRenderer();
+  await setupRenderers(msg);
   const decoders = await probeDecoders();
   post('decoders', { decoders });
+  const tested = selfTestDecoders(decoders); // while connecting
   let conn;
   try {
     conn = await connect(msg.endpoints);
@@ -1632,10 +1850,12 @@ async function start(msg) {
   post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name });
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
+  const helloDecoders = await tested;
   transport.sendControl({
     t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
-    client: msg.client, decoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
+    client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
   });
+  post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
   const pingTimer = setInterval(sendPing, 1000);
   const watchdogTimer = setInterval(videoWatchdog, 250);
@@ -1662,10 +1882,17 @@ self.onmessage = (ev) => {
       if (m.m?.t === 'pause' || m.m?.t === 'resume') freeze.drawn = 0; // not a freeze
       transport?.sendControl(m.m);
       break;
-    case 'prefs': prefs = { ...prefs, ...m.prefs }; updateProbeMode(); break;
+    case 'prefs':
+      prefs = { ...prefs, ...m.prefs };
+      updateProbeMode();
+      pacer.setMode(prefs.pacing); // live
+      break;
+    case 'tick': pacer.tick(m.t - performance.timeOrigin, 'main'); break; // the main thread's animation frame (absolute ms)
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;
+    case 'resize': onResize(m.w, m.h); break;
     case 'dropTest': if (!dropTest.run) dropTest.armed = true; break;
+    case 'loseContext': renderer?.loseContext(); break; // test hook: the active path's GPU context is lost
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
       if (transport) { transport.sendControl({ t: 'bye' }); setTimeout(() => transport?.close(), 50); }

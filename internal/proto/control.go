@@ -24,7 +24,28 @@ type ClientInfo struct {
 // DecoderInfo reports what the browser can decode via WebCodecs.
 type DecoderInfo struct {
 	Family string `json:"family"` // h264 | hevc | av1
-	HW     bool   `json:"hw"`     // hardware decoder available
+	// HW: a hardware decoder is available. Clients with the decoder
+	// self-test (step 4.1) report false when the hardware decoder holds
+	// frames back, so that a family decoded in hardware without delay wins.
+	HW bool `json:"hw"`
+	// Timing is the client's timed decode of a short sample of this family
+	// (step 4.2), with the decoder its stream would use. Nil from clients
+	// before it, and when the timed decode failed. The host picks the codec
+	// family by it (see host.chooseFamily).
+	Timing *DecodeTiming `json:"timing,omitempty"`
+}
+
+// DecodeTiming is a timed decode: a W x H key frame and N P frames (decode
+// order = display order) fed one at a time, each after the previous one's
+// output, as frames arrive on a stream.
+type DecodeTiming struct {
+	// Ms is the median time from decode() to the frame's output over the N P
+	// frames: the decoder's latency per frame, not its throughput.
+	Ms    float64 `json:"ms"`
+	W     int     `json:"w"`
+	H     int     `json:"h"`
+	N     int     `json:"n"`
+	Accel string  `json:"accel"` // the WebCodecs hardwareAcceleration it decoded with
 }
 
 type AudioCaps struct {
@@ -226,6 +247,15 @@ type ClientMsg struct {
 	// "lost" (MsgLost): the frames of generation Gen from FromSeq on.
 	Gen     uint8  `json:"gen,omitempty"`
 	FromSeq uint32 `json:"fromSeq,omitempty"`
+	// Renderer ("stages"): the presentation path that drew the frames
+	// (canvas2d | webgl2 | webgpu, or bakeoff for a window with several;
+	// step 4.3): the draw and display rows depend on it. Empty from clients
+	// before it.
+	Renderer string `json:"renderer,omitempty"`
+	// Pacing ("stages"): the client's frame pacing mode for the window's
+	// frames (latency | smooth, or mixed when it changed; step 4.4): the hold
+	// and display rows depend on it. Empty from clients before it.
+	Pacing string `json:"pacing,omitempty"`
 }
 
 // MsgLost is the type of the message ({"t":"lost","gen":g,"fromSeq":s}) in
@@ -244,7 +274,14 @@ const CongestionDecoder = "decoder"
 
 // StageStat is one row of the per-stage latency summary a v2 client sends
 // every ~10 s ({"t":"stages"}): percentiles in ms over its last ~10 s window.
-// Names: capture, queue, network, transfer, wait, decode, draw, display, e2e.
+// Names: capture, queue, network, transfer, wait, decode, hold (only to hosts
+// that announce FeatureStageHold), draw, display, e2e.
+// FeatureStageHold is the Welcome.Features entry announcing that the host
+// takes the "hold" row (decoder output -> draw start: the frame pacing wait,
+// step 4.4). Hosts before it accept at most nine rows; clients report hold
+// and draw to them as one draw row (decoder output -> drawn).
+const FeatureStageHold = "stage-hold"
+
 type StageStat struct {
 	Name string  `json:"name"`
 	From string  `json:"from,omitempty"` // e2e only: capture | send (where end-to-end starts)

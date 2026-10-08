@@ -10,15 +10,20 @@
   <link rel="stylesheet" href="/css/app.css">
   <link rel="modulepreload" href="/js/stream-worker.js">
   <link rel="modulepreload" href="/js/protocol.js">
+  <link rel="modulepreload" href="/js/decoder-selftest.js">
+  <link rel="modulepreload" href="/js/decoder-selftest-clips.js">
+  <link rel="modulepreload" href="/js/renderers.js">
+  <link rel="modulepreload" href="/js/pacing.js">
   <script type="module" src="/js/stream.js"></script>
 </head>
 <body class="stream">
-  <div id="stage">
-    <canvas id="screen" tabindex="0" aria-label="Remote screen"></canvas>
+<!-- Fullscreen element (navigationUI "hide"): the stage with the canvas (one
+     per presentation path during the renderer bake-off) and the stream UI. -->
+<div id="player">
+  <div id="stage" tabindex="0" aria-label="Remote screen">
     <img id="remote-cursor" alt="">
   </div>
 
-  <div class="peek" id="peek"></div>
   <div class="toolbar hide" id="toolbar" role="toolbar" aria-label="Stream controls">
     <div class="title"><span class="dot on" id="conn-dot"></span><span class="name" id="host-name">…</span></div>
     <span class="pill" id="latency" title="Stream latency (send→draw): from the frame leaving the host until it is drawn on this screen">— ms</span>
@@ -56,5 +61,7 @@
     </div>
   </div>
   <div id="modal-root"></div>
+  <div id="toasts" aria-live="polite"></div>
+</div>
 </body>
 </html>

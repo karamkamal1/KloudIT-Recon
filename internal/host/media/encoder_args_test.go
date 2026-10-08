@@ -260,6 +260,50 @@ func TestNVIDIAEncoderArgs(t *testing.T) {
 	}
 }
 
+// TestNoYUV444 keeps 4:4:4 off (step 4.2): Chrome's hardware decode of HEVC
+// Range Extensions is reported on NVIDIA and Intel GPUs only, not AMD, so a
+// 4:4:4 stream would play only on some clients. ddagrab hands the GPU encoders
+// BGRA textures: FFmpeg 8.1's NVENC converts packed RGB to 4:2:0 by default
+// (rgb_mode yuv420, which the host never changes) and the host pins its HEVC
+// and H.264 profiles to Main and High; AMF encodes 4:2:0 only and has no such
+// option; software encoders get yuv420p.
+func TestNoYUV444(t *testing.T) {
+	c := ffmpeg81Caps(t)
+	for _, e := range []string{"av1_nvenc", "hevc_nvenc"} {
+		b, err := os.ReadFile(filepath.Join("testdata", "ffmpeg81-h-"+e+".txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !regexp.MustCompile(`(?m)^\s*-rgb_mode .*\(default yuv420\)`).Match(b) {
+			t.Errorf("%s: FFmpeg 8.1 help shows no rgb_mode default yuv420", e)
+		}
+	}
+	for _, name := range []string{"av1_amf", "hevc_amf", "h264_amf", "av1_nvenc", "hevc_nvenc", "h264_nvenc"} {
+		for _, q := range []string{"speed", "balanced", "quality"} {
+			for _, adaptive := range []bool{false, true} {
+				got := encoderArgMap(t, c, Params{Encoder: encoderNamed(name), FPS: 60, BitrateKbps: 20000, Quality: q, Adaptive: adaptive})
+				if _, ok := got["rgb_mode"]; ok {
+					t.Errorf("%s: -rgb_mode %s", name, got["rgb_mode"])
+				}
+				if p, ok := got["profile"]; ok && p != "main" && p != "high" {
+					t.Errorf("%s (%s): -profile %s", name, q, p)
+				}
+				for k, v := range got {
+					if strings.Contains(v, "444") || k == "pix_fmt" {
+						t.Errorf("%s (%s): -%s %s", name, q, k, v)
+					}
+				}
+			}
+		}
+	}
+	for _, sw := range []string{"libx264", "libsvtav1"} {
+		args, err := c.BuildArgs(Params{Encoder: encoderNamed(sw), FPS: 60, BitrateKbps: 20000, Source: Source{Backend: "test", NativeW: 640, NativeH: 360}})
+		if err != nil || !strings.Contains(strings.Join(args, " "), "format=yuv420p") {
+			t.Errorf("%s: no yuv420p conversion (%v): %q", sw, err, args)
+		}
+	}
+}
+
 // TestIntraRefreshEncoders checks which encoders the probe tries intra refresh
 // on and how it picks the mode: single slice where the encoder has the option
 // and the test encode passes, else plain, else none (a GPU without

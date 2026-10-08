@@ -48,6 +48,11 @@ type Config struct {
 	// VirtualDisplayLayout places the virtual monitor: primary | extend | only
 	// ("" = primary).
 	VirtualDisplayLayout string `json:"virtualDisplayLayout,omitempty"`
+	// AV1 is when the automatic codec choice uses AV1 (step 4.2): AV1Fallback
+	// ("" = default) only where HEVC does not work end-to-end, AV1Faster also
+	// instead of HEVC for clients that decode AV1 clearly faster (enable it
+	// after measuring this host's AV1 encoder: Phase 0 latency and VMAF).
+	AV1 string `json:"av1,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -142,6 +147,9 @@ func LoadConfig(path string) (*Config, error) {
 	if !transport.ValidCongestion(c.Congestion) {
 		return nil, fmt.Errorf("%s: congestion must be %q or %q, not %q", path, transport.CongestionReno, transport.CongestionMedia, c.Congestion)
 	}
+	if !validAV1(c.AV1) {
+		return nil, fmt.Errorf("%s: av1 must be %q or %q, not %q", path, AV1Fallback, AV1Faster, c.AV1)
+	}
 	if !media.ValidGPUPriority(c.GPUPriority) {
 		return nil, fmt.Errorf("%s: gpuPriority must be %q, %q, %q or %q, not %q", path,
 			media.GPUPriorityAuto, media.GPUPriorityHigh, media.GPUPriorityRealtime, media.GPUPriorityOff, c.GPUPriority)
@@ -185,6 +193,14 @@ func (c *Config) pipeline() string {
 		return pipelineAuto
 	}
 	return c.Pipeline
+}
+
+// av1 returns the AV1 policy of the automatic codec choice.
+func (c *Config) av1() string {
+	if c.AV1 == "" {
+		return AV1Fallback
+	}
+	return c.AV1
 }
 
 // gpuPriority returns the encoder's GPU scheduling priority mode.

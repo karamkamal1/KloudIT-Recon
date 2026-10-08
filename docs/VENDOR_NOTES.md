@@ -144,7 +144,8 @@ with Settings → Diagnostics → Latency probe). The overlay shows the counts a
    host screen→drawn p50 ≈ page→capture p50 + the overlay's capture→draw p50 (the stage stamps
    and the picture agree); no slow drift of the samples over the 10 minutes (plot
    `latency_ms` over `t_s`). Repeat with Settings → Renderer = WebGPU (export `method`
-   = `webgpu`) and with the 2D canvas (`copyTo NV12` or `canvas …`).
+   = `webgpu readback`), WebGL2 (`webgl2 readback`, step 4.3) and the 2D canvas (`copyTo NV12`
+   or `canvas …`).
 
 Verified in the sandbox:
 
@@ -245,7 +246,8 @@ Hardware checks:
   open, 2D canvas renderer and then WebGPU (Settings → Renderer, reconnect). Look for: overlay
   `Frame barcode (seq)` valid ≥ 99 % and 0 mismatched after 2 minutes (a mismatch means a frame
   was shown out of order or twice, or AMF skipped a frame: compare with `skip_frame`/
-  `frame_skipping` in 1.1), the export's `method` (`copyTo NV12` / `canvas …` / `webgpu`), and the
+  `frame_skipping` in 1.1), the export's `method` (`copyTo NV12` / `canvas …` / `webgpu readback` /
+  `webgl2 readback`), and the
   capture→drawn p50 within ±2 ms of the overlay's End-to-end (capture→draw) p50. Test (wallclock,
   the 10-minute run): `"capture": "ddagrab"` (and once `gfxcapture`), encoders `hevc_amf`,
   `av1_amf` (2560×1440: RDNA3 AV1 alignment, A7), `h264_amf`, 60 fps, wired LAN client; follow
@@ -2836,8 +2838,9 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   started `refFrames` 5; the log has "nvenc: the encoder's SPS: level 5.2, 5 reference
   frames (configured 5)" for H.264 (HEVC: level 5.1) and no "the encoder keeps N reference
   frames" warning. `ffprobe -v error -show_entries stream=profile,level,refs uhd.h264`: level
-  52, refs 5; `ffmpeg -v error -i uhd.hevc -c copy -bsf:v trace_headers -frames:v 1 -f null -
-  2>&1 | findstr "general_level_idc sps_max_dec_pic_buffering_minus1"`: 153 (5.1) and 5. A
+  52, refs 5; `ffmpeg -hide_banner -i uhd.hevc -c copy -bsf:v trace_headers -frames:v 1 -f null -
+  2>&1 | findstr "general_level_idc sps_max_dec_pic_buffering_minus1"` (not `-v error`:
+  `trace_headers` logs at the info level): 153 (5.1) and 5 (the value after `=`). A
   level of 6 or more at 4K60 (H.264 level_idc >= 60, HEVC general_level_idc >= 180) is a
   failure: record it with the driver version. (H.264 at 4K above 60 fps needs level 6.1 for
   its macroblock rate alone, A.3.1 MaxMBPS: expected there, not a failure; HEVC 4K120 stays
@@ -4883,3 +4886,890 @@ is unchanged; the Go API is `internal/host/encoder`:
   zero copy reads frames back: a few ms more latency).
 - The FFmpeg command-line path (GPL `ffmpeg.exe`, hevc_qsv through `hwmap`) stays the fallback
   when the helper is not usable.
+## 4.1 Decoder hygiene
+
+What changed (browser client only; no protocol change: the hello's per-family `hw` flag is now
+also false when the self-test below caught the hardware decoder holding frames back; a hardware
+decoder that errors, gives no output or starts slowly there is still reported as hardware):
+
+- Decoder configuration as before: `hardwareAcceleration: 'prefer-hardware'` (unless the user
+  picked software, or the self-test below moved the family to software) and
+  `optimizeForLatency: true`. `flush()` is never called while streaming (it waits for every
+  output and makes the next chunk a key frame); the backlog recovery and decoder errors reset
+  and reconfigure. It was not called before either; it is now a stated rule and checked.
+- Decode queue bound: at most 2 chunks wait inside the decoder (`decodeQueueSize` after a
+  `decode()`, `MAX_DECODE_QUEUE`); later chunks wait in front of it (`video.queue`) and are fed
+  on the decoder's `dequeue` event, after each output, with the next frame and from the 250 ms
+  watchdog (browsers without the event). There the client can still act on them: a key frame
+  makes the queued chunks before it unnecessary (dropped undecoded, not acknowledged: stats
+  `supersededChunks`), and the backlog recovery (unchanged thresholds: more than max(4, fps/10)
+  chunks for 500 ms) counts the chunks in the decoder and in front of it, and drops both.
+- Presentation: a decoded frame is drawn one task after its output (a `MessageChannel` hop,
+  p50 < 0.1 ms, p95 0.2 ms, p99 0.8 ms in the sandbox's headless Chromium while the E2E ran);
+  outputs already waiting by then (a burst after a stall, a decoder that releases frames
+  together) supersede each other: only the newest is drawn, the older ones are closed unseen
+  (stats `superseded`; still acknowledged as decoded, `0x40`, so the host's reference
+  capture/queue rows include them while the client's stage table has only drawn frames).
+  Deviation from the guide's wording "if two frames finish before a present opportunity": in
+  the default lowest-latency mode the present opportunity is the worker's next turn to draw,
+  not the next vsync: holding a frame for the next `requestAnimationFrame` would show a newer
+  frame one refresh later than drawing it at once. Vsync-paced coalescing belongs to step 4.4's
+  "Smooth" mode.
+- `VideoFrame` lifetime: every frame is closed as soon as it is drawn (2D: right after
+  `drawImage`); the WebGPU renderer keeps exactly one (`this.prev`, the previous frame, until the
+  next draw: the GPU must not sample a closed frame); probe clones are closed after the corner
+  readback. The worker counts open frames from the frames themselves (a closed frame has coded
+  width 0, independent of the code that closes them): stats `videoFrames {open, max, leaked}`;
+  a frame still open after 16 newer ones is a leak: it is closed, counted and logged once.
+  Bound by construction: at most 5 open at once (the new output, one waiting for its draw, the
+  WebGPU renderer's previous frame, two latency-probe clones).
+- Startup decoder self-test (`web/static/js/decoder-selftest.js`, run while connecting, the
+  hello waits for it): every family the browser decodes gets a 10-frame clip
+  (`web/static/js/decoder-selftest-clips.js`: 640x360, a key frame with its parameter sets,
+  then P frames only, decode order = display order, generated from FFmpeg as the host sends a
+  stream by `RECON_UPDATE_CLIPS=1 go test ./internal/codec -run TestDecoderSelfTestClips`; the
+  test without the variable checks the committed clips) fed one chunk at a time, each waiting
+  for its output (up to 1 s for the first, 100 ms after). Pass: first output after one chunk,
+  nothing held back, no error. A decoder that holds k frames back lags by k after every chunk;
+  three equal lags in a row end the input, then the test waits up to 1 s more without input
+  (review fix): a decoder that is merely slower than 100 ms per frame delivers the outputs
+  still due and passes (its ms/frame shows it), one that holds frames back outputs nothing more
+  and is caught (about 2.3 s; the families run in parallel, a passing decoder takes ten frame
+  decodes). A slow first output that then keeps up is reported as a slow start, a decoder
+  error as an error: neither is acted on. A hardware decoder that holds frames back is
+  reported to the host as no hardware decoder (`hw: false`: the host then prefers a family the
+  browser decodes in hardware without delay), and the family decodes in software when its
+  software decoder passed (`prefer-software`); if that software decoder falls behind (backlog
+  recovery; the clip is only 640x360), the session goes back to the hardware decoder with a
+  plain key frame request (review fix: no `congestion` report, so the host neither lowers the
+  bitrate nor caps it at the decoder's rate, and no overload notice; a later backlog on the
+  hardware decoder takes the normal path). Results: overlay rows "Decoder self-test" (one line
+  per family, e.g. "HEVC HW ✓ 1.4 ms/frame" or "H.264 HW holds 1 frame back, SW ✓ 2.1 ms/frame
+  → decoding in software"), `window.__recon.decoderTest`, and the log ("decoder self-test:
+  ...").
+- Live output lag: for every output, the chunks submitted after it before it came out; the
+  smallest per 0.5 s is stats `outputLag` and the overlay row "Decoder output lag". 0 on a
+  decoder that outputs at once; a decoder that holds frames back on the actual stream never
+  gets below its hold. This covers what the clip cannot: the clips signal zero reorder frames
+  (x264 writes the VUI `bitstream_restriction` with `max_num_reorder_frames` 0; HEVC carries
+  `sps_max_num_reorder_pics` in the SPS; SVT-AV1 low-delay has no hidden frames), and an H.264
+  stream without that VUI (some hardware encoders) can make a decoder that passed the test
+  hold frames for reordering on the real stream.
+- Overlay: "Decoder queue" (now, max; waiting in front of the decoder now, max), "Decoder output
+  lag", "VideoFrames open" (now, max, leaked), "Decoder self-test", and "superseded N (+M
+  undecoded)" (decoded outputs closed unseen, chunks dropped for a key frame) in the "Frames
+  dropped" row.
+
+Verified in the sandbox (headless Chromium from Playwright, software decoders; it decodes AV1
+only, so the E2E streams libsvtav1):
+
+- verified (sandbox): `internal/codec` `TestDecoderSelfTestClips`: the committed clips per
+  family have 10 frames at 640x360, the first with its parameter sets and the codec string the
+  host's `Params` derives from them (`avc1.64001f`, `hev1.1.6.L90.90`, `av01.0.04M.08`), no
+  later one with parameter sets; FFmpeg decodes each into frame types `IPPPPPPPPP` with
+  `has_b_frames` 0 (no reorder delay); 1.8 / 3.3 / 1.2 kB.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, 84 checks passed). Per streaming
+  scenario (WebTransport direct / relay, WebSocket relay, WebGPU renderer setting), with
+  `VideoDecoder.prototype.decode` / `flush` patched inside the stream worker (Playwright
+  evaluates in workers; independent of the worker's own counters): about 510 `decode()` calls
+  per 8 s, `decodeQueueSize` right after each at most 2 (max 2 in the first scenario, 1 in the
+  others), 0 `flush()` calls; VideoFrames open 0 at the end, at most 2 at once, 0 leaked; 1-2
+  outputs superseded per scenario; output lag 0. Late frames (host fault hook: every 97th frame
+  200 ms late, so about 12 frames are released at once): over 20 s 1419 `decode()` calls,
+  `decodeQueueSize` at most 2 while up to 11 chunks waited in front of the decoder, 38 outputs
+  superseded, VideoFrames at most 2 open, 0 leaked; the same ten chunks submitted at once to a
+  bare decoder reach `decodeQueueSize` 8 here (the bound is needed). Startup self-test on the
+  real decoder (AV1, dav1d via `no-preference`; this Chromium has no H.264 or HEVC decoder):
+  first output after 1 chunk (3.1 ms after configure), 0 held, 10 of 10 out, 1.0 ms/frame; the
+  overlay shows the "Decoder self-test", "Decoder queue" and "VideoFrames open" rows. Self-test
+  logic with a wrapper around the real decoder that holds frames back: passes it holding none
+  (first output after 1, 10/10), catches a hold of 1 (first output after 2, held 1, stopped
+  after 4 chunks) and of 2 (first after 3, held 2); with the hold only under
+  `prefer-hardware`: hello `hw` false, `prefer-software` passes, the family decodes in
+  software. Renderers (unit, the worker's own classes): of three frames drawn, the 2D renderer
+  leaves none open, the WebGPU renderer (headed Chromium on Xvfb, SwiftShader) exactly the last
+  one, which is its `prev`. All earlier checks (stage latency, crop, probe, loss handling,
+  bitrate recovery) still pass.
+- verified (sandbox, review fixes): browser E2E again, 84 of 84 checks passed (a first run
+  failed only the known shared-CPU "steady real-time playback" dip, in the relay scenario).
+  `superseded` now counts only decoded outputs closed unseen; chunks dropped undecoded in front
+  of the decoder for a key frame are `supersededChunks` (the "outputs superseded" numbers above
+  were one counter for both): per scenario 3-18 decoded outputs superseded, 0 chunks undecoded;
+  late frames 1424 `decode()` calls, up to 12 chunks waiting, 147 decoded outputs superseded, 0
+  undecoded (a busier CPU than the run above: load average 5). Self-test logic: a wrapper whose
+  every output comes 150 ms late (slower than the 100 ms per-frame wait, holding nothing) passes:
+  first output after 1, held 0, 5 of 5 out, 152.6 ms/frame. Before the fix such a decoder read
+  as holding frames back (reproduced in Node with a fake decoder at 110, 150 and 300 ms per
+  frame: held 1, 1, 2, `holdsFrames` true; after: held 0); holds of 1 and 2 are still caught
+  (held 1 and 2, about 2.3 s each now). The software-to-hardware fallback (no `congestion`
+  report) is not reached in the sandbox (no hardware decoder): checked by reading only.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (self-test and output lag on the AMD host's streams):
+  stream from the AMD host to Chrome on a Windows client (any GPU) once per codec (drawer:
+  Codec H.264, HEVC, AV1; FFmpeg path and, once Phase 3 is the default, the helper path), with
+  the overlay open (Ctrl+Alt+Shift+S): "Decoder self-test" shows each family the client decodes
+  with "HW ✓" (record the ms/frame), "Decoder output lag" stays at 0 frames during motion, and
+  "Decoder queue" max stays at 2 or less. Record any family with "holds N frames back" and any
+  output lag of 1 or more with the client's GPU, driver and browser version. For an H.264 output
+  lag, check the AMD encoder's SPS: capture the stream (`ffmpeg -f gdigrab -i desktop -frames:v
+  60 -c:v h264_amf -usage ultralowlatency -bf 0 amf.h264`, the session's arguments from the host
+  log's `starting encoder` line) and run `ffmpeg -hide_banner -i amf.h264 -c copy -bsf:v
+  trace_headers -f null - 2>&1 | findstr "bitstream_restriction_flag max_num_reorder_frames"`
+  (not `-v error`: `trace_headers` logs at the info level, which that hides; review fix): lines
+  like `bitstream_restriction_flag  1 = 1` and `max_num_reorder_frames  1 = 0` (the value after
+  `=`). Without `bitstream_restriction_flag` 1 and `max_num_reorder_frames` 0 the client's
+  hardware decoder may hold frames for reordering; record it (the fix is host-side: write the
+  VUI as Sunshine does). Checked here on a libx264 stream with that VUI: the command prints both
+  lines per SPS; with `-v error` it prints nothing.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same as for AMD with the NVIDIA host's
+  streams (h264_nvenc / hevc_nvenc / av1_nvenc and the helper's NVENC backend), including the
+  H.264 SPS check with `-c:v h264_nvenc -tune ull -bf 0`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (client decoders, AMD GPU in the client): Chrome and
+  Edge on a Windows PC with a Radeon GPU (D3D11 video decoder), then Firefox: the overlay's
+  "Decoder self-test" line per family; then a 10-minute stream with the WebGPU renderer at
+  1440p120 (or the client's highest): "VideoFrames open" max at most 5 and 0 leaked, "Freezes"
+  0, no "VideoFrame leak" in `__recon.logs`, and no console warning "A VideoFrame was garbage
+  collected without being closed". Repeat with the 2D renderer.
+- NVIDIA: unverified (no NVIDIA host available). Test: the client-decoder test above on a
+  Windows PC with a GeForce GPU (D3D11 / NVDEC through Chrome), and on a Mac (VideoToolbox) and
+  an Android phone (MediaCodec) if available: record the "Decoder self-test" lines; a decoder
+  that holds frames back must show "→ decoding in software" (when a software decoder exists for
+  that family) and the host must then pick another codec family under "Auto" (host log
+  `starting encoder ... encoder=`).
+
+## 4.3 Presentation bake-off
+
+What changed (browser client; the host only logs one more field):
+
+- Three presentation paths in `web/static/js/renderers.js`, each on an `OffscreenCanvas` in the
+  stream worker: (A) 2D canvas, `getContext('2d', {desynchronized: true})` and `drawImage`; (B)
+  WebGPU `importExternalTexture` (zero copy; WebGPU canvases have no low-latency mode); (C) new:
+  WebGL2, `getContext('webgl2', {desynchronized: true, alpha: false, antialias: false, ...})`,
+  `texImage2D(frame)` into a texture and one triangle. WebGL2, like WebGPU, first runs a
+  self-test on a scratch canvas (program, a `VideoFrame` upload, its orientation read back; a
+  canvas cannot change context type) and checks `getError()` once on the first decoder frame.
+  Each path reports what its context grants: `getContextAttributes().desynchronized` (true /
+  false; WebGPU: none). The overlay's *Renderer → context* row shows it with the canvas size;
+  the stats, the latency export and the host log (`latency stages ... renderer=webgl2`, from the
+  client's stage report) name the path.
+- Setting *Pipeline → Renderer*: Auto (default), 2D canvas, WebGL2, WebGPU (applies on
+  reconnect). Saved settings from before this step hold `renderer: "canvas2d"` (the old
+  default, saved with every settings change) and now read as Auto; an explicit WebGPU stays.
+- **Auto**: without a stored result for this browser, the first connection gets one canvas per
+  path and the worker runs a bake-off on the live stream. After 2 s of streaming the paths that
+  work take turns, A B C C B A (no path is always measured first), 1.5 s each (the first 250 ms
+  after a switch do not count; the main thread shows the active path's canvas). Meanwhile
+  display marks are taken as often as the main thread answers, and the start-up toolbar and
+  game-mode hint wait for the result (the toolbar's backdrop filter over the canvas would force
+  composition for whichever path is measured first). Per path: the Phase 0 *draw* stage
+  (decoder output → drawn) and *display* stage (drawn → the main thread's next animation
+  frame), p50/p95/mean, the draw p50 per round, the frames per second drawn and the failed draws
+  (a failed draw is not a sample). Auto's pick (`renderers.js` `pickPath`) is a heuristic: a
+  transferred canvas reaches the compositor without the main thread, so the display estimate is
+  the same whichever path drew (only CPU or GPU contention moves it), and the draw stage is the
+  worker's draw call. So: out are a path with failed draws or a lost context, fewer than 30
+  draw / 8 display samples, fewer than 80 % of the best path's frames per second (from 10 fps
+  up) or a display p50 more than one refresh above the best (it holds the page's frames back,
+  like WebGPU on the emulated GPU here); then a context that reports desynchronized comes first;
+  then the 2D canvas (the first path) stays unless another path's draw p50 is more than 1 ms
+  lower in both rounds (a near tie keeps the default, and is stored as such so the bake-off
+  does not repeat on every connection). The pick keeps drawing, the other canvases and contexts
+  go, and the main thread stores it with the reason and every path's numbers in `localStorage`
+  (`recon.present.v2`, keyed by browser major version and OS, e.g. `Chrome 141 · Linux`: a
+  browser update measures again; the v1 results of the earlier mean-based score are dropped).
+  Later connections draw with the stored pick on a single canvas; a stored pick that no longer
+  starts falls back to 2D and is forgotten, and a pick that fails 30 draws in a row while
+  streaming (a lost context, decoder frames that do not upload; WebGL2 now fails every draw
+  after its first-frame upload check fails, WebGPU after `device.lost`) is forgotten and the
+  client reconnects with the 2D canvas. A path picked in the settings stays (its errors show in
+  the overlay). The overlay lists the per-path rows (★ the pick, why a path is out) and the
+  reason for the pick; *Measure renderers again* (settings) clears it. An inconclusive bake-off
+  (a still picture: too few frames) stores nothing and runs again next time. The host log
+  labels a stage window that mixes paths (the bake-off) `renderer=bakeoff`.
+- Canvas sized to device pixels: the main thread observes the stage's
+  `devicePixelContentBoxSize` (or its CSS size times `devicePixelRatio`) and posts it to the
+  worker; every renderer sizes its canvas backing store to it and scales the picture to fit,
+  centred, with black bars (only the bars are painted, never the picture's area first: on a
+  front buffer that could reach the screen). The 2D canvas resizes with the next frame, WebGL2
+  and WebGPU redraw their last picture at once. The compositor never scales the canvas any more
+  (before: a canvas of the video's size, scaled by CSS `object-fit`).
+- Nothing on the canvas at rest: no transform, filter, opacity or blend on the canvas or its
+  ancestors; the 6 px `peek` strip over the canvas is gone (the toolbar now shows when the
+  pointer reaches the top edge); the hidden toolbar and the closed settings drawer are
+  `visibility: hidden` (before: transparent and off-screen, still painted with
+  `backdrop-filter`); the stage has no focus outline. The performance overlay (diagnostics) sits
+  on the canvas while open, as do toasts and the game-mode cursor.
+- Element fullscreen of `#player` (canvas stage and stream UI, so the toolbar and settings still
+  work) with `navigationUI: "hide"` (before: `document.documentElement`). Input (pointer lock,
+  focus, events) goes to the stage that holds the canvases, so a renderer switch during the
+  bake-off keeps the pointer lock.
+- Latency probe (0.2) on WebGL2: the cells are rendered from the texture the frame was uploaded
+  to into an 8×3 framebuffer, `readPixels` into a pixel buffer, a fence, `getBufferSubData`
+  once it has passed (export `method`: `webgl2 readback`; WebGPU's is now `webgpu readback`).
+
+Found in the sandbox (Chromium 141 from Playwright 1.56, Linux, no GPU):
+
+- `getContextAttributes().desynchronized`: 2D in the worker (transferred canvas and a plain
+  `OffscreenCanvas`): **true**. WebGL2 in the worker (transferred canvas or not): **false**,
+  although requested, while a WebGL2 context on a main-thread canvas in the same browser reports
+  true. So this Chromium grants WebGL2 no low-latency mode off the main thread; whether Chrome
+  and Edge on Windows do is a hardware check below. If they do not and the rig shows WebGL2
+  would otherwise win, the alternative is a main-thread WebGL2 path (each `VideoFrame`
+  transferred to the main thread to draw): not built, because it puts every frame on the thread
+  the worker design keeps frames away from (layout, input, GC).
+- `texImage2D(frame)` puts the frame's top row at texture coordinate 0 (checked by the WebGL2
+  self-test on every start).
+- Under DevTools device emulation (Playwright `deviceScaleFactor`) `devicePixelContentBoxSize`
+  reports CSS pixels while `devicePixelRatio` is emulated: the client uses it only when it
+  agrees with CSS size × `devicePixelRatio` within a pixel.
+- Cost of drawing at the screen's size where the 2D canvas is software (headless Chromium):
+  the 960×540 test picture scaled into the 1280×720 canvas gives a draw stage p50 of about
+  10-11 ms in the E2E (a microbenchmark of the same `drawImage`: 9.3 ms scaled, 5.0 ms into a
+  960×540 canvas; before, the compositor did the scaling); on a GPU-accelerated canvas this is
+  a GPU blit. WebGL2 through SwiftShader in headless Chromium reached only ~12 of 30 fps on this
+  4-core machine (the GPU process emulates the upload and draw on the CPU; the worker's own
+  share was 0.6-1.6 ms per frame), llvmpipe in a headed browser 30 of 30.
+
+Verified in the sandbox:
+
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, 114 of 114 checks passed, 125 of 125
+  after the review fixes; the run
+  before failed only the known shared-CPU "steady real-time playback" dip, WebSocket relay,
+  while jobs in other checkouts loaded the 4-core machine to a load average of ~8). The
+  transport scenarios (WebTransport direct / relay, WebSocket relay) draw with the 2D canvas in
+  headless Chromium: canvas 1280×720 = the 1280×720 CSS px box at DPR 1, `desynchronized` true,
+  nothing covering or transforming the canvas (8×8 `elementFromPoint` grid with the overlay
+  hidden; computed styles of the canvas and its ancestors), one canvas, 0 render errors, 54-65
+  fps of 60 per 0.5 s window, crop (1.7) and frame barcode (0.2, `copyTo I420`, 16/16 matching
+  seq) as before, element fullscreen of `#player` from the toolbar (revealed at the top edge)
+  and back (on the loaded headed page the WebGPU scenario's button click missed in two runs,
+  before the toolbar's hide timer; the hotkey then did it). WebGL2 and WebGPU run in a headed
+  Chromium on Xvfb with a 768×432 CSS px viewport at an emulated DPR of 1.25: canvas 960×540
+  (device pixels), 30 of 30 fps, the padded test picture cropped (bottom rows show the colour
+  bars, not the white padding), the barcode read back from the GPU (`webgl2 readback` 10/10,
+  `webgpu readback` 10/10 matching seq), `desynchronized` false (WebGL2) / not applicable
+  (WebGPU), 0 render errors, fullscreen and back with the canvas following its box, decoder
+  hygiene unchanged (VideoFrames at most 2-3 open, 0 leaked). The host log line carries
+  `renderer=canvas2d` (Go test `TestLogStagesRenderer`: the field is logged, a value that is not
+  a plain path name and an empty one are not).
+- verified (sandbox): renderer unit checks (the renderers.js classes, 2D and WebGL2 headless,
+  WebGPU headed): exact visible area for the two crop configs (no white, no grey), letterbox of
+  a 48×32 picture into a 100×40 box (60×40 at x 20, black bars, the four quadrant colours in
+  place), WebGL2 and WebGPU redrawing their last picture into a new 64×64 box without a new
+  frame, and of three frames drawn none left open (WebGPU: exactly the last, `prev`).
+- verified (sandbox): renderer Auto in the headed browser: the bake-off ran on the live stream
+  in about 11.5 s (2 s warm-up + 6 slots of 1.5 s) with all three paths, each with 74-81 draw
+  samples at 28-30 fps; WebGPU's display marks came back slowly (display p50 37-137 ms: the
+  CPU-emulated GPU delays the page's frames while WebGPU presents), so it got 4-23 display
+  samples. With the first rule (lowest mean draw + mean display, 1 ms tie window) the winner was
+  2D in four of seven runs and WebGL2 in the other three (e.g. 8.3 vs 2D 12.0, draw p50 0.39 vs
+  0.59 ms, display p50 7.4 vs 10.5 ms; in the review's run 10.2 vs 12.98 from a few display
+  outliers, draw means 0.51 vs 0.70 ms): the display estimate does not depend on the path (a
+  transferred canvas does not go through the main thread's frames), so noise picked the winner
+  and stored it. With the rule after the review (`pickPath`, E2E run of 125 of 125 checks):
+  2D draw p50 0.57 ms (rounds 0.64/0.52), display p50 8.71 ms, 30 fps, desynchronized true;
+  WebGL2 draw p50 0.40 ms (rounds 0.43/0.38), display p50 7.91 ms, 30.2 fps, desynchronized
+  false; WebGPU draw p50 0.67 ms, display p50 109.9 ms (n 13): out, *display lags*; pick: 2D,
+  "the only desynchronized context" (WebGL2 in this worker never reports desynchronized, so 2D
+  is Auto's pick here whatever the noise). The pick kept drawing, the other two canvases and
+  contexts were released, the result was stored under `Chrome 141 · Linux` with its reason, the
+  next connection drew with it at once on one canvas without a bake-off, *Measure renderers
+  again* cleared it, and the hygiene checks held across the switches (0 leaked, at most 2
+  open). While the paths were measured (58 samples) neither the start-up toolbar nor the
+  game-mode hint was on the canvas; both appeared with the result. The host's first stage line
+  of that session (its 10 s window spans several paths) reads `renderer=bakeoff`.
+- verified (sandbox): Auto's pick at unit level (`pickPath` on made-up numbers, E2E): the
+  review's run (WebGL2 0.2 ms faster to draw, not desynchronized; WebGPU's display a refresh
+  behind) → 2D, WebGPU out; both desynchronized and WebGL2 0.19 ms faster → 2D (near tie keeps
+  the default); WebGL2 3 ms faster in both rounds → WebGL2; faster in one round only → 2D; the
+  fastest path with failed draws or a lost context → out; 2D at 12 of 30 fps → WebGL2 although
+  not desynchronized; too few samples everywhere → no pick (nothing stored).
+- verified (sandbox): a stored WebGL2 pick whose context is lost while streaming (the worker's
+  `loseContext` test hook: `WEBGL_lose_context`): every later draw throws, after 30 failed
+  draws in a row the client forgot the stored pick and reconnected with the 2D canvas (1.7 s
+  after the loss at 10.9 fps of WebGL2 here; 30 fps on 2D after), one canvas, log
+  `presentation: webgl2 failed 30 draws in a row (WebGL2 context lost); reconnecting with the
+  2D canvas`. Failed draws make no stage record (draw, display, end-to-end) and count as errors
+  in the bake-off; frames are still acknowledged to the host. Not reproducible here: a WebGL2
+  upload that fails only for hardware decoder frames (the first-frame `getError` check), and a
+  WebGPU device loss (`device.lost`; the hook calls `device.destroy()`, not run in the E2E).
+- Not verifiable here: presentation on a real GPU (the sandbox has SwiftShader and llvmpipe),
+  front-buffer behaviour of `desynchronized`, the compositor's present mode, real DPR scaling
+  (only DevTools emulation), and browsers other than Chromium: the hardware checks below.
+
+Hardware checks (presentation is a client-side matter; the host vendor matters through the
+codec and the frame timing):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (click-to-photon per path with the 0.3 rig, Windows
+  11 client with a 120 Hz display, wired LAN, HEVC 1920×1080 120 fps, Chrome): in Recon's
+  settings set Renderer to *2D canvas*, reconnect, go fullscreen (toolbar button or
+  Ctrl+Alt+Shift+F), close the overlay after noting its *Renderer → context* row
+  (`desynchronized ✓/✗`, canvas = the screen in device pixels, e.g. 1920×1080 at 100 %, also
+  at 125 % Windows scaling on a 2400×1350 laptop panel), and run
+  `python3 tools/latency-rig/rig.py measure --port COM5 --host-sensor --label recon-hevc-1080p120-lan-chrome-canvas2d-amd --samples 100`;
+  repeat for *WebGL2* (`-webgl2-amd`) and *WebGPU* (`-webgpu-amd`), interleaving 100-sample
+  blocks with Moonlight (`moonlight-hevc-1080p120-lan-amd`) until each label has ≥ 200
+  samples; then `python3 tools/latency-rig/rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-4.3-amd.json`
+  and paste the table here. During each Recon block also run PresentMon on the browser's GPU
+  process: `.\PresentMon-2.x-x64.exe --process_name chrome.exe --output_file recon-chrome-<path>.csv --timed 30 --terminate_after_timed`
+  and `python3 tools/latency-rig/rig.py presentmon recon-chrome-<path>.csv`; record the
+  PresentMode shares per path (expect *Hardware: Independent Flip* or *Hardware Composed:
+  Independent Flip* for the best path in fullscreen with the overlay closed; *Composed: Flip*
+  costs about a refresh). Then set Renderer to *Auto*, click *Measure renderers again*,
+  reconnect, wait ~15 s and record the overlay's bake-off rows, the ★ pick and its reason:
+  pass if the rig's fastest path (median click→client) is Auto's pick or within 1 ms of it;
+  otherwise record both (Auto is a heuristic and cannot see the compositor) and the PresentMon
+  modes that explain the difference, and whether the rule should change (e.g. prefer WebGL2
+  where it reports desynchronized and the rig agrees). Repeat in Edge (`msedge.exe`) and Firefox (`firefox.exe`; Firefox reports no
+  `desynchronized`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same procedure streaming from an
+  RTX 20/30/40/50 host (labels ending in `-nvidia`, baseline
+  `moonlight-hevc-1080p120-lan-nvidia`), and on a Windows client with a GeForce GPU (the
+  presentation path depends on the client's GPU and driver: record the client GPU next to each
+  label).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (client GPUs and browsers, T10 browser matrix): on a
+  Windows client with a Radeon GPU, one with a GeForce GPU and one with Intel graphics (Chrome,
+  Edge, Firefox), and on a Mac (Safari 26.4, Chrome), open the stream with Renderer *Auto* after
+  *Measure renderers again* and record per browser and client GPU: the overlay's *context* row
+  per path (set each path once: does WebGL2 in the worker get `desynchronized` there, unlike
+  the Linux sandbox?), the bake-off rows and winner, and any path listed as unavailable with
+  its reason (`__recon.lastStats.renderer.errors`). Look for: WebGL2 `desynchronized ✓` on
+  Chrome/Edge for Windows (if ✗ everywhere, the main-thread WebGL2 path above is the next
+  experiment), no render errors, and that a 10-minute stream on the winner keeps "VideoFrames
+  open" max ≤ 5 and 0 leaked.
+- NVIDIA: unverified (no NVIDIA host available). Test: the client-GPU matrix above is the same
+  for an NVIDIA host; additionally stream AV1 from an RTX 40 host to each client and record
+  whether the winner changes with the codec (decoder output frames differ per codec and GPU).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (fullscreen and no overlays): on the Windows client
+  in Chrome, go fullscreen with the toolbar button: no browser UI or "press Esc" bar remains
+  after a few seconds (navigationUI `hide`), the toolbar slides in only with the pointer at the
+  top edge, `document.fullscreenElement.id` is `player` (DevTools console), and PresentMon in
+  fullscreen with the toolbar hidden shows an *Independent Flip* mode for the 2D canvas; with
+  the toolbar shown (pointer at the top) or the overlay open it may switch to *Composed: Flip*
+  (expected; record it).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same fullscreen and PresentMon check
+  on a client with a GeForce GPU.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Auto gives up a pick that stops drawing): on a
+  Windows client with a Radeon GPU, Renderer *Auto*, after one bake-off (so a result with this
+  browser's key is stored) set its pick to WebGL2 in the DevTools console:
+  `localStorage.setItem('recon.present.v2', JSON.stringify({...JSON.parse(localStorage.getItem('recon.present.v2')), winner: 'webgl2'}))`,
+  reconnect, check the overlay shows WebGL2, then force a GPU reset (`dxcap -forcetdr` from the Windows Graphics
+  Tools, admin prompt): look for the log line `presentation: webgl2 failed 30 draws in a row`
+  and a reconnect drawing with the 2D canvas within ~2 s, `recon.present.v2` removed; if the
+  browser restores the context within 30 frames instead, the stream continues on WebGL2
+  (record which). Repeat with `winner: 'webgpu'` (expect `WebGPU device lost` in the log).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same GPU-reset check on a client with
+  a GeForce GPU.
+
+## 4.4 Frame pacing modes
+
+What changed (browser client; the host only takes one more stage row, announced in its welcome,
+and logs one more field):
+
+- Setting *Pipeline → Frame pacing*: **Lowest latency** (the default) and **Smooth**, saved with
+  the other stream settings (`pacing` in `recon.prefs.v1`) and applied live: the drawer posts it
+  to the stream worker, no reconnect, the host is not involved. The frame pacer is
+  `web/static/js/pacing.js` (`Pacer`, `paceFate`), between the decoder's output and the
+  renderer, so it works the same with every presentation path of step 4.3 (2D, WebGL2, WebGPU)
+  and with Auto's bake-off, whose path switches happen inside a draw either way.
+- Lowest latency is the behaviour of step 4.1, unchanged: a decoded frame is drawn one task
+  after its output (a `MessageChannel` hop), outputs already waiting by then supersede each other
+  and only the newest is drawn.
+- Smooth: the frame waits for the next display refresh and is drawn in the worker's
+  `requestAnimationFrame` callback, so the screen gets at most one new frame per refresh. The
+  callback runs some time after the refresh starts (below: 0.1-16 ms here), and a desynchronized
+  canvas shows the draw when it happens, so the picture can still change mid-scanout (tearing
+  stays possible); Smooth evens the cadence, it does not align draws to the refresh boundary.
+  At most one frame waits: a newer output replaces it (the older one is closed unseen and
+  acknowledged as decoded, stats `superseded`, as in Lowest latency). "Drop
+  anything older than one refresh" (guide wording), as built: a frame is older than one refresh
+  when more than 1.25 refresh intervals passed from its decoder output to the start of the
+  refresh that would draw it (the callback's timestamp; the quarter refresh of slack covers a
+  frame that came out just as a refresh started). Such a frame (its refresh came late or was
+  skipped) is dropped when a newer frame is already in or in front of the decoder (that one
+  takes the next refresh; stats `pacing.counts.stale`), and drawn late otherwise
+  (`pacing.counts.late`). Deviation from a literal drop of every such frame: the host sends
+  nothing while the desktop is still, so dropping the last frame before a still picture would
+  leave an older picture on screen until something changes; and never two drops in a row, so a
+  refresh source that is always late cannot starve the screen. Superseding already keeps a
+  frame from waiting behind a newer one, so in steady streaming the stale rule only acts when
+  the browser delays its refresh callbacks (judged against the refresh interval the ticks show,
+  below, not the page-load measurement).
+- Refresh ticks: the worker's `requestAnimationFrame` (its timestamp is the start of the
+  refresh); where a browser has none in workers, the main thread posts its own animation frames'
+  start times (`ticks` on/off, only while Smooth needs them); and a watchdog: a frame that got no
+  tick for max(3 refreshes, 100 ms) is drawn from a timer (never dropped as stale, review fix: no
+  refresh would come sooner for the newer frame either; it is counted late), logged
+  once per run of such draws (`frame pacing: no display refresh within 100 ms of a decoded frame;
+  drawing from a timer`) and counted (`pacing.counts.timer`, the overlay's *watchdog*). The
+  first version used 3 refreshes + 10 ms (60 ms at 60 Hz): on the emulated GPU here the worker's
+  callbacks stall for 60 ms and more (up to seconds) while WebGPU presents, and the timer then
+  drew 16 of 84 frames,
+  working around the browser's own back-pressure; the watchdog is for a callback that never
+  comes, not for a slow one.
+- The refresh interval ("one refresh", review fix) is the one the pacer's ticks show: the
+  shortest of the last 30 intervals between refresh ticks (their timestamps are refresh starts,
+  so each interval is a whole number of refreshes). A stream below the refresh rate gets a tick
+  only every few refreshes, so at most every 250 ms the pacer also asks for the refresh right
+  after a frame's: consecutive refreshes then occur. (Asking for that tick after every frame
+  doubled the worker's refresh requests for a 30 fps stream at 60 Hz, and the headed test
+  browser then drew 18 fps in two of four runs in the window right after Auto's bake-off, where
+  the old pacer drew 24-32 fps in six runs and the same code without the extra ticks 26 and 28
+  fps.) Until 8 intervals are seen it is the main thread's measurement at page load
+  (`client.hz`), now the median interval of 30 animation frames instead of their mean: in the
+  headed browser here a frame skipped during the measurement made it 39 Hz (25.64 ms) for a 60
+  Hz display. The first version used only that measurement, so a page that later refreshes
+  slower than it measured (loaded on a 144 Hz monitor and fullscreened on a 60 Hz one, a browser
+  energy saver or OS low-power mode capping it to 30 fps) classed frames that waited one
+  ordinary refresh as stale and, with a newer chunk in the decoder, dropped every other frame
+  (the review's simulation of the pacer: a 60 fps stream on 60 Hz with a 144 Hz measurement drew
+  59 of 119 frames). With the observed interval the same simulation draws 115 of 119 (the 4
+  drops are among the first 8 frames, before 8 intervals are seen), and 119 of 119 from the
+  right measurement; a 30 fps stream on 60 Hz and a 60 fps stream on 144 Hz both settle on the
+  display's interval (16.67 / 6.94 ms) whatever the measurement, with 4 extra refresh requests
+  per second. The overlay's *Frame pacing* row and `lastStats.pacing.refreshMs` show the
+  interval in use.
+- Phase 0 stage accounting: a new stage **hold** (decoder output → draw start: the frame pacing
+  wait; one task in Lowest latency, the wait for the refresh in Smooth) between decode and draw;
+  **draw** is now the renderer's draw call (draw start → drawn; before: decoder output → drawn,
+  which included the one-task hop). The stages still telescope to end-to-end (capture → drawn),
+  which now includes the hold. Overlay: a *hold (frame pacing)* row in the stage table and a
+  *Frame pacing* row (mode; for Smooth the tick source, worker or page `rAF`, the refresh
+  interval, and the session's stale, late and watchdog counts). Stage dump (`stageDump`, the
+  latency export): per frame `drawStart`, `via` (hop | raf | main | timer), `tick` (the refresh
+  start), `refresh` (the refresh interval Smooth judged the frame by; review fix) and `pacing`.
+  The client's stage report names the mode (`pacing`: latency, smooth, or mixed when it changed
+  in the window); the host logs `pacing=` and the `hold=` row. Hosts announce `stage-hold` in
+  `welcome.features` (`proto.FeatureStageHold`); hosts before this step accept at most nine
+  rows, so the client reports hold and draw to them as one draw row (decoder output → drawn, the
+  old meaning). The bake-off result names the pacing mode it ran in; its draw stage no longer
+  includes the hop (it does not depend on the path).
+
+Found in the sandbox (Chromium 141 from Playwright 1.56, Linux, no GPU):
+
+- `requestAnimationFrame` exists in the dedicated worker (headless and headed) and its timestamp
+  is the start of the refresh: consecutive callbacks 16.6-16.8 ms apart (a skipped refresh:
+  33.3), the callback itself runs 0.1-16 ms after that timestamp (a drawing worker under load:
+  more).
+- Under the E2E's load (software AV1 encoder and decoder on 4 shared cores, the 2D canvas drawing
+  the 960×540 picture into 1280×720 in software, ~9 ms per frame), the page's frame production
+  (the worker's and the main thread's callbacks alike) ran at about 31-33 Hz instead of 60: Smooth
+  then draws at that rate (a 60 fps stream: about every other frame superseded), while Lowest
+  latency draws all 60 (of which the compositor shows about as many as Smooth draws: display
+  estimate p95 32 ms). Alone (no stream), a worker drawing the same 9.7 ms frame in every callback
+  keeps 58 Hz. On a GPU canvas the draw is a GPU blit.
+- WebGPU on the emulated GPU (SwiftShader, headed browser on Xvfb) starves the page's refreshes
+  while it presents (the page's frames lag, as in 4.3): the worker's own refresh loop measured
+  5-12 Hz in Lowest latency and 0.5-37.5 Hz in Smooth between runs; Smooth on WebGPU then draws
+  6.5-21 fps of 30, partly from the watchdog. A real GPU is a hardware check below.
+
+Verified in the sandbox:
+
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`), 148 of 148 checks passed, twice
+  (the last run with the final code). The runs before failed on the new checks' own criteria,
+  which then changed: they expected Smooth at the stream's 60 fps (the loaded page refreshes at
+  ~33 Hz), then at the measured refresh rate (WebGPU's stalled refreshes made the watchdog draw
+  some frames: now each draw is checked against the refreshes the worker actually ran), and a
+  frame count that only fit 4 s windows; WebGL2's failed on the `measureHz` mean (fixed in the
+  client, above). Unrelated to this step, one run failed the known shared-CPU "steady real-time
+  playback" dip and one (load average 7.5) the 1.4 skip-recovery and 1.5 bitrate-recovery
+  checks on decoder backlogs; both passed in the runs after. Load average 4-8 from jobs in other
+  checkouts.
+  - Pacer at unit level (10 checks, `pacing.js` on a fake clock): Lowest latency draws one task
+    after the output and a burst keeps the newest; Smooth waits for the refresh, one request and
+    one draw per refresh for two frames; older than one refresh with a newer frame in the decoder
+    → dropped stale, the newer drawn at the next refresh; without one → drawn late; never two
+    stale drops in a row; 19 ms at 16 ms refreshes is not stale (slack); no worker
+    `requestAnimationFrame` → the main thread's ticks, off again in Lowest latency; the watchdog
+    after 100 ms, logged once per run of timer draws, a real tick used again after it; live mode
+    switches in both directions with a frame waiting; `paceFate` at the edges.
+  - Each live Smooth window also runs a `requestAnimationFrame` loop of the test's in the worker
+    and checks every draw against it: drawn at the first refresh after the frame's decoder
+    output (no refresh of the worker's in between), or by the watchdog only where the worker ran
+    no refresh. Final run, 0 such misses in every window with the worker's ticks.
+  - Live, 2D canvas (headless, 60 fps stream, after the scenario's other checks), switched in
+    the drawer without a reconnect (same worker and connection): Smooth drew 107 frames in 4 s
+    (26.7 fps; the worker's own refresh loop ran at 34.0 Hz in the same window: this loaded page
+    refreshes at about half of 60 Hz), all from the worker's `requestAnimationFrame`, each at
+    the first refresh after its output, consecutive draws' refresh starts at least 16.66 ms
+    apart (one per vsync), hold p50/p95/p99 6.21/20.83/25.31 ms, refresh start − output at most
+    20.59 ms, 0 stale, 0 late, hold and draw equal to the frame's own marks, stages summing to
+    end-to-end (difference 0.000 ms), barcode 4/4 = seq, VideoFrames at most 2 open, 0 leaked,
+    the overlay's *Frame pacing* row `Smooth · each refresh (worker rAF, 16.67 ms) · stale 0 ·
+    late 0`. Without `requestAnimationFrame` in the worker: 86 frames in 2.5 s (34.3 fps) from
+    the page's animation frames, one per vsync. With one that never calls back: 24 frames in 3 s
+    (8.0 fps) from the watchdog, the log line once. Restored: 56 frames in 2 s (28.0 fps) from it
+    again, no timer draws. Back to Lowest latency: 150 frames in 2.5 s (59.9 fps) on decode, hold
+    p50/p95/p99 0.05/0.8/1.41 ms.
+  - Live, WebGL2 (headed, llvmpipe, 30 fps stream): Smooth 118 frames in 4 s (29.4 fps; refresh
+    58.8 Hz), each at the first refresh after its output, hold 6.3/17.03/18.88 ms, 1 stale, 0
+    late, barcode 4/4 (`webgl2 readback`); back to Lowest latency 30.0 fps, hold 0.07/0.15/0.18
+    ms. WebGPU (headed, SwiftShader): Smooth 81 frames (20.2 fps; the page's refresh 35.4 Hz on
+    average, with stalls), 77 from the worker's refresh, each at the first one after its output,
+    4 from the watchdog where the worker ran no refresh for 100 ms, 3 stale, barcode 3/3 (`webgpu
+    readback`), VideoFrames at most 3 open, 0 leaked; back to Lowest latency 30.0 fps (the page's
+    refresh meanwhile 11.6 Hz). In an earlier run the page refreshed at 0.5 Hz during the WebGPU
+    Smooth window and the watchdog drew most of 26 frames (6.5 fps).
+  - Auto's bake-off in Smooth (headed, all three paths): never drawn on decode across the path
+    switches (315 draws from the worker's refresh, 3 from the watchdog while WebGPU presented, 3
+    stale), the result and the stored pick carry `pacing: smooth`, the pick is the same as in 4.3
+    (2D, the only desynchronized context), and the host's first stage line reads
+    `renderer=bakeoff pacing=smooth ... hold="7.1/15.7/24.6 n=261" draw="0.5/0.9/4.4 n=261"`.
+  - Lowest latency in the transport scenarios (2D, 60 fps): hold p50 0.07-0.19 ms, p95 1.9-4.1
+    ms, p99 4.6-9.0 ms (the one-task hop on the loaded machine); the draw stage is now the 2D
+    canvas's `drawImage` alone (p50 9-11 ms here, software). The host's lines read
+    `renderer=canvas2d pacing=latency` (and `pacing=mixed` for the windows with a switch).
+- verified (sandbox): `go test ./...`: `TestLogStagesRenderer` (the host logs `pacing=` for
+  latency/smooth/mixed and nothing for other values, the `hold=` row, a ten-row report with
+  every stage) and `internal/e2e` (every client's welcome lists `stage-hold`).
+- verified (sandbox, ad hoc): the new client in Smooth against a host built from the commit
+  before this step (no `stage-hold` in its welcome): the host accepted the report and logged
+  `draw="12.4/15.7/19.2 n=297"` (hold and draw as one row; the client's own overlay had hold p50
+  7.63 ms and draw p50 4.38 ms) and no `hold=` or `pacing=`. Kept as a test since the review
+  fixes: the host's test hook `RECON_TEST_FAULTS=pre-stage-hold` plays such a host (no
+  `stage-hold` in the welcome; a report is logged only with at most nine rows, none named hold),
+  `TestLogStagesRenderer` checks that the hook logs the merged nine-row report and drops a
+  ten-row one, and the browser E2E streams from a host with the hook in Smooth: the host must log
+  the report, without `hold=`, its draw row with e2e's `n` and a p50 equal to the client's hold +
+  draw p50 from the stage dump (within max(1.5 ms, 15 %)) and at least 1 ms above draw alone.
+- verified (sandbox, review fixes): `go test ./...`, `go vet` (Linux and Windows), `node
+  --check`, and the browser E2E with 152 checks (13 pacer unit checks; the three new ones fail
+  on the previous `pacing.js`: the watchdog dropped a frame as stale, no interval from the
+  ticks, no extra tick). The machine was shared with other checkouts' test runs (load average
+  4-15 during most runs): the best run with the final code passed 150 of 152, failing only the
+  WebTransport relay "steady real-time playback" and "video decoding" fps checks of the Lowest
+  latency scenario (load rising to 6.7), and every check failed in some run passed in others;
+  the failures were real-time fps, loss-recovery and bitrate-recovery checks of the Lowest
+  latency scenarios (step 1.4/1.5 checks, untouched here), and, at load 9-15, WebGPU's starved
+  refreshes (no barcode sampled, the bake-off's draws under 250 from the worker's refresh). In
+  that run: Smooth on the 2D canvas 112 frames (27.9 fps of 60, the worker's refresh 32.9 Hz),
+  all from the worker's refresh, the pacer's refresh 16.67 ms from its ticks, each at the first
+  refresh after its output, every frame over 1.25 refresh counted late (checked per frame
+  against the interval it was judged by); the watchdog window 25 frames from the timer, stale
+  +0, late +3; WebGL2 28.5 fps of 30; WebGPU 17.7 fps of 30 from the worker's refresh; the
+  bake-off in Smooth 328 draws from the worker's refresh, 1 stale; the host with
+  `pre-stage-hold` logged `renderer=canvas2d pacing=smooth`, no hold row, draw p50 17.9 ms n 259
+  = e2e's n, the client's hold + draw p50 17.88 ms (stage dump, 260 frames), draw alone 12.63
+  ms. The fps right after Auto's bake-off (the check's "fps after", at least 20) read 22.0-28.0
+  in six runs with the final code and 18.1 in one at load 10.
+- Not verifiable here: presentation timing on a real GPU and display (front-buffer behaviour of
+  a desynchronized canvas drawn in the refresh callback, PresentMon's display intervals),
+  refresh rates other than 60 Hz, network jitter on the stream (the E2E runs on the shared
+  loopback; netem there would hit the other checkouts' tests), and browsers other than
+  Chromium: the hardware checks below.
+
+Hardware checks (frame pacing is a client-side matter; the host vendor matters through the frame
+timing of its encoder and capture):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (cadence and cost of Smooth, lan): AMD host streaming
+  HEVC 1920×1080 at 60 fps, then at 120 fps, wired LAN, to Chrome on a Windows 11 client with a
+  120 Hz display, Renderer *2D canvas*, fullscreen. Open the overlay (Ctrl+Alt+Shift+S) briefly:
+  the *Frame pacing* row in Smooth must read `Smooth · each refresh (worker rAF, 8.33 ms)` (the
+  refresh interval the pacer's ticks show, the display's; 16.67 means the browser runs the page
+  at 60 Hz, for example an energy saver: record it). Also move the browser window to a 60 Hz
+  monitor (or turn on the browser's energy saver) while streaming in Smooth: within a second the
+  row must follow (16.67 ms, or 33.33 at 30 fps), and stale must not climb with each frame. For
+  each mode (*Lowest latency*, then *Smooth*, switched in the drawer while streaming) close the
+  overlay and capture 30 s of PresentMon on the browser:
+  `.\PresentMon-2.x-x64.exe --process_name chrome.exe --output_file recon-amd-60fps-<mode>.csv --timed 30 --terminate_after_timed`,
+  then run `python3 tools/latency-rig/rig.py presentmon` once per capture (it takes one CSV:
+  `recon-amd-60fps-latency.csv`, then `recon-amd-60fps-smooth.csv`). Record per mode the
+  `MsBetweenDisplayChange` p50/p95 and the PresentMode shares. Pass: in Smooth at 60 fps the
+  display changes every 16.7 ms (p95 at most 17.5 ms, no 8.3/25 ms alternation), at 120 fps
+  every 8.3 ms; Lowest latency may alternate. Then reopen the overlay and record the stage rows
+  *hold* p50/p95 (Smooth: p50 about half the frame interval it waits for, p95 below 8.3 ms +
+  2 ms; Lowest latency: below 1 ms), *draw*, *display*, and the *Frame pacing* row's stale /
+  late / watchdog counts (expect watchdog 0, stale and late a few per minute at most). Then the
+  click-to-photon cost with the 0.3 rig: labels `recon-hevc-1080p120-lan-chrome-canvas2d-latency-amd`
+  and `...-smooth-amd`, 200 samples each, interleaved with Moonlight
+  `moonlight-hevc-1080p120-lan-pacing-off-amd` / `...-pacing-on-amd`
+  ([LATENCY_RIG.md](LATENCY_RIG.md), *Frame pacing*): expect Smooth about half a refresh
+  (~4 ms at 120 Hz) above Lowest latency on the median, and within ~5 ms of Moonlight with
+  frame pacing on. Repeat with Renderer *WebGL2* and *WebGPU* (the overlay's *Frame pacing* row
+  must still read `worker rAF`; record any watchdog draws: they mean the browser stalled its
+  callbacks for 100 ms).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same procedure streaming from an RTX
+  20/30/40/50 host (labels ending in `-nvidia`), and on a client with a GeForce GPU; record the
+  client GPU next to each result.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (the four network profiles, step 0.4): the cadence
+  test above (60 fps, PresentMon `MsBetweenDisplayChange` p50/p95, overlay *hold* p50/p95,
+  *Freezes*, *Frame pacing* stale/late, and *Frames dropped* superseded) for both modes under
+  each profile, relay path forced as in "How every later step reports the four profiles"
+  (`./netem.sh clear --ct 210`, `apply wifi`, `apply wan`, `apply capdrop` with `--host CLIENT_IP`),
+  reported as `lan / wifi / wan / capdrop` per mode with the `netem.sh status` line. Look for:
+  under `wifi` (5 ms ±10 ms jitter) Smooth keeps the display interval steadier than Lowest
+  latency (smaller `MsBetweenDisplayChange` p95 spread) at the cost of its hold; stale drops
+  stay rare (they need a refresh that came late, not network jitter); no watchdog draws.
+- NVIDIA: unverified (no NVIDIA host available). Test: the four-profile comparison above
+  streaming from the NVIDIA host.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (browsers, T10): with the AMD host, Smooth in Edge,
+  Firefox and Safari 26.4 (macOS) and Chrome on a Mac: the overlay's *Frame pacing* row names
+  the tick source: `worker rAF` where the browser runs `requestAnimationFrame` in workers,
+  `page rAF` otherwise (record which; both keep one frame per refresh), and the refresh interval
+  of the client's display (ProMotion Macs: 8.33 ms at 120 Hz, record whether a variable refresh
+  shows a different interval). Record any watchdog draws and the log line
+  (`__recon.logs`, "frame pacing: no display refresh").
+- NVIDIA: unverified (no NVIDIA host available). Test: the browser matrix above streaming from
+  the NVIDIA host.
+
+## 4.2 Codec selection by host GPU × client GPU
+
+What changed (browser client, hello, host session; no protocol version change: the hello's
+per-family `timing` is an optional field that hosts before it ignore, and clients before it
+leave out):
+
+- Client: after the step 4.1 hygiene test, every family whose decoder passed it is timed on a
+  1920×1080 clip (`web/static/js/decoder-timing-clips.js`: eight frames of FFmpeg's moving
+  `testsrc2`, a key frame with its parameter sets then P frames only, decode order = display
+  order; H.264 64 kB, HEVC 38 kB, AV1 66 kB; generated with the hygiene clips by
+  `RECON_UPDATE_CLIPS=1 go test ./internal/codec -run TestDecoderSelfTestClips`, which also
+  checks both committed files) with the decoder the stream would use (`prefer-hardware` unless
+  the user picked software or the hygiene test moved the family to software; not timed when
+  that decoder holds frames back, errors or gave no output). `isConfigSupported` with the
+  clip's own config (codec string from its parameter sets: `avc1.64002a`, `hev1.1.6.L123.90`,
+  `av01.0.09M.08`) comes first, then the frames go in one at a time, each after the previous
+  one's output (up to 250 ms each), like a stream's. The time is the median from `decode()` to
+  the output over the seven P frames (at least four must come out), so it is the decoder's
+  latency per frame, not its throughput. The families are interleaved frame by frame (every
+  family's key frame, then every family's first P frame, …; review fix) with one frame in
+  flight at a time (the hygiene tests, which run in parallel, have just warmed every decoder
+  up), so no two compete for the GPU's decode engine or the CPU, and a change of
+  load during the pass falls on every family alike instead of on whichever was timed then.
+  The clip module (226 kB) starts loading when the self-test starts and is cached by the
+  browser (the gateway serves it with an ETag). The hello waits for the self-test on every
+  connection and the host waits 10 s for the hello, so the timing pass has a budget (review
+  fix): 1.5 s in all from the end of the hygiene tests, the wait for the clips included (an
+  import that has not finished by then leaves every family untimed and goes on loading for the
+  next connection), and 0.5 s per family (its frames' `decode()` → output, the key frame's
+  decoder start included); a family whose P frame is not out within 250 ms gets no more
+  frames. A family not timed within the budget goes to the host without a time, and the host
+  keeps its default order for it. The hello carries per family `timing: {ms, w, h, n,
+  accel}`; the overlay's self-test line adds "timed 1080p: N ms/frame" and its label how long
+  the whole self-test took, "Decoder self-test (N ms)" (the console log has `decoder self-test
+  took N ms`);
+  `window.__recon.helloDecoders` holds what was sent. Why a separate 1080p clip:
+  the 4.1 clip (640×360, nearly empty P frames) mostly measures the fixed cost of a decode
+  call; in this sandbox software AV1 takes 0.3-0.7 ms per frame there and 4.1-4.6 ms on the
+  1080p clip, and a hardware decoder's round trip to the GPU process would lose to software
+  on the small clip although it wins on real pictures.
+- Host side of the rule, from encoder availability, not GPU names (`internal/host/codec.go`):
+  a family is there when an encoder of it passed the probe's test encode (FFmpeg path; the
+  helper's caps `codecs` on the helper path) and has not failed in the session. RDNA2 (no AV1
+  encoder) fails `av1_amf`'s test encode, NVIDIA before the RTX 40 series fails `av1_nvenc`'s
+  (both expected, unverified below), so AV1 is absent there. RDNA3's AV1 encoder pads sizes
+  that are not 64×16-aligned (step 1.7 probe): it never replaces another family at such a
+  size, and when it is the pick anyway (asked for, or no HEVC) step 1.7's guard gives way to
+  HEVC with its notice, as before.
+- The rule (also in docs/ARCHITECTURE.md, "Codec negotiation"): host-forced encoder, then the
+  client's codec setting, else automatic: the first tier with a family both ends can use:
+  (1) hardware encode + hardware decode: HEVC → AV1 → H.264; (2) hardware encode, software
+  decode: H.264 → HEVC → AV1; (3) software encode: H.264 → AV1 → HEVC, always the first there
+  (review fix: the order is the host's CPU cost of encoding, which the client's decode times do
+  not tell; before the fix a client that decodes AV1 faster got libsvtav1 instead of libx264
+  with `"av1": "faster"`, also on a GPU host whose hardware encoders had all failed). In tiers
+  1 and 2 the first family is the default (HEVC on AMD and NVIDIA hosts alike) and a later one
+  replaces it only when the client decodes it clearly faster at the stream's picture size (both
+  timed): at least 10 % and 0.5 ms less per frame, or for a family that compresses worse (H.264
+  against HEVC or AV1) at least 25 % and 2 ms. The stream's size (review fix): a frame's time
+  is a fixed cost per call (a hardware decoder's round trip to the GPU process) plus work that
+  grows with the picture, and one 1080p sample cannot tell them apart, so the times are scaled
+  down by pixel count for a smaller picture and never up for a larger one: the gain must hold
+  whatever the split (the share of the default's time is the same either way). Before the fix
+  the 1080p times were scaled up too, so a 0.6 ms difference at 1080p (possibly all fixed cost)
+  became 2.4 ms per 3840×2160 frame and made H.264 replace HEVC at 4K, where its extra bits cost
+  the most. AV1 competes on speed only with host.json `"av1": "faster"`; the default
+  `"fallback"` keeps step 1.7's behaviour (AV1 only where HEVC does not work end-to-end).
+  Clients without timings get the tier order alone, which is the order before this step.
+- Host log: `session started ... decoders="hevc:hw:2.10ms@1920x1080 av1:hw:1.85ms@1920x1080
+  h264:hw:1.40ms@1920x1080"` (`hw`: hardware without holding frames back; `-`: not timed), and
+  per new choice `codec choice encoder=hevc_amf family=hevc reason="auto, hardware encode and
+  decode: first choice" size=2560x1440 av1=fallback decoders=...`.
+- Deviations from the guide's wording, as built: "pick per client by measured decode time" is
+  a margin rule around a default, not the fastest family outright: the times come from one
+  short clip (noise of a few tenths of a millisecond), and H.264 costs about a third more bits
+  for the same picture, so it must save a lot. Hardware decoding stays a tier above the
+  measurement: the clip is a low-bitrate picture (2-6 kB per P frame), which understates a
+  software decoder's cost at streaming bitrates (its entropy decoding grows with the bits), so
+  a software decoder is never preferred to hardware for its sample time. One sample size: the
+  rule cannot see a family that is slower at 1080p but faster at 4K (it keeps the default
+  then); a second size would add to the self-test the hello waits for. "On AMD host use AV1
+  screen-content tools for text" (review fix: neither built nor listed here before): the native
+  helper's AMF AV1 encoder now sets `AMF_VIDEO_ENCODER_AV1_SCREEN_CONTENT_TOOLS` and
+  `AMF_VIDEO_ENCODER_AV1_PALETTE_MODE` to true explicitly (best effort: a driver that refuses
+  them logs "properties not accepted (their defaults stay)"). Both are documented as on by
+  default (`VideoEncoderAV1.h`), so this guards against a usage or driver default rather than
+  changing the documented behaviour. `FORCE_INTEGER_MV` stays off (whole-pixel motion suits
+  scrolling text, not a game's sub-pixel motion). The FFmpeg path cannot set them (FFmpeg 8.1's
+  `av1_amf` has no such option, `internal/host/media/testdata/ffmpeg81-h-av1_amf.txt`) and keeps
+  the driver's default. Whether the encoder codes palette blocks is unverified (hardware test
+  below).
+- 4:4:4 stays off: the host encodes 4:2:0 only (NVENC HEVC pinned to Main and H.264 to High,
+  AMF encodes 4:2:0 only, the QSV path converts to NV12), and the client asks only for Main
+  profile support. Reported (guide, not checked here): Chrome decodes HEVC Range Extensions
+  4:4:4 in hardware on NVIDIA (Chrome 137+, driver 572.16+) and Intel GPUs, not on AMD; a
+  4:4:4 stream would therefore play only on some clients' GPUs. For text on an AMD host AV1
+  has its screen-content tools instead (previous bullet; unverified).
+
+Verified in the sandbox (no GPU; this Chromium decodes AV1 only, in software; the host encodes
+with libx264 / libsvtav1):
+
+- verified (sandbox): `go test ./internal/host -run 'TestChooseFamily|TestCodecSelection'`:
+  the in-tier rule on made-up times (HEVC default; AV1 replaces it only with `faster` and a
+  gain of at least 10 % and 0.5 ms, not with 0.2 ms or 8 %, not when its encoder pads the
+  size, not against an untimed HEVC; H.264 not for 1 ms or for 2 ms that are only 20 %, but
+  for 3 ms; after the review fix the same 0.6 ms per 1080p frame is enough neither at
+  1920×1080 nor at 3840×2160, 3 ms is enough at 3840×2160 but not at 1280×720 (1.33 ms there if
+  it is all per pixel), AV1's 0.6 ms is enough at 3840×2160 but not at 1280×720), and host GPU
+  × client GPU through `buildParams`: an RDNA3-like host (av1_amf with the probed 64×16
+  alignment) picks hevc_amf by default, av1_amf with `faster` at 2560×1440 for a client that
+  decodes AV1 faster, hevc_amf at 1920×1080 (no notice); an RDNA2-like and an RTX 30-like
+  host (no AV1 encoder) stay on HEVC; an RTX 40-like host picks av1_nvenc only with `faster`; a client whose HEVC decoder takes 6 ms gets H.264; a browser
+  without HEVC gets AV1 before H.264 (RTX 40) or H.264 (RTX 30); AV1 decoded only in software
+  never beats hardware HEVC; a client before step 4.2 gets HEVC; the client's codec setting and
+  a host-forced encoder still win; one `codec choice` log line per change.
+  `TestCodecSelectionFailover`: a failed encoder hands over to the next family by the same
+  rule. `TestCodecSelectionSoftwareEncode` (review fix): a software-only host and an RTX 40-like
+  host whose three NVENC encoders all failed in the session pick libx264 with `"av1": "faster"`
+  for a client that decodes AV1 in 1.4 ms and H.264 in 2.0 ms per 1080p frame. The review
+  fix's new cases fail against the code before it (h264 at 4K; libsvtav1 in both software
+  cases). `TestHelloTiming`, `TestDecoderSummary`, `TestLoadConfigAV1` (`av1` accepts `fallback`
+  and `faster`, rejects anything else). Step 1.7's `TestAlignmentGuard` and the earlier encoder
+  failover tests pass unchanged.
+- verified (sandbox): `go test ./internal/host/media -run TestNoYUV444`: with the FFmpeg 8.1
+  encoder options, no AMF or NVENC argument set (every quality, adaptive on and off) asks for
+  4:4:4 (no `-rgb_mode`, profiles only `main` / `high`, no value with `444`), FFmpeg 8.1's
+  `hevc_nvenc` / `av1_nvenc` help shows `rgb_mode` defaulting to `yuv420` (ddagrab's BGRA
+  textures become 4:2:0), and the software encoders get `format=yuv420p`.
+- verified (sandbox): `TestDecoderSelfTestClips/TIMING_CLIPS`: three 1920×1080 clips, frames
+  `IPPPPPPP`, `has_b_frames` 0, codec strings from their parameter sets; the hygiene clips
+  regenerate byte for byte.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`), first scenario: the real decoder
+  (AV1, dav1d via `no-preference`) is timed at 4.09 ms per 1080p frame over 7 P frames (the
+  4.1 clip: 0.51 ms/frame); the hello the worker sent (`__recon.helloDecoders`) carries exactly
+  that timing; the host's `session started` line has `decoders=av1:sw:4.09ms@1920x1080` and its
+  `codec choice` line `encoder=libsvtav1 family=av1 reason="auto, software encode: first
+  choice" size=960x556 av1=fallback`; the overlay's self-test line reads "AV1 any ✓ 0.51
+  ms/frame · timed 1080p: 4.09 ms/frame". Logic on a fake decoder that answers each frame after
+  a fixed delay per codec (no real decoding, so all three families): 40 ms → 40.61 ms/frame
+  over 7 frames; H.264 24 ms → 25.16, HEVC 12 ms → 12.72, AV1 40 ms → 40.3; the three timing
+  runs do not overlap; the hello entries carry them. The whole self-test with one family
+  (hygiene + timing) took 68 ms in a separate headless run (AV1 software: 0.3 ms/frame on the
+  4.1 clip, 4.6 ms on the timing clip). Only one family decodes here, so the choice between
+  families is covered by the Go tests above, not end to end. Browser E2E 156 of 156 in the
+  final run (AV1 timed at 4.77 ms per 1080p frame there; fake decoder 40 ms → 41.12). Three
+  earlier runs, while other checkouts' tests kept the 4-core machine at a load average of 5-11,
+  failed only frame-rate checks (steady playback, video decoding, Smooth pacing, the bake-off,
+  the lan restart count) and once or twice the recovery "skip" check, whose key-frame count
+  includes the key frame a decoder backlog asks for when the bitrate cut is rate-limited
+  (`congestion` reason `decoder` → `requestKeyframe`); every 4.2 check passed in every run.
+- verified (sandbox), after the review fixes: browser E2E timing logic on the fake decoder
+  (24 / 12 / 40 ms per 1080p frame for H.264 / HEVC / AV1, 10 ms on the hygiene clip): times
+  24.29 / 12.3 / 40.24 ms over 7 P frames each, decode order `avc1 hev1 av01 avc1 hev1 av01 …`
+  (24 decodes, interleaved), never more than one 1080p decode in flight. Budget: AV1 at 200 ms
+  per frame goes untimed while H.264 and HEVC are timed as before (whole pass 804 ms); every
+  family at 400 ms per 1080p frame and 50 ms on the hygiene clip (the review's slowest case,
+  9978 ms before the fix): the whole self-test takes 2005 ms, every family untimed; a clip
+  import that never finishes: nothing timed after 301 ms (budget 300 ms in that test). The same
+  numbers in Node with the same fake decoder for 3 families at 20 / 120 / 260 / 400 ms per 1080p
+  frame: 1000 / 2005 / 2003 / 2005 ms (review's run before the fix: 994 / 3429 / 4406 / 9978 ms).
+  Real decoder (AV1, dav1d): self-test 88 ms in all, timed 4.09 ms per 1080p frame; the overlay
+  label reads "Decoder self-test (88 ms)" (a first version added a row instead, which pushed
+  the overlay's "Export latency data" button below the E2E's 1280x720 viewport). Helper: `make
+  helper` (mingw) builds without warnings with the AV1 screen-content properties; `make
+  helper-test` under Wine/Xvfb passes (AMD paths skip without AMD hardware, as before). Browser
+  E2E 157 of 157 in the final run; one earlier run at a load average of 16 (other checkouts'
+  tests) failed only frame-rate checks and stopped at a screenshot timeout.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (host rules): `& "$env:ProgramFiles\KlouditRecon\recon-host.exe"
+  probe` lists `av1_amf`, `hevc_amf`, `h264_amf` as working, and the agent's log at startup has
+  `encoder pads the coded picture encoder=av1_amf probe=1920x1080 coded=1920x1082 alignment=64x16`
+  (step 1.7). Then with the default `host.json` (no `av1` key) connect from Chrome on a client
+  with hardware HEVC and AV1 decoding at the host's native 2560x1440: host.log `codec choice
+  encoder=hevc_amf ... reason="auto, hardware encode and decode: first choice"`. Add `"av1":
+  "faster"`, restart the agent (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask
+  'KloudIT Recon Host'`) and reconnect: `codec choice encoder=av1_amf ... reason="... av1 decodes
+  clearly faster than hevc (...)"` when the overlay's self-test shows AV1's "timed 1080p" at
+  least 10 % and 0.5 ms below HEVC's (2560x1440 scales them by 1.78), else hevc_amf with "first
+  choice"; then Settings → Resolution 1920x1080: `codec choice encoder=hevc_amf` and no "AV1 on
+  this GPU needs 64×16-aligned sizes" notice. Record the host.log lines and the overlay's
+  self-test line.
+- AMD RDNA2: unverified (no RDNA2 host available). Test: `recon-host.exe probe` on an RX 6000
+  series host: `av1_amf` must not be among the working encoders, and the rejected list must show
+  it with FFmpeg's AMF error (expected: `CreateComponent(AMFVideoEncoder_AV1) failed` /
+  `AMF_ENCODER_NOT_PRESENT`); a session with `"av1": "faster"` and an AV1-capable client logs
+  `codec choice encoder=hevc_amf`.
+- NVIDIA: unverified (no NVIDIA host available). Test (host rules): `recon-host.exe probe` on an
+  RTX 40/50 host lists `av1_nvenc` as working, no `encoder pads the coded picture` line for it
+  (NVENC signals 1080p with a frame size of 1920x1080); on an RTX 20/30 host `av1_nvenc` is in the
+  rejected list (expected FFmpeg error: `Codec not supported` or `No capable devices found`).
+  Then the session checks of the RDNA3 test above at 1920x1080 and 2560x1440: `hevc_nvenc` by
+  default, `av1_nvenc` with `"av1": "faster"` when the client decodes AV1 clearly faster (at
+  either size: no padding), `hevc_nvenc` on RTX 20/30 whatever the policy.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (client timings, AMD GPU in the client): Chrome and
+  Edge on a Windows PC with a Radeon GPU, streaming from the AMD host: the overlay's "Decoder
+  self-test" lines show each family "HW ✓ … · timed 1080p: N ms/frame" (record N per family and
+  the browser, driver and GPU). Then, per codec (Settings → Codec H.264, HEVC, AV1) at 1920x1080
+  60 fps, 30 Mbit/s, record the overlay's *decode* stage p50/p95 after 30 s: the timed value
+  should be within 50 % or 1 ms (whichever is larger) of the live decode p50 (the clip predicts
+  the decoder's latency per frame; a large miss means its low-bitrate picture does not
+  represent the stream, record it). Record the host's Auto choice (`codec choice` line) for
+  this client with the default policy and with `"av1": "faster"`.
+- NVIDIA: unverified (no NVIDIA host available). Test (client timings, NVIDIA GPU in the client):
+  the client-timing test above on a Windows PC with a GeForce GPU (NVDEC through Chrome's
+  D3D11 decoder), streaming from the AMD host (the client side does not depend on the host's
+  vendor); also an Intel iGPU client and a Mac (VideoToolbox) if available.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (when to enable `"av1": "faster"` on this host, guide
+  "switch to AV1 per host only after Phase 0 + VMAF"): (1) latency: stream 2560x1440 60 fps at
+  30 Mbit/s with Settings → Codec HEVC, then AV1, 60 s each, and record the overlay's
+  capture→encoded p50/p95 (step 0.1); AV1 should not be more than 1 ms above HEVC at p95.
+  (2) quality: record a 20 s reference of a game scene losslessly on the host (`ffmpeg -f lavfi
+  -i ddagrab=output_idx=0:framerate=60 -t 20 -vf hwdownload,format=bgra -c:v ffv1 ref.mkv`,
+  then encode it with each encoder's arguments from the host log's `starting encoder` line at
+  the same bitrate (`ffmpeg -i ref.mkv -vf format=nv12 -c:v hevc_amf <args> hevc.mkv`, same with
+  `av1_amf`), and score with an FFmpeg build that has libvmaf (the gyan.dev full build): `ffmpeg
+  -i hevc.mkv -i ref.mkv -lavfi "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]libvmaf"
+  -f null -` (and `av1.mkv`); record the VMAF mean at 10, 20 and 40 Mbit/s. Enable `faster` when
+  AV1 scores at least HEVC's VMAF at each bitrate and passes (1).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with `hevc_nvenc` / `av1_nvenc`
+  on an RTX 40/50 host.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (4:4:4 note, recorded, kept off): on Windows clients
+  with an AMD, an NVIDIA (Chrome 137+, driver 572.16+) and an Intel GPU, make a 4:4:4 HEVC file
+  (`ffmpeg -f lavfi -i testsrc2=s=1920x1080:r=60 -frames:v 120 -c:v libx265 -pix_fmt yuv444p
+  -tag:v hvc1 rext444.mp4`), open it in Chrome (drag it into a tab) and check
+  `chrome://media-internals` → the player → `kVideoDecoderName` (`D3D11VideoDecoder`: hardware)
+  or a decode error (Chrome has no software HEVC decoder). Expected from the reports: NVIDIA
+  and Intel play it, AMD does not. Record GPU, driver and Chrome version; the host stays on
+  4:2:0 either way.
+- NVIDIA: unverified (no NVIDIA host available). Test: the 4:4:4 check above covers the NVIDIA
+  client; no host-side NVIDIA check (the host never encodes 4:4:4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 screen-content tools, review fix): open a
+  text-heavy desktop (a code editor and a web page with small text, nothing moving) and record
+  10 s of the helper's AV1 output twice at 2560x1440 60 fps, 10 Mbit/s: `recon-encoder.exe
+  --encode-test=on.ivf --backend=amf --codec=av1 --capture=dda --width=2560 --height=1440
+  --fps=60 --kbps=10000 --frames=600` with the build as is, and `off.ivf` from a build with the
+  two `setBool(..., true)` calls under "AV1 screen content tools" in
+  `native/recon-encoder/src/amf/amf_backend.cpp` changed to `false`. (1) The helper's log has
+  no `properties not accepted ... Av1ScreenContentTools` / `Av1PaletteMode` line.
+  (2) Sequence and frame headers: `ffmpeg -i on.ivf -c copy -bsf:v trace_headers -f null - 2>&1 |
+  findstr /i "screen_content"`: with the tools on expect `seq_choose_screen_content_tools = 1`
+  (each frame header then has `allow_screen_content_tools`: expect 1) or
+  `seq_force_screen_content_tools = 1`; with them off both 0. The headers do not show whether
+  blocks use the palette (FFmpeg does not trace tile data); (3) does. (3) Quality: grab the same desktop losslessly (`ffmpeg -f lavfi -i
+  ddagrab=output_idx=0:framerate=60 -t 10 -vf hwdownload,format=bgra -c:v ffv1 ref.mkv`) and
+  score both streams against it with libvmaf as in the "av1 faster" test above, plus a
+  side-by-side screenshot of 10 px text; record VMAF and the bits per frame. Expected: on is
+  the driver default and sharper (or equal) at the same bitrate. Also stream with the FFmpeg
+  path (`av1_amf`, no option for these) and run (2) on a recording of it to see the driver's
+  default.
+- NVIDIA: unverified (no NVIDIA host available). Test: none needed for this item (the NVENC
+  backend does not set AV1 screen-content tools; NVENC's AV1 encoder decides them itself). For
+  the record, run check (2) above on an `av1_nvenc` recording of the same desktop.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (the four network profiles, step 0.4): the choice
+  depends on the client's decoders and the host's encoders, not on the network, so `lan /
+  wifi / wan / capdrop` must give the same `codec choice` line for the same client (check under
+  each profile, relay path forced as in "How every later step reports the four profiles").
+  Under `wan`, in a fresh browser profile, also record the overlay's "Decoder self-test (N ms)"
+  (or the console's `decoder self-test took N ms`) on the
+  first connection (the 226 kB timing clip is downloaded once) and on the second (cached): the
+  timing pass is capped at 1.5 s, so expect at most that much more on the first; note whether a
+  family went untimed on the first (no "timed 1080p" on its line: the clip came too late).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same four-profile check streaming
+  from the NVIDIA host.

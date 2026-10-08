@@ -55,6 +55,8 @@ struct AmfCodecProps {
     const wchar_t* alignmentMode = nullptr;        // AV1
     const wchar_t* switchFrameMode = nullptr;      // AV1 SWITCH_FRAME_INSERTION_MODE
     amf_int64 switchFrameNone = 0;
+    const wchar_t* screenContentTools = nullptr;   // AV1
+    const wchar_t* paletteMode = nullptr;          // AV1 (dynamic; needs screenContentTools)
     const wchar_t* colorBitDepth = nullptr;
     const wchar_t* inputColorProfile = nullptr;
     const wchar_t* inputTransfer = nullptr;
@@ -356,6 +358,8 @@ inline const AmfCodecProps& amfAv1Props() {
         c.alignmentMode = AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE;
         c.switchFrameMode = AMF_VIDEO_ENCODER_AV1_SWITCH_FRAME_INSERTION_MODE;
         c.switchFrameNone = AMF_VIDEO_ENCODER_AV1_SWITCH_FRAME_INSERTION_MODE_NONE;
+        c.screenContentTools = AMF_VIDEO_ENCODER_AV1_SCREEN_CONTENT_TOOLS;
+        c.paletteMode = AMF_VIDEO_ENCODER_AV1_PALETTE_MODE;
         c.colorBitDepth = AMF_VIDEO_ENCODER_AV1_COLOR_BIT_DEPTH;
         c.inputColorProfile = AMF_VIDEO_ENCODER_AV1_INPUT_COLOR_PROFILE;
         c.inputTransfer = AMF_VIDEO_ENCODER_AV1_INPUT_TRANSFER_CHARACTERISTIC;

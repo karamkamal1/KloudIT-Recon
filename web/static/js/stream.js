@@ -4,6 +4,8 @@
 import { api, me, el, toast, capabilities } from './api.js';
 import * as P from './protocol.js';
 import { codeToScancode } from './keymap.js';
+import { PATHS, LABELS } from './renderers.js';
+import { PACING, PACING_LABELS } from './pacing.js';
 
 const $ = (id) => document.getElementById(id);
 const hostId = new URLSearchParams(location.search).get('host');
@@ -24,12 +26,20 @@ const ICONS = {
 const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
   audio: true, audioCodec: 'opus', volume: 100, jitterMs: 30,
-  renderer: 'canvas2d', decoder: 'hardware', path: 'auto', transport: 'auto',
+  renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto',
   mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
 const PREF_KEY = 'recon.prefs.v1';
 let prefs = { ...DEFAULTS };
-try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREF_KEY) || '{}')); } catch {}
+try {
+  const saved = JSON.parse(localStorage.getItem(PREF_KEY) || '{}');
+  // Before step 4.3 every saved set held the then default renderer
+  // "canvas2d"; that default is now "auto" (an explicit WebGPU choice stays).
+  if (!saved.rendererV && saved.renderer === 'canvas2d') delete saved.renderer;
+  Object.assign(prefs, saved, { rendererV: 2 });
+} catch {}
+if (prefs.renderer !== 'auto' && !PATHS.includes(prefs.renderer)) prefs.renderer = 'auto';
+if (!PACING.includes(prefs.pacing)) prefs.pacing = 'latency';
 const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} };
 
 const RESOLUTIONS = {
@@ -54,7 +64,13 @@ function hostPrefs() {
 
 const S = {
   worker: null,
-  canvas: $('screen'),
+  surface: $('stage'), // input target (pointer lock, focus, events) holding the canvases
+  canvases: {}, // presentation path -> its canvas (only the active one is shown)
+  box: null, // the canvas box in device pixels
+  present: null, // presentPlan() of this connection
+  renderer: null, // the worker's active renderer (info)
+  bakeoff: null, // this session's presentation bake-off result
+  present2D: false, // Auto's path failed while drawing: the 2D canvas for this page
   connected: false,
   streaming: false,
   userClosed: false,
@@ -95,14 +111,19 @@ function splash(title, sub, { button = null, spinner = false } = {}) {
   $('spinner').classList.toggle('hidden', !spinner);
 }
 
+// The display's refresh rate: the median interval of 30 animation frames, so
+// frames the browser skips while the page loads do not count (frame pacing,
+// step 4.4, takes its refresh interval from this).
 async function measureHz() {
   return new Promise((res) => {
-    let n = 0;
-    let t0 = 0;
+    const d = [];
+    let last = 0;
     const tick = (t) => {
-      if (!t0) t0 = t;
-      if (++n < 30) requestAnimationFrame(tick);
-      else res(Math.round((1000 * (n - 1)) / (t - t0)));
+      if (last) d.push(t - last);
+      last = t;
+      if (d.length < 30) { requestAnimationFrame(tick); return; }
+      d.sort((a, b) => a - b);
+      res(Math.round(1000 / d[d.length >> 1]));
     };
     requestAnimationFrame(tick);
   });
@@ -142,14 +163,135 @@ async function audioChannel() {
   return { port: ch.port2 };
 }
 
-function freshCanvas() {
-  // A canvas can only be transferred to a worker once, so every connection gets a new one.
-  const c = el('canvas', { id: 'screen', tabindex: '0', 'aria-label': 'Remote screen' });
-  S.canvas.replaceWith(c);
-  S.canvas = c;
-  bindCanvas(c);
-  applyCursor();
-  return c;
+// ---------------------------------------------------------------------------
+// Presentation (guide step 4.3). Renderer "auto": the first connection
+// without a stored result gives the worker a canvas per path and it runs the
+// bake-off on the live stream (stream-worker.js; the pick is a heuristic,
+// renderers.js pickPath: the 2D default unless another path is clearly
+// better); the pick and the numbers are stored here (localStorage, per
+// browser major version and OS: a browser update measures again). A path
+// chosen in the settings is used as is.
+
+const PRESENT_KEY = 'recon.present.v2';
+try { localStorage.removeItem('recon.present.v1'); } catch {} // picked by a noisier rule
+
+function deviceKey() {
+  const ua = navigator.userAgent;
+  let browser = 'Browser';
+  for (const [name, re] of [['Edge', /Edg\/(\d+)/], ['Opera', /OPR\/(\d+)/], ['Firefox', /Firefox\/(\d+)/], ['Chrome', /Chrome\/(\d+)/], ['Safari', /Version\/(\d+).*Safari/]]) {
+    const m = re.exec(ua);
+    if (m) { browser = `${name} ${m[1]}`; break; }
+  }
+  const os = navigator.userAgentData?.platform || (/Windows|Android|iPhone|iPad|Mac OS X|CrOS|Linux/.exec(ua) || ['unknown OS'])[0];
+  return `${browser} · ${os}`;
+}
+
+function storedPresent() {
+  try {
+    const s = JSON.parse(localStorage.getItem(PRESENT_KEY) || 'null');
+    return s && s.key === deviceKey() && PATHS.includes(s.winner) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+function storePresent(rec) {
+  try {
+    if (rec) localStorage.setItem(PRESENT_KEY, JSON.stringify(rec));
+    else localStorage.removeItem(PRESENT_KEY);
+  } catch {}
+}
+
+function presentPlan() {
+  if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [prefs.renderer] };
+  if (S.present2D) return { mode: 'auto', paths: ['canvas2d'] };
+  const s = storedPresent();
+  if (s) return { mode: 'auto', paths: [s.winner] };
+  return { mode: 'bakeoff', paths: [...PATHS] };
+}
+
+// One canvas per path (a canvas is transferred to the worker once and keeps
+// its context type), the first one shown. Returns them for the worker.
+function stageCanvases(paths) {
+  for (const c of Object.values(S.canvases)) c.remove();
+  S.canvases = {};
+  const out = {};
+  for (const p of paths) {
+    const c = el('canvas', { 'data-path': p });
+    S.surface.insertBefore(c, $('remote-cursor'));
+    S.canvases[p] = c;
+    out[p] = c.transferControlToOffscreen();
+  }
+  showCanvas(paths[0]);
+  return out;
+}
+
+function showCanvas(slot) {
+  for (const [p, c] of Object.entries(S.canvases)) {
+    c.hidden = p !== slot;
+    if (p === slot) c.id = 'screen';
+    else c.removeAttribute('id');
+  }
+}
+
+function onRenderer(info) {
+  S.renderer = info;
+  if (S.conn) S.conn.renderer = info.name;
+  showCanvas(info.slot);
+  // The stored winner no longer works here: measure again next time.
+  if (info.mode === 'auto' && info.name !== info.slot) storePresent(null);
+}
+
+function onCanvasGone(slot) {
+  S.canvases[slot]?.remove();
+  delete S.canvases[slot];
+}
+
+function onBakeoff(result) {
+  S.bakeoff = result;
+  streamHints();
+  if (!result.winner) return;
+  const v = S.videoCfg;
+  storePresent({
+    key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
+    video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
+  });
+  toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
+}
+
+// Auto's path failed draw after draw (the worker gave up on it): forget it
+// and reconnect with the 2D canvas (a canvas keeps its context type).
+function onPresentFailed(m) {
+  storePresent(null);
+  S.present2D = true;
+  toast(`Renderer: ${LABELS[m.path] || m.path} stopped drawing (${m.reason}); reconnecting with the 2D canvas.`, 'warn', 5000);
+  teardown();
+  S.attempts = 0;
+  connect();
+}
+
+// The canvas box in device pixels: the renderers size their canvas to it, so
+// the compositor never scales the picture. devicePixelContentBoxSize where
+// the browser has it (exact, snapped) and it agrees with the CSS size times
+// devicePixelRatio within a pixel (DevTools device emulation reports CSS
+// pixels there), else the CSS size times devicePixelRatio.
+function stageBoxNow() {
+  const r = S.surface.getBoundingClientRect();
+  return { w: Math.round(r.width * devicePixelRatio), h: Math.round(r.height * devicePixelRatio) };
+}
+
+const stageObserver = new ResizeObserver((entries) => {
+  const e = entries[entries.length - 1];
+  const d = e.devicePixelContentBoxSize?.[0];
+  const w = Math.round(e.contentRect.width * devicePixelRatio);
+  const h = Math.round(e.contentRect.height * devicePixelRatio);
+  S.box = d && Math.abs(d.inlineSize - w) <= 1 && Math.abs(d.blockSize - h) <= 1 ? { w: d.inlineSize, h: d.blockSize } : { w, h };
+  post({ type: 'resize', ...S.box });
+});
+try {
+  stageObserver.observe(S.surface, { box: 'device-pixel-content-box' });
+} catch {
+  stageObserver.observe(S.surface);
 }
 
 async function connect() {
@@ -164,17 +306,21 @@ async function connect() {
   $('host-name').textContent = ep.host;
   document.title = `${ep.host} · KloudIT Recon`;
   const { sab, port } = await audioChannel().catch(() => ({}));
-  const off = freshCanvas().transferControlToOffscreen();
+  S.present = presentPlan();
+  S.renderer = null;
+  S.bakeoff = null;
+  const canvases = stageCanvases(S.present.paths);
   const w = new Worker('/js/stream-worker.js', { type: 'module', name: 'recon-stream' });
   S.worker = w;
-  w.onmessage = (ev) => onWorker(ev.data);
-  w.onerror = (e) => onClosed(`worker error: ${e.message}`, true);
-  const transfer = [off];
+  // A worker being torn down (reconnect) still posts its last messages.
+  w.onmessage = (ev) => { if (S.worker === w) onWorker(ev.data); };
+  w.onerror = (e) => { if (S.worker === w) onClosed(`worker error: ${e.message}`, true); };
+  const transfer = Object.values(canvases);
   if (port) transfer.push(port);
   w.postMessage({
-    type: 'start', canvas: off, endpoints: ep,
+    type: 'start', canvases, present: { mode: S.present.mode }, box: S.box || stageBoxNow(), endpoints: ep,
     prefs: {
-      renderer: prefs.renderer, decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe,
+      decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
       skipUdpRelay: performance.now() - S.udpRelayFailedAt < 10 * 60 * 1000,
     },
     hostPrefs: hostPrefs(),
@@ -185,6 +331,7 @@ async function connect() {
 
 function teardown() {
   releaseAll();
+  onTicks(false);
   if (S.worker) {
     const w = S.worker;
     w.postMessage({ type: 'close' });
@@ -244,21 +391,36 @@ function onWorker(m) {
       S.streaming = true;
       S.attempts = 0;
       $('splash').classList.add('hidden');
-      S.canvas.focus();
-      showToolbar(3000);
-      if (prefs.mouse === 'game') toast('Game mode: click the screen to capture the mouse (Esc releases it).', 'info', 5000);
+      S.surface.focus();
+      // During the bake-off nothing covers the canvas (the toolbar has a
+      // backdrop filter), so every path is measured alike: the start-up
+      // toolbar and hint come with its result.
+      if (S.present?.mode !== 'bakeoff') streamHints();
       break;
     case 'cursor': onCursorShape(m.shape); break;
     case 'cursorPos': onCursorPos(m); break;
     case 'notice': toast(m.msg, m.level === 'error' ? 'error' : m.level === 'warn' ? 'warn' : 'info', 6000); break;
     case 'stats': onStats(m); break;
+    case 'renderer': onRenderer(m.info); break;
+    case 'gone': onCanvasGone(m.slot); break;
+    case 'bakeoff': onBakeoff(m.result); break;
+    case 'presentFailed': onPresentFailed(m); break;
     case 'drawn': onDrawnMark(m); break;
+    case 'ticks': onTicks(m.on); break;
     case 'stageDump': S.stageDump = m.recs; break;
     case 'dropTest': S.dropTest = m.result; break;
+    case 'decoderTest': S.decoderTest = m.tests; S.decoderTestMs = m.ms; break;
+    case 'hello': S.helloDecoders = m.decoders; break;
     case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
   }
+}
+
+// Shown once the stream is up: the toolbar for a moment, the game-mode hint.
+function streamHints() {
+  showToolbar(3000);
+  if (prefs.mouse === 'game') toast('Game mode: click the screen to capture the mouse (Esc releases it).', 'info', 5000);
 }
 
 // Display estimate for the worker's per-stage latency: the first animation
@@ -274,6 +436,24 @@ function onDrawnMark(m) {
     if (abs < drawnMark.t) { requestAnimationFrame(tick); return; }
     post({ type: 'displayed', id: drawnMark.id, t: abs });
     drawnMark = null;
+  };
+  requestAnimationFrame(tick);
+}
+
+// Frame pacing "Smooth" in a browser whose workers have no
+// requestAnimationFrame (pacing.js): the worker asks for this page's
+// animation frames instead; each one's start goes to it as an absolute time.
+// One loop at a time (gen: a loop of an earlier worker stops).
+const ticks = { on: false, gen: 0 };
+function onTicks(on) {
+  if (!!on === ticks.on) return;
+  ticks.on = !!on;
+  const gen = ++ticks.gen;
+  if (!on) return;
+  const tick = (ts) => {
+    if (ticks.gen !== gen) return;
+    post({ type: 'tick', t: performance.timeOrigin + ts });
+    requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
 }
@@ -340,7 +520,7 @@ document.addEventListener('visibilitychange', () => {
 // Mouse
 
 function contentRect() {
-  const r = S.canvas.getBoundingClientRect();
+  const r = S.surface.getBoundingClientRect();
   const vw = S.video.w || 16;
   const vh = S.video.h || 9;
   const scale = Math.min(r.width / vw, r.height / vh);
@@ -376,29 +556,39 @@ function sendRel(dx, dy) {
   r.settle = [40, 150].map((d) => setTimeout(() => sendDg(P.mouseRel(++r.seq, cx, cy)), d));
 }
 
-const locked = () => document.pointerLockElement === S.canvas;
+const locked = () => document.pointerLockElement === S.surface;
 
 async function lockPointer() {
   try {
-    await S.canvas.requestPointerLock({ unadjustedMovement: true });
+    await S.surface.requestPointerLock({ unadjustedMovement: true });
   } catch {
-    try { await S.canvas.requestPointerLock(); } catch {}
+    try { await S.surface.requestPointerLock(); } catch {}
   }
 }
 
+// The toolbar shows when the pointer reaches the top edge (no element over
+// the canvas for that: anything on top of it can cost the browser its
+// direct presentation path).
+let atTop = false;
+
 const moveEvent = 'onpointerrawupdate' in window ? 'pointerrawupdate' : 'pointermove';
 document.addEventListener(moveEvent, (e) => {
+  const top = e.clientY < 6 && !locked();
+  if (top && !atTop) showToolbar();
+  atTop = top;
   if (!S.streaming) return;
   if (locked()) {
     if (e.movementX || e.movementY) sendRel(e.movementX, e.movementY);
     return;
   }
   if (prefs.mouse !== 'desktop') return;
-  if (e.target !== S.canvas && !S.buttons.size) return;
+  if (!S.surface.contains(e.target) && !S.buttons.size) return;
   sendAbs(e.clientX, e.clientY);
 }, { passive: true });
 
-function bindCanvas(c) {
+// Input goes to the stage that holds the canvases (one per presentation path
+// during the bake-off), so pointer lock and focus survive a renderer switch.
+function bindSurface(c) {
   c.addEventListener('pointerdown', (e) => {
     if (!S.streaming) return;
     e.preventDefault();
@@ -469,7 +659,7 @@ function onCursorShape(shape) {
 
 function applyCursor() {
   const cur = S.cursor;
-  const c = S.canvas;
+  const c = S.surface; // the canvases inherit the cursor
   if (prefs.cursor !== 'local' || !S.welcome?.features?.includes('cursor')) {
     c.style.cursor = prefs.cursor === 'video' ? 'none' : 'default';
     return;
@@ -554,7 +744,6 @@ function showToolbar(ms = 2500) {
   }, ms);
 }
 function hideToolbar() { $('toolbar').classList.add('hide'); }
-$('peek').addEventListener('pointerenter', () => showToolbar());
 $('toolbar').addEventListener('pointerleave', () => showToolbar(1200));
 
 function updateToolbarState() {
@@ -570,7 +759,8 @@ async function toggleFullscreen() {
     await document.exitFullscreen().catch(() => {});
     return;
   }
-  await document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+  // Element fullscreen of the player (canvas stage + stream UI), browser UI hidden.
+  await $('player').requestFullscreen({ navigationUI: 'hide' }).catch((e) => S.logs.push(`${new Date().toISOString()} fullscreen refused: ${e.message}`));
 }
 
 document.addEventListener('fullscreenchange', async () => {
@@ -593,7 +783,7 @@ function toggleStats() {
 const STAGE_LABELS = [
   ['present', 'game present→capture'], ['capture', 'capture→encoded'], ['submit', '  capture→encoder'], ['encode', '  encode'],
   ['queue', 'host queue'], ['network', 'network'], ['transfer', 'transfer'],
-  ['wait', 'reorder/wait'], ['decode', 'decode'], ['draw', 'draw'], ['display', '+ display (est.)'],
+  ['wait', 'reorder/wait'], ['decode', 'decode'], ['hold', 'hold (frame pacing)'], ['draw', 'draw'], ['display', '+ display (est.)'],
 ];
 const fmt = (v, d = 1, unit = ' ms') => (v === null || v === undefined || !isFinite(v) ? '—' : `${v.toFixed(d)}${unit}`);
 const cls = (v, a, b) => (v === null || v === undefined ? '' : v < a ? 'good' : v < b ? 'warn' : 'bad');
@@ -642,10 +832,11 @@ function onStats(st) {
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Loss recovery', recoveryText(v.recovery, st)),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
-    row('Renderer', S.conn ? S.conn.renderer : '—'),
+    ...presentRows(st, row),
+    pacingRow(st.pacing, row),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
-    row('Decoder queue', String(st.queue)),
-    row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
+    ...decoderRows(st, row),
+    row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · superseded ${st.superseded ?? 0} (+${st.supersededChunks ?? 0} undecoded) · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
     st.recovered || st.recoveredByKey ? row('  recovered', `${st.recovered} by recovery frame · ${st.recoveredByKey} by key frame · ${st.recoveryDiscarded} frames waited out`) : null,
     row('Freezes > 100 ms', st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0', st.freezes ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
@@ -676,6 +867,65 @@ function targetRow(v, row) {
   const mb = (kbps) => (kbps / 1000).toFixed(1);
   const backedOff = v.maxBitrate > v.bitrate;
   return row('  target', backedOff ? `${mb(v.bitrate)} of ${mb(v.maxBitrate)} Mbps (backed off)` : `${mb(v.bitrate)} Mbps`, backedOff ? 'warn' : '');
+}
+
+// Presentation (step 4.3): the active path, what its context reports
+// (getContextAttributes().desynchronized) and the canvas size in device
+// pixels, then the bake-off's draw and display stages per path and why Auto
+// picked its path (this session's, or the result stored for this browser).
+const desyncText = (r) => (r.desynchronized === true ? 'desynchronized ✓' : r.desynchronized === false ? 'desynchronized ✗ (not granted)'
+  : r.name === 'webgpu' ? 'no low-latency mode' : 'desynchronized not reported');
+
+function presentRows(st, row) {
+  const r = st.renderer;
+  if (!r) return [row('Renderer', S.conn ? S.conn.renderer : '—')];
+  const b = r.bake;
+  const how = r.mode === 'setting' ? 'setting' : b && !b.done ? `auto: measuring ${b.warming ? '(warm-up)' : `${b.slot}/${b.slots}`}` : 'auto';
+  const rows = [
+    row('Renderer', `${LABELS[r.name] || r.name}${r.name !== r.slot ? ` (${LABELS[r.slot] || r.slot} failed)` : ''} · ${how}`),
+    row('  context', `${desyncText(r)} · canvas ${r.canvas[0]}×${r.canvas[1]}${r.drawErrors ? ` · ${r.drawErrors} errors` : ''}`, r.desynchronized === false || r.drawErrors ? 'warn' : ''),
+  ];
+  const res = b?.done ? b : storedPresent();
+  if (res?.results) {
+    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}`, `draw p50/p95 · display p50 · fps${res.pacing ? ` (pacing: ${res.pacing})` : ''}`));
+    for (const p of PATHS) {
+      const x = res.results[p];
+      if (!x) continue;
+      const v = x.error ? 'unavailable' : `${x.draw.p50 ?? '—'}/${x.draw.p95 ?? '—'} · ${x.display.p50 ?? '—'} · ${x.fps ?? '—'}${x.out ? ` · ${x.out}` : ''}`;
+      rows.push(row(`  ${p === res.winner ? '★ ' : ''}${LABELS[p]}`, v, p === res.winner ? 'good' : x.out ? 'warn' : ''));
+    }
+    if (res.why) rows.push(row('  pick', res.why));
+  }
+  return rows;
+}
+
+// Frame pacing (step 4.4): the mode; for Smooth where its refresh ticks come
+// from (the worker's requestAnimationFrame, else this page's), the refresh
+// interval it works with (the one its ticks show), and this session's frames
+// dropped stale (older than one refresh, a newer one on its way), drawn late,
+// and drawn from the watchdog timer (no refresh tick came: warn).
+const TICKS = { raf: 'worker rAF', main: 'page rAF' };
+function pacingRow(pc, row) {
+  if (!pc) return null;
+  if (pc.mode !== 'smooth') return row('Frame pacing', `${PACING_LABELS.latency} · draw on decode`);
+  const c = pc.counts;
+  return row('Frame pacing', `${PACING_LABELS.smooth} · each refresh (${TICKS[pc.ticks] || pc.ticks}, ${pc.refreshMs} ms) · stale ${c.stale} · late ${c.late}` +
+    `${c.timer ? ` · watchdog ${c.timer}` : ''}`, c.timer ? 'warn' : '');
+}
+
+// Decoder hygiene (step 4.1): the queue in the decoder (bound 2) and in front
+// of it, the output lag (frames the decoder holds back on this stream), the
+// VideoFrames open, and the startup self-test per codec family with how long
+// it took in all (the hello waits for it: hygiene and step 4.2's timing).
+function decoderRows(st, row) {
+  const vf = st.videoFrames;
+  return [
+    row('Decoder queue', `${st.queue} (max ${st.queueMax ?? '—'}) · waiting ${st.waiting ?? 0} (max ${st.waitingMax ?? '—'})`, st.queueMax > 2 ? 'bad' : ''),
+    row('Decoder output lag', st.outputLag === null || st.outputLag === undefined ? '—' : `${st.outputLag} frame${st.outputLag === 1 ? '' : 's'}`, st.outputLag > 0 ? 'warn' : ''),
+    vf ? row('VideoFrames open', `${vf.open} (max ${vf.max})${vf.leaked ? ` · ${vf.leaked} leaked` : ''}`, vf.leaked ? 'bad' : '') : null,
+    ...(S.decoderTest || []).map((t, i) => row(i ? '' : `Decoder self-test${S.decoderTestMs !== undefined ? ` (${S.decoderTestMs} ms)` : ''}`, t.text,
+      t.software || (t.hw && !t.hw.ok) ? 'warn' : '')),
+  ];
 }
 
 // Latency probe (frame barcode) rows: sample counts and capture->drawn
@@ -710,13 +960,14 @@ function exportLatency() {
     host: S.welcome ? { name: S.welcome.host, os: S.welcome.os, version: S.welcome.version, features: S.welcome.features } : null,
     client: { ua: navigator.userAgent, hz: S.hz, dpr: devicePixelRatio, screen: [Math.round(screen.width * devicePixelRatio), Math.round(screen.height * devicePixelRatio)] },
     connection: S.conn, video: S.videoCfg, probe: d.probe, stages: d.stages,
+    renderer: S.lastStats?.renderer || null, present: storedPresent(),
   });
 }
 S.exportLatency = exportLatency;
 
 async function downloadLatency() {
   const data = await exportLatency();
-  S.canvas.focus();
+  S.surface.focus();
   if (!data) { toast('No latency data yet.', 'warn'); return; }
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const name = `recon-latency-${(data.host?.name || 'host').replace(/[^\w.-]+/g, '_')}-${data.exportedAt.replace(/[:.]/g, '-')}.json`;
@@ -755,7 +1006,7 @@ function pasteDialog() {
       el('div', { class: 'modal-actions' },
         el('button', { onclick: async () => { try { ta.value = await navigator.clipboard.readText(); } catch { toast('Clipboard access denied', 'warn'); } } }, 'From clipboard'),
         el('button', { onclick: close }, 'Cancel'),
-        el('button', { class: 'btn-primary', onclick: () => { if (ta.value) sendIn(P.textEvent(ta.value)); close(); S.canvas.focus(); } }, 'Send'))));
+        el('button', { class: 'btn-primary', onclick: () => { if (ta.value) sendIn(P.textEvent(ta.value)); close(); S.surface.focus(); } }, 'Send'))));
   $('modal-root').append(bg);
   ta.focus();
 }
@@ -767,7 +1018,16 @@ function toggleDrawer() {
   const d = $('drawer');
   d.classList.toggle('open');
   if (d.classList.contains('open') && locked()) document.exitPointerLock();
-  if (!d.classList.contains('open')) S.canvas.focus();
+  if (!d.classList.contains('open')) S.surface.focus();
+}
+
+function presentHint() {
+  const s = storedPresent();
+  if (!s) {
+    return 'Auto tries each renderer on the live stream for about 10 s on the first connection: a desynchronized context first, the 2D canvas ' +
+      'unless another draws clearly faster. A heuristic: the latency rig decides.';
+  }
+  return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}.`;
 }
 
 function field(label, control, hint) {
@@ -793,6 +1053,8 @@ const applyLive = () => {
   applyTimer = setTimeout(() => sendCtl({ t: 'settings', prefs: hostPrefs() }), 250);
 };
 const needsReconnect = () => toast('Applies on the next connection — click Reconnect.', 'info', 3500);
+// Frame pacing (step 4.4) applies live in the worker (the host is not involved).
+const applyPacing = () => post({ type: 'prefs', prefs: { pacing: prefs.pacing } });
 
 function buildDrawer() {
   const w = S.welcome || {};
@@ -821,7 +1083,7 @@ function buildDrawer() {
   $('drawer').replaceChildren(
     el('h3', {}, 'Stream settings', el('button', { class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Video'),
-      field('Codec', select('codec', codecOpts, applyLive), 'HEVC/AV1 give more quality per bit; H.264 decodes fastest everywhere.'),
+      field('Codec', select('codec', codecOpts, applyLive), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
       field('Bitrate', el('div', { class: 'range-row' }, bitrate, out), 'LAN: 50–150 Mbps. Internet: match your upload speed.'),
       field('Frame rate', select('fps', fpsOpts, applyLive)),
       field('Resolution', select('resolution', [['native', 'Native (host display)'], ['client', 'Match this screen'], ['2160', '3840×2160'], ['1440', '2560×1440'], ['1080', '1920×1080'], ['900', '1600×900'], ['720', '1280×720']], applyLive), 'Downscaling happens on the GPU (Windows Graphics Capture).'),
@@ -846,7 +1108,11 @@ function buildDrawer() {
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Pipeline'),
       field('Network path', select('path', [['auto', 'Auto (direct, then relay)'], ['direct', 'Direct to PC only'], ['relay', 'Relay via gateway']], needsReconnect)),
       field('Transport', select('transport', [['auto', 'WebTransport (QUIC), fall back to WebSocket'], ['websocket', 'WebSocket only']], needsReconnect)),
-      field('Renderer', select('renderer', [['canvas2d', 'Low-latency 2D canvas (desynchronized)'], ['webgpu', 'WebGPU zero-copy']], needsReconnect)),
+      field('Renderer', select('renderer', [['auto', 'Auto (measured in this browser)'], ['canvas2d', '2D canvas (desynchronized)'],
+        ['webgl2', 'WebGL2 (desynchronized if granted)'], ['webgpu', 'WebGPU (zero-copy)']], needsReconnect), presentHint()),
+      el('button', { class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),
+      field('Frame pacing', select('pacing', [['latency', 'Lowest latency (draw on decode)'], ['smooth', 'Smooth (one frame per display refresh)']], applyPacing),
+        'Applies at once. Smooth holds each frame for the next display refresh: an even cadence for up to one refresh more latency (overlay: hold).'),
       field('Decoder', select('decoder', [['hardware', 'Prefer hardware'], ['software', 'Prefer software']], needsReconnect)),
     ),
     el('div', { class: 'actions' },
@@ -872,7 +1138,7 @@ async function boot() {
   $('btn-export-latency').onclick = downloadLatency;
   $('stats').classList.toggle('hidden', !prefs.stats);
   updateToolbarState();
-  bindCanvas(S.canvas);
+  bindSurface(S.surface);
   if (!hostId) {
     splash('No machine selected', 'Go back and pick a PC.', {});
     return;

@@ -46,6 +46,9 @@ export const FEATURE_FRAME_EXT = 'frame-ext';
 export const FEATURE_RATE_REPORT = 'rate-report';
 export const RATE_REPORT_OWD = 1; // owdP50Us / owdMaxUs valid
 export const RATE_REPORT_FRAME = 2; // gen / lastSeq name a received frame
+// The host takes the "hold" row (frame pacing wait) in the client's stage
+// report; without it the client reports hold and draw as one draw row.
+export const FEATURE_STAGE_HOLD = 'stage-hold';
 
 export const AUDIO_OPUS = 1;
 export const AUDIO_PCM = 2;

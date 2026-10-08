@@ -108,7 +108,10 @@ func (s *Session) openPipeline() (notice string) {
 			s.pipeMu.Lock()
 			s.helperEncs, s.helperCaps = media.HelperEncoders(c), c
 			s.pipeMu.Unlock()
-			if e, err := s.negotiateEncoder(prefs, false); err != nil || !e.Helper {
+			// The stream's size is not known here (0, 0: neither padding nor
+			// decode times scaled to it); buildParams negotiates again at it
+			// and leaves the helper if that codec is not one of its.
+			if e, _, err := s.negotiateEncoder(prefs, 0, 0, false); err != nil || !e.Helper {
 				why = fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", e.Name, encoderNames(s.helperEncs))
 			}
 		}

@@ -40,9 +40,14 @@ Techniques used (most of them are new to browser-based game streaming):
 - **Overlapped encoder restarts.** Changing bitrate, resolution, codec or display starts a new
   encoder *while the old one keeps streaming*, then switches on the new key frame. You get no freeze.
 - **The entire media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`
-  (`optimizeForLatency`) → an **OffscreenCanvas** that draws each frame the instant it decodes.
-  It uses a **desynchronized** (front-buffer) 2D canvas, or **WebGPU `importExternalTexture`**
-  zero-copy rendering after a built-in self-test. The main thread can't stall a frame.
+  (`optimizeForLatency`, at most 2 chunks queued, never flushed) → an **OffscreenCanvas** that
+  draws each frame the instant it decodes and closes it at once. Three presentation paths: a
+  **desynchronized** (front-buffer) 2D canvas, **WebGL2** (`texImage2D` of the frame) or
+  **WebGPU `importExternalTexture`** zero-copy rendering; **Auto** tries them on the live stream
+  the first time and keeps a pick for that browser (a heuristic: the desynchronized 2D canvas
+  unless another path is clearly better; the latency rig decides). The canvas is sized to device
+  pixels with nothing on top of it, so the compositor never scales or covers it. The main thread
+  can't stall a frame. A startup self-test catches decoders that hold frames back and avoids them.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
@@ -73,7 +78,7 @@ Techniques used (most of them are new to browser-based game streaming):
   it), in the encoder at once on the native helper, with overlapped restarts on FFmpeg (an
   immediate one after a capacity drop). At the 2 Mbit/s floor it lowers the frame rate
   (120 → 90 → 60) instead. A decoder backlog gets
-  flushed and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
+  dropped and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
   then climbs back only to 85 % of where the decoder fell behind.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
@@ -111,7 +116,7 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
 ```
  Browser (Chrome / Edge / Firefox / Safari 26.4+)
    main thread: UI, raw input, gamepads, AudioWorklet
-   worker:      WebTransport ─► reorder ─► VideoDecoder ─► OffscreenCanvas (desync 2D / WebGPU)
+   worker:      WebTransport ─► reorder ─► VideoDecoder ─► OffscreenCanvas (2D / WebGL2 / WebGPU)
         │   HTTPS (UI, API)            TCP 8443
         │   UDP relay (WebTransport)   UDP 8444-8459 ── relay path, one port per session
         │   HTTP/3 WebTransport        UDP 8443  ── relay fallback (QUIC splice)
@@ -245,14 +250,32 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 | **Q** | Disconnect |
 
 **Settings** (applied live unless noted):
-- **Codec**: Auto picks HEVC → AV1 → H.264, preferring hardware encode on the PC *and*
-  hardware decode in your browser.
+- **Codec**: Auto prefers hardware encode on the PC *and* hardware decode in your browser, and
+  there HEVC (then AV1, then H.264), on AMD and NVIDIA PCs alike. While connecting, the browser
+  times each codec's decoder on a short 1080p clip (overlay: "Decoder self-test … timed 1080p");
+  a codec your browser decodes clearly faster replaces HEVC (H.264 only when it saves a lot, as
+  it needs more bitrate for the same picture; AV1 only on PCs with `"av1": "faster"`). AV1 is
+  available only where the PC's GPU encodes it (AMD RDNA3 and newer, NVIDIA RTX 40 and newer);
+  RDNA3 uses it only at sizes in 64×16 steps (e.g. not 1920×1080).
 - **Bitrate**: 50–150 Mbps on a LAN. Over the internet, stay below your upload speed.
 - **Frame rate** (up to 240) and **resolution** (native, or downscaled on the GPU).
 - **Encoder preset**: lowest latency / balanced / best quality.
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer size.
-- **Network path, transport, renderer and decoder**: these apply on reconnect.
+- **Network path, transport, renderer and decoder**: these apply on reconnect. Renderer
+  *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for about 10 s on
+  the first connection in a browser and remembers its pick for that browser version: a path
+  that fails draws, cannot keep the frame rate or holds the page's frames back is out, a
+  desynchronized context comes first, and it leaves the 2D canvas only for a path that draws
+  clearly faster in both rounds (overlay: per-path numbers and why; *Measure renderers again*
+  repeats it). This is a heuristic: the browser cannot measure presentation itself. A picked
+  path that stops drawing is dropped for the 2D canvas. Pick a renderer to override Auto, for
+  example after measuring click-to-photon with the latency rig
+  ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
+- **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
+  decodes. *Smooth* draws at most one new frame per display refresh, in the refresh's animation
+  frame callback, for an even cadence; it costs up to one refresh of latency (the overlay's
+  *hold* row) and drops a frame that missed its refresh when a newer one is already decoding.
 - **Latency probe** (Diagnostics): open `tools/latency-test/index.html` (in the release zip:
   `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
   host screen → drawn latency measured from the picture, and **Export latency data** saves it.
@@ -307,6 +330,7 @@ The new password (at least 10 characters) is read from stdin.
 | `capture` | `auto` | `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion; never chosen by `auto`. The agent uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6) |
 | `pipeline` | `auto` | Video pipeline: `auto` streams with the native encoder helper `recon-encoder.exe` (installed next to `recon-host.exe`: DXGI / AMD Direct Capture / WGC capture, AMF or NVENC in the running process, so key frames and bitrate changes need no encoder restart, and a lost frame is answered with a recovery frame from frames the browser acknowledged instead of a key frame: AMF long-term references, NVENC reference invalidation; a frame stream that stalls past its deadline while newer frames wait is then cancelled and recovered the same way, see "The loss-recovery ladder" in `docs/ARCHITECTURE.md`) when it starts, has an encoder for the codec negotiated with the browser and the session needs nothing only FFmpeg offers (the cursor drawn into the video, a window capture without Windows.Graphics.Capture in the helper, `capture` `x11grab` or `test`, an FFmpeg `encoder` forced here); otherwise FFmpeg. `helper` also streams the test pattern (`capture` `test`) with the helper's synthetic GPU source and tells the user when it cannot use the helper; `ffmpeg` never uses it. Three helper failures within 60 s move the session to FFmpeg (restarts after the first back off; failed restarts within 3 s of a driver reset do not count). host.log says which pipeline a session uses and why (`video pipeline`). Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.1b, 3.5 and 2.3 |
 | `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` (FFmpeg), or a helper encoder such as `hevc_amf_helper` |
+| `av1` | `fallback` | When the automatic codec choice uses AV1 (on a GPU that encodes it): `fallback` only where HEVC does not work end-to-end (a browser without HEVC; then before H.264); `faster` also instead of HEVC for a browser that decodes AV1 clearly faster (at least 10 % and 0.5 ms per frame). Switch to `faster` after measuring this PC's AV1 encoder (latency overlay, image quality). The host log's `codec choice` line says what was chosen and why |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
@@ -438,9 +462,10 @@ recovery mode the host announces, `intra-refresh` runs libx264 with periodic int
 NVENC runs, so the host announces `skip` from its real encoder arguments, `ref-recovery` makes the
 FFmpeg pipeline stand in for the native helper's ACK-based recovery (a key frame every few frames,
 sent as a P-frame, and after a loss the next one flagged as the recovery frame; the host announces
-`invalidate`), and `still=after:N` sends only the first N frames of every encoder generation, like
-a desktop that stops changing (`internal/host/faults.go`). Never set it on a real host; the agent
-logs a warning when it is set.
+`invalidate`), `still=after:N` sends only the first N frames of every encoder generation, like
+a desktop that stops changing, and `pre-stage-hold` takes the client's latency reports as a host
+from before step 4.4 did (no `stage-hold` in the welcome, at most nine rows)
+(`internal/host/faults.go`). Never set it on a real host; the agent logs a warning when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·
