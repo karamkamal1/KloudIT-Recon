@@ -176,7 +176,7 @@ async function readAll(stream) {
   return { buf: out, first };
 }
 
-async function openWebTransport(url, hashes, label) {
+async function openWebTransport(url, hashes, label, timeoutMs) {
   const opts = { requireUnreliable: true, congestionControl: 'low-latency' };
   if (hashes && hashes.length) {
     opts.serverCertificateHashes = hashes.map((h) => ({ algorithm: 'sha-256', value: b64(h) }));
@@ -184,7 +184,7 @@ async function openWebTransport(url, hashes, label) {
   const wt = new WebTransport(url, opts);
   wt.closed.catch(() => {});
   try {
-    await withTimeout(wt.ready, label === 'direct' ? 2500 : 6000, `WebTransport ${label}`);
+    await withTimeout(wt.ready, timeoutMs, `WebTransport ${label}`);
   } catch (e) {
     try { wt.close(); } catch {}
     throw e;
@@ -285,18 +285,51 @@ async function openWebSocket(url) {
   };
 }
 
+// UDP relay (guide step 2.6): the gateway allocates a UDP port, the host
+// binds to it from the inside, and the browser runs one QUIC connection with
+// the host's WebTransport server through it (the host's certificate, pinned by
+// hash, and a host ticket bound to the allocation).
+async function allocateRelay(url) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 8000);
+  try {
+    const r = await fetch(url, { method: 'POST', credentials: 'same-origin', signal: ac.signal });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+    return body;
+  } catch (e) {
+    throw new Error(`relay allocation: ${e.name === 'AbortError' ? 'timed out' : e.message}`);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function connect(ep) {
   const attempts = [];
   const wtOK = typeof WebTransport !== 'undefined' && prefs.transport !== 'websocket';
-  if (wtOK && ep.direct && prefs.path !== 'relay') attempts.push(['direct', () => openWebTransport(ep.direct.url, ep.direct.hashes, 'direct'), ep.direct.ticket]);
-  if (wtOK && prefs.path !== 'direct') attempts.push(['relay', () => openWebTransport(ep.relay.wt, ep.relay.hashes, 'relay'), '']);
-  if (prefs.path !== 'direct') attempts.push(['websocket', () => openWebSocket(ep.relay.ws), '']);
+  if (wtOK && ep.direct && prefs.path !== 'relay') {
+    attempts.push(['direct', async () => ({ t: await openWebTransport(ep.direct.url, ep.direct.hashes, 'direct', 2500), ticket: ep.direct.ticket })]);
+  }
+  if (wtOK && ep.relay.udp && prefs.path !== 'direct' && !prefs.skipUdpRelay) {
+    attempts.push(['relay', async () => {
+      const a = await allocateRelay(ep.relay.udp);
+      try {
+        return { t: await openWebTransport(a.url, a.hashes, 'relay', 3000), ticket: a.ticket };
+      } catch (e) {
+        post('udpRelayFailed', {}); // the relay ports are probably blocked: skip them for a while
+        throw e;
+      }
+    }]);
+  }
+  if (wtOK && prefs.path !== 'direct') {
+    attempts.push(['relay-splice', async () => ({ t: await openWebTransport(ep.relay.wt, ep.relay.hashes, 'relay-splice', 6000), ticket: '' })]);
+  }
+  if (prefs.path !== 'direct') attempts.push(['websocket', async () => ({ t: await openWebSocket(ep.relay.ws), ticket: '' })]);
   let lastErr;
-  for (const [label, fn, ticket] of attempts) {
+  for (const [label, fn] of attempts) {
     try {
       post('status', { text: `Connecting (${label})…` });
-      const t = await fn();
-      return { t, ticket };
+      return await fn();
     } catch (e) {
       lastErr = e;
       post('log', { text: `${label} failed: ${e.message}` });

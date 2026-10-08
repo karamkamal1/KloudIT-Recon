@@ -53,7 +53,10 @@ type Agent struct {
 	nonces    map[string]int64
 	tunnel    transport.BidiStream // control stream to the gateway
 	tunnelMu  sync.Mutex
-	directRot *tlsutil.Rotating
+	directRot *tlsutil.Rotating // certificate of the direct path and the UDP relay
+
+	relayMu sync.Mutex
+	relay   *relayServer // UDP relay socket, started on the first allocation
 
 	pairMu   sync.RWMutex
 	pairing  pairing
@@ -247,9 +250,11 @@ func (a *Agent) isActive(s *Session) bool {
 	return a.active == s
 }
 
-// verifyTicket validates a direct-path ticket issued by the gateway. The ticket
-// is bound to the browser origin that requested it.
-func (a *Agent) verifyTicket(tok, origin string) (string, error) {
+// verifyTicket validates a ticket the gateway issued for the direct path or a
+// UDP relay allocation (relay: the allocation the session arrived through, ""
+// on the direct path). The ticket is bound to the browser origin that
+// requested it.
+func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 	a.mu.Lock()
 	key := a.directKey
 	a.mu.Unlock()
@@ -266,6 +271,9 @@ func (a *Agent) verifyTicket(tok, origin string) (string, error) {
 	}
 	if !strings.EqualFold(t.Origin, origin) {
 		return "", errors.New("ticket was issued to a different origin")
+	}
+	if t.Relay != relay {
+		return "", errors.New("ticket was issued for another path")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -297,13 +305,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 	errc := make(chan error, 2)
+	// The direct path and the UDP relay terminate the browser's QUIC connection
+	// with this certificate, which the browser pins by hash. Created before the
+	// gateway tunnel starts, which advertises its hashes.
+	rot, err := tlsutil.NewRotating([]string{"recon-host"}, 13*24*time.Hour, 5*24*time.Hour)
+	if err != nil {
+		return err
+	}
+	a.directRot = rot
+	rot.OnRotate(func() { a.sendTunnel(proto.TunnelMsg{T: "direct", Direct: a.directInfo(), Relay: a.relayInfo()}) })
+	go rot.Run(ctx.Done())
 	if a.cfg.DirectPort > 0 {
-		// Created before the gateway tunnel starts, which advertises its hashes.
-		rot, err := tlsutil.NewRotating([]string{"recon-host"}, 13*24*time.Hour, 5*24*time.Hour)
-		if err != nil {
-			return err
-		}
-		a.directRot = rot
 		go func() { errc <- a.runDirect(ctx, rot) }()
 	}
 	go func() { errc <- a.runGateway(ctx) }()
@@ -416,7 +428,7 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 	reg := proto.TunnelMsg{
 		T: "register", HostID: p.HostID, Token: p.Token, Name: p.Name,
 		OS: runtime.GOOS + "/" + runtime.GOARCH, Version: Version,
-		MACs: localMACs(outboundLocalAddr(conn.RemoteAddr())), Direct: a.directInfo(),
+		MACs: localMACs(outboundLocalAddr(conn.RemoteAddr())), Direct: a.directInfo(), Relay: a.relayInfo(),
 	}
 	for _, e := range a.caps.Encoders {
 		reg.Encoders = append(reg.Encoders, e.Name)
@@ -502,6 +514,8 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 			a.sendTunnel(proto.TunnelMsg{T: "pong"})
 		case "open":
 			go a.openData(ctx, m)
+		case "relay":
+			go a.openRelay(ctx, m, udpAddrPort(conn.RemoteAddr()).Addr())
 		}
 	}
 }
@@ -516,7 +530,8 @@ func (q *quicStreamAdapter) CancelWrite()                       { q.s.CancelWrit
 func (q *quicStreamAdapter) SetReadDeadline(t time.Time) error  { return q.s.SetReadDeadline(t) }
 func (q *quicStreamAdapter) SetWriteDeadline(t time.Time) error { return q.s.SetWriteDeadline(t) }
 
-// openData dials a dedicated QUIC connection for one relayed session.
+// openData dials a dedicated QUIC connection for one session the gateway
+// relays by splicing it with the browser's QUIC connection or WebSocket.
 func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -542,7 +557,7 @@ func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 		return
 	}
 	st.Close()
-	a.HandleConn(transport.FromQUIC(conn), SessionMeta{Path: "relay", User: m.User})
+	a.HandleConn(transport.FromQUIC(conn), SessionMeta{Path: "relay-splice", User: m.User})
 }
 
 // outboundLocalAddr returns the source address the OS routes from to reach
@@ -597,9 +612,6 @@ func localMACs(local net.Addr) []string {
 // the certificate is pinned by hash (no CA needed).
 
 func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
-	rot.OnRotate(func() { a.sendTunnel(proto.TunnelMsg{T: "direct", Direct: a.directInfo()}) })
-	go rot.Run(ctx.Done())
-
 	sem := make(chan struct{}, 4) // bound concurrent unauthenticated handshakes
 	mux := http.NewServeMux()
 	srv := &webtransport.Server{

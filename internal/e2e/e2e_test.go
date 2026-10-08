@@ -174,7 +174,8 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 		slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}),
 	})
 	web := fstest.MapFS{"index.html": {Data: []byte("<!doctype html>")}}
-	gw, err := gateway.New(gateway.Config{Listen: fmt.Sprintf("127.0.0.1:%d", port), DataDir: filepath.Join(dir, "gw"), Web: web}, log.With("c", "gateway"))
+	relayPorts := fmt.Sprintf("%d,%d,%d", freePort(t), freePort(t), freePort(t))
+	gw, err := gateway.New(gateway.Config{Listen: fmt.Sprintf("127.0.0.1:%d", port), DataDir: filepath.Join(dir, "gw"), RelayPorts: relayPorts, Web: web}, log.With("c", "gateway"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,6 +260,7 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 
 type tickets struct {
 	Relay struct {
+		UDP    string   `json:"udp"` // POST: allocate a UDP relay port
 		WT     string   `json:"wt"`
 		WS     string   `json:"ws"`
 		Hashes []string `json:"hashes"`
@@ -276,6 +278,33 @@ func (e *env) connectInfo() tickets {
 		e.t.Fatal(err)
 	}
 	return tk
+}
+
+// udpRelay is the answer to a UDP relay allocation.
+type udpRelay struct {
+	URL    string   `json:"url"`
+	Hashes []string `json:"hashes"`
+	Ticket string   `json:"ticket"`
+}
+
+// allocRelay POSTs the connect answer's UDP relay ticket, as the browser does.
+func (e *env) allocRelay(rawURL string) (udpRelay, error) {
+	var a udpRelay
+	if rawURL == "" {
+		return a, errors.New("no UDP relay offered")
+	}
+	req, _ := http.NewRequest("POST", rawURL, nil)
+	req.Header.Set("Origin", e.base)
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return a, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return a, fmt.Errorf("allocate relay: %d %s", resp.StatusCode, b)
+	}
+	return a, json.Unmarshal(b, &a)
 }
 
 var defaultPrefs = proto.Prefs{FPS: 60, BitrateKbps: 3000}
@@ -573,11 +602,61 @@ func checkInput(t *testing.T, logPath string) {
 func TestStreamingPaths(t *testing.T) {
 	e := setup(t)
 
-	t.Run("webtransport-relay", func(t *testing.T) {
+	// UDP relay (guide step 2.6): one QUIC connection with the host's
+	// WebTransport server, the gateway forwarding its datagrams.
+	t.Run("webtransport-udp-relay", func(t *testing.T) {
+		os.Truncate(e.logPath, 0)
+		from := e.logs.Len()
+		tk := e.connectInfo()
+		a, err := e.allocRelay(tk.Relay.UDP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(a.URL, e.base) || !slices.Equal(a.Hashes, tk.Direct.Hashes) {
+			t.Fatalf("relay endpoint %s %v: want an allocation port and the host's certificate %v", a.URL, a.Hashes, tk.Direct.Hashes)
+		}
+		r := runWT(t, e, a.URL, a.Hashes, a.Ticket, 2, 3*time.Second)
+		t.Logf("udp relay: %+v", r)
+		if !r.welcome || r.configs < 1 || r.frames < 100 || r.keyframes < 1 || r.audio < 100 {
+			t.Fatalf("unexpected result %+v", r)
+		}
+		checkExt(t, r, 2)
+		checkInput(t, e.logPath)
+		if len(e.logs.lines(from, `msg="session started"`, "path=relay ")) == 0 || len(e.logs.lines(from, `msg="udp relay: session started"`)) == 0 {
+			t.Fatal("the session did not run over the UDP relay")
+		}
+		// The relay ticket was single use.
+		if _, err := e.allocRelay(tk.Relay.UDP); err == nil || !strings.Contains(err.Error(), "401") {
+			t.Fatalf("reused relay ticket: %v", err)
+		}
+	})
+
+	// Host tickets are bound to their path: a relay allocation's ticket does not
+	// open the direct path, a direct ticket does not open a relay allocation.
+	t.Run("udp-relay-ticket-bound-to-allocation", func(t *testing.T) {
+		tk := e.connectInfo()
+		a, err := e.allocRelay(tk.Relay.UDP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := runWT(t, e, a.URL, a.Hashes, tk.Direct.Ticket, 1, time.Second); r.welcome || r.frames > 0 {
+			t.Fatalf("direct ticket accepted on a relay allocation: %+v", r)
+		}
+		tk = e.connectInfo()
+		a, err = e.allocRelay(tk.Relay.UDP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, a.Ticket, 1, time.Second); r.welcome || r.frames > 0 {
+			t.Fatalf("relay ticket accepted on the direct path: %+v", r)
+		}
+	})
+
+	t.Run("webtransport-relay-splice", func(t *testing.T) {
 		os.Truncate(e.logPath, 0)
 		tk := e.connectInfo()
 		r := runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 1, 3*time.Second)
-		t.Logf("relay: %+v", r)
+		t.Logf("relay splice: %+v", r)
 		if !r.welcome || r.configs < 1 || r.frames < 100 || r.keyframes < 1 || r.audio < 100 {
 			t.Fatalf("unexpected result %+v", r)
 		}
@@ -732,13 +811,20 @@ func TestStreamingPaths(t *testing.T) {
 	})
 }
 
-// Host config "congestion": "media": the direct server and the relay data
-// connection run the media congestion controller.
+// Host config "congestion": "media": the direct server, the UDP relay server
+// and the relay data connection run the media congestion controller.
 func TestStreamingMediaCongestion(t *testing.T) {
 	e := setup(t, func(c *host.Config) { c.Congestion = transport.CongestionMedia })
 	run := func(t *testing.T, path string, dur time.Duration, prefs proto.Prefs) result {
 		tk := e.connectInfo()
-		if path == "relay" {
+		switch path {
+		case "relay":
+			a, err := e.allocRelay(tk.Relay.UDP)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return runWTPrefs(t, e, a.URL, a.Hashes, a.Ticket, 1, dur, prefs)
+		case "relay-splice":
 			return runWTPrefs(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 1, dur, prefs)
 		}
 		if tk.Direct == nil {
@@ -746,7 +832,7 @@ func TestStreamingMediaCongestion(t *testing.T) {
 		}
 		return runWTPrefs(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 1, dur, prefs)
 	}
-	for _, path := range []string{"relay", "direct"} {
+	for _, path := range []string{"relay", "relay-splice", "direct"} {
 		t.Run(path, func(t *testing.T) {
 			from := e.logs.Len()
 			r := run(t, path, 3*time.Second, defaultPrefs)
@@ -754,7 +840,7 @@ func TestStreamingMediaCongestion(t *testing.T) {
 			if !r.welcome || r.frames < 100 || r.keyframes < 1 || r.audio < 100 {
 				t.Fatalf("unexpected result %+v", r)
 			}
-			if len(e.logs.lines(from, `msg="media congestion control"`, "path="+path)) == 0 {
+			if len(e.logs.lines(from, `msg="media congestion control"`, "path="+path+" ")) == 0 {
 				t.Fatal("the session did not set a media congestion target")
 			}
 		})

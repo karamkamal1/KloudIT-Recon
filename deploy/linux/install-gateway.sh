@@ -113,5 +113,6 @@ if [[ -f /var/lib/kloudit-recon/setup-token.txt ]]; then
   echo "  Setup token (first login): $(cat /var/lib/kloudit-recon/setup-token.txt)"
   echo "    (stays valid until the admin account is created; also in /var/lib/kloudit-recon/setup-token.txt)"
 fi
-echo "  Ports: TCP $PORT (HTTPS) and UDP $PORT (HTTP/3 + WebTransport + host tunnels)"
+RELAY=$(sed -n 's/^RECON_RELAY_PORTS=//p' "$envf" | tail -1)
+echo "  Ports: TCP $PORT (HTTPS), UDP $PORT (HTTP/3 + WebTransport + host tunnels), UDP ${RELAY:-8444-8459} (relay)"
 echo "  Logs:  journalctl -u recon-gateway -f"

@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import dgram from 'node:dgram';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pw = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -32,6 +33,13 @@ function freePort() {
   return new Promise((res) => {
     const s = net.createServer();
     s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
+  });
+}
+
+function freeUdpPort() {
+  return new Promise((res) => {
+    const s = dgram.createSocket('udp4');
+    s.bind(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
   });
 }
 
@@ -566,7 +574,16 @@ const directPort = await freePort();
 const base = `https://127.0.0.1:${port}`;
 const inputLog = join(dir, 'input.log');
 
-const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(dir, 'gw')], {}, 'gateway');
+// UDP relay ports (one per relayed session). One of them is held by a socket
+// that swallows every datagram, like a firewall that drops the relay ports:
+// the gateway skips it (in use), the page's CSP allows it.
+const relayPorts = [await freeUdpPort(), await freeUdpPort(), await freeUdpPort()];
+const blackhole = dgram.createSocket('udp4');
+await new Promise((res) => blackhole.bind(0, '127.0.0.1', res));
+const blockedPort = blackhole.address().port;
+blackhole.unref();
+process.on('exit', () => { try { blackhole.close(); } catch {} });
+const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(dir, 'gw'), '-relay-ports', [...relayPorts, blockedPort].join(',')], {}, 'gateway');
 await until(() => existsSync(join(dir, 'gw', 'setup-token.txt')), 10000, 'gateway setup token');
 const setupToken = readFileSync(join(dir, 'gw', 'setup-token.txt'), 'utf8').trim();
 
@@ -622,7 +639,10 @@ try {
   // 3. Stream over each path -------------------------------------------------
   const scenarios = [
     { name: 'WebTransport direct', prefs: { path: 'auto', transport: 'auto' }, expect: ['webtransport', 'direct'] },
-    { name: 'WebTransport relay', prefs: { path: 'relay', transport: 'auto' }, expect: ['webtransport', 'relay'] },
+    // UDP relay (step 2.6): one QUIC connection with the host through a gateway relay port.
+    { name: 'WebTransport relay', prefs: { path: 'relay', transport: 'auto' }, expect: ['webtransport', 'relay'], gatewayLog: /msg="udp relay: session started"/ },
+    // The relay port is unreachable (firewall): the client falls back to the QUIC splice on the main port.
+    { name: 'WebTransport relay fallback (splice)', prefs: { path: 'relay', transport: 'auto' }, expect: ['webtransport', 'relay-splice'], blockUdpRelay: true },
     { name: 'WebSocket relay', prefs: { path: 'relay', transport: 'websocket' }, expect: ['websocket', 'relay'] },
     { name: 'WebGPU renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu' }, expect: ['webtransport', 'direct'] },
   ];
@@ -651,6 +671,17 @@ try {
     writeFileSync(inputLog, '');
     await page.goto(`${base}/`);
     await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), sc.prefs);
+    // The gateway allocates a relay port and the host binds to it, but the
+    // browser is sent to the port whose datagrams are dropped.
+    const blockRoute = async (route) => {
+      const resp = await route.fetch();
+      const body = await resp.json();
+      if (body.url) body.url = body.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+      await route.fulfill({ response: resp, json: body });
+    };
+    if (sc.blockUdpRelay) await ctx.route('**/api/relay/udp*', blockRoute);
+    const gwLog0 = gw.log.length;
+    const con0 = consoleLines.length;
     await page.click('.host.online a.btn-primary');
     await page.waitForURL(/\/stream\?host=/);
     await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
@@ -658,8 +689,19 @@ try {
     await page.click('#btn-start');
     await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
     const firstFrameMs = Date.now() - t0;
+    if (sc.blockUdpRelay) await ctx.unroute('**/api/relay/udp*', blockRoute);
     const conn = await page.evaluate(() => window.__recon.conn);
     check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1], `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
+    if (sc.blockUdpRelay) {
+      // The allocation worked; the WebTransport connection to the port did not.
+      const why = consoleLines.slice(con0).find((l) => l.includes('relay failed:')) || '';
+      check(`${sc.name}: the UDP relay was tried first and its port did not answer`,
+        /\brelay failed: WebTransport relay timed out/.test(why), why.replace(/^.*?relay failed/, 'relay failed').slice(0, 200));
+    }
+    if (sc.gatewayLog) {
+      const line = (gw.log.slice(gwLog0).match(new RegExp(`${sc.gatewayLog.source}[^\n]*`)) || [''])[0];
+      check(`${sc.name}: the gateway forwards the session's datagrams`, !!line, line.replace(/^.*?msg=/, '').slice(0, 200));
+    }
 
     // Wait for steady state (software decoders need a moment to warm up on
     // small CI machines), then measure a fresh stats window.

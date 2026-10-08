@@ -27,10 +27,11 @@ import (
 
 // SessionMeta describes how a connection reached the host.
 type SessionMeta struct {
-	Path          string // relay | direct
-	User          string // authenticated by the gateway (relay path)
-	RequireTicket bool   // direct path: the client must present a gateway-signed ticket
-	Origin        string // direct path: Origin header of the WebTransport request
+	Path          string // direct | relay (UDP relay) | relay-splice (gateway data connection)
+	User          string // authenticated by the gateway (relay-splice path)
+	RequireTicket bool   // direct and relay paths: the client must present a gateway-signed ticket
+	Origin        string // direct and relay paths: Origin header of the WebTransport request
+	Relay         string // relay path: the allocation the connection arrived through
 }
 
 // Session is one streaming client.
@@ -168,11 +169,11 @@ func (s *Session) run() error {
 		return errors.New("bad hello")
 	}
 	if s.meta.RequireTicket {
-		user, err := s.a.verifyTicket(s.hello.Ticket, s.meta.Origin)
+		user, err := s.a.verifyTicket(s.hello.Ticket, s.meta.Origin, s.meta.Relay)
 		if err != nil {
 			s.sendJSON(proto.Notice{T: "error", Level: "error", Msg: "unauthorized"})
 			s.c.Close(transport.CodeAuth, "unauthorized")
-			return fmt.Errorf("direct ticket: %w", err)
+			return fmt.Errorf("%s ticket: %w", s.meta.Path, err)
 		}
 		s.meta.User = user
 		if s.onAuth != nil {

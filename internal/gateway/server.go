@@ -46,6 +46,7 @@ type Config struct {
 	SessionIdle time.Duration // log out after this much inactivity
 	SessionMax  time.Duration // absolute session lifetime
 	TrustProxy  []string      // CIDRs of reverse proxies whose X-Forwarded-For is trusted
+	RelayPorts  string        // UDP relay ports, e.g. "8444-8459" ("" = no UDP relay, QUIC splice only)
 	Web         fs.FS         // static web client
 }
 
@@ -63,6 +64,7 @@ type Server struct {
 	TunnelPin  string
 
 	hosts   *registry
+	relay   *udpRelay // nil: no UDP relay ports configured
 	wt      *webtransport.Server
 	mux     *http.ServeMux
 	static  map[string]staticFile
@@ -127,6 +129,13 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 		apiIP:    newLimiter(600, 120),
 		lockouts: newLockout(),
 		hashSem:  make(chan struct{}, 2),
+	}
+	ports, err := parseRelayPorts(cfg.RelayPorts)
+	if err != nil {
+		return nil, err
+	}
+	if len(ports) > 0 {
+		s.relay = newUDPRelay(log, nil, ports)
 	}
 	for _, c := range cfg.TrustProxy {
 		if _, n, err := net.ParseCIDR(c); err == nil {
@@ -297,6 +306,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	_ = udpConn.SetReadBuffer(8 << 20)
 	_ = udpConn.SetWriteBuffer(8 << 20)
+	if s.relay != nil {
+		s.relay.ip = udpAddr.IP // allocations listen where the main port does
+		defer s.relay.closeAll()
+	}
 
 	httpSrv := &http.Server{
 		Handler:           s.mux,
@@ -362,8 +375,12 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 	go s.janitor(ctx)
+	relayPorts := "off"
+	if s.relay != nil {
+		relayPorts = s.cfg.RelayPorts
+	}
 	s.log.Info("gateway listening", "addr", s.cfg.Listen, "tcp", "https/wss", "udp", "http3/webtransport/host-tunnel",
-		"tunnel_pin", s.TunnelPin)
+		"udp_relay_ports", relayPorts, "tunnel_pin", s.TunnelPin)
 
 	select {
 	case <-ctx.Done():

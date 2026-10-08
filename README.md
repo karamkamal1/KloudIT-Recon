@@ -46,7 +46,9 @@ Techniques used (most of them are new to browser-based game streaming):
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
-  origin. If the direct path fails, Recon falls back to the gateway relay, then to WebSocket.
+  origin. If the direct path fails, Recon falls back to the gateway relay, which forwards the
+  datagrams of the same end-to-end QUIC connection (one congestion controller, the PC's), then to
+  a QUIC splice on the gateway's main port, then to WebSocket.
 - **Raw input with no lost motion.** `pointerrawupdate` plus Pointer Lock with
   `unadjustedMovement` gives raw mouse deltas. Mouse motion travels as unreliable datagrams that
   carry *running totals*, so a lost datagram only delays motion and never drops it. The host
@@ -107,17 +109,20 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
    main thread: UI, raw input, gamepads, AudioWorklet
    worker:      WebTransport ─► reorder ─► VideoDecoder ─► OffscreenCanvas (desync 2D / WebGPU)
         │   HTTPS (UI, API)            TCP 8443
-        │   HTTP/3 WebTransport        UDP 8443  ── relay path
+        │   UDP relay (WebTransport)   UDP 8444-8459 ── relay path, one port per session
+        │   HTTP/3 WebTransport        UDP 8443  ── relay fallback (QUIC splice)
         │   WebSocket (fallback)       TCP 8443
         │
         │                ┌─────────────────────────────────────────────┐
         ├───────────────►│ recon-gateway  (Proxmox LXC, ~20 MB RAM)    │
         │                │ auth · 2FA · users · audit · Wake-on-LAN    │
         │                │ private CA · rotating WebTransport certs    │
-        │                │ cut-through relay (QUIC↔QUIC, WS↔QUIC)      │
+        │                │ UDP relay (datagram forwarder, TURN-like)   │
+        │                │ cut-through splice (QUIC↔QUIC, WS↔QUIC)     │
         │                └──────────────▲──────────────────────────────┘
         │                               │ QUIC tunnel, host dials out,
-        │                               │ gateway identity pinned (SPKI)
+        │                               │ gateway identity pinned (SPKI);
+        │                               │ UDP relay socket, also outbound
         │   direct path (LAN):          │
         │   WebTransport UDP 47998      │
         │   cert-hash pinned, ticket    │
@@ -249,7 +254,8 @@ The stream pauses automatically when the tab is hidden, which frees your PC's GP
 The best option is **Tailscale or WireGuard** to your home network. QUIC/UDP passes through
 untouched, so you keep WebTransport and the direct path. Other options:
 
-- **Port forwarding**: forward **TCP and UDP 8443** to the gateway. The account is protected by
+- **Port forwarding**: forward **TCP and UDP 8443** and **UDP 8444–8459** (the relay ports,
+  `-relay-ports`) to the gateway, with the same port numbers. The account is protected by
   Argon2id, 2FA, rate limiting and lockout. Set `RECON_NAMES` to your domain and preferably use
   a real certificate (`-cert`/`-key`).
 - **HTTP-only reverse proxies / tunnels** (e.g. Cloudflare Tunnel) carry only TCP. Recon
@@ -267,6 +273,7 @@ untouched, so you keep WebTransport and the direct path. Other options:
 | `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP); the container's IPs and hostname are always included |
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
 | `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
+| `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40031,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. `off`: relay only through the QUIC splice on 8443 |
 | `-trust-proxy` | none | CIDR of a reverse proxy whose `X-Forwarded-For` is trusted |
 
 On a Linux/LXC install the settings live in `/etc/kloudit-recon/gateway.env` (one
@@ -293,7 +300,7 @@ The new password (at least 10 characters) is read from stdin.
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
 | `directAddr` | auto | Address to advertise for the direct path |
-| `congestion` | `reno` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
+| `congestion` | `reno` | QUIC congestion control of the host's video connections (the direct path and the UDP relay, both end to end with the browser, and the QUIC splice relay's host → gateway data connection, whose gateway → browser leg stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency. With `capture` `amf` the FFmpeg chain keeps that wall-clock pts (`vsrc_amf`'s own pts are rounded to 1/fps), and `off` only stops sending capture stamps to the client |
 | `gpuPriority` | `auto` | GPU scheduling priority of the FFmpeg capture/encode process, so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
@@ -327,6 +334,12 @@ command: `recon-host.exe -v probe`.
   outdated GPU driver. Update it and restart the agent.
 - **The browser always uses WebSocket.** UDP 8443 is blocked between the browser and the
   gateway, or your browser lacks WebTransport. Check your firewall, port forwarding or proxy.
+- **The overlay's Transport row says `relay-splice` instead of `relay`.** The relay ports (UDP
+  8444–8459) don't reach the gateway from the browser or the PC, so the client fell back to the
+  splice on 8443, which runs a second congestion controller on the gateway. Open or forward the
+  range, or set `-relay-ports` to ports that are open. The gateway log says
+  `udp relay: the browser never arrived` (browser side) and the PC's host.log
+  `the gateway's relay port did not answer` (PC side).
 - **The direct path is never used.** Allow UDP 47998 on the PC (the installer adds a
   Private-network rule; mark your network as *Private* in Windows). Some browsers ask for
   local-network access the first time.
@@ -357,7 +370,7 @@ Repository layout:
 | Path | Contents |
 |---|---|
 | `cmd/recon-gateway`, `cmd/recon-host` | The two programs' entry points |
-| `internal/gateway` | Web server, accounts/2FA, API, relay, Wake-on-LAN, TLS |
+| `internal/gateway` | Web server, accounts/2FA, API, relay (UDP forwarder, QUIC/WebSocket splice), Wake-on-LAN, TLS |
 | `internal/host` | PC agent: sessions, direct path, gateway tunnel; `media/` (FFmpeg, audio), `input/` (SendInput), `platform/` (monitors, cursor, ViGEm) |
 | `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters (`transport/cc`: media congestion controller), NUT demuxer, codec strings |
 | `third_party/quic-go` | quic-go with a pluggable congestion-control hook (`go.mod` replace; see `third_party/README.md`) |

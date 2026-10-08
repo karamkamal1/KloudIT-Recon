@@ -79,7 +79,10 @@ on the gateway's veth then never touches the video, and the results look unimpai
 browser, set Stream settings > Pipeline > Network path to "Relay via gateway" (relay tests) or
 "Direct to PC only" (direct tests), then click Reconnect. For relay tests you can instead set
 `directPort` to 0 in the PC's `host.json`. Before measuring, open the stats overlay and check that
-its Transport row ends in `· relay` or `· direct`.
+its Transport row ends in `· relay` (UDP relay: one QUIC connection from the PC to the browser,
+forwarded by the gateway on one of its relay ports, 8444–8459 by default), `· relay-splice` (the
+fallback when the relay ports are blocked: QUIC terminated on the gateway's port 8443) or
+`· direct`.
 
 ### On the Proxmox node (relay path)
 
@@ -165,7 +168,7 @@ are supported. Everything else goes through a pass-through class untouched. The 
 matches, which are available on every kernel.
 
 ```bash
-./netem.sh apply wan --ct 210 --port 8443                 # all gateway traffic (both relay legs)
+./netem.sh apply wan --ct 210 --port 8443,$(seq -s, 8444 8459) --proto udp  # all relay traffic (both legs)
 ./netem.sh apply wifi --iface eth0 --port 47998 --proto udp  # Linux client: only the direct path
 ```
 
@@ -199,7 +202,7 @@ filter.
 | Where | Filter |
 |---|---|
 | PC, direct path | `udp and (udp.SrcPort == 47998 or udp.DstPort == 47998)` |
-| PC, relay path (its tunnel to the gateway) | `udp and (udp.DstPort == 8443 or udp.SrcPort == 8443)` |
+| PC, relay path (UDP relay ports and the splice's tunnel to the gateway) | `udp and ((udp.DstPort >= 8443 and udp.DstPort <= 8459) or (udp.SrcPort >= 8443 and udp.SrcPort <= 8459))` |
 | Windows client, to one PC or gateway | `ip.DstAddr == 192.168.1.20 or ip.SrcAddr == 192.168.1.20` |
 
 | Profile | Lag | Drop | Throttle | Bandwidth |

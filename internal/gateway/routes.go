@@ -2,11 +2,13 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/karamkamal1/kloudit-recon/internal/auth"
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
 
@@ -53,6 +56,7 @@ func (s *Server) routes() {
 	m.Handle("DELETE /api/users/{name}", s.authed(s.handleUserDelete, true))
 	m.Handle("GET /api/audit", s.authed(s.handleAudit, true))
 	// Media relay (authorised by single-use tickets).
+	m.HandleFunc("POST /api/relay/udp", s.handleUDPRelay)
 	m.HandleFunc("/wt/relay", s.handleWTRelay)
 	m.HandleFunc("GET /ws/relay", s.handleWSRelay)
 	// Static client.
@@ -72,7 +76,7 @@ func (s *Server) secure(next http.Handler) http.Handler {
 		h.Set("Cross-Origin-Embedder-Policy", "require-corp")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), gamepad=(self), fullscreen=(self)")
-		h.Set("Content-Security-Policy", s.csp())
+		h.Set("Content-Security-Policy", s.csp(r))
 		if s.wtRot == nil {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
@@ -88,8 +92,9 @@ func (s *Server) secure(next http.Handler) http.Handler {
 	})
 }
 
-// csp allows connections to self plus every host's direct endpoint.
-func (s *Server) csp() string {
+// csp allows connections to self, every host's direct endpoint and the UDP
+// relay ports (under the name the page was loaded from).
+func (s *Server) csp(r *http.Request) string {
 	connect := []string{"'self'"}
 	s.hosts.mu.Lock()
 	for _, hc := range s.hosts.hosts {
@@ -98,6 +103,16 @@ func (s *Server) csp() string {
 		}
 	}
 	s.hosts.mu.Unlock()
+	if s.relay != nil {
+		host := requestHostname(r)
+		if len(s.relay.ports) > 32 {
+			connect = append(connect, "https://"+net.JoinHostPort(host, "*"))
+		} else {
+			for _, p := range s.relay.ports {
+				connect = append(connect, "https://"+net.JoinHostPort(host, strconv.Itoa(p)))
+			}
+		}
+	}
 	return "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; " +
 		"connect-src " + strings.Join(connect, " ") + "; worker-src 'self'; manifest-src 'self'; media-src 'self' blob:; " +
 		"frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
@@ -257,6 +272,94 @@ func (s *Server) takeTicket(r *http.Request) (*relayTicket, error) {
 	}
 	delete(s.tickets, auth.TokenHash(t))
 	return rt, nil
+}
+
+// requestHostname is the host part of the request's Host header.
+func requestHostname(r *http.Request) string {
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		return h
+	}
+	return strings.Trim(r.Host, "[]")
+}
+
+// handleUDPRelay allocates a UDP relay port for a browser holding a relay
+// ticket (guide step 2.6), has the host bind its relay socket to it, and tells
+// the browser where to connect: the allocation port on this gateway's name,
+// the host's certificate hashes and a host ticket bound to the allocation. The
+// browser then runs one QUIC connection end to end with the host, and the
+// gateway only forwards its datagrams (udprelay.go).
+func (s *Server) handleUDPRelay(w http.ResponseWriter, r *http.Request) {
+	if s.relay == nil {
+		jsonError(w, http.StatusNotFound, "the UDP relay is off")
+		return
+	}
+	if !s.sameOrigin(r) {
+		jsonError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	rt, err := s.takeTicket(r)
+	if err != nil {
+		jsonError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	hc := s.hosts.get(rt.hostID)
+	if hc == nil {
+		jsonError(w, http.StatusServiceUnavailable, errHostOffline.Error())
+		return
+	}
+	hashes := hc.relayHashes()
+	if len(hashes) == 0 {
+		jsonError(w, http.StatusNotImplemented, "the host agent predates the UDP relay")
+		return
+	}
+	ip := s.clientIP(r)
+	clientIP, err := netip.ParseAddr(ip)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "unknown client address")
+		return
+	}
+	name := s.hostName(rt.hostID)
+	a, err := s.relay.allocate(allocRequest{
+		user: rt.user, hostID: rt.hostID, clientIP: clientIP,
+		onLock: func(netip.AddrPort) {
+			s.audit.Log("stream_start", rt.user, ip, "host "+name+" via udp relay")
+		},
+		onEnd: func(st *relayStats) {
+			s.audit.Log("stream_end", rt.user, ip, fmt.Sprintf("host %s after %s", name, st.Last.Sub(st.Started).Round(time.Second)))
+		},
+	})
+	if err != nil {
+		jsonError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err := hc.send(proto.TunnelMsg{T: "relay", SID: a.id, Nonce: base64.StdEncoding.EncodeToString(a.token), User: rt.user, Port: a.port}); err != nil {
+		a.close()
+		jsonError(w, http.StatusServiceUnavailable, errHostOffline.Error())
+		return
+	}
+	select {
+	case <-a.bound:
+	case <-a.done: // the host did not bind in time
+		jsonError(w, http.StatusServiceUnavailable, "the host did not reach the relay port")
+		return
+	case <-r.Context().Done():
+		a.close()
+		return
+	}
+	tok, err := auth.SignTicket(hc.directKey, proto.DirectTicket{
+		HostID: rt.hostID, User: rt.user, Exp: time.Now().Add(60 * time.Second).Unix(), Nonce: auth.RandomToken(12),
+		Origin: "https://" + r.Host, Relay: a.id,
+	})
+	if err != nil {
+		a.close()
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"url":    "https://" + net.JoinHostPort(requestHostname(r), strconv.Itoa(a.port)) + "/wt",
+		"hashes": hashes,
+		"ticket": tok,
+	})
 }
 
 func (s *Server) handleWTRelay(w http.ResponseWriter, r *http.Request) {

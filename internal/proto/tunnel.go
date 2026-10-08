@@ -22,16 +22,20 @@ type TunnelMsg struct {
 	Version  string        `json:"version,omitempty"`
 	MACs     []string      `json:"macs,omitempty"`
 	Direct   *DirectInfo   `json:"direct,omitempty"`
+	Relay    *RelayInfo    `json:"relay,omitempty"` // also in "direct" updates; absent: no UDP relay (older hosts)
 	Encoders []string      `json:"encoders,omitempty"`
 	Monitors []MonitorInfo `json:"monitors,omitempty"`
 
 	// registered (gateway -> host)
 	DirectKey string `json:"directKey,omitempty"` // base64, HMAC key for direct-path tickets
 
-	// open (gateway -> host)
+	// open (gateway -> host): a relay data connection (QUIC splice)
+	// relay (gateway -> host): a UDP relay allocation; SID is its ID, Nonce
+	// its base64 bind token, Port the gateway's allocation port
 	SID   string `json:"sid,omitempty"`
 	Nonce string `json:"nonce,omitempty"`
 	User  string `json:"user,omitempty"`
+	Port  int    `json:"port,omitempty"`
 
 	// status (host -> gateway)
 	Streaming bool   `json:"streaming,omitempty"`
@@ -45,6 +49,12 @@ type DirectInfo struct {
 	Port   int      `json:"port"`
 	Addr   string   `json:"addr,omitempty"`   // advertised host/IP (else: tunnel peer address)
 	Hashes []string `json:"hashes,omitempty"` // base64 SHA-256 certificate hashes
+}
+
+// RelayInfo describes the host's end of the UDP relay: the WebTransport server
+// behind its outbound relay socket, with the direct path's certificate.
+type RelayInfo struct {
+	Hashes []string `json:"hashes"` // base64 SHA-256 certificate hashes
 }
 
 // DataHello authenticates a per-session data connection (ALPN recon-data/1).
@@ -61,7 +71,8 @@ type DirectTicket struct {
 	User   string `json:"u"`
 	Exp    int64  `json:"exp"`
 	Nonce  string `json:"n"`
-	Origin string `json:"o"` // page origin the ticket was issued to; must match the WebTransport Origin header
+	Origin string `json:"o"`           // page origin the ticket was issued to; must match the WebTransport Origin header
+	Relay  string `json:"r,omitempty"` // UDP relay allocation the session must arrive through ("" = direct path only)
 }
 
 // PairingCode is shown by the gateway when a host is added and consumed by

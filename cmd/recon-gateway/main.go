@@ -44,6 +44,8 @@ func main() {
 	cert := flag.String("cert", env("RECON_CERT", ""), "TLS certificate (PEM); default: generated private CA")
 	key := flag.String("key", env("RECON_KEY", ""), "TLS key (PEM)")
 	public := flag.String("public-addr", env("RECON_PUBLIC_ADDR", ""), "host:port the host agents use to reach this gateway")
+	relayPorts := flag.String("relay-ports", env("RECON_RELAY_PORTS", gateway.DefaultRelayPorts),
+		"UDP ports for relayed WebTransport sessions, one per session (e.g. 8444-8459; off = QUIC splice relay on the main port only)")
 	webDir := flag.String("web", env("RECON_WEB_DIR", ""), "serve the web client from this directory (development)")
 	verbose := flag.Bool("v", false, "debug logging")
 	var names, proxies multiFlag
@@ -82,7 +84,7 @@ func main() {
 	}
 	srv, err := gateway.New(gateway.Config{
 		Listen: *listen, DataDir: *data, Names: names, CertFile: *cert, KeyFile: *key,
-		PublicAddr: *public, TrustProxy: proxies, Web: webFS,
+		PublicAddr: *public, TrustProxy: proxies, RelayPorts: *relayPorts, Web: webFS,
 	}, log)
 	if err != nil {
 		log.Error("startup failed", "err", err)
