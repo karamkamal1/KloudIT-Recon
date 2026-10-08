@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
+	"github.com/karamkamal1/kloudit-recon/internal/host/qualify"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -205,6 +207,93 @@ func TestOpenPipeline(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("the unused helper was not closed")
 				}
+			}
+		})
+	}
+}
+
+// TestSessionLiveBitrateQualified: a session on the helper reads the
+// live-bitrate qualification next to host.json (recon-host qualify) and
+// starts the stream with the live-bitrate mode it chose for the codec and rate
+// control: flush where seamless failed (bitrate changes then keep the full
+// period between them), seamless where it passed (changes may come every
+// 2 s); results of another GPU are not used; without a file the helper's
+// defaults apply.
+func TestSessionLiveBitrateQualified(t *testing.T) {
+	cells := func(seamless string) []qualify.Cell {
+		return []qualify.Cell{{Codec: "h264", RC: "cbr", LiveBitrate: "seamless", Verdict: seamless},
+			{Codec: "h264", RC: "cbr", LiveBitrate: "flush", Verdict: "pass"}}
+	}
+	for _, c := range []struct {
+		name     string
+		results  *qualify.Results
+		wantLive any // the start's liveBitrate
+		wantLog  string
+		gap      time.Duration
+	}{
+		{"flush", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
+			Cells: cells("fail")}, "flush", "choice=\"h264: adaptive cbr/flush, fixed vbr/\"", 0},
+		{"seamless", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
+			Cells: cells("pass")}, "seamless", "h264: adaptive cbr/seamless", rateSeamlessGap},
+		{"other GPU", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 6800",
+			Cells: cells("fail")}, nil, "live-bitrate qualification not used", 0},
+		{"none", nil, nil, "no live-bitrate qualification", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if c.results != nil {
+				r := *c.results // its choice is left out: recon-host computes it from the cells
+				if err := r.Save(qualify.PathFor(filepath.Join(dir, "host.json"))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			l := &fakeLauncher{caps: helperCaps(fakeH264, `"dda"`, false), started: make(chan *encoder.Fake, 4)}
+			l.handle = func(f *encoder.Fake, m map[string]any) {
+				if m["t"] == "start" {
+					live, _ := m["liveBitrate"].(string)
+					if live == "" {
+						live = "seamless"
+					}
+					f.Send(encoder.Started{Backend: "amf", Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30,
+						Kbps: int(m["kbps"].(float64)), LiveBitrate: live, Barcode: true})
+				}
+			}
+			cfg := &Config{Capture: "test", Pipeline: "helper", TestWidth: 320, TestHeight: 180, DefaultFPS: 30, MaxFPS: 60,
+				DefaultKbps: 4000, MaxKbps: 100000, path: filepath.Join(dir, "host.json")}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			logs := &lockedLog{}
+			s := &Session{
+				a:     &Agent{cfg: cfg, caps: &media.Caps{}, inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch},
+				hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}}},
+				tried: map[string]bool{}, usage: map[string]string{}, encFails: map[string]int{},
+				ctx: ctx, cancel: cancel, ctrl: &fakeCtrl{}, frameQ: make(chan *media.Frame, 64), pipeSwap: make(chan struct{}, 1),
+				log: slog.New(slog.NewTextHandler(logs, nil)),
+			}
+			if n := s.openPipeline(); n != "" {
+				t.Fatalf("notice %q", n)
+			}
+			defer func() { s.vid().Stop() }()
+			go s.videoEvents()
+			if err := s.startVideo(false, ""); err != nil {
+				t.Fatal(err)
+			}
+			f := <-l.started
+			if m := expectFakeMsg(t, f, "start"); m["liveBitrate"] != c.wantLive || m["rc"] != "cbr" {
+				t.Fatalf("start liveBitrate %v rc %v, want %v cbr", m["liveBitrate"], m["rc"], c.wantLive)
+			}
+			if lines := logs.lines(c.wantLog); len(lines) != 1 {
+				t.Fatalf("log lines with %q: %q\n%s", c.wantLog, lines, logs.lines("level="))
+			}
+			key := []byte{0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac, 0, 0, 0, 1, 0x68, 0xeb, 0, 0, 0, 1, 0x65, 0x88}
+			f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+			select {
+			case <-s.frameQ:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no frame")
+			}
+			if g := rateGap(s.vid().Capabilities()); g != c.gap {
+				t.Fatalf("rate gap %v, want %v (capabilities %+v)", g, c.gap, s.vid().Capabilities())
 			}
 		})
 	}

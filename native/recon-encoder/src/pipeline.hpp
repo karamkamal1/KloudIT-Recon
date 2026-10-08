@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,6 +33,12 @@ struct PipelineOptions {
     // --dump-nv12: writes the converted frame with id kDumpFrameId (or the
     // first one after it) to this file, raw NV12, then logs it.
     std::string dumpPath;
+    // Called on the capture thread right before a frame is submitted, with its
+    // frame id (again with the same id after the encoder refused it as busy).
+    // The encode test's rate schedule (step 3.6) calls setRate here, so a
+    // change applies exactly from that frame on (backends apply a setRate at
+    // the next submit).
+    std::function<void(uint64_t frameId)> beforeSubmit;
 };
 
 class Pipeline {
@@ -56,6 +63,8 @@ public:
     // makes it an IDR (Backend::forceIdr right before submitting it), so the
     // frame recon-host starts a new stream generation on carries barcode 0.
     void forceIdr() { idrRequests_.fetch_add(1); }
+    // Sets PipelineOptions::beforeSubmit; only before start().
+    void setBeforeSubmit(std::function<void(uint64_t)> fn) { opt_.beforeSubmit = std::move(fn); }
 
 private:
     void captureLoop();

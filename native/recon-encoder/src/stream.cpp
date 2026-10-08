@@ -1,6 +1,7 @@
 #include "stream.hpp"
 
 #include "d3d/convert.hpp"
+#include "nvenc/nvenc_runtime.hpp"
 #include "platform/platform.hpp"
 
 namespace recon {
@@ -31,8 +32,12 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
             s = Status::Error("unsupported", "the encoder wants NV12 but the capture has no GPU device");
         } else {
             auto mode = d3d::Nv12Converter::Output::Nv12;
-            if (!d3d::Nv12Converter::nv12RenderTargets(src.device) && choice.caps.backend == "mock") {
-                mode = d3d::Nv12Converter::Output::Planar;  // the mock reads nothing: still exercise the shaders
+            if (!d3d::Nv12Converter::nv12RenderTargets(src.device) &&
+                (choice.caps.backend == "mock" || (choice.caps.backend == "nvenc" && nvencRuntime().testDouble))) {
+                // The mock and the NVENC test double read nothing (Wine has no
+                // NV12 render targets): still exercise the shaders; the luma
+                // plane stands in for the NV12 texture (Pipeline::captureLoop).
+                mode = d3d::Nv12Converter::Output::Planar;
             }
             conv = std::make_unique<d3d::Nv12Converter>();
             s = conv->init(src.device, in.width, in.height, p.barcode, mode, 6, in.contentWidth, in.contentHeight);

@@ -248,7 +248,7 @@ the pipeline's `Capabilities`, never from a vendor:
 |---|---|---|
 | process | one `ffmpeg` per generation | one `recon-encoder.exe` per session (docs/HELPER_PROTOCOL.md) |
 | key frame for the client | a new generation, started at once (urgent restart) | an IDR in the running encoder (`ForceIDR`): a new generation without a new process |
-| bitrate change | an overlapped restart (rate limited, see above) | in the running encoder (`LiveBitrate`: AMF/NVENC seamless, or an encoder flush with an IDR) |
+| bitrate change | an overlapped restart (rate limited, see above) | in the running encoder (`LiveBitrate`: AMF/NVENC seamless, or an encoder flush with an IDR), as the live-bitrate qualification measured it (below) |
 | loss recovery | key frame, or skip with intra refresh | key frame; `Recover`/`Ack` plumbed for LTR / reference invalidation (step 3.5 wires the client) |
 | stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly) |
 
@@ -276,6 +276,18 @@ client takes the new fps for its gap timeout (clients that ignore it keep the ge
 config). The helper scales its whole source to the whole encoded size, so a client size of
 another aspect ratio than the monitor's is fitted to the monitor's (a window is encoded at its
 own size).
+
+**Live bitrate.** How the helper's encoder may change its bitrate is measured once per GPU by
+`recon-host qualify` (GUIDE 3.6, `internal/host/qualify`; docs/HELPER_PROTOCOL.md
+"Live-bitrate qualification"): per codec, rate-control mode and live-bitrate mode, a 60 s
+high-motion run stepping 50 -> 20 -> 50 Mbit/s every 2 s, judged on key frames at the changes,
+P-frame sizes at the new target within 3 frames, frame-id and barcode gaps and a clean decode.
+The results (`live-bitrate.json` next to host.json) are read when a session opens the helper:
+it starts each stream with `seamless` where that passed, else `flush`, else a new helper per
+bitrate change, and adaptive-bitrate streams with the rate-control mode that changed seamlessly
+(CBR first). The rate controller then lets bitrate changes on a qualified seamless encoder come
+every 2 s, others keep 10 s between changes (a flush costs a key frame). Without results the
+helper's caps defaults apply.
 
 **Lifecycle.** The helper the session launched to read its caps starts the stream; while a stream
 is live a spare helper is kept launched (caps read, nothing started), so a restart skips the

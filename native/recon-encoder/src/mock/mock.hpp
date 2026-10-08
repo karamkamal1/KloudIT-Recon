@@ -41,7 +41,12 @@ private:
 // ReplayEncoder outputs the canned clip: frame 0 is an IDR, 1..59 are P frames,
 // and it loops back to the IDR. forceIdr (and recover, which has no LTR to use)
 // jumps back to frame 0. setRate is accepted (recon-host sees it in the stats)
-// but cannot change the canned bitstream. With a GPU capture (dda, amd-direct,
+// but cannot change the canned pictures; with MockOptions::followRate it pads
+// every frame with H.264 filler data to the target bitrate (key frames to three
+// times a P frame), applied from the next submitted frame (rateLag frames
+// later), so frame sizes follow it as a CBR encoder's would. With start's
+// liveBitrate "flush" a setRate restarts the clip with an IDR and a new gen
+// (MockOptions::idrOnRate: an IDR in seamless mode too). With a GPU capture (dda, amd-direct,
 // wgc) it asks for NV12 input, so capture and the colour conversion run for
 // real on a host without an encoder backend; the converted frames are ignored.
 // It enforces the init() / release() contract: an init() after a start that
@@ -49,12 +54,14 @@ private:
 class ReplayEncoder : public Backend {
 public:
     explicit ReplayEncoder(const MockOptions& opt);
+    ~ReplayEncoder() override;
     const char* name() const override { return "mock"; }
     Caps caps() override;
     Status init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) override;
     void release() override;
     Status submit(const EncoderFrame& frame, const SubmitInfo& info) override;
     Next receive(EncodedFrame& out, int timeoutMs, Status& err) override;
+    void releaseOutput(EncodedFrame& f) override;
     Status forceIdr() override;
     Status recover(uint64_t lostFromFrameId, std::optional<uint64_t> ackedLtrFrameId) override;
     Status setRate(const RateParams& r) override;
@@ -81,6 +88,13 @@ private:
     bool idrPending_ = false;
     bool initialized_ = false;  // init() succeeded, release() not called since
     size_t pos_ = 0;
+    // Rate (followRate, flush): the target frames are sized for, a setRate
+    // waiting for the next submit, and the old target kept for rateLag frames.
+    int kbps_ = 0, fps_ = 60, lagKbps_ = 0;
+    uint64_t lagLeft_ = 0;
+    bool flush_ = false, ratePending_ = false;
+    RateParams pendingRate_;
+    uint32_t gen_ = 0;
 };
 
 }  // namespace recon

@@ -10,6 +10,8 @@
 #include <mutex>
 #include <optional>
 
+#include <nlohmann/json.hpp>
+
 #include "codec/bitstream.hpp"
 #include "d3d/device.hpp"
 #include "protocol.hpp"
@@ -79,7 +81,22 @@ const OptionField kStartOptions[] = {
     {"--intra-refresh", "intraRefreshFrames", Kind::Int},
     {"--monitor", "monitor", Kind::Int},
     {"--hmonitor", "hmonitor", Kind::Hex},
+    {"--motion", "motion", Kind::Bool},
 };
+
+// "A,B,..." -> non-negative integers.
+bool parseInts(const std::string& v, std::vector<int>& out) {
+    out.clear();
+    size_t pos = 0;
+    for (;;) {
+        const size_t comma = v.find(',', pos);
+        const std::string part = v.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!isInt(part) || part[0] == '-') return false;
+        out.push_back(std::atoi(part.c_str()));
+        if (comma == std::string::npos) return true;
+        pos = comma + 1;
+    }
+}
 
 }  // namespace
 
@@ -97,6 +114,31 @@ bool encodeTestOption(const std::string& key, const std::string& val, EncodeTest
     if (key == "--dxgi-gate") {
         ok = val == "0" || val == "1";
         o.dxgiGate = val != "0";
+        o.used = true;
+        return true;
+    }
+    if (key == "--rate-schedule") {
+        // K1[,K2...]:N
+        const size_t colon = val.rfind(':');
+        ok = colon != std::string::npos && parseInts(val.substr(0, colon), o.rateLevels) && isInt(val.substr(colon + 1)) &&
+             (o.rateEvery = std::atoi(val.substr(colon + 1).c_str())) > 0 &&
+             std::all_of(o.rateLevels.begin(), o.rateLevels.end(), [](int k) { return k > 0 && k <= 2000000; });
+        o.used = true;
+        return true;
+    }
+    if (key == "--frame-log") {
+        ok = !(o.frameLog = val).empty();
+        o.used = true;
+        return true;
+    }
+    if (key == "--barcode") {
+        // X,Y,CELL: the start's barcode (validated by the start parser).
+        std::vector<int> v;
+        ok = parseInts(val, v) && v.size() == 3;
+        if (ok) {
+            startFields() += ",\"barcode\":{\"x\":" + std::to_string(v[0]) + ",\"y\":" + std::to_string(v[1]) +
+                             ",\"cell\":" + std::to_string(v[2]) + "}";
+        }
         o.used = true;
         return true;
     }
@@ -163,6 +205,7 @@ public:
         int32_t ltrSlot = -1;
         int64_t captureQpc = 0, submitQpc = 0, outputQpc = 0;
         size_t bytes = 0;
+        bool written = false;  // went into the output file (not discarded after a simulated loss)
         std::vector<uint8_t> payload;
     };
     // Reads every published slot (the consumer side of docs/HELPER_PROTOCOL.md).
@@ -391,6 +434,26 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
     if (codec == Codec::Av1) ivfHeader(file, codedW, codedH, uint32_t(p.fps), 0);
     std::fflush(stdout);
 
+    // The rate schedule: set on the capture thread right before the frame
+    // that starts each step is submitted (Pipeline::setBeforeSubmit).
+    std::mutex scheduleMu;
+    std::vector<std::pair<uint64_t, int>> rateChanges;  // first frame id at the rate, kbps
+    if (o.rateEvery > 0 && !o.rateLevels.empty()) {
+        Pipeline* pl = sr.pipeline.get();
+        sr.pipeline->setBeforeSubmit([&, pl](uint64_t id) {
+            const uint64_t every = uint64_t(o.rateEvery);
+            if (id <= 1 || (id - 1) % every != 0) return;
+            const int next = o.rateLevels[size_t(((id - 1) / every - 1) % o.rateLevels.size())];
+            {
+                std::lock_guard<std::mutex> lock(scheduleMu);
+                if (!rateChanges.empty() && rateChanges.back().first == id) return;  // the same frame again (encoder busy)
+                rateChanges.emplace_back(id, next);
+            }
+            const Status rs = pl->setRate(RateParams{next, 0, 0});
+            if (!rs.ok) std::printf("encode-test: rate schedule: %d kbps at frame %llu: %s\n", next, static_cast<unsigned long long>(id), rs.text.c_str());
+        });
+    }
+
     sr.pipeline->start();
     const int64_t freq = qpcFrequency(), t0 = qpcNow();
     const int64_t limit = t0 + freq * (int64_t(o.frames) * 4 / std::max(1, p.fps) + 15);
@@ -475,6 +538,7 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                 }
             }
             f.payload.clear();
+            f.written = true;
             all.push_back(std::move(f));
         }
         if (lastId >= uint64_t(o.frames)) break;
@@ -563,6 +627,61 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
             fpsNow = fpsAfter;
         } else {
             std::printf("encode-test: %s at %llu applied\n", e.what.c_str(), id(e.firedAt));
+        }
+    }
+    if (o.rateEvery > 0) {
+        std::lock_guard<std::mutex> lock(scheduleMu);
+        std::printf("encode-test: rate schedule: %zu changes every %d frames (%s kbps), first at frame %llu\n", rateChanges.size(),
+                    o.rateEvery, [&] {
+                        std::string l = std::to_string(p.kbps);
+                        for (int k : o.rateLevels) l += " -> " + std::to_string(k);
+                        return l;
+                    }().c_str(),
+                    static_cast<unsigned long long>(rateChanges.empty() ? 0 : rateChanges.front().first));
+    }
+    if (!o.frameLog.empty()) {
+        // One JSON object per line: started, the frames, the end counters.
+        std::FILE* log = nullptr;
+        if (_wfopen_s(&log, fromUtf8(o.frameLog).c_str(), L"wb") != 0 || !log) {
+            std::printf("encode-test: FAIL cannot write the frame log %s\n", o.frameLog.c_str());
+            ok = false;
+        } else {
+            std::lock_guard<std::mutex> lock(scheduleMu);
+            std::fprintf(log, "%s\n", encodeStarted(st).c_str());
+            size_t change = 0;
+            int target = p.kbps;
+            for (const auto& f : all) {
+                while (change < rateChanges.size() && rateChanges[change].first <= f.frameId) target = rateChanges[change++].second;
+                nlohmann::ordered_json j = {{"t", "frame"},
+                                            {"id", f.frameId},
+                                            {"gen", f.gen},
+                                            {"key", (f.flags & ring::kFlagKey) != 0},
+                                            {"seqStart", (f.flags & ring::kFlagSeqStart) != 0},
+                                            {"recovery", (f.flags & ring::kFlagRecovery) != 0},
+                                            {"repeat", (f.flags & ring::kFlagRepeat) != 0},
+                                            {"bytes", f.bytes},
+                                            {"droppedBefore", f.droppedBefore},
+                                            {"written", f.written},
+                                            {"kbps", target},
+                                            {"captureQpc", f.captureQpc},
+                                            {"submitQpc", f.submitQpc},
+                                            {"outputQpc", f.outputQpc}};
+                std::fprintf(log, "%s\n", j.dump().c_str());
+            }
+            nlohmann::ordered_json changes = nlohmann::ordered_json::array();
+            for (const auto& [id, k] : rateChanges) changes.push_back({{"frameId", id}, {"kbps", k}});
+            nlohmann::ordered_json end = {{"t", "end"},
+                                          {"frames", all.size()},
+                                          {"lastId", lastId},
+                                          {"written", written},
+                                          {"droppedByHelper", rep.dropped()},
+                                          {"errors", rep.errors()},
+                                          {"fatal", rep.fatalRaised()},
+                                          {"timedOut", timedOut},
+                                          {"qpcFrequency", freq},
+                                          {"rateChanges", changes}};
+            std::fprintf(log, "%s\n", end.dump().c_str());
+            std::fclose(log);
         }
     }
     std::printf("encode-test: check: ffprobe -v error -show_frames -show_entries frame=key_frame,pict_type,pkt_size %s\n"

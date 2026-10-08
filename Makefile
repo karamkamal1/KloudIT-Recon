@@ -46,18 +46,24 @@ helper:
 	fi
 
 # Helper integration tests (mock backend, the NVENC backend against its test double
-# recon-fake-nvenc.dll) under Wine, against the mingw build, and the session's pipeline
-# on it (media: HelperVideo, the GPU priority table shared with the helper). Wine's D3D11
+# recon-fake-nvenc.dll) under Wine, against the mingw build, the session's pipeline
+# on it (media: HelperVideo, the GPU priority table shared with the helper) and the
+# live-bitrate qualification (qualify: recon-host qualify's runs and checks). Wine's D3D11
 # needs an X display with 24-bit colour: run under xvfb-run -a -s "-screen 0 1280x720x24"
 # (Mesa llvmpipe) to include the GPU conversion self-test, the synthetic-gpu pipeline
 # tests and the NVENC test; headless they skip.
 HELPER_TEST_ENV = RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
-	RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))'
+	RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
+	$(if $(WIN_FFMPEG),RECON_FFMPEG='$(WIN_FFMPEG)')
+# WIN_FFMPEG (optional): a Windows ffmpeg.exe (Wine path, e.g. Z:\opt\ffmpeg\bin\ffmpeg.exe) for
+# the qualification tests' decode checks (internal/host/qualify).
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/media.test.exe ./internal/host/media
+	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/qualify.test.exe ./internal/host/qualify
 	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./encoder.test.exe -test.v -test.count=1
 	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./media.test.exe -test.v -test.count=1 -test.run 'Helper|GPUPriority|ClockFromQPC'
+	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./qualify.test.exe -test.v -test.count=1 -test.run 'Qualify'
 
 
 # third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests

@@ -3036,3 +3036,114 @@ recon-host.exe by `install-host.ps1`):
   frames and live bitrate without restarts, the restart below 300 ms, the fallback to FFmpeg
   (hevc_nvenc), and AV1 (RTX 40+) at 1920x1080 without visible padding (crop fields only if
   the helper's `started` reports a larger coded size).
+
+## 3.6 Live-bitrate qualification
+
+`recon-host qualify` (`cmd/recon-host/qualify.go`, `internal/host/qualify`) runs the GUIDE 3.6
+matrix through the native helper: every codec of the helper's encoder x rate-control mode (AMF
+`cbr`, `vbr` = LATENCY_CONSTRAINED_VBR, `vbr_peak` = PEAK_CONSTRAINED_VBR, new start value; NVENC
+`cbr`) x live-bitrate mode (`seamless`, `flush`). Each run is the helper's encode test on the
+synthetic GPU source in its new high-motion mode (start `motion`: presents without pauses, a
+scrolling pattern under full-frame noise, scaled to 1920x1080) at 60 fps, 50 Mbit/s, stepping to
+20 and back every 2 s for 60 s (`--rate-schedule`: each new rate set on the capture thread right
+before the frame that should have it, so the change frame is exact) with the frame barcode at
+(16, 16); `--frame-log` records every frame's flags, size and target. FFmpeg decodes each stream
+once (showinfo for key flags and picture types, the barcode cropped and read with
+`proto.BarcodeReadLuma`). A cell passes with no key frame on a change (`flush`: one within 5
+frames of every change), every decoded intra frame flagged key and the other way round, P-frame
+sizes within 25 % of the new target in a 3-frame window starting at most 3 frames after each
+change and in the second half of every phase, no frame-id gap or helper drop, every barcode the
+frame's sequence number (at most 1 % unreadable) and no decoder error; `inconclusive` when the
+source did not fill the start bitrate. The results are printed and saved as `live-bitrate.json`
+next to `host.json` (format: docs/HELPER_PROTOCOL.md "Live-bitrate qualification"). Sessions on
+the helper read it when they open the pipeline (`live-bitrate qualification ... choice=...` in
+host.log; only for the same backend and adapter name): per codec and rate-control mode
+`seamless` where it passed, else `flush`, else a new helper per bitrate change; adaptive-bitrate
+streams use CBR where it changes seamlessly, else the first of PEAK_CONSTRAINED_VBR and
+LATENCY_CONSTRAINED_VBR that does (GUIDE 10: adaptive = the 3.6 winner). The rate controller lets
+changes on a qualified seamless encoder follow each other after 2 s (the qualification's step);
+flush, unqualified and FFmpeg streams keep 10 s between changes ("change less often").
+Deviation: the per-GPU results live in `live-bitrate.json` (what recon-host reads); this file
+gets the table of a hardware run (below) for the record.
+
+Hardware checks:
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with no stream running, in PowerShell
+  `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` (18 runs, about 30 minutes; it finds
+  ffmpeg like the agent; `-codecs hevc -rc cbr` for a 2-run smoke test first). Progress lines
+  `[n/18] hevc cbr seamless: PASS`, then the table and `results saved to
+  %APPDATA%\KlouditRecon\live-bitrate.json (logs in %APPDATA%\KlouditRecon\qualify-<time>)`.
+  Pass looks like `hevc  cbr  seamless  PASS  3600  29  0 unexpected  1  92-104  3600/3600 ok`
+  (3600 frames, 29 changes, max lag 0-3 frames, steady sizes 75-125 % of the target, every
+  barcode read) and `flush` rows `0 unexpected, 0 missing`. Failures name the reason: `29 key
+  frames after the first: 121 (0 after the change at 121), ...` (the encoder makes an IDR on a
+  seamless change: that mode gets `flush`), `P-frame sizes reached the new target later than 3
+  frames after N of the changes (up to K frames; at ...)` (rate control too slow), `steady
+  P-frame sizes between X % and Y %` (does not hold the target: VBV not changed at run time?
+  look for `amf: setRate: not accepted` in the cell's `.log`), `barcodes: ... gaps` / `the
+  decoder output N frames of M` (frames lost), `the decoder reported N errors` (artifacts). An
+  `INCONCLUSIVE` row (`P frames used X % of the start bitrate before any change`) means the
+  synthetic source did not need 50 Mbit/s: rerun that cell with `-capture dda` while a
+  high-motion game runs full screen on the primary monitor. GUIDE 10 expects CBR to pass
+  seamless on all three codecs. Record here: the table, the `choice` lines, driver version;
+  then start a stream from Chrome and check host.log for `live-bitrate qualification ...
+  choice="hevc: adaptive cbr/seamless, ..."` and `encoder helper started ... live_bitrate=seamless
+  rate_control=cbr live_bitrate_from=qualification`, and that Settings bitrate changes log
+  `changing the bitrate in the encoder` without `restarting video`. Also note one cell's
+  `follow.levels` (measured/target size per step) from the JSON.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (desktop source, GUIDE 3.6 "or the desktop"): run a
+  high-motion game borderless at 1920x1080 on the primary monitor and, from a second screen or
+  remotely, `recon-host.exe qualify -capture dda -codecs hevc -rc cbr,vbr -duration 30s`:
+  the same verdicts as with the synthetic source (idle repeats are left out of the size checks;
+  a static desktop gives `INCONCLUSIVE`).
+- NVIDIA: unverified (no NVIDIA host available). Test: `& "$env:ProgramFiles\KlouditRecon\recon-host.exe"
+  qualify` on an RTX host (HEVC and H.264, AV1 on RTX 40+; `cbr` only, `-rc cbr,vbr` to add VBR;
+  about 10 minutes): expect every `seamless` row to PASS (NvEncReconfigureEncoder without reset
+  or IDR) and `flush` rows with a key frame per change; a GPU without
+  `NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE` shows FAIL rows with `P-frame sizes reached the new
+  target later ... never within the phase` (setRate answered `unsupported`: sessions then
+  restart). Record the table and the host.log lines as for AMD (`backend=nvenc`).
+
+Verified in the sandbox (Linux, no GPU, no Windows):
+- `go test ./internal/host/qualify`: the judge on synthetic frame logs (`TestJudge*`): a clean
+  60 s run passes with 29 changes and max lag 0; an IDR one frame after each change fails
+  seamless ("4 key frames after the first: 122 (1 after the change at 121)") and passes flush; a
+  flush change without a key frame and a key frame far from any change fail; sizes 3 frames late
+  pass (max lag 3), 5 frames late fail, an overshooting phase and a change that never settles
+  fail; a source that cannot fill 50 Mbit/s is `inconclusive`, unless something else failed;
+  an encoder that stays low after the first change fails; frame-id gaps, droppedBefore and
+  helper drops fail; an unflagged intra frame, decoder errors and a missing decoded frame fail;
+  1 % unreadable barcodes is allowed, more fails; a frame missing from the stream shows as
+  wrong barcodes and a gap; barcodes restart at a sequence start; idle repeats are ignored.
+  `TestDecode` encodes a 320x180 stream with Go-drawn barcodes, a forced IDR at frame 20 and
+  frame 30 left out with libx264, decodes it with the sandbox FFmpeg 6.1: 59 frames, key flags
+  and types right, every barcode read; judged with a frame log lacking that frame it is one
+  frame-id gap and no barcode gap; a truncated stream yields decoder errors, garbage an error.
+  `TestChoose`: CBR seamless first, PEAK_CONSTRAINED_VBR when only it is seamless, flush,
+  restart, nothing for errors / inconclusive / another adapter or backend / the test double;
+  `TestResultsFile` (round trip, BOM, version).
+- Session: `TestHelperVideoLiveBitrateQualified` (the start's `rc` / `liveBitrate` from the
+  choice; `restart` makes a bitrate change a new helper; capabilities `LiveBitrateFlush` /
+  `LiveBitrateMeasured`; adaptive on/off is a new helper), `TestSessionLiveBitrateQualified`
+  (live-bitrate.json next to host.json: flush and seamless reach the start, another GPU's results
+  and a missing file are logged and not used; rate gap 2 s only for qualified seamless),
+  `TestRateSeamlessGap` (changes 2 s apart, the quiet period still 10 s, back to 10 s with gap 0).
+- Helper (mingw build, no warnings) under Wine 9.0 with `xvfb-run -a -s "-screen 0 1280x720x24"
+  make helper-test WINE=/usr/lib/wine/wine64 WIN_FFMPEG=<FFmpeg 8.1 win64 ffmpeg.exe>`: all
+  encoder, media and qualify integration tests pass, among them `TestQualifyMock` (the mock with
+  `--mock-follow-rate`: H.264 frames padded with filler data to the target, 59 frames with a
+  change every 10; both cells PASS, decoded by the Windows FFmpeg 8.1 without errors, choice
+  seamless; with `--mock-idr-on-rate` seamless FAILs with 5 unexpected key frames at the changes
+  and flush PASSes, choice flush; with `--mock-rate-lag=5` both FAIL on the lag, choice restart),
+  `TestQualifyNvencTestDouble` (the NVENC backend on the test double, which now sizes frames like
+  its configured rate, through the synthetic GPU source in motion mode on Wine's D3D11 (planar
+  conversion stand-in), 320x180, 3 s, a change every 500 ms: all six cells PASS, decode checks
+  skipped), `TestHelperIntegrationMotionSource` (no idle repeats, fps held, the barcode at (16,16)
+  of the dumped frame 30 reads 29, the picture is noise; `motion` with capture `synthetic` is
+  `bad_message`), and the unchanged NVENC self-test against the padded test double.
+  `wine recon-host.exe qualify -backend mock -helper ... -ffmpeg <ffmpeg.exe>` prints the table
+  and writes the results into its work directory (test runs never overwrite the real file).
+- Every changed helper source passes `clang++ --target=x86_64-w64-mingw32 -std=c++20
+  -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Wconversion` without warnings. Browser E2E
+  (FFmpeg path, unchanged by this step: its rate gap stays the 10 s period): 73 of 73 checks
+  passed; a first run while another agent's E2E loaded the shared CPU (load 14) had 7
+  frame-rate / decoder-backlog failures and passed unchanged when rerun alone.

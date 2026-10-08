@@ -1065,10 +1065,12 @@ func (s *Session) encoderFailed(p media.Params) {
 // most 2 s apart, and a decoder flush also caps later raises. Otherwise (the
 // client saw the delay grow) the restart is overlapped: the current
 // generation streams on until the new one's first key frame; such a cut
-// needs 10 s since the last change of the bitrate. A signal that cuts nothing
-// still holds off the next raise.
+// needs 10 s since the last change of the bitrate (2 s on an encoder
+// qualified to change seamlessly: rateGap). A signal that cuts nothing still
+// holds off the next raise.
 func (s *Session) congestion(delayMs int, sig rateSignal) bool {
 	urgent := sig != signalDelay
+	s.rate.setGap(rateGap(s.vid().Capabilities()))
 	from, to, ok := s.rate.congestion(sig)
 	if !ok {
 		s.log.Debug("congestion: bitrate kept", "kbps", from, "delayMs", delayMs, "urgent", urgent)
@@ -1088,6 +1090,19 @@ func (s *Session) congestion(delayMs int, sig rateSignal) bool {
 	return true
 }
 
+// rateGap is the minimum time between two bitrate changes for the pipeline
+// that streams: rateSeamlessGap where the encoder was qualified to change its
+// bitrate seamlessly (recon-host qualify, GUIDE 3.6: no key frame, no
+// restart); otherwise 0, the full period: a flushing encoder (a key frame per
+// change, GUIDE 3.6 "change less often"), one whose live change is only
+// assumed, and FFmpeg's restarts.
+func rateGap(c media.PipelineCaps) time.Duration {
+	if c.LiveBitrate && c.LiveBitrateMeasured && !c.LiveBitrateFlush {
+		return rateSeamlessGap
+	}
+	return 0
+}
+
 // rateLoop raises the bitrate after a congestion back-off once the network
 // has been quiet (rateController.tick): an overlapped restart at the new
 // bitrate, like a settings change.
@@ -1104,6 +1119,7 @@ func (s *Session) rateLoop() {
 			s.rate.hold() // nothing streams (paused, or the encoder is starting or failing): nothing to judge
 			continue
 		}
+		s.rate.setGap(rateGap(s.vid().Capabilities()))
 		from, to, ok := s.rate.tick()
 		if !ok {
 			continue

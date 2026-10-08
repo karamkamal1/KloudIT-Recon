@@ -18,7 +18,7 @@ struct NvencRuntime {
     HMODULE module = nullptr;     // kept loaded for the process
     uint32_t driverVersion = 0;   // newest API the driver supports: (major << 4) | minor
     std::string versionText;      // "NVENC API 13.0 (driver supports 13.1)"
-    bool testDouble = false;      // loaded by --self-test-nvenc=DLL (not the driver)
+    bool testDouble = false;      // loaded by --self-test-nvenc=DLL / --nvenc-test-dll=DLL (not the driver)
     NV_ENCODE_API_FUNCTION_LIST api{};
 };
 
@@ -38,9 +38,10 @@ NvencRuntime loadNvencRuntime(HMODULE module);
 // "NV_ENC_ERR_INVALID_PARAM (8)".
 std::string nvencStatusText(NVENCSTATUS s);
 
-// --self-test-nvenc=DLL: from now on nvencRuntime() is this DLL (a test double
-// of the driver, loaded by its full path) instead of System32's. Must be called
-// before anything uses nvencRuntime(). Never used outside the self-test.
+// --self-test-nvenc=DLL, and --nvenc-test-dll=DLL of the encode test and
+// --print-caps: from now on nvencRuntime() is this DLL (a test double of the
+// driver, loaded by its full path) instead of System32's. Must be called before
+// anything uses nvencRuntime(). Never used in the mode recon-host runs.
 bool useTestNvencRuntime(const std::wstring& path, std::string& err);
 
 }  // namespace recon

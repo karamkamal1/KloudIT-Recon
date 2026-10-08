@@ -236,7 +236,7 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
         if (!gotW || !gotH) c.assumed.insert(c.assumed.end(), {"alignW", "alignH"});
     }
     c.forceIdr = true;
-    c.liveBitrate = "seamless";     // AMD Streaming SDK UpdateBitrate: SetProperty, no flush; 3.6 qualifies it
+    c.liveBitrate = "seamless";     // AMD Streaming SDK UpdateBitrate: SetProperty, no flush; recon-host qualify (3.6) measures it
     c.assumed.push_back("liveBitrate");
     c.yuv444 = false;
     // Intra refresh (without user LTR and SVC: AMF docs, MAX_LTR_FRAMES
@@ -346,8 +346,9 @@ struct RateValues {
     amf_int64 target = 0, peak = 0, vbv = 0;
 };
 
-// Peak = target (CBR, GUIDE 3.3; for LATENCY_CONSTRAINED_VBR too, as Sunshine
-// passes rc_max_rate = bit_rate); VBV = bitrate / fps x vbvFrames (GUIDE 3.3:
+// Peak = target (CBR, GUIDE 3.3; for LATENCY_CONSTRAINED_VBR and
+// PEAK_CONSTRAINED_VBR too, as Sunshine passes rc_max_rate = bit_rate: the
+// target is what the rate controller lets the network carry); VBV = bitrate / fps x vbvFrames (GUIDE 3.3:
 // 1.0-1.5 frames; the Streaming SDK uses one frame).
 RateValues rateValues(int kbps, double vbvFrames, int fps) {
     RateValues v;
@@ -548,7 +549,7 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     s.setInt(P_->encodingLatencyMode, P_->lowestLatency);
     const amf_int64 preset = p.quality == "quality" ? P_->presetQuality : p.quality == "balanced" ? P_->presetBalanced : P_->presetSpeed;
     s.setInt(P_->qualityPreset, preset);
-    s.setInt(P_->rateControl, p.rc == "cbr" ? P_->rcCbr : P_->rcLatencyVbr, true);
+    s.setInt(P_->rateControl, p.rc == "cbr" ? P_->rcCbr : p.rc == "vbr_peak" ? P_->rcPeakVbr : P_->rcLatencyVbr, true);
     s.setBool(P_->preAnalysis, false);
     if (P_->preEncodeIsInt) s.setInt(P_->preEncode, AMF_VIDEO_ENCODER_PREENCODE_DISABLED);
     else s.setBool(P_->preEncode, false);
@@ -921,7 +922,7 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     out.fps = p.fps;
     out.kbps = p.kbps;
     out.liveBitrate = flushMode_ ? "flush" : "seamless";
-    out.rateControl = p.rc == "cbr" ? "cbr" : "vbr_latency";
+    out.rateControl = p.rc == "cbr" ? "cbr" : p.rc == "vbr_peak" ? "vbr_peak" : "vbr_latency";
     out.usage = usage_ == P_->usageUltraLowLatency ? "ultra_low_latency" : "low_latency";
     out.ltrSlots = p.ltrSlots;
     out.ltrInterval = p.ltrSlots ? lc.interval : 0;

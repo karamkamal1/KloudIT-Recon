@@ -5,6 +5,12 @@
 // for 0.6 s, and again. So the shared PacedCapture logic (fps cap, newest
 // wins, idle repeats), the NV12 conversion with its pool and the barcode run
 // end to end in CI and under Wine. Not listed in caps; request it explicitly.
+// With start's "motion" it is a high-motion source instead (the live-bitrate
+// qualification of step 3.6): it presents without idle phases and every image
+// is new: an 8 px checkerboard with a ramp scrolling 12 px right and 5 px down
+// per present under full-frame noise (about +-40 per channel). Scaled to a
+// 1080p stream that is far more than any bitrate the qualification asks for,
+// so the encoder's rate control always decides the frame sizes.
 #include <algorithm>
 #include <mutex>
 #include <vector>
@@ -35,6 +41,9 @@ protected:
     }
 
 private:
+    void drawPattern();
+    void drawMotion();
+
     d3d::Device dev_;
     ComPtr<ID3D11Texture2D> slots_[2];
     int cur_ = 0;
@@ -42,6 +51,8 @@ private:
     std::vector<uint8_t> pixels_;
     int64_t start_ = 0, presentPeriod_ = 0, nextPresent_ = 0;
     uint64_t presents_ = 0;
+    bool motion_ = false;
+    uint32_t noise_ = 0x9e3779b9u;  // xorshift32 state of the motion noise
 };
 
 Status GpuTestCapture::init(const StartParams& p) {
@@ -71,6 +82,7 @@ Status GpuTestCapture::init(const StartParams& p) {
         if (FAILED(hr)) return Status::Error("init_failed", "creating the test texture failed: " + d3d::hrText(hr));
     }
     pixels_.resize(size_t(td.Width) * td.Height * 4);
+    motion_ = p.motion;
     const int64_t freq = qpcFrequency();
     presentPeriod_ = freq / std::min(240, 2 * p.fps);
     start_ = nextPresent_ = qpcNow();
@@ -82,10 +94,10 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
     const int64_t freq = qpcFrequency();
     const int64_t deadline = qpcNow() + int64_t(timeoutMs) * freq / 1000;
     for (;;) {
-        // 1 s of presents, then 0.6 s without any.
+        // 1 s of presents, then 0.6 s without any (motion: no pause).
         const int64_t cycle = freq * 16 / 10;
         const int64_t phase = (nextPresent_ - start_) % cycle;
-        if (phase >= freq) nextPresent_ += cycle - phase;
+        if (phase >= freq && !motion_) nextPresent_ += cycle - phase;
         if (nextPresent_ > deadline) {
             sleepUntil(deadline);
             return stopping() ? Next::Stopped : Next::Timeout;
@@ -94,24 +106,47 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
         const int64_t present = nextPresent_;
         nextPresent_ += presentPeriod_;
         if (qpcNow() - present > presentPeriod_ * 4) nextPresent_ = qpcNow();  // fell behind (debugger): resync
-        // A colour that changes with every present and a bar that moves.
         ++presents_;
-        const uint32_t w = src_.width, h = src_.height, bar = uint32_t(presents_ * 7 % w);
-        for (uint32_t y = 0; y < h; ++y) {
-            for (uint32_t x = 0; x < w; ++x) {
-                uint8_t* px = &pixels_[(size_t(y) * w + x) * 4];
-                const bool onBar = x >= bar && x < bar + 16;
-                px[0] = onBar ? 255 : uint8_t(x * 255 / w);
-                px[1] = onBar ? 255 : uint8_t(y * 255 / h);
-                px[2] = onBar ? 255 : uint8_t(presents_ * 3);
-                px[3] = 255;
-            }
-        }
-        dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, pixels_.data(), w * 4, 0);
+        if (motion_) drawMotion();
+        else drawPattern();
+        dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, pixels_.data(), src_.width * 4, 0);
         a.presentQpc = present;
         a.captureQpc = qpcNow();
         a.dirtyPct = 100;
         return Next::Frame;
+    }
+}
+
+// A colour that changes with every present and a bar that moves.
+void GpuTestCapture::drawPattern() {
+    const uint32_t w = src_.width, h = src_.height, bar = uint32_t(presents_ * 7 % w);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t* px = &pixels_[(size_t(y) * w + x) * 4];
+            const bool onBar = x >= bar && x < bar + 16;
+            px[0] = onBar ? 255 : uint8_t(x * 255 / w);
+            px[1] = onBar ? 255 : uint8_t(y * 255 / h);
+            px[2] = onBar ? 255 : uint8_t(presents_ * 3);
+            px[3] = 255;
+        }
+    }
+}
+
+// High motion: a scrolling checkerboard with a ramp under full-frame noise.
+void GpuTestCapture::drawMotion() {
+    const uint32_t w = src_.width, h = src_.height, dx = uint32_t(presents_ * 12), dy = uint32_t(presents_ * 5);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t* px = &pixels_[(size_t(y) * w + x) * 4];
+            const uint32_t sx = x + dx, sy = y + dy;
+            const int base = (((sx >> 3) ^ (sy >> 3)) & 1 ? 180 : 60) + int((sx * 7 + sy * 3) & 31);
+            noise_ ^= noise_ << 13, noise_ ^= noise_ >> 17, noise_ ^= noise_ << 5;
+            for (int c = 0; c < 3; ++c) {
+                const int n = int((noise_ >> (8 * c)) & 0xff) - 128;
+                px[c] = uint8_t(std::clamp(base + n * 5 / 16, 0, 255));
+            }
+            px[3] = 255;
+        }
     }
 }
 

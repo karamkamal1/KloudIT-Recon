@@ -102,8 +102,8 @@ else()
 endif()
 
 # recon-fake-nvenc.dll: a test double of the NVIDIA driver's NVENC runtime
-# (test/fake_nvenc.cpp) for `recon-encoder --self-test-nvenc=DLL`, which loads
-# it by its path. Never shipped or installed: the helper itself loads
+# (test/fake_nvenc.cpp) for `recon-encoder --self-test-nvenc=DLL` and
+# `--encode-test ... --nvenc-test-dll=DLL`, which load it by its path. Never shipped or installed: the helper itself loads
 # nvEncodeAPI64.dll from System32 only, and releases bundle recon-encoder.exe alone.
 add_library(recon-fake-nvenc SHARED test/fake_nvenc.cpp test/fake_nvenc.def)
 target_include_directories(recon-fake-nvenc SYSTEM PRIVATE ${THIRD_PARTY}/nv-codec-headers/include)

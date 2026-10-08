@@ -20,6 +20,7 @@
 #include "control.hpp"
 #include "d3d/convert.hpp"
 #include "encode_test.hpp"
+#include "nvenc/nvenc_runtime.hpp"
 #include "pipeline.hpp"
 #include "platform/platform.hpp"
 #include "protocol.hpp"
@@ -36,7 +37,7 @@ const char kUsage[] =
     "       recon-encoder --print-caps [--backend=B]\n"
     "       recon-encoder --gpu-priority-table\n"
     "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder | --self-test-nvenc[=DLL]\n"
-    "       recon-encoder --encode-test=FILE [--backend=B] [encode test options]\n"
+    "       recon-encoder --encode-test=FILE [--backend=B] [--nvenc-test-dll=DLL] [encode test options]\n"
     "       recon-encoder --version\n"
     "\n"
     "Started by recon-host; speaks the protocol in docs/HELPER_PROTOCOL.md on stdin/stdout.\n"
@@ -49,6 +50,12 @@ const char kUsage[] =
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
     "  --mock-hang-at=N     mock only: never return from submitting frame N (a call stuck in the driver)\n"
+    "  --mock-follow-rate   mock only: pad frames with H.264 filler data to the target bitrate (key frames 3x), so\n"
+    "                       frame sizes follow setRate; liveBitrate flush restarts the clip with an IDR\n"
+    "  --mock-rate-lag=N    mock only, with --mock-follow-rate: sizes follow a setRate N frames late\n"
+    "  --mock-idr-on-rate   mock only: every setRate also makes an IDR (an encoder that fails the seamless check)\n"
+    "  --nvenc-test-dll=DLL --encode-test and --print-caps only: load DLL (the test double recon-fake-nvenc.dll)\n"
+    "                       as the NVENC runtime\n"
     "  --dump-nv12=PATH     write converted frame 30 (raw NV12, encoded size) to PATH\n"
     "  --print-caps         print the capabilities JSON and exit\n"
     "  --gpu-priority-table print the GPU priority decision for every mode x vendor x HAGS state (JSON lines)\n"
@@ -63,12 +70,16 @@ const char kUsage[] =
     "Encode test: one stream through the real capture, conversion, encoder and ring, without\n"
     "recon-host; the bitstream goes to FILE (Annex-B for h264/hevc, IVF for av1), a summary to stdout:\n"
     "  --codec=hevc|h264|av1  --capture=dda|amd-direct|wgc|synthetic-gpu|synthetic  --frames=N (300)\n"
-    "  --width=W --height=H (0 = capture size)  --fps=N (60)  --kbps=N (20000)  --rc=cbr|vbr\n"
+    "  --width=W --height=H (0 = capture size)  --fps=N (60)  --kbps=N (20000)  --rc=cbr|vbr|vbr_peak\n"
     "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
     "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
     "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
     "  --dxgi-gate=0|1 (1)  0: DDA and NVENC's Lock/UnlockBitstream not serialized (docs/VENDOR_NOTES.md 3.4 A/B)\n"
-    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n";
+    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n"
+    "  --rate-schedule=K1[,K2...]:N  every N frames the next rate of the list (cyclically), set right before the\n"
+    "                       frame is submitted (frame 1+k*N is the first at the k-th new rate; step 3.6)\n"
+    "  --barcode=X,Y,CELL   draw the frame barcode (GUIDE 0.2)  --motion=0|1  synthetic-gpu: high-motion source\n"
+    "  --frame-log=FILE     JSON lines: started, one line per frame (flags, bytes, target kbps), end counters\n";
 
 struct Args {
     bool printCaps = false;
@@ -79,6 +90,7 @@ struct Args {
     bool selfTestEncoder = false;
     bool selfTestNvenc = false;
     std::string selfTestNvencDll;  // --self-test-nvenc=DLL (test double), empty = the driver
+    std::string nvencTestDll;      // --nvenc-test-dll=DLL: the NVENC runtime for --encode-test / --print-caps
     EncodeTestOptions encodeTest;
     std::string dumpNv12;
     bool version = false;
@@ -134,6 +146,10 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         else if (key == "--mock-error-at") ok = parseNumber(val, a.mock.errorAt);
         else if (key == "--mock-fatal-at") ok = parseNumber(val, a.mock.fatalAt);
         else if (key == "--mock-hang-at") ok = parseNumber(val, a.mock.hangAt);
+        else if (key == "--mock-follow-rate") a.mock.followRate = true;
+        else if (key == "--mock-rate-lag") ok = parseNumber(val, a.mock.rateLag) && a.mock.rateLag <= 1000;
+        else if (key == "--mock-idr-on-rate") a.mock.idrOnRate = true;
+        else if (key == "--nvenc-test-dll") ok = !(a.nvencTestDll = val).empty();
         else {
             err = "unknown argument " + arg;
             return false;
@@ -147,8 +163,14 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         err = "unknown backend " + a.backend;
         return false;
     }
-    if ((a.mock.errorAt || a.mock.fatalAt || a.mock.hangAt) && a.backend != "mock") {
+    if ((a.mock.errorAt || a.mock.fatalAt || a.mock.hangAt || a.mock.followRate || a.mock.rateLag || a.mock.idrOnRate) &&
+        a.backend != "mock") {
         err = "--mock-* options need --backend=mock";
+        return false;
+    }
+    if (!a.nvencTestDll.empty() && a.encodeTest.output.empty() && !a.printCaps) {
+        // Never in the mode recon-host runs: a DLL loaded by path is for tests only.
+        err = "--nvenc-test-dll needs --encode-test or --print-caps";
         return false;
     }
     if (a.encodeTest.used && a.encodeTest.output.empty()) {
@@ -273,6 +295,14 @@ int main(int argc, char** argv) {
         return rc;
     }
 
+    if (!a.nvencTestDll.empty()) {
+        // Before anything loads the NVENC runtime (chooseBackend probes it).
+        std::string derr;
+        if (!useTestNvencRuntime(fromUtf8(a.nvencTestDll), derr)) {
+            std::fprintf(stderr, "recon-encoder: --nvenc-test-dll: %s\n", derr.c_str());
+            return kExitUsage;
+        }
+    }
     BackendChoice choice = chooseBackend(a.backend, a.mock);
     if (!a.encodeTest.output.empty()) return runEncodeTest(a.encodeTest, choice);
     if (a.printCaps) {

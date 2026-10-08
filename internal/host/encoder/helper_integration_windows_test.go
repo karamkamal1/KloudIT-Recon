@@ -885,3 +885,59 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 		t.Fatalf("barcode of the dumped frame 30 reads %d (valid %v), want %d (sequence from frame %d)", v, ok, 30-seqBase, seqBase)
 	}
 }
+
+// The synthetic GPU source's high-motion mode (start "motion", the live-bitrate
+// qualification's source, step 3.6): presents without pauses (no idle
+// repeats), every image noisy, the barcode readable over it; and "motion"
+// with another capture is refused.
+func TestHelperIntegrationMotionSource(t *testing.T) {
+	dump := t.TempDir() + `\frame30.nv12`
+	h := launchMock(t, "--dump-nv12="+dump)
+	const w, hgt, fps = 320, 180, 30
+	_, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", FPS: fps, Kbps: 4000, Motion: true})
+	if he := (*HelperError)(nil); !errors.As(err, &he) || he.Code != "bad_message" || !strings.Contains(he.Text, "motion") {
+		t.Fatalf("motion with capture synthetic: %v", err)
+	}
+	_, err = h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000, Motion: true,
+		Barcode: &Barcode{X: 16, Y: 16, Cell: proto.BarcodeCell}})
+	var he *HelperError
+	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+		t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+	}
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	var frames []*Frame
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		frames = append(frames, nextFrame(t, h))
+	}
+	for _, f := range frames {
+		if f.Repeat {
+			t.Fatalf("frame %d is an idle repeat: the motion source must present all the time", f.FrameID)
+		}
+	}
+	if n := maxPerSecond(frames, h.QPCFrequency()); n > fps+2 || n < fps*8/10 {
+		t.Fatalf("%d frames in one second at %d fps", n, fps)
+	}
+	b, err := os.ReadFile(dump)
+	if err != nil || len(b) != w*hgt*3/2 {
+		t.Fatalf("dump: %d bytes, %v", len(b), err)
+	}
+	// The barcode at (16, 16) reads 29 (frame 30 of the sequence from frame 1).
+	if v, ok := proto.BarcodeReadLuma(b[16*w+16:w*hgt], w, proto.BarcodeCell); !ok || v != 29 {
+		t.Fatalf("barcode reads %d (valid %v), want 29", v, ok)
+	}
+	// Noise: neighbouring luma samples below the barcode differ a lot.
+	diff, n := 0, 0
+	for y := 80; y < hgt; y++ {
+		for x := 1; x < w; x++ {
+			d := int(b[y*w+x]) - int(b[y*w+x-1])
+			diff += max(d, -d)
+			n++
+		}
+	}
+	if avg := float64(diff) / float64(n); avg < 8 {
+		t.Fatalf("mean neighbour difference %.1f: not the high-motion picture", avg)
+	}
+}

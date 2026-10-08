@@ -77,12 +77,13 @@ jobs:
           $caps = & $exe --print-caps --backend=mock
           $caps
           if ($caps -match 'no C\+\+/WinRT headers') { throw "MSVC build without C++/WinRT: Windows.Graphics.Capture missing" }
-      - name: Helper integration tests (mock backend, NVENC test double; the session pipeline on the helper)
+      - name: Helper integration tests (mock backend, NVENC test double; the session pipeline on the helper; the live-bitrate qualification)
         run: |
           $env:RECON_HELPER_EXE = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
           $env:RECON_FAKE_NVENC = (Resolve-Path build/recon-encoder/bin/recon-fake-nvenc.dll).Path
           go test -count=1 -v ./internal/host/encoder
           go test -count=1 -v -run 'Helper|GPUPriority|ClockFromQPC' ./internal/host/media
+          go test -count=1 -v -run 'Qualify' ./internal/host/qualify
       - uses: actions/upload-artifact@v4
         with:
           name: recon-encoder-msvc

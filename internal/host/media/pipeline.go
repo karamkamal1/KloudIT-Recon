@@ -62,6 +62,13 @@ type PipelineCaps struct {
 	// LiveBitrate: SetRate changes the bitrate in the running encoder (no new
 	// encoder process, no key frame unless the encoder flushes).
 	LiveBitrate bool
+	// LiveBitrateFlush: a live change flushes the encoder and makes a key
+	// frame (helper liveBitrate "flush"), so changes should be rare.
+	LiveBitrateFlush bool
+	// LiveBitrateMeasured: how the bitrate changes was measured on this GPU
+	// (recon-host qualify, GUIDE 3.6) rather than assumed from the encoder's
+	// defaults.
+	LiveBitrateMeasured bool
 	// ForceIDR: ForceKeyframe forces an IDR in the running encoder.
 	ForceIDR bool
 	// IntraRefresh: the encoder runs periodic intra refresh.

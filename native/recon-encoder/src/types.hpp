@@ -90,17 +90,24 @@ struct StartParams {
     int fps = 60;
     int kbps = 10000;
     double vbvFrames = 1.0;     // VBV buffer in frame intervals
-    std::string rc = "cbr";     // "cbr" | "vbr" (the backend picks its low-latency flavour)
+    // "cbr" | "vbr" (the backend picks its low-latency flavour: AMF
+    // LATENCY_CONSTRAINED_VBR) | "vbr_peak" (AMF PEAK_CONSTRAINED_VBR; NVENC
+    // VBR, as "vbr"). Peak = target in every mode.
+    std::string rc = "cbr";
     std::string quality = "speed";  // "speed" | "balanced" | "quality"
     bool hdr = false;
     int ltrSlots = 0;   // long-term reference slots to reserve (ACK-based recovery, 3.5)
     int svcLayers = 1;  // temporal layers
     // Encoder knobs (optional; defaults are the backend's).
-    std::string liveBitrate;     // "" = the codec's caps liveBitrate | "seamless" | "flush" (step 3.6 tests both)
+    std::string liveBitrate;     // "" = the codec's caps liveBitrate | "seamless" | "flush" (recon-host qualify measures both, step 3.6)
     int encoderInstance = -1;    // hardware encoder engine (AMF INSTANCE_INDEX), -1 = backend default
     int ltrInterval = 0;         // frames between LTR marks, 0 = fps/10 (about 100 ms)
     int intraRefreshFrames = 0;  // intra refresh cycle in frames, 0 = off (not with ltrSlots or svcLayers > 1)
     bool zeroCopy = true;        // AMD Direct Capture surfaces go to the AMF encoder unconverted when possible
+    // synthetic-gpu only: a high-motion source (presents without idle phases,
+    // every image new: a fast-scrolling texture under full-frame noise), the
+    // live-bitrate qualification's (step 3.6) worst case for rate control.
+    bool motion = false;
 };
 
 // RateParams is the "setRate" control message; fps 0 = unchanged.
@@ -148,8 +155,8 @@ struct CodecCaps {
     // message for it yet: GUIDE 5 "FPS before resolution").
     bool dynamicResolution = false;
     // Fields above that are documented or default values rather than detected
-    // on this GPU (e.g. AMF AV1 "roi": there is no ROI cap; "liveBitrate" until
-    // step 3.6 measures it). Sent only when not empty.
+    // on this GPU (e.g. AMF AV1 "roi": there is no ROI cap; "liveBitrate":
+    // recon-host qualify measures it, step 3.6). Sent only when not empty.
     std::vector<std::string> assumed;
 };
 

@@ -33,7 +33,7 @@ type StartParams struct {
 	FPS       int     `json:"fps"`
 	Kbps      int     `json:"kbps"`
 	VBVFrames float64 `json:"vbvFrames,omitempty"` // VBV buffer in frame intervals (default 1)
-	RC        string  `json:"rc,omitempty"`        // cbr (default) | vbr
+	RC        string  `json:"rc,omitempty"`        // cbr (default) | vbr (AMF LATENCY_CONSTRAINED_VBR) | vbr_peak (AMF PEAK_CONSTRAINED_VBR; NVENC VBR)
 	Quality   string  `json:"quality,omitempty"`   // speed (default) | balanced | quality
 	HDR       bool    `json:"hdr,omitempty"`
 	LTRSlots  int     `json:"ltrSlots,omitempty"`  // long-term reference slots (ACK-based recovery)
@@ -58,6 +58,10 @@ type StartParams struct {
 	LTRInterval        int    `json:"ltrInterval,omitempty"`        // frames between LTR marks; 0 = fps/10
 	IntraRefreshFrames int    `json:"intraRefreshFrames,omitempty"` // intra refresh cycle in frames; 0 = off (not with LTRSlots)
 	ZeroCopy           *bool  `json:"zeroCopy,omitempty"`           // AMD Direct Capture surfaces straight into AMF when possible; nil = true
+	// Motion (capture synthetic-gpu only): the high-motion test source of the
+	// live-bitrate qualification (step 3.6): presents without pauses, every
+	// image new (a scrolling pattern under full-frame noise).
+	Motion bool `json:"motion,omitempty"`
 }
 
 // Barcode places the frame barcode of GUIDE 0.2 into every encoded frame,
@@ -142,8 +146,9 @@ type CodecCaps struct {
 	// without a new session (NVENC); no control message uses it yet.
 	DynamicResolution bool `json:"dynamicResolution"`
 	// Assumed names the fields above that are documented or default values,
-	// not detected on this GPU (e.g. AMF AV1 "roi", "liveBitrate" until the
-	// step 3.6 qualification); omitted when everything was detected.
+	// not detected on this GPU (e.g. AMF AV1 "roi"; "liveBitrate", which
+	// recon-host qualify measures: internal/host/qualify); omitted when
+	// everything was detected.
 	Assumed []string `json:"assumed,omitempty"`
 }
 
@@ -192,7 +197,7 @@ type Started struct {
 	CropBottom  int `json:"cropBottom"`
 	// What the encoder does (diagnostics and the recovery / rate logic).
 	LiveBitrate        string `json:"liveBitrate"`        // seamless | flush: how SetRate is applied
-	RateControl        string `json:"rateControl"`        // e.g. cbr | vbr_latency
+	RateControl        string `json:"rateControl"`        // e.g. cbr | vbr_latency | vbr_peak (AMF); cbr | vbr (NVENC)
 	Usage              string `json:"usage"`              // e.g. ultra_low_latency (AMF H.264 may fall back to low_latency)
 	LTRSlots           int    `json:"ltrSlots"`           // LTR slots in use; 0 = no LTR recovery (the codec's caps Recovery applies)
 	LTRInterval        int    `json:"ltrInterval"`        // frames between LTR marks

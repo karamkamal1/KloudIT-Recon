@@ -203,8 +203,8 @@ CodecDetails readDetails(const NV_ENCODE_API_FUNCTION_LIST& nv, void* enc, Codec
     d.ltrFrames = cap(NV_ENC_CAPS_NUM_MAX_LTR_FRAMES);
     cc.intraRefresh = cap(NV_ENC_CAPS_SUPPORT_INTRA_REFRESH) != 0;
     d.dynBitrate = cap(NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE) != 0;
-    // NvEncReconfigureEncoder without a reset or an IDR (GUIDE 3.4); step 3.6
-    // qualifies it per codec and rate-control mode.
+    // NvEncReconfigureEncoder without a reset or an IDR (GUIDE 3.4); recon-host
+    // qualify (step 3.6) measures it per codec and rate-control mode.
     cc.liveBitrate = d.dynBitrate ? "seamless" : "restart";
     if (d.dynBitrate) cc.assumed.push_back("liveBitrate");
     cc.maxTemporalLayers = cap(NV_ENC_CAPS_SUPPORT_TEMPORAL_SVC) ? std::max(1, cap(NV_ENC_CAPS_NUM_MAX_TEMPORAL_LAYERS)) : 1;
@@ -717,6 +717,8 @@ Status NvencEncoder::configure() {
 
     NV_ENC_RC_PARAMS& rc = config_.rcParams;
     const nvenc::Rate r = nvenc::rateFor(kbps_, vbvFrames_, fps_);
+    // "vbr" and "vbr_peak" are both VBR capped at the target (maxBitRate =
+    // averageBitRate): NVENC has no separate peak-constrained mode.
     rc.rateControlMode = start_.rc == "cbr" ? NV_ENC_PARAMS_RC_CBR : NV_ENC_PARAMS_RC_VBR;
     rc.averageBitRate = r.average;
     rc.maxBitRate = r.max;

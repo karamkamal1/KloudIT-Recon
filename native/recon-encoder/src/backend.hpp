@@ -201,6 +201,13 @@ struct MockOptions {
     uint64_t errorAt = 0;  // report a non-fatal "mock_error" when this frame id is submitted
     uint64_t fatalAt = 0;  // fail fatally ("mock_fatal") when this frame id is submitted
     uint64_t hangAt = 0;   // never return from submit() for this frame id (a call stuck in the driver)
+    // Live-bitrate qualification tests (step 3.6): frames padded with H.264
+    // filler data to the target bitrate, so their sizes follow setRate
+    // (rateLag frames late); idrOnRate makes every setRate an IDR, like an
+    // encoder that cannot change its bitrate seamlessly.
+    bool followRate = false;
+    uint64_t rateLag = 0;
+    bool idrOnRate = false;
 };
 
 struct BackendChoice {

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -16,6 +17,24 @@ bool hasNal(const uint8_t* p, size_t n, uint8_t type) {
         if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1 && (p[i + 3] & 0x1f) == type) return true;
     }
     return false;
+}
+
+// Bytes of one frame at kbps and fps.
+size_t frameBytes(int kbps, int fps) { return size_t(int64_t(kbps) * 1000 / 8 / std::max(1, fps)); }
+
+// The access unit padded to `target` bytes with a filler data NAL unit (type
+// 12, nal_ref_idc 0: 0xFF bytes and the RBSP stop bit, after the slice as H.264
+// 7.4.1.2.3 allows; 0xFF never forms a start code). Owned by the caller.
+std::vector<uint8_t>* padded(const uint8_t* au, size_t n, size_t target) {
+    auto* out = new std::vector<uint8_t>(au, au + n);
+    constexpr size_t kOverhead = 6;  // start code, NAL header, stop bit
+    if (target > n + kOverhead) {
+        const uint8_t head[] = {0, 0, 0, 1, 0x0c};
+        out->insert(out->end(), head, head + sizeof(head));
+        out->insert(out->end(), target - n - kOverhead, 0xff);
+        out->push_back(0x80);
+    }
+    return out;
 }
 
 }  // namespace
@@ -53,6 +72,10 @@ ReplayEncoder::ReplayEncoder(const MockOptions& opt) : opt_(opt) {
             return;
         }
     }
+}
+
+ReplayEncoder::~ReplayEncoder() {
+    for (EncodedFrame& f : queue_) releaseOutput(f);
 }
 
 Caps ReplayEncoder::caps() {
@@ -93,20 +116,29 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     pos_ = 0;
     idrPending_ = false;
     stopped_ = false;
+    for (EncodedFrame& f : queue_) releaseOutput(f);
     queue_.clear();
+    kbps_ = lagKbps_ = p.kbps;
+    fps_ = p.fps;
+    lagLeft_ = 0;
+    flush_ = p.liveBitrate == "flush";
+    ratePending_ = false;
+    gen_ = 0;
     out.backend = name();
     out.codec = "h264";
     out.width = kClipWidth;  // the canned stream has one size, whatever was asked
     out.height = kClipHeight;
     out.fps = p.fps;
     out.kbps = p.kbps;
-    out.liveBitrate = "seamless";  // recorded only: the canned stream does not change
+    out.liveBitrate = flush_ ? "flush" : "seamless";
+    out.rateControl = p.rc;
     return Status::Ok();
 }
 
 void ReplayEncoder::release() {
     std::lock_guard<std::mutex> lock(mu_);
     initialized_ = false;
+    for (EncodedFrame& f : queue_) releaseOutput(f);
     queue_.clear();
 }
 
@@ -121,6 +153,20 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (stopped_) return Status::Ok();
+        if (ratePending_) {
+            // A setRate applies to this frame (as AMF's SetProperty before
+            // SubmitInput and NVENC's reconfiguration before the picture).
+            ratePending_ = false;
+            if (opt_.rateLag > 0) {
+                if (lagLeft_ == 0) lagKbps_ = kbps_;  // frames keep the size they had for rateLag frames
+                lagLeft_ = opt_.rateLag;
+            }
+            if (pendingRate_.kbps > 0) kbps_ = pendingRate_.kbps;
+            if (pendingRate_.fps > 0) fps_ = pendingRate_.fps;
+            pendingRate_ = RateParams{};
+            if (flush_) ++gen_;
+            if (flush_ || opt_.idrOnRate) idrPending_ = true;
+        }
         if (idrPending_) {
             pos_ = 0;
             idrPending_ = false;
@@ -128,10 +174,19 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
         EncodedFrame e;
         e.info = info;
         e.key = pos_ == 0;
+        e.gen = gen_;
         e.width = kClipWidth;
         e.height = kClipHeight;
         e.data = kMockClip + aus_[pos_].first;
         e.size = aus_[pos_].second;
+        if (opt_.followRate) {
+            const int kbps = lagLeft_ > 0 ? lagKbps_ : kbps_;
+            if (lagLeft_ > 0) --lagLeft_;
+            auto* buf = padded(e.data, e.size, frameBytes(kbps, fps_) * (e.key ? 3 : 1));
+            e.data = buf->data();
+            e.size = buf->size();
+            e.token = buf;
+        }
         pos_ = (pos_ + 1) % aus_.size();
         queue_.push_back(e);
     }
@@ -166,7 +221,18 @@ Status ReplayEncoder::recover(uint64_t lostFromFrameId, std::optional<uint64_t>)
     return forceIdr();
 }
 
-Status ReplayEncoder::setRate(const RateParams&) { return Status::Ok(); }
+void ReplayEncoder::releaseOutput(EncodedFrame& f) {
+    delete static_cast<std::vector<uint8_t>*>(f.token);
+    f.token = nullptr;
+}
+
+Status ReplayEncoder::setRate(const RateParams& r) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (r.kbps > 0) pendingRate_.kbps = r.kbps;
+    if (r.fps > 0) pendingRate_.fps = r.fps;
+    ratePending_ = true;
+    return Status::Ok();
+}
 
 Status ReplayEncoder::setRoi(const std::vector<RoiRect>&) { return Status::Ok(); }
 

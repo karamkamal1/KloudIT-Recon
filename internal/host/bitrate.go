@@ -13,7 +13,11 @@ import (
 // recent minimum) the bitrate goes back up 15 % at a time to the user's
 // setting, or below it after the client's decoder fell behind.
 // Every change is a new encoder generation (the FFmpeg command line cannot
-// change the bitrate of a running encoder), so changes are rate-limited.
+// change the bitrate of a running encoder), so changes are rate-limited. On
+// the native helper an encoder qualified to change seamlessly (recon-host
+// qualify, GUIDE 3.6) changes in place without a key frame, so changes there
+// may follow each other after rateSeamlessGap; one that flushes (a key frame
+// per change) keeps the full period.
 const (
 	rateCutPct    = 75   // a congestion signal cuts the bitrate to 75 %
 	rateRaisePct  = 115  // a quiet period raises it by 15 %
@@ -27,6 +31,11 @@ const (
 	// rateEmergencyGap is the minimum time between two emergency cuts (host
 	// frame-queue overflow, a client that flushed its decoder).
 	rateEmergencyGap = 2 * time.Second
+	// rateSeamlessGap is the minimum time between two changes (cuts or
+	// raises) on an encoder qualified to change its bitrate seamlessly: the
+	// interval the qualification steps at. The quiet period before a raise
+	// stays ratePeriod.
+	rateSeamlessGap = 2 * time.Second
 	// rateTick is how often the session evaluates the delay and checks for a
 	// raise; each evaluation judges the acknowledgements since the last.
 	rateTick = 500 * time.Millisecond
@@ -64,6 +73,7 @@ const (
 type rateController struct {
 	now    func() time.Time // nil: time.Now (tests use a fake clock)
 	period time.Duration    // 0: ratePeriod (test hook rate-period shortens it)
+	gap    time.Duration    // minimum time between two changes, 0: the period (setGap; guarded by mu)
 
 	mu         sync.Mutex
 	ceiling    int       // kbps: the bitrate the settings ask for, never exceeded
@@ -96,6 +106,24 @@ func (r *rateController) interval() time.Duration {
 		return r.period
 	}
 	return ratePeriod
+}
+
+// changeGap is the minimum time between two changes (cuts on a delay
+// report, raises): the period, or the shorter gap set for the encoder.
+// Called with r.mu held.
+func (r *rateController) changeGap() time.Duration {
+	if r.gap > 0 && r.gap < r.interval() {
+		return r.gap
+	}
+	return r.interval()
+}
+
+// setGap sets the minimum time between two changes for the encoder that
+// streams now (rateSeamlessGap for a qualified seamless one; 0: the period).
+func (r *rateController) setGap(d time.Duration) {
+	r.mu.Lock()
+	r.gap = d
+	r.mu.Unlock()
 }
 
 // target returns the bitrate of a new encoder generation: the current
@@ -138,8 +166,8 @@ func (r *rateController) hold() {
 
 // congestion handles a congestion signal and reports whether it cut the
 // bitrate (from -> to kbps). Every signal restarts the quiet period. A
-// client's delay report (signalDelay) cuts at most once per period after any
-// change; an emergency (signalOverflow, signalDecoder) cuts at most once
+// client's delay report (signalDelay) cuts at most once per period (or gap,
+// setGap) after any change; an emergency (signalOverflow, signalDecoder) cuts at most once
 // every rateEmergencyGap. Nothing is cut at the floor. A decoder flush that
 // cuts also caps later raises (rateDecoderPct of from) until reset.
 func (r *rateController) congestion(sig rateSignal) (from, to int, ok bool) {
@@ -154,7 +182,7 @@ func (r *rateController) congestion(sig rateSignal) (from, to int, ok bool) {
 		if !r.lastCut.IsZero() && now.Sub(r.lastCut) < rateEmergencyGap {
 			return r.cur, r.cur, false
 		}
-	} else if !r.lastChange.IsZero() && now.Sub(r.lastChange) < r.interval() {
+	} else if !r.lastChange.IsZero() && now.Sub(r.lastChange) < r.changeGap() {
 		return r.cur, r.cur, false
 	}
 	next := max(r.cur*rateCutPct/100, min(rateFloorKbps, r.ceiling))
@@ -193,7 +221,7 @@ func (r *rateController) ack(owd time.Duration) {
 // tick judges the one-way delay of the frames acknowledged since the last
 // tick and raises the bitrate when it may (from -> to kbps): the bitrate is
 // below the ceiling (and the decoder's cap), the quiet period has lasted a
-// whole period, and the last change is a period ago. The delay is high, and
+// whole period, and the last change is a period (or gap, setGap) ago. The delay is high, and
 // the quiet period starts again, when the median since the last tick is more
 // than owdSlack above the minimum of the last owdWindow, and also when frames
 // went out ackTimeout ago or longer with no acknowledgement since, from a
@@ -241,7 +269,7 @@ func (r *rateController) tick() (from, to int, ok bool) {
 		limit = min(limit, r.decoderCap)
 	}
 	if r.cur <= 0 || r.cur >= limit || now.Sub(r.quietSince) < r.interval() ||
-		(!r.lastChange.IsZero() && now.Sub(r.lastChange) < r.interval()) {
+		(!r.lastChange.IsZero() && now.Sub(r.lastChange) < r.changeGap()) {
 		return r.cur, r.cur, false
 	}
 	from = r.cur

@@ -13,6 +13,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
+	"github.com/karamkamal1/kloudit-recon/internal/host/qualify"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -128,14 +129,53 @@ func (s *Session) openPipeline() (notice string) {
 		return ""
 	}
 	c := h.Caps()
+	lb := s.a.liveBitrateResults(s.log, c)
 	s.video = media.NewHelperVideo(media.HelperOptions{
 		Launch: func() (*encoder.Helper, error) { return s.a.launchHelper(s.log) },
 		First:  h, Log: s.log, Clock: s.a.hostClock, KeepSpare: true,
+		LiveBitrate: func(c encoder.Caps, codec string, adaptive bool) (string, string, bool) {
+			return lb.Choose(c, codec, adaptive)
+		},
 	})
 	s.log.Info("video pipeline", "pipeline", media.PipelineHelper, "config", mode, "backend", c.Backend, "vendor", c.Vendor,
 		"adapter", c.AdapterName, "encoders", encoderNames(s.helperEncs), "capture", strings.Join(c.Capture, ","),
 		"hags", hagsText(c.HAGSEnabled))
 	return ""
+}
+
+// liveBitrateResults reads the live-bitrate qualification of the helper's
+// encoder (recon-host qualify, GUIDE 3.6: live-bitrate.json next to the host
+// config) for a session on the helper with caps c, and logs what it says; nil
+// when there is none or it is for another GPU or backend (the helper's
+// defaults apply).
+func (a *Agent) liveBitrateResults(log *slog.Logger, c encoder.Caps) *qualify.Results {
+	if a.cfg.path == "" {
+		return nil
+	}
+	path := qualify.PathFor(a.cfg.path)
+	r, err := qualify.Load(path)
+	switch {
+	case err != nil:
+		log.Warn("live-bitrate qualification not used", "file", path, "err", err)
+		return nil
+	case r == nil:
+		log.Info("no live-bitrate qualification: the helper's defaults apply (run recon-host qualify)", "file", path)
+		return nil
+	}
+	if ok, why := r.Matches(c); !ok {
+		log.Warn("live-bitrate qualification not used", "file", path, "reason", why)
+		return nil
+	}
+	var parts []string
+	choices := r.Choices()
+	for _, codec := range []string{"hevc", "av1", "h264"} {
+		if ch, ok := choices[codec]; ok {
+			parts = append(parts, fmt.Sprintf("%s: adaptive %s/%s, fixed vbr/%s", codec, ch.AdaptiveRC, ch.Adaptive, ch.Fixed))
+		}
+	}
+	log.Info("live-bitrate qualification", "file", path, "measured", r.Time.Format(time.RFC3339), "adapter", r.AdapterName,
+		"choice", strings.Join(parts, "; "))
+	return r
 }
 
 // leaveHelper moves the session from the native helper to FFmpeg for the

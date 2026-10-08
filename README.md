@@ -317,6 +317,21 @@ only delivers a frame when the screen or the mouse pointer changes, so keep some
 (move the mouse, play a video) until the `frame=` counter reaches 600. Flags go before the
 command: `recon-host.exe -v probe`.
 
+Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` once per GPU (and again after a
+driver update), with no stream running, to measure how the native helper's encoder changes its
+bitrate while it runs: for every codec, rate-control mode (AMD: CBR, latency- and peak-constrained
+VBR; NVIDIA: CBR) and live-bitrate mode (`seamless`, `flush`) it encodes a high-motion test
+source for 60 s while the bitrate steps 50 → 20 → 50 Mbit/s every 2 s, and checks that no key
+frame appears on a change (`seamless`), the frame sizes reach the new target within 3 frames, no
+frame or frame barcode is missing and the stream decodes cleanly (about half an hour on AMD,
+with FFmpeg for the decode checks). It prints a table and saves `live-bitrate.json` next to
+`host.json`; sessions on the helper then use `seamless` where it passed (bitrate changes as
+often as every 2 s), else `flush` (a key frame per change, changes at most every 10 s), else a
+new helper per change, and adaptive-bitrate sessions use the rate-control mode that changed
+seamlessly (CBR first). Without the file the helper's defaults apply. `recon-host qualify -h`
+lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") and
+`docs/VENDOR_NOTES.md` (3.6).
+
 ## Troubleshooting
 
 - **The PC stays offline.** Look at `%APPDATA%\KlouditRecon\host.log`. `dial ...: timeout`

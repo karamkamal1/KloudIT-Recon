@@ -67,6 +67,7 @@ fatal error, `4` the threads did not stop within 500 ms of deciding to exit (wat
 recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
                   [--backend=auto|amf|nvenc|mock] [--log-level=error|warn|info|debug]
                   [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
+                  [--mock-follow-rate] [--mock-rate-lag=N] [--mock-idr-on-rate]
                   [--dump-nv12=PATH]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
 recon-encoder.exe --gpu-priority-table              # the GPU priority decision table (see GPU priority)
@@ -75,6 +76,7 @@ recon-encoder.exe --self-test-pacer                 # frame pacing policy (see S
 recon-encoder.exe --self-test-encoder               # recovery policies, parameter sets, ROI maps, NVENC settings (see Self-tests)
 recon-encoder.exe --self-test-nvenc[=DLL]           # the NVENC backend against its test double DLL, or the driver (see Self-tests)
 recon-encoder.exe --encode-test=FILE [--backend=...] [options]   # one stream to a file (see Encode test)
+recon-encoder.exe --encode-test=FILE --nvenc-test-dll=DLL ...    # the same on the NVENC test double (tests)
 recon-encoder.exe --version
 ```
 
@@ -84,11 +86,17 @@ recon-encoder.exe --version
 * `--backend`: `auto` probes the primary adapter's vendor first (AMF on AMD, NVENC on
   NVIDIA), loading `amfrt64.dll` / `nvEncodeAPI64.dll` dynamically from System32 only
   (`LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`), so one binary serves both
-  vendors. `mock` is the GPU-free test backend. (`--self-test-nvenc=DLL` is the only
-  place a DLL is loaded by path: the NVENC test double, for that self-test alone.)
+  vendors. `mock` is the GPU-free test backend. (`--self-test-nvenc=DLL` and
+  `--nvenc-test-dll=DLL` are the only places a DLL is loaded by path: the NVENC test
+  double, for that self-test and for encode tests / `--print-caps` alone.)
 * `--mock-error-at` / `--mock-fatal-at`: test fault injection (mock backend only): a
   non-fatal `mock_error` / a fatal `mock_fatal` when that frame id is submitted.
   `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
+  `--mock-follow-rate`, `--mock-rate-lag`, `--mock-idr-on-rate`: frame sizes that follow
+  `setRate` (see "Mock backend"), for the live-bitrate qualification's tests.
+* `--nvenc-test-dll=DLL`: with `--encode-test` or `--print-caps` only (refused otherwise):
+  the NVENC backend uses DLL, the test double `recon-fake-nvenc.dll`, as its runtime. Like
+  `--self-test-nvenc=DLL` a test hook; the mode recon-host runs never loads a DLL by path.
 * `--dump-nv12`: writes the converted frame with id 30 (the first converted one from 30
   on) to PATH as raw NV12 at the encoded size (Y plane, then interleaved CbCr), e.g. for
   `ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 PATH`. Diagnostics.
@@ -125,7 +133,7 @@ ignored by recon-host.
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
+| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr` \| `vbr_peak`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr` (AMF LATENCY_CONSTRAINED_VBR), `vbr_peak` is AMF's PEAK_CONSTRAINED_VBR (NVENC: VBR, as `vbr`); added in step 3.6, older helpers refuse it; recon-host sends what the live-bitrate qualification chose, see "Live-bitrate qualification"), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible); `motion` (step 3.6, `synthetic-gpu` only, else `bad_message`: its high-motion mode, see "Capture") | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder), and starts a new sequence: its ring slot has SEQ_START and its barcode value is 0 (step 3.1b; recon-host starts a new stream generation there). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: every frame from `lostFromFrameId` to the newest one is invalidated and the next frame references an older one (`ackedLtrFrameId` is not used); AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without a usable reference an IDR. |
 | `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
@@ -182,8 +190,9 @@ ignored by recon-host.
   per-block QP offsets) | `none`; `alignW`/`alignH` the coded-size alignment (AV1 on
   RDNA3: 64x16); `dynamicResolution` (additive, step 3.4): the running encoder can change
   its coded size without a new session (NVENC `NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE`; no
-  control message uses it yet, older helpers omit it = false). Values start as vendor defaults; the
-  Phase 3.6 qualification results in docs/VENDOR_NOTES.md overwrite them. `assumed`
+  control message uses it yet, older helpers omit it = false). Values start as vendor defaults;
+  `liveBitrate` is measured per codec and rate-control mode by `recon-host qualify` (step 3.6, see
+  "Live-bitrate qualification"), whose results recon-host uses over this default. `assumed`
   (optional, additive): the names of the fields above that are documented or default
   values rather than detected on this GPU, e.g. `["roi","liveBitrate"]` for AMF AV1;
   absent when every field was detected (the mock never sends it).
@@ -233,8 +242,8 @@ the picture is the top-left `width` x `height` and the last `cropRight` columns 
 1.7, `proto.VideoConfig`). H.264 and HEVC signal their cropping in the SPS, so their coded
 size is the picture size. `liveBitrate`: how `setRate` is applied (`seamless` = new rate
 from the next frame, no IDR; `flush` = forced IDR + encoder flush + re-init, a new `gen`).
-`rateControl`: the encoder's rate-control mode (`cbr`, or `vbr_latency` for AMF's
-LATENCY_CONSTRAINED_VBR). `usage`: the AMF usage (`ultra_low_latency`, or `low_latency`
+`rateControl`: the encoder's rate-control mode (`cbr`, `vbr_latency` for AMF's
+LATENCY_CONSTRAINED_VBR, `vbr_peak` for its PEAK_CONSTRAINED_VBR; NVENC `cbr` or `vbr`). `usage`: the AMF usage (`ultra_low_latency`, or `low_latency`
 after the H.264 fallback of AMF issue #410). `ltrSlots`/`ltrInterval`: LTR recovery in use
 (0 = no LTR recovery; the codec's caps `recovery` says what a loss costs: `invalidate` =
 NVENC reference invalidation, `none` = an IDR). `encoderInstance`/`hwInstances`: the
@@ -450,7 +459,7 @@ after both threads have been joined.
 | `amd-direct` | AMD Direct Capture (`AMFDisplayCapture`), AMD adapters only, opt-in | the output's adapter, wrapped in an `AMFContext` | `WAIT_FOR_PRESENT`, framerate (0,1), dirty rects, `DUPLICATEOUTPUT`; monitor index = the output's index on its adapter (VERIFY) |
 | `wgc` | Windows.Graphics.Capture: a monitor or a window | the monitor's adapter | MSVC build only (C++/WinRT); cursor off (listed only where Windows allows it), border off where allowed |
 | `synthetic` | timer-driven frame counter, no image | none | mock tests |
-| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path |
+| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s; with `motion` (step 3.6) it presents without pauses and every 640x360 image is new: an 8 px checkerboard with a ramp scrolling 12 px right and 5 px down per present under full-frame noise (+-40 per channel), which no tested bitrate can carry at 1080p, so the encoder's rate control always sets the frame sizes | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path; the live-bitrate qualification's source |
 
 Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
 `hmonitor` (the HMONITOR recon-host already has for each monitor); `adapterLuid` (as in
@@ -590,8 +599,9 @@ say, FFmpeg's assumption for RDNA3, marked `assumed`; `start` reads the factors 
 the initialized encoder, see "AV1 alignment"), `intraRefresh` (the encoder takes the intra
 refresh property after `USAGE` and reads it back on the probe encoder; never with user LTR
 or SVC). `recovery` is `ltr` when at least 2 LTR slots are possible, `liveBitrate` starts
-as `seamless` (the AMD Streaming SDK changes the bitrate without a flush; step 3.6
-qualifies it per codec and rate-control mode; until then marked `assumed`), `forceIdr` is
+as `seamless` (the AMD Streaming SDK changes the bitrate without a flush), always marked
+`assumed`: `recon-host qualify` (step 3.6, "Live-bitrate qualification") measures it per codec
+and rate-control mode, and recon-host uses those results over the caps; `forceIdr` is
 true.
 
 **Configuration** (before `Init`; the dynamic ones again after it, as FFmpeg does):
@@ -604,8 +614,8 @@ true.
 | `PROFILE` | H.264 High, HEVC Main, AV1 Main (8-bit; HDR is step 3.9) |
 | `LOWLATENCY_MODE` (H.264, HEVC) / AV1 `ENCODING_LATENCY_MODE` | true / `LOWEST_LATENCY` |
 | `QUALITY_PRESET` | `quality`: speed (default) / balanced / quality |
-| `RATE_CONTROL_METHOD` | `CBR` for `rc` `cbr`, else `LATENCY_CONSTRAINED_VBR` |
-| `TARGET_BITRATE` / `PEAK_BITRATE` / `VBV_BUFFER_SIZE` | `kbps`, peak = target, VBV = bitrate / fps x `vbvFrames` |
+| `RATE_CONTROL_METHOD` | `CBR` for `rc` `cbr`, `PEAK_CONSTRAINED_VBR` for `vbr_peak`, else `LATENCY_CONSTRAINED_VBR` |
+| `TARGET_BITRATE` / `PEAK_BITRATE` / `VBV_BUFFER_SIZE` | `kbps`, peak = target (in every mode: the target is what the rate controller lets the network carry), VBV = bitrate / fps x `vbvFrames` |
 | `ENFORCE_HRD`, `FILLER_DATA`, `RATE_CONTROL_SKIP_FRAME`, `PRE_ANALYSIS`, `PREENCODE` | all off |
 | `ENABLE_VBAQ` (H.264, HEVC) / AV1 `AQ_MODE` | on / `CAQ` |
 | `GOP_SIZE` (HEVC, AV1) / H.264 `IDR_PERIOD` | 0: IDR only when forced; HEVC `NUM_GOPS_PER_IDR` 1 |
@@ -714,7 +724,7 @@ with the most video memory), `NvEncGetEncodeGUIDs` and per codec `NvEncGetEncode
 | `recovery` | `invalidate` with `SUPPORT_REF_PIC_INVALIDATION` and `SUPPORT_MULTIPLE_REF_FRAMES` (Sunshine turns RFI off without the latter), else `none` |
 | `maxLtr` | 0: the backend recovers by invalidation and uses no LTR (`start` needs `ltrSlots` 0); `NUM_MAX_LTR_FRAMES` is in the `start` log line |
 | `intraRefresh` | `SUPPORT_INTRA_REFRESH` |
-| `liveBitrate` | `seamless` with `SUPPORT_DYN_BITRATE_CHANGE` (marked `assumed` until step 3.6), else `restart` |
+| `liveBitrate` | `seamless` with `SUPPORT_DYN_BITRATE_CHANGE` (marked `assumed`: `recon-host qualify` measures it, step 3.6), else `restart` |
 | `maxTemporalLayers` | `NUM_MAX_TEMPORAL_LAYERS` with `SUPPORT_TEMPORAL_SVC`, else 1 |
 | `roi` | `emphasis`, marked `assumed` (QP delta maps; no cap bit exists for them) |
 | `sliceOutput` | `SUPPORT_SUBFRAME_READBACK` |
@@ -738,7 +748,7 @@ among `NvEncGetInputFormats`.
 | `enablePTD` / `enableEncodeAsync` | 1 / 1 when `ASYNC_ENCODE_SUPPORT`, else 0 (sync mode, polled output) |
 | `gopLength`, `idrPeriod` | `NVENC_INFINITE_GOPLENGTH`: IDRs only when forced |
 | `frameIntervalP` | 1: no B frames |
-| `rateControlMode` | `CBR` for `rc` `cbr`, `VBR` capped at the target for `vbr` |
+| `rateControlMode` | `CBR` for `rc` `cbr`, `VBR` capped at the target for `vbr` and `vbr_peak` (NVENC has no separate peak-constrained mode) |
 | `averageBitRate` / `maxBitRate` | `kbps` |
 | `vbvBufferSize` | bitrate / fps x `vbvFrames` (NVENC guide 9: "single frame = bitrate/framerate"); 0 (the driver's) without `SUPPORT_CUSTOM_VBV_BUF_SIZE` |
 | `lowDelayKeyFrameScale` | 3: an IDR about three P frames large (the ULL default 1 makes key frames as small as P frames) |
@@ -876,7 +886,10 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   rules (struct versions, API version, register / map / lock / unlock / unmap order,
   completion events before a lock, buffers and events not reused while pending,
   parameters that cannot be reconfigured, `NvEncGetSequenceParams` on the encode thread,
-  QP map sizes, everything released and EOS sent before `NvEncDestroyEncoder`), models the
+  QP map sizes, everything released and EOS sent before `NvEncDestroyEncoder`), sizes every
+  frame like the configured rate (averageBitRate / frame rate, key frames
+  `lowDelayKeyFrameScale` times that: the marker padded, so a reconfiguration shows in the
+  next frame's size; `padToRate=0` turns it off), models the
   DPB and invalidation (each frame names the frame it was predicted from; a real H.264 /
   HEVC SPS states the reference frames it keeps, fewer than asked with `keepRefs`),
   encodes on one simulated engine and logs every call. The test checks the settings the
@@ -922,7 +935,8 @@ one line per scripted event. Exit code 0 = every event handled, 1 = failed, 2 = 
 start. Options become `start` fields (validated by the same parser): `--codec`,
 `--capture` (`synthetic-gpu` needs no display), `--width`, `--height`, `--fps`, `--kbps`,
 `--rc`, `--quality`, `--vbv`, `--ltr-slots`, `--ltr-interval`, `--live-bitrate`,
-`--instance`, `--zero-copy=0|1`, `--intra-refresh`, `--monitor`, `--hmonitor`; plus
+`--instance`, `--zero-copy=0|1`, `--intra-refresh`, `--monitor`, `--hmonitor`, `--motion=0|1`,
+`--barcode=X,Y,CELL`; plus
 `--frames=N` (stop after frame id N, default 300), `--ack-delay=N` (a simulated client
 acknowledges every LTR frame N frames after receiving it, default 2), `--dxgi-gate=0|1`
 (default 1; 0 switches `d3d::dxgiGate()` off, so DDA's `AcquireNextFrame` and NVENC's
@@ -943,6 +957,22 @@ recon-encoder.exe --encode-test=out.hevc --backend=amf --codec=hevc --capture=sy
 On an NVIDIA host the same with `--backend=nvenc` (without `--ltr-slots`): a loss line then
 says "by reference invalidation (no IDR)" instead of "from an LTR (no IDR)".
 
+Step 3.6 added, for the live-bitrate qualification:
+
+* `--rate-schedule=K1[,K2...]:N`: every N frames the next rate of the list, cyclically
+  (`--kbps=50000 --rate-schedule=20000,50000:120`: 50 Mbit/s, from frame 121 20 Mbit/s, from
+  241 50 Mbit/s, ...). Unlike `--at=N:rate=`, which fires when frame N comes out of the ring
+  (frames already in the encoder keep the old rate), the schedule calls `setRate` on the
+  capture thread right before frame 1 + k x N is submitted, so that frame is exactly the first
+  at the new rate (backends apply a `setRate` at the next submit; a frame refused as
+  `encoder_busy` keeps its id and gets it on the retry).
+* `--frame-log=FILE`: JSON lines, written when the run ends: the `started` message; one
+  `{"t":"frame","id","gen","key","seqStart","recovery","repeat","bytes","droppedBefore","written","kbps","captureQpc","submitQpc","outputQpc"}`
+  per frame out of the ring, in ring order (`kbps`: the target the frame was submitted with,
+  start or schedule; `written`: it went into FILE); and
+  `{"t":"end","frames","lastId","written","droppedByHelper","errors","fatal","timedOut","qpcFrequency","rateChanges":[{"frameId","kbps"}]}`.
+* `--nvenc-test-dll=DLL` (see "Command line"): the NVENC backend on its test double.
+
 The Go integration test `TestHelperIntegrationEncodeTest` runs it with the mock backend;
 `RECON_HELPER_ENCODE_TEST="--backend=amf --codec=hevc ..."` (or `--backend=nvenc ...`) runs it
 against a real encoder.
@@ -955,12 +985,103 @@ waitable timer at `start.fps`) and a replay encoder that outputs a real H.264 st
 frames, Constrained Baseline, access unit delimiters; regenerate with
 `testdata/gen-mock-clip.sh`), compiled into the executable. It loops the clip;
 `forceIdr` and `recover` (no LTR) jump back to the IDR; `setRate` is recorded and shows
-in the stats but cannot change the canned bitstream. Caps: vendor `mock`, `h264` only,
+in the stats but cannot change the canned pictures. With `--mock-follow-rate` (step 3.6)
+every frame is padded with an H.264 filler data NAL unit (type 12, after the slice) to the
+size the target gives it (kbps x 1000 / 8 / fps; a key frame three times that), from the
+first frame submitted after a `setRate`, so frame sizes follow it as a CBR encoder's would
+(`--mock-rate-lag=N`: N frames late); with start's `liveBitrate` `flush` a `setRate` jumps
+back to the IDR with a new `gen` (`--mock-idr-on-rate`: in `seamless` mode too, an encoder
+that fails the seamless check). The stream still decodes (filler data is skipped). The
+clip's IDR every 60 frames limits seamless runs to 59 frames. Caps: vendor `mock`, `h264` only,
 recovery `none`, liveBitrate `seamless`. With a GPU capture (`dda`, `amd-direct`, `wgc`,
 `synthetic-gpu`) the mock asks for NV12 input, so capture, pacing, GPU priority and the
 colour conversion run for real on a host without an encoder backend (the converted frames
 are ignored; `--dump-nv12` shows one). On a device without NV12 render targets it falls
 back to the planar test mode.
+
+## Live-bitrate qualification
+
+`recon-host qualify` (`internal/host/qualify`, GUIDE 3.6) measures how the helper's encoder
+changes its bitrate while it runs and records it for sessions. It reads the helper's caps
+(`--print-caps`) and runs one encode test per codec of the caps x rate-control mode (AMF:
+`cbr`, `vbr` = LATENCY_CONSTRAINED_VBR, `vbr_peak` = PEAK_CONSTRAINED_VBR; NVENC and others:
+`cbr`) x live-bitrate mode (`seamless`, `flush`):
+
+```
+recon-encoder.exe --encode-test=DIR\hevc-cbr-seamless.hevc --frame-log=DIR\hevc-cbr-seamless.jsonl
+    --backend=auto --codec=hevc --capture=synthetic-gpu --motion=1 --width=1920 --height=1080 --fps=60
+    --kbps=50000 --rc=cbr --live-bitrate=seamless --frames=3600 --rate-schedule=20000,50000:120
+    --barcode=16,16,16
+```
+
+(50 -> 20 -> 50 Mbit/s every 2 s for 60 s on the high-motion source; `-capture dda` encodes
+the desktop instead, where something must keep the screen busy: a game, or a full-screen
+video.) FFmpeg (5.1+) decodes the written stream once
+(`ffmpeg -loglevel level+info -f hevc -i FILE -vf crop=128:48:16:16,showinfo,format=gray -fps_mode passthrough -f rawvideo -`):
+`showinfo` gives each frame's key flag and picture type, the crop is the barcode, read as the
+browser reads it (`proto.BarcodeReadLuma`), and `[error]` lines are decoder errors. A cell
+passes when all of these hold:
+
+| Check | Pass when |
+|---|---|
+| run | the frame log is complete (no fatal error, no timeout), at least 95 % of the planned frames |
+| frame ids | consecutive from 1: no gap, no `droppedBefore`, nothing dropped by the helper |
+| key frames | `seamless`: none after the first; `flush`: one within 5 frames of every change and none elsewhere |
+| frame types | every frame the decoder sees as intra (key or I) is flagged key by the encoder and the other way round (an unflagged intra frame on a change fails too) |
+| sizes | after each change some window of 3 P frames starting at most 3 P frames after it has a mean within 25 % of the new target's frame size (kbps x 1000 / 8 / fps); the second half of every phase too (key frames and idle repeats left out) |
+| barcodes | the decoder output every written frame, each barcode shows its frame's sequence number, no unexplained jumps, at most 1 % unreadable |
+| decode | no decoder errors |
+
+A cell whose P frames used less than 75 % of the start bitrate before the first change is
+`inconclusive` (the source does not need the high bitrate, so the sizes cannot show whether
+the encoder follows) unless something else failed; one that could not start (the encoder
+refused the mode) is an `error`. The mock and the NVENC test double run the same way in the
+tests (the mock: 59 frames with a change every 10, no barcode in its canned clip; the test
+double: decode and barcode checks skipped, its bitstream does not decode).
+
+The results go to `live-bitrate.json` next to `host.json` (test runs: into their work
+directory), printed as a table as well:
+
+```json
+{"version":1,"time":"2026-10-08T12:00:00Z","host":"GAMING-PC","helperVersion":"0.1.0","backend":"amf",
+ "vendor":"amd","adapterName":"AMD Radeon RX 7900 XT","adapterLuid":"00000000:0000c3a1",
+ "source":{"capture":"synthetic-gpu","motion":true,"width":1920,"height":1080,"fps":60,"barcode":true},
+ "schedule":{"highKbps":50000,"lowKbps":20000,"stepMs":2000,"durationMs":60000,"stepFrames":120,"frames":3600},
+ "criteria":{"followFrames":3,"windowFrames":3,"sizeTolerance":0.25,"keyWithinFrames":5,"maxUnreadablePct":1},
+ "cells":[{"codec":"hevc","rc":"cbr","liveBitrate":"seamless","verdict":"pass","rateControl":"cbr",
+   "startedLiveBitrate":"seamless","width":1920,"height":1080,"fps":60,"frames":3600,"rateChanges":29,
+   "keyFrames":{"mismatched":0},
+   "follow":{"maxLagFrames":1,"steadyMin":0.93,"steadyMax":1.02,"levels":{"20000":0.99,"50000":0.97},"firstPhase":0.96},
+   "frameIds":{"gaps":0,"droppedBefore":0,"droppedByHelper":0},
+   "barcode":{"checked":3600,"unreadable":0,"wrong":0,"gaps":0},
+   "decode":{"frames":3600,"errors":0,"warnings":0},"seconds":63.2,"log":"...\\hevc-cbr-seamless.log"}],
+ "choice":{"hevc":{"adaptiveRc":"cbr","adaptive":"seamless","fixed":"seamless"}}}
+```
+
+`cells[].failures` / `notes` say why a cell failed and which checks were skipped; `follow`
+gives the ratios of measured to target sizes (`levels` per target, `firstPhase` before any
+change), `maxLagFrames` -1 if a change never reached its target. `choice` is what sessions do
+with it (written for people; recon-host recomputes it from the cells,
+`qualify.Results.Choose`):
+
+* The results apply to a helper whose caps have the same `backend` and `adapterName` (not
+  the LUID, which changes with every boot); results of the test double never apply.
+* Per codec and rate-control mode: `seamless` where that cell passed, else `flush` where
+  that one passed, else `restart` (both were judged and failed: every bitrate change starts a
+  new helper, as on the FFmpeg path); nothing (the helper's defaults) where the cells are
+  missing, errors or inconclusive.
+* Adaptive-bitrate sessions (the rate controller changes the bitrate) run `cbr` where it
+  changes seamlessly, else the first of `vbr_peak` and `vbr` that does (GUIDE 10: adaptive =
+  the 3.6 winner), else `cbr` with its `flush` / `restart`. Fixed-bitrate sessions run `vbr`
+  with its own mode.
+* recon-host sends the chosen `rc` and `liveBitrate` in `start` (`restart`: no
+  `liveBitrate`, and a `setRate` becomes a new helper). The session's rate controller lets
+  changes on a qualified `seamless` encoder follow each other after 2 s (the qualification's
+  step); a `flush` one (a key frame per change), an unqualified one and FFmpeg keep 10 s
+  between changes. host.log: `live-bitrate qualification ... choice=...` when a session
+  opens the helper, `live_bitrate_from=qualification` on `encoder helper started`.
+
+Run it again after a driver update. Hardware results and the exact commands: docs/VENDOR_NOTES.md 3.6.
 
 ## Building and testing
 
@@ -968,6 +1089,7 @@ back to the planar test mode.
 make helper        # mingw-w64 cross build -> dist/windows/recon-encoder.exe (no WGC)
 make helper-test WINE=wine64   # Go integration tests under Wine against that build
 xvfb-run -a make helper-test WINE=wine64   # plus the D3D11 parts (Mesa llvmpipe)
+# WIN_FFMPEG='Z:\path\to\ffmpeg.exe' (a Windows FFmpeg) adds the qualification tests' decode checks
 ```
 
 Releases ship the MSVC build from CI (job `helper-windows` uploads it, `release-binaries`

@@ -1,6 +1,7 @@
 // recon-fake-nvenc.dll: a test double of the NVIDIA driver's NVENC runtime
-// (nvEncodeAPI64.dll) for `recon-encoder --self-test-nvenc=DLL`, which loads it
-// by its full path in place of System32's (it is never installed anywhere).
+// (nvEncodeAPI64.dll) for `recon-encoder --self-test-nvenc=DLL` and
+// `--encode-test ... --nvenc-test-dll=DLL` (recon-host qualify's tests), which
+// load it by its full path in place of System32's (it is never installed anywhere).
 // It lets the NVENC backend run without an NVIDIA GPU (Wine, CI on
 // windows-latest with WARP) and checks how the backend uses the API:
 //
@@ -23,7 +24,12 @@
 // Bitstreams are structurally valid (H.264 / HEVC NAL units with parameter sets
 // on IDRs, AV1 OBUs) and carry a text marker "NVFAKE ts=<id> ref=<id> t=<type>"
 // (no zero bytes, so no accidental start codes) naming the frame and the frame
-// it was predicted from. The H.264 / HEVC SPS is a real one (level 5.1, the
+// it was predicted from, padded with 'x' after " pad=" to the size the rate
+// control would give the frame (averageBitRate / frame rate; IDR and intra frames
+// lowDelayKeyFrameScale times that), so a reconfigured bitrate shows in the
+// frame sizes from the next frame on, as with a CBR encoder that follows at
+// once (recon-host qualify's live-bitrate checks, step 3.6; set padToRate=0 for
+// bare markers). The H.264 / HEVC SPS is a real one (level 5.1, the
 // reference frames kept); keepRefs=N makes the double keep fewer than asked,
 // like a driver that clamps the DPB. An encode takes `encodeUs` on a single engine (frames
 // finish one after another); async mode signals the events from a worker thread.
@@ -65,6 +71,7 @@ struct Config {
     int encodeUs = 1500;    // simulated encode time
     uint64_t failEncodeTs = 0;  // NvEncEncodePicture fails (NV_ENC_ERR_GENERIC) for this inputTimeStamp
     int keepRefs = 0;       // > 0: keep at most this many reference frames (DPB and SPS), whatever was asked
+    int padToRate = 1;      // frames padded to the configured bitrate (the marker alone with 0)
 };
 
 struct Frame {
@@ -301,26 +308,40 @@ std::string parameterSets(const Session& s) {
     return out;
 }
 
+// The bytes a frame of this type gets from the configured rate (padToRate).
+size_t rateBytes(const Session& s, NV_ENC_PIC_TYPE type) {
+    const NV_ENC_RC_PARAMS& rc = s.config.rcParams;
+    const uint32_t num = std::max(1u, s.init.frameRateNum), den = std::max(1u, s.init.frameRateDen);
+    size_t n = size_t(uint64_t(rc.averageBitRate) / 8 * den / num);
+    if (type != NV_ENC_PIC_TYPE_P) n *= std::max<size_t>(1, rc.lowDelayKeyFrameScale);
+    return n;
+}
+
 std::string bitstream(const Session& s, const Frame& f, bool withHeaders) {
     char marker[96];
     const char* t = f.type == NV_ENC_PIC_TYPE_IDR ? "IDR" : f.type == NV_ENC_PIC_TYPE_I ? "I" : "P";
     std::snprintf(marker, sizeof(marker), "NVFAKE ts=%llu ref=%llu t=%s", static_cast<unsigned long long>(f.ts),
                   static_cast<unsigned long long>(f.ref), t);
     const bool idr = f.type == NV_ENC_PIC_TYPE_IDR;
-    std::string out;
+    std::string out, payload = marker;
+    const size_t target = g_cfg.padToRate ? rateBytes(s, f.type) : 0;
     if (s.codec == Codec::Av1) {
         out += std::string("\x12\x00", 2);  // temporal delimiter
         if (idr && withHeaders) out += parameterSets(s);
-        const std::string payload = marker;
+        if (target > out.size() + payload.size() + 16) payload += " pad=" + std::string(target - out.size() - payload.size() - 16, 'x');
         out += char(0x32);  // OBU_FRAME, has_size
-        out += char(payload.size());
+        for (size_t v = payload.size();; v >>= 7) {  // obu_size, leb128
+            out += char((v & 0x7f) | (v > 0x7f ? 0x80 : 0));
+            if (v <= 0x7f) break;
+        }
         out += payload;
         return out;
     }
     if (idr && withHeaders) out += parameterSets(s);
     if (s.codec == Codec::H264) out += std::string("\0\0\0\1", 4) + char(idr ? 0x65 : 0x41);
     else out += std::string("\0\0\0\1", 4) + char(idr ? 19 << 1 : 1 << 1) + char(1);
-    out += marker;
+    if (target > out.size() + payload.size() + 5) payload += " pad=" + std::string(target - out.size() - payload.size() - 5, 'x');
+    out += payload;
     return out;
 }
 
@@ -981,7 +1002,7 @@ bool setKey(const std::string& k, const std::string& v) {
         {"tenBit", &g_cfg.tenBit}, {"yuv444", &g_cfg.yuv444}, {"customVbv", &g_cfg.customVbv}, {"intraRefresh", &g_cfg.intraRefresh},
         {"cabac", &g_cfg.cabac}, {"subframe", &g_cfg.subframe}, {"stateAdvance", &g_cfg.stateAdvance}, {"maxW", &g_cfg.maxW},
         {"maxH", &g_cfg.maxH}, {"minW", &g_cfg.minW}, {"minH", &g_cfg.minH}, {"encodeUs", &g_cfg.encodeUs},
-        {"keepRefs", &g_cfg.keepRefs},
+        {"keepRefs", &g_cfg.keepRefs}, {"padToRate", &g_cfg.padToRate},
     };
     for (const auto& [name, ptr] : ints) {
         if (k == name) return i(*ptr);

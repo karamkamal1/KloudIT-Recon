@@ -139,11 +139,12 @@ void Pipeline::captureLoop() {
                 rep_.error(cs, "");
                 continue;
             }
-            ef.nv12 = cf.nv12;
+            ef.nv12 = cf.nv12 ? cf.nv12 : cf.y;  // planar test mode (stream.cpp): the luma plane stands in
             ef.hold = cf.hold;
             ef.poolIndex = cf.index;
             if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);
         }
+        if (opt_.beforeSubmit) opt_.beforeSubmit(info.frameId);
         info.submitQpc = qpcNow();
         Status s = enc_.submit(ef, info);
         ef = EncoderFrame{};  // the backend kept its own reference if it needs one

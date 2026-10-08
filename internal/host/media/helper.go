@@ -86,6 +86,15 @@ type HelperOptions struct {
 	// while a stream is live, so a restart or a new stream skips the process
 	// start and the caps probe (GUIDE 3.1: a restart within ~300 ms).
 	KeepSpare bool
+	// LiveBitrate picks a stream's rate-control mode (start "rc") and how its
+	// bitrate changes from a live-bitrate qualification of the helper's
+	// encoder (recon-host qualify, GUIDE 3.6; the host passes
+	// qualify.Results.Choose): mode "seamless" or "flush" (start
+	// "liveBitrate"), or "restart" (neither passed: a new helper per
+	// change); ok false where it says nothing about this encoder, codec or
+	// mode, and the helper's defaults apply. adaptive: the session's rate
+	// controller changes the bitrate. Optional.
+	LiveBitrate func(c encoder.Caps, codec string, adaptive bool) (rc, mode string, ok bool)
 }
 
 // ErrHelperGaveUp is returned by Start after the pipeline gave up.
@@ -108,6 +117,10 @@ type helperProc struct {
 	// announce: its bitrate or frame rate changed in place while it was live;
 	// a RateChange goes out before its next frame.
 	announce bool
+	// liveMeasured: its rc and live-bitrate mode come from a qualification
+	// (HelperOptions.LiveBitrate); liveRestart: that qualification found no
+	// live mode that works, so bitrate changes start a new helper.
+	liveMeasured, liveRestart bool
 
 	// The stream, guarded by HelperVideo.mu.
 	live     bool
@@ -203,7 +216,7 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 	if cur == nil {
 		cur = v.active
 	}
-	if cur != nil && !cur.resized && sameHelperStream(cur.sp, sp) {
+	if cur != nil && !cur.resized && cur.params.Adaptive == p.Adaptive && sameHelperStream(cur.sp, sp) {
 		fps := 0
 		if cur.sp.FPS != sp.FPS {
 			fps = sp.FPS
@@ -211,7 +224,7 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 		rate := cur.sp.Kbps != sp.Kbps || fps > 0
 		if !rate || v.liveBitrate(cur) {
 			h, starting := cur.h, cur.started.Codec == ""
-			sp.LTRSlots, sp.ZeroCopy = cur.sp.LTRSlots, cur.sp.ZeroCopy // as withCaps made them
+			sp.LTRSlots, sp.ZeroCopy, sp.RC, sp.LiveBitrate = cur.sp.LTRSlots, cur.sp.ZeroCopy, cur.sp.RC, cur.sp.LiveBitrate // as withCaps made them
 			cur.params, cur.sp = p, sp
 			if urgent && cur == v.pending && v.active != nil {
 				v.kill(v.active) // the starting stream takes over at its first key frame
@@ -251,11 +264,14 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 }
 
 // sameHelperStream reports whether two starts describe the same stream apart
-// from bitrate and frame rate (which SetRate changes) and what withCaps adds.
+// from bitrate and frame rate (which SetRate changes) and what withCaps adds
+// (the rate-control mode follows from Params.Adaptive, which the caller
+// compares).
 func sameHelperStream(a, b encoder.StartParams) bool {
 	bc := a.Barcode == nil && b.Barcode == nil || a.Barcode != nil && b.Barcode != nil && *a.Barcode == *b.Barcode
 	for _, sp := range []*encoder.StartParams{&a, &b} {
 		sp.Kbps, sp.FPS, sp.LTRSlots, sp.ZeroCopy, sp.Barcode, sp.EncoderInstance = 0, 0, 0, nil, nil, nil
+		sp.RC, sp.LiveBitrate = "", ""
 	}
 	return bc && a == b
 }
@@ -264,14 +280,28 @@ func sameHelperStream(a, b encoder.StartParams) bool {
 // (before its helper is launched: as the newest helper's caps say). Called
 // with v.mu held.
 func (v *HelperVideo) liveBitrate(pr *helperProc) bool {
+	if pr.liveRestart {
+		return false
+	}
+	lb := v.liveMode(pr)
+	return lb == "seamless" || lb == "flush"
+}
+
+// liveMode is how the proc's encoder applies SetRate: as started says, else
+// as its start asks (a qualification), else as the caps say. Called with v.mu
+// held.
+func (v *HelperVideo) liveMode(pr *helperProc) string {
 	lb := pr.started.LiveBitrate
+	if lb == "" {
+		lb = pr.sp.LiveBitrate
+	}
 	if lb == "" {
 		lb = pr.codecCaps.LiveBitrate
 	}
 	if lb == "" && pr.h == nil {
 		lb = v.caps.Codecs[pr.sp.Codec].LiveBitrate
 	}
-	return lb == "seamless" || lb == "flush"
+	return lb
 }
 
 // startParams turns a generation's parameters into the helper's start
@@ -325,11 +355,19 @@ func (v *HelperVideo) startParams(p Params) (encoder.StartParams, error) {
 	return sp, nil
 }
 
+// liveChoice is what a qualification decided for a proc (withCaps).
+type liveChoice struct {
+	measured bool // rc and liveBitrate come from HelperOptions.LiveBitrate
+	restart  bool // no live mode passed: bitrate changes start a new helper
+}
+
 // withCaps completes a start for the helper that runs it: two LTR slots where
-// the codec recovers from long-term references (GUIDE 3.5), and no zero-copy
-// capture after two capture_failed restarts of a zero-copy stream. Called with
-// v.mu held.
-func (v *HelperVideo) withCaps(sp encoder.StartParams, caps encoder.Caps) encoder.StartParams {
+// the codec recovers from long-term references (GUIDE 3.5), no zero-copy
+// capture after two capture_failed restarts of a zero-copy stream, and the
+// rate-control and live-bitrate modes a qualification of this encoder chose
+// (HelperOptions.LiveBitrate; else the helper's defaults). Called with v.mu
+// held.
+func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encoder.Caps) (encoder.StartParams, liveChoice) {
 	if cc, ok := caps.Codecs[sp.Codec]; ok && cc.Recovery == "ltr" && cc.MaxLTR >= 2 {
 		sp.LTRSlots = 2
 	}
@@ -337,7 +375,22 @@ func (v *HelperVideo) withCaps(sp encoder.StartParams, caps encoder.Caps) encode
 		off := false
 		sp.ZeroCopy = &off
 	}
-	return sp
+	var lc liveChoice
+	if v.opt.LiveBitrate != nil {
+		if rc, mode, ok := v.opt.LiveBitrate(caps, sp.Codec, adaptive); ok {
+			lc.measured = true
+			if rc != "" {
+				sp.RC = rc
+			}
+			switch mode {
+			case "seamless", "flush":
+				sp.LiveBitrate = mode
+			case "restart":
+				lc.restart = true
+			}
+		}
+	}
+	return sp, lc
 }
 
 // kill stops a proc's helper (asynchronously: Close waits for it to exit).
@@ -418,7 +471,9 @@ func (v *HelperVideo) run(pr *helperProc) {
 	pr.h = h
 	if h != nil {
 		pr.codecCaps = h.Caps().Codecs[pr.sp.Codec]
-		pr.sp = v.withCaps(pr.sp, h.Caps())
+		var lc liveChoice
+		pr.sp, lc = v.withCaps(pr.sp, pr.params.Adaptive, h.Caps())
+		pr.liveMeasured, pr.liveRestart = lc.measured, lc.restart
 	}
 	sp := pr.sp
 	v.mu.Unlock()
@@ -438,11 +493,23 @@ func (v *HelperVideo) run(pr *helperProc) {
 	v.log.Info("encoder helper started", "backend", st.Backend, "capture", st.Capture, "codec", st.Codec,
 		"size", fmt.Sprintf("%dx%d", st.Width, st.Height), "fps", st.FPS, "kbps", st.Kbps, "adapter", st.AdapterName,
 		"vendor", st.Vendor, "gpu_priority", st.GPUPriority, "live_bitrate", st.LiveBitrate, "rate_control", st.RateControl,
-		"ltr_slots", st.LTRSlots, "zero_copy", st.ZeroCopy, "barcode", st.Barcode, "cursor_in_video", st.CursorInVideo)
+		"live_bitrate_from", liveSource(pr), "ltr_slots", st.LTRSlots, "zero_copy", st.ZeroCopy, "barcode", st.Barcode,
+		"cursor_in_video", st.CursorInVideo)
 	if later.Kbps != sp.Kbps || later.FPS != sp.FPS {
 		_ = h.SetRate(later.Kbps, 0, later.FPS)
 	}
 	v.read(pr)
+}
+
+// liveSource says where a proc's live-bitrate mode comes from, for the log.
+func liveSource(pr *helperProc) string {
+	switch {
+	case pr.liveRestart:
+		return "qualification (no live mode passed: a new helper per change)"
+	case pr.liveMeasured:
+		return "qualification"
+	}
+	return "helper default"
 }
 
 // read delivers a started proc's frames and capture changes until its helper
@@ -836,6 +903,8 @@ func (v *HelperVideo) Capabilities() PipelineCaps {
 	}
 	c.ForceIDR = pr.codecCaps.ForceIDR
 	c.LiveBitrate = v.liveBitrate(pr)
+	c.LiveBitrateFlush = c.LiveBitrate && v.liveMode(pr) == "flush"
+	c.LiveBitrateMeasured = pr.liveMeasured
 	c.CursorInVideo = pr.started.CursorInVideo
 	c.IntraRefresh = pr.started.IntraRefreshFrames > 0
 	switch {

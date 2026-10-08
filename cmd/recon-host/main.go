@@ -4,6 +4,7 @@
 //	recon-host pair <code>   store the pairing code shown by the gateway
 //	recon-host run           connect to the gateway and serve streams
 //	recon-host probe         show ffmpeg, its encoders and their command lines
+//	recon-host qualify       measure the native helper's live bitrate changes (GUIDE 3.6)
 package main
 
 import (
@@ -31,6 +32,12 @@ Usage:
   recon-host [flags] run                   run the agent (default)
   recon-host [flags] probe                 show ffmpeg, encoders (with their ffmpeg
                                            command lines), capture backends and monitors
+  recon-host [flags] qualify [qualify flags]
+                                           measure how the native encoder helper's encoder
+                                           changes its bitrate while it runs (codec x rate
+                                           control x live-bitrate mode); results go to
+                                           live-bitrate.json next to the config, which
+                                           sessions use (recon-host qualify -h for its flags)
   recon-host version
 
 Flags:
@@ -121,6 +128,12 @@ func main() {
 		} else {
 			fmt.Println("gamepads:  ", err)
 		}
+	case "qualify":
+		cfg, err := host.LoadConfig(*cfgPath)
+		if err != nil {
+			fatal(err)
+		}
+		os.Exit(qualifyCmd(cfg, *cfgPath, flag.Args()[1:]))
 	case "run":
 		cfg, err := host.LoadConfig(*cfgPath)
 		if err != nil {

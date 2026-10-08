@@ -31,7 +31,7 @@ struct AmfCodecProps {
     const wchar_t* qualityPreset = nullptr;
     amf_int64 presetSpeed = 0, presetBalanced = 0, presetQuality = 0;
     const wchar_t* rateControl = nullptr;
-    amf_int64 rcCbr = 0, rcLatencyVbr = 0;
+    amf_int64 rcCbr = 0, rcLatencyVbr = 0, rcPeakVbr = 0;
     const wchar_t* preAnalysis = nullptr;
     const wchar_t* preEncode = nullptr;
     bool preEncodeIsInt = false;                   // H.264: AMF_VIDEO_ENCODER_PREENCODE_MODE_ENUM, else bool
@@ -135,6 +135,7 @@ inline const AmfCodecProps& amfH264Props() {
         c.rateControl = AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD;
         c.rcCbr = AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR;
         c.rcLatencyVbr = AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
+        c.rcPeakVbr = AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
         c.preAnalysis = AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE;
         c.preEncode = AMF_VIDEO_ENCODER_PREENCODE_ENABLE;
         c.preEncodeIsInt = true;
@@ -218,6 +219,7 @@ inline const AmfCodecProps& amfHevcProps() {
         c.rateControl = AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD;
         c.rcCbr = AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR;
         c.rcLatencyVbr = AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
+        c.rcPeakVbr = AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
         c.preAnalysis = AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE;
         c.preEncode = AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE;
         c.vbaq = AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ;
@@ -303,6 +305,7 @@ inline const AmfCodecProps& amfAv1Props() {
         c.rateControl = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD;
         c.rcCbr = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_CBR;
         c.rcLatencyVbr = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
+        c.rcPeakVbr = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
         c.preAnalysis = AMF_VIDEO_ENCODER_AV1_PRE_ANALYSIS_ENABLE;
         c.preEncode = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_PREENCODE;
         c.aqMode = AMF_VIDEO_ENCODER_AV1_AQ_MODE;

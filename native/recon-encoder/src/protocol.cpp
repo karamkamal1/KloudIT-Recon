@@ -102,7 +102,8 @@ Status parseStart(const json& j, StartParams& p) {
         !optField(j, "hdr", p.hdr, err) || !optField(j, "ltrSlots", p.ltrSlots, err) ||
         !optField(j, "svcLayers", p.svcLayers, err) || !optField(j, "liveBitrate", p.liveBitrate, err) ||
         !optField(j, "encoderInstance", p.encoderInstance, err) || !optField(j, "ltrInterval", p.ltrInterval, err) ||
-        !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err)) {
+        !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err) ||
+        !optField(j, "motion", p.motion, err)) {
         return bad(err);
     }
     if (p.codec != "h264" && p.codec != "hevc" && p.codec != "av1") return bad("codec must be h264, hevc or av1");
@@ -111,7 +112,7 @@ Status parseStart(const json& j, StartParams& p) {
     if (!inRange(p.fps, 1, 480)) return bad("fps out of range");
     if (!inRange(p.kbps, 1, 2000000)) return bad("kbps out of range");
     if (!(p.vbvFrames > 0 && p.vbvFrames <= 30)) return bad("vbvFrames out of range");
-    if (p.rc != "cbr" && p.rc != "vbr") return bad("rc must be cbr or vbr");
+    if (p.rc != "cbr" && p.rc != "vbr" && p.rc != "vbr_peak") return bad("rc must be cbr, vbr or vbr_peak");
     if (p.quality != "speed" && p.quality != "balanced" && p.quality != "quality") return bad("unknown quality");
     if (!inRange(p.ltrSlots, 0, 8)) return bad("ltrSlots out of range");
     if (!inRange(p.svcLayers, 1, 4)) return bad("svcLayers out of range");
@@ -124,6 +125,7 @@ Status parseStart(const json& j, StartParams& p) {
     if ((p.window || !p.windowTitle.empty()) && !p.capture.empty() && p.capture != "wgc") {
         return bad("window capture needs capture \"wgc\"");
     }
+    if (p.motion && p.capture != "synthetic-gpu") return bad("motion needs capture \"synthetic-gpu\"");
     return Status::Ok();
 }
 

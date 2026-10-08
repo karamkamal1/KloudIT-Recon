@@ -245,6 +245,46 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
+// TestRateSeamlessGap: on an encoder qualified to change its bitrate
+// seamlessly (setGap(rateSeamlessGap)) changes may follow each other after
+// 2 s instead of 10 s; the quiet period before the first raise stays 10 s,
+// emergencies keep their own 2 s, and a gap above the period (a shortened
+// test period) is the period.
+func TestRateSeamlessGap(t *testing.T) {
+	h := newRateHarness(t, 40000)
+	h.r.setGap(rateSeamlessGap)
+	h.cut(false, 40000, 30000, true)
+	h.wait(1500 * time.Millisecond)
+	h.cut(false, 0, 0, false) // 1.5 s after the cut
+	h.wait(2 * time.Second)
+	h.cut(false, 30000, 22500, true) // 3.5 s: the 2 s gap is over
+	cutAt := h.clock.Sub(h.start)
+	r := h.run(20*time.Second, steady)
+	if len(r) < 3 || r[0].from != 22500 || r[0].at-cutAt < 10*time.Second {
+		t.Fatalf("raises %+v: the first 10 s after the last cut", r)
+	}
+	for i := 1; i < len(r); i++ {
+		if d := r[i].at - r[i-1].at; d < rateSeamlessGap || d > rateSeamlessGap+rateTick+time.Second/60 {
+			t.Fatalf("raises %d and %d %v apart, want 2 s", i-1, i, d)
+		}
+	}
+	if h.cur() != 40000 {
+		t.Fatalf("target %d, want back at the ceiling 40000", h.cur())
+	}
+	// Back to the full period (a flushing encoder, FFmpeg): 10 s again.
+	h.r.setGap(0)
+	h.wait(10 * time.Second)
+	h.cut(false, 40000, 30000, true)
+	h.wait(3 * time.Second)
+	h.cut(false, 0, 0, false)
+	// A gap longer than a shortened period is the period.
+	r2 := &rateController{now: func() time.Time { return h.clock }, period: time.Second}
+	r2.setGap(rateSeamlessGap)
+	if g := r2.changeGap(); g != time.Second {
+		t.Fatalf("gap %v with a 1 s period", g)
+	}
+}
+
 // TestRateDecrease: cuts are 25 %, stop at 2 Mbit/s (or at a lower ceiling),
 // and need a generation; a settings change (reset) drops the back-off.
 func TestRateDecrease(t *testing.T) {

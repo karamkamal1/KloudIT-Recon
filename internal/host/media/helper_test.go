@@ -590,6 +590,117 @@ func TestHelperVideoRateInPlace(t *testing.T) {
 	}
 }
 
+// A live-bitrate qualification (HelperOptions.LiveBitrate, recon-host
+// qualify) picks the stream's rate-control and live-bitrate modes: seamless
+// and flush go into the start and SetRate stays in the running encoder,
+// restart makes every bitrate change a new helper; without a result the
+// helper's defaults apply. Switching adaptive bitrate on or off is a new
+// stream.
+func TestHelperVideoLiveBitrateQualified(t *testing.T) {
+	type choice struct {
+		rc, mode string
+		ok       bool
+	}
+	for _, c := range []struct {
+		choice       choice
+		wantRC       string
+		wantLive     any // the start's liveBitrate (nil: not sent)
+		live, flush  bool
+		measured     bool
+		helpersAfter int // helpers launched after a bitrate change
+	}{
+		{choice{"vbr_peak", "seamless", true}, "vbr_peak", "seamless", true, false, true, 1},
+		{choice{"cbr", "flush", true}, "cbr", "flush", true, true, true, 1},
+		{choice{"cbr", "restart", true}, "cbr", nil, false, false, true, 2},
+		{choice{"", "", false}, "cbr", nil, true, false, false, 1},
+	} {
+		t.Run(c.choice.rc+"-"+c.choice.mode, func(t *testing.T) {
+			clock := testClock()
+			fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+				live, _ := m["liveBitrate"].(string)
+				if live == "" {
+					live = "seamless" // the caps' default
+				}
+				f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60,
+					Kbps: int(m["kbps"].(float64)), LiveBitrate: live, RateControl: m["rc"].(string)})
+			})
+			var asked []string
+			var mu sync.Mutex
+			v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock,
+				LiveBitrate: func(caps encoder.Caps, codec string, adaptive bool) (string, string, bool) {
+					mu.Lock()
+					asked = append(asked, fmt.Sprintf("%s %s %v", caps.AdapterName, codec, adaptive))
+					mu.Unlock()
+					return c.choice.rc, c.choice.mode, c.choice.ok
+				}})
+			defer v.Stop()
+			p := helperParams()
+			if err := v.Start(p, false); err != nil {
+				t.Fatal(err)
+			}
+			f := fh.nextStarted()
+			m := expectMsg(t, f, "start")
+			if m["rc"] != c.wantRC || m["liveBitrate"] != c.wantLive {
+				t.Fatalf("start rc %v liveBitrate %v, want %v %v", m["rc"], m["liveBitrate"], c.wantRC, c.wantLive)
+			}
+			f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_000_000)})
+			nextEvent(t, v) // config
+			nextEvent(t, v) // frame
+			pc := v.Capabilities()
+			if pc.LiveBitrate != c.live || pc.LiveBitrateFlush != c.flush || pc.LiveBitrateMeasured != c.measured {
+				t.Fatalf("capabilities %+v", pc)
+			}
+			if err := v.SetRate(15000, 0); err != nil {
+				t.Fatal(err)
+			}
+			if c.helpersAfter == 1 {
+				if m := expectMsg(t, f, "setRate"); m["kbps"] != float64(15000) {
+					t.Fatalf("setRate %v", m)
+				}
+			} else if m := expectMsg(t, fh.nextStarted(), "start"); m["kbps"] != float64(15000) || m["rc"] != c.wantRC {
+				t.Fatalf("new helper's start %v", m)
+			}
+			if n := fh.launched(); n != c.helpersAfter {
+				t.Fatalf("%d helpers after the bitrate change, want %d", n, c.helpersAfter)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if asked[0] != "AMD Radeon RX 7900 XT h264 true" {
+				t.Fatalf("asked %q", asked)
+			}
+		})
+	}
+	// Adaptive bitrate on or off is another rate-control mode: a new helper.
+	clock := testClock()
+	fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60,
+			Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless", RateControl: m["rc"].(string)})
+	})
+	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock,
+		LiveBitrate: func(_ encoder.Caps, _ string, adaptive bool) (string, string, bool) {
+			if adaptive {
+				return "cbr", "seamless", true
+			}
+			return "vbr", "flush", true
+		}})
+	defer v.Stop()
+	p := helperParams()
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	f := fh.nextStarted()
+	f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_000_000)})
+	nextEvent(t, v)
+	nextEvent(t, v)
+	p.Adaptive = false
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	if m := expectMsg(t, fh.nextStarted(), "start"); m["rc"] != "vbr" || m["liveBitrate"] != "flush" {
+		t.Fatalf("fixed-bitrate start %v", m)
+	}
+}
+
 // Replacements back off: the first at once, the next RestartBackoff later
 // per failure since a helper last went live. After a device_lost, helpers
 // that fail before going live within ResetGrace do not count toward giving
@@ -734,7 +845,7 @@ func TestHelperStartParams(t *testing.T) {
 		p.Source = c.src
 		p.Adaptive = false
 		sp, err := v.startParams(p)
-		sp = v.withCaps(sp, h.Caps())
+		sp, _ = v.withCaps(sp, p.Adaptive, h.Caps())
 		got := fmt.Sprintf("capture=%s monitor=%d hmonitor=%d window=%s size=%dx%d", sp.Capture, sp.Monitor, sp.HMonitor,
 			sp.WindowTitle, sp.Width, sp.Height)
 		if err != nil || got != c.want || sp.RC != "vbr" || sp.LTRSlots != 2 || sp.ZeroCopy != nil {
@@ -749,15 +860,17 @@ func TestHelperStartParams(t *testing.T) {
 	// No LTR slots for a codec that does not recover from long-term references.
 	p = helperParams()
 	p.Encoder.Family = "hevc"
-	if sp, _ := v.startParams(p); v.withCaps(sp, h.Caps()).LTRSlots != 0 {
+	if sp, _ := v.startParams(p); first(v.withCaps(sp, false, h.Caps())).LTRSlots != 0 {
 		t.Errorf("hevc (not in caps) got LTR slots")
 	}
 	// Two zero-copy capture failures: the next helper converts.
 	v.zeroCopyFails = 2
-	if sp, _ := v.startParams(helperParams()); v.withCaps(sp, h.Caps()).ZeroCopy == nil || *v.withCaps(sp, h.Caps()).ZeroCopy {
+	if sp, _ := v.startParams(helperParams()); first(v.withCaps(sp, true, h.Caps())).ZeroCopy == nil || *first(v.withCaps(sp, true, h.Caps())).ZeroCopy {
 		t.Errorf("zeroCopy not off after two zero-copy capture failures")
 	}
 }
+
+func first[A, B any](a A, _ B) A { return a }
 
 // The clock conversion is exact: QPC ticks at any frequency map to the host
 // clock's microseconds with the same integer arithmetic as the clock itself.
