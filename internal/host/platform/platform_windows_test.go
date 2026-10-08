@@ -11,7 +11,7 @@ func TestMonitorsAndCursor(t *testing.T) {
 		t.Fatalf("monitors: %v %v", mons, err)
 	}
 	for _, m := range mons {
-		t.Logf("monitor %d %q %dx%d@%d at (%d,%d) primary=%v hmon=%#x dxgi=%d", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.HMonitor, m.DXGIOutput)
+		t.Logf("monitor %d %q %dx%d@%d at (%d,%d) primary=%v hmon=%#x dxgi=%d rotated=%v", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.HMonitor, m.DXGIOutput, m.Rotated)
 		if m.W <= 0 || m.H <= 0 || m.HMonitor == 0 {
 			t.Fatal("bad monitor")
 		}

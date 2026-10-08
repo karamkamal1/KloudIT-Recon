@@ -575,7 +575,9 @@ func (s *Session) useAMFCapture(p *media.Params, mon platform.Monitor) {
 // shown to include it (docs/VENDOR_NOTES.md 1.6). Its monitor_index is taken
 // to be the DXGI output index on adapter 0, on whose device FFmpeg opens AMF
 // (VERIFY): a monitor that is not an output of adapter 0 (another GPU, an
-// IddCx virtual display) has none.
+// IddCx virtual display) has none. vsrc_amf ignores the capture's rotation
+// (AMF leaves it to the consumer; ddagrab rotates), so a rotated monitor
+// stays on ddagrab.
 func (a *Agent) amfCaptureBlocker(enc media.EncoderInfo, drawCursor bool, mon platform.Monitor) string {
 	if err := a.caps.CanCaptureAMF(enc); err != nil {
 		return err.Error()
@@ -585,6 +587,8 @@ func (a *Agent) amfCaptureBlocker(enc media.EncoderInfo, drawCursor bool, mon pl
 		return "the video must carry the cursor"
 	case mon.DXGIOutput < 0 || mon.DXGIOutput > 8:
 		return fmt.Sprintf("monitor %d is not output 0-8 of DXGI adapter 0", mon.Index)
+	case mon.Rotated:
+		return fmt.Sprintf("monitor %d is rotated", mon.Index)
 	}
 	return ""
 }

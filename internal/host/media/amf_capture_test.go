@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"slices"
@@ -38,12 +39,16 @@ func TestParseFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all := map[string]bool{"select": true}
+	all := map[string]bool{"select": true, "settb": true, "setpts": true}
 	if err := checkAMFCapture(help, all); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkAMFCapture(help, map[string]bool{}); err == nil {
-		t.Fatal("no error without select")
+	for f := range all {
+		without := maps.Clone(all)
+		delete(without, f)
+		if err := checkAMFCapture(help, without); err == nil || !strings.Contains(err.Error(), f) {
+			t.Fatalf("without %s: %v", f, err)
+		}
 	}
 	// A vsrc_amf without capture modes (or another option BuildArgs sets).
 	var noMode []string
@@ -106,14 +111,23 @@ func TestBuildArgsAMF(t *testing.T) {
 		}
 	}
 
+	// Without capture stamps (CaptureClock false) the pts still come from the
+	// wall clock in µs: vsrc_amf's own are rounded to 1/framerate and paced
+	// frames could share one.
 	hevc := EncoderInfo{"hevc_amf", "hevc", "amd", true}
 	args, err := c.BuildArgs(Params{Source: Source{Backend: "amf"}, Encoder: hevc, FPS: 60})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j := strings.Join(args, " "); !strings.Contains(j, "vsrc_amf=monitor_index=0:framerate=60:capture_mode=wait_for_present:duplicate_output=1,select='") ||
-		strings.Contains(j, "setpts") || strings.Contains(j, "hwmap") || strings.Contains(j, "hwdownload") || strings.Contains(j, "format=") {
+	if j := strings.Join(args, " "); !strings.Contains(j, "vsrc_amf=monitor_index=0:framerate=60:capture_mode=wait_for_present:duplicate_output=1,"+
+		framePacer(60)+",settb=AVTB,setpts=time(0)*1000000[v] ") || !strings.Contains(j, " -enc_time_base 1:1000000 ") ||
+		strings.Contains(j, "hwmap") || strings.Contains(j, "hwdownload") || strings.Contains(j, "format=") {
 		t.Fatalf("args %s", j)
+	}
+	// ddagrab's frames are on its 1/framerate grid already: no retiming there.
+	args, err = c.BuildArgs(Params{Source: Source{Backend: "ddagrab"}, Encoder: hevc, FPS: 60})
+	if j := strings.Join(args, " "); err != nil || strings.Contains(j, "setpts") || strings.Contains(j, "enc_time_base") {
+		t.Fatalf("ddagrab args %s: %v", j, err)
 	}
 	for _, bad := range []struct {
 		p    Params
@@ -240,40 +254,43 @@ func TestAMFCapture(t *testing.T) {
 		if e.Vendor != "amd" {
 			continue
 		}
-		t.Run(e.Name, func(t *testing.T) {
-			p := Params{Source: Source{Backend: "amf"}, Encoder: e, FPS: 60, BitrateKbps: 20000, Quality: "speed", CaptureClock: caps.CanStampCapture()}
-			args, err := caps.BuildArgs(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, caps.FFmpeg, args...)
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &stdout, &stderr
-			err = cmd.Run()
-			msg := strings.ReplaceAll(stderr.String(), "\r", "")
-			switch {
-			case ctx.Err() != nil && stdout.Len() > 0:
-				t.Logf("captured: %d bytes of NUT in 10 s", stdout.Len())
-			case ctx.Err() != nil:
-				t.Logf("no frame in 10 s (no present on a still desktop?): %s", msg)
-			case err == nil:
-				t.Fatalf("ffmpeg ended without an error: %s", msg)
-			case e.Name == "av1_amf" && strings.Contains(msg, `"header_insertion_mode" option value "idr"`):
-				// A3: av1_amf only takes none|gop|frame; step 1.1 replaces the
-				// AMD encoder arguments.
-				t.Skip("av1_amf rejects -header_insertion_mode idr (A3, fixed by the 1.1 AMD arguments)")
-			default:
-				for _, r := range runtimeErrors {
-					if strings.Contains(msg, r) {
-						t.Logf("stopped at the AMF runtime: %s", r)
-						return
-					}
+		// The capture clock is in the chain with and without capture stamps.
+		for _, stamps := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/stamps=%v", e.Name, stamps), func(t *testing.T) {
+				p := Params{Source: Source{Backend: "amf"}, Encoder: e, FPS: 60, BitrateKbps: 20000, Quality: "speed", CaptureClock: stamps}
+				args, err := caps.BuildArgs(p)
+				if err != nil {
+					t.Fatal(err)
 				}
-				t.Fatalf("%v: %s", err, msg)
-			}
-		})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, caps.FFmpeg, args...)
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				err = cmd.Run()
+				msg := strings.ReplaceAll(stderr.String(), "\r", "")
+				switch {
+				case ctx.Err() != nil && stdout.Len() > 0:
+					t.Logf("captured: %d bytes of NUT in 10 s", stdout.Len())
+				case ctx.Err() != nil:
+					t.Logf("no frame in 10 s (no present on a still desktop?): %s", msg)
+				case err == nil:
+					t.Fatalf("ffmpeg ended without an error: %s", msg)
+				case e.Name == "av1_amf" && strings.Contains(msg, `"header_insertion_mode" option value "idr"`):
+					// A3: av1_amf only takes none|gop|frame; step 1.1 replaces the
+					// AMD encoder arguments.
+					t.Skip("av1_amf rejects -header_insertion_mode idr (A3, fixed by the 1.1 AMD arguments)")
+				default:
+					for _, r := range runtimeErrors {
+						if strings.Contains(msg, r) {
+							t.Logf("stopped at the AMF runtime: %s", r)
+							return
+						}
+					}
+					t.Fatalf("%v: %s", err, msg)
+				}
+			})
+		}
 	}
 }
 

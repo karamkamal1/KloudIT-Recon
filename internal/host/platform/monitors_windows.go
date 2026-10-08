@@ -81,10 +81,11 @@ func Monitors() ([]Monitor, error) {
 		return nil, err
 	}
 	// Map HMONITOR -> DXGI output index on adapter 0 (what ddagrab enumerates).
-	for idx, hmon := range dxgiOutputs() {
+	for idx, o := range dxgiOutputs() {
 		for i := range mons {
-			if mons[i].HMonitor == hmon {
+			if mons[i].HMonitor == o.hmon {
 				mons[i].DXGIOutput = idx
+				mons[i].Rotated = o.rotation >= 2 // DXGI_MODE_ROTATION_ROTATE90/180/270
 			}
 		}
 	}
@@ -127,8 +128,14 @@ type dxgiOutputDesc struct {
 	monitor    uintptr
 }
 
-// dxgiOutputs returns the HMONITOR of each output of adapter 0, in order.
-func dxgiOutputs() []uint64 {
+type dxgiOutput struct {
+	hmon     uint64
+	rotation uint32 // DXGI_MODE_ROTATION
+}
+
+// dxgiOutputs returns the HMONITOR and rotation of each output of adapter 0,
+// in order.
+func dxgiOutputs() []dxgiOutput {
 	if procCreateDXGIFactory1.Find() != nil {
 		return nil
 	}
@@ -142,7 +149,7 @@ func dxgiOutputs() []uint64 {
 		return nil
 	}
 	defer adapter.release()
-	var out []uint64
+	var out []dxgiOutput
 	for i := uintptr(0); i < 16; i++ {
 		var output *comObj
 		if r := adapter.call(7 /*EnumOutputs*/, i, uintptr(unsafe.Pointer(&output))); int32(r) < 0 || output == nil {
@@ -150,9 +157,9 @@ func dxgiOutputs() []uint64 {
 		}
 		var desc dxgiOutputDesc
 		if r := output.call(7 /*GetDesc*/, uintptr(unsafe.Pointer(&desc))); int32(r) >= 0 {
-			out = append(out, uint64(desc.monitor))
+			out = append(out, dxgiOutput{uint64(desc.monitor), desc.rotation})
 		} else {
-			out = append(out, 0)
+			out = append(out, dxgiOutput{})
 		}
 		output.release()
 	}

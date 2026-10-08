@@ -834,12 +834,14 @@ Hardware checks:
 `"capture": "amf"` in host.json captures with FFmpeg 8.1's `vsrc_amf` (AMD Direct Capture,
 `AMFDisplayCapture`) instead of ddagrab:
 `vsrc_amf=monitor_index=<DXGI output>:framerate=<fps>:capture_mode=wait_for_present:duplicate_output=1`,
-then a `select` frame pacer, then the capture clock. It is opt-in and never chosen by `auto`. A
-session uses it only with an AMF encoder, only when the video need not carry the cursor, and only
-for a monitor that is output 0–8 of DXGI adapter 0. Otherwise it captures with ddagrab and logs
+then a `select` frame pacer, then the capture clock (always, see the pts note below). It is
+opt-in and never chosen by `auto`. A session uses it only with an AMF encoder, only when the
+video need not carry the cursor, and only for an unrotated monitor that is output 0–8 of DXGI
+adapter 0. Otherwise it captures with ddagrab and logs
 `AMD Direct Capture (capture "amf") not used, capturing with ddagrab reason=…` once per change.
 After a failed amf generation, the rest of the session uses ddagrab (`AMD Direct Capture failed,
-using ddagrab for this session`).
+using ddagrab for this session`). A generation fails only when FFmpeg exits, which a capture
+error after start-up does not cause (see the runtime-error note below).
 
 How the frames reach the encoder (FFmpeg release/8.1 sources: `libavfilter/vsrc_amf.c`,
 `libavcodec/amfenc.c`, `libavutil/hwcontext_amf.c`, `fftools/ffmpeg_enc.c`):
@@ -859,6 +861,17 @@ How the frames reach the encoder (FFmpeg release/8.1 sources: `libavfilter/vsrc_
   `format` filter is needed; any of them would add a conversion or a copy.
 - The encoder gets the capture format (8-bit BGRA on an SDR desktop) and converts RGB→YUV
   itself, as it does with ddagrab's BGRA textures.
+- Other capture formats do not reach the encoder. `vsrc_amf` sets the frames context's
+  `sw_format` to the capture format (`av_amf_to_av_format`), and `av_hwframe_ctx_init` runs
+  `amf_frames_init` (`libavutil/hwcontext_amf.c`), which accepts only NV12, YUV420P, BGRA, RGBA,
+  BGR0 and P010 (plus the D3D11/D3D12/DXVA2 formats). `AMF_SURFACE_RGBA_F16` (11) maps to
+  `rgbaf16le` and `AMF_SURFACE_R10G10B10A2` (13) to `x2bgr10le`, so with either capture format
+  `vsrc_amf` fails at output configuration (`Pixel format 'rgbaf16le' is not supported`,
+  `Failed to initialize hardware frames context`), FFmpeg exits before the encoder opens, and
+  the session falls back to ddagrab after that one failed generation (one `Video encoder
+  restarted` notice). The agent has no HDR guard: which format the driver reports on an HDR
+  desktop is the open question (HDR check below), and a guard keyed on the desktop's colour
+  space would also block amf if the driver hands out BGRA there.
 - `duplicate_output=1` (also vsrc_amf's default) hands out a copy of the captured surface. The
   AMF Display Capture guide says captured surfaces may be DCC-compressed, and such surfaces
   cannot go to the encoder directly.
@@ -867,13 +880,43 @@ How the frames reach the encoder (FFmpeg release/8.1 sources: `libavfilter/vsrc_
   (`media.framePacer`, a `select` expression on the wall clock) therefore keeps the average at the
   session's fps: one interval of credit, at least half an interval of jitter tolerance, and
   recovery from wall-clock steps.
-- Frame pts are `amf_high_precision_clock()` at capture, rescaled to 1/framerate. The agent's
-  capture clock (`setpts=time(0)*1000000`) replaces them.
+- Frame pts are `amf_high_precision_clock()` at capture, rescaled (rounded) to 1/framerate. Two
+  frames the pacer passes less than an interval apart (it keeps the schedule after a late frame)
+  can land on the same pts; the NUT muxer then shifts one with a `Non-monotonic DTS` warning.
+  So every vsrc_amf chain ends with the capture clock (`settb=AVTB,setpts=time(0)*1000000`)
+  and the encoder runs with `-enc_time_base 1:1000000`, also when the client gets no capture
+  stamps (v1 client, `"captureTimestamps": "off"`; the agent then sends no capture stamp).
+  ddagrab needs neither: its timer puts frames on its 1/framerate grid.
 - `vsrc_amf` has no cursor option.
+- `vsrc_amf` never reads `AMF_DISPLAYCAPTURE_ROTATION`. The AMF header documents it as the
+  captured monitor's rotation state, read after `Init`, so turning the picture upright is left
+  to the consumer; ddagrab does it (`vsrc_ddagrab.c`, `DXGI_MODE_ROTATION_ROTATE90/180/270`),
+  and the AMF SDK's open-source capture component refuses rotated outputs (`DDAPISource.cpp`:
+  `Unsupported display rotation`). A rotated monitor would give a failed generation or a
+  sideways picture whose size does not match the monitor the input is mapped to. So the agent
+  keeps rotated monitors on ddagrab (`reason="monitor N is rotated"`, from the
+  `DXGI_OUTPUT_DESC.Rotation` the monitor list already reads).
 - On `AMF_REPEAT`, `vsrc_amf` returns `EAGAIN` without sleeping, and libavfilter's buffersink
   (`get_frame_internal`) requests again at once. So FFmpeg's filter thread polls `QueryOutput`
   in a loop between presents. The AMF guide asks for sleeps of at least 1 ms, as step 3.2
   specifies for the native helper. See the CPU check below.
+- Runtime capture errors do not end FFmpeg. After start-up, `vsrc_amf` turns every failed
+  `QueryOutput` into `EAGAIN` with a `QueryOutput failed: N` warning (a failed
+  `QueryInterface(IID_AMFSurface)` likewise, with its own error line), and the buffersink asks
+  again at once, as for `AMF_REPEAT`; only `AMF_EOF` ends the stream. So a capture that breaks
+  while streaming (a display mode change, a switch to exclusive fullscreen, the secure desktop,
+  if the driver reports them as errors) shows as a frozen picture while FFmpeg keeps retrying,
+  not as a failed generation, and the session does not fall back. FFmpeg prints a run of
+  identical warnings once (`AV_LOG_SKIP_REPEATED`, which `-loglevel warning` keeps, and stderr
+  is a pipe), so host.log at `"logLevel": "debug"` gets one `ffmpeg` record with `QueryOutput
+  failed: N` per run, not one per retry. Any restart (a settings change, a reconnect) creates a
+  new capture: if that cannot start, FFmpeg exits and the fallback applies. The agent has no
+  stall check for this: a still desktop also delivers no frames in `wait_for_present` mode, and
+  FFmpeg's one warning per run, which can arrive before the last frames still in the encoder, is
+  too weak a signal to end a generation on. The AMF SDK's open-source component re-creates its
+  desktop duplication on `DXGI_ERROR_ACCESS_LOST` (the mode and fullscreen switches) and returns
+  `AMF_REPEAT`; whether the driver's component ever reports lasting errors is checked by the
+  fullscreen check below, which then decides whether the agent needs a stall check.
 
 Verified in the sandbox:
 
@@ -886,9 +929,17 @@ Verified in the sandbox:
   a non-AMF encoder, a missing `vsrc_amf`, a video that must carry the cursor, and a monitor
   index outside 0–8. The probe drops `vsrc_amf` unless its help lists `monitor_index`,
   `framerate`, `duplicate_output`, `capture_mode` and `wait_for_present`, and the build has
-  `select`.
+  `select`, `settb` and `setpts`. Without capture stamps the chain still ends with the capture
+  clock and `-enc_time_base 1:1000000`; a ddagrab chain does not.
+- verified (sandbox, FFmpeg 6.1.1 Linux): pts collisions behind the pacer, emulated with
+  `testsrc2=r=144` jittered ±4 ms (`setpts=(N/144+0.004*sin(N*1.7))/TB,realtime`), rounded
+  like vsrc_amf (`settb=1/60`), paced to 60 fps, 300 frames to NUT with libx264: without the
+  capture clock 39 `Non-monotonic DTS` shifts; with `settb=AVTB,setpts=time(0)*1000000` and
+  `-enc_time_base 1:1000000` none, 300 distinct pts. Regular 144 Hz presents without jitter
+  collide only once, at the start (the pacer's first two frames).
 - verified (sandbox, Wine + FFmpeg 8.1.3 BtbN win64 build): the generated command lines for
-  `hevc_amf` and `h264_amf`, with and without capture timestamps, are accepted up to
+  `hevc_amf` and `h264_amf`, with and without capture timestamps (rechecked with the capture
+  clock in both), are accepted up to
   `DLL amfrt64.dll failed to open` / `Failed to create  hardware device context (AMF)` in vsrc_amf's
   output configuration. Control runs with `capture_mode=wait_for_presentx`,
   `duplicate_output=2`, `monitor_index=9` and a misspelt function in the pacer expression are
@@ -911,12 +962,15 @@ Verified in the sandbox:
     60 Hz source loses 88. The test catches both, and the step-guard removal.
 - verified (sandbox): session (`internal/host` `TestAMFCaptureBackend`): `auto` never picks
   amf; `"capture": "amf"` uses it with `hevc_amf`. It falls back to ddagrab for `libx264`, a
-  video cursor, a monitor without a DXGI output on adapter 0 (`dxgi=-1`) and an FFmpeg without
-  vsrc_amf, logging once per reason and again when the reason changes; a whole `buildParams`
-  with the client's video cursor stays on ddagrab with the same encoder. After an amf
-  generation fails, the session stays on ddagrab; a failed ddagrab generation does not disable
-  amf. An encoder failure event now carries the failed generation's parameters
-  (`TestVideoFailureParams`).
+  video cursor, a monitor without a DXGI output on adapter 0 (`dxgi=-1`), a rotated monitor and
+  an FFmpeg without vsrc_amf, logging once per reason and again when the reason changes; a whole
+  `buildParams` with the client's video cursor stays on ddagrab with the same encoder. After an
+  amf generation fails, the session stays on ddagrab; a failed ddagrab generation does not
+  disable amf. An encoder failure event now carries the failed generation's parameters
+  (`TestVideoFailureParams`). The rotation flag comes from the `GetDesc` call that already
+  maps `dxgi=` (`DXGI_OUTPUT_DESC.Rotation`, the field before the `HMONITOR` it reads); Wine has
+  no DXGI output here (`TestMonitorsAndCursor` under Wine: `dxgi=-1 rotated=false`), so the
+  rotated case is covered by the rotation check below.
 - Finding, not changed here: `handleEncoderFailure` decides "same encoder failed twice: exclude
   it" from `Video.Current()`. `Video.read` clears the failed generation before it sends the
   failure event, so `Current()` returns nothing (or another, still running generation). The
@@ -957,8 +1011,14 @@ called "the AMF test line" below. Keep something moving on that monitor while it
 - AMD RDNA3 (RX 7900 XT): unverified (VERIFY monitor_index mapping). The agent passes the
   monitor's DXGI output index on adapter 0 (`dxgi=` in the probe's `monitor` lines, the same
   number ddagrab's `output_idx` gets). The AMF header says only that the index "is determined by
-  using EnumAdapters() in DXGI", and the AMF guide adds "0 specifies the default monitor". Test
-  with two monitors on the RX 7900 XT (different resolutions help):
+  using EnumAdapters() in DXGI", and the AMF guide adds "0 specifies the default monitor". The
+  open-source legacy capture component in the AMF SDK, which "implements the same API"
+  (`amf/public/src/components/DisplayCapture/DDAPISource.cpp`, `GetNewDuplicator`), takes the
+  index as an `EnumOutputs` index on the adapter of the AMF context's D3D11 device, modulo the
+  number of outputs: the mapping the agent uses, with vsrc_amf's device on the default adapter.
+  The driver's component (the one vsrc_amf creates) is closed source, hence VERIFY; if it also
+  wraps, a wrong index shows another monitor instead of failing. Test with two monitors on the
+  RX 7900 XT (different resolutions help):
   1. Note each `monitor N: \\.\DISPLAYk W×H … dxgi=D` line of the probe.
   2. Run the AMF test line with D = 0, then D = 1. Its log shows `Capture resolution: W×H`; the
      mp4 must show the monitor whose `dxgi=` is D.
@@ -979,24 +1039,52 @@ called "the AMF test line" below. Keep something moving on that monitor while it
      behind.
   If the AMF capture contains the pointer, record it. The agent must then also avoid amf with
   the local cursor, and could use amf for `drawCursor`.
-- AMD RDNA3 (RX 7900 XT): unverified (VERIFY borderless vs exclusive fullscreen). Test: with
-  `"capture": "amf"`, run a game uncapped (vsync off) in each mode: (a) borderless fullscreen,
-  (b) exclusive fullscreen (a DX11 game that offers it), (c) windowed. Switch modes with
-  Alt+Enter while streaming. Pass: the picture keeps updating in every mode (overlay fps near
-  the requested fps; `stream stats` in host.log), with no black or frozen picture. At a mode
-  switch the stream either continues, or host.log shows `AMD Direct Capture failed, using
-  ddagrab for this session` and the picture is back within about 1 s. Record per mode: works /
-  black / frozen / falls back, and capture→encoded p95.
-- AMD RDNA3 (RX 7900 XT): unverified (VERIFY HDR desktop). Test:
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY borderless vs exclusive fullscreen, mode
+  switches). Test: with `"capture": "amf"` and `"logLevel": "debug"`, run a game uncapped
+  (vsync off) in each mode: (a) borderless fullscreen, (b) exclusive fullscreen (a DX11 game
+  that offers it), (c) windowed. Switch modes with Alt+Enter while streaming. Then, on the
+  desktop, change the streamed monitor's resolution and then its refresh rate (Windows display
+  settings), and press Ctrl+Alt+Del and come back (secure desktop). Pass: the picture keeps
+  updating in every mode (overlay fps near the requested fps; `stream stats` in host.log), with
+  no black or frozen picture, and after each switch. A capture error after start-up does not end
+  FFmpeg (see the runtime-error note above), so a failure shows as a frozen picture (overlay
+  fps 0) with `QueryOutput failed: N` in host.log, not as a fallback; a frozen picture without
+  that line is a capture that delivers nothing. Record per mode and switch: works / black /
+  frozen (with or without `QueryOutput failed`, and N) / recovers by itself (after how long),
+  and capture→encoded p95. For a frozen picture, change a setting in the client (a restart
+  creates a new capture) and record whether the picture comes back, on amf or after `AMD Direct
+  Capture failed, using ddagrab for this session`. After a resolution change, also record the
+  picture size in the overlay and whether input still lands where clicked. Any frozen case means
+  the agent needs a stall check for amf (end the generation on that signal and restart on
+  ddagrab).
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY HDR desktop). Known from the FFmpeg 8.1 sources
+  (see above): with capture format 11 (RGBA_F16) or 13 (R10G10B10A2), `vsrc_amf` fails at
+  frames-context init (`Pixel format 'rgbaf16le' is not supported` / `'x2bgr10le'`) before the
+  encoder opens, and the session falls back to ddagrab after that one failed generation. The
+  open question is only which capture format the driver reports on an HDR desktop. Test:
   1. Turn on Windows Settings → Display → Use HDR, then run the AMF test line. Record
      `Capture format: N` (AMF_SURFACE_FORMAT: 3 BGRA, 11 RGBA_F16, 13 R10G10B10A2) and whether
-     the encoder opens. FFmpeg passes `rgbaf16le` / `x2bgr10le` to amfenc at 8-bit depth; it is
-     unknown whether AMF converts them or refuses.
-  2. Stream an HDR video or game with `"capture": "amf"`, then with `"ddagrab"` (which gives an
-     SDR-converted picture), and compare.
-  Pass: amf starts and its colours are no worse than ddagrab's. If it fails, or the colours are
-  washed out, clipped or tinted, record it: the agent then needs an HDR guard (ddagrab on an HDR
-  desktop) until 3.9.
+     FFmpeg gets past it (expected for 11 and 13: the two lines above, then exit).
+  2. Stream an HDR video or game with `"capture": "amf"`. For 11 or 13: host.log shows
+     `AMD Direct Capture failed, using ddagrab for this session` after the first generation and
+     the client one `Video encoder restarted` notice; record how long the picture takes to
+     appear. For 3: compare the picture with `"ddagrab"` (which gives an SDR-converted picture).
+  Pass: amf starts and its colours are no worse than ddagrab's, or it fails exactly as above and
+  the ddagrab stream follows. If the format is 11 or 13, record it: the agent then needs an HDR
+  guard (ddagrab when `DXGI_OUTPUT_DESC1.ColorSpace` is
+  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`) to skip the failed first generation, until 3.9.
+  If the colours are washed out, clipped or tinted, record it: the same guard applies.
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY rotated monitor; amf blocked until then). The
+  agent keeps a rotated monitor on ddagrab because `vsrc_amf` does not rotate (see above). Test:
+  1. Rotate a monitor to portrait (Windows display settings → Display orientation → Portrait)
+     and stream it with `"capture": "amf"`. Pass: host.log shows `AMD Direct Capture (capture
+     "amf") not used, capturing with ddagrab reason="monitor N is rotated"`, and the picture is
+     upright with input landing where clicked. Repeat with Portrait (flipped) and Landscape
+     (flipped).
+  2. Run the AMF test line with that monitor's `dxgi=` index and record `Capture resolution:
+     W×H` (landscape or portrait), whether FFmpeg starts, and whether the mp4 is upright or
+     sideways. If it is upright at the portrait size for every orientation, the driver rotates,
+     and the block can go.
 - AMD RDNA3 (RX 7900 XT): unverified (VERIFY IddCx virtual display; expected unsupported). Test:
   1. Add a virtual monitor (SudoVDA or Virtual Display Driver) and note its `dxgi=` in the probe.
   2. Stream it with `"capture": "amf"`.

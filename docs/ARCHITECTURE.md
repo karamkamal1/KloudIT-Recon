@@ -131,9 +131,9 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   (no hwmap, no copy beyond the capture's own `duplicate_output` copy). A `select` expression
   caps the rate at the session's fps: the AMF docs define the `framerate` option only for
   `keep_framerate` mode.
-  The session uses it only with an AMF encoder, without the cursor in the video and for a
-  monitor on DXGI adapter 0. Otherwise, and for the rest of a session after it failed once, it
-  captures with ddagrab (see `docs/VENDOR_NOTES.md`, 1.6).
+  The session uses it only with an AMF encoder, without the cursor in the video and for an
+  unrotated monitor on DXGI adapter 0. Otherwise, and for the rest of a session after it failed
+  once, it captures with ddagrab (see `docs/VENDOR_NOTES.md`, 1.6).
 
 - **Why NUT:** a frame is forwarded as soon as its last byte is written (see
   `internal/nut/nut_test.go: TestStreamingLatency`). Raw Annex-B has no boundaries, and

@@ -374,15 +374,18 @@ func parseFilters(out []byte) map[string]bool {
 
 // checkAMFCapture checks that BuildArgs can use vsrc_amf: "ffmpeg -h
 // filter=vsrc_amf" (help) lists the options and the capture mode it sets, and
-// the build has select for framePacer.
+// the build has select for framePacer and settb/setpts for the capture clock,
+// which every vsrc_amf chain carries.
 func checkAMFCapture(help []byte, filters map[string]bool) error {
 	for _, o := range []string{"monitor_index", "framerate", "duplicate_output", "capture_mode", "wait_for_present"} {
 		if !regexp.MustCompile(`(?m)^\s+` + o + `\s`).Match(help) {
 			return fmt.Errorf("vsrc_amf has no %s", o)
 		}
 	}
-	if !filters["select"] {
-		return errors.New("no select filter")
+	for _, f := range []string{"select", "settb", "setpts"} {
+		if !filters[f] {
+			return fmt.Errorf("no %s filter", f)
+		}
 	}
 	return nil
 }
@@ -509,7 +512,8 @@ type Params struct {
 	// CaptureClock stamps every frame with its wall-clock capture time: pts
 	// become the wall clock in µs right after the source (CaptureClockFilter)
 	// and the encoder runs at a µs time base (it still gets the frame rate for
-	// rate control). Video turns them into Frame.CaptureUs.
+	// rate control). Video turns them into Frame.CaptureUs. Capture "amf"
+	// gets that pts and time base also without it (BuildArgs), unreported.
 	CaptureClock bool
 	// Barcode draws the frame barcode of each frame's index (= Frame.Seq) into
 	// the top-left corner (BarcodeFilter; test source only).
@@ -655,7 +659,8 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	e := p.Encoder
 	args := []string{"-hide_banner", "-loglevel", "warning", "-nostdin"}
-	gpuFrames := false // source produces D3D11 frames (amf: AMF surfaces)
+	gpuFrames := false      // source produces D3D11 frames (amf: AMF surfaces)
+	clock := p.CaptureClock // pts = wall-clock capture time in µs
 	var chain string
 	cursor := "0"
 	if p.DrawCursor {
@@ -705,6 +710,12 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		chain = fmt.Sprintf("vsrc_amf=monitor_index=%d:framerate=%d:capture_mode=wait_for_present:duplicate_output=1,%s",
 			p.Source.Output, p.FPS, framePacer(p.FPS))
 		gpuFrames = true
+		// vsrc_amf rounds each frame's AMF capture time to its 1/framerate
+		// time base, so two frames the pacer passes less than an interval
+		// apart can share a pts (the muxer then shifts one with a
+		// "Non-monotonic DTS" warning). The wall clock in µs keeps them
+		// apart, also when the client gets no capture stamps.
+		clock = true
 	case "x11grab":
 		args = append(args, "-f", "x11grab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor)
 		if p.Source.NativeW > 0 {
@@ -724,7 +735,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unknown capture backend %q", p.Source.Backend)
 	}
-	if p.CaptureClock {
+	if clock {
 		// Evaluated as the frame leaves the source (after realtime pacing for
 		// the test source), before any conversion or encoding.
 		chain += "," + CaptureClockFilter
@@ -788,7 +799,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)
-	if p.CaptureClock {
+	if clock {
 		// Keep µs precision through the encoder; its frame rate still comes
 		// from the source (checked: libx264/libsvtav1 bitrate and fps unchanged).
 		args = append(args, "-enc_time_base", "1:1000000")

@@ -326,6 +326,7 @@ func TestAMFCaptureBackend(t *testing.T) {
 		{"software encoder", x264, false, mon, true, "only feeds AMF encoders, not libx264"},
 		{"cursor in the video", hevc, true, mon, true, "cursor"},
 		{"monitor on another adapter", hevc, false, platform.Monitor{Index: 1, DXGIOutput: -1}, true, "not output 0-8 of DXGI adapter 0"},
+		{"rotated monitor", hevc, false, platform.Monitor{Index: 1, W: 1440, H: 2560, DXGIOutput: 2, Rotated: true}, true, "monitor 1 is rotated"},
 		{"FFmpeg without vsrc_amf", hevc, false, mon, false, "vsrc_amf"},
 	} {
 		caps.Filters["vsrc_amf"] = c.filters
