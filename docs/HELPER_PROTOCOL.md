@@ -39,7 +39,15 @@ session's video pipeline on the helper: it starts the replacement as soon as the
 started) while a stream is live so a restart skips the process start and the caps probe
 (under Wine: 175-191 ms from the failure to the new helper's first frame, 700-760 ms
 without the spare), and after three failures within 60 s (a fatal error, an exit, a
-refused `start`) gives the session back to FFmpeg. A zero-copy stream that ends with
+refused `start`) gives the session back to FFmpeg. Only the first replacement since a
+helper last went live starts at once; each further one waits 300 ms more (300, 600, ...
+1500 ms), and after a `device_lost` (driver reset) helpers that fail before they go live
+within the next 3 s are retried without counting toward the three. A replacement still
+starting is kept when the session asks for the same stream again (a key frame request:
+its first frame is a key frame; a bitrate change: it follows the `started`). A
+`captureChanged` `resized` to another size than `started`'s `captureWidth`/`captureHeight`
+makes the next start a new helper even with the same parameters (the session restarts it
+once the size has been stable for 300 ms). A zero-copy stream that ends with
 `capture_failed` is restarted as it was once; the second time the new helper gets
 `zeroCopy` false. It sends `ack` for every frame with `ltrSlot >= 0` the client
 acknowledges and `recover` when the session asks (GUIDE 3.5 wires the client side).
@@ -289,7 +297,7 @@ entry point). `ltrSlot` and `temporalLayer` complete the picture.
 
 | `reason` | Meaning | Helper meanwhile |
 |---|---|---|
-| `resized` | the source has a new size or rotation (mode change, rotated display, resized window) | keeps the encoded size and scales the new source into it; recon-host restarts the helper if it wants the new native size |
+| `resized` | the source has a new size or rotation (mode change, rotated display, resized window) | keeps the encoded size and scales the new source into it; recon-host starts a new helper once the size has been stable for 300 ms |
 | `lost` | capture is not possible right now (`DXGI_ERROR_ACCESS_LOST` during a mode or full-screen switch, secure desktop, output or window gone); `text` says why | repeats the last image every `idleRepeatMs`, retries every 250 ms |
 | `restored` | capture works again | |
 
@@ -544,7 +552,9 @@ stage its draws depend on (HS/DS/GS, stream output, predication) rather than tru
 shared immediate context's state. Shaders are
 compiled at start with `D3DCompile` from System32's `d3dcompiler_47.dll` (no build-time
 shader compiler needed; a few milliseconds). An odd capture size is encoded at the next
-smaller even size when `width`/`height` are 0.
+smaller even size when `width`/`height` are 0. The whole source is scaled to the whole
+`width` x `height` (no letterbox): recon-host asks for a size with the source's aspect
+ratio (a monitor scaled to fit the client's size, a window at its own size).
 
 `barcode` draws the frame barcode of GUIDE 0.2 into every frame in the same pass, exactly
 the format of `internal/proto/barcode.go` that the browser's latency probe reads: the

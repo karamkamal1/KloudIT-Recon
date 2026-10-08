@@ -61,6 +61,10 @@ type Session struct {
 	pipeSwap   chan struct{}  // leaveHelper replaced video: videoEvents reads the new one's events
 	helperEncs []media.EncoderInfo
 	helperCaps encoder.Caps // the native helper's, while video is one (helperEncs != nil)
+	// cursorInVideo: the live generation's frames show the mouse pointer
+	// (VideoEvent.CursorInVideo), read by cursorLoop without the pipeline's lock.
+	cursorInVideo atomic.Bool
+	resizeTimer   *time.Timer // a capture size change waiting to settle (captureChanged)
 
 	audio    *media.Audio
 	frameQ   chan *media.Frame
@@ -749,9 +753,15 @@ func (s *Session) videoEvents() {
 			s.encoderLost(ev.Lost)
 		case ev.Capture != nil:
 			s.captureChanged(ev.Capture)
+		case ev.Rate != nil:
+			// The live generation's encoder changed its bitrate or frame
+			// rate in place: the client's config of it is updated.
+			_, ceiling := s.rate.kbps()
+			s.sendJSON(proto.Rate{T: "rate", Gen: ev.Rate.Gen, BitrateKbps: ev.Rate.Kbps, FPS: ev.Rate.FPS, MaxBitrateKbps: ceiling})
 		case ev.Config != nil:
 			s.encoderLive()
 			s.videoUp.Store(true)
+			s.cursorInVideo.Store(ev.CursorInVideo)
 			c := *ev.Config
 			if r := s.a.faults.recovery; r != "" {
 				c.Recovery = r
@@ -981,19 +991,31 @@ func (s *Session) encoderLost(l *media.LostFrames) {
 	}
 }
 
+// resizeSettle is how long a capture source must keep its new size before
+// the stream restarts at it: a window being resized reports every frame.
+const resizeSettle = 300 * time.Millisecond
+
 // captureChanged follows the native helper's capture source: a new size or
-// rotation restarts the stream at the new native size (and maps input to the
-// monitor's new geometry), a lost capture (secure desktop, mode switch) is
-// shown to the user.
+// rotation restarts the stream at the new size (a new helper, overlapped; and
+// maps input to the monitor's new geometry) once it settled, a lost capture
+// (secure desktop, mode switch) is shown to the user. Called by videoEvents
+// only.
 func (s *Session) captureChanged(c *media.CaptureChange) {
 	s.log.Info("capture changed", "reason", c.Reason, "size", fmt.Sprintf("%dx%d", c.Width, c.Height), "rotation", c.Rotation, "text", c.Text)
 	switch c.Reason {
 	case "resized":
-		if !s.paused.Load() {
+		if s.resizeTimer != nil {
+			s.resizeTimer.Reset(resizeSettle)
+			return
+		}
+		s.resizeTimer = time.AfterFunc(resizeSettle, func() {
+			if s.ctx.Err() != nil || s.paused.Load() {
+				return // resume starts afresh
+			}
 			if err := s.startVideo(false, "capture resized"); err != nil {
 				s.log.Warn("restart after a capture change failed", "err", err)
 			}
-		}
+		})
 	case "lost":
 		s.notice("info", "Screen capture is paused ("+trunc(c.Text, 120)+"); the last picture stays until it is back.")
 	}
@@ -1171,9 +1193,9 @@ func (s *Session) setRate(kbps int, urgent bool, reason string) error {
 	}
 	if p, ok := v.Current(); ok {
 		s.setCongestionTarget(p)
-		_, ceiling := s.rate.kbps()
-		s.sendJSON(proto.Rate{T: "rate", Gen: v.Gen(), BitrateKbps: kbps, MaxBitrateKbps: ceiling})
 	}
+	// The client hears of it from the pipeline (VideoEvent.Rate) once the
+	// live encoder runs at it; a starting stream's config has it.
 	if urgent {
 		return s.keyframe(reason)
 	}
@@ -1463,7 +1485,7 @@ func (s *Session) cursorLoop() {
 		if err != nil {
 			continue
 		}
-		if s.vid().Capabilities().CursorInVideo {
+		if s.cursorInVideo.Load() {
 			cs.Visible = false // the stream shows the pointer already (a WGC capture that could not leave it out)
 		}
 		if cs.Visible != lastVisible || (cs.Visible && cs.Handle != lastHandle) {

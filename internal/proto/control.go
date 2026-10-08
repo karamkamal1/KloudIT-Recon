@@ -145,14 +145,15 @@ const (
 	RecoveryKeyframe = "keyframe" // request a key frame (FFmpeg path: a new encoder generation)
 )
 
-// Rate announces a bitrate change of the running generation Gen that needed
-// no new generation (the native helper changes it in the encoder): the
-// VideoConfig's bitrate and maxBitrate, updated. Clients that ignore it keep
-// showing the generation's config.
+// Rate announces a bitrate or frame rate change of the running generation Gen
+// that needed no new generation (the native helper changes them in the
+// encoder): the VideoConfig's bitrate, fps and maxBitrate, updated. Clients
+// that ignore it keep the generation's config.
 type Rate struct {
 	T              string `json:"t"` // "rate"
 	Gen            uint8  `json:"gen"`
 	BitrateKbps    int    `json:"bitrate"`
+	FPS            int    `json:"fps,omitempty"`
 	MaxBitrateKbps int    `json:"maxBitrate,omitempty"`
 }
 

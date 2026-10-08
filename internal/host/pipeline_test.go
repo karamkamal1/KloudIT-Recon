@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -64,6 +66,46 @@ func TestHelperBlocker(t *testing.T) {
 		got := s.helperBlocker(c.prefs, c.drawCursor, c.caps)
 		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestHelperSource: what the helper captures, and at which size. The helper
+// stretches its source to the size it is given, so a client size of another
+// aspect ratio than the monitor's is fitted to the monitor's (even, never
+// larger than the client asked, never upscaled); a window keeps its own size.
+func TestHelperSource(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		capture string
+		mon     platform.Monitor
+		prefs   proto.Prefs
+		want    string
+	}{
+		{"native", "auto", platform.Monitor{W: 2560, H: 1440, DXGIOutput: 1, HMonitor: 7}, proto.Prefs{}, "ddagrab out=1 0x0"},
+		{"larger than the monitor", "auto", platform.Monitor{W: 1920, H: 1080, DXGIOutput: 0}, proto.Prefs{Width: 2560, Height: 1440},
+			"ddagrab out=0 0x0"},
+		{"same aspect", "auto", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1920, Height: 1080}, "ddagrab out=0 1920x1080"},
+		{"ultrawide host, 16:9 client", "auto", platform.Monitor{W: 3440, H: 1440}, proto.Prefs{Width: 1920, Height: 1080},
+			"ddagrab out=0 1920x804"},
+		{"16:9 host, 16:10 client", "gfxcapture", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1920, Height: 1200},
+			"gfxcapture out=0 1920x1080"},
+		{"portrait host", "amf", platform.Monitor{W: 1080, H: 1920, Rotated: true}, proto.Prefs{Width: 1920, Height: 1080},
+			"amf out=0 608x1080"},
+		{"taller than the monitor only", "auto", platform.Monitor{W: 2560, H: 1080}, proto.Prefs{Width: 1920, Height: 1200},
+			"ddagrab out=0 1920x810"},
+		{"window", "auto", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1280, Height: 1024, Window: "Notepad"},
+			"gfxcapture out=0 0x0 window=Notepad"},
+	} {
+		s := &Session{a: &Agent{cfg: &Config{Capture: c.capture}}}
+		p := media.Params{Source: media.Source{Backend: "ddagrab"}, DrawCursor: true}
+		s.helperSource(&p, c.prefs, c.mon)
+		got := fmt.Sprintf("%s out=%d %dx%d", p.Source.Backend, p.Source.Output, p.Width, p.Height)
+		if p.Source.Window != "" {
+			got += " window=" + p.Source.Window
+		}
+		if got != c.want || p.DrawCursor || p.Source.NativeW != c.mon.W || p.Source.HMonitor != c.mon.HMonitor {
+			t.Errorf("%s: %s (%+v), want %s", c.name, got, p.Source, c.want)
 		}
 	}
 }
@@ -171,26 +213,29 @@ func TestOpenPipeline(t *testing.T) {
 // TestSessionOnHelper drives a session on the (fake) native helper: the
 // stream starts in the helper with the test pattern's barcode, key frame
 // requests and bitrate changes act in the running encoder (no restart, no
-// new helper), losses in the helper are reported to the client, and repeated
-// helper failures move the session to FFmpeg.
+// new helper), losses in the helper are reported to the client, a capture
+// size change restarts the stream with a new helper once it settled, a key
+// frame request while a replacement helper starts keeps that one, and
+// repeated helper failures move the session to FFmpeg.
 func TestSessionOnHelper(t *testing.T) {
 	var mu sync.Mutex
-	failing := false
+	failing, hold := false, false
 	l := &fakeLauncher{caps: helperCaps(fakeH264, `"dda"`, false), started: make(chan *encoder.Fake, 8)}
 	l.handle = func(f *encoder.Fake, m map[string]any) {
 		if m["t"] != "start" {
 			return
 		}
 		mu.Lock()
-		fail := failing
+		fail, h := failing, hold
 		mu.Unlock()
-		if fail {
-			f.Send(encoder.HelperError{Code: "device_lost", Text: "TDR (test)", Fatal: true})
+		switch {
+		case fail:
+			f.Send(encoder.HelperError{Code: "encode_failed", Text: "test", Fatal: true})
 			f.Exit(3)
-			return
+		case !h:
+			f.Send(encoder.Started{Backend: "amf", Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30,
+				Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless", Barcode: true})
 		}
-		f.Send(encoder.Started{Backend: "amf", Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30,
-			Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless", Barcode: true})
 	}
 	ff, _ := exec.LookPath("ffmpeg")
 	caps := &media.Caps{}
@@ -275,16 +320,82 @@ func TestSessionOnHelper(t *testing.T) {
 		t.Fatal("a second helper started a stream")
 	default:
 	}
-	waitMsg(t, ctrl, `"t":"rate"`, `"bitrate":3000`)
+	waitMsg(t, ctrl, `"t":"rate"`, `"gen":2`, `"bitrate":3000`, `"fps":30`)
 	waitMsg(t, ctrl, `"t":"dropped"`, `"gen":2`, `"fromSeq":1`, `"count":2`) // sent asynchronously
 	waitMsg(t, ctrl, `"t":"video"`, `"gen":2`, `"encoder":"h264_amf_helper"`)
 
-	// Three failures within a minute: the session continues on FFmpeg, its
-	// generations after the helper's.
+	// The capture source changed size (a display mode change or rotation;
+	// a window being resized reports every frame): once it settled, one new
+	// helper, although the session's parameters are the same.
+	for i := 0; i < 3; i++ {
+		f.Send(encoder.CaptureChanged{Reason: "resized", Width: 180, Height: 320, Rotation: 90})
+		time.Sleep(50 * time.Millisecond)
+	}
+	var f2 *encoder.Fake
+	select {
+	case f2 = <-l.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no new helper after the capture was resized")
+	}
+	f2.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 7, OutputQPC: 8})
+	if fr := nextFrame(); fr.Gen != 3 || fr.Seq != 0 {
+		t.Fatalf("first frame after the resize %+v", fr)
+	}
+	select {
+	case <-f.Exited():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resized helper was not shut down")
+	}
+	select {
+	case <-l.started:
+		t.Fatal("more than one new helper for the resize")
+	case <-time.After(500 * time.Millisecond):
+	}
+	if l := logs.lines(`msg="restarting video" reason="capture resized"`); len(l) != 1 {
+		t.Fatalf("resize restarts %q", l)
+	}
+	f = f2
+
+	// The helper fails; while its replacement starts, the client asks for a
+	// key frame (its watchdog): the starting helper is kept, no other one.
+	mu.Lock()
+	hold = true
+	mu.Unlock()
+	f.Send(encoder.HelperError{Code: "encode_failed", Text: "test", Fatal: true})
+	var f3 *encoder.Fake
+	select {
+	case f3 = <-l.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no replacement helper")
+	}
+	s.kickMu.Lock()
+	s.lastKick = time.Time{}
+	s.kickMu.Unlock()
+	s.requestKeyframe()
+	select {
+	case <-l.started:
+		t.Fatal("the key frame request started another helper")
+	case <-f3.Exited():
+		t.Fatal("the key frame request killed the starting helper")
+	case <-time.After(300 * time.Millisecond):
+	}
+	mu.Lock()
+	hold = false
+	mu.Unlock()
+	f3.Send(encoder.Started{Backend: "amf", Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30, Kbps: 3000,
+		LiveBitrate: "seamless", Barcode: true})
+	f3.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 9, OutputQPC: 10})
+	if fr := nextFrame(); fr.Gen != 4 || fr.Seq != 0 {
+		t.Fatalf("replacement's first frame %+v", fr)
+	}
+	f = f3
+
+	// Two more failures (three within a minute): the session continues on
+	// FFmpeg, its generations after the helper's.
 	mu.Lock()
 	failing = true
 	mu.Unlock()
-	f.Send(encoder.HelperError{Code: "device_lost", Text: "TDR (test)", Fatal: true})
+	f.Send(encoder.HelperError{Code: "encode_failed", Text: "test", Fatal: true})
 	f.Exit(3)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -305,8 +416,8 @@ func TestSessionOnHelper(t *testing.T) {
 	}
 	for deadline := time.Now().Add(20 * time.Second); ; {
 		fr := nextFrame()
-		if fr.Gen > 2 {
-			break // gen 3 and later: an FFmpeg generation (helper restarts never went live)
+		if fr.Gen > 4 {
+			break // gen 5 and later: an FFmpeg generation (helper restarts never went live)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("no FFmpeg frames")

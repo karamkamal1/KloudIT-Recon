@@ -1304,8 +1304,13 @@ function onControl(m) {
       break;
     case 'clock': if (Number.isFinite(m.wallOffsetUs)) probe.wallOffsetUs = m.wallOffsetUs; updateProbeMode(); break;
     case 'video': onVideoConfig(m); break;
-    // The running generation's bitrate changed in the encoder (native helper).
-    case 'rate': post('rate', { gen: m.gen, bitrate: m.bitrate, maxBitrate: m.maxBitrate }); break;
+    // The running generation's bitrate or frame rate changed in the encoder
+    // (native helper). The config is updated in place: configureDecoder
+    // compares it by identity.
+    case 'rate':
+      if (video.cfg?.gen === m.gen && m.fps > 0) video.cfg.fps = m.fps;
+      post('rate', { gen: m.gen, bitrate: m.bitrate, fps: m.fps, maxBitrate: m.maxBitrate });
+      break;
     case P.MSG_DROPPED: onDropped(m); break;
     case 'audio': onAudioConfig(m); break;
     case 'cursor': post('cursor', { shape: m }); break;

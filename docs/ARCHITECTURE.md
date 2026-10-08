@@ -269,18 +269,27 @@ that answers `forceIdr`), and `seq` is the frame id minus that frame's. A forced
 therefore begins a new generation with the same parameters, which is exactly what a client that
 asked for a key frame waits for (it discards the rest of the generation it asked in); old clients
 see nothing new. Frames the helper drops (its ring is full: recon-host fell behind) are reported
-like frames the session dropped (`{"t":"dropped"}`) and answered with a key frame. A bitrate
-change in the encoder is announced with `{"t":"rate","gen","bitrate","maxBitrate"}` (clients
-that ignore it keep the generation's config).
+like frames the session dropped (`{"t":"dropped"}`) and answered with a key frame. A bitrate or
+frame rate change in the encoder (the rate controller, or a settings change) is announced before
+the live generation's next frame with `{"t":"rate","gen","bitrate","fps","maxBitrate"}`; the
+client takes the new fps for its gap timeout (clients that ignore it keep the generation's
+config). The helper scales its whole source to the whole encoded size, so a client size of
+another aspect ratio than the monitor's is fitted to the monitor's (a window is encoded at its
+own size).
 
 **Lifecycle.** The helper the session launched to read its caps starts the stream; while a stream
 is live a spare helper is kept launched (caps read, nothing started), so a restart skips the
 process start and the caps probe. A stream that differs in more than bitrate and frame rate (codec,
-size, monitor, capture method) needs a new helper, started overlapped like an FFmpeg generation.
-A helper that reports a fatal error or exits is replaced at once (target: first frame within
-~300 ms; with the spare under Wine 175-191 ms, see `docs/VENDOR_NOTES.md`, 3.1b), and the new
-one starts with an IDR as a new generation. Three failures within 60 s end the helper pipeline:
-the session continues on FFmpeg with a notice.
+size, monitor, capture method) needs a new helper, started overlapped like an FFmpeg generation,
+and so does one whose source changed size or rotation (`captureChanged` `resized`: the session
+restarts it once the size has been stable for 300 ms; meanwhile the helper scales). A helper still
+starting the same stream is kept (a key frame request or a bitrate change while it starts does not
+replace it). A helper that reports a fatal error or exits is replaced at once (target: first frame
+within ~300 ms; with the spare under Wine 175-191 ms, see `docs/VENDOR_NOTES.md`, 3.1b), and the
+new one starts with an IDR as a new generation; further replacements before one goes live wait
+300 ms more each (at most 1.5 s). Three failures within 60 s end the helper pipeline: the session
+continues on FFmpeg with a notice. Helpers that fail before going live within 3 s of a
+`device_lost` (a driver reset) do not count.
 
 ## The browser pipeline
 

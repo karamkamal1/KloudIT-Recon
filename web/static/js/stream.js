@@ -231,7 +231,7 @@ function onWorker(m) {
     case 'welcome': S.welcome = m.info; buildDrawer(); break;
     case 'video': S.videoCfg = m.cfg; break;
     case 'rate':
-      if (S.videoCfg?.gen === m.gen) S.videoCfg = { ...S.videoCfg, bitrate: m.bitrate, maxBitrate: m.maxBitrate ?? S.videoCfg.maxBitrate };
+      if (S.videoCfg?.gen === m.gen) S.videoCfg = { ...S.videoCfg, bitrate: m.bitrate, fps: m.fps || S.videoCfg.fps, maxBitrate: m.maxBitrate ?? S.videoCfg.maxBitrate };
       break;
     case 'audio': S.audioCfg = m.cfg; break;
     case 'resolution': S.video = { w: m.w, h: m.h }; break;

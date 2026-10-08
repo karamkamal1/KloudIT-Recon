@@ -65,6 +65,9 @@ type VideoEvent struct {
 	// generation's encoder needs to restore the picture by itself
 	// (HealFrames of its arguments; 0: a lost frame needs a key frame).
 	HealFrames int
+	// CursorInVideo, with Config: the generation's frames contain the mouse
+	// pointer, so the client must not draw its own.
+	CursorInVideo bool
 	// Restarted, with Err: the pipeline handles the failure itself
 	// (HelperVideo restarts the native helper, or a starting one takes
 	// over); a new generation follows with a key frame, the session only
@@ -75,8 +78,11 @@ type VideoEvent struct {
 	Fallback  bool
 	// Lost: frames that will never reach the session (HelperVideo: the
 	// helper dropped them). Capture: the capture source changed (HelperVideo).
+	// Rate: the live generation's bitrate or frame rate changed in its
+	// encoder, without a new generation (HelperVideo).
 	Lost    *LostFrames
 	Capture *CaptureChange
+	Rate    *RateChange
 }
 
 // encoderFault reports whether an encoder process's stderr shows that the
@@ -463,7 +469,7 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				}
 			}
 			v.mu.Unlock()
-			v.emit(VideoEvent{Config: cfg, HealFrames: HealFrames(pr.args, st.Width, st.Height)})
+			v.emit(VideoEvent{Config: cfg, HealFrames: HealFrames(pr.args, st.Width, st.Height), CursorInVideo: pr.params.DrawCursor})
 			v.emit(VideoEvent{Frame: f})
 		case v.active == pr:
 			v.mu.Unlock()

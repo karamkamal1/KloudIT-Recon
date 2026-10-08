@@ -52,6 +52,10 @@ type HelperVideo struct {
 	closed   bool
 	gaveUp   bool
 	failures []time.Time // recent failures, for the give-up rule
+	streak   int         // failures since a helper last went live, for the back-off
+	// After a device_lost (driver reset) helpers that fail before they go
+	// live do not count as failures until then: the GPU may need seconds.
+	graceUntil time.Time
 	// A zero-copy AMD Direct Capture source that changed (capture_failed) is
 	// restarted as is once; the second time the new helper converts frames.
 	zeroCopyFails int
@@ -71,6 +75,13 @@ type HelperOptions struct {
 	// GiveUpWindow end the pipeline (default 3 in 60 s).
 	GiveUp       int
 	GiveUpWindow time.Duration
+	// The replacement of a failed helper starts at once, the next ones
+	// RestartBackoff later per failure since a helper last went live (default
+	// 300 ms, at most 5 x). Helpers that fail before going live within
+	// ResetGrace of a device_lost (a driver reset, default 3 s) do not count
+	// toward GiveUp.
+	RestartBackoff time.Duration
+	ResetGrace     time.Duration
 	// KeepSpare keeps one more helper launched (caps read, nothing started)
 	// while a stream is live, so a restart or a new stream skips the process
 	// start and the caps probe (GUIDE 3.1: a restart within ~300 ms).
@@ -90,6 +101,13 @@ type helperProc struct {
 	killed    bool
 	since     time.Time // when it was asked for (restarts: when its predecessor failed)
 	restart   bool      // it replaces a failed helper (logs the restart time)
+	// resized: its source no longer has the size it started with
+	// (captureChanged), so it encodes a scaled picture: the next Start needs a
+	// new helper.
+	resized bool
+	// announce: its bitrate or frame rate changed in place while it was live;
+	// a RateChange goes out before its next frame.
+	announce bool
 
 	// The stream, guarded by HelperVideo.mu.
 	live     bool
@@ -114,6 +132,12 @@ func NewHelperVideo(opt HelperOptions) *HelperVideo {
 	}
 	if opt.GiveUpWindow <= 0 {
 		opt.GiveUpWindow = time.Minute
+	}
+	if opt.RestartBackoff <= 0 {
+		opt.RestartBackoff = 300 * time.Millisecond
+	}
+	if opt.ResetGrace <= 0 {
+		opt.ResetGrace = 3 * time.Second
 	}
 	if opt.Clock == nil {
 		opt.Clock = NewHostClock()
@@ -156,9 +180,11 @@ func (v *HelperVideo) Gen() uint8 {
 
 // Start starts the stream for p. A running stream that differs only in
 // bitrate and frame rate is changed in place where the encoder can (live
-// bitrate), and urgent then forces a key frame in it; anything else needs a
-// new helper, started overlapped unless urgent (the current one stops at
-// once).
+// bitrate), and urgent then forces a key frame in it; a helper still starting
+// the same stream is kept (its first frame is a key frame; a new rate goes
+// into its start or follows it). Anything else needs a new helper, started
+// overlapped unless urgent (the current one stops at once), and so does a
+// stream whose source changed size since it started (resized).
 func (v *HelperVideo) Start(p Params, urgent bool) error {
 	sp, err := v.startParams(p)
 	if err != nil {
@@ -177,14 +203,14 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 	if cur == nil {
 		cur = v.active
 	}
-	if cur != nil && cur.started.Codec != "" && sameHelperStream(cur.sp, sp) {
+	if cur != nil && !cur.resized && sameHelperStream(cur.sp, sp) {
 		fps := 0
 		if cur.sp.FPS != sp.FPS {
 			fps = sp.FPS
 		}
 		rate := cur.sp.Kbps != sp.Kbps || fps > 0
-		if !rate || liveBitrate(cur) {
-			h := cur.h
+		if !rate || v.liveBitrate(cur) {
+			h, starting := cur.h, cur.started.Codec == ""
 			sp.LTRSlots, sp.ZeroCopy = cur.sp.LTRSlots, cur.sp.ZeroCopy // as withCaps made them
 			cur.params, cur.sp = p, sp
 			if urgent && cur == v.pending && v.active != nil {
@@ -192,10 +218,16 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 				v.active = nil
 			}
 			v.mu.Unlock()
+			if starting {
+				return nil // run starts it with sp, or sets the rate right after its start
+			}
 			if rate {
 				if err := h.SetRate(sp.Kbps, 0, fps); err != nil {
 					return err
 				}
+				v.mu.Lock()
+				cur.announce = cur.live // a starting stream's config will have the rate
+				v.mu.Unlock()
 			}
 			if urgent {
 				return h.ForceIDR()
@@ -228,11 +260,16 @@ func sameHelperStream(a, b encoder.StartParams) bool {
 	return bc && a == b
 }
 
-// liveBitrate reports whether the proc's encoder changes its bitrate in place.
-func liveBitrate(pr *helperProc) bool {
+// liveBitrate reports whether the proc's encoder changes its bitrate in place
+// (before its helper is launched: as the newest helper's caps say). Called
+// with v.mu held.
+func (v *HelperVideo) liveBitrate(pr *helperProc) bool {
 	lb := pr.started.LiveBitrate
 	if lb == "" {
 		lb = pr.codecCaps.LiveBitrate
+	}
+	if lb == "" && pr.h == nil {
+		lb = v.caps.Codecs[pr.sp.Codec].LiveBitrate
 	}
 	return lb == "seamless" || lb == "flush"
 }
@@ -428,6 +465,12 @@ func (v *HelperVideo) read(pr *helperProc) {
 		case c := <-h.CaptureChanges():
 			v.mu.Lock()
 			relevant := !pr.killed && (v.active == pr || v.pending == pr)
+			if c.Reason == "resized" {
+				// Back at the size it started with (or turned by 180°) it
+				// needs no new helper.
+				st := pr.started
+				pr.resized = st.CaptureWidth <= 0 || c.Width != st.CaptureWidth || c.Height != st.CaptureHeight
+			}
 			v.mu.Unlock()
 			if relevant {
 				v.emit(VideoEvent{Capture: &CaptureChange{Reason: c.Reason, Width: c.Width, Height: c.Height, Rotation: c.Rotation, Text: c.Text}})
@@ -482,12 +525,14 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 			}
 			pr.live = true
 			pr.codec = codec.NewParams(pr.sp.Codec, nil)
-			defer v.refillSpare() // after v.mu is released
+			v.streak, v.graceUntil = 0, time.Time{} // capture and encoder work (again)
+			defer v.refillSpare()                   // after v.mu is released
 		}
 		v.gen++
 		pr.gen, pr.seqBase, pr.ptsBase = v.gen, f.FrameID, capture
 		clear(pr.ltr)
 		pr.ackedLTR = pr.ackedLTR[:0]
+		pr.announce = false // the new config has the current rate
 		data = pr.codec.PrepareKeyFrame(data)
 		cfg := v.config(pr)
 		if first {
@@ -501,7 +546,7 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 		} else {
 			v.log.Debug("forced key frame: new generation", "gen", pr.gen, "frame_id", f.FrameID)
 		}
-		evs = append(evs, VideoEvent{Config: cfg})
+		evs = append(evs, VideoEvent{Config: cfg, CursorInVideo: pr.started.CursorInVideo})
 	case !pr.live:
 		// Nothing to switch to before the stream's first key frame (it was
 		// dropped): ask for one, and give up on a helper that sends none.
@@ -517,6 +562,10 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 		return
 	case f.Key:
 		data = pr.codec.PrepareKeyFrame(data)
+	}
+	if pr.announce {
+		pr.announce = false
+		evs = append(evs, VideoEvent{Rate: &RateChange{Gen: pr.gen, Kbps: pr.sp.Kbps, FPS: pr.sp.FPS}})
 	}
 	fr := v.convert(pr, f, data, capture, freq, now)
 	v.mu.Unlock()
@@ -572,10 +621,14 @@ func (v *HelperVideo) convert(pr *helperProc, f *encoder.Frame, data []byte, cap
 // config is the VideoConfig of a proc's generation: codec string from the key
 // frame's parameter sets, size and crop from started (AV1 on RDNA3 is coded in
 // 64x16 multiples; GUIDE 1.7's crop fields make the client crop it like an
-// FFmpeg stream). Called with v.mu held.
+// FFmpeg stream), bitrate and frame rate as last set (start or setRate).
+// Called with v.mu held.
 func (v *HelperVideo) config(pr *helperProc) *proto.VideoConfig {
 	st := pr.started
-	fps := st.FPS
+	fps := pr.sp.FPS
+	if fps <= 0 {
+		fps = st.FPS
+	}
 	if fps <= 0 {
 		fps = pr.params.FPS
 	}
@@ -594,9 +647,12 @@ func (v *HelperVideo) config(pr *helperProc) *proto.VideoConfig {
 var defaultCodecString = map[string]string{"h264": "avc1.640033", "hevc": "hvc1.1.6.L153.B0", "av1": "av01.0.13M.08"}
 
 // failed handles a proc whose helper exited, failed or refused the start:
-// unless it was stopped on purpose, a new helper takes its place at once
-// (Restarted), and after GiveUp failures within GiveUpWindow the pipeline
-// gives up (Fallback).
+// unless it was stopped on purpose, a new helper takes its place (Restarted):
+// at once after the first failure since a helper last went live, then
+// RestartBackoff later per further failure; after GiveUp failures within
+// GiveUpWindow the pipeline gives up (Fallback). A device_lost (driver reset)
+// opens a grace of ResetGrace in which helpers that fail before they go live
+// are retried without counting.
 func (v *HelperVideo) failed(pr *helperProc, err error) {
 	v.mu.Lock()
 	if pr.killed || v.closed || (v.active != pr && v.pending != pr) {
@@ -612,14 +668,25 @@ func (v *HelperVideo) failed(pr *helperProc, err error) {
 		v.pending = nil
 	}
 	now := time.Now()
-	v.failures = append(slices.DeleteFunc(v.failures, func(t time.Time) bool { return now.Sub(t) > v.opt.GiveUpWindow }), now)
+	v.failures = slices.DeleteFunc(v.failures, func(t time.Time) bool { return now.Sub(t) > v.opt.GiveUpWindow })
 	var he *encoder.HelperError
-	if errors.As(err, &he) && he.Code == "capture_failed" && pr.started.ZeroCopy {
+	isHE := errors.As(err, &he)
+	counted := live || !now.Before(v.graceUntil)
+	if counted {
+		v.failures = append(v.failures, now)
+		if isHE && he.Code == "device_lost" {
+			v.graceUntil = now.Add(v.opt.ResetGrace)
+		}
+	}
+	v.streak++
+	if isHE && he.Code == "capture_failed" && pr.started.ZeroCopy {
 		v.zeroCopyFails++
 	}
 	giveUp := len(v.failures) >= v.opt.GiveUp
 	failedParams := pr.params
 	var next *helperProc
+	var serr error
+	delay := time.Duration(min(v.streak-1, 5)) * v.opt.RestartBackoff
 	if giveUp {
 		v.gaveUp = true
 		for _, o := range []*helperProc{v.active, v.pending} {
@@ -634,6 +701,7 @@ func (v *HelperVideo) failed(pr *helperProc, err error) {
 		next = &helperProc{params: pr.params, since: now, restart: true}
 		next.params.BitrateKbps = pr.sp.Kbps
 		next.params.FPS = pr.sp.FPS
+		next.sp, serr = v.startParams(next.params)
 		v.pending = next
 	}
 	n := len(v.failures)
@@ -644,20 +712,27 @@ func (v *HelperVideo) failed(pr *helperProc, err error) {
 			Failed: &failedParams, Live: live, EncoderFault: true, Fallback: true})
 		return
 	}
-	v.log.Warn("encoder helper failed, restarting it", "err", err, "live", live, "failures", n)
+	v.log.Warn("encoder helper failed, restarting it", "err", err, "live", live, "failures", n, "counted", counted, "retry_in", delay)
 	// Restarted also when a starting helper (overlapped Start) takes over:
 	// either way the pipeline handles it.
 	v.emit(VideoEvent{Err: err, Failed: &failedParams, Live: live, EncoderFault: true, Restarted: true})
-	if next != nil {
-		sp, serr := v.startParams(next.params)
-		v.mu.Lock()
-		next.sp = sp
-		v.mu.Unlock()
-		if serr != nil {
-			v.failed(next, serr)
-			return
-		}
+	switch {
+	case next == nil:
+	case serr != nil:
+		v.failed(next, serr)
+	case delay <= 0:
 		go v.run(next)
+	default:
+		// Not on a GPU that is still failing (a driver reset): a Start of the
+		// same stream meanwhile keeps next waiting, another one replaces it.
+		time.AfterFunc(delay, func() {
+			v.mu.Lock()
+			gone := next.killed || v.closed
+			v.mu.Unlock()
+			if !gone {
+				v.run(next)
+			}
+		})
 	}
 }
 
@@ -760,7 +835,7 @@ func (v *HelperVideo) Capabilities() PipelineCaps {
 		return c
 	}
 	c.ForceIDR = pr.codecCaps.ForceIDR
-	c.LiveBitrate = liveBitrate(pr)
+	c.LiveBitrate = v.liveBitrate(pr)
 	c.CursorInVideo = pr.started.CursorInVideo
 	c.IntraRefresh = pr.started.IntraRefreshFrames > 0
 	switch {

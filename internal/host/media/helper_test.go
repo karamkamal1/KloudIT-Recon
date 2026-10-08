@@ -335,6 +335,10 @@ func TestHelperVideoRestart(t *testing.T) {
 	}
 	f2 := fh.nextStarted()
 	f1.Publish(&encoder.Frame{FrameID: 2, LTRSlot: -1, Data: h264P, CaptureQPC: qpcAt(clock, 1_016_000)})
+	// The live generation's new bitrate is announced before its next frame.
+	if r := nextEvent(t, v).Rate; r == nil || r.Gen != 1 || r.Kbps != 15000 || r.FPS != 60 {
+		t.Fatalf("rate change %+v", r)
+	}
 	if fr := nextEvent(t, v).Frame; fr == nil || fr.Gen != 1 || fr.Seq != 1 {
 		t.Fatalf("old stream's frame while the new one starts %+v", fr)
 	}
@@ -413,6 +417,263 @@ func TestHelperVideoFailures(t *testing.T) {
 	}
 	if err := v.Start(helperParams(), true); !errors.Is(err, ErrHelperGaveUp) {
 		t.Fatalf("Start after giving up: %v", err)
+	}
+}
+
+// A source that changed size ("resized"; the helper scales it into the old
+// size meanwhile) gets a new helper at the next Start, also with the same
+// parameters: a stream at the native size has width and height 0, so only the
+// resize tells it apart. A source back at its starting size needs none.
+func TestHelperVideoResize(t *testing.T) {
+	clock := testClock()
+	fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+			CaptureWidth: 1920, CaptureHeight: 1080, LiveBitrate: "seamless"})
+	})
+	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock})
+	defer v.Stop()
+	p := helperParams() // the native size: width and height 0
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	f1 := fh.nextStarted()
+	if m := expectMsg(t, f1, "start"); m["width"] != nil || m["height"] != nil {
+		t.Fatalf("start %v, want the capture size", m)
+	}
+	f1.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_000_000)})
+	nextEvent(t, v)
+	nextEvent(t, v)
+	if err := v.Start(p, false); err != nil || fh.launched() != 1 {
+		t.Fatalf("the same stream again: %v, %d helpers", err, fh.launched())
+	}
+	// Turned by 180°: the same size, no new helper.
+	f1.Send(encoder.CaptureChanged{Reason: "resized", Width: 1920, Height: 1080, Rotation: 180})
+	if cc := nextEvent(t, v).Capture; cc == nil || cc.Reason != "resized" || cc.Rotation != 180 {
+		t.Fatalf("capture change %+v", cc)
+	}
+	if err := v.Start(p, false); err != nil || fh.launched() != 1 {
+		t.Fatalf("after a resize to the same size: %v, %d helpers", err, fh.launched())
+	}
+	f1.Send(encoder.CaptureChanged{Reason: "resized", Width: 1080, Height: 1920, Rotation: 90})
+	if cc := nextEvent(t, v).Capture; cc == nil || cc.Reason != "resized" {
+		t.Fatalf("capture change %+v", cc)
+	}
+	// What the session does next: the same parameters (the monitor's new
+	// size is not in the helper's start).
+	p.Source.NativeW, p.Source.NativeH = 1080, 1920
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	f2 := fh.nextStarted()
+	f2.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_100_000)})
+	if c := nextEvent(t, v).Config; c == nil || c.Gen != 2 {
+		t.Fatalf("config of the new helper %+v", c)
+	}
+	select {
+	case <-f1.Exited():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resized helper was not shut down")
+	}
+}
+
+// A helper still starting the same stream is kept: a key frame request
+// (urgent Start) or a bitrate change while the replacement of a failed helper
+// starts neither kills it nor launches another; the new bitrate follows its
+// start.
+func TestHelperVideoKeepsStartingHelper(t *testing.T) {
+	clock := testClock()
+	var mu sync.Mutex
+	hold := false // the next start is answered by the test
+	fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		mu.Lock()
+		h := hold
+		mu.Unlock()
+		if !h {
+			f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60,
+				Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless"})
+		}
+	})
+	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock})
+	defer v.Stop()
+	p := helperParams()
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	f1 := fh.nextStarted()
+	f1.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_000_000)})
+	nextEvent(t, v)
+	nextEvent(t, v)
+	mu.Lock()
+	hold = true
+	mu.Unlock()
+	f1.Send(encoder.HelperError{Code: "encode_failed", Text: "test", Fatal: true})
+	if ev := nextEvent(t, v); ev.Err == nil || !ev.Restarted {
+		t.Fatalf("failure %+v", ev)
+	}
+	f2 := fh.nextStarted() // asked to start, not answered yet
+	if c := v.Capabilities(); c.ForceIDR {
+		t.Fatalf("capabilities of a starting helper %+v", c)
+	}
+	// What the session does for a key frame request now (no ForceIDR): an
+	// urgent Start with the same parameters. Then a bitrate change.
+	if err := v.Start(p, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.SetRate(12000, 0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-f2.Exited():
+		t.Fatal("the starting helper was killed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if n := fh.launched(); n != 2 {
+		t.Fatalf("%d helpers launched, want 2", n)
+	}
+	f2.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+		LiveBitrate: "seamless"})
+	if m := expectMsg(t, f2, "setRate"); m["kbps"] != float64(12000) {
+		t.Fatalf("setRate after the start %v", m)
+	}
+	f2.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 2_000_000)})
+	if c := nextEvent(t, v).Config; c == nil || c.Gen != 2 || c.BitrateKbps != 12000 {
+		t.Fatalf("config %+v", c)
+	}
+}
+
+// A frame rate change in place (a settings change): the helper gets setRate
+// with the fps, the live generation's change is announced (RateChange) before
+// its next frame, and later configs (a forced key frame's generation) carry
+// the new frame rate.
+func TestHelperVideoRateInPlace(t *testing.T) {
+	clock := testClock()
+	fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+			LiveBitrate: "seamless"})
+	})
+	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock})
+	defer v.Stop()
+	p := helperParams()
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	f := fh.nextStarted()
+	f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_000_000)})
+	if c := nextEvent(t, v).Config; c == nil || c.FPS != 60 {
+		t.Fatalf("config %+v", c)
+	}
+	nextEvent(t, v)
+	p.FPS = 120
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	if m := expectMsg(t, f, "setRate"); m["fps"] != float64(120) || m["kbps"] != float64(20000) || fh.launched() != 1 {
+		t.Fatalf("setRate %v (%d helpers)", m, fh.launched())
+	}
+	f.Publish(&encoder.Frame{FrameID: 2, LTRSlot: -1, Data: h264P, CaptureQPC: qpcAt(clock, 1_016_000)})
+	if r := nextEvent(t, v).Rate; r == nil || r.Gen != 1 || r.FPS != 120 || r.Kbps != 20000 {
+		t.Fatalf("rate change %+v", r)
+	}
+	if fr := nextEvent(t, v).Frame; fr == nil || fr.Seq != 1 {
+		t.Fatalf("frame %+v", fr)
+	}
+	f.Publish(&encoder.Frame{FrameID: 3, LTRSlot: -1, Data: h264P, CaptureQPC: qpcAt(clock, 1_024_000)})
+	if fr := nextEvent(t, v).Frame; fr == nil || fr.Seq != 2 {
+		t.Fatalf("frame after the announcement %+v (announced once)", fr)
+	}
+	if err := v.ForceKeyframe(); err != nil {
+		t.Fatal(err)
+	}
+	f.Publish(&encoder.Frame{FrameID: 4, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_032_000)})
+	if c := nextEvent(t, v).Config; c == nil || c.Gen != 2 || c.FPS != 120 {
+		t.Fatalf("config after the in-place fps change %+v", c)
+	}
+}
+
+// Replacements back off: the first at once, the next RestartBackoff later
+// per failure since a helper last went live. After a device_lost, helpers
+// that fail before going live within ResetGrace do not count toward giving
+// up (a driver reset takes seconds); once one goes live the counting is back.
+func TestHelperVideoBackoff(t *testing.T) {
+	clock := testClock()
+	var mu sync.Mutex
+	refuse := 0 // starts to refuse
+	var starts []time.Time
+	fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		r := refuse > 0
+		if r {
+			refuse--
+		}
+		mu.Unlock()
+		if r {
+			f.Send(encoder.HelperError{Code: "init_failed", Text: "D3D11CreateDevice: DXGI_ERROR_DEVICE_REMOVED", Re: "start"})
+			return
+		}
+		f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000})
+		f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key})
+	})
+	const backoff = 150 * time.Millisecond
+	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock, RestartBackoff: backoff, ResetGrace: 5 * time.Second})
+	defer v.Stop()
+	if err := v.Start(helperParams(), false); err != nil {
+		t.Fatal(err)
+	}
+	f1 := fh.nextStarted()
+	if c := nextEvent(t, v).Config; c == nil {
+		t.Fatal("no config")
+	}
+	nextEvent(t, v)
+
+	// A driver reset: the live helper reports device_lost, three replacements
+	// in a row refuse to start (more than GiveUp), the fourth streams.
+	mu.Lock()
+	refuse = 3
+	mu.Unlock()
+	lost := time.Now()
+	f1.Send(encoder.HelperError{Code: "device_lost", Text: "TDR (test)", Fatal: true})
+	for i := 0; i < 4; i++ {
+		ev := nextEvent(t, v)
+		if ev.Err == nil || !ev.Restarted || ev.Fallback {
+			t.Fatalf("failure %d: %+v, want a restart", i+1, ev)
+		}
+	}
+	if c := nextEvent(t, v).Config; c == nil || c.Gen != 2 {
+		t.Fatalf("config after the reset %+v", c)
+	}
+	// Starts: f1, then the replacements: at once, and 1, 2, 3 backoffs after
+	// the previous one.
+	mu.Lock()
+	gaps := []time.Duration{starts[1].Sub(lost)}
+	for i := 2; i < len(starts); i++ {
+		gaps = append(gaps, starts[i].Sub(starts[i-1]))
+	}
+	mu.Unlock()
+	if len(gaps) != 4 || gaps[0] > backoff/2 {
+		t.Fatalf("starts after the failure %v, the first at once", gaps)
+	}
+	for i, g := range gaps[1:] {
+		if g < time.Duration(i+1)*backoff {
+			t.Fatalf("restart %d came %v after the previous one, want >= %v (%v)", i+2, g, time.Duration(i+1)*backoff, gaps)
+		}
+	}
+
+	// Live again: a refused start counts again. With the device_lost, the
+	// third failure within the window gives up.
+	mu.Lock()
+	refuse = 1
+	mu.Unlock()
+	fh.mu.Lock()
+	f5 := fh.fakes[len(fh.fakes)-1]
+	fh.mu.Unlock()
+	nextEvent(t, v) // its first frame
+	f5.Send(encoder.HelperError{Code: "encode_failed", Text: "test", Fatal: true})
+	if ev := nextEvent(t, v); ev.Err == nil || !ev.Restarted {
+		t.Fatalf("failure after the reset %+v", ev)
+	}
+	if ev := nextEvent(t, v); ev.Err == nil || !ev.Fallback {
+		t.Fatalf("refused start after the reset %+v, want the fallback (device_lost + 2)", ev)
 	}
 }
 

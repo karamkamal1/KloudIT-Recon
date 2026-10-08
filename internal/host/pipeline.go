@@ -205,9 +205,12 @@ func (s *Session) helperBlocker(prefs proto.Prefs, drawCursor bool, c *encoder.C
 // helperSource points p (from sessionParams) at what the native helper
 // captures for monitor mon: a window (WGC) when the client asks for one, AMD
 // Direct Capture or WGC when the host config asks for them, the helper's
-// synthetic GPU source with the frame barcode for the test pattern, else DDA;
-// at the client's size, since the helper scales any capture (FFmpeg needs
-// gfxcapture to scale).
+// synthetic GPU source with the frame barcode for the test pattern, else DDA.
+// A monitor is scaled to the largest even size within the client's that has
+// the monitor's aspect ratio (the helper scales any capture, FFmpeg needs
+// gfxcapture to scale; the helper stretches the source to the size it is
+// given, gfxcapture's scale_aspect letterboxes); a window is encoded at its
+// own size, whose aspect ratio is not known here.
 func (s *Session) helperSource(p *media.Params, prefs proto.Prefs, mon platform.Monitor) {
 	if p.Source.Backend == "test" {
 		p.Barcode = true // the helper draws it (GUIDE 0.2's format)
@@ -225,10 +228,17 @@ func (s *Session) helperSource(p *media.Params, prefs proto.Prefs, mon platform.
 	switch {
 	case prefs.Window != "":
 		src = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window, NativeW: mon.W, NativeH: mon.H}
+		w, h = 0, 0
 	case s.a.cfg.Capture == "gfxcapture":
 		src.Backend = "gfxcapture"
 	case s.a.cfg.Capture == "amf":
 		src.Backend = "amf"
+	}
+	if w > 0 && h > 0 && mon.W > 0 && mon.H > 0 {
+		w, h = media.FitAspect(w, h, mon.W, mon.H)
+	}
+	if w&^1 == 0 || h&^1 == 0 {
+		w, h = 0, 0 // 0 x 0: the capture size (one 0 would keep that dimension only)
 	}
 	p.Source = src
 	p.Width, p.Height = w&^1, h&^1

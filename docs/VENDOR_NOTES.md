@@ -2931,6 +2931,44 @@ Verified in the sandbox (Linux, no GPU, no Windows):
   overlay's new rows (game present→capture, capture→encoder, encode) appear only for frames
   with the helper's tags 1 and 3, which the FFmpeg path never sends.
 
+Review fixes (verified in the sandbox: `go test -race`, and under Wine `make helper-test`, where
+the first restart still starts at once: 742-757 ms cold, 184-198 ms with the spare, two runs):
+- A `resized` capture change to another size than the helper started with (`started`
+  `captureWidth`/`captureHeight`) marks it; the next `Start` starts a new one even with the
+  same parameters (a stream at the native size has width/height 0, so the parameters do not
+  change). `TestHelperVideoResize` (a 180° turn, same size: no new helper; 90°: a new one);
+  `TestSessionOnHelper`: three `resized` events 50 ms
+  apart give one `restarting video reason="capture resized"` 300 ms after the last and one
+  new helper, which takes over as the next generation.
+- The helper stretches its source to the requested size, so the session fits the client's
+  size to the monitor's aspect ratio (`media.FitAspect`, the arithmetic of FFmpeg's
+  `force_original_aspect_ratio=decrease`, also used for x11grab) and encodes a window at its
+  own size. `TestHelperSource`: 3440x1440 with 1920x1080 → 1920x804, 2560x1440 with 1920x1200
+  → 1920x1080, portrait 1080x1920 with 1920x1080 → 608x1080, never upscaled.
+- A `Start` of the same stream keeps a helper that is still starting (urgent: the first frame
+  is a key frame anyway; a new bitrate goes into the start or a `setRate` right after
+  `started`), so a key frame request or a bitrate change while a replacement starts no longer
+  kills it for a cold launch. `TestHelperVideoKeepsStartingHelper`; `TestSessionOnHelper`
+  (a key frame request while the replacement starts: no other helper, it streams).
+- In-place bitrate / frame rate changes (rate controller or settings) go out as
+  `VideoEvent.Rate` before the live generation's next frame, and the session sends
+  `{"t":"rate","gen","bitrate","fps","maxBitrate"}` (no longer for a change that only reached
+  a starting helper); the worker updates its config's fps (gap timeout, buffer limit), and
+  later configs carry the frame rate as last set. `TestHelperVideoRateInPlace`,
+  `TestHelperVideoRestart`, `TestSessionOnHelper` (`"fps":30` in the rate message).
+- Restart back-off: the first replacement since a helper last went live starts at once, each
+  further one 300 ms later than the previous (at most 1.5 s); after `device_lost`, helpers
+  that fail before going live within 3 s do not count toward the three failures.
+  `TestHelperVideoBackoff` (device_lost then three refused starts: no fallback, starts at 0,
+  +150, +300, +450 ms with a 150 ms test back-off, then live; afterwards two more failures
+  give up), `TestHelperVideoFailures` unchanged.
+- The cursor loop reads whether the video shows the pointer from an atomic set on each
+  generation's config (`VideoEvent.CursorInVideo`), no longer from the pipeline under its lock
+  (FFmpeg's is held across CreateProcess).
+- Browser E2E (FFmpeg path, `node --check` on the changed scripts): 73 of 73 checks passed; the
+  `rate` message with `fps` only comes from the helper, so the worker's new handling is covered
+  by the Go session test's message and the hardware check below.
+
 Hardware checks (host.json `"pipeline": "auto"`, recon-encoder.exe installed next to
 recon-host.exe by `install-host.ps1`):
 - AMD RDNA3 (RX 7900 XT): unverified. Test (selection): start a session from Chrome with
@@ -2956,13 +2994,20 @@ recon-host.exe by `install-host.ps1`):
   recon-encoder.exe in Task Manager (the active one: Process Explorer shows two, the newer one
   idle is the spare): host.log `encoder helper failed, restarting it` then `encoder ready ...
   restart=true startup=<ms>`; startup below 300 ms (sandbox: 175-191 ms under Wine). Also a driver
-  reset (Win+Ctrl+Shift+B): `device_lost`, the same restart, the picture back within a second.
+  reset (Win+Ctrl+Shift+B), three times a minute apart: `encoder helper failed, restarting it
+  err="... (device_lost) ..." live=true failures=1 counted=true retry_in=0s`; replacements that
+  fail while the driver resets log `counted=false` with `retry_in` 300 ms, 600 ms, ...; then
+  `encoder ready ... restart=true` and the picture is back within ~3 s; never `giving up` (each
+  reset counts once). Note the number of `counted=false` lines per reset here: if a reset
+  regularly outlasts the 3 s grace, raise `HelperOptions.ResetGrace` (media/helper.go).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (fallback to FFmpeg): rename recon-encoder.exe while
   a stream runs and kill the running helpers three times within a minute (the spare too):
   host.log `native encoder helper gave up, streaming with FFmpeg for the rest of the session`
   and `video pipeline pipeline=ffmpeg was=helper`; the browser shows the notice and the stream
   continues on hevc_amf (FFmpeg) with a higher generation number; the next session starts on
-  FFmpeg with `reason="recon-encoder.exe is not installed ..."` (rename it back afterwards).
+  FFmpeg with `reason="it did not start: ..."` (the agent looks for recon-encoder.exe once, at
+  start: `recon-encoder.exe is not installed ...` only after an agent restart; rename it back
+  afterwards).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (barcode and AV1 crop on the helper): host.json
   `"capture": "test", "pipeline": "helper"`: the helper streams its synthetic GPU source with
   the frame barcode, the welcome lists `barcode-seq` and the overlay's `Frame barcode (seq)`
@@ -2970,12 +3015,22 @@ recon-host.exe by `install-host.ps1`):
   `"encoder": "av1_amf_helper"`): host.log `coded picture is padded, client crops ...
   coded=1920x1088 crop_bottom=8`, the overlay's Video row says `(coded 1920×1088, cropped)` and
   no grey rows show at the bottom.
-- AMD RDNA3 (RX 7900 XT): unverified. Test (capture changes): change the desktop resolution
-  during a stream: `capture changed reason=resized` then `restarting video reason="capture
-  resized"`, the stream continues at the new native size with the cursor mapped correctly;
-  press Win+L: a notice "Screen capture is paused (...)" and the last picture stays until
-  unlock.
-- NVIDIA: unverified (no NVIDIA host available). Test: the same seven checks on an RTX host;
+- AMD RDNA3 (RX 7900 XT): unverified. Test (capture changes): at the default resolution
+  (`native`) change the desktop resolution during a stream, then rotate the display to portrait
+  and back: each time `capture changed reason=resized`, ~300 ms later `restarting video
+  reason="capture resized"` and a new `encoder helper started ... size=<new size>` (e.g.
+  1440x2560 in portrait), `encoder ready ... gen=<n+1>`; the picture is not squeezed, the
+  cursor maps correctly. With `"capture": "gfxcapture"` and a window (Settings → window):
+  drag-resize it for a few seconds: one restart after the drag ends, not one per frame. Press
+  Win+L: a notice "Screen capture is paused (...)" and the last picture stays until unlock.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (client size and frame rate): on a 3440x1440 (or
+  any non-16:9) monitor choose the 1920x1080 preset: `encoder helper started ...
+  size=1920x804`, the picture not stretched (FFmpeg would letterbox 1920x1080 with gfxcapture);
+  then change the frame rate in Settings 60 → 120 (a 120 Hz monitor): no new `encoder helper
+  started`, in the browser console `__recon.videoCfg.fps` is 120 (from the `rate` message) and
+  the overlay's `Frame rate` row reaches ~120; force a key frame (as above): the new
+  generation's config still says 120.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same eight checks on an RTX host;
   expect `backend=nvenc vendor=nvidia`, `gpu_priority=high` with HAGS on (`realtime` with HAGS
   off), `ltr_slots=0` (NVENC recovers by invalidation: `Capabilities` `invalidate`), forced key
   frames and live bitrate without restarts, the restart below 300 ms, the fallback to FFmpeg

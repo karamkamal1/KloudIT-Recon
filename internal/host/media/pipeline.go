@@ -99,10 +99,19 @@ type LostFrames struct {
 	Why   string
 }
 
+// RateChange: the encoder of generation Gen now runs at Kbps and FPS, changed
+// in place (HelperVideo: a live setRate), so the generation's VideoConfig is
+// out of date.
+type RateChange struct {
+	Gen       uint8
+	Kbps, FPS int
+}
+
 // CaptureChange is a change of the capture source (HelperVideo): Reason
 // "resized" (new size or rotation: the stream keeps its size, scaled, until
-// restarted), "lost" (capture is impossible for now, the last image is
-// repeated) or "restored".
+// restarted; the next Start starts a new helper even with the same Params),
+// "lost" (capture is impossible for now, the last image is repeated) or
+// "restored".
 type CaptureChange struct {
 	Reason        string
 	Width, Height int

@@ -704,12 +704,7 @@ func (p Params) OutputSize() (w, h int) {
 	case "x11grab":
 		w, h = p.Source.NativeW, p.Source.NativeH
 		if p.Width > 0 && p.Height > 0 && w > 0 && h > 0 {
-			// scale=W:H:force_original_aspect_ratio=decrease:force_divisible_by=2,
-			// as libavfilter/scale_eval.c computes it (av_rescale rounds to
-			// the nearest multiple of 2, then down).
-			rescale := func(a, b, c int) int { return (a*b + c/2) / c }
-			fw, fh := min(p.Width, rescale(p.Height, w, h*2)*2), min(p.Height, rescale(p.Width, h, w*2)*2)
-			return fw &^ 1, fh &^ 1
+			return FitAspect(p.Width, p.Height, w, h)
 		}
 		return w, h
 	case "gfxcapture":
@@ -721,6 +716,17 @@ func (p Params) OutputSize() (w, h int) {
 		}
 	}
 	return p.Source.NativeW, p.Source.NativeH
+}
+
+// FitAspect returns the largest even size within boxW x boxH with the aspect
+// ratio of srcW x srcH (all > 0): FFmpeg's
+// scale=W:H:force_original_aspect_ratio=decrease:force_divisible_by=2, as
+// libavfilter/scale_eval.c computes it (av_rescale rounds to the nearest
+// multiple of 2, then down).
+func FitAspect(boxW, boxH, srcW, srcH int) (w, h int) {
+	rescale := func(a, b, c int) int { return (a*b + c/2) / c }
+	w, h = min(boxW, rescale(boxH, srcW, srcH*2)*2), min(boxH, rescale(boxW, srcH, srcW*2)*2)
+	return w &^ 1, h &^ 1
 }
 
 // CanCaptureAMF reports why AMD Direct Capture (Source.Backend "amf") cannot
