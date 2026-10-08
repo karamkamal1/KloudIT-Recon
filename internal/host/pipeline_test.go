@@ -217,12 +217,18 @@ func TestOpenPipeline(t *testing.T) {
 // starts the stream with the live-bitrate mode it chose for the codec and rate
 // control: flush where seamless failed (bitrate changes then keep the full
 // period between them), seamless where it passed (changes may come every
-// 2 s); results of another GPU are not used; without a file the helper's
-// defaults apply.
+// 2 s); results of another GPU, or measured with another quality preset than
+// the session's, are not used; without a file the helper's defaults apply.
 func TestSessionLiveBitrateQualified(t *testing.T) {
+	// Run as the session starts H.264 here: no preset (the helper's
+	// default, speed), two LTR slots (recovery ltr).
 	cells := func(seamless string) []qualify.Cell {
-		return []qualify.Cell{{Codec: "h264", RC: "cbr", LiveBitrate: "seamless", Verdict: seamless},
-			{Codec: "h264", RC: "cbr", LiveBitrate: "flush", Verdict: "pass"}}
+		return []qualify.Cell{{Codec: "h264", Quality: "speed", LTRSlots: 2, RC: "cbr", LiveBitrate: "seamless", Verdict: seamless},
+			{Codec: "h264", Quality: "speed", LTRSlots: 2, RC: "cbr", LiveBitrate: "flush", Verdict: "pass"}}
+	}
+	balanced := cells("pass")
+	for i := range balanced {
+		balanced[i].Quality = "balanced"
 	}
 	for _, c := range []struct {
 		name     string
@@ -232,9 +238,11 @@ func TestSessionLiveBitrateQualified(t *testing.T) {
 		gap      time.Duration
 	}{
 		{"flush", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
-			Cells: cells("fail")}, "flush", "choice=\"h264: adaptive cbr/flush, fixed vbr/\"", 0},
+			Cells: cells("fail")}, "flush", "choice=\"h264 speed: adaptive cbr/flush, fixed vbr/-\"", 0},
 		{"seamless", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
-			Cells: cells("pass")}, "seamless", "h264: adaptive cbr/seamless", rateSeamlessGap},
+			Cells: cells("pass")}, "seamless", "h264 speed: adaptive cbr/seamless", rateSeamlessGap},
+		{"other preset", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
+			Cells: balanced}, nil, "h264 balanced: adaptive cbr/seamless", 0},
 		{"other GPU", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 6800",
 			Cells: cells("fail")}, nil, "live-bitrate qualification not used", 0},
 		{"none", nil, nil, "no live-bitrate qualification", 0},

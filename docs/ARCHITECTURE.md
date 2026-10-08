@@ -279,13 +279,14 @@ own size).
 
 **Live bitrate.** How the helper's encoder may change its bitrate is measured once per GPU by
 `recon-host qualify` (GUIDE 3.6, `internal/host/qualify`; docs/HELPER_PROTOCOL.md
-"Live-bitrate qualification"): per codec, rate-control mode and live-bitrate mode, a 60 s
-high-motion run stepping 50 -> 20 -> 50 Mbit/s every 2 s, judged on key frames at the changes,
+"Live-bitrate qualification"): per codec, quality preset, rate-control mode and live-bitrate
+mode, a 60 s high-motion run, started as a session starts it (preset, LTR slots), stepping
+50 -> 20 -> 50 Mbit/s every 2 s, judged on key frames at the changes,
 P-frame sizes at the new target within 3 frames, frame-id and barcode gaps and a clean decode.
 The results (`live-bitrate.json` next to host.json) are read when a session opens the helper:
-it starts each stream with `seamless` where that passed, else `flush`, else a new helper per
-bitrate change, and adaptive-bitrate streams with the rate-control mode that changed seamlessly
-(CBR first). The rate controller then lets bitrate changes on a qualified seamless encoder come
+it starts each stream (cells of its codec, preset and LTR slots only) with `seamless` where that
+passed, else `flush`, else a new helper per bitrate change where `seamless` failed, and
+adaptive-bitrate streams with the rate-control mode that changed seamlessly (CBR first). The rate controller then lets bitrate changes on a qualified seamless encoder come
 every 2 s, others keep 10 s between changes (a flush costs a key frame). Without results the
 helper's caps defaults apply.
 

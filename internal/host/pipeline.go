@@ -133,8 +133,8 @@ func (s *Session) openPipeline() (notice string) {
 	s.video = media.NewHelperVideo(media.HelperOptions{
 		Launch: func() (*encoder.Helper, error) { return s.a.launchHelper(s.log) },
 		First:  h, Log: s.log, Clock: s.a.hostClock, KeepSpare: true,
-		LiveBitrate: func(c encoder.Caps, codec string, adaptive bool) (string, string, bool) {
-			return lb.Choose(c, codec, adaptive)
+		LiveBitrate: func(c encoder.Caps, sp encoder.StartParams, adaptive bool) (string, string, bool) {
+			return lb.Choose(c, sp, adaptive)
 		},
 	})
 	s.log.Info("video pipeline", "pipeline", media.PipelineHelper, "config", mode, "backend", c.Backend, "vendor", c.Vendor,
@@ -166,15 +166,8 @@ func (a *Agent) liveBitrateResults(log *slog.Logger, c encoder.Caps) *qualify.Re
 		log.Warn("live-bitrate qualification not used", "file", path, "reason", why)
 		return nil
 	}
-	var parts []string
-	choices := r.Choices()
-	for _, codec := range []string{"hevc", "av1", "h264"} {
-		if ch, ok := choices[codec]; ok {
-			parts = append(parts, fmt.Sprintf("%s: adaptive %s/%s, fixed vbr/%s", codec, ch.AdaptiveRC, ch.Adaptive, ch.Fixed))
-		}
-	}
 	log.Info("live-bitrate qualification", "file", path, "measured", r.Time.Format(time.RFC3339), "adapter", r.AdapterName,
-		"choice", strings.Join(parts, "; "))
+		"choice", strings.Join(r.ChoiceLines(), "; "))
 	return r
 }
 

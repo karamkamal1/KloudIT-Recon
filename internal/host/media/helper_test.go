@@ -627,9 +627,9 @@ func TestHelperVideoLiveBitrateQualified(t *testing.T) {
 			var asked []string
 			var mu sync.Mutex
 			v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock,
-				LiveBitrate: func(caps encoder.Caps, codec string, adaptive bool) (string, string, bool) {
+				LiveBitrate: func(caps encoder.Caps, sp encoder.StartParams, adaptive bool) (string, string, bool) {
 					mu.Lock()
-					asked = append(asked, fmt.Sprintf("%s %s %v", caps.AdapterName, codec, adaptive))
+					asked = append(asked, fmt.Sprintf("%s %s %s ltr %d %v", caps.AdapterName, sp.Codec, sp.Quality, sp.LTRSlots, adaptive))
 					mu.Unlock()
 					return c.choice.rc, c.choice.mode, c.choice.ok
 				}})
@@ -665,7 +665,9 @@ func TestHelperVideoLiveBitrateQualified(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if asked[0] != "AMD Radeon RX 7900 XT h264 true" {
+			// The qualification is asked about the stream as it starts:
+			// codec, quality preset, two LTR slots (recovery ltr).
+			if asked[0] != "AMD Radeon RX 7900 XT h264 speed ltr 2 true" {
 				t.Fatalf("asked %q", asked)
 			}
 		})
@@ -677,7 +679,7 @@ func TestHelperVideoLiveBitrateQualified(t *testing.T) {
 			Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless", RateControl: m["rc"].(string)})
 	})
 	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock,
-		LiveBitrate: func(_ encoder.Caps, _ string, adaptive bool) (string, string, bool) {
+		LiveBitrate: func(_ encoder.Caps, _ encoder.StartParams, adaptive bool) (string, string, bool) {
 			if adaptive {
 				return "cbr", "seamless", true
 			}

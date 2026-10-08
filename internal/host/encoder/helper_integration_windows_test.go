@@ -912,10 +912,25 @@ func TestHelperIntegrationMotionSource(t *testing.T) {
 	for time.Now().Before(deadline) {
 		frames = append(frames, nextFrame(t, h))
 	}
+	// The motion source presents all the time (the plain one pauses 0.6 s in
+	// every 1.6 s). A starved capture thread may still miss a present now and
+	// then (an idle repeat 100 ms later), so a few repeats are fine, a pause
+	// is not.
+	repeats, last, longest := 0, int64(0), int64(0)
 	for _, f := range frames {
 		if f.Repeat {
-			t.Fatalf("frame %d is an idle repeat: the motion source must present all the time", f.FrameID)
+			repeats++
 		}
+		if f.PresentQPC > last {
+			if last > 0 {
+				longest = max(longest, f.PresentQPC-last)
+			}
+			last = f.PresentQPC
+		}
+	}
+	if repeats*20 > len(frames) || longest > h.QPCFrequency()*4/10 {
+		t.Fatalf("%d idle repeats in %d frames, %d ms at most between presents: the motion source must present all the time",
+			repeats, len(frames), longest*1000/h.QPCFrequency())
 	}
 	if n := maxPerSecond(frames, h.QPCFrequency()); n > fps+2 || n < fps*8/10 {
 		t.Fatalf("%d frames in one second at %d fps", n, fps)

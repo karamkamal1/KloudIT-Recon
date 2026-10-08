@@ -27,6 +27,8 @@ func qualifyCmd(cfg *host.Config, cfgPath string, args []string) int {
 	helper := fs.String("helper", filepath.Join(filepath.Dir(exe), "recon-encoder.exe"), "the native encoder helper")
 	fs.StringVar(&o.Backend, "backend", "auto", "encoder backend: auto | amf | nvenc | mock")
 	codecs := fs.String("codecs", "", "codecs to qualify, comma separated (default: every codec of the helper's encoder)")
+	qualities := fs.String("quality", strings.Join(qualify.Qualities, ","), "encoder quality presets (the client's preset setting); "+
+		"sessions with a preset not qualified get the helper's defaults")
 	rcs := fs.String("rc", "", "rate-control modes: cbr, vbr (AMF LATENCY_CONSTRAINED_VBR), vbr_peak (AMF PEAK_CONSTRAINED_VBR); default AMF all three, NVENC cbr")
 	modes := fs.String("modes", "seamless,flush", "live-bitrate modes")
 	fs.StringVar(&o.Capture, "capture", "", "source: synthetic-gpu (default, high motion) | dda | amd-direct (with a high-motion game or video on the monitor)")
@@ -48,11 +50,13 @@ func qualifyCmd(cfg *host.Config, cfgPath string, args []string) int {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: recon-host [-config FILE] qualify [flags]
 
-Runs one stream per codec x rate-control mode x live-bitrate mode through the native encoder
-helper, stepping the bitrate between -high and -low every -step for -duration, and checks: no
-IDR on a change (seamless; flush must make one), P-frame sizes at the new target within 3
-frames, no frame-id or barcode gaps, a stream that decodes cleanly. Sessions then use seamless
-where it passed, else flush (with less frequent changes). Stop streaming sessions first.
+Runs one stream per codec x quality preset x rate-control mode x live-bitrate mode through the
+native encoder helper, started as sessions start it (the preset, LTR slots where the codec
+recovers from them), stepping the bitrate between -high and -low every -step for -duration, and
+checks: no IDR on a change (seamless; flush must make one), P-frame sizes at the new target
+within 3 frames, no frame-id or barcode gaps, a stream that decodes cleanly. Sessions then use
+seamless where it passed, else flush (with less frequent changes), else a new encoder per
+change. Stop streaming sessions first.
 
 `)
 		fs.PrintDefaults()
@@ -66,7 +70,7 @@ where it passed, else flush (with less frequent changes). Stop streaming session
 		}
 		return strings.Split(s, ",")
 	}
-	o.Helper, o.Codecs, o.RCModes, o.Modes = *helper, split(*codecs), split(*rcs), split(*modes)
+	o.Helper, o.Codecs, o.Qualities, o.RCModes, o.Modes = *helper, split(*codecs), split(*qualities), split(*rcs), split(*modes)
 	o.HelperArgs = strings.Fields(*helperArgs)
 	if _, err := os.Stat(o.Helper); err != nil {
 		fmt.Fprintln(os.Stderr, "error: the native encoder helper:", err)

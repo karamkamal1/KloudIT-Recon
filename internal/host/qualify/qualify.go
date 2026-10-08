@@ -1,13 +1,15 @@
 // Package qualify is the live-bitrate qualification of the native encoder
-// helper (GUIDE 3.6, `recon-host qualify`): for every codec x rate-control
-// mode x live-bitrate mode (seamless, flush) of the helper's encoder it runs
-// one stream on a high-motion source with the bitrate stepping between a high
-// and a low target every 2 s for 60 s, and judges whether the encoder follows
-// without an IDR (seamless), within 3 frames, with no frame-id or barcode gaps
-// and a stream that decodes cleanly. The results go to live-bitrate.json next
-// to host.json; sessions read it to pick the live-bitrate mode per codec and
-// rate-control mode (Results.Choose): seamless where it passed, else flush
-// (with less frequent rate changes), else a new helper per change.
+// helper (GUIDE 3.6, `recon-host qualify`): for every codec x quality preset x
+// rate-control mode x live-bitrate mode (seamless, flush) of the helper's
+// encoder it runs one stream, started as a session starts it (the preset, the
+// LTR slots of encoder.Caps.LTRSlots), on a high-motion source with the
+// bitrate stepping between a high and a low target every 2 s for 60 s, and
+// judges whether the encoder follows without an IDR (seamless), within 3
+// frames, with no frame-id or barcode gaps and a stream that decodes cleanly.
+// The results go to live-bitrate.json next to host.json; sessions read it to
+// pick the live-bitrate mode per codec, preset and rate-control mode
+// (Results.Choose): seamless where it passed, else flush (with less frequent
+// rate changes), else a new helper per change.
 //
 // Each run is the helper's encode test (recon-encoder.exe --encode-test,
 // docs/HELPER_PROTOCOL.md) with --rate-schedule, which sets each new rate on
@@ -18,6 +20,7 @@
 package qualify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -48,9 +51,12 @@ type Options struct {
 	// checks (noted in every cell).
 	FFmpeg string
 
-	Codecs  []string // default: every codec of the helper's caps
-	RCModes []string // default: amf cbr, vbr, vbr_peak; nvenc and others cbr
-	Modes   []string // default: seamless, flush
+	Codecs []string // default: every codec of the helper's caps
+	// Qualities: start's quality presets (default Qualities: every preset
+	// a session may ask for; Choose uses only the presets measured).
+	Qualities []string
+	RCModes   []string // default: amf cbr, vbr, vbr_peak; nvenc and others cbr
+	Modes     []string // default: seamless, flush
 
 	// Capture: synthetic-gpu (the default; its high-motion mode) | dda |
 	// amd-direct | synthetic (the mock backend's default: its canned
@@ -103,6 +109,9 @@ func (o *Options) defaults() {
 	}
 	if o.Duration <= 0 {
 		o.Duration = 60 * time.Second
+	}
+	if len(o.Qualities) == 0 {
+		o.Qualities = Qualities
 	}
 	if len(o.Modes) == 0 {
 		o.Modes = []string{ModeSeamless, ModeFlush}
@@ -230,33 +239,40 @@ func Run(ctx context.Context, o Options) (*Results, error) {
 		barcodeSkip = decodeSkip
 	}
 
-	total := len(codecs) * len(rcs) * len(o.Modes)
+	total := len(codecs) * len(o.Qualities) * len(rcs) * len(o.Modes)
 	fmt.Fprintf(o.Out, "qualifying %s on %s (%s): %d runs of %.0f s, logs in %s\n", caps.Backend, caps.AdapterName, caps.Vendor, total,
 		float64(frames)/float64(o.FPS), dir)
 	n := 0
 	for _, codec := range codecs {
-		for _, rc := range rcs {
-			for _, mode := range o.Modes {
-				n++
-				if err := ctx.Err(); err != nil {
-					return nil, err
+		for _, quality := range o.Qualities {
+			for _, rc := range rcs {
+				for _, mode := range o.Modes {
+					n++
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					// Started as a session starts this codec: its preset and
+					// LTR slots (encoder.Caps.LTRSlots, as media.HelperVideo).
+					c := Cell{Codec: codec, Quality: quality, LTRSlots: caps.LTRSlots(codec), RC: rc, LiveBitrate: mode}
+					if _, ok := caps.Codecs[codec]; !ok {
+						c.Verdict = VerdictError
+						c.Failures = []string{"the helper's encoder has no " + codec + " (" + caps.Unavailable[caps.Backend+"-"+codec] + ")"}
+					} else {
+						runCell(ctx, o, cellRun{dir: dir, backend: caps.Backend, capture: capture, motion: motion, barcode: barcode,
+							mock: mock, frames: frames, step: step, decodeSkip: decodeSkip, barcodeSkip: barcodeSkip}, &c)
+					}
+					fmt.Fprintf(o.Out, "[%d/%d] %s %s %s %s: %s", n, total, codec, quality, rc, mode, strings.ToUpper(c.Verdict))
+					if len(c.Failures) > 0 {
+						fmt.Fprintf(o.Out, " (%s)", strings.Join(c.Failures, "; "))
+					}
+					fmt.Fprintln(o.Out)
+					r.Cells = append(r.Cells, c)
 				}
-				c := Cell{Codec: codec, RC: rc, LiveBitrate: mode}
-				if _, ok := caps.Codecs[codec]; !ok {
-					c.Verdict = VerdictError
-					c.Failures = []string{"the helper's encoder has no " + codec + " (" + caps.Unavailable[caps.Backend+"-"+codec] + ")"}
-				} else {
-					runCell(ctx, o, cellRun{dir: dir, backend: caps.Backend, capture: capture, motion: motion, barcode: barcode,
-						mock: mock, frames: frames, step: step, decodeSkip: decodeSkip, barcodeSkip: barcodeSkip}, &c)
-				}
-				fmt.Fprintf(o.Out, "[%d/%d] %s %s %s: %s", n, total, codec, rc, mode, strings.ToUpper(c.Verdict))
-				if len(c.Failures) > 0 {
-					fmt.Fprintf(o.Out, " (%s)", strings.Join(c.Failures, "; "))
-				}
-				fmt.Fprintln(o.Out)
-				r.Cells = append(r.Cells, c)
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // the last run was cut short: not a verdict
 	}
 	sortCells(r.Cells)
 	for _, c := range r.Cells {
@@ -276,19 +292,18 @@ type cellRun struct {
 	decodeSkip, barcodeSkip string
 }
 
-// runCell runs one encode test and judges it.
-func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
-	name := fmt.Sprintf("%s-%s-%s", c.Codec, c.RC, c.LiveBitrate)
-	ext := map[string]string{"h264": ".h264", "hevc": ".hevc", "av1": ".ivf"}[c.Codec]
-	stream := filepath.Join(cr.dir, name+ext)
-	frameLog := filepath.Join(cr.dir, name+".jsonl")
-	logPath := filepath.Join(cr.dir, name+".log")
-	c.Log = logPath
-	_ = os.Remove(frameLog)
+// cellArgs returns the encode test's arguments for a cell: its stream
+// started like a session's (codec, quality preset, LTR slots, whose frames the
+// encode test acknowledges after --ack-delay frames), rc and live-bitrate
+// mode, with the rate schedule.
+func cellArgs(o Options, cr cellRun, c *Cell, stream, frameLog string) []string {
 	args := []string{"--encode-test=" + stream, "--frame-log=" + frameLog, "--backend=" + cr.backend, "--codec=" + c.Codec,
-		"--capture=" + cr.capture, "--fps=" + fmt.Sprint(o.FPS), "--kbps=" + fmt.Sprint(o.HighKbps), "--rc=" + c.RC,
-		"--live-bitrate=" + c.LiveBitrate, "--frames=" + fmt.Sprint(cr.frames),
+		"--capture=" + cr.capture, "--fps=" + fmt.Sprint(o.FPS), "--kbps=" + fmt.Sprint(o.HighKbps), "--quality=" + c.Quality,
+		"--rc=" + c.RC, "--live-bitrate=" + c.LiveBitrate, "--frames=" + fmt.Sprint(cr.frames),
 		fmt.Sprintf("--rate-schedule=%d,%d:%d", o.LowKbps, o.HighKbps, cr.step)}
+	if c.LTRSlots > 0 {
+		args = append(args, fmt.Sprintf("--ltr-slots=%d", c.LTRSlots))
+	}
 	if o.Width > 0 && o.Height > 0 {
 		args = append(args, fmt.Sprintf("--width=%d", o.Width), fmt.Sprintf("--height=%d", o.Height))
 	}
@@ -307,7 +322,19 @@ func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
 	if cr.mock {
 		args = append(args, "--mock-follow-rate") // frame sizes that follow the rate
 	}
-	args = append(args, o.HelperArgs...)
+	return append(args, o.HelperArgs...)
+}
+
+// runCell runs one encode test and judges it.
+func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
+	name := fmt.Sprintf("%s-%s-%s-%s", c.Codec, c.Quality, c.RC, c.LiveBitrate)
+	ext := map[string]string{"h264": ".h264", "hevc": ".hevc", "av1": ".ivf"}[c.Codec]
+	stream := filepath.Join(cr.dir, name+ext)
+	frameLog := filepath.Join(cr.dir, name+".jsonl")
+	logPath := filepath.Join(cr.dir, name+".log")
+	c.Log = logPath
+	_ = os.Remove(frameLog)
+	args := cellArgs(o, cr, c, stream, frameLog)
 
 	// The encode test gives up by itself after 4 x the planned time + 15 s.
 	limit := time.Duration(cr.frames*4/max(o.FPS, 1)+60) * time.Second
@@ -325,19 +352,16 @@ func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
 
 	var ee *exec.ExitError
 	if errors.As(runErr, &ee) && ee.ExitCode() == 2 {
-		// Could not start: the encoder refused this codec / mode.
-		c.Verdict = VerdictError
-		c.Failures = []string{"the stream did not start: " + lastLine(out, "encode-test: ")}
+		startFailed(lastLine(out, "encode-test: "), c)
 		return
 	}
 	log, err := ReadRunLog(frameLog)
 	if err != nil {
-		c.Verdict = VerdictError
 		why := err.Error()
 		if runErr != nil {
 			why = runErr.Error() + ": " + lastLine(out, "")
 		}
-		c.Failures = []string{"no frame log: " + why}
+		noFrameLog(out, why, c)
 		return
 	}
 	st := log.Started
@@ -366,11 +390,40 @@ func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
 	if st.LiveBitrate != "" && st.LiveBitrate != c.LiveBitrate {
 		c.Notes = append(c.Notes, fmt.Sprintf("the encoder runs liveBitrate %s, not %s", st.LiveBitrate, c.LiveBitrate))
 	}
+	if log.HasStarted && st.LTRSlots != c.LTRSlots {
+		c.Notes = append(c.Notes, fmt.Sprintf("the encoder runs %d LTR slots, not %d", st.LTRSlots, c.LTRSlots))
+	}
 	Judge(in, c)
 	if runErr != nil && c.Verdict == VerdictPass {
 		c.Verdict = VerdictFail
 		c.Failures = append(c.Failures, "the encode test failed: "+lastLine(out, "encode-test: FAIL"))
 	}
+}
+
+// startFailed records a run whose stream did not start (the encode test's
+// exit code 2): an error, except where the encoder refuses the live-bitrate
+// mode itself (NVENC without NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE answers
+// start with unsupported "liveBitrate ..."): that mode does not work on this
+// encoder, a fail, so sessions restart rather than fall back to a default.
+func startFailed(line string, c *Cell) {
+	const failed = "encode-test: start failed: "
+	if why, ok := strings.CutPrefix(line, failed+"unsupported: "); ok && strings.HasPrefix(why, "liveBitrate ") {
+		c.Verdict, c.Failures = VerdictFail, []string{"the encoder refuses the mode: " + why}
+		return
+	}
+	c.Verdict, c.Failures = VerdictError, []string{"the stream did not start: " + line}
+}
+
+// noFrameLog records a run that left no frame log (the encode test writes it
+// at the end): a fail when its stream had started (the encode test printed
+// started), i.e. the helper crashed, hung or was killed during the run in
+// this mode; else an error (it never got that far).
+func noFrameLog(out []byte, why string, c *Cell) {
+	if bytes.Contains(out, []byte(`encode-test: {"t":"started"`)) {
+		c.Verdict, c.Failures = VerdictFail, []string{"the helper crashed or hung during the run (no frame log): " + why}
+		return
+	}
+	c.Verdict, c.Failures = VerdictError, []string{"no frame log: " + why}
 }
 
 // lastLine returns the last line of out starting with prefix (any line for "").

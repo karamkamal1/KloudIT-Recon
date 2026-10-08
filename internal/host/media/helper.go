@@ -91,10 +91,11 @@ type HelperOptions struct {
 	// encoder (recon-host qualify, GUIDE 3.6; the host passes
 	// qualify.Results.Choose): mode "seamless" or "flush" (start
 	// "liveBitrate"), or "restart" (neither passed: a new helper per
-	// change); ok false where it says nothing about this encoder, codec or
-	// mode, and the helper's defaults apply. adaptive: the session's rate
-	// controller changes the bitrate. Optional.
-	LiveBitrate func(c encoder.Caps, codec string, adaptive bool) (rc, mode string, ok bool)
+	// change); ok false where it says nothing about this encoder, codec,
+	// quality preset, LTR slots or mode, and the helper's defaults apply. sp
+	// is the start so far (codec, quality, ltrSlots); adaptive: the
+	// session's rate controller changes the bitrate. Optional.
+	LiveBitrate func(c encoder.Caps, sp encoder.StartParams, adaptive bool) (rc, mode string, ok bool)
 }
 
 // ErrHelperGaveUp is returned by Start after the pipeline gave up.
@@ -368,16 +369,14 @@ type liveChoice struct {
 // (HelperOptions.LiveBitrate; else the helper's defaults). Called with v.mu
 // held.
 func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encoder.Caps) (encoder.StartParams, liveChoice) {
-	if cc, ok := caps.Codecs[sp.Codec]; ok && cc.Recovery == "ltr" && cc.MaxLTR >= 2 {
-		sp.LTRSlots = 2
-	}
+	sp.LTRSlots = caps.LTRSlots(sp.Codec)
 	if v.zeroCopyFails >= 2 {
 		off := false
 		sp.ZeroCopy = &off
 	}
 	var lc liveChoice
 	if v.opt.LiveBitrate != nil {
-		if rc, mode, ok := v.opt.LiveBitrate(caps, sp.Codec, adaptive); ok {
+		if rc, mode, ok := v.opt.LiveBitrate(caps, sp, adaptive); ok {
 			lc.measured = true
 			if rc != "" {
 				sp.RC = rc

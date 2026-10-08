@@ -329,6 +329,6 @@ pick up the old files.
 | Proxmox node | `pct enter 210` | Shell inside the container (it has no root password) |
 | PC | `Get-Content "$env:APPDATA\KlouditRecon\host.log" -Tail 30` | Agent log |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), monitors, controllers |
-| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 30 min, no stream running); sessions use the results (`live-bitrate.json`) |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 70 min on AMD, 25 on NVIDIA; `-quality balanced` a third of that; no stream running); sessions use the results (`live-bitrate.json`) |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" pair "recon1:..."` | Re-pair. The running agent picks up the new code within seconds. |

@@ -56,14 +56,17 @@ HELPER_TEST_ENV = RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/reco
 	RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
 	$(if $(WIN_FFMPEG),RECON_FFMPEG='$(WIN_FFMPEG)')
 # WIN_FFMPEG (optional): a Windows ffmpeg.exe (Wine path, e.g. Z:\opt\ffmpeg\bin\ffmpeg.exe) for
-# the qualification tests' decode checks (internal/host/qualify).
+# the qualification tests' decode checks (internal/host/qualify). All three test binaries run
+# even when one fails; the target fails at the end, naming them.
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/media.test.exe ./internal/host/media
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/qualify.test.exe ./internal/host/qualify
-	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./encoder.test.exe -test.v -test.count=1
-	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./media.test.exe -test.v -test.count=1 -test.run 'Helper|GPUPriority|ClockFromQPC'
-	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./qualify.test.exe -test.v -test.count=1 -test.run 'Qualify'
+	cd $(DIST)/obj && failed=; \
+	$(HELPER_TEST_ENV) $(WINE) ./encoder.test.exe -test.v -test.count=1 || failed="$$failed encoder"; \
+	$(HELPER_TEST_ENV) $(WINE) ./media.test.exe -test.v -test.count=1 -test.run 'Helper|GPUPriority|ClockFromQPC' || failed="$$failed media"; \
+	$(HELPER_TEST_ENV) $(WINE) ./qualify.test.exe -test.v -test.count=1 -test.run 'Qualify' || failed="$$failed qualify"; \
+	if [ -n "$$failed" ]; then echo "helper-test: FAIL:$$failed" >&2; exit 1; fi
 
 
 # third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests

@@ -39,8 +39,9 @@ const (
 	// before the first change, so the sizes cannot show whether the encoder
 	// follows (use a higher-motion source).
 	VerdictInconclusive = "inconclusive"
-	// VerdictError: the run did not happen (the encoder refused the mode,
-	// the helper failed to start).
+	// VerdictError: the run did not happen (the helper or its encoder failed
+	// to start). An encoder that refuses the live-bitrate mode itself, and a
+	// helper that crashes or hangs after its stream started, fail instead.
 	VerdictError = "error"
 )
 
@@ -123,7 +124,11 @@ type Cell struct {
 	Codec       string `json:"codec"`
 	RC          string `json:"rc"`          // cbr | vbr | vbr_peak (start's rc)
 	LiveBitrate string `json:"liveBitrate"` // seamless | flush
-	Verdict     string `json:"verdict"`
+	// Quality / LTRSlots: the start's quality preset and LTR slots, as a
+	// session starts this codec on this encoder (Choose matches on both).
+	Quality  string `json:"quality"`
+	LTRSlots int    `json:"ltrSlots"`
+	Verdict  string `json:"verdict"`
 	// Failures say why a cell failed (or is inconclusive / an error).
 	Failures []string `json:"failures,omitempty"`
 	// Notes: checks that were skipped and why, other observations.

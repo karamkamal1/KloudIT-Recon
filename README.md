@@ -319,16 +319,19 @@ command: `recon-host.exe -v probe`.
 
 Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` once per GPU (and again after a
 driver update), with no stream running, to measure how the native helper's encoder changes its
-bitrate while it runs: for every codec, rate-control mode (AMD: CBR, latency- and peak-constrained
-VBR; NVIDIA: CBR) and live-bitrate mode (`seamless`, `flush`) it encodes a high-motion test
-source for 60 s while the bitrate steps 50 → 20 → 50 Mbit/s every 2 s, and checks that no key
-frame appears on a change (`seamless`), the frame sizes reach the new target within 3 frames, no
-frame or frame barcode is missing and the stream decodes cleanly (about half an hour on AMD,
-with FFmpeg for the decode checks). It prints a table and saves `live-bitrate.json` next to
-`host.json`; sessions on the helper then use `seamless` where it passed (bitrate changes as
-often as every 2 s), else `flush` (a key frame per change, changes at most every 10 s), else a
-new helper per change, and adaptive-bitrate sessions use the rate-control mode that changed
-seamlessly (CBR first). Without the file the helper's defaults apply. `recon-host qualify -h`
+bitrate while it runs: for every codec, encoder preset (speed, balanced, quality), rate-control
+mode (AMD: CBR, latency- and peak-constrained VBR; NVIDIA: CBR) and live-bitrate mode
+(`seamless`, `flush`) it encodes a high-motion test source for 60 s, started as sessions start
+it (the preset, AMD's long-term reference slots), while the bitrate steps 50 → 20 → 50 Mbit/s
+every 2 s, and checks that no key frame appears on a change (`seamless`), the frame sizes reach
+the new target within 3 frames, no frame or frame barcode is missing and the stream decodes
+cleanly (about 70 minutes on AMD, 25 on NVIDIA, with FFmpeg for the decode checks; `-quality
+balanced` measures only the client's default preset, in a third of the time). It prints a table
+and saves `live-bitrate.json` next to `host.json`; sessions on the helper then use `seamless`
+where it passed (bitrate changes as often as every 2 s), else `flush` (a key frame per change,
+changes at most every 10 s), else a new helper per change, and adaptive-bitrate sessions use the
+rate-control mode that changed seamlessly (CBR first). Without the file, or for a preset it did
+not measure, the helper's defaults apply. `recon-host qualify -h`
 lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") and
 `docs/VENDOR_NOTES.md` (3.6).
 

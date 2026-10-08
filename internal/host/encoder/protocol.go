@@ -165,6 +165,17 @@ func (c CodecCaps) IsAssumed(field string) bool {
 // Usable reports whether the helper can encode anything.
 func (c *Caps) Usable() bool { return c.Backend != "none" && c.Backend != "" && len(c.Codecs) > 0 }
 
+// LTRSlots returns the long-term reference slots a stream of codec starts
+// with (StartParams.LTRSlots): two where the codec recovers from LTR frames
+// (GUIDE 3.5), else 0. Sessions and the live-bitrate qualification
+// (internal/host/qualify) both start their streams this way.
+func (c *Caps) LTRSlots(codec string) int {
+	if cc, ok := c.Codecs[codec]; ok && cc.Recovery == "ltr" && cc.MaxLTR >= 2 {
+		return 2
+	}
+	return 0
+}
+
 // Started answers a successful Start with what the encoder actually does.
 type Started struct {
 	Backend       string `json:"backend"`

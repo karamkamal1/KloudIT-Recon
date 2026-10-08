@@ -191,7 +191,7 @@ ignored by recon-host.
   RDNA3: 64x16); `dynamicResolution` (additive, step 3.4): the running encoder can change
   its coded size without a new session (NVENC `NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE`; no
   control message uses it yet, older helpers omit it = false). Values start as vendor defaults;
-  `liveBitrate` is measured per codec and rate-control mode by `recon-host qualify` (step 3.6, see
+  `liveBitrate` is measured per codec, quality preset and rate-control mode by `recon-host qualify` (step 3.6, see
   "Live-bitrate qualification"), whose results recon-host uses over this default. `assumed`
   (optional, additive): the names of the fields above that are documented or default
   values rather than detected on this GPU, e.g. `["roi","liveBitrate"]` for AMF AV1;
@@ -600,8 +600,8 @@ the initialized encoder, see "AV1 alignment"), `intraRefresh` (the encoder takes
 refresh property after `USAGE` and reads it back on the probe encoder; never with user LTR
 or SVC). `recovery` is `ltr` when at least 2 LTR slots are possible, `liveBitrate` starts
 as `seamless` (the AMD Streaming SDK changes the bitrate without a flush), always marked
-`assumed`: `recon-host qualify` (step 3.6, "Live-bitrate qualification") measures it per codec
-and rate-control mode, and recon-host uses those results over the caps; `forceIdr` is
+`assumed`: `recon-host qualify` (step 3.6, "Live-bitrate qualification") measures it per codec,
+quality preset and rate-control mode, and recon-host uses those results over the caps; `forceIdr` is
 true.
 
 **Configuration** (before `Init`; the dynamic ones again after it, as FFmpeg does):
@@ -1003,15 +1003,20 @@ back to the planar test mode.
 
 `recon-host qualify` (`internal/host/qualify`, GUIDE 3.6) measures how the helper's encoder
 changes its bitrate while it runs and records it for sessions. It reads the helper's caps
-(`--print-caps`) and runs one encode test per codec of the caps x rate-control mode (AMF:
-`cbr`, `vbr` = LATENCY_CONSTRAINED_VBR, `vbr_peak` = PEAK_CONSTRAINED_VBR; NVENC and others:
-`cbr`) x live-bitrate mode (`seamless`, `flush`):
+(`--print-caps`) and runs one encode test per codec of the caps x quality preset (`speed`,
+`balanced`, `quality`: every preset a session may ask for; `-quality` narrows it) x
+rate-control mode (AMF: `cbr`, `vbr` = LATENCY_CONSTRAINED_VBR, `vbr_peak` =
+PEAK_CONSTRAINED_VBR; NVENC and others: `cbr`) x live-bitrate mode (`seamless`, `flush`). Each
+stream starts as a session starts that codec on this encoder: its `quality`, and `ltrSlots` 2
+where the codec recovers from LTR frames (caps `recovery` `ltr`, `maxLtr` >= 2: AMF), whose
+marked frames the encode test acknowledges `--ack-delay` (2) frames later, so AMF runs with its
+LTR setup (MAX_LTR_FRAMES, LTR_MODE, per-frame marks and FORCE_LTR_REFERENCE):
 
 ```
-recon-encoder.exe --encode-test=DIR\hevc-cbr-seamless.hevc --frame-log=DIR\hevc-cbr-seamless.jsonl
-    --backend=auto --codec=hevc --capture=synthetic-gpu --motion=1 --width=1920 --height=1080 --fps=60
-    --kbps=50000 --rc=cbr --live-bitrate=seamless --frames=3600 --rate-schedule=20000,50000:120
-    --barcode=16,16,16
+recon-encoder.exe --encode-test=DIR\hevc-speed-cbr-seamless.hevc --frame-log=DIR\hevc-speed-cbr-seamless.jsonl
+    --backend=auto --codec=hevc --capture=synthetic-gpu --fps=60 --kbps=50000 --quality=speed --rc=cbr
+    --live-bitrate=seamless --frames=3600 --rate-schedule=20000,50000:120 --ltr-slots=2
+    --width=1920 --height=1080 --motion=1 --barcode=16,16,16
 ```
 
 (50 -> 20 -> 50 Mbit/s every 2 s for 60 s on the high-motion source; `-capture dda` encodes
@@ -1034,8 +1039,11 @@ passes when all of these hold:
 
 A cell whose P frames used less than 75 % of the start bitrate before the first change is
 `inconclusive` (the source does not need the high bitrate, so the sizes cannot show whether
-the encoder follows) unless something else failed; one that could not start (the encoder
-refused the mode) is an `error`. The mock and the NVENC test double run the same way in the
+the encoder follows) unless something else failed. One that could not start is an `error`,
+except where the encoder refuses the live-bitrate mode itself (`start` answers `unsupported`
+"liveBitrate ...": NVENC without NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE), which fails that
+mode; a helper that crashes or hangs after its stream started (no frame log) fails too. The
+mock and the NVENC test double run the same way in the
 tests (the mock: 59 frames with a change every 10, no barcode in its canned clip; the test
 double: decode and barcode checks skipped, its bitstream does not decode).
 
@@ -1043,33 +1051,38 @@ The results go to `live-bitrate.json` next to `host.json` (test runs: into their
 directory), printed as a table as well:
 
 ```json
-{"version":1,"time":"2026-10-08T12:00:00Z","host":"GAMING-PC","helperVersion":"0.1.0","backend":"amf",
+{"version":2,"time":"2026-10-08T12:00:00Z","host":"GAMING-PC","helperVersion":"0.1.0","backend":"amf",
  "vendor":"amd","adapterName":"AMD Radeon RX 7900 XT","adapterLuid":"00000000:0000c3a1",
  "source":{"capture":"synthetic-gpu","motion":true,"width":1920,"height":1080,"fps":60,"barcode":true},
  "schedule":{"highKbps":50000,"lowKbps":20000,"stepMs":2000,"durationMs":60000,"stepFrames":120,"frames":3600},
  "criteria":{"followFrames":3,"windowFrames":3,"sizeTolerance":0.25,"keyWithinFrames":5,"maxUnreadablePct":1},
- "cells":[{"codec":"hevc","rc":"cbr","liveBitrate":"seamless","verdict":"pass","rateControl":"cbr",
+ "cells":[{"codec":"hevc","rc":"cbr","liveBitrate":"seamless","quality":"speed","ltrSlots":2,"verdict":"pass","rateControl":"cbr",
    "startedLiveBitrate":"seamless","width":1920,"height":1080,"fps":60,"frames":3600,"rateChanges":29,
    "keyFrames":{"mismatched":0},
    "follow":{"maxLagFrames":1,"steadyMin":0.93,"steadyMax":1.02,"levels":{"20000":0.99,"50000":0.97},"firstPhase":0.96},
    "frameIds":{"gaps":0,"droppedBefore":0,"droppedByHelper":0},
    "barcode":{"checked":3600,"unreadable":0,"wrong":0,"gaps":0},
-   "decode":{"frames":3600,"errors":0,"warnings":0},"seconds":63.2,"log":"...\\hevc-cbr-seamless.log"}],
- "choice":{"hevc":{"adaptiveRc":"cbr","adaptive":"seamless","fixed":"seamless"}}}
+   "decode":{"frames":3600,"errors":0,"warnings":0},"seconds":63.2,"log":"...\\hevc-speed-cbr-seamless.log"}],
+ "choice":{"hevc":{"speed":{"adaptiveRc":"cbr","adaptive":"seamless","fixed":"seamless"}}}}
 ```
 
 `cells[].failures` / `notes` say why a cell failed and which checks were skipped; `follow`
 gives the ratios of measured to target sizes (`levels` per target, `firstPhase` before any
-change), `maxLagFrames` -1 if a change never reached its target. `choice` is what sessions do
-with it (written for people; recon-host recomputes it from the cells,
-`qualify.Results.Choose`):
+change), `maxLagFrames` -1 if a change never reached its target. `choice` (per codec and
+quality preset) is what sessions do with it (written for people; recon-host recomputes it from
+the cells, `qualify.Results.Choose`). Version 1 files (no `quality` / `ltrSlots`: measured at
+`speed` without LTR slots) are refused: run the qualification again.
 
 * The results apply to a helper whose caps have the same `backend` and `adapterName` (not
   the LUID, which changes with every boot); results of the test double never apply.
-* Per codec and rate-control mode: `seamless` where that cell passed, else `flush` where
-  that one passed, else `restart` (both were judged and failed: every bitrate change starts a
-  new helper, as on the FFmpeg path); nothing (the helper's defaults) where the cells are
-  missing, errors or inconclusive.
+* Only cells run as the session's stream starts count: the same codec, `quality` (none = the
+  helper's default `speed`) and `ltrSlots`; a preset that was not qualified gets the helper's
+  defaults.
+* Per codec, preset and rate-control mode: `seamless` where that cell passed, else `flush`
+  where that one passed, else `restart` where `seamless` failed (every bitrate change starts a
+  new helper, as on the FFmpeg path; never the helper's default then, which is `seamless` on
+  AMF); nothing (the helper's defaults) where the `seamless` cell is missing, an error or
+  inconclusive and `flush` did not pass.
 * Adaptive-bitrate sessions (the rate controller changes the bitrate) run `cbr` where it
   changes seamlessly, else the first of `vbr_peak` and `vbr` that does (GUIDE 10: adaptive =
   the 3.6 winner), else `cbr` with its `flush` / `restart`. Fixed-bitrate sessions run `vbr`
@@ -1078,8 +1091,9 @@ with it (written for people; recon-host recomputes it from the cells,
   `liveBitrate`, and a `setRate` becomes a new helper). The session's rate controller lets
   changes on a qualified `seamless` encoder follow each other after 2 s (the qualification's
   step); a `flush` one (a key frame per change), an unqualified one and FFmpeg keep 10 s
-  between changes. host.log: `live-bitrate qualification ... choice=...` when a session
-  opens the helper, `live_bitrate_from=qualification` on `encoder helper started`.
+  between changes. host.log: `live-bitrate qualification ... choice="hevc speed: adaptive
+  cbr/seamless, fixed vbr/seamless; ..."` when a session opens the helper,
+  `live_bitrate_from=qualification` on `encoder helper started`.
 
 Run it again after a driver update. Hardware results and the exact commands: docs/VENDOR_NOTES.md 3.6.
 

@@ -20,8 +20,9 @@ import (
 // FileName is the results file, next to the host config (host.json).
 const FileName = "live-bitrate.json"
 
-// ResultsVersion is the results file format.
-const ResultsVersion = 1
+// ResultsVersion is the results file format (2: cells carry the quality
+// preset and LTR slots they ran with; version 1 measured neither).
+const ResultsVersion = 2
 
 // PathFor returns the results file for a host config file.
 func PathFor(configPath string) string { return filepath.Join(filepath.Dir(configPath), FileName) }
@@ -30,10 +31,17 @@ func PathFor(configPath string) string { return filepath.Join(filepath.Dir(confi
 const (
 	ModeSeamless = "seamless" // setRate changes the rate from the next frame, no IDR
 	ModeFlush    = "flush"    // setRate makes an IDR (and an AMF Flush + ReInit)
-	// ModeRestart: neither passed: every bitrate change starts a new helper
-	// (as on the FFmpeg path).
+	// ModeRestart: seamless failed and flush did not pass: every bitrate
+	// change starts a new helper (as on the FFmpeg path).
 	ModeRestart = "restart"
 )
+
+// Qualities are the start's quality presets sessions may ask for (the
+// client's encoder preset setting), each qualified on its own.
+var Qualities = []string{"speed", "balanced", "quality"}
+
+// DefaultQuality is the helper's quality preset when start has none.
+const DefaultQuality = "speed"
 
 // Source describes what the runs encoded.
 type Source struct {
@@ -56,8 +64,8 @@ type Schedule struct {
 	Frames     int `json:"frames"`     // planned frames per run
 }
 
-// Choice is what a session uses for one codec (Choose), written to the file
-// for people (sessions recompute it from the cells).
+// Choice is what a session uses for one codec and quality preset (Choose),
+// written to the file for people (sessions recompute it from the cells).
 type Choice struct {
 	// AdaptiveRC / Adaptive: the rate-control mode and live-bitrate mode
 	// of a session whose rate controller changes the bitrate (GUIDE 10:
@@ -81,13 +89,14 @@ type Results struct {
 	AdapterLUID   string    `json:"adapterLuid,omitempty"` // changes with every boot: informational
 	// TestDouble: measured against the NVENC test double, never used by
 	// sessions.
-	TestDouble bool              `json:"testDouble,omitempty"`
-	Source     Source            `json:"source"`
-	Schedule   Schedule          `json:"schedule"`
-	Criteria   Criteria          `json:"criteria"`
-	Notes      []string          `json:"notes,omitempty"`
-	Cells      []Cell            `json:"cells"`
-	Choice     map[string]Choice `json:"choice"`
+	TestDouble bool     `json:"testDouble,omitempty"`
+	Source     Source   `json:"source"`
+	Schedule   Schedule `json:"schedule"`
+	Criteria   Criteria `json:"criteria"`
+	Notes      []string `json:"notes,omitempty"`
+	Cells      []Cell   `json:"cells"`
+	// Choice: per codec and quality preset.
+	Choice map[string]map[string]Choice `json:"choice"`
 }
 
 // Save writes the results file (indented JSON).
@@ -142,94 +151,152 @@ func (r *Results) Matches(c encoder.Caps) (bool, string) {
 	return true, ""
 }
 
-func (r *Results) cell(codec, rc, mode string) *Cell {
+// stream is what a cell ran besides rc and live-bitrate mode: Choose uses
+// only cells that ran a session's stream exactly so.
+type stream struct {
+	codec, quality string
+	ltrSlots       int
+}
+
+// streamOf returns the stream of a session's start (no quality: the
+// helper's default preset).
+func streamOf(sp encoder.StartParams) stream {
+	q := sp.Quality
+	if q == "" {
+		q = DefaultQuality
+	}
+	return stream{sp.Codec, q, sp.LTRSlots}
+}
+
+func (r *Results) cell(s stream, rc, mode string) *Cell {
 	for i := range r.Cells {
-		if c := &r.Cells[i]; c.Codec == codec && c.RC == rc && c.LiveBitrate == mode {
+		if c := &r.Cells[i]; c.Codec == s.codec && c.Quality == s.quality && c.LTRSlots == s.ltrSlots && c.RC == rc &&
+			c.LiveBitrate == mode {
 			return c
 		}
 	}
 	return nil
 }
 
-func (r *Results) passed(codec, rc, mode string) bool {
-	c := r.cell(codec, rc, mode)
-	return c != nil && c.Passed()
+func (r *Results) verdict(s stream, rc, mode string) string {
+	if c := r.cell(s, rc, mode); c != nil {
+		return c.Verdict
+	}
+	return ""
 }
 
-// judged reports whether a cell ran and was judged pass or fail (not an
-// error, not inconclusive: those say nothing about the encoder).
-func (r *Results) judged(codec, rc, mode string) bool {
-	c := r.cell(codec, rc, mode)
-	return c != nil && (c.Verdict == VerdictPass || c.Verdict == VerdictFail)
-}
-
-// pick returns the live-bitrate mode for codec and rc: seamless where it
-// passed, else flush where it passed, else restart where both were judged;
-// ok false otherwise (not measured, or not conclusively).
-func (r *Results) pick(codec, rc string) (string, bool) {
+// pick returns the live-bitrate mode for a stream and rc: seamless where it
+// passed, else flush where it passed, else restart where seamless was judged
+// and failed (never the helper's default then, which may be seamless); ok
+// false otherwise (seamless not measured or not conclusively, flush not
+// passed).
+func (r *Results) pick(s stream, rc string) (string, bool) {
 	switch {
-	case r.passed(codec, rc, ModeSeamless):
+	case r.verdict(s, rc, ModeSeamless) == VerdictPass:
 		return ModeSeamless, true
-	case r.passed(codec, rc, ModeFlush):
+	case r.verdict(s, rc, ModeFlush) == VerdictPass:
 		return ModeFlush, true
-	case r.judged(codec, rc, ModeSeamless) && r.judged(codec, rc, ModeFlush):
+	case r.verdict(s, rc, ModeSeamless) == VerdictFail:
 		return ModeRestart, true
 	}
 	return "", false
 }
 
 // Choose returns the rate-control mode (start's rc) and live-bitrate mode
-// (seamless | flush | restart) a stream of codec should use on a helper with
-// caps c, from these results; ok false where they say nothing about it (other
-// GPU or backend, codec or mode not measured): then the helper's defaults
-// apply. adaptive: the session's rate controller changes the bitrate; it
-// runs CBR where CBR changes seamlessly, else the first of PEAK_CONSTRAINED_VBR
-// and LATENCY_CONSTRAINED_VBR that does (GUIDE 10: adaptive = the 3.6
-// winner), else CBR with flush (or restart). A fixed-bitrate stream runs rc
-// vbr (the backend's low-latency VBR) with its own measured mode.
-func (r *Results) Choose(c encoder.Caps, codec string, adaptive bool) (rc, mode string, ok bool) {
+// (seamless | flush | restart) a stream should use on a helper with caps c,
+// from these results; sp is its start (codec, quality preset, LTR slots: only
+// cells that ran exactly that count). ok false where they say nothing about
+// it (other GPU or backend; codec, preset, LTR slots or mode not measured):
+// then the helper's defaults apply. adaptive: the session's rate controller
+// changes the bitrate; it runs CBR where CBR changes seamlessly, else the
+// first of PEAK_CONSTRAINED_VBR and LATENCY_CONSTRAINED_VBR that does (GUIDE
+// 10: adaptive = the 3.6 winner), else CBR with flush (or restart). A
+// fixed-bitrate stream runs rc vbr (the backend's low-latency VBR) with its
+// own measured mode.
+func (r *Results) Choose(c encoder.Caps, sp encoder.StartParams, adaptive bool) (rc, mode string, ok bool) {
 	if m, _ := r.Matches(c); !m {
 		return "", "", false
 	}
+	s := streamOf(sp)
 	rc = "vbr"
 	if adaptive {
-		if r.passed(codec, "cbr", ModeSeamless) {
-			return "cbr", ModeSeamless, true
-		}
-		for _, alt := range []string{"vbr_peak", "vbr"} {
-			if r.passed(codec, alt, ModeSeamless) {
+		for _, alt := range []string{"cbr", "vbr_peak", "vbr"} {
+			if r.verdict(s, alt, ModeSeamless) == VerdictPass {
 				return alt, ModeSeamless, true
 			}
 		}
 		rc = "cbr"
 	}
-	if mode, ok = r.pick(codec, rc); !ok {
+	if mode, ok = r.pick(s, rc); !ok {
 		return "", "", false
 	}
 	return rc, mode, true
 }
 
 // Choices computes from the cells what a session on this GPU uses for every
-// codec measured (Choose; the test double's results too, for the record).
-func (r *Results) Choices() map[string]Choice {
-	out := map[string]Choice{}
+// codec and quality preset measured (Choose; the test double's results too,
+// for the record).
+func (r *Results) Choices() map[string]map[string]Choice {
+	out := map[string]map[string]Choice{}
 	c := encoder.Caps{Backend: r.Backend, AdapterName: r.AdapterName}
 	rr := *r
 	rr.TestDouble = false
 	for _, cell := range r.Cells {
-		if _, done := out[cell.Codec]; done {
+		if _, done := out[cell.Codec][cell.Quality]; done {
 			continue
 		}
+		sp := encoder.StartParams{Codec: cell.Codec, Quality: cell.Quality, LTRSlots: cell.LTRSlots}
 		var ch Choice
-		if rc, mode, ok := rr.Choose(c, cell.Codec, true); ok {
+		if rc, mode, ok := rr.Choose(c, sp, true); ok {
 			ch.AdaptiveRC, ch.Adaptive = rc, mode
 		}
-		if _, mode, ok := rr.Choose(c, cell.Codec, false); ok {
+		if _, mode, ok := rr.Choose(c, sp, false); ok {
 			ch.Fixed = mode
 		}
-		out[cell.Codec] = ch
+		if out[cell.Codec] == nil {
+			out[cell.Codec] = map[string]Choice{}
+		}
+		out[cell.Codec][cell.Quality] = ch
 	}
 	return out
+}
+
+// ChoiceLines describes Choices, one line per codec and quality preset
+// ("hevc speed: adaptive cbr/seamless, fixed vbr/flush"; "-": the helper's
+// default), codecs and presets in their usual order.
+func (r *Results) ChoiceLines() []string {
+	var out []string
+	choices := r.Choices()
+	for _, codec := range sortedBy(codecOrder, choices) {
+		for _, q := range sortedBy(Qualities, choices[codec]) {
+			ch := choices[codec][q]
+			out = append(out, fmt.Sprintf("%s %s: adaptive %s/%s, fixed vbr/%s", codec, q, dash(ch.AdaptiveRC), dash(ch.Adaptive), dash(ch.Fixed)))
+		}
+	}
+	return out
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// sortedBy returns the keys of m, those in order first (in that order), then
+// the others sorted.
+func sortedBy[V any](order []string, m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		if x, y := rank(order, keys[i]), rank(order, keys[j]); x != y {
+			return x < y
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }
 
 // fillChoice writes Choices into the file's Choice.
@@ -241,7 +308,7 @@ func (r *Results) Print(w io.Writer) {
 		r.Backend, r.AdapterName, r.Vendor, r.HelperVersion, r.Source.Capture, r.Source.Width, r.Source.Height, r.Source.FPS,
 		r.Schedule.HighKbps, r.Schedule.LowKbps, r.Schedule.StepMs, r.Schedule.DurationMs)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "codec\trc\tliveBitrate\tverdict\tframes\tchanges\tkeys\tmax lag\tsteady %\tbarcode\twhy")
+	fmt.Fprintln(tw, "codec\tquality\tltr\trc\tliveBitrate\tverdict\tframes\tchanges\tkeys\tmax lag\tsteady %\tbarcode\twhy")
 	for _, c := range r.Cells {
 		keys := fmt.Sprintf("%d unexpected", len(c.KeyFrames.Unexpected))
 		if c.LiveBitrate == ModeFlush {
@@ -257,19 +324,16 @@ func (r *Results) Print(w io.Writer) {
 			bc = fmt.Sprintf("%d/%d ok", c.Barcode.Checked-c.Barcode.Unreadable-c.Barcode.Wrong, c.Barcode.Checked)
 		}
 		why := strings.Join(c.Failures, "; ")
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", c.Codec, c.RC, c.LiveBitrate, strings.ToUpper(c.Verdict),
-			c.Frames, c.RateChanges, keys, lag, steady, bc, why)
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", c.Codec, c.Quality, c.LTRSlots, c.RC, c.LiveBitrate,
+			strings.ToUpper(c.Verdict), c.Frames, c.RateChanges, keys, lag, steady, bc, why)
 	}
 	tw.Flush()
-	codecs := make([]string, 0, len(r.Choice))
-	for k := range r.Choice {
-		codecs = append(codecs, k)
-	}
-	sort.Strings(codecs)
-	for _, k := range codecs {
-		ch := r.Choice[k]
-		fmt.Fprintf(w, "%s: adaptive bitrate -> rc %s, live bitrate %s; fixed bitrate (rc vbr) -> %s\n", k, orDash(ch.AdaptiveRC),
-			orDash(ch.Adaptive), orDash(ch.Fixed))
+	for _, codec := range sortedBy(codecOrder, r.Choice) {
+		for _, q := range sortedBy(Qualities, r.Choice[codec]) {
+			ch := r.Choice[codec][q]
+			fmt.Fprintf(w, "%s, quality %s: adaptive bitrate -> rc %s, live bitrate %s; fixed bitrate (rc vbr) -> %s\n", codec, q,
+				orDash(ch.AdaptiveRC), orDash(ch.Adaptive), orDash(ch.Fixed))
+		}
 	}
 	for _, n := range r.Notes {
 		fmt.Fprintln(w, "note:", n)
@@ -283,18 +347,22 @@ func orDash(s string) string {
 	return s
 }
 
-// sortCells orders cells by codec (hevc, av1, h264), rc (cbr, vbr,
-// vbr_peak) and mode (seamless, flush).
-func sortCells(cells []Cell) {
-	rank := func(list []string, v string) int {
-		if i := slices.Index(list, v); i >= 0 {
-			return i
-		}
-		return len(list)
+func rank(list []string, v string) int {
+	if i := slices.Index(list, v); i >= 0 {
+		return i
 	}
+	return len(list)
+}
+
+// sortCells orders cells by codec (hevc, av1, h264), quality preset (speed,
+// balanced, quality), rc (cbr, vbr, vbr_peak) and mode (seamless, flush).
+func sortCells(cells []Cell) {
 	sort.SliceStable(cells, func(i, j int) bool {
 		a, b := cells[i], cells[j]
 		if x, y := rank(codecOrder, a.Codec), rank(codecOrder, b.Codec); x != y {
+			return x < y
+		}
+		if x, y := rank(Qualities, a.Quality), rank(Qualities, b.Quality); x != y {
 			return x < y
 		}
 		if x, y := rank(rcOrder, a.RC), rank(rcOrder, b.RC); x != y {
