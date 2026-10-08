@@ -199,6 +199,10 @@ type ClientMsg struct {
 	// step 4.3): the draw and display rows depend on it. Empty from clients
 	// before it.
 	Renderer string `json:"renderer,omitempty"`
+	// Pacing ("stages"): the client's frame pacing mode for the window's
+	// frames (latency | smooth, or mixed when it changed; step 4.4): the hold
+	// and display rows depend on it. Empty from clients before it.
+	Pacing string `json:"pacing,omitempty"`
 }
 
 // CongestionDecoder is the reason of a "congestion" message from a client
@@ -209,7 +213,14 @@ const CongestionDecoder = "decoder"
 
 // StageStat is one row of the per-stage latency summary a v2 client sends
 // every ~10 s ({"t":"stages"}): percentiles in ms over its last ~10 s window.
-// Names: capture, queue, network, transfer, wait, decode, draw, display, e2e.
+// Names: capture, queue, network, transfer, wait, decode, hold (only to hosts
+// that announce FeatureStageHold), draw, display, e2e.
+// FeatureStageHold is the Welcome.Features entry announcing that the host
+// takes the "hold" row (decoder output -> draw start: the frame pacing wait,
+// step 4.4). Hosts before it accept at most nine rows; clients report hold
+// and draw to them as one draw row (decoder output -> drawn).
+const FeatureStageHold = "stage-hold"
+
 type StageStat struct {
 	Name string  `json:"name"`
 	From string  `json:"from,omitempty"` // e2e only: capture | send (where end-to-end starts)

@@ -3228,3 +3228,199 @@ codec and the frame timing):
   (record which). Repeat with `winner: 'webgpu'` (expect `WebGPU device lost` in the log).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same GPU-reset check on a client with
   a GeForce GPU.
+
+## 4.4 Frame pacing modes
+
+What changed (browser client; the host only takes one more stage row, announced in its welcome,
+and logs one more field):
+
+- Setting *Pipeline → Frame pacing*: **Lowest latency** (the default) and **Smooth**, saved with
+  the other stream settings (`pacing` in `recon.prefs.v1`) and applied live: the drawer posts it
+  to the stream worker, no reconnect, the host is not involved. The frame pacer is
+  `web/static/js/pacing.js` (`Pacer`, `paceFate`), between the decoder's output and the
+  renderer, so it works the same with every presentation path of step 4.3 (2D, WebGL2, WebGPU)
+  and with Auto's bake-off, whose path switches happen inside a draw either way.
+- Lowest latency is the behaviour of step 4.1, unchanged: a decoded frame is drawn one task
+  after its output (a `MessageChannel` hop), outputs already waiting by then supersede each other
+  and only the newest is drawn.
+- Smooth: the frame waits for the next display refresh and is drawn in the worker's
+  `requestAnimationFrame` callback, so the screen gets at most one new frame per refresh, drawn as
+  the refresh starts. At most one frame waits: a newer output replaces it (the older one is
+  closed unseen and acknowledged as decoded, stats `superseded`, as in Lowest latency). "Drop
+  anything older than one refresh" (guide wording), as built: a frame is older than one refresh
+  when more than 1.25 refresh intervals passed from its decoder output to the start of the
+  refresh that would draw it (the callback's timestamp; the quarter refresh of slack covers a
+  frame that came out just as a refresh started). Such a frame (its refresh came late or was
+  skipped) is dropped when a newer frame is already in or in front of the decoder (that one
+  takes the next refresh; stats `pacing.counts.stale`), and drawn late otherwise
+  (`pacing.counts.late`). Deviation from a literal drop of every such frame: the host sends
+  nothing while the desktop is still, so dropping the last frame before a still picture would
+  leave an older picture on screen until something changes; and never two drops in a row, so a
+  refresh source that is always late cannot starve the screen. Superseding already keeps a
+  frame from waiting behind a newer one, so in steady streaming the stale rule only acts when
+  the browser delays its refresh callbacks.
+- Refresh ticks: the worker's `requestAnimationFrame` (its timestamp is the start of the
+  refresh); where a browser has none in workers, the main thread posts its own animation frames'
+  start times (`ticks` on/off, only while Smooth needs them); and a watchdog: a frame that got no
+  tick for max(3 refreshes, 100 ms) is drawn (or dropped by the same rule) from a timer, logged
+  once per run of such draws (`frame pacing: no display refresh within 100 ms of a decoded frame;
+  drawing from a timer`) and counted (`pacing.counts.timer`, the overlay's *watchdog*). The
+  first version used 3 refreshes + 10 ms (60 ms at 60 Hz): on the emulated GPU here the worker's
+  callbacks stall for 60 ms and more (up to seconds) while WebGPU presents, and the timer then
+  drew 16 of 84 frames,
+  working around the browser's own back-pressure; the watchdog is for a callback that never
+  comes, not for a slow one.
+- The refresh interval is the main thread's measurement at page load (`client.hz`), now the
+  median interval of 30 animation frames instead of their mean: in the headed browser here a
+  frame skipped during the measurement made it 39 Hz (25.64 ms) for a 60 Hz display.
+- Phase 0 stage accounting: a new stage **hold** (decoder output → draw start: the frame pacing
+  wait; one task in Lowest latency, the wait for the refresh in Smooth) between decode and draw;
+  **draw** is now the renderer's draw call (draw start → drawn; before: decoder output → drawn,
+  which included the one-task hop). The stages still telescope to end-to-end (capture → drawn),
+  which now includes the hold. Overlay: a *hold (frame pacing)* row in the stage table and a
+  *Frame pacing* row (mode; for Smooth the tick source, worker or page `rAF`, the refresh
+  interval, and the session's stale, late and watchdog counts). Stage dump (`stageDump`, the
+  latency export): per frame `drawStart`, `via` (hop | raf | main | timer), `tick` (the refresh
+  start) and `pacing`. The client's stage report names the mode (`pacing`: latency, smooth, or
+  mixed when it changed in the window); the host logs `pacing=` and the `hold=` row. Hosts
+  announce `stage-hold` in `welcome.features` (`proto.FeatureStageHold`); hosts before this step
+  accept at most nine rows, so the client reports hold and draw to them as one draw row (decoder
+  output → drawn, the old meaning). The bake-off result names the pacing mode it ran in; its
+  draw stage no longer includes the hop (it does not depend on the path).
+
+Found in the sandbox (Chromium 141 from Playwright 1.56, Linux, no GPU):
+
+- `requestAnimationFrame` exists in the dedicated worker (headless and headed) and its timestamp
+  is the start of the refresh: consecutive callbacks 16.6-16.8 ms apart (a skipped refresh:
+  33.3), the callback itself runs 0.1-16 ms after that timestamp (a drawing worker under load:
+  more).
+- Under the E2E's load (software AV1 encoder and decoder on 4 shared cores, the 2D canvas drawing
+  the 960×540 picture into 1280×720 in software, ~9 ms per frame), the page's frame production
+  (the worker's and the main thread's callbacks alike) ran at about 31-33 Hz instead of 60: Smooth
+  then draws at that rate (a 60 fps stream: about every other frame superseded), while Lowest
+  latency draws all 60 (of which the compositor shows about as many as Smooth draws: display
+  estimate p95 32 ms). Alone (no stream), a worker drawing the same 9.7 ms frame in every callback
+  keeps 58 Hz. On a GPU canvas the draw is a GPU blit.
+- WebGPU on the emulated GPU (SwiftShader, headed browser on Xvfb) starves the page's refreshes
+  while it presents (the page's frames lag, as in 4.3): the worker's own refresh loop measured
+  5-12 Hz in Lowest latency and 0.5-37.5 Hz in Smooth between runs; Smooth on WebGPU then draws
+  6.5-21 fps of 30, partly from the watchdog. A real GPU is a hardware check below.
+
+Verified in the sandbox:
+
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`), 148 of 148 checks passed, twice
+  (the last run with the final code). The runs before failed on the new checks' own criteria,
+  which then changed: they expected Smooth at the stream's 60 fps (the loaded page refreshes at
+  ~33 Hz), then at the measured refresh rate (WebGPU's stalled refreshes made the watchdog draw
+  some frames: now each draw is checked against the refreshes the worker actually ran), and a
+  frame count that only fit 4 s windows; WebGL2's failed on the `measureHz` mean (fixed in the
+  client, above). Unrelated to this step, one run failed the known shared-CPU "steady real-time
+  playback" dip and one (load average 7.5) the 1.4 skip-recovery and 1.5 bitrate-recovery
+  checks on decoder backlogs; both passed in the runs after. Load average 4-8 from jobs in other
+  checkouts.
+  - Pacer at unit level (10 checks, `pacing.js` on a fake clock): Lowest latency draws one task
+    after the output and a burst keeps the newest; Smooth waits for the refresh, one request and
+    one draw per refresh for two frames; older than one refresh with a newer frame in the decoder
+    → dropped stale, the newer drawn at the next refresh; without one → drawn late; never two
+    stale drops in a row; 19 ms at 16 ms refreshes is not stale (slack); no worker
+    `requestAnimationFrame` → the main thread's ticks, off again in Lowest latency; the watchdog
+    after 100 ms, logged once per run of timer draws, a real tick used again after it; live mode
+    switches in both directions with a frame waiting; `paceFate` at the edges.
+  - Each live Smooth window also runs a `requestAnimationFrame` loop of the test's in the worker
+    and checks every draw against it: drawn at the first refresh after the frame's decoder
+    output (no refresh of the worker's in between), or by the watchdog only where the worker ran
+    no refresh. Final run, 0 such misses in every window with the worker's ticks.
+  - Live, 2D canvas (headless, 60 fps stream, after the scenario's other checks), switched in
+    the drawer without a reconnect (same worker and connection): Smooth drew 107 frames in 4 s
+    (26.7 fps; the worker's own refresh loop ran at 34.0 Hz in the same window: this loaded page
+    refreshes at about half of 60 Hz), all from the worker's `requestAnimationFrame`, each at
+    the first refresh after its output, consecutive draws' refresh starts at least 16.66 ms
+    apart (one per vsync), hold p50/p95/p99 6.21/20.83/25.31 ms, refresh start − output at most
+    20.59 ms, 0 stale, 0 late, hold and draw equal to the frame's own marks, stages summing to
+    end-to-end (difference 0.000 ms), barcode 4/4 = seq, VideoFrames at most 2 open, 0 leaked,
+    the overlay's *Frame pacing* row `Smooth · each refresh (worker rAF, 16.67 ms) · stale 0 ·
+    late 0`. Without `requestAnimationFrame` in the worker: 86 frames in 2.5 s (34.3 fps) from
+    the page's animation frames, one per vsync. With one that never calls back: 24 frames in 3 s
+    (8.0 fps) from the watchdog, the log line once. Restored: 56 frames in 2 s (28.0 fps) from it
+    again, no timer draws. Back to Lowest latency: 150 frames in 2.5 s (59.9 fps) on decode, hold
+    p50/p95/p99 0.05/0.8/1.41 ms.
+  - Live, WebGL2 (headed, llvmpipe, 30 fps stream): Smooth 118 frames in 4 s (29.4 fps; refresh
+    58.8 Hz), each at the first refresh after its output, hold 6.3/17.03/18.88 ms, 1 stale, 0
+    late, barcode 4/4 (`webgl2 readback`); back to Lowest latency 30.0 fps, hold 0.07/0.15/0.18
+    ms. WebGPU (headed, SwiftShader): Smooth 81 frames (20.2 fps; the page's refresh 35.4 Hz on
+    average, with stalls), 77 from the worker's refresh, each at the first one after its output,
+    4 from the watchdog where the worker ran no refresh for 100 ms, 3 stale, barcode 3/3 (`webgpu
+    readback`), VideoFrames at most 3 open, 0 leaked; back to Lowest latency 30.0 fps (the page's
+    refresh meanwhile 11.6 Hz). In an earlier run the page refreshed at 0.5 Hz during the WebGPU
+    Smooth window and the watchdog drew most of 26 frames (6.5 fps).
+  - Auto's bake-off in Smooth (headed, all three paths): never drawn on decode across the path
+    switches (315 draws from the worker's refresh, 3 from the watchdog while WebGPU presented, 3
+    stale), the result and the stored pick carry `pacing: smooth`, the pick is the same as in 4.3
+    (2D, the only desynchronized context), and the host's first stage line reads
+    `renderer=bakeoff pacing=smooth ... hold="7.1/15.7/24.6 n=261" draw="0.5/0.9/4.4 n=261"`.
+  - Lowest latency in the transport scenarios (2D, 60 fps): hold p50 0.07-0.19 ms, p95 1.9-4.1
+    ms, p99 4.6-9.0 ms (the one-task hop on the loaded machine); the draw stage is now the 2D
+    canvas's `drawImage` alone (p50 9-11 ms here, software). The host's lines read
+    `renderer=canvas2d pacing=latency` (and `pacing=mixed` for the windows with a switch).
+- verified (sandbox): `go test ./...`: `TestLogStagesRenderer` (the host logs `pacing=` for
+  latency/smooth/mixed and nothing for other values, the `hold=` row, a ten-row report with
+  every stage) and `internal/e2e` (every client's welcome lists `stage-hold`).
+- verified (sandbox, ad hoc, not kept as a test): the new client in Smooth against a host built
+  from the commit before this step (no `stage-hold` in its welcome): the host accepted the
+  report and logged `draw="12.4/15.7/19.2 n=297"` (hold and draw as one row; the client's own
+  overlay had hold p50 7.63 ms and draw p50 4.38 ms) and no `hold=` or `pacing=`.
+- Not verifiable here: presentation timing on a real GPU and display (front-buffer behaviour of
+  a desynchronized canvas drawn in the refresh callback, PresentMon's display intervals),
+  refresh rates other than 60 Hz, network jitter on the stream (the E2E runs on the shared
+  loopback; netem there would hit the other checkouts' tests), and browsers other than
+  Chromium: the hardware checks below.
+
+Hardware checks (frame pacing is a client-side matter; the host vendor matters through the frame
+timing of its encoder and capture):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (cadence and cost of Smooth, lan): AMD host streaming
+  HEVC 1920×1080 at 60 fps, then at 120 fps, wired LAN, to Chrome on a Windows 11 client with a
+  120 Hz display, Renderer *2D canvas*, fullscreen. Open the overlay (Ctrl+Alt+Shift+S) briefly:
+  the *Frame pacing* row in Smooth must read `Smooth · each refresh (worker rAF, 8.33 ms)` (the
+  display's interval; 16.67 means the page-load measurement missed, record it). For each mode
+  (*Lowest latency*, then *Smooth*, switched in the drawer while streaming) close the overlay and
+  capture 30 s of PresentMon on the browser:
+  `.\PresentMon-2.x-x64.exe --process_name chrome.exe --output_file recon-amd-60fps-<mode>.csv --timed 30 --terminate_after_timed`,
+  then `python3 tools/latency-rig/rig.py presentmon recon-amd-60fps-*.csv`. Record per mode the
+  `MsBetweenDisplayChange` p50/p95 and the PresentMode shares. Pass: in Smooth at 60 fps the
+  display changes every 16.7 ms (p95 at most 17.5 ms, no 8.3/25 ms alternation), at 120 fps
+  every 8.3 ms; Lowest latency may alternate. Then reopen the overlay and record the stage rows
+  *hold* p50/p95 (Smooth: p50 about half the frame interval it waits for, p95 below 8.3 ms +
+  2 ms; Lowest latency: below 1 ms), *draw*, *display*, and the *Frame pacing* row's stale /
+  late / watchdog counts (expect watchdog 0, stale and late a few per minute at most). Then the
+  click-to-photon cost with the 0.3 rig: labels `recon-hevc-1080p120-lan-chrome-canvas2d-latency-amd`
+  and `...-smooth-amd`, 200 samples each, interleaved with Moonlight
+  `moonlight-hevc-1080p120-lan-pacing-off-amd` / `...-pacing-on-amd`
+  ([LATENCY_RIG.md](LATENCY_RIG.md), *Frame pacing*): expect Smooth about half a refresh
+  (~4 ms at 120 Hz) above Lowest latency on the median, and within ~5 ms of Moonlight with
+  frame pacing on. Repeat with Renderer *WebGL2* and *WebGPU* (the overlay's *Frame pacing* row
+  must still read `worker rAF`; record any watchdog draws: they mean the browser stalled its
+  callbacks for 100 ms).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same procedure streaming from an RTX
+  20/30/40/50 host (labels ending in `-nvidia`), and on a client with a GeForce GPU; record the
+  client GPU next to each result.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (the four network profiles, step 0.4): the cadence
+  test above (60 fps, PresentMon `MsBetweenDisplayChange` p50/p95, overlay *hold* p50/p95,
+  *Freezes*, *Frame pacing* stale/late, and *Frames dropped* superseded) for both modes under
+  each profile, relay path forced as in "How every later step reports the four profiles"
+  (`./netem.sh clear --ct 210`, `apply wifi`, `apply wan`, `apply capdrop` with `--host CLIENT_IP`),
+  reported as `lan / wifi / wan / capdrop` per mode with the `netem.sh status` line. Look for:
+  under `wifi` (5 ms ±10 ms jitter) Smooth keeps the display interval steadier than Lowest
+  latency (smaller `MsBetweenDisplayChange` p95 spread) at the cost of its hold; stale drops
+  stay rare (they need a refresh that came late, not network jitter); no watchdog draws.
+- NVIDIA: unverified (no NVIDIA host available). Test: the four-profile comparison above
+  streaming from the NVIDIA host.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (browsers, T10): with the AMD host, Smooth in Edge,
+  Firefox and Safari 26.4 (macOS) and Chrome on a Mac: the overlay's *Frame pacing* row names
+  the tick source: `worker rAF` where the browser runs `requestAnimationFrame` in workers,
+  `page rAF` otherwise (record which; both keep one frame per refresh), and the refresh interval
+  of the client's display (ProMotion Macs: 8.33 ms at 120 Hz, record whether a variable refresh
+  shows a different interval). Record any watchdog draws and the log line
+  (`__recon.logs`, "frame pacing: no display refresh").
+- NVIDIA: unverified (no NVIDIA host available). Test: the browser matrix above streaming from
+  the NVIDIA host.

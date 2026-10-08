@@ -4,13 +4,16 @@
 //
 //   WebTransport (per-frame QUIC streams + datagrams) or WebSocket fallback
 //     -> reorder by sequence -> VideoDecoder (optimizeForLatency, at most 2 queued)
-//     -> immediate draw: desynchronized 2D canvas, WebGL2 texture upload or
-//        WebGPU external texture (renderers.js), on a canvas sized to device pixels
+//     -> frame pacing (pacing.js): draw on decode (Lowest latency) or at the
+//        next display refresh (Smooth)
+//     -> desynchronized 2D canvas, WebGL2 texture upload or WebGPU external
+//        texture (renderers.js), on a canvas sized to device pixels
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
 import { runSelfTests } from './decoder-selftest.js';
 import { createRenderer, LABELS, PATHS, PICK, pickPath, withTimeout } from './renderers.js';
+import { Pacer } from './pacing.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -22,6 +25,7 @@ const now = () => performance.now();
 let transport = null;
 let prefs = {};
 let byeReason = '';
+let hostFeatures = []; // welcome.features
 let renderer = null; // the active presentation path (see Presentation)
 
 const video = {
@@ -450,7 +454,9 @@ function onResize(w, h) {
 // answers them. Per path: the draw and display stages (p50, p95, mean), the
 // draw p50 per round, the frames per second it drew and its failed draws
 // (they count for nothing else); renderers.js pickPath() picks from them.
-// The main thread keeps everything off the canvas while this runs.
+// The main thread keeps everything off the canvas while this runs. The
+// result names the frame pacing mode(s) it ran in (step 4.4; the draw stage
+// does not depend on it, the display stage does, alike for every path).
 const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250 };
 
 const baking = () => !!pres.bake && !pres.bake.done;
@@ -504,23 +510,24 @@ function bakeFinish() {
       continue;
     }
     const recs = b.recs[path].flat();
-    const draw = recs.map((x) => x.s[6]);
-    const display = recs.filter((x) => x.s[7] !== null).map((x) => x.s[7]);
+    const draw = recs.map((x) => x.s[ST.draw]);
+    const display = recs.filter((x) => x.s[ST.display] !== null).map((x) => x.s[ST.display]);
     results[path] = {
       desynchronized: r.desynchronized, gpu: r.gpu, draw: bakeStat(draw), display: bakeStat(display),
-      drawRounds: b.recs[path].map((v) => pct(v.map((x) => x.s[6]))?.p50 ?? null),
+      drawRounds: b.recs[path].map((v) => pct(v.map((x) => x.s[ST.draw]))?.p50 ?? null),
       fps: b.dur[path] ? +((1000 * recs.length) / b.dur[path]).toFixed(1) : 0, errors: b.errors[path], lost: !!r.lost,
     };
   }
   const pick = pickPath(results, pres.refreshMs);
   for (const [p, why] of Object.entries(pick.out)) results[p].out = why;
   const winner = pick.winner;
-  b.result = { winner, why: pick.why, results, rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs } };
+  const pacing = pacingOf(PATHS.flatMap((p) => b.recs[p]?.flat() || []));
+  b.result = { winner, why: pick.why, results, pacing, rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs } };
   const txt = (p) => {
     const x = results[p];
     return x.error ? `${p} unavailable` : `${p} draw p50 ${x.draw.p50 ?? '—'} ms (rounds ${x.drawRounds.join('/')}), display p50 ${x.display.p50 ?? '—'} ms, ${x.fps} fps${x.out ? ` (${x.out})` : ''}`;
   };
-  post('log', { text: `presentation bake-off: ${winner ? `${winner} (${pick.why})` : 'inconclusive'}; ${PATHS.map(txt).join('; ')}` });
+  post('log', { text: `presentation bake-off (frame pacing ${pacing}): ${winner ? `${winner} (${pick.why})` : 'inconclusive'}; ${PATHS.map(txt).join('; ')}` });
   post('bakeoff', { result: b.result });
   // The winner stays (inconclusive: the first path); the others go once it has drawn.
   const keep = pres.list.find((r) => r.name === winner) || pres.list[0];
@@ -871,17 +878,29 @@ function trackFrame(f) {
   frames.max = Math.max(frames.max, openFrames());
 }
 
-// Draw on decode, one task after the output: outputs already queued behind
-// it (a burst after a stall or a backlog, a decoder that releases frames
-// together) supersede it, and only the newest is drawn; the older ones are
-// closed unseen (counted in stats.superseded, acknowledged as decoded).
-const present = { pending: null, scheduled: false, channel: new MessageChannel() };
-present.channel.port1.onmessage = () => {
-  present.scheduled = false;
-  const p = present.pending;
-  present.pending = null;
-  if (p) drawFrame(p.frame, p.meta, p.decoded);
-};
+// Frame pacing (step 4.4, pacing.js; prefs.pacing, applied live). Lowest
+// latency draws on decode, one task after the output: outputs already queued
+// behind it (a burst after a stall or a backlog, a decoder that releases
+// frames together) supersede it, and only the newest is drawn. Smooth draws
+// at the next display refresh (the worker's requestAnimationFrame), one frame
+// waiting at most, a newer output replacing it. Frames dropped either way are
+// closed unseen and acknowledged as decoded (stats.superseded; Smooth's stale
+// frames: pacer.counts.stale). The wait is the "hold" stage.
+const pacer = new Pacer({
+  draw: (it) => drawFrame(it.frame, it.meta, it.decoded, it),
+  drop: (it, why) => {
+    it.frame.close();
+    if (why === 'superseded') stats.superseded++;
+    if (it.meta) ackFrame(it.meta, it.decoded);
+  },
+  newerComing: () => video.inflight.size + video.queue.length > 0,
+  refreshMs: () => pres.refreshMs,
+  // Read on every request (a browser without it in workers: the main thread's ticks).
+  raf: () => (typeof self.requestAnimationFrame === 'function' ? (cb) => self.requestAnimationFrame(cb) : null),
+  mainTicks: (on) => post('ticks', { on }),
+  now,
+  log: (text) => post('log', { text }),
+});
 
 function onDecoded(frame) {
   trackFrame(frame);
@@ -898,17 +917,7 @@ function onDecoded(frame) {
     stats.decodeN++;
   }
   feedDecoder();
-  const old = present.pending;
-  if (old) {
-    old.frame.close();
-    stats.superseded++;
-    if (old.meta) ackFrame(old.meta, old.decoded);
-  }
-  present.pending = { frame, meta, decoded };
-  if (!present.scheduled) {
-    present.scheduled = true;
-    present.channel.port2.postMessage(null);
-  }
+  pacer.offer({ frame, meta, decoded });
 }
 
 // Frame acknowledgement (0x40): one-way delay and decode time of a decoded frame.
@@ -919,7 +928,9 @@ function ackFrame(meta, decoded) {
   return owd;
 }
 
-function drawFrame(frame, meta, decoded) {
+// pace: the pacer's item (via: what started the draw; tick: the refresh's start in Smooth).
+function drawFrame(frame, meta, decoded, pace) {
+  const start = now(); // the hold ends
   // Padding the host announced (VideoConfig crop) is not shown.
   const vr = frame.visibleRect;
   const vis = P.visibleArea(video.cfg, vr ? vr.width : frame.displayWidth, vr ? vr.height : frame.displayHeight, frame.displayWidth, frame.displayHeight);
@@ -966,7 +977,7 @@ function drawFrame(frame, meta, decoded) {
   stats.owdSum += ackFrame(meta, decoded);
   stats.owdN++;
   // A failed draw put nothing on screen: no stage record (draw, display, e2e).
-  const rec = drew ? recordStages(meta, decoded, presented) : null;
+  const rec = drew ? recordStages(meta, decoded, start, presented, pace) : null;
   bakeTick(presented, rec);
   if (!rec) return;
   stats.totalSum += rec.e2e;
@@ -998,22 +1009,26 @@ function finishDropTest() {
 // ---------------------------------------------------------------------------
 // Per-stage latency. Host stamps (capture, encodeDone: frame header extension;
 // send: header) are host-clock µs, converted with the clock sync; the client
-// adds first/last byte, decode submit/output, drawn and displayed (estimate:
-// the main thread's next requestAnimationFrame after the draw, sampled).
+// adds first/last byte, decode submit/output, draw start, drawn and displayed
+// (estimate: the main thread's next requestAnimationFrame after the draw,
+// sampled).
 //
 //   capture→encodeDone | host queue | network (send→first byte) | transfer |
-//   reorder/wait (last byte→submit) | decode | draw | display (est.)
+//   reorder/wait (last byte→submit) | decode | hold (output→draw start: the
+//   frame pacing wait, step 4.4) | draw | display (est.)
 //
 // End-to-end runs from capture (or send, when the host cannot stamp the
 // capture) to drawn and is the per-frame sum of the stages in that span; the
-// sampled display estimate comes on top.
+// sampled display estimate comes on top. Hosts without the welcome feature
+// stage-hold get hold and draw as one draw row (decoder output → drawn).
 
-const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'draw', 'display'];
+const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'hold', 'draw', 'display'];
+const ST = Object.fromEntries(STAGES.map((name, i) => [name, i]));
 const STAGE_WINDOW_MS = 10000;
 const DISPLAY_SAMPLE_MS = 50; // display marks: ~20/s keeps the main thread's rAF work small
 const lat = { recs: [], pending: null, markId: 0, lastMark: 0, lastReport: now() };
 
-function recordStages(m, decoded, drawn) {
+function recordStages(m, decoded, start, drawn, pace) {
   const capUs = m.ext?.captureUs;
   const doneUs = m.ext?.encodeDoneUs;
   const sendL = hostToLocal(m.sendUs);
@@ -1024,11 +1039,16 @@ function recordStages(m, decoded, drawn) {
   s[3] = m.recv - m.first;
   s[4] = m.t - m.recv;
   s[5] = decoded - m.t;
-  s[6] = drawn - decoded;
+  s[ST.hold] = start - decoded;
+  s[ST.draw] = drawn - start;
   const fromCapture = s[0] !== null;
+  const pacing = pace?.via === 'hop' ? 'latency' : 'smooth';
   const rec = {
-    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name,
-    raw: { captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded, drawn },
+    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name, pacing,
+    raw: {
+      captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded,
+      drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null,
+    },
   };
   lat.recs.push(rec);
   while (lat.recs.length && lat.recs[0].t < drawn - STAGE_WINDOW_MS) lat.recs.shift();
@@ -1052,7 +1072,7 @@ function onDisplayed(id, abs) {
   const shown = abs - performance.timeOrigin;
   if (shown < rec.t) return;
   rec.raw.displayed = shown;
-  rec.s[7] = shown - rec.t;
+  rec.s[ST.display] = shown - rec.t;
 }
 
 function pct(v) {
@@ -1074,7 +1094,7 @@ function stageSummary() {
   let sum = 0;
   let e2eSum = 0;
   for (const r of recs) {
-    for (let i = first; i < 7; i++) sum += r.s[i];
+    for (let i = first; i < ST.display; i++) sum += r.s[i];
     e2eSum += fromCapture ? r.e2e : r.e2eSend;
   }
   return {
@@ -1086,18 +1106,29 @@ function stageSummary() {
   };
 }
 
+// The frame pacing mode the records were drawn in: latency, smooth, or mixed
+// (the setting changed meanwhile); null without records.
+function pacingOf(recs) {
+  const modes = new Set(recs.map((r) => r.pacing));
+  return modes.size > 1 ? 'mixed' : modes.size ? [...modes][0] : null;
+}
+
 // Every 10 s the host logs the summary next to its encoder (results per vendor).
 function reportStages(sum) {
   const t = now();
   if (!sum || t - lat.lastReport < 10000 || !transport) return;
   lat.lastReport = t;
+  // Hosts before step 4.4 take at most 9 rows: hold and draw as one draw row there.
+  const hold = hostFeatures.includes(P.FEATURE_STAGE_HOLD);
+  const stages = hold ? sum.stages : { ...sum.stages, hold: null, draw: pct(lat.recs.map((r) => r.s[ST.hold] + r.s[ST.draw])) };
   const rows = [];
-  for (const name of STAGES) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
+  for (const name of STAGES) if (stages[name]) rows.push({ name, ...stages[name] });
   rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
   // The presentation path that drew the window's frames (draw and display
-  // depend on it); "bakeoff" for a window with several (the bake-off).
+  // depend on it); "bakeoff" for a window with several (the bake-off). The
+  // frame pacing mode (hold and display depend on it).
   const paths = new Set(lat.recs.map((r) => r.path));
-  transport.sendControl({ t: 'stages', stages: rows, renderer: paths.size === 1 ? [...paths][0] : 'bakeoff' });
+  transport.sendControl({ t: 'stages', stages: rows, renderer: paths.size === 1 ? [...paths][0] : 'bakeoff', pacing: pacingOf(lat.recs) });
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,7 +1444,8 @@ function onAudioPacket(d) {
 function onControl(m) {
   switch (m.t) {
     case 'welcome':
-      probe.features = m.features || [];
+      hostFeatures = m.features || [];
+      probe.features = hostFeatures;
       probe.wallOffsetUs = m.wallOffsetUs ?? null;
       updateProbeMode();
       post('welcome', { info: m });
@@ -1494,6 +1526,10 @@ function postStats() {
     // Presentation (4.3): the active path, what its context reports, the
     // canvas size (device pixels) and the bake-off's progress or result.
     renderer: renderer ? rendererInfo() : null,
+    // Frame pacing (4.4): the mode, where Smooth's refresh ticks come from,
+    // the draws per source and Smooth's stale (dropped) and late frames,
+    // this session; the refresh interval it assumes.
+    pacing: { ...pacer.info(), refreshMs: +pres.refreshMs.toFixed(2) },
     hw: video.hw,
     synced: clock.offset !== null,
   });
@@ -1536,6 +1572,7 @@ async function selfTestDecoders(decoders) {
 
 async function start(msg) {
   prefs = msg.prefs || {};
+  pacer.setMode(prefs.pacing);
   if (msg.audioSab) audio.ring = new RingWriter(msg.audioSab);
   if (msg.audioPort) audio.port = msg.audioPort;
   await setupRenderers(msg);
@@ -1581,7 +1618,12 @@ self.onmessage = (ev) => {
       if (m.m?.t === 'pause' || m.m?.t === 'resume') freeze.drawn = 0; // not a freeze
       transport?.sendControl(m.m);
       break;
-    case 'prefs': prefs = { ...prefs, ...m.prefs }; updateProbeMode(); break;
+    case 'prefs':
+      prefs = { ...prefs, ...m.prefs };
+      updateProbeMode();
+      pacer.setMode(prefs.pacing); // live
+      break;
+    case 'tick': pacer.tick(m.t - performance.timeOrigin, 'main'); break; // the main thread's animation frame (absolute ms)
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;
     case 'resize': onResize(m.w, m.h); break;

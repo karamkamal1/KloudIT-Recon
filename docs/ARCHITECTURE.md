@@ -246,6 +246,9 @@ WebGPU: scaled texture coordinates).
 worker:  WebTransport.incomingUnidirectionalStreams ─► readAll ─► reorder ─► VideoDecoder
                                                                         │ output(frame)
                                                                         ▼
+                                        pacing.js: draw on decode (Lowest latency) or at the
+                                        next display refresh (Smooth, worker requestAnimationFrame)
+                                                                        ▼
                                         renderers.js on an OffscreenCanvas sized to device pixels:
                                           canvas2d  getContext('2d', {desynchronized:true}).drawImage
                                           webgl2    getContext('webgl2', {desynchronized:true}),
@@ -255,10 +258,28 @@ main:    pointerrawupdate / keys / gamepads ──postMessage──► worker �
 audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─► AudioWorklet (adaptive jitter buffer)
 ```
 
-- Frames are drawn the moment they decode (one task after the decoder's output); there's no
-  requestAnimationFrame wait. Outputs that are already waiting by then (a burst after a stall)
-  supersede each other: only the newest is drawn, the older ones are closed unseen. A
-  desynchronized canvas bypasses the compositor's double buffering where the platform supports it.
+- Frame pacing (step 4.4, `pacing.js`), Settings → Pipeline → *Frame pacing*, applied live in
+  the worker (no reconnect, the host is not involved):
+  - **Lowest latency** (the default): frames are drawn the moment they decode (one task after
+    the decoder's output); there's no requestAnimationFrame wait. Outputs that are already
+    waiting by then (a burst after a stall) supersede each other: only the newest is drawn, the
+    older ones are closed unseen. A desynchronized canvas bypasses the compositor's double
+    buffering where the platform supports it.
+  - **Smooth**: a decoded frame waits for the next display refresh (the worker's
+    `requestAnimationFrame`, whose timestamp is the refresh's start) and is drawn there, so the
+    screen gets at most one new frame per refresh, drawn as the refresh starts. It costs up to
+    one refresh of latency. At most one frame waits: a newer output replaces it (the older one
+    is closed unseen). A frame older than one refresh when its refresh comes (more than 1.25
+    refresh intervals from its output to the refresh's start: the refresh came late or was
+    skipped) is dropped when a newer frame is already in the decoder (that one takes the next
+    refresh); otherwise it is drawn late, because it is the newest picture there is (the last
+    frame before a still desktop must not be lost), and never two drops in a row, so a refresh
+    source that is always late cannot starve the screen. Without `requestAnimationFrame` in the
+    worker the main thread posts its animation frames' start times; a frame that gets no tick
+    for max(3 refreshes, 100 ms) is handled from a timer (logged; the overlay counts these
+    *watchdog* draws; long enough not to override the browser's own back-pressure, which
+    delays the callbacks while its compositor or GPU is behind). Both modes work with every presentation path below, and with Auto's
+    bake-off.
 - Presentation (step 4.3): three paths, Settings → Renderer: 2D canvas (desynchronized), WebGL2
   (desynchronized requested; `texImage2D(frame)` into a texture, one triangle), WebGPU
   (`importExternalTexture`, zero copy; WebGPU canvases have no low-latency mode), or **Auto**
@@ -279,9 +300,10 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   (no path always measured first), 1.5 s each (the first 250 ms after a switch do not count),
   while display marks are taken as often as the main thread answers; the start-up toolbar and
   game-mode hint wait for the result, so nothing of the app's covers the canvas meanwhile. Per
-  path: the Phase 0 *draw* (decoder output → drawn) and *display* (drawn → the main thread's
+  path: the Phase 0 *draw* (draw start → drawn) and *display* (drawn → the main thread's
   next animation frame) stages, the draw p50 per round, the frames per second drawn and the
-  failed draws. The pick (`renderers.js` `pickPath`) is a heuristic, not a measurement of
+  failed draws (the result names the frame pacing mode it ran in; the display stage depends
+  on it, alike for every path). The pick (`renderers.js` `pickPath`) is a heuristic, not a measurement of
   presentation: a worker's canvas reaches the compositor without the main thread, so the
   display estimate is the same for every path unless one holds the page's frames back, and the
   draw stage is only the worker's draw call. Out: a path with failed draws or a lost context,
@@ -298,8 +320,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   the pick; Settings → *Measure renderers again* clears it. The click-to-photon rig (step 0.3)
   and PresentMon decide on real clients, and a path chosen in Settings overrides Auto. The
   client's stage report to the host names the path that drew the window's frames
-  (`renderer`; `bakeoff` for a window with several), so the host log keeps the draw and
-  display rows per renderer.
+  (`renderer`; `bakeoff` for a window with several) and the frame pacing mode (`pacing`:
+  `latency`, `smooth`, or `mixed` when it changed in the window), so the host log keeps the
+  hold, draw and display rows per renderer and mode.
 - Decoder hygiene: `prefer-hardware` + `optimizeForLatency`; `flush()` is never called while
   streaming (it waits for every output and makes the next chunk a key frame; recovery resets and
   reconfigures instead). At most 2 chunks wait inside the decoder (`decodeQueueSize`); later ones
@@ -323,7 +346,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
 - **Per-stage latency** (overlay, Ctrl+Alt+Shift+S): every frame is split into
   capture→encoded, host queue (encodeDone→send), network (send→first byte), transfer (first→last
   byte; 0 over WebSocket, where a frame arrives as one message), reorder/wait (last byte→decode
-  submit), decode, draw and display (est.). The display estimate is the main thread's next
+  submit), decode, hold (decoder output→draw start: the frame pacing wait, one task in Lowest
+  latency, the wait for the display refresh in Smooth), draw (the renderer's draw call) and
+  display (est.). The display estimate is the main thread's next
   `requestAnimationFrame` after the draw, sampled at most every 50 ms, one mark in flight. The
   overlay shows p50/p95/p99 over the last 10 s per stage and for **end-to-end (capture→draw)**,
   the per-frame sum of the stages up to draw. Without a capture stamp (old host, capture
@@ -332,7 +357,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   `window.__recon.lastStats.stages`, and every 10 s the client sends them to the host
   (`{"t":"stages"}`), which logs them next to the encoder name and vendor, together with its own
   capture→encoded and queue times of the frames the client acknowledged (`0x40`) in the same
-  10 s (`host_capture`, `host_queue`).
+  10 s (`host_capture`, `host_queue`). Hosts announce `stage-hold` in `welcome.features` when
+  they take the hold row; to older hosts (at most nine rows) the client reports hold and draw
+  as one draw row (decoder output→drawn), as before step 4.4.
 
 ## Direct path
 

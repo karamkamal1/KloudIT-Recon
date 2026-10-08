@@ -252,6 +252,10 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   path that stops drawing is dropped for the 2D canvas. Pick a renderer to override Auto, for
   example after measuring click-to-photon with the latency rig
   ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
+- **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
+  decodes. *Smooth* draws at most one new frame per display refresh, as the refresh starts, for
+  an even cadence; it costs up to one refresh of latency (the overlay's *hold* row) and drops a
+  frame that missed its refresh when a newer one is already decoding.
 - **Latency probe** (Diagnostics): open `tools/latency-test/index.html` (in the release zip:
   `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
   host screen → drawn latency measured from the picture, and **Export latency data** saves it.

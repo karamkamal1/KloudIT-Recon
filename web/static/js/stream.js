@@ -5,6 +5,7 @@ import { api, me, el, toast, capabilities } from './api.js';
 import * as P from './protocol.js';
 import { codeToScancode } from './keymap.js';
 import { PATHS, LABELS } from './renderers.js';
+import { PACING, PACING_LABELS } from './pacing.js';
 
 const $ = (id) => document.getElementById(id);
 const hostId = new URLSearchParams(location.search).get('host');
@@ -25,7 +26,7 @@ const ICONS = {
 const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
   audio: true, audioCodec: 'opus', volume: 100, jitterMs: 30,
-  renderer: 'auto', decoder: 'hardware', path: 'auto', transport: 'auto',
+  renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto',
   mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
 const PREF_KEY = 'recon.prefs.v1';
@@ -38,6 +39,7 @@ try {
   Object.assign(prefs, saved, { rendererV: 2 });
 } catch {}
 if (prefs.renderer !== 'auto' && !PATHS.includes(prefs.renderer)) prefs.renderer = 'auto';
+if (!PACING.includes(prefs.pacing)) prefs.pacing = 'latency';
 const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} };
 
 const RESOLUTIONS = {
@@ -108,14 +110,19 @@ function splash(title, sub, { button = null, spinner = false } = {}) {
   $('spinner').classList.toggle('hidden', !spinner);
 }
 
+// The display's refresh rate: the median interval of 30 animation frames, so
+// frames the browser skips while the page loads do not count (frame pacing,
+// step 4.4, takes its refresh interval from this).
 async function measureHz() {
   return new Promise((res) => {
-    let n = 0;
-    let t0 = 0;
+    const d = [];
+    let last = 0;
     const tick = (t) => {
-      if (!t0) t0 = t;
-      if (++n < 30) requestAnimationFrame(tick);
-      else res(Math.round((1000 * (n - 1)) / (t - t0)));
+      if (last) d.push(t - last);
+      last = t;
+      if (d.length < 30) { requestAnimationFrame(tick); return; }
+      d.sort((a, b) => a - b);
+      res(Math.round(1000 / d[d.length >> 1]));
     };
     requestAnimationFrame(tick);
   });
@@ -245,7 +252,7 @@ function onBakeoff(result) {
   if (!result.winner) return;
   const v = S.videoCfg;
   storePresent({
-    key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results,
+    key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
     video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
   });
   toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
@@ -311,7 +318,7 @@ async function connect() {
   if (port) transfer.push(port);
   w.postMessage({
     type: 'start', canvases, present: { mode: S.present.mode }, box: S.box || stageBoxNow(), endpoints: ep,
-    prefs: { decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe },
+    prefs: { decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
     audioSab: sab, audioPort: port,
@@ -320,6 +327,7 @@ async function connect() {
 
 function teardown() {
   releaseAll();
+  onTicks(false);
   if (S.worker) {
     const w = S.worker;
     w.postMessage({ type: 'close' });
@@ -390,6 +398,7 @@ function onWorker(m) {
     case 'bakeoff': onBakeoff(m.result); break;
     case 'presentFailed': onPresentFailed(m); break;
     case 'drawn': onDrawnMark(m); break;
+    case 'ticks': onTicks(m.on); break;
     case 'stageDump': S.stageDump = m.recs; break;
     case 'dropTest': S.dropTest = m.result; break;
     case 'decoderTest': S.decoderTest = m.tests; break;
@@ -418,6 +427,24 @@ function onDrawnMark(m) {
     if (abs < drawnMark.t) { requestAnimationFrame(tick); return; }
     post({ type: 'displayed', id: drawnMark.id, t: abs });
     drawnMark = null;
+  };
+  requestAnimationFrame(tick);
+}
+
+// Frame pacing "Smooth" in a browser whose workers have no
+// requestAnimationFrame (pacing.js): the worker asks for this page's
+// animation frames instead; each one's start goes to it as an absolute time.
+// One loop at a time (gen: a loop of an earlier worker stops).
+const ticks = { on: false, gen: 0 };
+function onTicks(on) {
+  if (!!on === ticks.on) return;
+  ticks.on = !!on;
+  const gen = ++ticks.gen;
+  if (!on) return;
+  const tick = (ts) => {
+    if (ticks.gen !== gen) return;
+    post({ type: 'tick', t: performance.timeOrigin + ts });
+    requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
 }
@@ -745,7 +772,7 @@ function toggleStats() {
 
 const STAGE_LABELS = [
   ['capture', 'capture→encoded'], ['queue', 'host queue'], ['network', 'network'], ['transfer', 'transfer'],
-  ['wait', 'reorder/wait'], ['decode', 'decode'], ['draw', 'draw'], ['display', '+ display (est.)'],
+  ['wait', 'reorder/wait'], ['decode', 'decode'], ['hold', 'hold (frame pacing)'], ['draw', 'draw'], ['display', '+ display (est.)'],
 ];
 const fmt = (v, d = 1, unit = ' ms') => (v === null || v === undefined || !isFinite(v) ? '—' : `${v.toFixed(d)}${unit}`);
 const cls = (v, a, b) => (v === null || v === undefined ? '' : v < a ? 'good' : v < b ? 'warn' : 'bad');
@@ -795,6 +822,7 @@ function onStats(st) {
     row('Loss recovery', v.recovery === 'skip' ? 'skip frame (intra refresh)' : 'key frame'),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
     ...presentRows(st, row),
+    pacingRow(st.pacing, row),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     ...decoderRows(st, row),
     row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · superseded ${st.superseded ?? 0} (+${st.supersededChunks ?? 0} undecoded) · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
@@ -832,7 +860,7 @@ function presentRows(st, row) {
   ];
   const res = b?.done ? b : storedPresent();
   if (res?.results) {
-    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}`, 'draw p50/p95 · display p50 · fps'));
+    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}`, `draw p50/p95 · display p50 · fps${res.pacing ? ` (pacing: ${res.pacing})` : ''}`));
     for (const p of PATHS) {
       const x = res.results[p];
       if (!x) continue;
@@ -842,6 +870,20 @@ function presentRows(st, row) {
     if (res.why) rows.push(row('  pick', res.why));
   }
   return rows;
+}
+
+// Frame pacing (step 4.4): the mode; for Smooth where its refresh ticks come
+// from (the worker's requestAnimationFrame, else this page's), the refresh
+// interval it assumes, and this session's frames dropped stale (older than
+// one refresh, a newer one on its way), drawn late, and drawn from the
+// watchdog timer (no refresh tick came: warn).
+const TICKS = { raf: 'worker rAF', main: 'page rAF' };
+function pacingRow(pc, row) {
+  if (!pc) return null;
+  if (pc.mode !== 'smooth') return row('Frame pacing', `${PACING_LABELS.latency} · draw on decode`);
+  const c = pc.counts;
+  return row('Frame pacing', `${PACING_LABELS.smooth} · each refresh (${TICKS[pc.ticks] || pc.ticks}, ${pc.refreshMs} ms) · stale ${c.stale} · late ${c.late}` +
+    `${c.timer ? ` · watchdog ${c.timer}` : ''}`, c.timer ? 'warn' : '');
 }
 
 // Decoder hygiene (step 4.1): the queue in the decoder (bound 2) and in front
@@ -982,6 +1024,8 @@ const applyLive = () => {
   applyTimer = setTimeout(() => sendCtl({ t: 'settings', prefs: hostPrefs() }), 250);
 };
 const needsReconnect = () => toast('Applies on the next connection — click Reconnect.', 'info', 3500);
+// Frame pacing (step 4.4) applies live in the worker (the host is not involved).
+const applyPacing = () => post({ type: 'prefs', prefs: { pacing: prefs.pacing } });
 
 function buildDrawer() {
   const w = S.welcome || {};
@@ -1038,6 +1082,8 @@ function buildDrawer() {
       field('Renderer', select('renderer', [['auto', 'Auto (measured in this browser)'], ['canvas2d', '2D canvas (desynchronized)'],
         ['webgl2', 'WebGL2 (desynchronized if granted)'], ['webgpu', 'WebGPU (zero-copy)']], needsReconnect), presentHint()),
       el('button', { class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),
+      field('Frame pacing', select('pacing', [['latency', 'Lowest latency (draw on decode)'], ['smooth', 'Smooth (one frame per display refresh)']], applyPacing),
+        'Applies at once. Smooth holds each frame for the next display refresh: an even cadence for up to one refresh more latency (overlay: hold).'),
       field('Decoder', select('decoder', [['hardware', 'Prefer hardware'], ['software', 'Prefer software']], needsReconnect)),
     ),
     el('div', { class: 'actions' },

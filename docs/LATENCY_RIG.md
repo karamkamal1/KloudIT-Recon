@@ -389,6 +389,22 @@ must equal the screen in device pixels in fullscreen. Then compare the winner wi
 (overlay *bake-off* rows, ★): if they differ, set the rig's winner in the settings and record
 both in docs/VENDOR_NOTES.md (step 4.3).
 
+### Frame pacing (step 4.4)
+
+Recon's *Pipeline → Frame pacing* has two modes, applied at once: *Lowest latency* (the
+default, like Moonlight with *Frame pacing* off) draws each frame when it decodes; *Smooth*
+(like Moonlight with *Frame pacing* on) draws at most one new frame per display refresh, as the
+refresh starts, and costs up to one refresh. Measure both against the matching Moonlight
+setting: labels such as `recon-hevc-1080p120-lan-chrome-canvas2d-latency` and
+`...-smooth`, with Moonlight's `moonlight-hevc-1080p120-lan-pacing-off` and `...-pacing-on` as
+the baselines. The expected cost of *Smooth* is about half a refresh on the median (a frame
+waits on average half a refresh for the next one), at most one refresh more at p95. For the
+cadence, capture PresentMon during each block and compare `MsBetweenDisplayChange` (p50 and
+p95, and its spread): with a stream at the display's refresh rate *Smooth* should show a
+steadier interval than *Lowest latency* on a stream with network jitter (the `wifi` profile,
+[NETEM.md](NETEM.md)). The overlay's *Frame pacing* row counts frames dropped as stale, drawn
+late and drawn from the watchdog timer; record them with each Smooth block.
+
 ## Without hardware
 
 ```sh

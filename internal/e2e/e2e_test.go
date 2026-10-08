@@ -307,6 +307,7 @@ type result struct {
 	extFrames, stamped, badFrames     int  // frames with the header extension, with ordered stage stamps, unparsable
 	welcome, extFeature               bool // welcome received; it advertised the frame header extension
 	barcodeFeature                    bool // welcome advertised the test pattern's frame barcode
+	stageHoldFeature                  bool // welcome advertised the stage report's hold row
 	wallOffsetUs                      int64
 	firstFrameLatency                 time.Duration
 	recovery                          []string           // VideoConfig.Recovery of each config
@@ -335,6 +336,7 @@ func (r *result) control(m []byte) {
 		r.welcome = true
 		r.extFeature = slices.Contains(x.Features, proto.FeatureFrameExt)
 		r.barcodeFeature = slices.Contains(x.Features, proto.FeatureBarcodeSeq)
+		r.stageHoldFeature = slices.Contains(x.Features, proto.FeatureStageHold)
 		r.wallOffsetUs = x.WallOffsetUs
 	case "video":
 		r.configs++
@@ -393,6 +395,10 @@ func checkExt(t *testing.T, r result, v int) {
 	// offset is wall clock minus a host clock that started with the agent.
 	if !r.barcodeFeature {
 		t.Fatalf("v%d client: welcome lacks %s with the test source", v, proto.FeatureBarcodeSeq)
+	}
+	// Step 4.4: the stage report's hold row (frame pacing) is taken from every client.
+	if !r.stageHoldFeature {
+		t.Fatalf("v%d client: welcome lacks %s", v, proto.FeatureStageHold)
 	}
 	if start := time.UnixMicro(r.wallOffsetUs); time.Since(start) < 0 || time.Since(start) > time.Hour {
 		t.Fatalf("v%d client: implausible wallOffsetUs %d (host clock started %v)", v, r.wallOffsetUs, start)

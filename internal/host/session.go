@@ -287,7 +287,7 @@ func (s *Session) sendWelcome() error {
 	for _, e := range s.a.caps.Encoders {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
-	w.Features = s.a.features()
+	w.Features = append(s.a.features(), proto.FeatureStageHold)
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
@@ -1402,7 +1402,7 @@ func (s *Session) controlLoop() error {
 		case "keyframe":
 			s.requestKeyframe()
 		case "stages":
-			s.logStages(m.Stages, m.Renderer)
+			s.logStages(m.Stages, m.Renderer, m.Pacing)
 		case "congestion":
 			// Overlapped: the client keeps decoding the current generation
 			// until the new one is ready, unless it flushed its decoder: then
@@ -1509,16 +1509,20 @@ func pctString(v []float64) string {
 
 // stageNames are the rows a client latency summary may contain.
 var stageNames = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
-	"decode": true, "draw": true, "display": true, "e2e": true}
+	"decode": true, "hold": true, "draw": true, "display": true, "e2e": true}
 
 // rendererName accepts the presentation paths a client may name.
 var rendererName = regexp.MustCompile(`^[a-z0-9-]{1,24}$`)
 
+// pacingModes are the frame pacing modes a client may name (step 4.4).
+var pacingModes = map[string]bool{"latency": true, "smooth": true, "mixed": true}
+
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
 // the host's own measurement of its stages (host_capture, host_queue), with
-// the client's presentation path (renderer) when it names one.
-func (s *Session) logStages(rows []proto.StageStat, renderer string) {
+// the client's presentation path (renderer) and frame pacing mode (pacing)
+// when it names them.
+func (s *Session) logStages(rows []proto.StageStat, renderer, pacing string) {
 	p, ok := s.video.Active()
 	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
 		return
@@ -1527,6 +1531,9 @@ func (s *Session) logStages(rows []proto.StageStat, renderer string) {
 		"kbps", p.BitrateKbps}
 	if rendererName.MatchString(renderer) {
 		args = append(args, "renderer", renderer)
+	}
+	if pacingModes[pacing] {
+		args = append(args, "pacing", pacing)
 	}
 	for _, r := range rows {
 		if !stageNames[r.Name] {

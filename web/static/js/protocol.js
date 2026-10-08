@@ -38,6 +38,9 @@ export const EXT_TAGS = {
 // Hello version that asks the host for extended frame headers.
 export const HELLO_VERSION = 2;
 export const FEATURE_FRAME_EXT = 'frame-ext';
+// The host takes the "hold" row (frame pacing wait) in the client's stage
+// report; without it the client reports hold and draw as one draw row.
+export const FEATURE_STAGE_HOLD = 'stage-hold';
 
 export const AUDIO_OPUS = 1;
 export const AUDIO_PCM = 2;
