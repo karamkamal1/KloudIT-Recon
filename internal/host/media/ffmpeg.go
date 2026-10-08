@@ -126,9 +126,14 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	c.Version, c.VersionInfo = parseVersion(out)
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
-	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts", "drawbox"} {
-		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
-			c.Filters[f] = true
+	c.Filters = parseFilters(out)
+	if c.Filters["vsrc_amf"] {
+		help, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-h", "filter=vsrc_amf").Output()
+		if err := checkAMFCapture(help, c.Filters); err != nil {
+			c.Filters["vsrc_amf"] = false
+			if log != nil {
+				log.Info("AMD Direct Capture (vsrc_amf) unusable", "err", err)
+			}
 		}
 	}
 	if c.Filters["settb"] && c.Filters["setpts"] {
@@ -352,6 +357,36 @@ func testBarcode(ctx context.Context, ffmpeg string) error {
 	return nil
 }
 
+// probeFilters are the filters BuildArgs may use.
+var probeFilters = []string{"ddagrab", "gfxcapture", "vsrc_amf", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime",
+	"testsrc2", "settb", "setpts", "drawbox", "select"}
+
+// parseFilters returns which of probeFilters "ffmpeg -filters" lists.
+func parseFilters(out []byte) map[string]bool {
+	m := map[string]bool{}
+	for _, f := range probeFilters {
+		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
+			m[f] = true
+		}
+	}
+	return m
+}
+
+// checkAMFCapture checks that BuildArgs can use vsrc_amf: "ffmpeg -h
+// filter=vsrc_amf" (help) lists the options and the capture mode it sets, and
+// the build has select for framePacer.
+func checkAMFCapture(help []byte, filters map[string]bool) error {
+	for _, o := range []string{"monitor_index", "framerate", "duplicate_output", "capture_mode", "wait_for_present"} {
+		if !regexp.MustCompile(`(?m)^\s+` + o + `\s`).Match(help) {
+			return fmt.Errorf("vsrc_amf has no %s", o)
+		}
+	}
+	if !filters["select"] {
+		return errors.New("no select filter")
+	}
+	return nil
+}
+
 var optLine = regexp.MustCompile(`^\s{1,4}-([A-Za-z0-9_\-]+)\s+<`)
 
 // parseVersion returns the first line of "ffmpeg -version" and its lines
@@ -451,8 +486,8 @@ func (c *Caps) Pads(enc string, w, h int) bool {
 
 // Source selects what is captured.
 type Source struct {
-	Backend  string // ddagrab | gfxcapture | x11grab | test
-	Output   int    // ddagrab output index (adapter 0)
+	Backend  string // ddagrab | gfxcapture | amf | x11grab | test
+	Output   int    // ddagrab output_idx / amf monitor_index: DXGI output index on adapter 0
 	HMonitor uint64 // gfxcapture monitor handle
 	Window   string // gfxcapture window title regex (optional)
 	Display  string // x11grab display, e.g. ":0.0"
@@ -518,6 +553,19 @@ func (p Params) OutputSize() (w, h int) {
 	return p.Source.NativeW, p.Source.NativeH
 }
 
+// CanCaptureAMF reports why AMD Direct Capture (Source.Backend "amf") cannot
+// feed enc, or nil: this build needs a usable vsrc_amf (Probe checks its
+// options), and its AMF surfaces only go to the AMF encoders.
+func (c *Caps) CanCaptureAMF(enc EncoderInfo) error {
+	if !c.Filters["vsrc_amf"] {
+		return errors.New("this ffmpeg build has no usable vsrc_amf filter (AMD Direct Capture: FFmpeg >= 8.1 with AMF)")
+	}
+	if !strings.HasSuffix(enc.Name, "_amf") {
+		return fmt.Errorf("AMD Direct Capture only feeds AMF encoders, not %s", enc.Name)
+	}
+	return nil
+}
+
 // CaptureClockFilter sets each frame's pts to the wall clock (av_gettime())
 // in µs. time(0) replaces setpts' deprecated RTCTIME constant.
 const CaptureClockFilter = "settb=AVTB,setpts=time(0)*1000000"
@@ -563,6 +611,29 @@ func BarcodeFilter(cell int) string {
 	return strings.Join(parts, ",")
 }
 
+// framePacer returns a select filter that passes at most fps frames a second
+// on average from a source that delivers frames at its own pace: vsrc_amf in
+// wait_for_present mode returns every present of DWM or a fullscreen game,
+// whatever its framerate option says (the AMF Display Capture API defines
+// that only for keep_framerate mode). The encoder's rate control assumes fps
+// frames a second: a 144 Hz display streamed at 60 fps would get 2.4 times
+// the bitrate.
+//
+// The clock is time(0), the wall clock in seconds when the frame arrives.
+// ld(0) is the time the next frame is due and ld(1) the clock minus it. A
+// frame passes when it is due, and the next one is due one interval later;
+// a late frame keeps up to one interval of credit, so a source a little
+// faster than fps still yields fps (after a late frame two may pass back to
+// back), and one at fps loses no frame to jitter below half an interval. A
+// clock that jumped back by more than two intervals (a wall-clock step) passes
+// the frame and restarts the schedule instead of stalling the stream. FFmpeg
+// evaluates both operands of a binary operator in order (libavutil/eval.c), so
+// st(1) is stored before ld(1) reads it; the quotes keep the commas inside the
+// filter's argument.
+func framePacer(fps int) string {
+	return fmt.Sprintf("select='if(gte(st(1,time(0)-ld(0)),0)+lt(ld(1),-2/%[1]d),1+0*st(0,ld(0)+ld(1)+1/%[1]d-clip(ld(1),0,1/%[1]d)),0)'", fps)
+}
+
 var safeRegex = regexp.MustCompile(`^[A-Za-z0-9 _.\-()*+?^$|\[\]]{1,128}$`)
 
 // escapeFilterValue quotes a value for use inside a filtergraph option.
@@ -584,7 +655,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	e := p.Encoder
 	args := []string{"-hide_banner", "-loglevel", "warning", "-nostdin"}
-	gpuFrames := false // source produces D3D11 frames
+	gpuFrames := false // source produces D3D11 frames (amf: AMF surfaces)
 	var chain string
 	cursor := "0"
 	if p.DrawCursor {
@@ -614,6 +685,25 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 			opts = append(opts, fmt.Sprintf("width=%d", p.Width), fmt.Sprintf("height=%d", p.Height), "resize_mode=scale_aspect", "scale_mode=bilinear")
 		}
 		chain = "gfxcapture=" + strings.Join(opts, ":")
+		gpuFrames = true
+	case "amf":
+		// AMD Direct Capture (experimental): vsrc_amf returns AMF surfaces
+		// (AV_PIX_FMT_AMF_SURFACE) on its own AMF device, and amfenc encodes
+		// them in place on that device: zero copy, no hwmap. duplicate_output
+		// hands out a copy of the captured surface, which may be
+		// DCC-compressed and then cannot go to the encoder (AMF Display
+		// Capture API). The filter has no cursor option.
+		if err := c.CanCaptureAMF(e); err != nil {
+			return nil, err
+		}
+		if p.DrawCursor {
+			return nil, errors.New("AMD Direct Capture cannot draw the cursor")
+		}
+		if p.Source.Output < 0 || p.Source.Output > 8 {
+			return nil, fmt.Errorf("AMD Direct Capture: monitor index %d out of range 0-8", p.Source.Output)
+		}
+		chain = fmt.Sprintf("vsrc_amf=monitor_index=%d:framerate=%d:capture_mode=wait_for_present:duplicate_output=1,%s",
+			p.Source.Output, p.FPS, framePacer(p.FPS))
 		gpuFrames = true
 	case "x11grab":
 		args = append(args, "-f", "x11grab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor)
@@ -651,7 +741,8 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	// Convert into what the encoder accepts.
 	switch {
 	case gpuFrames && (e.Vendor == "nvidia" || e.Vendor == "amd"):
-		// NVENC and AMF consume D3D11 textures directly: zero copy.
+		// NVENC and AMF consume D3D11 textures directly, AMF also vsrc_amf's
+		// AMF surfaces: zero copy.
 	case gpuFrames && e.Vendor == "intel" && c.Filters["vpp_qsv"]:
 		// QSV turns BGRA input into 4:4:4 HEVC, which browsers cannot decode:
 		// convert to NV12 on the GPU first.

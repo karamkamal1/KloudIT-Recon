@@ -120,9 +120,20 @@ units, high resolution) · `4` release-all · `5` UTF-8 text (typed as Unicode k
 
 ```
 ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + vpp_qsv → NV12)
+vsrc_amf (opt-in)     ──AMF surface────►  AMF only
      │ (no CPU copy)                          │
      └────────── ffmpeg child process ────────┴──► NUT on stdout ──► Go demuxer ──► frame queue
 ```
+
+- **AMD Direct Capture (experimental, `capture: "amf"`):** FFmpeg 8.1's `vsrc_amf` in
+  `wait_for_present` mode delivers each present of DWM or a fullscreen game as an AMF surface on
+  its own AMF device. `*_amf` encoders take that frames context and encode the surfaces in place
+  (no hwmap, no copy beyond the capture's own `duplicate_output` copy). A `select` expression
+  caps the rate at the session's fps: the AMF docs define the `framerate` option only for
+  `keep_framerate` mode.
+  The session uses it only with an AMF encoder, without the cursor in the video and for a
+  monitor on DXGI adapter 0. Otherwise, and for the rest of a session after it failed once, it
+  captures with ddagrab (see `docs/VENDOR_NOTES.md`, 1.6).
 
 - **Why NUT:** a frame is forwarded as soon as its last byte is written (see
   `internal/nut/nut_test.go: TestStreamingLatency`). Raw Annex-B has no boundaries, and

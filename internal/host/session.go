@@ -48,10 +48,12 @@ type Session struct {
 	ctrl   transport.BidiStream
 
 	hello       proto.Hello
-	prefsMu     sync.Mutex // guards prefs, monitor and alignNotice
+	prefsMu     sync.Mutex // guards prefs, monitor, alignNotice and amfFallback
 	prefs       proto.Prefs
 	monitor     platform.Monitor
 	alignNotice string // last coded-size alignment notice, sent once
+	amfFallback string // why the last generation did not use capture "amf", logged once
+	amfFailed   atomic.Bool
 
 	video    *media.Video
 	audio    *media.Audio
@@ -480,7 +482,9 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	case "gfxcapture":
 		p.Source = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window, NativeW: mon.W, NativeH: mon.H}
 		p.Width, p.Height = w, h
-	case "ddagrab":
+	case "ddagrab", "amf":
+		// "amf" needs the encoder: useAMFCapture decides below. Both capture
+		// the whole monitor at its native size.
 		out := mon.DXGIOutput
 		if out < 0 {
 			out = mon.Index
@@ -497,6 +501,9 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		return media.Params{}, err
 	}
 	p.Encoder = enc
+	if backend == "amf" {
+		s.useAMFCapture(&p, mon)
+	}
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()
 	repeat := notice == s.alignNotice
@@ -509,10 +516,56 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	return p, nil
 }
 
-// backendFor picks the capture backend for the requested preferences.
+// useAMFCapture switches p from ddagrab to AMD Direct Capture of the same
+// monitor (capture "amf", experimental) unless amfCaptureBlocker or an
+// earlier failure in this session rules it out; then p stays on ddagrab and
+// the reason is logged once per change.
+func (s *Session) useAMFCapture(p *media.Params, mon platform.Monitor) {
+	why := s.a.amfCaptureBlocker(p.Encoder, p.DrawCursor, mon)
+	if why == "" && s.amfFailed.Load() {
+		why = "it failed earlier in this session"
+	}
+	s.prefsMu.Lock()
+	repeat := why == s.amfFallback
+	s.amfFallback = why
+	s.prefsMu.Unlock()
+	if why == "" {
+		p.Source.Backend = "amf" // Output: the monitor's DXGI output index
+		return
+	}
+	if !repeat {
+		s.log.Info("AMD Direct Capture (capture \"amf\") not used, capturing with ddagrab", "reason", why)
+	}
+}
+
+// amfCaptureBlocker returns why AMD Direct Capture cannot capture mon for enc,
+// or "" if it can. vsrc_amf hands AMF surfaces to the encoder, which only an
+// AMF encoder takes (CanCaptureAMF); it has no cursor option, so a video that
+// must carry the cursor stays on ddagrab (draw_mouse) until the driver is
+// shown to include it (docs/VENDOR_NOTES.md 1.6). Its monitor_index is taken
+// to be the DXGI output index on adapter 0, on whose device FFmpeg opens AMF
+// (VERIFY): a monitor that is not an output of adapter 0 (another GPU, an
+// IddCx virtual display) has none.
+func (a *Agent) amfCaptureBlocker(enc media.EncoderInfo, drawCursor bool, mon platform.Monitor) string {
+	if err := a.caps.CanCaptureAMF(enc); err != nil {
+		return err.Error()
+	}
+	switch {
+	case drawCursor:
+		return "the video must carry the cursor"
+	case mon.DXGIOutput < 0 || mon.DXGIOutput > 8:
+		return fmt.Sprintf("monitor %d is not output 0-8 of DXGI adapter 0", mon.Index)
+	}
+	return ""
+}
+
+// backendFor picks the capture backend for the requested preferences. AMD
+// Direct Capture ("amf") is opt-in, never chosen automatically, and is only
+// a request: buildParams falls back to ddagrab when amfCaptureBlocker rules it
+// out for the session's encoder.
 func (a *Agent) backendFor(prefs proto.Prefs) string {
 	switch a.cfg.Capture {
-	case "ddagrab", "gfxcapture", "x11grab", "test":
+	case "ddagrab", "gfxcapture", "x11grab", "test", "amf":
 		return a.cfg.Capture
 	}
 	gfx := a.caps.Filters["gfxcapture"]
@@ -603,6 +656,7 @@ func (s *Session) videoEvents() {
 		}
 		switch {
 		case ev.Err != nil:
+			s.noteCaptureFailure(ev)
 			s.handleEncoderFailure(ev.Err)
 		case ev.Config != nil:
 			s.failures = 0
@@ -621,6 +675,15 @@ func (s *Session) videoEvents() {
 				s.congestion(0)
 			}
 		}
+	}
+}
+
+// noteCaptureFailure takes the session off AMD Direct Capture when a
+// generation that used it failed: the experimental capture is suspected
+// before the encoder, and the restart that follows uses ddagrab.
+func (s *Session) noteCaptureFailure(ev media.VideoEvent) {
+	if ev.Failed.Source.Backend == "amf" && !s.amfFailed.Swap(true) {
+		s.log.Warn("AMD Direct Capture failed, using ddagrab for this session", "err", ev.Err)
 	}
 }
 

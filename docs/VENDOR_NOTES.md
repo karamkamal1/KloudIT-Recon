@@ -806,3 +806,206 @@ Hardware checks:
   `pads:` line under `av1_nvenc`. Codec AV1 at a 1920×1080 desktop streams AV1 (overlay `Video
   1920×1080 AV1`, no toast). If a `pads:` line does appear, record it: the guard then applies
   to NVIDIA as well, by capability.
+
+## 1.6 AMD Direct Capture (experimental)
+
+`"capture": "amf"` in host.json captures with FFmpeg 8.1's `vsrc_amf` (AMD Direct Capture,
+`AMFDisplayCapture`) instead of ddagrab:
+`vsrc_amf=monitor_index=<DXGI output>:framerate=<fps>:capture_mode=wait_for_present:duplicate_output=1`,
+then a `select` frame pacer, then the capture clock. It is opt-in and never chosen by `auto`. A
+session uses it only with an AMF encoder, only when the video need not carry the cursor, and only
+for a monitor that is output 0–8 of DXGI adapter 0. Otherwise it captures with ddagrab and logs
+`AMD Direct Capture (capture "amf") not used, capturing with ddagrab reason=…` once per change.
+After a failed amf generation, the rest of the session uses ddagrab (`AMD Direct Capture failed,
+using ddagrab for this session`).
+
+How the frames reach the encoder (FFmpeg release/8.1 sources: `libavfilter/vsrc_amf.c`,
+`libavcodec/amfenc.c`, `libavutil/hwcontext_amf.c`, `fftools/ffmpeg_enc.c`):
+
+- `vsrc_amf` outputs only `AV_PIX_FMT_AMF_SURFACE`. Without a filter device (the agent passes
+  none) it creates its own AMF device: `InitDX11(NULL)`, i.e. D3D11 on the adapter the AMF
+  runtime picks by default (taken to be DXGI adapter 0; see the monitor_index check). It also
+  creates an AMF frames context whose `sw_format` is the capture format
+  (BGRA → `bgr0`). Each frame's `data[0]` is the `AMFSurface` from `QueryOutput`.
+- `select`, `settb` and `setpts` do not touch pixels and are not hwframe-aware, so libavfilter
+  passes the frames context through, as with ddagrab's D3D11 frames.
+- The encoder's input format is then `amf_surface`, and amfenc declares
+  `HW_CONFIG_ENCODER_FRAMES(AMF_SURFACE, AMF)`. So `hw_device_setup_for_encode` hands it the
+  filter's frames context. `ff_amf_encode_init` takes that context's AMF device as is (no
+  derived device), and `amf_submit_frame` (`case AV_PIX_FMT_AMF_SURFACE`) `Acquire()`s the
+  surface and submits it. That is zero copy on one AMF context. No `hwmap`, `hwupload` or
+  `format` filter is needed; any of them would add a conversion or a copy.
+- The encoder gets the capture format (8-bit BGRA on an SDR desktop) and converts RGB→YUV
+  itself, as it does with ddagrab's BGRA textures.
+- `duplicate_output=1` (also vsrc_amf's default) hands out a copy of the captured surface. The
+  AMF Display Capture guide says captured surfaces may be DCC-compressed, and such surfaces
+  cannot go to the encoder directly.
+- `framerate` only paces `keep_framerate` mode. Per the AMF guide, `wait_for_present` returns
+  frames at the presentation rate of DWM or the fullscreen game. The pacer
+  (`media.framePacer`, a `select` expression on the wall clock) therefore keeps the average at the
+  session's fps: one interval of credit, at least half an interval of jitter tolerance, and
+  recovery from wall-clock steps.
+- Frame pts are `amf_high_precision_clock()` at capture, rescaled to 1/framerate. The agent's
+  capture clock (`setpts=time(0)*1000000`) replaces them.
+- `vsrc_amf` has no cursor option.
+- On `AMF_REPEAT`, `vsrc_amf` returns `EAGAIN` without sleeping, and libavfilter's buffersink
+  (`get_frame_internal`) requests again at once. So FFmpeg's filter thread polls `QueryOutput`
+  in a loop between presents. The AMF guide asks for sleeps of at least 1 ms, as step 3.2
+  specifies for the native helper. See the CPU check below.
+
+Verified in the sandbox:
+
+- verified (sandbox): command line on the real FFmpeg 8.1.3 Windows build data: `-filters`
+  output, `-h filter=vsrc_amf` and `-h encoder=` for all six GPU encoders, all in
+  `internal/host/media/testdata` and parsed by the probe's own functions (`TestParseFilters`,
+  `TestBuildArgsAMF`, `TestWriteReport`; the probe report's capture line now includes
+  `vsrc_amf=`). Checked: the exact chain, then the capture clock. No hwmap, hwdownload or format
+  conversion. Encoder arguments identical to a ddagrab session with the same parameters. Refused:
+  a non-AMF encoder, a missing `vsrc_amf`, a video that must carry the cursor, and a monitor
+  index outside 0–8. The probe drops `vsrc_amf` unless its help lists `monitor_index`,
+  `framerate`, `duplicate_output`, `capture_mode` and `wait_for_present`, and the build has
+  `select`.
+- verified (sandbox, Wine + FFmpeg 8.1.3 BtbN win64 build): the generated command lines for
+  `hevc_amf` and `h264_amf`, with and without capture timestamps, are accepted up to
+  `DLL amfrt64.dll failed to open` / `Failed to create  hardware device context (AMF)` in vsrc_amf's
+  output configuration. Control runs with `capture_mode=wait_for_presentx`,
+  `duplicate_output=2`, `monitor_index=9` and a misspelt function in the pacer expression are
+  refused at filter initialisation, before that point. So option values are checked.
+  `TestAMFCapture` in the cross-compiled `media.test.exe` under Wine, with ffmpeg.exe on PATH,
+  probes `vsrc_amf` as usable and gets the same result. `av1_amf` with this tree's AMD arguments
+  stops earlier at `-header_insertion_mode idr` (A3; the test skips it with that reason). With
+  step 1.1's `-header_insertion_mode frame` it also reaches the AMF runtime.
+- verified (sandbox): frame pacer, with the expression running in FFmpeg on frames with set
+  arrival times (`TestFramePacer`: `time(0)` replaced by `t`; identical results on FFmpeg 6.1.1
+  Linux and 8.1.3 under Wine). Each run is 5 s of presents.
+  - Paced to 60 fps (301 frames passed): 144 Hz (of 720), 240 Hz (of 1200), 75 Hz (of 375),
+    61 Hz (of 305).
+  - Every frame passed: 144 Hz at 144 fps (720/720); 60 Hz with ±7 ms jitter (300/300);
+    59.94 Hz (300/300); 30 fps (150/150); irregular 100 fps frames ±4 ms at 144 fps (500/500).
+  - Wall clock stepping back 10 s after 2 s: 301 of 720 (without the step guard: 121, a 10 s
+    stall). Stepping forward 10 s: 302.
+  - Real time with `time(0)`: a 144 fps source gives 121 frames in 2 s.
+  - Mutation check: with half an interval of credit, 75 Hz gives 282 frames and the jittered
+    60 Hz source loses 88. The test catches both, and the step-guard removal.
+- verified (sandbox): session (`internal/host` `TestAMFCaptureBackend`): `auto` never picks
+  amf; `"capture": "amf"` uses it with `hevc_amf`. It falls back to ddagrab for `libx264`, a
+  video cursor, a monitor without a DXGI output on adapter 0 (`dxgi=-1`) and an FFmpeg without
+  vsrc_amf, logging once per reason and again when the reason changes; a whole `buildParams`
+  with the client's video cursor stays on ddagrab with the same encoder. After an amf
+  generation fails, the session stays on ddagrab; a failed ddagrab generation does not disable
+  amf. An encoder failure event now carries the failed generation's parameters
+  (`TestVideoFailureParams`).
+- Finding, not changed here: `handleEncoderFailure` decides "same encoder failed twice: exclude
+  it" from `Video.Current()`. `Video.read` clears the failed generation before it sends the
+  failure event, so `Current()` returns nothing (or another, still running generation). The
+  exclusion therefore only runs while a second generation exists, and then names that
+  generation's encoder. The amf fallback reads the new `VideoEvent.Failed` instead. Relevant to
+  1.1's h264_amf retry.
+
+Hardware checks (setup for all: FFmpeg 8.1 from the installer;
+`& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` shows `capture: ddagrab=true
+gfxcapture=true vsrc_amf=true`; in host.json `"capture": "amf"`, `"encoder": "hevc_amf"`,
+`"logLevel": "debug"` (host.log then has the `ffmpeg args`); restart the agent with
+`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`; host.log
+must show `starting encoder … capture=amf`. For the manual FFmpeg runs, open PowerShell in the
+folder of ffmpeg.exe (the `ffmpeg:` line of the probe) and use
+`.\ffmpeg -hide_banner -loglevel info -filter_complex "vsrc_amf=monitor_index=D:framerate=60:capture_mode=wait_for_present:duplicate_output=1[v]" -map "[v]" -frames:v 120 -c:v hevc_amf -usage ultralowlatency -b:v 20M -y $env:TEMP\amf-D.mp4`,
+called "the AMF test line" below. Keep something moving on that monitor while it runs:
+`wait_for_present` only delivers presents.)
+
+- AMD RDNA3 (RX 7900 XT): unverified (acceptance: amf beats ddagrab on capture→packet p95, else
+  it stays opt-in). Test:
+  1. `"capture": "ddagrab"`, `"encoder": "hevc_amf"`; Chrome client on wired LAN; the
+     2560×1440 monitor at its native refresh; client FPS 60.
+  2. Run "Running the 10-minute latency test" (section 0.2) with `tools/latency-test` full-screen
+     on the streamed monitor and export the JSON. Record from the overlay and the export:
+     capture→encoded p50/p95/p99 (= capture→packet: capture stamp to the packet read by the
+     agent), page→capture p50/p95, host screen→drawn p50/p95. From host.log record the last
+     `latency stages` lines (`host_capture`) and `stream stats` (fps, Mbit/s).
+  3. Repeat with `"capture": "amf"` (check `capture=amf` in host.log), then repeat steps 2–3 with
+     client FPS = the monitor's refresh rate.
+  4. Repeat both backends for 5 minutes each with a GPU-bound game in borderless fullscreen
+     (overlay numbers only, no barcode).
+  5. Pass (amf may become the default for AMF encoders in a later step): amf's capture→encoded
+     p95 is lower than ddagrab's in every run, and the CPU and frame-rate checks below pass.
+     Otherwise amf stays opt-in. Also compare page→capture p95 and host screen→drawn p95. The
+     capture stamp is taken after the capture filter for both backends, so capture→encoded does
+     not contain the capture's own delay (present → filter output). page→capture does, and that
+     delay is where wait_for_present should win over ddagrab's timer (B7). Record both.
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY monitor_index mapping). The agent passes the
+  monitor's DXGI output index on adapter 0 (`dxgi=` in the probe's `monitor` lines, the same
+  number ddagrab's `output_idx` gets). The AMF header says only that the index "is determined by
+  using EnumAdapters() in DXGI", and the AMF guide adds "0 specifies the default monitor". Test
+  with two monitors on the RX 7900 XT (different resolutions help):
+  1. Note each `monitor N: \\.\DISPLAYk W×H … dxgi=D` line of the probe.
+  2. Run the AMF test line with D = 0, then D = 1. Its log shows `Capture resolution: W×H`; the
+     mp4 must show the monitor whose `dxgi=` is D.
+  3. Stream with `"capture": "amf"` and pick each monitor in the client: the picture shows that
+     monitor and input lands on it.
+  4. Make the other monitor the primary display (Windows display settings) and repeat step 2.
+     Record whether index 0 follows the primary display or the DXGI output order.
+  If the mapping differs, record the rule. `amfCaptureBlocker` and the "amf" branch of
+  `buildParams` (internal/host/session.go) must then map to it.
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY cursor inclusion). The agent never uses amf when
+  the video must carry the cursor (`drawCursor`, or the client's video cursor; host.log
+  `reason="the video must carry the cursor"`). With the default local cursor the client draws the
+  pointer, so the capture must not contain it. Test:
+  1. Run the AMF test line on the primary monitor while moving the mouse over a playing video.
+     Does the mp4 show the pointer?
+  2. Stream with `"capture": "amf"`, `drawCursor` false, client cursor local, and move the
+     pointer. Pass: one pointer only, with no second pointer baked into the video and trailing
+     behind.
+  If the AMF capture contains the pointer, record it. The agent must then also avoid amf with
+  the local cursor, and could use amf for `drawCursor`.
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY borderless vs exclusive fullscreen). Test: with
+  `"capture": "amf"`, run a game uncapped (vsync off) in each mode: (a) borderless fullscreen,
+  (b) exclusive fullscreen (a DX11 game that offers it), (c) windowed. Switch modes with
+  Alt+Enter while streaming. Pass: the picture keeps updating in every mode (overlay fps near
+  the requested fps; `stream stats` in host.log), with no black or frozen picture. At a mode
+  switch the stream either continues, or host.log shows `AMD Direct Capture failed, using
+  ddagrab for this session` and the picture is back within about 1 s. Record per mode: works /
+  black / frozen / falls back, and capture→encoded p95.
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY HDR desktop). Test:
+  1. Turn on Windows Settings → Display → Use HDR, then run the AMF test line. Record
+     `Capture format: N` (AMF_SURFACE_FORMAT: 3 BGRA, 11 RGBA_F16, 13 R10G10B10A2) and whether
+     the encoder opens. FFmpeg passes `rgbaf16le` / `x2bgr10le` to amfenc at 8-bit depth; it is
+     unknown whether AMF converts them or refuses.
+  2. Stream an HDR video or game with `"capture": "amf"`, then with `"ddagrab"` (which gives an
+     SDR-converted picture), and compare.
+  Pass: amf starts and its colours are no worse than ddagrab's. If it fails, or the colours are
+  washed out, clipped or tinted, record it: the agent then needs an HDR guard (ddagrab on an HDR
+  desktop) until 3.9.
+- AMD RDNA3 (RX 7900 XT): unverified (VERIFY IddCx virtual display; expected unsupported). Test:
+  1. Add a virtual monitor (SudoVDA or Virtual Display Driver) and note its `dxgi=` in the probe.
+  2. Stream it with `"capture": "amf"`.
+  Pass when its `dxgi=` is -1 (not an output of adapter 0): host.log shows
+  `reason="monitor N is not output 0-8 of DXGI adapter 0"`. Whether ddagrab then captures the
+  right monitor is the existing ddagrab behaviour (it falls back to the monitor's list index);
+  record it. When it has a `dxgi=` (an IddCx render adapter), record whether the picture is the
+  virtual monitor, or whether host.log shows `AMD Direct Capture failed, using ddagrab for this
+  session` followed by a working ddagrab stream.
+- AMD RDNA3 (RX 7900 XT): unverified (frame rate in wait_for_present mode, still desktop). Test:
+  1. Use a monitor above 60 Hz (e.g. 144 Hz), `"capture": "amf"`, client FPS 60. Stream (a) the
+     desktop with a 60 fps video playing, (b) an uncapped game in borderless and in exclusive
+     fullscreen running above the refresh rate.
+     Pass: `stream stats` and the overlay show about 60 fps (the pacer) and about the configured
+     bitrate, not 2.4× it.
+  2. Set client FPS to the refresh rate. Pass: fps ≈ min(game fps, refresh) with no periodic
+     dips.
+  3. Connect to a completely still desktop without touching anything, and then change a setting
+     (a key-frame restart). Record whether the picture appears and how long the first frame
+     takes. `wait_for_present` may deliver nothing until the screen changes; ddagrab delivers
+     the current picture at once. If it stays black, the agent needs a first frame on still
+     screens.
+- AMD RDNA3 (RX 7900 XT): unverified (CPU cost of vsrc_amf's polling). Test: Task Manager →
+  Details, add the CPU column. Stream the still desktop and then a game, once with
+  `"capture": "amf"` and once with `"ddagrab"`, and record ffmpeg.exe CPU % and the game's fps in
+  the same scene. Expected from the source: about one logical core (100/N % on an N-thread CPU)
+  with amf, versus a few % with ddagrab, at HIGH priority class. If so, record the game's fps
+  cost; that alone keeps amf opt-in on the FFmpeg path (the native helper of step 3.2 sleeps at
+  least 1 ms on `AMF_REPEAT`).
+- NVIDIA: unverified (no NVIDIA host available); AMD Direct Capture does not apply to NVIDIA.
+  Test: with `"capture": "amf"` on an NVIDIA host, the probe still lists `vsrc_amf=true` (the
+  filter is in the build), and host.log shows `AMD Direct Capture (capture "amf") not used,
+  capturing with ddagrab reason="AMD Direct Capture only feeds AMF encoders, not hevc_nvenc"`
+  once per session. The stream runs exactly as with `"capture": "ddagrab"`.

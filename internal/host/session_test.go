@@ -6,9 +6,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -272,5 +275,113 @@ func TestAlignmentGuard(t *testing.T) {
 		if p.Encoder.Name != want || len(rec.notices(t)) != notices {
 			t.Fatalf("step %d %dx%d: encoder %s", i, sz[0], sz[1], p.Encoder.Name)
 		}
+	}
+}
+
+// TestAMFCaptureBackend checks the opt-in AMD Direct Capture backend (step
+// 1.6): only configured, never automatic; used only with an AMF encoder,
+// without a cursor in the video and for a monitor on DXGI adapter 0, else
+// ddagrab with one log line per change; after a failure the session stays on
+// ddagrab.
+func TestAMFCaptureBackend(t *testing.T) {
+	caps := &media.Caps{Filters: map[string]bool{"ddagrab": true, "gfxcapture": true, "vsrc_amf": true, "select": true},
+		Encoders: []media.EncoderInfo{
+			{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+			{Name: "libx264", Family: "h264", Vendor: "software"},
+		}}
+	var logs bytes.Buffer
+	newSession := func(capture string) *Session {
+		cfg := &Config{Capture: capture}
+		cfg.Defaults()
+		logs.Reset()
+		return &Session{
+			a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+			hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{{Family: "hevc", HW: true}, {Family: "h264", HW: true}}},
+			ctrl:  &ctrlRecorder{}, tried: map[string]bool{},
+			log: slog.New(slog.NewTextHandler(&logs, nil)),
+		}
+	}
+	fallbacks := func() int { return strings.Count(logs.String(), "not used, capturing with ddagrab") }
+
+	// Never chosen automatically, only when configured.
+	if b := newSession("auto").a.backendFor(proto.Prefs{}); b != "ddagrab" {
+		t.Fatalf("auto picks %s", b)
+	}
+	if b := newSession("amf").a.backendFor(proto.Prefs{}); b != "amf" {
+		t.Fatalf("configured amf: %s", b)
+	}
+
+	hevc, x264 := caps.Encoders[0], caps.Encoders[1]
+	mon := platform.Monitor{Index: 1, W: 2560, H: 1440, DXGIOutput: 2}
+	for _, c := range []struct {
+		name    string
+		enc     media.EncoderInfo
+		cursor  bool
+		mon     platform.Monitor
+		filters bool
+		want    string // "" = usable
+	}{
+		{"AMF encoder", hevc, false, mon, true, ""},
+		{"software encoder", x264, false, mon, true, "only feeds AMF encoders, not libx264"},
+		{"cursor in the video", hevc, true, mon, true, "cursor"},
+		{"monitor on another adapter", hevc, false, platform.Monitor{Index: 1, DXGIOutput: -1}, true, "not output 0-8 of DXGI adapter 0"},
+		{"FFmpeg without vsrc_amf", hevc, false, mon, false, "vsrc_amf"},
+	} {
+		caps.Filters["vsrc_amf"] = c.filters
+		got := newSession("amf").a.amfCaptureBlocker(c.enc, c.cursor, c.mon)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+	caps.Filters["vsrc_amf"] = true
+
+	// The switch from ddagrab to amf keeps the monitor's output index.
+	s := newSession("amf")
+	dda := media.Params{Source: media.Source{Backend: "ddagrab", Output: 2, NativeW: 2560, NativeH: 1440}, Encoder: hevc}
+	p := dda
+	s.useAMFCapture(&p, mon)
+	if p.Source != (media.Source{Backend: "amf", Output: 2, NativeW: 2560, NativeH: 1440}) || fallbacks() != 0 {
+		t.Fatalf("source %+v, log %s", p.Source, logs.String())
+	}
+	// A fallback is logged once while its reason stays, again when it changes.
+	for i, c := range []struct {
+		cursor bool
+		logs   int
+	}{{true, 1}, {true, 1}, {false, 1}, {true, 2}} {
+		p = dda
+		p.DrawCursor = c.cursor
+		s.useAMFCapture(&p, mon)
+		if wantAMF := !c.cursor; (p.Source.Backend == "amf") != wantAMF || fallbacks() != c.logs {
+			t.Fatalf("step %d: source %s, %d fallback lines", i, p.Source.Backend, fallbacks())
+		}
+	}
+
+	// A client that wants the cursor in the video keeps a whole buildParams
+	// on ddagrab, with the reason in the log once.
+	s = newSession("amf")
+	for i := 0; i < 2; i++ {
+		p, err := s.buildParams(proto.Prefs{Cursor: "video"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Source.Backend != "ddagrab" || p.Encoder.Name != "hevc_amf" || fallbacks() != 1 {
+			t.Fatalf("buildParams: %+v, log %s", p, logs.String())
+		}
+	}
+
+	// A failed amf generation moves the rest of the session to ddagrab.
+	s = newSession("amf")
+	s.noteCaptureFailure(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Failed to initialize capture component: 3"),
+		Failed: media.Params{Source: media.Source{Backend: "ddagrab"}}})
+	p = dda
+	if s.useAMFCapture(&p, mon); p.Source.Backend != "amf" {
+		t.Fatal("a ddagrab failure turned AMD Direct Capture off")
+	}
+	s.noteCaptureFailure(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Failed to initialize capture component: 3"),
+		Failed: media.Params{Source: media.Source{Backend: "amf"}}})
+	p = dda
+	if s.useAMFCapture(&p, mon); p.Source.Backend != "ddagrab" || !strings.Contains(logs.String(), "AMD Direct Capture failed") ||
+		!strings.Contains(logs.String(), "failed earlier in this session") {
+		t.Fatalf("after a failure: %s, log %s", p.Source.Backend, logs.String())
 	}
 }

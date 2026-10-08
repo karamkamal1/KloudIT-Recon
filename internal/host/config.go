@@ -22,7 +22,7 @@ type Config struct {
 	Token      string `json:"token"`
 
 	FFmpeg     string `json:"ffmpeg,omitempty"`
-	Capture    string `json:"capture"` // auto | ddagrab | gfxcapture | x11grab | test
+	Capture    string `json:"capture"` // auto | ddagrab | gfxcapture | x11grab | test | amf (AMD Direct Capture, experimental, opt-in)
 	X11Display string `json:"x11Display,omitempty"`
 	Encoder    string `json:"encoder,omitempty"` // force an encoder, e.g. hevc_nvenc
 	DrawCursor bool   `json:"drawCursor"`        // bake the cursor into the video instead of local rendering

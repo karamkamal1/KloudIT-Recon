@@ -40,7 +40,8 @@ const wallOffsetEvery = 1_000_000 // µs
 type VideoEvent struct {
 	Config *proto.VideoConfig // a new generation starts with the next frame
 	Frame  *Frame
-	Err    error // the active encoder failed
+	Err    error  // the active encoder failed
+	Failed Params // with Err: the failed generation's parameters
 }
 
 // Video manages encoder generations. Restarting (to force a key frame or change
@@ -236,7 +237,7 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				if msg == "" {
 					msg = err.Error()
 				}
-				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg)})
+				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg), Failed: pr.params})
 			}
 			return
 		}

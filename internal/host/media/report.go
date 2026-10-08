@@ -22,7 +22,7 @@ func (c *Caps) WriteReport(w io.Writer, sample Params) {
 	for _, l := range version {
 		fmt.Fprintf(w, "            %s\n", l)
 	}
-	fmt.Fprintf(w, "capture:    ddagrab=%v gfxcapture=%v\n", c.Filters["ddagrab"], c.Filters["gfxcapture"])
+	fmt.Fprintf(w, "capture:    ddagrab=%v gfxcapture=%v vsrc_amf=%v\n", c.Filters["ddagrab"], c.Filters["gfxcapture"], c.Filters["vsrc_amf"])
 	if len(c.Encoders) > 0 {
 		fmt.Fprintf(w, "session:    %s (command line under each encoder)\n", describeSample(sample))
 	}

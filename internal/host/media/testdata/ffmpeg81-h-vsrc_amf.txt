@@ -1,0 +1,17 @@
+Filter vsrc_amf
+  AMD AMF screen capture
+    Inputs:
+        none (source filter)
+    Outputs:
+       #0: default (video)
+amf_capture AVOptions:
+   monitor_index     <int>        ..FV....... Index of display monitor to capture (from 0 to 8) (default 0)
+   framerate         <video_rate> ..FV....... Capture framerate (default "60")
+   duplicate_output  <boolean>    ..FV....... Use display output duplication for screen capture (default true)
+   capture_mode      <int>        ..FV....... Capture synchronization mode (from 0 to 2) (default keep_framerate)
+     keep_framerate  0            ..FV....... Capture component maintains the frame rate
+     wait_for_present 1            ..FV....... Capture component waits for flip (present) event
+     get_current     2            ..FV....... Returns current visible surface immediately
+
+
+Exiting with exit code 0

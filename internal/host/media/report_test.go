@@ -12,13 +12,13 @@ import (
 )
 
 // caps81 returns Caps for the FFmpeg 8.1 Windows build (BtbN win64 GPL, the
-// one the installer downloads) from its real "ffmpeg -version" and
-// "ffmpeg -h encoder=..." output in testdata, with every encoder usable.
+// one the installer downloads) from its real "ffmpeg -version",
+// "ffmpeg -filters", "ffmpeg -h filter=vsrc_amf" and "ffmpeg -h encoder=..."
+// output in testdata, with every encoder usable.
 func caps81(t *testing.T) *Caps {
 	t.Helper()
 	c := &Caps{
 		FFmpeg:       `C:\Program Files\KlouditRecon\ffmpeg\bin\ffmpeg.exe`,
-		Filters:      map[string]bool{"ddagrab": true, "gfxcapture": true, "hwdownload": true, "settb": true, "setpts": true},
 		Rejected:     map[string]string{"av1_qsv": "exit status 0xb1b4b1ab: Error creating a MFX session: -9."},
 		options:      map[string]map[string]bool{},
 		captureClock: true,
@@ -28,6 +28,16 @@ func caps81(t *testing.T) *Caps {
 		t.Fatal(err)
 	}
 	c.Version, c.VersionInfo = parseVersion(out)
+	if out, err = os.ReadFile("testdata/ffmpeg81-filters.txt"); err != nil {
+		t.Fatal(err)
+	}
+	c.Filters = parseFilters(out) // as Probe does
+	if out, err = os.ReadFile("testdata/ffmpeg81-h-vsrc_amf.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkAMFCapture(out, c.Filters); err != nil {
+		t.Fatal(err)
+	}
 	for _, e := range candidates {
 		help, err := os.ReadFile(filepath.Join("testdata", "ffmpeg81-h-"+e.Name+".txt"))
 		if err != nil {
@@ -93,7 +103,7 @@ func TestWriteReport(t *testing.T) {
 		want = append(want, "            "+l)
 	}
 	want = append(want,
-		"capture:    ddagrab=true gfxcapture=true",
+		"capture:    ddagrab=true gfxcapture=true vsrc_amf=true",
 		"session:    ddagrab output 0 at its native size, 60 fps, 30 Mbit/s, quality balanced, capture timestamps (command line under each encoder)")
 	if len(lines) < len(want) || !slices.Equal(lines[:len(want)], want) {
 		t.Fatalf("report head:\n%s\nwant:\n%s", strings.Join(lines[:min(len(lines), len(want))], "\n"), strings.Join(want, "\n"))
