@@ -397,11 +397,18 @@ func TestSessionOnHelper(t *testing.T) {
 	}
 
 	// A delay report (from a client without rate reports): the bitrate
-	// changes in the encoder (x0.85), the client hears of it.
+	// changes in the encoder (x0.85), the client hears of it. A seamless
+	// change makes no key frame: the client's key-frame request right after
+	// it still gets one.
+	s.kickMu.Lock()
+	s.lastKick = time.Time{}
+	s.kickMu.Unlock()
 	s.congestion(120, signalDelay)
 	if m := expectFakeMsg(t, f, "setRate"); m["kbps"] != float64(3400) {
 		t.Fatalf("setRate %v", m)
 	}
+	s.requestKeyframe()
+	expectFakeMsg(t, f, "forceIdr")
 
 	// Frames the helper dropped: reported to the client, and a key frame.
 	s.kickMu.Lock()

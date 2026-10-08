@@ -197,13 +197,19 @@ type ccCounters struct {
 
 // fromReport converts a report that arrived at now; comp is the pacer share
 // of the frames it covers, cc the media congestion controller's counters
-// (without them the client's own loss count is used).
-func (f *rateFeedback) fromReport(r proto.RateReport, now time.Time, comp time.Duration, cc ccCounters) feedback {
+// (without them the client's own loss count is used). ok is false for a
+// report not newer than the last one (its client clock): a reordered or
+// duplicated datagram, whose counters would make wrapped differences; the
+// next report's differences cover its frames.
+func (f *rateFeedback) fromReport(r proto.RateReport, now time.Time, comp time.Duration, cc ccCounters) (feedback, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fb := feedback{at: now, decodeQ: int(r.DecodeQueue)}
 	if f.have {
 		p := f.last
+		if int32(r.TimeMs-p.TimeMs) <= 0 {
+			return feedback{}, false
+		}
 		fb.frames = int(r.Frames - p.Frames)
 		fb.bytes = int64(r.Bytes - p.Bytes)
 		fb.interval = time.Duration(r.TimeMs-p.TimeMs) * time.Millisecond
@@ -221,7 +227,7 @@ func (f *rateFeedback) fromReport(r proto.RateReport, now time.Time, comp time.D
 		fb.qd = fb.owd - comp
 		f.note(fb.owd, fb.owdMax)
 	}
-	return fb
+	return fb, true
 }
 
 // ccDelta puts the media congestion controller's losses and acknowledged

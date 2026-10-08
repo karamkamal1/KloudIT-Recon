@@ -189,7 +189,8 @@ minus `encodeDoneUs`, or `send_us` without the extension: the 0x40 ack's measure
 own delay-based `{"t":"congestion"}` (the decoder's `reason:"decoder"` one stays). Older hosts
 never see a 0x41 (the client sends it only on the feature); older clients keep their own delay
 detection and their 0x40 acks, which the host's rate controller reads instead (every 100 ms
-as one report, without losses or the decoder's backlog).
+as one report, without the client's own loss count or the decoder's backlog; the losses are the
+media congestion controller's, none with `reno`).
 
 For mouse motion, the client keeps running totals and the host applies `total − last_total`
 for each datagram it accepts (stale sequence numbers are ignored). After motion stops, the
@@ -284,15 +285,16 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     gateway buffers what its client leg cannot carry).
   - *Emergencies* as before: a host frame-queue overflow (the backlog is dropped and reported,
     `{"t":"dropped"}`) or a client that flushed its decoder (`{"t":"congestion","reason":
-    "decoder"}`) cuts at once by 25 % (an overflow at least to 0.85 × the delivered rate) with
-    an urgent restart, but not within 2 s of any other decrease (the old generation that still
-    streams is what overflows: the starting one takes over at once); a decoder flush also caps
+    "decoder"}`) cuts at once by 25 % (an overflow at least to 0.85 × the delivered rate, but
+    from at least half the target, as a decrease) with an urgent restart, but not within 2 s of
+    any other decrease (the old generation that still streams is what overflows: the starting
+    one takes over at once); a decoder flush also caps
     later increases at 85 % of the bitrate it cut from, until the settings change. An older
     client's delay report (`{"t":"congestion"}`) decreases like the controller's own decision.
   - *Frame rate.* At the floor (2 Mbit/s, or the setting if lower) a decrease lowers the frame
     rate a rung instead, 120 → 90 → 60, and nothing below 60 (resolution is not changed); the
-    frame rate goes back up a rung every 5 s once the bitrate is 1.5 × the floor and nothing
-    decreased for 5 s.
+    frame rate goes back up a rung every 5 s once the bitrate is 1.5 × the floor (or at the
+    setting or the decoder's cap, where that is lower) and nothing decreased for 5 s.
   - *Applying it.* The continuous target reaches the encoder as often as its pipeline takes
     changes (`ratePolicy`): an encoder qualified to change seamlessly (`recon-host qualify`)
     every 250 ms in steps of 2 % or more; one only assumed seamless every second; a flushing

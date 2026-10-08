@@ -76,6 +76,13 @@ type Session struct {
 	track    sendTrack      // frames sent, for the rate controller's feedback (ratefeedback.go)
 	fb       rateFeedback   // the client's receive reports (or acks), turned into feedback
 	noticeAt atomic.Int64   // unix ns of the last congestion notice to the user (rate limited)
+
+	// sendSince: unix ns when frameSender took the frame it sends (0: it
+	// waits for one); sendOpening: it still waits for the frame's stream.
+	// For the overflow log (logOverflow).
+	sendSince   atomic.Int64
+	sendOpening atomic.Bool
+
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
 	// order with its own (an FFmpeg restart must not hold up input).
@@ -821,13 +828,43 @@ func (s *Session) videoEvents() {
 				// restart with a fresh key frame right away. Within 2 s of
 				// the last cut the bitrate stays, but the restart does not
 				// wait either: the dropped frames were the newest ones.
-				s.reportDropped(append(s.drainQueue(), ev.Frame), "queue overflow")
+				dropped := append(s.drainQueue(), ev.Frame)
+				s.logOverflow(dropped)
+				s.reportDropped(dropped, "queue overflow")
 				if !s.congestion(0, signalOverflow) {
 					s.urgentRestart("queue overflow")
 				}
 			}
 		}
 	}
+}
+
+// logOverflow records what led to a frame-queue overflow: the span of the
+// dropped frames' timestamps and of their encodeDone times (frames the
+// encoder delivered in a burst of its own, or a sender that stood still for
+// their whole span), what the sender was doing and for how long, and the
+// media congestion controller's window.
+func (s *Session) logOverflow(fs []*media.Frame) {
+	attrs := []any{"frames", len(fs)}
+	if n := len(fs); n > 1 {
+		attrs = append(attrs, "pts_span_ms", (fs[n-1].PtsUs-fs[0].PtsUs)/1000,
+			"encode_done_span_ms", (int64(fs[n-1].EncodeDoneUs)-int64(fs[0].EncodeDoneUs))/1000)
+	}
+	stage := "idle"
+	if at := s.sendSince.Load(); at != 0 {
+		stage = "write"
+		if s.sendOpening.Load() {
+			stage = "open stream"
+		}
+		attrs = append(attrs, "sender_busy_ms", time.Since(time.Unix(0, at)).Milliseconds())
+	}
+	attrs = append(attrs, "sender", stage)
+	if m := transport.MediaControl(s.c); m != nil {
+		st := m.Stats()
+		attrs = append(attrs, "cc_target_kbps", st.TargetBitrate/1000, "cc_window", st.Window, "cc_collapses", st.Collapses,
+			"cc_lost", st.LostPackets)
+	}
+	s.log.Info("frame queue overflow", attrs...)
 }
 
 // drainQueue discards the queued frames and returns them, oldest first.
@@ -1173,9 +1210,6 @@ func (s *Session) congestion(delayMs int, sig rateSignal) bool {
 // applyRate puts a change of the rate controller into effect (setRate) and
 // logs it; decreases also tell the user, at most once per 30 s.
 func (s *Session) applyRate(c rateChange, delayMs int) {
-	s.kickMu.Lock()
-	s.lastKick = time.Now() // a restart below also delivers a key frame
-	s.kickMu.Unlock()
 	_, ceiling := s.rate.kbps()
 	reason := "bitrate recovery"
 	if c.down {
@@ -1254,7 +1288,10 @@ func (s *Session) rateReport(r proto.RateReport) {
 	if r.Flags&proto.RateReportFrame != 0 {
 		comp, _ = s.track.cover(r.Gen, r.LastSeq)
 	}
-	fb := s.fb.fromReport(r, time.Now(), comp, s.ccCounters())
+	fb, ok := s.fb.fromReport(r, time.Now(), comp, s.ccCounters())
+	if !ok {
+		return // out of order
+	}
 	fb.pending, fb.pendingValid = s.track.pending(s.a.clock())
 	before := s.rate.decreasedAt()
 	c, ok := s.rate.report(fb)
@@ -1308,6 +1345,13 @@ func (s *Session) urgentRestart(reason string) {
 	}
 }
 
+// kicked notes that a key frame is on its way (lastKick).
+func (s *Session) kicked() {
+	s.kickMu.Lock()
+	s.lastKick = time.Now()
+	s.kickMu.Unlock()
+}
+
 // requestKeyframe gets a key frame to a client that needs one (a confirmed
 // loss under recovery "keyframe", a decoder error, or its watchdog), at most
 // one every 500 ms.
@@ -1346,10 +1390,16 @@ func (s *Session) keyframe(reason string) error {
 // the native helper), else as a new generation (overlapped unless urgent).
 // urgent: at once, and the client also needs a key frame (frames were
 // dropped, or it flushed its decoder), or the old FFmpeg generation must stop
-// now (a large cut: applyPolicy.cutUrgent).
+// now (a large cut: applyPolicy.cutUrgent). A change that delivers a key
+// frame (a restart, an encoder flush, urgent) covers the client's key-frame
+// requests of the next 500 ms (lastKick); a seamless live change does not.
 func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	v := s.vid()
-	if !v.Capabilities().LiveBitrate {
+	c := v.Capabilities()
+	if !c.LiveBitrate || c.LiveBitrateFlush || urgent {
+		s.kicked()
+	}
+	if !c.LiveBitrate {
 		return s.startVideo(urgent, reason)
 	}
 	newFPS := 0
@@ -1359,6 +1409,7 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	s.log.Info("changing the bitrate in the encoder", "reason", reason, "kbps", kbps, "fps", newFPS, "urgent", urgent)
 	if err := v.SetRate(kbps, newFPS); err != nil {
 		s.log.Warn("bitrate change in the encoder failed, restarting", "err", err)
+		s.kicked()
 		return s.startVideo(urgent, reason)
 	}
 	if p, ok := v.Current(); ok {
@@ -1377,15 +1428,19 @@ func (s *Session) frameSender() {
 	faults := s.a.faults
 	for n := 1; ; n++ {
 		var f *media.Frame
+		s.sendSince.Store(0)
 		select {
 		case <-s.ctx.Done():
 			return
 		case f = <-s.frameQ:
 		}
+		s.sendOpening.Store(true)
+		s.sendSince.Store(time.Now().UnixNano())
 		s.applyCongestionTarget()
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 		st, err := s.c.OpenUniStreamSync(ctx)
 		cancel()
+		s.sendOpening.Store(false)
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return

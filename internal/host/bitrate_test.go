@@ -511,6 +511,22 @@ func TestRateEmergency(t *testing.T) {
 	if h.cur() != 12750 {
 		t.Fatalf("target %d after the decoder flush, want the cap 12750", h.cur())
 	}
+	// An overflow after the frames stalled: nothing acknowledged in the last
+	// 100 ms. At most a halving, as in decrease: 0.85 x half the target, and
+	// the last known-good rate half the target.
+	h = newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	for i := 0; i < 5; i++ {
+		h.clock = h.clock.Add(25 * time.Millisecond)
+		h.r.report(feedback{at: h.clock, ackedValid: true})
+	}
+	if d, ok := h.r.carried(h.clock); !ok || d != 0 {
+		t.Fatalf("carried %.0f %v, want 0 (nothing acknowledged)", d, ok)
+	}
+	c, ok = h.r.congestion(signalOverflow)
+	if !ok || c.toKbps != 8500 || h.r.lastGood != 10000 {
+		t.Fatalf("overflow after a stall: %+v %v, last known-good %.0f; want a cut to 8500 from 10000", c, ok, h.r.lastGood)
+	}
 	// The floor.
 	h = newCtl(t, 2500, 60, seamless)
 	c, ok = h.r.congestion(signalOverflow)
@@ -526,35 +542,38 @@ func TestRateEmergency(t *testing.T) {
 
 // TestRateFPSLadder: at the floor a decrease lowers the frame rate a rung
 // (120 -> 90 -> 60) instead, and nothing below 60; once the bitrate is well
-// above the floor again the frame rate goes back up a rung every 5 s.
+// above the floor again (1.5 x, or at a limit below that: a setting of 2500)
+// the frame rate goes back up a rung every 5 s.
 func TestRateFPSLadder(t *testing.T) {
-	h := newCtl(t, 10000, 120, seamless)
-	h.run(3*time.Second, flat(20*time.Millisecond))
-	h.r.mu.Lock()
-	h.r.est, h.r.applied = 2000, 2000
-	h.r.mu.Unlock()
-	h.r.live(2000, 120)
-	h.run(1500*time.Millisecond, flat(40*time.Millisecond))
-	var fps []int
-	for _, c := range h.changes {
-		if !c.down || c.toKbps != 2000 {
-			t.Fatalf("change %+v at the floor, want frame-rate decreases at 2000", c)
+	for _, ceiling := range []int{10000, 2500} {
+		h := newCtl(t, ceiling, 120, seamless)
+		h.run(3*time.Second, flat(20*time.Millisecond))
+		h.r.mu.Lock()
+		h.r.est, h.r.applied = 2000, 2000
+		h.r.mu.Unlock()
+		h.r.live(2000, 120)
+		h.run(1500*time.Millisecond, flat(40*time.Millisecond))
+		var fps []int
+		for _, c := range h.changes {
+			if !c.down || c.toKbps != 2000 {
+				t.Fatalf("setting %d: change %+v at the floor, want frame-rate decreases at 2000", ceiling, c)
+			}
+			fps = append(fps, c.toFPS)
 		}
-		fps = append(fps, c.toFPS)
-	}
-	if len(fps) != 2 || fps[0] != 90 || fps[1] != 60 {
-		t.Fatalf("frame rates %v, want 90, 60", fps)
-	}
-	h.changes = nil
-	h.run(20*time.Second, flat(20*time.Millisecond))
-	var up []int
-	for _, c := range h.changes {
-		if c.toFPS != c.fromFPS {
-			up = append(up, c.toFPS)
+		if len(fps) != 2 || fps[0] != 90 || fps[1] != 60 {
+			t.Fatalf("setting %d: frame rates %v, want 90, 60", ceiling, fps)
 		}
-	}
-	if len(up) != 2 || up[0] != 90 || up[1] != 120 || h.fps != 120 {
-		t.Fatalf("frame rates back %v (now %d), want 90 then 120", up, h.fps)
+		h.changes = nil
+		h.run(20*time.Second, flat(20*time.Millisecond))
+		var up []int
+		for _, c := range h.changes {
+			if c.toFPS != c.fromFPS {
+				up = append(up, c.toFPS)
+			}
+		}
+		if len(up) != 2 || up[0] != 90 || up[1] != 120 || h.fps != 120 {
+			t.Fatalf("setting %d: frame rates back %v (now %d), want 90 then 120", ceiling, up, h.fps)
+		}
 	}
 }
 
@@ -713,7 +732,8 @@ func TestSendTrack(t *testing.T) {
 }
 
 // TestRateFeedback: reports become differences of their counters (also
-// across the wrap), the client's own losses count only without the media
+// across the wrap), a reordered or duplicated report is ignored (its client
+// clock is not newer), the client's own losses count only without the media
 // congestion controller, whose counters restart with a new path; acks of
 // clients without reports become one report per call.
 func TestRateFeedback(t *testing.T) {
@@ -721,24 +741,40 @@ func TestRateFeedback(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	r := proto.RateReport{Flags: proto.RateReportOWD, TimeMs: 0xffffffff - 10, Frames: 100, Bytes: 0xffffff00, OWDP50Us: 25000,
 		OWDMaxUs: 40000, Lost: 2, Audio: 1000}
-	if fb := f.fromReport(r, now, 0, ccCounters{}); fb.frames != 0 || !fb.owdValid || fb.qd != 25*time.Millisecond {
+	if fb, ok := f.fromReport(r, now, 0, ccCounters{}); !ok || fb.frames != 0 || !fb.owdValid || fb.qd != 25*time.Millisecond {
 		t.Fatalf("first report: %+v", fb)
 	}
+	first := r
 	r.TimeMs, r.Frames, r.Bytes, r.Lost, r.Audio = 15, 103, 0x100, 3, 1003
-	fb := f.fromReport(r, now.Add(25*time.Millisecond), 5*time.Millisecond, ccCounters{})
+	fb, _ := f.fromReport(r, now.Add(25*time.Millisecond), 5*time.Millisecond, ccCounters{})
 	if fb.frames != 3 || fb.bytes != 0x200 || fb.interval != 26*time.Millisecond || fb.lost != 1 || fb.total != 7 ||
 		fb.qd != 20*time.Millisecond || fb.owd != 25*time.Millisecond {
 		t.Fatalf("second report: %+v", fb)
 	}
+	// The first report again (reordered), and the second (duplicated):
+	// ignored, and the next report's differences are from the second.
+	for _, old := range []proto.RateReport{first, r} {
+		if fb, ok := f.fromReport(old, now.Add(30*time.Millisecond), 0, ccCounters{}); ok {
+			t.Fatalf("an old report taken: %+v", fb)
+		}
+	}
+	r.TimeMs, r.Frames, r.Bytes, r.Lost, r.Audio = 40, 105, 0x300, 3, 1004
+	if fb, ok := f.fromReport(r, now.Add(50*time.Millisecond), 0, ccCounters{}); !ok || fb.frames != 2 || fb.bytes != 0x200 ||
+		fb.interval != 25*time.Millisecond || fb.lost != 0 || fb.total != 3 {
+		t.Fatalf("the report after old ones: %+v %v", fb, ok)
+	}
 	cc := ccCounters{ok: true, lost: 10, total: 1000, acked: 1e6, nonVideoKbps: 360}
-	f.fromReport(r, now.Add(50*time.Millisecond), 0, cc)
+	r.TimeMs += 25
+	f.fromReport(r, now.Add(75*time.Millisecond), 0, cc)
 	cc.lost, cc.total, cc.acked = 12, 1100, 1.1e6
-	fb = f.fromReport(r, now.Add(75*time.Millisecond), 0, cc)
+	r.TimeMs += 25
+	fb, _ = f.fromReport(r, now.Add(100*time.Millisecond), 0, cc)
 	if fb.lost != 2 || fb.total != 100 || !fb.ackedValid || fb.acked != 100000 || fb.nonVideoKbps != 360 {
 		t.Fatalf("media congestion controller deltas: %+v", fb)
 	}
 	cc.lost, cc.total, cc.acked = 1, 10, 1000 // a new path's controller
-	if fb := f.fromReport(r, now.Add(100*time.Millisecond), 0, cc); fb.total != 0 || fb.ackedValid {
+	r.TimeMs += 25
+	if fb, _ := f.fromReport(r, now.Add(125*time.Millisecond), 0, cc); fb.total != 0 || fb.ackedValid {
 		t.Fatalf("after a path change: %+v", fb)
 	}
 	var a rateFeedback
@@ -762,7 +798,8 @@ func TestRateFeedback(t *testing.T) {
 // capdrop profile (50 -> 15 -> 50 Mbit/s, 20 s steps, 50 ms queue) at a
 // 30 Mbit/s setting: no host frame-queue overflow, one-way delay p95 during
 // the dip under the baseline's + 30 ms, the bitrate back within 15 % of the
-// setting within 10 s of capacity returning; and the other profiles.
+// setting within 10 s of capacity returning, and staying there; and the
+// other profiles.
 
 func TestRateSimCapdrop(t *testing.T) {
 	for _, c := range []struct {
@@ -785,7 +822,7 @@ func TestRateSimCapdrop(t *testing.T) {
 				prop: time.Millisecond, policy: c.policy, applyDelay: 400 * time.Millisecond, keyFactor: 2, fill: c.fill, audioKbps: 160,
 				relay: c.relay, seed: 1})
 			base, dip := s.owdPct(5*time.Second, 20*time.Second, 0.95), s.owdPct(20*time.Second, 40*time.Second, 0.95)
-			back := s.firstAtLeast(40*time.Second, 30000*85/100)
+			back := s.heldFrom(40*time.Second, 30000*85/100)
 			t.Logf("overflows %v, one-way delay p95 %v before, %v during the dip; back at 85 %% %v after capacity returned; decreases %v\n%s",
 				s.overflows, base, dip, back-40*time.Second, s.decreases(0, s.cfg.dur), s.trace())
 			if len(s.overflows) > c.overflows {

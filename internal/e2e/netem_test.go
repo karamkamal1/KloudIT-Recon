@@ -30,7 +30,7 @@ import (
 // stream runs. It reports, and checks: no host frame-queue overflow, the
 // one-way delay p95 during the dip under the baseline's (the 15 s before)
 // + 30 ms, and the bitrate target back within 15 % of the setting within
-// 10 s of the capacity's return.
+// 10 s of the capacity's return, staying there to the end of the run.
 
 // Environment of the run (set by test/netem/capdrop.sh).
 const (
@@ -240,15 +240,21 @@ func TestNetemCapdrop(t *testing.T) {
 		}
 		return v
 	}
+	// Back: from when on (after the capacity returned) the target stays
+	// within 15 % of the setting until the client stopped (-1: it ends
+	// below).
 	back := time.Duration(-1)
-	for _, c := range changes {
-		if c.at >= dipTo && c.to >= ceiling*85/100 {
-			back = c.at - dipTo
-			break
-		}
-	}
-	if back < 0 && targetAt(dipTo) >= ceiling*85/100 {
+	if targetAt(dipTo) >= ceiling*85/100 {
 		back = 0
+	}
+	for _, c := range changes {
+		switch {
+		case c.at < dipTo || c.at >= clientEnd:
+		case c.to < ceiling*85/100:
+			back = -1
+		case back < 0:
+			back = c.at - dipTo
+		}
 	}
 	base, dip := owd(5*time.Second, dipFrom, 0.95), owd(dipFrom, dipTo, 0.95)
 	var trace strings.Builder
@@ -258,7 +264,7 @@ func TestNetemCapdrop(t *testing.T) {
 	summary := fmt.Sprintf("capdrop (50 -> 15 -> 50 Mbit/s at +0/+20/+40 s), setting %d kbit/s:\n"+
 		"  frame-queue overflows: %d\n"+
 		"  one-way delay p50/p95: before the dip %v/%v, during the dip %v/%v, after %v/%v\n"+
-		"  target back within 15 %% of the setting %v after the capacity returned (at +40 s: %d kbit/s)\n"+
+		"  target back within 15 %% of the setting (and staying there) %v after the capacity returned (at +40 s: %d kbit/s)\n"+
 		"  target changes:%s\n  received Mbit/s per second: %s",
 		ceiling, overflows, owd(5*time.Second, dipFrom, 0.5), base, owd(dipFrom, dipTo, 0.5), dip, owd(dipTo+10*time.Second, run, 0.5),
 		owd(dipTo+10*time.Second, run, 0.95), back, targetAt(dipTo), trace.String(), strings.Join(mbps, " "))
@@ -271,6 +277,6 @@ func TestNetemCapdrop(t *testing.T) {
 		t.Errorf("one-way delay p95 %v during the dip, want under the baseline %v + 30 ms", dip, base)
 	}
 	if back < 0 || back > 10*time.Second {
-		t.Errorf("target back within 15 %% of the setting %v after the capacity returned, want within 10 s", back)
+		t.Errorf("target back within 15 %% of the setting (and staying there) %v after the capacity returned, want within 10 s", back)
 	}
 }

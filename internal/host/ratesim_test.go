@@ -365,8 +365,11 @@ func runSim(c simConfig) simResult {
 			if rr.Flags&proto.RateReportFrame != 0 {
 				comp, _ = track.cover(rr.Gen, rr.LastSeq)
 			}
-			fb := rf.fromReport(rr, clock(), comp, ccCounters{ok: true, lost: lostPkts, total: lostPkts + ackedPkts, acked: ackedBytes,
+			fb, ok := rf.fromReport(rr, clock(), comp, ccCounters{ok: true, lost: lostPkts, total: lostPkts + ackedPkts, acked: ackedBytes,
 				nonVideoKbps: c.audioKbps + ccOverheadKbps})
+			if !ok {
+				continue
+			}
 			fb.pending, fb.pendingValid = track.pending(uint64(now.Microseconds()) + 1)
 			if ch, ok := r.report(fb); ok {
 				apply(ch)
@@ -417,15 +420,20 @@ func (s simResult) appliedAt(t time.Duration) int {
 	return v
 }
 
-// firstAtLeast is the first moment from t on with the target at least kbps
-// (-1: never).
-func (s simResult) firstAtLeast(t time.Duration, kbps int) time.Duration {
+// heldFrom is the moment from t on after which the target stays at least
+// kbps to the end of the run (-1: it ends below).
+func (s simResult) heldFrom(t time.Duration, kbps int) time.Duration {
+	from := time.Duration(-1)
 	for _, p := range s.points {
-		if p.at >= t && p.applied >= kbps {
-			return p.at
+		switch {
+		case p.at < t:
+		case p.applied < kbps:
+			from = -1
+		case from < 0:
+			from = p.at
 		}
 	}
-	return -1
+	return from
 }
 
 // decreases counts the decreases by why in [from, to).

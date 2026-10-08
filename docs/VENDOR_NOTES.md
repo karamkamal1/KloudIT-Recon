@@ -3401,7 +3401,7 @@ What changed:
   dip, recovery time, the target's changes, the received rate per second), `host.log` and
   `client.json`, and fails unless there is no frame-queue overflow, the delay p95 during the dip
   is under the 15 s before's + 30 ms, and the target is back within 15 % of the setting within
-  10 s of the capacity's return.
+  10 s of the capacity's return and stays there to the end of the run.
 
 Deviations from the guide's wording, and why:
 
@@ -3455,7 +3455,9 @@ Deviations from the guide's wording, and why:
 - *Decoder backlog* holds increases above max(4, fps/10) frames (the client's own flush
   threshold); the decoder's flush stays the emergency cut it was.
 - *Frame-rate ladder* (optional in the guide): implemented, 120 → 90 → 60 at the 2 Mbit/s floor,
-  back up a rung every 5 s at 1.5 × the floor; resolution is never changed.
+  back up a rung every 5 s at 1.5 × the floor (or at the setting or the decoder's cap, where that
+  is lower: with a setting of 3 Mbit/s or less the bitrate never gets to 1.5 × the floor);
+  resolution is never changed.
 - *Report fields.* Beyond the guide's list (frames, bytes, OWD p50/max, loss count,
   decodeQueueSize) the report carries the newest frame (to know which frames it covers: the
   pacer correction and the stall check), the client's clock (rates over lost reports; a report
@@ -3464,6 +3466,34 @@ Deviations from the guide's wording, and why:
 - *The end-to-end run uses a Go client, not the browser*, in the client's namespace: the same
   reports and clock sync as `stream-worker.js`, without a display server in the namespace. The
   browser's reports are covered by the browser E2E (below) on the loopback.
+
+Review fixes (each with a test that fails without it):
+
+- *The overflow cut is bounded like a decrease*: from at least half the target, also as the
+  last known-good rate. It started from 0.85 × the acknowledged rate of the last 100 ms, which
+  after frames stalled for a tenth of a second is near 0: one overflow went to the 2 Mbit/s
+  floor on a path with full capacity (`TestRateEmergency`: an overflow after 100 ms with nothing
+  acknowledged cuts 20000 → 8500).
+- *A seamless live bitrate change no longer swallows key-frame requests*: the session's 500 ms
+  key-frame guard (`lastKick`) is set only by changes that deliver a key frame (a restart, an
+  encoder flush, an urgent change). The helper's seamless changes come every 250 ms–1 s, and a
+  client's `{"t":"keyframe"}` within 500 ms of one was dropped (`TestSessionOnHelper`: a
+  seamless change, then a key-frame request, gets `forceIdr`).
+- *Reordered or duplicated rate reports are ignored* (client clock not newer than the last
+  report's); they made wrapped counter differences (a spurious loss decrease with `reno`).
+  `TestRateFeedback`.
+- *The frame-rate ladder climbs back where the limit is below 1.5 × the floor*
+  (`TestRateFPSLadder` with a 2500 kbit/s setting).
+- *The capdrop acceptance requires the target to stay within 15 % of the setting* from the
+  recovery to the end of the run (`TestNetemCapdrop` and the simulation; the simulation's
+  numbers below are unchanged).
+- *Overflow diagnostics*: host.log `frame queue overflow frames= pts_span_ms=
+  encode_done_span_ms= sender= sender_busy_ms= cc_target_kbps= cc_window= cc_collapses=
+  cc_lost=` (the namespace runs below).
+
+After the fixes: `go test ./...` (with `internal/e2e`) passes, and the browser E2E passes 80/80
+(load ~5; bitrate-recovery scenario: cut 8000 → 6800, back to 8000 in four overlapped steps, no
+freeze over 100 ms).
 
 Verified in the sandbox (Linux, 4 CPUs shared with other jobs, no GPU: FFmpeg's libx264 and
 libsvtav1, i.e. the restart policy; the helper's seamless and flush policies only in the
@@ -3495,8 +3525,8 @@ simulation):
   bottleneck with a byte-limited FIFO (netem.sh's htb + 50 ms bfifo), random loss,
   retransmissions, a Wi-Fi-like gate, client reports every 25 ms. capdrop at a 30 Mbit/s setting
   (frame-queue overflows; one-way delay p95 before → during the dip; target back within 15 % of
-  the setting after the capacity's return), all within the guide's numbers except the overflow
-  at the drop where noted:
+  the setting after the capacity's return, and staying there), all within the guide's numbers
+  except the overflow at the drop where noted:
   - qualified seamless (helper): 0; 15 → 30 ms; 2.8 s
   - seamless, encoder at 80 % of its target: 0; 12 → 24 ms; 2.3 s
   - seamless, relay path (no acknowledgements from the client): 1, at the drop; 15 → 24 ms; 6.3 s
@@ -3525,14 +3555,18 @@ simulation):
   at load 2 and at load 10.
 - Namespace run (`sudo test/netem/capdrop.sh`, capdrop at a 30 Mbit/s setting, libx264
   1280×720 60 fps, FFmpeg restarts; the guide's three criteria; load average from other jobs in
-  brackets). The final code, eight runs: six pass, e.g. 0 overflows, one-way delay p95 9.9 →
+  brackets). The results below until "After the review" used a weaker recovery check than the
+  test has now (the first change after +40 s that reached 85 % of the setting, not that the
+  target stayed there), and the code before the review fixes. Eight runs: six pass, e.g. 0
+  overflows, one-way delay p95 9.9 →
   21.9 ms during the dip, back in 5.6 s [2–3]; 9.8 → 21.8 ms, 5.8 s [2–5]; 10.2 → 26.7 ms,
   5.1 s [3–7]; 15.1 → 19.9 ms, 6.5 s [5–12]; 22.7 → 25.2 ms, 8.7 s [9–11]; 25.0 → 43.4 ms,
   7.5 s [1–9] (its two overflows came at 62.0 s, after the client had stopped reading; the test
-  now ignores those). Two fail, at load 7–12: back in 10.1 s (0 overflows, 20.4 → 28.4 ms) [9–12]; and one
+  now ignores those). Two fail: back in 10.1 s (0 overflows, 20.4 → 28.4 ms) [9–12]; and one
   overflow at the capacity's return, when the frames stopped for 0.33 s while netem.sh
-  reconfigured the shaper (its four `tc` calls took 0.4 s at that load), 13.0 → 23.7 ms, back in
-  11.1 s [7–11]. Before the halving bound, three runs at load ~2 passed: 0 overflows, 10.0 →
+  reconfigured the shaper, 13.0 → 23.7 ms, back in 11.1 s [7–11] (that the reconfiguration
+  caused it is not established: overflows also come without one, below). Before the halving
+  bound, three runs at load ~2 passed: 0 overflows, 10.0 →
   26.2, 9.8 → 22.3, 10.0 → 25.3 ms, 5.8, 4.1, 4.4 s. How the rules came about: the first version
   (overlapped FFmpeg cuts, decreases from the delivered rates only) failed all three criteria
   (2 overflows, one of them the new generation's key frame; 9.7 → 63 ms; 13.3 s) → urgent large
@@ -3540,6 +3574,40 @@ simulation):
   4 overflows, 74 ms) → the queue-growth capacity; then a run cut 30 → 6.4 Mbit/s before the dip
   after frames stopped for 0.1 s (next to nothing acknowledged in 100 ms) → at most a halving.
   The urgent restarts: 1–4 per run, each a freeze of one FFmpeg start-up (70–220 ms here).
+
+  After the review: the review's run at load 1.4–1.9 failed with 3 overflows at +44.1 and
+  +44.2 s, 4 s after the last shaper change and 0.4 s after an overlapped restart to the full
+  30 Mbit/s: nothing reached the client for ~0.25 s with no network queue (the frames before had
+  ~8 ms one-way delay, the next one 52 ms). The overflow then cut 30000 → 2000 kbit/s (the
+  emergency cut had no lower bound: the acknowledged rate of the 100 ms of the stall was near
+  0), and the target stayed below 85 % of the setting for ~16 s on the 50 Mbit/s path, which
+  the old check reported as "back in 2.56 s". Its second run passed (10.1 → 23.3 ms, 7.2 s).
+  With the fixes above (the overflow cut bounded like a decrease, the stricter recovery check)
+  and a new `frame queue overflow` log line, eleven runs: one at load 0.2–1.5 passes (0
+  overflows, 10.2 → 22.5 ms, back and staying in 8.9 s); the other ten ran while other jobs'
+  browser E2E runs kept the load at 2–15 (4 CPUs): one more passes (9.9 → 23.7 ms, 9.3 s
+  [6–14]), nine fail: overflows in four runs (five overflows: at +7.3 and +17.4 s before the
+  dip and at +21.5 s, with no packet lost yet; at +26.4 and +34.3 s during the dip, after 23 and
+  32 lost packets), the dip's delay p95 over the baseline + 30 ms in four (48.7–61.8 ms against
+  baselines of 10–21 ms), the target back and staying within 10 s missed in five (10.1, 12.5,
+  13.9, 17.4 s, and once still under 85 % at the end; the last two after a delay decrease to
+  0.43 × at +44.8 and +45.0 s, on the 50 Mbit/s path). The overflow lines all read the same
+  way: the sender was in the middle of a frame's write for 8–12 ms (not waiting for a stream,
+  not stalled), no
+  persistent-congestion collapse of the congestion window (`cc_collapses=0`), and the 7
+  dropped frames had come out of FFmpeg within 25–61 ms (their timestamps within 31–75 ms),
+  where 7 frames at 60 fps take 100 ms: the encoder delivered frames faster than real time after
+  falling behind (the test pattern's `realtime` filter catches up in a burst when FFmpeg was
+  starved of CPU: libx264, the client, the host, a second libx264 during an overlapped restart
+  and the other jobs share 4 CPUs), and the media congestion controller paces at 1.2 × the
+  target, so such a burst cannot be sent before the 6-frame queue fills. The review's low-load
+  overflow fits the same pattern (an encoder stall, then a burst) but came before this log line:
+  its cause is not established. So T6 (no host frame-queue overflow) is not met reliably in
+  the sandbox: an overflow can occur at low load, and with an encoder that delivers in bursts it
+  occurs on a path with capacity to spare. Each one now costs at most a halving and an urgent
+  restart (before the fix: up to ~16 s near the floor). Not done: telling an encoder burst from
+  congestion (dropped frames' encodeDone span far under their count × the frame interval, no
+  losses) and not cutting for it, or letting the pacer drain such a backlog faster.
 - Browser E2E (`make build && node test/e2e/browser.mjs`, headless Chromium on the loopback,
   libsvtav1): 80/80 checks in each of four runs across the controller's last four versions,
   the last with the final code. Every scenario's worker sent 315–319 rate reports in its
@@ -3561,8 +3629,10 @@ Hardware checks:
   Bitrate 30 Mbps, constant motion. On the Proxmox node run
   `./netem.sh apply capdrop --ct 210 --host CLIENT_IP`, wait 70 s, `./netem.sh status --ct 210`
   (note T15 and T50, the times of the 15 and 50 Mbit/s steps), `./netem.sh clear --ct 210`. On the
-  PC: `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|stream stats' | Select-Object -Last 80`.
-  Pass: no `frames dropped why="queue overflow"`; `report_owd_p95_ms` of the `stream stats` lines
+  PC: `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|frame queue overflow|stream stats' | Select-Object -Last 80`.
+  Pass: no `frames dropped why="queue overflow"` (if there is one, record the `frame queue
+  overflow` line before it: an `encode_done_span_ms` far under 100 for its 7 frames at 60 fps
+  means the encoder delivered them in a burst); `report_owd_p95_ms` of the `stream stats` lines
   between T15 and T50 below the one before T15 + 30; a `bitrate recovery: raising bitrate ...
   to=` of at least 25500 within 10 s after T50; the changes are `changing the bitrate in the
   encoder` (no `restarting video reason=congestion`). Record the decreases (`why=`), the

@@ -199,8 +199,10 @@ the one-way delays it measures on a ping-synchronised clock) in the other, appli
 the client's interface (both directions) once the stream runs, and writes
 `test/netem/results/summary.txt`: frame-queue overflows, the one-way delay before, during and
 after the 15 Mbit/s step, how long the bitrate target takes to get back within 15 % of the
-setting, the target's changes and the received rate per second. The host and the shaper share one
-machine, so the host runs with `QUIC_GO_DISABLE_GSO=true` (see above). It checks the FFmpeg path
+setting (and stay there to the end of the run), the target's changes and the received rate per
+second; host.log has a `frame queue overflow` line for each overflow (what the frame sender was
+doing and for how long, the dropped frames' timestamp spans, the congestion window). The host
+and the shaper share one machine, so the host runs with `QUIC_GO_DISABLE_GSO=true` (see above). It checks the FFmpeg path
 (restarts), not the native helper. Results: `docs/VENDOR_NOTES.md`, 2.2.
 
 ## Windows (clumsy)

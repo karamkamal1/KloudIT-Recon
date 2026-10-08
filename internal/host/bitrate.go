@@ -52,7 +52,8 @@ import (
 //     decoder fell behind cuts at once (rateEmergencyFactor) with an urgent
 //     restart, but not within rateEmergencyGap of any other decrease.
 //   - At the floor, the frame rate goes down a rung (120 -> 90 -> 60) before
-//     anything else, and back up once the bitrate is well above the floor.
+//     anything else, and back up once the bitrate is well above the floor
+//     (1.5 x, or at the limit where that is lower).
 //
 // The continuous target reaches the encoder at most as often as its pipeline
 // can take changes (ratePolicy): a qualified seamless encoder every 250 ms, a
@@ -775,10 +776,11 @@ func (r *rateController) fpsUp(now time.Time) {
 // returns the cut, if any. A client's delay report (signalDelay) decreases
 // like the controller's own delay decision. An emergency (signalOverflow,
 // signalDecoder) cuts by rateEmergencyFactor (an overflow at least to
-// rateDecreaseFactor x the delivered rate), in the encoder at once, but not
-// within rateEmergencyGap of the last decrease of any kind: right after one,
-// the old generation (or rate) that still streams overflows the queue, and
-// the session only hurries the switch. A decoder flush that cuts also caps
+// rateDecreaseFactor x the delivered rate, but from at least
+// decreaseMinShare of the target), in the encoder at once, but not within
+// rateEmergencyGap of the last decrease of any kind: right after one, the old
+// generation (or rate) that still streams overflows the queue, and the
+// session only hurries the switch. A decoder flush that cuts also caps
 // later increases (rateDecoderPct of the bitrate it cut from) until reset.
 // Nothing is cut at the floor, or before the first generation.
 func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
@@ -803,6 +805,9 @@ func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
 	if sig == signalOverflow {
 		why = "overflow"
 		if d, ok := r.carried(now); ok {
+			// At most a halving, as in decrease: frames that stalled for
+			// a tenth of a second leave next to nothing acknowledged.
+			d = max(d, from*decreaseMinShare)
 			to = min(to, d*rateDecreaseFactor)
 			r.lastGood = d
 		} else {
@@ -849,7 +854,7 @@ func (r *rateController) tick(stalled bool) (rateChange, bool) {
 	if r.mayIncrease(now, stalled) {
 		r.increase(now, dt)
 	}
-	if r.fps < r.fpsMax && r.mayIncrease(now, stalled) && r.est >= 1.5*r.floor() &&
+	if r.fps < r.fpsMax && r.mayIncrease(now, stalled) && r.est >= min(1.5*r.floor(), r.limit()) &&
 		now.Sub(r.lastDecrease) >= fpsHold && now.Sub(r.lastFPSChange) >= fpsHold {
 		r.fpsUp(now)
 	}
