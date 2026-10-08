@@ -24,7 +24,7 @@ func CursorImage(uint64) (*CursorShape, error) { return nil, ErrUnsupported }
 type Gamepads struct{}
 
 // OpenGamepads is unsupported outside Windows.
-func OpenGamepads() (*Gamepads, error) { return nil, ErrUnsupported }
+func OpenGamepads(func(idx int, large, small uint8)) (*Gamepads, error) { return nil, ErrUnsupported }
 
 func (*Gamepads) Update(int, Pad) error { return ErrUnsupported }
 func (*Gamepads) Unplug(int)            {}

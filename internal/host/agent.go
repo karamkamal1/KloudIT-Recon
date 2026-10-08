@@ -220,7 +220,7 @@ func (a *Agent) gamepads() *platform.Gamepads {
 		return a.pads
 	}
 	a.padsTry = time.Now()
-	p, err := platform.OpenGamepads()
+	p, err := platform.OpenGamepads(a.rumble)
 	if err != nil {
 		if !errors.Is(err, platform.ErrUnsupported) {
 			a.log.Info("virtual gamepads unavailable", "err", err)

@@ -53,12 +53,15 @@ func TestParseTestFaults(t *testing.T) {
 	if f, err := parseTestFaults("pre-stage-hold"); err != nil || f != (testFaults{preStageHold: true}) || !f.active() {
 		t.Fatalf("pre-stage-hold: %+v %v", f, err)
 	}
+	if f, err := parseTestFaults("rumble-echo"); err != nil || f != (testFaults{rumbleEcho: true}) || !f.active() {
+		t.Fatalf("rumble-echo: %+v %v", f, err)
+	}
 	for _, bad := range []string{"delay=every:97", "delay=every:0:10ms", "delay=every:5:-1ms", "delay=every:5:1h",
 		"drop=every:x", "drop=sometimes:3", "drop=every:3:4", "recovery=maybe", "loss=1%", "intra-refresh=1",
 		"ref-recovery=1", "ref-recovery,intra-refresh", "ref-recovery,recovery=skip", "recovery=invalidate",
 		"still", "still=60", "still=after:0", "still=after:x", "still=every:60",
 		"rate-period=1s", // the 1.5 controller's hook, gone with it (GUIDE 2.2)
-		"pre-stage-hold=1"} {
+		"pre-stage-hold=1", "rumble-echo=1"} {
 		if _, err := parseTestFaults(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

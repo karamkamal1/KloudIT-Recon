@@ -636,7 +636,7 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 				if n%20 == 0 { // a ping every 500 ms
 					id := n / 20
 					pings[id] = time.Now()
-					c.SendDatagram(proto.PingDatagram(id, 0))
+					c.SendDatagram(proto.PingDatagram(id, 0, 0)) // no min RTT: a client before step 4.6
 				}
 				if opts.reportOWD == nil {
 					mu.Unlock()

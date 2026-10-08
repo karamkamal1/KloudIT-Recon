@@ -32,7 +32,15 @@
 // is checked on a fake clock. Client-side upscaling (Phase 5): the WebGPU
 // renderer's FSR 1 passes against a CPU reference written from ffx_fsr1.h
 // (unit), and a scenario streaming the 960x540 picture onto a 1920x1080
-// canvas with upscaling Auto (FSR 1 draws), then Off, live.
+// canvas with upscaling Auto (FSR 1 draws), then Off, live. Input and audio
+// (step 4.6): on this loopback link the host switches Opus to 5 ms frames
+// from the RTT the client's pings report and the jitter buffer adapts within
+// 10-60 ms; fullscreen holds Chromium's Keyboard Lock, and Safari's
+// fullscreen option (keyboardLock: "browser") is checked on a stubbed
+// requestFullscreen; a fake gamepad's triggers come back as force feedback
+// (host test hook rumble-echo) and are played with
+// vibrationActuator.playEffect; the client reports unadjustedMovement only
+// when the browser read the option.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -41,6 +49,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import dgram from 'node:dgram';
+import vm from 'node:vm';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pw = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -300,6 +309,8 @@ async function checkFullscreen(name) {
     el = await fsElement(6000);
   }
   const inFs = await sized();
+  // keyboard.lock() resolves asynchronously (slowly on a loaded machine).
+  const kbLock = el ? await until(() => page.evaluate(() => window.__recon.keyboardLock), 8000, 'keyboard lock').catch(() => null) : null;
   await page.keyboard.press('Control+Alt+Shift+KeyF');
   const left = await until(() => page.evaluate(() => !document.fullscreenElement), 6000, 'leaving fullscreen').catch(() => false);
   const out = await sized();
@@ -308,6 +319,77 @@ async function checkFullscreen(name) {
   check(`${name}: toolbar at the top edge, element fullscreen of the player and back, the canvas follows its box`, shown && el === 'player' && left && fits(inFs) && fits(out),
     `toolbar shown ${shown}; fullscreen element ${el} via ${via}; in fullscreen box ${inFs.box?.w}x${inFs.box?.h}, canvas ${inFs.canvas?.join('x')}; ` +
       `after: box ${out.box?.w}x${out.box?.h}, canvas ${out.canvas?.join('x')}${refused ? `; ${refused.replace(/^\S+ /, '')}` : ''}`);
+  // Keyboard Lock (step 4.6): Chromium has navigator.keyboard.lock(). Judged
+  // when fullscreen went in and out as asked (on a loaded machine a late
+  // toolbar click and the hotkey can cross; the check above reports that).
+  const kbAfter = await until(async () => ((await page.evaluate(() => window.__recon.keyboardLock)) === null ? 'off' : null), 3000, 'keyboard lock released')
+    .then(() => null, () => page.evaluate(() => window.__recon.keyboardLock));
+  const kbLog = (await page.evaluate(() => window.__recon.logs)).filter((l) => l.includes('keyboard lock')).pop() || '';
+  const kbDetail = `in fullscreen: ${kbLock}; after: ${kbAfter}${kbLog ? `; ${kbLog.replace(/^\S+ /, '')}` : ''}`;
+  if (el === 'player' && left) {
+    check(`${name}: Keyboard Lock held in fullscreen (navigator.keyboard.lock), released with it`, kbLock === 'keyboard.lock' && kbAfter === null, kbDetail);
+  } else {
+    console.log(`- ${name}: Keyboard Lock not judged (fullscreen ${el ?? 'not entered'}, left ${left}): ${kbDetail}`);
+  }
+}
+
+// Audio (step 4.6). This loopback link is a LAN (minimum RTT far below
+// 10 ms): once the client's pings report the RTT the host switches Opus to
+// 5 ms frames (log "audio frame size"), announces them in an audio config,
+// and the client receives 5 ms packets (their Opus TOC); the jitter buffer
+// (Auto, the default) keeps a target within 10-60 ms; the overlay shows both.
+async function checkAudio(name) {
+  const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const read = () => page.evaluate(() => ({ st: window.__recon.lastStats, cfg: window.__recon.audioCfg, j: window.__recon.audioJitter }));
+  const r = (await until(async () => {
+    const x = await read();
+    return x.st?.audioFrameMs === 5 && x.cfg?.frameMs === 5 && x.j ? x : null;
+  }, 8000, 'audio at 5 ms').catch(() => null)) || (await read());
+  const sid = await page.evaluate(() => window.__recon.welcome?.session);
+  const line = (hostProc.log.match(new RegExp(`msg="audio frame size" session=${sid} [^\\n]*`)) || [''])[0];
+  const overlay = await page.textContent('#stats').catch(() => '');
+  const row = (overlay.match(/Audio[^\n]*?lost \d+/) || [''])[0];
+  const { st, cfg, j } = r;
+  check(`${name}: audio: Opus 5 ms frames on this LAN (picked by the host from the client's minimum RTT), adaptive jitter buffer within 10-60 ms`,
+    st?.audioFrameMs === 5 && cfg?.frameMs === 5 && / ms=5 /.test(line) && st.minRtt > 0 && st.minRtt < 10 && j?.auto === true &&
+      j.targetMs >= 10 && j.targetMs <= 60 && /opus 5 ms/.test(row) && / auto /.test(row),
+    `packets ${st?.audioFrameMs} ms, config ${cfg?.frameMs} ms, client min RTT ${st?.minRtt?.toFixed(2)} ms; host: ${line.replace(/^.*?msg=/, '') || 'no switch logged'}; ` +
+      `jitter buffer: target ${j?.targetMs?.toFixed(1)} ms (${j?.auto ? 'auto' : 'fixed'}), level ${j?.levelMs?.toFixed(1)} ms, underruns ${j?.underruns}, ` +
+      `trimmed ${j?.skippedMs?.toFixed(1)} ms; overlay "${row}"`);
+  results.push({ audio: name, stats: { audioFrameMs: st?.audioFrameMs, minRtt: st?.minRtt, audioMs: st?.audioMs }, cfg, jitter: j });
+
+  // A new audio stream with the same codec: the codec setting changes, the
+  // codec does not (here "" — the host's choice, Opus — and back to "opus";
+  // a client without an Opus decoder gets PCM for either setting). The host
+  // restarts audio, its sequence from 0; the client takes the new stream at
+  // once (it used to drop its packets as late until their sequence passed
+  // the old stream's: as long as audio had run). Audio flows: the ring the
+  // worker fills holds more than one render quantum (2.7 ms; a starved
+  // jitter buffer keeps less) in at least half the samples over the 3 s
+  // after each switch.
+  const restarts = () => (hostProc.log.match(new RegExp(`msg="audio capture packet" session=${sid} `, 'g')) || []).length;
+  const restartWith = async (v) => {
+    const before = restarts();
+    await page.evaluate((v) => {
+      const sel = [...document.querySelectorAll('#drawer select')].find((x) => [...x.options].some((o) => o.value === 'pcm'));
+      if (![...sel.options].some((o) => o.value === v)) sel.append(new Option('host default', v));
+      sel.value = v;
+      sel.dispatchEvent(new Event('change'));
+    }, v);
+    await until(async () => restarts() > before, 5000, 'audio restart').catch(() => {});
+    const ms = [];
+    for (let i = 0; i < 12; i++) {
+      await sleep(250);
+      ms.push(await page.evaluate(() => window.__recon.lastStats?.audioMs ?? 0));
+    }
+    return { restarted: restarts() > before, flowing: ms.filter((x) => x > 2.7).length, ms: ms.map((x) => Math.round(x)) };
+  };
+  const toDefault = await restartWith('');
+  const toOpus = await restartWith('opus');
+  check(`${name}: audio: a restart with the same codec (codec setting "" and back to "opus"): the client plays the new stream at once (sequence from 0)`,
+    toDefault.restarted && toOpus.restarted && toDefault.flowing >= 6 && toOpus.flowing >= 6,
+    `restarted ${toDefault.restarted}/${toOpus.restarted}; buffered audio in ${toDefault.flowing} and ${toOpus.flowing} of 12 samples ` +
+      `(ms: ${toDefault.ms.join(' ')} | ${toOpus.ms.join(' ')})`);
 }
 
 // Renderer "auto" (step 4.3). Without a stored result the first connection
@@ -1682,6 +1764,273 @@ async function checkPreStageHoldHost() {
   await page.evaluate(() => { window.__recon.userClosed = true; });
 }
 
+// Input (step 4.6), on a host with the test hook rumble-echo (it plays a
+// gamepad's triggers back as force feedback, as a game's rumble comes back
+// through ViGEmBus, which this host lacks).
+// Rumble: a fake gamepad (navigator.getGamepads and gamepadconnected
+// replaced in the page) with the left trigger full and the right at a
+// quarter: the host sends DgRumble 255/64 at once and every 100 ms while it
+// runs; the client plays each with vibrationActuator.playEffect("dual-rumble",
+// strong 1, weak 64/255, 250 ms) (the median gap between them about 100 ms),
+// and the release (0/0, sent three times) resets the actuator, with no effect
+// played after it.
+// Keyboard Lock on a stubbed requestFullscreen without navigator.keyboard
+// (Safari 26.4; the stub enters Chromium's real fullscreen without the
+// option): the option keyboardLock "browser" goes with navigationUI "hide"
+// and the client reports the lock; a browser that refuses the value
+// (TypeError) gets fullscreen without it; one that ignores the option (does
+// not read it) has no lock; with navigator.keyboard.lock (Chromium) the
+// option is not passed. Pointer Lock on a stubbed requestPointerLock (game
+// mode): the client reports unadjustedMovement only when the browser read the
+// option and granted the lock; one that ignores it (Firefox, Safari) or
+// refuses it (NotSupportedError, then a plain lock) does not.
+async function checkInputHost() {
+  await restartHost({ RECON_TEST_FAULTS: 'rumble-echo' }, 'host-rumble');
+  await startStream({ path: 'auto', transport: 'auto' });
+  await page.evaluate(() => {
+    const calls = [];
+    const resets = [];
+    const pad = {
+      index: 0, id: 'E2E fake pad', connected: true, mapping: 'standard', timestamp: 0,
+      buttons: Array.from({ length: 17 }, () => ({ pressed: false, value: 0 })), axes: [0, 0, 0, 0],
+      vibrationActuator: {
+        effects: ['dual-rumble', 'trigger-rumble'],
+        playEffect(type, p) { calls.push({ type, ...p, t: performance.now() }); return Promise.resolve('complete'); },
+        reset() { resets.push(performance.now()); return Promise.resolve('complete'); },
+      },
+    };
+    window.__pad = { pad, calls, resets, present: true };
+    navigator.getGamepads = () => (window.__pad.present ? [pad, null, null, null] : [null, null, null, null]);
+    const ev = new Event('gamepadconnected');
+    Object.defineProperty(ev, 'gamepad', { value: pad });
+    window.dispatchEvent(ev);
+  });
+  const triggers = (lt, rt) => page.evaluate(([l, r]) => {
+    const b = window.__pad.pad.buttons;
+    b[6] = { pressed: l > 0.5, value: l };
+    b[7] = { pressed: r > 0.5, value: r };
+  }, [lt, rt]);
+  await sleep(300);
+  await triggers(1, 0.25);
+  // Running: wait for six effects (half a second of repeats; longer on a loaded machine).
+  await until(() => page.evaluate(() => window.__pad.calls.length >= 6), 8000, 'rumble effects').catch(() => {});
+  const running = await page.evaluate(() => window.__pad.calls.length);
+  await triggers(0, 0);
+  await until(() => page.evaluate(() => window.__pad.resets.length >= 1), 8000, 'rumble reset').catch(() => {});
+  await sleep(600); // the stop's repeats
+  const r = await page.evaluate(() => ({ calls: window.__pad.calls, resets: window.__pad.resets, rumbles: window.__recon.rumbles }));
+  await page.evaluate(() => { window.__pad.present = false; });
+  const want = (c) => c.type === 'dual-rumble' && c.strongMagnitude === 1 && Math.abs(c.weakMagnitude - 64 / 255) < 1e-9 && c.duration === 250;
+  const on = r.calls.filter(want);
+  const gaps = on.slice(1).map((c, i) => c.t - on[i].t);
+  const median = [...gaps].sort((a, b) => a - b)[gaps.length >> 1] ?? NaN;
+  const firstReset = r.resets[0] ?? Infinity;
+  const late = r.calls.filter((c) => c.t > firstReset).length;
+  check('gamepad rumble (fake gamepad, host test hook rumble-echo): DgRumble played with vibrationActuator.playEffect("dual-rumble") and repeated about every 100 ms while it runs; the stop resets the actuator',
+    on.length >= 6 && on.length === r.calls.length && median >= 50 && median <= 150 && r.resets.length >= 1 && late === 0,
+    `${on.length} effects (strong 1, weak 64/255, 250 ms) of ${r.calls.length} played, ${running} before the release, gaps median ` +
+      `${median.toFixed(0)} ms (${gaps.length ? `${Math.min(...gaps).toFixed(0)}-${Math.max(...gaps).toFixed(0)}` : '-'}); ${r.resets.length} resets after the release, ` +
+      `${late} effects after the first; ${r.rumbles} rumble datagrams played`);
+  results.push({ rumble: { effects: on.length, calls: r.calls.length, resets: r.resets.length, gaps } });
+
+  // Keyboard Lock: Safari's fullscreen option, on a stubbed requestFullscreen.
+  await page.evaluate(() => {
+    window.__fsOrig = Element.prototype.requestFullscreen;
+    Object.defineProperty(navigator, 'keyboard', { value: undefined, configurable: true });
+  });
+  const fsCase = async (kind) => {
+    await page.evaluate((k) => {
+      window.__recon.keyboardLock = null;
+      window.__fs = [];
+      Element.prototype.requestFullscreen = function (o) {
+        // An old browser does not read members it does not know.
+        const lock = k === 'ignores' || !('keyboardLock' in o) ? null : o.keyboardLock;
+        window.__fs.push({ el: this.id, navigationUI: o.navigationUI, lock });
+        if (k === 'refuses' && lock) return Promise.reject(new TypeError(`The provided value '${lock}' is not a valid enum value of type FullscreenKeyboardLock.`));
+        return window.__fsOrig.call(this, { navigationUI: o.navigationUI }); // real fullscreen
+      };
+    }, kind);
+    await page.keyboard.press('Control+Alt+Shift+KeyF');
+    await until(() => page.evaluate(() => !!document.fullscreenElement), 5000, 'fullscreen').catch(() => {});
+    await sleep(300);
+    const res = await page.evaluate(() => ({ calls: window.__fs, lock: window.__recon.keyboardLock, fs: document.fullscreenElement?.id ?? null,
+      log: window.__recon.logs.filter((l) => l.includes('keyboard lock')).pop() || '' }));
+    await page.evaluate(() => document.fullscreenElement && document.exitFullscreen().catch(() => {}));
+    await until(() => page.evaluate(() => !document.fullscreenElement), 5000, 'leaving fullscreen').catch(() => {});
+    return res;
+  };
+  const safari = await fsCase('safari');
+  const refuses = await fsCase('refuses');
+  const ignores = await fsCase('ignores');
+  await page.evaluate(() => { delete navigator.keyboard; });
+  const chromium = await fsCase('chromium');
+  await page.evaluate(() => { Element.prototype.requestFullscreen = window.__fsOrig; });
+  const one = (x, lock) => x.fs === 'player' && x.calls.length === 1 && x.calls[0].el === 'player' && x.calls[0].navigationUI === 'hide' && x.calls[0].lock === lock;
+  check('Keyboard Lock without navigator.keyboard (Safari 26.4): requestFullscreen({keyboardLock: "browser"}); refused value: fullscreen without it; ignored option: no lock; Chromium: no option',
+    one(safari, 'browser') && safari.lock === 'fullscreen option' &&
+      refuses.fs === 'player' && refuses.calls.length === 2 && refuses.calls[0].lock === 'browser' && refuses.calls[1].lock === null && refuses.calls[1].navigationUI === 'hide' &&
+      refuses.lock === null && /keyboard lock refused \(TypeError/.test(refuses.log) &&
+      one(ignores, null) && ignores.lock === null && one(chromium, null),
+    `safari: ${JSON.stringify(safari.calls)} → ${safari.lock}; refuses: ${JSON.stringify(refuses.calls)} → ${refuses.lock} (${refuses.log.replace(/^\S+ /, '').slice(0, 80)}); ` +
+      `ignores: ${JSON.stringify(ignores.calls)} → ${ignores.lock}; chromium: ${JSON.stringify(chromium.calls)}`);
+
+  // Pointer Lock: unadjustedMovement, on a stubbed requestPointerLock.
+  await page.evaluate(() => { window.__plOrig = Element.prototype.requestPointerLock; });
+  const plCase = async (kind) => {
+    await page.evaluate((k) => {
+      window.__recon.pointerRaw = null;
+      window.__pl = [];
+      Element.prototype.requestPointerLock = function (o) {
+        // A browser without the option does not read it; one that reads it
+        // rejects what it cannot grant.
+        const raw = k === 'ignores' || !o ? null : o.unadjustedMovement;
+        window.__pl.push({ raw });
+        if (k === 'refuses' && raw) return Promise.reject(new DOMException('unadjustedMovement is not supported', 'NotSupportedError'));
+        return Promise.resolve();
+      };
+    }, kind);
+    await page.keyboard.press('Control+Alt+Shift+KeyM'); // game mode: locks the pointer
+    await until(() => page.evaluate(() => window.__recon.pointerRaw !== null), 3000, 'pointer lock').catch(() => {});
+    const res = await page.evaluate(() => ({ calls: window.__pl, raw: window.__recon.pointerRaw }));
+    await page.keyboard.press('Control+Alt+Shift+KeyM'); // back to desktop mode
+    return res;
+  };
+  const plReads = await plCase('reads');
+  const plIgnores = await plCase('ignores');
+  const plRefuses = await plCase('refuses');
+  await page.evaluate(() => { Element.prototype.requestPointerLock = window.__plOrig; });
+  check('Pointer Lock: unadjustedMovement reported only when the browser read the option and granted the lock (ignored, refused: not)',
+    plReads.raw === true && plReads.calls.length === 1 && plReads.calls[0].raw === true &&
+      plIgnores.raw === false && plIgnores.calls.length === 1 && plIgnores.calls[0].raw === null &&
+      plRefuses.raw === false && plRefuses.calls.length === 2 && plRefuses.calls[0].raw === true && plRefuses.calls[1].raw === null,
+    `reads: ${JSON.stringify(plReads)}; ignores: ${JSON.stringify(plIgnores)}; refuses: ${JSON.stringify(plRefuses)}`);
+  await page.evaluate(() => { window.__recon.userClosed = true; });
+}
+
+// The audio jitter buffer at unit level (step 4.6, audio-worklet.js), run
+// here in Node on a simulated clock: 5 ms packets of a 440 Hz tone into the
+// SharedArrayBuffer ring as the worker writes them, an audio device that
+// renders 10 ms at a time in 128-sample quanta (Windows shared mode). Auto on
+// a clean LAN (0-1 ms jitter): settles at a 10-20 ms target without an
+// underrun, and its trims are crossfaded (no sample-to-sample jump above the
+// tone's own slope plus the fade's: no click). 40 ms delay spikes every 2 s
+// for 30 s, then a clean link: at most two underruns, then none while the
+// target holds above the spike, at most 60 ms; back to 10-20 ms within 30 s
+// of the spikes ending, with the level following. Fixed 30 ms: the target
+// stays 30 ms. Intermittent audio (sound/silence cycles; WASAPI loopback
+// sends nothing while nothing plays): the host moves the pts on by each pause
+// and the worker reports the first packet after one ({pause: true}, here 5 ms
+// after it arrived, as the page passes it on): every pause's underrun is
+// taken back and the target stays at 10-20 ms while sound plays. The worklet
+// reports its state once a second.
+function simulateJitter({ seconds, jitter = 1, spikeEvery = 0, spikeMs = 0, cleanAfter = Infinity, opts = {}, seed = 1, onMs = Infinity, offMs = 0, pauseMarks = true }) {
+  let Proc = null;
+  const reports = [];
+  vm.runInNewContext(readFileSync(join(root, 'web', 'static', 'js', 'audio-worklet.js'), 'utf8'), {
+    sampleRate: 48000, Atomics, Int32Array, Float32Array, SharedArrayBuffer, Math,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (m) => reports.push(m) }; } },
+    registerProcessor: (_name, c) => { Proc = c; },
+  });
+  const sab = new SharedArrayBuffer(8 + 48000 * 2 * 4);
+  const p = new Proc({ processorOptions: { sab, ...opts } });
+  const idx = new Int32Array(sab, 0, 2);
+  const data = new Float32Array(sab, 8);
+  const cap = data.length / 2;
+  const push = (L) => { // stream-worker.js RingWriter
+    const w = Atomics.load(idx, 0);
+    const n = Math.min(L.length, cap - 1 - ((w - Atomics.load(idx, 1) + cap) % cap));
+    let q = w;
+    for (let i = 0; i < n; i++) { data[2 * q] = L[i]; data[2 * q + 1] = L[i]; if (++q === cap) q = 0; }
+    Atomics.store(idx, 0, q);
+  };
+  let rng = seed;
+  const rand = () => ((rng = (rng * 16807) % 2147483647) / 2147483647);
+  let sent = 0;
+  let nextSend = 0;
+  let arrival = 0;
+  let debt = 0;
+  const inflight = [];
+  const out = [];
+  const underruns = [];
+  const levels = [];
+  const sounding = (ms) => ms % (onMs + offMs) < onMs;
+  let paused = false;
+  const marks = []; // when the page passes a pause on to the worklet
+  for (let step = 0; step < seconds * 4000; step++) { // 0.25 ms steps
+    const t = step / 4;
+    for (; nextSend <= t; nextSend += 5, sent += 240) {
+      if (!sounding(nextSend)) { paused = true; continue; }
+      const spike = spikeEvery && nextSend > 0 && nextSend % spikeEvery === 0 && nextSend < cleanAfter ? spikeMs : 0;
+      arrival = Math.max(arrival, nextSend + jitter * rand() + spike); // in order: a late packet holds up the next
+      inflight.push({ at: arrival, s: sent, pause: paused });
+      paused = false;
+    }
+    while (inflight.length && inflight[0].at <= t) {
+      const { s, pause } = inflight.shift();
+      push(Float32Array.from({ length: 240 }, (_, i) => 0.5 * Math.sin((2 * Math.PI * 440 * (s + i)) / 48000)));
+      if (pause && pauseMarks) marks.push(t + 5);
+    }
+    while (marks.length && marks[0] <= t) {
+      marks.shift();
+      p.port.onmessage({ data: { pause: true } });
+    }
+    if (step % 40 === 0) { // the device's 10 ms period
+      for (debt += 480; debt >= 128; debt -= 128) {
+        const L = new Float32Array(128);
+        const u = p.underruns;
+        p.process([], [[L, new Float32Array(128)]]);
+        if (p.underruns > u) underruns.push(t / 1000);
+        out.push(...L);
+      }
+      levels.push({ t: t / 1000, level: p.available() / 48, target: p.target / 48, playing: sounding(t) && !p.buffering });
+    }
+  }
+  return { p, reports, underruns, out, levels };
+}
+
+async function checkJitterRule() {
+  const at = (r, s) => r.levels.find((l) => l.t >= s);
+  const mean = (r, a, b) => { const x = r.levels.filter((l) => l.t >= a && l.t < b); return x.reduce((v, l) => v + l.level, 0) / x.length; };
+  const slope = (out, from) => { let m = 0; for (let i = from + 1; i < out.length; i++) m = Math.max(m, Math.abs(out[i] - out[i - 1])); return m; };
+  const tone = (2 * Math.PI * 440 / 48000) * 0.5; // the tone's steepest step
+  const lan = simulateJitter({ seconds: 20 });
+  const lanTarget = lan.p.target / 48;
+  const lanSlope = slope(lan.out, 0); // the tone starts at phase 0: no step when playback starts
+  const last = lan.reports.at(-1) || {};
+  check('jitter buffer (unit): Auto on a clean LAN settles at a 10-20 ms target, no underrun, crossfaded trims (no click), reports once a second',
+    lanTarget >= 10 && lanTarget <= 20 && lan.underruns.length === 0 && lan.p.skippedMs > 0 && lanSlope < tone + 0.01 &&
+      lan.reports.length >= 19 && last.t === 'jitter' && last.auto === true && last.targetMs === lanTarget,
+    `target ${lanTarget.toFixed(1)} ms, underruns ${lan.underruns.length}, level (after each render burst) ${mean(lan, 10, 20).toFixed(1)} ms in 10-20 s, ` +
+      `trimmed ${lan.p.skippedMs.toFixed(1)} ms; largest step ${lanSlope.toFixed(4)} (tone ${tone.toFixed(4)}); ${lan.reports.length} reports`);
+  const spiky = simulateJitter({ seconds: 70, jitter: 3, spikeEvery: 2000, spikeMs: 40, cleanAfter: 30000 });
+  const late = spiky.underruns.filter((t) => t > 5);
+  const peak = Math.max(...spiky.levels.map((l) => l.target));
+  const calm = at(spiky, 60).target;
+  check('jitter buffer (unit): 40 ms delay spikes every 2 s: at most two underruns, then none with the target above the spike (at most 60 ms); 10-20 ms again within 30 s of a clean link',
+    spiky.underruns.length <= 2 && late.length === 0 && at(spiky, 20).target >= 40 && peak <= 60 && calm >= 10 && calm <= 20 && mean(spiky, 60, 70) < 20,
+    `underruns at ${spiky.underruns.map((t) => `${t.toFixed(1)} s`).join(', ') || 'none'}; target at 5/20/29 s ${[5, 20, 29].map((s) => at(spiky, s).target.toFixed(1)).join('/')} ms (peak ` +
+      `${peak.toFixed(1)}), at 60 s ${calm.toFixed(1)} ms; level 20-30 s ${mean(spiky, 20, 30).toFixed(1)} ms, 60-70 s ${mean(spiky, 60, 70).toFixed(1)} ms`);
+  const fixed = simulateJitter({ seconds: 10, opts: { auto: false, targetMs: 30 } });
+  check('jitter buffer (unit): Fixed 30 ms keeps its target', fixed.p.target / 48 === 30 && fixed.underruns.length === 0 && fixed.reports.at(-1)?.auto === false,
+    `target ${fixed.p.target / 48} ms, underruns ${fixed.underruns.length}, level ${mean(fixed, 5, 10).toFixed(1)} ms`);
+  // Sounds with pauses between them (the end of each runs the buffer dry):
+  // 600 ms every 2.1 s, and 3 s on / 3 s off, for a minute (ending in a
+  // sound); hosts before the pause marker for comparison (detail only).
+  const gaps = [[600, 1500], [3000, 3000]].map(([on, off]) => {
+    const r = simulateJitter({ seconds: 61, onMs: on, offMs: off });
+    const playing = r.levels.filter((l) => l.playing && l.t >= 5);
+    const lo = Math.min(...playing.map((l) => l.target));
+    const hi = Math.max(...playing.map((l) => l.target));
+    const unmarked = simulateJitter({ seconds: 61, onMs: on, offMs: off, pauseMarks: false });
+    return { on, off, lo, hi, underruns: r.p.underruns, pauses: r.p.pauses, drains: r.underruns.length, unmarked: unmarked.p.target / 48, unmarkedUnderruns: unmarked.p.underruns };
+  });
+  check('jitter buffer (unit): sounds with pauses (600 ms every 2.1 s; 3 s on, 3 s off) and the host\'s pause marker: every pause\'s underrun taken back, the target 10-20 ms while sound plays',
+    gaps.every((g) => g.lo >= 10 && g.hi <= 20 && g.underruns === 0 && g.pauses === g.drains && g.pauses >= 9),
+    gaps.map((g) => `${g.on}/${g.off} ms: target ${g.lo.toFixed(1)}-${g.hi.toFixed(1)} ms while playing, ${g.pauses} pauses taken back of ${g.drains} drains, ` +
+      `${g.underruns} underruns (without the marker: target ${g.unmarked.toFixed(1)} ms, ${g.unmarkedUnderruns} underruns)`).join('; '));
+  results.push({ jitterRule: { lan: { target: lanTarget, slope: lanSlope, skippedMs: lan.p.skippedMs }, spiky: { underruns: spiky.underruns, peak, calm }, gaps } });
+}
+
 // The frame pacer at unit level (step 4.4, pacing.js) on a fake clock: what
 // it draws and drops, and from which tick, in both modes, at the stale rule's
 // edges (older than one refresh with or without a newer frame in the
@@ -2436,6 +2785,7 @@ try {
     if (sc.name === 'WebTransport direct' || (sc.probe && !sc.upscale)) await checkFullscreen(sc.name);
     if (sc.upscale) await checkUpscaleStream(sc, rate).catch((e) => check(`${sc.name}: upscaling`, false, e.message));
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
+    if (sc === scenarios[0]) await checkAudio(sc.name);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
 
     // Input: keyboard + mouse (desktop mode = absolute) + wheel, in the middle
@@ -2541,6 +2891,7 @@ try {
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
   await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
   await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
+  await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
@@ -2548,6 +2899,7 @@ try {
   await checkUpscaleUnit(xvfbOk).catch((e) => check('FSR 1 shader (unit)', false, e.message));
   await checkPickRule().catch((e) => check("Auto's pick (unit)", false, e.message));
   await checkPacerRule().catch((e) => check('frame pacing (unit)', false, e.message));
+  await checkJitterRule().catch((e) => check('jitter buffer (unit)', false, e.message));
   await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
 
   // 3d. Latency probe, wallclock mode -----------------------------------------

@@ -45,6 +45,10 @@ import (
 //	                  reports: no stage-hold in the welcome, and a report is
 //	                  logged only with at most nine rows and without a hold
 //	                  row (stageNamesBeforeHold), as those hosts did
+//	rumble-echo       play a client gamepad's triggers back to it as force
+//	                  feedback (left trigger: large motor, right: small), as
+//	                  a game's rumble comes back through ViGEmBus; works
+//	                  without ViGEmBus, so a test sees the DgRumble path
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -65,11 +69,12 @@ type testFaults struct {
 	refRecovery  bool
 	stillAfter   int  // frames of a generation before its source goes still
 	preStageHold bool // sendWelcome, logStages
+	rumbleEcho   bool // Session.gamepad
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold
+		f.preStageHold || f.rumbleEcho
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -141,8 +146,13 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: pre-stage-hold takes no value", rule)
 			}
 			f.preStageHold = true
+		case "rumble-echo":
+			if val != "" {
+				return f, fmt.Errorf("%s: rumble-echo takes no value", rule)
+			}
+			f.rumbleEcho = true
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

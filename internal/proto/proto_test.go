@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFraming(t *testing.T) {
@@ -308,9 +309,27 @@ func TestInputParsing(t *testing.T) {
 	if !ok || m.Seq != 5 || m.CumX != -10 || m.CumY != 20 {
 		t.Fatalf("%+v", m)
 	}
-	p := Pong(PingDatagram(9, 123.5), 42)
-	if len(p) != 24 || p[0] != DgPong || !bytes.Equal(p[4:16], PingDatagram(9, 123.5)[4:16]) {
+	ping := PingDatagram(9, 123.5, 1500)
+	p := Pong(ping, 42)
+	if len(p) != 24 || p[0] != DgPong || !bytes.Equal(p[4:16], ping[4:16]) {
 		t.Fatal("pong does not echo ping")
+	}
+	if got := PingMinRTT(ping); got != 1500*time.Microsecond {
+		t.Fatalf("PingMinRTT = %v, want 1.5ms", got)
+	}
+	// A client before step 4.6 sends 16 bytes: no RTT, and the pong is the same.
+	old := ping[:16]
+	if got := PingMinRTT(old); got != 0 {
+		t.Fatalf("PingMinRTT of a 16-byte ping = %v, want 0", got)
+	}
+	if !bytes.Equal(Pong(old, 42), p) {
+		t.Fatal("pong differs for a ping without the RTT")
+	}
+	if got := PingMinRTT(PingDatagram(1, 0, 0)); got != 0 {
+		t.Fatalf("PingMinRTT before a measurement = %v, want 0", got)
+	}
+	if got := PingMinRTT(append([]byte{DgPong}, ping[1:]...)); got != 0 {
+		t.Fatalf("PingMinRTT of a pong = %v, want 0", got)
 	}
 }
 
@@ -458,5 +477,42 @@ console.log(Buffer.from(b).toString('hex'));`
 		OWDP50Us: 8000, OWDMaxUs: 2147483647, Lost: 3, Audio: 500, DecodeQueue: 65535}
 	if !ok || len(jb) != RateReportLen || got != want {
 		t.Fatalf("protocol.js rateReport: %+v (%d bytes), want %+v", got, len(jb), want)
+	}
+}
+
+// TestPingJS: protocol.js writes the client's minimum RTT where PingMinRTT
+// reads it, and its ping is what PingDatagram builds (needs node).
+func TestPingJS(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	script := `
+const P = await import(process.argv[1]);
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+console.log(JSON.stringify([hex(P.ping(9, 123.5, 1.5)), hex(P.ping(9, 123.5)), hex(P.ping(9, 123.5, 1e9)), hex(P.ping(9, 123.5, -3))]));`
+	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js)).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var got []string
+	if err := json.Unmarshal(out, &got); err != nil || len(got) != 4 {
+		t.Fatalf("%v: %s", err, out)
+	}
+	for i, want := range []struct {
+		rtt time.Duration
+		dg  []byte
+	}{
+		{1500 * time.Microsecond, PingDatagram(9, 123.5, 1500)},
+		{0, PingDatagram(9, 123.5, 0)},
+		{4294967295 * time.Microsecond, PingDatagram(9, 123.5, 4294967295)}, // clamped to u32
+		{0, PingDatagram(9, 123.5, 0)},                                      // negative: 0
+	} {
+		b, _ := hex.DecodeString(got[i])
+		if !bytes.Equal(b, want.dg) || PingMinRTT(b) != want.rtt {
+			t.Errorf("ping %d: protocol.js % x (RTT %v), want % x (RTT %v)", i, b, PingMinRTT(b), want.dg, want.rtt)
+		}
 	}
 }

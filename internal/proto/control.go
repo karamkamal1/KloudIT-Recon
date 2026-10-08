@@ -217,6 +217,10 @@ type AudioConfig struct {
 	Channels   int    `json:"channels"`
 	FrameMs    int    `json:"frameMs"`
 	Enabled    bool   `json:"enabled"`
+	// SameStream marks a config that changes the running stream (its Opus
+	// frame duration, step 4.6): its sequence numbers go on. Any other
+	// config announces a new stream, numbered from 0.
+	SameStream bool `json:"sameStream,omitempty"`
 }
 
 // CursorShape carries a cursor image (PNG, base64) for local cursor rendering.

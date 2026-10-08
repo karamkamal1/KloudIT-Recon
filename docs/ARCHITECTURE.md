@@ -230,12 +230,13 @@ not sent while the client waited for a recovery or key frame), `recovered` / `re
 
 | Type | Dir | Layout | Notes |
 |---|---|---|---|
-| `0x10` audio | H→C | codec, u16 seq, u32 pts(48 kHz), payload | Opus 10 ms (CELT LD) or PCM s16 5 ms |
+| `0x10` audio | H→C | codec, u16 seq, u32 pts(48 kHz), payload | Opus (CELT LD) 10 ms, 5 ms on a LAN (from the ping's RTT) when the capture delivers at most 5 ms at a time; the packets carry their duration; or PCM s16 5 ms. The pts moves on by a pause of the capture source (50 ms or more) |
 | `0x11` cursor pos | H→C | visible, u32 seq, u16 x, u16 y | normalised to the captured display |
 | `0x20` mouse rel | C→H | u32 seq, i32 **cumulative** x, i32 **cumulative** y | loss only delays motion, never drops it |
 | `0x21` mouse abs | C→H | u32 seq, u16 x, u16 y | latest wins |
 | `0x22` gamepad | C→H | idx, connected, u32 seq, XInput state | full snapshot, re-sent every 100 ms |
-| `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, (u64 host µs) | NTP-style clock sync, minimum-RTT sample |
+| `0x23` rumble | H→C | idx, u8 large motor, u8 small motor | force feedback from ViGEmBus; a running state re-sent every 100 ms, a stop 3 times |
+| `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, ping: u32 min RTT µs; pong: u64 host µs | NTP-style clock sync, minimum-RTT sample; the ping's min RTT (since step 4.6; 16-byte pings before) picks the Opus frame |
 | `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, the ACKs of reference recovery, and the rate controller's feedback from clients without rate reports |
 | `0x41` rate report | C→H | flags, gen, 0, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
 
@@ -698,6 +699,43 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   they take the hold row; to older hosts (no hold row; at most nine rows before step 3.1b,
   twelve since) the client reports hold and draw as one draw row (decoder output→drawn), as
   before step 4.4.
+- **Input and audio** (step 4.6). Mouse: `pointerrawupdate` (raw, uncoalesced) with Pointer Lock
+  `unadjustedMovement` (OS acceleration off; falls back to plain Pointer Lock), sent as
+  cumulative totals in `0x20` datagrams. Keyboard Lock in fullscreen: `navigator.keyboard.lock()`
+  where it exists (Chromium); Safari 26.4 has no `navigator.keyboard` and takes the lock as a
+  fullscreen option, `requestFullscreen({keyboardLock: "browser"})` (whatwg/fullscreen#232),
+  passed only to browsers without `navigator.keyboard.lock`, as a getter so the client knows
+  whether the browser read it; a refused value falls back to fullscreen without it. The
+  overlay's Input row (in fullscreen or pointer lock; and `window.__recon.keyboardLock`) names
+  the lock in effect, and "unadjusted" when the browser read Pointer Lock's
+  `unadjustedMovement` (passed as a getter too) and granted the lock. Gamepads: polled at
+  250 Hz (`0x22`); force feedback comes back as `0x23`: the host keeps one
+  `IOCTL_XUSB_REQUEST_NOTIFICATION` pending per virtual pad (overlapped I/O on the ViGEmBus
+  handle) and forwards each change of the motor speeds to the active session, which repeats a
+  running state every 100 ms and a stop three times (datagrams can be lost); the client plays
+  each with `vibrationActuator.playEffect("dual-rumble")` for 250 ms (so the repeats join up and
+  the motors stop soon after they end) and `reset()` on a stop (Firefox: `hapticActuators[0].pulse`).
+  Audio: the client's pings carry its minimum RTT of the last 30 s; the host picks Opus 5 ms frames
+  below 10 ms (LAN) and 10 ms above 20 ms (WAN), keeps the current one in between and starts with
+  10 ms (`media.OpusFrameMs`), but 5 ms frames only while the capture source delivers at most 5 ms
+  at a time (`media.Audio.PickFrameMs`): WASAPI shared-mode loopback delivers one 10 ms engine
+  period per packet, and two 5 ms packets sent together save nothing. A switch changes the
+  running encoder at its next frame and goes out as an `audio` config with `sameStream: true`
+  (any other `audio` config starts a new stream, its sequence from 0: the client then forgets the
+  old sequence, also when the codec stays the same). The client takes each packet's duration
+  from its Opus TOC (loss concealment by pts), so a switch needs no decoder change. The
+  AudioWorklet's jitter buffer (Settings → Jitter buffer: Auto, or Fixed with the size slider)
+  starts at 20 ms and adapts between 10 and 60 ms: the deepest drop of its fill level below the
+  mean of a 250 ms window (packet size, network jitter, the audio device's render bursts; a delay
+  spike is one deep drop), the largest of the last 10 s, plus 2.5 ms, plus 10 ms per underrun
+  (decaying 1 ms/s); a window whose mean level is above the target drops the excess (at most 5 ms
+  per window, crossfaded over one render quantum); Auto refills a little above the target after
+  an underrun. WASAPI loopback sends nothing while nothing plays, so the buffer runs dry at the
+  end of every sound: the host moves the pts on by a capture pause of 50 ms or more, the worker
+  sees the jump on the first packet after it (beyond what lost packets held) and the worklet takes that
+  underrun back (count, bias and the drop of the drain), so sounds with gaps keep the target of
+  continuous audio. The overlay's Audio row shows the
+  packet duration, level/target, underruns and lost packets.
 
 ## Direct path
 

@@ -131,8 +131,9 @@ func main() {
 			fmt.Printf("monitor %d:  %s %dx%d@%dHz at (%d,%d) primary=%v dxgi=%d\n", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.DXGIOutput)
 		}
 		fmt.Println("virtual display:", vdisplay.New(vdisplay.Options{}).Detect())
-		if _, err := platform.OpenGamepads(); err == nil {
+		if g, err := platform.OpenGamepads(nil); err == nil {
 			fmt.Println("gamepads:   ViGEmBus available")
+			g.Close()
 		} else {
 			fmt.Println("gamepads:  ", err)
 		}

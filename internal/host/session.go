@@ -70,6 +70,7 @@ type Session struct {
 	cursorInVideo atomic.Bool
 	resizeTimer   *time.Timer // a capture size change waiting to settle (captureChanged)
 
+	audioMu  sync.Mutex // guards audio: startAudio and stopAudio, applyAudioFrame
 	audio    *media.Audio
 	frameQ   chan *media.Frame
 	paused   atomic.Bool
@@ -116,6 +117,16 @@ type Session struct {
 	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
 	audioKbps atomic.Int64             // audio bitrate while audio runs
 
+	// The client's minimum round-trip time (ns) from its pings (clients
+	// since step 4.6, proto.PingMinRTT; 0 until one carries it), and the
+	// signal that it or the audio capture packets changed, for
+	// audioFrameLoop.
+	clientRTT atomic.Int64
+	rttSeen   chan struct{}
+
+	rumbles  rumbleState   // force feedback being forwarded to the client
+	rumbleGo chan struct{} // a rumble started: rumbleLoop repeats it
+
 	rel      input.RelTracker
 	absGate  input.SeqGate
 	padGates [4]input.SeqGate
@@ -151,6 +162,8 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		ctx: ctx, cancel: cancel,
 		frameQ:      make(chan *media.Frame, 6),
 		pipeSwap:    make(chan struct{}, 1),
+		rttSeen:     make(chan struct{}, 1),
+		rumbleGo:    make(chan struct{}, 1),
 		tried:       map[string]bool{},
 		usage:       map[string]string{},
 		encFails:    map[string]int{},
@@ -258,6 +271,8 @@ func (s *Session) run() error {
 	}
 	s.startAudio()
 	defer s.stopAudio()
+	go s.audioFrameLoop()
+	go s.rumbleLoop()
 	go s.datagrams()
 	go s.cursorLoop()
 	go s.statsLoop()
@@ -1778,6 +1793,8 @@ func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, pro
 // Audio
 
 func (s *Session) startAudio() {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
 	prefs := s.currentPrefs()
 	enabled := s.a.cfg.Audio && prefs.AudioEnabled()
 	codec := "opus"
@@ -1791,8 +1808,10 @@ func (s *Session) startAudio() {
 		s.sendJSON(proto.AudioConfig{T: "audio", Enabled: false})
 		return
 	}
-	s.audio = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps}, s.log)
-	s.sendJSON(proto.AudioConfig{T: "audio", Enabled: true, Codec: codec, SampleRate: 48000, Channels: 2, FrameMs: s.audio.FrameMs()})
+	// 10 ms frames until the first capture packet says whether 5 ms ones
+	// would save anything (media.Audio.PickFrameMs; applyAudioFrame).
+	s.audio = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, CaptureChanged: s.audioFrameCheck}, s.log)
+	s.sendJSON(audioConfig(s.audio, false))
 	err := s.audio.Start(func(pkt []byte) {
 		if !s.paused.Load() {
 			_ = s.c.SendDatagram(pkt)
@@ -1807,11 +1826,64 @@ func (s *Session) startAudio() {
 }
 
 func (s *Session) stopAudio() {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
 	if s.audio != nil {
 		s.audio.Stop()
 		s.audio = nil
 		s.audioKbps.Store(0)
 	}
+}
+
+// audioConfig announces a's stream; same marks a change within the running
+// stream (its frame duration), whose sequence numbers go on.
+func audioConfig(a *media.Audio, same bool) proto.AudioConfig {
+	return proto.AudioConfig{T: "audio", Enabled: true, Codec: a.Codec(), SampleRate: 48000, Channels: 2, FrameMs: a.FrameMs(), SameStream: same}
+}
+
+// audioFrameCheck has audioFrameLoop check the frame duration.
+func (s *Session) audioFrameCheck() {
+	select {
+	case s.rttSeen <- struct{}{}:
+	default:
+	}
+}
+
+// audioFrameLoop picks the Opus frame duration from the client's minimum
+// round-trip time whenever a ping reports a new one or the capture packets
+// change (step 4.6: 5 ms frames on a LAN when the capture delivers at most
+// 5 ms at a time, 10 ms otherwise; media.Audio.PickFrameMs). Clients before
+// step 4.6 report no RTT and keep 10 ms frames.
+func (s *Session) audioFrameLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.rttSeen:
+		}
+		s.applyAudioFrame()
+	}
+}
+
+// applyAudioFrame switches a running Opus encoder to the frame duration the
+// client's RTT and the capture packets ask for, from its next frame on, and
+// announces it in a new audio config of the same stream (the packets carry
+// their duration too: the client decodes them without it; it takes the
+// config's frameMs only for its display and as a fallback).
+func (s *Session) applyAudioFrame() {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	a := s.audio
+	if a == nil || a.Codec() != "opus" {
+		return
+	}
+	rtt := time.Duration(s.clientRTT.Load())
+	ms := a.PickFrameMs(rtt)
+	if !a.SetFrameMs(ms) {
+		return
+	}
+	s.log.Info("audio frame size", "ms", ms, "client_min_rtt_ms", float64(rtt.Microseconds())/1000, "capture_ms", a.CaptureMs())
+	s.sendJSON(audioConfig(a, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,6 +1936,9 @@ func (s *Session) datagrams() {
 			if p := proto.Pong(d, s.a.clock()); p != nil {
 				_ = s.c.SendDatagram(p)
 			}
+			if rtt := proto.PingMinRTT(d); rtt > 0 && s.clientRTT.Swap(int64(rtt)) != int64(rtt) {
+				s.audioFrameCheck()
+			}
 		case proto.DgMouseRel:
 			if m, ok := proto.ParseMouseRel(d); ok && s.a.isActive(s) {
 				if dx, dy := s.rel.Update(m.Seq, m.CumX, m.CumY); dx != 0 || dy != 0 {
@@ -1908,6 +1983,13 @@ func (s *Session) datagrams() {
 }
 
 func (s *Session) gamepad(g proto.Gamepad) {
+	if !g.Connected {
+		s.rumble(int(g.Index), 0, 0) // a pad that is gone has nothing to repeat
+	} else if s.a.faults.rumbleEcho {
+		// Test hook: the triggers come back as force feedback, as a game's
+		// would through ViGEmBus (also without it).
+		s.rumble(int(g.Index), g.LT, g.RT)
+	}
 	pads := s.a.gamepads()
 	if pads == nil {
 		s.padWarn.Do(func() {
@@ -1917,6 +1999,11 @@ func (s *Session) gamepad(g proto.Gamepad) {
 	}
 	if !g.Connected {
 		pads.Unplug(int(g.Index))
+		// Again: a change ViGEmBus reported while the pad was being
+		// unplugged can have set the motors after the stop above (the
+		// unplug has ended the pad's listener now), and nothing would
+		// stop them.
+		s.rumble(int(g.Index), 0, 0)
 		return
 	}
 	err := pads.Update(int(g.Index), platform.Pad{Buttons: g.Buttons, LT: g.LT, RT: g.RT, LX: g.LX, LY: g.LY, RX: g.RX, RY: g.RY})
