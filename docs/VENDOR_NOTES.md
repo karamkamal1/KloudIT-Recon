@@ -3826,3 +3826,122 @@ unless a test says otherwise; overlay Ctrl+Alt+Shift+S; host log
   run with `intraRefresh` like sessions); record whether `seamless` still passes for CBR.
 - NVIDIA: unverified (no NVIDIA host available). Test (T3 and T4): the two AMD tests above with
   hevc_nvenc_helper (and h264, av1 on RTX 40+), same steps and pass criteria.
+## 2.6 Relay without the double congestion loop
+
+Transport-only change: no encoder or GPU code is involved, so AMD and NVIDIA hosts behave the
+same. WebTransport clients that cannot reach the PC directly now run one QUIC connection end to
+end with the host's WebTransport server through a gateway **UDP relay allocation** (one UDP
+port per relayed session from `-relay-ports`, default 8444-8459; the host binds its outbound
+relay socket to it with a token from the tunnel); the gateway forwards datagrams and the host's
+`congestion` controller is the only one on the path. The QUIC splice on 8443 stays as the
+fallback and for WebSocket clients (`docs/ARCHITECTURE.md`, Relay).
+
+Deviation from the guide's preferred design: the guide asks to keep the gateway's single port
+8443 if at all possible, demultiplexing by QUIC connection ID (the host's server issuing CIDs
+with a gateway prefix). That works for every packet after the server's first answer, but not
+for the browser's first flight: a QUIC Initial carries a connection ID the browser chose at
+random and the SNI of the gateway's name, the same for every session, and nothing JavaScript
+can set (the URL path travels only inside the encrypted handshake with the host). On a shared
+port the gateway could tell neither which session nor whether a relayed session at all an
+Initial starts, short of guessing by source IP (ambiguous for two sessions behind one NAT and
+for the gateway's own HTTP/3 endpoint). Hence the guide's alternative: a small configurable
+port range, with the port as the routing key, documented for firewalls (README, INSTALL,
+NETEM, deploy files). Both legs use the allocation port, so the host's packets need no
+encapsulation (no MTU loss) and the host's socket is a plain UDP socket (quic-go keeps GSO).
+
+Verified in the sandbox (Linux, no GPU, loopback; IPv4 only, the sandbox has no IPv6):
+
+- Real quic-go connections through the forwarder (`internal/gateway/udprelay_test.go`): a 4 MiB
+  stream echo and datagrams through an allocation; the host's `release` frees the port at once.
+  Nothing reaches the host or gets an answer before the bind; a wrong token does not bind; a
+  QUIC client on 127.0.0.2 (another IP than the requester's) cannot lock the allocation; a
+  short-header packet does not lock it; after the lock a stranger's datagrams (even a valid
+  bind) are dropped and it gets no answer. Lifetimes (unbound, bound but never reached, idle
+  after the client vanished) end the allocation; 4 pending allocations per user; ports in use
+  by other programs are skipped; the rate limiter. `go test -race` clean.
+- Source address on a socket bound to all addresses (the default `-listen :8443`): the browser
+  (127.0.0.1) sends to the gateway's other address (192.0.2.2), whose answers the routing table
+  would send from 127.0.0.1; with `IP_PKTINFO` they leave from 192.0.2.2
+  (`TestUDPRelayAnswersFromTheTargetedAddress`; it fails with the control message removed).
+- Measurement (`TestUDPRelayLatencyAndThroughput`, three runs): loopback round trip p50
+  direct 202-224 µs, UDP relay 242-251 µs, so the relay adds 23-41 µs (< 2 ms + propagation);
+  p99 457-712 µs vs 510-831 µs. Bulk on loopback: direct 2.3 Gbit/s, through the forwarder
+  0.97 Gbit/s (one goroutine, two syscalls per datagram; the host caps video at `maxKbps`,
+  250 Mbit/s by default). With a lossy browser leg (UDP proxy, 20 ms each way, 1 % loss each
+  way) at a 40 Mbit/s target with the media controller: direct 46.3-46.6 Mbit/s (CV of 100 ms
+  windows 0.16-0.21), UDP relay 45.5-46.5 Mbit/s (CV 0.16-0.25): the same as direct; the QUIC
+  splice 4.7-4.9 Mbit/s, since its browser leg runs the gateway's NewReno, which cuts its
+  window on every loss while the host's controller never sees those losses. (On a clean
+  loopback all three are flat; the splice's two loops show only under loss or a bottleneck.)
+- `internal/e2e` (real gateway and host agent in-process): a session over the UDP relay streams
+  (frames with stage stamps, key frame, audio, input), the host logs `path=relay`, the gateway
+  `udp relay: session started`; the relay ticket is single use; a direct ticket is refused on a
+  relay allocation and a relay ticket on the direct path ("ticket was issued for another
+  path"); the splice relay still streams (`path=relay-splice`); with `"congestion": "media"`
+  the UDP relay session sets the media congestion target.
+- Browser E2E (`test/e2e/browser.mjs`, headless Chromium, software encoders): "WebTransport
+  relay" connects as `webtransport/relay` through a relay port (gateway log checked) and passes
+  every check (steady 60 fps, stages, crop, frame barcode, audio, input). A new "WebTransport
+  relay fallback (splice)" scenario sends the browser to a configured relay port whose
+  datagrams a silent socket swallows, like a firewall that drops the relay range (Playwright
+  rewrites the allocation answer; the gateway skips that port because it is in use, the page's
+  CSP lists it): the client logs "relay failed: WebTransport relay timed out" after 3 s,
+  connects as `webtransport/relay-splice` and passes the same checks. A first version sent the
+  browser to a port outside `-relay-ports`, and Chromium refused it by the CSP's
+  `connect-src` ("violates the document's Content Security Policy"), which confirms the worker's
+  WebTransport is subject to the gateway's CSP and the relay ports must be listed there.
+- Review fix, the host's bind blocked (a firewall in front of the gateway that lets only 8443
+  through, with the PC outside the gateway's LAN): the gateway used to wait 5 s for the bind and
+  answer the allocation with 503, which the client did not count as a blocked relay, so every
+  connect paid the wait again. Now the gateway waits 2 s (the host binds within a round trip)
+  and answers 504, the host stops sending binds after 2 s as well, and the client treats a 504
+  like a relay port that does not answer: splice at once, the UDP relay skipped for 10 minutes
+  of the page. `internal/e2e` `TestUDPRelayHostCannotBind`: the host reaches the gateway
+  through a UDP forwarder on 127.0.0.2, so it sends its binds to 127.0.0.2:<relay port>, where
+  nothing listens; the allocation fails with 504 after 2.003 s, the host logs `the gateway's
+  relay port did not answer`, the splice relay streams. Browser E2E "UDP relay, host cannot
+  bind" (Playwright answers the allocation with the gateway's 504): the client logs `relay
+  failed: relay allocation: the host did not reach the relay port`, connects as
+  `relay-splice`, and the drawer's Reconnect in the same page goes to the splice without a
+  second allocation request.
+- Review fix, `TestUDPRelayLifetimes` flake: an allocation closed `done` before it left the port
+  table. Reproduced every time with a 20 ms sleep between the two ("1 allocations left"); it
+  now leaves the table first (the test passes with sleeps on both sides). `go test -race` of
+  `internal/gateway`, `internal/host` and `internal/e2e` clean.
+- Windows: the relay tests built for Windows cannot run under Wine 9.0: every Go UDP socket
+  fails there (`WSAIoctl(SIO_UDP_CONNRESET)`, error 10045). `GOOS=windows go vet ./...` passes.
+
+Not verified (needs real networks or Windows):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: on the Windows host with the agent from this build,
+  from a client outside the LAN (phone hotspot) with the router forwarding TCP+UDP 8443 and
+  UDP 8444-8459 to the gateway, Settings > Network path "Relay via gateway", connect: the
+  overlay's Transport row reads `webtransport · relay`, host.log has `relay socket ready` and
+  `session started ... path=relay remote=<gateway>:<844x>`, the gateway log `udp relay: session
+  started ... browser=<client public IP>`. Stream 10 minutes at 20 Mbit/s: no freezes beyond the
+  direct path's; compare the overlay's network stage and RTT with the same client on the splice
+  (`-relay-ports off` on the gateway, restart): the UDP relay should be within propagation of
+  the direct path and the splice's p95 higher under any loss. Windows Firewall: no prompt, no
+  inbound rule needed (`Get-NetFirewallRule` unchanged).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same as AMD; nothing in the relay
+  depends on the GPU.
+- NAT types and paths: unverified. Test: the PC behind a symmetric NAT (a mobile hotspot as the
+  PC's uplink) with the gateway elsewhere: the bind must still work (the host sends to the
+  exact allocation port first). A client behind CGNAT that uses different public IPs for TCP
+  and UDP: expect `udp relay: the browser never arrived` and the client on `relay-splice`
+  (documented limitation). A client that switches networks mid-stream: the connection drops and
+  the client reconnects (no migration through the relay).
+- IPv6 and multi-homed gateways: unverified (no IPv6 here). Test: a gateway with several IPv6
+  addresses (SLAAC + temporary + ULA) and `-listen :8443`; a client on IPv6: the relay session
+  works (answers leave from the address the client targeted, `IPV6_PKTINFO`).
+- Docker (`network_mode: host`) and Proxmox firewall: unverified. Test: with the Proxmox
+  firewall on, add an IN rule for UDP 8444-8459 next to 8443; the relay session works. Without
+  that rule and with the PC outside the gateway's LAN: the client connects as `relay-splice`
+  about 2 s after the direct attempt (browser console `relay failed: relay allocation: the host
+  did not reach the relay port`), and a Reconnect within 10 minutes goes straight to the splice.
+- Other browsers: unverified. Test: Edge and Firefox (WebTransport with
+  `serverCertificateHashes` to the gateway on a relay port); Safari 26.4: whether it supports
+  `serverCertificateHashes` at all (else it uses the splice or WebSocket as before).
+- PMTU: unverified on real paths. The forwarder sets DF and drops oversized datagrams like a
+  router; on a path with a smaller MTU than the host's probe, quic-go's DPLPMTUD should settle
+  below it (watch for stalls after the first seconds on PPPoE / VPN client links).

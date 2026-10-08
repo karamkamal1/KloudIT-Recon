@@ -148,8 +148,8 @@ func LoadConfig(path string) (*Config, error) {
 	return c, nil
 }
 
-// congestion returns the congestion controller for the direct server and the
-// relay data connections: media by default since the rate controller (GUIDE
+// congestion returns the congestion controller for the direct server, the UDP
+// relay and the splice relay's data connections: media by default since the rate controller (GUIDE
 // 2.2) backs off for it; reno stays selectable. The default stays empty in the
 // file, so a later release can change it.
 func (c *Config) congestion() string {

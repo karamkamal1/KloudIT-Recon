@@ -17,5 +17,5 @@ COPY --from=build /out/recon-gateway /recon-gateway
 # Owned by the non-root user so a fresh named volume is writable.
 COPY --from=build --chown=nonroot:nonroot /out/data /data
 VOLUME ["/data"]
-EXPOSE 8443/tcp 8443/udp
+EXPOSE 8443/tcp 8443/udp 8444-8459/udp
 ENTRYPOINT ["/recon-gateway", "-data", "/data"]

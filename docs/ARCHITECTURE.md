@@ -8,7 +8,7 @@ design choice was made.
 | Component | Runs on | Role |
 |---|---|---|
 | `recon-host` | Windows gaming PC | Capture, encode, audio, input injection, cursor shapes, virtual gamepads, direct WebTransport endpoint |
-| `recon-gateway` | Proxmox LXC / VM / Docker | Web client, accounts, 2FA, audit, host registry, Wake-on-LAN, relay |
+| `recon-gateway` | Proxmox LXC / VM / Docker | Web client, accounts, 2FA, audit, host registry, Wake-on-LAN, relay (UDP forwarder; QUIC splice and WebSocket as fallbacks) |
 | Web client | Browser | Login, dashboard, stream player (worker + AudioWorklet) |
 
 The gateway is the trust anchor. Browsers authenticate to it, and hosts dial out to it
@@ -24,7 +24,13 @@ listener is one QUIC endpoint that dispatches connections by **ALPN**:
 |---|---|---|
 | `h3` | Browser (HTTP/3 + WebTransport) | Short-lived ECDSA cert (< 14 days, rotated every 5), pinned by hash |
 | `recon-host/1` | Host agent control connection | Long-lived tunnel identity, pinned by SPKI hash in the pairing code |
-| `recon-data/1` | Host agent per-session media connection | same |
+| `recon-data/1` | Host agent per-session media connection (QUIC splice relay) | same |
+
+The UDP relay ([below](#relay)) adds a small range of UDP ports, one per relayed session
+(`-relay-ports`, default 8444–8459). It cannot share port 8443: the first packet a browser sends,
+its QUIC Initial, carries only a connection ID the browser chose at random and the gateway's own
+name (SNI), the same for every session, so on a shared port the gateway could not tell which
+session, or whether a relayed session at all, it starts. The port is the routing key.
 
 ## Session channels
 
@@ -74,8 +80,8 @@ only advances with the timer tick). Readers skip unknown tags (`len` says how fa
 Compatibility: the host sets bit 7 only for clients whose `hello` has `v >= 2`, and advertises
 `frame-ext` in their `welcome.features`. v1 clients get the byte-identical 24-byte header with
 the old `send_us`, and no `frame-ext` feature. The gateway
-never parses frames (QUIC relay: stream splice; WebSocket: one `0x02` message per stream), so the
-extension passes unchanged on every path.
+never parses frames (UDP relay: encrypted end to end; QUIC splice: stream splice; WebSocket: one
+`0x02` message per stream), so the extension passes unchanged on every path.
 
 **Capture time on the FFmpeg path.** FFmpeg's command line cannot report when a frame was
 captured, so the host makes the pts carry it: `settb=AVTB,setpts=time(0)*1000000` right after the
@@ -306,8 +312,8 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   - *Decrease* ×0.85 when the delay stays over the target for 3 reports in a row and is not
     falling (a queue that drains needs no second decrease), or when more than 2 % of the
     packets of the last second were lost; from the rate the path delivered when that is lower
-    than the target: on the direct path the connection's acknowledged bytes of the last 100 ms
-    (less audio and overhead), else the client's receive rate of the last 250 ms or 1 s, divided
+    than the target: on the direct path and the UDP relay (the host's QUIC connection ends at the
+    browser) the connection's acknowledged bytes of the last 100 ms (less audio and overhead), else the client's receive rate of the last 250 ms or 1 s, divided
     by the encoder's fill (its output as a share of its target over the last second: encoders do
     not hit their target exactly). A delay decrease also starts from the capacity the queue's
     growth implies when the queue grows by 0.25 s per second or more and stands 20 ms over the
@@ -326,8 +332,8 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     divided by the encoder's fill), and only with fresh reports (frames covered in the last
     500 ms: a still desktop has nothing to judge), the delay under the target, the client's
     decoder keeping up (a backlog over max(4, fps/10) frames holds) and no stalled path (a frame
-    sent 1 s ago that no report covered, from a client that reports: on the relay paths the
-    gateway buffers what its client leg cannot carry).
+    sent 1 s ago that no report covered, from a client that reports: on the QUIC splice and
+    WebSocket relay paths the gateway buffers what its client leg cannot carry).
   - *Emergencies* as before: a host frame-queue overflow (the backlog is dropped and reported,
     `{"t":"dropped"}`) or a client that flushed its decoder (`{"t":"congestion","reason":
     "decoder"}`) cuts at once by 25 % (an overflow at least to 0.85 × the delivered rate, but
@@ -370,8 +376,9 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     has the numbers.
 - **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
   `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
-  (see `third_party/README.md`). Host config `congestion` picks it for the direct path and the
-  relay data connection (host → gateway; the gateway → browser leg of a relay session always
+  (see `third_party/README.md`). Host config `congestion` picks it for the host's video
+  connections: the direct path and the UDP relay (both end to end with the browser) and the
+  QUIC splice relay's data connection (host → gateway; the splice's gateway → browser leg always
   uses NewReno): `media` (`internal/transport/cc`, the default since the rate controller backs
   off for it) or `reno` (quic-go's NewReno):
   pacing = 1.2 × the session's send rate (encoder bitrate + audio bitrate + 200 kbit/s for
@@ -508,15 +515,80 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
    origin equals the WebTransport `Origin` header. Unauthenticated sessions are capped at 8 and
    time out after 10 s.
 
-If the direct connection doesn't succeed within 2.5 s, the client falls back to the relay over
-WebTransport, then over WebSocket. Each path uses its own single-use ticket.
+If the direct connection doesn't succeed within 2.5 s, the client falls back to the UDP relay
+(3 s), then to the QUIC splice relay over WebTransport (6 s), then to WebSocket. Each path uses
+its own single-use ticket. The direct path is always tried first: on a LAN, or over Tailscale /
+WireGuard (subnet routing to the PC's address, or `directAddr` set to the PC's tailnet address),
+the browser reaches the PC without the gateway in the media path. The relay is the last resort.
 
 ## Relay
 
+### UDP relay (WebTransport clients)
+
+The relay forwards **UDP datagrams**, not streams: the browser runs **one QUIC connection end to
+end with the host's WebTransport server** (the direct path's server certificate, pinned by hash),
+and the gateway only moves its datagrams between two addresses, unmodified, like a TURN server.
+There is exactly one congestion controller on the path, the host's (`congestion`), and the
+browser's ACKs reach it directly. The splice below terminates QUIC at the gateway instead, so two
+controllers run in series: the host → gateway leg sends at its own pace, the gateway buffers what
+its NewReno → browser leg cannot carry, and the browser's losses never reach the host's
+controller (measured on loopback with 40 ms RTT and 1 % loss on the browser leg, 40 Mbit/s video
+target: UDP relay 45.5–46.5 Mbit/s like the direct path's 46.3–46.6, the splice 4.7–4.9 Mbit/s;
+`internal/gateway` `TestUDPRelayLatencyAndThroughput`, numbers in `docs/VENDOR_NOTES.md` 2.6).
+
+```
+browser ──QUIC (host cert, pinned)──► gateway :8444 ──same datagrams──► host relay socket ──► WebTransport server
+        ◄──────────────────────────── allocation ◄──────────────────── (outbound, NAT-friendly)
+```
+
+1. `POST /api/hosts/{id}/connect` also returns `relay.udp`, an allocation URL with a single-use
+   relay ticket, when the gateway has relay ports and the host's agent supports the UDP relay
+   (it advertises `relay.hashes` in its registration).
+2. The browser POSTs it. The gateway takes the ticket, reserves a free port from `-relay-ports`
+   (a socket of its own, on the same address as port 8443) and sends the host a `relay` tunnel
+   message: allocation ID, port and a random 256-bit token.
+3. The host sends `bind` (`u8 0x01 | "RLY" | token`) from its **relay socket**, one outbound UDP
+   socket for all relayed sessions, to the gateway's allocation port, every 200 ms until the
+   gateway answers `bound` (`u8 0x02 | "RLY"`). That opens the path through the PC's NAT and
+   firewall from the inside: the PC needs no inbound port. These control packets have the two
+   high bits of their first byte clear, so they can never be QUIC packets (RFC 9000 sets bit
+   0x40), and quic-go on the host's relay socket hands them to `Transport.ReadNonQUICPacket`.
+4. The gateway answers the POST with `https://<gateway name>:<port>/wt`, the host's certificate
+   hashes and a **host ticket** like the direct path's (HMAC under the per-tunnel key, user, 60 s,
+   nonce, page origin) plus the allocation ID.
+5. The browser opens `new WebTransport(url, {serverCertificateHashes})`. Its first QUIC Initial
+   from the IP address that made the POST **locks** the allocation to that address; the gateway
+   forwards it to the host's address and from then on forwards datagrams between exactly these
+   two addresses. Answers leave from the local address each peer's datagrams arrived at
+   (`IP_PKTINFO`), and DF is set, so the path MTU both ends discover is the real one.
+6. The host's QUIC server accepts one connection per announced allocation (from the gateway's
+   allocation address only) and the session's hello must carry the host ticket bound to that
+   allocation; `path=relay` in the host log. When the connection has ended, the host sends
+   `release` (`u8 0x03 | "RLY" | token`) and the gateway frees the port.
+
+Lifetimes: the host must bind within 2 s, the browser must arrive within 20 s, and an
+allocation with no datagram either way for 30 s ends (QUIC itself idles out after 20 s and sends
+keep-alives every 5 s). A user may hold at most 4 allocations the browser has not reached yet.
+Forwarding is rate limited per direction (browser → host 32 Mbit/s, which carries ACKs, input
+and pings; host → browser 1 Gbit/s). A browser that changes its address (network switch)
+loses the connection and reconnects; the gateway does not follow migrations. If the relay port
+is blocked (typically a firewall that only lets 8443 through), the client falls back to the
+splice and skips the UDP relay for the next 10 minutes of that page: when the browser's
+WebTransport connection to the port does not succeed within 3 s, or when the host's `bind`
+does not reach the port within 2 s, in which case the gateway answers the allocation with
+`504` and the client goes on to the splice at once.
+
+Overhead: on loopback the relay adds 20–40 µs to the median round trip (direct about 210 µs,
+relayed about 250 µs) and forwards about 1 Gbit/s on one core (the direct path: 2.3 Gbit/s).
+
+### QUIC splice (fallback) and WebSocket
+
 The gateway asks the host for a fresh `recon-data/1` connection, authenticated with a session ID
 and nonce. It then splices the two connections **cut-through**: bytes are forwarded as they
-arrive, streams are mapped 1:1, and FIN/reset propagate. A frame is never buffered in full. For
-WebSocket clients, the gateway translates channel messages to and from QUIC streams and datagrams.
+arrive, streams are mapped 1:1, and FIN/reset propagate. A frame is never buffered in full. The
+host logs these sessions as `path=relay-splice`, the client as `relay-splice` (WebTransport) or
+`relay` (WebSocket). For WebSocket clients, the gateway translates channel messages to and from
+QUIC streams and datagrams.
 
 ## Clock sync and latency accounting
 

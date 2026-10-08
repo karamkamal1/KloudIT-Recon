@@ -176,9 +176,9 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 			hc.mu.Lock()
 			hc.streaming, hc.user = m.Streaming, m.User
 			hc.mu.Unlock()
-		case "direct":
+		case "direct": // certificate rotation
 			hc.mu.Lock()
-			hc.info.Direct = m.Direct
+			hc.info.Direct, hc.info.Relay = m.Direct, m.Relay
 			hc.mu.Unlock()
 		}
 	}
@@ -223,6 +223,17 @@ func (s *Server) handleHostData(conn *quic.Conn) {
 	default:
 		conn.CloseWithError(1, "")
 	}
+}
+
+// relayHashes returns the certificate hashes of the host's UDP relay endpoint
+// (none: the agent predates the UDP relay).
+func (h *hostConn) relayHashes() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.info.Relay == nil {
+		return nil
+	}
+	return append([]string(nil), h.info.Relay.Hashes...)
 }
 
 var errHostOffline = errors.New("host is offline")

@@ -107,7 +107,7 @@ KloudIT Recon gateway is running.
   Open: https://192.168.1.50:8443
   Setup token (first login): AbCdEf...
     (stays valid until the admin account is created; also in /var/lib/kloudit-recon/setup-token.txt)
-  Ports: TCP 8443 (HTTPS) and UDP 8443 (HTTP/3 + WebTransport + host tunnels)
+  Ports: TCP 8443 (HTTPS), UDP 8443 (HTTP/3 + WebTransport + host tunnels), UDP 8444-8459 (relay)
   Logs:  journalctl -u recon-gateway -f
 
 Done. Container 210 runs the gateway (pct enter 210 for a shell; it has no root password).
@@ -264,8 +264,10 @@ anywhere.
 Test it before you leave: disconnect the laptop from your home Wi-Fi, connect it to your phone's
 hotspot instead, and start a stream.
 
-**Alternative: port forwarding.** Forward **TCP and UDP 8443** on your router to
-`192.168.1.50`. Then:
+**Alternative: port forwarding.** Forward **TCP and UDP 8443** and **UDP 8444–8459** (the relay
+ports, one per relayed session) on your router to `192.168.1.50`, keeping the port numbers.
+Without the relay ports streams still work, through the gateway's QUIC splice on 8443, but with
+two congestion controllers in series (see `docs/ARCHITECTURE.md`, Relay). Then:
 
 - Add your public name to the certificate:
   `pct exec 210 -- /root/recon/install-gateway.sh --binary /root/recon/recon-gateway --name your.domain`.

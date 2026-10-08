@@ -520,8 +520,9 @@ func (s *Server) handleHostWake(w http.ResponseWriter, r *http.Request, u *User,
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleHostConnect issues single-use tickets for the relay (WebTransport and
-// WebSocket) and, when the host offers one, for the direct path.
+// handleHostConnect issues single-use tickets for the relay (UDP relay when
+// the gateway has relay ports and the host supports it, QUIC splice over
+// WebTransport, WebSocket) and, when the host offers one, for the direct path.
 func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *User, ls *LoginSession) {
 	id := r.PathValue("id")
 	h, ok := s.store.GetHost(id)
@@ -546,11 +547,16 @@ func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *Us
 	if s.wtRot != nil {
 		hashes = s.wtRot.HashesB64()
 	}
-	resp["relay"] = map[string]any{
+	relay := map[string]any{
 		"wt":     "https://" + r.Host + "/wt/relay?t=" + newTicket(),
 		"ws":     "wss://" + r.Host + "/ws/relay?t=" + newTicket(),
 		"hashes": hashes,
 	}
+	if s.relay != nil && len(hc.relayHashes()) > 0 {
+		// POST it to allocate a UDP relay port (handleUDPRelay).
+		relay["udp"] = "https://" + r.Host + "/api/relay/udp?t=" + newTicket()
+	}
+	resp["relay"] = relay
 	if u := hc.directURL(); u != "" {
 		origin := "https://" + r.Host
 		tok, err := auth.SignTicket(hc.directKey, proto.DirectTicket{

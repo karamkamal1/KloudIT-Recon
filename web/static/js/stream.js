@@ -59,6 +59,7 @@ const S = {
   streaming: false,
   userClosed: false,
   attempts: 0,
+  udpRelayFailedAt: -Infinity, // the UDP relay's ports did not answer: try the splice relay first for a while
   video: { w: 0, h: 0 },
   videoCfg: null,
   audioCfg: null,
@@ -172,7 +173,10 @@ async function connect() {
   if (port) transfer.push(port);
   w.postMessage({
     type: 'start', canvas: off, endpoints: ep,
-    prefs: { renderer: prefs.renderer, decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe },
+    prefs: {
+      renderer: prefs.renderer, decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe,
+      skipUdpRelay: performance.now() - S.udpRelayFailedAt < 10 * 60 * 1000,
+    },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
     audioSab: sab, audioPort: port,
@@ -223,6 +227,7 @@ function onWorker(m) {
       S.logs.push(`${new Date().toISOString()} ${m.text}`);
       if (S.logs.length > 200) S.logs.shift();
       break;
+    case 'udpRelayFailed': S.udpRelayFailedAt = performance.now(); break;
     case 'connected':
       S.conn = m;
       S.connected = true;

@@ -8,13 +8,15 @@ if you expose it to the internet.
 ```
 Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUIC, pinned identity, host token)──► Host
    └──────────(direct path: hash-pinned cert + gateway-signed one-time ticket)──────────────────────┘
+   └──────────(UDP relay: same QUIC end to end, datagrams forwarded by the gateway)─────────────────┘
 ```
 
 - The **gateway** authenticates people, and it is the only party that can authorise a stream. If
   the gateway is compromised, every paired host is compromised, so it runs with minimal privileges
   (below).
 - A **host** trusts the gateway whose tunnel certificate matches the SPKI pin in its pairing code,
-  plus any browser presenting a valid gateway-signed direct ticket.
+  plus any browser presenting a valid gateway-signed direct ticket (or relay ticket, bound to the
+  relay allocation the browser arrives through).
 
 ## Authentication
 
@@ -39,12 +41,14 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **CSRF:** every state-changing API call needs the per-session token in `X-Recon-CSRF` and a
   same-origin `Origin`. Login and setup require a same-origin `Origin` plus a custom header.
   No CORS is enabled.
-- **WebSocket / WebTransport:** need a same-origin `Origin` and a **single-use ticket** (192-bit,
-  60 s, bound to user and host, stored only as a hash).
+- **WebSocket / WebTransport / UDP relay allocation:** need a same-origin `Origin` and a
+  **single-use ticket** (192-bit, 60 s, bound to user and host, stored only as a hash).
 - **Headers:** a strict CSP (`script-src 'self'`, no inline script or style,
-  `frame-ancestors 'none'`, `connect-src` limited to self plus known direct endpoints), COOP/COEP
-  (cross-origin isolation), CORP, `nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options:
-  DENY`, Permissions-Policy, and HSTS when a real certificate is configured.
+  `frame-ancestors 'none'`, `connect-src` limited to self, the hosts' known direct endpoints and
+  the UDP relay ports on the name the page was loaded from; with more than 32 relay ports, any
+  port on that name), COOP/COEP (cross-origin isolation), CORP, `nosniff`,
+  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, Permissions-Policy, and HSTS when a
+  real certificate is configured.
 - **Input limits:** JSON bodies are capped at 64 KiB with unknown fields rejected; control
   messages at 1 MiB, input events at 64 KiB, frames at 32 MiB, datagrams at 1200 B; strict parsing
   of every binary event.
@@ -64,6 +68,37 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **Direct path:** the browser pins the host certificate by SHA-256 hash, which it receives over
   the authenticated gateway API. The host accepts only gateway-HMAC'd tickets that are single-use,
   60 s, origin-bound and host-bound.
+- **UDP relay:** the gateway forwards the datagrams of one QUIC connection between the browser
+  and the host, so it sees only ciphertext. The browser pins the host's certificate as on the
+  direct path, and the TLS session keys exist only at the two ends: the relay itself can drop or
+  delay packets, but not read or alter the stream. (A compromised gateway can still hand the
+  browser other certificate hashes and tickets: see Trust boundaries.)
+  - **Allocations** come only from a single-use relay ticket. Each is a UDP port of its own from
+    `-relay-ports`, with a random 256-bit token the gateway sends the host over the
+    authenticated tunnel. The host proves itself by sending that token from its relay socket
+    (`bind`); nothing else can take the host side of an allocation.
+  - **The host accepts only relayed sessions the gateway authorised:** its relay socket's QUIC
+    server refuses connections from any address other than an allocation the gateway announced
+    over the tunnel, one connection per allocation, and the session's hello must carry a
+    gateway-HMAC'd ticket (single use, 60 s, origin-bound, host-bound) bound to that very
+    allocation. A direct ticket does not open a relay allocation and a relay ticket does not
+    open the direct path.
+  - **No open reflector:** the gateway sends nothing to an address before it has proven itself.
+    The host side is bound only by the token; the browser side only by a full-size QUIC Initial
+    (≥ 1200 bytes) from the IP address that requested the allocation over HTTPS. After that,
+    datagrams are forwarded only between these two addresses, everything else is dropped
+    silently, and the answer to a `bind` (4 bytes) is smaller than the bind (36 bytes). Until
+    the handshake completes, the host's QUIC stack limits what it sends to an unvalidated
+    address to 3 × what it received (RFC 9000 anti-amplification). Forwarding is rate limited
+    (browser → host 32 Mbit/s, host → browser 1 Gbit/s).
+  - **Lifetimes and quotas:** the host must bind within 2 s, the browser must arrive within
+    20 s, and an allocation ends after 30 s without a datagram or when the host releases it. A
+    user may hold at most 4 allocations the browser has not reached yet; the port range caps
+    the total. Starts and ends are audited (`stream_start` / `stream_end` "via udp relay").
+  - The `bind`/`release` token travels in clear on the gateway ↔ host path. Someone who can read
+    that path could replay it from their own address only before the real `bind` arrives (the
+    first valid one wins) or release the allocation (ending the session); they could already
+    drop the packets. QUIC's own encryption is unaffected.
 
 ## Host-side safety
 
@@ -74,7 +109,11 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   which blocks filter injection such as `movie=`.
 - The host config holding the token is created in the user's profile with owner-only ACLs.
 - The firewall rule for the direct path covers only the Private and Domain profiles and only the
-  agent executable.
+  agent executable. The UDP relay needs no inbound rule: the host's relay socket sends to the
+  gateway's allocation ports first, and it is the PC's stateful firewall (and a NAT in front of
+  it) that then admits datagrams from those ports only. The socket itself refuses every other
+  QUIC sender that gets through (`CONNECTION_REFUSED`, or Version Negotiation for an unknown
+  QUIC version) and never opens a connection or a session for it.
 
 ## Gateway hardening (systemd)
 
@@ -91,6 +130,10 @@ host add/remove/re-pair/online/auth failures, Wake-on-LAN, and stream start/end 
 Admins can view it in the UI.
 
 ## Known limitations
+
+- The UDP relay matches the browser's UDP source IP against the IP of its HTTPS request. A client
+  whose network uses different public IPs for TCP and UDP (some carrier-grade NATs, or TCP over
+  IPv6 and UDP over IPv4) cannot lock an allocation and falls back to the QUIC splice relay.
 
 - All authenticated users can reach all hosts. Per-host permissions are not implemented.
 - TOTP secrets are stored in the 0600 state file, not encrypted at rest.

@@ -138,8 +138,8 @@ const (
 	feedbackFresh = 500 * time.Millisecond
 	// ackTimeout: a frame sent this long ago that no feedback covered, from a
 	// client that sends feedback, means the path to the client stalls (on the
-	// relay paths the gateway buffers what its client leg cannot carry, so
-	// the host's frame queue does not overflow).
+	// splice relay paths the gateway buffers what its client leg cannot carry,
+	// so the host's frame queue does not overflow).
 	ackTimeout = time.Second
 	// noFeedbackQuiet: a client that never sends feedback (no reports, no
 	// acks) gets increases (incSlow) only this long after the last decrease.
@@ -463,7 +463,8 @@ func (r *rateController) output(n int) {
 }
 
 // setPath tells the controller whether the session's connection ends at the
-// client (the direct path): its acknowledgements are then the client's.
+// client (the direct path, the UDP relay): its acknowledgements are then the
+// client's.
 func (r *rateController) setPath(direct bool) {
 	r.mu.Lock()
 	r.ackDirect = direct
@@ -647,8 +648,8 @@ func (r *rateController) delivered(now time.Time, window time.Duration) (float64
 // frames still wait for retransmissions (a frame counts for the client only
 // when complete), which after a capacity drop is the new capacity, but only
 // on the host's own connection: used where that ends at the client (the
-// direct path; on the relay paths it ends at the gateway). Called with r.mu
-// held.
+// direct path and the UDP relay; on the splice relay paths it ends at the
+// gateway). Called with r.mu held.
 func (r *rateController) ackDelivered(now time.Time) (float64, bool) {
 	var b int64
 	var span time.Duration
