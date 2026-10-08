@@ -573,6 +573,69 @@ func TestQueueOverflowEscalates(t *testing.T) {
 	})
 }
 
+// TestLogStagesRenderer: a client's stage summary ({"t":"stages"}) is logged
+// next to the encoder with the presentation path the client names (step
+// 4.3: the draw and display rows depend on it); a value that is not a plain
+// path name, or none (older clients), adds nothing.
+func TestLogStagesRenderer(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	caps, err := media.Probe(context.Background(), ff, nil)
+	if err != nil {
+		t.Skipf("probe: %v", err)
+	}
+	enc, ok := caps.Best("h264")
+	if !ok {
+		t.Skip("no h264 encoder")
+	}
+	cfg := &Config{Capture: "test", Encoder: enc.Name, TestWidth: 320, TestHeight: 180, DefaultFPS: 30, MaxFPS: 60,
+		DefaultKbps: 4000, MaxKbps: 100000}
+	ctx, cancel := context.WithCancel(context.Background())
+	logs := &lockedLog{}
+	s := &Session{
+		a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil), hostClock: media.NewClock()},
+		hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: enc.Family}}},
+		tried: map[string]bool{}, usage: map[string]string{},
+		ctx: ctx, cancel: cancel, ctrl: &fakeCtrl{}, frameQ: make(chan *media.Frame, 6),
+		log: slog.New(slog.NewTextHandler(logs, nil)),
+	}
+	s.video = media.NewVideo(caps, s.log, s.a.clock)
+	t.Cleanup(func() { cancel(); s.video.Stop() })
+	go s.videoEvents()
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.After(20 * time.Second); ; {
+		if _, ok := s.video.Active(); ok {
+			break
+		}
+		select {
+		case <-s.frameQ:
+		case <-deadline:
+			t.Fatal("the encoder sends no frames")
+		}
+	}
+	rows := []proto.StageStat{{Name: "draw", N: 40, P50: 0.4, P95: 0.9, P99: 1.2}, {Name: "e2e", From: "capture", N: 40, P50: 20, P95: 30, P99: 40}}
+	var in bytes.Buffer
+	for _, r := range []string{"webgl2", `x" injected="1`, ""} {
+		b, _ := json.Marshal(proto.ClientMsg{T: "stages", Stages: rows, Renderer: r})
+		if err := proto.WriteMsg(&in, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.ctrl = &scriptedCtrl{r: &in}
+	if err := s.controlLoop(); !errors.Is(err, io.EOF) {
+		t.Fatalf("control loop: %v", err)
+	}
+	l := logs.lines(`msg="latency stages`)
+	if len(l) != 3 || !strings.Contains(l[0], " renderer=webgl2 ") || !strings.Contains(l[0], `draw="0.4/0.9/1.2 n=40"`) ||
+		strings.Contains(l[1], "renderer=") || strings.Contains(l[1], "injected") || strings.Contains(l[2], "renderer=") {
+		t.Fatalf("stage lines:\n%s", strings.Join(l, "\n"))
+	}
+}
+
 // scriptedCtrl hands controlLoop the client messages in r, then io.EOF.
 type scriptedCtrl struct {
 	fakeCtrl

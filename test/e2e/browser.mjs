@@ -14,7 +14,13 @@
 // client crops it. Decoder hygiene (step 4.1): every scenario checks the
 // decode queue bound, that flush() is never called and that no VideoFrame is
 // left open; the startup decoder self-test is checked on the real decoders
-// and, with a wrapper that holds frames back, on its logic.
+// and, with a wrapper that holds frames back, on its logic. Presentation
+// (step 4.3): the transport scenarios draw with the 2D canvas, then the same
+// checks (frames drawn, crop, frame barcode) run with WebGL2 and, in a headed
+// browser on Xvfb, WebGPU; every renderer scenario checks the canvas is sized
+// to device pixels with nothing on top of it, and element fullscreen; the
+// renderer "auto" bake-off runs on the live stream and its stored winner is
+// used by the next connection.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -128,7 +134,7 @@ async function checkStages(name, st) {
 // 90 % of the sampled frames must show a valid barcode equal to the frame's seq
 // (the picture drawn is the frame its header describes), and the capture->drawn
 // histogram must have data.
-async function checkProbe(name) {
+async function checkProbe(name, method = null) {
   // A loaded machine can stall decoding for a while: give it up to 10 s more for 10 samples.
   await until(() => page.evaluate(() => window.__recon.probe?.sampled >= 10), 10000, '10 probe samples').catch(() => {});
   const pr = await page.evaluate(() => window.__recon.probe);
@@ -136,8 +142,8 @@ async function checkProbe(name) {
   const share = pr?.sampled ? matched / pr.sampled : 0;
   const hist = pr?.histogram ? Object.values(pr.histogram).reduce((a, b) => a + b, 0) : 0;
   const l = pr?.latency;
-  check(`${name}: frame barcode = seq on >= 90 % of sampled frames, capture→drawn histogram`,
-    pr?.mode === 'seq' && pr.sampled >= 10 && share >= 0.9 && hist > 0 && l?.n === hist,
+  check(`${name}: frame barcode = seq on >= 90 % of sampled frames, capture→drawn histogram${method ? ` (read back by ${method})` : ''}`,
+    pr?.mode === 'seq' && pr.sampled >= 10 && share >= 0.9 && hist > 0 && l?.n === hist && (!method || pr.method === method),
     pr ? `${pr.sampled} sampled (${pr.method}): ${matched} match seq (${(100 * share).toFixed(0)} %), ${pr.invalid} invalid, ${pr.mismatched} mismatched, ` +
       `${pr.implausible} implausible, ${pr.skipped} skipped; capture→drawn p50/p95/p99 ${l ? `${l.p50}/${l.p95}/${l.p99} ms (n ${l.n})` : '—'}` +
       `${pr.lastInvalid ? `; last invalid: seq ${pr.lastInvalid.seq}, cells ${pr.lastInvalid.luma}` : ''}` : 'no probe state');
@@ -148,11 +154,11 @@ async function checkProbe(name) {
 // Coded-size crop (step 1.7): the host pads the 960x540 test pattern with
 // TEST_PAD white rows and announces them (video config cropBottom). The client
 // must show exactly 960x540: the bottom rows on screen are the pattern's
-// colour bars (yellow at 5/12, blue at 7/12 of the width; x outside the stats
-// overlay and the toasts), not white padding, and not the bars squeezed
-// together with the padding. testsrc2's moving shape crosses those rows for
-// single frames (13 of 2400): up to five screenshots 200 ms apart, one must
-// show both bars.
+// colour bars (yellow at 5/12, blue at 7/12 of the width; x outside the
+// toasts, the stats overlay hidden meanwhile), not white padding, and not the
+// bars squeezed together with the padding. testsrc2's moving shape crosses
+// those rows for single frames (13 of 2400): up to five screenshots 200 ms
+// apart, one must show both bars.
 const TEST_PAD = 16;
 async function checkCrop(name) {
   const cfg = await page.evaluate(() => window.__recon.videoCfg);
@@ -166,6 +172,13 @@ async function checkCrop(name) {
   let px = null;
   let bars = false;
   let shots = 0;
+  // The stats overlay (semi-transparent) reaches the bottom rows in a small viewport.
+  const statsShown = await page.evaluate(() => {
+    const el = document.getElementById('stats');
+    const shown = !el.classList.contains('hidden');
+    el.classList.add('hidden');
+    return shown;
+  });
   while (!bars && shots < 5) {
     if (shots++) await sleep(200);
     const png = await page.screenshot({ clip });
@@ -186,6 +199,7 @@ async function checkCrop(name) {
     const [br, bg, bb] = px.blue;
     bars = yr > 150 && yg > 150 && yb < 110 && br < 110 && bg < 110 && bb > 150;
   }
+  if (statsShown) await page.evaluate(() => document.getElementById('stats').classList.remove('hidden'));
   // The worker logs what the decoder outputs for a padded stream.
   const logLine = (await page.evaluate(() => window.__recon.logs)).filter((l) => l.includes('padded picture:')).pop() || '';
   check(`${name}: padded picture cropped to the announced size (video config crop)`,
@@ -193,6 +207,165 @@ async function checkCrop(name) {
       logLine.includes(`decoder output ${cfg.codedWidth}x${cfg.codedHeight}`),
     `config ${cfg?.width}x${cfg?.height} coded ${cfg?.codedWidth}x${cfg?.codedHeight} cropBottom ${cfg?.cropBottom}; shown ${vid.w}x${vid.h} (${renderer}); ` +
       `bottom rows (screenshot ${shots}) at 5/12 rgb(${px.yellow}) (yellow bar), at 7/12 rgb(${px.blue}) (blue bar); log: ${logLine.replace(/^\S+ /, '')}`);
+}
+
+// Presentation (step 4.3): the expected path drew the frames, its context
+// reports whether desynchronized was granted (the 2D canvas must have it in
+// Chromium), the canvas backing store is the device-pixel size of its box
+// (no compositor scaling), and nothing transforms the canvas or sits on top
+// of it at rest (sampled on an 8x8 grid; the stats overlay, diagnostics, is
+// hidden for the check and toasts are transient).
+async function checkPresentation(name, path) {
+  const st = await page.evaluate(() => window.__recon.lastStats);
+  const r = st?.renderer;
+  const d = await page.evaluate(() => {
+    const c = document.getElementById('screen');
+    const stats = document.getElementById('stats');
+    const shown = !stats.classList.contains('hidden');
+    stats.classList.add('hidden');
+    const b = c.getBoundingClientRect();
+    const styled = [];
+    for (let e = c; e; e = e.parentElement) {
+      const cs = getComputedStyle(e);
+      const bad = [cs.transform !== 'none' && `transform ${cs.transform}`, cs.filter !== 'none' && `filter ${cs.filter}`,
+        (cs.backdropFilter || 'none') !== 'none' && `backdrop-filter ${cs.backdropFilter}`, cs.opacity !== '1' && `opacity ${cs.opacity}`,
+        cs.mixBlendMode !== 'normal' && `mix-blend-mode ${cs.mixBlendMode}`].filter(Boolean);
+      if (bad.length) styled.push(`${e.id || e.tagName.toLowerCase()}: ${bad.join(', ')}`);
+    }
+    const covered = new Set();
+    for (let i = 0; i < 8; i++) {
+      for (let j = 0; j < 8; j++) {
+        const top = document.elementFromPoint(b.left + ((i + 0.5) * b.width) / 8, b.top + ((j + 0.5) * b.height) / 8);
+        if (top !== c && !top?.closest('#toasts')) covered.add(top ? top.id || top.className || top.tagName : 'nothing');
+      }
+    }
+    if (shown) stats.classList.remove('hidden');
+    return { css: [b.width, b.height], dpr: devicePixelRatio, box: window.__recon.box, canvases: document.querySelectorAll('#stage canvas').length, styled, covered: [...covered] };
+  });
+  const want = d.css.map((v) => Math.round(v * d.dpr));
+  const sizeOk = !!r && r.canvas[0] === d.box?.w && r.canvas[1] === d.box?.h && Math.abs(d.box.w - want[0]) <= 1 && Math.abs(d.box.h - want[1]) <= 1;
+  check(`${name}: ${path} draws on a canvas sized to its box in device pixels, nothing transforms or covers it`,
+    r?.name === path && r.drawErrors === 0 && sizeOk && !d.styled.length && !d.covered.length && d.canvases === 1 && (path !== 'canvas2d' || r.desynchronized === true),
+    `${r?.name}${r?.gpu ? ` (${r.gpu})` : ''}, getContextAttributes().desynchronized ${r?.desynchronized}; canvas ${r?.canvas?.join('x')} for a box of ` +
+      `${d.css.map((v) => +v.toFixed(1)).join('x')} CSS px at dpr ${d.dpr} (${d.box?.w}x${d.box?.h}); ${r?.drawErrors} render errors; ${d.canvases} canvas(es); ` +
+      `transforms/filters: ${d.styled.join('; ') || 'none'}; covered by: ${d.covered.join(', ') || 'nothing'}`);
+  results.push({ presentation: name, renderer: r, dom: d });
+}
+
+// Element fullscreen (the player: canvas stage + stream UI, navigationUI
+// "hide"; the option itself is not observable from the page) from the
+// toolbar, which appears when the pointer reaches the top edge (on a loaded
+// machine the toolbar can hide again before the click lands: then the
+// Ctrl+Alt+Shift+F hotkey), and back by the hotkey; the canvas follows its
+// box both ways.
+async function checkFullscreen(name) {
+  const sized = async () => {
+    await sleep(800); // a stats update after the resize
+    return page.evaluate(() => ({ box: window.__recon.box, canvas: window.__recon.lastStats?.renderer?.canvas }));
+  };
+  const fsElement = (ms) => until(() => page.evaluate(() => document.fullscreenElement?.id), ms, 'fullscreen').catch(() => null);
+  await page.mouse.move(100, 60);
+  await page.mouse.move(100, 2, { steps: 3 });
+  const shown = await until(() => page.evaluate(() => !document.getElementById('toolbar').classList.contains('hide')), 3000, 'toolbar').catch(() => false);
+  await page.click('#btn-fullscreen', { timeout: 3000 }).catch(() => {});
+  let via = 'toolbar button';
+  let el = await fsElement(3000);
+  if (!el) {
+    via = 'hotkey (the button click missed)';
+    await page.keyboard.press('Control+Alt+Shift+KeyF');
+    el = await fsElement(6000);
+  }
+  const inFs = await sized();
+  await page.keyboard.press('Control+Alt+Shift+KeyF');
+  const left = await until(() => page.evaluate(() => !document.fullscreenElement), 6000, 'leaving fullscreen').catch(() => false);
+  const out = await sized();
+  const fits = (x) => x.canvas?.[0] === x.box?.w && x.canvas?.[1] === x.box?.h;
+  const refused = (await page.evaluate(() => window.__recon.logs)).filter((l) => l.includes('fullscreen refused')).pop() || '';
+  check(`${name}: toolbar at the top edge, element fullscreen of the player and back, the canvas follows its box`, shown && el === 'player' && left && fits(inFs) && fits(out),
+    `toolbar shown ${shown}; fullscreen element ${el} via ${via}; in fullscreen box ${inFs.box?.w}x${inFs.box?.h}, canvas ${inFs.canvas?.join('x')}; ` +
+      `after: box ${out.box?.w}x${out.box?.h}, canvas ${out.canvas?.join('x')}${refused ? `; ${refused.replace(/^\S+ /, '')}` : ''}`);
+}
+
+// Renderer "auto" (step 4.3). Without a stored result the first connection
+// runs the bake-off on the live stream: every path that works here takes
+// turns (two rounds), its draw and display stages are measured, the winner
+// keeps drawing on the only canvas left and is stored for this browser
+// (localStorage); the overlay lists the paths. The next connection uses the
+// stored winner at once; "Measure renderers again" clears it. In the headed
+// browser (Xvfb) when there is one, where all three paths work; headless,
+// WebGPU is unavailable and the bake-off runs with the other two.
+async function checkBakeoff() {
+  const mainPage = page;
+  page = (await headedPage().catch(() => null)) || mainPage;
+  try {
+    const all = page === mainPage ? ['canvas2d', 'webgl2'] : ['canvas2d', 'webgl2', 'webgpu'];
+    await page.goto(`${base}/`);
+    await page.evaluate(() => localStorage.removeItem('recon.present.v1'));
+    await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
+    const calls = await watchDecoder();
+    const t0 = Date.now();
+    const result = await until(() => page.evaluate(() => window.__recon.bakeoff), 60000, 'bake-off result').catch(() => null);
+    const took = (Date.now() - t0) / 1000;
+    // The winner takes over with its next frame, then the other canvases go.
+    await until(() => page.evaluate(() => document.querySelectorAll('#stage canvas').length === 1), 5000, 'one canvas').catch(() => {});
+    await sleep(600); // a stats update from the winner
+    const st = await page.evaluate(() => window.__recon.lastStats);
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('recon.present.v1') || 'null'));
+    const canvases = await page.evaluate(() => [...document.querySelectorAll('#stage canvas')].map((c) => `${c.dataset.path}${c.hidden ? ' (hidden)' : ''}`));
+    const overlay = await page.textContent('#stats').catch(() => '');
+    const res = result?.results || {};
+    const row = (p) => (res[p]?.error ? `${p}: unavailable (${res[p].error})`
+      : `${p}: draw p50/p95 ${res[p]?.draw?.p50}/${res[p]?.draw?.p95} ms (n ${res[p]?.draw?.n}), display ${res[p]?.display?.p50}/${res[p]?.display?.p95} ms (n ${res[p]?.display?.n}), ` +
+        `${res[p]?.fps} fps${res[p]?.slow ? ' (drops frames)' : ''}, score ${res[p]?.score}, desynchronized ${res[p]?.desynchronized}`);
+    // The rule: the lowest score among the paths that kept the frame rate
+    // (ties within tieMs: desynchronized first, then the PATHS order).
+    const ok = all.filter((p) => res[p]?.score !== undefined && !res[p].slow);
+    const best = Math.min(...ok.map((p) => res[p].score));
+    const near = ok.filter((p) => res[p].score <= best + (result?.tieMs ?? 1));
+    const want = near.find((p) => res[p].desynchronized === true) || near[0];
+    check(`renderer auto: bake-off on the live stream measures draw and display of ${all.join(', ')}, the winner keeps drawing and is stored`,
+      !!result?.winner && result.winner === want && ok.length >= 2 && all.every((p) => res[p]?.draw?.n >= 30 && res[p].display.n >= 1) &&
+        st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && canvases.length === 1 &&
+        canvases[0] === result.winner && overlay.includes('bake-off') && overlay.includes('★ ') && st.fps > 20,
+      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: winner ${result?.winner}; ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
+        `canvases left: ${canvases.join(', ')}; stored key ${stored?.key}; ${st?.fps?.toFixed(1)} fps after`);
+    await checkHygiene('renderer auto (bake-off switches)', calls, st);
+    results.push({ bakeoff: result, stored });
+    await page.evaluate(() => { window.__recon.userClosed = true; });
+
+    await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
+    await sleep(3000);
+    const st2 = await page.evaluate(() => window.__recon.lastStats);
+    const canvases2 = await page.evaluate(() => document.querySelectorAll('#stage canvas').length);
+    check('renderer auto: the next connection draws with the stored winner at once (no bake-off, one canvas)',
+      !!stored && st2?.renderer?.name === stored.winner && st2.renderer.mode === 'auto' && !st2.renderer.bake && canvases2 === 1 && st2.fps > 20,
+      `${st2?.renderer?.name} (mode ${st2?.renderer?.mode}, bake-off ${JSON.stringify(st2?.renderer?.bake)}), ${canvases2} canvas, ${st2?.fps?.toFixed(1)} fps`);
+    await page.evaluate(() => [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Measure renderers again')).click());
+    const cleared = await page.evaluate(() => localStorage.getItem('recon.present.v1'));
+    check('renderer auto: "Measure renderers again" clears the stored result', cleared === null);
+    await page.evaluate(() => { window.__recon.userClosed = true; });
+  } finally {
+    page = mainPage;
+  }
+}
+
+// A headed Chromium on its own Xvfb display (WebGPU works there, not in
+// headless here), signed in like the main page; null without Xvfb.
+let headed = null;
+async function headedPage() {
+  if (headed) return headed.page;
+  if (spawnSync('sh', ['-c', 'command -v Xvfb']).status !== 0) return null;
+  const disp = await startXvfb('1920x1080x24');
+  const b = await chromium.launch({
+    headless: false, env: { ...process.env, DISPLAY: disp },
+    args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
+  });
+  const c = await b.newContext({ ignoreHTTPSErrors: true, viewport: HEADED_VIEWPORT, deviceScaleFactor: HEADED_DPR, storageState: await ctx.storageState() });
+  const p = await c.newPage();
+  p.on('console', onConsole);
+  p.on('pageerror', onPageError);
+  headed = { browser: b, page: p };
+  return p;
 }
 
 // Decoder hygiene (step 4.1). The stream worker's VideoDecoder calls are
@@ -319,8 +492,8 @@ async function checkSelfTestLogic() {
 let testPage = null; // headed browser showing tools/latency-test (wallclock scenario)
 
 // Starts an X server and returns its display (":N").
-async function startXvfb() {
-  const xvfb = spawn('Xvfb', ['-displayfd', '3', '-screen', '0', '1280x720x24', '-nolisten', 'tcp'], { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+async function startXvfb(screen = '1280x720x24') {
+  const xvfb = spawn('Xvfb', ['-displayfd', '3', '-screen', '0', screen, '-nolisten', 'tcp'], { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
   xvfb.log = '';
   procs.push(xvfb);
   return new Promise((res, rej) => {
@@ -331,77 +504,96 @@ async function startXvfb() {
   });
 }
 
-// Renderer crop at unit level (step 1.7): the worker's own Canvas2DRenderer
-// and WebGPURenderer (their source, cut out of stream-worker.js) draw a 64x40
-// frame whose top-left 48x32 holds four colour quadrants, columns 48-63 grey
-// and rows 32-39 white, with the area protocol.js visibleArea() computes for
-// a video config that crops the bottom 8 rows, and for one that also crops
-// the right 16 columns. The canvas must be exactly the visible size, with no
-// white (and, for the second, no grey). WebGPU runs in a headed browser on
-// Xvfb: in headless Chromium here SwiftShader rejects
-// queue.onSubmittedWorkDone() ("A valid external Instance reference no longer
-// exists."), so the app's WebGPU self-test fails and the E2E WebGPU scenario
-// draws with the 2D renderer.
+// Renderers at unit level (steps 1.7, 4.1, 4.3): the client's own renderers
+// (web/static/js/renderers.js: 2D, WebGL2, WebGPU) draw a 64x40 frame whose
+// top-left 48x32 holds four colour quadrants, columns 48-63 grey and rows
+// 32-39 white, with the area protocol.js visibleArea() computes for a video
+// config that crops the bottom 8 rows, and for one that also crops the right
+// 16 columns. Without a box the canvas must be exactly the visible size, with
+// no white (and, for the second, no grey). Then the second config into a
+// 100x40 box (device pixels): the picture scaled to 60x40 and centred, black
+// bars left and right; WebGL2 and WebGPU redraw their last picture into a
+// new 64x64 box without a new frame. WebGPU runs in a headed browser on Xvfb:
+// in headless Chromium here SwiftShader rejects queue.onSubmittedWorkDone()
+// after an external texture import ("A valid external Instance reference no
+// longer exists."), so the app's WebGPU self-test fails there.
 async function checkRendererCrop(haveX) {
   let b = browser;
   if (haveX) {
     const disp = await startXvfb();
     b = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: disp }, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
   }
-  const workerSrc = readFileSync(join(root, 'web', 'static', 'js', 'stream-worker.js'), 'utf8');
-  const start = workerSrc.indexOf('// Rendering');
-  const end = workerSrc.indexOf('async function makeRenderer');
-  const fn = workerSrc.indexOf('function withTimeout(');
-  if (start < 0 || end < 0 || fn < 0) throw new Error('renderer code not found in stream-worker.js');
   // Evaluated through the DevTools protocol, which the page's CSP does not
-  // restrict; protocol.js comes from the gateway like in the app.
+  // restrict; the modules come from the gateway like in the app.
   const expr = `(async () => {
 const P = await import('/js/protocol.js');
-const post = () => {};
-${workerSrc.slice(fn, workerSrc.indexOf('\n}\n', fn) + 3)}
-${workerSrc.slice(start, end)}
+const R = await import('/js/renderers.js');
 const src = new OffscreenCanvas(64, 40);
 const g = src.getContext('2d');
 g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 40);
 g.fillStyle = '#808080'; g.fillRect(48, 0, 16, 32);
 [['#f00', '#0f0'], ['#00f', '#ff0']].forEach((row, y) => row.forEach((c, x) => { g.fillStyle = c; g.fillRect(x * 24, y * 16, 24, 16); }));
+const pixels = async (r, canvas) => {
+  if (r.device) await r.device.queue.onSubmittedWorkDone();
+  const bmp = canvas.transferToImageBitmap();
+  const c2 = new OffscreenCanvas(bmp.width, bmp.height).getContext('2d');
+  c2.drawImage(bmp, 0, 0);
+  const d = c2.getImageData(0, 0, bmp.width, bmp.height).data;
+  let white = 0, grey = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i] > 200 && d[i + 1] > 200 && d[i + 2] > 200) white++;
+    if (Math.abs(d[i] - 128) < 30 && Math.abs(d[i + 1] - 128) < 30 && Math.abs(d[i + 2] - 128) < 30) grey++;
+  }
+  const at = (x, y) => [...d.subarray((y * bmp.width + x) * 4, (y * bmp.width + x) * 4 + 3)];
+  return { w: bmp.width, h: bmp.height, white, grey, at };
+};
+const near = (px, want) => px.every((v, i) => Math.abs(v - want[i]) < 40);
+const quads = (p, x0, y0, cw, ch) => [[0, 0, [255, 0, 0]], [1, 0, [0, 255, 0]], [0, 1, [0, 0, 255]], [1, 1, [255, 255, 0]]]
+  .every(([qx, qy, c]) => near(p.at(Math.floor(x0 + (qx + 0.5) * cw), Math.floor(y0 + (qy + 0.5) * ch)), c));
+const cropped = { width: 48, height: 32, codedWidth: 64, codedHeight: 40, cropRight: 16, cropBottom: 8 };
 const out = [];
-for (const cfg of [{ width: 64, height: 32, codedWidth: 64, codedHeight: 40, cropBottom: 8 },
-  { width: 48, height: 32, codedWidth: 64, codedHeight: 40, cropRight: 16, cropBottom: 8 }]) {
-  for (const kind of ['2d', 'webgpu']) {
+for (const kind of R.PATHS) {
+  for (const cfg of [{ width: 64, height: 32, codedWidth: 64, codedHeight: 40, cropBottom: 8 }, cropped]) {
     const canvas = new OffscreenCanvas(1, 1);
     let r;
-    try {
-      r = kind === '2d' ? new Canvas2DRenderer(canvas) : await WebGPURenderer.create(canvas);
-    } catch (e) { out.push({ kind, cfg, error: e.message }); continue; }
+    try { r = await R.createRenderer(kind, canvas); } catch (e) { out.push({ kind, cfg, error: e.message }); continue; }
     const frame = new VideoFrame(src, { timestamp: 0 });
     r.draw(frame, null, P.visibleArea(cfg, frame.visibleRect.width, frame.visibleRect.height, frame.displayWidth, frame.displayHeight));
-    if (kind === 'webgpu') await r.device.queue.onSubmittedWorkDone();
-    const bmp = canvas.transferToImageBitmap();
-    const c2 = new OffscreenCanvas(bmp.width, bmp.height).getContext('2d');
-    c2.drawImage(bmp, 0, 0);
-    const d = c2.getImageData(0, 0, bmp.width, bmp.height).data;
-    let white = 0, grey = 0;
-    for (let i = 0; i < d.length; i += 4) {
-      if (d[i] > 200 && d[i + 1] > 200 && d[i + 2] > 200) white++;
-      if (Math.abs(d[i] - 128) < 30 && Math.abs(d[i + 1] - 128) < 30 && Math.abs(d[i + 2] - 128) < 30) grey++;
-    }
-    out.push({ kind, cfg, w: bmp.width, h: bmp.height, white, grey });
-    r.prev?.close();
+    const p = await pixels(r, canvas);
+    out.push({ kind, cfg, w: p.w, h: p.h, white: p.white, grey: p.grey, desync: r.desynchronized });
+    r.destroy();
   }
+  // Letterbox into a 100x40 box, then (WebGL2, WebGPU) a redraw into 64x64.
+  const canvas = new OffscreenCanvas(1, 1);
+  let r;
+  try { r = await R.createRenderer(kind, canvas); } catch (e) { out.push({ kind, box: true, error: e.message }); continue; }
+  r.resize(100, 40);
+  const frame = new VideoFrame(src, { timestamp: 0 });
+  r.draw(frame, null, P.visibleArea(cropped, 64, 40, 64, 40));
+  const p = await pixels(r, canvas);
+  const box = { kind, box: true, w: p.w, h: p.h, white: p.white, grey: p.grey, rect: r.rect,
+    bars: near(p.at(10, 20), [0, 0, 0]) && near(p.at(90, 20), [0, 0, 0]), quads: quads(p, 20, 0, 30, 20) };
+  if (kind !== 'canvas2d') {
+    r.resize(64, 64);
+    r.redraw();
+    const q = await pixels(r, canvas);
+    // 48x32 into 64x64: 64x43 at y 10.
+    box.redraw = { w: q.w, h: q.h, quads: quads(q, 0, 10, 32, 21), bars: near(q.at(32, 4), [0, 0, 0]) && near(q.at(32, 60), [0, 0, 0]), white: q.white };
+  }
+  out.push(box);
+  r.destroy();
 }
 // Frames the renderer leaves open after drawing three in a row (closed: coded width 0).
 const keep = [];
-for (const kind of ['2d', 'webgpu']) {
+for (const kind of R.PATHS) {
   let r;
-  try {
-    r = kind === '2d' ? new Canvas2DRenderer(new OffscreenCanvas(1, 1)) : await WebGPURenderer.create(new OffscreenCanvas(1, 1));
-  } catch (e) { keep.push({ kind, error: e.message }); continue; }
+  try { r = await R.createRenderer(kind, new OffscreenCanvas(1, 1)); } catch (e) { keep.push({ kind, error: e.message }); continue; }
   const fs = [0, 1, 2].map((i) => new VideoFrame(src, { timestamp: i }));
   for (const f of fs) r.draw(f, null, P.visibleArea(null, 64, 40, 64, 40));
-  if (kind === 'webgpu') await r.device.queue.onSubmittedWorkDone();
+  if (r.device) await r.device.queue.onSubmittedWorkDone();
   keep.push({ kind, open: fs.map((f, i) => (f.codedWidth ? i : -1)).filter((i) => i >= 0), prevIsLast: r.prev === fs[2] });
   r.prev?.close();
+  r.destroy();
 }
 return { out, keep };
 })()`;
@@ -410,23 +602,30 @@ return { out, keep };
     const p = await ctx2.newPage();
     await p.goto(`${base}/login`);
     const { out: res, keep } = await p.evaluate(expr);
-    for (const kind of ['2d', 'webgpu']) {
-      const rows = res.filter((x) => x.kind === kind);
+    for (const kind of ['canvas2d', 'webgl2', 'webgpu']) {
+      const rows = res.filter((x) => x.kind === kind && !x.box);
+      const box = res.find((x) => x.kind === kind && x.box);
       const skipped = kind === 'webgpu' && !haveX && rows.every((x) => x.error);
+      if (skipped) {
+        console.log(`- renderer unit checks (${kind}): skipped, WebGPU needs a headed browser (Xvfb) here: ${rows[0].error}`);
+        continue;
+      }
       const ok = rows.length === 2 && rows.every((x) => !x.error && x.w === x.cfg.width && x.h === x.cfg.height && x.white === 0 &&
         (x.cfg.width === 64 ? x.grey === 16 * 32 : x.grey === 0));
-      if (skipped) console.log(`- renderer crop (${kind}): skipped, WebGPU needs a headed browser (Xvfb) here: ${rows[0].error}`);
-      else {
-        check(`renderer crop (${kind}): draws only the visible area announced by the video config`, ok,
-          rows.map((x) => (x.error ? x.error : `${x.cfg.width}x${x.cfg.height} of 64x40: canvas ${x.w}x${x.h}, ${x.white} white, ${x.grey} grey px`)).join('; '));
-      }
+      check(`renderer crop (${kind}): draws only the visible area announced by the video config`, ok,
+        rows.map((x) => (x.error ? x.error : `${x.cfg.width}x${x.cfg.height} of 64x40: canvas ${x.w}x${x.h}, ${x.white} white, ${x.grey} grey px`)).join('; ') +
+          (rows[0]?.desync !== undefined ? `; getContextAttributes().desynchronized ${rows[0].desync}` : ''));
+      const rd = box?.redraw;
+      check(`renderer letterbox (${kind}): canvas = the device-pixel box, picture scaled to fit and centred${kind === 'canvas2d' ? '' : ', redrawn into a new box without a new frame'}`,
+        !!box && !box.error && box.w === 100 && box.h === 40 && box.rect?.x === 20 && box.rect?.w === 60 && box.rect?.h === 40 && box.bars && box.quads && box.white === 0 && box.grey === 0 &&
+          (kind === 'canvas2d' || (rd && rd.w === 64 && rd.h === 64 && rd.quads && rd.bars && rd.white === 0)),
+        box?.error || `canvas ${box?.w}x${box?.h}, picture ${JSON.stringify(box?.rect)}, bars black ${box?.bars}, quadrants ${box?.quads}, ${box?.white} white, ${box?.grey} grey` +
+          (rd ? `; redraw: canvas ${rd.w}x${rd.h}, quadrants ${rd.quads}, bars ${rd.bars}, ${rd.white} white` : ''));
       // Step 4.1: every frame closed once drawn; WebGPU keeps exactly the last (this.prev).
       const k = keep.find((x) => x.kind === kind);
-      if (!skipped) {
-        check(`renderer (${kind}) closes every frame it drew${kind === 'webgpu' ? ' except the last (this.prev)' : ''}`,
-          !k.error && (kind === '2d' ? k.open.length === 0 : k.open.length === 1 && k.open[0] === 2 && k.prevIsLast),
-          k.error || `of 3 frames drawn, open: [${k.open}]${kind === 'webgpu' ? `, prev is the last: ${k.prevIsLast}` : ''}`);
-      }
+      check(`renderer (${kind}) closes every frame it drew${kind === 'webgpu' ? ' except the last (this.prev)' : ''}`,
+        !k.error && (kind === 'webgpu' ? k.open.length === 1 && k.open[0] === 2 && k.prevIsLast : k.open.length === 0),
+        k.error || `of 3 frames drawn, open: [${k.open}]${kind === 'webgpu' ? `, prev is the last: ${k.prevIsLast}` : ''}`);
     }
   } finally {
     await ctx2.close();
@@ -458,7 +657,7 @@ async function checkWallclockProbe() {
   await until(async () => (await page.$$('.host.online')).length === 1, 60000, 'host online after restart');
 
   // 30 fps: software AV1 decode of the 1280x720 screen has to keep up for 10 minutes on CI machines.
-  await page.evaluate(() => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, latencyProbe: true, bitrate: 8, fps: 30 })));
+  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, latencyProbe: true, bitrate: 8, fps: 30, ...PREFS_2D });
   await page.click('.host.online a.btn-primary');
   await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
   await page.click('#btn-start');
@@ -536,7 +735,7 @@ async function restartHost(env, name) {
 
 async function startStream(prefs) {
   await page.goto(`${base}/`);
-  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), prefs);
+  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, ...PREFS_2D, ...prefs });
   await page.click('.host.online a.btn-primary');
   await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
   await page.click('#btn-start');
@@ -724,10 +923,25 @@ const browser = await chromium.launch({
   args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
 });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
-const page = await ctx.newPage();
+// The page the checks drive: the headless one, or the headed one (headedPage)
+// for the scenarios that need it.
+let page = await ctx.newPage();
+// The headed browser's pages: 768x432 CSS px at a device pixel ratio of
+// 1.25, so the renderers' canvas (sized to device pixels) is 960x540, the
+// test pattern's size: WebGL2 and WebGPU draw through a CPU-emulated GPU here
+// (SwiftShader, llvmpipe), and their scenarios stream at 30 fps for the same
+// reason.
+const HEADED_VIEWPORT = { width: 768, height: 432 };
+const HEADED_DPR = 1.25;
+// Saved settings as the client writes them (rendererV: written since step
+// 4.3; without it a saved "canvas2d", the earlier default, reads as "auto").
+// The 2D canvas unless a scenario picks another renderer.
+const PREFS_2D = { rendererV: 2, renderer: 'canvas2d' };
 const consoleLines = [];
-page.on('console', (m) => { consoleLines.push(`[${m.type()}] ${m.text()}`); if (process.env.E2E_VERBOSE) console.log('[page]', m.text()); });
-page.on('pageerror', (e) => consoleLines.push(`[pageerror] ${e.message}`));
+const onConsole = (m) => { consoleLines.push(`[${m.type()}] ${m.text()}`); if (process.env.E2E_VERBOSE) console.log('[page]', m.text()); };
+const onPageError = (e) => consoleLines.push(`[pageerror] ${e.message}`);
+page.on('console', onConsole);
+page.on('pageerror', onPageError);
 
 let failed = false;
 try {
@@ -770,10 +984,16 @@ try {
 
   // 3. Stream over each path -------------------------------------------------
   const scenarios = [
-    { name: 'WebTransport direct', prefs: { path: 'auto', transport: 'auto' }, expect: ['webtransport', 'direct'] },
-    { name: 'WebTransport relay', prefs: { path: 'relay', transport: 'auto' }, expect: ['webtransport', 'relay'] },
-    { name: 'WebSocket relay', prefs: { path: 'relay', transport: 'websocket' }, expect: ['websocket', 'relay'] },
-    { name: 'WebGPU renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu' }, expect: ['webtransport', 'direct'] },
+    { name: 'WebTransport direct', prefs: { path: 'auto', transport: 'auto', renderer: 'canvas2d' }, expect: ['webtransport', 'direct'] },
+    { name: 'WebTransport relay', prefs: { path: 'relay', transport: 'auto', renderer: 'canvas2d' }, expect: ['webtransport', 'relay'] },
+    { name: 'WebSocket relay', prefs: { path: 'relay', transport: 'websocket', renderer: 'canvas2d' }, expect: ['websocket', 'relay'] },
+    // WebGL2 and WebGPU draw through a CPU-emulated GPU here (30 fps streams):
+    // in the headed browser on Xvfb (HEADED_VIEWPORT), where WebGL2 runs on
+    // llvmpipe (headless: SwiftShader, about 12 of 30 fps on 4 cores) and
+    // WebGPU works at all (it fails in headless Chromium, see
+    // checkRendererCrop). Without Xvfb WebGL2 runs headless.
+    { name: 'WebGL2 renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgl2', fps: 30 }, expect: ['webtransport', 'direct'], probe: 'webgl2 readback', headed: 'prefer' },
+    { name: 'WebGPU renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu', fps: 30 }, expect: ['webtransport', 'direct'], probe: 'webgpu readback', headed: true },
   ];
   if (process.env.E2E_ROTATE) scenarios.push(scenarios.shift());
 
@@ -781,7 +1001,7 @@ try {
   // software AV1 decoder instance falls behind for a few seconds (the client
   // detects this, flushes and recovers); hardware decoding is not affected.
   await page.goto(`${base}/`);
-  await page.evaluate(() => localStorage.setItem('recon.prefs.v1', JSON.stringify({ path: 'relay' })));
+  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { path: 'relay', ...PREFS_2D });
   await page.click('.host.online a.btn-primary');
   await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
   await page.click('#btn-start');
@@ -796,10 +1016,21 @@ try {
   check('warm-up stream (self-heals if the decoder falls behind)', warm && warm.fps >= 30,
     `${warm?.fps.toFixed(1)} fps, ${warm?.keyRequests} recovery key frames, waited ${((Date.now() - warmStart) / 1000).toFixed(1)} s extra`);
   await page.evaluate(() => { window.__recon.userClosed = true; });
+  const mainPage = page;
   for (const sc of scenarios) {
+    page = mainPage;
+    if (sc.headed) {
+      const hp = await headedPage().catch((e) => { console.log(`- headed browser: ${e.message}`); return null; });
+      if (hp) page = hp;
+      else if (sc.headed === 'prefer') console.log(`- ${sc.name}: headless (no Xvfb for a headed browser)`);
+      else {
+        console.log(`- ${sc.name}: skipped (needs a headed browser on Xvfb: WebGPU fails in headless Chromium here)`);
+        continue;
+      }
+    }
     writeFileSync(inputLog, '');
     await page.goto(`${base}/`);
-    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), sc.prefs);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), { ...PREFS_2D, ...sc.prefs });
     await page.click('.host.online a.btn-primary');
     await page.waitForURL(/\/stream\?host=/);
     await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
@@ -808,7 +1039,8 @@ try {
     await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
     const firstFrameMs = Date.now() - t0;
     const conn = await page.evaluate(() => window.__recon.conn);
-    check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1], `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
+    check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1] && conn.renderer === sc.prefs.renderer,
+      `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
     const calls = await watchDecoder();
 
     // Wait for steady state (software decoders need a moment to warm up on
@@ -824,18 +1056,21 @@ try {
     // Steady state = the last 1.5 s of the 8 s window all at real-time rate.
     const tail = timeline.slice(-3);
     const avg = tail.reduce((a, p) => a + p.fps, 0) / Math.max(1, tail.length);
-    const steady = tail.length === 3 && avg >= 50; // per-0.5 s samples jitter when frames bunch at a boundary
+    const rate = sc.prefs.fps || 60; // the stream's frame rate
+    const steady = tail.length === 3 && avg >= (rate * 5) / 6; // per-0.5 s samples jitter when frames bunch at a boundary
     const st = await page.evaluate(() => window.__recon.lastStats);
     check(`${sc.name}: steady real-time playback`, steady, `last 1.5 s: ${tail.map((p) => p.fps).join(' / ')} fps; key requests ${st?.keyRequests}`);
     const cfg = await page.evaluate(() => window.__recon.videoCfg);
-    check(`${sc.name}: video decoding`, st && st.fps > 45, `${st?.fps.toFixed(1)} fps, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}`);
+    check(`${sc.name}: video decoding`, st && st.fps > rate * 0.75, `${st?.fps.toFixed(1)} fps of ${rate}, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}`);
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
     await checkStages(sc.name, st);
     await checkCrop(sc.name);
+    await checkPresentation(sc.name, sc.prefs.renderer);
     await checkHygiene(sc.name, calls, st);
     if (sc === scenarios[0]) await checkSelfTest(cfg);
-    const pr = await checkProbe(sc.name);
+    const pr = await checkProbe(sc.name, sc.probe);
+    if (sc.name === 'WebTransport direct' || sc.probe) await checkFullscreen(sc.name);
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
 
@@ -919,17 +1154,21 @@ try {
     }
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }
+  page = mainPage;
 
-  // 3a. Loss handling with the host's fault-injection hook --------------------
+  // 3a. Renderer "auto": the presentation bake-off -----------------------------
+  await checkBakeoff().catch((e) => check('renderer auto (bake-off) scenario', false, e.message));
+
+  // 3b. Loss handling with the host's fault-injection hook --------------------
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
   await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
 
-  // 3b. Renderer crop (unit) ----------------------------------------------------
+  // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
   await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
   await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
 
-  // 3c. Latency probe, wallclock mode -----------------------------------------
+  // 3d. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a
   // second, headed Chromium; the client (latency probe enabled) reads the
   // page's wall-clock barcode back and converts it with the host's wall-clock
@@ -965,6 +1204,7 @@ try {
   const appLogs = await page.evaluate(() => (window.__recon ? window.__recon.logs : [])).catch(() => []);
   writeFileSync(join(outDir, 'console.log'), consoleLines.concat(appLogs).join('\n'));
   await testPage?.close().catch(() => {});
+  await headed?.browser.close().catch(() => {});
   rmSync(join(dir, 'testpage-profile'), { recursive: true, force: true });
   writeFileSync(join(outDir, 'host.log'), procs.filter((p) => p.spawnargs.includes('run')).map((p) => p.log).join('\n--- host restarted ---\n'));
   writeFileSync(join(outDir, 'gateway.log'), gw.log);

@@ -144,7 +144,8 @@ with Settings → Diagnostics → Latency probe). The overlay shows the counts a
    host screen→drawn p50 ≈ page→capture p50 + the overlay's capture→draw p50 (the stage stamps
    and the picture agree); no slow drift of the samples over the 10 minutes (plot
    `latency_ms` over `t_s`). Repeat with Settings → Renderer = WebGPU (export `method`
-   = `webgpu`) and with the 2D canvas (`copyTo NV12` or `canvas …`).
+   = `webgpu readback`), WebGL2 (`webgl2 readback`, step 4.3) and the 2D canvas (`copyTo NV12`
+   or `canvas …`).
 
 Verified in the sandbox:
 
@@ -245,7 +246,8 @@ Hardware checks:
   open, 2D canvas renderer and then WebGPU (Settings → Renderer, reconnect). Look for: overlay
   `Frame barcode (seq)` valid ≥ 99 % and 0 mismatched after 2 minutes (a mismatch means a frame
   was shown out of order or twice, or AMF skipped a frame: compare with `skip_frame`/
-  `frame_skipping` in 1.1), the export's `method` (`copyTo NV12` / `canvas …` / `webgpu`), and the
+  `frame_skipping` in 1.1), the export's `method` (`copyTo NV12` / `canvas …` / `webgpu readback` /
+  `webgl2 readback`), and the
   capture→drawn p50 within ±2 ms of the overlay's End-to-end (capture→draw) p50. Test (wallclock,
   the 10-minute run): `"capture": "ddagrab"` (and once `gfxcapture`), encoders `hevc_amf`,
   `av1_amf` (2560×1440: RDNA3 AV1 alignment, A7), `h264_amf`, 60 fps, wired LAN client; follow
@@ -3002,3 +3004,177 @@ only, so the E2E streams libsvtav1):
   that holds frames back must show "→ decoding in software" (when a software decoder exists for
   that family) and the host must then pick another codec family under "Auto" (host log
   `starting encoder ... encoder=`).
+
+## 4.3 Presentation bake-off
+
+What changed (browser client; the host only logs one more field):
+
+- Three presentation paths in `web/static/js/renderers.js`, each on an `OffscreenCanvas` in the
+  stream worker: (A) 2D canvas, `getContext('2d', {desynchronized: true})` and `drawImage`; (B)
+  WebGPU `importExternalTexture` (zero copy; WebGPU canvases have no low-latency mode); (C) new:
+  WebGL2, `getContext('webgl2', {desynchronized: true, alpha: false, antialias: false, ...})`,
+  `texImage2D(frame)` into a texture and one triangle. WebGL2, like WebGPU, first runs a
+  self-test on a scratch canvas (program, a `VideoFrame` upload, its orientation read back; a
+  canvas cannot change context type) and checks `getError()` once on the first decoder frame.
+  Each path reports what its context grants: `getContextAttributes().desynchronized` (true /
+  false; WebGPU: none). The overlay's *Renderer → context* row shows it with the canvas size;
+  the stats, the latency export and the host log (`latency stages ... renderer=webgl2`, from the
+  client's stage report) name the path.
+- Setting *Pipeline → Renderer*: Auto (default), 2D canvas, WebGL2, WebGPU (applies on
+  reconnect). Saved settings from before this step hold `renderer: "canvas2d"` (the old
+  default, saved with every settings change) and now read as Auto; an explicit WebGPU stays.
+- **Auto**: without a stored result for this browser, the first connection gets one canvas per
+  path and the worker runs a bake-off on the live stream. After 2 s of streaming the paths that
+  work take turns, A B C A B C, 1.5 s each (the first 250 ms after a switch do not count; the
+  main thread shows the active path's canvas). Meanwhile display marks are taken as often as
+  the main thread answers. Per path: the Phase 0 *draw* stage (decoder output → drawn) and
+  *display* stage (drawn → the main thread's next animation frame), p50/p95/mean, and the frames
+  per second it drew. Score = mean draw + mean display, from ≥ 30 draw and ≥ 8 display samples.
+  A path that drew fewer than 80 % of the best path's frames per second is out (from 10 fps up).
+  The lowest score wins; within 1 ms a path whose context reports desynchronized wins (its
+  front-buffer presentation saves time this estimate cannot see), else the order 2D, WebGL2,
+  WebGPU. The winner keeps drawing, the other canvases and contexts go, and the main thread
+  stores the winner with every path's numbers in `localStorage` (`recon.present.v1`, keyed by
+  browser major version and OS, e.g. `Chrome 141 · Linux`: a browser update measures again).
+  Later connections draw with the stored winner on a single canvas; a stored winner that no
+  longer works falls back to 2D and is forgotten. The overlay lists the per-path rows (★ the
+  winner); *Measure renderers again* (settings) clears the result. An inconclusive bake-off (a
+  still picture: too few frames) stores nothing and runs again next time.
+- Canvas sized to device pixels: the main thread observes the stage's
+  `devicePixelContentBoxSize` (or its CSS size times `devicePixelRatio`) and posts it to the
+  worker; every renderer sizes its canvas backing store to it and scales the picture to fit,
+  centred, with black bars (only the bars are painted, never the picture's area first: on a
+  front buffer that could reach the screen). The 2D canvas resizes with the next frame, WebGL2
+  and WebGPU redraw their last picture at once. The compositor never scales the canvas any more
+  (before: a canvas of the video's size, scaled by CSS `object-fit`).
+- Nothing on the canvas at rest: no transform, filter, opacity or blend on the canvas or its
+  ancestors; the 6 px `peek` strip over the canvas is gone (the toolbar now shows when the
+  pointer reaches the top edge); the hidden toolbar and the closed settings drawer are
+  `visibility: hidden` (before: transparent and off-screen, still painted with
+  `backdrop-filter`); the stage has no focus outline. The performance overlay (diagnostics) sits
+  on the canvas while open, as do toasts and the game-mode cursor.
+- Element fullscreen of `#player` (canvas stage and stream UI, so the toolbar and settings still
+  work) with `navigationUI: "hide"` (before: `document.documentElement`). Input (pointer lock,
+  focus, events) goes to the stage that holds the canvases, so a renderer switch during the
+  bake-off keeps the pointer lock.
+- Latency probe (0.2) on WebGL2: the cells are rendered from the texture the frame was uploaded
+  to into an 8×3 framebuffer, `readPixels` into a pixel buffer, a fence, `getBufferSubData`
+  once it has passed (export `method`: `webgl2 readback`; WebGPU's is now `webgpu readback`).
+
+Found in the sandbox (Chromium 141 from Playwright 1.56, Linux, no GPU):
+
+- `getContextAttributes().desynchronized`: 2D in the worker (transferred canvas and a plain
+  `OffscreenCanvas`): **true**. WebGL2 in the worker (transferred canvas or not): **false**,
+  although requested, while a WebGL2 context on a main-thread canvas in the same browser reports
+  true. So this Chromium grants WebGL2 no low-latency mode off the main thread; whether Chrome
+  and Edge on Windows do is a hardware check below. If they do not and the rig shows WebGL2
+  would otherwise win, the alternative is a main-thread WebGL2 path (each `VideoFrame`
+  transferred to the main thread to draw): not built, because it puts every frame on the thread
+  the worker design keeps frames away from (layout, input, GC).
+- `texImage2D(frame)` puts the frame's top row at texture coordinate 0 (checked by the WebGL2
+  self-test on every start).
+- Under DevTools device emulation (Playwright `deviceScaleFactor`) `devicePixelContentBoxSize`
+  reports CSS pixels while `devicePixelRatio` is emulated: the client uses it only when it
+  agrees with CSS size × `devicePixelRatio` within a pixel.
+- Cost of drawing at the screen's size where the 2D canvas is software (headless Chromium):
+  the 960×540 test picture scaled into the 1280×720 canvas gives a draw stage p50 of about
+  10-11 ms in the E2E (a microbenchmark of the same `drawImage`: 9.3 ms scaled, 5.0 ms into a
+  960×540 canvas; before, the compositor did the scaling); on a GPU-accelerated canvas this is
+  a GPU blit. WebGL2 through SwiftShader in headless Chromium reached only ~12 of 30 fps on this
+  4-core machine (the GPU process emulates the upload and draw on the CPU; the worker's own
+  share was 0.6-1.6 ms per frame), llvmpipe in a headed browser 30 of 30.
+
+Verified in the sandbox:
+
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, 114 of 114 checks passed; the run
+  before failed only the known shared-CPU "steady real-time playback" dip, WebSocket relay,
+  while jobs in other checkouts loaded the 4-core machine to a load average of ~8). The
+  transport scenarios (WebTransport direct / relay, WebSocket relay) draw with the 2D canvas in
+  headless Chromium: canvas 1280×720 = the 1280×720 CSS px box at DPR 1, `desynchronized` true,
+  nothing covering or transforming the canvas (8×8 `elementFromPoint` grid with the overlay
+  hidden; computed styles of the canvas and its ancestors), one canvas, 0 render errors, 54-65
+  fps of 60 per 0.5 s window, crop (1.7) and frame barcode (0.2, `copyTo I420`, 16/16 matching
+  seq) as before, element fullscreen of `#player` from the toolbar (revealed at the top edge)
+  and back (on the loaded headed page the WebGPU scenario's button click missed in two runs,
+  before the toolbar's hide timer; the hotkey then did it). WebGL2 and WebGPU run in a headed
+  Chromium on Xvfb with a 768×432 CSS px viewport at an emulated DPR of 1.25: canvas 960×540
+  (device pixels), 30 of 30 fps, the padded test picture cropped (bottom rows show the colour
+  bars, not the white padding), the barcode read back from the GPU (`webgl2 readback` 10/10,
+  `webgpu readback` 10/10 matching seq), `desynchronized` false (WebGL2) / not applicable
+  (WebGPU), 0 render errors, fullscreen and back with the canvas following its box, decoder
+  hygiene unchanged (VideoFrames at most 2-3 open, 0 leaked). The host log line carries
+  `renderer=canvas2d` (Go test `TestLogStagesRenderer`: the field is logged, a value that is not
+  a plain path name and an empty one are not).
+- verified (sandbox): renderer unit checks (the renderers.js classes, 2D and WebGL2 headless,
+  WebGPU headed): exact visible area for the two crop configs (no white, no grey), letterbox of
+  a 48×32 picture into a 100×40 box (60×40 at x 20, black bars, the four quadrant colours in
+  place), WebGL2 and WebGPU redrawing their last picture into a new 64×64 box without a new
+  frame, and of three frames drawn none left open (WebGPU: exactly the last, `prev`).
+- verified (sandbox): renderer Auto in the headed browser: the bake-off ran on the live stream
+  in about 11.5 s (2 s warm-up + 6 slots of 1.5 s) with all three paths, each with 74-81 draw
+  samples at 28-30 fps; WebGPU's display marks came back slowly (display p50 37-137 ms: the
+  CPU-emulated GPU delays the page's frames while WebGPU presents), so it got 4-23 display
+  samples and scored worst (e.g. 73.6, 95.4) or had too few; the winner was 2D in four of seven
+  runs (e.g. score 35.2 vs WebGL2 46.8; 9.45 vs 9.68, a tie the desynchronized 2D canvas wins
+  anyway) and WebGL2 in the other three (e.g. 8.3 vs 2D 12.0, draw p50 0.39 vs 0.59 ms, display
+  p50 7.4 vs 10.5 ms): on emulated GPUs the two are within the run-to-run noise of the display
+  estimate, which is why the rig decides on hardware. The winner kept drawing, the other two
+  canvases and contexts were released (about 0.5 s later on the loaded headed page), the result
+  was stored under `Chrome 141 · Linux`, the next connection drew with it at once on one canvas
+  without a bake-off, *Measure renderers again* cleared it, and the hygiene checks held across
+  the switches (0 leaked, at most 3 open).
+- Not verifiable here: presentation on a real GPU (the sandbox has SwiftShader and llvmpipe),
+  front-buffer behaviour of `desynchronized`, the compositor's present mode, real DPR scaling
+  (only DevTools emulation), and browsers other than Chromium: the hardware checks below.
+
+Hardware checks (presentation is a client-side matter; the host vendor matters through the
+codec and the frame timing):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (click-to-photon per path with the 0.3 rig, Windows
+  11 client with a 120 Hz display, wired LAN, HEVC 1920×1080 120 fps, Chrome): in Recon's
+  settings set Renderer to *2D canvas*, reconnect, go fullscreen (toolbar button or
+  Ctrl+Alt+Shift+F), close the overlay after noting its *Renderer → context* row
+  (`desynchronized ✓/✗`, canvas = the screen in device pixels, e.g. 1920×1080 at 100 %, also
+  at 125 % Windows scaling on a 2400×1350 laptop panel), and run
+  `python3 tools/latency-rig/rig.py measure --port COM5 --host-sensor --label recon-hevc-1080p120-lan-chrome-canvas2d-amd --samples 100`;
+  repeat for *WebGL2* (`-webgl2-amd`) and *WebGPU* (`-webgpu-amd`), interleaving 100-sample
+  blocks with Moonlight (`moonlight-hevc-1080p120-lan-amd`) until each label has ≥ 200
+  samples; then `python3 tools/latency-rig/rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-4.3-amd.json`
+  and paste the table here. During each Recon block also run PresentMon on the browser's GPU
+  process: `.\PresentMon-2.x-x64.exe --process_name chrome.exe --output_file recon-chrome-<path>.csv --timed 30 --terminate_after_timed`
+  and `python3 tools/latency-rig/rig.py presentmon recon-chrome-<path>.csv`; record the
+  PresentMode shares per path (expect *Hardware: Independent Flip* or *Hardware Composed:
+  Independent Flip* for the best path in fullscreen with the overlay closed; *Composed: Flip*
+  costs about a refresh). Then set Renderer to *Auto*, click *Measure renderers again*,
+  reconnect, wait ~15 s and record the overlay's bake-off rows and the ★ winner: pass if the
+  rig's fastest path (median click→client) is Auto's pick or within 1 ms of it; otherwise
+  record both (Auto cannot see the compositor) and the PresentMon modes that explain the
+  difference. Repeat in Edge (`msedge.exe`) and Firefox (`firefox.exe`; Firefox reports no
+  `desynchronized`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same procedure streaming from an
+  RTX 20/30/40/50 host (labels ending in `-nvidia`, baseline
+  `moonlight-hevc-1080p120-lan-nvidia`), and on a Windows client with a GeForce GPU (the
+  presentation path depends on the client's GPU and driver: record the client GPU next to each
+  label).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (client GPUs and browsers, T10 browser matrix): on a
+  Windows client with a Radeon GPU, one with a GeForce GPU and one with Intel graphics (Chrome,
+  Edge, Firefox), and on a Mac (Safari 26.4, Chrome), open the stream with Renderer *Auto* after
+  *Measure renderers again* and record per browser and client GPU: the overlay's *context* row
+  per path (set each path once: does WebGL2 in the worker get `desynchronized` there, unlike
+  the Linux sandbox?), the bake-off rows and winner, and any path listed as unavailable with
+  its reason (`__recon.lastStats.renderer.errors`). Look for: WebGL2 `desynchronized ✓` on
+  Chrome/Edge for Windows (if ✗ everywhere, the main-thread WebGL2 path above is the next
+  experiment), no render errors, and that a 10-minute stream on the winner keeps "VideoFrames
+  open" max ≤ 5 and 0 leaked.
+- NVIDIA: unverified (no NVIDIA host available). Test: the client-GPU matrix above is the same
+  for an NVIDIA host; additionally stream AV1 from an RTX 40 host to each client and record
+  whether the winner changes with the codec (decoder output frames differ per codec and GPU).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (fullscreen and no overlays): on the Windows client
+  in Chrome, go fullscreen with the toolbar button: no browser UI or "press Esc" bar remains
+  after a few seconds (navigationUI `hide`), the toolbar slides in only with the pointer at the
+  top edge, `document.fullscreenElement.id` is `player` (DevTools console), and PresentMon in
+  fullscreen with the toolbar hidden shows an *Independent Flip* mode for the 2D canvas; with
+  the toolbar shown (pointer at the top) or the overlay open it may switch to *Composed: Flip*
+  (expected; record it).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same fullscreen and PresentMon check
+  on a client with a GeForce GPU.

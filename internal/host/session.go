@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"regexp"
 	"runtime"
 	"sort"
 	"sync"
@@ -1401,7 +1402,7 @@ func (s *Session) controlLoop() error {
 		case "keyframe":
 			s.requestKeyframe()
 		case "stages":
-			s.logStages(m.Stages)
+			s.logStages(m.Stages, m.Renderer)
 		case "congestion":
 			// Overlapped: the client keeps decoding the current generation
 			// until the new one is ready, unless it flushed its decoder: then
@@ -1510,16 +1511,23 @@ func pctString(v []float64) string {
 var stageNames = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
 	"decode": true, "draw": true, "display": true, "e2e": true}
 
+// rendererName accepts the presentation paths a client may name.
+var rendererName = regexp.MustCompile(`^[a-z0-9-]{1,24}$`)
+
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
-// the host's own measurement of its stages (host_capture, host_queue).
-func (s *Session) logStages(rows []proto.StageStat) {
+// the host's own measurement of its stages (host_capture, host_queue), with
+// the client's presentation path (renderer) when it names one.
+func (s *Session) logStages(rows []proto.StageStat, renderer string) {
 	p, ok := s.video.Active()
 	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
 		return
 	}
 	args := []any{"encoder", p.Encoder.Name, "vendor", p.Encoder.Vendor, "source", p.Source.Backend, "fps", p.FPS,
 		"kbps", p.BitrateKbps}
+	if rendererName.MatchString(renderer) {
+		args = append(args, "renderer", renderer)
+	}
 	for _, r := range rows {
 		if !stageNames[r.Name] {
 			continue

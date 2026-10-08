@@ -41,10 +41,12 @@ Techniques used (most of them are new to browser-based game streaming):
   encoder *while the old one keeps streaming*, then switches on the new key frame. You get no freeze.
 - **The entire media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`
   (`optimizeForLatency`, at most 2 chunks queued, never flushed) → an **OffscreenCanvas** that
-  draws each frame the instant it decodes and closes it at once. It uses a **desynchronized**
-  (front-buffer) 2D canvas, or **WebGPU `importExternalTexture`** zero-copy rendering after a
-  built-in self-test. The main thread can't stall a frame. A startup self-test catches decoders
-  that hold frames back and avoids them.
+  draws each frame the instant it decodes and closes it at once. Three presentation paths: a
+  **desynchronized** (front-buffer) 2D canvas, **WebGL2** (`texImage2D` of the frame) or
+  **WebGPU `importExternalTexture`** zero-copy rendering; **Auto** measures them on the live
+  stream the first time and keeps the fastest for that browser. The canvas is sized to device
+  pixels with nothing on top of it, so the compositor never scales or covers it. The main thread
+  can't stall a frame. A startup self-test catches decoders that hold frames back and avoids them.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
@@ -107,7 +109,7 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
 ```
  Browser (Chrome / Edge / Firefox / Safari 26.4+)
    main thread: UI, raw input, gamepads, AudioWorklet
-   worker:      WebTransport ─► reorder ─► VideoDecoder ─► OffscreenCanvas (desync 2D / WebGPU)
+   worker:      WebTransport ─► reorder ─► VideoDecoder ─► OffscreenCanvas (2D / WebGL2 / WebGPU)
         │   HTTPS (UI, API)            TCP 8443
         │   HTTP/3 WebTransport        UDP 8443  ── relay path
         │   WebSocket (fallback)       TCP 8443
@@ -239,7 +241,12 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 - **Encoder preset**: lowest latency / balanced / best quality.
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer size.
-- **Network path, transport, renderer and decoder**: these apply on reconnect.
+- **Network path, transport, renderer and decoder**: these apply on reconnect. Renderer
+  *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for about 10 s on
+  the first connection in a browser, keeps the one with the lowest draw + display time and
+  remembers it for that browser version (overlay: per-path numbers; *Measure renderers again*
+  repeats it). Pick a renderer to override it, for example after measuring click-to-photon with
+  the latency rig ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
 - **Latency probe** (Diagnostics): open `tools/latency-test/index.html` (in the release zip:
   `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
   host screen → drawn latency measured from the picture, and **Export latency data** saves it.

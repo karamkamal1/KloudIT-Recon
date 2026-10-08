@@ -4,11 +4,13 @@
 //
 //   WebTransport (per-frame QUIC streams + datagrams) or WebSocket fallback
 //     -> reorder by sequence -> VideoDecoder (optimizeForLatency, at most 2 queued)
-//     -> immediate draw on a desynchronized 2D canvas or WebGPU external texture
+//     -> immediate draw: desynchronized 2D canvas, WebGL2 texture upload or
+//        WebGPU external texture (renderers.js), on a canvas sized to device pixels
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
 import { runSelfTests } from './decoder-selftest.js';
+import { createRenderer, LABELS, PATHS, withTimeout } from './renderers.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -20,8 +22,7 @@ const now = () => performance.now();
 let transport = null;
 let prefs = {};
 let byeReason = '';
-let renderer = null;
-let canvas = null;
+let renderer = null; // the active presentation path (see Presentation)
 
 const video = {
   cfg: null,
@@ -133,14 +134,6 @@ function b64(s) {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
-}
-
-function withTimeout(p, ms, what) {
-  let t;
-  return Promise.race([
-    p.finally(() => clearTimeout(t)),
-    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out`)), ms); }),
-  ]);
 }
 
 /** Incremental parser for u32-length-prefixed messages on a byte stream. */
@@ -313,229 +306,215 @@ async function connect(ep) {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Presentation (guide step 4.3; the paths are in renderers.js). The main
+// thread hands over one canvas per path the session may use (msg.canvases,
+// in order) and how to choose (msg.present.mode):
+//
+//   setting   the user picked a path: its canvas only (2D on it if that path
+//             does not work here)
+//   auto      renderer "auto" with a stored result for this browser/OS: the
+//             winner's canvas (2D on it if the winner no longer works)
+//   bakeoff   renderer "auto" without one: a canvas per path; the paths that
+//             work take turns on the live stream, their draw and display
+//             stages (Phase 0) are measured, the winner stays and the main
+//             thread stores it (localStorage) with the numbers
+//
+// The main thread shows the active renderer's canvas ('renderer', posted
+// after the renderer's first frame), removes the canvases of paths that are
+// gone ('gone'), and reports the canvas box in device pixels ('resize'):
+// every renderer sizes its canvas to it, so the compositor never scales the
+// picture.
 
-class Canvas2DRenderer {
-  constructor(c) {
-    this.c = c;
-    this.ctx = c.getContext('2d', { alpha: false, desynchronized: true });
-    this.name = 'canvas2d-desync';
-  }
-  // req: latency probe sample; the corner is read back after the draw from a clone.
-  // vis: the part of the frame to show (P.visibleArea).
-  draw(frame, req, vis) {
-    if (req) req.clone = frame.clone();
-    const w = Math.round(vis.w);
-    const h = Math.round(vis.h);
-    if (this.c.width !== w || this.c.height !== h) {
-      this.c.width = w;
-      this.c.height = h;
-    }
-    if (vis.fx < 1 || vis.fy < 1) this.ctx.drawImage(frame, 0, 0, vis.w, vis.h, 0, 0, w, h); // padding cropped
-    else this.ctx.drawImage(frame, 0, 0);
-    frame.close();
-  }
-}
+const pres = {
+  mode: 'setting',
+  list: [], // renderers, each on its own canvas (r.slot: the path the canvas was made for)
+  errors: {}, // path -> why it does not work here
+  box: null, // [w, h] device pixels of the canvas box
+  next: null, // the renderer that takes over before the next draw
+  retire: [], // renderers dropped once the next one has drawn
+  announce: false, // post 'renderer' after the next draw
+  bake: null,
+  drawErrors: 0,
+  lastError: '',
+};
 
-const WGSL = `
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex: texture_external;
-@group(0) @binding(2) var<uniform> crop: vec4f; // xy: visible share of the frame (VideoConfig crop)
-struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
-@vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
-  var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
-  var o: VOut;
-  o.pos = vec4f(p[i], 0.0, 1.0);
-  o.uv = vec2f((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5) * crop.xy;
-  return o;
-}
-@fragment fn fs(v: VOut) -> @location(0) vec4f {
-  return textureSampleBaseClampToEdge(tex, samp, v.uv);
-}`;
-
-// Latency probe on the WebGPU path: one texel per barcode cell, the mean of
-// 4x4 samples over the cell's inner half, rendered from the external texture
-// the frame is drawn from; copyTextureToBuffer + mapAsync read the 8x3 texels
-// back without a frame readback or a pipeline stall.
-const PROBE_WGSL = `
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex: texture_external;
-@group(0) @binding(2) var<uniform> cell: vec4f; // xy: cell size in texture coordinates
-@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
-  var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
-  return vec4f(p[i], 0.0, 1.0);
-}
-@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let c = floor(pos.xy);
-  var acc = vec3f(0.0);
-  for (var j = 0; j < 4; j++) {
-    for (var i = 0; i < 4; i++) {
-      let f = vec2f(0.3125 + f32(i) * 0.125, 0.3125 + f32(j) * 0.125);
-      acc += textureSampleBaseClampToEdge(tex, samp, (c + f) * cell.xy).rgb;
-    }
-  }
-  return vec4f(acc / 16.0, 1.0);
-}`;
-
-class WebGPURenderer {
-  // Runs the full import -> draw -> submit path on a scratch canvas first: a
-  // canvas cannot switch context types, so the real one is only claimed once
-  // WebGPU demonstrably works on this device/driver.
-  static async selfTest(device, format, pipelineFor) {
-    const scratch = new OffscreenCanvas(16, 16);
-    const ctx = scratch.getContext('webgpu');
-    ctx.configure({ device, format, alphaMode: 'opaque' });
-    const src = new OffscreenCanvas(16, 16);
-    src.getContext('2d').fillRect(0, 0, 16, 16);
-    const vf = new VideoFrame(src, { timestamp: 0 });
-    const crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+async function setupRenderers(msg) {
+  pres.mode = msg.present?.mode || 'setting';
+  if (msg.box?.w > 0 && msg.box?.h > 0) pres.box = [msg.box.w, msg.box.h];
+  const log = (text) => post('log', { text });
+  for (const [slot, c] of Object.entries(msg.canvases || {})) {
+    let r = null;
     try {
-      device.pushErrorScope('validation');
-      const { pipeline, sampler } = pipelineFor;
-      const ext = device.importExternalTexture({ source: vf });
-      device.queue.writeBuffer(crop, 0, new Float32Array([1, 1, 0, 0]));
-      const bg = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [{ binding: 0, resource: sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: crop } }],
-      });
-      const enc = device.createCommandEncoder();
-      const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bg);
-      pass.draw(3);
-      pass.end();
-      device.queue.submit([enc.finish()]);
-      await withTimeout(device.queue.onSubmittedWorkDone(), 1500, 'WebGPU self-test');
-      const err = await device.popErrorScope();
-      if (err) throw new Error(err.message);
-    } finally {
-      vf.close();
-      crop.destroy();
-    }
-  }
-
-  static async create(c) {
-    if (!self.navigator.gpu) throw new Error('WebGPU unavailable');
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) throw new Error('no WebGPU adapter');
-    const device = await adapter.requestDevice();
-    const formatProbe = navigator.gpu.getPreferredCanvasFormat();
-    {
-      const m = device.createShaderModule({ code: WGSL });
-      const pl = device.createRenderPipeline({
-        layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: formatProbe }] },
-        primitive: { topology: 'triangle-list' },
-      });
-      await WebGPURenderer.selfTest(device, formatProbe, { pipeline: pl, sampler: device.createSampler() });
-    }
-    const ctx = c.getContext('webgpu');
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    ctx.configure({ device, format, alphaMode: 'opaque' });
-    const module = device.createShaderModule({ code: WGSL });
-    const pipeline = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module, entryPoint: 'vs' },
-      fragment: { module, entryPoint: 'fs', targets: [{ format }] },
-      primitive: { topology: 'triangle-list' },
-    });
-    const r = new WebGPURenderer();
-    Object.assign(r, { c, device, ctx, pipeline, sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }), prev: null, name: 'webgpu-zero-copy' });
-    r.crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    r.cropXY = [0, 0];
-    try {
-      device.pushErrorScope('validation');
-      const pm = device.createShaderModule({ code: PROBE_WGSL });
-      r.probePipeline = device.createRenderPipeline({
-        layout: 'auto', vertex: { module: pm, entryPoint: 'vs' }, fragment: { module: pm, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
-        primitive: { topology: 'triangle-list' },
-      });
-      const err = await device.popErrorScope();
-      if (err) throw new Error(err.message);
-      r.probeTex = device.createTexture({ size: [P.BARCODE_COLS, P.BARCODE_ROWS], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-      r.probeCell = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      // Two readbacks in flight at most (probe.inflight); rows are 256-byte aligned.
-      r.probeBufs = [0, 1].map(() => device.createBuffer({ size: 256 * P.BARCODE_ROWS, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }));
+      r = await createRenderer(slot, c, { log });
     } catch (e) {
-      r.probePipeline = null; // the probe falls back to a frame copy
-      post('log', { text: `WebGPU latency probe unavailable (${e.message})` });
-    }
-    return r;
-  }
-  draw(frame, req, vis) {
-    const w = Math.round(vis.w);
-    const h = Math.round(vis.h);
-    if (this.c.width !== w || this.c.height !== h) {
-      this.c.width = w;
-      this.c.height = h;
-    }
-    if (this.cropXY[0] !== vis.fx || this.cropXY[1] !== vis.fy) {
-      // Texture coordinates span the visible part only (VideoConfig crop).
-      this.cropXY = [vis.fx, vis.fy];
-      this.device.queue.writeBuffer(this.crop, 0, new Float32Array([vis.fx, vis.fy, 0, 0]));
-    }
-    const ext = this.device.importExternalTexture({ source: frame });
-    const bg = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.crop } }],
-    });
-    const enc = this.device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-    });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, bg);
-    pass.draw(3);
-    pass.end();
-    const buf = req ? this.probePass(enc, ext, frame, req) : null;
-    this.device.queue.submit([enc.finish()]);
-    if (buf) req.luma = this.probeRead(buf);
-    else if (req) req.clone = frame.clone();
-    // Keep the frame alive until the next one so the GPU never samples a closed frame.
-    if (this.prev) this.prev.close();
-    this.prev = frame;
-  }
-  probePass(enc, ext, frame, req) {
-    if (!this.probePipeline || !this.probeBufs.length) return null;
-    const buf = this.probeBufs.pop();
-    this.device.queue.writeBuffer(this.probeCell, 0, new Float32Array([req.cell / frame.displayWidth, req.cell / frame.displayHeight, 0, 0]));
-    const bg = this.device.createBindGroup({
-      layout: this.probePipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.probeCell } }],
-    });
-    const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.probeTex.createView(), loadOp: 'clear', storeOp: 'store' }] });
-    pass.setPipeline(this.probePipeline);
-    pass.setBindGroup(0, bg);
-    pass.draw(3);
-    pass.end();
-    enc.copyTextureToBuffer({ texture: this.probeTex }, { buffer: buf, bytesPerRow: 256, rowsPerImage: P.BARCODE_ROWS }, [P.BARCODE_COLS, P.BARCODE_ROWS]);
-    return buf;
-  }
-  async probeRead(buf) {
-    try {
-      await buf.mapAsync(GPUMapMode.READ);
-      const px = new Uint8Array(buf.getMappedRange());
-      const luma = [];
-      for (let k = 0; k < P.BARCODE_BITS; k++) {
-        const o = Math.floor(k / P.BARCODE_COLS) * 256 + (k % P.BARCODE_COLS) * 4;
-        luma.push(0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2]);
+      pres.errors[slot] = e.message;
+      log(`${LABELS[slot] || slot} renderer unavailable (${e.message})`);
+      if (pres.mode !== 'bakeoff' && slot !== 'canvas2d') {
+        log('using the low-latency 2D canvas instead');
+        r = await createRenderer('canvas2d', c, { log }).catch(() => null); // the canvas may be claimed already
       }
-      return luma;
-    } finally {
-      if (buf.mapState !== 'unmapped') { try { buf.unmap(); } catch {} }
-      this.probeBufs.push(buf);
     }
+    if (!r) {
+      post('gone', { slot });
+      continue;
+    }
+    r.slot = slot;
+    if (pres.box) r.resize(...pres.box);
+    pres.list.push(r);
+  }
+  renderer = pres.list[0];
+  if (!renderer) throw new Error('no renderer works in this browser');
+  pres.announce = true;
+  if (pres.mode === 'bakeoff') {
+    const order = pres.list.map((r) => r.name);
+    const per = (v) => Object.fromEntries(order.map((p) => [p, v()]));
+    pres.bake = { order, slot: 0, t0: 0, slotStart: 0, lastT: 0, recs: per(() => []), dur: per(() => 0), done: false, result: null };
+    post('log', { text: `presentation bake-off: ${order.join(', ')}` });
   }
 }
 
-async function makeRenderer() {
-  if (prefs.renderer === 'webgpu') {
-    try {
-      return await WebGPURenderer.create(canvas);
-    } catch (e) {
-      post('log', { text: `WebGPU renderer unavailable (${e.message}); using low-latency 2D canvas` });
-    }
+function rendererInfo() {
+  const r = renderer;
+  return {
+    name: r.name, slot: r.slot, mode: pres.mode, desynchronized: r.desynchronized, gpu: r.gpu, canvas: r.canvasSize(),
+    errors: pres.errors, drawErrors: pres.drawErrors, bake: bakeState(),
+  };
+}
+
+// The next renderer takes over before a draw; it is announced after it.
+function switchRenderer() {
+  const r = pres.next;
+  pres.next = null;
+  if (!r || r === renderer) return;
+  renderer.idle();
+  renderer = r;
+  pres.announce = true;
+}
+
+function announceRenderer() {
+  pres.announce = false;
+  post('renderer', { info: rendererInfo() });
+  if (pres.retire.length) post('log', { text: `presentation: ${renderer.name} draws; ${pres.retire.map((r) => r.name).join(', ')} released` });
+  for (const r of pres.retire) {
+    try { r.destroy(); } catch {}
+    post('gone', { slot: r.slot });
   }
-  return new Canvas2DRenderer(canvas);
+  pres.retire = [];
+}
+
+function renderError(e) {
+  pres.drawErrors++;
+  if (e.message !== pres.lastError) post('log', { text: `render error (${renderer.name}): ${e.message}` });
+  pres.lastError = e.message;
+}
+
+function onResize(w, h) {
+  if (!(w > 0 && h > 0)) return;
+  pres.box = [w, h];
+  for (const r of pres.list) r.resize(w, h);
+  try {
+    renderer?.redraw(); // WebGL2 / WebGPU still hold the last picture; 2D resizes with the next frame
+  } catch (e) {
+    renderError(e);
+  }
+}
+
+// Presentation bake-off: after BAKE.warmupMs of streaming (decoder warm-up)
+// the paths take turns, A B C A B C, BAKE.slotMs of drawn frames each (the
+// first BAKE.skipMs after a switch do not count). Meanwhile display marks are
+// taken as often as the main thread answers them. Score per path: mean draw
+// + mean display (ms), from at least BAKE.minDraw / BAKE.minDisplay samples.
+// A path that drew fewer than BAKE.minShare of the frames per second the
+// best one drew (from 10 fps up: a still picture sends few frames) is out:
+// drawing that cannot keep up costs frames, not only draw time. The lowest
+// score wins; scores within BAKE.tieMs of it count as equal, and among those
+// a path whose context reports desynchronized wins (its front-buffer
+// presentation saves time the display estimate cannot see), else the
+// earlier one in PATHS.
+const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, tieMs: 1, minDraw: 30, minDisplay: 8, minShare: 0.8 };
+
+const baking = () => !!pres.bake && !pres.bake.done;
+
+// After each drawn frame with a stage record. A slot's time runs from its
+// first frame; the frame rate counts the time between counted frames (gaps
+// capped at 100 ms, so a pause does not count).
+function bakeTick(rec) {
+  const b = pres.bake;
+  if (!b || b.done) return;
+  const t = rec.t;
+  const gap = Math.min(t - b.lastT, 100);
+  b.lastT = t;
+  if (!b.t0) b.t0 = t;
+  if (t - b.t0 < BAKE.warmupMs) return;
+  if (!b.slotStart) b.slotStart = t;
+  const path = renderer.name;
+  if (t - b.slotStart >= BAKE.skipMs && b.recs[path]) {
+    b.recs[path].push(rec);
+    b.dur[path] += gap;
+  }
+  if (t - b.slotStart < BAKE.slotMs) return;
+  b.slotStart = 0;
+  if (++b.slot >= b.order.length * BAKE.rounds) {
+    bakeFinish();
+    return;
+  }
+  pres.next = pres.list.find((r) => r.name === b.order[b.slot % b.order.length]);
+}
+
+function bakeStat(v) {
+  const s = pct(v);
+  return s ? { p50: s.p50, p95: s.p95, mean: +(v.reduce((a, x) => a + x, 0) / v.length).toFixed(2), n: s.n } : { n: 0 };
+}
+
+function bakeWinner(results) {
+  let scored = PATHS.filter((p) => results[p].score !== undefined);
+  const fps = Math.max(0, ...scored.map((p) => results[p].fps));
+  if (fps >= 10) {
+    for (const p of scored) if (results[p].fps < BAKE.minShare * fps) results[p].slow = true;
+    scored = scored.filter((p) => !results[p].slow);
+  }
+  if (!scored.length) return null;
+  const best = Math.min(...scored.map((p) => results[p].score));
+  const near = scored.filter((p) => results[p].score <= best + BAKE.tieMs);
+  return near.find((p) => results[p].desynchronized === true) || near[0];
+}
+
+function bakeFinish() {
+  const b = pres.bake;
+  b.done = true;
+  const results = {};
+  for (const path of PATHS) {
+    const r = pres.list.find((x) => x.name === path);
+    if (!r) {
+      results[path] = { error: pres.errors[path] || 'not tried' };
+      continue;
+    }
+    const recs = b.recs[path] || [];
+    const draw = recs.map((x) => x.s[6]);
+    const display = recs.filter((x) => x.s[7] !== null).map((x) => x.s[7]);
+    const res = { desynchronized: r.desynchronized, gpu: r.gpu, draw: bakeStat(draw), display: bakeStat(display), fps: b.dur[path] ? +((1000 * recs.length) / b.dur[path]).toFixed(1) : 0 };
+    if (draw.length >= BAKE.minDraw && display.length >= BAKE.minDisplay) res.score = +(res.draw.mean + res.display.mean).toFixed(2);
+    results[path] = res;
+  }
+  const winner = bakeWinner(results);
+  b.result = { winner, results, rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs, tieMs: BAKE.tieMs };
+  const txt = (p) => (results[p].score !== undefined ? `${results[p].score} ms at ${results[p].fps} fps${results[p].slow ? ' (too slow)' : ''}` : results[p].error || 'too few samples');
+  post('log', { text: `presentation bake-off: ${winner || 'inconclusive'} wins (draw + display mean: ${PATHS.map((p) => `${p} ${txt(p)}`).join(', ')})` });
+  post('bakeoff', { result: b.result });
+  // The winner stays (inconclusive: the first path); the others go once it has drawn.
+  const keep = pres.list.find((r) => r.name === winner) || pres.list[0];
+  pres.next = keep;
+  pres.retire = pres.list.filter((r) => r !== keep);
+  pres.list = [keep];
+  pres.announce = true;
+}
+
+function bakeState() {
+  const b = pres.bake;
+  if (!b) return null;
+  if (b.done) return { done: true, ...b.result };
+  const warming = !b.t0 || now() - b.t0 < BAKE.warmupMs;
+  return { done: false, warming, path: renderer?.name, slot: b.slot + 1, slots: b.order.length * BAKE.rounds, order: b.order };
 }
 
 // ---------------------------------------------------------------------------
@@ -932,12 +911,13 @@ function drawFrame(frame, meta, decoded) {
       post('log', { text: `padded picture: coded ${c.codedWidth}x${c.codedHeight} announced, decoder output ${vr?.width}x${vr?.height} (display ${frame.displayWidth}x${frame.displayHeight}), showing ${size}` });
     }
   }
+  if (pres.next) switchRenderer();
   const req = probeStart(frame, meta, vis);
   try {
     renderer.draw(frame, req, vis);
   } catch (e) {
     frame.close();
-    post('log', { text: `render error: ${e.message}` });
+    renderError(e);
   }
   const presented = now();
   if (req?.clone) trackFrame(req.clone);
@@ -957,8 +937,10 @@ function drawFrame(frame, meta, decoded) {
     firstFrame = false;
     post('firstFrame', { renderer: renderer.name });
   }
+  if (pres.announce) announceRenderer();
   if (!meta || clock.offset === null) return;
   const rec = recordStages(meta, decoded, presented);
+  bakeTick(rec);
   stats.owdSum += ackFrame(meta, decoded);
   stats.owdN++;
   stats.totalSum += rec.e2e;
@@ -1024,9 +1006,10 @@ function recordStages(m, decoded, drawn) {
   };
   lat.recs.push(rec);
   while (lat.recs.length && lat.recs[0].t < drawn - STAGE_WINDOW_MS) lat.recs.shift();
-  // At most one display mark in flight: the main thread answers within a refresh.
+  // At most one display mark in flight: the main thread answers within a
+  // refresh. The presentation bake-off takes one whenever it can.
   if (lat.pending && drawn - lat.pending.t > 250) lat.pending = null; // main thread throttled (hidden)
-  if (!lat.pending && drawn - lat.lastMark >= DISPLAY_SAMPLE_MS) {
+  if (!lat.pending && drawn - lat.lastMark >= (baking() ? 0 : DISPLAY_SAMPLE_MS)) {
     lat.pending = rec;
     lat.lastMark = drawn;
     rec.mark = ++lat.markId;
@@ -1085,7 +1068,8 @@ function reportStages(sum) {
   const rows = [];
   for (const name of STAGES) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
   rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
-  transport.sendControl({ t: 'stages', stages: rows });
+  // The presentation path drawing now (draw and display depend on it).
+  transport.sendControl({ t: 'stages', stages: rows, renderer: renderer?.name });
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,9 +1088,11 @@ function reportStages(sum) {
 //              clock sync. Latency: page drew it -> drawn here, which adds the
 //              host's render, present and capture delay to capture -> drawn.
 //
-// Readback never stalls the decoder: Canvas2D reads a clone of the frame
-// after the draw (VideoFrame.copyTo of the corner, else drawImage into a
-// small canvas), WebGPU renders the cells into 8x3 texels and maps them.
+// Readback never stalls the decoder: the 2D renderer hands over a clone of
+// the frame, read after the draw (VideoFrame.copyTo of the corner, else
+// drawImage into a small canvas); WebGL2 and WebGPU render the cells from the
+// texture the frame was drawn from into 8x3 texels and read those back
+// asynchronously (renderers.js).
 
 const PROBE_EVERY = 30;
 const PROBE_RANGE = [-100, 5000]; // ms; outside: implausible (clock or barcode wrong)
@@ -1136,13 +1122,13 @@ function probeStart(frame, meta, vis) {
   if (probe.inflight >= 2) { probe.skipped++; return null; }
   const cell = probe.mode === 'seq' ? P.BARCODE_CELL : vis.w / P.BARCODE_WALLCLOCK_CELLS;
   if (P.BARCODE_COLS * cell > vis.w || P.BARCODE_ROWS * cell > vis.h) { probe.skipped++; return null; }
-  return { mode: probe.mode, epoch: probe.epoch, cell, meta, offset: clock.offset, wallOffsetUs: probe.wallOffsetUs, clone: null, luma: null };
+  return { mode: probe.mode, epoch: probe.epoch, cell, meta, offset: clock.offset, wallOffsetUs: probe.wallOffsetUs, clone: null, luma: null, via: renderer.name };
 }
 
 function probeSample(req, drawn) {
   const luma = req.clone ? readCornerLuma(req.clone, req.cell) : req.luma;
   if (!luma) { probe.skipped++; return; }
-  if (!req.clone) probe.method = 'webgpu';
+  if (!req.clone) probe.method = `${req.via} readback`;
   probe.inflight++;
   luma.then((l) => probeResult(req, drawn, l), (e) => {
     if (e?.message !== probe.lastError) post('log', { text: `latency probe readback failed: ${e?.message}` });
@@ -1477,6 +1463,9 @@ function postStats() {
     supersededChunks: stats.supersededChunks,
     outputLag: isFinite(stats.lagMin) ? stats.lagMin : null,
     videoFrames: { open: openFrames(), max: frames.max, leaked: frames.leaked },
+    // Presentation (4.3): the active path, what its context reports, the
+    // canvas size (device pixels) and the bake-off's progress or result.
+    renderer: renderer ? rendererInfo() : null,
     hw: video.hw,
     synced: clock.offset !== null,
   });
@@ -1519,10 +1508,9 @@ async function selfTestDecoders(decoders) {
 
 async function start(msg) {
   prefs = msg.prefs || {};
-  canvas = msg.canvas;
   if (msg.audioSab) audio.ring = new RingWriter(msg.audioSab);
   if (msg.audioPort) audio.port = msg.audioPort;
-  renderer = await makeRenderer();
+  await setupRenderers(msg);
   const decoders = await probeDecoders();
   post('decoders', { decoders });
   const tested = selfTestDecoders(decoders); // while connecting
@@ -1568,6 +1556,7 @@ self.onmessage = (ev) => {
     case 'prefs': prefs = { ...prefs, ...m.prefs }; updateProbeMode(); break;
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;
+    case 'resize': onResize(m.w, m.h); break;
     case 'dropTest': if (!dropTest.run) dropTest.armed = true; break;
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':

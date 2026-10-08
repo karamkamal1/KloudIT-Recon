@@ -372,6 +372,22 @@ Record the mode next to each click-to-photon configuration, for every renderer (
 desynchronized canvas, WebGPU, WebGL2: guide step 4.3) and for Moonlight. A difference of about
 one refresh between configurations should line up with a difference in present mode.
 
+### Renderers (step 4.3)
+
+Recon's stream settings (*Pipeline → Renderer*) pick the presentation path: *2D canvas*,
+*WebGL2*, *WebGPU*, or *Auto* (the default), which measures the three on the live stream on the
+first connection in a browser and keeps the one with the lowest draw + display time (Phase 0
+stages). Auto's numbers come from inside the browser and cannot see the compositor; the rig and
+PresentMon can. To compare the paths, set each renderer in turn (reconnect after each change),
+close the performance overlay (it sits on the canvas and forces composition), go fullscreen and
+measure one label per renderer, for example `recon-hevc-1080p120-lan-chrome-canvas2d`,
+`...-webgl2`, `...-webgpu`, interleaving 100-sample blocks as above. Note for each label the
+overlay's *Renderer → context* row (opened briefly before the block): whether the browser
+granted `desynchronized` (`getContextAttributes().desynchronized`) and the canvas size, which
+must equal the screen in device pixels in fullscreen. Then compare the winner with Auto's pick
+(overlay *bake-off* rows, ★): if they differ, set the rig's winner in the settings and record
+both in docs/VENDOR_NOTES.md (step 4.3).
+
 ## Without hardware
 
 ```sh

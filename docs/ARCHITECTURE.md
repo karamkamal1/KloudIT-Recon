@@ -246,8 +246,11 @@ WebGPU: scaled texture coordinates).
 worker:  WebTransport.incomingUnidirectionalStreams ─► readAll ─► reorder ─► VideoDecoder
                                                                         │ output(frame)
                                                                         ▼
-                                        OffscreenCanvas.getContext('2d', {desynchronized:true}).drawImage
-                                        or WebGPU importExternalTexture (zero copy) after a self-test
+                                        renderers.js on an OffscreenCanvas sized to device pixels:
+                                          canvas2d  getContext('2d', {desynchronized:true}).drawImage
+                                          webgl2    getContext('webgl2', {desynchronized:true}),
+                                                    texImage2D(frame) + one triangle (after a self-test)
+                                          webgpu    importExternalTexture (zero copy, after a self-test)
 main:    pointerrawupdate / keys / gamepads ──postMessage──► worker ──► input stream / datagrams
 audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─► AudioWorklet (adaptive jitter buffer)
 ```
@@ -256,6 +259,38 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   requestAnimationFrame wait. Outputs that are already waiting by then (a burst after a stall)
   supersede each other: only the newest is drawn, the older ones are closed unseen. A
   desynchronized canvas bypasses the compositor's double buffering where the platform supports it.
+- Presentation (step 4.3): three paths, Settings → Renderer: 2D canvas (desynchronized), WebGL2
+  (desynchronized requested; `texImage2D(frame)` into a texture, one triangle), WebGPU
+  (`importExternalTexture`, zero copy; WebGPU canvases have no low-latency mode), or **Auto**
+  (the default). The overlay shows the active path and what its context reports
+  (`getContextAttributes().desynchronized`: granted or not). Every renderer draws into a canvas
+  whose backing store is the device-pixel size of its box (the main thread observes
+  `devicePixelContentBoxSize` and posts it to the worker; 2D resizes with the next frame, WebGL2
+  and WebGPU redraw their last picture at once), scaled to fit and centred with black bars, so
+  the compositor never scales the canvas. Nothing sits on the canvas at rest: the toolbar appears
+  when the pointer reaches the top edge (no strip element over the canvas) and is
+  `visibility: hidden` otherwise, like the closed settings drawer; no transform, filter or
+  opacity on the canvas or its ancestors. Fullscreen is element fullscreen of the player (canvas
+  stage and stream UI) with `navigationUI: "hide"`. Input (pointer lock, focus, events) goes to
+  the stage that holds the canvas.
+- **Auto** measures instead of assuming: the first connection in a browser without a stored
+  result gets a canvas per path (a canvas keeps its context type) and the worker runs a
+  bake-off on the live stream after 2 s of warm-up: the paths that work take turns, A B C A B C,
+  1.5 s each (the first 250 ms after a switch do not count), while display marks are taken as
+  often as the main thread answers. Score per path: mean *draw* + mean *display* (the Phase 0
+  stages: decoder output → drawn, drawn → the main thread's next animation frame). A path that
+  drew fewer than 80 % of the best path's frames per second is out (it cannot keep up). The
+  lowest score wins; within 1 ms a path whose context reports desynchronized wins (front-buffer
+  presentation saves time this estimate cannot see), else the order 2D, WebGL2, WebGPU. The winner keeps
+  drawing, the other canvases go, and the main thread stores the winner and every path's
+  numbers in `localStorage` (`recon.present.v1`) for this browser major version and OS; the
+  next connections use it on a single canvas (a stored winner that no longer works falls back to
+  2D and is forgotten). The overlay lists the per-path draw/display p50/p95 and scores; Settings
+  → *Measure renderers again* clears it. The in-browser numbers cannot see the compositor's
+  presentation (Composed vs Independent Flip): the click-to-photon rig (step 0.3) and PresentMon
+  decide on real clients, and a path chosen in Settings overrides Auto. The client's stage
+  report to the host names the path (`renderer`), so the host log keeps the draw and display
+  rows per renderer.
 - Decoder hygiene: `prefer-hardware` + `optimizeForLatency`; `flush()` is never called while
   streaming (it waits for every output and makes the next chunk a key frame; recovery resets and
   reconfigures instead). At most 2 chunks wait inside the decoder (`decodeQueueSize`); later ones
@@ -369,8 +404,10 @@ before the draw and afterwards copies only the corner (`VideoFrame.copyTo` with 
 of I420/NV12/…, or RGB) or, if the frame cannot be copied, draws the corner into a small
 `OffscreenCanvas`; the clone is closed as soon as the copy resolves. The WebGPU renderer renders
 the cells from the external texture it already imported into an 8×3 texture (one texel per cell,
-the mean of 4×4 samples over the cell's inner half), `copyTextureToBuffer` and `mapAsync`. At most
-two readbacks are in flight.
+the mean of 4×4 samples over the cell's inner half), `copyTextureToBuffer` and `mapAsync`. The
+WebGL2 renderer does the same from the texture the frame was uploaded to: the cells into an 8×3
+framebuffer, `readPixels` into a pixel buffer, a fence, and `getBufferSubData` once the fence has
+passed (polled on timers). At most two readbacks are in flight.
 
 The overlay shows sampled / valid / mismatched counts and the histogram's p50/p95/p99
 (1 ms buckets over the whole connection), `window.__recon.probe` holds the same summary, and
