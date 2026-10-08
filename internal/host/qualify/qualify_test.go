@@ -68,3 +68,30 @@ func TestRunFailures(t *testing.T) {
 		t.Fatalf("crash before the start: %+v", c)
 	}
 }
+
+// The libavcodec backend (GUIDE 3.8) runs as sessions run it: with the host
+// config's FFmpeg library directory; its streams start without LTR slots or
+// intra refresh (caps recovery none, no intra refresh).
+func TestCellArgsLavc(t *testing.T) {
+	caps := encoder.Caps{Backend: "lavc", Codecs: map[string]encoder.CodecCaps{"hevc": {Recovery: "none", ForceIDR: true, LiveBitrate: "flush"}}}
+	o := Options{FFmpegDir: `C:\Program Files\KlouditRecon\ffmpeg-lgpl`}
+	o.defaults()
+	cr := cellRun{backend: "lavc", capture: "synthetic-gpu", motion: true, frames: 3600, step: 120}
+	c := &Cell{Codec: "hevc", Quality: "speed", LTRSlots: caps.LTRSlots("hevc"), RC: DefaultRCModes("lavc")[0], LiveBitrate: ModeSeamless,
+		IntraRefresh: caps.IntraRefreshFrames("hevc", 60)}
+	args := strings.Join(cellArgs(o, cr, c, "s.hevc", "s.jsonl"), " ")
+	for _, want := range []string{"--backend=lavc", `--ffmpeg-dir=C:\Program Files\KlouditRecon\ffmpeg-lgpl`, "--rc=cbr"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args lack %s: %s", want, args)
+		}
+	}
+	for _, bad := range []string{"--ltr-slots", "--intra-refresh", "--lavc-test-encoder", "--nvenc-test-dll"} {
+		if strings.Contains(args, bad) {
+			t.Errorf("args with %s: %s", bad, args)
+		}
+	}
+	o.LavcTestEncoder = "libx264"
+	if args := o.backendArgs("lavc"); !slices.Contains(args, "--lavc-test-encoder=libx264") || args[0] != "--backend=lavc" {
+		t.Errorf("test encoder args %q", args)
+	}
+}

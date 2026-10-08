@@ -4870,14 +4870,13 @@ Ultra for AV1), after `install-host.ps1 -InstallLibavcodec` and a current Intel 
 
 ### Session integration (for the session rewrite)
 
-The pipeline selection of step 3.1b is not in this worktree's base, so `internal/host/session.go`
-is unchanged; the Go API is `internal/host/encoder`:
+Done in "3.8 wiring" below (these were the notes for it). The Go API is `internal/host/encoder`:
 
 - No session change is needed for the backend to be used: `Launch` with `Backend` "auto" picks
   `lavc` on an Intel primary adapter when the libraries are installed (default directory next
   to the helper); `Caps.Usable()` then holds and the 3.1b selection (helper when the caps
-  handshake succeeds, else FFmpeg) applies unchanged. `Options.FFmpegDir` only for a host.json
-  override (e.g. `"helperFFmpegDir"`); leave it empty normally.
+  handshake succeeds, else FFmpeg) applies unchanged. `Options.FFmpegDir`: recon-host passes
+  host.json `"helperFFmpegDir"` (default `ffmpeg-lgpl` next to it; 3.8 wiring).
 - Behaviour from caps, not vendor names: `CodecCaps.Recovery` "none" -> a confirmed loss is
   `ForceIDR` (or `Recover`, which does the same); `LiveBitrate` / `Started.LiveBitrate` "flush"
   -> rate changes cost an IDR: change less often (as 3.6's flush handling); `ROI` "none" -> no
@@ -4886,6 +4885,167 @@ is unchanged; the Go API is `internal/host/encoder`:
   zero copy reads frames back: a few ms more latency).
 - The FFmpeg command-line path (GPL `ffmpeg.exe`, hevc_qsv through `hwmap`) stays the fallback
   when the helper is not usable.
+
+## 3.8 wiring Sessions on the libavcodec backend
+
+What changed (session side of 3.8; the helper's backend is unchanged):
+
+- Pipeline selection (`internal/host/pipeline.go`: `openPipeline`, `chooseHelper`, `helperFits`,
+  `adapterBlocker`; docs/ARCHITECTURE.md "Two pipelines") tries, in order: the helper with a
+  vendor backend (AMF, NVENC), the helper's libavcodec backend, FFmpeg's command line. The first
+  launch is the helper's `auto` (vendor of adapter 0 first, `lavc` last, or first on an Intel
+  adapter 0); when the backend it chose cannot serve the session for a reason of its own (its
+  `adapterLuid` is not the captured monitor's adapter in `caps.outputs`; `lavc` with
+  `helperLibavcodec` `off`; the negotiated codec is not one of its codecs) recon-host launches the
+  next backend of that order the caps did not report unavailable, with `--backend=...`. The
+  chosen backend is pinned for the session (restarts, spare). host.log: one `video pipeline` line
+  with `backend=` and `skipped="amf: ...; nvenc: ...; lavc: ..."` (why each earlier rung was not
+  used); `native encoder helper: trying another backend backend=... instead_of=... reason=...`
+  per relaunch; at agent start `native encoder helper installed ... libavcodec="libraries in
+  <dir>"` or `"not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec
+  installs FFmpeg's LGPL libraries there)"` or `off (host config "helperLibavcodec")`.
+- Host config: `helperFFmpegDir` (default `<install>\ffmpeg-lgpl`, relative paths from the
+  install directory; recon-host passes it as `--ffmpeg-dir` to every helper and to `recon-host
+  qualify`), `helperLibavcodec` `auto` (default) | `off`.
+- The codec is negotiated at the stream's real size in `openPipeline` too (as `buildParams`),
+  so the 4.2 decode-time choice cannot move the session to FFmpeg right after it opened the
+  helper (merge note (d)).
+- Behaviour from the caps, unchanged code paths checked for this combination (recovery `none`,
+  `forceIdr` true, `liveBitrate` / `liveFps` `flush` assumed, `maxLtr` 0, no intra refresh, SVC
+  or ROI): `start` carries no `ltrSlots` / `intraRefreshFrames` / `svcLayers`; the client is told
+  recovery `keyframe` (also clients with hello v3); a loss goes to the ladder's rung 4 with
+  `ForceIDR`: an IDR in the running encoder, never `recover`, never a restart; the rate controller
+  runs its `flush` policy (a key frame per change; increases at most every 2 s); a qualification
+  of the backend (`backend` `lavc`, cbr cells only) makes it `seamless` (250 ms) or `restart` (a
+  new helper per change, same backend); fixed-bitrate sessions (rc `vbr`, not qualified on this
+  backend) keep the helper's default (`flush`).
+- `encoder helper started` logs `recovery=` and, for the libavcodec backend, `encoder=`
+  (`hevc_qsv`, ...), `usage=` (`low_power` or `default`) and `preset=`, next to `zero_copy=`.
+- `recon-host qualify`: `-backend lavc`, `-ffmpeg-dir` (default: host config), tests
+  `-lavc-test-encoder`; the results file gains `testEncoder` (results of the test encoders never
+  apply to sessions). The results file holds one backend: the one sessions use (`-backend auto`).
+
+### Verified in the sandbox
+
+- verified (sandbox): selection order with fake helpers (`go test ./internal/host -run
+  'PipelineSelection|AdapterBlocker|SessionOnLavcHelper|OpenPipeline'`): AMF chosen with
+  nothing skipped; NVENC with `skipped="amf: ..."`; `lavc` when no vendor backend is usable
+  (`skipped` lists AMF's and NVENC's reasons); helper present but libavcodec libraries missing
+  -> FFmpeg, `reason="it has no usable encoder"`, `skipped=... lavc: its FFmpeg libraries are
+  not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec installs ...)`;
+  `helperLibavcodec` `off` with NVENC usable -> relaunch with `nvenc` (launches `""`, `nvenc`);
+  `off` with nothing else -> FFmpeg; a codec only the libavcodec backend has (AV1 client, AMF
+  without AV1) -> relaunch with `lavc`; a codec no backend has -> FFmpeg with every backend's
+  reason. A monitor on another GPU than the backend's rules it out (DDA, AMD Direct Capture, WGC
+  monitor capture); window and test captures are not checked.
+- verified (sandbox): a session on a fake helper with the libavcodec backend's real caps
+  (`TestSessionOnLavcHelper`): start without LTR / intra refresh / SVC, rc `cbr`; VideoConfig
+  `encoder` `h264_lavc_helper`, `recovery` `keyframe` for a hello-v3 client; capabilities
+  ForceIDR, LiveBitrate + Flush, rate policy `flush`; helper-dropped frames and a client `lost`
+  -> `forceIdr`, no `recover`, no restart; a congestion cut -> `setRate`, the flush key frame
+  inside the generation, `{"t":"rate"}` to the client, a key-frame request right after it
+  covered; the spare helper launched with `lavc`; a qualification with seamless passed ->
+  `liveBitrate` `seamless`, policy `seamless`, `live_bitrate_from=qualification`; one where both
+  failed -> no live bitrate, policy `restart`, the cut starts a new `lavc` helper. Race detector
+  clean (`-race -count=3`).
+- verified (sandbox, Wine 9.0 + Xvfb, mingw build, BtbN `ffmpeg-n8.1-latest-win64-gpl-shared-8.1`
+  as of 2026-10-08, SHA-256 `4468dc0e...26644`): `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64 FFMPEG_DIR=<its bin>` (WINEPREFIX=the shared prefix,
+  WINEDEBUG=-all): all pass, among them `TestHelperVideoLavc` (HelperVideo, the session's
+  pipeline, on the real helper `--backend=lavc --lavc-test-encoder=libx264` with the synthetic GPU
+  source): config gen 1 `h264_lavc_helper` `recovery` `keyframe`; capabilities as above
+  (`flush`: Flush set; `seamless` via a qualification: not set, measured); 10 frames, key only
+  first; `Recover` -> `ErrNoRecovery`; `ForceKeyframe` -> gen 2 key frame from the running
+  helper 27-32 ms after the request; `SetRate(1000)` -> RateChange(gen 2, 1000) then, `flush`, a
+  key frame within 3 frames in gen 2, `seamless` none in 20 frames; one helper launched in all;
+  the session's byte stream decodes cleanly with the build's `ffmpeg.exe`. And
+  `TestQualifyLavcTestEncoder` (`recon-host qualify`'s runs with `Backend lavc`, `FFmpegDir`,
+  `LavcTestEncoder libx264`, 320x180@60, 4000 <-> 1500 kbps every 500 ms for 3 s): two cells (h264
+  speed cbr seamless / flush: cbr only, no LTR slots, no intra refresh), 180 frames, 5 changes,
+  0 unexpected key frames, flush: 0 changes without a key frame, 180/180 barcodes, clean decode;
+  libx264 ultrafast follows the sizes 5-10 frames late (seamless FAIL, flush INCONCLUSIVE: a
+  property of that software encoder, not judged by the test); results marked `testEncoder`, never
+  chosen. `TestQualifyMock`, `TestQualifyNvencTestDouble` and every encoder / media helper test
+  still pass.
+- verified (sandbox): `go vet ./...`, `GOOS=windows go vet ./...`, `go test ./...` (the e2e
+  package under the shared lock). The browser E2E (Linux: FFmpeg pipeline, which this step does
+  not change there) passed 177 checks and failed 8 real-time / fps checks (`steady real-time
+  playback`, `video decoding` at 35-44 fps of 60, ...) while other jobs kept the 4-core sandbox at
+  a load of 6-8; the base commit, built from `git archive` and run right after under the same lock
+  and load, gave the same 177 / 8 with the same kind of failures.
+- Not run here: anything on Quick Sync Video (no Intel GPU; under Wine adapter 0 reports NVIDIA,
+  so `auto` never picks `lavc` and the adapter check sees no real second GPU).
+
+### Hardware checks
+
+On an Intel host (12th gen Core or newer with Iris Xe / UHD 7xx, or an Arc card; Arc and Core
+Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe next to it,
+`install-host.ps1 -InstallLibavcodec` done, host.json `"pipeline": "auto"`; logs in
+`$env:APPDATA\KlouditRecon\host.log`, the stats overlay Ctrl+Alt+Shift+S, the browser's
+`__recon.logs`:
+
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (start-up): restart the
+  agent (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`);
+  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'native encoder helper installed' |
+  Select-Object -Last 1` shows `libavcodec="libraries in C:\Program Files\KlouditRecon\ffmpeg-lgpl"`.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (selection): open a stream
+  from Chrome; `Select-String host.log -Pattern 'msg="video pipeline"' | Select-Object -Last 1`
+  shows `pipeline=helper ... backend=lavc vendor=intel adapter="Intel(R) ..."
+  encoders=hevc_lavc_helper,...,h264_lavc_helper skipped="amf: ...; nvenc: ..."`, and
+  `msg="encoder helper started" backend=lavc ... encoder=hevc_qsv usage=low_power ... zero_copy=true
+  live_bitrate=flush ... recovery=keyframe ltr_slots=0 intra_refresh=0` (record `usage`,
+  `zero_copy`; `zero_copy=false` costs a few ms: record the overlay's encode p50 / p95). The
+  overlay shows Encoder `hevc_lavc_helper` and "Loss recovery: key frame".
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (libraries missing): rename
+  `C:\Program Files\KlouditRecon\ffmpeg-lgpl` to `ffmpeg-lgpl.off`, restart the agent: the start
+  line says `libavcodec="not installed: ...ffmpeg-lgpl has no avcodec-62.dll (install-host.ps1
+  -InstallLibavcodec ...)"`; a stream logs `video pipeline pipeline=ffmpeg ... reason="it has no
+  usable encoder" skipped="amf: ...; nvenc: ...; lavc: its FFmpeg libraries are not installed:
+  ..."` and streams with FFmpeg's `hevc_qsv` (`msg="starting encoder"`). Rename it back.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (`helperLibavcodec` off):
+  add `"helperLibavcodec": "off"` to host.json, restart: `libavcodec="off (host config
+  \"helperLibavcodec\")"`; a stream logs `pipeline=ffmpeg reason="its libavcodec backend is off
+  (host config \"helperLibavcodec\")"`. Remove it again.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (losses: an IDR in the
+  running encoder, no restart): start the agent for this test only with
+  `Stop-ScheduledTask 'KloudIT Recon Host'; $env:RECON_TEST_FAULTS="drop=every:300"; &
+  "$env:ProgramFiles\KlouditRecon\recon-host.exe"` (one dropped frame every 5 s at 60 fps) and
+  stream HEVC with constant motion for 2 minutes: every `frames dropped why="test fault"` is
+  followed by `forcing a key frame reason="frame lost"`, no `recovering from a loss`, no
+  `restarting video`, no `encoder helper failed`; the client's `__recon.lastStats.keyFrames` grows by one per
+  drop; the picture recovers within ~2 frame intervals (overlay Freezes row: none > 100 ms).
+  Repeat with H.264 and (Arc / Core Ultra) AV1. Record the time from `frames dropped` to the
+  next key frame's arrival (client `__recon.logs`).
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (rate changes): with the
+  capdrop profile (`./netem.sh apply capdrop --ct <gateway CTID> --host <client IP>`, 0.4) for 5
+  minutes, host.log: `changing the bitrate in the encoder` lines (no `restarting video`), each
+  followed by a key frame on the client (flush), increases at least 2 s apart; the overlay's
+  bitrate follows the steps. Then run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify
+  -quality speed` (Intel: 2-3 codecs x cbr x seamless / flush, about 6 minutes; record the
+  table), restart the stream: `live-bitrate qualification ... choice="hevc speed: adaptive
+  cbr/<mode>, ..."` and `encoder helper started ... live_bitrate=<mode>
+  live_bitrate_from=qualification`; with `seamless` the capdrop run shows no key frames at the
+  changes and changes 250 ms apart. Record per codec whether the QSV runtime resets without a new
+  sequence (seamless pass) as in 3.8's `--live-bitrate=seamless` check.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (hybrid laptop, Intel iGPU
+  + NVIDIA dGPU, both backends usable): stream the internal panel: `backend=lavc` (adapter 0 is
+  the iGPU; `skipped` has no nvenc entry, or `nvenc: usable, not tried (the helper chose lavc
+  for Intel...)`). Then choose an external monitor wired to the dGPU in the client's monitor
+  setting: `native encoder helper: trying another backend backend=nvenc instead_of=lavc
+  reason="its lavc encoder runs on Intel(R) ..., the monitor (\\.\DISPLAYn) is on NVIDIA ..."`
+  and `video pipeline pipeline=helper backend=nvenc` (for an already running session: `video
+  pipeline pipeline=ffmpeg was=helper reason="its lavc encoder runs on ..."`, the session moves to
+  FFmpeg). Record which outputs DXGI lists on which adapter (`recon-encoder.exe --print-caps`
+  `outputs`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (no regression; with an Intel iGPU enabled and
+  `-InstallLibavcodec` done, and without): a stream logs `video pipeline pipeline=helper ...
+  backend=amf` without `skipped`, `msg="encoder helper started"` without `encoder=` /
+  `usage=`; the time from `session started` to `encoder ready` is the same as before (no
+  relaunch: one `encoder helper:` start banner per session plus the spare). A monitor on the
+  iGPU's outputs (if any) logs `trying another backend backend=lavc` and streams on Quick Sync.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD test with `backend=nvenc`
+  (`skipped="amf: AMF runtime ... not found ..."` is expected there).
+
 ## 4.1 Decoder hygiene
 
 What changed (browser client only; no protocol change: the hello's per-family `hw` flag is now

@@ -42,11 +42,22 @@ import (
 type Options struct {
 	Helper     string   // recon-encoder.exe
 	HelperArgs []string // extra helper arguments for every run (tests: --mock-rate-lag=5)
-	Backend    string   // auto (default) | amf | nvenc | mock
+	Backend    string   // auto (default) | amf | nvenc | lavc | mock
 	// NvencTestDLL runs the NVENC backend against this test double of the
 	// NVIDIA runtime (recon-fake-nvenc.dll; tests only). Its bitstream does
 	// not decode: the decode and barcode checks are skipped.
 	NvencTestDLL string
+	// FFmpegDir is where the libavcodec backend (GUIDE 3.8) loads FFmpeg's
+	// shared libraries from (the helper's --ffmpeg-dir; recon-host qualify
+	// passes the host config's, as sessions run the helper); "" = the
+	// helper's default.
+	FFmpegDir string
+	// LavcTestEncoder runs the libavcodec backend with these FFmpeg
+	// encoders instead of Quick Sync Video (the helper's
+	// --lavc-test-encoder, e.g. libx264 of an FFmpeg GPL shared build; tests
+	// only, with Backend lavc). Software encoders: the results never apply
+	// to sessions (Results.TestEncoder).
+	LavcTestEncoder string
 	// FFmpeg decodes the streams (frame types, barcodes); "" skips those
 	// checks (noted in every cell).
 	FFmpeg string
@@ -55,7 +66,7 @@ type Options struct {
 	// Qualities: start's quality presets (default Qualities: every preset
 	// a session may ask for; Choose uses only the presets measured).
 	Qualities []string
-	RCModes   []string // default: amf cbr, vbr, vbr_peak; nvenc and others cbr
+	RCModes   []string // default: amf cbr, vbr, vbr_peak; nvenc, lavc and others cbr
 	Modes     []string // default: seamless, flush
 
 	// Capture: synthetic-gpu (the default; its high-motion mode) | dda |
@@ -123,7 +134,9 @@ func (o *Options) defaults() {
 
 // DefaultRCModes returns the rate-control modes qualified for a backend
 // (GUIDE 3.6): AMF's CBR, LATENCY_CONSTRAINED_VBR (rc vbr) and
-// PEAK_CONSTRAINED_VBR (rc vbr_peak); NVENC (and the mock) CBR.
+// PEAK_CONSTRAINED_VBR (rc vbr_peak); NVENC, libavcodec (Quick Sync's
+// low-delay VBR with the peak at the target, which rc cbr and vbr_peak both
+// are) and the mock CBR.
 func DefaultRCModes(backend string) []string {
 	if backend == "amf" {
 		return []string{"cbr", "vbr", "vbr_peak"}
@@ -131,12 +144,27 @@ func DefaultRCModes(backend string) []string {
 	return []string{"cbr"}
 }
 
-// Caps runs the helper's --print-caps.
-func Caps(ctx context.Context, helper, backend, nvencTestDLL string) (encoder.Caps, error) {
-	args := []string{"--print-caps", "--backend=" + backend, "--log-level=error"}
-	if nvencTestDLL != "" {
-		args = append(args, "--nvenc-test-dll="+nvencTestDLL)
+// backendArgs are the helper arguments that pick and set up its encoder
+// backend, for --print-caps and every run alike.
+func (o Options) backendArgs(backend string) []string {
+	args := []string{"--backend=" + backend}
+	if o.NvencTestDLL != "" {
+		args = append(args, "--nvenc-test-dll="+o.NvencTestDLL)
 	}
+	if o.FFmpegDir != "" {
+		args = append(args, "--ffmpeg-dir="+o.FFmpegDir)
+	}
+	if o.LavcTestEncoder != "" {
+		args = append(args, "--lavc-test-encoder="+o.LavcTestEncoder)
+	}
+	return args
+}
+
+// Caps runs the helper's --print-caps with o's backend.
+func Caps(ctx context.Context, o Options) (encoder.Caps, error) {
+	o.defaults()
+	helper := o.Helper
+	args := append([]string{"--print-caps", "--log-level=error"}, o.backendArgs(o.Backend)...)
 	var c encoder.Caps
 	out, err := exec.CommandContext(ctx, helper, args...).Output()
 	if err != nil {
@@ -157,7 +185,7 @@ func Caps(ctx context.Context, helper, backend, nvencTestDLL string) (encoder.Ca
 // verdict "error"; Run itself fails only when the helper cannot run at all.
 func Run(ctx context.Context, o Options) (*Results, error) {
 	o.defaults()
-	caps, err := Caps(ctx, o.Helper, o.Backend, o.NvencTestDLL)
+	caps, err := Caps(ctx, o)
 	if err != nil {
 		return nil, err
 	}
@@ -172,8 +200,11 @@ func Run(ctx context.Context, o Options) (*Results, error) {
 	host, _ := os.Hostname()
 	r := &Results{Version: ResultsVersion, Time: time.Now().UTC().Truncate(time.Second), Host: host,
 		HelperVersion: caps.HelperVersion, Backend: caps.Backend, Vendor: caps.Vendor, AdapterName: caps.AdapterName,
-		AdapterLUID: caps.AdapterLUID, TestDouble: o.NvencTestDLL != "", Criteria: DefaultCriteria()}
+		AdapterLUID: caps.AdapterLUID, TestDouble: o.NvencTestDLL != "", TestEncoder: o.LavcTestEncoder, Criteria: DefaultCriteria()}
 
+	if o.LavcTestEncoder != "" {
+		r.Notes = append(r.Notes, "libavcodec test encoder "+o.LavcTestEncoder+" (software, not Quick Sync Video): sessions never use these results")
+	}
 	mock := caps.Backend == "mock"
 	capture := o.Capture
 	if capture == "" {
@@ -299,10 +330,10 @@ type cellRun struct {
 // encode test acknowledges after --ack-delay frames), rc and live-bitrate
 // mode, with the rate schedule.
 func cellArgs(o Options, cr cellRun, c *Cell, stream, frameLog string) []string {
-	args := []string{"--encode-test=" + stream, "--frame-log=" + frameLog, "--backend=" + cr.backend, "--codec=" + c.Codec,
-		"--capture=" + cr.capture, "--fps=" + fmt.Sprint(o.FPS), "--kbps=" + fmt.Sprint(o.HighKbps), "--quality=" + c.Quality,
-		"--rc=" + c.RC, "--live-bitrate=" + c.LiveBitrate, "--frames=" + fmt.Sprint(cr.frames),
-		fmt.Sprintf("--rate-schedule=%d,%d:%d", o.LowKbps, o.HighKbps, cr.step)}
+	args := append([]string{"--encode-test=" + stream, "--frame-log=" + frameLog}, o.backendArgs(cr.backend)...)
+	args = append(args, "--codec="+c.Codec, "--capture="+cr.capture, "--fps="+fmt.Sprint(o.FPS), "--kbps="+fmt.Sprint(o.HighKbps),
+		"--quality="+c.Quality, "--rc="+c.RC, "--live-bitrate="+c.LiveBitrate, "--frames="+fmt.Sprint(cr.frames),
+		fmt.Sprintf("--rate-schedule=%d,%d:%d", o.LowKbps, o.HighKbps, cr.step))
 	if c.LTRSlots > 0 {
 		args = append(args, fmt.Sprintf("--ltr-slots=%d", c.LTRSlots))
 	}
@@ -320,9 +351,6 @@ func cellArgs(o Options, cr cellRun, c *Cell, stream, frameLog string) []string 
 	}
 	if cr.barcode {
 		args = append(args, fmt.Sprintf("--barcode=%d,%d,%d", barcodeAt.X, barcodeAt.Y, barcodeAt.Cell))
-	}
-	if o.NvencTestDLL != "" {
-		args = append(args, "--nvenc-test-dll="+o.NvencTestDLL)
 	}
 	if cr.mock {
 		args = append(args, "--mock-follow-rate") // frame sizes that follow the rate

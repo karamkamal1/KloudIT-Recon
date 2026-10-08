@@ -44,11 +44,15 @@ type Agent struct {
 	audioSource media.AudioSource
 	faults      testFaults // TestFaultsEnv: tests only
 
-	// launchHelper starts the native encoder helper for a session; nil when
-	// the host has none (helperMissing says why: not Windows, host config
-	// "pipeline" "ffmpeg", or recon-encoder.exe missing).
-	launchHelper  func(log *slog.Logger) (*encoder.Helper, error)
+	// launchHelper starts the native encoder helper for a session with an
+	// encoder backend ("" = auto: the helper's own order); nil when the host
+	// has none (helperMissing says why: not Windows, host config "pipeline"
+	// "ffmpeg", or recon-encoder.exe missing). lavcMissing says why the
+	// helper's libavcodec backend cannot find FFmpeg's libraries ("" when
+	// they are installed).
+	launchHelper  func(log *slog.Logger, backend string) (*encoder.Helper, error)
 	helperMissing string
+	lavcMissing   string
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads

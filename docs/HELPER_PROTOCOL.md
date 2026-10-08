@@ -1161,6 +1161,20 @@ device has no NV12 render targets, Wine), the synthetic capture's test pattern o
 `preset` `ultrafast`, `tune` `zerolatency`, `forced-idr` 1, `scenecut` 0. It never runs in
 production (the installed LGPL build has no libx264).
 
+**Sessions** (step 3.8 wiring; docs/ARCHITECTURE.md "Two pipelines"). recon-host launches every
+helper with `--ffmpeg-dir` = host config `helperFFmpegDir` (default `ffmpeg-lgpl\` next to
+recon-host.exe, which is where the helper looks by default too; a relative value is taken from
+that directory) and checks at start that `avcodec-62.dll` and `avutil-60.dll` are there. A session
+takes this backend when the helper's `auto` choice falls to it (no AMF / NVENC encoder, or an
+Intel primary adapter) or when the vendor backend cannot serve it (another GPU's monitor, a codec
+it lacks: then recon-host relaunches the helper with `--backend=lavc`), unless
+`helperLibavcodec` is `off`; the backend is then pinned for the session's restarts and spare.
+From the caps: `recover` is never sent (recovery `none`: the session forces an IDR, the client
+is told recovery `keyframe`), `start` carries no `ltrSlots` / `intraRefreshFrames` / `svcLayers`,
+and `liveBitrate` `flush` (a key frame per `setRate`; the rate controller's flush policy) unless
+`recon-host qualify` measured `seamless`. The `encoder helper started` log line carries
+`encoder`, `usage`, `preset` and `zero_copy`.
+
 ## Phase 5 features
 
 GUIDE 9's differentiators, helper and Go client side (`internal/host/encoder`); the session
@@ -1447,7 +1461,10 @@ changes its bitrate while it runs and records it for sessions. It reads the help
 (`--print-caps`) and runs one encode test per codec of the caps x quality preset (`speed`,
 `balanced`, `quality`: every preset a session may ask for; `-quality` narrows it) x
 rate-control mode (AMF: `cbr`, `vbr` = LATENCY_CONSTRAINED_VBR, `vbr_peak` =
-PEAK_CONSTRAINED_VBR; NVENC and others: `cbr`) x live-bitrate mode (`seamless`, `flush`). Each
+PEAK_CONSTRAINED_VBR; NVENC, libavcodec and others: `cbr`) x live-bitrate mode (`seamless`,
+`flush`). The helper runs as sessions run it (`--backend=auto`, `--ffmpeg-dir` = host config
+`helperFFmpegDir`; `-backend lavc` measures the libavcodec backend on a host where `auto` picks
+another one; tests: `-lavc-test-encoder libx264`, whose results never apply). Each
 stream starts as a session starts that codec on this encoder: its `quality`, and `ltrSlots` 2
 where the codec recovers from LTR frames (caps `recovery` `ltr`, `maxLtr` >= 2: AMF), whose
 marked frames the encode test acknowledges `--ack-delay` (2) frames later, so AMF runs with its

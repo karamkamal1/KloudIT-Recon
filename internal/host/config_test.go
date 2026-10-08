@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,5 +166,36 @@ func TestConfigVirtualDisplay(t *testing.T) {
 	}
 	if _, err := load(`{"virtualDisplayLayout":"mirror"}`); err == nil || !strings.Contains(err.Error(), "virtualDisplayLayout") {
 		t.Fatalf("unknown virtualDisplayLayout: %v", err)
+	}
+}
+
+// TestConfigLibavcodec: host config helperLibavcodec (auto | off) and
+// helperFFmpegDir (default ffmpeg-lgpl next to recon-host.exe; relative to
+// that directory).
+func TestConfigLibavcodec(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	install := filepath.Join(dir, "KlouditRecon")
+	c, err := load(`{}`)
+	if err != nil || !c.libavcodecOn() || c.helperFFmpegDir(install) != filepath.Join(install, "ffmpeg-lgpl") {
+		t.Fatalf("defaults: %v on %v dir %q", err, c.libavcodecOn(), c.helperFFmpegDir(install))
+	}
+	if c, err = load(`{"helperLibavcodec":"off","helperFFmpegDir":"libs/ffmpeg"}`); err != nil || c.libavcodecOn() ||
+		c.helperFFmpegDir(install) != filepath.Join(install, "libs", "ffmpeg") {
+		t.Fatalf("off, relative dir: %v on %v dir %q", err, c.libavcodecOn(), c.helperFFmpegDir(install))
+	}
+	abs := filepath.Join(dir, "ffmpeg-8.1")
+	if c, err = load(`{"helperLibavcodec":"auto","helperFFmpegDir":` + strconv.Quote(abs) + `}`); err != nil || !c.libavcodecOn() ||
+		c.helperFFmpegDir(install) != abs {
+		t.Fatalf("auto, absolute dir: %v dir %q", err, c.helperFFmpegDir(install))
+	}
+	if _, err := load(`{"helperLibavcodec":"on"}`); err == nil || !strings.Contains(err.Error(), "helperLibavcodec") {
+		t.Fatalf("bad value: %v", err)
 	}
 }

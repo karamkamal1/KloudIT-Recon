@@ -25,11 +25,11 @@ func qualifyCmd(cfg *host.Config, cfgPath string, args []string) int {
 	var o qualify.Options
 	exe, _ := os.Executable()
 	helper := fs.String("helper", filepath.Join(filepath.Dir(exe), "recon-encoder.exe"), "the native encoder helper")
-	fs.StringVar(&o.Backend, "backend", "auto", "encoder backend: auto | amf | nvenc | mock")
+	fs.StringVar(&o.Backend, "backend", "auto", "encoder backend: auto (as sessions start the helper) | amf | nvenc | lavc | mock")
 	codecs := fs.String("codecs", "", "codecs to qualify, comma separated (default: every codec of the helper's encoder)")
 	qualities := fs.String("quality", strings.Join(qualify.Qualities, ","), "encoder quality presets (the client's preset setting); "+
 		"sessions with a preset not qualified get the helper's defaults")
-	rcs := fs.String("rc", "", "rate-control modes: cbr, vbr (AMF LATENCY_CONSTRAINED_VBR), vbr_peak (AMF PEAK_CONSTRAINED_VBR); default AMF all three, NVENC cbr")
+	rcs := fs.String("rc", "", "rate-control modes: cbr, vbr (AMF LATENCY_CONSTRAINED_VBR), vbr_peak (AMF PEAK_CONSTRAINED_VBR); default AMF all three, NVENC and libavcodec cbr")
 	modes := fs.String("modes", "seamless,flush", "live-bitrate modes")
 	fs.StringVar(&o.Capture, "capture", "", "source: synthetic-gpu (default, high motion) | dda | amd-direct (with a high-motion game or video on the monitor)")
 	fs.IntVar(&o.Monitor, "monitor", 0, "dda / amd-direct: output index on the primary adapter")
@@ -45,7 +45,9 @@ func qualifyCmd(cfg *host.Config, cfgPath string, args []string) int {
 	fs.StringVar(&o.WorkDir, "dir", "", "directory for the streams and logs (default qualify-<time> next to the config)")
 	fs.BoolVar(&o.Keep, "keep", false, "keep the encoded streams (about 250 MB per run at the defaults)")
 	ffmpeg := fs.String("ffmpeg", "", "ffmpeg (5.1+) for the decode and barcode checks (default: as the agent finds it)")
+	fs.StringVar(&o.FFmpegDir, "ffmpeg-dir", cfg.LibavcodecDir(), "where the libavcodec backend loads FFmpeg's shared libraries from (host config helperFFmpegDir)")
 	fs.StringVar(&o.NvencTestDLL, "nvenc-test-dll", "", "tests: run the NVENC backend against this test double (recon-fake-nvenc.dll)")
+	fs.StringVar(&o.LavcTestEncoder, "lavc-test-encoder", "", "tests: run the libavcodec backend (-backend lavc) with these FFmpeg software encoders, e.g. libx264")
 	helperArgs := fs.String("helper-args", "", "tests: extra helper arguments for every run, space separated (e.g. --mock-rate-lag=5)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: recon-host [-config FILE] qualify [flags]
@@ -85,7 +87,7 @@ change. Stop streaming sessions first.
 		}
 	}
 	confDir := filepath.Dir(cfgPath)
-	test := o.Backend == "mock" || o.NvencTestDLL != ""
+	test := o.Backend == "mock" || o.NvencTestDLL != "" || o.LavcTestEncoder != ""
 	if o.WorkDir == "" {
 		o.WorkDir = filepath.Join(confDir, "qualify-"+timeStamp())
 	}

@@ -466,6 +466,33 @@ Direct Capture or DDA it lacks, `capture` `x11grab` / `test`, or an FFmpeg encod
 host.json. Otherwise FFmpeg. A later settings change that needs FFmpeg moves the session to
 FFmpeg for good, with the generation numbers continuing.
 
+The rungs, in order (GUIDE 3.8; `chooseHelper` in `internal/host/pipeline.go`):
+
+1. The helper with the GPU vendor's own encoder backend (AMF, NVENC): reference recovery, live
+   bitrate.
+2. The helper's libavcodec backend (Intel Quick Sync Video through FFmpeg 8.x's shared
+   libraries in host config `helperFFmpegDir`, by default `ffmpeg-lgpl\` next to
+   `recon-host.exe`; `helperLibavcodec` `off` skips it): its caps say recovery `none` (every
+   loss costs a key frame, forced in the running encoder: no restart), live bitrate `flush` (a
+   key frame per change, so the rate controller changes it seconds apart) unless a qualification
+   measured `seamless`, no LTR, SVC, ROI or intra refresh. The session reads all of this from
+   the caps, as for any backend.
+3. FFmpeg's command line.
+
+The first launch lets the helper pick its backend (`auto`: the primary display adapter's
+vendor first; libavcodec last, or first on an Intel primary adapter, whose outputs AMF and NVENC
+cannot encode). Each backend encodes only captures of its own GPU (`caps.adapterLuid`), so a
+monitor whose output (`caps.outputs`, by HMONITOR) is on another GPU, a laptop's external port
+on the discrete GPU for instance, rules that backend out; so do `helperLibavcodec` `off` and a
+negotiated codec that is not one of its codecs. Then the next backend in the order that the
+caps did not report unavailable is launched explicitly (`--backend=...`), until one fits or none
+is left. The codec is negotiated at the stream's real size (as `buildParams` does), so the
+decode-time choice (step 4.2) cannot differ. The chosen backend is pinned for the session: its
+restarts and the spare helper launch with it. host.log has one `video pipeline` line per session
+with the choice, the reason and why each rung before it was skipped (`skipped="amf: AMF runtime
+... not found; nvenc: ...; lavc: its FFmpeg libraries are not installed: ..."`), and at start
+`native encoder helper installed ... libavcodec=libraries in ...` (or why not).
+
 **Generations on the helper.** The helper numbers frames itself (frame ids; a gap is a lost
 frame). A generation starts at a key frame flagged SEQ_START (the stream's first frame, and the IDR
 that answers `forceIdr`), and `seq` is the frame id minus that frame's. A forced key frame

@@ -575,12 +575,18 @@ func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, frameExt 
 	return p, backend
 }
 
-func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
-	mons := s.a.monitors()
-	mon := mons[0]
+// monitorFor returns the monitor a session with prefs captures: the one it
+// names, else the first.
+func (a *Agent) monitorFor(prefs proto.Prefs) platform.Monitor {
+	mons := a.monitors()
 	if prefs.Monitor >= 0 && prefs.Monitor < len(mons) {
-		mon = mons[prefs.Monitor]
+		return mons[prefs.Monitor]
 	}
+	return mons[0]
+}
+
+func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
+	mon := s.a.monitorFor(prefs)
 	s.prefsMu.Lock()
 	s.monitor = mon
 	s.prefsMu.Unlock()
@@ -589,7 +595,11 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	// Capture timestamps only reach clients that parse the frame extension.
 	p, backend := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
 	if helper, _, c := s.onHelper(); helper {
-		if why := s.helperBlocker(prefs, p.DrawCursor, &c); why != "" {
+		why := s.helperBlocker(prefs, p.DrawCursor, &c)
+		if why == "" {
+			why = s.adapterBlocker(prefs, mon, &c) // another monitor, on another GPU
+		}
+		if why != "" {
 			s.leaveHelper(why)
 		}
 	}

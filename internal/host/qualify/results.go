@@ -83,18 +83,20 @@ type Results struct {
 	Time          time.Time `json:"time"`
 	Host          string    `json:"host,omitempty"`
 	HelperVersion string    `json:"helperVersion"`
-	Backend       string    `json:"backend"` // amf | nvenc | mock
+	Backend       string    `json:"backend"` // amf | nvenc | lavc | mock
 	Vendor        string    `json:"vendor"`
 	AdapterName   string    `json:"adapterName"`
 	AdapterLUID   string    `json:"adapterLuid,omitempty"` // changes with every boot: informational
-	// TestDouble: measured against the NVENC test double, never used by
-	// sessions.
-	TestDouble bool     `json:"testDouble,omitempty"`
-	Source     Source   `json:"source"`
-	Schedule   Schedule `json:"schedule"`
-	Criteria   Criteria `json:"criteria"`
-	Notes      []string `json:"notes,omitempty"`
-	Cells      []Cell   `json:"cells"`
+	// TestDouble: measured against the NVENC test double; TestEncoder:
+	// with the libavcodec backend's test encoders (Options.LavcTestEncoder,
+	// software). Neither is ever used by sessions.
+	TestDouble  bool     `json:"testDouble,omitempty"`
+	TestEncoder string   `json:"testEncoder,omitempty"`
+	Source      Source   `json:"source"`
+	Schedule    Schedule `json:"schedule"`
+	Criteria    Criteria `json:"criteria"`
+	Notes       []string `json:"notes,omitempty"`
+	Cells       []Cell   `json:"cells"`
 	// Choice: per codec and quality preset.
 	Choice map[string]map[string]Choice `json:"choice"`
 }
@@ -136,13 +138,16 @@ func Load(path string) (*Results, error) {
 
 // Matches reports whether the results were measured on the encoder of a
 // helper with these caps (same backend and adapter; why not otherwise).
-// Results of the NVENC test double never match.
+// Results of the NVENC test double or of the libavcodec backend's test
+// encoders never match.
 func (r *Results) Matches(c encoder.Caps) (bool, string) {
 	switch {
 	case r == nil:
 		return false, "no results"
 	case r.TestDouble:
 		return false, "measured with the NVENC test double"
+	case r.TestEncoder != "":
+		return false, "measured with the libavcodec backend's test encoder " + r.TestEncoder
 	case r.Backend != c.Backend:
 		return false, fmt.Sprintf("measured on backend %s, the helper runs %s", r.Backend, c.Backend)
 	case r.AdapterName != c.AdapterName:
@@ -234,13 +239,13 @@ func (r *Results) Choose(c encoder.Caps, sp encoder.StartParams, adaptive bool) 
 }
 
 // Choices computes from the cells what a session on this GPU uses for every
-// codec and quality preset measured (Choose; the test double's results too,
-// for the record).
+// codec and quality preset measured (Choose; test runs' results too, for the
+// record).
 func (r *Results) Choices() map[string]map[string]Choice {
 	out := map[string]map[string]Choice{}
 	c := encoder.Caps{Backend: r.Backend, AdapterName: r.AdapterName}
 	rr := *r
-	rr.TestDouble = false
+	rr.TestDouble, rr.TestEncoder = false, ""
 	for _, cell := range r.Cells {
 		if _, done := out[cell.Codec][cell.Quality]; done {
 			continue

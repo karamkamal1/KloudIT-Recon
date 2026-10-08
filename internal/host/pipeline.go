@@ -3,6 +3,7 @@ package host
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,8 +25,20 @@ import (
 // helperExeName is the native encoder helper, installed next to recon-host.exe.
 const helperExeName = "recon-encoder.exe"
 
+// helperBackends are the helper's encoder backends in the order sessions try
+// them (GUIDE 3.8): the GPU vendors' own encoders (AMF, NVENC: reference
+// recovery, seamless bitrate changes), then libavcodec (Intel Quick Sync
+// Video through FFmpeg's shared libraries: key-frame recovery). After them
+// comes the FFmpeg command line.
+var helperBackends = []string{"amf", "nvenc", backendLavc}
+
+// backendLavc is the helper's libavcodec backend.
+const backendLavc = "lavc"
+
 // setupHelper finds the native encoder helper next to the running executable
-// (Windows, host config "pipeline" auto or helper) and logs what it found.
+// (Windows, host config "pipeline" auto or helper) and the FFmpeg libraries of
+// its libavcodec backend (host config "helperFFmpegDir"), and logs what it
+// found.
 func (a *Agent) setupHelper() {
 	switch {
 	case a.cfg.pipeline() == media.PipelineFFmpeg:
@@ -34,18 +47,29 @@ func (a *Agent) setupHelper() {
 		a.helperMissing = "the native encoder helper is Windows-only"
 	default:
 		exe, err := os.Executable()
+		dir := ""
 		if err == nil {
-			exe = filepath.Join(filepath.Dir(exe), helperExeName)
+			dir = filepath.Dir(exe)
+			exe = filepath.Join(dir, helperExeName)
 			_, err = os.Stat(exe)
 		}
 		if err != nil {
 			a.helperMissing = helperExeName + " is not installed next to recon-host: " + err.Error()
 			break
 		}
-		a.launchHelper = func(log *slog.Logger) (*encoder.Helper, error) {
-			return encoder.Launch(encoder.Options{Exe: exe, Log: log, CapsTimeout: 5 * time.Second})
+		ffDir := a.cfg.helperFFmpegDir(dir)
+		a.lavcMissing = encoder.LavcMissing(ffDir)
+		a.launchHelper = func(log *slog.Logger, backend string) (*encoder.Helper, error) {
+			return encoder.Launch(encoder.Options{Exe: exe, Backend: backend, FFmpegDir: ffDir, Log: log, CapsTimeout: 5 * time.Second})
 		}
-		a.log.Info("native encoder helper installed", "path", exe, "pipeline", a.cfg.pipeline())
+		lavc := "libraries in " + ffDir
+		switch {
+		case !a.cfg.libavcodecOn():
+			lavc = `off (host config "helperLibavcodec")`
+		case a.lavcMissing != "":
+			lavc = "not installed: " + a.lavcMissing
+		}
+		a.log.Info("native encoder helper installed", "path", exe, "pipeline", a.cfg.pipeline(), "libavcodec", lavc)
 		return
 	}
 	a.log.Info("native encoder helper not used", "reason", a.helperMissing, "pipeline", a.cfg.pipeline())
@@ -77,13 +101,18 @@ func (s *Session) encoders() []media.EncoderInfo {
 	return append(slices.Clone(encs), s.a.caps.Encoders...)
 }
 
-// openPipeline decides the session's video pipeline, once: the native helper
-// when the host config allows it ("pipeline" auto or helper), it is installed,
-// starts and can encode, the codec negotiated with this browser is one of its
-// codecs and the session needs nothing only FFmpeg offers (helperBlocker);
-// else FFmpeg. It logs the decision and why, and returns a notice for the
-// user when "pipeline" "helper" could not be honoured. Later the session moves
-// to FFmpeg for good when it needs FFmpeg after all (leaveHelper).
+// openPipeline decides the session's video pipeline, once, trying in this
+// order (GUIDE 3.8): the native helper with a GPU vendor's encoder backend
+// (AMF, NVENC), the helper's libavcodec backend (Intel Quick Sync Video; host
+// config "helperLibavcodec", its FFmpeg libraries in "helperFFmpegDir"), then
+// FFmpeg's command line. The helper is used when the host config allows it
+// ("pipeline" auto or helper), it is installed, starts and can encode, the
+// codec negotiated with this browser is one of its codecs and the session
+// needs nothing only FFmpeg offers (helperBlocker); chooseHelper steps through
+// its backends. It logs the decision, why, and why each earlier rung was
+// skipped, and returns a notice for the user when "pipeline" "helper" could
+// not be honoured. Later the session moves to FFmpeg for good when it needs
+// FFmpeg after all (leaveHelper).
 func (s *Session) openPipeline() (notice string) {
 	mode := s.a.cfg.pipeline()
 	prefs := s.currentPrefs()
@@ -96,53 +125,220 @@ func (s *Session) openPipeline() (notice string) {
 		why = s.helperBlocker(prefs, drawCursor, nil)
 	}
 	var h *encoder.Helper
+	skipped := helperSkips{}
 	if why == "" {
-		var err error
-		if h, err = s.a.launchHelper(s.log); err != nil {
-			why = "it did not start: " + err.Error()
-		} else if c := h.Caps(); !c.Usable() {
-			why = "it has no usable encoder (" + unavailableText(c) + ")"
-		} else if why = s.helperBlocker(prefs, drawCursor, &c); why == "" {
-			// The codec this browser and the host agree on must be one of
-			// the helper's (its encoders come first in the negotiation).
-			s.pipeMu.Lock()
-			s.helperEncs, s.helperCaps = media.HelperEncoders(c), c
-			s.pipeMu.Unlock()
-			// The stream's size is not known here (0, 0: neither padding nor
-			// decode times scaled to it); buildParams negotiates again at it
-			// and leaves the helper if that codec is not one of its.
-			if e, _, err := s.negotiateEncoder(prefs, 0, 0, false); err != nil || !e.Helper {
-				why = fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", e.Name, encoderNames(s.helperEncs))
-			}
-		}
-		if why != "" && h != nil {
-			go h.Close()
-			h = nil
-		}
+		h, why = s.chooseHelper(prefs, drawCursor, skipped)
 	}
 	s.pipeMu.Lock()
 	defer s.pipeMu.Unlock()
 	if h == nil {
 		s.helperEncs, s.helperCaps = nil, encoder.Caps{}
 		s.video = media.NewVideo(s.a.caps, s.log, s.a.clock)
-		s.log.Info("video pipeline", "pipeline", media.PipelineFFmpeg, "config", mode, "reason", why)
+		attrs := []any{"pipeline", media.PipelineFFmpeg, "config", mode, "reason", why}
+		if len(skipped) > 0 {
+			attrs = append(attrs, "skipped", skipped.String())
+		}
+		s.log.Info("video pipeline", attrs...)
 		if mode == media.PipelineHelper {
+			if len(skipped) > 0 {
+				why += "; " + skipped.String()
+			}
 			return "The native encoder is not used (" + why + "); streaming with FFmpeg."
 		}
 		return ""
 	}
 	c := h.Caps()
 	lb := s.a.liveBitrateResults(s.log, c)
+	backend := c.Backend // restarts and the spare run the same backend
 	s.video = media.NewHelperVideo(media.HelperOptions{
-		Launch: func() (*encoder.Helper, error) { return s.a.launchHelper(s.log) },
+		Launch: func() (*encoder.Helper, error) { return s.a.launchHelper(s.log, backend) },
 		First:  h, Log: s.log, Clock: s.a.hostClock, KeepSpare: true,
 		LiveBitrate: func(c encoder.Caps, sp encoder.StartParams, adaptive bool) (string, string, bool) {
 			return lb.Choose(c, sp, adaptive)
 		},
 	})
-	s.log.Info("video pipeline", "pipeline", media.PipelineHelper, "config", mode, "backend", c.Backend, "vendor", c.Vendor,
+	attrs := []any{"pipeline", media.PipelineHelper, "config", mode, "backend", c.Backend, "vendor", c.Vendor,
 		"adapter", c.AdapterName, "encoders", encoderNames(s.helperEncs), "capture", strings.Join(c.Capture, ","),
-		"hags", hagsText(c.HAGSEnabled))
+		"hags", hagsText(c.HAGSEnabled)}
+	if len(skipped) > 0 {
+		attrs = append(attrs, "skipped", skipped.String())
+	}
+	s.log.Info("video pipeline", attrs...)
+	return ""
+}
+
+// helperSkips collects why the pipeline selection passed over each of the
+// helper's backends (backend -> why), for the "video pipeline" log line.
+type helperSkips map[string]string
+
+// String lists them in the selection order ("amf: ...; nvenc: ...").
+func (k helperSkips) String() string {
+	var parts []string
+	for _, b := range helperBackends {
+		if why, ok := k[b]; ok {
+			parts = append(parts, b+": "+why)
+		}
+	}
+	for _, b := range slices.Sorted(maps.Keys(k)) {
+		if !slices.Contains(helperBackends, b) {
+			parts = append(parts, b+": "+k[b])
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// chooseHelper launches the native helper and returns it when it can serve
+// the session (helperFits), else nil and why not. The first launch lets the
+// helper choose its backend ("auto": the primary display adapter's vendor
+// encoder first, libavcodec last, or first on an Intel primary adapter, whose
+// outputs AMF and NVENC cannot encode); when that backend cannot serve the
+// session for a reason of its own (its encoder runs on another adapter than
+// the monitor's, the libavcodec backend is off, the codec negotiated with
+// this browser is not one of its codecs), the next backend in the selection
+// order (helperBackends) the helper reported usable is launched instead.
+// skipped gets why each backend before the one chosen (all of them, when
+// none is, except the last one tried: its reason is returned) was passed
+// over.
+func (s *Session) chooseHelper(prefs proto.Prefs, drawCursor bool, skipped helperSkips) (*encoder.Helper, string) {
+	mon := s.a.monitorFor(prefs)
+	tried := map[string]bool{}
+	unavailable := map[string]string{} // over every launch
+	choice := ""                       // the helper's own choice of backend, for the log
+	// fill notes why the backends before index upTo of helperBackends were
+	// not used where no launch said so: unavailable, turned off, not
+	// installed, or usable but not the helper's choice.
+	fill := func(upTo int, except string) {
+		for _, b := range helperBackends[:upTo] {
+			if _, done := skipped[b]; done || b == except {
+				continue
+			}
+			switch {
+			case b == backendLavc && !s.a.cfg.libavcodecOn():
+				skipped[b] = `off (host config "helperLibavcodec")`
+			case b == backendLavc && s.a.lavcMissing != "":
+				skipped[b] = "its FFmpeg libraries are not installed: " + s.a.lavcMissing
+			case unavailable[b] != "":
+				skipped[b] = unavailable[b]
+			case tried[b]:
+				skipped[b] = "not usable"
+			default:
+				skipped[b] = "usable, not tried (" + choice + ")"
+			}
+		}
+	}
+	backend := "" // auto
+	for {
+		h, err := s.a.launchHelper(s.log, backend)
+		if err != nil {
+			if backend == "" {
+				return nil, "it did not start: " + err.Error()
+			}
+			tried[backend] = true
+			fill(len(helperBackends), backend)
+			return nil, fmt.Sprintf("it did not start with backend %s: %v", backend, err)
+		}
+		c := h.Caps()
+		tried[backend], tried[c.Backend] = true, true
+		for k, v := range c.Unavailable {
+			if unavailable[k] == "" {
+				unavailable[k] = v
+			}
+		}
+		if choice == "" {
+			choice = "the helper chose " + c.Backend
+			if c.AdapterName != "" {
+				choice += " for " + c.AdapterName
+			}
+		}
+		why, backendOnly := s.helperFits(prefs, drawCursor, mon, &c)
+		if why == "" {
+			if i := slices.Index(helperBackends, c.Backend); i > 0 {
+				fill(i, "")
+			}
+			return h, ""
+		}
+		go h.Close()
+		switch {
+		case !c.Usable() && backend != "":
+			fill(len(helperBackends), backend)
+			why := c.Unavailable[backend]
+			if why == "" {
+				why = "no encoder"
+			}
+			return nil, fmt.Sprintf("its %s backend is not usable (%s)", backend, why)
+		case !c.Usable():
+			fill(len(helperBackends), "")
+			return nil, why
+		case !backendOnly:
+			return nil, why // the session needs something no backend changes
+		}
+		next := ""
+		for _, b := range helperBackends {
+			usable := unavailable[b] == "" && (b != backendLavc || s.a.cfg.libavcodecOn() && s.a.lavcMissing == "")
+			if !tried[b] && usable {
+				next = b
+				break
+			}
+		}
+		if next == "" {
+			fill(len(helperBackends), c.Backend)
+			return nil, why
+		}
+		skipped[c.Backend] = why
+		s.log.Info("native encoder helper: trying another backend", "backend", next, "instead_of", c.Backend, "reason", why)
+		backend = next
+	}
+}
+
+// helperFits returns why the helper with caps c cannot serve a session with
+// prefs on monitor mon, or "" if it can; backendOnly: the reason is its
+// backend's (another backend may serve the session). On success the session's
+// encoders are the helper's (onHelper).
+func (s *Session) helperFits(prefs proto.Prefs, drawCursor bool, mon platform.Monitor, c *encoder.Caps) (why string, backendOnly bool) {
+	switch {
+	case !c.Usable():
+		return "it has no usable encoder", false
+	case c.Backend == backendLavc && !s.a.cfg.libavcodecOn():
+		return `its libavcodec backend is off (host config "helperLibavcodec")`, true
+	}
+	if why := s.helperBlocker(prefs, drawCursor, c); why != "" {
+		return why, false
+	}
+	if why := s.adapterBlocker(prefs, mon, c); why != "" {
+		return why, true
+	}
+	// The codec this browser and the host agree on must be one of the
+	// helper's (its encoders come first in the negotiation), at the stream's
+	// size as buildParams negotiates it (padding, decode times).
+	s.pipeMu.Lock()
+	s.helperEncs, s.helperCaps = media.HelperEncoders(*c), *c
+	encs := s.helperEncs
+	s.pipeMu.Unlock()
+	p, _ := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
+	w, h := p.OutputSize()
+	if e, _, err := s.negotiateEncoder(prefs, w, h, false); err != nil || !e.Helper {
+		return fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", e.Name, encoderNames(encs)), true
+	}
+	return "", false
+}
+
+// adapterBlocker returns why the helper with caps c cannot encode monitor
+// mon, or "": every backend encodes on one GPU (c.AdapterLUID) and takes only
+// captures of that GPU's outputs (the helper captures on the output's own
+// GPU: DXGI Desktop Duplication, AMD Direct Capture and its WGC device alike),
+// so a monitor on another GPU (a laptop's external port on the discrete GPU,
+// a desktop with monitors on two) needs another backend. A window capture
+// (its monitor is not known here) and the test source are not checked, nor a
+// monitor the caps do not list.
+func (s *Session) adapterBlocker(prefs proto.Prefs, mon platform.Monitor, c *encoder.Caps) string {
+	if prefs.Window != "" || s.a.cfg.Capture == "test" || mon.HMonitor == 0 || c.AdapterLUID == "" {
+		return ""
+	}
+	for _, o := range c.Outputs {
+		if o.HMonitor == mon.HMonitor && o.AdapterLUID != "" && !strings.EqualFold(o.AdapterLUID, c.AdapterLUID) {
+			return fmt.Sprintf("its %s encoder runs on %s, the monitor (%s) is on %s", c.Backend, c.AdapterName, o.Name, o.AdapterName)
+		}
+	}
 	return ""
 }
 
@@ -287,19 +483,6 @@ func encoderNames(encs []media.EncoderInfo) string {
 		names[i] = e.Name
 	}
 	return strings.Join(names, ",")
-}
-
-func unavailableText(c encoder.Caps) string {
-	keys := make([]string, 0, len(c.Unavailable))
-	for k := range c.Unavailable {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	var parts []string
-	for _, k := range keys {
-		parts = append(parts, k+": "+c.Unavailable[k])
-	}
-	return strings.Join(parts, "; ")
 }
 
 func hagsText(h *bool) string {

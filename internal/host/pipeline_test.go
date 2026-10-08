@@ -113,21 +113,31 @@ func TestHelperSource(t *testing.T) {
 	}
 }
 
-// fakeLauncher launches fake helpers for sessions.
+// fakeLauncher launches fake helpers for sessions. byBackend: the caps of a
+// launch with that backend ("" = auto), else caps; backends records them.
 type fakeLauncher struct {
-	caps    string
-	handle  encoder.FakeHandler
-	err     error
-	mu      sync.Mutex
-	fakes   []*encoder.Fake
-	started chan *encoder.Fake
+	caps      string
+	byBackend map[string]string
+	handle    encoder.FakeHandler
+	err       error
+	mu        sync.Mutex
+	fakes     []*encoder.Fake
+	backends  []string
+	started   chan *encoder.Fake
 }
 
-func (l *fakeLauncher) launch(*slog.Logger) (*encoder.Helper, error) {
+func (l *fakeLauncher) launch(_ *slog.Logger, backend string) (*encoder.Helper, error) {
+	l.mu.Lock()
+	l.backends = append(l.backends, backend)
+	l.mu.Unlock()
 	if l.err != nil {
 		return nil, l.err
 	}
-	h, f, err := encoder.LaunchFake(l.caps, func(f *encoder.Fake, m map[string]any) {
+	caps := l.caps
+	if c, ok := l.byBackend[backend]; ok {
+		caps = c
+	}
+	h, f, err := encoder.LaunchFake(caps, func(f *encoder.Fake, m map[string]any) {
 		if l.handle != nil {
 			l.handle(f, m)
 		}

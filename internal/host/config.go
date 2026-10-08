@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -41,6 +42,16 @@ type Config struct {
 	// recon-host.exe, Windows) when it starts, can encode the negotiated codec
 	// and the session needs nothing only FFmpeg offers; else FFmpeg.
 	Pipeline string `json:"pipeline,omitempty"`
+	// HelperFFmpegDir is where the helper's libavcodec backend (Intel Quick
+	// Sync Video, GUIDE 3.8) loads FFmpeg 8.x's shared libraries from ("" =
+	// ffmpeg-lgpl next to recon-host.exe, where install-host.ps1
+	// -InstallLibavcodec puts them; a relative path is taken from
+	// recon-host.exe's directory).
+	HelperFFmpegDir string `json:"helperFFmpegDir,omitempty"`
+	// HelperLibavcodec: whether sessions may stream with the helper's
+	// libavcodec backend where it has no AMF or NVENC encoder for them: auto
+	// | off ("" = auto; off: the FFmpeg command line instead).
+	HelperLibavcodec string `json:"helperLibavcodec,omitempty"`
 	// VirtualDisplay gives a session a virtual monitor matched to the client
 	// (resolution and frame rate) through an installed IddCx driver
 	// (internal/host/vdisplay): off | auto | on ("" = off).
@@ -160,6 +171,11 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: pipeline must be %q, %q or %q, not %q", path, pipelineAuto, media.PipelineHelper,
 			media.PipelineFFmpeg, c.Pipeline)
 	}
+	switch c.HelperLibavcodec {
+	case "", libavcodecAuto, libavcodecOff:
+	default:
+		return nil, fmt.Errorf("%s: helperLibavcodec must be %q or %q, not %q", path, libavcodecAuto, libavcodecOff, c.HelperLibavcodec)
+	}
 	if !vdisplay.ValidPolicy(c.VirtualDisplay) {
 		return nil, fmt.Errorf("%s: virtualDisplay must be %q, %q or %q, not %q", path,
 			vdisplay.PolicyOff, vdisplay.PolicyAuto, vdisplay.PolicyOn, c.VirtualDisplay)
@@ -193,6 +209,40 @@ func (c *Config) pipeline() string {
 		return pipelineAuto
 	}
 	return c.Pipeline
+}
+
+// Host config "helperLibavcodec" values.
+const (
+	libavcodecAuto = "auto"
+	libavcodecOff  = "off"
+)
+
+// libavcodecOn reports whether sessions may use the helper's libavcodec
+// backend (host config "helperLibavcodec", default auto).
+func (c *Config) libavcodecOn() bool { return c.HelperLibavcodec != libavcodecOff }
+
+// helperFFmpegDir returns the directory the helper's libavcodec backend loads
+// FFmpeg's shared libraries from, for an agent installed in installDir:
+// helperFFmpegDir, relative to installDir, by default ffmpeg-lgpl there.
+func (c *Config) helperFFmpegDir(installDir string) string {
+	d := c.HelperFFmpegDir
+	if d == "" {
+		d = encoder.LavcDirName
+	}
+	if !filepath.IsAbs(d) {
+		d = filepath.Join(installDir, d)
+	}
+	return filepath.Clean(d)
+}
+
+// LibavcodecDir is the directory of the helper's libavcodec libraries for
+// this executable (recon-host qualify runs the helper with it, as sessions do).
+func (c *Config) LibavcodecDir() string {
+	dir := "."
+	if exe, err := os.Executable(); err == nil {
+		dir = filepath.Dir(exe)
+	}
+	return c.helperFFmpegDir(dir)
 }
 
 // av1 returns the AV1 policy of the automatic codec choice.
