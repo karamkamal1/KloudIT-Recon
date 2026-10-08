@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"path/filepath"
@@ -523,6 +524,180 @@ func TestSessionOnHelper(t *testing.T) {
 	if l := logs.lines(`msg="starting encoder"`); len(l) == 0 || strings.Contains(l[0], "_helper") {
 		t.Fatalf("FFmpeg start %q", l)
 	}
+}
+
+// TestSessionRefRecovery: ACK-based recovery end to end in the session (GUIDE
+// 3.5) on a fake AMF helper with LTR slots. A client with hello v >= 3 is
+// told recovery "ltr"; its frame ACKs of LTR-marked frames reach the helper;
+// frames the helper dropped and losses the client reports ({"t":"lost"}) are
+// answered with a recover naming the newest acknowledged LTR frame, never a
+// key frame; the recovery frame goes out flagged and the answer is logged; a
+// loss nothing can be recovered from (the generation's key frame) gets a key
+// frame in the encoder; a stale generation's report nothing. A v2 client is
+// told "keyframe" and gets key frames, as before.
+func TestSessionRefRecovery(t *testing.T) {
+	key := []byte{0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac, 0, 0, 0, 1, 0x68, 0xeb, 0, 0, 0, 1, 0x65, 0x88}
+	pFrame := []byte{0, 0, 0, 1, 0x41, 0x9a}
+	type rig struct {
+		s    *Session
+		f    *encoder.Fake
+		ctrl *fakeCtrl
+		in   *io.PipeWriter
+		logs *lockedLog
+	}
+	setup := func(t *testing.T, helloV int) rig {
+		l := &fakeLauncher{caps: helperCaps(fakeH264, `"dda"`, false), started: make(chan *encoder.Fake, 8)}
+		l.handle = func(f *encoder.Fake, m map[string]any) {
+			if m["t"] == "start" {
+				f.Send(encoder.Started{Backend: "amf", Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30,
+					Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless", LTRSlots: int(m["ltrSlots"].(float64)), Barcode: true})
+			}
+		}
+		cfg := &Config{Capture: "test", Pipeline: "helper", TestWidth: 320, TestHeight: 180, DefaultFPS: 30, MaxFPS: 60,
+			DefaultKbps: 4000, MaxKbps: 100000}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		logs := &lockedLog{}
+		inR, inW := io.Pipe()
+		ctrl := &scriptedCtrl{r: inR}
+		s := &Session{
+			a:     &Agent{cfg: cfg, caps: &media.Caps{}, inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch},
+			hello: proto.Hello{V: helloV, Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}}},
+			tried: map[string]bool{}, usage: map[string]string{}, encFails: map[string]int{},
+			ctx: ctx, cancel: cancel, ctrl: ctrl, frameQ: make(chan *media.Frame, 64), pipeSwap: make(chan struct{}, 1),
+			log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		}
+		if n := s.openPipeline(); n != "" {
+			t.Fatalf("notice %q", n)
+		}
+		t.Cleanup(func() { inW.Close(); s.vid().Stop() })
+		go s.videoEvents()
+		go func() { _ = s.controlLoop() }()
+		if err := s.startVideo(false, ""); err != nil {
+			t.Fatal(err)
+		}
+		f := <-l.started
+		if m := expectFakeMsg(t, f, "start"); m["ltrSlots"] != float64(2) {
+			t.Fatalf("start %v", m)
+		}
+		return rig{s: s, f: f, ctrl: &ctrl.fakeCtrl, in: inW, logs: logs}
+	}
+	nextFrame := func(t *testing.T, s *Session) *media.Frame {
+		t.Helper()
+		select {
+		case fr := <-s.frameQ:
+			return fr
+		case <-time.After(5 * time.Second):
+			t.Fatal("no frame reached the session")
+		}
+		return nil
+	}
+	send := func(t *testing.T, r rig, m proto.ClientMsg) {
+		t.Helper()
+		b, _ := json.Marshal(m)
+		if err := proto.WriteMsg(r.in, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitLog := func(t *testing.T, logs *lockedLog, substr string) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); len(logs.lines(substr)) == 0; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("no log line with %s", substr)
+			}
+		}
+	}
+	// none fails on a message of type typ the helper gets within 200 ms.
+	none := func(t *testing.T, f *encoder.Fake, typ string) {
+		t.Helper()
+		deadline := time.After(200 * time.Millisecond)
+		for {
+			select {
+			case m := <-f.Messages():
+				if m["t"] == typ {
+					t.Fatalf("unexpected %s: %v", typ, m)
+				}
+			case <-deadline:
+				return
+			}
+		}
+	}
+
+	t.Run("v3 client", func(t *testing.T) {
+		r := setup(t, proto.HelloVersionRecovery)
+		s, f := r.s, r.f
+		f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+		f.Publish(&encoder.Frame{FrameID: 2, LTRSlot: 0, Data: pFrame, CaptureQPC: 3, OutputQPC: 4})
+		f.Publish(&encoder.Frame{FrameID: 3, LTRSlot: -1, Data: pFrame, CaptureQPC: 5, OutputQPC: 6})
+		for seq := uint32(0); seq < 3; seq++ {
+			if fr := nextFrame(t, s); fr.Gen != 1 || fr.Seq != seq {
+				t.Fatalf("frame %+v", fr)
+			}
+		}
+		waitMsg(t, r.ctrl, `"t":"video"`, `"gen":1`, `"recovery":"ltr"`)
+		// The client decoded frames 1-3 (seq 0-2): the ACK of the LTR frame
+		// goes on to the helper.
+		for seq := uint32(0); seq < 3; seq++ {
+			s.vid().Ack(1, seq)
+		}
+		if m := expectFakeMsg(t, f, "ack"); m["frameId"] != float64(2) {
+			t.Fatalf("ack %v", m)
+		}
+		// The helper dropped frame 4 (ring full): the client is told, the
+		// helper recovers from frame 2; no key frame.
+		f.Publish(&encoder.Frame{FrameID: 5, LTRSlot: -1, DroppedBefore: 1, Data: pFrame, CaptureQPC: 7, OutputQPC: 8})
+		if fr := nextFrame(t, s); fr.Seq != 4 {
+			t.Fatalf("frame after the loss %+v", fr)
+		}
+		waitMsg(t, r.ctrl, `"t":"dropped"`, `"gen":1`, `"fromSeq":3`, `"count":1`)
+		if m := expectFakeMsg(t, f, "recover"); m["lostFromFrameId"] != float64(4) || m["ackedLtrFrameId"] != float64(2) {
+			t.Fatalf("recover %v", m)
+		}
+		none(t, f, "forceIdr")
+		f.Publish(&encoder.Frame{FrameID: 6, LTRSlot: -1, Recovery: true, RefFloor: 2, Data: pFrame, CaptureQPC: 9, OutputQPC: 10})
+		fr := nextFrame(t, s)
+		if fr.Seq != 5 || !fr.Recovery || fr.RefFloor != 1 {
+			t.Fatalf("recovery frame %+v", fr)
+		}
+		h, ext := videoHeader(fr, proto.HelloVersionRecovery, 100)
+		if v, ok := ext.Get(proto.ExtRefFloor); !ok || v != 1 || h.Flags&proto.FrameFlagKey != 0 {
+			t.Fatalf("recovery frame header %+v ext %v", h, ext)
+		}
+		waitLog(t, r.logs, `msg="loss recovered" gen=1 from_seq=3 by="recovery frame" at=1/5`)
+
+		// A loss only the client saw: {"t":"lost"}.
+		send(t, r, proto.ClientMsg{T: proto.MsgLost, Gen: 1, FromSeq: 5})
+		if m := expectFakeMsg(t, f, "recover"); m["lostFromFrameId"] != float64(6) || m["ackedLtrFrameId"] != float64(2) {
+			t.Fatalf("recover after the client's report %v", m)
+		}
+		// Another generation's report: nothing to do.
+		send(t, r, proto.ClientMsg{T: proto.MsgLost, Gen: 9, FromSeq: 5})
+		none(t, f, "recover")
+		// The generation's key frame lost: nothing to recover from, a key
+		// frame in the encoder (no restart).
+		send(t, r, proto.ClientMsg{T: proto.MsgLost, Gen: 1, FromSeq: 0})
+		expectFakeMsg(t, f, "forceIdr")
+		waitLog(t, r.logs, `msg="no recovery frame possible, forcing a key frame" gen=1 from_seq=0`)
+		if l := r.logs.lines(`msg="restarting video"`); len(l) != 0 {
+			t.Fatalf("restarts %q", l)
+		}
+	})
+
+	t.Run("v2 client", func(t *testing.T) {
+		r := setup(t, proto.HelloVersionFrameExt)
+		s, f := r.s, r.f
+		f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+		f.Publish(&encoder.Frame{FrameID: 2, LTRSlot: 0, Data: pFrame, CaptureQPC: 3, OutputQPC: 4})
+		nextFrame(t, s)
+		nextFrame(t, s)
+		waitMsg(t, r.ctrl, `"t":"video"`, `"gen":1`, `"recovery":"keyframe"`)
+		s.vid().Ack(1, 1)
+		expectFakeMsg(t, f, "ack") // the helper's LTR policy still runs
+		f.Publish(&encoder.Frame{FrameID: 4, LTRSlot: -1, DroppedBefore: 1, Data: pFrame, CaptureQPC: 5, OutputQPC: 6})
+		nextFrame(t, s)
+		expectFakeMsg(t, f, "forceIdr")
+		none(t, f, "recover")
+	})
 }
 
 func expectFakeMsg(t *testing.T, f *encoder.Fake, typ string) map[string]any {

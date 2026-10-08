@@ -635,16 +635,32 @@ function onStats(st) {
     row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}${v.cropRight || v.cropBottom ? ` (coded ${v.codedWidth}×${v.codedHeight}, cropped)` : ''}`),
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
-    row('Loss recovery', v.recovery === 'skip' ? 'skip frame (intra refresh)' : 'key frame'),
+    row('Loss recovery', recoveryText(v.recovery, st)),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
     row('Renderer', S.conn ? S.conn.renderer : '—'),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     row('Decoder queue', String(st.queue)),
     row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
+    st.recovered || st.recoveredByKey ? row('  recovered', `${st.recovered} by recovery frame · ${st.recoveredByKey} by key frame · ${st.recoveryDiscarded} frames waited out`) : null,
     row('Freezes > 100 ms', st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0', st.freezes ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
+}
+
+// What a lost frame costs in this generation (VideoConfig.recovery): reference
+// recovery waits for the encoder's recovery frame (GUIDE 3.5), unless this
+// browser's decoder rejected one (then key frames).
+function recoveryText(mode, st) {
+  switch (mode) {
+    case 'skip': return 'skip frame (intra refresh)';
+    case 'ltr':
+    case 'invalidate': {
+      const how = mode === 'ltr' ? 'LTR' : 'reference invalidation';
+      return st.recoveryRejected ? `key frame (decoder rejected ${how} recovery)` : `recovery frame (${how})`;
+    }
+    default: return 'key frame';
+  }
 }
 
 // The encoder's bitrate target: below the setting while a congestion

@@ -1,6 +1,7 @@
 package host
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -23,6 +24,12 @@ import (
 //	intra-refresh     run libx264 with periodic intra refresh, as the probe
 //	                  enables it for NVENC: the host then announces the
 //	                  recovery from the real encoder arguments (skip)
+//	ref-recovery      the FFmpeg pipeline stands in for an encoder with
+//	                  reference recovery (GUIDE 3.5, media.Caps.UseTestRecovery):
+//	                  a key frame every media.TestRecoveryGOP frames, sent as
+//	                  P-frames, recovery "invalidate" announced, and after a
+//	                  loss (a drop, the client's "lost") the next one sent as
+//	                  the recovery frame (RECOVERY, refFloor)
 //	still=after:N     only the first N frames of every generation go out, as
 //	                  from a desktop that stops changing (ddagrab and
 //	                  gfxcapture send frames only on change); the session
@@ -47,12 +54,15 @@ type testFaults struct {
 	// intraRefresh makes libx264 use periodic intra refresh (NewAgent:
 	// media.Caps.UseIntraRefresh).
 	intraRefresh bool
-	stillAfter   int           // frames of a generation before its source goes still
-	ratePeriod   time.Duration // rateController.period
+	// refRecovery makes the FFmpeg pipeline simulate reference recovery
+	// (NewAgent: media.Caps.UseTestRecovery).
+	refRecovery bool
+	stillAfter  int           // frames of a generation before its source goes still
+	ratePeriod  time.Duration // rateController.period
 }
 
 func (f testFaults) active() bool {
-	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.stillAfter > 0 || f.ratePeriod > 0
+	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 || f.ratePeriod > 0
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -108,6 +118,11 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: intra-refresh takes no value", rule)
 			}
 			f.intraRefresh = true
+		case "ref-recovery":
+			if val != "" {
+				return f, fmt.Errorf("%s: ref-recovery takes no value", rule)
+			}
+			f.refRecovery = true
 		case "still":
 			n, err := strconv.Atoi(strings.TrimPrefix(val, "after:"))
 			if !strings.HasPrefix(val, "after:") || err != nil || n < 1 {
@@ -121,8 +136,11 @@ func parseTestFaults(s string) (testFaults, error) {
 			}
 			f.ratePeriod = d
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, still, rate-period)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, rate-period)", rule)
 		}
+	}
+	if f.refRecovery && (f.intraRefresh || f.recovery != "") {
+		return f, errors.New("ref-recovery excludes intra-refresh and recovery=")
 	}
 	return f, nil
 }

@@ -38,6 +38,14 @@ const video = {
   keyRequested: 0,
   waitSince: 0,
   hostDropped: new Set(), // seqs of the current generation the host reported dropped
+  // Reference recovery (VideoConfig.recovery "ltr" / "invalidate"): the loss
+  // being recovered ({ gen, from, since, discarded }: nothing from seq `from`
+  // on is decoded until a frame ends it), when the last recovery frame was
+  // decoded ({ t, codec }), and the codecs whose decoder rejected one (their
+  // losses then ask for key frames).
+  recover: null,
+  recoveredAt: null,
+  refRejected: new Set(),
 };
 
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
@@ -45,6 +53,7 @@ const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 }
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
+  recovered: 0, recoveredByKey: 0, recoveryDiscarded: 0, recoveryRejected: 0, keyFrames: 0,
   audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0,
 };
 
@@ -565,6 +574,16 @@ async function configureDecoder(cfg) {
 function onDecodeError(e) {
   post('log', { text: `decoder error: ${e.message}` });
   if (dropTest.run && !dropTest.run.error) dropTest.run.error = e.message;
+  // Right after a recovery frame: this decoder does not take recovery frames
+  // after skipped ones (docs/VENDOR_NOTES.md 3.5); this codec's losses ask
+  // for key frames from now on.
+  const ra = video.recoveredAt;
+  if (ra && now() - ra.t < RECOVERY_REJECT_MS && !video.refRejected.has(ra.codec)) {
+    video.refRejected.add(ra.codec);
+    stats.recoveryRejected++;
+    post('log', { text: `the decoder rejected a recovery frame (${ra.codec}, ${video.hw ? 'hardware' : 'software'}): losses ask for key frames from now on` });
+  }
+  video.recoveredAt = null;
   requestKeyframe('decoder error');
   if (video.cfg) configureDecoder(video.cfg).then(() => drainEarly());
 }
@@ -574,6 +593,7 @@ function onDecodeError(e) {
 function requestKeyframe(reason, send = true) {
   const t = now();
   video.waitingKey = true;
+  video.recover = null; // the key frame ends any recovery
   video.reorder.clear();
   // Nothing of this generation is decoded any more, also when the request is
   // not sent again so soon (its gaps must not count as losses).
@@ -590,8 +610,14 @@ function requestKeyframe(reason, send = true) {
 // limits or lost with a connection hiccup; this guarantees video resumes.
 function videoWatchdog() {
   if (!transport || !video.cfg) return;
-  const waiting = video.waitingKey || video.lostGen === video.cfg.gen;
   const t = now();
+  if (video.recover && t - video.recover.since > recoveryWait()) {
+    // The recovery frame did not come (the report or the frame got lost, or
+    // the encoder could not make one): fall back to a key frame.
+    requestKeyframe('no recovery frame');
+    return;
+  }
+  const waiting = video.waitingKey || video.lostGen === video.cfg.gen;
   if (!waiting) { video.waitSince = 0; return; }
   if (!video.waitSince) { video.waitSince = t; return; }
   if (t - video.waitSince > 1000 && t - video.keyRequested > 1000) {
@@ -611,6 +637,7 @@ async function onVideoConfig(cfg) {
   video.hostDropped.clear();
   video.gapSince = 0;
   video.lostGen = -1;
+  video.recover = null;
   post('video', { cfg });
   if (await configureDecoder(cfg)) drainEarly();
 }
@@ -697,25 +724,77 @@ function checkGap() {
 // A confirmed loss of the frames from expectSeq on: the run the host
 // reported, else everything up to the oldest buffered frame. Recovery "skip"
 // (the encoder heals the picture by itself: intra refresh) continues with the
-// next frame; "keyframe" asks for a key frame (on the FFmpeg path a new
-// encoder generation), as does a loss before this generation's key frame.
+// next frame; "ltr" / "invalidate" (reference recovery) continue too, but
+// decode nothing until the encoder's recovery frame (awaitRecovery);
+// "keyframe" asks for a key frame (on the FFmpeg path a new encoder
+// generation), as do a loss before this generation's key frame and reference
+// recovery on a decoder that rejected a recovery frame.
 function frameLost(reason) {
-  let to = video.expectSeq;
+  const from = video.expectSeq;
+  const reported = video.hostDropped.has(from);
+  let to = from;
   while (video.hostDropped.has(to)) video.hostDropped.delete(to++);
-  if (to === video.expectSeq) to = Math.min(...video.reorder.keys());
-  const missing = to - video.expectSeq;
+  if (to === from) to = Math.min(...video.reorder.keys());
+  const missing = to - from;
   stats.dropped += missing;
-  const skip = P.recoveryOf(video.cfg) === P.RECOVERY_SKIP && !video.waitingKey && video.decoder?.state === 'configured';
-  if (!skip) {
+  const mode = P.recoveryOf(video.cfg);
+  const decoding = !video.waitingKey && video.decoder?.state === 'configured';
+  if (decoding && mode === P.RECOVERY_SKIP) {
+    stats.skipped += missing;
+    post('log', { text: `skipping ${missing} lost frame(s) from ${video.cfg.gen}/${from} (${reason}); the encoder heals the picture` });
+  } else if (decoding && P.isRefRecovery(mode) && !video.refRejected.has(video.cfg.codec)) {
+    awaitRecovery(from, reported, reason);
+  } else {
     video.gapSince = 0;
     requestKeyframe(reason);
     return;
   }
-  stats.skipped += missing;
-  post('log', { text: `skipping ${missing} lost frame(s) from ${video.cfg.gen}/${video.expectSeq} (${reason}); the encoder heals the picture` });
   video.expectSeq = to;
   for (const k of video.reorder.keys()) if (k < to) video.reorder.delete(k);
   decodeInOrder();
+}
+
+// Reference recovery: the last good picture stays on screen and nothing from
+// seq `from` on is decoded (decodeFrame discards) until a frame that ends the
+// wait (P.endsRecovery: a recovery frame whose references are all older than
+// the oldest lost frame, or a key frame). A loss the host did not report is
+// reported to it ({"t":"lost"}); it answers with a recovery frame. A later
+// loss while waiting keeps the oldest one.
+function awaitRecovery(from, reported, reason) {
+  const cfg = video.cfg;
+  if (!video.recover) {
+    video.recover = { gen: cfg.gen, from, since: now(), discarded: 0 };
+    post('log', { text: `lost frame(s) from ${cfg.gen}/${from} (${reason}): waiting for a recovery frame (${cfg.recovery})` });
+  } else {
+    video.recover.from = Math.min(video.recover.from, from);
+  }
+  if (!reported) transport?.sendControl({ t: P.MSG_LOST, gen: cfg.gen, fromSeq: from });
+}
+
+// How long to wait for a recovery frame before asking for a key frame: the
+// host answers within a round trip and a frame (the helper repeats a still
+// picture every 100 ms).
+const RECOVERY_WAIT_MS = 1000;
+const recoveryWait = () => Math.max(RECOVERY_WAIT_MS, 4 * clock.rtt);
+// A decoder error this soon after a recovery frame was fed counts as the
+// decoder rejecting it.
+const RECOVERY_REJECT_MS = 1000;
+
+// The frame f ends the wait for a recovery frame: decode it and resume.
+function endRecovery(f) {
+  const r = video.recover;
+  video.recover = null;
+  const t = now();
+  if (f.key) {
+    stats.recoveredByKey++;
+  } else {
+    stats.recovered++;
+    video.recoveredAt = { t, codec: video.cfg?.codec };
+  }
+  const how = f.key ? 'key frame' : `recovery frame (refFloor ${f.ext.refFloor})`;
+  post('log', { text: `recovered from the loss at ${r.gen}/${r.from} with ${how} ${f.gen}/${f.seq} after ${Math.round(t - r.since)} ms, ${r.discarded} frame(s) discarded` });
+  const dt = dropTest.run;
+  if (dt?.recovery && !dt.recoveredBy) dt.recoveredBy = { seq: f.seq, key: f.key, refFloor: f.ext?.refFloor ?? null, ms: Math.round(t - r.since), discarded: r.discarded };
 }
 
 // The host discarded frames it will never send: treat them as lost now.
@@ -767,12 +846,28 @@ function decodeFrame(f) {
   }
   const d = video.decoder;
   if (!d || d.state !== 'configured') return;
+  if (f.key) stats.keyFrames++;
+  if (video.recover) {
+    if (!P.endsRecovery(f, video.recover.from)) {
+      video.recover.discarded++;
+      stats.recoveryDiscarded++;
+      return;
+    }
+    endRecovery(f);
+  }
   if (dropTest.armed && !f.key) {
     // Never decoded: the next frame references one the decoder has not seen.
+    // Under reference recovery the client treats it as lost: it waits for
+    // the recovery frame the host makes for it.
     dropTest.armed = false;
-    dropTest.run = { gen: f.gen, seq: f.seq, codec: video.cfg?.codec, encoder: video.cfg?.encoder, hw: video.hw, at: now(), decoded: 0, error: null };
-    post('log', { text: `drop test: skipping frame ${f.gen}/${f.seq} (${video.cfg?.codec}, ${video.hw ? 'hardware' : 'software'} decoder)` });
+    const ref = P.isRefRecovery(P.recoveryOf(video.cfg)) && !video.refRejected.has(video.cfg.codec);
+    dropTest.run = {
+      gen: f.gen, seq: f.seq, codec: video.cfg?.codec, encoder: video.cfg?.encoder, hw: video.hw, at: now(), decoded: 0, error: null,
+      recovery: ref ? video.cfg.recovery : null, recoveredBy: null,
+    };
+    post('log', { text: `drop test: skipping frame ${f.gen}/${f.seq} (${video.cfg?.codec}, ${video.hw ? 'hardware' : 'software'} decoder${ref ? `, waiting for a recovery frame (${video.cfg.recovery})` : ''})` });
     setTimeout(finishDropTest, DROP_TEST_MS);
+    if (ref) awaitRecovery(f.seq, false, 'drop test');
     return;
   }
   video.inflight.set(f.ptsUs, {
@@ -848,12 +943,17 @@ function onDecoded(frame) {
   }
 }
 
-// Debug toggle for the decoder check in docs/VENDOR_NOTES.md (1.4): does this
-// browser's decoder accept a P-frame after a skipped frame (what recovery
-// "skip" does)? postMessage({type:'dropTest'}) drops the next delta frame
-// before the decoder; after DROP_TEST_MS the result ({ decoded, error, ... })
-// goes to the main thread (window.__recon.dropTest) and the log. The picture
-// stays damaged until the encoder heals it (intra refresh) or a key frame.
+// Debug toggle for the decoder checks in docs/VENDOR_NOTES.md (1.4, 3.5): does
+// this browser's decoder accept a P-frame after a skipped frame (what recovery
+// "skip" does), and under reference recovery the encoder's recovery frame
+// after skipped frames? postMessage({type:'dropTest'}) drops the next delta
+// frame before the decoder; after DROP_TEST_MS the result ({ decoded, error,
+// recovery, recoveredBy, ... }) goes to the main thread
+// (window.__recon.dropTest) and the log. Under "skip" the picture stays
+// damaged until the encoder heals it (intra refresh) or a key frame; under
+// reference recovery the drop is a loss the host is told of ({"t":"lost"}),
+// and recoveredBy names the frame that ended it (key: a key frame instead of
+// a recovery frame).
 const DROP_TEST_MS = 2000;
 const dropTest = { armed: false, run: null };
 
@@ -861,9 +961,13 @@ function finishDropTest() {
   const r = dropTest.run;
   if (!r) return;
   dropTest.run = null;
-  const result = { ...r, ms: DROP_TEST_MS, ok: !r.error && r.decoded > 0 };
+  const result = { ...r, ms: DROP_TEST_MS, ok: !r.error && r.decoded > 0 && (!r.recovery || !!r.recoveredBy) };
   delete result.at;
-  post('log', { text: `drop test: ${result.ok ? 'decoder accepted' : 'decoder did NOT accept'} the frames after the skipped one: ${r.decoded} decoded in ${DROP_TEST_MS} ms${r.error ? `, error: ${r.error}` : ''}` });
+  const rb = r.recoveredBy;
+  const rec = !r.recovery ? '' : !rb ? '; no recovery frame came'
+    : rb.key ? `; a key frame (${r.gen}/${rb.seq}) ended the wait after ${rb.ms} ms, not a recovery frame`
+      : `; recovery frame ${r.gen}/${rb.seq} (refFloor ${rb.refFloor}) after ${rb.ms} ms, ${rb.discarded} frame(s) discarded`;
+  post('log', { text: `drop test: ${result.ok ? 'decoder accepted' : 'decoder did NOT accept'} the frames after the skipped one: ${r.decoded} decoded in ${DROP_TEST_MS} ms${rec}${r.error ? `, error: ${r.error}` : ''}` });
   post('dropTest', { result });
 }
 
@@ -1363,6 +1467,11 @@ function postStats() {
     skipped: stats.skipped,
     hostDropped: stats.hostDropped,
     keyRequests: stats.keyRequests,
+    recovered: stats.recovered,
+    recoveredByKey: stats.recoveredByKey,
+    recoveryDiscarded: stats.recoveryDiscarded,
+    recoveryRejected: stats.recoveryRejected,
+    keyFrames: stats.keyFrames, // key frames fed to the decoder (IDRs)
     freezes: stats.freezes,
     lastFreeze: stats.lastFreeze || null,
     audioPackets: stats.audioPackets,

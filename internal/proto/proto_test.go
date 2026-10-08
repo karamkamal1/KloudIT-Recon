@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -186,7 +187,9 @@ console.log(JSON.stringify(out));`
 }
 
 // TestLossRecoveryJS checks that protocol.js reads the host's "dropped"
-// message and VideoConfig.Recovery as Go writes them (needs node).
+// message and VideoConfig.Recovery as Go writes them, and which frames end
+// the wait for a recovery frame under reference recovery (GUIDE 3.5; needs
+// node).
 func TestLossRecoveryJS(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -204,7 +207,35 @@ func TestLossRecoveryJS(t *testing.T) {
 		"skip":     msg(VideoConfig{T: "video", Recovery: RecoverySkip}),
 		"keyframe": msg(VideoConfig{T: "video", Recovery: RecoveryKeyframe}),
 		"oldHost":  msg(VideoConfig{T: "video"}),
+		"ltr":      msg(VideoConfig{T: "video", Recovery: RecoveryLTR}),
+		"inval":    msg(VideoConfig{T: "video", Recovery: RecoveryInvalidate}),
+		"future":   msg(VideoConfig{T: "video", Recovery: "something-new"}),
+		"lost":     msg(ClientMsg{T: MsgLost, Gen: 3, FromSeq: 77}),
 	}
+	// Frames as the host sends them to a v3 client: a recovery frame (refFloor
+	// 9), a key frame, a P-frame, a P-frame without the extension.
+	frame := func(key bool, refFloor int) string {
+		h := FrameHeader{Type: FrameTypeVideo, Gen: 3, Seq: 12, Flags: FrameFlagExt}
+		if key {
+			h.Flags |= FrameFlagKey
+		}
+		var ext FrameExt
+		ext.Set(ExtEncodeDoneUs, 1234)
+		if refFloor >= 0 {
+			ext.Set(ExtRefFloor, uint64(refFloor))
+		}
+		if refFloor == -2 {
+			h.Flags &^= FrameFlagExt
+		}
+		b := make([]byte, FrameHeaderLen)
+		h.Marshal(b)
+		if h.Flags&FrameFlagExt != 0 {
+			b = ext.Append(b)
+		}
+		return hex.EncodeToString(append(b, 0, 0, 0, 1))
+	}
+	frames := map[string]string{"recovery": frame(false, 9), "key": frame(true, -1), "p": frame(false, -1), "plain": frame(false, -2)}
+	in["frames"] = msg(frames)
 	b, _ := json.Marshal(in)
 	script := `
 const P = await import(process.argv[1]);
@@ -213,7 +244,15 @@ console.log(JSON.stringify({
   consts: [P.MSG_DROPPED, P.RECOVERY_SKIP, P.RECOVERY_KEYFRAME, P.CONGESTION_DECODER],
   dropped: P.parseDropped(m.dropped), noCount: P.parseDropped(m.noCount), tooMany: P.parseDropped(m.tooMany),
   badSeq: P.parseDropped(m.badSeq), noGen: P.parseDropped(m.noGen),
-  recovery: [P.recoveryOf(m.skip), P.recoveryOf(m.keyframe), P.recoveryOf(m.oldHost), P.recoveryOf(null)],
+  recovery: [P.recoveryOf(m.skip), P.recoveryOf(m.keyframe), P.recoveryOf(m.oldHost), P.recoveryOf(null),
+    P.recoveryOf(m.ltr), P.recoveryOf(m.inval), P.recoveryOf(m.future)],
+  ref: [P.isRefRecovery(P.recoveryOf(m.ltr)), P.isRefRecovery(P.recoveryOf(m.inval)), P.isRefRecovery(P.recoveryOf(m.skip)), P.isRefRecovery(P.recoveryOf(m.future))],
+  refConsts: [P.RECOVERY_LTR, P.RECOVERY_INVALIDATE, P.MSG_LOST, String(P.HELLO_VERSION), String(m.lost.gen), String(m.lost.fromSeq)],
+  // endsRecovery after a loss at seq 10 (and 9): the recovery frame (refFloor 9) ends it only for 10.
+  ends: Object.entries(m.frames).map(([k, hex]) => {
+    const h = P.parseFrameHeader(Uint8Array.from(hex.match(/../g).map((x) => parseInt(x, 16))));
+    return k + ':' + P.endsRecovery(h, 10) + '/' + P.endsRecovery(h, 9);
+  }).sort(),
 }));`
 	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js), string(b)).Output()
 	if err != nil {
@@ -223,7 +262,8 @@ console.log(JSON.stringify({
 	var got struct {
 		Consts                                   []string
 		Dropped, NoCount, TooMany, BadSeq, NoGen *rng
-		Recovery                                 []string
+		Recovery, RefConsts, Ends                []string
+		Ref                                      []bool
 	}
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -240,8 +280,17 @@ console.log(JSON.stringify({
 	if got.BadSeq != nil || got.NoGen != nil {
 		t.Errorf("malformed accepted: %+v %+v", got.BadSeq, got.NoGen)
 	}
-	if strings.Join(got.Recovery, ",") != "skip,keyframe,keyframe,keyframe" {
-		t.Errorf("recoveryOf: %v (skip, keyframe, old host, none)", got.Recovery)
+	if strings.Join(got.Recovery, ",") != "skip,keyframe,keyframe,keyframe,ltr,invalidate,keyframe" {
+		t.Errorf("recoveryOf: %v (skip, keyframe, old host, none, ltr, invalidate, unknown)", got.Recovery)
+	}
+	if fmt.Sprint(got.Ref) != "[true true false false]" {
+		t.Errorf("isRefRecovery (ltr, invalidate, skip, unknown): %v", got.Ref)
+	}
+	if want := []string{RecoveryLTR, RecoveryInvalidate, MsgLost, fmt.Sprint(HelloVersionRecovery), "3", "77"}; fmt.Sprint(got.RefConsts) != fmt.Sprint(want) {
+		t.Errorf("constants and lost message %v, want %v", got.RefConsts, want)
+	}
+	if want := "[key:true/true p:false/false plain:false/false recovery:true/false]"; fmt.Sprint(got.Ends) != want {
+		t.Errorf("endsRecovery: %v, want %s", got.Ends, want)
 	}
 }
 

@@ -3183,3 +3183,168 @@ Verified in the sandbox (Linux, no GPU, no Windows):
   fails and fails at the end naming them (`helper-test: FAIL: encoder`).
   `TestHelperIntegrationMotionSource` passed 5 of 5 runs under Wine with six busy loops on the
   4 CPUs (load about 7), the condition in which the earlier zero-repeat check failed.
+
+## 3.5 ACK-based recovery
+
+What changed (GUIDE 3.5; the helper's side, the AMF LTR policy and NVENC reference invalidation,
+came with 3.3 and 3.4, the session plumbing with 3.1b; this step wires them end to end):
+
+- Protocol (backwards compatible): `VideoConfig.recovery` gains `ltr` and `invalidate`
+  (reference recovery), announced only to clients with `hello.v >= 3`; older clients get
+  `keyframe` and behave as before (an IDR in the running encoder on the helper). The marker of a
+  recovery frame is frame extension tag 5 `refFloor` (3.1b: present exactly on recovery frames;
+  the RECOVERY ring flag becomes `media.Frame.Recovery`). New client message
+  `{"t":"lost","gen":g,"fromSeq":s}` for a loss the host did not report (a gap that outlasted the
+  late-frame wait); hosts that never announce reference recovery never get it. The client's frame
+  ACK (`0x40`, sent from the decoder's output once the clock is synced) is the ACK of GUIDE 3.5.
+- Host (`internal/host/media/helper.go`, `ackring.go`, `session.go`): `HelperVideo` keeps a ring
+  of the live generation's frames {frame id, LTR slot, acknowledged} (512 frames), maps the
+  client's `gen/seq` ACKs to helper frame ids and sends `ack` for every LTR-marked frame once.
+  On a loss at seq L under reference recovery (frames the session could not send: stream open or
+  write failed, the 3 s write deadline, the fault hook; frames the helper dropped:
+  `DroppedBefore` / frame-id gaps; the client's `lost`), the session calls `Recover(L)`, which
+  sends `recover` with `ackedLtrFrameId` = the newest acknowledged LTR frame before L whose slot
+  no later frame was marked into and no key frame has cleared since (none: the helper decides,
+  usually an IDR). The answer (the next frame flagged RECOVERY with `refFloor` < L, or a key
+  frame) is a `VideoEvent.Recovered`, logged `loss recovered gen=… from_seq=… by="recovery
+  frame"|"key frame" at=gen/seq wait_ms=…` and counted in the 10 s `stream stats` line
+  (`recovered`, `recovered_by_key`). `recovering from a loss … why=…` logs each request; a loss
+  that cannot be recovered (the generation's key frame) logs `no recovery frame possible, forcing
+  a key frame`. A frame-queue overflow keeps its key frame (it also cuts the bitrate); the FFmpeg
+  pipeline keeps key-frame recovery (`Recover` = `ErrNoRecovery`) and skip.
+- Client (`stream-worker.js`): under `ltr`/`invalidate` a confirmed loss at L stops feeding the
+  decoder (the last good picture stays on screen) and discards every frame until
+  `P.endsRecovery` (a key frame, or `refFloor` < L), feeds that one and resumes. A later loss
+  while waiting keeps the oldest L; no recovery frame within max(1 s, 4 × RTT) asks for a key
+  frame (`requesting key frame (no recovery frame)`). On `VideoDecoder` `error()` it reconfigures
+  the decoder and asks for a key frame (forced IDR in the helper, no restart); an error within
+  1 s of a recovery frame marks this codec's decoder as rejecting recovery frames
+  (`the decoder rejected a recovery frame ...`), whose losses then ask for key frames for the rest
+  of the session (the "failing combos use IDR recovery" rule; overlay "Loss recovery: key frame
+  (decoder rejected ...)"). The overlay shows the mode and `recovered N by recovery frame · M by
+  key frame · K frames waited out`; `__recon.lastStats` has `recovered`, `recoveredByKey`,
+  `recoveryDiscarded`, `recoveryRejected`, `keyFrames` (IDRs fed to the decoder). The drop test
+  (`__recon.worker.postMessage({type:'dropTest'})`) under reference recovery treats the dropped
+  frame as a loss the client saw: it sends `lost` and reports `recovery` and `recoveredBy`
+  ({seq, key, refFloor, ms, discarded}). 1.4 (dropped reports, late-frame wait) and 1.2 (skip)
+  are unchanged.
+- Test hook `RECON_TEST_FAULTS=ref-recovery` (`media.Caps.UseTestRecovery`): the FFmpeg pipeline
+  stands in for an encoder with reference invalidation so the browser path runs without a GPU: a
+  key frame every `TestRecoveryGOP` (fps/6) frames, sent as P-frames (no key flag); after a
+  `Recover` the first key frame after the lost one goes out as the recovery frame (RECOVERY,
+  `refFloor` = L-1); recovery `invalidate` announced.
+- Deviations: GUIDE 2.3's deadline drop (cancel a frame stream past max(2 frame intervals, 25 ms)
+  when a newer frame is ready) belongs to Phase 2.3 and is not built here; the existing host
+  drops (failed or cancelled streams, the 3 s write deadline) feed the recovery, and 2.3's drops
+  will too (they go through the same `lostFrame`). ACKs need the clock sync (the first pongs,
+  ~100 ms into a session), as before; a loss before the first acknowledged LTR costs an IDR.
+
+Verified in the sandbox:
+
+- verified (sandbox): `internal/host/media` `TestAckRing` (newest acknowledged LTR before the
+  loss; a slot marked again loses its old frame, also to a frame after the loss; key frames clear
+  everything and are never recovery points; one forwarded ACK per marked frame; frames older than
+  the ring forgotten); `TestHelperVideoRecovery` against the fake helper (ACKs of LTR frames
+  reach the helper once, others and stale generations do not; `recover` names the newest
+  acknowledged LTR still held, nothing after a key frame; frames the encoder had in flight do not
+  count as the answer; a recovery frame from before the loss does, one only from after it does
+  not; an in-stream IDR and a forced key frame of a new generation end a pending loss as `Key`;
+  NVENC caps announce `invalidate`, no LTR slots, `recover` without `ackedLtrFrameId`; AMF without
+  LTR slots announces `keyframe` and `Recover` is `ErrNoRecovery`); `TestHelperVideoStream`
+  (config `ltr`); `TestTestRecovery` (libx264 and libsvtav1 stand-ins: only the first frame
+  flagged key, the recovery frame the first key frame after the loss with `refFloor` L-1, the
+  `Recovered` event, and what the client decodes (frames before L, then the recovery frame
+  onwards) equals the undamaged decode frame for frame).
+- verified (sandbox): `internal/host` `TestSessionRefRecovery` (fake AMF helper with 2 LTR
+  slots; v3 client: config `ltr`, the client's ACK of the LTR frame reaches the helper, a helper
+  drop gives `dropped` + `recover lostFromFrameId=4 ackedLtrFrameId=2` and no `forceIdr`, the
+  recovery frame goes out with extension `refFloor` and no key flag, `loss recovered ...
+  by="recovery frame"` logged; `{"t":"lost"}` from the client gives a `recover`; another
+  generation's report nothing; a lost key frame a `forceIdr`, never a restart. v2 client: config
+  `keyframe`, a helper drop gives `forceIdr`, no `recover`); `TestParseTestFaults`
+  (`ref-recovery`, exclusive with `intra-refresh` and `recovery=`); `internal/proto`
+  `TestLossRecoveryJS` (protocol.js: `ltr`/`invalidate` modes, unknown modes mean `keyframe`,
+  `HELLO_VERSION` 3, the `lost` message fields, `endsRecovery` on Go-encoded frame headers:
+  recovery frame with `refFloor` 9 ends a loss at 10, not at 9; key frames end any; plain
+  P-frames none); `TestSessionOnHelper` unchanged (v2: key frames).
+- verified (sandbox), browser E2E (`test/e2e/browser.mjs`, headless Chromium, libsvtav1
+  960×540 60 fps, software AV1 decode, direct WebTransport; Playwright's Chromium has no H.264
+  decoder): scenario `host-faults-ref` with `RECON_TEST_FAULTS="delay=every:97:200ms,
+  drop=every:193,ref-recovery"`, 20 s: config `recovery: invalidate`; 6 frames dropped, each
+  reported (`client told 6`), each asked of the encoder (`recovering from a loss`: 6) and answered
+  by a recovery frame (host `by="recovery frame"` 6, `by="key frame"` 0); the client recovered 6
+  by recovery frame, 0 by key frame, discarded 29 frames while waiting (about 5 per loss with a
+  key frame every 10 frames), decoded no IDR (`keyFrames` 0) and asked for no key frame; no
+  decoder error, no host restart; 13 frames delayed 200 ms caused no `lost` and no `frame lost`;
+  57.8 fps mean; the frame barcode matched `seq` on 47 of 47 sampled frames (0 invalid: no damaged
+  picture was drawn). The same in the first run (before the last edits).
+  The drop test under reference recovery (the client drops a frame itself and reports it with
+  `lost`): 2 of 2 accepted, recovery frames 10 and 6 frames after the dropped one (`refFloor` =
+  the frame before it) after 150 and 108 ms (the stand-in's next key frame, up to 10 frames
+  later; a real encoder answers with its next frame), 104 and 114 frames decoded in the 2 s after,
+  host log `recovering from a loss ... why=client` twice. All 76 checks passed, among them the
+  unchanged `keyframe` (6 drops: 6 key-frame requests and restarts) and `skip` scenarios, lan,
+  bitrate recovery and the 1.4 drop test.
+- verified (sandbox): `make helper-test` under Wine (the media package's helper tests against
+  the real recon-encoder.exe with the mock backend, the encoder and qualify packages):
+  67 passed, 0 failed (`TestHelperVideoRecovery`, `TestHelperVideoStream` and
+  `TestHelperVideoIntegration` among them); skipped as before: AMD Direct Capture, WGC, AMF failed
+  start, the NVENC driver subtest, `TestLaunchUnsupported`, `TestVideoGPUPriorityLog`.
+- Not run: the 0.4 `wifi` profile (no `sch_netem` in the sandbox kernel; see 1.4); the T5
+  acceptance therefore is a hardware check below.
+
+Hardware checks (host.json `"pipeline": "auto"`, recon-encoder.exe next to recon-host.exe; the
+stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` and the browser's
+`__recon.logs`). On the helper the drop test now runs reference recovery; the 1.4 decoder check
+(plain skipping) needs `"pipeline": "ffmpeg"`.
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (VERIFY matrix, AMD host × AMD client GPU: Chrome's
+  hardware decoder accepts the LTR recovery frame after skipped frames): on a client with an RDNA3
+  GPU (the RX 7900 XT itself via a browser on the host, or a second RDNA3 PC), `chrome://gpu`
+  lists hardware decode for H.264, HEVC and AV1. Stream from the host; for each codec in turn
+  (Settings > Codec HEVC, AV1 at 2560×1440, H.264) check the overlay: Encoder `<codec>_amf_helper`,
+  Codec row `(HW)`, "Loss recovery: recovery frame (LTR)". After 10 s run in DevTools on the
+  stream page
+  `for (let i = 0; i < 10; i++) setTimeout(() => __recon.worker.postMessage({type:'dropTest'}), i * 3000)`,
+  after 35 s `__recon.logs.filter((l) => /drop test|recovered from|rejected|decoder error/.test(l))`.
+  Pass per codec: 10 of 10 "decoder accepted ... recovery frame g/s (refFloor r) after N ms"
+  (N below ~50 ms on a LAN: one round trip plus a frame), no `decoder error`, no `the decoder
+  rejected a recovery frame`, host.log has 10 `recovering from a loss ... why=client` each
+  followed by `loss recovered ... by="recovery frame"`, and the picture shows no smearing after
+  the recovery (with `"capture": "test", "pipeline": "helper"` the overlay's Frame barcode row
+  stays at 0 mismatched / 0 invalid). Record codec × result, driver and Chrome versions. A codec
+  that fails shows `the decoder rejected a recovery frame`, after which its losses use key frames
+  automatically: note it here as "IDR recovery" for that combination.
+- NVIDIA: unverified (no NVIDIA host available, and no NVIDIA client either). Test (VERIFY
+  matrix, AMD host × NVIDIA client GPU): the same 10 drop tests per codec from a client with an
+  NVIDIA GPU (RTX 20 or later; AV1 decode needs RTX 30+) against the AMD host. Same records.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (host-side losses on the helper): start the agent
+  for this test only with `$env:RECON_TEST_FAULTS="drop=every:300"` (one dropped frame every 5 s
+  at 60 fps, as a failed frame stream) and stream HEVC for 2 minutes with constant motion.
+  host.log: every `frames dropped ... why="test fault"` is followed by `recovering from a loss
+  ... why="test fault"` and `loss recovered ... by="recovery frame" wait_ms=<one or two frame
+  intervals>`, no `forcing a key frame`, no `restarting video`; the client: no `requesting key
+  frame`, `__recon.lastStats.recovered` equals the number of drops, `keyFrames` stays at 1 per
+  generation. Repeat for AV1 and H.264.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (T5 acceptance, wifi: >= 90 % of losses recovered
+  without an IDR): force the relay path (Network path "Relay via gateway", Transport row
+  `· relay`), `./netem.sh apply wifi --ct <gateway CTID> --host <client IP>` on the Proxmox node
+  (0.4), hevc_amf_helper at 1920×1080 60 fps 20 Mbit/s, 10 minutes of constant motion (a game or
+  a video). Because frames travel on reliable streams, `wifi`'s 1 % packet loss mostly delays
+  frames; run it once plainly and once with `$env:RECON_TEST_FAULTS="drop=every:300"` on the host
+  (about 120 losses in 10 minutes on top of real ones). For each run sum the `stream stats`
+  lines' `recovered=` (R) and `recovered_by_key=` (K) over the run:
+  `Select-String host.log -Pattern 'msg="stream stats"'`; T5 = R / (R + K). Pass: T5 >= 0.9 in
+  both runs. Also record the client's `__recon.lastStats` `recovered`, `recoveredByKey`,
+  `recoveryDiscarded`, `keyRequests` and the key-request reasons in `__recon.logs` (there should
+  be no `no recovery frame`), the freezes > 100 ms (`Freezes` row; GUIDE T3: < 1 per 10 min),
+  and the median `wait_ms` of the `loss recovered` lines. Repeat with AV1 and H.264.
+- NVIDIA: unverified (no NVIDIA host available). Test (VERIFY matrix, NVIDIA host ×
+  AMD/NVIDIA client GPU, reference invalidation): on an RTX host (`backend=nvenc`, overlay "Loss
+  recovery: recovery frame (reference invalidation)"), the same 10 drop tests per codec (HEVC,
+  H.264, AV1 on RTX 40+) from a client with an AMD GPU and one with an NVIDIA GPU; pass as for
+  AMD, with `refFloor` = the frame before the dropped one (or older after an earlier recovery).
+- NVIDIA: unverified (no NVIDIA host available). Test (host-side losses and T5 acceptance):
+  the `drop=every:300` run and both `wifi` T5 runs above on the RTX host; expect
+  `by="recovery frame"` for losses within the encoder's reference window (up to 5 frames, 4 at 4K
+  H.264/HEVC: 3.4) and `by="key frame"` beyond it; pass T5 >= 0.9.

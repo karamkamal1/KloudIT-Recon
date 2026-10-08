@@ -168,6 +168,9 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		if a.faults.intraRefresh && !caps.UseIntraRefresh("libx264") {
 			return nil, fmt.Errorf("%s: intra-refresh needs libx264", TestFaultsEnv)
 		}
+		if a.faults.refRecovery {
+			caps.UseTestRecovery()
+		}
 		log.Warn("TEST fault injection is on: video frames are delayed and dropped on purpose", TestFaultsEnv, v)
 	}
 	return a, nil

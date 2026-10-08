@@ -191,7 +191,7 @@ func TestHelperVideoStream(t *testing.T) {
 	c := ev.Config
 	if c == nil || c.Gen != 1 || c.Codec != "avc1.64001f" || c.Family != "h264" || c.Width != 1920 || c.Height != 1080 ||
 		c.CodedWidth != 1920 || c.CodedHeight != 1088 || c.CropBottom != 8 || c.CropRight != 0 || c.Encoder != "h264_amf_helper" ||
-		c.Capture != "dda" || c.Recovery != proto.RecoveryKeyframe || c.BitrateKbps != 20000 || c.FPS != 60 {
+		c.Capture != "dda" || c.Recovery != proto.RecoveryLTR || c.BitrateKbps != 20000 || c.FPS != 60 {
 		t.Fatalf("config %+v", c)
 	}
 	fr := nextEvent(t, v).Frame
@@ -235,7 +235,9 @@ func TestHelperVideoStream(t *testing.T) {
 	}
 
 	// The client acknowledged the LTR frame (seq 0) and lost frame seq 2: the
-	// recovery names the acknowledged LTR frame.
+	// ACK goes on to the helper, but the key frame since (frame 3) emptied the
+	// LTR slots, so the recovery names no LTR frame (TestHelperVideoRecovery
+	// has the rest).
 	v.Ack(1, 1) // not an LTR frame: not passed on
 	v.Ack(1, 0)
 	if m := expectMsg(t, f, "ack"); m["frameId"] != float64(1) {
@@ -244,7 +246,7 @@ func TestHelperVideoStream(t *testing.T) {
 	if err := v.Recover(1, 2); err != nil {
 		t.Fatal(err)
 	}
-	if m := expectMsg(t, f, "recover"); m["lostFromFrameId"] != float64(3) || m["ackedLtrFrameId"] != float64(1) {
+	if m := expectMsg(t, f, "recover"); m["lostFromFrameId"] != float64(3) || m["ackedLtrFrameId"] != nil {
 		t.Fatalf("recover %v", m)
 	}
 	if err := v.Recover(7, 0); err == nil {
@@ -264,6 +266,10 @@ func TestHelperVideoStream(t *testing.T) {
 	}
 	if fr := nextEvent(t, v).Frame; fr == nil || fr.Gen != 2 || fr.Seq != 0 || !fr.Key || fr.PtsUs != 0 {
 		t.Fatalf("forced key frame %+v", fr)
+	}
+	// It also answered the loss of generation 1 (no recovery frame came).
+	if r := nextEvent(t, v).Recovered; r == nil || r.Gen != 1 || r.From != 2 || r.AtGen != 2 || r.AtSeq != 0 || !r.Key {
+		t.Fatalf("recovered %+v", r)
 	}
 	if fh.launched() != 1 {
 		t.Fatalf("the forced key frame launched a helper (%d)", fh.launched())
@@ -286,6 +292,229 @@ func TestHelperVideoStream(t *testing.T) {
 	f.Send(encoder.CaptureChanged{Reason: "resized", Width: 2560, Height: 1440})
 	if cc := nextEvent(t, v).Capture; cc == nil || cc.Reason != "resized" || cc.Width != 2560 {
 		t.Fatalf("capture change %+v", cc)
+	}
+}
+
+// fakeNVCaps: an NVIDIA helper whose HEVC recovers by reference invalidation.
+const fakeNVCaps = `{"t":"caps","v":1,"helperVersion":"test","backend":"nvenc","vendor":"nvidia","adapterName":"NVIDIA GeForce RTX 4080",
+"codecs":{"hevc":{"maxW":8192,"maxH":8192,"forceIdr":true,"recovery":"invalidate","maxLtr":0,"liveBitrate":"seamless","alignW":1,"alignH":1}},
+"capture":["dda"],"cursorInVideo":false,"outputs":[],"qpcFrequency":10000000}`
+
+// ACK-based recovery bookkeeping (GUIDE 3.5) against the fake helper: the
+// client's ACKs of LTR-marked frames reach the helper (once), Recover names
+// the newest acknowledged LTR frame before the loss that its slot still
+// holds, and the answer (a recovery frame from before the loss, or a key
+// frame) comes back as a Recovered event; frames the encoder had in flight
+// before it answer nothing. Reference invalidation (NVENC) and streams without
+// LTR slots.
+func TestHelperVideoRecovery(t *testing.T) {
+	clock := testClock()
+	fh := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+			LiveBitrate: "seamless", LTRSlots: 2, Vendor: "amd"})
+	})
+	v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock})
+	defer v.Stop()
+	if err := v.Start(helperParams(), false); err != nil {
+		t.Fatal(err)
+	}
+	f := fh.nextStarted()
+	id := uint64(0)
+	// publish sends the next frame (LTR slot ltr, -1 none) and returns its event.
+	publish := func(ltr int32, mod func(*encoder.Frame)) *Frame {
+		t.Helper()
+		id++
+		fr := &encoder.Frame{FrameID: id, LTRSlot: ltr, Data: h264P, CaptureQPC: qpcAt(clock, 5_000_000+int64(id)*16_667)}
+		if id == 1 {
+			fr.Key, fr.SeqStart, fr.Data = true, true, h264Key
+		}
+		if mod != nil {
+			mod(fr)
+		}
+		f.Publish(fr)
+		ev := nextEvent(t, v)
+		if ev.Config != nil {
+			if ev.Config.Recovery != proto.RecoveryLTR {
+				t.Fatalf("config recovery %q, want ltr", ev.Config.Recovery)
+			}
+			ev = nextEvent(t, v)
+		}
+		if ev.Frame == nil || uint64(ev.Frame.Seq) != id-1 {
+			t.Fatalf("frame %d: event %+v", id, ev)
+		}
+		return ev.Frame
+	}
+	noAck := func() {
+		t.Helper()
+		select {
+		case m := <-f.Messages():
+			if m["t"] == "ack" {
+				t.Fatalf("unexpected ack %v", m)
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	// seq = id - 1. Frames 2 and 4 are marked into slots 0 and 1.
+	publish(-1, nil) // 1: key frame, seq 0
+	publish(0, nil)  // 2
+	publish(-1, nil) // 3
+	publish(1, nil)  // 4
+	publish(-1, nil) // 5
+	v.Ack(1, 0)      // the key frame: no LTR, not passed on
+	v.Ack(1, 2)
+	noAck()
+	v.Ack(1, 1)
+	if m := expectMsg(t, f, "ack"); m["frameId"] != float64(2) {
+		t.Fatalf("ack %v", m)
+	}
+	v.Ack(1, 1) // again: not passed on twice
+	v.Ack(7, 3) // another generation: ignored
+	noAck()
+	v.Ack(1, 3)
+	if m := expectMsg(t, f, "ack"); m["frameId"] != float64(4) {
+		t.Fatalf("ack %v", m)
+	}
+
+	// Frame 6 (seq 5) is lost: recover from frame 4, the newest acknowledged LTR.
+	if err := v.Recover(1, 5); err != nil {
+		t.Fatal(err)
+	}
+	if m := expectMsg(t, f, "recover"); m["lostFromFrameId"] != float64(6) || m["ackedLtrFrameId"] != float64(4) {
+		t.Fatalf("recover %v", m)
+	}
+	publish(-1, nil) // 6: was in the encoder already, not the answer
+	publish(-1, nil) // 7
+	// 8: the recovery frame
+	fr := publish(-1, func(f *encoder.Frame) { f.Recovery, f.RefFloor = true, 4 })
+	if !fr.Recovery || fr.RefFloor != 3 {
+		t.Fatalf("recovery frame %+v", fr)
+	}
+	r := nextEvent(t, v).Recovered
+	if r == nil || r.Gen != 1 || r.From != 5 || r.AtGen != 1 || r.AtSeq != 7 || r.Key || r.Wait < 0 {
+		t.Fatalf("recovered %+v", r)
+	}
+
+	// Frame 9 goes into slot 0 (frame 2's) and is lost before the client got
+	// it; a loss at frame 10 recovers from 4, not from 2 (overwritten) or 9.
+	publish(0, nil)  // 9
+	publish(-1, nil) // 10
+	if err := v.Recover(1, 8); err != nil {
+		t.Fatal(err)
+	}
+	if m := expectMsg(t, f, "recover"); m["lostFromFrameId"] != float64(9) || m["ackedLtrFrameId"] != float64(4) {
+		t.Fatalf("recover %v", m)
+	}
+	// A second loss while the first is not answered: the answer must come
+	// from before the first one (seq 8); a recovery frame from frame 9 (an
+	// answer to a later loss only) does not count.
+	if err := v.Recover(1, 9); err != nil {
+		t.Fatal(err)
+	}
+	expectMsg(t, f, "recover")
+	publish(-1, func(f *encoder.Frame) { f.Recovery, f.RefFloor = true, 9 }) // 11
+	// The encoder had no usable LTR after all: an IDR, which also ends the loss.
+	publish(-1, func(f *encoder.Frame) { f.Key, f.Data = true, h264Key }) // 12
+	r = nextEvent(t, v).Recovered
+	if r == nil || r.From != 8 || r.AtSeq != 11 || !r.Key {
+		t.Fatalf("recovered by key frame %+v", r)
+	}
+	// The key frame emptied the slots: nothing acknowledged is left.
+	publish(1, nil) // 13
+	v.Ack(1, 12)
+	expectMsg(t, f, "ack")
+	publish(-1, nil) // 14
+	if err := v.Recover(1, 11); err != nil {
+		t.Fatal(err)
+	}
+	if m := expectMsg(t, f, "recover"); m["lostFromFrameId"] != float64(12) || m["ackedLtrFrameId"] != nil {
+		t.Fatalf("recover after the key frame (only frame 13 acknowledged, after the loss) %v", m)
+	}
+	if err := v.Recover(1, 0); err == nil {
+		t.Fatal("Recover of the generation's key frame")
+	}
+	if err := v.Recover(2, 3); err == nil {
+		t.Fatal("Recover of a generation that does not stream")
+	}
+	// A forced key frame starts generation 2 and answers the pending loss.
+	if err := v.ForceKeyframe(); err != nil {
+		t.Fatal(err)
+	}
+	expectMsg(t, f, "forceIdr")
+	id++
+	f.Publish(&encoder.Frame{FrameID: id, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 6_000_000)})
+	if c := nextEvent(t, v).Config; c == nil || c.Gen != 2 || c.Recovery != proto.RecoveryLTR {
+		t.Fatalf("config %+v", c)
+	}
+	if fr := nextEvent(t, v).Frame; fr == nil || fr.Gen != 2 || fr.Seq != 0 {
+		t.Fatalf("frame %+v", fr)
+	}
+	if r := nextEvent(t, v).Recovered; r == nil || r.Gen != 1 || r.From != 11 || r.AtGen != 2 || r.AtSeq != 0 || !r.Key {
+		t.Fatalf("recovered by the new generation %+v", r)
+	}
+	// ACKs of generation 1 are stale now.
+	v.Ack(1, 12)
+	noAck()
+
+	// NVENC: reference invalidation, no LTR slots, no ACKs passed on.
+	nv := newFakeHelpers(t, fakeNVCaps, func(f *encoder.Fake, m map[string]any) {
+		f.Send(encoder.Started{Backend: "nvenc", Capture: "dda", Codec: "hevc", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+			LiveBitrate: "seamless", Vendor: "nvidia"})
+	})
+	vn := NewHelperVideo(HelperOptions{Launch: nv.launch, Clock: clock})
+	defer vn.Stop()
+	p := helperParams()
+	p.Encoder = EncoderInfo{Name: "hevc_nvenc_helper", Family: "hevc", Vendor: "nvidia", HW: true, Helper: true}
+	if err := vn.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	fn := nv.nextStarted()
+	if m := expectMsg(t, fn, "start"); m["ltrSlots"] != nil && m["ltrSlots"] != float64(0) {
+		t.Fatalf("NVENC start with LTR slots: %v", m)
+	}
+	hevcKey := []byte{0, 0, 0, 1, 0x26, 0x01, 0xaf}
+	fn.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: hevcKey, CaptureQPC: qpcAt(clock, 7_000_000)})
+	if c := nextEvent(t, vn).Config; c == nil || c.Recovery != proto.RecoveryInvalidate {
+		t.Fatalf("NVENC config %+v", c)
+	}
+	nextEvent(t, vn)
+	if c := vn.Capabilities(); c.Recovery != RecoveryInvalidate {
+		t.Fatalf("NVENC capabilities %+v", c)
+	}
+	fn.Publish(&encoder.Frame{FrameID: 2, LTRSlot: -1, Data: h264P, CaptureQPC: qpcAt(clock, 7_016_667)})
+	nextEvent(t, vn)
+	vn.Ack(1, 1)
+	if err := vn.Recover(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if m := expectMsg(t, fn, "recover"); m["lostFromFrameId"] != float64(2) || m["ackedLtrFrameId"] != nil {
+		t.Fatalf("NVENC recover %v", m)
+	}
+	fn.Publish(&encoder.Frame{FrameID: 3, LTRSlot: -1, Recovery: true, RefFloor: 1, Data: h264P, CaptureQPC: qpcAt(clock, 7_033_333)})
+	if fr := nextEvent(t, vn).Frame; fr == nil || !fr.Recovery || fr.RefFloor != 0 {
+		t.Fatalf("NVENC recovery frame %+v", fr)
+	}
+	if r := nextEvent(t, vn).Recovered; r == nil || r.Key || r.From != 1 || r.AtSeq != 2 {
+		t.Fatalf("NVENC recovered %+v", r)
+	}
+
+	// AMF without LTR slots (maxLtr < 2, or a start that asked for none): a
+	// loss needs a key frame.
+	nl := newFakeHelpers(t, fakeAMDCaps, func(f *encoder.Fake, m map[string]any) {
+		f.Send(encoder.Started{Backend: "amf", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+			LiveBitrate: "seamless", Vendor: "amd"})
+	})
+	vl := NewHelperVideo(HelperOptions{Launch: nl.launch, Clock: clock})
+	defer vl.Stop()
+	if err := vl.Start(helperParams(), false); err != nil {
+		t.Fatal(err)
+	}
+	fl := nl.nextStarted()
+	fl.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 8_000_000)})
+	if c := nextEvent(t, vl).Config; c == nil || c.Recovery != proto.RecoveryKeyframe {
+		t.Fatalf("config without LTR slots %+v", c)
+	}
+	if err := vl.Recover(1, 1); !errors.Is(err, ErrNoRecovery) {
+		t.Fatalf("Recover without LTR slots: %v", err)
 	}
 }
 

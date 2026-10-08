@@ -59,6 +59,9 @@ type Caps struct {
 	// intraRefresh holds the periodic intra refresh mode (IntraRefreshOn,
 	// IntraRefreshSingleSlice) of the encoders that run with one.
 	intraRefresh map[string]string
+	// testRecovery: TESTS ONLY (UseTestRecovery), every encoder stands in for
+	// one with reference recovery.
+	testRecovery bool
 
 	align map[string]Alignment // encoders that pad the coded picture
 }
@@ -584,6 +587,24 @@ func (c *Caps) UseIntraRefresh(enc string) bool {
 	return true
 }
 
+// UseTestRecovery makes the FFmpeg pipeline stand in for an encoder with
+// reference recovery (GUIDE 3.5: the native helper's LTR or reference
+// invalidation). TESTS ONLY (host RECON_TEST_FAULTS ref-recovery): every
+// encoder runs with a key frame every TestRecoveryGOP frames; Video announces
+// recovery "invalidate", sends the key frames after a generation's first as
+// P-frames (no key flag: the client must not use them as entry points), and
+// after a Recover the first of them that follows the lost frame as the
+// recovery frame (Frame.Recovery, refFloor = the frame before the loss), which
+// is what a client under reference recovery waits for. A software encoder
+// cannot make a real recovery frame from the FFmpeg command line; an intra
+// frame references nothing, so it is a valid one.
+func (c *Caps) UseTestRecovery() { c.testRecovery = true }
+
+// TestRecoveryGOP is the key frame interval of UseTestRecovery at fps: about
+// 6 per second, so a recovery frame follows a loss within ~170 ms (well within
+// the client's wait for one).
+func TestRecoveryGOP(fps int) int { return max(4, fps/6) }
+
 // intraRefreshSeconds is the periodic intra refresh period. A frame lost at a
 // random point heals after one to two periods (see Recovery), so half a
 // second heals within 0.5-1 s; a shorter period costs more bits on every
@@ -976,6 +997,9 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		// first frame. With intra refresh, an hour of frames would also be an
 		// hour of damage after a loss.
 		gop = IntraRefreshPeriod(p.FPS)
+	}
+	if c.testRecovery {
+		gop = TestRecoveryGOP(p.FPS)
 	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)

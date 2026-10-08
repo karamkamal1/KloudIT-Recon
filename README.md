@@ -288,7 +288,7 @@ The new password (at least 10 characters) is read from stdin.
 | Key | Default | Meaning |
 |---|---|---|
 | `capture` | `auto` | `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion; never chosen by `auto`. The agent uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6) |
-| `pipeline` | `auto` | Video pipeline: `auto` streams with the native encoder helper `recon-encoder.exe` (installed next to `recon-host.exe`: DXGI / AMD Direct Capture / WGC capture, AMF or NVENC in the running process, so key frames and bitrate changes need no encoder restart) when it starts, has an encoder for the codec negotiated with the browser and the session needs nothing only FFmpeg offers (the cursor drawn into the video, a window capture without Windows.Graphics.Capture in the helper, `capture` `x11grab` or `test`, an FFmpeg `encoder` forced here); otherwise FFmpeg. `helper` also streams the test pattern (`capture` `test`) with the helper's synthetic GPU source and tells the user when it cannot use the helper; `ffmpeg` never uses it. Three helper failures within 60 s move the session to FFmpeg (restarts after the first back off; failed restarts within 3 s of a driver reset do not count). host.log says which pipeline a session uses and why (`video pipeline`). Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.1b |
+| `pipeline` | `auto` | Video pipeline: `auto` streams with the native encoder helper `recon-encoder.exe` (installed next to `recon-host.exe`: DXGI / AMD Direct Capture / WGC capture, AMF or NVENC in the running process, so key frames and bitrate changes need no encoder restart, and a lost frame is answered with a recovery frame from frames the browser acknowledged instead of a key frame: AMF long-term references, NVENC reference invalidation) when it starts, has an encoder for the codec negotiated with the browser and the session needs nothing only FFmpeg offers (the cursor drawn into the video, a window capture without Windows.Graphics.Capture in the helper, `capture` `x11grab` or `test`, an FFmpeg `encoder` forced here); otherwise FFmpeg. `helper` also streams the test pattern (`capture` `test`) with the helper's synthetic GPU source and tells the user when it cannot use the helper; `ffmpeg` never uses it. Three helper failures within 60 s move the session to FFmpeg (restarts after the first back off; failed restarts within 3 s of a driver reset do not count). host.log says which pipeline a session uses and why (`video pipeline`). Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.1b and 3.5 |
 | `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` (FFmpeg), or a helper encoder such as `hevc_amf_helper` |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
@@ -403,13 +403,15 @@ On Linux the host agent streams a test pattern (`capture: test`) or an X11 displ
 **Tests only:** the environment variable `RECON_TEST_FAULTS` makes the host agent damage its own
 video stream on purpose, so the tests can check the loss handling: for example
 `RECON_TEST_FAULTS="delay=every:97:200ms,drop=every:193"` sends every 97th frame 200 ms late and
-drops every 193rd (reported to the client like a real drop); `recovery=skip|keyframe` overrides
-the recovery mode the host announces, `intra-refresh` runs libx264 with periodic intra
-refresh, as NVENC runs, so the host announces `skip` from its real encoder arguments, and
-`still=after:N` sends only the first N frames of every encoder generation, like a desktop that
-stops changing, and `rate-period=2s` shortens the bitrate controller's 10 s quiet period and rate
-limit so a test sees the bitrate recover within seconds (`internal/host/faults.go`). Never set it
-on a real host; the agent logs a warning when it is set.
+drops every 193rd (reported to the client like a real drop); `recovery=skip|keyframe` overrides the
+recovery mode the host announces, `intra-refresh` runs libx264 with periodic intra refresh, as
+NVENC runs, so the host announces `skip` from its real encoder arguments, `ref-recovery` makes the
+FFmpeg pipeline stand in for the native helper's ACK-based recovery (a key frame every few frames,
+sent as a P-frame, and after a loss the next one flagged as the recovery frame; the host announces
+`invalidate`), and `still=after:N` sends only the first N frames of every encoder generation, like
+a desktop that stops changing, and `rate-period=2s` shortens the bitrate controller's 10 s quiet
+period and rate limit so a test sees the bitrate recover within seconds
+(`internal/host/faults.go`). Never set it on a real host; the agent logs a warning when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·

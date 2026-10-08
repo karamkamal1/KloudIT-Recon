@@ -50,7 +50,14 @@ makes the next start a new helper even with the same parameters (the session res
 once the size has been stable for 300 ms). A zero-copy stream that ends with
 `capture_failed` is restarted as it was once; the second time the new helper gets
 `zeroCopy` false. It sends `ack` for every frame with `ltrSlot >= 0` the client
-acknowledges and `recover` when the session asks (GUIDE 3.5 wires the client side).
+acknowledges (once per frame, as the client's frame ACK datagram arrives), and `recover` for
+every loss the session learns of (step 3.5: frames the session could not send, frames the
+helper dropped, losses the client reports) with `ackedLtrFrameId` = the newest acknowledged LTR
+frame before the loss that no later frame was marked over and no key frame has cleared since, from
+its ring of the generation's frames {frame id, `ltrSlot`, acknowledged}. It reports the answer (the
+next `recovery` frame with `refFloor` before the loss, or a key frame) to the session, which logs
+it (`loss recovered`); the client waits for exactly that frame (docs/ARCHITECTURE.md, reference
+recovery).
 
 The helper exits on its own when stdin reaches EOF, so it never outlives recon-host. Once
 it has decided to exit (fatal error, `shutdown`, stdin EOF or a broken stdout) it must be
@@ -417,7 +424,8 @@ while read < w:
 ```
 
 A frame with `droppedBefore > 0` (equivalently a gap in `frameId`) tells recon-host that
-frames were lost; it treats them like any other loss (recovery ladder, GUIDE 2.3). There is
+frames were lost; it treats them like any other loss (recovery ladder, GUIDE 2.3: a `recover`
+under reference recovery, step 3.5, else `forceIdr`). There is
 no "slot released" event: the helper looks at `readCount` when it writes and never waits.
 
 ## Threads (helper)

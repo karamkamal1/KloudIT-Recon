@@ -1,6 +1,9 @@
 package media
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Pipeline is a video pipeline: it runs encoder generations for Params and
 // delivers their configs, frames and failures as VideoEvents. Video (one
@@ -42,7 +45,9 @@ type Pipeline interface {
 	// were lost: with Capabilities().Recovery "ltr" or "invalidate" the
 	// encoder codes the next frame from frames the client still has (ltr: an
 	// acknowledged long-term reference) and flags it as a recovery frame
-	// (Frame.Recovery), else ErrNoRecovery.
+	// (Frame.Recovery), else ErrNoRecovery. The outcome follows as a
+	// VideoEvent.Recovered: a recovery frame, or a key frame where the encoder
+	// had nothing to recover from.
 	Recover(gen uint8, lostFrom uint32) error
 	// Ack reports that the client decoded frame seq of generation gen (frame
 	// ack datagram); pipelines with long-term references use it.
@@ -104,6 +109,20 @@ type LostFrames struct {
 	From  uint32
 	Count int
 	Why   string
+}
+
+// Recovered is the encoder's answer to a Recover of generation Gen's frames
+// from seq From on: frame AtSeq of generation AtGen, a recovery frame (it
+// references only frames before From) or, with Key, a key frame (no usable
+// reference: an IDR in the running encoder, or the first frame of a new
+// generation). Wait is the time from Recover to that frame.
+type Recovered struct {
+	Gen   uint8
+	From  uint32
+	AtGen uint8
+	AtSeq uint32
+	Key   bool
+	Wait  time.Duration
 }
 
 // RateChange: the encoder of generation Gen now runs at Kbps and FPS, changed

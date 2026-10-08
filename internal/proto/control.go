@@ -112,8 +112,13 @@ type VideoConfig struct {
 	// Recovery is how the client recovers from a confirmed frame loss (a frame
 	// the host reported dropped, or a gap that outlasted the late-frame
 	// timeout): RecoverySkip when the encoder heals the picture by itself
-	// (intra refresh), RecoveryKeyframe (also when empty: hosts before this
-	// field) when the decoder needs a key frame.
+	// (intra refresh); RecoveryLTR or RecoveryInvalidate (clients with hello
+	// v >= HelloVersionRecovery only) when the encoder answers the loss with a
+	// recovery frame (frame extension refFloor) that references only frames
+	// the client decoded before it: the client decodes nothing from the lost
+	// frame on until that frame (or a key frame) and reports losses the host
+	// does not know of with Lost; RecoveryKeyframe (also when empty: hosts
+	// before this field) when the decoder needs a key frame.
 	Recovery string `json:"recovery,omitempty"`
 	// Crop, set when the coded picture is larger than Width x Height
 	// (omitted otherwise): the decoder outputs CodedWidth x CodedHeight, of
@@ -143,7 +148,22 @@ func (c *VideoConfig) SetCrop(w, h, codedW, codedH int) {
 const (
 	RecoverySkip     = "skip"     // skip the lost frame and keep decoding
 	RecoveryKeyframe = "keyframe" // request a key frame (FFmpeg path: a new encoder generation)
+	// Reference recovery (GUIDE 3.5, native helper): wait for the recovery
+	// frame. LTR: it references an acknowledged long-term reference (AMF);
+	// invalidate: the encoder invalidated the lost frames and references an
+	// older one (NVENC). The client handles both alike.
+	RecoveryLTR        = "ltr"
+	RecoveryInvalidate = "invalidate"
 )
+
+// RefRecovery reports whether a VideoConfig.Recovery value is reference
+// recovery (RecoveryLTR, RecoveryInvalidate).
+func RefRecovery(r string) bool { return r == RecoveryLTR || r == RecoveryInvalidate }
+
+// HelloVersionRecovery is the first hello version whose clients handle
+// RecoveryLTR and RecoveryInvalidate (and send Lost); older clients get
+// RecoveryKeyframe instead.
+const HelloVersionRecovery = 3
 
 // Rate announces a bitrate or frame rate change of the running generation Gen
 // that needed no new generation (the native helper changes them in the
@@ -198,12 +218,23 @@ type Notice struct {
 
 // ClientMsg is the union of client->host control messages after Hello.
 type ClientMsg struct {
-	T       string      `json:"t"` // settings | keyframe | congestion | stages | pause | resume | bye
+	T       string      `json:"t"` // settings | keyframe | lost | congestion | stages | pause | resume | bye
 	Prefs   *Prefs      `json:"prefs,omitempty"`
 	DelayMs int         `json:"delayMs,omitempty"`
 	Reason  string      `json:"reason,omitempty"` // "congestion": CongestionDecoder, or "" (one-way delay grew)
 	Stages  []StageStat `json:"stages,omitempty"` // "stages": the client's latency summary
+	// "lost" (MsgLost): the frames of generation Gen from FromSeq on.
+	Gen     uint8  `json:"gen,omitempty"`
+	FromSeq uint32 `json:"fromSeq,omitempty"`
 }
+
+// MsgLost is the type of the message ({"t":"lost","gen":g,"fromSeq":s}) in
+// which a client under reference recovery (VideoConfig.Recovery RecoveryLTR or
+// RecoveryInvalidate) reports a loss the host did not report to it (Dropped):
+// a gap in the sequence that outlasted its late-frame wait. The host answers
+// with a recovery frame (or a key frame). Hosts before it ignore the message
+// (they never announce reference recovery).
+const MsgLost = "lost"
 
 // CongestionDecoder is the reason of a "congestion" message from a client
 // whose decoder fell behind: it flushed the decoder and discards the current

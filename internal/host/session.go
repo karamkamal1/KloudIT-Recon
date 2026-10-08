@@ -82,10 +82,13 @@ type Session struct {
 	// Recovery "skip" bounded in time (watchHeal), guarded by healMu: the
 	// live generation, how many frames after a lost one it needs to heal it
 	// (0: it announced "keyframe"), and its reported loss not yet healed.
-	healMu     sync.Mutex
-	healGen    uint8
-	healFrames int
-	heal       *healWatch
+	// liveRecovery: the recovery mode the client was told for healGen
+	// (VideoConfig.Recovery; reference recovery: recoverLoss).
+	healMu       sync.Mutex
+	healGen      uint8
+	healFrames   int
+	heal         *healWatch
+	liveRecovery string
 
 	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
 	audioKbps atomic.Int64             // audio bitrate while audio runs
@@ -105,6 +108,10 @@ type sessionStats struct {
 	owdSum              atomic.Int64
 	owdMax              atomic.Int64
 	dropped             atomic.Int64 // frames the host discarded (reportDropped)
+	// Losses under reference recovery (recoverLoss): answered with a
+	// recovery frame, or with a key frame (none possible, or the encoder fell
+	// back to one).
+	recovered, recoveredByKey atomic.Int64
 }
 
 var errClosed = errors.New("session closed")
@@ -751,6 +758,8 @@ func (s *Session) videoEvents() {
 			s.handleEncoderFailure(ev)
 		case ev.Lost != nil:
 			s.encoderLost(ev.Lost)
+		case ev.Recovered != nil:
+			s.lossRecovered(ev.Recovered)
 		case ev.Capture != nil:
 			s.captureChanged(ev.Capture)
 		case ev.Rate != nil:
@@ -763,6 +772,11 @@ func (s *Session) videoEvents() {
 			s.videoUp.Store(true)
 			s.cursorInVideo.Store(ev.CursorInVideo)
 			c := *ev.Config
+			if proto.RefRecovery(c.Recovery) && s.hello.V < proto.HelloVersionRecovery {
+				// Older clients cannot wait for a recovery frame: after a
+				// loss they ask for a key frame (an IDR in the encoder).
+				c.Recovery = proto.RecoveryKeyframe
+			}
 			if r := s.a.faults.recovery; r != "" {
 				c.Recovery = r
 			}
@@ -849,7 +863,7 @@ type healWatch struct{ seq uint32 }
 func (s *Session) healConfig(c *proto.VideoConfig, healFrames int) {
 	s.healMu.Lock()
 	defer s.healMu.Unlock()
-	s.healGen, s.healFrames, s.heal = c.Gen, 0, nil
+	s.healGen, s.healFrames, s.heal, s.liveRecovery = c.Gen, 0, nil, c.Recovery
 	if c.Recovery == proto.RecoverySkip {
 		s.healFrames = healFrames
 	}
@@ -979,16 +993,69 @@ func (s *Session) helperFallback(ev media.VideoEvent) {
 // encoderLost handles frames the pipeline lost before they reached the
 // session (the native helper's ring was full: this process fell behind, or
 // an encoder error): the client is told at once, as for frames the session
-// dropped, and gets a key frame unless the generation heals by itself.
+// dropped, and the encoder recovers (a recovery frame under reference
+// recovery, else a key frame) unless the generation heals by itself.
 func (s *Session) encoderLost(l *media.LostFrames) {
 	frames := make([]*media.Frame, 0, l.Count)
 	for i := 0; i < l.Count; i++ {
 		frames = append(frames, &media.Frame{Gen: l.Gen, Seq: l.From + uint32(i)})
 	}
 	s.reportDropped(frames, l.Why)
-	if s.vid().Capabilities().Recovery != media.RecoverySkip {
+	if !s.recoverLoss(l.Gen, l.From, l.Why) && s.vid().Capabilities().Recovery != media.RecoverySkip {
 		s.requestKeyframe()
 	}
+}
+
+// lostFrame handles a frame the session could not send (its stream failed or
+// was cancelled; the test hook's drops): the client is told, and under
+// reference recovery the encoder recovers. Otherwise the client asks for a
+// key frame (recovery "keyframe") or skips the frame ("skip").
+func (s *Session) lostFrame(f *media.Frame, why string) {
+	s.reportDropped([]*media.Frame{f}, why)
+	s.recoverLoss(f.Gen, f.Seq, why)
+}
+
+// recoverLoss answers a confirmed loss of generation gen's frames from seq
+// from on where the client was told reference recovery for that generation
+// (VideoConfig.Recovery ltr / invalidate, GUIDE 3.5; the client then decodes
+// nothing from the lost frame on until a recovery frame or a key frame): the
+// encoder codes its next frame from frames the client still holds
+// (Pipeline.Recover: an acknowledged LTR, or invalidating the lost frames),
+// and where it cannot, the client gets a key frame (an IDR in the running
+// encoder on the helper). It reports whether it handled the loss; otherwise
+// the generation's own recovery applies (skip: nothing; keyframe: the client
+// asks for a key frame).
+func (s *Session) recoverLoss(gen uint8, from uint32, why string) bool {
+	s.healMu.Lock()
+	ref := gen == s.healGen && proto.RefRecovery(s.liveRecovery)
+	s.healMu.Unlock()
+	if !ref {
+		return false
+	}
+	err := s.vid().Recover(gen, from)
+	if err == nil {
+		s.log.Info("recovering from a loss", "gen", gen, "from_seq", from, "why", why)
+		return true
+	}
+	s.stats.recoveredByKey.Add(1)
+	s.log.Info("no recovery frame possible, forcing a key frame", "gen", gen, "from_seq", from, "why", why, "err", err)
+	s.requestKeyframe()
+	return true
+}
+
+// lossRecovered logs the encoder's answer to a recoverLoss: the frame that
+// recovered the loss (one per loss: under the "wifi" profile, GUIDE T5 wants
+// >= 90 % of them recovery frames, not key frames).
+func (s *Session) lossRecovered(r *media.Recovered) {
+	by := "recovery frame"
+	if r.Key {
+		by = "key frame"
+		s.stats.recoveredByKey.Add(1)
+	} else {
+		s.stats.recovered.Add(1)
+	}
+	s.log.Info("loss recovered", "gen", r.Gen, "from_seq", r.From, "by", by, "at", fmt.Sprintf("%d/%d", r.AtGen, r.AtSeq),
+		"wait_ms", r.Wait.Milliseconds())
 }
 
 // resizeSettle is how long a capture source must keep its new size before
@@ -1237,7 +1304,7 @@ func (s *Session) frameSender() {
 				return
 			}
 			s.log.Debug("open frame stream", "err", err)
-			s.reportDropped([]*media.Frame{f}, "stream failed")
+			s.lostFrame(f, "stream failed")
 			continue
 		}
 		h, ext := videoHeader(f, s.hello.V, s.a.clock())
@@ -1252,7 +1319,7 @@ func (s *Session) frameSender() {
 			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
 			_, _ = st.Write(buf[:len(buf)/2])
 			st.CancelWrite()
-			s.reportDropped([]*media.Frame{f}, "test fault")
+			s.lostFrame(f, "test fault")
 			continue
 		} else if delay > 0 {
 			// Test hook: this frame arrives late, the next ones on time.
@@ -1272,7 +1339,7 @@ func (s *Session) sendFrame(st transport.SendStream, f *media.Frame, h proto.Fra
 	if _, err := st.Write(b); err != nil {
 		st.CancelWrite()
 		if s.ctx.Err() == nil {
-			s.reportDropped([]*media.Frame{f}, "stream failed")
+			s.lostFrame(f, "stream failed")
 		}
 		return
 	}
@@ -1593,6 +1660,10 @@ func (s *Session) controlLoop() error {
 			}
 		case "keyframe":
 			s.requestKeyframe()
+		case proto.MsgLost:
+			// A loss only the client saw (a gap that outlasted its wait),
+			// under reference recovery: it waits for the recovery frame.
+			s.recoverLoss(m.Gen, m.FromSeq, "client")
 		case "stages":
 			s.logStages(m.Stages)
 		case "congestion":
@@ -1746,6 +1817,7 @@ func (s *Session) statsLoop() {
 		owdSum := s.stats.owdSum.Swap(0)
 		owdMax := s.stats.owdMax.Swap(0)
 		dropped := s.stats.dropped.Swap(0)
+		recovered, byKey := s.stats.recovered.Swap(0), s.stats.recoveredByKey.Swap(0)
 		avg := int64(0)
 		if acks > 0 {
 			avg = owdSum / acks
@@ -1753,6 +1825,6 @@ func (s *Session) statsLoop() {
 		target, ceiling := s.rate.kbps()
 		s.log.Info("stream stats", "fps", float64(frames)/10, "mbps", float64(bytes)*8/10/1e6,
 			"owd_avg_ms", float64(avg)/1000, "owd_max_ms", float64(owdMax)/1000, "kbps_target", target,
-			"kbps_max", ceiling, "dropped", dropped)
+			"kbps_max", ceiling, "dropped", dropped, "recovered", recovered, "recovered_by_key", byKey)
 	}
 }

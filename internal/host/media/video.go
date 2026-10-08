@@ -79,10 +79,12 @@ type VideoEvent struct {
 	// Lost: frames that will never reach the session (HelperVideo: the
 	// helper dropped them). Capture: the capture source changed (HelperVideo).
 	// Rate: the live generation's bitrate or frame rate changed in its
-	// encoder, without a new generation (HelperVideo).
-	Lost    *LostFrames
-	Capture *CaptureChange
-	Rate    *RateChange
+	// encoder, without a new generation (HelperVideo). Recovered: how the
+	// encoder answered a Recover (after the frame that answered it).
+	Lost      *LostFrames
+	Capture   *CaptureChange
+	Rate      *RateChange
+	Recovered *Recovered
 }
 
 // encoderFault reports whether an encoder process's stderr shows that the
@@ -133,6 +135,11 @@ type encProc struct {
 	started  time.Time
 	killed   bool
 	errDone  chan struct{} // closed when stderr is fully consumed
+	// A Recover waiting for its recovery frame (Caps.UseTestRecovery only):
+	// the oldest lost seq and when it was asked for. Guarded by Video.mu.
+	recovering  bool
+	recoverFrom uint32
+	recoverAt   time.Time
 }
 
 // NewVideo creates a manager. clock returns the host monotonic time in µs.
@@ -167,8 +174,11 @@ func (v *Video) Capabilities() PipelineCaps {
 	c := PipelineCaps{Name: PipelineFFmpeg, Recovery: RecoveryNone}
 	if pr := v.active; pr != nil {
 		c.Recovery = RecoveryKeyframe
-		if pr.recovery == proto.RecoverySkip {
+		switch pr.recovery {
+		case proto.RecoverySkip:
 			c.Recovery, c.IntraRefresh = RecoverySkip, true
+		case proto.RecoveryInvalidate:
+			c.Recovery = RecoveryInvalidate // tests: Caps.UseTestRecovery
 		}
 		c.CursorInVideo = pr.params.DrawCursor
 	}
@@ -201,8 +211,26 @@ func (v *Video) SetRate(kbps, fps int) error {
 }
 
 // Recover: the FFmpeg encoders keep no references the client could recover
-// from.
-func (v *Video) Recover(gen uint8, lostFrom uint32) error { return ErrNoRecovery }
+// from. Tests (Caps.UseTestRecovery): the next key frame after frame lostFrom
+// goes out as the recovery frame.
+func (v *Video) Recover(gen uint8, lostFrom uint32) error {
+	if !v.caps.testRecovery {
+		return ErrNoRecovery
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	pr := v.active
+	switch {
+	case pr == nil || pr.gen != gen:
+		return fmt.Errorf("video: generation %d does not stream", gen)
+	case lostFrom == 0:
+		return fmt.Errorf("video: the key frame of generation %d was lost: nothing to recover from", gen)
+	case !pr.recovering:
+		pr.recovering, pr.recoverFrom, pr.recoverAt = true, lostFrom, time.Now()
+	}
+	pr.recoverFrom = min(pr.recoverFrom, lostFrom)
+	return nil
+}
 
 // Ack: unused (no long-term references).
 func (v *Video) Ack(gen uint8, seq uint32) {}
@@ -453,6 +481,9 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 			}
 			v.active, v.pending = pr, nil
 			pr.recovery = Recovery(pr.args, st.Width, st.Height, pr.params.FPS)
+			if v.caps.testRecovery {
+				pr.recovery = proto.RecoveryInvalidate
+			}
 			cfg := &proto.VideoConfig{
 				T: "video", Gen: pr.gen, Family: params.Family, Codec: params.Codec,
 				FPS: pr.params.FPS, BitrateKbps: pr.params.BitrateKbps,
@@ -472,12 +503,33 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 			v.emit(VideoEvent{Config: cfg, HealFrames: HealFrames(pr.args, st.Width, st.Height), CursorInVideo: pr.params.DrawCursor})
 			v.emit(VideoEvent{Frame: f})
 		case v.active == pr:
+			rec := v.testRecoveryFrame(pr, f)
 			v.mu.Unlock()
 			v.emit(VideoEvent{Frame: f})
+			if rec != nil {
+				v.emit(VideoEvent{Recovered: rec})
+			}
 		default:
 			v.mu.Unlock() // superseded generation, drain until killed
 		}
 	}
+}
+
+// testRecoveryFrame turns a key frame after the generation's first into a
+// P-frame, or into the recovery frame a Recover waits for (Caps.UseTestRecovery
+// only; see there), and returns the Recover's answer then. Called with v.mu
+// held.
+func (v *Video) testRecoveryFrame(pr *encProc, f *Frame) *Recovered {
+	if !v.caps.testRecovery || !f.Key {
+		return nil
+	}
+	f.Key = false
+	if !pr.recovering || f.Seq <= pr.recoverFrom {
+		return nil
+	}
+	pr.recovering = false
+	f.Recovery, f.RefFloor = true, pr.recoverFrom-1
+	return &Recovered{Gen: pr.gen, From: pr.recoverFrom, AtGen: pr.gen, AtSeq: f.Seq, Wait: time.Since(pr.recoverAt)}
 }
 
 // visibleSize returns the picture to show (w, h) and the coded picture the

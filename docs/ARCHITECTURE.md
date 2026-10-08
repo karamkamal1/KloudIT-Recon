@@ -123,13 +123,40 @@ What the client does about a lost frame depends on `recovery` in the `video` mes
   a loss it reported (`media.HealFrames`) within 2 s (`media.MaxHeal`), it restarts the encoder,
   overlapped, and the new generation's first frame (an IDR of the current picture) replaces the
   damaged one.
+- `ltr` / `invalidate` (**reference recovery**, the native helper, GUIDE 3.5; clients with
+  `hello.v >= 3`, older ones get `keyframe`): the encoder answers a loss with a **recovery frame**
+  that references only frames the client decoded before it: `ltr` (AMF) an acknowledged long-term
+  reference, `invalidate` (NVENC) the newest frame before the loss after invalidating the lost
+  ones. It carries frame extension tag 5 `refFloor` (the oldest frame it may reference, a `seq` of
+  the generation), which is also the marker: only recovery frames have it. After a loss at seq L
+  the client stops feeding the decoder (the last good picture stays on screen) and discards every
+  frame until one with `refFloor < L` (or a key frame) arrives, feeds it and resumes. The host
+  recovers the losses it reported (`dropped`) on its own; a gap that outlasted the late-frame wait
+  the client reports with `{"t":"lost","gen":g,"fromSeq":L}` (hosts that never announce these
+  modes never get it). No recovery frame within max(1 s, 4 × RTT): a key frame request. A decoder error within 1 s
+  of a recovery frame means this decoder rejects them after skipped frames: that codec's losses ask
+  for key frames from then on (docs/VENDOR_NOTES.md 3.5 has the browser × GPU matrix).
+
+  The host side: the client acknowledges every frame it decodes (`0x40`, sent from the decoder's
+  output). `media.HelperVideo` keeps a ring of the generation's frames {frame id, LTR slot,
+  acknowledged} and passes the acknowledgements of LTR-marked frames to the helper (`ack`), whose
+  LTR policy only keeps reusing slots the client holds. On a loss at L (a frame the session could
+  not send: its stream failed, or the hook dropped it; frames the helper dropped; the client's
+  `lost`) the session calls `Recover(L)`: the helper gets `recover` with the newest acknowledged
+  LTR frame before L that its slot still holds (no later mark into that slot, nothing before the
+  latest key frame). The recovery frame, or the key frame the encoder falls back to, is logged
+  (`loss recovered ... by="recovery frame"` / `by="key frame"`, counted per 10 s in `stream stats`
+  as `recovered` / `recovered_by_key`); a loss nothing can be recovered from (the generation's key
+  frame) gets a key frame in the encoder. A frame-queue overflow keeps its key frame (it also cuts
+  the bitrate).
 - `keyframe` (everything else, and hosts before the field): the client asks for a key frame
-  (`{"t":"keyframe"}`), which on the FFmpeg path is a new encoder generation.
+  (`{"t":"keyframe"}`), which on the FFmpeg path is a new encoder generation and on the native
+  helper an IDR in the running encoder.
 
 A loss before the generation's first key frame always asks for a key frame, and so does a decoder
-error, which is also the fallback when a decoder rejects a frame after a skipped one (an AV1
-frame inherits its entropy-coding state from a reference frame, so a missing reference can make
-the next frames undecodable, not just blurred).
+error (the decoder is reconfigured), which is also the fallback when a decoder rejects a frame
+after a skipped one (an AV1 frame inherits its entropy-coding state from a reference frame, so a
+missing reference can make the next frames undecodable, not just blurred).
 
 ### Datagrams
 
@@ -141,7 +168,7 @@ the next frames undecodable, not just blurred).
 | `0x21` mouse abs | C→H | u32 seq, u16 x, u16 y | latest wins |
 | `0x22` gamepad | C→H | idx, connected, u32 seq, XInput state | full snapshot, re-sent every 100 ms |
 | `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, (u64 host µs) | NTP-style clock sync, minimum-RTT sample |
-| `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | host-side telemetry |
+| `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, bitrate recovery, and the ACKs of reference recovery |
 
 For mouse motion, the client keeps running totals and the host applies `total − last_total`
 for each datagram it accepts (stale sequence numbers are ignored). After motion stops, the
@@ -249,7 +276,7 @@ the pipeline's `Capabilities`, never from a vendor:
 | process | one `ffmpeg` per generation | one `recon-encoder.exe` per session (docs/HELPER_PROTOCOL.md) |
 | key frame for the client | a new generation, started at once (urgent restart) | an IDR in the running encoder (`ForceIDR`): a new generation without a new process |
 | bitrate change | an overlapped restart (rate limited, see above) | in the running encoder (`LiveBitrate`: AMF/NVENC seamless, or an encoder flush with an IDR), as the live-bitrate qualification measured it (below) |
-| loss recovery | key frame, or skip with intra refresh | key frame; `Recover`/`Ack` plumbed for LTR / reference invalidation (step 3.5 wires the client) |
+| loss recovery | key frame, or skip with intra refresh | a recovery frame (`ltr` / `invalidate`, see above), key frame where the encoder has neither |
 | stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly) |
 
 **Choosing** (host config `pipeline`: `auto` | `helper` | `ffmpeg`, once per session, logged as
@@ -269,7 +296,8 @@ that answers `forceIdr`), and `seq` is the frame id minus that frame's. A forced
 therefore begins a new generation with the same parameters, which is exactly what a client that
 asked for a key frame waits for (it discards the rest of the generation it asked in); old clients
 see nothing new. Frames the helper drops (its ring is full: recon-host fell behind) are reported
-like frames the session dropped (`{"t":"dropped"}`) and answered with a key frame. A bitrate or
+like frames the session dropped (`{"t":"dropped"}`) and answered with a recovery frame (reference
+recovery, above), or a key frame where the stream has none. A bitrate or
 frame rate change in the encoder (the rate controller, or a settings change) is announced before
 the live generation's next frame with `{"t":"rate","gen","bitrate","fps","maxBitrate"}`; the
 client takes the new fps for its gap timeout (clients that ignore it keep the generation's

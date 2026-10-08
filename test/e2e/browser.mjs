@@ -401,9 +401,9 @@ async function startStream(prefs) {
 
 // Stream over direct WebTransport from a host started with faults; measure
 // `seconds` after a warm-up.
-async function lossRun(name, faults, seconds) {
+async function lossRun(name, faults, seconds, prefs = {}) {
   const host = await restartHost({ RECON_TEST_FAULTS: faults }, name);
-  await startStream({ path: 'auto', transport: 'auto' });
+  await startStream({ path: 'auto', transport: 'auto', ...prefs });
   await sleep(4000); // decoder warm-up
   const st0 = await page.evaluate(() => window.__recon.lastStats);
   const log0 = host.log.length;
@@ -424,7 +424,17 @@ async function lossRun(name, faults, seconds) {
     dropped: (hl.match(/msg="frames dropped".*? why="test fault"/g) || []).length,
     restarts: restartsByReason(hl),
     keyRequestReasons: keyRequestsByReason(con),
-    client: { keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped') },
+    client: {
+      keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped'),
+      recovered: delta('recovered'), recoveredByKey: delta('recoveredByKey'), discarded: delta('recoveryDiscarded'),
+      rejected: delta('recoveryRejected'), keyFrames: delta('keyFrames'),
+    },
+    // Reference recovery on the host: losses it asked the encoder to recover,
+    // and how the encoder answered (recovery frame, key frame).
+    recovering: (hl.match(/msg="recovering from a loss"/g) || []).length,
+    recoveredByFrame: (hl.match(/msg="loss recovered".*? by="recovery frame"/g) || []).length,
+    recoveredByKey: (hl.match(/msg="loss recovered".*? by="key frame"/g) || []).length + (hl.match(/msg="no recovery frame possible/g) || []).length,
+    hostLog: hl,
     // The decoder's own error lines, not the key-frame requests they cause.
     decoderErrors: con.filter((l) => l.includes('decoder error:')).length,
   };
@@ -499,7 +509,51 @@ async function checkLossHandling() {
     `${s.cfg?.encoder} recovery ${s.cfg?.recovery}: host dropped ${s.dropped}, client told ${s.client.hostDropped}, skipped ${s.client.skipped}, ` +
       `decoder errors after a skip ${s.decoderErrors} (fallback: reset + key frame); client key-frame requests: ${counts(s.keyRequestReasons)}; ` +
       `host restarts: ${counts(s.restarts)}; ${s.fps.toFixed(1)} fps mean over ${s.seconds} s`);
-  results.push({ loss: 'faults', keyframe: k, skip: s });
+  // Reference recovery (GUIDE 3.5) on the software path: the hook makes the
+  // software encoder (libsvtav1: Playwright's Chromium decodes no H.264;
+  // internal/host/media TestTestRecovery covers libx264 too) stand in for an
+  // encoder that recovers by reference invalidation
+  // (ref-recovery: a key frame every fps/6 frames, sent as P-frames; after a
+  // loss the host flags the next one RECOVERY with refFloor = the frame
+  // before the loss; recovery "invalidate" announced). Every dropped frame
+  // must be answered by such a frame: the client decodes nothing from the
+  // lost frame until it (the last good picture stays), resumes with it, and
+  // asks for no key frame; the host starts no new generation for a loss.
+  // Late frames still wait (no "frame lost"). The client counts the key
+  // frames (IDRs) it decoded and the frames it waited out.
+  const r = await lossRun('host-faults-ref', `${LOSS_FAULTS},ref-recovery`, 20);
+  const refRestarts = r.restarts['keyframe request (urgent)'] || 0;
+  const lossKeys = ['dropped by host', 'frame lost', 'no recovery frame'].reduce((a, k) => a + (r.keyRequestReasons[k] || 0), 0);
+  const hostRec = r.recoveredByFrame + r.recoveredByKey;
+  check('reference recovery (software stand-in): dropped frames recovered by a recovery frame, frames up to it discarded, no key-frame request or restart for a loss',
+    r.cfg?.recovery === 'invalidate' && r.dropped >= 3 && r.client.hostDropped >= r.dropped - 1 &&
+      r.recoveredByFrame >= r.dropped - 1 && r.recoveredByFrame >= 0.9 * hostRec &&
+      r.client.recovered >= r.dropped - 1 && r.client.discarded > 0 && r.client.rejected === 0 && r.decoderErrors === 0 &&
+      lossKeys === 0 && refRestarts <= (r.keyRequestReasons['decoder error'] || 0) + (r.keyRequestReasons.watchdog || 0) &&
+      !r.keyRequestReasons['frame lost'] && r.fps >= 10,
+    `${r.cfg?.encoder} recovery ${r.cfg?.recovery}: host dropped ${r.dropped} (${r.delayed} delayed 200 ms), asked the encoder to recover ${r.recovering}, ` +
+      `answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}; client told ${r.client.hostDropped}, ` +
+      `recovered ${r.client.recovered} by recovery frame and ${r.client.recoveredByKey} by key frame, ${r.client.discarded} frames discarded meanwhile, ` +
+      `${r.client.keyFrames} IDRs decoded, decoder errors ${r.decoderErrors}; client key-frame requests: ${counts(r.keyRequestReasons)}; ` +
+      `host restarts: ${counts(r.restarts)}; ${r.fps.toFixed(1)} fps mean over ${r.seconds} s`);
+  await checkProbe('reference recovery');
+  // The drop test under reference recovery: the client drops a frame itself,
+  // reports it ({"t":"lost"}), and the host answers with a recovery frame.
+  const rts = [];
+  for (let i = 0; i < 2; i++) {
+    await page.evaluate(() => { window.__recon.dropTest = null; window.__recon.worker.postMessage({ type: 'dropTest' }); });
+    rts.push(await until(() => page.evaluate(() => window.__recon.dropTest), 8000, 'drop test result').catch(() => null));
+  }
+  const host = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const clientLost = (host.log.match(/msg="recovering from a loss".*? why=client/g) || []).length;
+  check('reference recovery: a loss only the client saw (drop test) is reported ("lost") and answered by a recovery frame the decoder accepts',
+    rts.every((d) => d?.ok && d.recovery === 'invalidate' && d.recoveredBy && !d.recoveredBy.key && d.recoveredBy.refFloor < d.seq) && clientLost >= rts.length,
+    `${rts.map((d) => (d ? `${d.gen}/${d.seq}: ${d.recoveredBy ? `${d.recoveredBy.key ? 'key frame' : `recovery frame ${d.recoveredBy.seq} (refFloor ${d.recoveredBy.refFloor})`} after ${d.recoveredBy.ms} ms, ${d.recoveredBy.discarded} discarded` : 'not recovered'}, ${d.decoded} decoded${d.error ? `, ${d.error}` : ''}` : 'no result')).join('; ')}; ` +
+      `host: ${clientLost} client-reported losses recovered`);
+  delete r.hostLog;
+  delete k.hostLog;
+  delete s.hostLog;
+  results.push({ loss: 'faults', keyframe: k, skip: s, ref: r, refDropTests: rts });
   await page.evaluate(() => { window.__recon.userClosed = true; });
 }
 

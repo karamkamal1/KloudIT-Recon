@@ -35,8 +35,9 @@ export const EXT_TAGS = {
   5: 'refFloor', 6: 'ltrSlot', 7: 'temporalLayer',
 };
 
-// Hello version that asks the host for extended frame headers.
-export const HELLO_VERSION = 2;
+// Hello version: 2 asks the host for extended frame headers, 3 says the client
+// handles reference recovery (VideoConfig.recovery "ltr" / "invalidate").
+export const HELLO_VERSION = 3;
 export const FEATURE_FRAME_EXT = 'frame-ext';
 
 export const AUDIO_OPUS = 1;
@@ -49,6 +50,15 @@ export const AUDIO_PCM = 2;
 export const MSG_DROPPED = 'dropped';
 export const RECOVERY_SKIP = 'skip'; // the encoder heals itself (intra refresh): skip the frame
 export const RECOVERY_KEYFRAME = 'keyframe'; // request a key frame
+// Reference recovery (native helper, GUIDE 3.5): the encoder answers a loss
+// with a recovery frame (frame extension refFloor < the lost seq) coded from
+// frames the client decoded before the loss: an acknowledged long-term
+// reference (ltr, AMF) or after invalidating the lost frames (invalidate,
+// NVENC). Decode nothing from the lost frame on until that frame (or a key
+// frame); report losses the host did not ({"t":"lost","gen","fromSeq"}).
+export const RECOVERY_LTR = 'ltr';
+export const RECOVERY_INVALIDATE = 'invalidate';
+export const MSG_LOST = 'lost';
 // {"t":"congestion","reason":"decoder"}: the decoder fell behind and was flushed (restart at once).
 export const CONGESTION_DECODER = 'decoder';
 const MAX_DROPPED = 1024;
@@ -60,8 +70,20 @@ export function parseDropped(m) {
   return { gen: m.gen, from: m.fromSeq, count };
 }
 
+const RECOVERY_MODES = [RECOVERY_SKIP, RECOVERY_LTR, RECOVERY_INVALIDATE];
+
 /** A VideoConfig's recovery mode; hosts before the field (or unknown values) mean keyframe. */
-export const recoveryOf = (cfg) => (cfg?.recovery === RECOVERY_SKIP ? RECOVERY_SKIP : RECOVERY_KEYFRAME);
+export const recoveryOf = (cfg) => (RECOVERY_MODES.includes(cfg?.recovery) ? cfg.recovery : RECOVERY_KEYFRAME);
+
+/** Whether a recovery mode waits for the encoder's recovery frame (ltr, invalidate). */
+export const isRefRecovery = (mode) => mode === RECOVERY_LTR || mode === RECOVERY_INVALIDATE;
+
+/**
+ * Whether a frame (parsed header) ends the wait after a loss at seq `lostFrom`
+ * under reference recovery: a key frame, or a recovery frame whose oldest
+ * reference (refFloor) is older than the lost frame.
+ */
+export const endsRecovery = (h, lostFrom) => h.key || (h.ext?.refFloor !== undefined && h.ext.refFloor < lostFrom);
 
 const enc = new TextEncoder();
 

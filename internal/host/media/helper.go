@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"sort"
 	"sync"
 	"time"
 
@@ -19,6 +18,15 @@ import (
 // process captures and encodes, and runtime controls act on the running
 // encoder: ForceKeyframe is an in-encoder IDR, SetRate a live bitrate change,
 // Recover a reference recovery, where the helper's caps allow them.
+//
+// Recovery (GUIDE 3.5). Every frame of the live generation goes into a ring
+// with its LTR slot; the client's frame ACKs (Ack) mark it acknowledged, and
+// ACKs of LTR-marked frames go on to the helper, whose LTR policy only reuses
+// slots the client holds. Recover(L) names the newest acknowledged LTR frame
+// before L that is still in its slot (ackRing.newestAckedLTR) to the helper,
+// which codes the next frame from it (AMF) or invalidates L and later (NVENC);
+// that frame comes back flagged RECOVERY with refFloor, and the answer (or the
+// key frame the helper fell back to) is reported as a Recovered event.
 //
 // Generations. The helper numbers its frames (frame ids, gaps = lost frames);
 // the client sees (gen, seq). A generation starts at a key frame that starts a
@@ -124,20 +132,21 @@ type helperProc struct {
 	liveMeasured, liveRestart bool
 
 	// The stream, guarded by HelperVideo.mu.
-	live     bool
-	gen      uint8  // generation of the frames it sends
-	seqBase  uint64 // frame id of the generation's seq 0
-	lastID   uint64 // newest frame id seen
-	ptsBase  uint64 // capture time of the generation's first frame (host µs)
-	noKey    int    // frames before the first key frame
-	codec    *codec.Params
-	ltr      map[uint32]uint64 // seq -> frame id of unacknowledged LTR-marked frames of gen
-	ackedLTR []uint64          // frame ids of acknowledged LTR frames of gen, ascending (newest few)
+	live    bool
+	gen     uint8  // generation of the frames it sends
+	seqBase uint64 // frame id of the generation's seq 0
+	lastID  uint64 // newest frame id seen
+	ptsBase uint64 // capture time of the generation's first frame (host µs)
+	noKey   int    // frames before the first key frame
+	codec   *codec.Params
+	acks    ackRing // gen's frames: LTR marks and the client's ACKs
+	// A Recover of gen waiting for its answer: the next recovery frame that
+	// references only frames before seq recoverFrom (the oldest loss), or a
+	// key frame; recoverAt: when it was asked for.
+	recovering  bool
+	recoverFrom uint32
+	recoverAt   time.Time
 }
-
-// helperMaxLTRs bounds the LTR frames a proc remembers (marks come about
-// every 100 ms; older ones are no use for recovery anyway).
-const helperMaxLTRs = 32
 
 // NewHelperVideo creates the pipeline; nothing runs until Start.
 func NewHelperVideo(opt HelperOptions) *HelperVideo {
@@ -565,7 +574,7 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 		v.mu.Unlock()
 		return // superseded: drain until its helper is gone
 	}
-	var evs []VideoEvent
+	var evs, after []VideoEvent // before and after the frame
 	if pr.live && f.FrameID > pr.lastID+1 {
 		// The helper lost frames (ring full: this process did not keep up;
 		// or an encoder error): gaps in the frame ids.
@@ -594,10 +603,15 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 			v.streak, v.graceUntil = 0, time.Time{} // capture and encoder work (again)
 			defer v.refillSpare()                   // after v.mu is released
 		}
+		if pr.recovering {
+			// A new generation answers the loss with its key frame.
+			pr.recovering = false
+			after = append(after, VideoEvent{Recovered: &Recovered{Gen: pr.gen, From: pr.recoverFrom, AtGen: v.gen + 1, Key: true,
+				Wait: time.Since(pr.recoverAt)}})
+		}
 		v.gen++
 		pr.gen, pr.seqBase, pr.ptsBase = v.gen, f.FrameID, capture
-		clear(pr.ltr)
-		pr.ackedLTR = pr.ackedLTR[:0]
+		pr.acks.reset()
 		pr.announce = false // the new config has the current rate
 		data = pr.codec.PrepareKeyFrame(data)
 		cfg := v.config(pr)
@@ -634,11 +648,19 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 		evs = append(evs, VideoEvent{Rate: &RateChange{Gen: pr.gen, Kbps: pr.sp.Kbps, FPS: pr.sp.FPS}})
 	}
 	fr := v.convert(pr, f, data, capture, freq, now)
+	if pr.recovering && (fr.Key || fr.Recovery && fr.RefFloor < pr.recoverFrom) {
+		pr.recovering = false
+		after = append(after, VideoEvent{Recovered: &Recovered{Gen: pr.gen, From: pr.recoverFrom, AtGen: pr.gen, AtSeq: fr.Seq, Key: fr.Key,
+			Wait: time.Since(pr.recoverAt)}})
+	}
 	v.mu.Unlock()
 	for _, ev := range evs {
 		v.emit(ev)
 	}
 	v.emit(VideoEvent{Frame: fr})
+	for _, ev := range after {
+		v.emit(ev)
+	}
 }
 
 // convert builds the session's frame. Called with v.mu held.
@@ -666,20 +688,12 @@ func (v *HelperVideo) convert(pr *helperProc, f *encoder.Frame, data []byte, cap
 	if f.Recovery && f.RefFloor >= pr.seqBase && f.RefFloor < f.FrameID {
 		fr.Recovery, fr.RefFloor = true, uint32(f.RefFloor-pr.seqBase)
 	}
+	ltr := -1
 	if f.LTRSlot >= 0 && f.LTRSlot < 256 {
 		fr.MarkedLTR, fr.LTRSlot = true, uint8(f.LTRSlot)
-		if pr.ltr == nil {
-			pr.ltr = map[uint32]uint64{}
-		}
-		pr.ltr[fr.Seq] = f.FrameID
-		if len(pr.ltr) > helperMaxLTRs {
-			oldest := fr.Seq
-			for s := range pr.ltr {
-				oldest = min(oldest, s)
-			}
-			delete(pr.ltr, oldest)
-		}
+		ltr = int(f.LTRSlot)
 	}
+	pr.acks.add(f.FrameID, ltr, f.Key)
 	fr.TemporalLayer = uint8(min(f.TemporalLayer, 255))
 	return fr
 }
@@ -699,7 +713,7 @@ func (v *HelperVideo) config(pr *helperProc) *proto.VideoConfig {
 		fps = pr.params.FPS
 	}
 	c := &proto.VideoConfig{T: "video", Gen: pr.gen, Family: pr.codec.Family, Codec: pr.codec.Codec, FPS: fps,
-		BitrateKbps: pr.sp.Kbps, Encoder: pr.params.Encoder.Name, Capture: st.Capture, Recovery: proto.RecoveryKeyframe}
+		BitrateKbps: pr.sp.Kbps, Encoder: pr.params.Encoder.Name, Capture: st.Capture, Recovery: pr.recovery()}
 	if c.Codec == "" {
 		c.Codec = defaultCodecString[c.Family]
 		v.log.Warn("no parameter sets in the encoder helper's key frame, using a generic codec string", "codec", c.Codec)
@@ -906,15 +920,22 @@ func (v *HelperVideo) Capabilities() PipelineCaps {
 	c.LiveBitrateMeasured = pr.liveMeasured
 	c.CursorInVideo = pr.started.CursorInVideo
 	c.IntraRefresh = pr.started.IntraRefreshFrames > 0
+	c.Recovery = pr.recovery()
+	return c
+}
+
+// recovery is how a started proc's stream recovers a lost frame: from an
+// acknowledged long-term reference where it runs LTR slots (AMF), by
+// reference invalidation where the encoder has it (NVENC), else with a key
+// frame.
+func (pr *helperProc) recovery() string {
 	switch {
 	case pr.started.LTRSlots > 0:
-		c.Recovery = RecoveryLTR
+		return RecoveryLTR
 	case pr.codecCaps.Recovery == "invalidate":
-		c.Recovery = RecoveryInvalidate
-	default:
-		c.Recovery = RecoveryKeyframe
+		return RecoveryInvalidate
 	}
-	return c
+	return RecoveryKeyframe
 }
 
 // ForceKeyframe makes the live encoder's next frame an IDR, which starts a
@@ -949,9 +970,10 @@ func (v *HelperVideo) SetRate(kbps, fps int) error {
 	return v.Start(p, false)
 }
 
-// Recover asks the live encoder to code the next frame from frames the
-// client still holds (helper "recover": LTR or reference invalidation),
-// naming the newest acknowledged LTR frame before the loss.
+// Recover asks the live encoder to code its next frame from frames the client
+// still holds (helper "recover": LTR or reference invalidation), naming the
+// newest acknowledged LTR frame before the loss that its slot still holds.
+// The answer comes as a Recovered event.
 func (v *HelperVideo) Recover(gen uint8, lostFrom uint32) error {
 	v.mu.Lock()
 	pr := v.active
@@ -959,47 +981,52 @@ func (v *HelperVideo) Recover(gen uint8, lostFrom uint32) error {
 		v.mu.Unlock()
 		return fmt.Errorf("video: generation %d does not stream", gen)
 	}
-	if pr.codecCaps.Recovery != "ltr" && pr.codecCaps.Recovery != "invalidate" {
+	if r := pr.recovery(); r != RecoveryLTR && r != RecoveryInvalidate {
 		v.mu.Unlock()
 		return ErrNoRecovery
 	}
+	if lostFrom == 0 {
+		v.mu.Unlock()
+		return fmt.Errorf("video: the key frame of generation %d was lost: nothing to recover from", gen)
+	}
 	id := pr.seqBase + uint64(lostFrom)
 	var acked *uint64
-	for i := len(pr.ackedLTR) - 1; i >= 0; i-- {
-		if pr.ackedLTR[i] < id {
-			a := pr.ackedLTR[i]
-			acked = &a
-			break
-		}
+	if a, ok := pr.acks.newestAckedLTR(id); ok {
+		acked = &a
 	}
+	fresh := !pr.recovering
+	if fresh {
+		pr.recovering, pr.recoverFrom, pr.recoverAt = true, lostFrom, time.Now()
+	}
+	pr.recoverFrom = min(pr.recoverFrom, lostFrom)
 	h := pr.h
 	v.mu.Unlock()
-	return h.Recover(id, acked)
+	err := h.Recover(id, acked)
+	if err != nil && fresh {
+		v.mu.Lock()
+		pr.recovering = false // the caller falls back to a key frame
+		v.mu.Unlock()
+	}
+	return err
 }
 
-// Ack passes the client's acknowledgement of an LTR-marked frame on to the
-// helper, which only reuses long-term references the client holds.
+// Ack records the client's acknowledgement of a frame and passes those of
+// LTR-marked frames on to the helper, which only reuses long-term references
+// the client holds.
 func (v *HelperVideo) Ack(gen uint8, seq uint32) {
 	v.mu.Lock()
 	pr := v.active
-	if pr == nil || pr.gen != gen || pr.ltr == nil {
+	if pr == nil || !pr.live || pr.gen != gen {
 		v.mu.Unlock()
 		return
 	}
-	id, ok := pr.ltr[seq]
-	if !ok {
-		v.mu.Unlock()
-		return
-	}
-	delete(pr.ltr, seq)
-	pr.ackedLTR = append(pr.ackedLTR, id)
-	sort.Slice(pr.ackedLTR, func(i, j int) bool { return pr.ackedLTR[i] < pr.ackedLTR[j] })
-	if len(pr.ackedLTR) > helperMaxLTRs {
-		pr.ackedLTR = pr.ackedLTR[len(pr.ackedLTR)-helperMaxLTRs:]
-	}
+	id := pr.seqBase + uint64(seq)
+	ltr, _ := pr.acks.ack(id)
 	h := pr.h
 	v.mu.Unlock()
-	_ = h.Ack(id)
+	if ltr {
+		_ = h.Ack(id)
+	}
 }
 
 func (v *HelperVideo) emit(ev VideoEvent) {
