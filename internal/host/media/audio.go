@@ -36,19 +36,38 @@ type AudioConfig struct {
 	// OpusFrameWAN (anything else: OpusFrameWAN); SetFrameMs changes it
 	// while audio runs. PCM packets are always 5 ms.
 	FrameMs int
+	// CaptureChanged, if set, is called (from the capture goroutine) when
+	// the duration of the source's capture packets changes (CaptureMs).
+	CaptureChanged func()
 }
 
 // Opus frame durations in ms (step 4.6). The host collects a whole frame
-// before it encodes it, and the client's jitter buffer must hold at least one
-// packet, so 5 ms frames take about 10 ms off the audio path compared with
-// 10 ms ones. On a LAN that is a large share of the audio latency. Over a WAN
-// it is a small one, while 5 ms frames double the packet rate (twice the
-// header overhead, a loss pattern of more and shorter gaps) and code less
-// efficiently, so 10 ms frames are used there, and until the link is measured.
+// before it encodes it, and the client's jitter buffer must hold at least
+// what arrives at once, so 5 ms frames can take up to 10 ms off the audio
+// path compared with 10 ms ones, but only when the source delivers its audio
+// at least every 5 ms. A source that delivers 10 ms at a time (WASAPI
+// shared-mode loopback: one packet per audio engine period, 10 ms by
+// default) makes two 5 ms packets go out together, at the moment one 10 ms
+// packet would: no audio leaves earlier and the client still sees a 10 ms
+// arrival cadence, only the packet rate doubles. So 5 ms frames are used on a
+// LAN only while the capture packets are at most 5 ms (Audio.PickFrameMs).
+// Over a WAN the saving is a small share of the latency, while 5 ms frames
+// double the packet rate (twice the header overhead, a loss pattern of more
+// and shorter gaps) and code less efficiently, so 10 ms frames are used
+// there, and until the link and the capture are measured.
 const (
 	OpusFrameLAN = 5
 	OpusFrameWAN = 10
 )
+
+// sourcePause is how long a source must deliver nothing for the host to treat
+// it as paused rather than late: WASAPI loopback delivers nothing while
+// nothing plays. The pts then moves on by the pause, so the client can tell
+// the end of a sound from packets the network held up (its jitter buffer
+// runs dry either way). Well above the capture period (10 ms) and buffer
+// (20 ms): a capture thread held up for longer than those loses audio, which
+// leaves a gap in the timeline too.
+var sourcePause = 50 * time.Millisecond // a variable for tests
 
 // The minimum round-trip times that mark a link as LAN (below lanMaxRTT) or
 // WAN (above wanMinRTT). In between the frame duration stays as it is, so a
@@ -84,6 +103,7 @@ type Audio struct {
 	cfg     AudioConfig
 	log     *slog.Logger
 	frameMs atomic.Int32 // Opus frame duration the encoder switches to at its next frame
+	capMs   atomic.Int32 // the source's last capture packet in ms, 0 before the first
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -120,6 +140,22 @@ func (a *Audio) SetFrameMs(ms int) bool {
 		return false
 	}
 	return a.frameMs.Swap(int32(ms)) != int32(ms)
+}
+
+// CaptureMs is the duration of the source's last capture packet (one call of
+// its sink) in whole ms, 0 before the first.
+func (a *Audio) CaptureMs() int { return int(a.capMs.Load()) }
+
+// PickFrameMs returns the Opus frame duration for a link whose minimum
+// round-trip time measures minRTT (OpusFrameMs from the current duration),
+// with 5 ms frames only while the source's capture packets are at most 5 ms
+// (none before the first): with larger ones they would save nothing.
+func (a *Audio) PickFrameMs(minRTT time.Duration) int {
+	ms := OpusFrameMs(a.FrameMs(), minRTT)
+	if c := a.CaptureMs(); ms == OpusFrameLAN && (c == 0 || c > OpusFrameLAN) {
+		return OpusFrameWAN
+	}
+	return ms
 }
 
 func (a *Audio) Codec() string { return a.cfg.Codec }
@@ -169,7 +205,26 @@ func (a *Audio) Start(send func([]byte)) error {
 		if a.cfg.Codec == "pcm" {
 			codecID = proto.AudioCodecPCM
 		}
+		var last time.Time // the source's last delivery
 		sink := func(s []float32) {
+			now := time.Now()
+			frames := len(s) / audioChannels
+			if ms := int32((frames*1000 + audioRate/2) / audioRate); a.capMs.Swap(ms) != ms {
+				if a.log != nil {
+					a.log.Info("audio capture packet", "ms", ms, "frames", frames, "source", a.src.Name())
+				}
+				if a.cfg.CaptureChanged != nil {
+					a.cfg.CaptureChanged()
+				}
+			}
+			// The source paused (sourcePause): the pts moves on by the
+			// pause. A partial frame from before it is dropped (less than a
+			// frame, the tail of a sound).
+			if idle := now.Sub(last) - time.Duration(frames)*time.Second/audioRate; !last.IsZero() && idle >= sourcePause {
+				pts += uint32(len(pcm)/audioChannels) + uint32(idle*audioRate/time.Second)
+				pcm = pcm[:0]
+			}
+			last = now
 			pcm = append(pcm, s...)
 			for {
 				if enc != nil {

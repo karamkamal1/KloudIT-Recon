@@ -70,6 +70,10 @@ func (c chanSource) Run(ctx context.Context, sink func([]float32)) error {
 // packet's duration (no samples lost or repeated), its Opus TOC says the
 // duration the encoder used, and a decoder decodes it to that many samples.
 func TestAudioFrameSwitch(t *testing.T) {
+	// The chunks come in bursts, with waits between them that a loaded
+	// machine can stretch: no source pauses here (TestAudioSourcePause).
+	defer func(d time.Duration) { sourcePause = d }(sourcePause)
+	sourcePause = time.Hour
 	src := make(chanSource)
 	a := NewAudio(src, AudioConfig{Codec: "opus", BitrateKbps: 128}, nil)
 	if a.FrameMs() != OpusFrameWAN {
@@ -153,6 +157,113 @@ func TestAudioFrameSwitch(t *testing.T) {
 	}
 	if NewAudio(src, AudioConfig{FrameMs: OpusFrameLAN}, nil).FrameMs() != OpusFrameLAN {
 		t.Fatal("AudioConfig.FrameMs not used at the start")
+	}
+}
+
+// TestAudioSourcePause: a source that delivers nothing for a while (WASAPI
+// loopback while nothing plays) moves the pts on by the pause, so the client
+// can tell it from late packets; the sequence goes on, and a partial frame
+// from before the pause is dropped. Back-to-back chunks (a source ahead of
+// real time) move nothing.
+func TestAudioSourcePause(t *testing.T) {
+	src := make(chanSource)
+	a := NewAudio(src, AudioConfig{Codec: "opus", BitrateKbps: 128}, nil)
+	pkts := make(chan []byte, 64)
+	if err := a.Start(func(p []byte) { pkts <- append([]byte(nil), p...) }); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Stop()
+	chunk := func(frames int) []float32 { return make([]float32, frames*2) }
+	recv := func() []byte {
+		select {
+		case p := <-pkts:
+			return p
+		case <-time.After(2 * time.Second):
+			t.Fatal("no packet")
+			return nil
+		}
+	}
+	for i := 0; i < 3; i++ {
+		src <- chunk(480)
+	}
+	src <- chunk(336) // 7 ms: no packet, left over at the pause
+	for i := 0; i < 3; i++ {
+		if p := recv(); binary.LittleEndian.Uint32(p[4:]) != uint32(480*i) {
+			t.Fatalf("packet %d pts %d", i, binary.LittleEndian.Uint32(p[4:]))
+		}
+	}
+	const pause = 200 * time.Millisecond
+	time.Sleep(pause)
+	src <- chunk(480)
+	src <- chunk(480)
+	p3, p4 := recv(), recv()
+	if seq := binary.LittleEndian.Uint16(p3[2:]); seq != 3 || binary.LittleEndian.Uint16(p4[2:]) != 4 {
+		t.Fatalf("sequence after the pause: %d, %d", seq, binary.LittleEndian.Uint16(p4[2:]))
+	}
+	// 1440 + the dropped 336 + the pause less the chunk's own 10 ms (a
+	// loaded machine stretches the sleep).
+	jump := int(binary.LittleEndian.Uint32(p3[4:])) - 1440 - 336
+	if lo := 48 * int((pause - 10*time.Millisecond).Milliseconds()); jump < lo || jump > lo+48*300 {
+		t.Fatalf("pts moved on by %d samples (%.1f ms) after a %v pause", jump, float64(jump)/48, pause)
+	}
+	if d := binary.LittleEndian.Uint32(p4[4:]) - binary.LittleEndian.Uint32(p3[4:]); d != 480 {
+		t.Fatalf("pts step after the pause %d", d)
+	}
+}
+
+// TestAudioCaptureMs: the capture packet duration is measured from the
+// source's chunks (rounded, reported on a change), and 5 ms Opus frames are
+// picked on a LAN only while it is at most 5 ms: a source delivering 10 ms at
+// a time would send two 5 ms packets at once, saving nothing.
+func TestAudioCaptureMs(t *testing.T) {
+	defer func(d time.Duration) { sourcePause = d }(sourcePause)
+	sourcePause = time.Hour
+	src := make(chanSource)
+	changed := make(chan int, 8)
+	var a *Audio
+	a = NewAudio(src, AudioConfig{Codec: "opus", BitrateKbps: 128, CaptureChanged: func() { changed <- a.CaptureMs() }}, nil)
+	lan := time.Millisecond
+	if a.CaptureMs() != 0 || a.PickFrameMs(lan) != OpusFrameWAN {
+		t.Fatalf("before the first capture packet: %d ms, pick %d", a.CaptureMs(), a.PickFrameMs(lan))
+	}
+	if err := a.Start(func([]byte) {}); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Stop()
+	wait := func(want int) {
+		t.Helper()
+		select {
+		case got := <-changed:
+			if got != want {
+				t.Fatalf("capture %d ms, want %d", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no change to %d ms reported", want)
+		}
+	}
+	src <- make([]float32, 480*2) // WASAPI shared mode: one engine period
+	wait(10)
+	src <- make([]float32, 481*2) // a resampled period: still 10 ms
+	src <- make([]float32, 479*2)
+	if a.PickFrameMs(lan) != OpusFrameWAN || a.PickFrameMs(40*lan) != OpusFrameWAN {
+		t.Fatal("5 ms frames picked for 10 ms capture packets")
+	}
+	src <- make([]float32, 240*2)
+	wait(5)
+	if len(changed) != 0 {
+		t.Fatalf("changes reported for the same duration: %d", <-changed)
+	}
+	for _, c := range []struct {
+		rtt  time.Duration
+		want int
+	}{{0, OpusFrameWAN}, {lan, OpusFrameLAN}, {15 * lan, OpusFrameWAN}, {40 * lan, OpusFrameWAN}} {
+		if got := a.PickFrameMs(c.rtt); got != c.want {
+			t.Errorf("5 ms capture, RTT %v: pick %d, want %d", c.rtt, got, c.want)
+		}
+	}
+	a.SetFrameMs(OpusFrameLAN)
+	if a.PickFrameMs(15*lan) != OpusFrameLAN { // between the bounds: stays
+		t.Error("5 ms frames not kept between the bounds")
 	}
 }
 

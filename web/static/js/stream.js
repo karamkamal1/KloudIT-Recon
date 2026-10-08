@@ -92,7 +92,7 @@ const S = {
   kbLock: null,
   get keyboardLock() { return document.fullscreenElement ? this.kbLock : null; },
   set keyboardLock(v) { this.kbLock = v; },
-  pointerRaw: null, // the last pointer lock was granted with unadjustedMovement
+  pointerRaw: null, // the last pointer lock was granted with unadjustedMovement (the browser read the option)
   rumbles: 0, // force-feedback datagrams played
   audioJitter: null, // the jitter buffer's last report (audio-worklet.js)
   hz: 60,
@@ -389,6 +389,7 @@ function onWorker(m) {
     case 'welcome': S.welcome = m.info; buildDrawer(); break;
     case 'video': S.videoCfg = m.cfg; break;
     case 'audio': S.audioCfg = m.cfg; break;
+    case 'audioPause': audio.node?.port.postMessage({ pause: true }); break;
     case 'resolution': S.video = { w: m.w, h: m.h }; break;
     case 'firstFrame':
       S.streaming = true;
@@ -562,9 +563,16 @@ function sendRel(dx, dy) {
 const locked = () => document.pointerLockElement === S.surface;
 
 async function lockPointer() {
+  // The option as a getter, as for the Keyboard Lock: a browser that ignores
+  // it (Firefox, Safari: dictionary members they do not know) never reads it
+  // and keeps OS acceleration; one that reads it rejects the lock when it
+  // cannot grant it (NotSupportedError).
+  const opts = {};
+  let read = false;
+  Object.defineProperty(opts, 'unadjustedMovement', { enumerable: true, get() { read = true; return true; } });
   try {
-    await S.surface.requestPointerLock({ unadjustedMovement: true });
-    S.pointerRaw = true; // as far as the browser says (Firefox and Safari ignore the option)
+    await S.surface.requestPointerLock(opts);
+    S.pointerRaw = read;
   } catch {
     S.pointerRaw = false;
     try { await S.surface.requestPointerLock(); } catch {}
@@ -919,8 +927,9 @@ function inputRow(row) {
 }
 
 // Audio (step 4.6): codec and packet duration (the host picks Opus 5 ms on
-// a LAN, 10 ms over a WAN, from the RTT), the jitter buffer's level and
-// target (adaptive or fixed), underruns and packets lost.
+// a LAN, from the RTT, when its capture delivers at most 5 ms at a time;
+// 10 ms otherwise), the jitter buffer's level and target (adaptive or
+// fixed), underruns (not the ends of sounds) and packets lost.
 function audioRow(st, row) {
   const c = S.audioCfg;
   if (!c?.enabled) return row('Audio', 'off');

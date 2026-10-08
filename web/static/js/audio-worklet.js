@@ -1,7 +1,8 @@
 // Low-latency audio playout. Samples arrive from the stream worker through a
 // lock-free SharedArrayBuffer ring (or a MessagePort when the page is not
 // cross-origin isolated). A jitter buffer absorbs network jitter: it holds
-// about `target` of audio, refills to it after an underrun, and drops what
+// about `target` of audio, refills to it (Auto: a little above it,
+// refillLevel) after an underrun, and drops what
 // grows above it (clock drift, bursts) so audio never drifts behind video.
 //
 // Target (step 4.6). Adaptive (default): 20 ms at the start, then what the
@@ -12,6 +13,12 @@
 // underrun raises by 10 ms and that decays by 1 ms per second without one. On
 // a clean LAN (5 ms packets) that is 10-20 ms; a jittery link moves it up to
 // 60 ms. Fixed: the target set in the settings.
+// A pause of the host's audio source is not jitter: WASAPI loopback sends
+// nothing while nothing plays, so the buffer runs dry at the end of every
+// sound. The host moves the pts on by such a pause, and the stream worker
+// reports the first packet after one ({pause: true}, through the page): the
+// underrun that ended the sound is then taken back (its count and its bias),
+// so sounds with gaps keep the target where continuous audio has it.
 // The level follows the target: a 250 ms window whose mean level is above it
 // drops the excess, at most 5 ms per window, in one render quantum with a
 // crossfade (the jump of a hard cut would click); far above it (a burst after
@@ -45,6 +52,10 @@ class ReconAudio extends AudioWorkletProcessor {
     this.drops = []; // per window: mean level - lowest level, samples
     this.win = { n: 0, min: Infinity, sum: 0, frames: 0 };
     this.sinceUnderrun = 0; // samples played
+    this.pauses = 0; // underruns taken back: the host's source paused
+    this.undo = null; // the last underrun's state before it, until a pause can take it back
+    this.dry = 0; // samples played since samples last arrived
+    this.left = 0; // samples in the buffer after the last render quantum
     this.sinceReport = 0;
     this.tL = new Float32Array(128 + Math.ceil(MAX_SKIP_MS * this.ms)); // a render quantum + the most one window drops
     this.tR = new Float32Array(this.tL.length);
@@ -55,6 +66,8 @@ class ReconAudio extends AudioWorkletProcessor {
         m.port.onmessage = (e) => { this.queue.push(e.data); this.queued += e.data.length / 2; };
       } else if (m && m.sab) {
         this.setRing(m.sab);
+      } else if (m && m.pause) {
+        this.sourcePaused();
       } else if (m && (m.targetMs || m.auto !== undefined)) {
         if (m.targetMs) this.fixedMs = m.targetMs;
         if (m.auto !== undefined) this.auto = !!m.auto;
@@ -141,6 +154,36 @@ class ReconAudio extends AudioWorkletProcessor {
     this.target = Math.round(ms * this.ms);
   }
 
+  // sourcePaused takes back the last underrun: it was the host's source
+  // pausing (the stream worker saw the pts move on by the pause), not the
+  // network. The notice comes before the buffer has refilled, or soon after
+  // (the excess of the higher target is then trimmed); one later than a
+  // quarter of a second of playing after the underrun is about another one.
+  sourcePaused() {
+    const u = this.undo;
+    if (!u) return;
+    this.undo = null;
+    this.underruns--;
+    this.pauses++;
+    this.bias = u.bias;
+    this.sinceUnderrun += u.since;
+    // The level's drop as the buffer ran dry is not jitter either: forget
+    // the windows it fell in.
+    this.drops = u.drops;
+    this.win = { n: 0, min: Infinity, sum: 0, frames: this.win.frames };
+    this.retarget();
+  }
+
+  // refillLevel is the level playback starts at after an underrun (or at the
+  // start): Auto refills to the top of the band the level is kept in (the
+  // trimming below leaves up to max(3 ms, a quarter of the target) above the
+  // target), where continuous playback sits; a refill to the target itself
+  // ran dry in the audio device's next render burst whenever the target was
+  // about the burst's size (10 ms in Windows shared mode). Fixed: the target.
+  refillLevel() {
+    return this.auto ? this.target + Math.max(3 * this.ms, this.target / 4) : this.target;
+  }
+
   // endWindow adapts the target to the window's level and returns how many
   // samples to drop now (the mean level's excess over the target).
   endWindow() {
@@ -164,7 +207,7 @@ class ReconAudio extends AudioWorkletProcessor {
     this.sinceReport = 0;
     this.port.postMessage({
       t: 'jitter', auto: this.auto, targetMs: this.target / this.ms, levelMs: this.available() / this.ms,
-      underruns: this.underruns, skippedMs: this.skippedMs, biasMs: this.bias,
+      underruns: this.underruns, pauses: this.pauses, skippedMs: this.skippedMs, biasMs: this.bias,
     });
   }
 
@@ -175,12 +218,18 @@ class ReconAudio extends AudioWorkletProcessor {
     const n = L.length;
     this.report(n);
     const avail = this.available();
+    if (avail > this.left) this.dry = 0;
+    this.left = avail;
     if (this.buffering) {
-      if (avail >= this.target) this.buffering = false;
+      if (avail >= this.refillLevel()) this.buffering = false;
       else return true; // output silence while filling
     }
     if (avail < n) {
       this.underruns++;
+      // The windows the level ran dry in, for a pause to forget: this one,
+      // and the one before when the drain began in it.
+      const drops = this.win.frames < this.dry ? this.drops.slice(0, -1) : this.drops.slice();
+      this.undo = { bias: this.bias, since: this.sinceUnderrun, drops };
       this.sinceUnderrun = 0;
       if (this.auto) this.bias = Math.min(MAX_MS, this.bias + UNDERRUN_BIAS_MS);
       this.retarget();
@@ -188,10 +237,13 @@ class ReconAudio extends AudioWorkletProcessor {
       return true;
     }
     this.sinceUnderrun += n;
+    this.dry += n;
+    if (this.undo && this.sinceUnderrun > sampleRate / 4) this.undo = null;
     const high = this.target + Math.max(this.target, Math.round(sampleRate * 0.04));
     if (avail > high) {
       this.skip(avail - this.target);
       this.read(L, R, n);
+      this.left = this.available();
       return true;
     }
     const w = this.win;
@@ -202,6 +254,7 @@ class ReconAudio extends AudioWorkletProcessor {
     const k = w.frames >= WINDOW * sampleRate ? this.endWindow() : 0;
     if (k > 0 && avail >= n + k) this.readSkipping(L, R, n, k);
     else this.read(L, R, n);
+    this.left = this.available();
     return true;
   }
 }

@@ -1399,11 +1399,13 @@ function onAudioConfig(cfg) {
     audio.cfg.channels === cfg.channels;
   audio.cfg = cfg;
   post('audio', { cfg });
-  // A new frame duration alone (the host follows the RTT, step 4.6) keeps
-  // the decoder: Opus packets carry their duration.
-  if (same && (cfg.codec !== 'opus' || audio.decoder?.state === 'configured')) return;
-  // Anything else is a new audio stream from the host: its sequence numbers
-  // start again from 0.
+  // A new frame duration of the running stream (the host follows the RTT,
+  // step 4.6; sameStream) keeps the decoder and the sequence: Opus packets
+  // carry their duration.
+  if (same && cfg.sameStream && (cfg.codec !== 'opus' || audio.decoder?.state === 'configured')) return;
+  // Anything else is a new audio stream from the host, also one with the same
+  // codec (a codec setting a client without an Opus decoder gets PCM for, a
+  // host before step 4.6): its sequence numbers start again from 0.
   audio.lastSeq = -1;
   if (audio.decoder) { try { audio.decoder.close(); } catch {} audio.decoder = null; }
   if (!cfg.enabled || cfg.codec !== 'opus') return;
@@ -1441,6 +1443,12 @@ function onAudioPacket(d) {
       stats.audioLost += gap;
       silence(missing > 0 && missing <= gap * 960 ? missing : gap * samples);
     } else if (gap >= 0x8000) return; // late/duplicate
+    // The pts moved on by more than the lost packets held: the host's audio
+    // source paused (WASAPI loopback sends nothing while nothing plays; the
+    // host moves the pts on by a pause of 50 ms or more). The jitter buffer
+    // ran dry because the sound ended, not because the network held packets
+    // up: the AudioWorklet takes that underrun back (through the page).
+    if (gap < 4 && ((pts - audio.nextPts) | 0) > (gap + 1) * 960) post('audioPause');
   }
   audio.lastSeq = seq;
   audio.nextPts = (pts + samples) >>> 0;

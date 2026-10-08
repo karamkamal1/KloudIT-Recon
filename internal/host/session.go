@@ -85,7 +85,8 @@ type Session struct {
 
 	// The client's minimum round-trip time (ns) from its pings (clients
 	// since step 4.6, proto.PingMinRTT; 0 until one carries it), and the
-	// signal that it changed, for audioFrameLoop.
+	// signal that it or the audio capture packets changed, for
+	// audioFrameLoop.
 	clientRTT atomic.Int64
 	rttSeen   chan struct{}
 
@@ -1193,9 +1194,10 @@ func (s *Session) startAudio() {
 		s.sendJSON(proto.AudioConfig{T: "audio", Enabled: false})
 		return
 	}
-	frameMs := media.OpusFrameMs(0, time.Duration(s.clientRTT.Load()))
-	s.audio = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, FrameMs: frameMs}, s.log)
-	s.sendJSON(audioConfig(s.audio))
+	// 10 ms frames until the first capture packet says whether 5 ms ones
+	// would save anything (media.Audio.PickFrameMs; applyAudioFrame).
+	s.audio = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, CaptureChanged: s.audioFrameCheck}, s.log)
+	s.sendJSON(audioConfig(s.audio, false))
 	err := s.audio.Start(func(pkt []byte) {
 		if !s.paused.Load() {
 			_ = s.c.SendDatagram(pkt)
@@ -1219,14 +1221,25 @@ func (s *Session) stopAudio() {
 	}
 }
 
-func audioConfig(a *media.Audio) proto.AudioConfig {
-	return proto.AudioConfig{T: "audio", Enabled: true, Codec: a.Codec(), SampleRate: 48000, Channels: 2, FrameMs: a.FrameMs()}
+// audioConfig announces a's stream; same marks a change within the running
+// stream (its frame duration), whose sequence numbers go on.
+func audioConfig(a *media.Audio, same bool) proto.AudioConfig {
+	return proto.AudioConfig{T: "audio", Enabled: true, Codec: a.Codec(), SampleRate: 48000, Channels: 2, FrameMs: a.FrameMs(), SameStream: same}
+}
+
+// audioFrameCheck has audioFrameLoop check the frame duration.
+func (s *Session) audioFrameCheck() {
+	select {
+	case s.rttSeen <- struct{}{}:
+	default:
+	}
 }
 
 // audioFrameLoop picks the Opus frame duration from the client's minimum
-// round-trip time whenever a ping reports a new one (step 4.6: 5 ms frames
-// on a LAN, 10 ms over a WAN; media.OpusFrameMs). Clients before step 4.6
-// report none and keep 10 ms frames.
+// round-trip time whenever a ping reports a new one or the capture packets
+// change (step 4.6: 5 ms frames on a LAN when the capture delivers at most
+// 5 ms at a time, 10 ms otherwise; media.Audio.PickFrameMs). Clients before
+// step 4.6 report no RTT and keep 10 ms frames.
 func (s *Session) audioFrameLoop() {
 	for {
 		select {
@@ -1239,10 +1252,10 @@ func (s *Session) audioFrameLoop() {
 }
 
 // applyAudioFrame switches a running Opus encoder to the frame duration the
-// client's RTT asks for, from its next frame on, and announces it in a new
-// audio config (the packets carry their duration too: the client decodes them
-// without it; it takes the config's frameMs only for its display and as a
-// fallback).
+// client's RTT and the capture packets ask for, from its next frame on, and
+// announces it in a new audio config of the same stream (the packets carry
+// their duration too: the client decodes them without it; it takes the
+// config's frameMs only for its display and as a fallback).
 func (s *Session) applyAudioFrame() {
 	s.audioMu.Lock()
 	defer s.audioMu.Unlock()
@@ -1251,12 +1264,12 @@ func (s *Session) applyAudioFrame() {
 		return
 	}
 	rtt := time.Duration(s.clientRTT.Load())
-	ms := media.OpusFrameMs(a.FrameMs(), rtt)
+	ms := a.PickFrameMs(rtt)
 	if !a.SetFrameMs(ms) {
 		return
 	}
-	s.log.Info("audio frame size", "ms", ms, "client_min_rtt_ms", float64(rtt.Microseconds())/1000)
-	s.sendJSON(audioConfig(a))
+	s.log.Info("audio frame size", "ms", ms, "client_min_rtt_ms", float64(rtt.Microseconds())/1000, "capture_ms", a.CaptureMs())
+	s.sendJSON(audioConfig(a, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,10 +1323,7 @@ func (s *Session) datagrams() {
 				_ = s.c.SendDatagram(p)
 			}
 			if rtt := proto.PingMinRTT(d); rtt > 0 && s.clientRTT.Swap(int64(rtt)) != int64(rtt) {
-				select {
-				case s.rttSeen <- struct{}{}:
-				default:
-				}
+				s.audioFrameCheck()
 			}
 		case proto.DgMouseRel:
 			if m, ok := proto.ParseMouseRel(d); ok && s.a.isActive(s) {
@@ -1364,6 +1374,11 @@ func (s *Session) gamepad(g proto.Gamepad) {
 	}
 	if !g.Connected {
 		pads.Unplug(int(g.Index))
+		// Again: a change ViGEmBus reported while the pad was being
+		// unplugged can have set the motors after the stop above (the
+		// unplug has ended the pad's listener now), and nothing would
+		// stop them.
+		s.rumble(int(g.Index), 0, 0)
 		return
 	}
 	err := pads.Update(int(g.Index), platform.Pad{Buttons: g.Buttons, LT: g.LT, RT: g.RT, LX: g.LX, LY: g.LY, RX: g.RX, RY: g.RY})

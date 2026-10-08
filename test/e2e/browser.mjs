@@ -35,7 +35,8 @@
 // Chromium's Keyboard Lock, and Safari's fullscreen option
 // (keyboardLock: "browser") is checked on a stubbed requestFullscreen; a fake
 // gamepad's triggers come back as force feedback (host test hook
-// rumble-echo) and are played with vibrationActuator.playEffect.
+// rumble-echo) and are played with vibrationActuator.playEffect; the
+// client reports unadjustedMovement only when the browser read the option.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -342,6 +343,39 @@ async function checkAudio(name) {
       `jitter buffer: target ${j?.targetMs?.toFixed(1)} ms (${j?.auto ? 'auto' : 'fixed'}), level ${j?.levelMs?.toFixed(1)} ms, underruns ${j?.underruns}, ` +
       `trimmed ${j?.skippedMs?.toFixed(1)} ms; overlay "${row}"`);
   results.push({ audio: name, stats: { audioFrameMs: st?.audioFrameMs, minRtt: st?.minRtt, audioMs: st?.audioMs }, cfg, jitter: j });
+
+  // A new audio stream with the same codec: the codec setting changes, the
+  // codec does not (here "" — the host's choice, Opus — and back to "opus";
+  // a client without an Opus decoder gets PCM for either setting). The host
+  // restarts audio, its sequence from 0; the client takes the new stream at
+  // once (it used to drop its packets as late until their sequence passed
+  // the old stream's: as long as audio had run). Audio flows: the ring the
+  // worker fills holds more than one render quantum (2.7 ms; a starved
+  // jitter buffer keeps less) in at least half the samples over the 3 s
+  // after each switch.
+  const restarts = () => (hostProc.log.match(new RegExp(`msg="audio capture packet" session=${sid} `, 'g')) || []).length;
+  const restartWith = async (v) => {
+    const before = restarts();
+    await page.evaluate((v) => {
+      const sel = [...document.querySelectorAll('#drawer select')].find((x) => [...x.options].some((o) => o.value === 'pcm'));
+      if (![...sel.options].some((o) => o.value === v)) sel.append(new Option('host default', v));
+      sel.value = v;
+      sel.dispatchEvent(new Event('change'));
+    }, v);
+    await until(async () => restarts() > before, 5000, 'audio restart').catch(() => {});
+    const ms = [];
+    for (let i = 0; i < 12; i++) {
+      await sleep(250);
+      ms.push(await page.evaluate(() => window.__recon.lastStats?.audioMs ?? 0));
+    }
+    return { restarted: restarts() > before, flowing: ms.filter((x) => x > 2.7).length, ms: ms.map((x) => Math.round(x)) };
+  };
+  const toDefault = await restartWith('');
+  const toOpus = await restartWith('opus');
+  check(`${name}: audio: a restart with the same codec (codec setting "" and back to "opus"): the client plays the new stream at once (sequence from 0)`,
+    toDefault.restarted && toOpus.restarted && toDefault.flowing >= 6 && toOpus.flowing >= 6,
+    `restarted ${toDefault.restarted}/${toOpus.restarted}; buffered audio in ${toDefault.flowing} and ${toOpus.flowing} of 12 samples ` +
+      `(ms: ${toDefault.ms.join(' ')} | ${toOpus.ms.join(' ')})`);
 }
 
 // Renderer "auto" (step 4.3). Without a stored result the first connection
@@ -1123,7 +1157,10 @@ async function checkPreStageHoldHost() {
 // and the client reports the lock; a browser that refuses the value
 // (TypeError) gets fullscreen without it; one that ignores the option (does
 // not read it) has no lock; with navigator.keyboard.lock (Chromium) the
-// option is not passed.
+// option is not passed. Pointer Lock on a stubbed requestPointerLock (game
+// mode): the client reports unadjustedMovement only when the browser read the
+// option and granted the lock; one that ignores it (Firefox, Safari) or
+// refuses it (NotSupportedError, then a plain lock) does not.
 async function checkInputHost() {
   await restartHost({ RECON_TEST_FAULTS: 'rumble-echo' }, 'host-rumble');
   await startStream({ path: 'auto', transport: 'auto' });
@@ -1213,6 +1250,37 @@ async function checkInputHost() {
       one(ignores, null) && ignores.lock === null && one(chromium, null),
     `safari: ${JSON.stringify(safari.calls)} → ${safari.lock}; refuses: ${JSON.stringify(refuses.calls)} → ${refuses.lock} (${refuses.log.replace(/^\S+ /, '').slice(0, 80)}); ` +
       `ignores: ${JSON.stringify(ignores.calls)} → ${ignores.lock}; chromium: ${JSON.stringify(chromium.calls)}`);
+
+  // Pointer Lock: unadjustedMovement, on a stubbed requestPointerLock.
+  await page.evaluate(() => { window.__plOrig = Element.prototype.requestPointerLock; });
+  const plCase = async (kind) => {
+    await page.evaluate((k) => {
+      window.__recon.pointerRaw = null;
+      window.__pl = [];
+      Element.prototype.requestPointerLock = function (o) {
+        // A browser without the option does not read it; one that reads it
+        // rejects what it cannot grant.
+        const raw = k === 'ignores' || !o ? null : o.unadjustedMovement;
+        window.__pl.push({ raw });
+        if (k === 'refuses' && raw) return Promise.reject(new DOMException('unadjustedMovement is not supported', 'NotSupportedError'));
+        return Promise.resolve();
+      };
+    }, kind);
+    await page.keyboard.press('Control+Alt+Shift+KeyM'); // game mode: locks the pointer
+    await until(() => page.evaluate(() => window.__recon.pointerRaw !== null), 3000, 'pointer lock').catch(() => {});
+    const res = await page.evaluate(() => ({ calls: window.__pl, raw: window.__recon.pointerRaw }));
+    await page.keyboard.press('Control+Alt+Shift+KeyM'); // back to desktop mode
+    return res;
+  };
+  const plReads = await plCase('reads');
+  const plIgnores = await plCase('ignores');
+  const plRefuses = await plCase('refuses');
+  await page.evaluate(() => { Element.prototype.requestPointerLock = window.__plOrig; });
+  check('Pointer Lock: unadjustedMovement reported only when the browser read the option and granted the lock (ignored, refused: not)',
+    plReads.raw === true && plReads.calls.length === 1 && plReads.calls[0].raw === true &&
+      plIgnores.raw === false && plIgnores.calls.length === 1 && plIgnores.calls[0].raw === null &&
+      plRefuses.raw === false && plRefuses.calls.length === 2 && plRefuses.calls[0].raw === true && plRefuses.calls[1].raw === null,
+    `reads: ${JSON.stringify(plReads)}; ignores: ${JSON.stringify(plIgnores)}; refuses: ${JSON.stringify(plRefuses)}`);
   await page.evaluate(() => { window.__recon.userClosed = true; });
 }
 
@@ -1226,8 +1294,13 @@ async function checkInputHost() {
 // for 30 s, then a clean link: at most two underruns, then none while the
 // target holds above the spike, at most 60 ms; back to 10-20 ms within 30 s
 // of the spikes ending, with the level following. Fixed 30 ms: the target
-// stays 30 ms. The worklet reports its state once a second.
-function simulateJitter({ seconds, jitter = 1, spikeEvery = 0, spikeMs = 0, cleanAfter = Infinity, opts = {}, seed = 1 }) {
+// stays 30 ms. Intermittent audio (sound/silence cycles; WASAPI loopback
+// sends nothing while nothing plays): the host moves the pts on by each pause
+// and the worker reports the first packet after one ({pause: true}, here 5 ms
+// after it arrived, as the page passes it on): every pause's underrun is
+// taken back and the target stays at 10-20 ms while sound plays. The worklet
+// reports its state once a second.
+function simulateJitter({ seconds, jitter = 1, spikeEvery = 0, spikeMs = 0, cleanAfter = Infinity, opts = {}, seed = 1, onMs = Infinity, offMs = 0, pauseMarks = true }) {
   let Proc = null;
   const reports = [];
   vm.runInNewContext(readFileSync(join(root, 'web', 'static', 'js', 'audio-worklet.js'), 'utf8'), {
@@ -1257,16 +1330,26 @@ function simulateJitter({ seconds, jitter = 1, spikeEvery = 0, spikeMs = 0, clea
   const out = [];
   const underruns = [];
   const levels = [];
+  const sounding = (ms) => ms % (onMs + offMs) < onMs;
+  let paused = false;
+  const marks = []; // when the page passes a pause on to the worklet
   for (let step = 0; step < seconds * 4000; step++) { // 0.25 ms steps
     const t = step / 4;
     for (; nextSend <= t; nextSend += 5, sent += 240) {
+      if (!sounding(nextSend)) { paused = true; continue; }
       const spike = spikeEvery && nextSend > 0 && nextSend % spikeEvery === 0 && nextSend < cleanAfter ? spikeMs : 0;
       arrival = Math.max(arrival, nextSend + jitter * rand() + spike); // in order: a late packet holds up the next
-      inflight.push({ at: arrival, s: sent });
+      inflight.push({ at: arrival, s: sent, pause: paused });
+      paused = false;
     }
     while (inflight.length && inflight[0].at <= t) {
-      const { s } = inflight.shift();
+      const { s, pause } = inflight.shift();
       push(Float32Array.from({ length: 240 }, (_, i) => 0.5 * Math.sin((2 * Math.PI * 440 * (s + i)) / 48000)));
+      if (pause && pauseMarks) marks.push(t + 5);
+    }
+    while (marks.length && marks[0] <= t) {
+      marks.shift();
+      p.port.onmessage({ data: { pause: true } });
     }
     if (step % 40 === 0) { // the device's 10 ms period
       for (debt += 480; debt >= 128; debt -= 128) {
@@ -1276,7 +1359,7 @@ function simulateJitter({ seconds, jitter = 1, spikeEvery = 0, spikeMs = 0, clea
         if (p.underruns > u) underruns.push(t / 1000);
         out.push(...L);
       }
-      levels.push({ t: t / 1000, level: p.available() / 48, target: p.target / 48 });
+      levels.push({ t: t / 1000, level: p.available() / 48, target: p.target / 48, playing: sounding(t) && !p.buffering });
     }
   }
   return { p, reports, underruns, out, levels };
@@ -1307,7 +1390,22 @@ async function checkJitterRule() {
   const fixed = simulateJitter({ seconds: 10, opts: { auto: false, targetMs: 30 } });
   check('jitter buffer (unit): Fixed 30 ms keeps its target', fixed.p.target / 48 === 30 && fixed.underruns.length === 0 && fixed.reports.at(-1)?.auto === false,
     `target ${fixed.p.target / 48} ms, underruns ${fixed.underruns.length}, level ${mean(fixed, 5, 10).toFixed(1)} ms`);
-  results.push({ jitterRule: { lan: { target: lanTarget, slope: lanSlope, skippedMs: lan.p.skippedMs }, spiky: { underruns: spiky.underruns, peak, calm } } });
+  // Sounds with pauses between them (the end of each runs the buffer dry):
+  // 600 ms every 2.1 s, and 3 s on / 3 s off, for a minute (ending in a
+  // sound); hosts before the pause marker for comparison (detail only).
+  const gaps = [[600, 1500], [3000, 3000]].map(([on, off]) => {
+    const r = simulateJitter({ seconds: 61, onMs: on, offMs: off });
+    const playing = r.levels.filter((l) => l.playing && l.t >= 5);
+    const lo = Math.min(...playing.map((l) => l.target));
+    const hi = Math.max(...playing.map((l) => l.target));
+    const unmarked = simulateJitter({ seconds: 61, onMs: on, offMs: off, pauseMarks: false });
+    return { on, off, lo, hi, underruns: r.p.underruns, pauses: r.p.pauses, drains: r.underruns.length, unmarked: unmarked.p.target / 48, unmarkedUnderruns: unmarked.p.underruns };
+  });
+  check('jitter buffer (unit): sounds with pauses (600 ms every 2.1 s; 3 s on, 3 s off) and the host\'s pause marker: every pause\'s underrun taken back, the target 10-20 ms while sound plays',
+    gaps.every((g) => g.lo >= 10 && g.hi <= 20 && g.underruns === 0 && g.pauses === g.drains && g.pauses >= 9),
+    gaps.map((g) => `${g.on}/${g.off} ms: target ${g.lo.toFixed(1)}-${g.hi.toFixed(1)} ms while playing, ${g.pauses} pauses taken back of ${g.drains} drains, ` +
+      `${g.underruns} underruns (without the marker: target ${g.unmarked.toFixed(1)} ms, ${g.unmarkedUnderruns} underruns)`).join('; '));
+  results.push({ jitterRule: { lan: { target: lanTarget, slope: lanSlope, skippedMs: lan.p.skippedMs }, spiky: { underruns: spiky.underruns, peak, calm }, gaps } });
 }
 
 // The frame pacer at unit level (step 4.4, pacing.js) on a fake clock: what

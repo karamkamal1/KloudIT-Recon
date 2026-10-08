@@ -61,10 +61,12 @@ Techniques used (most of them are new to browser-based game streaming):
 - **Zero-latency local cursor.** In desktop mode the host sends its real cursor shapes (arrow,
   I-beam, resize…) and your browser renders them natively, so the pointer never lags.
 - **Lock-free audio.** System audio is captured with WASAPI loopback and encoded as Opus
-  (CELT low-delay) in pure Go, so the PC needs no extra DLLs: 5 ms frames on a LAN, 10 ms over
-  the internet, picked from the measured round-trip time. It travels as datagrams, through
-  `AudioDecoder`, a **SharedArrayBuffer** ring and an AudioWorklet whose jitter buffer adapts to
-  the network (10–20 ms on a LAN, up to 60 ms on a jittery link) and trims drift.
+  (CELT low-delay) in pure Go, so the PC needs no extra DLLs: 10 ms frames, 5 ms ones on a LAN
+  (from the measured round-trip time) when the capture delivers audio at least every 5 ms
+  (Windows' default 10 ms audio engine period does not, and smaller frames would then save
+  nothing). It travels as datagrams, through `AudioDecoder`, a **SharedArrayBuffer** ring and an
+  AudioWorklet whose jitter buffer adapts to the network (10–20 ms on a LAN, up to 60 ms on a
+  jittery link; the pauses between sounds do not count) and trims drift.
 - **Live latency readout.** NTP-style clock sync and per-frame host timestamps split every
   frame's *capture → on-screen* latency into capture/encode, host queue, network, transfer,
   reorder, decode, draw and display, with p50/p95/p99 per stage. A **latency probe** checks them

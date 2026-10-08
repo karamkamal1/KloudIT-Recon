@@ -3753,8 +3753,10 @@ already defined and played by clients):
 - Mouse: kept as it was (guide: "keep"): `pointerrawupdate` where the browser has it, Pointer
   Lock with `unadjustedMovement` (falling back to plain Pointer Lock), cumulative `0x20`
   datagrams. New: the overlay's *Input* row (shown in fullscreen or pointer lock only, so the
-  overlay keeps its height) shows whether the pointer is locked and whether the browser granted
-  `unadjustedMovement`, and which Keyboard Lock is on.
+  overlay keeps its height) shows whether the pointer is locked and whether the browser read the
+  `unadjustedMovement` option and granted the lock with it (the option is passed as a getter, as
+  for Keyboard Lock below: Firefox and Safari ignore it and never read it; a browser that reads
+  it rejects a lock it cannot grant, NotSupportedError), and which Keyboard Lock is on.
 - Keyboard Lock: Chrome, Edge and Opera as before (`navigator.keyboard.lock()` once in element
   fullscreen; now recorded as `window.__recon.keyboardLock = "keyboard.lock"`, and a refusal is
   logged). Safari 26.4 has no `navigator.keyboard`: its Keyboard Lock is the fullscreen option
@@ -3797,15 +3799,19 @@ already defined and played by clients):
   30 s (u32 µs) to each ping (`proto.PingMinRTT`). The host picks 5 ms frames below 10 ms
   (LAN: wired well below 1 ms, Wi-Fi a few ms), 10 ms above 20 ms (WAN), keeps the current one
   in between (no flapping near a bound) and starts every audio stream with 10 ms until a ping
-  reports an RTT (`media.OpusFrameMs`). A change switches the running gopus encoder
+  reports an RTT (`media.OpusFrameMs`), and until the first capture packet: 5 ms frames only
+  while the capture source delivers at most 5 ms at a time (`media.Audio.PickFrameMs`, review
+  fix below). A change switches the running gopus encoder
   (`SetFrameSize`) at its next frame boundary (no samples lost or repeated: pts steps stay
-  240/480), is logged (`audio frame size ms=5 client_min_rtt_ms=…`) and announced in a new
-  `audio` config. The client reads each packet's duration from its Opus TOC (RFC 6716 3.1), so it
-  decodes across a switch without reconfiguring, and conceals a loss by the pts gap; the
-  config's `frameMs` is only for display and as a fallback. PCM stays at 5 ms packets. Fixed on
-  the way: after a live audio codec change (Settings → Audio codec) the client dropped the new
-  stream's packets as late until their sequence numbers passed the old stream's (10 s and more);
-  a new stream now resets the sequence, and packets of the old codec are ignored.
+  240/480), is logged (`audio frame size ms=5 client_min_rtt_ms=… capture_ms=5`) and announced
+  in a new `audio` config with `sameStream: true`. The client reads each packet's duration from
+  its Opus TOC (RFC 6716 3.1), so it decodes across a switch without reconfiguring, and conceals
+  a loss by the pts gap; the config's `frameMs` is only for display and as a fallback. PCM stays
+  at 5 ms packets. Fixed on the way: after a live audio codec change (Settings → Audio codec) the
+  client dropped the new stream's packets as late until their sequence numbers passed the old
+  stream's (10 s and more); every `audio` config without `sameStream` now starts a new stream
+  (sequence reset, also when the codec stays the same: review fix below), and packets of the old
+  codec are ignored.
 - Jitter buffer (AudioWorklet): *Auto* (new default; existing saved settings keep their slider
   value for *Fixed*) starts at 20 ms and adapts within 10–60 ms: the deepest drop of the fill
   level below its mean in a 250 ms window (packet duration, network jitter, the audio device's
@@ -3816,16 +3822,67 @@ already defined and played by clients):
   the mean, held for 10 s, underruns at 2 and 4 s only.) A window whose mean level exceeds the
   target by more than max(3 ms, a quarter of it) drops the excess, at most 5 ms per window,
   crossfaded over one render quantum (128 samples) instead of a hard cut; far above it (a burst
-  after a stall) it drops to the target at once, as before. *Fixed* uses the slider's size with
-  the same trimming. The worklet reports target, level, underruns and trimmed audio once a
+  after a stall) it drops to the target at once, as before; after an underrun *Auto* refills to
+  the top of that band (target + max(3 ms, a quarter of it)), where continuous playback sits.
+  *Fixed* uses the slider's size with the same trimming. The end of a sound is not an underrun
+  (review fix below): the host moves the pts on by a capture pause, and the worklet takes the
+  underrun it caused back. The worklet reports target, level, underruns and trimmed audio once a
   second; the overlay's Audio row shows "opus 5 ms · buf level/target auto · underruns N · lost
   N".
+- Deviation from the guide's wording: "Opus 5 ms frames on LAN" holds only when the capture
+  delivers at most 5 ms at a time. WASAPI shared-mode loopback delivers one engine period per
+  packet, 10 ms by default, so on a stock Windows host the stream stays at 10 ms frames on a LAN
+  too: 5 ms frames would go out in pairs at the moment one 10 ms frame does and save nothing
+  (review fix below). Lowering the loopback's engine period (IAudioClient3 low-latency shared
+  mode) was not attempted: whether a loopback stream can use it is undocumented, and nothing here
+  could test it (hardware check below).
 - Deviation from the guide's wording: "jitter target 10–20 ms on LAN" is what the measurement
   gives on a clean LAN, not a value set by link type: the target follows the measured drops,
   which include the audio device's render period (Windows shared mode 10 ms), so a client with a
   large device buffer sits higher. The LAN/WAN split for Opus uses the client's minimum RTT, which
   is end to end on every path (direct, relay, WebSocket); the host's own QUIC RTT would only
   cover the host → gateway leg on the relay path.
+
+Review fixes (after the first commit of this step):
+
+- The end of every sound counted as an underrun. WASAPI loopback delivers nothing while nothing
+  plays (`audio_windows_test.go`: "silence produces none"; the review cites GStreamer's wasapisrc
+  and NAudio for the same), the host's pts went up one frame per packet across such a pause, and the
+  client could not tell it from packets the network held up: each sound's end added 10 ms of
+  bias that only decayed while audio played, so desktop use (short sounds with gaps) drove *Auto*
+  to its 60 ms cap on a clean LAN (reproduced with the real worklet in Node: 600 ms sounds every
+  2.1 s → 60 ms from 10 s on, 29 underruns a minute; 3 s on / 3 s off → 60 ms). Now the host
+  moves the pts on by a capture pause (a source that delivered nothing for 50 ms or more beyond
+  its last chunk; a partial frame from before it, less than one frame, is dropped), as RTP does
+  across silence; the worker sees the pts jump on the first packet after it (more than 20 ms
+  beyond what the packets before it, lost ones included, held) and the page passes `{pause: true}` to the
+  worklet, which takes the underrun of the last quarter second back: its count (reported as
+  `pauses` instead), its bias, and the drop of the level as it ran dry (the windows the drain
+  fell in). Taking it back alone left the target at 25-35 ms: every sound then starts from a
+  refill, and a refill to the target itself (10 ms) ran dry in the audio device's next 10 ms
+  render burst; *Auto* now refills to the top of the band continuous playback sits in. Hosts
+  before this fix send no pts jump: the client behaves as before with them.
+- 5 ms Opus frames did not save the stated ~10 ms with the real capture source: shared-mode
+  WASAPI loopback delivers one packet per engine period (10 ms by default), so each sink call
+  produced two 5 ms packets at once, at the moment one 10 ms packet would have gone out; only
+  the packet rate doubled (the sandbox's test tone delivers 5 ms chunks on a 5 ms ticker, which
+  hid it). The host now measures the capture packet (`audio capture packet ms=10 frames=480
+  source=wasapi-loopback` in host.log at each start and change) and picks 5 ms frames only
+  while it is at most 5 ms; the comment, README and ARCHITECTURE claims are corrected.
+- A new audio stream with the same codec kept the old sequence: the host restarts audio when
+  the codec setting changes even when the codec it uses stays the same (a client without an
+  Opus `AudioDecoder` gets PCM for either setting), and the worker returned before resetting
+  `lastSeq`, dropping the new stream for as long as the old one had run. The frame-size switch
+  now sends its config with `sameStream: true` (old clients ignore the field; old hosts never
+  send a config within a stream), and every other config resets the sequence.
+- A ViGEmBus notification completing between the session's rumble stop and `pads.Unplug` (the
+  listener checks its stop flag before the callback, not atomically with the unplug) could set
+  the motors running again for a pad that was gone, repeated every 100 ms for the rest of the
+  session. The session now stops the pad's rumble again after `Unplug` returns (which waits for
+  the listener to end).
+- The Input row said "locked (unadjusted)" whenever `requestPointerLock({unadjustedMovement:
+  true})` resolved, also in browsers that ignore the option (Firefox, Safari). The option is now
+  a getter, as for Keyboard Lock: "unadjusted" only when the browser read it and granted the lock.
 
 Verified in the sandbox (no GPU, no Windows, no controller; Linux host with the test-tone audio
 source):
@@ -3840,7 +3897,8 @@ source):
   a session starts Opus at 10 ms, a ping without an RTT (16 bytes, or 0) changes nothing, one
   reporting 0.8 ms switches to 5 ms (new `audio` config, then only 240-sample pts steps), 14–15
   ms keeps it, 40 ms switches back, 12 ms keeps 10 ms, an audio restart starts with the last
-  RTT's duration, PCM stays 5 ms; rumble: sent at once, repeated every 100 ms while running (4
+  RTT's duration (since the review fixes: once the first capture packet is seen), PCM stays
+  5 ms; rumble: sent at once, repeated every 100 ms while running (4
   datagrams in 350 ms), the stop three times and then nothing, a disconnecting pad stops, LED-only
   changes send nothing, only the active session gets it. `go test ./internal/proto -run 'TestPing'`:
   protocol.js writes the RTT where Go reads it (clamped to u32, negative → 0), a 16-byte ping
@@ -3890,6 +3948,36 @@ source):
   (state now set only while in fullscreen, and read from `document.fullscreenElement`, as
   `fullscreenchange` reaches a busy page late), and the rumble check waits for the effects
   instead of fixed sleeps.
+- verified (sandbox), review fixes: `go test ./internal/host/media -run 'TestAudioSourcePause|TestAudioCaptureMs|TestAudioFrameSwitch' -race`:
+  a source silent for 200 ms moves the next packet's pts on by the pause (less the chunk's own
+  10 ms) plus the dropped 7 ms partial frame, the sequence goes on, back-to-back chunks move
+  nothing; the capture packet measures 10 ms for 480 frames (479 and 481 too, no new report) and
+  5 ms for 240, and 5 ms frames are picked only for the latter (unknown → 10 ms).
+  `go test ./internal/host -run 'TestAudioFrame' -race`: a session's first config is a new
+  stream (`sameStream` unset), each switch has `sameStream: true`, a restart is a new stream at
+  10 ms that switches to 5 ms once the test tone's 5 ms capture packets are seen; with 480-frame
+  capture packets a 0.8 ms RTT keeps 10 ms frames (one config, 480-sample pts steps). Browser
+  E2E, new checks, both passing in two runs: the jitter buffer unit check with sounds and pauses
+  (600 ms every 2.1 s, and 3 s / 3 s, for a minute, the pause notice 5 ms after the first packet
+  of each sound): target 10.0 ms while sound plays, 29 and 10 pauses taken back of as many
+  drains, 0 underruns, against 60 ms and 29/10 underruns without the host's marker; the three
+  earlier jitter checks unchanged (clean LAN 10 ms without an underrun, the spikes case
+  underrunning at 2 and 4 s only, Fixed 30 ms); a restart with the same codec (the codec
+  setting "" — Opus, the host's choice — and back to "opus"; each restart seen in host.log):
+  the ring held audio in 12 and 12, then 12 and 10, of 12 samples over the 3 s after each
+  (the old worker would have dropped the new stream for as long as the old one had run); Pointer
+  Lock on a stubbed `requestPointerLock`: a browser that reads the option → "unadjusted", one
+  that ignores it → not, one that refuses it (NotSupportedError, then a plain lock) → not. The
+  host's log now reads `audio frame size ... ms=5 client_min_rtt_ms=1.49 capture_ms=5`. Runs
+  (load average 6-9, serialised with other checkouts' E2E runs): 166 of 169 passed, then 163 of
+  169; every failure a frame-rate check of other steps on the AV1 software decode at 60 fps
+  ("WebTransport direct: steady real-time playback" 46/48/33.5 and 37.6/37.6/30.9 fps, "video
+  decoding" 33.5 and 30.9 fps of 60, before any check of this step; "frame pacing Smooth:
+  requestAnimationFrame restored" at 26-34 fps; in the second run also "WebSocket relay: video
+  decoding" 42.5 fps, the WebGPU Smooth barcode sample (0 sampled) and the Smooth bake-off's
+  late draws). `go test ./internal/e2e/...` passes. Not covered: the rumble race (Windows and
+  ViGEmBus only; the fix is one call after `Unplug`), real WASAPI pauses and packet sizes
+  (hardware checks below).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (controller rumble on real hardware; nothing in it
   depends on the GPU): on the host with ViGEmBus installed (`recon-host.exe probe` prints
   "gamepads: ViGEmBus available"), stream from Chrome on a Windows client with an Xbox controller
@@ -3904,8 +3992,10 @@ source):
   a DualSense on USB and on Bluetooth in Chrome (Chrome drives DualSense rumble through HID),
   with Edge, and with Safari 26 on a Mac (Gamepad haptics); Firefox has no `vibrationActuator`
   by default (expected: no rumble, no error). Then disconnect the controller while it rumbles
-  (it must not keep rumbling when reconnected) and end the session while it rumbles (the motors
-  stop within ~0.3 s). Record per browser and controller: rumbles yes/no, stop delay, and
+  (it must not keep rumbling when reconnected; review fix: also not when the game sets the motors
+  every frame, e.g. a racing game's engine rumble: unplug in mid-rumble ten times, reconnect, and
+  the controller stays still until the game rumbles again) and end the session while it rumbles
+  (the motors stop within ~0.3 s). Record per browser and controller: rumbles yes/no, stop delay, and
   whether a long effect pulses (a gap between the 250 ms effects would mean the repeats arrive
   late: note the client's Wi-Fi/RTT).
 - NVIDIA: unverified (no NVIDIA host available). Test: the rumble test above on the NVIDIA host
@@ -3913,14 +4003,37 @@ source):
 - AMD RDNA3 (RX 7900 XT): unverified. Test (Opus frames and jitter buffer on real links): with the
   host wired, stream from a Windows client on wired LAN, then on Wi-Fi, then through the netem
   `wan` profile (`make netem PROFILE=wan`, docs/NETEM.md), 2 minutes each with music playing on
-  the host. Expected: host.log `audio frame size ... ms=5 client_min_rtt_ms=<10` on LAN and Wi-Fi
-  (no line on `wan`: the stream stays at 10 ms, `client_min_rtt_ms` would be ~40), overlay Audio
-  row "opus 5 ms" / "opus 10 ms". Record the row's level/target and underruns after 2 minutes per
-  link (expected: target 10–20 ms on wired LAN, higher on Wi-Fi, no more than 60 ms anywhere; a
-  few underruns while the target grows, then none on wired LAN), and listen for clicks when the
-  buffer trims (overlay: the target stays while "buf" drops back). Optional: the netem `wifi`
-  profile (5 ms ± 10 ms jitter) should raise the target towards 30–60 ms with underruns stopping
-  after the first seconds.
+  the host. Expected: host.log `audio capture packet ms=10 frames=480 source=wasapi-loopback`
+  at each audio start (the WASAPI packet size: frames per GetBuffer, one engine period; record
+  it), and therefore no `audio frame size ... ms=5` line on any link (5 ms frames only with
+  capture packets of at most 5 ms), overlay Audio row "opus 10 ms". Record the row's
+  level/target and underruns after 2 minutes per link (expected: target 10–20 ms on wired LAN,
+  higher on Wi-Fi, no more than 60 ms anywhere; a few underruns while the target grows, then
+  none on wired LAN), and listen for clicks when the buffer trims (overlay: the target stays
+  while "buf" drops back). Optional: the netem `wifi` profile (5 ms ± 10 ms jitter) should raise
+  the target towards 30–60 ms with underruns stopping after the first seconds.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (sounds with pauses; review fix): on wired LAN, with
+  nothing else playing on the host, play short sounds with gaps for 2 minutes (e.g. in
+  PowerShell `1..60 | % { [console]::beep(880, 300); Start-Sleep -Milliseconds 1700 }`, or click
+  through Windows system sounds). Expected: overlay Audio row target 10–20 ms and underruns 0 (or
+  a few at the start), while `window.__recon.audioJitter.pauses` in the page console grows by one
+  per gap (each sound's end, taken back); a client against a host before this fix shows the
+  target climbing to 60 ms instead. If `pauses` stays 0 while underruns grow, loopback delivers
+  silent packets between the sounds on this host (an app keeping a stream open): then no
+  pause is involved and the target should stay low anyway; record which.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (audio latency at 5 vs 10 ms frames; review fix):
+  measure host → client audio delay: play a click every second on the host (e.g. a WAV of
+  clicks in a loop) and record the host's line-out and the client's line-out on the two channels
+  of one recorder (a USB interface or a PC line-in with Audacity); the delay is the offset of the
+  clicks between the channels (it includes the client's output latency, not the host's own
+  playback). First as is (10 ms capture packets, 10 ms frames). Then lower the engine period:
+  run an app that opens a low-latency shared-mode stream on the same output device
+  (IAudioClient3, e.g. REAPER with "WASAPI Shared mode" and a small block size, or the Windows
+  SDK's low-latency audio sample) and restart the stream: if host.log then shows `audio capture
+  packet ms=` 5 or less, the host switches to 5 ms frames on the LAN (`audio frame size ms=5`);
+  measure again. Expected: up to ~10 ms less with 5 ms capture packets and frames; record both
+  delays, the capture packet sizes and whether the loopback period follows the engine's at all
+  (if it stays 10 ms, 5 ms frames cannot help on this host).
 - NVIDIA: unverified (no NVIDIA host available). Test: the audio test above streaming from the
   NVIDIA host (audio is CPU-only, WASAPI loopback + gopus; no GPU dependence expected).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (Keyboard Lock): from Chrome or Edge on Windows enter
@@ -3931,5 +4044,8 @@ source):
   open menu on the host) and not leave fullscreen; record how Safari lets you leave (expected:
   holding Esc, or its own UI) and which other keys (Cmd+Tab, Cmd+W, Cmd+Q) still go to macOS.
   On Safari before 26.4 the row reads "keyboard lock off" and Esc leaves fullscreen, as before.
+  Pointer Lock (review fix): in game mode (Ctrl+Alt+Shift+M, click the picture) the Input row
+  reads "pointer locked (unadjusted)" in Chrome and Edge on Windows, and "pointer locked"
+  without it in Firefox and Safari (they ignore the option); record the row per browser.
 - NVIDIA: unverified (no NVIDIA host available). Test: the Keyboard Lock test above against the
   NVIDIA host (client-side only).
