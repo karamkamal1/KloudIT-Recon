@@ -408,8 +408,8 @@ On Linux the host agent streams a test pattern (`capture: test`) or an X11 displ
 video stream on purpose, so the tests can check the loss handling: for example
 `RECON_TEST_FAULTS="delay=every:97:200ms,drop=every:193"` holds every 97th frame's stream still for
 200 ms (the frame arrives late; under reference recovery the host cancels it at its deadline, as
-any frame stream that stalls while newer frames wait) and drops every 193rd (reported to the client
-like a real drop); `recovery=skip|keyframe` overrides the
+any frame whose write the transport holds back while newer frames wait; packets lost after the
+write are QUIC's to retransmit) and drops every 193rd (reported to the client like a real drop); `recovery=skip|keyframe` overrides the
 recovery mode the host announces, `intra-refresh` runs libx264 with periodic intra refresh, as
 NVENC runs, so the host announces `skip` from its real encoder arguments, `ref-recovery` makes the
 FFmpeg pipeline stand in for the native helper's ACK-based recovery (a key frame every few frames,

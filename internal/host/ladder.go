@@ -23,12 +23,16 @@ import (
 //     (rung 2) of the live generation. Key frames and recovery frames are
 //     never cancelled (another one would have to take their place); under
 //     "skip" and "keyframe" a late frame goes on (the loss would cost a
-//     smeared picture or a key frame, a late frame only time).
+//     smeared picture or a key frame, a late frame only time). Once its write
+//     returned (the transport took the frame) and its stream is closed, a
+//     frame is QUIC's to deliver: lost packets are retransmitted, not
+//     cancelled (docs/VENDOR_NOTES.md 2.3, deviation 7).
 //  2. Recover without a key frame (recovery "ltr" / "invalidate": the native
 //     helper's AMF long-term references or NVENC reference invalidation, GUIDE
 //     3.5): the encoder codes its next frame from frames the client holds.
 //     The frames from the loss up to that recovery frame are useless to the
-//     client (it discards them) and are not sent (lossWait).
+//     client (it discards them) and are not sent (lossWait); they are
+//     reported in runs (discardRun).
 //  3. Intra refresh, as a safety net only. Recovery "skip" (FFmpeg's NVENC
 //     H.264 / HEVC, where rung 2 does not exist and rung 4 is an encoder
 //     restart): the client decodes on and the refresh heals the picture,
@@ -367,12 +371,13 @@ func (s *sendState) due(in ladderIn, queued bool, now time.Time) []cancelledFram
 
 // setWait notes that the client discards generation gen's frames from seq
 // from on until the answer to their loss (rung 2; rung 4 with wholeGen: none
-// in the generation). A wait in the same generation that is not over yet (or
-// whose answer comes after the loss) is widened. The frames
-// taken already from there on may hold the answer (a loss the client
-// reported a round trip late): then the wait ended at it; where the kept
-// frames do not reach back that far nothing is known, and nothing is
-// discarded.
+// in the generation). A wait in the same generation that is not over yet, or
+// whose answer is at or after the loss, is widened and looks for its answer
+// again: the client keeps the oldest loss it waits on, and a lost answer (a
+// recovery frame or key frame) answers nothing. The frames taken already
+// after the lost one may hold the answer (a loss the client reported a round
+// trip late): then the wait ended at it; where the kept frames do not reach
+// back that far nothing is known, and nothing is discarded.
 func (s *sendState) setWait(gen uint8, from uint32, rung int, wholeGen bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -380,9 +385,10 @@ func (s *sendState) setWait(gen uint8, from uint32, rung int, wholeGen bool) {
 		return // frames of a newer generation went out: the client is leaving this one
 	}
 	w := lossWait{active: true, gen: gen, from: from, rung: rung, wholeGen: wholeGen}
-	if o := s.wait; o.active && o.gen == gen && (!o.ended || from < o.end) {
-		// The same wait: not answered yet, or the loss is before its
-		// answer (which answers it too unless it is older than the wait).
+	if o := s.wait; o.active && o.gen == gen && (!o.ended || from <= o.end) {
+		// The same wait: not answered yet, the loss is before its answer
+		// (which answers it too unless it is older than the wait), or the
+		// answer itself was lost.
 		w.from, w.rung, w.wholeGen = min(o.from, from), max(o.rung, rung), o.wholeGen || wholeGen
 	}
 	lo := uint64(1)
@@ -396,7 +402,7 @@ func (s *sendState) setWait(gen uint8, from uint32, rung int, wholeGen bool) {
 			complete = true // the kept frames reach back before the loss (or the generation's start)
 			continue
 		}
-		if !w.ended && w.endedBy(t.key, t.recovery, t.refFloor) {
+		if !w.ended && t.seq > from && w.endedBy(t.key, t.recovery, t.refFloor) {
 			w.ended, w.end = true, t.seq
 		}
 	}
@@ -404,4 +410,65 @@ func (s *sendState) setWait(gen uint8, from uint32, rung int, wholeGen bool) {
 		w.ended, w.end = true, w.from
 	}
 	s.wait = w
+}
+
+// discardReportAfter bounds how long a run of discarded frames goes
+// unreported (discardRun): a "keyframe" wait lasts until the next
+// generation, up to the client's 1 s watchdog.
+const discardReportAfter = 250 * time.Millisecond
+
+// discardRun is the run of consecutive frames of a generation the session
+// discarded (Session.discard) and has not reported yet: the client hears of
+// a run in one {"t":"dropped"} (and host.log in one line) when the run
+// breaks, when a frame is sent again (the wait ended) or discardReportAfter
+// after the run began. The client needs no report to end its wait (the
+// answer does that); it counts them.
+type discardRun struct {
+	mu    sync.Mutex
+	id    uint64 // runs begun so far; the current one's
+	gen   uint8
+	from  uint32
+	count int
+	why   string
+}
+
+// add appends frame seq of generation gen, discarded for why. A frame that
+// does not continue the run ends it: done holds the run's frames to report
+// (nil: none). begun is the id of the run the frame began (0: it continued
+// one); report it with take after discardReportAfter.
+func (r *discardRun) add(gen uint8, seq uint32, why string) (done []*media.Frame, doneWhy string, begun uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.count > 0 && (gen != r.gen || seq != r.from+uint32(r.count) || why != r.why) {
+		done, doneWhy = r.frames(), r.why
+		r.count = 0
+	}
+	if r.count == 0 {
+		r.id++
+		r.gen, r.from, r.why, begun = gen, seq, why, r.id
+	}
+	r.count++
+	return done, doneWhy, begun
+}
+
+// take ends run id (0: whichever is open) and returns its frames to report
+// (nil: none, or that run was reported already).
+func (r *discardRun) take(id uint64) ([]*media.Frame, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.count == 0 || id != 0 && id != r.id {
+		return nil, ""
+	}
+	fs := r.frames()
+	r.count = 0
+	return fs, r.why
+}
+
+// frames returns the run as frames for reportDropped. Called with r.mu held.
+func (r *discardRun) frames() []*media.Frame {
+	fs := make([]*media.Frame, r.count)
+	for i := range fs {
+		fs[i] = &media.Frame{Gen: r.gen, Seq: r.from + uint32(i)}
+	}
+	return fs
 }

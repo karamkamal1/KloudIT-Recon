@@ -206,6 +206,43 @@ func TestSendStateWait(t *testing.T) {
 		t.Fatalf("wait for a generation already left: %+v", s.wait)
 	}
 
+	// The answer itself lost (the client's "lost" for a late recovery frame,
+	// a failed stream): it answers nothing, the wait reopens from its loss
+	// (the client keeps waiting from there too) until the next answer.
+	var lost sendState
+	for seq := uint32(0); seq < 5; seq++ {
+		take(&lost, &fr{Gen: 1, Seq: seq, Key: seq == 0})
+	}
+	lost.setWait(1, 2, 2, false)
+	take(&lost, &fr{Gen: 1, Seq: 5, Recovery: true, RefFloor: 1}) // answers the loss at 2
+	take(&lost, &fr{Gen: 1, Seq: 6})
+	lost.setWait(1, 5, 2, false)
+	if w := lost.wait; w.ended || w.from != 2 {
+		t.Fatalf("the recovery frame lost: wait %+v, want from 2, not ended", w)
+	}
+	if a := take(&lost, &fr{Gen: 1, Seq: 7}); a != actDiscard {
+		t.Fatalf("after the lost recovery frame: %s, want discard", a)
+	}
+	if a := take(&lost, &fr{Gen: 1, Seq: 8, Recovery: true, RefFloor: 1}); a != actNone || lost.wait.end != 8 {
+		t.Fatalf("the next recovery frame: %s, wait %+v", a, lost.wait)
+	}
+	// Its loss reported a round trip late: the recovery frame taken since
+	// answers it.
+	lost.setWait(1, 5, 2, false)
+	if w := lost.wait; !w.ended || w.end != 8 || w.from != 2 {
+		t.Fatalf("the recovery frame's loss reported late: wait %+v, want from 2, ended at 8", w)
+	}
+	// An in-stream key frame lost: it is no answer to its own loss.
+	take(&lost, &fr{Gen: 1, Seq: 9, Key: true})
+	take(&lost, &fr{Gen: 1, Seq: 10})
+	lost.setWait(1, 9, 2, false)
+	if w := lost.wait; w.ended || w.from != 9 {
+		t.Fatalf("an in-stream key frame lost: wait %+v, want from 9, not ended", w)
+	}
+	if a := take(&lost, &fr{Gen: 1, Seq: 11}); a != actDiscard {
+		t.Fatalf("after the lost key frame: %s, want discard", a)
+	}
+
 	// More frames than kept: a loss before them cannot be judged (nothing is
 	// discarded); a recent one can.
 	var long sendState
@@ -230,6 +267,8 @@ type ladderPipeline struct {
 	keyframes int
 	starts    []bool // urgent
 	events    chan media.VideoEvent
+	starting  bool // Hurry finds a generation starting (it takes over)
+	hurries   int
 }
 
 func (p *ladderPipeline) Start(_ media.Params, urgent bool) error {
@@ -239,12 +278,17 @@ func (p *ladderPipeline) Start(_ media.Params, urgent bool) error {
 	return nil
 }
 func (p *ladderPipeline) Events() <-chan media.VideoEvent { return p.events }
-func (p *ladderPipeline) Hurry() (bool, bool)             { return false, false }
-func (p *ladderPipeline) Suspend()                        {}
-func (p *ladderPipeline) Stop()                           {}
-func (p *ladderPipeline) Active() (media.Params, bool)    { return media.Params{FPS: 60}, true }
-func (p *ladderPipeline) Current() (media.Params, bool)   { return media.Params{FPS: 60}, true }
-func (p *ladderPipeline) Gen() uint8                      { return 1 }
+func (p *ladderPipeline) Hurry() (bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hurries++
+	return p.starting, p.starting
+}
+func (p *ladderPipeline) Suspend()                      {}
+func (p *ladderPipeline) Stop()                         {}
+func (p *ladderPipeline) Active() (media.Params, bool)  { return media.Params{FPS: 60}, true }
+func (p *ladderPipeline) Current() (media.Params, bool) { return media.Params{FPS: 60}, true }
+func (p *ladderPipeline) Gen() uint8                    { return 1 }
 func (p *ladderPipeline) ForceKeyframe() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -270,7 +314,7 @@ func (p *ladderPipeline) state() ([]string, int, []bool) {
 }
 
 // TestFrameSenderLadder runs frameSender against stalled frame streams (a
-// write that does not progress, as on a path that holds a frame's packets)
+// write that does not progress, as when the congestion window is full)
 // with a newer frame queued behind: under reference recovery the stalled
 // stream is cancelled at its deadline (rung 1), reported dropped, the encoder
 // is asked to recover (rung 2), the frames up to the recovery frame are not
@@ -344,10 +388,16 @@ func TestFrameSenderLadder(t *testing.T) {
 		}
 		return int(h.Seq)
 	}
+	// waitDropped waits for reports of n frames in all.
 	waitDropped := func(t *testing.T, r rig, n int) []proto.Dropped {
 		t.Helper()
 		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
-			if d := r.ctrl.dropped(t); len(d) >= n {
+			d := r.ctrl.dropped(t)
+			frames := 0
+			for _, m := range d {
+				frames += m.Count
+			}
+			if frames >= n {
 				return d
 			}
 			if time.Now().After(deadline) {
@@ -378,8 +428,11 @@ func TestFrameSenderLadder(t *testing.T) {
 			t.Errorf("stalled stream cancelled after %v, want its deadline (33 ms)", at)
 		}
 		d := waitDropped(t, r, 3)
-		if got := droppedSeqs(d); got != "[2 3 4]" {
-			t.Fatalf("dropped %s, want 2 (cancelled) and 3, 4 (waiting for the recovery frame)", got)
+		if got := droppedSeqs(d); got != "[2 3 4]" || len(d) != 2 {
+			t.Fatalf("dropped %s in %d reports, want 2 (cancelled) and 3, 4 (waiting for the recovery frame, one run)", got, len(d))
+		}
+		if l := r.logs.lines(`msg="frames dropped" why="awaiting recovery frame" gen=1 from_seq=3 count=2`); len(l) != 1 {
+			t.Fatalf("discard log %q", r.logs.lines(`msg="frames dropped"`))
 		}
 		if rec, keys, starts := r.p.state(); len(rec) != 1 || rec[0] != "1/2" || keys != 0 || len(starts) != 0 {
 			t.Fatalf("pipeline: recover %v, key frames %d, starts %v; want one recover of 1/2", rec, keys, starts)
@@ -500,4 +553,116 @@ func TestFrameSenderLadder(t *testing.T) {
 			t.Fatalf("key frame counter %d", n)
 		}
 	})
+}
+
+// TestDiscardRun: consecutive discards of a generation are one report; a gap,
+// another generation or another reason ends the run; a run reported already
+// is not reported again (the timer of a run that a sent frame ended).
+func TestDiscardRun(t *testing.T) {
+	seqs := func(fs []*media.Frame) string {
+		var out []string
+		for _, f := range fs {
+			out = append(out, fmt.Sprintf("%d/%d", f.Gen, f.Seq))
+		}
+		return fmt.Sprint(out)
+	}
+	var r discardRun
+	done, _, first := r.add(1, 3, "awaiting recovery frame")
+	if done != nil || first == 0 {
+		t.Fatalf("first discard: done %v, begun %d", seqs(done), first)
+	}
+	for seq := uint32(4); seq < 6; seq++ {
+		if done, _, begun := r.add(1, seq, "awaiting recovery frame"); done != nil || begun != 0 {
+			t.Fatalf("seq %d: done %v, begun %d; want the run continued", seq, seqs(done), begun)
+		}
+	}
+	done, why, second := r.add(1, 8, "awaiting recovery frame") // a gap
+	if seqs(done) != "[1/3 1/4 1/5]" || why != "awaiting recovery frame" || second == 0 || second == first {
+		t.Fatalf("after a gap: done %v (%s), begun %d", seqs(done), why, second)
+	}
+	if fs, _ := r.take(first); fs != nil {
+		t.Fatalf("the first run reported twice: %v", seqs(fs))
+	}
+	if done, _, _ := r.add(2, 9, "awaiting recovery frame"); seqs(done) != "[1/8]" {
+		t.Fatalf("another generation: done %v", seqs(done))
+	}
+	if done, _, _ := r.add(2, 10, "awaiting key frame"); seqs(done) != "[2/9]" {
+		t.Fatalf("another reason: done %v", seqs(done))
+	}
+	if fs, why := r.take(0); seqs(fs) != "[2/10]" || why != "awaiting key frame" {
+		t.Fatalf("take: %v (%s)", seqs(fs), why)
+	}
+	if fs, _ := r.take(0); fs != nil {
+		t.Fatalf("nothing open, took %v", seqs(fs))
+	}
+}
+
+// TestOverflowRecovered: a frame-queue overflow within 2 s of the last
+// decrease (the bitrate cut is refused) on a pipeline whose bitrate changes
+// are new generations (no live bitrate). Rung 2 answers the dropped frames
+// with a recovery frame: no IDR; a generation starting at a lower bitrate
+// (an overlapped back-off) takes over at once. Without rung 2 ("keyframe")
+// the overflow gets its key frame.
+func TestOverflowRecovered(t *testing.T) {
+	for _, c := range []struct {
+		name, mode string
+		starting   bool
+		recovers   string
+		keys       int
+	}{
+		{"ltr", proto.RecoveryLTR, false, "[1/2]", 0},
+		{"ltr, a generation starting", proto.RecoveryLTR, true, "[1/2]", 0},
+		{"keyframe", proto.RecoveryKeyframe, false, "[]", 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, _, _ := testSession(t, testFaults{})
+			logs := &lockedLog{}
+			s.log = slog.New(slog.NewTextHandler(logs, nil))
+			p := &ladderPipeline{caps: media.PipelineCaps{Recovery: c.mode, ForceIDR: true}, events: make(chan media.VideoEvent),
+				starting: c.starting}
+			s.video = p
+			s.healConfig(&proto.VideoConfig{Gen: 1, Recovery: c.mode}, 0)
+			s.rate.mu.Lock()
+			s.rate.applied, s.rate.est, s.rate.lastDecrease = 20000, 20000, time.Now() // a cut moments ago
+			s.rate.mu.Unlock()
+			go s.videoEvents()
+			frame := func(seq uint32) { p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: seq, Key: seq == 0}} }
+			for seq := uint32(0); seq < 2; seq++ { // the client got the key frame and frame 1
+				frame(seq)
+				<-s.frameQ
+			}
+			for seq := uint32(2); seq < 10; seq++ { // nobody takes 2-7; 8 overflows the queue (6)
+				frame(seq) // returns once the previous frame is handled
+			}
+			if l := logs.lines(`msg="frame queue overflow" frames=7`); len(l) != 1 {
+				t.Fatalf("overflow log %q", logs.lines(`msg="frame queue overflow"`))
+			}
+			if l := logs.lines(`msg="congestion: lowering bitrate"`); len(l) != 0 {
+				t.Fatalf("cut within 2 s of the last: %q", l)
+			}
+			rec, keys, starts := p.state()
+			if fmt.Sprint(rec) != c.recovers || keys != c.keys || len(starts) != 0 {
+				t.Fatalf("recover %v, key frames %d, starts %v; want %s, %d, none", rec, keys, starts, c.recovers, c.keys)
+			}
+			if n := s.stats.keyframes.Load(); n != int64(c.keys) {
+				t.Fatalf("key frame counter %d, want %d", n, c.keys)
+			}
+			p.mu.Lock()
+			hurries := p.hurries
+			p.mu.Unlock()
+			if hurries != 1 {
+				t.Fatalf("%d Hurry calls, want 1 (a starting generation takes over)", hurries)
+			}
+			if l := logs.lines(`msg="restarting video" reason="queue overflow" urgent=true takeover=true`); len(l) != btoi(c.starting) {
+				t.Fatalf("takeover log %q", l)
+			}
+		})
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

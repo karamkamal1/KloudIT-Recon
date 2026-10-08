@@ -83,8 +83,10 @@ type Session struct {
 	sendSince   atomic.Int64
 	sendOpening atomic.Bool
 	// send: the frame streams being written and the loss the client waits
-	// on, for the loss-recovery ladder (ladder.go).
-	send sendState
+	// on, for the loss-recovery ladder (ladder.go); discards: the frames it
+	// discarded and has not reported yet.
+	send     sendState
+	discards discardRun
 
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
@@ -841,13 +843,21 @@ func (s *Session) videoEvents() {
 				// frame), else a fresh key frame right away (with the cut:
 				// an urgent restart or an IDR). Within 2 s of the last cut
 				// the bitrate stays, but the key frame does not wait
-				// either: the dropped frames were the newest ones.
+				// either: the dropped frames were the newest ones. A
+				// generation starting at a lower bitrate takes over then
+				// (urgentRestart, or only that where a recovery frame
+				// answers the loss).
 				dropped := append(s.drainQueue(), ev.Frame)
 				s.logOverflow(dropped)
 				s.reportDropped(dropped, "queue overflow")
 				recovered := s.overflowLoss(dropped)
-				if !s.overflowCut(recovered) && !(recovered && s.vid().Capabilities().LiveBitrate) {
-					s.urgentRestart("queue overflow")
+				if !s.overflowCut(recovered) {
+					switch {
+					case !recovered:
+						s.urgentRestart("queue overflow")
+					case !s.vid().Capabilities().LiveBitrate:
+						s.takeover("queue overflow")
+					}
 				}
 			}
 		}
@@ -1186,14 +1196,29 @@ func (s *Session) checkOut() {
 
 // discard reports a frame the session does not send (or stops sending)
 // because the client waits for the answer to a loss before it (step: the
-// ladder's, actDiscard): the client would discard it anyway.
+// ladder's, actDiscard): the client would discard it anyway. Consecutive
+// discards are reported as one run (discardRun).
 func (s *Session) discard(f *media.Frame, step ladderStep) {
 	s.stats.discarded.Add(1)
 	why := "awaiting recovery frame"
 	if step.rung == 4 {
 		why = "awaiting key frame"
 	}
-	s.reportDropped([]*media.Frame{f}, why)
+	done, doneWhy, begun := s.discards.add(f.Gen, f.Seq, why)
+	if done != nil {
+		s.reportDropped(done, doneWhy)
+	}
+	if begun != 0 {
+		time.AfterFunc(discardReportAfter, func() { s.reportDiscards(begun) })
+	}
+}
+
+// reportDiscards reports the run of discarded frames id (0: whichever is
+// open) unless it was reported already.
+func (s *Session) reportDiscards(id uint64) {
+	if fs, why := s.discards.take(id); fs != nil && s.ctx.Err() == nil {
+		s.reportDropped(fs, why)
+	}
 }
 
 // lossRecovered logs the encoder's answer to a Recover (Session.loss): the
@@ -1448,15 +1473,29 @@ func (s *Session) urgentRestart(reason string) {
 	s.kickMu.Lock()
 	s.lastKick = time.Now()
 	s.kickMu.Unlock()
-	if stopped, starting := s.vid().Hurry(); starting {
-		if stopped {
-			s.log.Info("restarting video", "reason", reason, "urgent", true, "takeover", true)
-		}
+	if s.takeover(reason) {
 		return
 	}
 	if err := s.keyframe(reason); err != nil {
 		s.log.Warn("urgent restart failed", "reason", reason, "err", err)
 	}
+}
+
+// takeover makes a generation that is starting (an overlapped back-off) take
+// over at once and stops the active one, for a queue overflow within two
+// seconds of a bitrate cut; it reports whether one was starting. Where a
+// recovery frame answers the overflow's loss (rung 2) this is all: no key
+// frame (GUIDE 2.3: an IDR only where rung 2 is unavailable); the starting
+// generation begins with a key frame of its own (lastKick).
+func (s *Session) takeover(reason string) bool {
+	stopped, starting := s.vid().Hurry()
+	if starting {
+		s.kicked()
+	}
+	if stopped {
+		s.log.Info("restarting video", "reason", reason, "urgent", true, "takeover", true)
+	}
+	return starting
 }
 
 // kicked notes that a key frame is on its way (lastKick).
@@ -1561,6 +1600,7 @@ func (s *Session) frameSender() {
 			s.discard(f, step)
 			continue
 		}
+		s.reportDiscards(0) // a frame goes out again: the run before it is complete
 		s.sendOpening.Store(true)
 		s.sendSince.Store(time.Now().UnixNano())
 		s.applyCongestionTarget()
@@ -1603,8 +1643,8 @@ func (s *Session) frameSender() {
 			continue
 		} else if delay > 0 {
 			// Test hook: this frame arrives late, the next ones on time
-			// (its stream stands still meanwhile, as when its packets wait
-			// for retransmissions).
+			// (its stream's write stands still meanwhile; rung 1 treats
+			// it as a write the transport holds back).
 			s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay)
 			late := append([]byte(nil), buf...)
 			time.AfterFunc(delay, func() { s.sendFrame(of, h, late) })
