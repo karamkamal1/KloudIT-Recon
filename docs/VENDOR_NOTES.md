@@ -3687,11 +3687,17 @@ What changed (GUIDE 2.3; docs/ARCHITECTURE.md "The loss-recovery ladder"):
   the live generation, never for key frames or recovery frames.
 - Rung 2 as in 3.5 (`Pipeline.Recover`), plus: from the loss until its answer (a recovery frame
   with `refFloor` < the lost seq, or a key frame: the client's `P.endsRecovery`) the host sends
-  nothing (the client would discard it; reported `dropped`, `why="awaiting recovery frame"`), also
-  stopping streams being written; for a loss it learns late (the client's `lost`) it looks back
-  over the last 256 frames it took for an answer already sent. A frame-queue overflow under
+  nothing (the client would discard it; reported `dropped`, `why="awaiting recovery frame"`, one
+  message and one host.log line per run of consecutive frames: when the run breaks, when a frame
+  goes out again or 250 ms after the run began), also stopping streams being written; for a loss
+  it learns late (the client's `lost`) it looks back over the last 256 frames it took for an
+  answer already sent after the lost frame. A lost answer (the recovery frame or an in-stream key
+  frame reported lost itself) answers nothing: the wait reopens from its loss, as the client keeps
+  waiting from there, until the encoder's next answer. A frame-queue overflow under
   reference recovery is answered by a recovery frame and the bitrate cut changes a seamless
-  encoder's rate in place: no IDR (before 2.3 an overflow always forced one).
+  encoder's rate in place: no IDR (before 2.3 an overflow always forced one); where the cut is
+  refused (within 2 s of the last decrease) only a generation starting at a lower bitrate takes
+  over, never an IDR, also on a helper without live bitrate changes.
 - Rung 3: the helper's `start` asks for intra refresh (`intraRefreshFrames` = half a second of
   frames, `encoder.Caps.IntraRefreshFrames`) where the codec's caps have `intraRefresh` and the
   stream runs no LTR slots and no SVC: NVENC beside reference invalidation, AMF H.264 without LTR;
@@ -3721,7 +3727,26 @@ What changed (GUIDE 2.3; docs/ARCHITECTURE.md "The loss-recovery ladder"):
   what holds up the host's own frame streams: on the direct path the path to the browser; on the
   relay paths (until 2.6 makes them one connection) the host → gateway leg, and a stall of the
   gateway → browser leg only once the gateway's stream receive window is full (the splice stops
-  reading), so it acts later there.
+  reading), so it acts later there. (7) Rung 1 cancels a frame while its stream's write stands
+  still (the transport has not taken the frame: a full congestion window, flow control), not a
+  frame whose write returned and whose stream the host closed (quic-go's `Write` returns once all
+  but the last packet's worth is handed to its packer; a frame of at most one packet returns at
+  once). Such a frame is QUIC's to deliver: a lost packet is detected after ~9/8 RTT (or three
+  later packets) and resent ahead of new data. GUIDE 2.3 says "CancelWrite it" without that
+  condition; it is left out because the host has no signal that a closed frame has not arrived:
+  the client acknowledges frames after decoding them (datagrams, lossy, behind the decoder's own
+  delay), its rate reports name the newest frame received (a later frame covers a missing one),
+  and quic-go's per-stream acknowledgements do not reach the session through webtransport-go (the
+  2.1 fork carries only the congestion-control hook). A timer without that signal (the deadline
+  plus a round trip without an ack) would also cancel frames that arrived, each costing a
+  recovery and the frames up to it. And on a path whose RTT is well below the deadline (Wi-Fi in
+  a home: a few ms) the retransmission arrives before a recovery frame could (the encoder makes
+  one only after the cancel; the frames after the lost one are useless to the client either way
+  under reference recovery). A stall long enough to matter (a Wi-Fi outage, a tail loss waiting
+  for a PTO with more frames to send) fills the media congestion window (pacing × (min RTT + 2
+  frame intervals)), and then the newer frames' writes stand still and rung 1 cancels those; the
+  closed frames before them arrive with the retransmissions. The test hook's delay and the unit
+  tests model a write that stands still, not packets lost after it.
 
 Verified in the sandbox:
 
@@ -3782,6 +3807,29 @@ Verified in the sandbox:
   when the X display it shared with another agent's run went away; rerun alone on a private
   display: exit 0, all passed. Skipped as before: AMD Direct Capture, WGC, AMF failed start, the
   NVENC driver subtest, `TestLaunchUnsupported`, `TestVideoGPUPriorityLog`.
+- Review fixes, verified (sandbox): (a) rung 1 and closed frame streams: deviation (7) above;
+  the test hook's and the docs' wording corrected (it models a write that stands still, not
+  packets lost after it); no code change. (b) A lost answer reopens the wait:
+  `TestSendStateWait` (the recovery frame reported lost: the wait goes back to the first loss and
+  the frames are discarded until the next recovery frame; its loss reported late: the newer
+  recovery frame answers it; a lost in-stream key frame answers nothing) failed before the fix
+  (`wait {from:5 ended:true end:5}`: the lost recovery frame ended its own wait). (c) Discards
+  reported in runs: `TestDiscardRun`, `TestFrameSenderLadder/invalidate` (seq 3–4 in one
+  `dropped` and one host.log line); `internal/e2e` `TestStreamingDeadlineDrop`: 7 of 7 held
+  streams cancelled, 15 frames reported dropped in 11 messages (7 cancels, 4 runs). (d) An
+  overflow answered by rung 2 on a pipeline without live bitrate, cut refused within 2 s of the
+  last decrease: `TestOverflowRecovered` (`ltr`: `Recover 1/2`, no IDR, no start, `key_frames`
+  0; with a generation starting it takes over, `takeover=true`, no IDR; `keyframe`: one IDR)
+  failed before the fix (one IDR under `ltr`). Browser E2E 81 of 81 (run under the shared E2E
+  lock; four earlier runs beside other agents' E2E runs, load 9–24 on 4 CPUs, failed on decoder
+  backlogs and queue overflows in unrelated checks too): `host-faults-ref` 9 of 10 held streams
+  cancelled, 13 recoveries by recovery frame, 0 by key frame, no IDR forced, no restart for a
+  loss; the client was told of 90 frames, 68 of them not sent while it waited, in 15 reports;
+  `host-faults` (`keyframe`): 82 discarded frames in 8 host.log lines (a 1.2 s wait: 75 frames in
+  5) where each frame had its own line before. That 1.2 s wait is older than 2.3: the hook's drop
+  came 226 ms after a bitrate restart, whose 500 ms key-frame guard (`lastKick`) swallowed the
+  host's and the client's key-frame requests although that generation's key frame had arrived,
+  until the client's 1 s watchdog.
 - Not run: the 0.4 `wifi` profile (no `sch_netem` in the sandbox kernel: `tc qdisc add ... netem`
   answers "Specified qdisc kind is unknown"); T3 and T4 are hardware checks below.
 
@@ -3798,9 +3846,14 @@ unless a test says otherwise; overlay Ctrl+Alt+Shift+S; host log
   `dropped`, `recovered`, `recovered_by_key` and `key_frames`
   (`Select-String host.log -Pattern 'msg="stream stats"'`), the `frame stream cancelled` lines
   (`age_ms` ≥ `deadline_ms`, each followed by `recovering from a loss ... why=deadline` and
-  `loss recovered ... by="recovery frame"`), and any `restarting video` or `forcing a key frame`
-  (there should be none after the session start). Repeat with AV1 at 2560×1440 and H.264, and
-  once on `lan` (expect `deadline_drops=0`, no freezes).
+  `loss recovered ... by="recovery frame"`; only frames whose write stood still past the
+  deadline, deviation (7): wifi's losses (1 %, bursts of 2) are repaired by QUIC retransmission
+  within a few ms and its 0–15 ms slots stay inside the congestion window, so few or none are
+  expected), and any `restarting video` or `forcing a key frame` (there should be none after the
+  session start). A freeze > 100 ms with no `frame stream cancelled` or `frames dropped` line at
+  its time is a closed frame that waited for retransmissions (deviation (7)): record how many
+  there were. Repeat with AV1 at 2560×1440 and H.264, and once on `lan` (expect
+  `deadline_drops=0`, no freezes).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (T4, zero encoder restarts with the helper): the same
   stream for 30 minutes under each of `lan`, `wifi`, `wan` and `capdrop` (0.4), after
   `recon-host qualify` (3.6) so that bitrate changes stay in the encoder. Pass: one

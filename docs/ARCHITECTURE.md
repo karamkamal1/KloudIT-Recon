@@ -186,14 +186,25 @@ running encoder (never from a vendor). Its rungs, cheapest first:
    are never cancelled (another one would have to take their place), and under `skip` and
    `keyframe` a late frame goes on (its loss would cost a smeared picture or a key frame, a late
    frame only time). frameSender checks at each stream's deadline and whenever a frame is queued.
+   Rung 1 sees frames whose write the transport holds back (a full congestion window, flow
+   control). A frame whose write returned and whose stream is closed is QUIC's to deliver: its
+   lost packets are retransmitted, not cancelled. The host has no signal that such a frame has
+   not arrived (the client acknowledges frames after decoding them, its rate reports name the
+   newest frame received, and QUIC's stream acknowledgements do not reach the session), and on a
+   path whose round trip is below the deadline a retransmission comes before a recovery frame
+   could; a stall long enough to matter fills the congestion window, and then the newer frames'
+   writes stand still and are cancelled (docs/VENDOR_NOTES.md 2.3, deviation 7).
 2. **Recover without a key frame** (`ltr` / `invalidate`, above). From the loss until the frame
    that answers it (a recovery frame with `refFloor` < the lost seq, or a key frame) every frame is
    useless to the client, which discards them: the host does not send them (or stops their
-   streams) and reports them `dropped` (`why="awaiting recovery frame"`), so the recovery frame
-   does not queue behind them. The host applies the client's rule (`P.endsRecovery`) to the frames
-   it takes; for a loss it learns of late (the client's `lost`) it looks back over the last 256
-   frames it took for an answer already sent, and where they do not reach back that far it
-   discards nothing.
+   streams) and reports them `dropped` (`why="awaiting recovery frame"`; one message per run of
+   consecutive frames, when the run breaks, a frame goes out again or 250 ms after it began), so
+   the recovery frame does not queue behind them. The host applies the client's rule
+   (`P.endsRecovery`) to the frames it takes; for a loss it learns of late (the client's `lost`)
+   it looks back over the last 256 frames it took for an answer already sent after the lost
+   frame, and where they do not reach back that far it discards nothing. A lost answer (the
+   recovery frame or key frame itself) answers nothing: the wait reopens from its loss, as the
+   client keeps waiting from there.
 3. **Intra refresh, as a safety net only.** `skip` (the FFmpeg path's NVENC H.264 / HEVC, where
    rung 2 does not exist and rung 4 is an encoder restart): the client decodes on and the refresh
    heals the picture, bounded in time (above). On the native helper intra refresh runs wherever it
@@ -341,7 +352,8 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     reference recovery on a seamless encoder: the cut in place, the dropped frames answered by a
     recovery frame; see the loss-recovery ladder), but not within 2 s of
     any other decrease (the old generation that still streams is what overflows: the starting
-    one takes over at once); a decoder flush also caps
+    one takes over at once; with nothing starting a key frame follows, unless a recovery frame
+    answers the dropped frames); a decoder flush also caps
     later increases at 85 % of the bitrate it cut from, until the settings change. An older
     client's delay report (`{"t":"congestion"}`) decreases like the controller's own decision.
   - *Frame rate.* At the floor (2 Mbit/s, or the setting if lower) a decrease lowers the frame

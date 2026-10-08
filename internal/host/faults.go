@@ -16,10 +16,13 @@ import (
 // real host: it damages the stream on purpose. Comma-separated rules:
 //
 //	delay=every:N:D   send every Nth frame D late (a Go duration, e.g. 200ms):
-//	                  its stream stands still meanwhile and the frames after it
-//	                  go out on time, as after a retransmission; under
-//	                  reference recovery the loss-recovery ladder cancels it at
-//	                  its deadline (rung 1: a newer frame is ready)
+//	                  its stream's write stands still meanwhile and the frames
+//	                  after it go out on time; under reference recovery the
+//	                  loss-recovery ladder cancels it at its deadline (rung 1:
+//	                  a newer frame is ready), as any frame whose write the
+//	                  transport holds back. It does not model packets lost
+//	                  after the write returned: QUIC retransmits those and
+//	                  rung 1 does not cancel them (docs/VENDOR_NOTES.md 2.3)
 //	drop=every:N      reset every Nth frame's stream after half of it was
 //	                  written, as if it had failed, and report it ({"t":"dropped"})
 //	recovery=skip|keyframe  announce this recovery mode in every VideoConfig

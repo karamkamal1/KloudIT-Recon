@@ -1333,9 +1333,12 @@ async function lossRun(name, faults, seconds, prefs = {}) {
     keyRequestReasons: keyRequestsByReason(con),
     // The loss-recovery ladder (GUIDE 2.3): frame streams cancelled past
     // their deadline (rung 1), frames the host did not send while the client
-    // waited for a recovery or key frame, IDRs forced in the encoder.
+    // waited for a recovery or key frame (one line per run: its count) and in
+    // how many runs, IDRs forced in the encoder.
     cancelled: (hl.match(/msg="frame stream cancelled"/g) || []).length,
-    hostDiscarded: (hl.match(/msg="frames dropped".*? why="awaiting (recovery|key) frame"/g) || []).length,
+    hostDiscarded: [...hl.matchAll(/msg="frames dropped".*? why="awaiting (?:recovery|key) frame".*? count=(\d+)/g)]
+      .reduce((a, m) => a + Number(m[1]), 0),
+    hostDiscardRuns: (hl.match(/msg="frames dropped".*? why="awaiting (recovery|key) frame"/g) || []).length,
     forcedKeys: (hl.match(/msg="forcing a key frame"/g) || []).length,
     client: {
       keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped'),
@@ -1504,7 +1507,7 @@ async function checkLossHandling() {
       !r.keyRequestReasons['frame lost'] && r.fps >= 10,
     `${r.cfg?.encoder} recovery ${r.cfg?.recovery}: host dropped ${r.dropped} and cancelled ${r.cancelled} (of ${r.delayed} delayed 200 ms), ` +
       `asked the encoder to recover ${r.recovering}, answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}; ` +
-      `client told ${r.client.hostDropped} (${r.hostDiscarded} not sent while it waited), ` +
+      `client told ${r.client.hostDropped} (${r.hostDiscarded} not sent while it waited, in ${r.hostDiscardRuns} reports), ` +
       `recovered ${r.client.recovered} by recovery frame and ${r.client.recoveredByKey} by key frame, ${r.client.discarded} frames discarded meanwhile ` +
       `(${r.lateSkips} times without waiting for a late frame before the recovery frame), ` +
       `${r.client.keyFrames} IDRs decoded, decoder errors ${r.decoderErrors}; client key-frame requests: ${counts(r.keyRequestReasons)}; ` +
