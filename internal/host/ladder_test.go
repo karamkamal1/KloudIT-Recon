@@ -216,6 +216,12 @@ func TestSendStateWait(t *testing.T) {
 	lost.setWait(1, 2, 2, false)
 	take(&lost, &fr{Gen: 1, Seq: 5, Recovery: true, RefFloor: 1}) // answers the loss at 2
 	take(&lost, &fr{Gen: 1, Seq: 6})
+	if from := lost.recoverFrom(1, 5); from != 2 {
+		t.Fatalf("the recovery frame lost: recover from %d, want 2 (the wait's first loss)", from)
+	}
+	if from := lost.recoverFrom(1, 6); from != 6 {
+		t.Fatalf("a loss after the answer: recover from %d, want 6", from)
+	}
 	lost.setWait(1, 5, 2, false)
 	if w := lost.wait; w.ended || w.from != 2 {
 		t.Fatalf("the recovery frame lost: wait %+v, want from 2, not ended", w)
@@ -455,6 +461,56 @@ func TestFrameSenderLadder(t *testing.T) {
 		}
 		if n, m := r.s.stats.cancelled.Load(), r.s.stats.discarded.Load(); n != 1 || m != 2 {
 			t.Fatalf("counters: %d cancelled, %d discarded; want 1 and 2", n, m)
+		}
+	})
+
+	// The recovery frame itself lost (the client's "lost" for it: its drop
+	// test, a failed stream): the client waits from the first loss again, so
+	// the encoder is asked to recover from there, and its answer (refFloor
+	// below the first loss) goes out with the frames after it. Asked to
+	// recover from the lost answer, the encoder's frame (refFloor 4) would be
+	// discarded with every frame after it.
+	t.Run("recovery frame lost", func(t *testing.T) {
+		r := setup(t, proto.RecoveryInvalidate, []int{2}, testFaults{}, media.PipelineCaps{ForceIDR: true})
+		// recovery queues the encoder's answer to its latest Recover as
+		// frame seq: refFloor = the frame before the loss it was asked to
+		// recover from (Video's test recovery, reference invalidation).
+		recovery := func(seq uint32) {
+			rec, _, _ := r.p.state()
+			var gen, from uint32
+			if len(rec) == 0 {
+				t.Fatal("no Recover")
+			}
+			if _, err := fmt.Sscanf(rec[len(rec)-1], "%d/%d", &gen, &from); err != nil {
+				t.Fatal(err)
+			}
+			queue(r, seq, seq+1, func(f *media.Frame) { f.Recovery, f.RefFloor = true, from-1 })
+		}
+		queue(r, 0, 5, nil) // seq 2 stalls: cancelled, the encoder recovers from 2; 3, 4 not sent
+		streams(t, r, 3)
+		waitDropped(t, r, 3)
+		recovery(5)
+		queue(r, 6, 7, nil)
+		streams(t, r, 5)
+		r.s.loss(lossConfirmed, 1, 5, "client") // the client lost the recovery frame
+		if rec, _, _ := r.p.state(); fmt.Sprint(rec) != "[1/2 1/2]" {
+			t.Fatalf("recover %v, want [1/2 1/2] (the lost answer reopens the wait from 2)", rec)
+		}
+		if l := r.logs.lines(`msg="recovering from a loss" gen=1 from_seq=5 why=client wait_from=2`); len(l) != 1 {
+			t.Fatalf("log %q", r.logs.lines(`msg="recovering from a loss"`))
+		}
+		queue(r, 7, 8, nil) // not sent: the client waits
+		recovery(8)
+		queue(r, 9, 10, nil)
+		st := streams(t, r, 7)
+		var sent []int
+		for _, x := range st {
+			if x.closed {
+				sent = append(sent, seqOf(x))
+			}
+		}
+		if fmt.Sprint(sent) != "[0 1 5 6 8 9]" {
+			t.Fatalf("frames sent %v, want [0 1 5 6 8 9]", sent)
 		}
 	})
 

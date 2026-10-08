@@ -3693,7 +3693,9 @@ What changed (GUIDE 2.3; docs/ARCHITECTURE.md "The loss-recovery ladder"):
   it learns late (the client's `lost`) it looks back over the last 256 frames it took for an
   answer already sent after the lost frame. A lost answer (the recovery frame or an in-stream key
   frame reported lost itself) answers nothing: the wait reopens from its loss, as the client keeps
-  waiting from there, until the encoder's next answer. A frame-queue overflow under
+  waiting from there, until the encoder's next answer, which `Pipeline.Recover` is asked to make
+  from that first loss (`sendState.recoverFrom`; an answer made for the lost one alone, `refFloor`
+  = its seq - 1, would end neither wait). A frame-queue overflow under
   reference recovery is answered by a recovery frame and the bitrate cut changes a seamless
   encoder's rate in place: no IDR (before 2.3 an overflow always forced one); where the cut is
   refused (within 2 s of the last decrease) only a generation starting at a lower bitrate takes
@@ -3830,6 +3832,17 @@ Verified in the sandbox:
   came 226 ms after a bitrate restart, whose 500 ms key-frame guard (`lastKick`) swallowed the
   host's and the client's key-frame requests although that generation's key frame had arrived,
   until the client's 1 s watchdog.
+- Integration fix (integ, after Phase 5), verified (sandbox): the browser E2E's drop test under
+  `host-faults-ref` skipped a recovery frame (6/80, the answer to the loss at 72): the client
+  reported it lost, the host reopened the wait from 72 but asked the encoder to recover from 80;
+  its recovery frame 6/90 (`refFloor` 79) and every frame after it were discarded (`frames
+  dropped why="awaiting recovery frame" from_seq=81 count=16`, then 97, 112, 127, 143) until the
+  client's `no recovery frame` key-frame request 1 s later. The encoder is now asked to recover
+  from the reopened wait's first loss (`Session.loss`, `sendState.recoverFrom`; host.log
+  `recovering from a loss ... wait_from=72`). `TestFrameSenderLadder/recovery_frame_lost` (the
+  encoder's answer to the reopened wait goes out with the frames after it) failed before the fix:
+  `recover [1/2 1/5]`, and with that check removed the answer and every later frame stayed unsent
+  (5 of 7 streams); `TestSendStateWait` checks `recoverFrom`.
 - Not run: the 0.4 `wifi` profile (no `sch_netem` in the sandbox kernel: `tc qdisc add ... netem`
   answers "Specified qdisc kind is unknown"); T3 and T4 are hardware checks below.
 

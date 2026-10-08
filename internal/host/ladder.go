@@ -385,10 +385,7 @@ func (s *sendState) setWait(gen uint8, from uint32, rung int, wholeGen bool) {
 		return // frames of a newer generation went out: the client is leaving this one
 	}
 	w := lossWait{active: true, gen: gen, from: from, rung: rung, wholeGen: wholeGen}
-	if o := s.wait; o.active && o.gen == gen && (!o.ended || from <= o.end) {
-		// The same wait: not answered yet, the loss is before its answer
-		// (which answers it too unless it is older than the wait), or the
-		// answer itself was lost.
+	if o := s.wait; o.joins(gen, from) {
 		w.from, w.rung, w.wholeGen = min(o.from, from), max(o.rung, rung), o.wholeGen || wholeGen
 	}
 	lo := uint64(1)
@@ -410,6 +407,30 @@ func (s *sendState) setWait(gen uint8, from uint32, rung int, wholeGen bool) {
 		w.ended, w.end = true, w.from
 	}
 	s.wait = w
+}
+
+// joins reports whether a loss of generation gen's frames from seq from on
+// is part of the wait w (setWait widens w): w is not answered yet, the loss
+// is before its answer (which answers it too unless it is older than the
+// wait), or the answer itself was lost.
+func (w lossWait) joins(gen uint8, from uint32) bool {
+	return w.active && w.gen == gen && (!w.ended || from <= w.end)
+}
+
+// recoverFrom returns the frame the encoder must recover from for a loss of
+// generation gen's frames from seq from on (Session.loss, rung 2): the
+// oldest loss of the wait it joins (joins), else from. A lost answer reopens
+// the wait from its first loss, here and at the client, and only a recovery
+// frame with refFloor below that ends it: one made for the lost answer alone
+// (refFloor from-1) would be discarded like every frame after it, until the
+// client gives up and asks for a key frame.
+func (s *sendState) recoverFrom(gen uint8, from uint32) uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.wait; o.joins(gen, from) {
+		return min(o.from, from)
+	}
+	return from
 }
 
 // discardReportAfter bounds how long a run of discarded frames goes

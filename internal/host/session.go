@@ -1149,9 +1149,16 @@ func (s *Session) loss(ev lossEvent, gen uint8, seq uint32, why string) ladderSt
 	}
 	st := ladder(in)
 	if st.act == actRecover {
-		err := v.Recover(gen, seq)
+		// A loss that joins the client's wait (its answer lost) is recovered
+		// from the wait's first loss (sendState.recoverFrom).
+		from := s.send.recoverFrom(gen, seq)
+		err := v.Recover(gen, from)
 		if err == nil {
-			s.log.Info("recovering from a loss", "gen", gen, "from_seq", seq, "why", why)
+			attrs := []any{"gen", gen, "from_seq", seq, "why", why}
+			if from != seq {
+				attrs = append(attrs, "wait_from", from)
+			}
+			s.log.Info("recovering from a loss", attrs...)
 			s.send.setWait(gen, seq, st.rung, false)
 			s.checkOut()
 			return st

@@ -204,7 +204,9 @@ running encoder (never from a vendor). Its rungs, cheapest first:
    it looks back over the last 256 frames it took for an answer already sent after the lost
    frame, and where they do not reach back that far it discards nothing. A lost answer (the
    recovery frame or key frame itself) answers nothing: the wait reopens from its loss, as the
-   client keeps waiting from there.
+   client keeps waiting from there, and the encoder is asked to recover from that first loss
+   (`sendState.recoverFrom`): an answer made for the lost one alone (`refFloor` = its seq - 1)
+   would end neither wait.
 3. **Intra refresh, as a safety net only.** `skip` (the FFmpeg path's NVENC H.264 / HEVC, where
    rung 2 does not exist and rung 4 is an encoder restart): the client decodes on and the refresh
    heals the picture, bounded in time (above). On the native helper intra refresh runs wherever it
