@@ -71,8 +71,13 @@ target_include_directories(recon-encoder SYSTEM PRIVATE
     ${THIRD_PARTY}/nv-codec-headers/include
     ${THIRD_PARTY}/nlohmann/include
 )
+# D3D10_ARBITRARY_HEADER_ORDERING: d3d/convert.hpp includes d3d10.h (for
+# ID3D10Multithread) before d3d11.h, which in the Windows SDK pulls in
+# d3d10_1.h; that header rejects an earlier d3d10.h with #error unless this
+# is defined (mingw-w64's headers do not check).
 target_compile_definitions(recon-encoder PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00
+    D3D10_ARBITRARY_HEADER_ORDERING
     RECON_ENCODER_VERSION="${PROJECT_VERSION}"
 )
 target_link_libraries(recon-encoder PRIVATE d3d11 dxgi)
