@@ -4253,7 +4253,8 @@ What changed (session side of 3.7; `internal/host/virtualdisplay.go`, docs/ARCHI
   Hz, HMONITOR, DXGI output) and captures it whole: FFmpeg `ddagrab` `output_idx` = its DXGI
   output (`gfxcapture` of its HMONITOR when it has none on adapter 0, or with host config capture
   `gfxcapture`; never `gfxcapture` scaling: the prefs size equals the display's), the helper
-  `capture: "dda"` with `hmonitor` (also with host config capture `amf`: `Session.capture`). FFmpeg
+  `capture: "dda"` with `hmonitor` (also with host config capture `amf`: `Session.capture`;
+  `capture: "wgc"` with that `hmonitor` when host config capture is `gfxcapture`). FFmpeg
   with capture `amf`: `useAMFCapture` logs `AMD Direct Capture (capture "amf") not used, capturing
   with ddagrab reason="monitor \\.\DISPLAYn is a virtual display, which AMD Direct Capture cannot
   capture"`. The fps cap is the display's refresh rate. Absolute mouse input
@@ -4267,12 +4268,23 @@ What changed (session side of 3.7; `internal/host/virtualdisplay.go`, docs/ARCHI
   display and another requested mode the video is suspended, `Create` replaces the display (old
   one removed, topology restored, new one added) and the next generation starts urgently on it
   (`virtual display changed mode=... was=...`); without one the policy decides again (e.g. a
-  client that asks for 120 fps on a 60 Hz monitor). A session keeps its display until it ends.
+  client that asks for 120 fps on a 60 Hz monitor). A change of `window` calls it too: a window
+  capture (protocol clients; the bundled web client never sends `window`) suspends the video,
+  removes the display at once (`leaving the virtual display reason="the client captures a
+  window"`) and restarts urgently on the window (FFmpeg `gfxcapture` as without a display, the
+  helper `wgc`); clearing `window` decides again. Otherwise a session keeps its display until it
+  ends.
 - Lost: `Display.Lost()` (SudoVDA's driver stopped answering; its watchdog removes the monitor) or
-  the display missing from the monitor list (VDD disabled by hand, Settings): the video is
-  suspended, the display removed at once (the package no longer lingers a lost display), the user
-  told ("The virtual display is gone (...); streaming the monitor."), the stream restarted on the
-  physical monitor, and no other display created in that session.
+  the display missing from the monitor list twice in a row (`watchVirtualDisplay` checks every
+  second: the VDD has no keepalive, Windows can remove or deactivate a SudoVDA monitor whose
+  driver still answers, and the helper's `dda` does not end a generation whose output vanished,
+  it reports `captureChanged` `lost` once and retries): the video is suspended, the display
+  removed at once (the package no longer lingers a lost display), the user told ("The virtual
+  display is gone (...); streaming the monitor."), the stream restarted urgently on the physical
+  monitor, and no other display created in that session. A generation being built when the
+  display is no longer listed (an FFmpeg restart after ddagrab failed; `captureMonitor`) removes
+  it and restores the topology before looking up the monitor it captures instead (no suspend: the
+  generation being built is the restart).
 - End: `closeVirtualDisplay` after the video stopped: the display stays `virtualDisplayLinger`
   seconds (host config, default 10, 0-600; 0 = restore at once) for a reconnect with the same mode
   (`virtual display reused`), then it is removed and the topology restored. A newer session that
@@ -4323,8 +4335,15 @@ decoder tests before the hello still finds it.
   `TestVirtualDisplayLost` (SudoVDA keepalive fails and the monitor departs: notice, suspend,
   urgent restart on the physical monitor, restored at once despite a 1 h linger, input mapped to
   the monitor, a later 2560x1440@144 request creates none and logs why; VDD-like display that
-  disappears from the list: the next generation captures the monitor, notice "Windows no longer
-  lists it", restored), `TestVirtualDisplayReconnect` (reconnect within the 1 s linger -> same
+  disappears from the list: the next generation captures the monitor, restored before it returns
+  and input mapped to the monitor at (0,0), notice "Windows no longer lists it"; VDD-like display
+  that disappears under a running generation that only reports `captureChanged` `lost` (the
+  helper's `dda`), through `videoEvents`: notice, suspend, urgent restart on the 1920x1080@60
+  monitor within the 2 s check, restored), `TestVirtualDisplayWindow` (through `controlLoop`: a
+  switch to `window` "Notepad" on a virtual display suspends, removes it at once despite a 1 h
+  linger and starts urgently with FFmpeg `gfxcapture` of the window; `captureBackend` gives
+  `gfxcapture` for a window also while the display exists; clearing `window` creates it again and
+  captures it with `ddagrab`), `TestVirtualDisplayReconnect` (reconnect within the 1 s linger -> same
   display, `reason="the monitor is the previous session's virtual display"`, 1 plug; a takeover at
   1920x1080@144 replaces it; the replaced session's end leaves it; removed 1 s after the last
   session), `TestVirtualDisplayAgent` (a crashed agent's display and journal (layout `only`, the
@@ -4345,7 +4364,9 @@ decoder tests before the hello still finds it.
   scaling / no output), the helper source following host config `amf`, no suspend before a
   re-create, AMD Direct Capture not turned down, the welcome listing all monitors, settings not
   updating the display, no reaction to a lost display, and the display created after the
-  pipeline.
+  pipeline. Review fixes: no monitor-list check in `watchVirtualDisplay`, the removal in
+  `captureMonitor` asynchronous again, `captureBackend` ignoring `window`, the display kept for a
+  window capture, `controlLoop` not passing a `window` change on.
 - verified (sandbox): `go vet ./...`, `GOOS=windows go vet ./...`, `go test ./...` (the e2e package
   under the shared lock: ok). Browser E2E (Linux: capture `test`, policy `off`, so the stream path
   is the one before this step): first run 176 passed / 9 failed, all real-time checks (`steady
@@ -4431,6 +4452,16 @@ Logs: `$env:APPDATA\KlouditRecon\host.log`; overlay Ctrl+Alt+Shift+S.
   on the physical monitor within ~5 s, host.log `virtual display lost, streaming the monitor`;
   changing the resolution afterwards creates no new display (`virtual display not used
   reason="the session's virtual display was lost (...)"`). Re-enable the driver.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (display vanishes without a keepalive failure, helper
+  pipeline): with the VDD, during a stream disable the virtual display in Device Manager (Display
+  adapters > the Virtual Display Driver device > Disable device) or in Settings > Display (the
+  virtual display > Disconnect this display); with SudoVDA, Settings > Display > Disconnect this
+  display (the driver keeps answering). Within ~2 s the client gets "The virtual display is gone
+  (Windows no longer lists it); streaming the monitor." and the stream continues on the physical
+  monitor (host.log `capture changed reason=lost`, then `virtual display lost, streaming the
+  monitor reason="Windows no longer lists it"` and `restarting video reason="virtual display
+  lost" urgent=true`); the picture does not stay frozen. Repeat with `"pipeline": "ffmpeg"` (FFmpeg
+  exits, the restart captures the monitor: the same notice).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (AMD Direct Capture refused): `"capture": "amf"`,
   `"pipeline": "ffmpeg"`: `AMD Direct Capture (capture "amf") not used, capturing with ddagrab
   reason="monitor \\.\DISPLAYn is a virtual display, which AMD Direct Capture cannot capture"`

@@ -566,12 +566,14 @@ the Virtual Display Driver; `internal/host/vdisplay`, session side in
   the display alone, `virtual: true`: the session captures nothing else, and the client offers no
   display choice for one monitor). A settings change of the size or frame rate replaces it: the
   video is suspended, `Create` removes the old display and adds one at the new mode, and the next
-  generation starts at once. A session without one decides again on such a change.
+  generation starts at once. A session without one decides again on such a change. A switch to a
+  window capture (prefs `window`) removes it at once; a monitor capture afterwards decides again.
 - **Capture.** Exactly that display, 1:1 (the prefs size equals the display's, so nothing scales):
   FFmpeg's `ddagrab` with its DXGI output index (`gfxcapture` of its HMONITOR when it is not an
   output of DXGI adapter 0, the render adapter the agent gives the driver, or when the host
-  config asks for `gfxcapture`), the helper's `dda` by HMONITOR. Never AMD Direct Capture (the
-  GPU's display engine never scans out an IddCx monitor): capture `amf` falls back to DDA for it.
+  config asks for `gfxcapture`), the helper's `dda` by HMONITOR (`wgc` of that HMONITOR when the
+  host config asks for `gfxcapture`). Never AMD Direct Capture (the GPU's display engine never
+  scans out an IddCx monitor): capture `amf` falls back to DDA for it.
   The fps cap is the display's refresh rate, so 120 fps on a 60 Hz host monitor works. Absolute
   mouse input and the client-side cursor map to the display's desktop rectangle (looked up in
   the monitor list for every generation).
@@ -579,10 +581,14 @@ the Virtual Display Driver; `internal/host/vdisplay`, session side in
   (10 s) it is removed and the topology from before it restored, unless a reconnecting client
   took it over (same mode: the same display, nothing rearranged; another mode: replaced). A
   display whose driver stops answering (SudoVDA's watchdog removes it), or that Windows no longer
-  lists, is removed at once and the session goes on with the physical monitor (notice) without
-  creating another. Agent shutdown (`Run` returning) removes it; after a crash or power loss the
-  next agent start replays the restore journal (`vdisplay-restore.json` next to host.json) before
-  any session. One virtual display exists at a time: a new session that takes over a running
+  lists (checked every second, gone after two misses in a row: the Virtual Display Driver has no
+  keepalive, and the helper's `dda` only reports a vanished output `lost` and retries), is left at
+  once: the video is suspended, the display removed, the topology restored and the stream
+  restarted on the physical monitor (notice), without creating another. A generation being built
+  when the display is no longer listed (an FFmpeg restart) removes it first, then captures the
+  monitor where the restore put it. Agent shutdown (`Run` returning) removes it; after a crash or
+  power loss the next agent start replays the restore journal (`vdisplay-restore.json` next to
+  host.json) before any session. One virtual display exists at a time: a new session that takes over a running
   one reuses or replaces it, and the replaced session's end leaves it alone.
 - **Not used** for the test pattern, x11grab and window captures. Decisions are logged once per
   session or change (`virtual display not used reason=...`, `streaming a virtual display ...`,

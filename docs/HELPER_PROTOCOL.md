@@ -561,7 +561,8 @@ after both threads have been joined.
 
 Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
 `hmonitor` (the HMONITOR recon-host already has for each monitor; a session's virtual display,
-GUIDE 3.7, is captured with `dda` by it, never `amd-direct`); `adapterLuid` (as in
+GUIDE 3.7, is captured with `dda` by it, or `wgc` when recon-host's host config `capture` is
+`gfxcapture`, never `amd-direct`); `adapterLuid` (as in
 caps, `"%08x:%08x"` HighPart:LowPart) + `monitor` = output index on that adapter;
 `monitor` alone = output index on DXGI adapter 0 (what ddagrab's `output_idx` means).
 The output must be attached to the desktop, else `no_output`. The D3D11 device is created

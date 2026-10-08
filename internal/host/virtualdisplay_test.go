@@ -511,8 +511,10 @@ func TestVirtualDisplayResolutionChange(t *testing.T) {
 // (SudoVDA's watchdog removes it) is left: the video suspended, the displays
 // restored, the user told, the stream restarted at once on the physical
 // monitor (input mapped there), and the session creates no other one. A
-// display Windows no longer lists (VDD, no keepalive) is left the same way
-// by the next generation.
+// display Windows no longer lists (VDD, no keepalive) is left the same way:
+// by the next generation, which captures the monitor where the restore put
+// it, and by a running one whose capture only reports it lost (the native
+// helper's DDA retries a vanished output).
 func TestVirtualDisplayLost(t *testing.T) {
 	sim := vdisplay.NewSim(vdisplay.DriverSudoVDA)
 	sim.AddMonitor(1920, 1080, 0, 0, 60)
@@ -548,12 +550,14 @@ func TestVirtualDisplayLost(t *testing.T) {
 		t.Fatalf("log %q", l)
 	}
 
-	// VDD: nothing pings it; the next generation finds it gone.
+	// VDD: nothing pings it; the next generation finds it gone, and maps
+	// input to the monitor where the restore put it (back at (0, 0)).
 	sim = vdisplay.NewSim(vdisplay.DriverVDD)
 	sim.AddMonitor(1920, 1080, 0, 0, 60)
 	r = newVDRig(t, sim, Config{VirtualDisplay: "on", VirtualDisplayLinger: linger(time.Hour)})
 	s, ctrl = r.session(t, hello)
 	s.openVirtualDisplay(hello.Prefs)
+	s.video = &recPipeline{}
 	if p, err := s.buildParams(hello.Prefs); err != nil || p.Source.NativeW != 2560 {
 		t.Fatalf("on the virtual display: %+v (%v)", p.Source, err)
 	}
@@ -561,7 +565,76 @@ func TestVirtualDisplayLost(t *testing.T) {
 	if p, err := s.buildParams(hello.Prefs); err != nil || p.Source.NativeW != 1920 || p.FPS != 60 {
 		t.Fatalf("after it left: %+v at %d fps (%v)", p.Source, p.FPS, err)
 	}
+	r.restored(t)
+	if got := (func() input.Rect { r.a.inj.MoveAbs(0, 0); return r.in.target() })(); got != (input.Rect{W: 1920, H: 1080}) {
+		t.Fatalf("input target %+v", got)
+	}
 	waitMsg(t, ctrl, `"t":"notice"`, "The virtual display is gone (Windows no longer lists it)")
+
+	// VDD under a running generation that only reports its capture lost (the
+	// native helper's DDA): the session notices that Windows no longer lists
+	// the display and restarts at once on the monitor.
+	sim = vdisplay.NewSim(vdisplay.DriverVDD)
+	sim.AddMonitor(1920, 1080, 0, 0, 60)
+	r = newVDRig(t, sim, Config{VirtualDisplay: "on", VirtualDisplayLinger: linger(time.Hour)})
+	s, ctrl = r.session(t, hello)
+	s.openVirtualDisplay(hello.Prefs)
+	pl = &recPipeline{}
+	pl.events = make(chan media.VideoEvent, 1)
+	s.video = pl
+	go s.videoEvents()
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	sim.Lose()
+	pl.events <- media.VideoEvent{Capture: &media.CaptureChange{Reason: "lost", Width: 2560, Height: 1440, Text: "no output"}}
+	waitMsg(t, ctrl, `"t":"notice"`, "The virtual display is gone (Windows no longer lists it); streaming the monitor.")
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if p, u, n := pl.last(); u && n == 1 && p.Source.NativeW == 1920 && p.FPS == 60 {
+			break
+		}
+		if time.Now().After(deadline) {
+			p, u, n := pl.last()
+			t.Fatalf("no restart on the monitor: urgent %v suspends %d %+v", u, n, p.Source)
+		}
+	}
+	if s.onVirtualDisplay() {
+		t.Fatal("the session still streams the virtual display")
+	}
+	r.restored(t)
+}
+
+// TestVirtualDisplayWindow: a session on a virtual display that switches to
+// a window capture streams the window (FFmpeg gfxcapture), the display
+// removed at once; a monitor capture afterwards decides again.
+func TestVirtualDisplayWindow(t *testing.T) {
+	sim := vdisplay.NewSim(vdisplay.DriverSudoVDA)
+	sim.AddMonitor(1920, 1080, 0, 0, 60)
+	r := newVDRig(t, sim, Config{Capture: "auto", VirtualDisplay: "auto", VirtualDisplayLinger: linger(time.Hour)})
+	hello := client(2560, 1440, 120)
+	s, _ := r.session(t, hello)
+	s.openVirtualDisplay(hello.Prefs)
+	pl := &recPipeline{}
+	s.video = pl
+	// A window is FFmpeg's gfxcapture also while the session still has one
+	// (a restart before the settings reach updateVirtualDisplay).
+	if b := s.captureBackend(proto.Prefs{FPS: 120, Window: "Notepad"}, virtualMonitor(t, sim, 1), true); b != "gfxcapture" {
+		t.Fatalf("window on a virtual display: %s", b)
+	}
+	settings(t, s, proto.Prefs{FPS: 120, Window: "Notepad"})
+	if p, u, n := pl.last(); !u || n != 1 || p.Source.Backend != "gfxcapture" || p.Source.Window != "Notepad" {
+		t.Fatalf("window: urgent %v suspends %d %+v", u, n, p.Source)
+	}
+	if s.onVirtualDisplay() {
+		t.Fatal("the session kept its virtual display for a window capture")
+	}
+	r.restored(t) // at once, despite the linger
+	settings(t, s, proto.Prefs{FPS: 120})
+	if p, u, _ := pl.last(); !u || p.Source.Backend != "ddagrab" || p.Source.Window != "" || p.Source.NativeW != 2560 || !s.onVirtualDisplay() {
+		t.Fatalf("back to the monitor: urgent %v %+v, virtual %v", u, p.Source, s.onVirtualDisplay())
+	}
+	s.closeVirtualDisplay()
+	r.a.closeVirtualDisplays()
 	r.restored(t)
 }
 

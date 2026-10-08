@@ -3,6 +3,7 @@ package host
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
@@ -14,10 +15,20 @@ import (
 // cannot show the client's mode 1:1) and an IddCx driver is installed, a
 // session streams a monitor created for its client: the client's size, the
 // stream's frame rate as refresh rate (above the physical monitor's), captured
-// 1:1 with Desktop Duplication. One per session; a reconnect within the
-// linger (host config "virtualDisplayLinger") gets the same one back; the
-// previous display topology is restored when the session ends, at agent
-// shutdown, and after a crash at the next start (the package's journal).
+// 1:1 with Desktop Duplication (Windows Graphics Capture when the host config
+// asks for gfxcapture). One per session; a reconnect within the linger (host
+// config "virtualDisplayLinger") gets the same one back; the previous display
+// topology is restored when the session ends, at agent shutdown, and after a
+// crash at the next start (the package's journal).
+
+// vdCheckEvery is how often a session checks that Windows still lists its
+// virtual display (watchVirtualDisplay); missing twice in a row, it is gone.
+// A display can go without its driver's keepalive failing (the Virtual
+// Display Driver has none; Windows can remove or deactivate a SudoVDA
+// monitor), and the native helper's DDA does not end a generation whose
+// output vanished (captureChanged "lost": it retries and repeats the last
+// image), so nothing else would move the session off it.
+const vdCheckEvery = time.Second
 
 // newVirtualDisplays makes the agent's virtual display manager (tests
 // replace it with a vdisplay.Sim's).
@@ -148,13 +159,14 @@ func (s *Session) decideVirtualDisplay(prefs proto.Prefs) (created bool, notice 
 	return true, ""
 }
 
-// updateVirtualDisplay follows a change of the client's size, frame rate or
-// monitor setting (prefs): a session on a virtual display gets one at the new
-// mode when the mode changed (vdisplay.Manager.Create replaces it; a session
-// keeps a virtual display until it ends), a session without one decides
-// again. It reports whether the capture changed: the caller then starts the
-// next generation at once (the display the current one captures is gone, or
-// the desktop was rearranged).
+// updateVirtualDisplay follows a change of the client's size, frame rate,
+// monitor or window setting (prefs): a session on a virtual display gets one
+// at the new mode when the mode changed (vdisplay.Manager.Create replaces
+// it), or none when it captures a window now (removed at once: the window
+// stays on the desktop; a later monitor capture decides again); a session
+// without one decides again. It reports whether the capture changed: the
+// caller then starts the next generation at once (the display the current
+// one captures is gone, or the desktop was rearranged).
 func (s *Session) updateVirtualDisplay(prefs proto.Prefs) bool {
 	vd := s.a.vd
 	if vd == nil || vd.Policy() == vdisplay.PolicyOff || s.ctx.Err() != nil || !s.a.isActive(s) {
@@ -170,6 +182,13 @@ func (s *Session) updateVirtualDisplay(prefs proto.Prefs) bool {
 		return created
 	}
 	old := s.vd
+	if why := s.virtualDisplayBlocker(prefs); why != "" {
+		s.vid().Suspend() // its capture goes with the display
+		s.vd, s.vdWhy = nil, why
+		err := old.Remove()
+		s.log.Info("leaving the virtual display", "reason", why, "name", old.Info().Name, "restore_err", err)
+		return true
+	}
 	req := s.requestedMode(prefs, old.Info().Monitor)
 	if req == s.vdMode {
 		return false
@@ -193,20 +212,48 @@ func (s *Session) updateVirtualDisplay(prefs proto.Prefs) bool {
 }
 
 // watchVirtualDisplay moves the session off display d when its driver stops
-// answering (SudoVDA's watchdog then removes the monitor).
+// answering (SudoVDA's watchdog then removes the monitor) or Windows no
+// longer lists it (vdCheckEvery), while d is the session's.
 func (s *Session) watchVirtualDisplay(d *vdisplay.Display) {
-	select {
-	case <-s.ctx.Done():
-		return
-	case <-d.Lost():
+	t := time.NewTicker(vdCheckEvery)
+	defer t.Stop()
+	missing := 0
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-d.Lost():
+			s.leaveVirtualDisplay(d, "its driver stopped answering")
+			return
+		case <-t.C:
+		}
+		s.vdMu.Lock()
+		mine := s.vd == d
+		s.vdMu.Unlock()
+		if !mine || !s.a.isActive(s) {
+			return // replaced, released, or the session is being replaced
+		}
+		if _, ok := d.Info().Find(s.a.monitors()); ok {
+			missing = 0
+		} else if missing++; missing >= 2 {
+			s.leaveVirtualDisplay(d, "Windows no longer lists it")
+			return
+		}
 	}
-	if s.takeVirtualDisplay(d, "its driver stopped answering") {
-		s.vid().Suspend() // its capture goes with the display
-		s.removeVirtualDisplay(d, "its driver stopped answering")
-		if s.ctx.Err() == nil && !s.paused.Load() {
-			if err := s.startVideo(true, "virtual display lost"); err != nil {
-				s.notice("error", "Could not restart video: "+err.Error())
-			}
+}
+
+// leaveVirtualDisplay moves the session off display d, which is gone (why):
+// the video is suspended, d removed and the topology restored, and the
+// stream restarted at once on the monitor.
+func (s *Session) leaveVirtualDisplay(d *vdisplay.Display, why string) {
+	if !s.takeVirtualDisplay(d, why) {
+		return
+	}
+	s.vid().Suspend() // its capture goes with the display
+	s.removeVirtualDisplay(d, why)
+	if s.ctx.Err() == nil && !s.paused.Load() {
+		if err := s.startVideo(true, "virtual display lost"); err != nil {
+			s.notice("error", "Could not restart video: "+err.Error())
 		}
 	}
 }
@@ -252,7 +299,8 @@ func (s *Session) closeVirtualDisplay() {
 // captureMonitor returns the monitor the session captures for prefs: its
 // virtual display d, as Windows lists it now, else the monitor prefs name (d
 // nil). A virtual display Windows no longer lists is gone: the session leaves
-// it.
+// it, removing it (and restoring the topology, which can move the monitor)
+// before the monitor is looked up.
 func (s *Session) captureMonitor(prefs proto.Prefs) (platform.Monitor, *vdisplay.Display) {
 	s.vdMu.Lock()
 	d := s.vd
@@ -265,7 +313,7 @@ func (s *Session) captureMonitor(prefs proto.Prefs) (platform.Monitor, *vdisplay
 	}
 	const why = "Windows no longer lists it"
 	if s.takeVirtualDisplay(d, why) {
-		go s.removeVirtualDisplay(d, why)
+		s.removeVirtualDisplay(d, why)
 	}
 	return s.a.monitorFor(prefs), nil
 }
@@ -295,9 +343,10 @@ func (s *Session) capture() string {
 // ddagrab, or with gfxcapture of its HMONITOR when the host config asks for
 // that, when it is not an output of DXGI adapter 0 (ddagrab's output_idx
 // counts those only) or this FFmpeg has no ddagrab. Capture "amf" stays a
-// request, which useAMFCapture turns down for a virtual display.
+// request, which useAMFCapture turns down for a virtual display. A window
+// is captured as without one (updateVirtualDisplay then removes it).
 func (s *Session) captureBackend(prefs proto.Prefs, mon platform.Monitor, virt bool) string {
-	if !virt {
+	if !virt || prefs.Window != "" {
 		return s.a.backendFor(prefs)
 	}
 	f := s.a.caps.Filters

@@ -645,9 +645,11 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	if virt && !enc.Helper && p.Source.Backend == "ddagrab" && mon.DXGIOutput < 0 {
 		// On FFmpeg (the helper gave up) without gfxcapture: ddagrab's
 		// output_idx counts the outputs of DXGI adapter 0 only.
+		// Removed before the monitor is looked up again: the restore can
+		// move it.
 		const why = "FFmpeg cannot capture it: it is not an output of DXGI adapter 0"
 		if s.takeVirtualDisplay(vd, why) {
-			go s.removeVirtualDisplay(vd, why)
+			s.removeVirtualDisplay(vd, why)
 		}
 		return s.buildParams(prefs)
 	}
@@ -2043,9 +2045,11 @@ func (s *Session) controlLoop() error {
 				// an audio-only change keeps it.
 				s.rate.reset()
 				// A virtual display follows the client's size and frame
-				// rate: a new one is a new capture, started at once.
+				// rate (and goes for a window capture): a new one is a new
+				// capture, started at once.
 				urgent := false
-				if old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.FPS != m.Prefs.FPS || old.Monitor != m.Prefs.Monitor {
+				if old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.FPS != m.Prefs.FPS || old.Monitor != m.Prefs.Monitor ||
+					old.Window != m.Prefs.Window {
 					urgent = s.updateVirtualDisplay(*m.Prefs)
 				}
 				if err := s.startVideo(urgent, "settings"); err != nil {
