@@ -52,7 +52,7 @@ const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 }
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
-  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, lagMin: Infinity,
+  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, supersededChunks: 0, lagMin: Infinity,
 };
 
 // Freezes: the picture stood still more than FREEZE_MS longer than the
@@ -753,7 +753,10 @@ function onDropped(m) {
 // decoder and waiting in front of it), drop it, and restart from a fresh key
 // frame (and ask the host to back off). Software decoding chosen only because
 // the hardware decoder held frames back goes back to hardware: a frame or
-// two held back costs less than a decoder that cannot keep up.
+// two held back costs less than a decoder that cannot keep up. That restart
+// asks for a key frame only: the client's own choice fell behind (the
+// self-test's clip is 640x360), not the device, so the host keeps its
+// bitrate and sets no decoder cap, and there is no overload notice.
 const overload = { since: 0, warned: false };
 function checkDecoderBacklog() {
   const d = video.decoder;
@@ -767,10 +770,13 @@ function checkDecoderBacklog() {
   overload.since = 0;
   try { d.reset(); } catch {}
   video.inflight.clear();
-  if (video.softwareFor.delete(video.cfg.family)) {
-    post('log', { text: 'software decoder fell behind: back to the hardware decoder (it holds frames back)' });
-  }
+  const toHW = video.softwareFor.delete(video.cfg.family);
   configureDecoder(video.cfg).then(() => drainEarly());
+  if (toHW) {
+    post('log', { text: 'software decoder fell behind: back to the hardware decoder (it holds frames back)' });
+    requestKeyframe('software decoder backlog');
+    return true;
+  }
   // One message: the host's congestion response lowers the bitrate *and*
   // restarts with a key frame, at once for this reason (other congestion
   // reports restart overlapped while the old generation streams on).
@@ -801,8 +807,8 @@ function decodeFrame(f) {
   }
   if (f.key && video.queue.length) {
     // Decoding the frames before a key frame would only delay it: nothing
-    // after it refers to them.
-    stats.superseded += video.queue.length;
+    // after it refers to them (never decoded: not acknowledged).
+    stats.supersededChunks += video.queue.length;
     video.queue = [];
   }
   video.queue.push(f);
@@ -1459,13 +1465,16 @@ function postStats() {
     audioMs,
     // Decoder hygiene (4.1): decodeQueueSize now and its maximum (bound
     // MAX_DECODE_QUEUE), chunks waiting in front of the decoder, decoded
-    // frames closed unseen for a newer one, the smallest output lag in this
-    // period (frames), the VideoFrames open now / at most / leaked.
+    // frames closed unseen for a newer one (superseded) and chunks dropped
+    // undecoded in front of the decoder for a key frame (supersededChunks),
+    // the smallest output lag in this period (frames), the VideoFrames open
+    // now / at most / leaked.
     queue: video.decoder ? video.decoder.decodeQueueSize : 0,
     queueMax: video.queueMax,
     waiting: video.queue.length,
     waitingMax: video.waitingMax,
     superseded: stats.superseded,
+    supersededChunks: stats.supersededChunks,
     outputLag: isFinite(stats.lagMin) ? stats.lagMin : null,
     videoFrames: { open: openFrames(), max: frames.max, leaked: frames.leaked },
     hw: video.hw,

@@ -18,7 +18,11 @@ export { CLIPS };
 
 // The first output may wait for the decoder to start (a hardware decoder's
 // set-up); a decoder that only answers later is reported as a slow start,
-// not as holding frames back, if it then keeps up frame by frame.
+// not as holding frames back, if it then keeps up frame by frame. Each later
+// chunk waits NEXT_OUTPUT_MS for its output; a decoder slower than that lags
+// too, so after the last chunk the test waits up to FIRST_OUTPUT_MS more
+// without new input: a slow decoder delivers the outputs still due, one that
+// holds frames back outputs nothing more (only that counts as holding).
 export const FIRST_OUTPUT_MS = 1000;
 export const NEXT_OUTPUT_MS = 100; // a 640x360 frame
 const FRAME_US = 16667;
@@ -36,7 +40,8 @@ function b64(s) {
  *   supported   false: none of accels is supported (nothing else is set)
  *   accel       the hardwareAcceleration decoded with
  *   firstAfter  chunks submitted when the first output arrived (1: at once; null: no output)
- *   held        frames the decoder still held back when the test stopped (chunks - outputs)
+ *   held        frames the decoder still held back when the test stopped (chunks - outputs,
+ *               after up to FIRST_OUTPUT_MS without new input)
  *   outputs     frames output, of frames submitted (sent)
  *   ok          first output after one chunk, nothing held back, no error
  *   error       the decoder's error message, or null
@@ -100,6 +105,7 @@ export async function selfTestDecoder(family, accels, opts = {}) {
       lastLag = lag;
       if (same >= 3) break;
     }
+    await waitFor(sentAt.length, firstOutputMs);
   } catch (e) {
     r.error = e?.message || String(e);
   } finally {
@@ -130,7 +136,7 @@ export const holdsFrames = (r) => !!r?.supported && !r.error && r.outputs > 0 &&
  *   reportHW  the hello's hw flag: a hardware decoder that does not hold frames back
  *   text      one line for the overlay and the log
  * The families run in parallel: a decoder that holds frames back costs about
- * FIRST_OUTPUT_MS + 3 x NEXT_OUTPUT_MS, the others a few frame decodes.
+ * 2 x FIRST_OUTPUT_MS + 3 x NEXT_OUTPUT_MS, the others a few frame decodes.
  */
 export async function runSelfTests(decoders, preferHW, opts = {}) {
   return Promise.all(decoders.map(async (d) => {

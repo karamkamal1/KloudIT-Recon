@@ -228,9 +228,10 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   collapses the window to two packets.
 
 Codec negotiation: the browser reports per family whether it can decode with hardware
-(`VideoDecoder.isConfigSupported` with `prefer-hardware`, and the hardware decoder passed the
-client's startup self-test, below). The host picks the first family with
-hardware on both ends, in the order HEVC → AV1 → H.264, then any hardware encoder, then software.
+(`VideoDecoder.isConfigSupported` with `prefer-hardware`, and the client's startup self-test,
+below, did not catch the hardware decoder holding frames back). The host picks the first family
+with hardware on both ends, in the order HEVC → AV1 → H.264, then any hardware encoder, then
+software.
 An encoder that would pad the session's picture size (probed alignment, above) gives way to HEVC,
 else H.264, with a notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when
 the client asks for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded
@@ -268,9 +269,10 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   `internal/codec/selftest_clips_test.go`) one chunk at a time; a decoder fit for streaming
   outputs each frame after its own chunk. A hardware decoder that holds frames back (each would
   cost that many frame intervals on every frame) is reported to the host as no hardware decoder,
-  and the family decodes in software when its software decoder passes (back to hardware if the
-  software decoder then falls behind). The overlay shows the results and the stream's live output
-  lag (chunks submitted after a frame before it came out, the smallest per 0.5 s).
+  and the family decodes in software when its software decoder passes (back to hardware, with a
+  key frame request but no back-off, if the software decoder then falls behind). The overlay
+  shows the results and the stream's live output lag (chunks submitted after a frame before it
+  came out, the smallest per 0.5 s).
 - If the decoder falls behind (more than max(4, fps/10) frames in the decoder or waiting in front
   of it for 500 ms), it is reset and resynchronised from a fresh key frame, and the host is asked
   to back off. Latency can't grow without bound.

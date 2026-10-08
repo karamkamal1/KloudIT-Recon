@@ -1430,9 +1430,11 @@ func (s *Session) controlLoop() error {
 }
 
 // hostStages keeps the host's own capture->encoded and queue times of the
-// frames a v2 client acknowledged in the last 10 s (it acks exactly the frames
-// it records stages for). They are logged next to the client's summary as a
-// reference for its rows that needs no clock sync.
+// frames a v2 client acknowledged in the last 10 s. They are logged next to
+// the client's summary as a reference for its rows that needs no clock sync.
+// The client acks every frame it decoded; it records stages only for the
+// frames it drew, so the few outputs it closed unseen for a newer one
+// (superseded, 4.1) are in these rows but not in its own.
 type hostStages struct {
 	mu   sync.Mutex
 	sent [512]hostStage // recent frames by seq, until acknowledged

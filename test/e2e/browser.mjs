@@ -228,8 +228,8 @@ async function checkHygiene(name, calls, st) {
   const ok = !!c && c.decodes >= 50 && c.maxQueue <= 2 && c.flushes === 0 && !!vf && vf.leaked === 0 && vf.max <= 5 && vf.open <= 4;
   check(`${name}: decoder hygiene: decodeQueueSize <= 2, no flush(), every VideoFrame closed`, ok,
     `${c ? `${c.decodes} decode() calls, decodeQueueSize max ${c.maxQueue}, ${c.flushes} flush()` : 'worker not instrumented'}; ` +
-      `VideoFrames open ${vf?.open}, max ${vf?.max}, leaked ${vf?.leaked}; chunks waiting max ${st?.waitingMax}; superseded ${st?.superseded}; output lag ${st?.outputLag}`);
-  results.push({ hygiene: name, calls: c, videoFrames: vf, waitingMax: st?.waitingMax, superseded: st?.superseded, outputLag: st?.outputLag });
+      `VideoFrames open ${vf?.open}, max ${vf?.max}, leaked ${vf?.leaked}; chunks waiting max ${st?.waitingMax}; superseded ${st?.superseded} decoded, ${st?.supersededChunks} undecoded; output lag ${st?.outputLag}`);
+  results.push({ hygiene: name, calls: c, videoFrames: vf, waitingMax: st?.waitingMax, superseded: st?.superseded, supersededChunks: st?.supersededChunks, outputLag: st?.outputLag });
   return c;
 }
 
@@ -251,8 +251,9 @@ async function checkSelfTest(cfg) {
 // The self-test's logic on a decoder that holds frames back: a wrapper around
 // this browser's VideoDecoder that outputs frame i only once frame i + hold is
 // out (claiming hardware support; with hwOnly it holds only when configured
-// prefer-hardware). Also how deep a burst of the clip's chunks gets into the
-// bare decoder's queue (why the client bounds it).
+// prefer-hardware; with delay every output comes that many ms late, a slow
+// decoder that holds nothing). Also how deep a burst of the clip's chunks gets
+// into the bare decoder's queue (why the client bounds it).
 async function checkSelfTestLogic() {
   const ctx2 = await browser.newContext({ ignoreHTTPSErrors: true });
   try {
@@ -266,11 +267,12 @@ async function checkSelfTestLogic() {
         if ((await VideoDecoder.isConfigSupported(cfgOf(f)).catch(() => ({}))).supported) { fam = f; break; }
       }
       if (!fam) return { error: 'no clip decodable' };
-      const fake = (hold, hwOnly = false) => class {
+      const fake = (hold, hwOnly = false, delay = 0) => class {
         static async isConfigSupported(c) { return { supported: true, config: c }; }
         constructor({ output, error }) {
           this.held = [];
-          this.d = new VideoDecoder({ output: (f) => { this.held.push(f); while (this.held.length > this.hold) output(this.held.shift()); }, error });
+          const out = delay ? (f) => setTimeout(() => output(f), delay) : output;
+          this.d = new VideoDecoder({ output: (f) => { this.held.push(f); while (this.held.length > this.hold) out(this.held.shift()); }, error });
         }
         configure(c) {
           this.hold = !hwOnly || c.hardwareAcceleration === 'prefer-hardware' ? hold : 0;
@@ -280,6 +282,7 @@ async function checkSelfTestLogic() {
         close() { for (const f of this.held) f.close(); this.d.close(); }
       };
       const good = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(0) });
+      const slow = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(0, false, 150) });
       const hold1 = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(1) });
       const hold2 = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(2) });
       const [choice] = await T.runSelfTests([{ family: fam, hw: true }], true, { Decoder: fake(1, true) });
@@ -294,15 +297,16 @@ async function checkSelfTestLogic() {
         burst = Math.max(burst, d.decodeQueueSize);
       });
       d.close();
-      return { fam, good, hold1, hold2, choice, burst };
+      return { fam, good, slow, hold1, hold2, choice, burst };
     });
     if (res.error) { check('decoder self-test logic', false, res.error); return; }
-    const { good, hold1, hold2, choice } = res;
+    const { good, slow, hold1, hold2, choice } = res;
     const row = (r) => `ok ${r.ok}, first output after ${r.firstAfter}, held ${r.held}, ${r.outputs}/${r.sent} out`;
-    check('decoder self-test logic: passes a decoder that outputs at once, catches one that holds 1 or 2 frames back',
+    check('decoder self-test logic: passes a decoder that outputs at once or slowly (150 ms per frame), catches one that holds 1 or 2 frames back',
       good.ok && good.firstAfter === 1 && good.held === 0 && good.outputs === 10 &&
+        slow.ok && slow.firstAfter === 1 && slow.held === 0 && slow.outputs === slow.sent &&
         !hold1.ok && hold1.firstAfter === 2 && hold1.held === 1 && !hold2.ok && hold2.firstAfter === 3 && hold2.held === 2,
-      `${res.fam}: outputs at once: ${row(good)}; holds 1: ${row(hold1)}; holds 2: ${row(hold2)}`);
+      `${res.fam}: outputs at once: ${row(good)}; 150 ms late: ${row(slow)}, ${slow.decodeMs} ms/frame; holds 1: ${row(hold1)}; holds 2: ${row(hold2)}`);
     check('decoder self-test decision: a hardware decoder that holds frames back is reported as no hardware decoder; the family decodes in software',
       choice.software === true && choice.reportHW === false && choice.hw?.held === 1 && choice.sw?.ok === true, choice.text);
     console.log(`- the clip's 10 chunks at once into a bare decoder (${res.fam}) reach decodeQueueSize ${res.burst}`);
