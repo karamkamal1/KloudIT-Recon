@@ -211,8 +211,8 @@ bool deviceRemoved(ID3D11Device* device, const std::string& what, Status& out) {
     return true;
 }
 
-std::mutex& dxgiGate() {
-    static std::mutex gate;
+DxgiGate& dxgiGate() {
+    static DxgiGate gate;
     return gate;
 }
 

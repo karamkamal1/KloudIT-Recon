@@ -31,6 +31,21 @@ bool hasParameterSets(Codec c, const uint8_t* data, size_t size);
 // frame. Returns an empty vector if the extradata is not in the expected form.
 std::vector<uint8_t> withParameterSets(Codec c, const uint8_t* data, size_t size, const uint8_t* extra, size_t extraSize);
 
+// What the first sequence parameter set in Annex-B data (an encoder's
+// parameter sets, or a key frame) says about the stream: its level and the
+// reference frames a decoder keeps for it. H.264 (7.3.2.1.1): level_idc and
+// max_num_ref_frames. HEVC (7.3.2.2.1): general_level_idc and
+// sps_max_dec_pic_buffering_minus1 of the highest sub-layer (the DPB holds the
+// current picture too, so this is the number of reference pictures besides
+// it). False when there is no SPS or it cannot be parsed; always false for
+// AV1, whose sequence header has no such field (eight reference slots).
+struct SpsInfo {
+    int levelIdc = 0;   // H.264 level_idc (51 = 5.1), HEVC general_level_idc (153 = 5.1)
+    int refFrames = 0;
+};
+bool parseSps(Codec c, const uint8_t* data, size_t size, SpsInfo& out);
+std::string levelText(Codec c, int levelIdc);  // "5.1"
+
 inline uint32_t alignUp(uint32_t v, uint32_t a) { return a > 1 ? (v + a - 1) / a * a : v; }
 
 // Region-of-interest importance map for encoders that take one value per

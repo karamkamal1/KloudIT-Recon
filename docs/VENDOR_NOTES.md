@@ -536,8 +536,9 @@ reported in `unavailable.nvenc` with the driver to install, 570.0), caps from
 `NvEncGetEncodeCaps`, `NvEncOpenEncodeSessionEx` on the capture's D3D11 device, the GUIDE 3.4
 configuration (ultra-low-latency tuning, preset P4 up to 1440p120 moving toward P1 at 4K120
 by pixel rate, infinite GOP / IDR period, no B frames, CBR with a one-frame VBV,
-`lowDelayKeyFrameScale` 3, spatial AQ, quarter-resolution two-pass, six reference frames with
-one reference per frame, parameter sets on every IDR), async output with one completion event
+`lowDelayKeyFrameScale` 3, spatial AQ, quarter-resolution two-pass, six reference frames (five
+for H.264 / HEVC where the level 5.x DPB limit is lower, e.g. 3840x2160) with one reference
+per frame, parameter sets on every IDR), async output with one completion event
 per bitstream buffer and the pipeline's output thread (sync polling where the GPU has no
 async mode), NV12 pool textures registered once and mapped per frame, forced IDRs, loss
 recovery by `NvEncInvalidateRefFrames` (`src/codec/rfi.hpp`: every frame from the loss to the
@@ -616,6 +617,56 @@ Verified in the sandbox (Linux, no GPU, no Windows):
 - Under Wine without an NVENC runtime: `--print-caps --backend=nvenc` reports `backend` none
   with `unavailable.nvenc` "NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module
   not found (error 126)"; `--encode-test --backend=nvenc` exits 2 with the same reason.
+- Review fixes: (1) async locks use `NV_ENC_LOCK_BITSTREAM::doNotWait` 0 once the frame's
+  completion event has fired: NVENC guide 13.0 section 6.3 prescribes `enableEncodeAsync` 1,
+  `doNotWait` 0 and `enableOutputInVidmem` 0 for applications that call AcquireNextFrame on
+  another thread (the other two were already so); the SDK sample
+  `NvEncoder::GetEncodedPacket` also waits for the event and locks with `doNotWait` false.
+  Sync polling and the teardown's lock of a frame whose event did not come within its
+  deadline keep `doNotWait` 1. The encode test's new `--dxgi-gate=0` switches
+  `d3d::dxgiGate()` off for the hardware A/B below. (2) Reference frames: 6, fewer where the
+  level 5.x DPB limit at the coded size is lower (H.264 A.3.1 MaxDpbFrames, MaxDpbMbs 184320;
+  HEVC A.4.2 MaxDpbSize, MaxLumaPs 8912896, less the current picture): 5 for H.264 and HEVC
+  at 3840x2160, as Sunshine keeps (nvenc_base.cpp configure_reference_frames: 5 for H.264 /
+  HEVC, 8 for AV1); 6 references there would need level 6 (the limits FFmpeg's
+  h264_levels.c / h265_profile_level.c apply). Before the first frame the backend parses the
+  SPS from NvEncGetSequenceParams (H.264 `max_num_ref_frames`, HEVC
+  `sps_max_dec_pic_buffering_minus1`, and the level), logs it, and narrows the invalidation
+  window with a warning if the encoder keeps fewer than configured. (3) caps `maxLtr` is 0
+  for NVENC (the slots `start` accepts, as with AMF; NUM_MAX_LTR_FRAMES is in the start log
+  line), and the protocol now says `ltrSlots` 0 = no LTR recovery, caps `recovery` telling
+  what a loss costs. (4) Comments and docs say what the code does: the gate covers
+  NvEncLockBitstream, the copy and NvEncUnlockBitstream (all guide 6.3 names);
+  NvEncUnmapInputResource follows outside it.
+- Review fixes, verified in the sandbox: mingw `make helper` without warnings; the strict
+  clang syntax check is clean on every changed source (nvenc_backend, nvenc_policy, nvenc
+  selftest, codec bitstream / rfi / selftest, d3d device, dda_capture, encode_test, main, the
+  test double). `--self-test-encoder` (Wine): the SPS parser on libx264 / libx265 output
+  (H.264 High 3840x2160 refs 5 level 5.2; Main 1920x1080 refs 6 level 5.0 with
+  pic_order_cnt_type 0; HEVC 3840x2160 5 / level 5.1; HEVC with a temporal sub-layer 4 /
+  level 4.1), on two hand-written SPS (H.264 with scaling lists, pic_order_cnt_type 1 and an
+  emulation prevention byte before max_num_ref_frames; HEVC with three sub-layers, sub-layer
+  profile / level info and the ordering info for the highest only) and on the mock clip's
+  Baseline SPS; FFmpeg 8.1's `trace_headers` decodes every vector to the expected values;
+  truncated, AV1 and SPS-less input refused. References by level: H.264 1920x1080 6,
+  3840x2160 5, 4096x2304 5, 4096x4096 6 (level 6); HEVC 1920x1080 6, 3440x1440 6, 3840x2160
+  5, 5120x1440 5, 5120x2880 6, 7680x4320 5; AV1 6. The invalidation window narrowed from 6 to
+  3 mid-stream (a loss of 3 frames -> IDR, of 2 -> recovery from the frame before them).
+  `--self-test-nvenc=recon-fake-nvenc.dll` (Wine + Xvfb; the double now writes a real SPS
+  and can keep fewer references than asked, `keepRefs`): every section ok; all 100 locks of
+  each async stream with doNotWait 0, the sync ones with 1; refFrames and init refs 5 for
+  HEVC 3840x2160@90 and H.264 3840x2160@60, 6 for AV1 3840x2160 and every 1080p stream; caps
+  maxLtr 0 with the double's 8 LTR frames; new section "fewer reference frames than asked
+  (SPS)" (H.264 and HEVC, keepRefs 3): recovery frame 13 from 10, the loss of 20..22 (the
+  whole 3-frame DPB) an IDR at 23, no intra fallback. Mutation checks, one at a time:
+  doNotWait always 1, no window resize after the SPS, the DPB always 6, an 87-bit sub-layer
+  profile skip, no emulation-prevention removal: each fails its self-test (without the
+  resize, frame 23 goes out flagged as a recovery from 19 and the double codes it intra:
+  the finding's failure). `--encode-test --backend=mock --capture=synthetic --dxgi-gate=0`
+  prints "dxgi gate off" and completes; `--dxgi-gate=2` and the option without
+  `--encode-test` are refused. `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`: 30
+  pass, 4 skip, as before (`TestHelperIntegrationNvenc/TestDouble` passes). gofmt, go vet
+  (Linux, Windows) and go test ./... pass (Go: comments only).
 
 Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-encoder.exe`;
 `--log-level=debug` adds the probe time and per-loss lines):
@@ -630,8 +681,9 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   --backend=nvenc --log-level=debug 2>caps.log`: `backend` nvenc, `vendor` nvidia; codecs h264,
   hevc and on RTX 40/50 av1 (on RTX 20/30 `unavailable.nvenc-av1` says "RTX 40"); record maxW /
   maxH (expected 4096 for h264, 8192 for hevc / av1), `tenBit` (hevc / av1 true), `yuv444`
-  (h264 / hevc true), `recovery` invalidate, `maxLtr`, `intraRefresh` true, `liveBitrate`
-  seamless, `maxTemporalLayers`, `sliceOutput`, `hwInstances` (RTX 4080 / 4090: 2; record),
+  (h264 / hevc true), `recovery` invalidate, `maxLtr` 0 (the backend uses no LTR; the start
+  log line's "LTR frames cap N (unused)" is the GPU's count: record N), `intraRefresh` true,
+  `liveBitrate` seamless, `maxTemporalLayers`, `sliceOutput`, `hwInstances` (RTX 4080 / 4090: 2; record),
   `dynamicResolution` true, `assumed` `["liveBitrate","roi"]`; caps.log has "nvenc probe: N ms"
   (expect < 300 ms).
 - NVIDIA: unverified (no NVIDIA host available). Test (old driver): on a host with a driver
@@ -648,8 +700,11 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   ffprobe): `recon-encoder.exe --encode-test=hevc.hevc --backend=nvenc --codec=hevc
   --capture=synthetic-gpu --width=1920 --height=1080 --fps=60 --kbps=20000 --frames=600
   --at=120:idr`: exit 0; started has `preset` p4, `usage` ultra_low_latency, `asyncEncode`
-  true, `refFrames` 6, `rateControl` cbr; key frames only at 1 and 121; submit->output p95 below
-  3 ms; `ffprobe -show_streams hevc.hevc` says hevc Main 1920x1080, `color_space=bt709`,
+  true, `refFrames` 6, `rateControl` cbr; the log has "nvenc: the encoder's SPS: level L, 6
+  reference frames (configured 6)" and no warning "the encoder keeps N reference frames"
+  (record L: with 6 references at 1920x1080 H.264 needs level 5.0, since 4.2 allows 4, and
+  HEVC 5.0, since 4.1 allows 5; any level up to 5.2 is fine); key frames only at 1 and 121;
+  submit->output p95 below 3 ms; `ffprobe -show_streams hevc.hevc` says hevc Main 1920x1080, `color_space=bt709`,
   `color_range=tv`, `has_b_frames=0`; `ffmpeg -v error -i hevc.hevc -f null -` prints nothing;
   `ffprobe -show_frames -select_streams v hevc.hevc` packet sizes: the IDRs about 3x the average
   P frame (lowDelayKeyFrameScale 3; record the ratio). Repeat with `--codec=h264
@@ -678,12 +733,35 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   started `preset` p1; submit->output p95 below 8 ms (one frame interval); if not, record it
   and try `multiPass` disabled at P1 (src/nvenc/nvenc_backend.cpp configure()). On GPUs with two
   or more NVENC engines compare with a single engine (split-frame encoding is left on auto).
-- NVIDIA: unverified (no NVIDIA host available). Test (DDA + NVENC threads, the dxgiGate):
-  `--encode-test=dda.hevc --backend=nvenc --codec=hevc --capture=dda --fps=120 --frames=3600`
-  with a game at 120+ fps: submit->output p95 within the encode time + 2.5 ms (one 2 ms
-  AcquireNextFrame slice plus the gap), no "NVENC did not finish frame" error, no stalls;
-  then 30 minutes in recon-host with HAGS on (started `gpuPriority` high): no hang, no growth
-  in the helper's private bytes.
+- NVIDIA: unverified (no NVIDIA host available). Test (DDA + NVENC threads: guide 6.3's
+  settings with and without the dxgiGate, review fix): with a game at 120+ fps on the NVIDIA
+  display, `recon-encoder.exe --encode-test=gate.hevc --backend=nvenc --codec=hevc
+  --capture=dda --fps=120 --frames=3600`, then the same with `--dxgi-gate=0
+  --encode-test=nogate.hevc` (its first line says "dxgi gate off"). Both runs: started
+  `asyncEncode` true (enableEncodeAsync 1; the backend locks with doNotWait 0 after the event
+  and keeps the output in system memory), no "NVENC did not finish frame" error, no stalls,
+  `ffmpeg -v error -i FILE -f null -` prints nothing. Record submit->output and
+  capture->output p50 / p95 / max of both. With the gate, submit->output p95 should be within
+  the encode time + 2.5 ms (one 2 ms AcquireNextFrame slice plus the gap). If the run
+  without the gate is clean and its p95 lower (the gate then only adds the slice wait),
+  repeat it for 30 minutes (`--frames=216000`) with HAGS on and with HAGS off; still clean:
+  remove `d3d::DxgiGate` from the NVENC output thread and the DDA capture in a follow-up and
+  record the numbers here; anything failing without it (errors, stalls, corrupt frames,
+  output spikes): keep the gate and record what failed. Then 30 minutes in recon-host with
+  HAGS on (started `gpuPriority` high): no hang, no growth in the helper's private bytes.
+- NVIDIA: unverified (no NVIDIA host available). Test (level and reference frames at 4K,
+  review fix): `recon-encoder.exe --encode-test=uhd.h264 --backend=nvenc --codec=h264
+  --capture=synthetic-gpu --width=3840 --height=2160 --fps=60 --kbps=60000 --frames=120
+  2>uhd-h264.log`, and the same with `--codec=hevc --encode-test=uhd.hevc 2>uhd-hevc.log`:
+  started `refFrames` 5; the log has "nvenc: the encoder's SPS: level 5.2, 5 reference
+  frames (configured 5)" for H.264 (HEVC: level 5.1) and no "the encoder keeps N reference
+  frames" warning. `ffprobe -v error -show_entries stream=profile,level,refs uhd.h264`: level
+  52, refs 5; `ffmpeg -v error -i uhd.hevc -c copy -bsf:v trace_headers -frames:v 1 -f null -
+  2>&1 | findstr "general_level_idc sps_max_dec_pic_buffering_minus1"`: 153 (5.1) and 5. A
+  level of 6 or more at 4K60 (H.264 level_idc >= 60, HEVC general_level_idc >= 180) is a
+  failure: record it with the driver version. (H.264 at 4K above 60 fps needs level 6.1 for
+  its macroblock rate alone, A.3.1 MaxMBPS: expected there, not a failure; HEVC 4K120 stays
+  5.2.) `ffmpeg -v error -i FILE -f null -` prints nothing for both files.
 - NVIDIA: unverified (no NVIDIA host available). Test (ROI): `--at=100:roi=900,500,128,128,10
   --at=300:roi=off` on a 1920x1080 stream: no errors, the frames 100-299 a few percent larger
   in that region (`ffmpeg -i FILE -vf "crop=128:128:900:500" ...` sharper), then back; with

@@ -23,7 +23,9 @@
 // Bitstreams are structurally valid (H.264 / HEVC NAL units with parameter sets
 // on IDRs, AV1 OBUs) and carry a text marker "NVFAKE ts=<id> ref=<id> t=<type>"
 // (no zero bytes, so no accidental start codes) naming the frame and the frame
-// it was predicted from. An encode takes `encodeUs` on a single engine (frames
+// it was predicted from. The H.264 / HEVC SPS is a real one (level 5.1, the
+// reference frames kept); keepRefs=N makes the double keep fewer than asked,
+// like a driver that clamps the DPB. An encode takes `encodeUs` on a single engine (frames
 // finish one after another); async mode signals the events from a worker thread.
 //
 // Control (only the self-test calls it): ReconFakeNvencControl(command, reply,
@@ -62,6 +64,7 @@ struct Config {
     int maxW = 8192, maxH = 8192, minW = 145, minH = 49;
     int encodeUs = 1500;    // simulated encode time
     uint64_t failEncodeTs = 0;  // NvEncEncodePicture fails (NV_ENC_ERR_GENERIC) for this inputTimeStamp
+    int keepRefs = 0;       // > 0: keep at most this many reference frames (DPB and SPS), whatever was asked
 };
 
 struct Frame {
@@ -204,27 +207,95 @@ Session* session(void* enc) {
 }
 
 uint32_t dpbSize(const Session& s) {
+    uint32_t n = 1;
     switch (s.codec) {
-    case Codec::H264: return s.config.encodeCodecConfig.h264Config.maxNumRefFrames;
-    case Codec::Hevc: return s.config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB;
-    case Codec::Av1: return s.config.encodeCodecConfig.av1Config.maxNumRefFramesInDPB;
-    default: return 1;
+    case Codec::H264: n = s.config.encodeCodecConfig.h264Config.maxNumRefFrames; break;
+    case Codec::Hevc: n = s.config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB; break;
+    case Codec::Av1: n = s.config.encodeCodecConfig.av1Config.maxNumRefFramesInDPB; break;
+    default: break;
     }
+    // A driver that keeps fewer than asked (set keepRefs=N).
+    if (g_cfg.keepRefs > 0) n = std::min(n, uint32_t(g_cfg.keepRefs));
+    return std::max<uint32_t>(1, n);
 }
 
 uint32_t qpBlock(Codec c) { return c == Codec::H264 ? 16 : c == Codec::Hevc ? 32 : 64; }
 
+// RBSP writer for the SPS: u(n), ue(v), trailing bits, then emulation
+// prevention (00 00 0x -> 00 00 03 0x for x <= 3, 7.4.1).
+struct BitWriter {
+    std::vector<int> bits;
+    void u(int n, uint32_t v) {
+        for (int i = n - 1; i >= 0; --i) bits.push_back(int((v >> i) & 1));
+    }
+    void ue(uint32_t v) {
+        const uint64_t x = uint64_t(v) + 1;
+        int n = 0;
+        while ((x >> n) > 1) ++n;
+        u(n, 0);
+        for (int i = n; i >= 0; --i) bits.push_back(int((x >> i) & 1));
+    }
+    std::string nal(const std::string& header) {
+        bits.push_back(1);  // rbsp_stop_one_bit
+        while (bits.size() % 8) bits.push_back(0);
+        std::string out = header;
+        int zeros = 0;
+        for (size_t i = 0; i < bits.size(); i += 8) {
+            int b = 0;
+            for (size_t j = 0; j < 8; ++j) b = (b << 1) | bits[i + j];
+            if (zeros >= 2 && b <= 3) {
+                out += char(3);
+                zeros = 0;
+            }
+            out += char(b);
+            zeros = b == 0 ? zeros + 1 : 0;
+        }
+        return out;
+    }
+};
+
+// A real SPS (what the backend reads the level and reference frames from):
+// H.264 High (7.3.2.1.1) with max_num_ref_frames, HEVC Main (7.3.2.2.1) with
+// sps_max_dec_pic_buffering_minus1 = the reference frames kept (dpbSize), level
+// 5.1, the session's size.
+std::string sps(const Session& s) {
+    const uint32_t w = s.init.encodeWidth, h = s.init.encodeHeight, refs = dpbSize(s);
+    BitWriter b;
+    if (s.codec == Codec::H264) {
+        const uint32_t mbW = (w + 15) / 16, mbH = (h + 15) / 16;
+        b.u(8, 100), b.u(8, 0), b.u(8, 51), b.ue(0);          // profile_idc High, constraints, level 5.1, sps id
+        b.ue(1), b.ue(0), b.ue(0), b.u(1, 0), b.u(1, 0);       // 4:2:0, 8 bit, no bypass, no scaling matrix
+        b.ue(0), b.ue(2), b.ue(refs), b.u(1, 0);               // log2_max_frame_num_minus4, poc type 2, max_num_ref_frames, no gaps
+        b.ue(mbW - 1), b.ue(mbH - 1), b.u(1, 1), b.u(1, 1);    // size in macroblocks, frame_mbs_only, direct_8x8_inference
+        const uint32_t cropBottom = (mbH * 16 - h) / 2;
+        b.u(1, cropBottom ? 1 : 0);
+        if (cropBottom) b.ue(0), b.ue(0), b.ue(0), b.ue(cropBottom);
+        b.u(1, 0);  // vui_parameters_present_flag
+        return b.nal(std::string("\x67", 1));
+    }
+    b.u(4, 0), b.u(3, 0), b.u(1, 1);  // vps id, sps_max_sub_layers_minus1, temporal_id_nesting
+    // profile_tier_level: Main, Main tier, progressive / frame only, level 5.1
+    b.u(2, 0), b.u(1, 0), b.u(5, 1), b.u(32, 0x60000000), b.u(4, 9), b.u(32, 0), b.u(11, 0), b.u(1, 0), b.u(8, 153);
+    b.ue(0), b.ue(1), b.ue(w), b.ue(h), b.u(1, 0);  // sps id, 4:2:0, size, no conformance window
+    b.ue(0), b.ue(0), b.ue(4), b.u(1, 1);            // 8 bit, log2_max_pic_order_cnt_lsb_minus4, ordering info present
+    b.ue(refs), b.ue(0), b.ue(0);                    // sps_max_dec_pic_buffering_minus1, no reordering, no latency limit
+    b.ue(0), b.ue(2), b.ue(0), b.ue(3), b.ue(0), b.ue(0);  // coding / transform block sizes and depths (CTB 32)
+    b.u(1, 0), b.u(1, 0), b.u(1, 0), b.u(1, 0);      // no scaling list, AMP, SAO, PCM
+    b.ue(0), b.u(1, 0), b.u(1, 0), b.u(1, 0), b.u(1, 0), b.u(1, 0);  // no short / long-term RPS, TMVP, strong intra, VUI, extension
+    return b.nal(std::string("\x42\x01", 2));
+}
+
 // Parameter sets of the session's codec (also NvEncGetSequenceParams).
-std::string parameterSets(Codec c) {
+std::string parameterSets(const Session& s) {
     std::string out;
-    if (c == Codec::H264) {
-        out += std::string("\0\0\0\1\x67", 5) + "SPS";
+    if (s.codec == Codec::H264) {
+        out += std::string("\0\0\0\1", 4) + sps(s);
         out += std::string("\0\0\0\1\x68", 5) + "PPS";
-    } else if (c == Codec::Hevc) {
+    } else if (s.codec == Codec::Hevc) {
         out += std::string("\0\0\0\1\x40\x01", 6) + "VPS";
-        out += std::string("\0\0\0\1\x42\x01", 6) + "SPS";
+        out += std::string("\0\0\0\1", 4) + sps(s);
         out += std::string("\0\0\0\1\x44\x01", 6) + "PPS";
-    } else if (c == Codec::Av1) {
+    } else if (s.codec == Codec::Av1) {
         out += std::string("\x0a\x05", 2) + "SEQHD";  // OBU_SEQUENCE_HEADER, has_size, 5 bytes
     }
     return out;
@@ -239,14 +310,14 @@ std::string bitstream(const Session& s, const Frame& f, bool withHeaders) {
     std::string out;
     if (s.codec == Codec::Av1) {
         out += std::string("\x12\x00", 2);  // temporal delimiter
-        if (idr && withHeaders) out += parameterSets(s.codec);
+        if (idr && withHeaders) out += parameterSets(s);
         const std::string payload = marker;
         out += char(0x32);  // OBU_FRAME, has_size
         out += char(payload.size());
         out += payload;
         return out;
     }
-    if (idr && withHeaders) out += parameterSets(s.codec);
+    if (idr && withHeaders) out += parameterSets(s);
     if (s.codec == Codec::H264) out += std::string("\0\0\0\1", 4) + char(idr ? 0x65 : 0x41);
     else out += std::string("\0\0\0\1", 4) + char(idr ? 19 << 1 : 1 << 1) + char(1);
     out += marker;
@@ -855,7 +926,7 @@ NVENCSTATUS NVENCAPI getSequenceParams(void* enc, NV_ENC_SEQUENCE_PARAM_PAYLOAD*
     // thread which is being used to call NvEncEncodePicture() function."
     s->seqThread = GetCurrentThreadId();
     if (s->encodeThread && s->encodeThread != s->seqThread) violation("NvEncGetSequenceParams from another thread than NvEncEncodePicture");
-    const std::string ps = parameterSets(s->codec);
+    const std::string ps = parameterSets(*s);
     if (!p->spsppsBuffer || p->inBufferSize < ps.size() || !p->outSPSPPSPayloadSize) return NV_ENC_ERR_NOT_ENOUGH_BUFFER;
     std::memcpy(p->spsppsBuffer, ps.data(), ps.size());
     *p->outSPSPPSPayloadSize = uint32_t(ps.size());
@@ -910,6 +981,7 @@ bool setKey(const std::string& k, const std::string& v) {
         {"tenBit", &g_cfg.tenBit}, {"yuv444", &g_cfg.yuv444}, {"customVbv", &g_cfg.customVbv}, {"intraRefresh", &g_cfg.intraRefresh},
         {"cabac", &g_cfg.cabac}, {"subframe", &g_cfg.subframe}, {"stateAdvance", &g_cfg.stateAdvance}, {"maxW", &g_cfg.maxW},
         {"maxH", &g_cfg.maxH}, {"minW", &g_cfg.minW}, {"minH", &g_cfg.minH}, {"encodeUs", &g_cfg.encodeUs},
+        {"keepRefs", &g_cfg.keepRefs},
     };
     for (const auto& [name, ptr] : ints) {
         if (k == name) return i(*ptr);

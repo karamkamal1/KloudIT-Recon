@@ -55,6 +55,31 @@ Rate rateFor(int kbps, double vbvFrames, int fps) {
     return r;
 }
 
+int dpbFramesFor(Codec c, uint32_t width, uint32_t height) {
+    if (!width || !height) return kDpbFrames;
+    int limit = kDpbFrames;
+    if (c == Codec::H264) {
+        // Frame size in macroblocks; level 5.1 / 5.2 MaxFS 36864, level 6.x
+        // MaxFS 139264 / MaxDpbMbs 696320 (Table A-1).
+        const uint64_t mbs = uint64_t(alignUp(width, 16) / 16) * (alignUp(height, 16) / 16);
+        const uint64_t maxDpbMbs = mbs <= 36864 ? 184320 : 696320;
+        limit = int(std::min<uint64_t>(16, maxDpbMbs / mbs));
+    } else if (c == Codec::Hevc) {
+        // pic_width / height_in_luma_samples are multiples of MinCbSizeY (8);
+        // 16 is the conservative choice where the encoder pads further.
+        const uint64_t w = alignUp(width, 16), h = alignUp(height, 16), ps = w * h;
+        uint64_t maxLumaPs = 8912896;  // levels 5 - 5.2 (Table A.8)
+        if (ps > maxLumaPs || w * w > 8 * maxLumaPs || h * h > 8 * maxLumaPs) maxLumaPs = 35651584;  // levels 6 - 6.2
+        constexpr int kMaxDpbPicBuf = 6;  // Main, Main 10
+        int maxDpbSize = kMaxDpbPicBuf;
+        if (ps <= maxLumaPs >> 2) maxDpbSize = std::min(4 * kMaxDpbPicBuf, 16);
+        else if (ps <= maxLumaPs >> 1) maxDpbSize = std::min(2 * kMaxDpbPicBuf, 16);
+        else if (ps <= (3 * maxLumaPs) >> 2) maxDpbSize = std::min(4 * kMaxDpbPicBuf / 3, 16);
+        limit = maxDpbSize - 1;  // the current picture takes one buffer
+    }
+    return std::clamp(limit, 1, kDpbFrames);
+}
+
 uint32_t qpMapBlock(Codec c) {
     switch (c) {
     case Codec::H264: return 16;

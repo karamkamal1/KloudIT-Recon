@@ -9,7 +9,8 @@
 // settings (docs/HELPER_PROTOCOL.md "NVENC encoder backend" has the table):
 // infinite GOP and IDR period, no B frames, CBR with a one-frame VBV, key frames
 // about three P frames large, spatial AQ, quarter-resolution two-pass, a DPB of
-// six frames with one reference per frame (room for reference invalidation),
+// six frames (five where the level 5.x limit is lower: H.264 / HEVC at
+// 3840x2160) with one reference per frame (room for reference invalidation),
 // parameter sets with every IDR; NvEncInitializeEncoder; four bitstream
 // buffers ("The number of IO buffers should be at least 4 + number of B
 // frames", NVENC guide 6.1), each with its own completion event in async mode.
@@ -17,9 +18,9 @@
 // Frames: the converter's NV12 pool textures, each registered once
 // (NvEncRegisterResource, NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX) and mapped per
 // frame (NvEncMapInputResource, which also waits for the conversion's GPU work);
-// unmapped after the frame's NvEncLockBitstream ("The client must unmap the
-// buffer after NvEncLockBitstream() API returns successfully"), when the pool
-// texture goes back to the converter. inputTimeStamp is the frame id, which
+// unmapped after the frame's NvEncLockBitstream has returned ("The client must
+// unmap the buffer after NvEncLockBitstream() API returns successfully"), when
+// the pool texture goes back to the converter. inputTimeStamp is the frame id, which
 // names the frame to NvEncInvalidateRefFrames. At most two frames are in the
 // encoder (GUIDE 10: "NVIDIA async with events <= 2 in flight").
 //
@@ -34,17 +35,23 @@
 //                   call NvEncEncodePicture"). It never waits for output, except
 //                   for the bounded drain before an invalidation.
 //   output thread   receive(): waits for the oldest frame's completion event
-//                   (async) or polls NvEncLockBitstream with doNotWait (sync),
-//                   then NvEncLockBitstream, copy, NvEncUnlockBitstream,
-//                   NvEncUnmapInputResource, all under d3d::dxgiGate(), so they
-//                   never run during the DDA capture thread's AcquireNextFrame
+//                   (async) or polls NvEncLockBitstream with doNotWait 1
+//                   (sync); NvEncLockBitstream, the copy and
+//                   NvEncUnlockBitstream run under d3d::dxgiGate(), so they
+//                   never overlap the DDA capture thread's AcquireNextFrame
 //                   (guide 6.3: "calling DXGI APIs like ... AcquireNextFrame
 //                   from the primary thread and NvEncLockBitstream /
 //                   NvEncUnlockBitstream from secondary thread, can lead to
-//                   suboptimal or undefined behavior").
+//                   suboptimal or undefined behavior"); then, outside the
+//                   gate, NvEncUnmapInputResource. The settings the same
+//                   section prescribes for such applications are used:
+//                   enableEncodeAsync 1 (where supported), doNotWait 0 for the
+//                   lock after the completion event, output in system memory
+//                   (enableOutputInVidmem 0).
 //   main thread     init() / release(), while neither of the others runs.
 // Every call on the session holds sessionMu_ (the capture and output threads'
-// calls are short: async mode never blocks in them, sync mode polls), since
+// calls are short: async mode locks a bitstream only once its event has fired,
+// so the blocking lock returns at once; sync mode polls), since
 // NVENC documents the two-thread model but not which other calls may overlap.
 // Lock order: d3d::dxgiGate(), then sessionMu_, then flightMu_ / ctlMu_.
 #include <algorithm>
@@ -159,6 +166,7 @@ struct CodecDetails {
     bool dynBitrate = false;     // NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE
     bool singleSliceIntraRefresh = false;
     bool nv12 = false;           // NV_ENC_BUFFER_FORMAT_NV12 in NvEncGetInputFormats
+    int ltrFrames = 0;           // NV_ENC_CAPS_NUM_MAX_LTR_FRAMES (logged; this backend uses no LTR)
 };
 
 // What NvEncGetEncodeCaps says about one codec on an open session.
@@ -189,7 +197,10 @@ CodecDetails readDetails(const NV_ENCODE_API_FUNCTION_LIST& nv, void* enc, Codec
     // Invalidation needs older frames to fall back to: without multiple
     // reference frames Sunshine turns RFI off (nvenc_base.cpp configure_reference_frames).
     cc.recovery = cap(NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) && d.multiRef ? "invalidate" : "none";
-    cc.maxLtr = cap(NV_ENC_CAPS_NUM_MAX_LTR_FRAMES);  // reported; this backend recovers by invalidation
+    // maxLtr is what start's ltrSlots may ask for (as with AMF): none, this
+    // backend recovers by invalidation; the hardware's count is logged at start.
+    cc.maxLtr = 0;
+    d.ltrFrames = cap(NV_ENC_CAPS_NUM_MAX_LTR_FRAMES);
     cc.intraRefresh = cap(NV_ENC_CAPS_SUPPORT_INTRA_REFRESH) != 0;
     d.dynBitrate = cap(NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE) != 0;
     // NvEncReconfigureEncoder without a reset or an IDR (GUIDE 3.4); step 3.6
@@ -496,7 +507,10 @@ void NvencEncoder::release() {
         }
         for (InFlight& f : left) {
             if (async_ && !f.signaled) {
-                WaitForSingleObject(out_[size_t(f.slot)].event, DWORD(std::max<int64_t>(0, (deadline - qpcNow()) * 1000 / freq_)));
+                // Signaled: lockFront's lock returns at once; else it polls
+                // until the deadline (a hung encoder).
+                f.signaled = WaitForSingleObject(out_[size_t(f.slot)].event,
+                                                 DWORD(std::max<int64_t>(0, (deadline - qpcNow()) * 1000 / freq_))) == WAIT_OBJECT_0;
             }
             NV_ENC_LOCK_BITSTREAM lk{};
             for (;;) {
@@ -830,7 +844,7 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     const CodecCaps& cc = det_.caps;
     flushMode_ = (p.liveBitrate.empty() ? cc.liveBitrate : p.liveBitrate) == "flush";
     async_ = det_.async;
-    refs_ = det_.multiRef ? nvenc::kDpbFrames : 1;
+    refs_ = det_.multiRef ? nvenc::dpbFramesFor(codec_, width_, height_) : 1;
     intraRefresh_ = p.intraRefreshFrames > 0 ? std::max(2, p.intraRefreshFrames) : 0;  // period, count = period - 1
     preset_ = nvenc::presetFor(width_, height_, fps_, p.quality);
     if (vbvFrames_ < 1.0 || vbvFrames_ > 1.5) logf(LogLevel::Info, "nvenc: vbvFrames %.2f (GUIDE 10: one frame for NVIDIA)", vbvFrames_);
@@ -891,11 +905,11 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     logf(LogLevel::Info,
          "nvenc: %s %ux%u %d fps %d kbps %s vbv %.2f frames (%u bits), preset P%d ultra-low-latency, %s output, %d reference frames, "
          "recovery %s, live bitrate %s, two-pass quarter resolution, spatial AQ, key frame scale %u, intra refresh %d, %d engine(s), "
-         "dynamic resolution %s (max %ux%u), emphasis map cap %d, state-advance cap %d, %s on %s",
+         "dynamic resolution %s (max %ux%u), emphasis map cap %d, state-advance cap %d, LTR frames cap %d (unused), %s on %s",
          p.codec.c_str(), width_, height_, fps_, kbps_, out.rateControl.c_str(), vbvFrames_, config_.rcParams.vbvBufferSize, preset_,
          async_ ? "async (events)" : "sync (polled)", refs_, cc.recovery.c_str(), out.liveBitrate.c_str(), nvenc::kKeyFrameScale,
          intraRefresh_, cc.hwInstances, cc.dynamicResolution ? "yes" : "no", init_.maxEncodeWidth, init_.maxEncodeHeight,
-         int(det_.emphasisMap), int(det_.stateAdvance), rt_.versionText.c_str(),
+         int(det_.emphasisMap), int(det_.stateAdvance), det_.ltrFrames, rt_.versionText.c_str(),
          src.adapter.found ? src.adapter.name.c_str() : "the capture device");
     return Status::Ok();
 }
@@ -923,6 +937,29 @@ void NvencEncoder::readSequenceParams() {
         return;
     }
     buf.resize(size);
+    // What the encoder writes, rather than what it was asked for: the level
+    // (a stream above 5.2 is one many hardware decoders refuse) and the
+    // reference frames it keeps. With fewer than refs_ the invalidation
+    // window shrinks to match, so a recovery never relies on a frame the
+    // encoder dropped (NvEncInvalidateRefFrames would then make an intra frame
+    // that goes out flagged as a recovery from refFloor). started.refFrames
+    // stays what was configured; the warning says what the encoder does.
+    SpsInfo sps;
+    if (codec_ != Codec::Av1) {
+        if (!parseSps(codec_, buf.data(), buf.size(), sps)) {
+            warnOnce("sps", std::string("cannot read the level and reference frames from the encoder's ") + codecName(codec_) +
+                                " SPS: the invalidation window stays " + std::to_string(rfi_.dpbSize()));
+        } else {
+            logf(LogLevel::Info, "nvenc: the encoder's SPS: level %s, %d reference frames (configured %d)",
+                 levelText(codec_, sps.levelIdc).c_str(), sps.refFrames, refs_);
+            if (sps.refFrames >= 1 && sps.refFrames < rfi_.dpbSize()) {
+                warnOnce("spsrefs", "the encoder keeps " + std::to_string(sps.refFrames) + " reference frames, not " +
+                                        std::to_string(refs_) + ": the invalidation window is " + std::to_string(sps.refFrames) +
+                                        " frames (started.refFrames said " + std::to_string(refs_) + ")");
+                rfi_.resize(sps.refFrames);
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(extraMu_);
     extradata_ = std::move(buf);
 }
@@ -1197,16 +1234,24 @@ Status NvencEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
     return rateError;
 }
 
-// Locks the front frame's bitstream (doNotWait: after its event in async
-// mode, polled in sync mode), copies it into outBuf_ if asked, unlocks it and
-// unmaps the frame's input, with d3d::dxgiGate() held (top of file).
+// Locks the front frame's bitstream, copies it into outBuf_ if asked and
+// unlocks it, with d3d::dxgiGate() held (top of file); the caller unmaps the
+// frame's input afterwards. doNotWait: 0 once the frame's completion event has
+// fired (async), as NVENC guide 6.3 prescribes for applications that call
+// AcquireNextFrame on another thread ("NV_ENC_LOCK_BITSTREAM::doNotWait = 0";
+// the encode is done, so the lock returns at once; the SDK sample
+// NvEncoder::GetEncodedPacket waits for the event and locks with doNotWait
+// false too). 1 where the frame may still be encoding: sync mode polls (guide
+// 6.2 and NvEncLockBitstream: NV_ENC_ERR_LOCK_BUSY, "retry the function after
+// few milliseconds"), and release() polls a frame whose event did not come
+// within its deadline, so a hung encoder cannot block the teardown.
 NVENCSTATUS NvencEncoder::lockFront(const InFlight& f, NV_ENC_LOCK_BITSTREAM& lk, bool copy) {
-    std::lock_guard<std::mutex> gate(d3d::dxgiGate());
+    std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
     std::lock_guard<std::mutex> lock(sessionMu_);
     lk = {};
     lk.version = NV_ENC_LOCK_BITSTREAM_VER;
     lk.outputBitstream = out_[size_t(f.slot)].bitstream;
-    lk.doNotWait = 1;
+    lk.doNotWait = async_ && f.signaled ? 0 : 1;
     const NVENCSTATUS s = nv_.nvEncLockBitstream(enc_, &lk);
     if (s != NV_ENC_SUCCESS) return s;
     if (copy) {
@@ -1266,7 +1311,7 @@ Next NvencEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         now = qpcNow();
         if (s == NV_ENC_ERR_LOCK_BUSY) {
             // Sync mode: not done yet ("the client can retry the function after
-            // few milliseconds"); async: should not happen after the event.
+            // few milliseconds"); async: not after the event (a blocking lock).
             if (now - front.info.submitQpc > kHangMs * freq_ / 1000) {
                 err = Status::Error("encode_failed", "NVENC did not finish frame " + std::to_string(front.info.frameId) + " within " +
                                                          std::to_string(kHangMs) + " ms",
@@ -1294,7 +1339,7 @@ Next NvencEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         return Next::Error;
     }
     lockErrors_ = 0;
-    unmap(front.mapped);  // after the successful lock, as the API requires
+    unmap(front.mapped);  // after the successful lock, as the API requires; outside the gate (guide 6.3 names Lock / Unlock only)
     {
         std::lock_guard<std::mutex> lock(flightMu_);
         if (!flight_.empty()) flight_.pop_front();

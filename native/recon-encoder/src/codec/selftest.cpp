@@ -3,8 +3,10 @@
 // driven like an encoder that marks and references exactly as asked, the
 // reference-invalidation policy (codec/rfi.hpp), parameter-set detection and
 // insertion on real H.264 access units (the mock clip) and on synthetic HEVC /
-// AV1 units, ROI importance and QP delta maps, the coded size alignment, and
-// the NVENC settings that need no driver (nvenc/nvenc_policy.hpp).
+// AV1 units, the level and reference frames read from SPS NAL units (x264 /
+// x265 output and hand-written ones), ROI importance and QP delta maps, the
+// coded size alignment, and the NVENC settings that need no driver
+// (nvenc/nvenc_policy.hpp).
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -368,6 +370,73 @@ void testBitstream() {
         expect(hasParameterSets(Codec::Av1, noSize.data(), noSize.size()), name, "OBU without size field not parsed");
         std::printf("  %-44s ok\n", name);
     }
+    name = "SPS: level and reference frames";
+    {
+        // SPS NAL units (header byte(s) first) written by libx264 / libx265
+        // (FFmpeg 8.1: H.264 High 3840x2160 -refs 5, Main 1920x1080 -refs 6
+        // with pic_order_cnt_type 0; HEVC 3840x2160 ref=5, 1920x1080 with a
+        // temporal sub-layer), and two written for this test (H.264 with
+        // scaling lists, pic_order_cnt_type 1 and an emulation prevention byte
+        // before max_num_ref_frames; HEVC with three sub-layers, sub-layer
+        // profile / level info and sps_max_dec_pic_buffering_minus1 for the
+        // highest only). FFmpeg's trace_headers bitstream filter decodes each
+        // to the values expected here.
+        const std::vector<uint8_t> x264Uhd{0x67, 0x64, 0x00, 0x34, 0xac, 0xd9, 0x80, 0x3c, 0x00, 0x43, 0xec, 0x04, 0x40,
+                                           0x00, 0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x1e, 0x03, 0xc6, 0x0c, 0x66, 0x80};
+        const std::vector<uint8_t> x264Fhd{0x67, 0x4d, 0x40, 0x32, 0xec, 0xe0, 0x3c, 0x01, 0x13, 0xf2, 0xe0, 0x22, 0x00,
+                                           0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x1e, 0x30, 0x63, 0x3c};
+        const std::vector<uint8_t> synH264{0x67, 0x64, 0x00, 0x33, 0xad, 0x95, 0x24, 0x92, 0x49, 0x24, 0x92, 0x50, 0x88, 0x42,
+                                           0x09, 0x24, 0x90, 0xd4, 0x92, 0x48, 0x6a, 0x49, 0x24, 0x35, 0x24, 0x92, 0x1a, 0x92,
+                                           0x49, 0x0d, 0x49, 0x24, 0x86, 0xa4, 0x92, 0x43, 0x52, 0x49, 0x21, 0xa9, 0x24, 0x90,
+                                           0xd5, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x0a, 0x66, 0x12, 0x50, 0x1e, 0x00, 0x89,
+                                           0xf9, 0x50};
+        const std::vector<uint8_t> x265Uhd{0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+                                           0x03, 0x00, 0x99, 0xa0, 0x01, 0xe0, 0x20, 0x02, 0x1c, 0x59, 0x66, 0x65, 0x4a, 0x4c, 0x2f,
+                                           0x01, 0x68, 0x08, 0x00, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x40};
+        const std::vector<uint8_t> x265Layers{0x42, 0x01, 0x02, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+                                              0x03, 0x00, 0x00, 0x03, 0x00, 0x7b, 0x00, 0x00, 0xa0, 0x03, 0xc0, 0x80,
+                                              0x10, 0xe5, 0x96, 0x56, 0x62, 0xb3, 0x49, 0x26, 0x57, 0x80, 0xb4, 0x04,
+                                              0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x20};
+        const std::vector<uint8_t> synHevc{0x42, 0x01, 0x05, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+                                           0x00, 0x00, 0x03, 0x00, 0x96, 0xd0, 0x00, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00,
+                                           0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x90, 0x93, 0xa0, 0x01, 0xe0,
+                                           0x20, 0x02, 0x20, 0x7c, 0x4e, 0x51, 0xb9, 0x24, 0xc2, 0x08};
+        struct S {
+            const char* what;
+            Codec c;
+            std::vector<uint8_t> data;  // Annex-B
+            int level, refs;
+            const char* levelName;
+        };
+        const auto pps264 = nal({0x68, 0xce, 0x38, 0x80}), pps265 = nal({0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40});
+        const S cases[] = {
+            {"x264 3840x2160 High", Codec::H264, cat({nal({}), x264Uhd, pps264}), 52, 5, "5.2"},
+            {"x264 1920x1080 Main", Codec::H264, cat({nal({}), x264Fhd}), 50, 6, "5.0"},
+            {"H.264 scaling lists", Codec::H264, cat({nal({}), synH264}), 51, 4, "5.1"},
+            {"mock clip IDR (Baseline)", Codec::H264, au(0), 21, 1, "2.1"},
+            {"x265 3840x2160", Codec::Hevc, cat({nal({0x40, 0x01, 0x0c}), nal({}), x265Uhd, pps265}), 153, 5, "5.1"},
+            {"x265 sub-layer", Codec::Hevc, cat({nal({}), x265Layers}), 123, 4, "4.1"},
+            {"HEVC sub-layer info", Codec::Hevc, cat({nal({}), synHevc}), 150, 5, "5.0"},
+        };
+        for (const S& k : cases) {
+            SpsInfo info;
+            const bool ok = parseSps(k.c, k.data.data(), k.data.size(), info);
+            expect(ok && info.levelIdc == k.level && info.refFrames == k.refs && levelText(k.c, info.levelIdc) == k.levelName, name,
+                   std::string(k.what) + ": " + (ok ? "level " + std::to_string(info.levelIdc) + " (" + levelText(k.c, info.levelIdc) +
+                                                          "), " + std::to_string(info.refFrames) + " reference frames"
+                                                    : "not parsed"));
+        }
+        SpsInfo info;
+        const std::vector<uint8_t> p = au(1), truncated = cat({nal({}), std::vector<uint8_t>(x264Uhd.begin(), x264Uhd.begin() + 6)});
+        std::vector<uint8_t> badLayers = cat({nal({}), synHevc});
+        badLayers[6] = uint8_t((badLayers[6] & 0xf1) | (7 << 1));  // sps_max_sub_layers_minus1 7
+        const std::vector<uint8_t> av1{0x0a, 0x03, 0x00, 0x00, 0x00};
+        expect(!parseSps(Codec::H264, p.data(), p.size(), info), name, "a P frame has an SPS");
+        expect(!parseSps(Codec::H264, truncated.data(), truncated.size(), info), name, "a truncated SPS was parsed");
+        expect(!parseSps(Codec::Hevc, badLayers.data(), badLayers.size(), info), name, "sps_max_sub_layers_minus1 7 accepted");
+        expect(!parseSps(Codec::Av1, av1.data(), av1.size(), info) && !parseSps(Codec::Hevc, nullptr, 0, info), name, "AV1 / empty");
+        std::printf("  %-44s ok\n", name);
+    }
 }
 
 void testRoi() {
@@ -515,6 +584,31 @@ void testRfi() {
         expect(st.recoveries >= 4 && st.idrFallbacks >= 2, name, "stats");
     }
     std::printf("  %-44s ok\n", name);
+
+    name = "invalidation: window resized to the encoder's";
+    {
+        // The encoder's SPS says it keeps 3 reference frames, not 6: frames
+        // older than the last 3 are gone, whatever was planned with 6.
+        RfiSim s(6);
+        s.until(20);
+        s.t.recover(19);
+        s.t.resize(3);  // window 18, 19, 20; the pending loss stays
+        expect(s.t.dpbSize() == 3 && s.t.pending(), name, "resize lost the pending loss or the size");
+        RfiTracker::Plan p = s.frame();  // 21: references 18
+        expect(p.recovery && p.refFloor == 18 && p.invalidate == std::vector<uint64_t>{19, 20}, name,
+               "loss at 19: refFloor " + std::to_string(p.refFloor) + ", invalidate " + ids(p.invalidate));
+        s.until(30);
+        s.t.recover(28);  // 28..30 = the whole 3-frame window: IDR (with 6 it would have recovered from 27)
+        p = s.frame();
+        expect(p.idr && !p.recovery, name, "loss of 3 frames with a 3-frame window: no IDR");
+        s.until(40);
+        s.t.recover(39);  // 39, 40 lost: 38 is still kept
+        p = s.frame();
+        expect(p.recovery && p.refFloor == 38, name, "loss of 2 frames: refFloor " + std::to_string(p.refFloor));
+        s.t.resize(0);  // clamped to 1
+        expect(s.t.dpbSize() == 1, name, "resize(0)");
+    }
+    std::printf("  %-44s ok\n", name);
 }
 
 void testNvencPolicy() {
@@ -546,6 +640,27 @@ void testNvencPolicy() {
         const int got = presetFor(x.w, x.h, x.fps, x.q);
         expect(got == x.want, name, std::to_string(x.w) + "x" + std::to_string(x.h) + "@" + std::to_string(x.fps) + " " + x.q + ": P" +
                                         std::to_string(got) + ", expected P" + std::to_string(x.want));
+    }
+    std::printf("  %-44s ok\n", name);
+
+    name = "NVENC reference frames by level";
+    struct D {
+        Codec c;
+        uint32_t w, h;
+        int want;
+    };
+    // H.264: level 5.1 / 5.2 MaxDpbMbs 184320 / frame macroblocks, at most 16
+    // (A.3.1), above level 5's frame size level 6's 696320; HEVC: MaxDpbSize
+    // (A.4.2) less the current picture; capped at kDpbFrames.
+    const D dpbs[] = {{Codec::H264, 1920, 1080, 6}, {Codec::H264, 2560, 1440, 6}, {Codec::H264, 3840, 2160, 5},
+                      {Codec::H264, 4096, 2160, 5}, {Codec::H264, 4096, 2304, 5}, {Codec::H264, 4096, 4096, 6},
+                      {Codec::Hevc, 1920, 1080, 6}, {Codec::Hevc, 3440, 1440, 6}, {Codec::Hevc, 3840, 2160, 5},
+                      {Codec::Hevc, 5120, 1440, 5}, {Codec::Hevc, 5120, 2880, 6}, {Codec::Hevc, 7680, 4320, 5},
+                      {Codec::Av1, 3840, 2160, 6},  {Codec::Av1, 7680, 4320, 6},  {Codec::Hevc, 0, 0, kDpbFrames}};
+    for (const D& x : dpbs) {
+        const int got = dpbFramesFor(x.c, x.w, x.h);
+        expect(got == x.want, name, std::string(codecName(x.c)) + " " + std::to_string(x.w) + "x" + std::to_string(x.h) + ": " +
+                                        std::to_string(got) + ", expected " + std::to_string(x.want));
     }
     std::printf("  %-44s ok\n", name);
 

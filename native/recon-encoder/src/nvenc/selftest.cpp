@@ -367,8 +367,11 @@ void testStream(Ctx& c, const std::string& codec, uint32_t w, uint32_t h) {
         return;
     }
     const bool rfi = c.caps.codecs[codec].recovery == "invalidate";
+    Codec cc{};
+    parseCodec(codec, cc);
+    const int refs = nvenc::dpbFramesFor(cc, w, h);
     expect(st.backend == "nvenc" && st.preset == "p" + std::to_string(nvenc::presetFor(w, h, 60, "speed")) && st.usage == "ultra_low_latency" &&
-               st.refFrames == nvenc::kDpbFrames && st.rateControl == "cbr" && st.codedWidth == int(w) && st.codedHeight == int(h),
+               st.refFrames == refs && st.rateControl == "cbr" && st.codedWidth == int(w) && st.codedHeight == int(h),
            name, "started: preset " + st.preset + ", usage " + st.usage + ", refFrames " + std::to_string(st.refFrames));
     if (c.fake) expect(st.asyncEncode && st.liveBitrate == "seamless" && st.hwInstances == 2, name, "started: async / liveBitrate / engines");
     Backend& b = hs.backend();
@@ -429,8 +432,6 @@ void testStream(Ctx& c, const std::string& codec, uint32_t w, uint32_t h) {
     }
     for (const Got& g : got) {
         if (g.key) {
-            Codec cc{};
-            parseCodec(codec, cc);
             expect(hasParameterSets(cc, reinterpret_cast<const uint8_t*>(g.data.data()), g.data.size()), name,
                    "key frame " + std::to_string(g.frameId) + " without parameter sets");
         }
@@ -451,13 +452,18 @@ void testStream(Ctx& c, const std::string& codec, uint32_t w, uint32_t h) {
         for (const auto& [k, v] : std::vector<std::pair<std::string, std::string>>{
                  {"gop", "inf"}, {"pint", "1"}, {"rc", "cbr"}, {"avg", std::to_string(r.average)}, {"vbv", std::to_string(r.vbv)},
                  {"ldkfs", "3"}, {"aq", "1"}, {"taq", "0"}, {"qpmap", "2"}, {"zrd", "1"}, {"la", "0"}, {"mp", "1"}, {"idr", "inf"},
-                 {"refs", "6"}, {"l0", "1"}, {"repeat", "1"}, {"vui", "1"}, {"ir", "0/0"}, {"layers", "1"}, {"profile", "set"},
+                 {"refs", std::to_string(refs)}, {"l0", "1"}, {"repeat", "1"}, {"vui", "1"}, {"ir", "0/0"}, {"layers", "1"}, {"profile", "set"},
                  {"level", codec == "av1" ? std::to_string(int(NV_ENC_LEVEL_AV1_AUTOSELECT)) : "0"}, {"maxsize", std::to_string(w) + "x" + std::to_string(h)}}) {
             expect(field(in, k) == v, name, "init " + k + "=" + field(in, k) + ", expected " + v);
         }
         expect(c.driver.log("register ").size() <= 6, name, "more registrations than pool textures");
         expect(field(c.driver.encodeLine(1), "flags") == "6" && field(c.driver.encodeLine(11), "flags") == "6", name,
                "forced IDRs without FORCEIDR | OUTPUT_SPSPPS");
+        // Async: every lock after the frame's completion event, blocking
+        // (doNotWait 0, NVENC guide 6.3's setting next to DXGI capture).
+        const std::vector<std::string> locks = c.driver.log("lock ts");
+        expect(locks.size() == 100, name, "locks: " + std::to_string(locks.size()));
+        for (const std::string& l : locks) expect(field(l, "donotwait") == "0", name, "an async lock with doNotWait: " + l);
         // Invalidations, in log order with the encode they precede.
         std::vector<uint64_t> inval;
         for (const std::string& l : c.driver.log("invalidate ")) {
@@ -478,8 +484,6 @@ void testStream(Ctx& c, const std::string& codec, uint32_t w, uint32_t h) {
             expect(field(reconf[1], "fps") == "30/1" && field(reconf[1], "vbv") == std::to_string(r3.vbv) && field(reconf[1], "forceidr") == "0",
                    name, "setRate fps: " + reconf[1]);
         }
-        Codec cc{};
-        parseCodec(codec, cc);
         const nvenc::QpMap m = nvenc::roiQpDeltaMap(cc, w, h, {RoiRect{100, 100, 64, 64, 10}});
         size_t covered = 0;
         for (int8_t v : m.values) covered += v != 0;
@@ -607,6 +611,7 @@ void testPresets(Ctx& c) {
     const Case cases[] = {{"h264", 1920, 1080, 60, "speed", "p4"},
                           {"hevc", 2560, 1440, 120, "quality", "p6"},
                           {"hevc", 3840, 2160, 90, "speed", "p2"},
+                          {"h264", 3840, 2160, 60, "speed", "p4"},
                           {"av1", 3840, 2160, 120, "speed", "p1"}};
     for (const Case& k : cases) {
         if (!c.has(k.codec, k.w, k.h)) continue;
@@ -626,6 +631,12 @@ void testPresets(Ctx& c) {
         }
         expect(st.preset == k.preset, name, std::string(k.codec) + " " + std::to_string(k.w) + "x" + std::to_string(k.h) + "@" +
                                                 std::to_string(k.fps) + " " + k.quality + ": " + st.preset + ", expected " + k.preset);
+        // The level 5.x DPB limit: 5 reference frames for H.264 / HEVC at 4K.
+        Codec cc{};
+        parseCodec(k.codec, cc);
+        const int refs = nvenc::dpbFramesFor(cc, k.w, k.h);
+        expect(st.refFrames == refs, name, std::string(k.codec) + " " + std::to_string(k.w) + "x" + std::to_string(k.h) + ": refFrames " +
+                                               std::to_string(st.refFrames) + ", expected " + std::to_string(refs));
         for (uint64_t id = 1; id <= 3; ++id) expect(hs.submit(id).ok, name, "submit");
         expect(hs.waitFor(3), name, std::string(k.codec) + ": frame 3 did not come out");
         hs.stop();
@@ -634,6 +645,9 @@ void testPresets(Ctx& c) {
             const std::vector<std::string> pc = c.driver.log("presetconfig ");
             expect(!pc.empty() && field(pc.front(), "preset") == std::string(k.preset).substr(1) && field(pc.front(), "tuning") == "3", name,
                    pc.empty() ? "no NvEncGetEncodePresetConfigEx" : pc.front());
+            const std::vector<std::string> init = c.driver.log("init ");
+            expect(!init.empty() && field(init.front(), "refs") == std::to_string(refs), name,
+                   init.empty() ? "no NvEncInitializeEncoder" : "init refs=" + field(init.front(), "refs"));
             expectClean(c, name);
         }
     }
@@ -660,7 +674,8 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     Caps caps = probeNvencCaps();
     const CodecCaps& h = caps.codecs["hevc"];
     expect(caps.backend == "nvenc" && caps.vendor == "nvidia" && caps.codecs.size() == 3, name, "backend / codecs");
-    expect(h.maxW == 8192 && h.maxH == 8192 && h.tenBit && h.yuv444 && h.forceIdr && h.recovery == "invalidate" && h.maxLtr == 8 &&
+    // maxLtr: the slots start's ltrSlots may ask for (none; the double reports 8 LTR frames).
+    expect(h.maxW == 8192 && h.maxH == 8192 && h.tenBit && h.yuv444 && h.forceIdr && h.recovery == "invalidate" && h.maxLtr == 0 &&
                h.intraRefresh && h.liveBitrate == "seamless" && h.maxTemporalLayers == 4 && h.roi == "emphasis" && h.sliceOutput &&
                h.hwInstances == 2 && !h.queryTimeout && h.alignW == 1 && h.alignH == 1 && h.dynamicResolution,
            name, "hevc caps");
@@ -750,6 +765,57 @@ void testFakeOnly(Ctx& c, HMODULE module) {
         } else {
             expect(false, name, "start: " + s.text);
         }
+    }
+    report(name, before);
+
+    name = "fewer reference frames than asked (SPS)";
+    before = failures;
+    for (const char* codec : {"h264", "hevc"}) {
+        // A driver that keeps only 3 reference frames, and says so in its
+        // SPS: the backend reads it back before the first frame and recovers
+        // only within those 3. Without that, the loss at 20 (20..22, the whole
+        // 3-frame DPB) would be planned as a recovery from 19, a frame the
+        // encoder no longer has: an intra frame flagged as a recovery.
+        c.driver.call("set keepRefs=3");
+        Harness hs(c.device, c.adapter);
+        StartParams p;
+        p.codec = codec;
+        p.width = 640;
+        p.height = 360;
+        Started st;
+        Status s;
+        if (!hs.start(p, st, s)) {
+            expect(false, name, std::string(codec) + ": start: " + s.text);
+            c.driver.call("reset");
+            continue;
+        }
+        expect(st.refFrames == nvenc::kDpbFrames, name, std::string(codec) + ": started.refFrames " + std::to_string(st.refFrames));
+        for (uint64_t id = 1; id <= 30; ++id) {
+            expect(hs.submit(id).ok, name, "submit");
+            if (id == 12 || id == 22) {
+                expect(hs.waitFor(id), name, "frame " + std::to_string(id) + " did not come out");
+                hs.backend().recover(id == 12 ? 11 : 20, std::nullopt);
+            }
+            Sleep(DWORD(c.delayMs));
+        }
+        expect(hs.waitFor(30), name, "frame 30 did not come out");
+        hs.stop();
+        std::vector<uint64_t> keys, recoveries;
+        for (const Got& g : hs.got()) {
+            if (g.key) keys.push_back(g.frameId);
+            if (g.recovery) {
+                recoveries.push_back(g.frameId);
+                expect(g.refFloor == 10, name, std::string(codec) + ": frame " + std::to_string(g.frameId) + " refFloor " + std::to_string(g.refFloor));
+            }
+            const size_t marker = g.data.find("NVFAKE");
+            const uint64_t ref = marker == std::string::npos ? ~uint64_t(0) : num(field(g.data.substr(marker), "ref"));
+            const uint64_t want = g.key ? 0 : g.recovery ? g.refFloor : g.frameId - 1;
+            expect(ref == want, name, std::string(codec) + ": frame " + std::to_string(g.frameId) + " predicted from " + std::to_string(ref));
+        }
+        expect(hs.got().size() == 30 && keys == std::vector<uint64_t>{1, 23} && recoveries == std::vector<uint64_t>{13}, name,
+               std::string(codec) + ": keys " + idList(keys) + ", recoveries " + idList(recoveries) + ", expected keys 1,23, recovery 13");
+        expect(c.driver.log("intra fallback").empty(), name, std::string(codec) + ": a recovery without a reference left");
+        expectClean(c, name);
     }
     report(name, before);
 

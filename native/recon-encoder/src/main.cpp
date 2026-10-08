@@ -65,6 +65,7 @@ const char kUsage[] =
     "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
     "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
     "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
+    "  --dxgi-gate=0|1 (1)  0: DDA and NVENC's Lock/UnlockBitstream not serialized (docs/VENDOR_NOTES.md 3.4 A/B)\n"
     "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n";
 
 struct Args {

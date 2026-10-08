@@ -165,7 +165,7 @@ Status DdaCapture::duplicate() {
     syncThreadDesktop();
     HRESULT hr;
     {
-        std::lock_guard<std::mutex> gate(d3d::dxgiGate());  // not while NVENC locks a bitstream (d3d/device.hpp)
+        std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());  // not while NVENC locks a bitstream (d3d/device.hpp)
         ComPtr<IDXGIOutput5> o5;
         if (SUCCEEDED(output_.output.As(&o5))) {
             // B8G8R8A8 only for now: an HDR (FP16) desktop is converted to it by
@@ -196,7 +196,7 @@ Status DdaCapture::duplicate() {
 
 void DdaCapture::releaseHeld() {
     if (held_ && dup_) {
-        std::lock_guard<std::mutex> gate(d3d::dxgiGate());
+        std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
         dup_->ReleaseFrame();
     }
     held_ = false;
@@ -287,7 +287,7 @@ int DdaCapture::dirtyPercent(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint
     meta_.resize(fi.TotalMetadataBufferSize);
     UINT used = 0;
     double area = 0;
-    std::lock_guard<std::mutex> gate(d3d::dxgiGate());
+    std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
     // Move rects first (their destinations changed), then dirty rects.
     if (FAILED(dup_->GetFrameMoveRects(UINT(meta_.size()), reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(meta_.data()), &used))) {
         return -1;
@@ -344,7 +344,7 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         // and NVENC must not lock a bitstream meanwhile (top of file).
         HRESULT hr;
         {
-            std::lock_guard<std::mutex> gate(d3d::dxgiGate());
+            std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
             hr = dup_->AcquireNextFrame(std::min(UINT(left), kAcquireSliceMs), &fi, res.GetAddressOf());
         }
         now = qpcNow();

@@ -127,7 +127,7 @@ struct CodecCaps {
     bool yuv444 = false;
     bool forceIdr = false;
     std::string recovery = "none";  // "ltr" | "invalidate" | "none"
-    int maxLtr = 0;
+    int maxLtr = 0;                 // LTR slots start's ltrSlots may ask for (0: no LTR recovery)
     bool intraRefresh = false;
     std::string liveBitrate = "restart";  // "seamless" | "flush" | "restart"
     int maxTemporalLayers = 1;
@@ -186,7 +186,7 @@ struct Started {
     std::string liveBitrate;     // "seamless" | "flush" (how setRate is applied)
     std::string rateControl;     // what the encoder runs, e.g. "cbr" | "vbr_latency"
     std::string usage;           // encoder usage, e.g. AMF "ultra_low_latency" (H.264 may fall back to "low_latency")
-    int ltrSlots = 0;            // LTR slots in use (0 = recovery by IDR)
+    int ltrSlots = 0;            // LTR slots in use (0 = no LTR recovery: caps recovery says what a loss costs)
     int ltrInterval = 0;         // frames between LTR marks
     int encoderInstance = 0;     // hardware engine used
     int hwInstances = 1;         // hardware engines the GPU has for this codec
@@ -195,7 +195,7 @@ struct Started {
     int intraRefreshFrames = 0;
     std::string preset;          // NVENC preset "p1".."p7" ("" for other backends)
     bool asyncEncode = false;    // NVENC: completion events (async mode), false = polled output (sync mode)
-    int refFrames = 0;           // reference frames the encoder keeps (NVENC DPB size; 0 = not reported)
+    int refFrames = 0;           // reference frames the encoder is configured to keep (NVENC DPB size; 0 = not reported)
 };
 
 // CaptureEvent is the helper -> Go "captureChanged" message.

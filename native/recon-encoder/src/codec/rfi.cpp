@@ -16,6 +16,15 @@ void RfiTracker::reset(int dpbSize) {
     stats_ = {};
 }
 
+void RfiTracker::resize(int dpbSize) {
+    std::lock_guard<std::mutex> lock(mu_);
+    dpb_ = size_t(std::max(1, dpbSize));
+    while (window_.size() > dpb_) {
+        invalid_.erase(window_.front());
+        window_.pop_front();
+    }
+}
+
 int RfiTracker::dpbSize() const {
     std::lock_guard<std::mutex> lock(mu_);
     return int(dpb_);

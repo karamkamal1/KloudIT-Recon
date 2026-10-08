@@ -44,8 +44,8 @@
 // (NvEncInvalidateRefFrames "can be called multiple times"). A recover() that
 // arrives between plan() and submitted() stays pending unless the submitted
 // frame already covers it.
-// Thread-safe: recover on the control thread, plan / submitted on the capture
-// thread, unplannedKey on the output thread.
+// Thread-safe: recover on the control thread, plan / submitted / resize on the
+// capture thread, unplannedKey on the output thread.
 #pragma once
 
 #include <cstdint>
@@ -75,6 +75,10 @@ public:
     // dpbSize: reference frames the encoder keeps (its maxNumRefFrames).
     void reset(int dpbSize);
     int dpbSize() const;
+    // Capture thread: the encoder keeps dpbSize reference frames after all
+    // (read back from its sequence parameter set): the window changes size
+    // and keeps the frames, invalidations and pending losses it still covers.
+    void resize(int dpbSize);
 
     // Control thread: frames from lostFrom on were lost.
     void recover(uint64_t lostFrom);

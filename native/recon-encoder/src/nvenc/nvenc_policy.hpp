@@ -1,6 +1,7 @@
 // NVENC settings that depend on the stream but not on the driver (GUIDE 3.4,
 // 10): API version negotiation, the preset by pixel rate, rate-control values,
-// the ROI QP delta map. No NVENC API calls here; checked by --self-test-encoder.
+// the reference frames by level, the ROI QP delta map. No NVENC API calls
+// here; checked by --self-test-encoder.
 #pragma once
 
 #include <cstdint>
@@ -53,6 +54,21 @@ constexpr uint32_t kKeyFrameScale = 3;
 // Reference frames kept (maxNumRefFrames / maxNumRefFramesInDPB, GUIDE 3.4:
 // 4-6): the recovery window of reference frame invalidation (codec/rfi.hpp).
 constexpr int kDpbFrames = 6;
+// kDpbFrames, or fewer where the level 5.x DPB limit at the coded size is
+// smaller: H.264 and HEVC 3840x2160 keep 5. More references than level 5.2
+// allows would make the driver either signal level 6 (decoders limited to
+// 5.1 / 5.2, typical for H.264 hardware decoders, refuse the stream) or keep
+// fewer than the invalidation window assumes. H.264 A.3.1: MaxDpbFrames =
+// Min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16), level 5.1 / 5.2
+// MaxDpbMbs 184320 (3840x2160 = 32400 macroblocks: 5). HEVC A.4.2: MaxDpbSize
+// from MaxLumaPs 8912896 and maxDpbPicBuf 6 (3840x2160: 6), which counts the
+// current picture (sps_max_dec_pic_buffering_minus1 + 1 <= MaxDpbSize), so one
+// reference fewer. A picture larger than level 5 allows takes level 6's
+// limits (it needs level 6 anyway). AV1: kDpbFrames (eight reference slots at
+// every level). Sunshine keeps 5 for H.264 / HEVC and 8 for AV1
+// (nvenc_base.cpp configure_reference_frames); FFmpeg h264_levels.c /
+// h265_profile_level.c apply the same limits when they pick a level.
+int dpbFramesFor(Codec c, uint32_t width, uint32_t height);
 
 // ROI as a QP delta map (NV_ENC_RC_PARAMS::qpMapMode = NV_ENC_QP_MAP_DELTA):
 // one signed byte per block, "per MB for H264, per CTB for HEVC and per SB for

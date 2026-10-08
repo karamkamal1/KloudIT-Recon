@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "codec/bitstream.hpp"
+#include "d3d/device.hpp"
 #include "protocol.hpp"
 #include "stream.hpp"
 
@@ -90,6 +91,12 @@ bool encodeTestOption(const std::string& key, const std::string& val, EncodeTest
     }
     if (key == "--ack-delay") {
         ok = isInt(val) && (o.ackDelay = std::atoi(val.c_str())) >= 0;
+        o.used = true;
+        return true;
+    }
+    if (key == "--dxgi-gate") {
+        ok = val == "0" || val == "1";
+        o.dxgiGate = val != "0";
         o.used = true;
         return true;
     }
@@ -334,6 +341,12 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
     }
     Codec codec;
     parseCodec(p.codec, codec);
+    if (!o.dxgiGate) {
+        // Before any capture or encoder thread runs (d3d/device.hpp).
+        d3d::dxgiGate().disable();
+        std::printf("encode-test: dxgi gate off: DDA AcquireNextFrame and NVENC NvEncLockBitstream / NvEncUnlockBitstream are not "
+                    "serialized (--dxgi-gate=0)\n");
+    }
     std::printf("encode-test: backend %s (%s), %s\n", choice.caps.backend.c_str(), choice.caps.adapterName.c_str(), json.c_str());
     if (auto it = choice.caps.codecs.find(p.codec); it != choice.caps.codecs.end()) {
         const CodecCaps& c = it->second;

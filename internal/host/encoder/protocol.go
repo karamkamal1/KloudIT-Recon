@@ -129,7 +129,7 @@ type CodecCaps struct {
 	YUV444            bool   `json:"yuv444"`
 	ForceIDR          bool   `json:"forceIdr"`
 	Recovery          string `json:"recovery"` // ltr | invalidate | none
-	MaxLTR            int    `json:"maxLtr"`
+	MaxLTR            int    `json:"maxLtr"`   // LTR slots Start's LTRSlots may ask for; 0 = no LTR recovery (NVENC invalidates)
 	IntraRefresh      bool   `json:"intraRefresh"`
 	LiveBitrate       string `json:"liveBitrate"` // seamless | flush | restart
 	MaxTemporalLayers int    `json:"maxTemporalLayers"`
@@ -195,7 +195,7 @@ type Started struct {
 	LiveBitrate        string `json:"liveBitrate"`        // seamless | flush: how SetRate is applied
 	RateControl        string `json:"rateControl"`        // e.g. cbr | vbr_latency
 	Usage              string `json:"usage"`              // e.g. ultra_low_latency (AMF H.264 may fall back to low_latency)
-	LTRSlots           int    `json:"ltrSlots"`           // LTR slots in use; 0 = recovery by IDR
+	LTRSlots           int    `json:"ltrSlots"`           // LTR slots in use; 0 = no LTR recovery (the codec's caps Recovery applies)
 	LTRInterval        int    `json:"ltrInterval"`        // frames between LTR marks
 	EncoderInstance    int    `json:"encoderInstance"`    // hardware engine used
 	HWInstances        int    `json:"hwInstances"`        // engines the GPU has for this codec
@@ -204,7 +204,9 @@ type Started struct {
 	IntraRefreshFrames int    `json:"intraRefreshFrames"` // intra refresh cycle, 0 = off
 	// NVENC (step 3.4; other backends leave them empty): the preset "p1".."p7",
 	// whether the output comes by completion events (async) or by polling, and
-	// the reference frames the encoder keeps (the invalidation window).
+	// the reference frames the encoder was configured to keep (the
+	// invalidation window: 6, 5 at 4K H.264 / HEVC; the helper narrows it,
+	// with a warning in its log, should the encoder's SPS say fewer).
 	Preset      string `json:"preset"`
 	AsyncEncode bool   `json:"asyncEncode"`
 	RefFrames   int    `json:"refFrames"`

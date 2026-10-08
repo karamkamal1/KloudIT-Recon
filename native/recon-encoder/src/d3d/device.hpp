@@ -6,6 +6,7 @@
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -78,7 +79,30 @@ bool deviceRemoved(ID3D11Device* device, const std::string& what, Status& out);
 // Model). The DDA capture holds it for one short AcquireNextFrame slice at a
 // time (capture/dda_capture.cpp), so the output thread waits at most a slice,
 // as it already did for the device lock AcquireNextFrame holds. One helper
-// runs one stream: a process-wide lock. Take it before any other lock.
-std::mutex& dxgiGate();
+// runs one stream: a process-wide lock (std::lock_guard<d3d::DxgiGate>). Take
+// it before any other lock.
+//
+// The same section of the guide names the settings for such applications
+// (enableEncodeAsync 1, NV_ENC_LOCK_BITSTREAM::doNotWait 0, output not in
+// video memory), which the NVENC backend uses; whether the gate is still
+// needed with them is the A/B measurement of docs/VENDOR_NOTES.md 3.4. For it
+// the encode test's --dxgi-gate=0 calls disable() before any thread starts:
+// lock() / unlock() then do nothing. Never off in normal operation.
+class DxgiGate {
+public:
+    void lock() {
+        if (on_.load(std::memory_order_relaxed)) mu_.lock();
+    }
+    void unlock() {
+        if (on_.load(std::memory_order_relaxed)) mu_.unlock();
+    }
+    void disable() { on_.store(false, std::memory_order_relaxed); }
+    bool enabled() const { return on_.load(std::memory_order_relaxed); }
+
+private:
+    std::mutex mu_;
+    std::atomic<bool> on_{true};
+};
+DxgiGate& dxgiGate();
 
 }  // namespace recon::d3d
