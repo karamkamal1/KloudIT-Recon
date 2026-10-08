@@ -881,6 +881,10 @@ function finishDropTest() {
 // sampled display estimate comes on top.
 
 const STAGES = ['capture', 'queue', 'network', 'transfer', 'wait', 'decode', 'draw', 'display'];
+// Frames of the native encoder helper also carry the game's present and the
+// encoder submit time: present->capture (before end-to-end starts), and
+// capture->encoded split into capture->submit and encode. Not in the sum.
+const DETAIL_STAGES = ['present', 'submit', 'encode'];
 const STAGE_WINDOW_MS = 10000;
 const DISPLAY_SAMPLE_MS = 50; // display marks: ~20/s keeps the main thread's rAF work small
 const lat = { recs: [], pending: null, markId: 0, lastMark: 0, lastReport: now() };
@@ -888,6 +892,13 @@ const lat = { recs: [], pending: null, markId: 0, lastMark: 0, lastReport: now()
 function recordStages(m, decoded, drawn) {
   const capUs = m.ext?.captureUs;
   const doneUs = m.ext?.encodeDoneUs;
+  const presUs = m.ext?.presentUs;
+  const subUs = m.ext?.encodeSubmitUs;
+  const d = [
+    presUs !== undefined && capUs !== undefined ? (capUs - presUs) / 1000 : null,
+    subUs !== undefined && capUs !== undefined ? (subUs - capUs) / 1000 : null,
+    subUs !== undefined && doneUs !== undefined ? (doneUs - subUs) / 1000 : null,
+  ];
   const sendL = hostToLocal(m.sendUs);
   const s = new Array(STAGES.length).fill(null);
   if (capUs !== undefined && doneUs !== undefined) s[0] = (doneUs - capUs) / 1000;
@@ -899,8 +910,11 @@ function recordStages(m, decoded, drawn) {
   s[6] = drawn - decoded;
   const fromCapture = s[0] !== null;
   const rec = {
-    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture,
-    raw: { captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded, drawn },
+    t: drawn, s, d, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture,
+    raw: {
+      presentUs: presUs, captureUs: capUs, encodeSubmitUs: subUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset,
+      first: m.first, last: m.recv, submit: m.t, output: decoded, drawn,
+    },
   };
   lat.recs.push(rec);
   while (lat.recs.length && lat.recs[0].t < drawn - STAGE_WINDOW_MS) lat.recs.shift();
@@ -942,6 +956,10 @@ function stageSummary() {
   const first = fromCapture ? 0 : 2;
   const rows = {};
   STAGES.forEach((name, i) => { rows[name] = pct(recs.filter((r) => r.s[i] !== null).map((r) => r.s[i])); });
+  DETAIL_STAGES.forEach((name, i) => {
+    const r = pct(recs.filter((x) => x.d[i] !== null).map((x) => x.d[i]));
+    if (r) rows[name] = r;
+  });
   let sum = 0;
   let e2eSum = 0;
   for (const r of recs) {
@@ -963,7 +981,7 @@ function reportStages(sum) {
   if (!sum || t - lat.lastReport < 10000 || !transport) return;
   lat.lastReport = t;
   const rows = [];
-  for (const name of STAGES) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
+  for (const name of [...STAGES, ...DETAIL_STAGES]) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
   rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
   transport.sendControl({ t: 'stages', stages: rows });
 }
@@ -1286,6 +1304,8 @@ function onControl(m) {
       break;
     case 'clock': if (Number.isFinite(m.wallOffsetUs)) probe.wallOffsetUs = m.wallOffsetUs; updateProbeMode(); break;
     case 'video': onVideoConfig(m); break;
+    // The running generation's bitrate changed in the encoder (native helper).
+    case 'rate': post('rate', { gen: m.gen, bitrate: m.bitrate, maxBitrate: m.maxBitrate }); break;
     case P.MSG_DROPPED: onDropped(m); break;
     case 'audio': onAudioConfig(m); break;
     case 'cursor': post('cursor', { shape: m }); break;

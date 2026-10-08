@@ -126,11 +126,27 @@ std::optional<bool> queryHags(const LUID& adapter);
 // priority need it). Returns false if the token does not hold it.
 bool enableIncreaseBasePriority();
 
-// Sets this process's GPU scheduling priority class (GUIDE 1.3):
-// mode "off" leaves it alone; otherwise REALTIME, except HIGH when mode is
-// "high" or when mode is "auto" on NVIDIA with HAGS on or unknown; a refused
-// REALTIME is retried as HIGH. Enables SeIncreaseBasePriorityPrivilege first.
-// Returns "realtime" | "high" | "failed" | "off" and logs the outcome.
+// The GPU scheduling priority decision (GUIDE 1.3): one table with recon-host,
+// which applies it to the FFmpeg encoder process (gpuPriorityClass in
+// internal/host/media/gpuprio.go), for the same config value (host.json
+// gpuPriority, passed in start's gpuPriority). Returns the class to ask for
+// first: "off" for mode "off"; "high" for "high", and for "auto" (or empty)
+// when NVIDIA is in the process and HAGS is on or unknown (NVIDIA drivers can
+// freeze or crash the encoder with REALTIME there: Sunshine display_base.cpp);
+// else "realtime". vendor is the adapter's that capture and encoder run on
+// (one adapter here, so also the encoder's); hags nullopt = unknown.
+// `recon-encoder --gpu-priority-table` prints it for every input and recon-host's
+// TestGPUPriorityAgreesWithHelper checks it against Go's table.
+const char* gpuPriorityFor(const std::string& mode, const std::string& vendor, std::optional<bool> hags);
+
+// --gpu-priority-table: one JSON line per mode x vendor x HAGS state,
+// {"mode":"auto","vendor":"nvidia","hags":"on","priority":"high"}.
+void printGpuPriorityTable();
+
+// Sets this process's GPU scheduling priority class (GUIDE 1.3) to
+// gpuPriorityFor(mode, adapter); a refused REALTIME is retried as HIGH.
+// Enables SeIncreaseBasePriorityPrivilege first. Returns "realtime" | "high" |
+// "failed" | "off" and logs the outcome.
 std::string applyGpuPriority(const std::string& mode, const AdapterInfo& adapter);
 
 }  // namespace recon

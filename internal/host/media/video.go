@@ -23,9 +23,20 @@ type Frame struct {
 	Seq          uint32
 	Key          bool
 	PtsUs        int64  // relative to the generation's first frame
+	PresentUs    uint64 // host clock when the game presented the image (native helper; 0 = unknown)
 	CaptureUs    uint64 // host clock when the frame was captured (0 = unknown)
-	EncodeDoneUs uint64 // host clock when the encoded frame was read from the encoder
-	Data         []byte
+	SubmitUs     uint64 // host clock when the frame went into the encoder (native helper; 0 = unknown)
+	EncodeDoneUs uint64 // host clock when the encoded frame came out of the encoder
+	// Recovery metadata (native helper; frame extension tags 5-7):
+	// Recovery frames reference only frames the client acknowledged, the
+	// oldest being seq RefFloor of this generation; MarkedLTR frames are kept
+	// in long-term reference slot LTRSlot; TemporalLayer is the SVC layer.
+	Recovery      bool
+	RefFloor      uint32
+	MarkedLTR     bool
+	LTRSlot       uint8
+	TemporalLayer uint8
+	Data          []byte
 }
 
 // maxCaptureToEncoded bounds plausible capture->encoded times; anything else
@@ -54,6 +65,18 @@ type VideoEvent struct {
 	// generation's encoder needs to restore the picture by itself
 	// (HealFrames of its arguments; 0: a lost frame needs a key frame).
 	HealFrames int
+	// Restarted, with Err: the pipeline handles the failure itself
+	// (HelperVideo restarts the native helper, or a starting one takes
+	// over); a new generation follows with a key frame, the session only
+	// tells the user. Fallback,
+	// with Err: the pipeline gave up (the native helper failed too often);
+	// the session continues on FFmpeg.
+	Restarted bool
+	Fallback  bool
+	// Lost: frames that will never reach the session (HelperVideo: the
+	// helper dropped them). Capture: the capture source changed (HelperVideo).
+	Lost    *LostFrames
+	Capture *CaptureChange
 }
 
 // encoderFault reports whether an encoder process's stderr shows that the
@@ -94,15 +117,16 @@ type Video struct {
 }
 
 type encProc struct {
-	gen     uint8
-	params  Params
-	args    []string // the ffmpeg command line (Recovery reads the encoder options)
-	cmd     *exec.Cmd
-	cancel  context.CancelFunc
-	stderr  *stderrRing
-	started time.Time
-	killed  bool
-	errDone chan struct{} // closed when stderr is fully consumed
+	gen      uint8
+	params   Params
+	recovery string   // the live generation's VideoConfig.Recovery
+	args     []string // the ffmpeg command line (Recovery reads the encoder options)
+	cmd      *exec.Cmd
+	cancel   context.CancelFunc
+	stderr   *stderrRing
+	started  time.Time
+	killed   bool
+	errDone  chan struct{} // closed when stderr is fully consumed
 }
 
 // NewVideo creates a manager. clock returns the host monotonic time in µs.
@@ -112,6 +136,70 @@ func NewVideo(caps *Caps, log *slog.Logger, clock func() uint64) *Video {
 
 // Events returns the event stream (configs, frames, errors).
 func (v *Video) Events() <-chan VideoEvent { return v.events }
+
+// Gen returns the number of the newest generation.
+func (v *Video) Gen() uint8 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.gen
+}
+
+// ContinueAfter makes the next generation gen+1: a Video that takes over from
+// another pipeline in a session keeps the client's generations increasing.
+func (v *Video) ContinueAfter(gen uint8) {
+	v.mu.Lock()
+	v.gen = gen
+	v.mu.Unlock()
+}
+
+// Capabilities: FFmpeg's command line can neither force a key frame nor
+// change the bitrate of a running encoder (both are new generations); a lost
+// frame needs a key frame unless the live generation runs intra refresh.
+func (v *Video) Capabilities() PipelineCaps {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	c := PipelineCaps{Name: PipelineFFmpeg, Recovery: RecoveryNone}
+	if pr := v.active; pr != nil {
+		c.Recovery = RecoveryKeyframe
+		if pr.recovery == proto.RecoverySkip {
+			c.Recovery, c.IntraRefresh = RecoverySkip, true
+		}
+		c.CursorInVideo = pr.params.DrawCursor
+	}
+	return c
+}
+
+// ForceKeyframe starts a new generation at once with the current parameters:
+// the FFmpeg command line cannot force a key frame in a running encoder. (The
+// session starts it itself, with parameters it builds afresh.)
+func (v *Video) ForceKeyframe() error {
+	p, ok := v.Current()
+	if !ok {
+		return errors.New("video: nothing to restart")
+	}
+	return v.Start(p, true)
+}
+
+// SetRate starts an overlapped generation at the new bitrate (and frame rate):
+// the FFmpeg command line sets them only at start.
+func (v *Video) SetRate(kbps, fps int) error {
+	p, ok := v.Current()
+	if !ok {
+		return errors.New("video: nothing to restart")
+	}
+	p.BitrateKbps = kbps
+	if fps > 0 {
+		p.FPS = fps
+	}
+	return v.Start(p, false)
+}
+
+// Recover: the FFmpeg encoders keep no references the client could recover
+// from.
+func (v *Video) Recover(gen uint8, lostFrom uint32) error { return ErrNoRecovery }
+
+// Ack: unused (no long-term references).
+func (v *Video) Ack(gen uint8, seq uint32) {}
 
 // Start launches a new encoder generation. If urgent is true the current
 // generation is stopped immediately (its frames are useless to the client, e.g.
@@ -358,11 +446,12 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				v.active.kill()
 			}
 			v.active, v.pending = pr, nil
+			pr.recovery = Recovery(pr.args, st.Width, st.Height, pr.params.FPS)
 			cfg := &proto.VideoConfig{
 				T: "video", Gen: pr.gen, Family: params.Family, Codec: params.Codec,
 				FPS: pr.params.FPS, BitrateKbps: pr.params.BitrateKbps,
 				Encoder: pr.params.Encoder.Name, Capture: pr.params.Source.Backend,
-				Recovery: Recovery(pr.args, st.Width, st.Height, pr.params.FPS),
+				Recovery: pr.recovery,
 			}
 			cfg.SetCrop(visibleSize(st, params, pr.params))
 			if v.log != nil {

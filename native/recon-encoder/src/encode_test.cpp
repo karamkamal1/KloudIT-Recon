@@ -418,7 +418,7 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                 e.firedAt = f.frameId;
                 Status es;
                 if (e.what == "idr") {
-                    es = choice.backend->forceIdr();
+                    sr.pipeline->forceIdr();  // as main.cpp does for "forceIdr"
                 } else if (e.what == "loss") {
                     // This frame and the ones after it never reach the
                     // "client" until a key frame or a recovery frame from

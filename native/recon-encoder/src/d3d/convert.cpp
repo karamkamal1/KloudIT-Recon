@@ -31,9 +31,9 @@ cbuffer Params : register(b0) {
     float4 coefY;     // dot(rgb, coef.xyz) + coef.w, UNORM8 units / 255
     float4 coefU;
     float4 coefV;
-    uint4 bcRect;     // barcode x0, y0, x1, y1 (exclusive), output pixels
-    uint4 bcGrid;     // blockW, blockH, cols, bits
-    uint4 bcValue;    // value low, value high, msbFirst, enabled
+    uint4 bcRect;     // barcode x0, y0, x1, y1 (exclusive), output pixels: 8 x 3 cells
+    uint4 bcGrid;     // x: cell size in output pixels
+    uint4 bcValue;    // x: the 24-bit word (value << 8 | crc), w: enabled
     uint4 flags;      // x: source is linear (scRGB FP16)
 };
 
@@ -58,13 +58,12 @@ float3 fetch(float2 lumaPos) {
     return c;
 }
 
+// The frame barcode (proto/barcode.go): cell k, row-major in 8 columns, shows
+// bit 23 - k of the word.
 int barcodeBit(uint2 p) {
     if (bcValue.w == 0 || p.x < bcRect.x || p.y < bcRect.y || p.x >= bcRect.z || p.y >= bcRect.w) return -1;
-    uint k = ((p.y - bcRect.y) / bcGrid.y) * bcGrid.z + (p.x - bcRect.x) / bcGrid.x;
-    if (k >= bcGrid.w) return -1;
-    uint b = bcValue.z != 0 ? bcGrid.w - 1 - k : k;
-    uint word = b < 32 ? bcValue.x : bcValue.y;
-    return (int)((word >> (b & 31)) & 1);
+    uint k = ((p.y - bcRect.y) / bcGrid.x) * 8 + (p.x - bcRect.x) / bcGrid.x;
+    return (int)((bcValue.x >> (23 - k)) & 1);
 }
 
 float ps_y(VSOut i) : SV_Target {
@@ -196,23 +195,31 @@ YuvCoefficients bt709Limited() {
     return c;
 }
 
-int barcodeBit(const BarcodeLayout& b, uint64_t value, uint32_t x, uint32_t y) {
+uint8_t barcodeCrc(uint16_t value) {
+    uint8_t crc = 0;
+    for (const uint8_t byte : {uint8_t(value >> 8), uint8_t(value)}) {
+        crc ^= byte;
+        for (int i = 0; i < 8; ++i) crc = (crc & 0x80) ? uint8_t((crc << 1) ^ 0x07) : uint8_t(crc << 1);
+    }
+    return uint8_t(crc ^ 0x55);
+}
+
+uint32_t barcodeWord(uint16_t value) { return uint32_t(value) << 8 | barcodeCrc(value); }
+
+int barcodeBit(const BarcodeLayout& b, uint16_t value, uint32_t x, uint32_t y) {
     if (!b.enabled) return -1;
-    const uint32_t x0 = uint32_t(b.x), y0 = uint32_t(b.y);
-    if (x < x0 || y < y0 || x >= x0 + uint32_t(b.cols * b.blockW) || y >= y0 + uint32_t(b.rows() * b.blockH)) return -1;
-    const uint32_t k = (y - y0) / uint32_t(b.blockH) * uint32_t(b.cols) + (x - x0) / uint32_t(b.blockW);
-    if (k >= uint32_t(b.bits)) return -1;
-    const uint32_t bit = b.msbFirst ? uint32_t(b.bits) - 1 - k : k;
-    return int((value >> bit) & 1);
+    const uint32_t x0 = uint32_t(b.x), y0 = uint32_t(b.y), cell = uint32_t(b.cell);
+    if (x < x0 || y < y0 || x >= x0 + uint32_t(b.width()) || y >= y0 + uint32_t(b.height())) return -1;
+    const uint32_t k = (y - y0) / cell * uint32_t(kBarcodeCols) + (x - x0) / cell;
+    return int((barcodeWord(value) >> (uint32_t(kBarcodeBits) - 1 - k)) & 1);
 }
 
 std::string barcodeProblem(const BarcodeLayout& b, uint32_t width, uint32_t height) {
     if (!b.enabled) return {};
-    if (int64_t(b.x) + int64_t(b.cols) * b.blockW > int64_t(width) ||
-        int64_t(b.y) + int64_t(b.rows()) * b.blockH > int64_t(height)) {
-        return "the barcode (" + std::to_string(b.cols * b.blockW) + "x" + std::to_string(b.rows() * b.blockH) + " at " +
-               std::to_string(b.x) + "," + std::to_string(b.y) + ") does not fit the " + std::to_string(width) + "x" +
-               std::to_string(height) + " output";
+    if (int64_t(b.x) + b.width() > int64_t(width) || int64_t(b.y) + b.height() > int64_t(height)) {
+        return "the barcode (" + std::to_string(b.width()) + "x" + std::to_string(b.height()) + " at " + std::to_string(b.x) +
+               "," + std::to_string(b.y) + ") does not fit the " + std::to_string(width) + "x" + std::to_string(height) +
+               " output";
     }
     return {};
 }
@@ -401,7 +408,7 @@ Status Nv12Converter::sourceView(ID3D11Texture2D* src, SrvEntry*& out) {
     return Status::Ok();
 }
 
-Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barcodeValue, ConvertedFrame& out) {
+Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint16_t barcodeValue, ConvertedFrame& out) {
     if (!cb_) return Status::Error("init_failed", "converter not initialized");
     // A free pool texture (the encoder may still hold some).
     int index = -1;
@@ -465,12 +472,9 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint64_t barco
     std::memcpy(c.coefV, k.v, sizeof(c.coefV));
     if (barcode_.enabled) {
         c.bcRect[0] = uint32_t(barcode_.x), c.bcRect[1] = uint32_t(barcode_.y);
-        c.bcRect[2] = uint32_t(barcode_.x + barcode_.cols * barcode_.blockW);
-        c.bcRect[3] = uint32_t(barcode_.y + barcode_.rows() * barcode_.blockH);
-        c.bcGrid[0] = uint32_t(barcode_.blockW), c.bcGrid[1] = uint32_t(barcode_.blockH);
-        c.bcGrid[2] = uint32_t(barcode_.cols), c.bcGrid[3] = uint32_t(barcode_.bits);
-        c.bcValue[0] = uint32_t(barcodeValue), c.bcValue[1] = uint32_t(barcodeValue >> 32);
-        c.bcValue[2] = barcode_.msbFirst ? 1 : 0, c.bcValue[3] = 1;
+        c.bcRect[2] = uint32_t(barcode_.x + barcode_.width()), c.bcRect[3] = uint32_t(barcode_.y + barcode_.height());
+        c.bcGrid[0] = uint32_t(barcode_.cell);
+        c.bcValue[0] = barcodeWord(barcodeValue), c.bcValue[3] = 1;
     }
     c.flags[0] = srv->linear ? 1 : 0;
     std::memcpy(m.pData, &c, sizeof(c));

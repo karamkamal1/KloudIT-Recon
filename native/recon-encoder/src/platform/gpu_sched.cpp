@@ -101,18 +101,31 @@ std::optional<bool> queryHags(const LUID& adapter) {
     return (caps.Value & kHwSchEnabled) != 0;
 }
 
+const char* gpuPriorityFor(const std::string& mode, const std::string& vendor, std::optional<bool> hags) {
+    if (mode == "off") return "off";
+    // HAGS unknown counts as on: the safe side for NVIDIA.
+    if (mode == "high" || (mode != "realtime" && vendor == "nvidia" && hags.value_or(true))) return "high";
+    return "realtime";
+}
+
+void printGpuPriorityTable() {
+    for (const char* mode : {"auto", "high", "realtime", "off"}) {
+        for (const char* vendor : {"amd", "nvidia", "intel", "other"}) {
+            for (const std::optional<bool> hags : {std::optional<bool>(true), std::optional<bool>(false), std::optional<bool>()}) {
+                std::printf("{\"mode\":\"%s\",\"vendor\":\"%s\",\"hags\":\"%s\",\"priority\":\"%s\"}\n", mode, vendor,
+                            !hags ? "unknown" : *hags ? "on" : "off", gpuPriorityFor(mode, vendor, hags));
+            }
+        }
+    }
+}
+
 std::string applyGpuPriority(const std::string& mode, const AdapterInfo& adapter) {
-    if (mode == "off") {
+    const std::string decision = gpuPriorityFor(mode, adapter.vendor, adapter.hags);
+    if (decision == "off") {
         logf(LogLevel::Info, "gpu priority: off (%s, %s)", adapter.vendor.c_str(), hagsText(adapter.hags));
         return "off";
     }
-    // NVIDIA drivers can freeze or crash the encoder with REALTIME when HAGS is
-    // on (Sunshine display_base.cpp; GUIDE 1.3/2): HIGH there, and also when
-    // HAGS cannot be detected, which is the safe side.
-    int prio = kPriorityRealtime;
-    if (mode == "high" || (mode == "auto" && adapter.vendor == "nvidia" && adapter.hags.value_or(true))) {
-        prio = kPriorityHigh;
-    }
+    const int prio = decision == "high" ? kPriorityHigh : kPriorityRealtime;
     const bool privilege = enableIncreaseBasePriority();
     auto set = gdiProc<SetProcessSchedulingPriorityClassFn>("D3DKMTSetProcessSchedulingPriorityClass");
     std::string result = "failed";

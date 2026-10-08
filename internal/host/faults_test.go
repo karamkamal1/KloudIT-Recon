@@ -162,7 +162,7 @@ func testSession(t *testing.T, faults testFaults) (*Session, *fakeConn, *fakeCtr
 	t.Cleanup(cancel)
 	c, ctrl := &fakeConn{}, &fakeCtrl{}
 	s := &Session{
-		a: &Agent{hostClock: media.NewClock(), faults: faults}, c: c, ctrl: ctrl, ctx: ctx, cancel: cancel,
+		a: &Agent{hostClock: media.NewHostClock(), faults: faults}, c: c, ctrl: ctrl, ctx: ctx, cancel: cancel,
 		frameQ: make(chan *media.Frame, 6), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return s, c, ctrl

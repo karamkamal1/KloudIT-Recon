@@ -34,6 +34,7 @@ namespace {
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
     "       recon-encoder --print-caps [--backend=B]\n"
+    "       recon-encoder --gpu-priority-table\n"
     "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder | --self-test-nvenc[=DLL]\n"
     "       recon-encoder --encode-test=FILE [--backend=B] [encode test options]\n"
     "       recon-encoder --version\n"
@@ -50,6 +51,7 @@ const char kUsage[] =
     "  --mock-hang-at=N     mock only: never return from submitting frame N (a call stuck in the driver)\n"
     "  --dump-nv12=PATH     write converted frame 30 (raw NV12, encoded size) to PATH\n"
     "  --print-caps         print the capabilities JSON and exit\n"
+    "  --gpu-priority-table print the GPU priority decision for every mode x vendor x HAGS state (JSON lines)\n"
     "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
     "                       the default hardware adapter (exit 0 ok, 1 failed, 77 no device)\n"
     "  --self-test-pacer    check the frame pacing policy on simulated presents (exit 0 ok, 1 failed)\n"
@@ -70,6 +72,7 @@ const char kUsage[] =
 
 struct Args {
     bool printCaps = false;
+    bool gpuPriorityTable = false;
     bool selfTestConvert = false;
     bool selfTestHardware = false;
     bool selfTestPacer = false;
@@ -111,6 +114,7 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
             a.selfTestHardware = val == "hw";
         }
         else if (key == "--self-test-pacer") a.selfTestPacer = true;
+        else if (key == "--gpu-priority-table") a.gpuPriorityTable = true;
         else if (key == "--self-test-encoder") a.selfTestEncoder = true;
         else if (key == "--self-test-nvenc") {
             a.selfTestNvenc = true;
@@ -152,7 +156,7 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         return false;
     }
     const bool standalone =
-        a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder || a.selfTestNvenc ||
+        a.printCaps || a.gpuPriorityTable || a.version || a.help || a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder || a.selfTestNvenc ||
         !a.encodeTest.output.empty();
     if (!standalone && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
         err = "--ring-handle, --ring-size and --event-handle are required";
@@ -239,6 +243,11 @@ int main(int argc, char** argv) {
     }
     if (a.version) {
         std::printf("recon-encoder %s (protocol %d)\n", RECON_ENCODER_VERSION, kProtocolVersion);
+        return kExitOk;
+    }
+    if (a.gpuPriorityTable) {
+        printGpuPriorityTable();
+        std::fflush(stdout);
         return kExitOk;
     }
     setLogLevel(a.logLevel);
@@ -359,7 +368,7 @@ int main(int argc, char** argv) {
             continue;
         }
         Status s;
-        if (m.type == "forceIdr") s = choice.backend->forceIdr();
+        if (m.type == "forceIdr") pipeline->forceIdr();
         else if (m.type == "recover") s = choice.backend->recover(m.lostFromFrameId, m.ackedLtrFrameId);
         else if (m.type == "setRate") s = pipeline->setRate(m.rate);
         else if (m.type == "setRoi") s = choice.backend->setRoi(m.rects);

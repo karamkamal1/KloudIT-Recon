@@ -22,6 +22,7 @@ import (
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/karamkamal1/kloudit-recon/internal/auth"
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
@@ -38,10 +39,16 @@ type Agent struct {
 	cfg         *Config
 	log         *slog.Logger
 	caps        *media.Caps
-	hostClock   func() uint64
+	hostClock   *media.Clock
 	inj         *input.Injector
 	audioSource media.AudioSource
 	faults      testFaults // TestFaultsEnv: tests only
+
+	// launchHelper starts the native encoder helper for a session; nil when
+	// the host has none (helperMissing says why: not Windows, host config
+	// "pipeline" "ffmpeg", or recon-encoder.exe missing).
+	launchHelper  func(log *slog.Logger) (*encoder.Helper, error)
+	helperMissing string
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -135,13 +142,14 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 	}
 	log.Info("ffmpeg ready", "version", caps.Version, "encoders", strings.Join(names, ","),
-		"ddagrab", caps.Filters["ddagrab"], "gfxcapture", caps.Filters["gfxcapture"], "intra_refresh", strings.Join(refresh, ","))
+		"ddagrab", caps.Filters["ddagrab"], "gfxcapture", caps.Filters["gfxcapture"], "vsrc_amf", caps.Filters["vsrc_amf"],
+		"intra_refresh", strings.Join(refresh, ","))
 	be, err := input.NewBackend()
 	if err != nil {
 		return nil, err
 	}
 	a := &Agent{
-		cfg: cfg, log: log, caps: caps, hostClock: media.NewClock(),
+		cfg: cfg, log: log, caps: caps, hostClock: media.NewHostClock(),
 		inj:         input.NewInjector(be),
 		audioSource: media.DefaultAudioSource(),
 		nonces:      map[string]int64{},
@@ -152,6 +160,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 			a.cfgMod = fi.ModTime()
 		}
 	}
+	a.setupHelper()
 	if v := os.Getenv(TestFaultsEnv); v != "" {
 		if a.faults, err = parseTestFaults(v); err != nil {
 			return nil, fmt.Errorf("%s: %w", TestFaultsEnv, err)
@@ -165,7 +174,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 }
 
 // clock is the host clock (µs) shared by frame timestamps and pongs.
-func (a *Agent) clock() uint64 { return a.hostClock() }
+func (a *Agent) clock() uint64 { return a.hostClock.Now() }
 
 func (a *Agent) monitors() []platform.Monitor {
 	mons, err := platform.Monitors()

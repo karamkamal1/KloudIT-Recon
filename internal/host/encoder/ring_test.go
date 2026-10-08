@@ -6,98 +6,17 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
-	"unsafe"
 )
 
-// testWriter is a Go copy of the producer in native/recon-encoder/src/ring.cpp
-// (RingWriter::write), used to test the reader without Windows.
-type testWriter struct {
-	mem            []byte
-	slots          uint64
-	slotSize       uint64
-	written        uint64
-	dropped        uint64
-	droppedPending uint32
-}
-
-func newTestRing(t *testing.T, slots, slotSize int) (*Ring, *testWriter) {
+// newTestRing returns a reader and the Go copy of the helper's producer
+// (fake.go) on one ring.
+func newTestRing(t *testing.T, slots, slotSize int) (*Ring, *ringWriter) {
 	t.Helper()
-	size, err := RingSize(slots, slotSize)
+	r, w, err := newFakeRing(slots, slotSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mem := make([]byte, size)
-	if err := InitRing(mem, slots, slotSize); err != nil {
-		t.Fatal(err)
-	}
-	r, err := NewRing(mem, slots, slotSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binary.LittleEndian.PutUint64(mem[offQPCFrequency:], 10_000_000)
-	return r, &testWriter{mem: mem, slots: uint64(slots), slotSize: uint64(slotSize)}
-}
-
-func (w *testWriter) counter(off int) *uint64 { return (*uint64)(unsafe.Pointer(&w.mem[off])) }
-
-// write publishes f; it returns false when the frame was dropped (ring full or too large).
-func (w *testWriter) write(f *Frame) bool { return w.writeMangled(f, nil) }
-
-// writeMangled is write with a hook that can corrupt the slot before it is published.
-func (w *testWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
-	read := atomic.LoadUint64(w.counter(offReadCount))
-	if uint64(len(f.Data)) > w.slotSize-slotHeaderSize || w.written-read == w.slots {
-		w.dropped++
-		w.droppedPending++
-		atomic.StoreUint64(w.counter(offDropped), w.dropped)
-		return false
-	}
-	s := w.mem[ringHeaderSize+(w.written%w.slots)*w.slotSize:]
-	clear(s[:slotHeaderSize])
-	le := binary.LittleEndian
-	var flags uint32
-	if f.Key {
-		flags |= FlagKey
-	}
-	if f.Recovery {
-		flags |= FlagRecovery
-	}
-	if f.Repeat {
-		flags |= FlagRepeat
-	}
-	if w.droppedPending > 0 {
-		flags |= FlagDroppedBefore
-	}
-	le.PutUint64(s[slotSeq:], w.written)
-	le.PutUint64(s[slotFrameID:], f.FrameID)
-	le.PutUint32(s[slotFlags:], flags)
-	le.PutUint32(s[slotGen:], f.Gen)
-	le.PutUint32(s[slotPayloadOffset:], slotHeaderSize)
-	le.PutUint32(s[slotPayloadSize:], uint32(len(f.Data)))
-	le.PutUint64(s[slotPresentQPC:], uint64(f.PresentQPC))
-	le.PutUint64(s[slotCaptureQPC:], uint64(f.CaptureQPC))
-	le.PutUint64(s[slotSubmitQPC:], uint64(f.SubmitQPC))
-	le.PutUint64(s[slotOutputQPC:], uint64(f.OutputQPC))
-	le.PutUint64(s[slotRefFloor:], f.RefFloor)
-	le.PutUint32(s[slotLTRSlot:], uint32(f.LTRSlot))
-	le.PutUint32(s[slotTemporalLayer:], f.TemporalLayer)
-	le.PutUint32(s[slotRefLTRMask:], f.RefLTRMask)
-	le.PutUint32(s[slotDroppedBefore:], w.droppedPending)
-	le.PutUint32(s[slotWidth:], f.Width)
-	le.PutUint32(s[slotHeight:], f.Height)
-	copy(s[slotHeaderSize:], f.Data)
-	if mangle != nil {
-		mangle(s)
-	}
-	atomic.StoreUint64(w.counter(offWriteCount), w.written+1)
-	w.written++
-	w.droppedPending = 0
-	return true
-}
-
-// slot returns the bytes of the slot that write index i lands in.
-func (w *testWriter) slot(i uint64) []byte {
-	return w.mem[ringHeaderSize+(i%w.slots)*w.slotSize:]
+	return r, w
 }
 
 func TestRingGeometry(t *testing.T) {
@@ -243,15 +162,15 @@ func TestRingCorrupt(t *testing.T) {
 	le := binary.LittleEndian
 	for _, c := range []struct {
 		name   string
-		mangle func(w *testWriter)
+		mangle func(w *ringWriter)
 	}{
-		{"writeCount beyond the ring", func(w *testWriter) { atomic.StoreUint64(w.counter(offWriteCount), 3) }},
-		{"writeCount behind readCount", func(w *testWriter) { atomic.StoreUint64(w.counter(offWriteCount), ^uint64(0)) }},
-		{"slot sequence", func(w *testWriter) { le.PutUint64(w.slot(0)[slotSeq:], 7) }},
-		{"payload offset inside header", func(w *testWriter) { le.PutUint32(w.slot(0)[slotPayloadOffset:], 64) }},
-		{"payload offset past slot", func(w *testWriter) { le.PutUint32(w.slot(0)[slotPayloadOffset:], 70<<10) }},
-		{"payload size past slot", func(w *testWriter) { le.PutUint32(w.slot(0)[slotPayloadSize:], 64<<10-127) }},
-		{"payload size wraps", func(w *testWriter) { le.PutUint32(w.slot(0)[slotPayloadSize:], ^uint32(0)) }},
+		{"writeCount beyond the ring", func(w *ringWriter) { atomic.StoreUint64(w.counter(offWriteCount), 3) }},
+		{"writeCount behind readCount", func(w *ringWriter) { atomic.StoreUint64(w.counter(offWriteCount), ^uint64(0)) }},
+		{"slot sequence", func(w *ringWriter) { le.PutUint64(w.slot(0)[slotSeq:], 7) }},
+		{"payload offset inside header", func(w *ringWriter) { le.PutUint32(w.slot(0)[slotPayloadOffset:], 64) }},
+		{"payload offset past slot", func(w *ringWriter) { le.PutUint32(w.slot(0)[slotPayloadOffset:], 70<<10) }},
+		{"payload size past slot", func(w *ringWriter) { le.PutUint32(w.slot(0)[slotPayloadSize:], 64<<10-127) }},
+		{"payload size wraps", func(w *ringWriter) { le.PutUint32(w.slot(0)[slotPayloadSize:], ^uint32(0)) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r, w := newTestRing(t, 2, 64<<10)

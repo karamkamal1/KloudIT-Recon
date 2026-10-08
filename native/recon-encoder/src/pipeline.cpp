@@ -63,6 +63,12 @@ Status Pipeline::setRate(const RateParams& r) {
 
 void Pipeline::captureLoop() {
     uint64_t nextId = 1;
+    // Sequences (forceIdr): seqBase is the frame id of the latest sequence
+    // start, whose barcode value is 0; idrServed counts the forceIdr requests
+    // the last sequence start answered. A start stays pending until a frame
+    // is submitted (not dropped before the encoder, not refused as busy).
+    uint64_t seqBase = 1, idrServed = 0;
+    bool firstPending = true;
     int64_t lastPoolWarn = 0, lastBusyWarn = 0;
     while (!stop_) {
         CapturedFrame frame;
@@ -94,11 +100,26 @@ void Pipeline::captureLoop() {
         info.captureQpc = frame.captureQpc;
         info.repeat = frame.repeat;
         info.dirtyPct = frame.dirtyPct;
+        const uint64_t idrWanted = idrRequests_.load();
+        bool idr = idrWanted != idrServed;
+        if (idr) {
+            // Recorded by the backend and applied to the next submitted frame:
+            // this one (or, should it be dropped or refused as busy, the next
+            // capture, which asks again).
+            Status fs = enc_.forceIdr();
+            if (!fs.ok) {
+                rep_.error(fs, "forceIdr");
+                idrServed = idrWanted;  // do not repeat a refused request with every frame
+                idr = false;
+            }
+        }
+        info.seqStart = firstPending || idr;
+        const uint64_t base = info.seqStart ? info.frameId : seqBase;
         EncoderFrame ef;
         ef.captured = &frame;
         if (opt_.converter && frame.texture) {
             d3d::ConvertedFrame cf;
-            Status cs = opt_.converter->convert(frame.texture, frame.rotation, info.frameId, cf);
+            Status cs = opt_.converter->convert(frame.texture, frame.rotation, uint16_t(info.frameId - base), cf);
             if (!cs.ok) {
                 cap_.release(frame);
                 if (cs.code == "pool_exhausted") {
@@ -139,6 +160,11 @@ void Pipeline::captureLoop() {
             continue;
         }
         ++nextId;
+        if (s.ok && info.seqStart) {
+            seqBase = info.frameId;
+            firstPending = false;
+            if (idr) idrServed = idrWanted;  // requests that arrived since are answered by the next frame
+        }
         if (!s.ok) {
             if (s.fatal) {
                 rep_.fatal(s);

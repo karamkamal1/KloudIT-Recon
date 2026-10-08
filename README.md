@@ -288,7 +288,8 @@ The new password (at least 10 characters) is read from stdin.
 | Key | Default | Meaning |
 |---|---|---|
 | `capture` | `auto` | `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion; never chosen by `auto`. The agent uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6) |
-| `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` |
+| `pipeline` | `auto` | Video pipeline: `auto` streams with the native encoder helper `recon-encoder.exe` (installed next to `recon-host.exe`: DXGI / AMD Direct Capture / WGC capture, AMF or NVENC in the running process, so key frames and bitrate changes need no encoder restart) when it starts, has an encoder for the codec negotiated with the browser and the session needs nothing only FFmpeg offers (the cursor drawn into the video, a window capture without Windows.Graphics.Capture in the helper, `capture` `x11grab` or `test`, an FFmpeg `encoder` forced here); otherwise FFmpeg. `helper` also streams the test pattern (`capture` `test`) with the helper's synthetic GPU source and tells the user when it cannot use the helper; `ffmpeg` never uses it. Three helper failures within 60 s move the session to FFmpeg. host.log says which pipeline a session uses and why (`video pipeline`). Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.1b |
+| `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` (FFmpeg), or a helper encoder such as `hevc_amf_helper` |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
@@ -296,7 +297,7 @@ The new password (at least 10 characters) is read from stdin.
 | `congestion` | `reno` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency. With `capture` `amf` the FFmpeg chain keeps that wall-clock pts (`vsrc_amf`'s own pts are rounded to 1/fps), and `off` only stops sending capture stamps to the client |
-| `gpuPriority` | `auto` | GPU scheduling priority of the FFmpeg capture/encode process, so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
+| `gpuPriority` | `auto` | GPU scheduling priority of the capture/encode process (FFmpeg, or the native helper, which applies the same rules to itself), so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 
@@ -363,7 +364,7 @@ Repository layout:
 | `third_party/quic-go` | quic-go with a pluggable congestion-control hook (`go.mod` replace; see `third_party/README.md`) |
 | `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |
 | `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline) |
-| `native/recon-encoder`, `internal/host/encoder` | Native capture/encode helper (C++, in progress) and its Go client; see `docs/HELPER_PROTOCOL.md` |
+| `native/recon-encoder`, `internal/host/encoder` | Native capture/encode helper (C++) and its Go client; `internal/host/media/helper.go` is the session's pipeline on it. See `docs/HELPER_PROTOCOL.md` |
 | `deploy/` | Proxmox, Linux, Docker and Windows installers |
 | `test/e2e`, `internal/e2e` | Browser end-to-end test; Go integration test (gateway + agent) |
 
@@ -373,7 +374,7 @@ make build       # dist/recon-gateway, dist/recon-host (Linux host = test patter
 make e2e         # real gateway + host + headless Chromium, latency rig flash page (npm i in test/e2e first)
 make release     # all bundles + SHA256SUMS
 make helper      # dist/windows/recon-encoder.exe (needs mingw-w64 + cmake; skipped without them)
-make helper-test # helper integration tests under Wine (WINE=path/to/wine64)
+make helper-test # helper integration tests under Wine (WINE=path/to/wine64; run under xvfb-run -a -s "-screen 0 1280x720x24" for the GPU tests)
 ```
 
 On Linux the host agent streams a test pattern (`capture: test`) or an X11 display

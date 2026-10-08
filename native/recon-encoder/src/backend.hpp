@@ -125,6 +125,10 @@ struct SubmitInfo {
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0;
     bool repeat = false;
     int dirtyPct = -1;
+    // The frame starts a new sequence (ring flag SEQ_START): the stream's first
+    // frame, or the frame a forceIdr made an IDR (Pipeline::forceIdr calls
+    // Backend::forceIdr right before submitting it). Its barcode value is 0.
+    bool seqStart = false;
 };
 
 // EncodedFrame is one access unit / temporal unit. data stays valid until

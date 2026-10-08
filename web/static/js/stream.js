@@ -230,6 +230,9 @@ function onWorker(m) {
       break;
     case 'welcome': S.welcome = m.info; buildDrawer(); break;
     case 'video': S.videoCfg = m.cfg; break;
+    case 'rate':
+      if (S.videoCfg?.gen === m.gen) S.videoCfg = { ...S.videoCfg, bitrate: m.bitrate, maxBitrate: m.maxBitrate ?? S.videoCfg.maxBitrate };
+      break;
     case 'audio': S.audioCfg = m.cfg; break;
     case 'resolution': S.video = { w: m.w, h: m.h }; break;
     case 'firstFrame':
@@ -581,8 +584,10 @@ function toggleStats() {
   updateToolbarState();
 }
 
+// present, submit and encode: frames of the native encoder helper only.
 const STAGE_LABELS = [
-  ['capture', 'capture→encoded'], ['queue', 'host queue'], ['network', 'network'], ['transfer', 'transfer'],
+  ['present', 'game present→capture'], ['capture', 'capture→encoded'], ['submit', '  capture→encoder'], ['encode', '  encode'],
+  ['queue', 'host queue'], ['network', 'network'], ['transfer', 'transfer'],
   ['wait', 'reorder/wait'], ['decode', 'decode'], ['draw', 'draw'], ['display', '+ display (est.)'],
 ];
 const fmt = (v, d = 1, unit = ' ms') => (v === null || v === undefined || !isFinite(v) ? '—' : `${v.toFixed(d)}${unit}`);

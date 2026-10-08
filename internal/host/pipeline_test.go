@@ -1,0 +1,376 @@
+package host
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"os/exec"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
+	"github.com/karamkamal1/kloudit-recon/internal/host/input"
+	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
+)
+
+// helperCaps returns a helper's caps message with the given codecs (JSON
+// object members), capture methods and cursorInVideo.
+func helperCaps(codecs, capture string, cursor bool) string {
+	return `{"t":"caps","v":1,"backend":"amf","vendor":"amd","adapterName":"AMD Radeon RX 7900 XT","hagsEnabled":true,` +
+		`"codecs":{` + codecs + `},"capture":[` + capture + `],"cursorInVideo":` + map[bool]string{true: "true", false: "false"}[cursor] +
+		`,"outputs":[],"unavailable":{"wgc":"this build has no C++/WinRT headers"},"qpcFrequency":10000000}`
+}
+
+const (
+	fakeH264 = `"h264":{"maxW":4096,"maxH":2304,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":1,"alignH":1}`
+	fakeHEVC = `"hevc":{"maxW":8192,"maxH":4352,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":1,"alignH":1}`
+)
+
+func TestHelperBlocker(t *testing.T) {
+	dda := encoder.Caps{Capture: []string{"dda"}, Unavailable: map[string]string{"wgc": "no WinRT"}}
+	all := encoder.Caps{Capture: []string{"dda", "amd-direct", "wgc"}}
+	for _, c := range []struct {
+		name       string
+		cfg        Config
+		prefs      proto.Prefs
+		drawCursor bool
+		caps       *encoder.Caps
+		want       string // substring; "" = the helper can serve the session
+	}{
+		{"auto, dda", Config{Capture: "auto"}, proto.Prefs{}, false, &dda, ""},
+		{"before the caps", Config{Capture: "auto"}, proto.Prefs{}, true, nil, ""},
+		{"x11grab", Config{Capture: "x11grab"}, proto.Prefs{}, false, nil, "x11grab"},
+		{"test pattern, auto", Config{Capture: "test"}, proto.Prefs{}, true, nil, "test pattern"},
+		{"test pattern, helper", Config{Capture: "test", Pipeline: "helper"}, proto.Prefs{}, true, &encoder.Caps{}, ""},
+		{"FFmpeg encoder forced", Config{Capture: "auto", Encoder: "hevc_amf"}, proto.Prefs{}, false, nil, "hevc_amf"},
+		{"helper encoder forced", Config{Capture: "auto", Encoder: "hevc_amf_helper"}, proto.Prefs{}, false, &dda, ""},
+		{"cursor in the video", Config{Capture: "auto"}, proto.Prefs{}, true, &dda, "cursor"},
+		{"cursor in the video, helper draws it", Config{Capture: "auto"}, proto.Prefs{}, true,
+			&encoder.Caps{Capture: []string{"dda"}, CursorInVideo: true}, ""},
+		{"window without WGC", Config{Capture: "auto"}, proto.Prefs{Window: "Notepad"}, false, &dda, "wgc (no WinRT)"},
+		{"window with WGC", Config{Capture: "auto"}, proto.Prefs{Window: "Notepad"}, false, &all, ""},
+		{"gfxcapture without WGC", Config{Capture: "gfxcapture"}, proto.Prefs{}, false, &dda, "wgc"},
+		{"AMD Direct Capture missing", Config{Capture: "amf"}, proto.Prefs{}, false, &dda, "amd-direct"},
+		{"AMD Direct Capture", Config{Capture: "amf"}, proto.Prefs{}, false, &all, ""},
+		{"no DDA", Config{Capture: "ddagrab"}, proto.Prefs{}, false, &encoder.Caps{Capture: []string{"amd-direct"}}, "dda"},
+	} {
+		cfg := c.cfg
+		s := &Session{a: &Agent{cfg: &cfg}}
+		got := s.helperBlocker(c.prefs, c.drawCursor, c.caps)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// fakeLauncher launches fake helpers for sessions.
+type fakeLauncher struct {
+	caps    string
+	handle  encoder.FakeHandler
+	err     error
+	mu      sync.Mutex
+	fakes   []*encoder.Fake
+	started chan *encoder.Fake
+}
+
+func (l *fakeLauncher) launch(*slog.Logger) (*encoder.Helper, error) {
+	if l.err != nil {
+		return nil, l.err
+	}
+	h, f, err := encoder.LaunchFake(l.caps, func(f *encoder.Fake, m map[string]any) {
+		if l.handle != nil {
+			l.handle(f, m)
+		}
+		if m["t"] == "start" && l.started != nil {
+			l.started <- f
+		}
+	})
+	if err == nil {
+		l.mu.Lock()
+		l.fakes = append(l.fakes, f)
+		l.mu.Unlock()
+	}
+	return h, err
+}
+
+func (l *fakeLauncher) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.fakes)
+}
+
+// TestOpenPipeline: the session's pipeline decision, logged once with its
+// reason.
+func TestOpenPipeline(t *testing.T) {
+	ffmpegCaps := &media.Caps{Encoders: []media.EncoderInfo{{Name: "libx264", Family: "h264", Vendor: "software"},
+		{Name: "libsvtav1", Family: "av1", Vendor: "software"}}}
+	h264, av1HW := []proto.DecoderInfo{{Family: "h264", HW: true}}, []proto.DecoderInfo{{Family: "av1", HW: true}}
+	for _, c := range []struct {
+		name     string
+		cfg      Config
+		missing  string
+		launcher *fakeLauncher
+		decoders []proto.DecoderInfo
+		helper   bool
+		reason   string // in the log line
+		notice   string
+	}{
+		{"not installed", Config{Capture: "test", Pipeline: "helper"}, "recon-encoder.exe is not installed", nil, h264, false,
+			"not installed", "not installed"},
+		{"launch fails", Config{Capture: "test", Pipeline: "helper"}, "", &fakeLauncher{err: errors.New("CreateProcess: access denied")}, h264,
+			false, "did not start", "did not start"},
+		{"no usable encoder", Config{Capture: "test", Pipeline: "helper"}, "", &fakeLauncher{caps: helperCaps(``, `"dda"`, false)}, h264,
+			false, "no usable encoder", "no usable encoder"},
+		{"codec not in the helper", Config{Capture: "test", Pipeline: "helper"}, "", &fakeLauncher{caps: helperCaps(fakeH264, `"dda"`, false)},
+			av1HW, false, "libsvtav1", "libsvtav1"},
+		{"test pattern in auto", Config{Capture: "test"}, "", &fakeLauncher{caps: helperCaps(fakeH264, `"dda"`, false)}, h264, false,
+			"test pattern", ""},
+		{"helper", Config{Capture: "test", Pipeline: "helper"}, "", &fakeLauncher{caps: helperCaps(fakeH264+","+fakeHEVC, `"dda"`, false)},
+			h264, true, "", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := c.cfg
+			cfg.Defaults()
+			logs := &lockedLog{}
+			a := &Agent{cfg: &cfg, caps: ffmpegCaps, hostClock: media.NewHostClock(), helperMissing: c.missing}
+			if c.launcher != nil {
+				a.launchHelper = c.launcher.launch
+			}
+			s := &Session{a: a, hello: proto.Hello{Decoders: c.decoders}, tried: map[string]bool{}, usage: map[string]string{},
+				ctx: context.Background(), ctrl: &fakeCtrl{}, log: slog.New(slog.NewTextHandler(logs, nil))}
+			notice := s.openPipeline()
+			defer s.vid().Stop()
+			_, isHelper := s.vid().(*media.HelperVideo)
+			lines := logs.lines(`msg="video pipeline"`)
+			if isHelper != c.helper || len(lines) != 1 || !strings.Contains(lines[0], c.reason) {
+				t.Fatalf("helper %v, log %q; want helper %v with %q", isHelper, lines, c.helper, c.reason)
+			}
+			if (notice == "") != (c.notice == "") || !strings.Contains(notice, c.notice) {
+				t.Fatalf("notice %q, want %q", notice, c.notice)
+			}
+			names := encoderNames(s.encoders())
+			if c.helper != strings.HasPrefix(names, "hevc_amf_helper,h264_amf_helper,libx264") {
+				t.Fatalf("encoders %s", names)
+			}
+			if c.launcher != nil && c.launcher.count() > 0 && !c.helper {
+				select {
+				case <-c.launcher.fakes[0].Exited():
+				case <-time.After(5 * time.Second):
+					t.Fatal("the unused helper was not closed")
+				}
+			}
+		})
+	}
+}
+
+// TestSessionOnHelper drives a session on the (fake) native helper: the
+// stream starts in the helper with the test pattern's barcode, key frame
+// requests and bitrate changes act in the running encoder (no restart, no
+// new helper), losses in the helper are reported to the client, and repeated
+// helper failures move the session to FFmpeg.
+func TestSessionOnHelper(t *testing.T) {
+	var mu sync.Mutex
+	failing := false
+	l := &fakeLauncher{caps: helperCaps(fakeH264, `"dda"`, false), started: make(chan *encoder.Fake, 8)}
+	l.handle = func(f *encoder.Fake, m map[string]any) {
+		if m["t"] != "start" {
+			return
+		}
+		mu.Lock()
+		fail := failing
+		mu.Unlock()
+		if fail {
+			f.Send(encoder.HelperError{Code: "device_lost", Text: "TDR (test)", Fatal: true})
+			f.Exit(3)
+			return
+		}
+		f.Send(encoder.Started{Backend: "amf", Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30,
+			Kbps: int(m["kbps"].(float64)), LiveBitrate: "seamless", Barcode: true})
+	}
+	ff, _ := exec.LookPath("ffmpeg")
+	caps := &media.Caps{}
+	if ff != "" {
+		if c, err := media.Probe(context.Background(), ff, nil); err == nil {
+			caps = c
+		}
+	}
+	cfg := &Config{Capture: "test", Pipeline: "helper", TestWidth: 320, TestHeight: 180, DefaultFPS: 30, MaxFPS: 60,
+		DefaultKbps: 4000, MaxKbps: 100000}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &lockedLog{}
+	ctrl := &fakeCtrl{}
+	s := &Session{
+		a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch},
+		hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}}},
+		tried: map[string]bool{}, usage: map[string]string{}, encFails: map[string]int{},
+		ctx: ctx, cancel: cancel, ctrl: ctrl, frameQ: make(chan *media.Frame, 64), pipeSwap: make(chan struct{}, 1),
+		log: slog.New(slog.NewTextHandler(logs, nil)),
+	}
+	if n := s.openPipeline(); n != "" {
+		t.Fatalf("notice %q", n)
+	}
+	defer func() { s.vid().Stop() }()
+	go s.videoEvents()
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	f := <-l.started
+	m := expectFakeMsg(t, f, "start")
+	if bc, _ := m["barcode"].(map[string]any); m["capture"] != "synthetic-gpu" || m["width"] != float64(320) || bc["cell"] != float64(16) {
+		t.Fatalf("start %v", m)
+	}
+	key := []byte{0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xac, 0, 0, 0, 1, 0x68, 0xeb, 0, 0, 0, 1, 0x65, 0x88}
+	nextFrame := func() *media.Frame {
+		t.Helper()
+		select {
+		case fr := <-s.frameQ:
+			return fr
+		case <-time.After(5 * time.Second):
+			t.Fatal("no frame reached the session")
+		}
+		return nil
+	}
+	f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+	if fr := nextFrame(); fr.Gen != 1 || fr.Seq != 0 || !fr.Key {
+		t.Fatalf("first frame %+v", fr)
+	}
+	if c := s.vid().Capabilities(); !c.ForceIDR || !c.LiveBitrate {
+		t.Fatalf("capabilities %+v", c)
+	}
+
+	// A key frame request: an IDR in the running encoder, a new generation.
+	s.requestKeyframe()
+	expectFakeMsg(t, f, "forceIdr")
+	f.Publish(&encoder.Frame{FrameID: 2, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 3, OutputQPC: 4})
+	if fr := nextFrame(); fr.Gen != 2 || fr.Seq != 0 {
+		t.Fatalf("forced key frame %+v", fr)
+	}
+
+	// A delay report: the bitrate changes in the encoder, the client hears of it.
+	s.congestion(120, signalDelay)
+	if m := expectFakeMsg(t, f, "setRate"); m["kbps"] != float64(3000) {
+		t.Fatalf("setRate %v", m)
+	}
+
+	// Frames the helper dropped: reported to the client, and a key frame.
+	s.kickMu.Lock()
+	s.lastKick = time.Time{}
+	s.kickMu.Unlock()
+	f.Publish(&encoder.Frame{FrameID: 5, LTRSlot: -1, DroppedBefore: 2, Data: []byte{0, 0, 0, 1, 0x41}, CaptureQPC: 5, OutputQPC: 6})
+	if fr := nextFrame(); fr.Gen != 2 || fr.Seq != 3 {
+		t.Fatalf("frame after the loss %+v", fr)
+	}
+	expectFakeMsg(t, f, "forceIdr")
+	if l := logs.lines(`msg="restarting video"`); len(l) != 0 {
+		t.Fatalf("restarts on the helper: %q", l)
+	}
+	select {
+	case <-l.started: // (the spare helper kept beside the stream is launched, not started)
+		t.Fatal("a second helper started a stream")
+	default:
+	}
+	waitMsg(t, ctrl, `"t":"rate"`, `"bitrate":3000`)
+	waitMsg(t, ctrl, `"t":"dropped"`, `"gen":2`, `"fromSeq":1`, `"count":2`) // sent asynchronously
+	waitMsg(t, ctrl, `"t":"video"`, `"gen":2`, `"encoder":"h264_amf_helper"`)
+
+	// Three failures within a minute: the session continues on FFmpeg, its
+	// generations after the helper's.
+	mu.Lock()
+	failing = true
+	mu.Unlock()
+	f.Send(encoder.HelperError{Code: "device_lost", Text: "TDR (test)", Fatal: true})
+	f.Exit(3)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok := s.vid().(*media.Video); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the session did not fall back to FFmpeg")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if l := logs.lines(`msg="video pipeline" pipeline=ffmpeg was=helper`); len(l) != 1 || !strings.Contains(l[0], "failed too often") {
+		t.Fatalf("fallback log %q", l)
+	}
+	waitMsg(t, ctrl, `"t":"notice"`, "streaming with FFmpeg")
+	if len(caps.Encoders) == 0 {
+		t.Skip("no ffmpeg: the FFmpeg generation cannot start here")
+	}
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		fr := nextFrame()
+		if fr.Gen > 2 {
+			break // gen 3 and later: an FFmpeg generation (helper restarts never went live)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no FFmpeg frames")
+		}
+	}
+	if l := logs.lines(`msg="starting encoder"`); len(l) == 0 || strings.Contains(l[0], "_helper") {
+		t.Fatalf("FFmpeg start %q", l)
+	}
+}
+
+func expectFakeMsg(t *testing.T, f *encoder.Fake, typ string) map[string]any {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case m := <-f.Messages():
+			if m["t"] == typ {
+				return m
+			}
+		case <-deadline:
+			t.Fatalf("the helper got no %s", typ)
+		}
+	}
+}
+
+// messages returns the control messages written so far.
+func (c *fakeCtrl) messages(t *testing.T) []string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := bytes.NewReader(c.buf.Bytes())
+	var out []string
+	for b.Len() > 0 {
+		m, err := proto.ReadMsg(b, proto.MaxControlMsg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v map[string]any
+		if json.Unmarshal(m, &v) == nil {
+			out = append(out, string(m))
+		}
+	}
+	return out
+}
+
+// waitMsg waits for a control message that contains all parts.
+func waitMsg(t *testing.T, c *fakeCtrl, parts ...string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !hasMsg(c.messages(t), parts...); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no control message with %q in %q", parts, c.messages(t))
+		}
+	}
+}
+
+func hasMsg(msgs []string, parts ...string) bool {
+	for _, m := range msgs {
+		ok := true
+		for _, p := range parts {
+			ok = ok && strings.Contains(m, p)
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}

@@ -30,8 +30,11 @@ import (
 type EncoderInfo struct {
 	Name   string `json:"name"`
 	Family string `json:"family"` // h264 | hevc | av1
-	Vendor string `json:"vendor"` // nvidia | amd | intel | vaapi | software
+	Vendor string `json:"vendor"` // nvidia | amd | intel | vaapi | software (native helper: its caps vendor)
 	HW     bool   `json:"hw"`
+	// Helper: a codec of the native encoder helper (HelperEncoders), encoded
+	// by HelperVideo instead of an FFmpeg encoder.
+	Helper bool `json:"helper,omitempty"`
 }
 
 // Caps is the result of probing the local ffmpeg build and GPU.
@@ -102,21 +105,21 @@ var intraRefreshEncoders = map[string]bool{"h264_nvenc": true, "hevc_nvenc": tru
 
 // candidate encoders in preference order within a family.
 var candidates = []EncoderInfo{
-	{"av1_nvenc", "av1", "nvidia", true},
-	{"hevc_nvenc", "hevc", "nvidia", true},
-	{"h264_nvenc", "h264", "nvidia", true},
-	{"av1_amf", "av1", "amd", true},
-	{"hevc_amf", "hevc", "amd", true},
-	{"h264_amf", "h264", "amd", true},
-	{"av1_qsv", "av1", "intel", true},
-	{"hevc_qsv", "hevc", "intel", true},
-	{"h264_qsv", "h264", "intel", true},
-	{"h264_vaapi", "h264", "vaapi", true},
-	{"hevc_vaapi", "hevc", "vaapi", true},
-	{"av1_vaapi", "av1", "vaapi", true},
-	{"libx264", "h264", "software", false},
-	{"libsvtav1", "av1", "software", false},
-	{"libaom-av1", "av1", "software", false},
+	{"av1_nvenc", "av1", "nvidia", true, false},
+	{"hevc_nvenc", "hevc", "nvidia", true, false},
+	{"h264_nvenc", "h264", "nvidia", true, false},
+	{"av1_amf", "av1", "amd", true, false},
+	{"hevc_amf", "hevc", "amd", true, false},
+	{"h264_amf", "h264", "amd", true, false},
+	{"av1_qsv", "av1", "intel", true, false},
+	{"hevc_qsv", "hevc", "intel", true, false},
+	{"h264_qsv", "h264", "intel", true, false},
+	{"h264_vaapi", "h264", "vaapi", true, false},
+	{"hevc_vaapi", "hevc", "vaapi", true, false},
+	{"av1_vaapi", "av1", "vaapi", true, false},
+	{"libx264", "h264", "software", false, false},
+	{"libsvtav1", "av1", "software", false, false},
+	{"libaom-av1", "av1", "software", false, false},
 }
 
 // FindFFmpeg locates the ffmpeg binary: explicit path, next to the executable,

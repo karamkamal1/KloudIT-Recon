@@ -62,17 +62,12 @@ Status bad(std::string text) { return Status::Error("bad_message", std::move(tex
 Status parseBarcode(const json& j, BarcodeLayout& b) {
     if (!j.is_object()) return bad("barcode must be an object");
     std::string err;
-    if (!optField(j, "x", b.x, err) || !optField(j, "y", b.y, err) || !optField(j, "blockW", b.blockW, err) ||
-        !optField(j, "blockH", b.blockH, err) || !optField(j, "cols", b.cols, err) || !optField(j, "bits", b.bits, err) ||
-        !optField(j, "msbFirst", b.msbFirst, err)) {
+    if (!optField(j, "x", b.x, err) || !optField(j, "y", b.y, err) || !optField(j, "cell", b.cell, err)) {
         return bad("barcode: " + err);
     }
-    // Even positions and sizes: every block covers whole 4:2:0 chroma samples.
+    // Even positions and sizes: every cell covers whole 4:2:0 chroma samples.
     if (!inRange(b.x, 0, 16384) || !inRange(b.y, 0, 16384) || (b.x & 1) || (b.y & 1)) return bad("barcode x/y must be even, 0..16384");
-    if (!inRange(b.blockW, 2, 256) || !inRange(b.blockH, 2, 256) || (b.blockW & 1) || (b.blockH & 1)) {
-        return bad("barcode blockW/blockH must be even, 2..256");
-    }
-    if (!inRange(b.cols, 1, 64) || !inRange(b.bits, 1, 64)) return bad("barcode cols and bits must be 1..64");
+    if (!inRange(b.cell, 2, 256) || (b.cell & 1)) return bad("barcode cell must be even, 2..256");
     b.enabled = true;
     return Status::Ok();
 }

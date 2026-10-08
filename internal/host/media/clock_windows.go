@@ -31,7 +31,7 @@ func monoMicros() int64 {
 	}
 	var c int64
 	qpc.Call(uintptr(unsafe.Pointer(&c)))
-	return c/qpcFreq*1_000_000 + c%qpcFreq*1_000_000/qpcFreq
+	return qpcMicros(c, qpcFreq)
 }
 
 // wallMicros reads the same clock as FFmpeg's av_gettime() in the MinGW-w64

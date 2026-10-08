@@ -53,6 +53,43 @@ func TestVideoHeader(t *testing.T) {
 	if _, ok := ext.Get(proto.ExtCaptureUs); ok {
 		t.Fatal("capture tag sent without a capture stamp")
 	}
+	for _, tag := range []byte{proto.ExtPresentUs, proto.ExtEncodeSubmitUs, proto.ExtRefFloor, proto.ExtLTRSlot, proto.ExtTemporalLayer} {
+		if _, ok := ext.Get(tag); ok {
+			t.Fatalf("tag %d sent for an FFmpeg frame", tag)
+		}
+	}
+
+	// A native helper's frame: its stages and recovery metadata (tags 1, 3,
+	// 5-7; refFloor only on recovery frames, 0 included), round trip through
+	// the wire format; v1 clients still get the plain header.
+	f = &media.Frame{Gen: 4, Seq: 9, PresentUs: 800, CaptureUs: 900, SubmitUs: 1200, EncodeDoneUs: 5000,
+		Recovery: true, RefFloor: 0, MarkedLTR: true, LTRSlot: 1, TemporalLayer: 1, Data: []byte{1, 2, 3}}
+	h, ext = videoHeader(f, proto.HelloVersionFrameExt, now)
+	b := make([]byte, proto.FrameHeaderLen)
+	h.Marshal(b)
+	b = append(ext.Append(b), f.Data...)
+	_, got, payload, err := proto.ParseFrame(b)
+	if err != nil || !bytes.Equal(payload, f.Data) {
+		t.Fatalf("parse: %v %v", err, payload)
+	}
+	for tag, want := range map[byte]uint64{proto.ExtPresentUs: 800, proto.ExtCaptureUs: 900, proto.ExtEncodeSubmitUs: 1200,
+		proto.ExtEncodeDoneUs: 5000, proto.ExtRefFloor: 0, proto.ExtLTRSlot: 1, proto.ExtTemporalLayer: 1} {
+		if v, ok := got.Get(tag); !ok || v != want {
+			t.Errorf("tag %d = %d %v, want %d", tag, v, ok, want)
+		}
+	}
+	f.Recovery, f.MarkedLTR, f.TemporalLayer = false, false, 0
+	if _, ext = videoHeader(f, proto.HelloVersionFrameExt, now); !func() bool {
+		_, r := ext.Get(proto.ExtRefFloor)
+		_, l := ext.Get(proto.ExtLTRSlot)
+		_, tl := ext.Get(proto.ExtTemporalLayer)
+		return !r && !l && !tl
+	}() {
+		t.Fatal("recovery tags on a frame without recovery metadata")
+	}
+	if h, ext = videoHeader(f, 1, now); h.Flags&proto.FrameFlagExt != 0 || !ext.Empty() {
+		t.Fatal("v1 client got the extension")
+	}
 }
 
 // TestEncoderFailureFallback drives the failure handler with the video
@@ -242,7 +279,7 @@ func TestMediaTargetSurvivesMigration(t *testing.T) {
 	}
 
 	s := &Session{
-		a: &Agent{hostClock: media.NewClock()}, c: transport.FromQUIC(server), ctx: ctx, frameQ: make(chan *media.Frame, 6),
+		a: &Agent{hostClock: media.NewHostClock()}, c: transport.FromQUIC(server), ctx: ctx, frameQ: make(chan *media.Frame, 6),
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	go s.frameSender()
@@ -376,7 +413,7 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		logs := &lockedLog{}
 		s := &Session{
-			a:     &Agent{cfg: cfg, caps: &c, inj: input.NewInjector(nil), hostClock: media.NewClock()},
+			a:     &Agent{cfg: cfg, caps: &c, inj: input.NewInjector(nil), hostClock: media.NewHostClock()},
 			hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: enc.Family}}},
 			tried: map[string]bool{}, usage: map[string]string{},
 			ctx: ctx, cancel: cancel, ctrl: &fakeCtrl{}, frameQ: make(chan *media.Frame, 6),

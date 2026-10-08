@@ -33,6 +33,17 @@ caller (the session), not in `internal/host/encoder`; the client only kills a he
 is still running 500 ms after reporting a fatal error, so `Done` follows the fatal error
 promptly.
 
+The caller is `media.HelperVideo` (`internal/host/media/helper.go`, step 3.1b), the
+session's video pipeline on the helper: it starts the replacement as soon as the fatal
+`error` arrives (not after the exit), keeps a spare helper launched (caps read, nothing
+started) while a stream is live so a restart skips the process start and the caps probe
+(under Wine: 175-191 ms from the failure to the new helper's first frame, 700-760 ms
+without the spare), and after three failures within 60 s (a fatal error, an exit, a
+refused `start`) gives the session back to FFmpeg. A zero-copy stream that ends with
+`capture_failed` is restarted as it was once; the second time the new helper gets
+`zeroCopy` false. It sends `ack` for every frame with `ltrSlot >= 0` the client
+acknowledges and `recover` when the session asks (GUIDE 3.5 wires the client side).
+
 The helper exits on its own when stdin reaches EOF, so it never outlives recon-host. Once
 it has decided to exit (fatal error, `shutdown`, stdin EOF or a broken stdout) it must be
 gone within 500 ms: a watchdog thread then terminates the process (exit code 4), so a
@@ -50,6 +61,7 @@ recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
                   [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
                   [--dump-nv12=PATH]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
+recon-encoder.exe --gpu-priority-table              # the GPU priority decision table (see GPU priority)
 recon-encoder.exe --self-test-convert               # GPU colour conversion on WARP (see Self-tests)
 recon-encoder.exe --self-test-pacer                 # frame pacing policy (see Self-tests)
 recon-encoder.exe --self-test-encoder               # recovery policies, parameter sets, ROI maps, NVENC settings (see Self-tests)
@@ -106,7 +118,7 @@ ignored by recon-host.
 | `t` | Fields | Meaning |
 |---|---|---|
 | `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr`), `quality` (`speed` \| `balanced` \| `quality`), `hdr`, `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
-| `forceIdr` | | Next frame is an IDR / key frame (in the running encoder). |
+| `forceIdr` | | Next frame is an IDR / key frame (in the running encoder), and starts a new sequence: its ring slot has SEQ_START and its barcode value is 0 (step 3.1b; recon-host starts a new stream generation there). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: every frame from `lostFromFrameId` to the newest one is invalidated and the next frame references an older one (`ackedLtrFrameId` is not used); AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without a usable reference an IDR. |
 | `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
 | `setRate` | `kbps`, `vbvFrames` (0 = unchanged), `fps` (0 = unchanged) | New target. No IDR unless the codec's `liveBitrate` is `flush`. |
@@ -115,7 +127,7 @@ ignored by recon-host.
 
 ```json
 {"t":"start","capture":"dda","monitor":0,"codec":"hevc","width":2560,"height":1440,"fps":120,"kbps":60000,"vbvFrames":1,"rc":"cbr","quality":"speed","ltrSlots":2}
-{"t":"start","hmonitor":65537,"codec":"hevc","fps":60,"kbps":20000,"gpuPriority":"auto","idleRepeatMs":100,"barcode":{"x":0,"y":0,"blockW":8,"blockH":8,"cols":16,"bits":32,"msbFirst":true}}
+{"t":"start","hmonitor":65537,"codec":"hevc","fps":60,"kbps":20000,"gpuPriority":"auto","idleRepeatMs":100,"barcode":{"x":0,"y":0,"cell":16}}
 {"t":"start","capture":"wgc","windowTitle":"Cyberpunk","codec":"hevc","fps":60,"kbps":30000}
 {"t":"start","capture":"dda","codec":"av1","fps":120,"kbps":50000,"ltrSlots":2,"liveBitrate":"flush","encoderInstance":1}
 {"t":"ack","frameId":1200}
@@ -341,7 +353,7 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 |---|---|---|
 | 0 | u64 | `seq`: the write index `n` this slot was written at |
 | 8 | u64 | `frameId`: helper frame counter, from 1, +1 per captured frame |
-| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0) |
+| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it) |
 | 20 | u32 | `gen`: encoder generation inside this helper (bumped on an in-helper re-init) |
 | 24 | u32 | `payloadOffset` from the slot start (>= 128) |
 | 28 | u32 | `payloadSize` in bytes |
@@ -485,6 +497,15 @@ encoder hangs with REALTIME + HAGS, Sunshine); `realtime` / `high` force one; `o
 leaves it. A refused REALTIME is retried as HIGH. The result is `started.gpuPriority` and
 a log line `gpu priority: realtime|high|failed|off (vendor, hags on|off|unknown)`.
 
+This is one decision table with recon-host, which applies it to the FFmpeg encoder process
+(`gpuPriorityClass` in `internal/host/media/gpuprio.go`), for the same config value (host
+config `gpuPriority`, passed as `start`'s `gpuPriority`). The helper's capture and encoder
+share one adapter, so "NVIDIA in the process" is that adapter's vendor.
+`recon-encoder.exe --gpu-priority-table` prints the helper's decision for every mode x
+vendor x HAGS state as JSON lines (`{"mode":"auto","vendor":"nvidia","hags":"unknown",
+"priority":"high"}`), and `TestGPUPriorityAgreesWithHelper` (internal/host/media, run by
+`make helper-test` and CI) checks every line against recon-host's table.
+
 ### Frame pacing
 
 GPU captures follow presents (DDA `AcquireNextFrame`, AMD `WAIT_FOR_PRESENT`, WGC frame
@@ -525,13 +546,19 @@ compiled at start with `D3DCompile` from System32's `d3dcompiler_47.dll` (no bui
 shader compiler needed; a few milliseconds). An odd capture size is encoded at the next
 smaller even size when `width`/`height` are 0.
 
-`barcode` draws the frame id into every frame in the same pass (GUIDE 0.2):
-`{"x","y","blockW","blockH","cols","bits","msbFirst"}`, all in output pixels after scaling;
-x, y, blockW, blockH even (whole chroma samples), blocks 2..256 pixels (GUIDE 0.2 wants
-at least 8x8 to survive compression), `cols` and `bits` 1..64. Block k (left to right,
-`cols` per row, top to bottom) shows bit `bits-1-k` of the frame id (`msbFirst`, default)
-or bit k: luma 235 for 1, 16 for 0, chroma 128. The value is the helper's `frameId`, the
-same id as in stats and the ring. The layout must fit the encoded size, else `bad_message`.
+`barcode` draws the frame barcode of GUIDE 0.2 into every frame in the same pass, exactly
+the format of `internal/proto/barcode.go` that the browser's latency probe reads: the
+value (16 bits) and its CRC-8 (polynomial 0x07, init 0, xorout 0x55, high byte first) form
+the 24-bit word `value << 8 | crc`, drawn as 8 x 3 square cells, row-major, cell k showing
+bit 23-k; luma 235 for 1, 16 for 0, chroma 128. `{"x","y","cell"}` in output pixels after
+scaling, all even (whole chroma samples), `cell` 2..256 (default 16, recon-host's
+`proto.BarcodeCell`). The value is the frame's sequence number, low 16 bits: frame id
+minus the frame id of the latest sequence start (SEQ_START: the stream's first frame and
+the IDR that answers a `forceIdr`), which is the `seq` recon-host sends the frame with, so
+the client's `seq` probe works on helper frames. The 8 x 3 cells must fit the encoded size,
+else `bad_message`. (Step 3.1b replaced the earlier generic block layout of the raw frame id,
+`blockW`/`blockH`/`cols`/`bits`/`msbFirst`; no recon-host had sent it, so the protocol
+version stays 1.)
 
 ## AMF encoder backend
 
@@ -859,7 +886,9 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   maths (D3D bilinear sampling, BT.709 coefficients): 1:1, 2:1 and 4:3 downscale, 2x
   upscale, rotations 90/180/270, a source the converter must copy first; absolute
   colour-bar values (e.g. red = 63/102/240), the orientation of a 90 degree rotation, the
-  barcode blocks (solid, neutral chroma, decoding to the value, MSB- and LSB-first), the
+  frame barcode (the CRC-8 words against values computed by `proto.BarcodeWord`, solid
+  cells, neutral chroma, read back as the browser reads it: inner half of each cell,
+  thresholds 96/160, CRC), the
   texture pool (reuse, exhaustion) and a picture scaled into a padded coded size (the
   repeated edge in the padding, for AV1's 64x16 alignment). It prints `mode nv12` when it tested NV12 render
   targets and `mode planar` when the device has none (Wine's wined3d) and the same shaders
@@ -868,8 +897,9 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
 CI runs them on windows-latest (`mode nv12` required; `--self-test-nvenc` with the test
 double on WARP); the Go integration tests run them too (`TestHelperIntegrationNvenc` with
 `RECON_FAKE_NVENC` pointing at the test double, and against the driver where there is
-one) and drive `synthetic-gpu` through the mock encoder (fps cap, idle repeats, and the
-barcode of a `--dump-nv12` frame decoding to its frame id).
+one) and drive `synthetic-gpu` through the mock encoder (fps cap, idle repeats, a
+`forceIdr` starting a new sequence, and the barcode of a `--dump-nv12` frame reading as its
+sequence number with `proto.BarcodeReadLuma`).
 
 ## Encode test
 

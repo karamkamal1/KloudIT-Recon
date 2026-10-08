@@ -47,7 +47,7 @@ func TestBuildArgsEscaping(t *testing.T) {
 	caps := &Caps{Filters: map[string]bool{"gfxcapture": true, "ddagrab": true}, options: map[string]map[string]bool{
 		"h264_nvenc": {"preset": true, "tune": true, "rc": true, "zerolatency": true, "delay": true, "forced-idr": true},
 	}}
-	enc := EncoderInfo{"h264_nvenc", "h264", "nvidia", true}
+	enc := EncoderInfo{"h264_nvenc", "h264", "nvidia", true, false}
 	args, err := caps.BuildArgs(Params{Source: Source{Backend: "gfxcapture", Window: "Game (DX12)"}, Encoder: enc, FPS: 120, BitrateKbps: 50000})
 	if err != nil {
 		t.Fatal(err)
@@ -527,7 +527,7 @@ func TestProbeAlignment(t *testing.T) {
 	if err != nil {
 		t.Skip("ffmpeg not installed")
 	}
-	svt := EncoderInfo{"libsvtav1", "av1", "software", false}
+	svt := EncoderInfo{"libsvtav1", "av1", "software", false, false}
 	if err := testEncode(context.Background(), ff, svt); err != nil {
 		t.Skipf("libsvtav1: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestProbeAlignment(t *testing.T) {
 		t.Fatalf("padded: alignment %dx%d", aw, ah)
 	}
 	// Not AV1: no sequence header to read.
-	if _, _, err := codedSize(context.Background(), ff, blackFramesArgs(EncoderInfo{"libx264", "h264", "software", false}, 64, 64, 3)); err == nil {
+	if _, _, err := codedSize(context.Background(), ff, blackFramesArgs(EncoderInfo{"libx264", "h264", "software", false, false}, 64, 64, 3)); err == nil {
 		t.Fatal("coded size of an H.264 stream")
 	}
 }

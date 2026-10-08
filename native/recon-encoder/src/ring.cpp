@@ -94,6 +94,10 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (f.recovery) flags |= kFlagRecovery;
     if (droppedPending_) flags |= kFlagDroppedBefore;
     if (f.info.repeat) flags |= kFlagRepeat;
+    // Every backend makes the frame after forceIdr an IDR; should one not,
+    // recon-host must not start a new stream generation on a frame that is
+    // no decoder entry point.
+    if (f.info.seqStart && f.key) flags |= kFlagSeqStart;
     store<uint64_t>(s + kSlotSeq, written_);
     store<uint64_t>(s + kSlotFrameId, f.info.frameId);
     store<uint32_t>(s + kSlotFlags, flags);

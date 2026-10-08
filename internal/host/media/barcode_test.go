@@ -16,7 +16,7 @@ import (
 
 func TestBarcodeArgs(t *testing.T) {
 	caps := &Caps{Filters: map[string]bool{"ddagrab": true, "realtime": true}, options: map[string]map[string]bool{}}
-	enc := EncoderInfo{"libx264", "h264", "software", false}
+	enc := EncoderInfo{"libx264", "h264", "software", false, false}
 	args, _ := caps.BuildArgs(Params{Source: Source{Backend: "test", NativeW: 640, NativeH: 360}, Encoder: enc, FPS: 60, CaptureClock: true, Barcode: true})
 	joined := strings.Join(args, " ")
 	// After the source and its capture clock, before the format conversion.

@@ -114,7 +114,7 @@ func TestBuildArgsAMF(t *testing.T) {
 	// Without capture stamps (CaptureClock false) the pts still come from the
 	// wall clock in µs: vsrc_amf's own are rounded to 1/framerate and paced
 	// frames could share one.
-	hevc := EncoderInfo{"hevc_amf", "hevc", "amd", true}
+	hevc := EncoderInfo{"hevc_amf", "hevc", "amd", true, false}
 	args, err := c.BuildArgs(Params{Source: Source{Backend: "amf"}, Encoder: hevc, FPS: 60})
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +136,7 @@ func TestBuildArgsAMF(t *testing.T) {
 		{Params{Source: Source{Backend: "amf"}, Encoder: hevc, DrawCursor: true}, "cursor"},
 		{Params{Source: Source{Backend: "amf", Output: 9}, Encoder: hevc}, "out of range"},
 		{Params{Source: Source{Backend: "amf", Output: -1}, Encoder: hevc}, "out of range"},
-		{Params{Source: Source{Backend: "amf"}, Encoder: EncoderInfo{"libx264", "h264", "software", false}}, "only feeds AMF encoders"},
+		{Params{Source: Source{Backend: "amf"}, Encoder: EncoderInfo{"libx264", "h264", "software", false, false}}, "only feeds AMF encoders"},
 	} {
 		if _, err := c.BuildArgs(bad.p); err == nil || !strings.Contains(err.Error(), bad.want) {
 			t.Errorf("%+v: %v, want %q", bad.p, err, bad.want)

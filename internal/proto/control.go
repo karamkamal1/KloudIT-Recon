@@ -145,6 +145,17 @@ const (
 	RecoveryKeyframe = "keyframe" // request a key frame (FFmpeg path: a new encoder generation)
 )
 
+// Rate announces a bitrate change of the running generation Gen that needed
+// no new generation (the native helper changes it in the encoder): the
+// VideoConfig's bitrate and maxBitrate, updated. Clients that ignore it keep
+// showing the generation's config.
+type Rate struct {
+	T              string `json:"t"` // "rate"
+	Gen            uint8  `json:"gen"`
+	BitrateKbps    int    `json:"bitrate"`
+	MaxBitrateKbps int    `json:"maxBitrate,omitempty"`
+}
+
 // Dropped tells the client that the host discarded Count frames of
 // generation Gen from FromSeq on, which it will never send (frame queue
 // overflow, or a frame stream that failed or was cancelled). The client

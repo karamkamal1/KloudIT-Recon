@@ -61,6 +61,7 @@ const (
 	FlagRecovery      = 1 << 1
 	FlagDroppedBefore = 1 << 2
 	FlagRepeat        = 1 << 3
+	FlagSeqStart      = 1 << 4
 )
 
 // ErrRingCorrupt means the shared memory holds something the helper cannot
@@ -75,6 +76,7 @@ type Frame struct {
 	Key           bool   // IDR / key frame with parameter sets
 	Recovery      bool   // references only acknowledged frames (RefFloor valid)
 	Repeat        bool   // idle re-submit of the previous image (nothing new on screen)
+	SeqStart      bool   // key frame starting a sequence: the stream's first, or ForceIDR's (barcodes count from it)
 	DroppedBefore uint32 // frames the helper dropped right before this one (ring full / too large)
 	RefFloor      uint64
 	LTRSlot       int32 // LTR slot this frame was marked into, -1 = none
@@ -194,6 +196,7 @@ func (r *Ring) Next() (*Frame, error) {
 		Key:           flags&FlagKey != 0,
 		Recovery:      flags&FlagRecovery != 0,
 		Repeat:        flags&FlagRepeat != 0,
+		SeqStart:      flags&FlagSeqStart != 0,
 		DroppedBefore: le.Uint32(s[slotDroppedBefore:]),
 		LTRSlot:       int32(le.Uint32(s[slotLTRSlot:])),
 		TemporalLayer: le.Uint32(s[slotTemporalLayer:]),

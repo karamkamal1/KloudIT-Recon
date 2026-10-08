@@ -44,21 +44,28 @@ struct Status {
     }
 };
 
-// BarcodeLayout places an in-band barcode of the frame id into every encoded
-// frame (GUIDE 0.2): bit k of the frame id (k = bits-1 .. 0 with msbFirst) is
-// block k, blocks run left to right, `cols` per row, top to bottom. A block is
-// luma 235 (bit 1) or 16 (bit 0) with neutral chroma, drawn in output pixels
-// (after scaling). x, y, blockW and blockH are even so every block covers whole
+// The frame barcode of GUIDE 0.2, exactly as internal/proto/barcode.go defines
+// it (and the browser's latency probe reads it): a 16-bit value and its CRC-8
+// form the 24-bit word value << 8 | crc, drawn as 8 x 3 square cells, row-major,
+// most significant bit first (cell k shows bit 23 - k); white (luma 235) = 1,
+// black (16) = 0, neutral chroma. The value is the frame's sequence number:
+// frames since the latest sequence start (the stream's first frame, or the key
+// frame that answered a forceIdr; ring flag SEQ_START), which is the seq
+// recon-host sends the frame with.
+constexpr int kBarcodeCols = 8;
+constexpr int kBarcodeRows = 3;
+constexpr int kBarcodeBits = kBarcodeCols * kBarcodeRows;
+
+// BarcodeLayout places the frame barcode into every encoded frame, in output
+// pixels (after scaling). x, y and cell are even so every cell covers whole
 // 4:2:0 chroma samples.
 struct BarcodeLayout {
     bool enabled = false;
-    int x = 0, y = 0;            // top-left corner in output pixels
-    int blockW = 8, blockH = 8;  // block size in output pixels
-    int cols = 32;               // blocks per row
-    int bits = 32;               // low bits of the frame id drawn (1..64)
-    bool msbFirst = true;        // first block = most significant bit
+    int x = 0, y = 0;  // top-left corner in output pixels
+    int cell = 16;     // cell size in output pixels (proto.BarcodeCell)
 
-    int rows() const { return (bits + cols - 1) / cols; }
+    int width() const { return kBarcodeCols * cell; }
+    int height() const { return kBarcodeRows * cell; }
 };
 
 // StartParams is the "start" control message.

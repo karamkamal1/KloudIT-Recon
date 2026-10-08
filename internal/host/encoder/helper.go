@@ -307,7 +307,8 @@ func (h *Helper) Start(p StartParams) (Started, error) {
 	}
 }
 
-// ForceIDR makes the next frame an IDR / key frame.
+// ForceIDR makes the next frame an IDR / key frame that starts a new sequence
+// (Frame.SeqStart; its barcode value is 0).
 func (h *Helper) ForceIDR() error { return h.send(simpleMsg{T: "forceIdr"}) }
 
 // Recover reports that frames from lostFrom on were lost. ackedLTR is the

@@ -1,131 +1,23 @@
 package encoder
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
-// fakeHelper plays recon-encoder.exe over in-memory pipes and a Go ring
-// producer, so the client side can be tested on any OS.
-type fakeHelper struct {
-	t       *testing.T
-	stdinR  *io.PipeReader
-	stdinW  *io.PipeWriter
-	stdoutR *io.PipeReader
-	stdoutW *io.PipeWriter
-	ring    *testWriter
-	event   chan struct{}
-
-	exitOnce sync.Once
-	exited   chan struct{}
-	code     int
-	released chan struct{}
-
-	msgs chan map[string]any // messages from Go, after the handler saw them
-}
-
-type fakeHandler func(f *fakeHelper, m map[string]any)
-
-func launchFake(t *testing.T, caps string, handle fakeHandler) (*Helper, *fakeHelper, error) {
+// launchFake starts the in-process fake helper (fake.go).
+func launchFake(t *testing.T, caps string, handle FakeHandler) (*Helper, *Fake, error) {
 	t.Helper()
-	r, w := newTestRing(t, 4, 64<<10)
-	f := &fakeHelper{t: t, ring: w, event: make(chan struct{}, 1), exited: make(chan struct{}),
-		released: make(chan struct{}), msgs: make(chan map[string]any, 64)}
-	f.stdinR, f.stdinW = io.Pipe()
-	f.stdoutR, f.stdoutW = io.Pipe()
-	go f.run(caps, handle)
-	h, err := newHelper(Options{CapsTimeout: 2 * time.Second, StartTimeout: 2 * time.Second}.withDefaults(), conn{
-		ctrlW: f.stdinW,
-		ctrlR: f.stdoutR,
-		ring:  r,
-		wait: func(d time.Duration) error {
-			select {
-			case <-f.event:
-			case <-time.After(d):
-			}
-			return nil
-		},
-		kill:     func() error { f.exit(1); return nil },
-		exited:   f.exited,
-		exitCode: func() int { return f.code },
-		release:  func() { close(f.released) },
+	h, f, err := LaunchFake(caps, handle)
+	t.Cleanup(func() {
+		if err := f.Err(); err != nil {
+			t.Error(err)
+		}
 	})
 	return h, f, err
-}
-
-func (f *fakeHelper) send(v any) {
-	b, _ := json.Marshal(v)
-	// Tag Go structs with their message type, as the helper does.
-	t := ""
-	switch v.(type) {
-	case Started:
-		t = "started"
-	case HelperError:
-		t = "error"
-	case Stats:
-		t = "stats"
-	case CaptureChanged:
-		t = "captureChanged"
-	}
-	if t != "" {
-		var m map[string]any
-		json.Unmarshal(b, &m)
-		m["t"] = t
-		b, _ = json.Marshal(m)
-	}
-	_ = proto.WriteMsg(f.stdoutW, b)
-}
-
-func (f *fakeHelper) exit(code int) {
-	f.exitOnce.Do(func() {
-		f.code = code
-		f.stdoutW.Close()
-		f.stdinR.Close()
-		close(f.exited)
-	})
-}
-
-func (f *fakeHelper) publish(fr *Frame) bool { return f.publishMangled(fr, nil) }
-
-func (f *fakeHelper) publishMangled(fr *Frame, mangle func([]byte)) bool {
-	ok := f.ring.writeMangled(fr, mangle)
-	select {
-	case f.event <- struct{}{}:
-	default:
-	}
-	return ok
-}
-
-func (f *fakeHelper) run(caps string, handle fakeHandler) {
-	f.send(json.RawMessage(caps))
-	for {
-		b, err := proto.ReadMsg(f.stdinR, MaxControlMsg)
-		if err != nil {
-			f.exit(0) // stdin closed: exit like the real helper
-			return
-		}
-		var m map[string]any
-		if err := json.Unmarshal(b, &m); err != nil {
-			f.t.Errorf("fake helper: bad message %q", b)
-			continue
-		}
-		if m["t"] == "shutdown" {
-			f.exit(0)
-			return
-		}
-		if handle != nil {
-			handle(f, m)
-		}
-		f.msgs <- m
-	}
 }
 
 func nextFrame(t *testing.T, h *Helper) *Frame {
@@ -158,14 +50,14 @@ func nextError(t *testing.T, h *Helper) *HelperError {
 }
 
 // replyStarted answers start like the mock backend and publishes n frames.
-func replyStarted(n int) fakeHandler {
-	return func(f *fakeHelper, m map[string]any) {
+func replyStarted(n int) FakeHandler {
+	return func(f *Fake, m map[string]any) {
 		if m["t"] != "start" {
 			return
 		}
-		f.send(Started{Backend: "mock", Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 4000})
+		f.Send(Started{Backend: "mock", Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 4000})
 		for i := 1; i <= n; i++ {
-			f.publish(&Frame{FrameID: uint64(i), Key: i == 1, LTRSlot: -1, Data: []byte{0, 0, 0, 1, byte(i)}})
+			f.Publish(&Frame{FrameID: uint64(i), Key: i == 1, LTRSlot: -1, Data: []byte{0, 0, 0, 1, byte(i)}})
 		}
 	}
 }
@@ -182,7 +74,7 @@ func TestHelperStartFramesClose(t *testing.T) {
 	if err != nil || st.Width != 320 || st.Capture != "synthetic" {
 		t.Fatalf("start: %+v %v", st, err)
 	}
-	if m := <-f.msgs; m["codec"] != "h264" || m["kbps"] != float64(4000) {
+	if m := <-f.Messages(); m["codec"] != "h264" || m["kbps"] != float64(4000) {
 		t.Fatalf("start message %v", m)
 	}
 	for i := 1; i <= 3; i++ {
@@ -202,7 +94,7 @@ func TestHelperStartFramesClose(t *testing.T) {
 	h.SetROI(nil)
 	h.Ack(2)
 	for _, want := range []string{"forceIdr", "recover", "setRate", "setRoi", "ack"} {
-		m := <-f.msgs
+		m := <-f.Messages()
 		if m["t"] != want {
 			t.Fatalf("got %v, want %s", m, want)
 		}
@@ -232,7 +124,7 @@ func TestHelperStartFramesClose(t *testing.T) {
 	if err := h.Err(); err != nil {
 		t.Fatalf("clean close reported %v", err)
 	}
-	<-f.released
+	<-f.Released()
 	if _, ok := <-h.Frames(); ok {
 		t.Fatal("frames channel still open after Close")
 	}
@@ -243,22 +135,22 @@ func TestHelperStartFramesClose(t *testing.T) {
 
 // Capture changes and idle repeats reach the caller.
 func TestHelperCaptureChangesAndRepeats(t *testing.T) {
-	h, _, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+	h, _, err := launchFake(t, mockCapsJSON, func(f *Fake, m map[string]any) {
 		if m["t"] != "start" {
 			return
 		}
-		f.send(Started{Backend: "mock", Capture: "dda", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 4000,
+		f.Send(Started{Backend: "mock", Capture: "dda", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 4000,
 			CaptureWidth: 2560, CaptureHeight: 1440, Vendor: "amd", GPUPriority: "realtime", IdleRepeatMs: 100})
-		f.publish(&Frame{FrameID: 1, Key: true, LTRSlot: -1, Data: []byte{0, 0, 0, 1, 0x65}})
-		f.send(CaptureChanged{Reason: "lost", Width: 2560, Height: 1440, Text: "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST"})
-		f.publish(&Frame{FrameID: 2, Repeat: true, LTRSlot: -1, Data: []byte{0, 0, 0, 1, 0x41}})
-		f.send(CaptureChanged{Reason: "resized", Width: 1920, Height: 1080})
+		f.Publish(&Frame{FrameID: 1, Key: true, LTRSlot: -1, Data: []byte{0, 0, 0, 1, 0x65}})
+		f.Send(CaptureChanged{Reason: "lost", Width: 2560, Height: 1440, Text: "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST"})
+		f.Publish(&Frame{FrameID: 2, Repeat: true, LTRSlot: -1, Data: []byte{0, 0, 0, 1, 0x41}})
+		f.Send(CaptureChanged{Reason: "resized", Width: 1920, Height: 1080})
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer h.Close()
-	st, err := h.Start(StartParams{Capture: "dda", Codec: "h264", FPS: 60, Kbps: 4000, Barcode: &Barcode{BlockW: 8, BlockH: 8, Cols: 8, Bits: 16}})
+	st, err := h.Start(StartParams{Capture: "dda", Codec: "h264", FPS: 60, Kbps: 4000, Barcode: &Barcode{Cell: 16}})
 	if err != nil || st.CaptureWidth != 2560 || st.GPUPriority != "realtime" {
 		t.Fatalf("start: %+v %v", st, err)
 	}
@@ -281,9 +173,9 @@ func TestHelperCaptureChangesAndRepeats(t *testing.T) {
 }
 
 func TestHelperStartRejected(t *testing.T) {
-	h, _, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+	h, _, err := launchFake(t, mockCapsJSON, func(f *Fake, m map[string]any) {
 		if m["t"] == "start" {
-			f.send(HelperError{Code: "unsupported", Text: "the mock backend only encodes h264", Re: "start"})
+			f.Send(HelperError{Code: "unsupported", Text: "the mock backend only encodes h264", Re: "start"})
 		}
 	})
 	if err != nil {
@@ -310,11 +202,11 @@ func TestHelperStartRejected(t *testing.T) {
 }
 
 func TestHelperFatal(t *testing.T) {
-	h, _, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+	h, _, err := launchFake(t, mockCapsJSON, func(f *Fake, m map[string]any) {
 		replyStarted(2)(f, m)
 		if m["t"] == "start" {
-			f.send(HelperError{Code: "mock_fatal", Text: "injected", Fatal: true})
-			f.exit(3)
+			f.Send(HelperError{Code: "mock_fatal", Text: "injected", Fatal: true})
+			f.Exit(3)
 		}
 	})
 	if err != nil {
@@ -354,9 +246,9 @@ func TestHelperFatal(t *testing.T) {
 // A helper that reported a fatal error exits; one that does not (threads stuck
 // in the driver) is killed after a short grace, not only at Close.
 func TestHelperFatalKillsStuckHelper(t *testing.T) {
-	h, f, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+	h, f, err := launchFake(t, mockCapsJSON, func(f *Fake, m map[string]any) {
 		if m["t"] == "forceIdr" {
-			f.send(HelperError{Code: "encode_failed", Text: "stuck in the driver", Fatal: true}) // and no exit
+			f.Send(HelperError{Code: "encode_failed", Text: "stuck in the driver", Fatal: true}) // and no exit
 		}
 	})
 	if err != nil {
@@ -379,7 +271,7 @@ func TestHelperFatalKillsStuckHelper(t *testing.T) {
 	if err := h.Err(); !errors.As(err, &he) || he.Code != "encode_failed" {
 		t.Fatalf("Err() = %v", err)
 	}
-	if f.code != 1 {
+	if f.Code() != 1 {
 		t.Fatalf("helper exited with %d, want killed (1)", f.code)
 	}
 }
@@ -388,7 +280,7 @@ func TestHelperFatalKillsStuckHelper(t *testing.T) {
 // stall neither the callers nor Close, which kills it.
 func TestHelperFrozenHelper(t *testing.T) {
 	frozen := make(chan struct{})
-	h, f, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+	h, f, err := launchFake(t, mockCapsJSON, func(f *Fake, m map[string]any) {
 		if m["t"] == "setRate" {
 			<-frozen // never reads stdin again
 		}
@@ -415,11 +307,11 @@ func TestHelperFrozenHelper(t *testing.T) {
 	case <-time.After(closeGrace + 3*time.Second):
 		t.Fatal("Close blocked on a helper that stopped reading")
 	}
-	<-f.exited
-	if f.code != 1 {
+	<-f.Exited()
+	if f.Code() != 1 {
 		t.Fatalf("helper exited with %d, want killed (1)", f.code)
 	}
-	<-f.released
+	<-f.Released()
 }
 
 // Requests the helper would treat as a fatal protocol error, or can never
@@ -440,7 +332,7 @@ func TestHelperRejectsOversizedRequests(t *testing.T) {
 	if err := h.SetROI(make([]ROIRect, MaxROIRects)); err != nil {
 		t.Fatal(err)
 	}
-	if m := <-f.msgs; m["t"] != "setRoi" || len(m["rects"].([]any)) != MaxROIRects {
+	if m := <-f.Messages(); m["t"] != "setRoi" || len(m["rects"].([]any)) != MaxROIRects {
 		t.Fatalf("got %v", m["t"])
 	}
 	select {
@@ -455,7 +347,7 @@ func TestHelperUnexpectedExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.exit(5)
+	f.Exit(5)
 	<-h.Done()
 	var ee *ExitError
 	if !errors.As(h.Err(), &ee) || ee.Code != 5 {
@@ -465,10 +357,10 @@ func TestHelperUnexpectedExit(t *testing.T) {
 }
 
 func TestHelperRingCorruptKillsHelper(t *testing.T) {
-	h, _, err := launchFake(t, mockCapsJSON, func(f *fakeHelper, m map[string]any) {
+	h, _, err := launchFake(t, mockCapsJSON, func(f *Fake, m map[string]any) {
 		if m["t"] == "start" {
-			f.send(Started{Backend: "mock"})
-			f.publishMangled(&Frame{FrameID: 1, Data: []byte{1}}, func(s []byte) { s[slotPayloadOffset] = 1 })
+			f.Send(Started{Backend: "mock"})
+			f.PublishMangled(&Frame{FrameID: 1, Data: []byte{1}}, func(s []byte) { s[slotPayloadOffset] = 1 })
 		}
 	})
 	if err != nil {
@@ -500,7 +392,7 @@ func TestHelperBadCaps(t *testing.T) {
 			h.Close()
 			t.Fatalf("%s: launch succeeded", caps)
 		}
-		<-f.exited // the client stopped the helper
+		<-f.Exited() // the client stopped the helper
 	}
 }
 
@@ -517,7 +409,7 @@ func TestHelperBackpressureDropsNewest(t *testing.T) {
 	// the producer drops the newest frames.
 	var written []uint64
 	for id := uint64(1); id <= 30; id++ {
-		if f.publish(&Frame{FrameID: id, Data: []byte{byte(id)}}) {
+		if f.Publish(&Frame{FrameID: id, Data: []byte{byte(id)}}) {
 			written = append(written, id)
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -535,7 +427,7 @@ func TestHelperBackpressureDropsNewest(t *testing.T) {
 	}
 	// Every written frame was delivered, so the ring is empty again: the next
 	// frame is written and carries the gap.
-	if !f.publish(&Frame{FrameID: 31, Data: []byte{31}}) {
+	if !f.Publish(&Frame{FrameID: 31, Data: []byte{31}}) {
 		t.Fatal("ring still full after the reader caught up")
 	}
 	fr := nextFrame(t, h)

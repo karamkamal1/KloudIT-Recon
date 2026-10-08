@@ -108,3 +108,26 @@ func TestConfigGPUPriority(t *testing.T) {
 		t.Fatalf("unknown gpuPriority: %v", err)
 	}
 }
+
+func TestConfigPipeline(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load(`{}`)
+	if err != nil || c.pipeline() != "auto" {
+		t.Fatalf("default: %v %q", err, c.pipeline())
+	}
+	for _, m := range []string{"auto", "helper", "ffmpeg"} {
+		if c, err := load(`{"pipeline":"` + m + `"}`); err != nil || c.pipeline() != m {
+			t.Fatalf("%s: %v", m, err)
+		}
+	}
+	if _, err := load(`{"pipeline":"native"}`); err == nil || !strings.Contains(err.Error(), "pipeline") {
+		t.Fatalf("unknown pipeline: %v", err)
+	}
+}

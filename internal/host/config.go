@@ -35,6 +35,11 @@ type Config struct {
 	// GPUPriority is the GPU scheduling priority of the encoder process
 	// (Windows): auto | high | realtime | off ("" = auto).
 	GPUPriority string `json:"gpuPriority,omitempty"`
+	// Pipeline picks the video pipeline: auto | helper | ffmpeg ("" = auto).
+	// auto uses the native encoder helper (recon-encoder.exe next to
+	// recon-host.exe, Windows) when it starts, can encode the negotiated codec
+	// and the session needs nothing only FFmpeg offers; else FFmpeg.
+	Pipeline string `json:"pipeline,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -133,6 +138,12 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: gpuPriority must be %q, %q, %q or %q, not %q", path,
 			media.GPUPriorityAuto, media.GPUPriorityHigh, media.GPUPriorityRealtime, media.GPUPriorityOff, c.GPUPriority)
 	}
+	switch c.Pipeline {
+	case "", pipelineAuto, media.PipelineHelper, media.PipelineFFmpeg:
+	default:
+		return nil, fmt.Errorf("%s: pipeline must be %q, %q or %q, not %q", path, pipelineAuto, media.PipelineHelper,
+			media.PipelineFFmpeg, c.Pipeline)
+	}
 	c.path = path
 	return c, nil
 }
@@ -145,6 +156,18 @@ func (c *Config) congestion() string {
 		return transport.CongestionReno
 	}
 	return c.Congestion
+}
+
+// pipelineAuto is the default of host config "pipeline": the native helper
+// where it can serve the session, else FFmpeg.
+const pipelineAuto = "auto"
+
+// pipeline returns the video pipeline mode: auto, helper or ffmpeg.
+func (c *Config) pipeline() string {
+	if c.Pipeline == "" {
+		return pipelineAuto
+	}
+	return c.Pipeline
 }
 
 // gpuPriority returns the encoder's GPU scheduling priority mode.

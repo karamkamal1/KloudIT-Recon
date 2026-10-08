@@ -3,7 +3,9 @@
 // 4:2:0 with chroma sited like H.264/HEVC chroma_sample_loc_type 0: co-sited
 // horizontally with the even luma column, between the two luma rows), rotated
 // for rotated displays, bilinearly scaled to the encoded size, with the
-// optional in-band frame-id barcode (GUIDE 0.2) drawn in the same pass.
+// optional in-band frame barcode (GUIDE 0.2: the frame's sequence number and its
+// CRC-8 in 8 x 3 cells, the format of internal/proto/barcode.go) drawn in the
+// same pass.
 //
 // Output textures come from a small pool. A converted frame stays reserved
 // while any copy of its `hold` exists, so the AMF / NVENC backends keep it
@@ -53,8 +55,14 @@ struct YuvCoefficients {
 };
 YuvCoefficients bt709Limited();
 
-// The barcode bit drawn at output luma pixel (x, y): -1 = no block there.
-int barcodeBit(const BarcodeLayout& b, uint64_t value, uint32_t x, uint32_t y);
+// The frame barcode's CRC-8 of a value (polynomial 0x07, init 0, xorout 0x55,
+// over the high byte, then the low byte: proto.BarcodeCRC) and the 24-bit word
+// drawn for it (value << 8 | crc: proto.BarcodeWord).
+uint8_t barcodeCrc(uint16_t value);
+uint32_t barcodeWord(uint16_t value);
+// The barcode bit drawn at output luma pixel (x, y) for a value: -1 = no
+// cell there.
+int barcodeBit(const BarcodeLayout& b, uint16_t value, uint32_t x, uint32_t y);
 // Checks a barcode layout against the output size (empty = fits).
 std::string barcodeProblem(const BarcodeLayout& b, uint32_t width, uint32_t height);
 
@@ -91,9 +99,10 @@ public:
     Status init(ID3D11Device* device, uint32_t width, uint32_t height, const BarcodeLayout& barcode, Output output,
                 int poolSize = 6, uint32_t contentWidth = 0, uint32_t contentHeight = 0);
     // Converts src (8-bit BGRA/RGBA, or FP16 scRGB which is clipped to SDR)
-    // into a free pool texture. Error "pool_exhausted" (non-fatal) when every
-    // pool texture is still reserved by the encoder.
-    Status convert(ID3D11Texture2D* src, int rotation, uint64_t barcodeValue, ConvertedFrame& out);
+    // into a free pool texture, with the barcode of barcodeValue (the frame's
+    // sequence number) when enabled. Error "pool_exhausted" (non-fatal) when
+    // every pool texture is still reserved by the encoder.
+    Status convert(ID3D11Texture2D* src, int rotation, uint16_t barcodeValue, ConvertedFrame& out);
     // Copies a converted frame to the CPU as tightly packed NV12 (Y plane, then
     // interleaved CbCr). Stalls until the GPU is done: tests and dumps only.
     Status readback(const ConvertedFrame& f, std::vector<uint8_t>& out);

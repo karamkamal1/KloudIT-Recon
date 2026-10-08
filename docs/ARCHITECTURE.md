@@ -62,7 +62,7 @@ The **extension** carries per-frame stage timestamps and recovery metadata:
 | 2 | `captureUs` | u64 | frame captured (FFmpeg path: see below) |
 | 3 | `encodeSubmitUs` | u64 | frame submitted to the encoder (native helper only) |
 | 4 | `encodeDoneUs` | u64 | encoded frame read from the encoder (NUT packet off the pipe) |
-| 5 | `refFloor` | u32 | oldest frame a recovery frame references |
+| 5 | `refFloor` | u32 | oldest frame (`seq` of this generation) a recovery frame references; present exactly on recovery frames |
 | 6 | `ltrSlot` | u8 | long-term reference slot the frame is marked into |
 | 7 | `temporalLayer` | u8 | temporal layer id |
 
@@ -238,6 +238,50 @@ capture knows), the video config announces `codedWidth`/`codedHeight`/`cropRight
 and the client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle;
 WebGPU: scaled texture coordinates).
 
+### Two pipelines: FFmpeg and the native helper
+
+The session drives its video through one interface, `media.Pipeline` (`Start`, `Events`,
+`ForceKeyframe`, `SetRate`, `Recover`, `Ack`, `Capabilities`, ...), and decides what to do from
+the pipeline's `Capabilities`, never from a vendor:
+
+| | FFmpeg (`media.Video`) | Native helper (`media.HelperVideo`) |
+|---|---|---|
+| process | one `ffmpeg` per generation | one `recon-encoder.exe` per session (docs/HELPER_PROTOCOL.md) |
+| key frame for the client | a new generation, started at once (urgent restart) | an IDR in the running encoder (`ForceIDR`): a new generation without a new process |
+| bitrate change | an overlapped restart (rate limited, see above) | in the running encoder (`LiveBitrate`: AMF/NVENC seamless, or an encoder flush with an IDR) |
+| loss recovery | key frame, or skip with intra refresh | key frame; `Recover`/`Ack` plumbed for LTR / reference invalidation (step 3.5 wires the client) |
+| stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly) |
+
+**Choosing** (host config `pipeline`: `auto` | `helper` | `ffmpeg`, once per session, logged as
+`video pipeline` with the reason): `auto` uses the helper on Windows when `recon-encoder.exe` is
+next to `recon-host.exe`, it starts and its caps are usable, the codec negotiated with the browser
+is one of its codecs (they take part in the negotiation as hardware encoders of the helper's
+vendor, named `<codec>_<backend>_helper`, ahead of FFmpeg's), and the session needs nothing only
+FFmpeg offers: the cursor drawn into the video (the helper's captures leave it out:
+`cursorInVideo` false), a window capture without Windows.Graphics.Capture in the helper, AMD
+Direct Capture or DDA it lacks, `capture` `x11grab` / `test`, or an FFmpeg encoder forced in
+host.json. Otherwise FFmpeg. A later settings change that needs FFmpeg moves the session to
+FFmpeg for good, with the generation numbers continuing.
+
+**Generations on the helper.** The helper numbers frames itself (frame ids; a gap is a lost
+frame). A generation starts at a key frame flagged SEQ_START (the stream's first frame, and the IDR
+that answers `forceIdr`), and `seq` is the frame id minus that frame's. A forced key frame
+therefore begins a new generation with the same parameters, which is exactly what a client that
+asked for a key frame waits for (it discards the rest of the generation it asked in); old clients
+see nothing new. Frames the helper drops (its ring is full: recon-host fell behind) are reported
+like frames the session dropped (`{"t":"dropped"}`) and answered with a key frame. A bitrate
+change in the encoder is announced with `{"t":"rate","gen","bitrate","maxBitrate"}` (clients
+that ignore it keep the generation's config).
+
+**Lifecycle.** The helper the session launched to read its caps starts the stream; while a stream
+is live a spare helper is kept launched (caps read, nothing started), so a restart skips the
+process start and the caps probe. A stream that differs in more than bitrate and frame rate (codec,
+size, monitor, capture method) needs a new helper, started overlapped like an FFmpeg generation.
+A helper that reports a fatal error or exits is replaced at once (target: first frame within
+~300 ms; with the spare under Wine 175-191 ms, see `docs/VENDOR_NOTES.md`, 3.1b), and the new
+one starts with an IDR as a new generation. Three failures within 60 s end the helper pipeline:
+the session continues on FFmpeg with a notice.
+
 ## The browser pipeline
 
 ```
@@ -262,7 +306,10 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   `requestAnimationFrame` after the draw, sampled at most every 50 ms, one mark in flight. The
   overlay shows p50/p95/p99 over the last 10 s per stage and for **end-to-end (capture→draw)**,
   the per-frame sum of the stages up to draw. Without a capture stamp (old host, capture
-  timestamps off) end-to-end is labelled **stream latency (send→draw)**. Add the display
+  timestamps off) end-to-end is labelled **stream latency (send→draw)**. Frames of the native
+  helper also carry the game's present and the encoder-submit time: the overlay then adds
+  game present→capture (before end-to-end starts) and splits capture→encoded into
+  capture→encoder and encode (not counted twice in the sum). Add the display
   estimate and your display's scan-out for glass-to-glass latency. The same numbers are on
   `window.__recon.lastStats.stages`, and every 10 s the client sends them to the host
   (`{"t":"stages"}`), which logs them next to the encoder name and vendor, together with its own
@@ -320,7 +367,7 @@ every 1- and 2-cell error).
 
 | Source | Value | Cell size | Client mode |
 |---|---|---|---|
-| Test pattern (`capture: "test"`) | encoder frame index = frame `seq` (low 16 bits) | 16 px of the encoded picture | `seq`, when the welcome lists `barcode-seq` |
+| Test pattern (`capture: "test"`; with `pipeline` `helper`: the helper's synthetic GPU source) | encoder frame index = frame `seq` (low 16 bits) | 16 px of the encoded picture | `seq`, when the welcome lists `barcode-seq` |
 | `tools/latency-test/index.html` full-screen on the host | host wall clock, ms (low 16 bits) | picture width / 96 | `wallclock`, when the user enables Settings → Diagnostics → Latency probe |
 
 The test pattern's barcode is an FFmpeg chain right after the source and its capture clock: one
@@ -328,7 +375,9 @@ black `drawbox` and one white 16×16 `drawbox` per cell whose timeline expressio
 bit from the frame index `n` (CRC bits are affine in the value bits, so each is a sum mod 2 of
 `gt(bitand(n,2^i),0)` terms). No per-pixel `geq`; the probe draws it on three frames and reads them
 back before the host announces it; it costs at most a few hundredths of a millisecond of CPU per
-frame (measurements in `docs/VENDOR_NOTES.md`, 0.2).
+frame (measurements in `docs/VENDOR_NOTES.md`, 0.2). The native helper draws the same format in its
+colour-conversion shader (`native/recon-encoder/src/d3d/convert.cpp`), with the frame's sequence
+number counted from the latest sequence start, so it equals the `seq` recon-host sends.
 
 **seq mode** compares the barcode with the frame header's `seq`. A mismatch means the picture
 being drawn is not the frame the header describes (stale, duplicated or skipped frame, or wrong

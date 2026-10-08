@@ -2,6 +2,7 @@
 // WARP device (no display or GPU needed) and checks it against a CPU
 // reference of the same maths, plus absolute BT.709 colour-bar values, the
 // orientation of a rotated display and the barcode blocks.
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -90,7 +91,7 @@ uint8_t unorm(double v) {
 // cw x ch: the content rectangle the image is scaled into (the rest of
 // w x h is padding: the same mapping continued, clamped to the edge).
 std::vector<uint8_t> reference(const Image& img, uint32_t w, uint32_t h, uint32_t cw, uint32_t ch, int rotation,
-                               const BarcodeLayout& bc, uint64_t value) {
+                               const BarcodeLayout& bc, uint16_t value) {
     const d3d::YuvCoefficients k = d3d::bt709Limited();
     std::vector<uint8_t> out(size_t(w) * h * 3 / 2);
     for (uint32_t y = 0; y < h; ++y) {
@@ -132,17 +133,59 @@ struct Case {
     uint32_t outW, outH;
     int rotation;
     BarcodeLayout barcode;
-    uint64_t value;
+    uint16_t value;
     int tolerance;         // max |GPU - reference| per sample
     bool noShaderBinding;  // source texture without D3D11_BIND_SHADER_RESOURCE (converter copies it)
     uint32_t contentW = 0, contentH = 0;  // picture inside outW x outH, the rest padding (0 = no padding)
 };
 
-BarcodeLayout layout(int x, int y, int bw, int bh, int cols, int bits, bool msb) {
+BarcodeLayout layout(int x, int y, int cell) {
     BarcodeLayout b;
     b.enabled = true;
-    b.x = x, b.y = y, b.blockW = bw, b.blockH = bh, b.cols = cols, b.bits = bits, b.msbFirst = msb;
+    b.x = x, b.y = y, b.cell = cell;
     return b;
+}
+
+// Reads the frame barcode like the browser's latency probe and
+// proto.BarcodeReadLuma: the mean luma of the inner half of every cell (in
+// each direction), below 96 a 0, above 160 a 1, anything between no barcode;
+// then the CRC. Returns false when it does not decode.
+bool readBarcode(const std::vector<uint8_t>& luma, uint32_t stride, const BarcodeLayout& b, uint16_t& value) {
+    uint32_t word = 0;
+    for (int k = 0; k < kBarcodeBits; ++k) {
+        const double c = k % kBarcodeCols, r = k / kBarcodeCols, cell = b.cell;
+        const int x0 = b.x + int(std::lround((c + 0.25) * cell)), x1 = std::max(b.x + int(std::lround((c + 0.75) * cell)), x0 + 1);
+        const int y0 = b.y + int(std::lround((r + 0.25) * cell)), y1 = std::max(b.y + int(std::lround((r + 0.75) * cell)), y0 + 1);
+        double sum = 0;
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) sum += luma[size_t(y) * stride + size_t(x)];
+        }
+        const double mean = sum / double((x1 - x0) * (y1 - y0));
+        if (mean > 160) word |= 1u << (kBarcodeBits - 1 - k);
+        else if (!(mean < 96)) return false;
+    }
+    value = uint16_t(word >> 8);
+    return (word & 0xff) == d3d::barcodeCrc(value);
+}
+
+// The barcode word must be bit for bit what internal/proto/barcode.go draws
+// (proto.BarcodeWord; the browser's protocol.js mirrors it).
+int checkBarcodeWords() {
+    static const struct {
+        uint16_t value;
+        uint32_t word;
+    } kGo[] = {{0x0000, 0x000055}, {0x0001, 0x000152}, {0x001D, 0x001D06}, {0x1234, 0x1234A4},
+               {0xA5C3, 0xA5C34B}, {0xBEEF, 0xBEEF4F}, {0xFFFF, 0xFFFF71}};
+    int failures = 0;
+    for (const auto& v : kGo) {
+        if (d3d::barcodeWord(v.value) != v.word) {
+            std::printf("  barcode word of 0x%04x: FAIL 0x%06x, want 0x%06x (proto.BarcodeWord)\n", unsigned(v.value),
+                        unsigned(d3d::barcodeWord(v.value)), unsigned(v.word));
+            ++failures;
+        }
+    }
+    std::printf("  %-28s %s\n", "barcode words (proto/barcode.go)", failures ? "FAIL" : "ok");
+    return failures;
 }
 
 class Checker {
@@ -247,32 +290,29 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
         if (std::abs(got[size_t(h - 4) * w + (w - 4)] - 16) > 1) chk.fail("rotation: bottom right is not black");
     }
 
-    // The barcode: every block solid 16 / 235 with neutral chroma, and it decodes to the value.
+    // The barcode: every cell solid 16 / 235 with neutral chroma, and it reads
+    // back as the value the way the browser's latency probe reads it.
     const BarcodeLayout& bc = c.barcode;
     if (bc.enabled) {
-        uint64_t decoded = 0;
-        for (int k = 0; k < bc.bits; ++k) {
-            const uint32_t bx = uint32_t(bc.x + (k % bc.cols) * bc.blockW), by = uint32_t(bc.y + (k / bc.cols) * bc.blockH);
-            int ones = 0;
-            for (uint32_t y = by; y < by + uint32_t(bc.blockH); ++y) {
-                for (uint32_t x = bx; x < bx + uint32_t(bc.blockW); ++x) {
+        for (int k = 0; k < kBarcodeBits; ++k) {
+            const uint32_t bx = uint32_t(bc.x + (k % kBarcodeCols) * bc.cell), by = uint32_t(bc.y + (k / kBarcodeCols) * bc.cell);
+            const int want = int(d3d::barcodeWord(c.value) >> (kBarcodeBits - 1 - k) & 1) ? 235 : 16;
+            for (uint32_t y = by; y < by + uint32_t(bc.cell); ++y) {
+                for (uint32_t x = bx; x < bx + uint32_t(bc.cell); ++x) {
                     const uint8_t v = got[size_t(y) * w + x];
-                    if (v != 16 && v != 235) chk.fail("barcode block %d pixel (%u,%u) = %d", k, x, y, v);
-                    ones += v == 235;
+                    if (v != want) chk.fail("barcode cell %d pixel (%u,%u) = %d, want %d", k, x, y, v, want);
                     if (x % 2 == 0 && y % 2 == 0) {
                         const uint8_t* p = uv + (size_t(y / 2) * (w / 2) + x / 2) * 2;
-                        if (p[0] != 128 || p[1] != 128) chk.fail("barcode block %d chroma %d,%d", k, p[0], p[1]);
+                        if (p[0] != 128 || p[1] != 128) chk.fail("barcode cell %d chroma %d,%d", k, p[0], p[1]);
                     }
                 }
             }
-            const int bit = ones * 2 > bc.blockW * bc.blockH;
-            const int pos = bc.msbFirst ? bc.bits - 1 - k : k;
-            decoded |= uint64_t(bit) << pos;
         }
-        const uint64_t mask = bc.bits == 64 ? ~0ull : (1ull << bc.bits) - 1;
-        if (decoded != (c.value & mask)) {
-            chk.fail("barcode decodes to 0x%llx, want 0x%llx", static_cast<unsigned long long>(decoded),
-                     static_cast<unsigned long long>(c.value & mask));
+        uint16_t read = 0;
+        if (!readBarcode(got, w, bc, read)) {
+            chk.fail("barcode does not read back (cells or CRC)");
+        } else if (read != c.value) {
+            chk.fail("barcode reads 0x%04x, want 0x%04x", unsigned(read), unsigned(c.value));
         }
     }
     // Padding: the last content column / row repeated (the clamp sampler), so
@@ -327,17 +367,17 @@ int runConvertSelfTest(bool hardware) {
 
     const Image img = testPattern(256, 128);
     const Case cases[] = {
-        {"1:1 + barcode", 256, 128, 0, layout(8, 96, 8, 8, 16, 32, true), 0xA5C30F1Eull, 1, false},
-        {"2:1 downscale + barcode", 128, 64, 0, layout(4, 48, 4, 4, 16, 24, true), 0x00C0FFEEull, 1, true},
-        {"4:3 downscale, lsb first", 192, 96, 0, layout(0, 0, 8, 8, 8, 16, false), 0x1234ull, 2, false},
-        {"1:1 rotated 90", 128, 256, 90, layout(16, 16, 8, 8, 8, 64, true), 0x0123456789ABCDEFull, 1, false},
+        {"1:1 + barcode", 256, 128, 0, layout(8, 72, 16), 0xA5C3, 1, false},
+        {"2:1 downscale + barcode", 128, 64, 0, layout(4, 36, 8), 0xC0FF, 1, true},
+        {"4:3 downscale + barcode", 192, 96, 0, layout(0, 0, 8), 0x1234, 2, false},
+        {"1:1 rotated 90 + barcode", 128, 256, 90, layout(16, 16, 12), 0x001D, 1, false},
         {"1:1 rotated 180", 256, 128, 180, BarcodeLayout{}, 0, 1, false},
         {"1:1 rotated 270", 128, 256, 270, BarcodeLayout{}, 0, 1, false},
         {"2:1 upscale", 512, 256, 0, BarcodeLayout{}, 0, 2, false},
         // AV1 on RDNA3: 200x90 coded as 256x96 (multiples of 64x16).
-        {"scaled into 64x16 padding", 256, 96, 0, layout(8, 64, 4, 4, 16, 16, true), 0xBEEFull, 2, false, 200, 90},
+        {"scaled into 64x16 padding", 256, 96, 0, layout(8, 64, 2), 0xBEEF, 2, false, 200, 90},
     };
-    int failures = 0;
+    int failures = checkBarcodeWords();
     for (const Case& c : cases) failures += runCase(dev.device.Get(), mode, img, c);
     std::printf("self-test-convert: %s (mode %s)\n", failures ? "FAIL" : "ok", nv12 ? "nv12" : "planar");
     return failures ? 1 : 0;

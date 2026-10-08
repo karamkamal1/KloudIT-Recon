@@ -2851,3 +2851,133 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   stream exits the helper within 500 ms (no watchdog exit code 4); a driver reset during a
   stream (Win+Ctrl+Shift+B) ends the helper with the fatal `device_lost` and recon-host's
   restart begins with an IDR.
+
+## 3.1b Helper session integration
+
+The session streams through `media.Pipeline`: FFmpeg (`media.Video`) or the native helper
+(`media.HelperVideo`, `internal/host/media/helper.go`), chosen per session by host config
+`pipeline` (`auto` | `helper` | `ffmpeg`) and logged as `video pipeline` with the reason. Key
+frames, bitrate changes and losses are decided from the pipeline's `Capabilities`: on the helper
+a key frame is an in-encoder IDR (a new generation without a new process, flagged SEQ_START in
+the ring), a bitrate change is a live `setRate`, frames the helper dropped are reported to the
+client; on FFmpeg every path is the restart it was before. Integration gaps fixed: the helper's
+barcode is GUIDE 0.2's format (16-bit sequence number + CRC-8 in 8x3 cells of 16 px) counted
+from the latest sequence start, so it equals the frame's `seq`; AV1 coded size and crop from
+`started` go through `proto.VideoConfig.SetCrop`; the GPU priority decision is one table for
+recon-host and the helper, checked by a test; the agent's `ffmpeg ready` line shows
+`vsrc_amf`.
+
+Verified in the sandbox (Linux, no GPU, no Windows):
+- `go test -race ./internal/host/...`: HelperVideo against the in-process fake helper
+  (`encoder.LaunchFake`, now shared by the encoder tests): start parameters (capture `dda` /
+  `amd-direct` / `wgc` / `synthetic-gpu` from the source, HMONITOR and output index, `rc` cbr
+  with adaptive bitrate else vbr, `ltrSlots` 2 only where the codec's caps say `ltr`, the
+  barcode `{"cell":16}` for the test pattern, `gpuPriority` from the config, `zeroCopy` false
+  after two zero-copy `capture_failed` restarts); frames: generation and seq from SEQ_START,
+  the four stage stamps converted exactly (QPC ticks at 10 MHz and at 3.579545 MHz to the
+  host clock's µs, `TestClockFromQPC`), unknown present time kept unknown, out-of-order
+  stamps dropped, a key frame without SEQ_START continuing the generation; the config's codec
+  string from the key frame's SPS and 1920x1080 coded as 1920x1088 announced as
+  `cropBottom` 8; live bitrate without a new helper; LTR acks forwarded only for LTR frames
+  and `recover` naming the newest acknowledged LTR before the loss; a forced key frame as
+  generation 2 seq 0 without a new helper; a frame-id gap reported as lost frames; capture
+  changes passed on; a new size as a second helper started overlapped (the old one streams
+  until the new one's key frame, then is shut down); a fatal error / exit replaced at once
+  at the current bitrate (`Restarted`), a refused start retried with a new helper, three
+  failures within 60 s giving up (`Fallback`, then `ErrHelperGaveUp`).
+- Session: `TestHelperBlocker` (what only FFmpeg offers: x11grab, the test pattern unless
+  `pipeline` `helper`, an FFmpeg encoder forced in host.json, the cursor in the video, window
+  capture / gfxcapture without WGC, AMD Direct Capture or DDA missing), `TestOpenPipeline`
+  (not installed, launch failure, unusable caps, a negotiated codec the helper lacks: each
+  FFmpeg with its reason in one `video pipeline` line and, for `pipeline` `helper`, a notice;
+  otherwise the helper's encoders first in the welcome), `TestSessionOnHelper` (a key frame
+  request is `forceIdr`, a delay report a `setRate` plus a `{"t":"rate"}` message, frames the
+  helper dropped are reported `{"t":"dropped"}` and answered with `forceIdr`, no "restarting
+  video", no second helper; three helper failures move the session to FFmpeg with a notice,
+  and the FFmpeg generation (libx264 here) continues the generation numbers),
+  `TestVideoHeader` (tags 1, 3, 5-7 round trip; refFloor 0 present on a recovery frame; none
+  on FFmpeg frames; v1 clients unchanged), `TestConfigPipeline`. The FFmpeg path's tests
+  (`TestQueueOverflowEscalates`, `TestEncoderFailureFallback`, `TestAlignmentGuard`, ...)
+  pass unchanged, including their exact log lines.
+- `xvfb-run -a -s "-screen 0 1280x720x24" make helper-test WINE=/usr/lib/wine/wine64`
+  (Wine 9.0, mingw build; Wine's D3D11 needs the 24-bit screen): every encoder integration
+  test, plus in `internal/host/media`: `TestGPUPriorityAgreesWithHelper` (all 48 rows of
+  `recon-encoder.exe --gpu-priority-table`, mode x vendor x HAGS, equal to recon-host's
+  `gpuPriorityClass`), `TestHelperVideoIntegration` (mock backend on the synthetic GPU
+  source: stamps in the host clock's domain, each frame's encode-done within 200 ms of the
+  host clock when it arrived; a forced key frame 33-35 ms after the request as generation 2
+  seq 0 from the same helper; `setRate` live; `--mock-fatal-at=45` replaced by a new helper
+  whose first frame came 700-760 ms after the failure was seen without a spare (process start
+  and caps probe under Wine are most of it); giving up after three failures),
+  `TestHelperVideoSpareRestart` (with the spare helper kept beside the stream, as sessions run
+  it: 175-191 ms from the failure to the new helper's first frame over three runs, D3D11
+  device creation and shader compile on llvmpipe included; GUIDE 3.1's target is 300 ms).
+  `TestHelperIntegrationGPUPipeline`: SEQ_START on frame 1 and on the key frame after a
+  `forceIdr` (and not on the mock clip's own later IDR), and the barcode of the dumped NV12
+  frame 30 reads `30 - seqStart` with `proto.BarcodeReadLuma`.
+- `--self-test-convert` (Wine, mode planar): the barcode words equal `proto.BarcodeWord` for
+  seven values (0, 1, 29, 0x1234, 0xA5C3, 0xBEEF, 0xFFFF), every cell solid 16/235 with
+  neutral chroma in 1:1, 2:1, 4:3, rotated and padded conversions (cells of 16, 8, 12, 2 px),
+  and each reads back as its value the way the browser's probe reads it. mingw GCC 13 build
+  without warnings; every changed source passes `clang++ --target=x86_64-w64-mingw32
+  -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow -Wconversion` without warnings.
+- Browser E2E (`node test/e2e/browser.mjs`, Linux, FFmpeg path, `pipeline` resolves to
+  ffmpeg: "the native encoder helper is Windows-only"): 73 of 73 checks passed. A first run
+  had one failure, "dropped frames skipped (recovery skip)": under CPU load the software
+  decoder fell behind four times (decoder backlog), and one of those `congestion` reports
+  within 2 s of a cut became a key-frame restart, which that check's tolerance (decoder
+  errors and watchdog requests only) does not count; the FFmpeg path's key-frame and
+  congestion handling is unchanged (same calls, same log lines), and the rerun passed. The
+  overlay's new rows (game present→capture, capture→encoder, encode) appear only for frames
+  with the helper's tags 1 and 3, which the FFmpeg path never sends.
+
+Hardware checks (host.json `"pipeline": "auto"`, recon-encoder.exe installed next to
+recon-host.exe by `install-host.ps1`):
+- AMD RDNA3 (RX 7900 XT): unverified. Test (selection): start a session from Chrome with
+  default settings; host.log has `video pipeline pipeline=helper config=auto backend=amf
+  vendor=amd adapter="AMD Radeon RX 7900 XT"` with `encoders=hevc_amf_helper,av1_amf_helper,
+  h264_amf_helper`, then `encoder helper started backend=amf capture=dda codec=hevc ...
+  gpu_priority=realtime live_bitrate=seamless ltr_slots=2` and `encoder ready ... pipeline=helper`;
+  the overlay's Encoder row says `hevc_amf_helper · dda`. Repeat with host.json
+  `"drawCursor": true`: `video pipeline pipeline=ffmpeg reason="the video must carry the
+  cursor, ..."` and the stream runs on hevc_amf through FFmpeg.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (stages): with the overlay open (Ctrl+Alt+Shift+S)
+  while a game runs, the latency rows include `game present→capture`, `  capture→encoder` and
+  `  encode` with plausible values (present→capture below one refresh interval, encode a few
+  ms at 1440p), and `capture→encoded` ≈ capture→encoder + encode; the host log's
+  `latency stages` line lists `present`, `submit` and `encode`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (forced key frames without a restart): in the
+  browser console run `__recon.worker.postMessage({type:'ctl', m:{t:'keyframe'}})` ten times,
+  a second apart: host.log shows `forcing a key frame reason="keyframe request"` each time,
+  never `restarting video`, no new `encoder helper started`; the overlay's frame rate does
+  not dip and there is no freeze > 100 ms (the `Freezes` row stays 0). The same with Settings
+  → bitrate changes (in-place `setRate`: `changing the bitrate in the encoder` / no restart).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (helper restart time): during a stream kill
+  recon-encoder.exe in Task Manager (the active one: Process Explorer shows two, the newer one
+  idle is the spare): host.log `encoder helper failed, restarting it` then `encoder ready ...
+  restart=true startup=<ms>`; startup below 300 ms (sandbox: 175-191 ms under Wine). Also a driver
+  reset (Win+Ctrl+Shift+B): `device_lost`, the same restart, the picture back within a second.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (fallback to FFmpeg): rename recon-encoder.exe while
+  a stream runs and kill the running helpers three times within a minute (the spare too):
+  host.log `native encoder helper gave up, streaming with FFmpeg for the rest of the session`
+  and `video pipeline pipeline=ffmpeg was=helper`; the browser shows the notice and the stream
+  continues on hevc_amf (FFmpeg) with a higher generation number; the next session starts on
+  FFmpeg with `reason="recon-encoder.exe is not installed ..."` (rename it back afterwards).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (barcode and AV1 crop on the helper): host.json
+  `"capture": "test", "pipeline": "helper"`: the helper streams its synthetic GPU source with
+  the frame barcode, the welcome lists `barcode-seq` and the overlay's `Frame barcode (seq)`
+  row shows >= 90 % valid, 0 mismatched; then in Settings choose AV1 at 1920x1080 (or
+  `"encoder": "av1_amf_helper"`): host.log `coded picture is padded, client crops ...
+  coded=1920x1088 crop_bottom=8`, the overlay's Video row says `(coded 1920×1088, cropped)` and
+  no grey rows show at the bottom.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (capture changes): change the desktop resolution
+  during a stream: `capture changed reason=resized` then `restarting video reason="capture
+  resized"`, the stream continues at the new native size with the cursor mapped correctly;
+  press Win+L: a notice "Screen capture is paused (...)" and the last picture stays until
+  unlock.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same seven checks on an RTX host;
+  expect `backend=nvenc vendor=nvidia`, `gpu_priority=high` with HAGS on (`realtime` with HAGS
+  off), `ltr_slots=0` (NVENC recovers by invalidation: `Capabilities` `invalidate`), forced key
+  frames and live bitrate without restarts, the restart below 300 ms, the fallback to FFmpeg
+  (hevc_nvenc), and AV1 (RTX 40+) at 1920x1080 without visible padding (crop fields only if
+  the helper's `started` reports a larger coded size).

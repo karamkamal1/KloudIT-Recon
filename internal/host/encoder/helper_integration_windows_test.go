@@ -146,8 +146,7 @@ func TestHelperIntegrationMock(t *testing.T) {
 	// A start that fails after the encoder was initialized (a barcode needs the
 	// GPU conversion): the helper must release the encoder (Backend::release,
 	// which the mock checks on its next init), so the start below works.
-	_, err = h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000,
-		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+	_, err = h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000, Barcode: &Barcode{Cell: proto.BarcodeCell}})
 	if !errors.As(err, &he) || he.Code != "unsupported" || he.Fatal {
 		t.Fatalf("barcode start on the synthetic source: %v", err)
 	}
@@ -751,8 +750,7 @@ func maxPerSecond(frames []*Frame, qpc int64) int {
 }
 
 func TestHelperIntegrationDDA(t *testing.T) {
-	captureCheck(t, "dda", StartParams{Width: 640, Height: 360,
-		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+	captureCheck(t, "dda", StartParams{Width: 640, Height: 360, Barcode: &Barcode{Cell: proto.BarcodeCell}})
 }
 
 func TestHelperIntegrationAMDDirect(t *testing.T) {
@@ -782,7 +780,7 @@ func TestHelperIntegrationAMFFailedStart(t *testing.T) {
 		ran++
 		p := StartParams{Capture: capture, Codec: "hevc", Width: 640, Height: 360, FPS: 60, Kbps: 4000}
 		bad := p
-		bad.Barcode = &Barcode{X: 600, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}
+		bad.Barcode = &Barcode{X: 600, Y: 0, Cell: proto.BarcodeCell}
 		_, err = h.Start(bad)
 		var he *HelperError
 		if !errors.As(err, &he) || he.Code != "bad_message" || he.Fatal {
@@ -822,7 +820,7 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	h := launchMock(t, "--dump-nv12="+dump)
 	const w, hgt, fps = 320, 180, 30
 	_, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000,
-		Barcode: &Barcode{X: 0, Y: 0, BlockW: 8, BlockH: 8, Cols: 16, Bits: 32, MSBFirst: true}})
+		Barcode: &Barcode{Cell: proto.BarcodeCell}})
 	var he *HelperError
 	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
 		t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
@@ -830,10 +828,29 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	// A forced IDR after frame 10 starts a new sequence: the barcodes from it
+	// on count from 0 again.
 	var frames []*Frame
 	deadline := time.Now().Add(3500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		frames = append(frames, nextFrame(t, h))
+		if len(frames) == 10 {
+			if err := h.ForceIDR(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	seqBase := uint64(0)
+	for _, f := range frames {
+		if f.SeqStart != (f.FrameID == 1 || f.FrameID > 10 && seqBase == 0 && f.Key) || f.SeqStart && !f.Key {
+			t.Fatalf("frame %d: key %v seqStart %v (sequence starts: frame 1 and the first key frame after 10)", f.FrameID, f.Key, f.SeqStart)
+		}
+		if f.SeqStart && f.FrameID > 1 {
+			seqBase = f.FrameID
+		}
+	}
+	if seqBase == 0 || seqBase > 30 {
+		t.Fatalf("forced IDR after frame 10 started a sequence at frame %d", seqBase)
 	}
 	qpc := h.QPCFrequency()
 	repeats, maxInSecond := 0, 0
@@ -857,19 +874,14 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 		t.Fatalf("only %d idle repeats in two 0.6 s pauses", repeats)
 	}
 
-	// The converted frame 30: the barcode in its top-left corner reads 30.
+	// The converted frame 30: the barcode in its top-left corner (proto's
+	// frame barcode, read as the browser reads it) is its sequence number.
 	b, err := os.ReadFile(dump)
 	if err != nil || len(b) != w*hgt*3/2 {
 		t.Fatalf("dump: %d bytes, %v", len(b), err)
 	}
-	var id uint32
-	for k := 0; k < 32; k++ {
-		x, y := (k%16)*8+4, (k/16)*8+4
-		if b[y*w+x] > 126 {
-			id |= 1 << (31 - k)
-		}
-	}
-	if id != 30 {
-		t.Fatalf("barcode of the dumped frame reads %d, want 30", id)
+	v, ok := proto.BarcodeReadLuma(b[:w*hgt], w, proto.BarcodeCell)
+	if !ok || uint64(v) != 30-seqBase {
+		t.Fatalf("barcode of the dumped frame 30 reads %d (valid %v), want %d (sequence from frame %d)", v, ok, 30-seqBase, seqBase)
 	}
 }

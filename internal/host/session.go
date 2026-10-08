@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/auth"
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
@@ -55,7 +56,12 @@ type Session struct {
 	amfFallback string // why the last generation did not use capture "amf", logged once
 	amfFailed   atomic.Bool
 
-	video    *media.Video
+	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
+	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()
+	pipeSwap   chan struct{}  // leaveHelper replaced video: videoEvents reads the new one's events
+	helperEncs []media.EncoderInfo
+	helperCaps encoder.Caps // the native helper's, while video is one (helperEncs != nil)
+
 	audio    *media.Audio
 	frameQ   chan *media.Frame
 	paused   atomic.Bool
@@ -105,6 +111,7 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		a: a, c: c, meta: meta, id: auth.RandomToken(6),
 		ctx: ctx, cancel: cancel,
 		frameQ:   make(chan *media.Frame, 6),
+		pipeSwap: make(chan struct{}, 1),
 		tried:    map[string]bool{},
 		usage:    map[string]string{},
 		encFails: map[string]int{},
@@ -188,15 +195,18 @@ func (s *Session) run() error {
 	defer s.releasePads()
 
 	s.prefs = s.hello.Prefs
+	pipeNotice := s.openPipeline() // the helper's encoders are in the welcome
+	defer func() { s.vid().Stop() }()
 	if err := s.sendWelcome(); err != nil {
 		return err
+	}
+	if pipeNotice != "" {
+		s.notice("warn", pipeNotice)
 	}
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		go s.wallClockLoop()
 	}
 
-	s.video = media.NewVideo(s.a.caps, s.log, s.a.clock)
-	defer s.video.Stop()
 	go s.frameSender()
 	go s.videoEvents()
 	if err := s.startVideo(false, ""); err != nil {
@@ -283,14 +293,16 @@ func (s *Session) sendWelcome() error {
 	for _, m := range s.a.monitors() {
 		w.Monitors = append(w.Monitors, proto.MonitorInfo{Index: m.Index, Name: m.Name, Width: m.W, Height: m.H, X: m.X, Y: m.Y, Primary: m.Primary, Hz: m.Hz})
 	}
-	for _, e := range s.a.caps.Encoders {
+	for _, e := range s.encoders() {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
 	w.Features = s.a.features()
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
-	if s.a.backendFor(s.prefs) == "test" && s.a.caps.CanDrawBarcode() {
+	// The test pattern's frames carry their seq as a barcode: FFmpeg's
+	// drawbox chain, or the native helper's conversion shader.
+	if helper, _, _ := s.onHelper(); s.a.backendFor(s.prefs) == "test" && (s.a.caps.CanDrawBarcode() || helper) {
 		w.Features = append(w.Features, proto.FeatureBarcodeSeq)
 	}
 	w.WallOffsetUs = media.WallOffset(s.a.clock)
@@ -333,7 +345,7 @@ func (s *Session) currentPrefs() proto.Prefs {
 // the user why ("" when nothing changed). An encoder forced in the host
 // config is kept: its padding is announced for the client to crop.
 func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, notice string, err error) {
-	e, err = s.negotiateEncoder(prefs)
+	e, err = s.negotiateEncoder(prefs, true)
 	caps := s.a.caps
 	if err != nil || !caps.Pads(e.Name, w, h) {
 		return e, "", err
@@ -379,12 +391,13 @@ func (s *Session) usableEncoder(e media.EncoderInfo) bool {
 }
 
 // pickEncoder returns the host's preferred usable encoder of a family the
-// browser decodes (only hardware encoders if hwOnly) that also passes ok.
+// browser decodes (only hardware encoders if hwOnly) that also passes ok. The
+// native helper's encoders (hardware) come first while the session runs on it.
 func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo) bool) (media.EncoderInfo, bool) {
 	if _, dec := s.clientDecoders()[fam]; !dec {
 		return media.EncoderInfo{}, false
 	}
-	for _, e := range s.a.caps.Encoders {
+	for _, e := range s.encoders() {
 		if e.Family == fam && (!hwOnly || e.HW) && s.usableEncoder(e) && (ok == nil || ok(e)) {
 			return e, true
 		}
@@ -393,13 +406,13 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 }
 
 // negotiateEncoder picks the encoder by configuration, preference and the
-// browser's decoders.
-func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
-	caps := s.a.caps
+// browser's decoders; notify: tell the user when the codec they asked for is
+// not available.
+func (s *Session) negotiateEncoder(prefs proto.Prefs, notify bool) (media.EncoderInfo, error) {
 	client := s.clientDecoders()
 	usable := s.usableEncoder
 	if s.a.cfg.Encoder != "" {
-		for _, e := range caps.Encoders {
+		for _, e := range s.encoders() {
 			if e.Name == s.a.cfg.Encoder {
 				if _, ok := client[e.Family]; ok && usable(e) {
 					return e, nil
@@ -412,7 +425,9 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error)
 		if e, ok := pick(prefs.Codec, false); ok {
 			return e, nil
 		}
-		s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
+		if notify {
+			s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
+		}
 	}
 	// Hardware encode + hardware decode first: HEVC, then AV1, then H.264.
 	for _, fam := range []string{"hevc", "av1", "h264"} {
@@ -519,18 +534,29 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 
 	// Capture timestamps only reach clients that parse the frame extension.
 	p, backend := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
+	if helper, _, c := s.onHelper(); helper {
+		if why := s.helperBlocker(prefs, p.DrawCursor, &c); why != "" {
+			s.leaveHelper(why)
+		}
+	}
 	outW, outH := p.OutputSize()
 	enc, notice, err := s.chooseEncoder(prefs, outW, outH)
 	if err != nil {
 		return media.Params{}, err
 	}
+	if helper, encs, _ := s.onHelper(); helper && !enc.Helper {
+		s.leaveHelper(fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", enc.Name, encoderNames(encs)))
+	}
 	p.Encoder = enc
+	switch {
+	case enc.Helper:
+		s.helperSource(&p, prefs, mon)
+	case backend == "amf":
+		s.useAMFCapture(&p, mon)
+	}
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
 	s.triedMu.Unlock()
-	if backend == "amf" {
-		s.useAMFCapture(&p, mon)
-	}
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()
 	repeat := notice == s.alignNotice
@@ -654,7 +680,7 @@ func (s *Session) startVideo(urgent bool, reason string) error {
 		s.log.Info("restarting video", "reason", reason, "urgent", urgent)
 	}
 	s.setCongestionTarget(p)
-	return s.video.Start(p, urgent)
+	return s.vid().Start(p, urgent)
 }
 
 // ccOverheadKbps is the media congestion controller's allowance for packet and
@@ -706,11 +732,23 @@ func (s *Session) videoEvents() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case ev = <-s.video.Events():
+		case <-s.pipeSwap:
+			continue // the pipeline changed: read the new one's events
+		case ev = <-s.vid().Events():
 		}
 		switch {
+		case ev.Err != nil && ev.Fallback:
+			s.helperFallback(ev)
+		case ev.Err != nil && ev.Restarted:
+			// The pipeline replaces its failed encoder itself (the native
+			// helper); a new generation with a key frame follows.
+			s.notice("warn", "Video encoder restarted ("+trunc(ev.Err.Error(), 160)+")")
 		case ev.Err != nil:
 			s.handleEncoderFailure(ev)
+		case ev.Lost != nil:
+			s.encoderLost(ev.Lost)
+		case ev.Capture != nil:
+			s.captureChanged(ev.Capture)
 		case ev.Config != nil:
 			s.encoderLive()
 			s.videoUp.Store(true)
@@ -864,7 +902,13 @@ func (s *Session) healDue(w *healWatch) {
 	}
 	s.lastKick = time.Now()
 	s.kickMu.Unlock()
-	if err := s.startVideo(false, "loss not healed"); err != nil {
+	var err error
+	if s.vid().Capabilities().ForceIDR {
+		err = s.keyframe("loss not healed")
+	} else {
+		err = s.startVideo(false, "loss not healed")
+	}
+	if err != nil {
 		s.log.Warn("restart after an unhealed loss failed", "err", err)
 	}
 }
@@ -907,6 +951,52 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 			}
 		}
 	})
+}
+
+// helperFallback moves the session to FFmpeg for good after the native
+// helper failed too often, and starts the first FFmpeg generation at once.
+func (s *Session) helperFallback(ev media.VideoEvent) {
+	s.log.Warn("native encoder helper gave up, streaming with FFmpeg for the rest of the session", "err", ev.Err)
+	s.leaveHelper("the helper failed too often: " + ev.Err.Error())
+	s.notice("warn", "The native encoder failed repeatedly; streaming with FFmpeg for the rest of this session.")
+	if s.ctx.Err() == nil && !s.paused.Load() {
+		if err := s.startVideo(true, "helper fallback"); err != nil {
+			s.notice("error", "Could not start video: "+err.Error())
+		}
+	}
+}
+
+// encoderLost handles frames the pipeline lost before they reached the
+// session (the native helper's ring was full: this process fell behind, or
+// an encoder error): the client is told at once, as for frames the session
+// dropped, and gets a key frame unless the generation heals by itself.
+func (s *Session) encoderLost(l *media.LostFrames) {
+	frames := make([]*media.Frame, 0, l.Count)
+	for i := 0; i < l.Count; i++ {
+		frames = append(frames, &media.Frame{Gen: l.Gen, Seq: l.From + uint32(i)})
+	}
+	s.reportDropped(frames, l.Why)
+	if s.vid().Capabilities().Recovery != media.RecoverySkip {
+		s.requestKeyframe()
+	}
+}
+
+// captureChanged follows the native helper's capture source: a new size or
+// rotation restarts the stream at the new native size (and maps input to the
+// monitor's new geometry), a lost capture (secure desktop, mode switch) is
+// shown to the user.
+func (s *Session) captureChanged(c *media.CaptureChange) {
+	s.log.Info("capture changed", "reason", c.Reason, "size", fmt.Sprintf("%dx%d", c.Width, c.Height), "rotation", c.Rotation, "text", c.Text)
+	switch c.Reason {
+	case "resized":
+		if !s.paused.Load() {
+			if err := s.startVideo(false, "capture resized"); err != nil {
+				s.log.Warn("restart after a capture change failed", "err", err)
+			}
+		}
+	case "lost":
+		s.notice("info", "Screen capture is paused ("+trunc(c.Text, 120)+"); the last picture stays until it is back.")
+	}
 }
 
 // noteCaptureFailure takes the session off AMD Direct Capture when a
@@ -970,7 +1060,7 @@ func (s *Session) congestion(delayMs int, sig rateSignal) bool {
 		s.log.Info("bitrate recovery limited by the client's decoder", "max", s.rate.decoderLimit())
 	}
 	s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(to)/1000))
-	if err := s.startVideo(urgent, "congestion"); err != nil {
+	if err := s.setRate(to, urgent, "congestion"); err != nil {
 		s.log.Warn("restart after congestion failed", "err", err)
 	}
 	return true
@@ -988,7 +1078,7 @@ func (s *Session) rateLoop() {
 			return
 		case <-t.C:
 		}
-		if _, live := s.video.Active(); !live || s.paused.Load() {
+		if _, live := s.vid().Active(); !live || s.paused.Load() {
 			s.rate.hold() // nothing streams (paused, or the encoder is starting or failing): nothing to judge
 			continue
 		}
@@ -1001,7 +1091,7 @@ func (s *Session) rateLoop() {
 		s.kickMu.Unlock()
 		_, ceiling := s.rate.kbps()
 		s.log.Info("bitrate recovery: raising bitrate", "from", from, "to", to, "max", ceiling)
-		if err := s.startVideo(false, "bitrate recovery"); err != nil {
+		if err := s.setRate(to, false, "bitrate recovery"); err != nil {
 			s.log.Warn("restart after bitrate recovery failed", "err", err)
 		}
 	}
@@ -1020,20 +1110,20 @@ func (s *Session) urgentRestart(reason string) {
 	s.kickMu.Lock()
 	s.lastKick = time.Now()
 	s.kickMu.Unlock()
-	if stopped, starting := s.video.Hurry(); starting {
+	if stopped, starting := s.vid().Hurry(); starting {
 		if stopped {
 			s.log.Info("restarting video", "reason", reason, "urgent", true, "takeover", true)
 		}
 		return
 	}
-	if err := s.startVideo(true, reason); err != nil {
+	if err := s.keyframe(reason); err != nil {
 		s.log.Warn("urgent restart failed", "reason", reason, "err", err)
 	}
 }
 
-// requestKeyframe restarts the encoder for a client that needs a key frame
-// (a confirmed loss under recovery "keyframe", a decoder error, or its
-// watchdog): the FFmpeg command line cannot force one in a running encoder.
+// requestKeyframe gets a key frame to a client that needs one (a confirmed
+// loss under recovery "keyframe", a decoder error, or its watchdog), at most
+// one every 500 ms.
 func (s *Session) requestKeyframe() {
 	s.kickMu.Lock()
 	if time.Since(s.lastKick) < 500*time.Millisecond {
@@ -1042,9 +1132,52 @@ func (s *Session) requestKeyframe() {
 	}
 	s.lastKick = time.Now()
 	s.kickMu.Unlock()
-	if err := s.startVideo(true, "keyframe request"); err != nil {
+	if err := s.keyframe("keyframe request"); err != nil {
 		s.log.Warn("keyframe restart failed", "err", err)
 	}
+}
+
+// keyframe makes the next frame a key frame of a new generation: in the
+// running encoder where the pipeline can force one (Capabilities().ForceIDR:
+// the native helper), else with a new generation started at once (FFmpeg's
+// command line cannot force one), built afresh from the settings.
+func (s *Session) keyframe(reason string) error {
+	v := s.vid()
+	if v.Capabilities().ForceIDR {
+		err := v.ForceKeyframe()
+		if err == nil {
+			s.log.Info("forcing a key frame", "reason", reason)
+			return nil
+		}
+		s.log.Warn("forcing a key frame failed, restarting", "reason", reason, "err", err)
+	}
+	return s.startVideo(true, reason)
+}
+
+// setRate puts the rate controller's new target into effect: in the running
+// encoder where the pipeline can (Capabilities().LiveBitrate: the native
+// helper), else as a new generation (overlapped unless urgent). urgent: the
+// client also needs a key frame (frames were dropped, or it flushed its
+// decoder).
+func (s *Session) setRate(kbps int, urgent bool, reason string) error {
+	v := s.vid()
+	if !v.Capabilities().LiveBitrate {
+		return s.startVideo(urgent, reason)
+	}
+	s.log.Info("changing the bitrate in the encoder", "reason", reason, "kbps", kbps, "urgent", urgent)
+	if err := v.SetRate(kbps, 0); err != nil {
+		s.log.Warn("bitrate change in the encoder failed, restarting", "err", err)
+		return s.startVideo(urgent, reason)
+	}
+	if p, ok := v.Current(); ok {
+		s.setCongestionTarget(p)
+		_, ceiling := s.rate.kbps()
+		s.sendJSON(proto.Rate{T: "rate", Gen: v.Gen(), BitrateKbps: kbps, MaxBitrateKbps: ceiling})
+	}
+	if urgent {
+		return s.keyframe(reason)
+	}
+	return nil
 }
 
 func (s *Session) frameSender() {
@@ -1135,6 +1268,24 @@ func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, pro
 	ext.Set(proto.ExtEncodeDoneUs, f.EncodeDoneUs)
 	if f.CaptureUs != 0 {
 		ext.Set(proto.ExtCaptureUs, f.CaptureUs)
+	}
+	// The native helper's stages and recovery metadata. refFloor is present
+	// exactly on recovery frames (that is the marker: readers skip unknown
+	// tags, v1 clients get no extension at all).
+	if f.PresentUs != 0 {
+		ext.Set(proto.ExtPresentUs, f.PresentUs)
+	}
+	if f.SubmitUs != 0 {
+		ext.Set(proto.ExtEncodeSubmitUs, f.SubmitUs)
+	}
+	if f.Recovery {
+		ext.Set(proto.ExtRefFloor, uint64(f.RefFloor))
+	}
+	if f.MarkedLTR {
+		ext.Set(proto.ExtLTRSlot, uint64(f.LTRSlot))
+	}
+	if f.TemporalLayer != 0 {
+		ext.Set(proto.ExtTemporalLayer, uint64(f.TemporalLayer))
 	}
 	return h, ext
 }
@@ -1245,6 +1396,7 @@ func (s *Session) datagrams() {
 			}
 		case proto.DgFrameAck:
 			if a, ok := proto.ParseFrameAck(d); ok {
+				s.vid().Ack(a.Gen, a.Seq)
 				s.hostStages.acked(a.Gen, a.Seq, s.a.clock())
 				s.rate.ack(time.Duration(a.OWDUs) * time.Microsecond)
 				s.stats.acks.Add(1)
@@ -1310,6 +1462,9 @@ func (s *Session) cursorLoop() {
 		cs, err := platform.GetCursor()
 		if err != nil {
 			continue
+		}
+		if s.vid().Capabilities().CursorInVideo {
+			cs.Visible = false // the stream shows the pointer already (a WGC capture that could not leave it out)
 		}
 		if cs.Visible != lastVisible || (cs.Visible && cs.Handle != lastHandle) {
 			lastVisible, lastHandle = cs.Visible, cs.Handle
@@ -1414,7 +1569,7 @@ func (s *Session) controlLoop() error {
 		case "pause":
 			if !s.paused.Swap(true) {
 				s.log.Info("client hidden: pausing video")
-				s.video.Suspend()
+				s.vid().Suspend()
 				s.drainQueue()
 			}
 		case "resume":
@@ -1504,15 +1659,17 @@ func pctString(v []float64) string {
 	return fmt.Sprintf("%.1f/%.1f/%.1f n=%d", q(0.5), q(0.95), q(0.99), len(v))
 }
 
-// stageNames are the rows a client latency summary may contain.
-var stageNames = map[string]bool{"capture": true, "queue": true, "network": true, "transfer": true, "wait": true,
-	"decode": true, "draw": true, "display": true, "e2e": true}
+// stageNames are the rows a client latency summary may contain: present,
+// submit and encode split capture->encoded where the native helper stamps
+// present and encoder submit times.
+var stageNames = map[string]bool{"present": true, "capture": true, "submit": true, "encode": true, "queue": true, "network": true,
+	"transfer": true, "wait": true, "decode": true, "draw": true, "display": true, "e2e": true}
 
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
 // the host's own measurement of its stages (host_capture, host_queue).
 func (s *Session) logStages(rows []proto.StageStat) {
-	p, ok := s.video.Active()
+	p, ok := s.vid().Active()
 	if !ok || len(rows) == 0 || len(rows) > len(stageNames) {
 		return
 	}

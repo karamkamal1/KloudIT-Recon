@@ -60,18 +60,17 @@ type StartParams struct {
 	ZeroCopy           *bool  `json:"zeroCopy,omitempty"`           // AMD Direct Capture surfaces straight into AMF when possible; nil = true
 }
 
-// Barcode places the frame id as a block barcode into every encoded frame
-// (GUIDE 0.2): block k shows bit k of the id (bits-1-k with MSBFirst), luma
-// 235 for 1 and 16 for 0 with neutral chroma, Cols blocks per row, in output
-// pixels. X, Y, BlockW and BlockH must be even.
+// Barcode places the frame barcode of GUIDE 0.2 into every encoded frame,
+// exactly as internal/proto/barcode.go defines it: the frame's sequence number
+// (low 16 bits) and its CRC-8 in proto.BarcodeCols x proto.BarcodeRows cells of
+// Cell output pixels, white = 1. The sequence number counts the frames since
+// the latest sequence start (Frame.SeqStart: the stream's first frame, or the
+// key frame that answered ForceIDR), so it is the seq recon-host sends the
+// frame with. X, Y and Cell must be even (Cell 2..256).
 type Barcode struct {
-	X        int  `json:"x"`
-	Y        int  `json:"y"`
-	BlockW   int  `json:"blockW"`
-	BlockH   int  `json:"blockH"`
-	Cols     int  `json:"cols"`
-	Bits     int  `json:"bits"` // low bits of the frame id, 1..64
-	MSBFirst bool `json:"msbFirst"`
+	X    int `json:"x"`
+	Y    int `json:"y"`
+	Cell int `json:"cell"`
 }
 
 // MaxROIRects is the most regions of interest one SetROI may carry.

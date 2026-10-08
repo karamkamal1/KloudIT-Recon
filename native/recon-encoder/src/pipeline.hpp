@@ -51,6 +51,11 @@ public:
     // setRate is recorded here (it shows up in every stats message) and
     // forwarded to the encoder and, for an fps change, to the capture.
     Status setRate(const RateParams& r);
+    // forceIdr ("forceIdr" message): the next captured frame starts a new
+    // sequence (SubmitInfo::seqStart, barcode value 0) and the capture thread
+    // makes it an IDR (Backend::forceIdr right before submitting it), so the
+    // frame recon-host starts a new stream generation on carries barcode 0.
+    void forceIdr() { idrRequests_.fetch_add(1); }
 
 private:
     void captureLoop();
@@ -68,6 +73,7 @@ private:
     PipelineOptions opt_;
     bool dumped_ = false;
 
+    std::atomic<uint64_t> idrRequests_{0};  // forceIdr calls so far
     std::atomic<bool> stop_{false};
     std::thread capture_;
     std::thread output_;

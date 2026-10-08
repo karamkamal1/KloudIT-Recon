@@ -46,14 +46,19 @@ helper:
 	fi
 
 # Helper integration tests (mock backend, the NVENC backend against its test double
-# recon-fake-nvenc.dll) under Wine, against the mingw build. Wine's D3D11 needs an X
-# display: run under xvfb-run (Mesa llvmpipe) to include the GPU conversion self-test,
-# the synthetic-gpu pipeline test and the NVENC test; headless they skip.
+# recon-fake-nvenc.dll) under Wine, against the mingw build, and the session's pipeline
+# on it (media: HelperVideo, the GPU priority table shared with the helper). Wine's D3D11
+# needs an X display with 24-bit colour: run under xvfb-run -a -s "-screen 0 1280x720x24"
+# (Mesa llvmpipe) to include the GPU conversion self-test, the synthetic-gpu pipeline
+# tests and the NVENC test; headless they skip.
+HELPER_TEST_ENV = RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
+	RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))'
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
-	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
-		RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
-		$(WINE) ./encoder.test.exe -test.v -test.count=1
+	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/media.test.exe ./internal/host/media
+	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./encoder.test.exe -test.v -test.count=1
+	cd $(DIST)/obj && $(HELPER_TEST_ENV) $(WINE) ./media.test.exe -test.v -test.count=1 -test.run 'Helper|GPUPriority|ClockFromQPC'
+
 
 # third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests
 # of the packages third_party/quic-go.patch changes.
