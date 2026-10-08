@@ -28,9 +28,11 @@ type Frame struct {
 	SubmitUs     uint64 // host clock when the frame went into the encoder (native helper; 0 = unknown)
 	EncodeDoneUs uint64 // host clock when the encoded frame came out of the encoder
 	// Recovery metadata (native helper; frame extension tags 5-7):
-	// Recovery frames reference only frames the client acknowledged, the
-	// oldest being seq RefFloor of this generation; MarkedLTR frames are kept
-	// in long-term reference slot LTRSlot; TemporalLayer is the SVC layer.
+	// Recovery frames reference only frames the client acknowledged: seq
+	// RefFloor of this generation is the newest earlier frame they (and the
+	// frames after them) may reference, none between it and the recovery
+	// frame; MarkedLTR frames are kept in long-term reference slot LTRSlot;
+	// TemporalLayer is the SVC layer.
 	Recovery      bool
 	RefFloor      uint32
 	MarkedLTR     bool

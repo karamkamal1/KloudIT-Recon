@@ -437,6 +437,8 @@ async function lossRun(name, faults, seconds, prefs = {}) {
     hostLog: hl,
     // The decoder's own error lines, not the key-frame requests they cause.
     decoderErrors: con.filter((l) => l.includes('decoder error:')).length,
+    // Recovery frames decoded as soon as they were buffered, ahead of late frames before them.
+    lateSkips: con.filter((l) => l.includes('ends the recovery wait')).length,
   };
 }
 
@@ -519,8 +521,9 @@ async function checkLossHandling() {
   // must be answered by such a frame: the client decodes nothing from the
   // lost frame until it (the last good picture stays), resumes with it, and
   // asks for no key frame; the host starts no new generation for a loss.
-  // Late frames still wait (no "frame lost"). The client counts the key
-  // frames (IDRs) it decoded and the frames it waited out.
+  // Late frames still wait (no "frame lost"), except those before a buffered
+  // recovery frame (all discarded anyway). The client counts the key frames
+  // (IDRs) it decoded and the frames it waited out.
   const r = await lossRun('host-faults-ref', `${LOSS_FAULTS},ref-recovery`, 20);
   const refRestarts = r.restarts['keyframe request (urgent)'] || 0;
   const lossKeys = ['dropped by host', 'frame lost', 'no recovery frame'].reduce((a, k) => a + (r.keyRequestReasons[k] || 0), 0);
@@ -533,7 +536,8 @@ async function checkLossHandling() {
       !r.keyRequestReasons['frame lost'] && r.fps >= 10,
     `${r.cfg?.encoder} recovery ${r.cfg?.recovery}: host dropped ${r.dropped} (${r.delayed} delayed 200 ms), asked the encoder to recover ${r.recovering}, ` +
       `answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}; client told ${r.client.hostDropped}, ` +
-      `recovered ${r.client.recovered} by recovery frame and ${r.client.recoveredByKey} by key frame, ${r.client.discarded} frames discarded meanwhile, ` +
+      `recovered ${r.client.recovered} by recovery frame and ${r.client.recoveredByKey} by key frame, ${r.client.discarded} frames discarded meanwhile ` +
+      `(${r.lateSkips} times without waiting for a late frame before the recovery frame), ` +
       `${r.client.keyFrames} IDRs decoded, decoder errors ${r.decoderErrors}; client key-frame requests: ${counts(r.keyRequestReasons)}; ` +
       `host restarts: ${counts(r.restarts)}; ${r.fps.toFixed(1)} fps mean over ${r.seconds} s`);
   await checkProbe('reference recovery');

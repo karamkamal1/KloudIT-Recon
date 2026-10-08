@@ -3214,7 +3214,10 @@ came with 3.3 and 3.4, the session plumbing with 3.1b; this step wires them end 
   pipeline keeps key-frame recovery (`Recover` = `ErrNoRecovery`) and skip.
 - Client (`stream-worker.js`): under `ltr`/`invalidate` a confirmed loss at L stops feeding the
   decoder (the last good picture stays on screen) and discards every frame until
-  `P.endsRecovery` (a key frame, or `refFloor` < L), feeds that one and resumes. A later loss
+  `P.endsRecovery` (a key frame, or `refFloor` < L), feeds that one and resumes. Once that frame
+  is buffered it does not wait for late frames before it (discarded anyway; one later than the
+  late-frame wait would otherwise be reported `lost` and cost a second recovery frame): `frame
+  g/s ends the recovery wait: not waiting for N late frame(s) before it`. A later loss
   while waiting keeps the oldest L; no recovery frame within max(1 s, 4 × RTT) asks for a key
   frame (`requesting key frame (no recovery frame)`). On `VideoDecoder` `error()` it reconfigures
   the decoder and asks for a key frame (forced IDR in the helper, no restart); an error within

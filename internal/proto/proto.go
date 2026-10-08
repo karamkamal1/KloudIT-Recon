@@ -82,7 +82,7 @@ const (
 	ExtCaptureUs      byte = 2 // u64 frame captured
 	ExtEncodeSubmitUs byte = 3 // u64 frame submitted to the encoder (native helper only)
 	ExtEncodeDoneUs   byte = 4 // u64 encoded frame available to the host
-	ExtRefFloor       byte = 5 // u32 oldest frame the decoder may reference (recovery frames)
+	ExtRefFloor       byte = 5 // u32 newest earlier frame a recovery frame (or a later one) may reference (recovery frames)
 	ExtLTRSlot        byte = 6 // u8 long-term reference slot this frame is marked into
 	ExtTemporalLayer  byte = 7 // u8 temporal layer id
 	extMaxTag              = 7

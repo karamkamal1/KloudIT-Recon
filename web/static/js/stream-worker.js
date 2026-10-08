@@ -707,10 +707,12 @@ const gapTimeout = () => Math.max(250, 4 * clock.rtt);
 // The next frame in sequence is missing. It is lost when the host reported it
 // dropped (act at once) or when the gap outlasts gapTimeout() (no report: an
 // older host, or a frame lost on the way); until then frames wait in the
-// reorder buffer.
+// reorder buffer, except a frame that ends a wait for a recovery frame
+// (skipToRecovery).
 function checkGap() {
   const cfg = video.cfg;
   if (!cfg || cfg.gen === video.lostGen) return;
+  if (video.recover && skipToRecovery()) return;
   const reported = video.hostDropped.has(video.expectSeq);
   if (!reported) {
     if (!video.reorder.size) return;
@@ -769,6 +771,30 @@ function awaitRecovery(from, reported, reason) {
     video.recover.from = Math.min(video.recover.from, from);
   }
   if (!reported) transport?.sendControl({ t: P.MSG_LOST, gen: cfg.gen, fromSeq: from });
+}
+
+// While waiting for a recovery frame every frame before the one that ends the
+// wait is discarded anyway: when that frame is buffered, continue with it at
+// once instead of waiting for the late frames before it (which would keep the
+// picture frozen and, past gapTimeout(), report them lost for a second
+// recovery frame). Frames before it that still arrive are ignored (onFrame).
+function skipToRecovery() {
+  const r = video.recover;
+  let to = Infinity;
+  for (const [s, f] of video.reorder) if (s < to && P.endsRecovery(f, r.from)) to = s;
+  if (to === Infinity) return false;
+  let late = 0;
+  for (let s = video.expectSeq; s < to; s++) {
+    const buffered = video.reorder.delete(s);
+    if (video.hostDropped.delete(s)) { stats.dropped++; continue; }
+    if (!buffered) late++;
+    r.discarded++;
+    stats.recoveryDiscarded++;
+  }
+  if (late) post('log', { text: `frame ${r.gen}/${to} ends the recovery wait: not waiting for ${late} late frame(s) before it` });
+  video.expectSeq = to;
+  decodeInOrder();
+  return true;
 }
 
 // How long to wait for a recovery frame before asking for a key frame: the

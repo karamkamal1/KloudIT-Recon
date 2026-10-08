@@ -62,7 +62,7 @@ The **extension** carries per-frame stage timestamps and recovery metadata:
 | 2 | `captureUs` | u64 | frame captured (FFmpeg path: see below) |
 | 3 | `encodeSubmitUs` | u64 | frame submitted to the encoder (native helper only) |
 | 4 | `encodeDoneUs` | u64 | encoded frame read from the encoder (NUT packet off the pipe) |
-| 5 | `refFloor` | u32 | oldest frame (`seq` of this generation) a recovery frame references; present exactly on recovery frames |
+| 5 | `refFloor` | u32 | newest earlier frame (`seq` of this generation) that a recovery frame, or any frame after it, may reference: no frame between `refFloor` and the recovery frame is referenced; present exactly on recovery frames |
 | 6 | `ltrSlot` | u8 | long-term reference slot the frame is marked into |
 | 7 | `temporalLayer` | u8 | temporal layer id |
 
@@ -127,10 +127,14 @@ What the client does about a lost frame depends on `recovery` in the `video` mes
   `hello.v >= 3`, older ones get `keyframe`): the encoder answers a loss with a **recovery frame**
   that references only frames the client decoded before it: `ltr` (AMF) an acknowledged long-term
   reference, `invalidate` (NVENC) the newest frame before the loss after invalidating the lost
-  ones. It carries frame extension tag 5 `refFloor` (the oldest frame it may reference, a `seq` of
-  the generation), which is also the marker: only recovery frames have it. After a loss at seq L
-  the client stops feeding the decoder (the last good picture stays on screen) and discards every
-  frame until one with `refFloor < L` (or a key frame) arrives, feeds it and resumes. The host
+  ones. It carries frame extension tag 5 `refFloor` (a `seq` of the generation: the newest frame
+  before the recovery frame that it, or any frame after it, may reference; no frame between
+  `refFloor` and the recovery frame is referenced), which is also the marker: only recovery frames
+  have it. `refFloor` bounds the references from above, so a recovery frame with `refFloor < L`
+  needs nothing from L on; only under that definition may the client resume at it. After a loss
+  at seq L the client stops feeding the decoder (the last good picture stays on screen) and
+  discards every frame until one with `refFloor < L` (or a key frame), feeds it and resumes; once
+  that frame is buffered it does not wait for late frames before it. The host
   recovers the losses it reported (`dropped`) on its own; a gap that outlasted the late-frame wait
   the client reports with `{"t":"lost","gen":g,"fromSeq":L}` (hosts that never announce these
   modes never get it). No recovery frame within max(1 s, 4 × RTT): a key frame request. A decoder error within 1 s

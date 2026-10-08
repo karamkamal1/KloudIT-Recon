@@ -80,8 +80,9 @@ export const isRefRecovery = (mode) => mode === RECOVERY_LTR || mode === RECOVER
 
 /**
  * Whether a frame (parsed header) ends the wait after a loss at seq `lostFrom`
- * under reference recovery: a key frame, or a recovery frame whose oldest
- * reference (refFloor) is older than the lost frame.
+ * under reference recovery: a key frame, or a recovery frame whose refFloor
+ * (the newest earlier frame it or a later frame may reference) is older than
+ * the lost frame.
  */
 export const endsRecovery = (h, lostFrom) => h.key || (h.ext?.refFloor !== undefined && h.ext.refFloor < lostFrom);
 
