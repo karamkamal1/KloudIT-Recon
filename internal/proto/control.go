@@ -103,8 +103,12 @@ type VideoConfig struct {
 	Height      int    `json:"height"`
 	FPS         int    `json:"fps"`
 	BitrateKbps int    `json:"bitrate"`
-	Encoder     string `json:"encoder"`
-	Capture     string `json:"capture"`
+	// MaxBitrateKbps is the bitrate the host goes back to after a congestion
+	// back-off (the settings' bitrate or the host default): BitrateKbps is
+	// below it while a back-off lasts. 0 from hosts before this field.
+	MaxBitrateKbps int    `json:"maxBitrate,omitempty"`
+	Encoder        string `json:"encoder"`
+	Capture        string `json:"capture"`
 	// Recovery is how the client recovers from a confirmed frame loss (a frame
 	// the host reported dropped, or a gap that outlasted the late-frame
 	// timeout): RecoverySkip when the encoder heals the picture by itself

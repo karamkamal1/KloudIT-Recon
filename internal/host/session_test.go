@@ -347,12 +347,23 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		go s.videoEvents()
 		return s, logs
 	}
-	// keepCutWindowOpen moves the last cut ahead so that a slow machine
-	// cannot leave the 2 s window before the overflow.
+	// keepCutWindowOpen moves the last cut (a change of the bitrate) ahead
+	// so that a slow machine cannot leave the 2 s window before the overflow.
 	keepCutWindowOpen := func(s *Session) {
-		s.kickMu.Lock()
-		s.lastCong = time.Now().Add(time.Hour)
-		s.kickMu.Unlock()
+		s.rate.mu.Lock()
+		s.rate.lastCut = time.Now().Add(time.Hour)
+		s.rate.lastChange = s.rate.lastCut
+		s.rate.mu.Unlock()
+	}
+	// backOff sets the controller's target as a cut would.
+	backOff := func(s *Session, kbps int) {
+		s.rate.mu.Lock()
+		s.rate.cur = kbps
+		s.rate.mu.Unlock()
+	}
+	target := func(s *Session) int {
+		cur, _ := s.rate.kbps()
+		return cur
 	}
 	waitFor := func(t *testing.T, logs *lockedLog, substr string) string {
 		t.Helper()
@@ -379,13 +390,13 @@ func TestQueueOverflowEscalates(t *testing.T) {
 			}
 		}
 		s.a.caps.FFmpeg = stall // the next generation stays starting
-		s.congestion(120, false)
+		s.congestion(120, signalDelay)
 		keepCutWindowOpen(s)
 		if _, ok := s.video.Active(); !ok {
 			t.Fatal("overlapped back-off stopped the active generation")
 		}
-		if p, _ := s.video.Current(); p.BitrateKbps != 3000 || s.curKbps.Load() != 3000 {
-			t.Fatalf("back-off to %d kbps (starting %d), want 3000", s.curKbps.Load(), p.BitrateKbps)
+		if p, _ := s.video.Current(); p.BitrateKbps != 3000 || target(s) != 3000 {
+			t.Fatalf("back-off to %d kbps (starting %d), want 3000", target(s), p.BitrateKbps)
 		}
 		// The client stops taking frames: generation 1 overflows the queue.
 		line := waitFor(t, logs, `msg="restarting video" reason="queue overflow" urgent=true`)
@@ -395,8 +406,8 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		if _, ok := s.video.Active(); ok {
 			t.Fatal("the old generation still streams after the overflow")
 		}
-		if p, ok := s.video.Current(); !ok || p.BitrateKbps != 3000 || s.curKbps.Load() != 3000 {
-			t.Fatalf("after the overflow: starting %v at %d kbps, target %d, want 3000 (no second cut)", ok, p.BitrateKbps, s.curKbps.Load())
+		if p, ok := s.video.Current(); !ok || p.BitrateKbps != 3000 || target(s) != 3000 {
+			t.Fatalf("after the overflow: starting %v at %d kbps, target %d, want 3000 (no second cut)", ok, p.BitrateKbps, target(s))
 		}
 		if n := len(logs.lines(`msg="starting encoder"`)); n != 2 {
 			t.Fatalf("%d encoder starts, want 2 (the starting generation is kept)", n)
@@ -408,7 +419,7 @@ func TestQueueOverflowEscalates(t *testing.T) {
 
 	t.Run("key frame dropped", func(t *testing.T) {
 		s, logs := session(t)
-		s.curKbps.Store(3000) // a cut moments ago
+		backOff(s, 3000) // a cut moments ago
 		keepCutWindowOpen(s)
 		if err := s.startVideo(false, ""); err != nil {
 			t.Fatal(err)
@@ -420,15 +431,15 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		if l := waitFor(t, logs, `msg="starting encoder" gen=2`); !strings.Contains(l, " kbps=3000 ") {
 			t.Fatalf("restart not at the lowered bitrate: %s", l)
 		}
-		if n := len(logs.lines(`msg="congestion: lowering bitrate"`)); n != 0 || s.curKbps.Load() != 3000 {
-			t.Fatalf("%d bitrate cuts, target %d kbps, want none and 3000", n, s.curKbps.Load())
+		if n := len(logs.lines(`msg="congestion: lowering bitrate"`)); n != 0 || target(s) != 3000 {
+			t.Fatalf("%d bitrate cuts, target %d kbps, want none and 3000", n, target(s))
 		}
 	})
 
 	// A key-frame request (a confirmed loss) keeps the back-off.
 	t.Run("keyframe request", func(t *testing.T) {
 		s, logs := session(t)
-		s.curKbps.Store(3000)
+		backOff(s, 3000)
 		if err := s.startVideo(false, ""); err != nil {
 			t.Fatal(err)
 		}
@@ -438,10 +449,67 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		}
 	})
 
+	// A decoder flush ({"t":"congestion","reason":"decoder"}) within 2 s of
+	// a cut cuts nothing but restarts at once for the key frame the client
+	// waits for; a delay report then restarts nothing. Outside the window
+	// the flush cuts with an urgent restart and caps the raises.
+	t.Run("decoder report", func(t *testing.T) {
+		s, logs := session(t)
+		go func() { // the client takes every frame: no queue overflow
+			for {
+				select {
+				case <-s.frameQ:
+				case <-s.ctx.Done():
+					return
+				}
+			}
+		}()
+		backOff(s, 3000)
+		if err := s.startVideo(false, ""); err != nil {
+			t.Fatal(err)
+		}
+		keepCutWindowOpen(s)
+		control := func(msgs ...proto.ClientMsg) {
+			t.Helper()
+			var in bytes.Buffer
+			for _, m := range msgs {
+				b, _ := json.Marshal(m)
+				if err := proto.WriteMsg(&in, b); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.ctrl = &scriptedCtrl{r: &in}
+			if err := s.controlLoop(); !errors.Is(err, io.EOF) {
+				t.Fatalf("control loop: %v", err)
+			}
+		}
+		control(proto.ClientMsg{T: "congestion", Reason: proto.CongestionDecoder}, proto.ClientMsg{T: "congestion", DelayMs: 120})
+		if l := logs.lines(`msg="restarting video"`); len(l) != 1 || !strings.Contains(l[0], `reason="keyframe request" urgent=true`) {
+			t.Fatalf("restarts %q, want one key-frame restart", l)
+		}
+		if n := len(logs.lines(`msg="congestion: lowering bitrate"`)); n != 0 || target(s) != 3000 || s.rate.decoderLimit() != 0 {
+			t.Fatalf("%d bitrate cuts, target %d kbps, decoder limit %d; want none, 3000, none", n, target(s), s.rate.decoderLimit())
+		}
+
+		s.rate.mu.Lock()
+		s.rate.lastCut, s.rate.lastChange = time.Time{}, time.Time{}
+		s.rate.mu.Unlock()
+		control(proto.ClientMsg{T: "congestion", Reason: proto.CongestionDecoder})
+		if l := logs.lines(`msg="congestion: lowering bitrate"`); len(l) != 1 || !strings.Contains(l[0], "from=3000 to=2250") || !strings.Contains(l[0], "urgent=true") {
+			t.Fatalf("cuts %q, want 3000 -> 2250 urgent", l)
+		}
+		if l := logs.lines(`msg="bitrate recovery limited by the client's decoder"`); len(l) != 1 || !strings.Contains(l[0], "max=2550") {
+			t.Fatalf("decoder limit lines %q, want max=2550", l)
+		}
+		if l := logs.lines(`msg="restarting video"`); len(l) != 2 || !strings.Contains(l[1], `reason=congestion urgent=true`) {
+			t.Fatalf("restarts %q, want an urgent congestion restart", l)
+		}
+	})
+
 	// A settings message that changes only the audio keeps it too.
 	t.Run("audio settings", func(t *testing.T) {
 		s, logs := session(t)
-		s.curKbps.Store(3000)
+		backOff(s, 3000)
 		if err := s.startVideo(false, ""); err != nil {
 			t.Fatal(err)
 		}
@@ -455,7 +523,7 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		if err := s.controlLoop(); !errors.Is(err, io.EOF) {
 			t.Fatalf("control loop: %v", err)
 		}
-		if kb := s.curKbps.Load(); kb != 3000 {
+		if kb := target(s); kb != 3000 {
 			t.Fatalf("audio-only settings change reset the back-off: target %d kbps, want 3000", kb)
 		}
 		s.requestKeyframe()

@@ -28,6 +28,10 @@ import (
 //	                  gfxcapture send frames only on change); the session
 //	                  discards the encoder's later frames before anything else
 //	                  sees them
+//	rate-period=D     the bitrate controller's quiet period before a raise
+//	                  and its minimum time between changes (both 10 s) become
+//	                  D (a Go duration, 100ms to 10s), so a test sees the
+//	                  bitrate recover within seconds
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -43,11 +47,12 @@ type testFaults struct {
 	// intraRefresh makes libx264 use periodic intra refresh (NewAgent:
 	// media.Caps.UseIntraRefresh).
 	intraRefresh bool
-	stillAfter   int // frames of a generation before its source goes still
+	stillAfter   int           // frames of a generation before its source goes still
+	ratePeriod   time.Duration // rateController.period
 }
 
 func (f testFaults) active() bool {
-	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.stillAfter > 0
+	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.stillAfter > 0 || f.ratePeriod > 0
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -109,8 +114,14 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: want still=after:N", rule)
 			}
 			f.stillAfter = n
+		case "rate-period":
+			d, err := time.ParseDuration(val)
+			if err != nil || d < 100*time.Millisecond || d > ratePeriod {
+				return f, fmt.Errorf("%s: want rate-period=D, 100ms <= D <= %v", rule, ratePeriod)
+			}
+			f.ratePeriod = d
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, still)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, still, rate-period)", rule)
 		}
 	}
 	return f, nil

@@ -179,14 +179,28 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
   immediately instead.
 - **Congestion:** if the per-session frame queue overflows (the network can't keep up), the host
   drops the backlog (and reports it, `{"t":"dropped"}`), lowers the bitrate by 25 % and restarts
-  with a key frame at once. The cut is rate-limited to once every 2 s, the urgent restart is not:
-  an overflow within 2 s of a cut restarts at once at the already lowered bitrate. The browser
-  also reports sustained growth in one-way delay (`{"t":"congestion"}`) before queues get deep;
-  that back-off restarts overlapped, so the picture keeps moving (if the old generation overflows
-  the queue meanwhile, it stops and the starting one takes over). A browser whose decoder fell
-  behind flushes it and sends `{"t":"congestion","reason":"decoder"}`, which restarts at once (it
-  discards the old generation anyway). A back-off stays in effect for every later restart (key
-  frames, encoder failures) until the user changes the video settings.
+  with a key frame at once. Such emergency cuts are at most one every 2 s, the urgent restart is
+  not limited: an overflow within 2 s of a cut restarts at once at the already lowered bitrate.
+  The browser also reports sustained growth in one-way delay (`{"t":"congestion"}`) before
+  queues get deep; that back-off restarts overlapped, so the picture keeps moving (if the old
+  generation overflows the queue meanwhile, it stops and the starting one takes over), and it
+  needs 10 s since the last bitrate change. A browser whose decoder fell behind flushes it and
+  sends `{"t":"congestion","reason":"decoder"}`, an emergency like the overflow: it restarts at
+  once (the client discards the old generation anyway), with a key-frame restart when the
+  bitrate cannot be cut. A back-off stays in effect for every later restart (key frames, encoder
+  failures) until the bitrate recovers or the user changes the video settings.
+- **Bitrate recovery** (`internal/host/bitrate.go`, the interim before a delay-gradient rate
+  controller): the client acknowledges every decoded frame with its one-way delay (`0x40`). When
+  10 s have passed without a congestion signal and with the delay low (every 500 ms the median
+  delay of the frames acknowledged since the last check is within 10 ms of the minimum of the
+  last 2 s, and acknowledgements keep coming while frames go out: a frame sent 1 s ago with no
+  acknowledgement since means a stalled path, which on the relay paths shows only that way,
+  since the gateway buffers what its client leg cannot carry), the host raises the bitrate by
+  15 %, up to the settings' bitrate (or the host default), with an overlapped restart; after a
+  decoder flush only up to 85 % of the bitrate the decoder fell behind at, until the settings
+  change. Every change, up or down, is at most one per 10 s; only the emergency cuts above may
+  come sooner. Each `video` config carries the target (`bitrate`) and the setting
+  (`maxBitrate`); the stats overlay shows "target … of … Mbps (backed off)".
 - **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
   `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
   (see `third_party/README.md`). Host config `congestion` picks it for the direct path and the

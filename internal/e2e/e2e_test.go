@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -289,6 +291,16 @@ func hello(ticket string, v int, prefs proto.Prefs) []byte {
 	return b
 }
 
+// frameAck builds the client's acknowledgement of a decoded frame
+// (proto.ParseFrameAck); the decode time is left 0.
+func frameAck(gen uint8, seq uint32, owd time.Duration) []byte {
+	b := make([]byte, 16)
+	b[0], b[1] = proto.DgFrameAck, gen
+	binary.LittleEndian.PutUint32(b[4:], seq)
+	binary.LittleEndian.PutUint32(b[8:], uint32(owd.Microseconds()))
+	return b
+}
+
 // result of a streaming run.
 type result struct {
 	configs, frames, keyframes, audio int
@@ -299,6 +311,7 @@ type result struct {
 	firstFrameLatency                 time.Duration
 	recovery                          []string           // VideoConfig.Recovery of each config
 	gens                              []uint8            // VideoConfig.Gen of each config
+	bitrates                          [][2]int           // VideoConfig bitrate and maxBitrate of each config
 	dropped                           []proto.Dropped    // the host's "dropped" reports
 	configAt, droppedAt               []time.Time        // when each config and "dropped" report arrived
 	received                          map[[2]uint32]bool // gen, seq of every complete frame
@@ -313,6 +326,8 @@ func (r *result) control(m []byte) {
 		WallOffsetUs int64
 		Recovery     string
 		Gen          uint8
+		Bitrate      int
+		MaxBitrate   int
 	}
 	json.Unmarshal(m, &x)
 	switch x.T {
@@ -325,6 +340,7 @@ func (r *result) control(m []byte) {
 		r.configs++
 		r.recovery = append(r.recovery, x.Recovery)
 		r.gens = append(r.gens, x.Gen)
+		r.bitrates = append(r.bitrates, [2]int{x.Bitrate, x.MaxBitrate})
 		r.configAt = append(r.configAt, time.Now())
 	case "dropped":
 		var d proto.Dropped
@@ -420,6 +436,19 @@ func runWTPrefs(t *testing.T, e *env, rawURL string, hashes []string, ticket str
 func runWTCtl(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs,
 	mid func(ctrl transport.BidiStream)) result {
 	t.Helper()
+	return runWTOpts(t, e, rawURL, hashes, ticket, v, dur, prefs, wtOpts{mid: mid})
+}
+
+// wtOpts are the optional parts of a streaming run.
+type wtOpts struct {
+	mid       func(ctrl transport.BidiStream) // runs halfway through with the control stream
+	ackOWD    time.Duration                   // > 0: acknowledge every frame (DgFrameAck) with this one-way delay, as a browser does
+	ackTilMid bool                            // stop acknowledging (still taking every frame) when mid runs
+}
+
+func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs,
+	opts wtOpts) result {
+	t.Helper()
 	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: transport.QUICConfig()}
 	hdr := http.Header{}
 	hdr.Set("Origin", e.base)
@@ -446,6 +475,7 @@ func runWTCtl(t *testing.T, e *env, rawURL string, hashes []string, ticket strin
 
 	var mu sync.Mutex
 	var r result
+	var acksOff atomic.Bool
 	go func() {
 		for {
 			m, err := proto.ReadMsg(ctrl, proto.MaxControlMsg)
@@ -486,6 +516,9 @@ func runWTCtl(t *testing.T, e *env, rawURL string, hashes []string, ticket strin
 			}
 			r.countFrame(b)
 			mu.Unlock()
+			if h, _, _, err := proto.ParseFrame(b); err == nil && opts.ackOWD > 0 && !acksOff.Load() {
+				c.SendDatagram(frameAck(h.Gen, h.Seq, opts.ackOWD))
+			}
 		}
 	}()
 	// Input: a key press and relative mouse motion with one "lost" datagram.
@@ -496,8 +529,9 @@ func runWTCtl(t *testing.T, e *env, rawURL string, hashes []string, ticket strin
 	// seq 2 intentionally skipped (lost): seq 3 carries the running total.
 	c.SendDatagram(proto.MouseRelDatagram(3, 12, -10))
 	c.SendDatagram(proto.MouseRelDatagram(2, 9, -6)) // late duplicate, must be ignored
-	if mid != nil {
-		mid(ctrl)
+	acksOff.Store(opts.ackTilMid)
+	if opts.mid != nil {
+		opts.mid(ctrl)
 	}
 	time.Sleep(dur / 2)
 	mu.Lock()
@@ -807,6 +841,89 @@ func TestStreamingFrameLoss(t *testing.T) {
 	}
 	if l := e.logs.lines(from, `msg="test fault: delaying frame"`); len(l) < 10 {
 		t.Fatalf("%d delayed frames logged", len(l))
+	}
+}
+
+// Guide step 1.5: the bitrate recovers after a congestion back-off. A client
+// congestion report cuts it by 25 % with an overlapped restart; frames
+// acknowledged with a steady one-way delay then raise it 15 % at a time back
+// to the setting, each with an overlapped restart, and every video config
+// carries the target and the setting. The test hook shortens the
+// controller's 10 s quiet period and rate limit to 1 s.
+func TestStreamingBitrateRecovery(t *testing.T) {
+	t.Setenv(host.TestFaultsEnv, "rate-period=1s")
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 10*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+		wtOpts{ackOWD: 5 * time.Millisecond, mid: func(ctrl transport.BidiStream) {
+			proto.WriteMsg(ctrl, []byte(`{"t":"congestion","delayMs":80}`))
+		}})
+	t.Logf("%d frames, configs (bitrate, max) %v", r.frames, r.bitrates)
+	changes := func(msg string) [][2]int {
+		var out [][2]int
+		for _, l := range e.logs.lines(from, `msg="`+msg+`"`) {
+			var c [2]int
+			if _, err := fmt.Sscanf(l[strings.Index(l, " from=")+1:], "from=%d to=%d", &c[0], &c[1]); err != nil {
+				t.Fatalf("%v: %s", err, l)
+			}
+			out = append(out, c)
+		}
+		return out
+	}
+	cuts, raises := changes("congestion: lowering bitrate"), changes("bitrate recovery: raising bitrate")
+	if !slices.Equal(cuts, [][2]int{{4000, 3000}}) {
+		t.Fatalf("cuts %v, want 4000 -> 3000 for the report", cuts)
+	}
+	if want := [][2]int{{3000, 3450}, {3450, 3967}, {3967, 4000}}; !slices.Equal(raises, want) {
+		t.Fatalf("raises %v, want %v (15 %% at a time up to the setting)", raises, want)
+	}
+	for _, l := range e.logs.lines(from, `msg="restarting video"`) {
+		if !strings.Contains(l, "urgent=false") {
+			t.Fatalf("urgent restart: %s", l)
+		}
+	}
+	if n := len(e.logs.lines(from, `msg="restarting video"`, `reason="bitrate recovery"`)); n != 3 {
+		t.Fatalf("%d bitrate recovery restarts, want 3", n)
+	}
+	// The configs: the setting, the back-off, then only up, ending at the
+	// setting; maxBitrate is the setting throughout.
+	low := slices.IndexFunc(r.bitrates, func(b [2]int) bool { return b[0] == 3000 })
+	if !r.welcome || len(r.bitrates) < 3 || r.bitrates[0][0] != 4000 || low < 0 || r.bitrates[len(r.bitrates)-1][0] != 4000 {
+		t.Fatalf("configs (bitrate, max) %v: want 4000, 3000, ..., 4000", r.bitrates)
+	}
+	for i, b := range r.bitrates {
+		if b[1] != 4000 || (i > low && b[0] < r.bitrates[i-1][0]) {
+			t.Fatalf("configs (bitrate, max) %v: max not 4000 or a cut after the report", r.bitrates)
+		}
+	}
+}
+
+// The bitrate does not recover while frames go out and the client, which
+// acknowledged frames before, acknowledges none (a stalled gateway-to-client
+// leg on the relay paths, where the gateway buffers the frames: here the
+// client keeps taking every frame and stops acknowledging): the congestion
+// report cuts, and no raise follows in the 5 s that would see one 3 s after
+// the cut (the period is longer than the 1 s the host waits for an
+// acknowledgement, as the real 10 s is).
+func TestStreamingBitrateStalledAcks(t *testing.T) {
+	t.Setenv(host.TestFaultsEnv, "rate-period=3s")
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 10*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+		wtOpts{ackOWD: 5 * time.Millisecond, ackTilMid: true, mid: func(ctrl transport.BidiStream) {
+			proto.WriteMsg(ctrl, []byte(`{"t":"congestion","delayMs":80}`))
+		}})
+	t.Logf("%d frames, configs (bitrate, max) %v", r.frames, r.bitrates)
+	if n := len(e.logs.lines(from, `msg="congestion: lowering bitrate"`, "from=4000 to=3000")); n != 1 {
+		t.Fatalf("%d cuts 4000 -> 3000, want 1", n)
+	}
+	if l := e.logs.lines(from, `msg="bitrate recovery: raising bitrate"`); len(l) != 0 {
+		t.Fatalf("raised while no frame was acknowledged: %q", l)
+	}
+	if !r.welcome || len(r.bitrates) == 0 || r.bitrates[len(r.bitrates)-1][0] != 3000 {
+		t.Fatalf("configs (bitrate, max) %v: want the last at 3000", r.bitrates)
 	}
 }
 

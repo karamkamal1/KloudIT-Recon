@@ -1201,3 +1201,211 @@ Hardware checks:
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (unchanged by 1.2) `recon-host.exe probe` prints no
   `intra-refresh=` on any `*_amf` encoder, and a stream's host.log line is `encoder ready ...
   recovery=keyframe`.
+
+## 1.5 Bitrate that recovers
+
+What changed (B3):
+
+- `internal/host/bitrate.go`: a small rate controller (`rateController`, interim until the 2.2
+  delay-gradient controller) owns the session's video bitrate target; before, `curKbps` only ever
+  went down until a settings change. Rules:
+  - Cut: a congestion signal lowers the target by 25 % (never below 2 Mbit/s, or the setting if
+    that is lower). A client delay report (`{"t":"congestion"}`) cuts only if the last change, up
+    or down, is at least 10 s ago, and restarts overlapped (`restarting video reason=congestion
+    urgent=false`). The emergencies keep the urgent path: a host frame-queue overflow and a client
+    that flushed its decoder (`{"t":"congestion","reason":"decoder"}`) cut even within 10 s of
+    another change, but at most once every 2 s, and restart at once. A refused signal still restarts the
+    quiet period. A decoder flush that cuts also caps later raises at 85 % of the bitrate it cut
+    from, until the settings change (`bitrate recovery limited by the client's decoder max=…` in
+    host.log; a second flush lowers the cap): the raises judge the network delay, not the
+    client's decode capacity, so without the cap a client that cannot decode the setting would
+    go through flush (an urgent restart, a frozen picture), cut and raise again every few tens of
+    seconds.
+  - Raise: every 500 ms the session judges the one-way delay of the frames the client
+    acknowledged since the last check (`0x40` frame acks, `OWDUs`: the client's last-byte receive
+    time minus the frame's encode-done time on the synchronised clock, so the host queue counts
+    too). The delay is low when their median is within 10 ms of the minimum over the last 2 s.
+    After 10 s with no congestion signal and the delay low at every check, the target rises by
+    15 % (integer kbit/s) up to the ceiling, the bitrate the settings ask for (`prefs.bitrate`,
+    else the host's `defaultKbps`, capped at `maxKbps`), with an overlapped restart (`bitrate
+    recovery: raising bitrate from=… to=… max=…`, then `restarting video reason="bitrate
+    recovery" urgent=false`). The next raise again needs 10 s since this one; since the check
+    runs every 500 ms, raises come 10–10.5 s apart. A check also counts as high delay when a
+    frame went to the transport 1 s ago or longer (`ackTimeout`) and the client, which has
+    acknowledged frames before, has acknowledged none since: the path to the client stalls. On
+    the relay paths (QUIC relay and WebSocket) that is the only sign of a stalled or collapsed
+    gateway-to-client leg: the gateway accepts the host's frames into its 16 MB flow-control
+    window, so the host's frame queue does not overflow, and the client, receiving nothing,
+    reports nothing. A stall that starts less than 1 s before a raise is due does not stop that
+    raise. A check with nothing sent (a still desktop) and the checks for a client that never
+    acknowledges (no clock sync yet, a v1 client) have no delay to judge: the quiet period runs
+    on time alone. A paused session (hidden tab) and a session without a live encoder generation
+    (starting, or failing) restart it.
+  - A settings change resets the controller (target = the new setting, no rate limit left).
+    Every other restart (key frame, encoder failure, resume) keeps the current target.
+- Visible: every `video` config carries the target (`bitrate`) and, new, the ceiling
+  (`maxBitrate`, omitted by older hosts); the stats overlay shows a `target` row under Bitrate
+  (`6.0 of 8.0 Mbps (backed off)` while backed off, in amber). host.log `stream stats` lines have
+  `kbps_target=` and, new, `kbps_max=`.
+- New client metric for the acceptance below: the stats overlay row `Freezes > 100 ms` counts
+  the times the picture stood still more than 100 ms longer than the source did, with the last
+  one's length, and each one is logged (`__recon.logs`: `freeze: 140 ms longer than the source
+  (until gen 7 seq 0)`; `seq 0` = the first frame of a new encoder generation, i.e. a switch).
+  Between consecutive frames of a generation the host's time between their encode-done stamps
+  is allowed (a still desktop sends nothing). After frames that were encoded but not drawn
+  (dropped by the host, lost, skipped, discarded while the client waits for a key frame or at
+  an encoder switch) only one frame interval is allowed, also across the restart that follows:
+  so it counts what the network, the decoder, an overlapped switch, loss recovery and urgent
+  restarts (the encoder's start-up included) hold up. A new generation after nothing of the old
+  one beyond the last drawn frame (a still desktop, then a switch) is judged like consecutive
+  frames; a capture stall on the host does not count. Hiding the tab starts it over.
+- Changed from 1.4: a decoder-backlog report that cannot cut (within 2 s of a cut, or at the
+  floor) now restarts for a key frame (`restarting video reason="keyframe request"`) instead of
+  leaving the client to its 1 s watchdog.
+- Test-only hook: `RECON_TEST_FAULTS=rate-period=D` shortens the 10 s quiet period and rate limit
+  (100 ms to 10 s) so the tests see the climb in seconds.
+- Limits (by the guide's definition of "low delay"): a 2 s minimum does not see a queue that
+  stands still for more than 2 s or grows slower than about 5 ms/s; the client's own detector
+  (45 ms over its 8 s minimum) and the host queue overflow remain the back-off triggers there.
+  And 15 % per 10 s is slow from a deep cut: from the last cut to X the target reaches 85 % of the
+  ceiling C after ceil(ln(0.85 C / X) / ln 1.15) raises, 10–10.5 s each, the first 10 s after the
+  last congestion signal, so the capdrop acceptance below (60 s, 5–6 raises, a factor of 2.0–2.3)
+  holds only for ceilings up to about twice the bitrate the dip leaves, and only if the delay is
+  back down soon after capacity returns.
+- What capdrop should do on the path the acceptance uses (relay via the gateway, netem on the
+  gateway shaping only the traffic to and from `CLIENT_IP`, so only the gateway-to-client leg;
+  derived, not measured): the host-to-gateway leg stays clean, and the gateway takes the excess
+  into its QUIC flow-control window for the host connection (16 MB to start, `QUICConfig`) while
+  its forwarding goroutines (one per frame stream, `relay.go`) wait on the client leg. So the
+  host's frame queue does not overflow until that window is full, and the cuts come from the
+  client's delay reports: at most one per 5 s from the client, and a cut needs 10 s since the
+  last change. Meanwhile the one-way delay grows by however much the gateway holds (seconds).
+  At a 20 Mbit/s setting the excess over 15 Mbit/s is about 5.5 Mbit/s, which needs about 23 s
+  to fill 16 MB, longer than the 20 s dip: no host overflow; expect 20 → 15 about 1 s into the
+  dip and, as 15 Mbit/s of video plus audio and overhead still exceed the link and the delay
+  keeps growing over the client's 8 s minimum, 15 → 11.25 about 10 s later; then raises from
+  11.25 once the gateway has drained (17 Mbit/s is 3 raises, about 30 s after the last delay
+  report). At a 50 Mbit/s setting the excess is about 35 Mbit/s (22.5 after the first delay-report
+  cut to 37.5), which fills the window in about 5 s; then the host's writes block, its queue overflows and emergency cuts follow at most every
+  2 s on top of the delay reports, and the gateway may also drop frames whose client stream it
+  cannot open within 3 s (the client sees those as lost frames). How deep that cuts, and so
+  whether the 60 s mark can be met, is not derived here: measure it (the AMD steps below record
+  the cut sequence). A direct-path run (netem on the client's own link: the host's QUIC
+  congestion window limits it) overflows the host queue within about 6 frames instead. The 2.2
+  controller (+5 %/s, faster far below the last good rate) is the fix for slow recovery from
+  deep cuts; this step does not change the guide's 15 %/10 s.
+
+Verified in the sandbox:
+
+- verified (sandbox): `internal/host` unit tests on a fake clock (`bitrate_test.go`, frames
+  acknowledged at 60 fps, the session's 500 ms checks): `TestRateRecovers` (cut 20000 → 15000,
+  nothing within 10 s, then 17250 / 19837 / 20000 at +10 / +20 / +30 s, each within one check of
+  being due, then nothing more), `TestRateHighDelayHolds` (a queue growing 10 ms/s for 30 s holds
+  the bitrate, the raise comes 10 s after the delay is back down; a bottleneck that fills in 3 s
+  and drains, over and over, holds it; 0–6 ms jitter plus one frame 80 ms late every 2 s does
+  not), `TestRateCeiling` (3000 kbit/s setting: nothing above it; 2250 → 2587 → 2975 → 3000, not
+  3421; a lower ceiling caps the target), `TestRateLimit` (a delay report 5 s after a cut and 3 s
+  after a raise cuts nothing and postpones the next raise by 10 s; 10 s after the raise it cuts;
+  emergencies cut within 10 s of a change but not within 2 s of a cut; raises at least 10 s apart),
+  `TestRateDecrease` (25 % steps, the 2 Mbit/s floor, a ceiling below the floor, nothing before
+  the first generation, a settings reset), `TestRateQuietWithoutAcks` (nothing sent, or frames
+  sent to a client that never acknowledges: the raise still comes after 10 s; a pause restarts
+  the period; at most 4096 kept acknowledgements), `TestRateStalledPath` (frames sent for 30 s
+  with no acknowledgement from a client that acknowledged before: no raise, and the raise comes
+  about 10 s after the acknowledgements resume; a stall over the moment a raise is due stops it
+  and the delay report after the stall cuts; acknowledgements 900 ms apart do not hold the
+  bitrate; without the stall rule the first case raises three times), `TestRateDecoderCap` (a
+  decoder flush at 20000 cuts to 15000 and caps the raises at 17000; a second flush at 17000
+  cuts to 12750 and caps at 14450; overflow cuts climb back to the cap, not past it; a settings
+  reset drops the cap; a flush within 2 s of a cut sets none); `TestQueueOverflowEscalates`
+  (1.4) passes on the controller, with a new subtest `decoder report` (a decoder report within
+  2 s of a cut cuts nothing and restarts once, `reason="keyframe request" urgent=true`; a delay
+  report then restarts nothing; outside the window the decoder report cuts 3000 → 2250 with an
+  urgent `reason=congestion` restart and logs the cap `max=2550`); `TestParseTestFaults` with
+  `rate-period`.
+- verified (sandbox): Go integration test `internal/e2e` `TestStreamingBitrateRecovery` (real
+  gateway and agent, libx264 4000 kbit/s 30 fps, direct WebTransport, a Go client that
+  acknowledges every frame with a 5 ms one-way delay, `RECON_TEST_FAULTS=rate-period=1s`, 10 s):
+  the client's congestion report cuts 4000 → 3000 with an overlapped restart, then the host raises
+  3000 → 3450 → 3967 → 4000 one period apart, every restart `urgent=false` (3 with `reason="bitrate
+  recovery"`), and the configs read (bitrate, maxBitrate) (4000, 4000), (3000, 4000), (3450, 4000),
+  (3967, 4000), (4000, 4000). `TestStreamingBitrateStalledAcks` (same setup,
+  `rate-period=3s`; the client acknowledges frames for 5 s, then sends the congestion report and
+  keeps taking every frame without acknowledging any, as a client behind a stalled relay leg
+  would look to the host): the report cuts 4000 → 3000 and no raise follows in the remaining
+  5 s; with the stall rule disabled the same run raises 3000 → 3450 three seconds after the cut.
+- verified (sandbox), browser E2E (`test/e2e/browser.mjs`, new scenario "bitrate recovery":
+  headless Chromium, libsvtav1 960×540 60 fps at 8 Mbit/s, software AV1 decode, direct
+  WebTransport, the real client's frame acknowledgements, `RECON_TEST_FAULTS=rate-period=2s`; 63 of
+  63 checks passed in the final run, and in the run before it): a congestion report sent through
+  the client cuts 8000 → 6000, then the host raises 6000 → 6900 → 7935 → 8000 about 2 s apart (2.4,
+  2.0 and 2.5 s after the previous change in the final run: the checks run every 500 ms), all
+  restarts `urgent=false` (1 `congestion`, 3 `bitrate recovery`), the configs go 6000 → 6900 → 7935
+  → 8000 with `maxBitrate` 8000, and the overlay's target row read `6.0 of 8.0 Mbps (backed off)`
+  during the back-off. Freezes over the four switches: one of 162 ms (four frames after the 6900
+  switch) in the final run; none in the two runs before it, which measured the plain gap between
+  drawn frames (an earlier version of the metric, which also counted a still source); this 4-core
+  sandbox runs two software AV1 encoders during each overlapped switch next to the software
+  decoder, so freezes are recorded there, not checked. The fault runs of 1.4 (every 97th frame sent
+  200 ms late) show up as freezes of about 200 ms each, as they should.
+- verified (sandbox), after the review fixes (stall rule, decoder cap, the freeze metric as
+  described above), browser E2E: 63 of 63 checks passed; "bitrate recovery" cut 8000 → 6000 and
+  raised 6000 → 6900 → 7935 → 8000 (no decoder flush, so no decoder limit), 1 `congestion` and
+  3 `bitrate recovery` restarts, all `urgent=false`, no freeze over the four switches. In the
+  1.4 loss scenarios every key-frame restart now logs a freeze at the new generation's first
+  frame: 113–321 ms after each frame the host dropped with recovery "keyframe" (`requesting key
+  frame (dropped by host)`, then `freeze: … (until gen G seq 0)`), 132–347 ms after the decoder
+  errors of the drop test and of the skip fallback; the earlier metric logged none of them (only
+  the 200 ms injected delays). The skipped frames of recovery "skip" log no freeze (the client
+  moves on at once).
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance, capdrop: bitrate back within 15 % of
+  the setting 60 s after capacity returns, no freeze over 100 ms at the switches) Gateway in
+  container 210 on the Proxmox node, client `CLIENT_IP` on wired LAN. In the browser set Stream
+  settings > Pipeline > Network path "Relay via gateway" and Reconnect (the overlay's Transport
+  row must end in `· relay`; see 0.4), Codec HEVC (hevc_amf), Resolution native 1920×1080, 60 fps,
+  Bitrate 20 Mbps, "Adaptive bitrate on congestion" on. Play something with constant motion
+  (a game or a full-screen video) and open the stats overlay (Ctrl+Alt+Shift+S); after 30 s
+  note the `Freezes > 100 ms` count and that the `target` row reads `20.0 Mbps`. On the node,
+  as root, from the gateway release folder run `./netem.sh apply capdrop --ct 210 --host
+  CLIENT_IP` (50 Mbit/s, 15 Mbit/s after 20 s, 50 Mbit/s again after 40 s and from then on),
+  wait 110 s, run
+  `./netem.sh status --ct 210` (copy the two step lines with their times: the `15` step and the
+  `50` step when capacity returns, T50) and then `./netem.sh clear --ct 210`. In DevTools on the
+  stream page run `__recon.logs.filter((l) => /freeze:|congestion/.test(l))`. On the PC run
+  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering bitrate|bitrate recovery|restarting video|starting encoder|stream stats|frames dropped' | Select-Object -Last 120`.
+  Pass: (1) at T50 + 60 s the target is at least 17000 kbit/s: the last `bitrate recovery:
+  raising bitrate ... to=` (or `stream stats ... kbps_target=`) at or before that time, also the
+  overlay's `target` row; (2) every raise is `to` ≤ 1.15 × `from`, at least 10 s after the
+  previous change, never above `max=20000`, and is followed by `restarting video
+  reason="bitrate recovery" urgent=false`; (3) no `freeze: N ms ... (until gen G seq S)` line
+  with S below 60 (the generation's first second) for a generation G that `starting encoder
+  gen=G` shows was started by a `reason="bitrate recovery"` or `reason=congestion urgent=false`
+  restart (freezes during the dip, around `frames dropped`, `urgent=true` restarts and lost
+  frames, may happen: record their count and lengths). Record the cuts (with `urgent=` and
+  `delayMs=`) and raises with times, the target at T50 + 60 s, the `owd_max_ms` of the `stream
+  stats` lines during the dip, any `frames dropped` lines and the freezes; compare the cuts with
+  "What capdrop should do" above (20 → 15 → 11.25 about 10 s apart, no queue overflow).
+  Then repeat with Bitrate 50 Mbps and record the same: the cut sequence (did the host queue
+  overflow: `frames dropped why="queue overflow"`), the target at T50 + 60 s and the time from
+  T50 until the target first reaches 42500, as the baseline for 2.2. Whether 50 Mbit/s can pass
+  (1) at 15 %/10 s depends on how deep the dip cuts on this path, which this run measures. Repeat
+  both with Codec AV1 at 2560×1440 (av1_amf) and H.264 (h264_amf).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (switch smoothness on the hardware encoder, no
+  netem) stream hevc_amf 1920×1080 60 fps at 20 Mbps with constant motion; in DevTools run
+  `__recon.worker.postMessage({type:'ctl', m:{t:'congestion', delayMs:100}})` once. host.log shows
+  `congestion: lowering bitrate from=20000 to=15000` and 10 s later the first `bitrate recovery`
+  raise (15000 → 17250 → 19837 → 20000, 10 s apart). Pass: no `freeze:` line in `__recon.logs`
+  for these four switches (`until gen G seq S` with S below 60 for one of the four new
+  generations G), the overlay's `target` row reads `15.0 of 20.0 Mbps (backed off)`, then
+  `17.3 of 20.0 ...`, `19.8 of 20.0 ...` and `20.0 Mbps`, and no `frames dropped` line in
+  host.log. The new AMF encoder's start-up (about
+  300 ms) is hidden by the overlap; a freeze here means the new generation's first IDR (its
+  transfer at the new bitrate, its decode) or the decoder reconfiguration holds up the picture:
+  record the freeze length and the client's decode p95 from the overlay.
+- NVIDIA: unverified (no NVIDIA host available). Test: the capdrop acceptance and the switch
+  smoothness check above with hevc_nvenc (and h264_nvenc, av1_nvenc on RTX 40+), same steps, same
+  pass criteria; with NVENC intra refresh (1.2) the first frame of each generation is still an
+  IDR, so the switches cost the same as on AMD.

@@ -620,6 +620,7 @@ function onStats(st) {
     el('hr'),
     row('Frame rate', `${st.fps.toFixed(1)} fps`),
     row('Bitrate', `${st.mbps.toFixed(1)} Mbps`),
+    targetRow(v, row),
     row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}`),
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
@@ -629,9 +630,20 @@ function onStats(st) {
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     row('Decoder queue', String(st.queue)),
     row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
+    row('Freezes > 100 ms', st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0', st.freezes ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
+}
+
+// The encoder's bitrate target: below the setting while a congestion
+// back-off lasts, raised step by step as the network stays quiet (hosts
+// before maxBitrate: the target only).
+function targetRow(v, row) {
+  if (!v.bitrate) return null;
+  const mb = (kbps) => (kbps / 1000).toFixed(1);
+  const backedOff = v.maxBitrate > v.bitrate;
+  return row('  target', backedOff ? `${mb(v.bitrate)} of ${mb(v.maxBitrate)} Mbps (backed off)` : `${mb(v.bitrate)} Mbps`, backedOff ? 'warn' : '');
 }
 
 // Latency probe (frame barcode) rows: sample counts and capture->drawn

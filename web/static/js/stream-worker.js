@@ -45,8 +45,41 @@ const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 }
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, totalN: 0,
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
-  audioPackets: 0, audioLost: 0,
+  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0,
 };
+
+// Freezes: the picture stood still more than FREEZE_MS longer than the
+// source did. Between consecutive frames of a generation (seq + 1) the source
+// may have been still (a still desktop sends nothing): the host's time
+// between their encode-done stamps is allowed. After frames that were encoded
+// but never drawn (dropped by the host, lost, skipped, discarded while
+// waiting for a key frame or at an encoder switch) the source was busy, so
+// only one frame interval is allowed, also across the encoder restart that
+// follows; that counts the network, the decoder, loss recovery and urgent
+// restarts. A new generation after nothing more of the old one than the last
+// drawn frame (a still source, then a switch) is judged like consecutive
+// frames. Counted for the session with the latest one's length, each logged
+// with the frame that ended it (seq 0: the first frame of a new encoder
+// generation). A pause (hidden tab) starts over. seen: generation -> the
+// highest seq the client knows the encoder produced (received, or reported
+// dropped).
+const FREEZE_MS = 100;
+const freeze = { drawn: 0, sentUs: 0, gen: -1, seq: 0, seen: new Map() };
+
+function freezeSeen(gen, seq) {
+  if (seq > (freeze.seen.get(gen) ?? -1)) freeze.seen.set(gen, seq);
+  if (freeze.seen.size > 8) freeze.seen.delete(freeze.seen.keys().next().value);
+}
+
+// The picture's stand-still before this drawn frame beyond what the source
+// explains (ms), or 0 for the first frame.
+function freezeStall(meta, sent, presented) {
+  if (!freeze.drawn) return 0;
+  const hostMs = (sent - freeze.sentUs) / 1000;
+  const next = meta.gen === freeze.gen && meta.seq === freeze.seq + 1;
+  const missed = !next && (meta.gen === freeze.gen || (freeze.seen.get(freeze.gen) ?? -1) > freeze.seq);
+  return presented - freeze.drawn - (missed ? Math.min(hostMs, 1000 / (video.cfg?.fps || 60)) : hostMs);
+}
 
 const congestion = { owdHist: [], over: 0, lastSent: 0 };
 
@@ -576,6 +609,7 @@ function onFrameBytes(buf, recv, first = recv) {
   h.recv = recv;
   h.first = first || recv;
   stats.bytes += buf.length;
+  freezeSeen(h.gen, h.seq);
   checkCongestion(recv - hostToLocal(sentUs(h)));
   onFrame(h);
 }
@@ -669,6 +703,7 @@ function onDropped(m) {
   const d = P.parseDropped(m);
   if (!d) return;
   stats.hostDropped += d.count;
+  freezeSeen(d.gen, d.from + d.count - 1);
   const cfg = video.cfg;
   if (!cfg || d.gen !== cfg.gen || d.gen === video.lostGen) return; // other generations are discarded anyway
   for (let s = Math.max(d.from, video.expectSeq); s < d.from + d.count; s++) video.hostDropped.add(s);
@@ -754,6 +789,16 @@ function onDecoded(frame) {
   const presented = now();
   if (req) probeSample(req, presented);
   stats.frames++;
+  if (meta) {
+    const sent = sentUs(meta);
+    const stall = freezeStall(meta, sent, presented);
+    Object.assign(freeze, { drawn: presented, sentUs: sent, gen: meta.gen, seq: meta.seq });
+    if (stall > FREEZE_MS) {
+      stats.freezes++;
+      stats.lastFreeze = stall;
+      post('log', { text: `freeze: ${Math.round(stall)} ms longer than the source (until gen ${meta.gen} seq ${meta.seq})` });
+    }
+  }
   if (firstFrame) {
     firstFrame = false;
     post('firstFrame', { renderer: renderer.name });
@@ -1262,6 +1307,8 @@ function postStats() {
     skipped: stats.skipped,
     hostDropped: stats.hostDropped,
     keyRequests: stats.keyRequests,
+    freezes: stats.freezes,
+    lastFreeze: stats.lastFreeze || null,
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
     audioMs,
@@ -1328,7 +1375,10 @@ self.onmessage = (ev) => {
     case 'start': start(m).catch((e) => post('closed', { reason: e.message, retry: true })); break;
     case 'in': transport?.sendInput(m.b); break;
     case 'dg': transport?.sendDatagram(m.b); break;
-    case 'ctl': transport?.sendControl(m.m); break;
+    case 'ctl':
+      if (m.m?.t === 'pause' || m.m?.t === 'resume') freeze.drawn = 0; // not a freeze
+      transport?.sendControl(m.m);
+      break;
     case 'prefs': prefs = { ...prefs, ...m.prefs }; updateProbeMode(); break;
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;

@@ -361,6 +361,61 @@ async function checkLossHandling() {
 }
 
 // ---------------------------------------------------------------------------
+// Bitrate recovery (guide step 1.5). A congestion report cuts the bitrate by
+// 25 %; while the client's frame acknowledgements show a steady one-way
+// delay, the host raises it 15 % at a time back to the setting, each step an
+// overlapped (non-urgent) restart, and the overlay shows the target. The
+// host's test-only hook shortens the controller's 10 s quiet period and rate
+// limit to 2 s. Back-offs of this CPU-only machine's own (decoder backlog)
+// may add cuts; the climb back to the setting must still happen, or, after a
+// decoder flush, to the cap the host then logs (85 % of the bitrate the
+// decoder fell behind at).
+
+async function checkBitrateRecovery() {
+  const host = await restartHost({ RECON_TEST_FAULTS: 'rate-period=2s' }, 'host-rate');
+  await startStream({ path: 'auto', transport: 'auto', bitrate: 8 });
+  await sleep(4000); // decoder warm-up
+  const log0 = host.log.length;
+  const con0 = consoleLines.length;
+  await page.evaluate(() => window.__recon.worker.postMessage({ type: 'ctl', m: { t: 'congestion', delayMs: 100 } }));
+  const seen = []; // the configs' bitrates, in order, while the bitrate climbs back
+  let cfg = null;
+  let overlay = '';
+  const changes = (re) => [...host.log.slice(log0).matchAll(re)].map((m) => [+m[1], +m[2]]);
+  const cutRe = /msg="congestion: lowering bitrate".*? from=(\d+) to=(\d+)/g;
+  const raiseRe = /msg="bitrate recovery: raising bitrate".*? from=(\d+) to=(\d+)/g;
+  // The host was restarted for this scenario: its whole log is this session.
+  const top = () => Math.min(8000, ...[...host.log.matchAll(/msg="bitrate recovery limited by the client's decoder" max=(\d+)/g)].map((m) => +m[1]));
+  for (const end = Date.now() + 45000; Date.now() < end;) {
+    await sleep(250);
+    const s = await page.evaluate(() => ({ cfg: window.__recon.videoCfg, text: document.getElementById('stats-body')?.innerText || '' }));
+    cfg = s.cfg;
+    if (cfg?.bitrate && seen[seen.length - 1] !== cfg.bitrate) seen.push(cfg.bitrate);
+    if (!overlay && /backed off/.test(s.text)) overlay = s.text; // redrawn with each stats update (500 ms)
+    const raises = changes(raiseRe);
+    if (changes(cutRe).length && raises.length && raises[raises.length - 1][1] === top() && cfg?.bitrate === top()) break;
+  }
+  const limit = top();
+  const cuts = changes(cutRe);
+  const raises = changes(raiseRe);
+  const restarts = restartsByReason(host.log.slice(log0));
+  const target = (overlay.match(/target\s*([^\n]*)/) || [])[1] || '';
+  // Freezes (the client's "freeze: N ms" log): recorded, not checked; on this
+  // CPU-only machine every switch also runs a second software encoder.
+  const freezes = consoleLines.slice(con0).map((l) => +(l.match(/freeze: (\d+) ms/) || [])[1]).filter((v) => v > 0);
+  check('bitrate recovery: a congestion cut, then 15 % raises back to the setting with overlapped restarts; overlay shows the target',
+    cuts.length >= 1 && raises.length >= (limit < 8000 ? 1 : 2) && raises.every(([a, b]) => b > a && b <= Math.floor(a * 1.15) + 1) &&
+      raises[raises.length - 1][1] === limit && cfg?.bitrate === limit && cfg?.maxBitrate === 8000 &&
+      (restarts['bitrate recovery'] || 0) === raises.length && !restarts['bitrate recovery (urgent)'] &&
+      /of 8\.0 Mbps \(backed off\)/.test(target),
+    `cuts ${cuts.map(([a, b]) => `${a}→${b}`).join(', ')}; raises ${raises.map(([a, b]) => `${a}→${b}`).join(', ')}; ` +
+      `configs ${seen.join(' → ')} kbps (max ${cfg?.maxBitrate}${limit < 8000 ? `, decoder limit ${limit}` : ''}); overlay while backed off: "${target}"; restarts: ${counts(restarts)}; ` +
+      `freezes > 100 ms: ${freezes.length ? freezes.join(', ') + ' ms' : 'none'}`);
+  results.push({ bitrateRecovery: { cuts, raises, configs: seen, decoderLimit: limit < 8000 ? limit : null, restarts, freezes } });
+  await page.evaluate(() => { window.__recon.userClosed = true; });
+}
+
+// ---------------------------------------------------------------------------
 
 const dir = mkdtempSync(join(tmpdir(), 'recon-e2e-'));
 const port = await freePort();
@@ -571,6 +626,7 @@ try {
 
   // 3a. Loss handling with the host's fault-injection hook --------------------
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
+  await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
 
   // 3b. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a

@@ -65,8 +65,10 @@ Techniques used (most of them are new to browser-based game streaming):
   drawn by `tools/latency-test/index.html` on the PC) and builds a capture → drawn histogram you
   can export as JSON.
 - **Self-protecting under load.** Delay-gradient congestion detection lowers the bitrate before
-  queues build up. A decoder backlog gets flushed and resynced from a fresh key frame, so
-  latency can't grow without bound.
+  queues build up, and the bitrate climbs back to your setting (15 % every 10 s) once the
+  network is quiet again. A decoder backlog gets flushed and resynced from a fresh key frame, so
+  latency can't grow without bound; the bitrate then climbs back only to 85 % of where the
+  decoder fell behind.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
   drops, and the client recovers at once: it skips the frame when the encoder heals the picture
@@ -375,8 +377,9 @@ drops every 193rd (reported to the client like a real drop); `recovery=skip|keyf
 the recovery mode the host announces, `intra-refresh` runs libx264 with periodic intra
 refresh, as NVENC runs, so the host announces `skip` from its real encoder arguments, and
 `still=after:N` sends only the first N frames of every encoder generation, like a desktop that
-stops changing (`internal/host/faults.go`). Never set it on a real host; the agent logs a warning
-when it is set.
+stops changing, and `rate-period=2s` shortens the bitrate controller's 10 s quiet period and rate
+limit so a test sees the bitrate recover within seconds (`internal/host/faults.go`). Never set it
+on a real host; the agent logs a warning when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·
