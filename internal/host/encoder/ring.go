@@ -56,12 +56,16 @@ const (
 	slotDroppedBefore = 84
 	slotWidth         = 88
 	slotHeight        = 92
+	slotDirtyPPM      = 96 // u32, valid with FlagDirty (Phase 5)
 
 	FlagKey           = 1 << 0
 	FlagRecovery      = 1 << 1
 	FlagDroppedBefore = 1 << 2
 	FlagRepeat        = 1 << 3
 	FlagSeqStart      = 1 << 4
+	// Phase 5 (additive: older helpers leave them unset).
+	FlagDirty       = 1 << 5 // the slot's dirty share is valid
+	FlagDiscardable = 1 << 6 // no later frame references this one
 )
 
 // ErrRingCorrupt means the shared memory holds something the helper cannot
@@ -81,6 +85,14 @@ type Frame struct {
 	RefFloor      uint64
 	LTRSlot       int32 // LTR slot this frame was marked into, -1 = none
 	TemporalLayer uint32
+	// Discardable: no later frame references this one (the top temporal
+	// layer of an SVC stream, a non-reference frame): it can be left out
+	// without breaking the decoding of any other (see Droppable).
+	Discardable bool
+	// Dirty is the share of the picture the capture reported as changed since
+	// the previous frame (0..1, from the dirty rects; 0 for an idle repeat),
+	// -1 = unknown (no dirty rects from this capture method, older helpers).
+	Dirty         float64
 	RefLTRMask    uint32
 	Width, Height uint32
 	// QPC ticks (Ring.QPCFrequency per second); PresentQPC is 0 when unknown.
@@ -197,6 +209,8 @@ func (r *Ring) Next() (*Frame, error) {
 		Recovery:      flags&FlagRecovery != 0,
 		Repeat:        flags&FlagRepeat != 0,
 		SeqStart:      flags&FlagSeqStart != 0,
+		Discardable:   flags&FlagDiscardable != 0,
+		Dirty:         -1,
 		DroppedBefore: le.Uint32(s[slotDroppedBefore:]),
 		LTRSlot:       int32(le.Uint32(s[slotLTRSlot:])),
 		TemporalLayer: le.Uint32(s[slotTemporalLayer:]),
@@ -211,6 +225,9 @@ func (r *Ring) Next() (*Frame, error) {
 	}
 	if f.Recovery {
 		f.RefFloor = le.Uint64(s[slotRefFloor:])
+	}
+	if flags&FlagDirty != 0 {
+		f.Dirty = min(1, float64(le.Uint32(s[slotDirtyPPM:]))/1e6)
 	}
 	r.read++
 	atomic.StoreUint64(r.counter(offReadCount), r.read)

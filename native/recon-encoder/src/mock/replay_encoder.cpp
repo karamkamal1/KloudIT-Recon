@@ -2,6 +2,7 @@
 #include <chrono>
 #include <string>
 
+#include "codec/hdr.hpp"
 #include "mock/mock.hpp"
 
 // Generated from testdata/mock_clip.h264 by cmake/embed.cmake.
@@ -92,6 +93,12 @@ Caps ReplayEncoder::caps() {
     h264.forceIdr = true;
     h264.recovery = "none";
     h264.liveBitrate = "seamless";
+    // Phase 5 plumbing checks: setRate's fps re-paces the capture, and two
+    // "engines" so start's encoderInstance can be exercised (it only shows in
+    // started); no SVC, re-encode or sub-frame output (a canned stream).
+    h264.liveFps = "seamless";
+    h264.hwInstances = kInstances;
+    h264.instanceSelect = true;
     c.codecs["h264"] = h264;
     c.capture = {"synthetic"};
     return c;
@@ -100,9 +107,19 @@ Caps ReplayEncoder::caps() {
 Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) {
     if (!clipError_.empty()) return Status::Error("unavailable", clipError_);
     if (p.codec != "h264") return Status::Error("unsupported", "the mock backend only encodes h264, not " + p.codec);
+    if (p.encoderInstance >= kInstances) {
+        return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) + ": the mock has " +
+                                                std::to_string(kInstances) + " engines");
+    }
+    if (p.svcLayers > 1) return Status::Error("unsupported", "svcLayers " + std::to_string(p.svcLayers) + ": the encoder supports 1");
+    if (p.reencodeOversized > 0) return Status::Error("unsupported", "reencodeOversized: the mock cannot re-encode (caps reencode false)");
+    if (p.sliceOutput > 0) return Status::Error("unsupported", "sliceOutput: the mock has no slice output (caps sliceOutput false)");
     in = InputSpec{};
+    // HDR10: P010 from an HDR source, so the HDR conversion runs too (the
+    // canned stream stays what it is, like its size).
+    const bool hdr = p.hdr && src.hdr && src.device;
     if (src.device) {
-        in.format = InputSpec::Format::Nv12;
+        in.format = hdr ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
         in.width = uint32_t(p.width ? p.width : int(src.width)) & ~1u;
         in.height = uint32_t(p.height ? p.height : int(src.height)) & ~1u;
     }
@@ -132,6 +149,11 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     out.kbps = p.kbps;
     out.liveBitrate = flush_ ? "flush" : "seamless";
     out.rateControl = p.rc;
+    out.liveFps = out.liveBitrate;  // the capture follows it; with flush also an IDR and a new gen
+    out.encoderInstance = std::max(0, p.encoderInstance);
+    out.hwInstances = kInstances;
+    out.svcLayers = 1;
+    describeColor(out, hdr ? std::optional<HdrMetadata>(hdrMetadataFor(src.display)) : std::nullopt);
     return Status::Ok();
 }
 

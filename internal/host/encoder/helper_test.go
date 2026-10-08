@@ -93,7 +93,11 @@ func TestHelperStartFramesClose(t *testing.T) {
 	h.SetRate(2500, 1.5, 90)
 	h.SetROI(nil)
 	h.Ack(2)
-	for _, want := range []string{"forceIdr", "recover", "setRate", "setRoi", "ack"} {
+	if err := h.SetFPS(0); err == nil {
+		t.Fatal("SetFPS(0) accepted")
+	}
+	h.SetFPS(30)
+	for _, want := range []string{"forceIdr", "recover", "setRate", "setRoi", "ack", "setRate"} {
 		m := <-f.Messages()
 		if m["t"] != want {
 			t.Fatalf("got %v, want %s", m, want)
@@ -104,7 +108,9 @@ func TestHelperStartFramesClose(t *testing.T) {
 				t.Fatalf("recover %v", m)
 			}
 		case "setRate":
-			if m["kbps"] != float64(2500) || m["vbvFrames"] != 1.5 || m["fps"] != float64(90) {
+			_, hasKbps := m["kbps"]
+			if (m["fps"] == float64(90) && (m["kbps"] != float64(2500) || m["vbvFrames"] != 1.5)) ||
+				(m["fps"] == float64(30) && hasKbps) || (m["fps"] != float64(90) && m["fps"] != float64(30)) {
 				t.Fatalf("setRate %v", m)
 			}
 		case "setRoi":

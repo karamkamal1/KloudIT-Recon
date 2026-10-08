@@ -17,7 +17,25 @@ void LtrTracker::reset(const Config& c) {
     recoveryPending_ = false;
     recoverySlot_ = -1;
     recoveryFrame_ = recoveryLostFrom_ = 0;
+    cfg_.layers = std::clamp(c.layers, 1, 4);
+    pos_ = phase_ = 0;
+    positions_.clear();
     stats_ = {};
+}
+
+int LtrTracker::layerAt(uint64_t pos, int layers) {
+    if (layers <= 1) return 0;
+    const uint64_t period = uint64_t(1) << (layers - 1);
+    uint64_t r = pos % period;
+    if (r == 0) return 0;
+    int trailingZeros = 0;
+    while (!(r & 1)) r >>= 1, ++trailingZeros;
+    return layers - 1 - trailingZeros;
+}
+
+void LtrTracker::setInterval(int interval) {
+    std::lock_guard<std::mutex> lock(mu_);
+    cfg_.interval = std::max(1, interval);
 }
 
 bool LtrTracker::enabled() const {
@@ -65,7 +83,13 @@ LtrTracker::Plan LtrTracker::plan(uint64_t frameId, int64_t now, bool idrRequest
     }
     if (idrRequested) {
         p.idr = true;
-    } else if (recoveryPending_) {
+        return p;  // a key frame clears the slots: nothing to mark or reference
+    }
+    // SVC: marks and recovery frames on base-layer frames only (top of file);
+    // a pending recovery waits for the next one.
+    p.layer = layerAt(pos_ + phase_, cfg_.layers);
+    if (p.layer != 0) return p;
+    if (recoveryPending_) {
         const Slot& s = slots_[size_t(recoverySlot_)];
         const bool overwritten =
             std::any_of(inflight_.begin(), inflight_.end(), [&](const Mark& m) { return m.slot == recoverySlot_; });
@@ -104,6 +128,11 @@ LtrTracker::Plan LtrTracker::plan(uint64_t frameId, int64_t now, bool idrRequest
 void LtrTracker::submitted(uint64_t frameId, const Plan& p, int64_t now) {
     std::lock_guard<std::mutex> lock(mu_);
     if (cfg_.slots == 0) return;
+    const uint64_t pos = p.idr ? 0 : pos_;
+    if (p.idr) phase_ = 0;
+    positions_.emplace_back(frameId, pos);
+    while (positions_.size() > 64) positions_.pop_front();  // outputs that never came (flushed)
+    pos_ = pos + 1;
     if (p.idr) {
         if (recoveryPending_) ++stats_.idrFallbacks;
         lastKey_ = frameId;
@@ -133,12 +162,36 @@ bool LtrTracker::output(uint64_t frameId, const Output& o, const Plan& planned, 
         if (inflight_.front().frameId == frameId) markedAt = inflight_.front().at;
         inflight_.pop_front();
     }
+    // SVC: follow the encoder's layer pattern (a key frame the encoder made
+    // on its own restarts it; so would a pattern that starts differently).
+    // A frame submitted before the newest planned IDR belongs to the pattern
+    // that IDR ended: it says nothing about the phase after it.
+    bool known = false;
+    uint64_t pos = 0;
+    while (!positions_.empty() && positions_.front().first <= frameId) {
+        if (positions_.front().first == frameId) known = true, pos = positions_.front().second;
+        positions_.pop_front();
+    }
+    if (cfg_.layers > 1 && known && frameId >= lastKey_ && o.temporalLayer >= 0 &&
+        layerAt(pos + phase_, cfg_.layers) != o.temporalLayer) {
+        const uint64_t period = uint64_t(1) << (cfg_.layers - 1);
+        for (uint64_t s = 0; s < period; ++s) {
+            if (layerAt(pos + s, cfg_.layers) == o.temporalLayer) {
+                phase_ = s;
+                ++stats_.layerResyncs;
+                break;
+            }
+        }
+    }
     if (o.key || o.clearsSlots) {
         for (Slot& s : slots_) s = Slot{};
     }
     if (o.markedSlot >= 0 && o.markedSlot < cfg_.slots) slots_[size_t(o.markedSlot)] = Slot{frameId, false, markedAt};
     if (!planned.recovery) return true;
-    const bool ok = o.intra || (o.refMask & planned.refMask) != 0;
+    // A recovery frame in an enhancement layer leaves the next base-layer
+    // frame predicted from the base layer before it, i.e. from a lost frame.
+    const bool baseLayer = cfg_.layers <= 1 || o.temporalLayer <= 0;
+    const bool ok = (o.intra || (o.refMask & planned.refMask) != 0) && baseLayer;
     if (!ok) ++stats_.failedRecoveries;
     return ok;
 }

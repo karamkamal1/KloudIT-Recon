@@ -48,6 +48,31 @@ std::string levelText(Codec c, int levelIdc);  // "5.1"
 
 inline uint32_t alignUp(uint32_t v, uint32_t a) { return a > 1 ? (v + a - 1) / a * a : v; }
 
+// Temporal scalability as an access unit / temporal unit signals it (GUIDE 5
+// temporal SVC: recon-host may leave out frames no other frame references).
+struct LayerInfo {
+    // temporal_id: H.264 the SVC prefix NAL unit (nal_unit_type 14,
+    // nal_unit_header_svc_extension, H.7.3.1.1); HEVC nuh_temporal_id_plus1 - 1
+    // of the first VCL NAL unit (7.3.1.2); AV1 the obu_extension_header of the
+    // first frame / frame header / tile group OBU (5.3.3). -1 = not signalled.
+    int temporalId = -1;
+    // Whether later pictures may reference this one: H.264 nal_ref_idc of the
+    // VCL NAL units (0 = non-reference picture); HEVC 0 for a sub-layer
+    // non-reference picture (nal_unit_type TRAIL_N, TSA_N, STSA_N, RADL_N,
+    // RASL_N, RSV_VCL_N10/12/14) at temporal id highestTemporalId (one at a
+    // lower sub-layer may still be referenced by a higher one), else 1; AV1 -1
+    // (its refresh_frame_flags sits deep in the frame header and is not parsed).
+    int reference = -1;
+};
+LayerInfo layerInfo(Codec c, const uint8_t* data, size_t size, int highestTemporalId);
+
+// Whether a frame can be left out without breaking the decoding of any other
+// frame: never a key frame; where the bitstream says (LayerInfo::reference)
+// that; otherwise the top temporal layer of an SVC stream (svcLayers > 1),
+// which in the hierarchical-P structure of AMF and NVENC temporal SVC no frame
+// references (AV1: VERIFY, docs/VENDOR_NOTES.md Phase 5).
+bool isDiscardable(bool key, const LayerInfo& bits, int svcLayers, uint32_t temporalLayer);
+
 // Region-of-interest importance map for encoders that take one value per
 // block (AMF ROI_DATA: AMF_SURFACE_GRAY32, 64x64 blocks for HEVC/AV1, 16x16
 // macroblocks for H.264; importance 0..10). The protocol's weights (-10..10)
@@ -60,5 +85,10 @@ struct RoiMap {
 };
 RoiMap roiImportanceMap(uint32_t width, uint32_t height, uint32_t block, const std::vector<RoiRect>& rects);
 constexpr uint32_t kRoiBackground = 5;
+// Copies the map into a host-memory AMF_SURFACE_GRAY32 plane: row y at
+// base + y * pitch, one 32-bit value per block (the AMF SimpleROI sample). The
+// bytes between a row's end and the pitch are left alone. False if the pitch
+// is smaller than a row.
+bool writeRoiPlane(const RoiMap& m, uint8_t* base, size_t pitch);
 
 }  // namespace recon

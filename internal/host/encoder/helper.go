@@ -37,7 +37,7 @@ func (e *ExitError) Error() string { return fmt.Sprintf("encoder helper exited w
 // Options configures Launch.
 type Options struct {
 	Exe          string        // path to recon-encoder.exe (absolute: next to recon-host.exe)
-	Backend      string        // auto (default) | amf | nvenc | mock
+	Backend      string        // auto (default) | amf | nvenc | lavc | mock
 	Slots        int           // ring slots (default DefaultSlots)
 	SlotSize     int           // bytes per slot, header included (default DefaultSlotSize)
 	LogLevel     string        // helper log level: error | warn | info (default) | debug
@@ -45,6 +45,13 @@ type Options struct {
 	Log          *slog.Logger  // receives the helper's stderr; nil discards it
 	CapsTimeout  time.Duration // how long Launch waits for caps (default 10 s)
 	StartTimeout time.Duration // how long Start waits for "started" (default 10 s)
+	// FFmpegDir is where the libavcodec backend (Intel Quick Sync Video, GUIDE
+	// 3.8) loads FFmpeg 8.x's shared DLLs from (avcodec-62.dll, avutil-60.dll,
+	// swresample-6.dll; install-host.ps1 -InstallLibavcodec puts BtbN's LGPL
+	// build into ffmpeg-lgpl\ next to the helper). "" = the helper's default:
+	// that ffmpeg-lgpl\ directory, then its own. Never the GPL ffmpeg.exe of
+	// the FFmpeg path (a static build without DLLs).
+	FFmpegDir string
 }
 
 func (o Options) withDefaults() Options {
@@ -332,8 +339,23 @@ func (h *Helper) SetRate(kbps int, vbvFrames float64, fps int) error {
 	return h.send(setRateMsg{T: "setRate", Kbps: kbps, VBVFrames: vbvFrames, FPS: fps})
 }
 
+// SetFPS changes the frame rate alone (Phase 5 "FPS before resolution":
+// under pressure lower the frame rate before the resolution, so each frame
+// gets more bits; LowerFPS gives the steps). The capture paces to it at once
+// and the encoder follows from its next frame; how seamless that is says the
+// stream's Started.LiveFPS (flush when the start asked for LiveBitrate
+// "flush"; CodecCaps.LiveFPS is only the default before a start; AMF
+// FRAMERATE: VERIFY no IDR). Helpers older than Phase 5 refuse a setRate
+// without kbps (bad_message): use SetRate with the current bitrate there.
+func (h *Helper) SetFPS(fps int) error {
+	if fps < 1 || fps > 480 {
+		return fmt.Errorf("encoder helper: fps %d out of range 1..480", fps)
+	}
+	return h.send(setRateMsg{T: "setRate", FPS: fps})
+}
+
 // SetROI replaces the regions of interest (nil clears them), at most
-// MaxROIRects.
+// MaxROIRects. FocusROI builds the cursor / crosshair regions.
 func (h *Helper) SetROI(rects []ROIRect) error {
 	if len(rects) > MaxROIRects {
 		return fmt.Errorf("encoder helper: %d ROI rects, at most %d", len(rects), MaxROIRects)
@@ -435,7 +457,7 @@ func (h *Helper) controlLoop(capsCh chan<- *Caps) {
 			}
 		case *CaptureChanged:
 			h.log.Info("encoder helper: capture changed", "reason", m.Reason, "width", m.Width, "height", m.Height,
-				"rotation", m.Rotation, "text", m.Text)
+				"rotation", m.Rotation, "hdr", m.HDR, "text", m.Text)
 			select {
 			case h.captures <- *m:
 			default:

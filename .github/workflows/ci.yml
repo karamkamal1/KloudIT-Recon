@@ -73,11 +73,23 @@ jobs:
           $out = & $exe --self-test-convert
           $out
           if ($LASTEXITCODE -ne 0) { throw "--self-test-convert failed ($LASTEXITCODE)" }
-          if (-not ($out -match 'self-test-convert: ok \(mode nv12\)')) { throw "conversion not tested on NV12 render targets" }
+          if (-not ($out -match 'self-test-convert: ok \(mode nv12;')) { throw "conversion not tested on NV12 render targets" }
           $caps = & $exe --print-caps --backend=mock
           $caps
           if ($caps -match 'no C\+\+/WinRT headers') { throw "MSVC build without C++/WinRT: Windows.Graphics.Capture missing" }
-      - name: Helper integration tests (mock backend, NVENC test double; the session pipeline on the helper; the live-bitrate qualification)
+      - name: FFmpeg 8.1 shared build for the libavcodec backend test (BtbN GPL shared, SHA-256 verified; test only)
+        run: |
+          $base = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
+          $zip = 'ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip'
+          $sums = (Invoke-WebRequest -UseBasicParsing "$base/checksums.sha256").Content
+          if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+          $expected = ($sums -split "`n" | Where-Object { $_.Trim() -match " $([regex]::Escape($zip))$" } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
+          Invoke-WebRequest -UseBasicParsing "$base/$zip" -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if (-not $expected -or $expected.ToLowerInvariant() -ne $actual) { throw "checksum mismatch for $zip (expected '$expected', got $actual)" }
+          Expand-Archive $zip -DestinationPath ffmpeg-shared
+          "RECON_FFMPEG_DIR=$((Resolve-Path ffmpeg-shared/*/bin).Path)" >> $env:GITHUB_ENV
+      - name: Helper integration tests (mock backend, NVENC test double, libavcodec backend with libx264; the session pipeline on the helper; the live-bitrate qualification)
         run: |
           $env:RECON_HELPER_EXE = (Resolve-Path build/recon-encoder/bin/recon-encoder.exe).Path
           $env:RECON_FAKE_NVENC = (Resolve-Path build/recon-encoder/bin/recon-fake-nvenc.dll).Path

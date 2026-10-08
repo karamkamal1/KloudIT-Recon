@@ -215,6 +215,12 @@ The installer:
 - opens UDP 47998 for the direct path on Private networks only (it warns if your network is
   set to Public)
 - installs ViGEmBus for controller support (`-InstallViGEm`)
+- optionally installs the Virtual Display Driver (`-InstallVirtualDisplay`: pinned release,
+  SHA-256 verified) for streaming a virtual monitor at the client's resolution and frame rate;
+  its device stays disabled (no extra monitor) until a session enables it
+- optionally downloads FFmpeg's LGPL shared libraries (`-InstallLibavcodec`: BtbN's FFmpeg 8.1
+  LGPL shared build, SHA-256 verified) into `ffmpeg-lgpl\` for the native encoder helper's
+  Intel Quick Sync backend; the GPL `ffmpeg.exe` stays the FFmpeg command-line path
 - starts the agent and checks that it reaches the gateway, and warns if no GPU encoder works
 
 The PC's card in the dashboard shows **Online** when the agent connects.
@@ -309,6 +315,8 @@ The new password (at least 10 characters) is read from stdin.
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency. With `capture` `amf` the FFmpeg chain keeps that wall-clock pts (`vsrc_amf`'s own pts are rounded to 1/fps), and `off` only stops sending capture stamps to the client |
 | `gpuPriority` | `auto` | GPU scheduling priority of the capture/encode process (FFmpeg, or the native helper, which applies the same rules to itself), so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
+| `virtualDisplay` | `off` | Stream a virtual monitor matched to the client (its resolution, and the stream's frame rate as refresh rate, e.g. 2560x1440@120 on a 60 Hz host monitor) through an installed IddCx driver: SudoVDA (comes with Apollo) or the Virtual Display Driver (`install-host.ps1 -InstallVirtualDisplay`). `auto`: when the monitor cannot show the client's mode 1:1; `on`: always; `off`. The previous display layout is restored when the session ends. Sessions do not use it yet (the package `internal/host/vdisplay` is ready, the session hook-up follows); test a driver with `recon-host.exe vdisplay` (see `docs/VENDOR_NOTES.md`, 3.7) |
+| `virtualDisplayLayout` | `primary` | Where the virtual monitor goes: `primary` (primary display, so games open on it; the other monitors stay on), `extend` (secondary, right of the others) or `only` (the other monitors are off during the session) |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 
@@ -385,7 +393,9 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   reconnect automatically.
 - The Windows secure desktop (lock screen, UAC) can't be captured (see above).
 - No microphone passthrough or host → browser clipboard sync yet (you can type text into the PC).
-- HDR streams are tone-mapped to SDR by the capture API.
+- HDR desktops are streamed as SDR (the capture API converts them). The native encoder
+  helper can already encode HDR10 (10-bit BT.2020 PQ with HDR metadata, HEVC / AV1, opt-in),
+  but the agent does not ask for it yet: browser HDR presentation comes later.
 
 ## Development
 
@@ -395,7 +405,7 @@ Repository layout:
 |---|---|
 | `cmd/recon-gateway`, `cmd/recon-host` | The two programs' entry points |
 | `internal/gateway` | Web server, accounts/2FA, API, relay (UDP forwarder, QUIC/WebSocket splice), Wake-on-LAN, TLS |
-| `internal/host` | PC agent: sessions, direct path, gateway tunnel; `media/` (FFmpeg, audio), `input/` (SendInput), `platform/` (monitors, cursor, ViGEm) |
+| `internal/host` | PC agent: sessions, direct path, gateway tunnel; `media/` (FFmpeg, audio), `input/` (SendInput), `platform/` (monitors, cursor, ViGEm), `vdisplay/` (virtual displays) |
 | `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters (`transport/cc`: media congestion controller), NUT demuxer, codec strings |
 | `third_party/quic-go` | quic-go with a pluggable congestion-control hook (`go.mod` replace; see `third_party/README.md`) |
 | `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "capture/dirty.hpp"
 #include "d3d/device.hpp"
 
 namespace recon {
@@ -76,9 +77,9 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
                 const Next r = acquire(0, a, err);
                 if (r == Next::Error || r == Next::Stopped) return r;
                 if (r == Next::Frame) {
-                    const int dirty = pendingInfo_.dirtyPct < 0 || a.dirtyPct < 0 ? -1 : std::min(100, pendingInfo_.dirtyPct + a.dirtyPct);
+                    const float dirty = mergeDirty(pendingInfo_.dirty, a.dirty);
                     pendingInfo_ = a;
-                    pendingInfo_.dirtyPct = dirty;
+                    pendingInfo_.dirty = dirty;
                 }
             }
             promote();
@@ -87,7 +88,7 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             out.index = index_++;
             out.presentQpc = pendingInfo_.presentQpc;
             out.captureQpc = pendingInfo_.captureQpc;
-            out.dirtyPct = pendingInfo_.dirtyPct;
+            out.dirty = pendingInfo_.dirty;
             pending_ = false;
             haveLast_ = true;
             std::lock_guard<std::mutex> lock(mu_);
@@ -103,7 +104,7 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             out.index = index_++;
             out.repeat = true;
             out.captureQpc = now;
-            out.dirtyPct = 0;
+            out.dirty = 0;
             std::lock_guard<std::mutex> lock(mu_);
             pacer_.delivered(now, true);
             return Next::Frame;

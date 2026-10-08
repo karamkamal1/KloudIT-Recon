@@ -120,4 +120,31 @@ QpMap roiQpDeltaMap(Codec c, uint32_t width, uint32_t height, const std::vector<
     return m;
 }
 
+size_t oversizeLimit(int kbps, int fps, double factor) {
+    const double avg = double(std::max(1, kbps)) * 1000.0 / 8.0 / double(std::max(1, fps));
+    return size_t(std::max(1.0, std::round(avg * std::max(0.0, factor))));
+}
+
+int reencodeQpDelta(Codec c, double ratio) {
+    const double steps = ratio > 1 ? std::ceil(6.0 * std::log2(ratio)) : 0.0;
+    const int qp = int(std::clamp(steps, 2.0, 12.0));
+    return c == Codec::Av1 ? 4 * qp : qp;
+}
+
+QpMap offsetQpMap(Codec c, uint32_t width, uint32_t height, const QpMap* roi, int delta) {
+    QpMap m;
+    const uint32_t block = qpMapBlock(c);
+    if (!width || !height) return m;
+    m.cols = (width + block - 1) / block;
+    m.rows = (height + block - 1) / block;
+    m.values.assign(size_t(m.cols) * m.rows, 0);
+    const bool useRoi = roi && roi->cols == m.cols && roi->rows == m.rows && roi->values.size() == m.values.size();
+    const int limit = c == Codec::Av1 ? 127 : 51;
+    for (size_t i = 0; i < m.values.size(); ++i) {
+        const int base = useRoi ? int(roi->values[i]) : 0;
+        m.values[i] = int8_t(std::clamp(base + delta, -limit, limit));
+    }
+    return m;
+}
+
 }  // namespace recon::nvenc

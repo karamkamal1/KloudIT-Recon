@@ -5,16 +5,24 @@
 // insertion on real H.264 access units (the mock clip) and on synthetic HEVC /
 // AV1 units, the level and reference frames read from SPS NAL units (x264 /
 // x265 output and hand-written ones), ROI importance and QP delta maps, the
-// coded size alignment, and the NVENC settings that need no driver
-// (nvenc/nvenc_policy.hpp).
+// coded size alignment, the NVENC settings that need no driver
+// (nvenc/nvenc_policy.hpp), and the HDR10 metadata and its encoder units
+// (codec/hdr.hpp). Phase 5: the LTR policy with temporal SVC (marks and
+// recoveries on base-layer frames, the layer prediction), temporal ids and the
+// discardable flag from H.264 / HEVC / AV1 units, the sub-frame output
+// assembler, the cursor / crosshair ROI maps of encoder.FocusROI written into
+// a pitched GRAY32 plane, and the NVENC re-encode limits and QP maps.
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "codec/ltr.hpp"
 #include "codec/rfi.hpp"
+#include "codec/slices.hpp"
 #include "mock/mock.hpp"
 #include "nvenc/nvenc_policy.hpp"
 #include "selftest.hpp"
@@ -439,6 +447,255 @@ void testBitstream() {
     }
 }
 
+// An encoder with temporal SVC as AMF documents it: the dyadic pattern after
+// every key frame, "the request to mark the current picture as LTR would be
+// delayed to the next base temporal layer picture if the current picture is in
+// an enhancement layer", FORCE_LTR_REFERENCE_BITFIELD honoured on the frame it
+// is set on. keyAt: a key frame it makes on its own (its pattern restarts).
+struct SvcEncoder {
+    SvcEncoder(LtrTracker& tracker, int numLayers, int pipelineDelay) : t(tracker), layers(numLayers), delay(pipelineDelay) {}
+    struct Out {
+        uint64_t id;
+        int layer;
+        LtrTracker::Plan plan;
+        LtrTracker::Output o;
+        bool ok;
+    };
+    LtrTracker& t;
+    int layers;
+    int delay;
+    uint64_t keyAt = 0;
+    uint64_t pos = 0;
+    int pendingMark = -1;
+    std::vector<std::pair<uint64_t, LtrTracker::Plan>> queue;
+    std::vector<LtrTracker::Output> queued;
+    std::vector<Out> out;
+
+    void frame(uint64_t id, int64_t now, bool idr) {
+        const LtrTracker::Plan p = t.plan(id, now, idr);
+        t.submitted(id, p, now);
+        LtrTracker::Output o;
+        o.key = o.intra = p.idr || id == keyAt;
+        if (o.key) pos = 0, pendingMark = -1;
+        o.temporalLayer = LtrTracker::layerAt(pos++, layers);
+        int mark = o.key ? -1 : p.markSlot;
+        if (mark >= 0 && o.temporalLayer != 0) {
+            pendingMark = mark;  // delayed to the next base-layer frame
+            mark = -1;
+        } else if (o.temporalLayer == 0) {
+            if (mark < 0) mark = pendingMark;
+            pendingMark = -1;
+        }
+        o.markedSlot = mark;
+        o.refMask = p.refMask;
+        queue.emplace_back(id, p);
+        queued.push_back(o);
+        while (int(queue.size()) > delay) {
+            const auto [fid, plan] = queue.front();
+            const LtrTracker::Output oo = queued.front();
+            queue.erase(queue.begin());
+            queued.erase(queued.begin());
+            const bool ok = t.output(fid, oo, plan, now);
+            out.push_back({fid, oo.temporalLayer, plan, oo, ok});
+        }
+    }
+    void ackMarks(uint64_t current, uint64_t after) {
+        for (const Out& x : out) {
+            if (x.o.markedSlot >= 0 && x.id + after == current) t.ack(x.id);
+        }
+    }
+};
+
+void testLtrSvc() {
+    const char* name = "SVC: LTR marks / recovery on base layer";
+    {
+        expect(LtrTracker::layerAt(0, 2) == 0 && LtrTracker::layerAt(1, 2) == 1 && LtrTracker::layerAt(2, 2) == 0 &&
+                   LtrTracker::layerAt(1, 3) == 2 && LtrTracker::layerAt(2, 3) == 1 && LtrTracker::layerAt(4, 3) == 0 &&
+                   LtrTracker::layerAt(6, 4) == 2 && LtrTracker::layerAt(5, 1) == 0,
+               name, "layerAt pattern");
+        LtrTracker t;
+        LtrTracker::Config c{2, 6, 1000};
+        c.layers = 2;
+        t.reset(c);
+        SvcEncoder enc(t, 2, 0);
+        for (uint64_t id = 1; id <= 41; ++id) {
+            enc.frame(id, int64_t(id), id == 1);
+            enc.ackMarks(id, 2);
+        }
+        int marks = 0;
+        for (const SvcEncoder::Out& x : enc.out) {
+            if (x.plan.markSlot >= 0) {
+                ++marks;
+                expect(x.layer == 0, name, "mark planned on frame " + std::to_string(x.id) + " in layer " + std::to_string(x.layer));
+            }
+            expect(x.o.markedSlot < 0 || x.layer == 0, name, "frame " + std::to_string(x.id) + " stored as LTR in an enhancement layer");
+            expect(x.plan.layer == x.layer, name, "frame " + std::to_string(x.id) + " predicted in layer " + std::to_string(x.plan.layer));
+        }
+        expect(marks >= 5, name, "only " + std::to_string(marks) + " marks in 41 frames");
+        // Frames 40 and 41 lost; 42 is an enhancement-layer frame (odd
+        // position): no recovery there, 43 (base layer) recovers.
+        expect(t.recover(40, std::nullopt), name, "no ACKed LTR to recover from");
+        enc.frame(42, 42, false);
+        enc.frame(43, 43, false);
+        const SvcEncoder::Out& e42 = enc.out[enc.out.size() - 2];
+        const SvcEncoder::Out& e43 = enc.out.back();
+        expect(e42.layer == 1 && !e42.plan.recovery && !e42.plan.idr, name, "the enhancement frame 42 was planned as the recovery");
+        expect(e43.layer == 0 && e43.plan.recovery && e43.plan.refFloor < 40 && e43.ok, name,
+               "base frame 43: recovery " + std::to_string(e43.plan.recovery) + ", refFloor " + std::to_string(e43.plan.refFloor));
+    }
+    std::printf("  %-44s ok\n", name);
+
+    name = "SVC: layer prediction follows the encoder";
+    {
+        // The encoder makes a key frame on its own at an odd position: its
+        // pattern restarts, the tracker learns it from the output (one frame
+        // in the encoder at a time, so frame 23 is planned before 22's layer
+        // is known: a mark there is delayed by the encoder, and tracked).
+        LtrTracker t;
+        LtrTracker::Config c{2, 3, 1000};
+        c.layers = 2;
+        t.reset(c);
+        SvcEncoder enc(t, 2, 1);
+        enc.keyAt = 22;
+        for (uint64_t id = 1; id <= 60; ++id) {
+            enc.frame(id, int64_t(id), id == 1);
+            enc.ackMarks(id, 2);
+        }
+        expect(t.stats().layerResyncs >= 1, name, "no resync after the encoder's own key frame");
+        int wrong = 0;
+        for (const SvcEncoder::Out& x : enc.out) {
+            expect(x.o.markedSlot < 0 || x.layer == 0, name, "LTR in an enhancement layer at " + std::to_string(x.id));
+            if (x.id > 24) wrong += x.plan.layer != x.layer;
+        }
+        expect(wrong == 0, name, std::to_string(wrong) + " frames after 24 predicted in the wrong layer");
+        bool slotsHeld = false;
+        for (const auto& v : t.slots()) slotsHeld = slotsHeld || (v.frameId > 22 && v.acked);
+        expect(slotsHeld, name, "no ACKed LTR after the unplanned key frame");
+        // A recovery frame that comes out in an enhancement layer is refused.
+        LtrTracker::Plan rp;
+        rp.recovery = true;
+        rp.refMask = 1;
+        LtrTracker::Output ro;
+        ro.refMask = 1;
+        ro.temporalLayer = 1;
+        expect(!t.output(1000, ro, rp, 1000), name, "a recovery frame in layer 1 was accepted");
+        ro.temporalLayer = 0;
+        expect(t.output(1001, ro, rp, 1001), name, "a base-layer recovery frame was refused");
+    }
+    std::printf("  %-44s ok\n", name);
+
+    name = "SVC: planned IDR with frames in flight";
+    {
+        // An unplanned key frame at an odd position (frame 4) shifts the
+        // prediction; a planned IDR (frame 9) restarts it while frames planned
+        // under the shift are still in the encoder (two at a time): their
+        // outputs must not shift the prediction after the IDR again.
+        LtrTracker t;
+        LtrTracker::Config c{2, 3, 1000};
+        c.layers = 2;
+        t.reset(c);
+        SvcEncoder enc(t, 2, 2);
+        enc.keyAt = 4;
+        for (uint64_t id = 1; id <= 30; ++id) {
+            enc.frame(id, int64_t(id), id == 1 || id == 9);
+            enc.ackMarks(id, 2);
+        }
+        int wrong = 0;
+        for (const SvcEncoder::Out& x : enc.out) {
+            if (x.id >= 9) wrong += x.plan.layer != x.layer;
+        }
+        expect(wrong == 0, name, std::to_string(wrong) + " frames from the IDR on predicted in the wrong layer");
+        expect(t.stats().layerResyncs == 1, name, std::to_string(t.stats().layerResyncs) + " resyncs, want 1");
+        // Frames 29 and 30 lost: the recovery is planned on a base-layer
+        // frame and accepted (no extra IDR).
+        expect(t.recover(29, std::nullopt), name, "no ACKed LTR to recover from");
+        for (uint64_t id = 31; id <= 34; ++id) enc.frame(id, int64_t(id), false);
+        int recoveries = 0;
+        for (const SvcEncoder::Out& x : enc.out) {
+            if (!x.plan.recovery) continue;
+            ++recoveries;
+            expect(x.layer == 0 && x.ok, name, "recovery frame " + std::to_string(x.id) + " in layer " + std::to_string(x.layer) + " refused");
+        }
+        expect(recoveries == 1 && t.stats().failedRecoveries == 0 && t.stats().idrFallbacks == 0, name,
+               std::to_string(recoveries) + " recoveries, " + std::to_string(t.stats().failedRecoveries) + " failed");
+    }
+    std::printf("  %-44s ok\n", name);
+}
+
+std::vector<uint8_t> bytes(std::initializer_list<int> b) {
+    std::vector<uint8_t> v;
+    for (int x : b) v.push_back(uint8_t(x));
+    return v;
+}
+
+void testLayers() {
+    const char* name = "temporal layers / discardable frames";
+    // H.264: SVC prefix NAL (14, svc_extension_flag, temporal_id 1) + a
+    // non-reference slice (nal_ref_idc 0); a reference slice; an IDR.
+    const std::vector<uint8_t> h264Enh = bytes({0, 0, 0, 1, 0x0e, 0x80, 0x00, 0x20, 0, 0, 1, 0x01, 0x88, 0x84});
+    const std::vector<uint8_t> h264Ref = bytes({0, 0, 0, 1, 0x41, 0x9a, 0x02});
+    const std::vector<uint8_t> h264Idr = bytes({0, 0, 0, 1, 0x67, 0x64, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88});
+    LayerInfo li = layerInfo(Codec::H264, h264Enh.data(), h264Enh.size(), 1);
+    expect(li.temporalId == 1 && li.reference == 0 && isDiscardable(false, li, 2, 1), name, "h264 enhancement frame");
+    li = layerInfo(Codec::H264, h264Ref.data(), h264Ref.size(), 1);
+    expect(li.temporalId == -1 && li.reference == 1 && !isDiscardable(false, li, 2, 1), name, "h264 reference frame in layer 1 discardable");
+    li = layerInfo(Codec::H264, h264Idr.data(), h264Idr.size(), 1);
+    expect(li.reference == 1 && !isDiscardable(true, li, 2, 0), name, "h264 IDR");
+    // HEVC: TRAIL_N in the top layer; TRAIL_N in a lower layer (a higher one
+    // may reference it); TRAIL_R in the top layer; IDR_W_RADL.
+    const std::vector<uint8_t> trailN1 = bytes({0, 0, 1, 0x00, 0x02, 0xaf}), trailN0 = bytes({0, 0, 1, 0x00, 0x01, 0xaf}),
+                               trailR1 = bytes({0, 0, 1, 0x02, 0x02, 0xaf}), idr = bytes({0, 0, 0, 1, 0x40, 0x01, 0x0c, 0, 0, 1, 0x26, 0x01, 0xaf});
+    li = layerInfo(Codec::Hevc, trailN1.data(), trailN1.size(), 1);
+    expect(li.temporalId == 1 && li.reference == 0 && isDiscardable(false, li, 2, 1), name, "hevc TRAIL_N top layer");
+    li = layerInfo(Codec::Hevc, trailN0.data(), trailN0.size(), 1);
+    expect(li.temporalId == 0 && li.reference == 1 && !isDiscardable(false, li, 2, 0), name, "hevc TRAIL_N below the top layer");
+    li = layerInfo(Codec::Hevc, trailR1.data(), trailR1.size(), 1);
+    expect(li.temporalId == 1 && li.reference == 1 && !isDiscardable(false, li, 2, 1), name, "hevc TRAIL_R top layer");
+    li = layerInfo(Codec::Hevc, idr.data(), idr.size(), 1);
+    expect(li.temporalId == 0 && li.reference == 1, name, "hevc IDR (after a VPS)");
+    // AV1: temporal delimiter, then OBU_FRAME with an extension (temporal_id
+    // 1) and a two-byte leb128 size; one without an extension.
+    std::vector<uint8_t> av1 = bytes({0x12, 0x00, 0x36, 0x20, 0x80, 0x01});
+    av1.resize(av1.size() + 128, 0x55);
+    li = layerInfo(Codec::Av1, av1.data(), av1.size(), 1);
+    expect(li.temporalId == 1 && li.reference == -1 && isDiscardable(false, li, 2, 1) && !isDiscardable(false, li, 2, 0) &&
+               !isDiscardable(false, li, 1, 0),
+           name, "av1 OBU extension temporal_id " + std::to_string(li.temporalId));
+    const std::vector<uint8_t> av1Plain = bytes({0x12, 0x00, 0x32, 0x02, 0x10, 0x20});
+    li = layerInfo(Codec::Av1, av1Plain.data(), av1Plain.size(), 1);
+    expect(li.temporalId == -1, name, "av1 without an extension");
+    std::printf("  %-44s ok\n", name);
+
+    name = "sub-frame output: slices put together";
+    {
+        SliceAssembler a;
+        const uint8_t s1[] = {1, 2}, s2[] = {3}, s3[] = {4, 5, 6};
+        SliceAssembler::Result r = a.add(SliceAssembler::Part::Frame, 4, s1, 2, 100);
+        expect(r.complete && a.parts() == 1 && a.frame().size() == 2 && a.frameId() == 4 && a.firstQpc() == 100, name, "a whole frame");
+        r = a.add(SliceAssembler::Part::Slice, 5, s1, 2, 200);
+        expect(!r.complete && a.collecting(), name, "first slice completed a frame");
+        r = a.add(SliceAssembler::Part::Slice, -1, s2, 1, 210);  // a part without the id
+        r = a.add(SliceAssembler::Part::Last, 5, s3, 3, 230);
+        expect(r.complete && a.parts() == 3 && a.frame() == std::vector<uint8_t>({1, 2, 3, 4, 5, 6}) && a.firstQpc() == 200 &&
+                   a.frameId() == 5 && !a.collecting(),
+               name, "three slices");
+        // Frame 6 never finishes: frame 7's first part drops its two parts.
+        a.add(SliceAssembler::Part::Slice, 6, s1, 2, 300);
+        a.add(SliceAssembler::Part::Slice, 6, s2, 1, 310);
+        r = a.add(SliceAssembler::Part::Slice, 7, s3, 3, 320);
+        expect(!r.complete && r.droppedParts == 2, name, "an unfinished frame was not dropped");
+        r = a.add(SliceAssembler::Part::Last, 7, s2, 1, 330);
+        expect(r.complete && a.parts() == 2 && a.frame() == std::vector<uint8_t>({4, 5, 6, 3}) && a.firstQpc() == 320, name,
+               "the frame after a dropped one");
+        // A whole frame while slices are collecting.
+        a.add(SliceAssembler::Part::Slice, 8, s1, 2, 400);
+        r = a.add(SliceAssembler::Part::Frame, 9, s2, 1, 410);
+        expect(r.complete && r.droppedParts == 1 && a.frameId() == 9 && a.frame().size() == 1 && a.droppedFrames() == 2, name,
+               "a whole frame after an unfinished one");
+    }
+    std::printf("  %-44s ok\n", name);
+}
+
 void testRoi() {
     const char* name = "ROI importance map";
     const RoiMap none = roiImportanceMap(1920, 1080, 64, {});
@@ -456,6 +713,50 @@ void testRoi() {
     expect(h264.cols == 4 && h264.rows == 2 && h264.values[5] == 7 && h264.values[0] == 5, name, "16x16 blocks wrong");
     const RoiMap clipped = roiImportanceMap(100, 100, 64, {RoiRect{90, 90, 500, 500, 10}});
     expect(clipped.values[3] == 10 && clipped.values[0] == 5, name, "clipping wrong");
+    std::printf("  %-44s ok\n", name);
+
+    // The rects encoder.FocusROI (internal/host/encoder/focus.go) makes for a
+    // 1920x1080 stream with the pointer at (100, 100), Background -2 (its Go
+    // test pins the same numbers): the whole picture at -2, a 135x135 square
+    // around the pointer at +6, a 180x180 one around the crosshair (the
+    // centre) at +8; and the pointer square clipped at the bottom-left corner.
+    name = "ROI maps of the cursor / crosshair rects";
+    {
+        const std::vector<RoiRect> focus = {RoiRect{0, 0, 1920, 1080, -2}, RoiRect{33, 33, 135, 135, 6}, RoiRect{870, 450, 180, 180, 8}};
+        const auto count = [](const auto& values, auto v) { return size_t(std::count(values.begin(), values.end(), v)); };
+        const RoiMap hevc = roiImportanceMap(1920, 1080, 64, focus);  // AMF HEVC / AV1: 64x64 blocks
+        expect(hevc.cols == 30 && hevc.rows == 17 && count(hevc.values, 8u) == 9 && count(hevc.values, 9u) == 12 &&
+                   count(hevc.values, 4u) == 510 - 21 && hevc.values[0] == 8 && hevc.values[2 * 30 + 2] == 8 && hevc.values[3 * 30 + 3] == 4 &&
+                   hevc.values[7 * 30 + 13] == 9 && hevc.values[9 * 30 + 16] == 9 && hevc.values[10 * 30 + 16] == 4,
+               name, "AMF HEVC importance map");
+        const RoiMap mb = roiImportanceMap(1920, 1080, 16, focus);  // AMF H.264: macroblocks
+        expect(mb.cols == 120 && mb.rows == 68 && count(mb.values, 8u) == 81 && count(mb.values, 9u) == 144, name,
+               "AMF H.264 importance map");
+        const nvenc::QpMap qh = nvenc::roiQpDeltaMap(Codec::Hevc, 1920, 1080, focus);  // NVENC HEVC: 32x32
+        expect(qh.cols == 60 && qh.rows == 34 && count(qh.values, int8_t(-6)) == 25 && count(qh.values, int8_t(-8)) == 36 &&
+                   count(qh.values, int8_t(2)) == 60 * 34 - 61,
+               name, "NVENC HEVC QP delta map");
+        const nvenc::QpMap qa = nvenc::roiQpDeltaMap(Codec::Av1, 1920, 1080, focus);  // NVENC AV1: 64x64, x4
+        expect(count(qa.values, int8_t(-24)) == 9 && count(qa.values, int8_t(-32)) == 12 && count(qa.values, int8_t(8)) == 510 - 21, name,
+               "NVENC AV1 QP delta map");
+        const RoiMap corner = roiImportanceMap(1920, 1080, 64, {RoiRect{0, 1008, 73, 72, 6}});
+        expect(count(corner.values, 8u) == 4 && corner.values[15 * 30] == 8 && corner.values[16 * 30 + 1] == 8, name, "clipped pointer square");
+        // Into a pitched host-memory GRAY32 plane (AMF ROI_DATA), padding untouched.
+        const size_t pitch = hevc.cols * 4 + 12;
+        std::vector<uint8_t> plane(pitch * hevc.rows, 0xee);
+        expect(writeRoiPlane(hevc, plane.data(), pitch), name, "writeRoiPlane refused a valid pitch");
+        bool rowsOk = true, padOk = true;
+        for (uint32_t y = 0; y < hevc.rows; ++y) {
+            for (uint32_t x = 0; x < hevc.cols; ++x) {
+                uint32_t v;
+                std::memcpy(&v, &plane[y * pitch + x * 4], 4);
+                rowsOk = rowsOk && v == hevc.values[size_t(y) * hevc.cols + x];
+            }
+            for (size_t b = hevc.cols * 4; b < pitch; ++b) padOk = padOk && plane[y * pitch + b] == 0xee;
+        }
+        expect(rowsOk && padOk, name, "GRAY32 plane rows / padding");
+        expect(!writeRoiPlane(hevc, plane.data(), hevc.cols * 4 - 4), name, "a pitch smaller than a row accepted");
+    }
     std::printf("  %-44s ok\n", name);
 
     name = "coded size alignment";
@@ -679,6 +980,66 @@ void testNvencPolicy() {
     const QpMap h264 = roiQpDeltaMap(Codec::H264, 64, 32, {RoiRect{0, 0, 16, 16, -4}, RoiRect{200, 200, 16, 16, 9}});
     expect(h264.cols == 4 && h264.rows == 2 && h264.values[0] == 4 && h264.values[1] == 0, name, "h264 map, rect outside");
     std::printf("  %-44s ok\n", name);
+
+    name = "NVENC re-encode limits and QP maps";
+    expect(oversizeLimit(20000, 60, 4.0) == 166667 && oversizeLimit(8000, 30, 2.5) == 83333, name, "limits");
+    expect(reencodeQpDelta(Codec::Hevc, 2.0) == 6 && reencodeQpDelta(Codec::H264, 1.05) == 2 && reencodeQpDelta(Codec::Hevc, 100) == 12 &&
+               reencodeQpDelta(Codec::Hevc, 3.0) == 10 && reencodeQpDelta(Codec::Av1, 2.0) == 24 && reencodeQpDelta(Codec::Av1, 1000) == 48,
+           name, "QP deltas");
+    QpMap roi;
+    roi.cols = roi.rows = 2;
+    roi.values = {-10, 0, 0, -51};
+    const QpMap up = offsetQpMap(Codec::Hevc, 64, 64, &roi, 6);
+    expect(up.cols == 2 && up.rows == 2 && up.values == std::vector<int8_t>({-4, 6, 6, -45}), name, "ROI map plus the offset");
+    expect(offsetQpMap(Codec::Hevc, 64, 64, &roi, 60).values[1] == 51 && offsetQpMap(Codec::Av1, 64, 64, nullptr, 200).values[0] == 127,
+           name, "clamping");
+    const QpMap plain = offsetQpMap(Codec::H264, 64, 32, &roi, 4);  // roi has the wrong size for 16x16 blocks: ignored
+    expect(plain.cols == 4 && plain.rows == 2 && std::all_of(plain.values.begin(), plain.values.end(), [](int8_t v) { return v == 4; }), name,
+           "uniform offset");
+    std::printf("  %-44s ok\n", name);
+}
+
+void testHdrMetadata() {
+    const char* name = "HDR10 metadata and its units";
+    DisplayColor d;
+    d.known = d.hdr = true;
+    d.minLuminance = 0.005, d.maxLuminance = 1000, d.maxFullFrameLuminance = 400;
+    d.red[0] = 0.64, d.red[1] = 0.33;  // the panel's (sRGB-like) primaries are not used
+    HdrMetadata m = hdrMetadataFor(d);
+    expect(m.red[0] == 0.708 && m.red[1] == 0.292 && m.green[0] == 0.170 && m.green[1] == 0.797 && m.blue[0] == 0.131 &&
+               m.blue[1] == 0.046 && m.white[0] == 0.3127 && m.white[1] == 0.3290,
+           name, "primaries: not BT.2020 / D65");
+    expect(m.maxLuminance == 1000 && m.minLuminance == 0.005 && m.maxCll == 1000 && m.maxFall == 400, name, "luminance from the display");
+    // Unknown, implausible or inconsistent values: a 1000 cd/m2 display.
+    const HdrMetadata unknown = hdrMetadataFor(DisplayColor{});
+    expect(unknown.maxLuminance == kDefaultHdrPeak && unknown.minLuminance == 0 && unknown.maxCll == 1000 && unknown.maxFall == 1000, name,
+           "unknown display");
+    d.maxLuminance = 50;
+    expect(hdrMetadataFor(d).maxLuminance == kDefaultHdrPeak, name, "peak below 80 cd/m2 accepted");
+    d.maxLuminance = 20000;
+    expect(hdrMetadataFor(d).maxLuminance == kDefaultHdrPeak, name, "peak above 10000 cd/m2 accepted");
+    d.maxLuminance = 600, d.maxFullFrameLuminance = 800, d.minLuminance = 7;
+    m = hdrMetadataFor(d);
+    expect(m.maxCll == 600 && m.maxFall == 600 && m.minLuminance == 0, name, "full-frame above peak / black level above 5 cd/m2");
+    // HEVC SEI (and AMF): chromaticity x 50000, luminance x 10000; AV1: 0.16,
+    // 24.8 and 18.14 fixed point.
+    d.maxLuminance = 1000, d.maxFullFrameLuminance = 400, d.minLuminance = 0.005;
+    m = hdrMetadataFor(d);
+    const MasteringCodes h = masteringCodes(m, false), a = masteringCodes(m, true);
+    expect(h.red[0] == 35400 && h.red[1] == 14600 && h.green[0] == 8500 && h.green[1] == 39850 && h.blue[0] == 6550 && h.blue[1] == 2300 &&
+               h.white[0] == 15635 && h.white[1] == 16450 && h.maxLuminance == 10000000 && h.minLuminance == 50,
+           name, "HEVC units");
+    expect(a.red[0] == 46399 && a.red[1] == 19137 && a.green[0] == 11141 && a.green[1] == 52232 && a.blue[0] == 8585 && a.blue[1] == 3015 &&
+               a.white[0] == 20493 && a.white[1] == 21561 && a.maxLuminance == 256000 && a.minLuminance == 82,
+           name, "AV1 units");
+    m.white[0] = 1.5;  // out of range: clamped
+    expect(masteringCodes(m, false).white[0] == 50000 && masteringCodes(m, true).white[0] == 65535, name, "clamping");
+    Started st;
+    describeColor(st, m);
+    expect(st.hdr && st.bitDepth == 10 && st.colorSpace == "bt2020-pq" && st.hdrMetadata, name, "started (HDR10)");
+    describeColor(st, std::nullopt);
+    expect(!st.hdr && st.bitDepth == 8 && st.colorSpace == "bt709" && !st.hdrMetadata, name, "started (SDR)");
+    std::printf("  %-44s ok\n", name);
 }
 
 }  // namespace
@@ -686,10 +1047,13 @@ void testNvencPolicy() {
 int runEncoderSelfTest() {
     failures = 0;
     testLtr();
+    testLtrSvc();
+    testLayers();
     testRfi();
     testBitstream();
     testRoi();
     testNvencPolicy();
+    testHdrMetadata();
     std::printf("self-test-encoder: %s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }

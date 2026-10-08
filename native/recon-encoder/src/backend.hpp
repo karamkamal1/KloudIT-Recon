@@ -37,7 +37,9 @@ struct CapturedFrame {
     // Idle re-submit of the previous image: nothing new was presented for
     // StartParams::idleRepeatMs (see the pacing policy in capture/pacer.hpp).
     bool repeat = false;
-    int dirtyPct = -1;  // share of the image that changed since the previous frame (dirty rects), -1 = unknown
+    // Share of the image that changed since the previous delivered frame
+    // (union area of the dirty and move rects, 0..1; capture/dirty.hpp), -1 = unknown.
+    float dirty = -1;
 
     ID3D11Texture2D* texture = nullptr;  // nullptr for the synthetic source
     // Clockwise rotation (0/90/180/270) from the texture to the displayed
@@ -61,6 +63,12 @@ struct SourceInfo {
     void* amfContext = nullptr;      // amf::AMFContext* of AMD Direct Capture surfaces, else nullptr
     int amfFormat = 0;               // their amf::AMF_SURFACE_FORMAT (AMF_DISPLAYCAPTURE_FORMAT), 0 = unknown
     bool cursorInVideo = false;      // frames contain the mouse pointer
+    // HDR frames (GUIDE 3.9): scRGB FP16 of an output in Windows HDR mode.
+    // Only when the start asked for hdr and the capture method can deliver
+    // them (DDA; AMD Direct Capture when its surfaces are RGBA_F16;
+    // synthetic-gpu); the encoder then makes an HDR10 stream.
+    bool hdr = false;
+    DisplayColor display;            // the captured output (HDR metadata), known = false if not asked / no output
 };
 
 // CaptureEvent (types.hpp) reports a source change, loss or recovery to recon-host.
@@ -94,27 +102,38 @@ public:
 // InputSpec is what an encoder backend wants from the pipeline (Backend::init
 // fills it). With Nv12 the pipeline converts every GPU frame (BT.709 limited
 // range, 4:2:0, scaled to width x height, optional barcode) into a pooled NV12
-// texture on the capture device (d3d/convert.hpp); Native passes the capture's
-// own image (the synthetic source, or AMD Direct Capture surfaces to an AMF
-// encoder on the same context, step 3.3).
+// texture on the capture device (d3d/convert.hpp); P010 does the same into
+// 10-bit P010 textures, BT.2020 + SMPTE ST 2084 (PQ) limited range (HDR10,
+// step 3.9); Native passes the capture's own image (the synthetic source, or
+// AMD Direct Capture surfaces to an AMF encoder on the same context, step 3.3).
 struct InputSpec {
-    enum class Format { Native, Nv12 } format = Format::Native;
+    enum class Format { Native, Nv12, P010 } format = Format::Native;
     uint32_t width = 0, height = 0;  // encoded size (even)
     // Nv12: the picture fills only the top-left contentWidth x contentHeight
     // of the texture (0 = all of it); the converter repeats the edge pixels
     // into the rest, padding the frame to a coded size the encoder needs (AV1
     // on RDNA3: multiples of 64x16). The barcode is drawn inside the content.
     uint32_t contentWidth = 0, contentHeight = 0;
+    // Nv12: the backend reads the converted frames on the CPU (the libavcodec
+    // backend's system-memory path), so on a device without NV12 render
+    // targets (Wine) the converter may hand out separate Y and CbCr textures
+    // instead (EncoderFrame::y / uv).
+    bool planarOk = false;
 };
 
 // EncoderFrame is what Backend::submit gets.
 struct EncoderFrame {
     const CapturedFrame* captured = nullptr;
-    // InputSpec::Nv12: the converted frame, DXGI_FORMAT_NV12 on the capture
-    // device. It stays reserved for the encoder as long as a copy of `hold`
-    // exists: keep one until the encoder no longer reads the texture (AMF:
-    // AMFSurfaceObserver::OnSurfaceDataRelease; NVENC: after the frame's output).
+    // InputSpec::Nv12 / P010: the converted frame, DXGI_FORMAT_NV12 (P010 for
+    // InputSpec::P010) on the capture device. It stays reserved for the
+    // encoder as long as a copy of `hold` exists: keep one until the encoder
+    // no longer reads the texture (AMF: AMFSurfaceObserver::OnSurfaceDataRelease;
+    // NVENC: after the frame's output).
     ID3D11Texture2D* nv12 = nullptr;
+    // InputSpec::planarOk on a device without NV12 render targets: nv12 is
+    // null and the frame is an R8 luma texture plus an R8G8 chroma texture.
+    ID3D11Texture2D* y = nullptr;
+    ID3D11Texture2D* uv = nullptr;
     std::shared_ptr<void> hold;
     int poolIndex = -1;  // stable per texture (e.g. for NvEncRegisterResource caching)
 };
@@ -124,7 +143,7 @@ struct SubmitInfo {
     uint64_t frameId = 0;
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0;
     bool repeat = false;
-    int dirtyPct = -1;
+    float dirty = -1;
     // The frame starts a new sequence (ring flag SEQ_START): the stream's first
     // frame, or the frame a forceIdr made an IDR (Pipeline::forceIdr calls
     // Backend::forceIdr right before submitting it). Its barcode value is 0.
@@ -143,7 +162,12 @@ struct EncodedFrame {
     uint64_t refFloor = 0;
     int32_t ltrSlot = -1;  // LTR slot this frame was marked into, -1 = none
     uint32_t temporalLayer = 0;
+    bool discardable = false;  // no later frame references it (codec/bitstream.hpp isDiscardable)
     uint32_t refLtrMask = 0;  // LTR slots this frame references
+    bool reencoded = false;    // encoded a second time at a higher QP (oversizeBytes: the first encode)
+    size_t oversizeBytes = 0;
+    int slices = 0;            // sliceOutput: parts it came out in
+    int64_t firstSliceQpc = 0;
     uint32_t width = 0, height = 0;
     const uint8_t* data = nullptr;
     size_t size = 0;
@@ -215,7 +239,7 @@ struct BackendChoice {
     Caps caps;                         // always filled (with "unavailable" reasons)
 };
 
-// Selects the encoder backend ("auto" | "mock" | "amf" | "nvenc") and probes
+// Selects the encoder backend ("auto" | "mock" | "amf" | "nvenc" | "lavc") and probes
 // every real backend and capture method for the caps' "unavailable" list.
 BackendChoice chooseBackend(const std::string& name, const MockOptions& mock);
 

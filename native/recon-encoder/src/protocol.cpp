@@ -1,5 +1,7 @@
 #include "protocol.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -103,7 +105,8 @@ Status parseStart(const json& j, StartParams& p) {
         !optField(j, "svcLayers", p.svcLayers, err) || !optField(j, "liveBitrate", p.liveBitrate, err) ||
         !optField(j, "encoderInstance", p.encoderInstance, err) || !optField(j, "ltrInterval", p.ltrInterval, err) ||
         !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err) ||
-        !optField(j, "motion", p.motion, err)) {
+        !optField(j, "motion", p.motion, err) || !optField(j, "reencodeOversized", p.reencodeOversized, err) ||
+        !optField(j, "sliceOutput", p.sliceOutput, err)) {
         return bad(err);
     }
     if (p.codec != "h264" && p.codec != "hevc" && p.codec != "av1") return bad("codec must be h264, hevc or av1");
@@ -122,6 +125,10 @@ Status parseStart(const json& j, StartParams& p) {
     if (!inRange(p.encoderInstance, -1, 15)) return bad("encoderInstance out of range (-1..15)");
     if (!inRange(p.ltrInterval, 0, 1000)) return bad("ltrInterval out of range (0..1000)");
     if (!inRange(p.intraRefreshFrames, 0, 1000)) return bad("intraRefreshFrames out of range (0..1000)");
+    if (p.reencodeOversized != 0 && !(p.reencodeOversized >= 1.5 && p.reencodeOversized <= 100)) {
+        return bad("reencodeOversized must be 0 (off) or 1.5..100 average frames");
+    }
+    if (!inRange(p.sliceOutput, 0, 64)) return bad("sliceOutput out of range (0..64)");
     if ((p.window || !p.windowTitle.empty()) && !p.capture.empty() && p.capture != "wgc") {
         return bad("window capture needs capture \"wgc\"");
     }
@@ -157,9 +164,11 @@ Status parseControl(std::string_view text, ControlMsg& m) {
             !optField(j, "fps", m.rate.fps, err)) {
             return bad(err);
         }
-        if (!inRange(m.rate.kbps, 1, 2000000)) return bad("kbps out of range");
+        // kbps 0 / absent = unchanged (a frame-rate change alone, Phase 5).
+        if (!inRange(m.rate.kbps, 0, 2000000)) return bad("kbps out of range");
         if (!(m.rate.vbvFrames >= 0 && m.rate.vbvFrames <= 30)) return bad("vbvFrames out of range");
         if (!inRange(m.rate.fps, 0, 480)) return bad("fps out of range");
+        if (m.rate.kbps == 0 && m.rate.vbvFrames == 0 && m.rate.fps == 0) return bad("setRate changes nothing (kbps, vbvFrames and fps all 0)");
         return Status::Ok();
     }
     if (m.type == "setRoi") {
@@ -204,6 +213,10 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"alignW", cc.alignW},
             {"alignH", cc.alignH},
             {"dynamicResolution", cc.dynamicResolution},
+            {"hdr10", cc.hdr10},
+            {"liveFps", cc.liveFps},
+            {"instanceSelect", cc.instanceSelect},
+            {"reencode", cc.reencode},
         };
         if (!cc.assumed.empty()) codecs[name]["assumed"] = cc.assumed;
     }
@@ -226,6 +239,11 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"height", o.height},
             {"rotation", o.rotation},
             {"attached", o.attached},
+            {"hdr", o.color.hdr},
+            {"bitsPerColor", o.color.bitsPerColor},
+            {"minLuminance", o.color.minLuminance},
+            {"maxLuminance", o.color.maxLuminance},
+            {"maxFullFrameLuminance", o.color.maxFullFrameLuminance},
         });
     }
     json j = {
@@ -251,6 +269,7 @@ std::string encodeStarted(const Started& s) {
     json j = {
         {"t", "started"},
         {"backend", s.backend},
+        {"encoder", s.encoder},
         {"capture", s.capture},
         {"codec", s.codec},
         {"width", s.width},
@@ -284,13 +303,31 @@ std::string encodeStarted(const Started& s) {
         {"preset", s.preset},
         {"asyncEncode", s.asyncEncode},
         {"refFrames", s.refFrames},
+        {"hdr", s.hdr},
+        {"bitDepth", s.bitDepth},
+        {"colorSpace", s.colorSpace},
+        {"svcLayers", s.svcLayers},
+        {"liveFps", s.liveFps},
+        {"reencodeOversized", s.reencodeOversized},
+        {"sliceOutput", s.sliceOutput},
     };
+    if (s.hdrMetadata) {
+        const HdrMetadata& m = *s.hdrMetadata;
+        j["hdrMetadata"] = {
+            {"displayPrimaries", {{m.red[0], m.red[1]}, {m.green[0], m.green[1]}, {m.blue[0], m.blue[1]}}},
+            {"whitePoint", {m.white[0], m.white[1]}},
+            {"maxLuminance", m.maxLuminance},
+            {"minLuminance", m.minLuminance},
+            {"maxCll", m.maxCll},
+            {"maxFall", m.maxFall},
+        };
+    }
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 std::string encodeCaptureEvent(const CaptureEvent& e) {
-    json j = {{"t", "captureChanged"}, {"reason", e.reason}, {"width", e.width},
-              {"height", e.height}, {"rotation", e.rotation}, {"text", e.text}};
+    json j = {{"t", "captureChanged"}, {"reason", e.reason}, {"width", e.width}, {"height", e.height},
+              {"rotation", e.rotation}, {"hdr", e.hdr}, {"text", e.text}};
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
@@ -303,7 +340,11 @@ std::string encodeStats(const FrameStats& s) {
         {"key", s.key},
         {"recovery", s.recovery},
         {"repeat", s.repeat},
-        {"dirtyPct", s.dirtyPct},
+        // dirtyPct: the share in whole percent, rounded up (any change >= 1);
+        // dirty: the same share as a fraction, -1 = unknown (Phase 5).
+        {"dirtyPct", s.dirty < 0 ? -1 : int(std::min(100.0, std::ceil(double(s.dirty) * 100.0 - 1e-6)))},
+        {"dirty", s.dirty < 0 ? -1.0 : std::round(double(s.dirty) * 1e6) / 1e6},
+        {"discardable", s.discardable},
         {"bytes", s.bytes},
         {"presentQpc", s.presentQpc},
         {"captureQpc", s.captureQpc},
@@ -319,6 +360,14 @@ std::string encodeStats(const FrameStats& s) {
     };
     if (s.dropped) j["reason"] = s.dropReason;
     if (s.recovery) j["refFloor"] = s.refFloor;
+    if (s.reencoded) {
+        j["reencoded"] = true;
+        j["oversizeBytes"] = s.oversizeBytes;
+    }
+    if (s.slices > 0) {
+        j["slices"] = s.slices;
+        j["firstSliceQpc"] = s.firstSliceQpc;
+    }
     return j.dump();
 }
 

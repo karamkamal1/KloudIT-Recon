@@ -29,10 +29,29 @@
 // (AMFContext::LockDX11), and holding it across a call that waits for AMF's own
 // threads could deadlock. (FFmpeg's amf_submit_frame_locked takes a plain
 // mutex of its own, not the device lock.)
+//
+// Phase 5 (GUIDE 9): temporal SVC (MAX_NUM_TEMPORAL_LAYERS before Init,
+// NUM_TEMPORAL_LAYERS; LTR marks and recovery frames on base-layer frames only,
+// codec/ltr.hpp; OUTPUT_TEMPORAL_LAYER, AV1 the OBU extension, and the
+// discardable flag from codec/bitstream.hpp), runtime frame-rate changes
+// (FRAMERATE before the next SubmitInput; a key frame right after one is
+// logged: VERIFY no IDR), INSTANCE_INDEX (caps instanceSelect), and the
+// sub-frame output experiment (start sliceOutput: OUTPUT_MODE SLICE / TILE,
+// the parts put back together by codec/slices.hpp, stats firstSliceQpc).
+// AMF cannot encode a frame without advancing its state: no reencodeOversized.
+//
+// HDR10 (GUIDE 3.9; start hdr from an HDR source): P010 input from the colour
+// conversion (BT.2020 PQ, limited range), COLOR_BIT_DEPTH 10, HEVC
+// PROFILE_MAIN_10 (AV1 Main), input and output colour profile / transfer /
+// primaries BT.2020 / SMPTE 2084 / BT.2020, and INPUT_HDR_METADATA, an
+// AMFBuffer of AMFHDRMetadata (codec/hdr.hpp), which the encoder writes as the
+// mastering display and content light level SEI / metadata OBUs (OBS
+// texture-amf.cpp and FFmpeg amfenc.c set the same properties).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -51,7 +70,9 @@
 #include "amf/amf_props.hpp"
 #include "amf/amf_runtime.hpp"
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "codec/ltr.hpp"
+#include "codec/slices.hpp"
 #include "d3d/device.hpp"
 #include "probes.hpp"
 
@@ -169,8 +190,12 @@ bool zeroCopyTexture(amf::AMFPlane* plane, DXGI_FORMAT& format) {
 
 // What GetCaps says about one codec on this GPU (AMF_Video_Encode_*_API.md
 // table A-3; the AMF EncoderLatency sample reads NUM_OF_HW_INSTANCES the same way).
-CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
+// svcLayers > 1: MAX_NUM_TEMPORAL_LAYERS is set first, since some caps depend
+// on it (AV1 CAP_MAX_NUM_LTR_FRAMES "is calculated based on current value of
+// AMF_VIDEO_ENCODER_AV1_MAX_NUM_TEMPORAL_LAYERS").
+CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P, int svcLayers = 1) {
     CodecDetails d;
+    if (svcLayers > 1 && P.maxTemporalLayers) enc->SetProperty(P.maxTemporalLayers, amf_int64(svcLayers));
     amf::AMFCapsPtr caps;
     AMF_RESULT r = enc->GetCaps(&caps);
     if (r != AMF_OK || !caps) {
@@ -215,6 +240,8 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
     const bool p010 = hasFormat(d, amf::AMF_SURFACE_P010);
     if (P.codec == Codec::Hevc) c.tenBit = getProp(caps.GetPtr(), P.capMaxProfile, v) && v >= P.profileMain10 && p010;
     else if (P.codec == Codec::Av1) c.tenBit = p010;  // AV1 Main covers 10-bit
+    // HDR10: 10-bit P010 input plus the HDR metadata property (HEVC, AV1).
+    c.hdr10 = c.tenBit && P.inputHdrMetadata && P.codec != Codec::H264;
     // LTR: AV1 reports its maximum; H.264 is documented as 0..2; HEVC as
     // 0..16 shared with the short-term references (one stays short-term).
     c.maxLtr = P.docMaxLtr;
@@ -238,6 +265,13 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P) {
     c.forceIdr = true;
     c.liveBitrate = "seamless";     // AMD Streaming SDK UpdateBitrate: SetProperty, no flush; recon-host qualify (3.6) measures it
     c.assumed.push_back("liveBitrate");
+    // FRAMERATE is a dynamic property like the bitrate (applied before the
+    // next SubmitInput); whether it changes without an IDR is a VERIFY item
+    // (docs/VENDOR_NOTES.md Phase 5): assumed.
+    c.liveFps = "seamless";
+    c.assumed.push_back("liveFps");
+    c.instanceSelect = P.instanceIndex != nullptr;  // INSTANCE_INDEX picks the VCN engine
+    c.reencode = false;  // no encode without advancing the encoder's state
     c.yuv444 = false;
     // Intra refresh (without user LTR and SVC: AMF docs, MAX_LTR_FRAMES
     // remarks): reported only when this encoder takes the property and reads
@@ -424,9 +458,13 @@ private:
     uint32_t width_ = 0, height_ = 0, codedW_ = 0, codedH_ = 0;
     amf::AMF_SURFACE_FORMAT inputFormat_ = amf::AMF_SURFACE_NV12;
     bool zeroCopy_ = false;
+    std::optional<HdrMetadata> hdr_;  // HDR10 stream: its metadata
+    amf::AMFBufferPtr hdrBuffer_;     // INPUT_HDR_METADATA
     bool flushMode_ = false;
     int queryTimeoutMs_ = 0;
     amf_int64 usage_ = 0;
+    int svcLayers_ = 1;  // temporal layers the encoder runs
+    int baseRun_ = 0;    // output thread: consecutive non-key layer-0 frames (SVC)
     int64_t freq_ = 1;
 
     // Current rate (capture thread after init).
@@ -459,8 +497,17 @@ private:
     std::atomic<uint32_t> gen_{0};
     HANDLE stopEvent_ = nullptr;
 
+    // A FRAMERATE change was applied before this frame (0 = none): a key
+    // frame right after it means the change was not seamless (VERIFY).
+    std::atomic<uint64_t> fpsChangeFrame_{0};
+
     // Output thread.
     PreciseTimer timer_;
+    // Sub-frame output (start sliceOutput): the parts of the frame being put
+    // together, and their buffers for the frame properties (output thread only).
+    SliceAssembler slices_;
+    std::vector<amf::AMFBufferPtr> parts_;
+    std::atomic<bool> resetSlices_{false};  // set by a flush (capture thread)
     std::vector<uint8_t> extradata_;  // guarded by extraMu_ (rewritten after ReInit)
     std::mutex extraMu_;
     std::vector<uint8_t> patched_;    // a key frame with parameter sets inserted
@@ -502,6 +549,7 @@ void AmfEncoder::release() {
     enc_ = nullptr;
     roiMap_ = nullptr;
     roiUniform_ = nullptr;
+    hdrBuffer_ = nullptr;
     if (ctx_ && ownContext_) ctx_->Terminate();
     ctx_ = nullptr;
     ownContext_ = false;
@@ -544,7 +592,7 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     s.setInt(P_->instanceIndex, std::max(0, p.encoderInstance), p.encoderInstance > 0);
     s.set(P_->frameSize, AMFConstructSize(amf_int32(codedW_), amf_int32(codedH_)), true);
     s.set(P_->frameRate, AMFConstructRate(amf_uint32(fps_), 1));
-    s.setInt(P_->profile, P_->profileValue);
+    s.setInt(P_->profile, hdr_ ? P_->profile10Value : P_->profileValue, bool(hdr_));
     s.setBool(P_->lowLatencyMode, true);  // "sets high priority queue ... POC mode 2" (Streaming SDK GPUEncoderHEVC.cpp)
     s.setInt(P_->encodingLatencyMode, P_->lowestLatency);
     const amf_int64 preset = p.quality == "quality" ? P_->presetQuality : p.quality == "balanced" ? P_->presetBalanced : P_->presetSpeed;
@@ -566,9 +614,16 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
         s.setInt(P_->maxLtr, ltr, true);
         s.setInt(P_->ltrMode, P_->ltrKeepUnused, true);
     }
-    if (p.svcLayers > 1) {
-        s.setInt(P_->maxTemporalLayers, p.svcLayers, true);
-        s.setInt(P_->numTemporalLayers, p.svcLayers, true);
+    // NUM_TEMPORAL_LAYERS is dynamic: applyDynamic (after this maximum).
+    if (p.svcLayers > 1) s.setInt(P_->maxTemporalLayers, p.svcLayers, true);
+    if (p.sliceOutput > 0) {
+        // Sub-frame output (Phase 5 experiment): every slice / tile comes out
+        // as a buffer of its own (OUTPUT_BUFFER_TYPE SLICE.., SLICE_LAST);
+        // AV1 one tile per tile group OBU. The count is "treated as
+        // suggestion" (AV1) and read back after Init.
+        s.setInt(P_->slicesPerFrame, p.sliceOutput, true);
+        s.setInt(P_->outputMode, P_->outputModeParts, true);
+        if (P_->tileGroupObu) s.setBool(P_->tileGroupObu, true);
     }
     if (queryTimeoutMs_) s.setInt(P_->queryTimeout, queryTimeoutMs_);  // read back after Init
     s.setInt(P_->inputQueueSize, kInputQueueSize);
@@ -584,17 +639,36 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     } else if (P_->alignmentMode) {
         s.setInt(P_->alignmentMode, AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS);
     }
-    // Colour: BT.709 limited range out (what the converter writes, and the VUI
-    // the browser decodes by). RGB input (zero-copy BGRA) is full range.
-    s.setInt(P_->colorBitDepth, AMF_COLOR_BIT_DEPTH_8);
-    if (inputFormat_ == amf::AMF_SURFACE_NV12) s.setInt(P_->inputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
-    s.setInt(P_->inputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
-    s.setInt(P_->inputPrimaries, AMF_COLOR_PRIMARIES_BT709);
-    s.setBool(P_->inputFullRange, inputFormat_ != amf::AMF_SURFACE_NV12);
-    s.setInt(P_->outputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
-    s.setInt(P_->outputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
-    s.setInt(P_->outputPrimaries, AMF_COLOR_PRIMARIES_BT709);
-    s.setBool(P_->outputFullRange, false);
+    if (hdr_) {
+        // HDR10: what the converter writes into P010 (BT.2020 matrix, PQ,
+        // limited range) and the VUI / AV1 colour config the client decodes
+        // by; the bit depth and profile are required (an 8-bit stream would
+        // be wrong, not just worse).
+        s.setInt(P_->colorBitDepth, AMF_COLOR_BIT_DEPTH_10, true);
+        s.setInt(P_->inputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_2020);
+        s.setInt(P_->inputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE2084);
+        s.setInt(P_->inputPrimaries, AMF_COLOR_PRIMARIES_BT2020);
+        s.setBool(P_->inputFullRange, false);
+        s.setInt(P_->outputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_2020);
+        s.setInt(P_->outputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE2084);
+        s.setInt(P_->outputPrimaries, AMF_COLOR_PRIMARIES_BT2020);
+        s.setBool(P_->outputFullRange, false);
+        // Not required: without it the stream is still HDR10 by its VUI,
+        // only without the metadata (logged).
+        if (hdrBuffer_) s.set(P_->inputHdrMetadata, static_cast<amf::AMFInterface*>(hdrBuffer_.GetPtr()));
+    } else {
+        // Colour: BT.709 limited range out (what the converter writes, and the VUI
+        // the browser decodes by). RGB input (zero-copy BGRA) is full range.
+        s.setInt(P_->colorBitDepth, AMF_COLOR_BIT_DEPTH_8);
+        if (inputFormat_ == amf::AMF_SURFACE_NV12) s.setInt(P_->inputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+        s.setInt(P_->inputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+        s.setInt(P_->inputPrimaries, AMF_COLOR_PRIMARIES_BT709);
+        s.setBool(P_->inputFullRange, inputFormat_ != amf::AMF_SURFACE_NV12);
+        s.setInt(P_->outputColorProfile, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+        s.setInt(P_->outputTransfer, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+        s.setInt(P_->outputPrimaries, AMF_COLOR_PRIMARIES_BT709);
+        s.setBool(P_->outputFullRange, false);
+    }
     applyDynamic(s);
     if (!s.errors.empty()) return Status::Error("init_failed", "AMF " + std::string(codecName(codec_)) + " rejected " + s.errorText());
     if (!s.warnings.empty()) {
@@ -613,6 +687,10 @@ void AmfEncoder::applyDynamic(PropSetter& s) {
     s.setBool(P_->enforceHrd, false);  // A6: Sunshine warns HRD can cause artifacts
     s.setBool(P_->fillerData, false);
     s.setBool(P_->skipFrame, false);   // A5: ULL turns rate-control frame skipping on
+    // Temporal SVC: "NUM_TEMPORAL_LAYERS is a dynamic property and can be
+    // changed at any time during an encoding session" (AMF_Video_Encode_HEVC_API.md),
+    // up to MAX_NUM_TEMPORAL_LAYERS (createAndConfigure, before Init only).
+    if (start_.svcLayers > 1) s.setInt(P_->numTemporalLayers, start_.svcLayers, true);
     // Intra refresh: the requested cycle, else explicitly off. H.264's
     // ULTRA_LOW_LATENCY and LOW_LATENCY usages default
     // INTRA_REFRESH_NUM_MBS_PER_SLOT to 255 (AMF_Video_Encode_API.md: "Ultra low
@@ -720,9 +798,22 @@ Status AmfEncoder::validate(const StartParams& p) {
     if (p.intraRefreshFrames > 0 && !cc.intraRefresh) {
         return Status::Error("unsupported", "the " + p.codec + " encoder does not take the intra refresh property (caps intraRefresh false)");
     }
+    if (p.sliceOutput > 0 && !cc.sliceOutput) {
+        return Status::Error("unsupported", "sliceOutput: the " + p.codec + " encoder has no " + (p.codec == "av1" ? "tile" : "slice") +
+                                                " output (caps sliceOutput false)");
+    }
+    if (p.reencodeOversized > 0) {
+        return Status::Error("unsupported", "reencodeOversized: AMF cannot encode a frame without advancing its state (caps reencode false)");
+    }
     if (p.encoderInstance >= cc.hwInstances) {
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) + ": the GPU has " +
                                                 std::to_string(cc.hwInstances) + " " + p.codec + " encoder(s)");
+    }
+    // Whatever the source: the same request gets the same answer whether or
+    // not Windows HDR is on at the moment.
+    if (p.hdr && !cc.hdr10) {
+        return Status::Error("unsupported", "hdr: the " + p.codec + " encoder cannot make HDR10 here (caps hdr10 false: " +
+                                                (p.codec == "h264" ? "HDR10 needs hevc or av1" : "no 10-bit P010 input") + ")");
     }
     return Status::Ok();
 }
@@ -739,7 +830,6 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
         return Status::Error("unsupported", "AMF cannot encode " + p.codec + " here: " +
                                                 (it == probe.codecs.end() ? probe.reason : it->second.reason));
     }
-    if (p.hdr) return Status::Error("unsupported", "HDR10 encoding comes with step 3.9");
     if (!src.device) {
         return Status::Error("unsupported", "the AMF encoder needs a GPU capture (dda, amd-direct, wgc or synthetic-gpu)");
     }
@@ -759,6 +849,9 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     if (vbvFrames_ < 1.0 || vbvFrames_ > 1.5) {
         logf(LogLevel::Info, "amf: vbvFrames %.2f is outside GUIDE 3.3's 1.0-1.5", vbvFrames_);
     }
+    // HDR10 when asked for and the source is HDR; an SDR source gives an SDR stream.
+    hdr_.reset();
+    if (p.hdr && src.hdr) hdr_ = hdrMetadataFor(src.display);
 
     // The context: AMD Direct Capture's (its surfaces can then be encoded as
     // they are), else one on the capture device.
@@ -786,7 +879,7 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     {
         amf::AMFComponentPtr probeEnc;
         if (rt.factory->CreateComponent(ctx_, P_->component, &probeEnc) == AMF_OK && probeEnc) {
-            CodecDetails d = readDetails(probeEnc, *P_);
+            CodecDetails d = readDetails(probeEnc, *P_, p.svcLayers);
             if (d.available) det_ = d;
         }
     }
@@ -800,6 +893,28 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     const CodecCaps& cc = det_.caps;
     flushMode_ = (p.liveBitrate.empty() ? cc.liveBitrate : p.liveBitrate) == "flush";
     queryTimeoutMs_ = cc.queryTimeout ? kQueryTimeoutMs : 0;
+    if (hdr_) {
+        // AMFHDRMetadata: chromaticity "normalized to 50000", luminance
+        // "normalized to 10000" (ColorSpace.h), the HEVC SEI units, for AV1 too
+        // (FFmpeg amfenc.c fills it the same way for every codec).
+        AMF_RESULT hr = ctx_->AllocBuffer(amf::AMF_MEMORY_HOST, sizeof(AMFHDRMetadata), &hdrBuffer_);
+        if (hr == AMF_OK && hdrBuffer_ && hdrBuffer_->GetNative()) {
+            const MasteringCodes mc = masteringCodes(*hdr_, false);
+            AMFHDRMetadata md{};
+            for (int i = 0; i < 2; ++i) {
+                md.redPrimary[i] = mc.red[i], md.greenPrimary[i] = mc.green[i], md.bluePrimary[i] = mc.blue[i];
+                md.whitePoint[i] = mc.white[i];
+            }
+            md.maxMasteringLuminance = mc.maxLuminance;
+            md.minMasteringLuminance = mc.minLuminance;
+            md.maxContentLightLevel = amf_uint16(std::min(hdr_->maxCll, 65535));
+            md.maxFrameAverageLightLevel = amf_uint16(std::min(hdr_->maxFall, 65535));
+            std::memcpy(hdrBuffer_->GetNative(), &md, sizeof(md));
+        } else {
+            hdrBuffer_ = nullptr;
+            logf(LogLevel::Warn, "amf: %s: the HDR10 stream goes without HDR metadata", amfError("AllocBuffer(AMFHDRMetadata)", hr).c_str());
+        }
+    }
 
     for (int pass = 0;; ++pass) {
         // Zero-copy: AMD Direct Capture surfaces straight into the encoder
@@ -809,10 +924,11 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
         // conversion.
         zeroCopy_ = src.amfContext && p.zeroCopy && !p.barcode.enabled && width_ == src.width && height_ == src.height &&
                     codedW_ == width_ && codedH_ == height_ && src.rotation == 0 && zeroCopyFormat(src.amfFormat) &&
-                    hasFormat(det_, src.amfFormat);
-        inputFormat_ = zeroCopy_ ? amf::AMF_SURFACE_FORMAT(src.amfFormat) : amf::AMF_SURFACE_NV12;
+                    hasFormat(det_, src.amfFormat) && !hdr_;
+        inputFormat_ = zeroCopy_ ? amf::AMF_SURFACE_FORMAT(src.amfFormat) : hdr_ ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
         if (pass == 0 && src.amfContext && p.zeroCopy && src.amfFormat && !zeroCopyFormat(src.amfFormat)) {
-            logf(LogLevel::Info, "amf: AMD Direct Capture surface format %d is not 8-bit BGRA/RGBA: converting to NV12", src.amfFormat);
+            logf(LogLevel::Info, "amf: AMD Direct Capture surface format %d is not 8-bit BGRA/RGBA: converting to %s", src.amfFormat,
+                 hdr_ ? "P010" : "NV12");
         }
         Status s = initEncoder();
         if (!s.ok) {
@@ -887,11 +1003,30 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
             logf(LogLevel::Warn, "amf: asked for %d LTR slots, the encoder has %lld", p.ltrSlots, static_cast<long long>(granted));
         }
     }
+    // What the encoder runs: temporal layers and slices / tiles per frame.
+    int layers = p.svcLayers, slices = p.sliceOutput;
+    {
+        amf_int64 v = 0;
+        if (p.svcLayers > 1 && getProp(enc_.GetPtr(), P_->numTemporalLayers, v) && v != p.svcLayers) {
+            logf(LogLevel::Warn, "amf: asked for %d temporal layers, the encoder reads %lld", p.svcLayers, static_cast<long long>(v));
+            layers = int(std::clamp<amf_int64>(v, 1, 4));
+        }
+        if (p.sliceOutput > 0 && getProp(enc_.GetPtr(), P_->slicesPerFrame, v) && v > 0 && v != p.sliceOutput) {
+            logf(LogLevel::Info, "amf: asked for %d %s per frame, the encoder reads %lld", p.sliceOutput, codec_ == Codec::Av1 ? "tiles" : "slices",
+                 static_cast<long long>(v));
+            slices = int(v);
+        }
+    }
+    svcLayers_ = layers;
     LtrTracker::Config lc;
     lc.slots = p.ltrSlots;
     lc.interval = p.ltrInterval ? p.ltrInterval : std::max(1, (p.fps + 5) / 10);
     lc.ackTimeout = kLtrAckTimeoutMs * freq_ / 1000;
+    lc.layers = layers;
     ltr_.reset(lc);
+    slices_.reset();
+    parts_.clear();
+    fpsChangeFrame_ = 0;
     {
         std::lock_guard<std::mutex> lock(ctlMu_);
         idrPending_ = true;  // the first frame: IDR with parameter sets
@@ -905,7 +1040,7 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
 
     in = InputSpec{};
     if (!zeroCopy_) {
-        in.format = InputSpec::Format::Nv12;
+        in.format = hdr_ ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
         in.width = codedW_;
         in.height = codedH_;
         if (codedW_ != width_ || codedH_ != height_) {
@@ -931,12 +1066,26 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
     out.queryTimeoutMs = queryTimeoutMs_;
     out.zeroCopy = zeroCopy_;
     out.intraRefreshFrames = intraRefresh;
+    out.svcLayers = layers;
+    out.liveFps = flushMode_ ? "flush" : "seamless";
+    out.sliceOutput = p.sliceOutput > 0 ? slices : 0;
+    describeColor(out, hdr_);
     logf(LogLevel::Info,
          "amf: %s %ux%u (coded %ux%u) %d fps %d kbps %s vbv %.2f frames, usage %s, preset %s, instance %d/%d, LTR %d (every %d), "
-         "query timeout %d ms, live bitrate %s, input %s, runtime %s",
+         "temporal layers %d, %s %d, query timeout %d ms, live bitrate %s, input %s, runtime %s",
          p.codec.c_str(), width_, height_, codedW_, codedH_, fps_, kbps_, out.rateControl.c_str(), vbvFrames_, out.usage.c_str(),
-         p.quality.c_str(), out.encoderInstance, cc.hwInstances, p.ltrSlots, out.ltrInterval, queryTimeoutMs_,
-         out.liveBitrate.c_str(), zeroCopy_ ? "AMD Direct Capture surfaces (zero-copy)" : "NV12", rt.versionText.c_str());
+         p.quality.c_str(), out.encoderInstance, cc.hwInstances, p.ltrSlots, out.ltrInterval, layers,
+         codec_ == Codec::Av1 ? "tile output" : "slice output", out.sliceOutput, queryTimeoutMs_,
+         out.liveBitrate.c_str(),
+         zeroCopy_                                 ? "AMD Direct Capture surfaces (zero-copy)"
+         : hdr_ && codec_ == Codec::Hevc ? "P010 (HDR10: BT.2020 PQ, Main10)"
+         : hdr_                                    ? "P010 (HDR10: BT.2020 PQ, 10-bit)"
+                                                   : "NV12",
+         rt.versionText.c_str());
+    if (hdr_) {
+        logf(LogLevel::Info, "amf: HDR10 metadata: mastering display %.0f / %.4f cd/m2, MaxCLL %d, MaxFALL %d%s", hdr_->maxLuminance,
+             hdr_->minLuminance, hdr_->maxCll, hdr_->maxFall, hdrBuffer_ ? "" : " (not passed: no buffer)");
+    }
     return Status::Ok();
 }
 
@@ -961,7 +1110,12 @@ Status AmfEncoder::applyRate(const RateParams& r, bool& idr) {
             s.setInt(P_->peakBitrate, v.peak);
         }
         s.setInt(P_->vbvSize, v.vbv);
-        if (fps_ != oldFps) s.set(P_->frameRate, AMFConstructRate(amf_uint32(fps_), 1));
+        if (fps_ != oldFps) {
+            // "FPS before resolution" (GUIDE 5): a dynamic property like the
+            // bitrate. VERIFY: no IDR (receive() logs a key frame right after it).
+            s.set(P_->frameRate, AMFConstructRate(amf_uint32(fps_), 1));
+            if (!start_.ltrInterval) ltr_.setInterval(std::max(1, (fps_ + 5) / 10));  // marks stay ~100 ms apart
+        }
         if (!s.warnings.empty()) logf(LogLevel::Warn, "amf: setRate: not accepted: %s", s.warningText().c_str());
         logf(LogLevel::Debug, "amf: rate %d kbps, vbv %lld bits, %d fps (seamless)", kbps_, static_cast<long long>(v.vbv), fps_);
         return Status::Ok();
@@ -995,9 +1149,13 @@ Status AmfEncoder::applyRate(const RateParams& r, bool& idr) {
     ++gen_;
     LtrTracker::Config lc;
     lc.slots = start_.ltrSlots;
-    lc.interval = start_.ltrInterval ? start_.ltrInterval : std::max(1, (start_.fps + 5) / 10);
+    lc.interval = start_.ltrInterval ? start_.ltrInterval : std::max(1, (fps_ + 5) / 10);
     lc.ackTimeout = kLtrAckTimeoutMs * freq_ / 1000;
+    lc.layers = svcLayers_;
     ltr_.reset(lc);
+    // Parts of a flushed frame still in slices_: the output thread drops them
+    // before the next part (also when the parts carry no frame id).
+    resetSlices_ = true;
     readExtradata();
     idr = true;
     logf(LogLevel::Info, "amf: rate %d kbps, %d fps (Flush + ReInit, generation %u)", kbps_, fps_, gen_.load());
@@ -1023,8 +1181,7 @@ Status AmfEncoder::roiSurface(const RoiMap& m, amf::AMFSurfacePtr& out) {
     amf::AMFPlane* plane = surf->GetPlaneAt(0);
     auto* base = static_cast<uint8_t*>(plane->GetNative());
     const amf_int32 pitch = plane->GetHPitch();
-    if (!base || pitch < amf_int32(m.cols * 4)) return Status::Error("encode_failed", "the ROI map surface has no usable memory");
-    for (uint32_t y = 0; y < m.rows; ++y) std::memcpy(base + size_t(y) * size_t(pitch), &m.values[size_t(y) * m.cols], m.cols * 4);
+    if (pitch <= 0 || !writeRoiPlane(m, base, size_t(pitch))) return Status::Error("encode_failed", "the ROI map surface has no usable memory");
     out = surf;
     return Status::Ok();
 }
@@ -1060,7 +1217,9 @@ Status AmfEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
     }
     if (rateDirty) {
         bool flushed = false;
+        const int fpsBefore = fps_;
         Status s = applyRate(rate, flushed);
+        if (!flushed && fps_ != fpsBefore) fpsChangeFrame_ = info.frameId;  // receive() checks it is not followed by a key frame
         if (flushed) {
             std::lock_guard<std::mutex> lock(ctlMu_);
             idrPending_ = idr = true;  // the first frame after ReInit
@@ -1232,7 +1391,38 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
             std::shared_lock<std::shared_mutex> shared(componentMu_);
             r = enc_->QueryOutput(&data);
         }
-        if (r == AMF_OK && data) break;
+        if (r == AMF_OK && data) {
+            if (start_.sliceOutput <= 0) break;
+            // Sub-frame output: one slice / tile per buffer, put back
+            // together here (codec/slices.hpp); query on until the last part.
+            amf::AMFBufferPtr part(data);
+            data = nullptr;
+            if (!part || !part->GetNative()) {
+                err = Status::Error("encode_failed", "AMF output is not a buffer");
+                return Next::Error;
+            }
+            amf_int64 type = P_->bufferFrame, id = -1;
+            getProp(part.GetPtr(), P_->outputBufferType, type);
+            getProp(part.GetPtr(), kFrameIdProp, id);
+            const SliceAssembler::Part kind = type == P_->bufferPart   ? SliceAssembler::Part::Slice
+                                              : type == P_->bufferLast ? SliceAssembler::Part::Last
+                                                                       : SliceAssembler::Part::Frame;
+            if (resetSlices_.exchange(false) && slices_.collecting()) {
+                logf(LogLevel::Debug, "amf: dropping the parts of a frame the flush discarded");
+                slices_.reset();
+                parts_.clear();
+            }
+            parts_.push_back(part);
+            const SliceAssembler::Result res =
+                slices_.add(kind, id, static_cast<const uint8_t*>(part->GetNative()), part->GetSize(), qpcNow());
+            if (res.droppedParts > 0) {
+                parts_.erase(parts_.begin(), parts_.begin() + std::min<std::ptrdiff_t>(res.droppedParts, std::ptrdiff_t(parts_.size()) - 1));
+                logf(LogLevel::Warn, "amf: %d %s of an unfinished frame dropped (no last part came)", res.droppedParts,
+                     codec_ == Codec::Av1 ? "tiles" : "slices");
+            }
+            if (res.complete) break;
+            continue;  // more parts of this frame: query again at once
+        }
         const int64_t now = qpcNow();
         if (r == AMF_REPEAT || r == AMF_OK || r == AMF_NEED_MORE_INPUT) {
             queryErrors_ = 0;
@@ -1258,13 +1448,27 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         if (!timer_.sleepUntil(now + freq_ / 1000, stopEvent_)) return Next::Stopped;
     }
     queryErrors_ = 0;
-    amf::AMFBufferPtr buf(data);
-    if (!buf || !buf->GetNative()) {
-        err = Status::Error("encode_failed", "AMF output is not a buffer");
-        return Next::Error;
+    // The frame's buffers: one, or its slices / tiles (sub-frame output). A
+    // frame property is taken from the first part that has it.
+    const bool sliced = start_.sliceOutput > 0;
+    if (!sliced) {
+        amf::AMFBufferPtr buf(data);
+        if (!buf || !buf->GetNative()) {
+            err = Status::Error("encode_failed", "AMF output is not a buffer");
+            return Next::Error;
+        }
+        parts_.assign(1, buf);
     }
+    std::vector<amf::AMFBufferPtr> parts = std::move(parts_);
+    parts_.clear();
+    const auto prop = [&](const wchar_t* name, amf_int64& v) {
+        for (amf::AMFBufferPtr& b : parts) {
+            if (getProp(b.GetPtr(), name, v)) return true;
+        }
+        return false;
+    };
     amf_int64 id = -1;
-    const bool haveId = getProp(buf.GetPtr(), kFrameIdProp, id);
+    const bool haveId = prop(kFrameIdProp, id);
     InFlight f;
     bool found = false;
     {
@@ -1286,11 +1490,21 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         f.frameId = haveId ? uint64_t(id) : 0;
         f.gen = gen_;
     }
-    amf_int64 type = -1, marked = -1, refMask = 0, layer = 0;
-    getProp(buf.GetPtr(), P_->outputType, type);
-    getProp(buf.GetPtr(), P_->outputMarkedLtr, marked);
-    getProp(buf.GetPtr(), P_->outputTemporalLayer, layer);
-    if (!getProp(buf.GetPtr(), P_->outputRefLtr, refMask) && f.plan.recovery) {
+    out = EncodedFrame{};
+    if (sliced) {
+        out.data = slices_.frame().data();
+        out.size = slices_.frame().size();
+        out.slices = slices_.parts();
+        out.firstSliceQpc = slices_.firstQpc();
+    } else {
+        out.data = static_cast<const uint8_t*>(parts.front()->GetNative());
+        out.size = parts.front()->GetSize();
+    }
+    amf_int64 type = -1, marked = -1, refMask = 0, layer = -1;
+    prop(P_->outputType, type);
+    prop(P_->outputMarkedLtr, marked);
+    const bool layerProp = prop(P_->outputTemporalLayer, layer);
+    if (!prop(P_->outputRefLtr, refMask) && f.plan.recovery) {
         // No referenced-LTR bitfield on the output: trust the request.
         warnOnce("refmask", "the encoder reports no OUTPUT_REFERENCED_LTR_INDEX_BITFIELD: recovery frames are not verified");
         refMask = amf_int64(f.plan.refMask);
@@ -1304,16 +1518,52 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     // a decoder entry point: not flagged KEY in the ring.
     o.clearsSlots = P_->outSwitch >= 0 && type == P_->outSwitch;
     if (o.clearsSlots) warnOnce("switch", "the AV1 encoder made a switch frame (its LTR slots are cleared) although switch frames are off");
+    // Temporal SVC: the layer (OUTPUT_TEMPORAL_LAYER; AV1 has none, its OBU
+    // extension says it) and whether any later frame can reference the frame.
+    bool discardable = false;
+    if (svcLayers_ > 1) {
+        const LayerInfo li = layerInfo(codec_, out.data, out.size, svcLayers_ - 1);
+        if (!layerProp) {
+            layer = li.temporalId;
+        } else if (li.temporalId >= 0 && li.temporalId != layer) {
+            warnOnce("layer", "OUTPUT_TEMPORAL_LAYER " + std::to_string(layer) + " but the bitstream says temporal id " +
+                                  std::to_string(li.temporalId) + " (frame " + std::to_string(f.frameId) + "): using the property");
+        }
+        if (layer < 0) warnOnce("nolayer", "SVC frames carry no temporal layer (no property, no temporal id): all reported as layer 0");
+        // started.svcLayers is read from the property store, which echoes what
+        // was set even if the encoder never applied it: the frames tell.
+        baseRun_ = layer == 0 && !o.key ? baseRun_ + 1 : 0;
+        if (baseRun_ == 8) {
+            warnOnce("nosvc", "svcLayers " + std::to_string(svcLayers_) +
+                                  ": 8 frames in a row came out in layer 0, the encoder runs no temporal layers");
+        }
+        discardable = isDiscardable(o.key, li, svcLayers_, uint32_t(std::max<amf_int64>(0, layer)));
+    }
+    o.temporalLayer = int(layer);
+    if (o.key && found && !f.plan.idr) {
+        // Not asked for: right after a FRAMERATE change it means the change
+        // was not seamless (the Phase 5 VERIFY item); otherwise the encoder
+        // decided on its own (scene change, an internal reset).
+        const uint64_t fc = fpsChangeFrame_.load();
+        if (fc && f.frameId >= fc && f.frameId < fc + 4) {
+            logf(LogLevel::Warn, "amf: the frame-rate change at frame %llu made a key frame (frame %llu): FRAMERATE is not seamless here "
+                                 "(docs/VENDOR_NOTES.md Phase 5)",
+                 static_cast<unsigned long long>(fc), static_cast<unsigned long long>(f.frameId));
+        } else {
+            warnOnce("unplannedkey", "the encoder made a key frame nobody asked for (frame " + std::to_string(f.frameId) + ")");
+        }
+    }
     const bool recoveryOk = ltr_.output(f.frameId, o, f.plan, qpcNow());
     if (f.plan.recovery && !recoveryOk) {
-        // The encoder did not code the recovery frame from its LTR: it still
-        // depends on lost frames. Not flagged RECOVERY; the next frame is an IDR.
-        logf(LogLevel::Warn, "amf: recovery frame %llu did not reference LTR slot mask 0x%x (referenced 0x%llx, type %lld): forcing an IDR",
+        // The encoder did not code the recovery frame from its LTR (or coded it
+        // in an SVC enhancement layer): it still depends on lost frames. Not
+        // flagged RECOVERY; the next frame is an IDR.
+        logf(LogLevel::Warn, "amf: recovery frame %llu did not reference LTR slot mask 0x%x as a base-layer frame (referenced 0x%llx, type %lld, "
+                             "layer %lld): forcing an IDR",
              static_cast<unsigned long long>(f.frameId), f.plan.refMask, static_cast<unsigned long long>(refMask),
-             static_cast<long long>(type));
+             static_cast<long long>(type), static_cast<long long>(layer));
         forceIdr();
     }
-    out = EncodedFrame{};
     out.info = f.info;
     out.info.frameId = f.frameId;
     out.outputQpc = qpcNow();
@@ -1323,11 +1573,10 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     out.refFloor = f.plan.refFloor;
     out.ltrSlot = int32_t(marked);
     out.temporalLayer = uint32_t(std::max<amf_int64>(0, layer));
+    out.discardable = discardable;
     out.refLtrMask = uint32_t(refMask);
     out.width = codedW_;
     out.height = codedH_;
-    out.data = static_cast<const uint8_t*>(buf->GetNative());
-    out.size = buf->GetSize();
     if (out.key && !hasParameterSets(codec_, out.data, out.size)) {
         // A key frame must be a decoder entry point (ring flag KEY): add the
         // encoder's parameter sets if it left them out.
@@ -1341,9 +1590,11 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
             warnOnce("headers-missing", "a key frame has no parameter sets and the extradata cannot supply them");
         }
     }
-    amf::AMFBuffer* raw = buf.GetPtr();
-    raw->Acquire();  // released by releaseOutput, after the ring copy
-    out.token = raw;
+    if (!sliced) {
+        amf::AMFBuffer* raw = parts.front().GetPtr();
+        raw->Acquire();  // released by releaseOutput, after the ring copy
+        out.token = raw;
+    }  // sliced: out.data is slices_'s copy, valid until the next receive()
     return Next::Frame;
 }
 

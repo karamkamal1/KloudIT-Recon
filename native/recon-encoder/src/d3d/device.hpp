@@ -3,7 +3,7 @@
 #pragma once
 
 #include <d3d11.h>
-#include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <atomic>
@@ -26,6 +26,11 @@ int rotationDegrees(DXGI_MODE_ROTATION r);
 
 // Every output of every adapter, in DXGI order (caps "outputs").
 std::vector<OutputDesc> enumerateOutputs();
+
+// The output's colour (IDXGIOutput6::GetDesc1): Windows HDR on or off, the
+// panel's primaries and luminance. known = false where DXGI cannot tell
+// (before Windows 10 1703, Wine).
+DisplayColor displayColor(IDXGIOutput* output);
 
 struct OutputRef {
     ComPtr<IDXGIAdapter1> adapter;

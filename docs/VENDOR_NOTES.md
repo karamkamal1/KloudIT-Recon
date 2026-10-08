@@ -2762,9 +2762,10 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   maxH (expected 4096 for h264, 8192 for hevc / av1), `tenBit` (hevc / av1 true), `yuv444`
   (h264 / hevc true), `recovery` invalidate, `maxLtr` 0 (the backend uses no LTR; the start
   log line's "LTR frames cap N (unused)" is the GPU's count: record N), `intraRefresh` true,
-  `liveBitrate` seamless, `maxTemporalLayers`, `sliceOutput`, `hwInstances` (RTX 4080 / 4090: 2; record),
-  `dynamicResolution` true, `assumed` `["liveBitrate","roi"]`; caps.log has "nvenc probe: N ms"
-  (expect < 300 ms).
+  `liveBitrate` seamless, `maxTemporalLayers`, `sliceOutput` false (no sub-frame output yet; the
+  start log line's "sub-frame readback cap N" is the GPU's bit: record N), `hwInstances` (RTX
+  4080 / 4090: 2; record), `dynamicResolution` true, `assumed` `["liveBitrate","roi"]`; caps.log
+  has "nvenc probe: N ms" (expect < 300 ms).
 - NVIDIA: unverified (no NVIDIA host available). Test (old driver): on a host with a driver
   older than 570 (or reported by a user), `--print-caps` shows `unavailable.nvenc` "the NVIDIA
   driver supports NVENC API 12.x, the helper needs 13.0: update the NVIDIA driver to 570.0 or
@@ -3945,3 +3946,940 @@ Not verified (needs real networks or Windows):
 - PMTU: unverified on real paths. The forwarder sets DF and drops oversized datagrams like a
   router; on a path with a smaller MTU than the host's probe, quic-go's DPLPMTUD should settle
   below it (watch for stalls after the first seconds on PPPoE / VPN client links).
+## 3.7 Virtual display matched to the client
+
+`internal/host/vdisplay` gives a session a virtual monitor through an installed IddCx (indirect
+display) driver: a monitor at the client's resolution and the stream's frame rate (e.g.
+2560x1440@120 on a host whose physical monitor is a 1080p60 one), optionally the primary or the
+only display, never rotated, captured with Desktop Duplication, and the previous display
+topology restored when the session ends. Host config `virtualDisplay` (`off` default, `auto`,
+`on`) and `virtualDisplayLayout` (`primary` default, `extend`, `only`); installer switch
+`-InstallVirtualDisplay`; test command `recon-host vdisplay`. The package is self-contained:
+the session (`internal/host/session.go`, being rewritten in another track) does not call it
+yet; "Session integration" below is the contract for that.
+
+### Driver research
+
+**SudoVDA** (SudoMaker/SudoVDA at a4b09fa, 2025-04-15; the copy Apollo ships is
+ClassicOldSong/Apollo at adc5c5a, 2026-05-21, `third-party/sudovda/`):
+
+- Control: `DeviceIoControl` on the device interface `{e5bcc234-1e0c-418a-a0d4-ef8b7501414d}`
+  (`Common/Include/sudovda-ioctl.h`, protocol 0.2.1; Apollo's copy is byte-identical).
+  `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800.., METHOD_BUFFERED, FILE_ANY_ACCESS)`: ADD 0x222000,
+  REMOVE 0x222004, SET_RENDER_ADAPTER 0x222008, GET_WATCHDOG 0x22200c, PING 0x222220,
+  GET_PROTOCOL_VERSION 0x2223fc. ADD takes `{UINT Width, Height, RefreshRate; GUID
+  MonitorGuid; CHAR DeviceName[14], SerialNumber[14]}` (56 bytes) and returns `{LUID
+  AdapterLuid; UINT TargetId}` from `IddCxMonitorArrival`.
+- Driver behaviour (`Virtual Display Driver (HDR)/SudoVDA/Driver.cpp`, `SudoVDAIoDeviceControl`):
+  ADD with a GUID that exists returns that monitor unchanged (so the agent REMOVEs its GUID
+  first); RefreshRate below 1000 is hertz, else millihertz (the agent sends millihertz); the
+  requested mode becomes the EDID's preferred mode, plus scaled variants and a default list;
+  REMOVE answers `STATUS_NOT_FOUND` for an unknown GUID; SET_RENDER_ADAPTER calls
+  `IddCxAdapterSetRenderAdapter`. The watchdog (`LoadSettings`, `RunWatchdog`): timeout from
+  `HKLM\SOFTWARE\SudoMaker\SudoVDA\watchdog` (default 3 s, 0 = off), counted down once a second
+  while monitors exist, reset by every IOCTL except GET_WATCHDOG; at 0 every virtual monitor
+  departs. The agent pings every timeout/3 (Apollo's `startPingThread`) and reports the
+  display lost after 4 failed pings in a row; a crashed agent's monitor is gone within the
+  timeout.
+- Compatibility (`sudovda.h` `isProtocolCompatible`): same major version, driver minor >= the
+  client's (0.2). Access: `SudoVDA.inf` sets `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)`, so a
+  non-elevated process may open it. Hardware id `root\sudomaker\sudovda`.
+- Render adapter: Microsoft's `IddCxAdapterSetRenderAdapter` page says the OS re-creates
+  existing swapchains on the new adapter when it changes, so drivers should set it before
+  adding monitors (Windows 10 1903+). The agent sends DXGI adapter 0's LUID before each ADD
+  (`Options.RenderAdapter`), so the virtual output should be enumerated on adapter 0, where
+  ddagrab's `output_idx` and the encoders are (VERIFY below).
+- Distribution: the SudoVDA repository has no releases or tags. Apollo's installer ships it
+  (`src_assets/windows/drivers/sudovda/install.bat`) signed with a self-signed certificate
+  (`CN=sudovda@su.mk`, code signing) that it adds to the machine's Root and TrustedPublisher
+  stores, then `nefconc --create-device-node` / `--install-driver`. Adding a third-party root
+  certificate is not something an installer switch should do silently, so the agent's
+  installer does not install SudoVDA; the agent uses it when Apollo put it there.
+
+**Virtual Display Driver** ("VDD", VirtualDrivers/Virtual-Display-Driver, tag 25.7.23 at
+d437ebc; master at d724496 is the same in these points):
+
+- `MttVDD.inf`: hardware id `Root\MttVDD`, class Display. `Driver.cpp`: on adapter init it
+  creates `<monitors><count>` monitors (`FinishInit` -> `CreateMonitor`) and never calls
+  `IddCxMonitorDeparture`: monitors exist exactly while the device runs.
+- Modes come from `vdd_settings.xml` in `HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver\VDDPATH`
+  (default `C:\VirtualDisplayDriver`): every `<resolution>` (width, height, refresh_rate) and
+  every resolution at every `<global><g_refresh_rate>` (`loadSettings`; the parser keys on the
+  last opened element's name, so the agent's parser does the same). `loadSettings` runs only
+  in `EvtDriverDeviceAdd`, i.e. when the device starts.
+- The named pipe `\\.\pipe\MTTVirtualDisplayPipe` (`D:(A;;GA;;;WD)`, one UTF-16 command per
+  connection: `RELOAD_DRIVER`, `SETDISPLAYCOUNT n`, `SETGPU "name"`, `PING`, `GETSETTINGS`, ...)
+  cannot apply new modes: `ReloadDriver(HANDLE hPipe)` passes the pipe handle to
+  `WdfObjectGet_IndirectDeviceContextWrapper` (a WDF object is expected) and only re-runs
+  `InitAdapter`, which does not re-read the settings. So the agent controls VDD through PnP
+  instead: it adds the client's mode to `vdd_settings.xml` when missing (a `<resolution>` entry
+  before `</resolutions>`, the rest of the file unchanged, the original kept once as
+  `vdd_settings.xml.recon-backup`), restarts the device (`DIF_PROPERTYCHANGE` /
+  `DICS_PROPCHANGE`), or enables it when it is disabled (`DICS_ENABLE`) and disables it again
+  after the session. These need the elevated agent (the logon task runs it elevated).
+  `install-host.ps1` leaves the device disabled after installing it, so enabling it per session
+  is the normal path: a running device keeps its monitor connected between sessions (Windows
+  extends the desktop onto it, and it shifts ddagrab's output indices), and the topology a
+  session restores then includes that monitor. `probe` says so for a running device.
+- Settings folder access: a folder created under `C:\` inherits "Authenticated Users: Modify"
+  from the drive root, and the agent writes into it elevated. The installer makes the folder
+  owned by Administrators with a non-inherited ACL (Administrators and SYSTEM full control,
+  Users read and execute; Users includes the driver's LocalService host). The agent writes
+  (settings, backup, temporary file) only when the folder and those files are not reparse
+  points, are owned by Administrators, SYSTEM or TrustedInstaller, and no ACE (inherit-only
+  ones included) gives anyone else write, delete or permission rights; otherwise the session's
+  virtual display fails with the `icacls` command that fixes it. A missing folder is created
+  with that ACL. `docs/SECURITY.md` (Host-side safety) has the rule.
+- Release 25.7.23, `VirtualDisplayDriver-x86.Driver.Only.zip` (an x64 driver despite the name:
+  `[Standard.NTamd64]`): SHA-256 `e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a`,
+  `DriverVer = 12/24/2024,11.30.4.434`, catalog signed by SignPath Foundation (GlobalSign GCC R45
+  CodeSigning CA 2020), so it installs without test signing. Its own unattended installer
+  (`Community Scripts/silent-install.ps1`) runs nefcon v1.14.0 `install MttVDD.inf Root\MttVDD`
+  and imports the catalog's certificates into TrustedPublisher; the agent's installer runs the
+  same nefcon command but leaves the trust decision to the Windows Security prompt.
+- nefcon (nefarius/nefcon, MIT) v1.14.0, `nefcon_v1.14.0.zip` SHA-256
+  `a15557da24a9efca203158de3b43b0eaf982db231f0194031f1ed428bc13e669`: `nefconc install <inf> <hwid>`
+  is devcon's install (create the root device node, then `UpdateDriverForPlugAndPlayDevices`),
+  exit code 3010 when a reboot is needed (`src/NefConUtil.cpp`).
+
+**Display topology** (CCD): the agent follows Sunshine's libdisplaydevice (LizardByte, at
+b9b8653): always `QDC_VIRTUAL_MODE_AWARE` / `SDC_VIRTUAL_MODE_AWARE` (16-bit mode indices);
+primary = source mode at (0, 0), made primary by shifting every source mode
+(`setAsPrimary`); a mode change sets the source mode size and the path's refresh rate, clears
+the target and desktop mode indices, and applies with `SDC_ALLOW_CHANGES` first, then strictly
+(`setDisplayModes`); refresh rates compare within 0.9 Hz; a display is switched on by building
+paths from `QDC_ALL_PATHS` with a free source id each (`makePathsForNewTopology`). The Go
+mirrors of `DISPLAYCONFIG_PATH_INFO` (72 bytes) and `DISPLAYCONFIG_MODE_INFO` (64 bytes) are
+pinned by tests.
+
+### How a session's virtual display works
+
+1. `Detect`: SudoVDA first (any mode on demand, crash watchdog), then VDD.
+2. `RequestedMode`: the client's prefs width/height, else its screen in device pixels (hello
+   `client.w/h`), rounded down to even, clamped to 640x360-7680x4320; refresh = the stream's fps
+   (prefs fps or `defaultFps`, at most `maxFps`, 24-500). A portrait client gets a tall mode,
+   never a rotated monitor.
+3. `Decide` (`auto`): yes when a driver is there and the physical monitor cannot show the mode
+   1:1 (other size, or fps above its refresh rate), or there is no physical monitor; `on`:
+   always (no driver: the session falls back and says why). Also yes when the monitor the
+   session would capture is the agent's own virtual display (left by the previous session,
+   lingering or still owned; as primary or only display it is the one a session picks first):
+   `Create` then reuses or replaces it, instead of the session capturing it unowned until the
+   linger timer removes it.
+4. `Create`: snapshot the active topology (and write it to `vdisplay-restore.json` next to
+   host.json), plug (SudoVDA: REMOVE leftover, SET_RENDER_ADAPTER, ADD; VDD: settings + PnP),
+   wait for the monitor (up to 6 s; switched on after 1.5 s if Windows left it off; given its
+   own source if Windows duplicates it), apply the mode and layout (rotation identity), check
+   the result, find the GDI monitor (HMONITOR, DXGI output). Only the refresh rate may differ
+   from the request (warned; the stream then runs at most at it); anything else undoes it all.
+   Layout `primary` and `extend` are saved to the display database for SudoVDA (its monitor
+   exists only while the agent holds it); never for `only` or VDD (a persistent VDD monitor saved
+   as primary would be primary after a reboot, before the agent runs; `only` would leave the
+   physical monitors dark).
+5. `Close`: after `Linger` (a reconnect with the same mode in that time gets the same display),
+   unplug (SudoVDA: REMOVE; VDD: disable only if the session enabled it), wait for the monitor to
+   leave, apply the snapshot exactly, else with `SDC_ALLOW_CHANGES`, else Windows' saved layout
+   (`SDC_USE_DATABASE_CURRENT`); the restore never saves. The departure is awaited on the target
+   CCD lists, also when the driver reported another adapter LUID (the journal is rewritten with
+   it). A VDD device that was already running before the session stays running: the snapshot
+   (which then includes its monitor) is applied first and the monitor stays as it was; only a
+   device the session enabled is disabled again, before the restore. `Recover` at agent start
+   replays the journal after a crash.
+
+### Session integration (for the session rewrite)
+
+- Agent start: `vd := vdisplay.New(cfg.virtualDisplayOptions())` plus `RenderAdapter` =
+  `platform.PrimaryAdapter().LUID`, `Linger` = 5 s, `Log`; `vd.Recover()` once before serving
+  sessions; `vd.Close()` on shutdown.
+- `buildParams` (first generation of a session, and when prefs change size/fps): `req :=
+  vdisplay.RequestedMode(hello.Client, prefs, cfg.DefaultFPS, cfg.MaxFPS).Complete(&phys)`;
+  `if use, why := vd.Decide(req, &phys); use { d, err := vd.Create(req) }`, with `phys` the
+  monitor from `a.monitors()` the session would capture, even when it is the agent's own
+  virtual display (Decide then says yes and Create takes it over). On success capture
+  `d.Info().Monitor` (find it in `a.monitors()` with `Info.Find`, or use it as is) instead of
+  `mons[prefs.Monitor]`: input target = its rectangle, `mon.Hz` = the virtual refresh (lifts
+  the fps cap), FFmpeg backend `ddagrab` with `output_idx` = `Monitor.DXGIOutput` (when it is
+  -1 the output is not on adapter 0: use the helper, or `gfxcapture` with its HMONITOR), helper
+  `capture: "dda"` with `hmonitor` = `Monitor.HMonitor`; never AMD Direct Capture
+  (`amfCaptureBlocker` should return "monitor N is a virtual display") and never
+  `gfxcapture` scaling (the monitor already has the client's size). On error: log, one notice
+  ("Virtual display unavailable: …; streaming the monitor"), capture the physical monitor.
+- Session end: `d.Close()`. `d.Lost()` closing (SudoVDA stopped answering): restart the video on
+  the physical monitor with a notice.
+- The welcome's monitor list is sent before the display exists; send the virtual display as the
+  selected monitor in the `video` config or re-send the list if the client shows it.
+
+### Verified in the sandbox
+
+- verified (sandbox): manager logic against a simulated CCD and driver
+  (`internal/host/vdisplay/fake_test.go`; Linux and Windows/Wine): primary (physical monitor
+  moved to (-1920, 0), layout saved for SudoVDA, journal while it exists, exact restore without
+  saving, journal removed), extend, only (physical off, never saved, back on after), a monitor
+  arriving rotated 90 degrees (identity, 2560x1440 not swapped), a 1080x2400 portrait client, a
+  monitor arriving off (switched on), a duplicated monitor (own source), a driver LUID that
+  differs from CCD's (found as the new target id), a refresh rate Windows will not set
+  (accepted at 60 Hz), a failed `SetDisplayConfig` (everything undone, journal removed), the
+  restore fallbacks (supplied, `SDC_ALLOW_CHANGES`, database), linger reuse and expiry, a
+  second session with another mode taking over, `Decide` on the agent's own lingering or owned
+  display (yes, and `Create` reuses it; a matching physical monitor still no), the departure
+  awaited on CCD's target when the driver reports another LUID (the fake's monitor leaves 30 ms
+  after the unplug; the restore comes after it; the journal holds CCD's target), keepalive
+  loss, a VDD device that was already running (restore before unplug, nothing saved), crash
+  recovery from the journal and a corrupt journal, no driver, a broken driver, a failed plug,
+  `Decide` / `RequestedMode` / `ParseMode` tables, stable monitor GUIDs. `go test -race` clean.
+- verified (sandbox): CCD struct layouts (`TestCCDLayout`, sizes and offsets per wingdi.h x64)
+  and on real data under Wine 9 (`TestQueryDisplayConfig`; `GOOS=windows go test -c
+  ./internal/host/vdisplay`, run with `xvfb-run -a wine64`): the source mode
+  decodes as 1920x1080 at (0, 0), the target mode as 1920x1080, rotation identity, and
+  `DisplayConfigGetDeviceInfo` names the source `\\.\DISPLAY1`, matching `platform.Monitors`.
+  Wine 9 rejects `QDC_VIRTUAL_MODE_AWARE` (the test then reads the classic layout) and does not
+  implement `DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME`; both exist on Windows 10+.
+- verified (sandbox): the settings folder check (`TestCheckPrivateSD`, Windows build under Wine
+  9): the ACL the agent and installer set (owner Administrators or SYSTEM) is accepted; refused:
+  the ACL a folder made under `C:\` inherits (Authenticated Users Modify), an inherit-only write
+  ACE for Users, a write-DAC ACE for Everyone, a non-administrator or CREATOR OWNER owner, no
+  DACL. `TestCreatePrivateDir` (the folder the agent creates passes its own check) skips under
+  Wine, whose file system here does not keep security descriptors; on Windows it runs. The
+  installer's link check (`Assert-NoVddLinks`) refused a symbolic link in a test folder (pwsh 7
+  on Linux).
+- verified (sandbox): SudoVDA IOCTL codes and the 56/12/16/8/4-byte buffers against the header
+  (`TestSudoVDAIoctlCodes`, `TestSudoVDAAddParams`, `TestSudoVDAReplies`).
+- verified (sandbox): the VDD settings parser and editor on the release's own
+  `vdd_settings.xml`: 35 modes (5 resolutions + 5 x 6 global rates, as the driver counts),
+  2560x1440@120 present, 3440x1440@120 added as one 5-line entry with the rest of the file
+  unchanged (42 modes after).
+- verified (sandbox): both pinned downloads (SHA-256 above, `sha256sum` and the installer's own
+  PowerShell loop in pwsh 7), the archive layout the installer expects, and the catalog signer
+  (`openssl pkcs7 -print_certs`: SignPath Foundation). Both scripts parse (pwsh parser).
+- verified (sandbox): `recon-host vdisplay` under Wine with no driver prints `driver: none (no
+  virtual display driver installed ...)` and exits 1; `probe` prints a `virtual display:` line.
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (driver install): in an elevated PowerShell in the
+  host bundle folder run `.\install-host.ps1 -InstallVirtualDisplay` (Apollo not installed);
+  accept the "SignPath Foundation" prompt. Expect "Virtual Display Driver and nefcon checksums
+  verified", nefcon "Device and driver installed successfully", `"virtualDisplay": "auto"` in
+  host.json, "Virtual Display Driver device ROOT\DISPLAY\000N disabled", Device Manager >
+  Display adapters > "Virtual Display Driver" disabled, Settings > System > Display showing only
+  the physical monitor(s), and `recon-host.exe probe` printing `virtual display: vdd device
+  ROOT\DISPLAY\000N disabled (enabled for sessions), 35 modes, 1 monitor(s) in
+  C:\VirtualDisplayDriver\vdd_settings.xml`. `icacls C:\VirtualDisplayDriver` must list only
+  BUILTIN\Administrators:(OI)(CI)(F), NT AUTHORITY\SYSTEM:(OI)(CI)(F) and
+  BUILTIN\Users:(OI)(CI)(RX), none of them "(I)", and `icacls
+  C:\VirtualDisplayDriver\vdd_settings.xml` the same three, inherited. With Apollo installed
+  instead: `virtual display: sudovda protocol 0.2.x, watchdog 3 s`. Record both, and whether a
+  reboot was needed (exit code 3010; then check the device is disabled after the reboot).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (VDD enabled per session, folder access): during the
+  `recon-host.exe vdisplay -hold` run below, Device Manager shows the device enabled and its
+  monitor is in the "with the virtual display:" list; after "removed and restored in" the device
+  is disabled again and "after:" equals "before:". Also check that the driver still reads its
+  restricted settings (the new mode is offered). Then
+  `icacls C:\VirtualDisplayDriver /grant *S-1-5-11:(OI)(CI)M` (Authenticated Users Modify) and
+  `-mode 3440x1440@100` (a mode not in the file): it must fail with "may change it" and the
+  `icacls` command to fix it, without touching the file, and `probe` must add "new modes cannot
+  be added: ..."; running the installer with `-InstallVirtualDisplay` again restores the access.
+  Last, with the device enabled by hand in Device Manager, `probe` says "running (its monitor
+  stays connected outside sessions: ...)".
+- AMD RDNA3 (RX 7900 XT): unverified. Test (2560x1440@120 above the host monitor's refresh):
+  set the physical monitor to 60 Hz, stop the agent (`Stop-ScheduledTask 'KloudIT Recon Host'`),
+  run `recon-host.exe vdisplay -mode 2560x1440@120 -layout primary -hold 120s`. Expect "created
+  in" under 2 s (SudoVDA) or 5 s (VDD, first run adds the mode and restarts the device), the
+  new monitor primary at (0,0) 2560x1440@120Hz, the physical one left of it, and a capture line
+  with `output_idx` >= 0 (VERIFY: DXGI lists the IddCx output on adapter 0, the render adapter;
+  record the value and adapter). While it holds, from a second PowerShell, move a browser with
+  a moving test page (e.g. tools/latency-test, or a 120 Hz UFO test) onto it (Win+Shift+Left/
+  Right) and run `ffmpeg -f lavfi -i ddagrab=output_idx=N:framerate=120 -t 10 -f null -`:
+  about 1200 frames, `fps=120`. Then the helper: `recon-encoder.exe --encode-test=v.hevc
+  --backend=amf --codec=hevc --capture=dda --hmonitor=0x... --fps=120 --kbps=50000
+  --frames=1200`: `started` with captureWidth 2560, captureHeight 1440, capture -> output p95
+  below one frame interval (8.3 ms), `ffmpeg -v error -i v.hevc -f null -` silent. Also try
+  `--capture=amd-direct --hmonitor=0x...`: expected to fail (AMD Direct Capture reads the
+  GPU's display engine, which does not scan out an IddCx monitor); record the error, which
+  confirms DDA is required.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (restore on disconnect): after the hold above the
+  command prints "removed and restored in" and an "after:" list identical to "before:" (names,
+  sizes, positions, primary, Hz); Settings > System > Display shows the original arrangement and
+  windows are back on the physical monitor. Repeat with `-layout only` (the physical monitor
+  goes dark during the hold and comes back) and `-layout extend` (nothing moves). Crash case:
+  run with `-hold 600s`, end recon-host.exe in Task Manager: SudoVDA removes the monitor within 3
+  s and Windows restores the layout by itself; VDD keeps its monitor (the device the run enabled
+  stays enabled); then `recon-host.exe vdisplay -hold 1s` prints "restoring the displays after
+  an unfinished virtual display session" (journal in %TEMP%\kloudit-recon-vdisplay-test),
+  disables the VDD device again and leaves the original layout.
+  With `-layout only` and VDD, also reboot during the hold: the physical monitor must light up
+  at the sign-in screen (nothing saved to the display database).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (games opening on the wrong monitor): with
+  `-layout primary` start two games during the hold (one borderless, one exclusive fullscreen,
+  ideally one that remembers its monitor, e.g. a Unity title): both should open on the virtual
+  display; a game that remembers the physical monitor needs its in-game display setting once.
+  With `-layout only` every game must open on the virtual display. Record each game and layout.
+  Note the DPI scale Windows picks for the new monitor (Settings > Display > Scale) and
+  whether it persists across runs (stable monitor identity).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (other client sizes, VDD): `-mode 3440x1440@120`
+  and `-mode 1080x2400@60`: the first run adds the mode to vdd_settings.xml (backup
+  `vdd_settings.xml.recon-backup` appears once) and restarts the device; the monitor is
+  3440x1440 / 1080x2400 with rotation 0 (Settings > Display: orientation Landscape / Portrait
+  without "(flipped)", the panel not rotated).
+- NVIDIA: unverified (no NVIDIA host available). Test: all of the above with `--backend=nvenc`
+  for the helper command; also the render adapter on a hybrid laptop (Intel iGPU + NVIDIA):
+  the capture line's `output_idx` must be on DXGI adapter 0 and `recon-encoder` must report the
+  NVIDIA adapter in `started`.
+
+## 3.9 HDR10 in the helper
+
+recon-encoder.exe can make HDR10 streams (opt-in: `start` with `hdr`; helper side and the Go
+client `internal/host/encoder` only, the session does not ask for it yet and the browser side
+is step 4.5). docs/HELPER_PROTOCOL.md "HDR10" is the reference. In short:
+
+- When the captured output is in Windows HDR mode (`IDXGIOutput6::GetDesc1` colour space
+  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`) and `hdr` was asked for, DDA duplicates with
+  `DuplicateOutput1([R16G16B16A16_FLOAT, B8G8R8A8_UNORM])` and gets the desktop as Windows
+  composes it (scRGB FP16); an SDR output (or WGC, which has no HDR path yet) gives an SDR
+  stream with `started.hdr` false, as Sunshine does. AMD Direct Capture is HDR when its
+  surfaces are `AMF_SURFACE_RGBA_F16`.
+- A pixel shader converts scRGB (x 80 cd/m2; an 8-bit source at 203 cd/m2, BT.2408) with the
+  BT.2087 BT.709 -> BT.2020 matrix and the ST 2084 PQ curve into P010 (BT.2020 NCL matrix,
+  10-bit limited range, 10-bit codes in the high bits). GUIDE 3.9's alternative R10G10B10A2
+  input is not used: both encoders take P010, which keeps matrix and chroma siting in the
+  helper's own tested shader.
+- AMF: `COLOR_BIT_DEPTH` 10, HEVC `PROFILE_MAIN_10` / AV1 Main, input and output colour
+  profile / transfer / primaries BT.2020 / SMPTE 2084 / BT.2020, `INPUT_HDR_METADATA`
+  (`AMFHDRMetadata` in an `AMFBuffer`, units x 50000 / x 10000), P010 input, no zero-copy.
+  NVENC: HEVC Main10 / AV1 Main with input and output bit depth 10, `YUV420_10BIT` (P010)
+  input, VUI / AV1 colour config BT.2020 / SMPTE 2084 / BT.2020 NCL, `outputMasteringDisplay`
+  and `outputMaxCll` with `pMasteringDisplay` / `pMaxCll` on every picture (HEVC units x 50000
+  / x 10000, AV1 0.16 / 24.8 / 18.14 fixed point as FFmpeg's nvenc.c converts).
+- Metadata: as Sunshine, BT.2020 primaries with D65 and the output's DXGI luminance range as
+  the mastering display's; this helper's own choice (Sunshine sends 0 = unknown): MaxCLL = the
+  output's peak, MaxFALL = its full-frame luminance; unknown or implausible values (peak
+  outside 80..10000 cd/m2) fall back to a 1000 cd/m2 display.
+- Caps (additive, protocol version stays 1): `codecs.*.hdr10`, `outputs[].hdr`,
+  `bitsPerColor`, `minLuminance`, `maxLuminance`, `maxFullFrameLuminance`; `started.hdr`,
+  `bitDepth`, `colorSpace` (`bt709` | `bt2020-pq`), `hdrMetadata`; `captureChanged` field
+  `hdr` and reason `hdr` (Windows HDR turned on / off during the stream; the stream keeps its
+  format). `start` with `hdr` and a codec without `hdr10` (H.264, a GPU without 10-bit
+  encoding or P010 input) fails with `unsupported`. Encode test option `--hdr=0|1`; the
+  `synthetic-gpu` test source plays an HDR output with `hdr`.
+
+Sources: Sunshine `src/platform/windows/display_base.cpp` (`is_hdr`, `get_hdr_metadata`,
+the FP16 capture format list) and `display_vram.cpp` / `convert_*_perceptual_quantizer*.hlsl`
+(scRGB -> PQ, P010 plane views); FFmpeg `libavcodec/amfenc.c` / `amfenc_hevc.c` (COLOR_BIT_DEPTH,
+the BT.2020 / SMPTE 2084 colour properties, `INPUT_HDR_METADATA` from mastering display side
+data) and `nvenc.c` (`outputMasteringDisplay` / `outputMaxCll`, `pMasteringDisplay` /
+`pMaxCll` per frame, the AV1 fixed-point units); OBS `plugins/obs-ffmpeg/texture-amf.cpp`
+(Main10, P010, `INPUT_HDR_METADATA` for HEVC and AV1); the vendored AMF 1.5.3 headers
+(`ColorSpace.h` `AMFHDRMetadata` units, `VideoEncoderHEVC.h` / `VideoEncoderAV1.h`) and
+nvEncodeAPI.h 13.0 (`MASTERING_DISPLAY_INFO`, `CONTENT_LIGHT_LEVEL`, bit depth fields); ITU-R
+BT.2020, BT.2087, BT.2100 (PQ), BT.2408 (203 cd/m2 HDR reference white), SMPTE ST 2084 / 2086,
+CTA-861.3; HEVC D.2.28 / D.2.35, AV1 6.7.3 / 6.7.4.
+
+### Verified in the sandbox
+
+- verified (sandbox): the conversion (`--self-test-convert` under Wine 9.0 / wined3d on Mesa
+  llvmpipe, `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`; mode planar for NV12 and
+  for P010, since wined3d has no NV12 / P010 render targets, so the same shaders run on
+  R8 / R8G8 and R16 / R16G16 textures): 14 cases ok, the 5 HDR10 ones (FP16 1:1 + barcode,
+  2:1 downscale from a copied source, 90 degree rotation, an 8-bit sRGB source at 203 cd/m2,
+  padding to 64x16) within 1 code of a double-precision CPU reference of the PQ curve and the
+  BT.2087 matrix; absolute codes Y 64 / 490 / 509 / 573 / 723 / 855 / 940 for 0 / 80 / 100 /
+  203 / 1000 / 4000 / 10000+ cd/m2, scRGB primaries at 80 cd/m2 (red 325/448/598), negative
+  colours black, P010 low bits zero, barcode 64 / 940 / 512; plus a new SDR case (an FP16
+  source clipped to SDR). Mutation check: changing one BT.2087 matrix coefficient and
+  truncating instead of rounding made the HDR10 cases fail.
+- verified (sandbox): `--self-test-encoder` "HDR10 metadata and its units": BT.2020 / D65,
+  the display's luminance, the fallbacks, HEVC / AMF codes (red 35400/14600, white
+  15635/16450, 1000 cd/m2 = 10000000, 0.005 cd/m2 = 50) and AV1 codes (red 46399/19137, 1000
+  cd/m2 = 256000, 0.005 = 82).
+- verified (sandbox): `--self-test-nvenc=recon-fake-nvenc.dll`: "HDR10 hevc" and "HDR10 av1"
+  (Main10 / AV1 Main with bit depth 10, the BT.2020 PQ colour description, P010 registered as
+  `YUV420_10BIT`, the metadata codes with each of 30 pictures, forced IDR and a loss, an SDR
+  source giving an 8-bit stream), "HDR10 refusals" (H.264; `tenBit=0`; no P010 input; each
+  from an HDR and from an SDR output), caps
+  `hdr10`; the test double flags input formats that do not match the bit depth, 10-bit HEVC
+  without Main10 and metadata in 8-bit streams.
+- verified (sandbox): `TestHelperIntegrationHDRPipeline` (Go client, mock backend,
+  `synthetic-gpu` with `hdr`): `started` hdr / bitDepth 10 / bt2020-pq / the 1000 cd/m2
+  panel's metadata; the dumped P010 frame 30 has its barcode reading 30 at codes 64 / 940
+  (since the merge with step 3.1b: GUIDE 0.2's barcode format, reading 29, frame 30's sequence
+  number, with `proto.BarcodeReadLuma` on the codes / 4), all low bits zero, and the 1000 cd/m2 patch at Y 723, CbCr 512. `TestHelperIntegrationEncodeTest`
+  runs `--hdr=1`; `TestDecodeMessages` decodes the new caps / started / captureChanged
+  fields; `TestHelperIntegrationGPUPipeline` checks an SDR stream reports bitDepth 8 / bt709.
+- Not run here: DDA's FP16 duplication (Wine's `DuplicateOutput` answers E_NOTIMPL: the DDA
+  test fails cleanly as before), the AMF HDR10 configuration (no AMD GPU), the MSVC build
+  (CI job `helper-windows`; it now accepts `self-test-convert: ok (mode nv12;` and logs the
+  HDR10 mode).
+
+### Hardware checks
+
+Turn Windows HDR on for the monitor (Settings > System > Display > Use HDR, or Win+Alt+B).
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (caps): `recon-encoder.exe --print-caps
+  --backend=amf`: the monitor's `outputs[]` entry has `"hdr":true`, `bitsPerColor` 10, and
+  `maxLuminance` / `maxFullFrameLuminance` as Windows HDR Calibration or the monitor's EDID
+  states them (compare with Settings > Display > Advanced display "Peak brightness");
+  `codecs.hevc.hdr10` and `codecs.av1.hdr10` true, `codecs.h264.hdr10` false. With HDR off,
+  `"hdr":false`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HEVC HDR10, DDA): play an HDR10 video or game in
+  borderless full screen and run `recon-encoder.exe --encode-test=hdr.hevc --backend=amf
+  --codec=hevc --capture=dda --hdr=1 --fps=60 --kbps=40000 --frames=600`. The started line has
+  `"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq"` and the log "dda: ... Windows HDR on (FP16
+  scRGB capture, N cd/m2 peak)". `ffprobe -v error -show_streams -show_frames -read_intervals
+  %+#2 -of json hdr.hevc`: profile "Main 10", pix_fmt yuv420p10le, color_range tv, color_space
+  bt2020nc, color_transfer smpte2084, color_primaries bt2020, and side data "Mastering display
+  metadata" (max_luminance = the display's peak, min_luminance, primaries 35400/14600 ... as
+  /50000 ratios) and "Content light level metadata" (max_content = peak, max_average =
+  full-frame) on the key frame. If the side data is missing, AMF ignores `INPUT_HDR_METADATA`
+  on this driver: record the Adrenalin version (the stream is still HDR10 by its VUI). Play
+  hdr.hevc on an HDR display (mpv `--vo=gpu-next` with HDR passthrough, or the Windows Films &
+  TV app): highlights above SDR white keep their detail and brightness as on the host,
+  desktop elements (taskbar) look as bright as on the host (the "SDR content brightness"
+  slider is part of the scRGB values).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 HDR10): the same with `--codec=av1`
+  (hdr.ivf): av1 Main, yuv420p10le, smpte2084 / bt2020, the mastering display and content
+  light level metadata; at 1920x1080 still coded 1920x1088 with cropBottom 8.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (P010 render targets and shader accuracy on the GPU):
+  `recon-encoder.exe --self-test-convert=hw` ends with "ok (mode nv12; HDR10 mode p010)" (all
+  HDR10 cases within 1-2 codes). Also on CI's WARP (windows-latest): record whether WARP
+  reports `HDR10 mode p010` or `planar`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (colour accuracy): show a full-screen HDR test
+  pattern with known patches (an HDR10 test video with 100 / 1000 cd/m2 patches, or the
+  Windows HDR Calibration app's screens), encode as above, then `ffmpeg -i hdr.hevc -frames:v 1
+  -vf crop=64:64:X:Y -f rawvideo -pix_fmt yuv420p10le patch.yuv` and read the Y values: a
+  1000 cd/m2 patch (if the display shows it unclipped) ~723, 100 cd/m2 ~509; SDR white
+  (taskbar text) at the "SDR content brightness" level.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HDR toggled during a stream): during an HDR10
+  encode test press Win+Alt+B: the log says "Windows HDR turned off for the output; the stream
+  stays HDR10" (`captureChanged` `hdr` false), frames keep coming (the SDR desktop at
+  203 cd/m2), no fatal error; turn it on again: "turned on", FP16 frames again. Start an SDR
+  stream (`--hdr=0`) on an HDR desktop and toggle: `hdr` events, the SDR picture unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AMD Direct Capture): `--capture=amd-direct --hdr=1`
+  on an HDR desktop: record the log, "amd-direct: ... Windows HDR on (FP16 scRGB capture)" or
+  "the capture surfaces are AMF format N, not RGBA_F16: SDR" (N = 11 RGBA_F16, 13
+  R10G10B10A2); with FP16 the ffprobe checks above apply.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (cost): the encode test's capture -> output p50 /
+  p95 at 3840x2160 120 fps HEVC with `--hdr=1` vs `--hdr=0` on the same HDR desktop (the SDR
+  stream lets DXGI convert): the P010 PQ pass should add well under 1 ms.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (virtual display, 3.7): with HDR enabled on the
+  SudoVDA / VDD monitor, `outputs[].hdr` true and the stream HDR10; record the luminance the
+  virtual EDID reports (an implausible peak falls back to 1000 cd/m2 in `started.hdrMetadata`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (exclusive full-screen HDR game): DDA keeps
+  delivering FP16 frames from an HDR game in exclusive full screen (the flip model may bypass
+  DWM: record whether frames stall or arrive as B8G8R8A8).
+- NVIDIA: unverified (no NVIDIA host available). Test (driver self-test): `recon-encoder.exe
+  --self-test-nvenc` (Windows HDR need not be on): "HDR10 hevc" ok on GTX 10 series and newer
+  (HEVC Main10), "HDR10 av1" ok on RTX 40 / 50 (skipped elsewhere), "self-test-nvenc: ok".
+- NVIDIA: unverified (no NVIDIA host available). Test (HEVC / AV1 HDR10, DDA): the AMD tests
+  above with `--backend=nvenc`; ffprobe must show the mastering display and content light
+  level side data. Record which frames carry them (`-show_frames` over 120 frames: every frame,
+  as the backend passes them with every picture, or key frames only) and the per-frame
+  overhead (about 40 bytes when on every frame); AV1: max_luminance must read the display's
+  peak (checks the 24.8 / 18.14 fixed-point conversion).
+- NVIDIA: unverified (no NVIDIA host available). Test (P010 render targets): `--self-test-convert=hw`
+  ends with "HDR10 mode p010".
+
+### Session integration (for the session rewrite and step 4.5)
+
+internal/host/session.go is unchanged; the Go API is in `internal/host/encoder`:
+
+- Ask for HDR (`StartParams.HDR`) only when the client can present it (step 4.5: an HDR
+  canvas and a decoder for HEVC Main10 / AV1 10-bit, `VideoDecoder.isConfigSupported` with
+  e.g. `hvc1.2.4.L153.B0` / `av01.0.13M.10`), the codec's `CodecCaps.HDR10` is true and the
+  monitor's `Output.HDR` is true. With `HDR10` false the helper refuses the start
+  (`unsupported`): fall back to an SDR start.
+- After `Start`, `Started.HDR` decides the stream's format: true = 10-bit BT.2020 PQ
+  (`BitDepth` 10, `ColorSpace` "bt2020-pq", `HDRMetadata`); the VideoConfig sent to the browser
+  then needs a Main10 / 10-bit codec string (HEVC profile 2, AV1 `.10`), the colour
+  description and the metadata (proto change in step 4.5). False = SDR as before.
+- `CaptureChanged{Reason: "hdr"}`: the output entered or left HDR mode; the stream keeps its
+  format (an HDR10 stream shows SDR content at 203 cd/m2). Restart the helper with the new
+  setting to follow.
+- The in-band barcode (0.2) uses codes 64 / 940 in HDR10 streams, i.e. 16 / 235 after an 8-bit
+  conversion: barcode readers that threshold 8-bit luma at mid-grey work unchanged. The
+  FFmpeg path stays SDR.
+
+## Phase 5 (helper features)
+
+GUIDE 9's differentiators on the helper and Go-client side (recon-encoder.exe and
+`internal/host/encoder`; `internal/host/session.go` is unchanged, see "Session integration"
+below). docs/HELPER_PROTOCOL.md "Phase 5 features" is the reference. All protocol changes are
+additive (version stays 1): caps `liveFps`, `instanceSelect`, `reencode`; start
+`reencodeOversized`, `sliceOutput`; started `svcLayers`, `liveFps`, `reencodeOversized`,
+`sliceOutput`; stats `dirty`, `discardable`, `reencoded` / `oversizeBytes`, `slices` /
+`firstSliceQpc`; `setRate` without `kbps` (a frame-rate change alone); ring slot flags DIRTY
+(bit 5) and DISCARDABLE (bit 6; bits 4 and 5 on the Phase 5 branch, moved up at its merge
+because step 3.1b's SEQ_START took bit 4) and `dirtyPpm` at offset 96 (formerly reserved,
+written 0 by older helpers).
+
+- (a) Temporal SVC, 2 layers: AMF sets `MAX_NUM_TEMPORAL_LAYERS` before `Init` and
+  `NUM_TEMPORAL_LAYERS` (H.264 `NUM_TEMPORAL_ENHANCMENT_LAYERS`; dynamic) before and again after
+  `Init` / `ReInit`, reads it back for `started.svcLayers` (warning "the encoder runs no
+  temporal layers" when 8 frames in a row come out in layer 0), and re-reads the caps with the
+  maximum set (AV1's LTR count depends on it); intra refresh stays refused with SVC. The LTR
+  policy (`src/codec/ltr.hpp`) plans marks and recovery frames only on base-layer frames (AMF:
+  "only base temporal layer pictures can be coded as LTR"; a recovery frame in the enhancement
+  layer would leave the next base frame predicted from a lost one), predicting the layer from
+  the position after the last key frame and re-synchronizing from the encoder's reported layers
+  (not from frames submitted before a planned IDR: it restarts the pattern); a recovery frame
+  that comes out in layer 1 is refused (IDR). NVENC already configured `enableTemporalSVC` (step
+  3.4); its `NV_ENC_LOCK_BITSTREAM::temporalId` is now reported. Each frame's layer is checked
+  against the bitstream and gets the `discardable` flag (`src/codec/bitstream.hpp` `layerInfo`:
+  H.264 `nal_ref_idc` 0 and the SVC prefix NAL unit, HEVC sub-layer non-reference NAL types at
+  the top layer and `nuh_temporal_id_plus1`, AV1 the OBU extension's `temporal_id`; AV1 has no
+  reference flag in reach, so its top layer counts as discardable: VERIFY). Go:
+  `Frame.Discardable`, `Frame.Droppable()` (discardable, not key, not recovery),
+  `Stats.Discardable`.
+- (b) ROI: Go `FocusROI` builds the background / pointer / crosshair rects; the helper's
+  existing maps (AMF GRAY32 importance per 64x64 block, H.264 16x16; NVENC QP delta per
+  16 / 32 / 64 block) now fill the AMF plane through the tested `writeRoiPlane`.
+- (c) Dirty share: DDA (move-rect destinations + dirty rects) and AMD Direct Capture
+  (`DIRTY_RECTS`) now report the union area as a fraction (`src/capture/dirty.hpp`;
+  previously a percent with overlaps counted twice) in stats `dirty` / `dirtyPct` and in the
+  ring (`dirtyPpm`, so it survives dropped stats); the first DDA frame of a (re)duplication
+  counts as wholly changed, and captures dropped before encoding (the encoder behind) add
+  their share to the next encoded frame. Go: `Frame.Dirty`, `Stats.Dirty`, `ActivityMeter`
+  (static desktop detection, `SuggestKbps`).
+- (d) FPS before resolution: `setRate` with `fps` alone (Go `SetFPS`, `LowerFPS` /
+  `RaiseFPS`); caps `liveFps`. AMF sets `FRAMERATE` before the next `SubmitInput` and moves the
+  default LTR interval along; a key frame right after the change is logged ("the frame-rate
+  change at frame N made a key frame"). NVENC reconfigures `frameRateNum` with `resetEncoder`
+  0 / `forceIDR` 0 (step 3.4 already did; the pipeline now keeps the bitrate when `kbps` is 0).
+- (e) Dedicated encode engine: `encoderInstance` (AMF `INSTANCE_INDEX`, read back) existed;
+  caps `instanceSelect` now says whether it can be used (AMF yes, NVENC no), Go
+  `EncoderInstanceFor("default" | "dedicated" | "N", caps)` turns a config choice into it; the
+  mock reports two engines so the plumbing is tested.
+- (f) NVENC re-encode of oversized frames behind `start` `reencodeOversized` (caps
+  `reencode` = `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`): `numStateBuffers` 2; every non-key
+  frame encoded with `NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE` into state buffer 0 and read
+  back on the capture thread; above the limit encoded again into state buffer 1 with the QP map
+  raised (about 6 QP per halving of the excess, 2..12, AV1 x 4, ROI kept); committed with
+  `NvEncRestoreEncoderState(chosen buffer, NV_ENC_STATE_RESTORE_FULL)` before the next frame.
+  AMF: not possible (`reencode` false, GUIDE "AMD skip").
+- (g) AMF slice / tile output experiment behind `start` `sliceOutput` N (caps
+  `sliceOutput`): `OUTPUT_MODE` `SLICE` (AV1 `TILE`, `TILE_GROUP_OBU` true) and
+  `SLICES_PER_FRAME` / `TILES_PER_FRAME`; the parts (`OUTPUT_BUFFER_TYPE`) are put back
+  together (`src/codec/slices.hpp`) and published as whole frames; stats `firstSliceQpc` say
+  when the first part was ready. NVENC answers `unsupported` (not implemented) and reports caps
+  `sliceOutput` false (its `SUPPORT_SUBFRAME_READBACK` bit only in the start log line).
+
+Sources: AMF_Video_Encode_API.md / _HEVC_API.md / _AV1_API.md (GPUOpen AMF master, read
+2026-10-08: SVC "NUM_TEMPORAL_LAYERS is a dynamic property ... MAX_NUM_TEMPORAL_LAYERS needs to
+be set before initializing", "only base temporal layer pictures can be coded as LTR ... the
+request ... would be delayed to the next base temporal layer picture", "Intra-refresh feature is
+not supported with SVC", AV1 `CAP_MAX_NUM_LTR_FRAMES` "calculated based on current value of
+MAX_NUM_TEMPORAL_LAYERS", `TILES_PER_FRAME` "treated as suggestion", `OUTPUT_MODE` /
+`OUTPUT_BUFFER_TYPE`, `INSTANCE_INDEX`, `FRAMERATE` dynamic), the vendored AMF 1.5.3 headers
+(property names and enums), nvEncodeAPI.h 13.0 (`NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE`,
+`numStateBuffers`, `stateBufferIdx`, `NvEncRestoreEncoderState` "after all previous encodes have
+finished", `NV_ENC_STATE_RESTORE_FULL`, `temporalId`, `NvEncGetSequenceParams` on the
+EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit), HEVC 7.4.2.2
+(sub-layer non-reference pictures), AV1 5.3.3 (OBU extension).
+
+### Verified in the sandbox
+
+- verified (sandbox): build: `make helper` (mingw-w64 GCC, -Wall -Wextra) without warnings;
+  every changed or new helper source (dirty, slices, ltr, bitstream, selftests, pacer,
+  paced_capture, dda / amd_direct capture, amf_backend, nvenc_backend / _policy / selftest,
+  protocol, ring, pipeline, encode_test, replay_encoder, main, the test double) passes
+  `clang++ --target=x86_64-w64-mingw32 -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic
+  -Wshadow -Wconversion` without warnings. The MSVC build is not verified here (CI job
+  `helper-windows`).
+- verified (sandbox): `--self-test-encoder` under Wine 9.0: "SVC: LTR marks / recovery on base
+  layer" (layerAt pattern for 2-4 layers; 41 frames with 2 layers: every planned mark on a
+  base-layer frame; a loss at 40/41: the enhancement frame 42 not used as the recovery, base
+  frame 43 recovers from the newest ACKed LTR), "SVC: layer prediction follows the encoder" (an
+  encoder that makes a key frame on its own at an odd position, one frame in flight: resync,
+  marks stay on base-layer frames, a recovery in layer 1 refused), "temporal layers /
+  discardable frames" (H.264 prefix NAL temporal_id 1 + `nal_ref_idc` 0 discardable, a
+  reference frame in layer 1 not; HEVC `TRAIL_N` at the top layer discardable, `TRAIL_N` below
+  it and `TRAIL_R` not, an IDR after a VPS; AV1 OBU extension with a two-byte leb128 size),
+  "sub-frame output: slices put together", "ROI maps of the cursor / crosshair rects" (AMF HEVC
+  9 / 12 blocks at importance 8 / 9 and 489 at 4, H.264 81 / 144 macroblocks, NVENC HEVC 25 / 36
+  blocks at -6 / -8 and +2 elsewhere, AV1 -24 / -32 / +8, the corner-clipped pointer square, the
+  pitched GRAY32 plane with untouched padding), "NVENC re-encode limits and QP maps".
+- verified (sandbox): `--self-test-pacer`: "dirty area (union of rects)" (a quarter, the same
+  rect twice, overlap 17500 / 40000, L shape + nested + clipped + empty + inverted, a caret
+  40 px, 257 rects summed and capped, merging two deliveries).
+- verified (sandbox): `--self-test-nvenc=recon-fake-nvenc.dll` under Wine + Xvfb: "temporal
+  SVC hevc / h264 / av1" (frames 1..20: layer (id-1) % 2, discardable exactly the layer-1
+  frames, keys 1 only, recovery frames 14 and 17 after losses at the base frame 13 and the
+  enhancement frame 16, every frame predicted as the hierarchical-P DPB model says: 14 and 15
+  from 11, 17 from 15), "re-encode oversized frames" (async and sync: 19 encodes without state
+  advance for 18 non-key frames, frame 8 (about 204 kB) encoded again to about 51 kB with the ROI
+  map + 12 QP into state buffer 1, 18 commits, frame 9 predicted from the committed second encode, the forced IDR 13
+  encoded normally, the loss at 15 recovered by frame 16 from 14; no rule violations: no frame
+  before the commit, no restore before the encodes finished, nothing uncommitted at destroy),
+  "cursor / crosshair ROI" (the QP map NVENC receives for H.264 / HEVC / AV1), caps `liveFps`
+  seamless (assumed) / restart without dynamic bitrate, `instanceSelect` false, `reencode` from
+  the cap, and the refusals (`sliceOutput`, `reencodeOversized` without the cap); every earlier
+  scenario unchanged.
+- verified (sandbox): mutation checks: planning marks on enhancement-layer frames, skipping
+  `NvEncRestoreEncoderState`, and summing overlapping dirty rects each make the self-tests above
+  fail.
+- verified (sandbox): `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`:
+  `TestHelperIntegrationPhase5` (mock: `EncoderInstanceFor("dedicated")` = engine 1 reported
+  in `started`, engine 2 / SVC / re-encode / sub-frame output `unsupported` and
+  `reencodeOversized` 1.2 `bad_message` with the helper still running, `SetFPS(20)` re-paces
+  from 61 to 21 frames per second with no forced key frame and stats fps 20 at 4000 kbps, the
+  synthetic source's dirty share unknown), `TestHelperIntegrationGPUPipeline` (synthetic-gpu:
+  every new image dirty 1, every idle repeat 0, through the ring), every earlier integration
+  test; `go test ./internal/host/encoder` (TestFocusROI pins the rects of the C++ test,
+  TestActivityMeter, TestDroppable, TestFPSSteps, TestEncoderInstanceFor,
+  TestRingDirtyAndDiscardable incl. an older helper's slot, the Phase 5 decode / encode cases,
+  SetFPS without `kbps`). A mock `--encode-test` with `--instance=1 --at=50:fps=30` and a
+  three-rect `roi=` event runs clean ("fps 30 at 50: no key frame").
+- verified (sandbox), review fixes: "SVC: planned IDR with frames in flight"
+  (`--self-test-encoder`; an unplanned key frame at an odd position, then a planned IDR with two
+  frames in the encoder: every frame from the IDR on predicted in the encoder's layer, one
+  resync, a later recovery on a base-layer frame accepted) failed before the fix in
+  `src/codec/ltr.cpp` (2 frames in the wrong layer, 3 resyncs) and passes after it;
+  `--self-test-nvenc` checks caps `sliceOutput` false with the double's
+  `SUPPORT_SUBFRAME_READBACK` set; the strict clang syntax check of the changed sources, `make
+  helper` without warnings, `xvfb-run -a make helper-test`, `go vet` (Linux and Windows) and `go
+  test ./...` pass. Not testable here: AMF `NUM_TEMPORAL_LAYERS` after `Init` and the "runs no
+  temporal layers" warning (no AMD GPU; covered by the SVC stream check below), the dirty share
+  of captures dropped before encoding (the mock never runs behind) and of DDA's first frame
+  after a re-duplication (Wine has no `DuplicateOutput`; covered by the DDA dirty-share check
+  below). The encode test's dirty summary now starts after frame 1 (the first image of the
+  duplication, dirty 1), so the idle-desktop check keeps its thresholds.
+- Not run here: anything on AMF (no AMD GPU: SVC, FRAMERATE, INSTANCE_INDEX, slice / tile
+  output), the NVIDIA driver, DDA dirty rects (Wine's `DuplicateOutput` answers E_NOTIMPL),
+  AMD Direct Capture dirty rects, Chrome decoding a stream with the discardable frames left out.
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC caps): `recon-encoder.exe --print-caps
+  --backend=amf`: record `maxTemporalLayers` for h264 / hevc / av1 (>= 2 expected on VCN 4)
+  and whether `maxLtr` changes for AV1 when a start asks for `svcLayers` 2 (log line "amf: ...
+  LTR ..." of the start).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC stream): for each codec run
+  `recon-encoder.exe --encode-test=svc.hevc --backend=amf --codec=hevc --capture=dda --svc=2
+  --fps=60 --kbps=20000 --frames=600` (AV1: `svc.ivf`) on a moving desktop / game. The started
+  line has `"svcLayers":2`; the summary "temporal layers: ~300 / ~300 frames in layer 0 / 1,
+  ~300 discardable"; the log has no "OUTPUT_TEMPORAL_LAYER ... but the bitstream says", no
+  "the encoder runs no temporal layers" and no "SVC frames carry no temporal layer".
+  `ffmpeg -v error -i svc.hevc -f null -` and `ffmpeg -v error -i svc.base.hevc -f null -`
+  print nothing (the base-only file plays at 30 fps without artifacts: check it in mpv).
+  Record the NAL types: `ffmpeg -i svc.hevc -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E
+  "nal_unit_type|nuh_temporal_id_plus1" | head -40`: layer-1 frames must be `TRAIL_N` (0) with
+  `nuh_temporal_id_plus1` 2; if AMF writes `TRAIL_R` the discardable count is 0 (nothing can be
+  dropped safely): record it. H.264: `nal_ref_idc` 0 on layer-1 slices. AV1:
+  `... trace_headers ... | grep -E "temporal_id|refresh_frame_flags"`: layer-1 frames must
+  have `refresh_frame_flags` 0 (the discardable rule assumes it).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC + LTR recovery): the SVC run with
+  `--ltr-slots=2 --at=200:loss --at=401:loss`: both losses "recovered ... from an LTR (no
+  IDR)", the recovery frames on even layer-0 frame ids (`ffprobe -show_frames` /
+  the summary), `ffmpeg -v error -i svc.hevc -f null -` clean; the log never says "recovery
+  frame ... did not reference LTR slot mask ... as a base-layer frame".
+- AMD RDNA3 (RX 7900 XT): unverified. Test (ROI): two runs on the same busy game scene at a
+  starved bitrate, `--capture=dda --codec=hevc --kbps=3000 --frames=600`, one with
+  `--at=30:roi=0,0,1920,1080,-2+33,33,135,135,6+870,450,180,180,8`: the crosshair region is
+  visibly sharper and the background softer with ROI (crop both files with
+  `ffmpeg -i roi.hevc -vf crop=180:180:870:450 -frames:v 1 c.png`); no "per-frame property not
+  accepted: ...ROI..." warning. Same for `--codec=av1` (AV1 has no ROI cap: confirm it works)
+  and `--codec=h264`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (dirty share, DDA): `--encode-test=d.hevc
+  --backend=amf --codec=hevc --capture=dda --frames=600` on an idle desktop with a blinking
+  caret in Notepad: the summary "dirty share after frame 1: mean < 0.001, max < 0.002"; repeat
+  while dragging a window: max > 0.05. On a rotated (portrait) display the share must stay in
+  0..1 (rects are in the unrotated desktop texture). Re-duplication: repeat the idle-desktop
+  run pressing Ctrl+Alt+Del and cancelling once (secure desktop: ACCESS_LOST, the duplication is
+  recreated): the summary's dirty max is now 1.000 (the first frame of the new duplication
+  counts as wholly changed) while the mean stays below 0.01.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (dirty share, AMD Direct Capture): the same with
+  `--capture=amd-direct`: the summary has a dirty line (not "N frames without dirty
+  information"), i.e. the driver delivers `AMF_DISPLAYCAPTURE_DIRTY_RECTS`; record whether a
+  full-screen game reports 1.0 per frame.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (FPS change, VERIFY no IDR): per codec and
+  `--rc=cbr|vbr`: `--encode-test=f.hevc --backend=amf --codec=hevc --capture=synthetic-gpu
+  --fps=120 --kbps=30000 --frames=900 --at=300:fps=60 --at=600:fps=120`: both lines say "no key
+  frame" and the log has no "the frame-rate change at frame N made a key frame"; the P-frame
+  bitrate per frame doubles at 60 fps (the summary's kbps over 30 frames stays near 30000);
+  `ffmpeg -v error` clean. With `--live-bitrate=flush` a key frame follows (expected). If a
+  key frame follows in seamless mode, record codec / driver: caps `liveFps` must then become
+  `flush` for it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (dedicated engine): `--print-caps --backend=amf`:
+  record `hwInstances` per codec (two VCN engines on Navi 31 expected) and `instanceSelect`
+  true. With Adrenalin Instant Replay recording, run `--encode-test=e0.hevc --backend=amf
+  --codec=hevc --capture=dda --fps=120 --kbps=40000 --frames=1200 --instance=0` and the same
+  with `--instance=1`: `started.encoderInstance` reads back 0 / 1; compare the summary's
+  submit -> output p95; Task Manager > Performance > GPU "Video Encode 0 / 1" shows which engine
+  each run and Instant Replay load. Record which engine Adrenalin uses (the GUIDE assumes 0);
+  `EncoderInstanceFor("dedicated")` picks 1.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (slice / tile output experiment): `--print-caps`:
+  record `sliceOutput` per codec. Where true: `--encode-test=s.hevc --backend=amf --codec=hevc
+  --capture=dda --fps=120 --kbps=40000 --frames=600 --slices=4` (AV1 `--slices=4`, H.264 too):
+  `started.sliceOutput` (the count the encoder took), the summary "sub-frame output: 4.0 parts
+  per frame; first part -> whole frame ms p50 X p95 Y" (X = what a sub-frame transport could
+  gain), key frames where requested (the frame type comes from the parts: check `--at=100:idr`
+  gives "key frame 101"), no "slices of an unfinished frame dropped", `ffmpeg -v error` clean.
+  Record the compression cost: the P-frame bitrate is set by the rate control, so compare
+  picture quality (VMAF) at equal kbps with and without `--slices`.
+- AMD RDNA3 (RX 7900 XT): unverified (not applicable: AMF has no encode without state advance).
+  Test: `--encode-test=r.hevc --backend=amf --reencode=3` must fail to start with
+  "reencodeOversized: AMF cannot encode a frame without advancing its state".
+- NVIDIA: unverified (no NVIDIA host available). Test (driver self-test):
+  `recon-encoder.exe --self-test-nvenc`: "temporal SVC hevc / h264 / av1" ok where the GPU has
+  temporal SVC (layers alternate 0 / 1, the layer-1 frames discardable: if NVENC uses another
+  pattern the test fails: record the pattern from `ffprobe`), "re-encode oversized frames" ok
+  (encodes without state advance and `NvEncRestoreEncoderState` accepted by the driver on every
+  frame; nothing is large enough to be re-encoded there), "self-test-nvenc: ok".
+- NVIDIA: unverified (no NVIDIA host available). Test (SVC stream): the AMD SVC test with
+  `--backend=nvenc` (no `--ltr-slots`; add `--at=200:loss --at=401:loss`: "by reference
+  invalidation (no IDR)"); the base-only file decodes clean; HEVC layer-1 NAL types `TRAIL_N`.
+- NVIDIA: unverified (no NVIDIA host available). Test (re-encode on a scene change):
+  `--encode-test=r.hevc --backend=nvenc --codec=hevc --capture=dda --fps=60 --kbps=10000
+  --frames=1200 --reencode=3` while switching every 2 s between two very different full-screen
+  photos (alt-tab): the summary "re-encoded N frames (bytes: A -> B, ...)" with B well below A;
+  the frames after a re-encoded one show no artifacts (mpv, `ffmpeg -v error` clean); compare
+  the submit -> output p50 / p95 with and without `--reencode` (inline mode waits for each
+  encode on the capture thread) and record both; record whether the driver ever refuses
+  `NvEncRestoreEncoderState` (log "the next frame is an IDR").
+- NVIDIA: unverified (no NVIDIA host available). Test (FPS change): the AMD FPS test with
+  `--backend=nvenc`: "no key frame" at both changes (reconfigure with `forceIDR` 0).
+- NVIDIA: unverified (no NVIDIA host available). Test (ROI, dirty share): the AMD ROI test
+  with `--backend=nvenc` (QP delta maps; AQ stays on) and the DDA dirty-share test.
+- NVIDIA: unverified (not applicable: NVENC spreads frames over its engines itself). Test:
+  `--print-caps --backend=nvenc`: `instanceSelect` false; `--instance=1` refused.
+
+### Session integration (for the session rewrite)
+
+`internal/host/session.go` is unchanged; the Go API is in `internal/host/encoder`:
+
+- Temporal SVC: start with `SVCLayers: 2` where `CodecCaps.MaxTemporalLayers >= 2` (on AMF
+  not together with `IntraRefreshFrames`; `LTRSlots` 2 still works). Under congestion (queue
+  growth, OWD rising: the rate controller of 2.2) leave out frames with `f.Droppable()` before
+  they get a sequence number: the client sees no gap, nothing is lost, the frame rate halves at
+  once and comes back with the next frame sent; do not `Recover` for them and do not count
+  them as losses in the 2.3 ladder (a lost base frame still is one). Fill the frame header TLV
+  tag 7 (temporalLayer) from `Frame.TemporalLayer`. Prefer thinning to a bitrate cut for
+  short spikes (instant, no encoder change). The client needs no change if dropped frames get
+  no sequence number; Chrome decoding the thinned stream is a check for that step.
+- ROI: whenever the pointer moves by more than a block (and for games at start: the centre),
+  `SetROI(FocusROI(started.CaptureWidth, started.CaptureHeight, started.Width, started.Height,
+  pointer, FocusOptions{Background: -2}))` where `CodecCaps.ROI != "none"`; rate-limit to about
+  10 per second (each change allocates a map); `SetROI(nil)` when it returns nil.
+- Dirty share: `ActivityMeter.Add(now, frame)` for every frame; cap the rate controller's
+  target with `SuggestKbps(now, target, floor)` through `SetRate` (seamless codecs only); the
+  FFmpeg path reports no dirty share (the meter then never lowers anything).
+- FPS before resolution: at the rate controller's bitrate floor `SetFPS(LowerFPS(fps, 30))`
+  where `Started.LiveFPS == "seamless"` (else it costs an IDR or a restart: skip; not
+  `CodecCaps.LiveFPS`, which a start with `LiveBitrate` "flush" overrides), and
+  `RaiseFPS(fps, requested)` once the bitrate has recovered; resolution changes only below the
+  lowest step.
+- Dedicated engine: a host config `encoderInstance` = `default` | `dedicated` | `N` ->
+  `EncoderInstanceFor(choice, caps)` -> `StartParams.EncoderInstance`; `default` until the
+  hardware check above says which engine Adrenalin uses.
+- Re-encode and slice output are experiments: expose them as config switches
+  (`StartParams.ReencodeOversized` where `CodecCaps.Reencode`, `StartParams.SliceOutput` where
+  the backend supports it) and log `Stats.Reencoded` / `OversizeBytes` and
+  `OutputQPC - FirstSliceQPC` for the overlay; off by default.
+
+## 3.8 libavcodec fallback backend (Intel Quick Sync Video)
+
+recon-encoder.exe has a third encoder backend, `lavc` (`native/recon-encoder/src/lavc/`), for
+GPUs without an AMF or NVENC backend: Intel Quick Sync Video through FFmpeg's `h264_qsv`,
+`hevc_qsv` and `av1_qsv`, with FFmpeg's shared DLLs loaded at run time (never required).
+docs/HELPER_PROTOCOL.md "libavcodec encoder backend" is the reference. In short:
+
+- Runtime: `avutil-60.dll` + `avcodec-62.dll` (+ `swresample-6.dll`) of an FFmpeg 8.x shared
+  build, from `--ffmpeg-dir` (Go: `encoder.Options.FFmpegDir`) or `ffmpeg-lgpl\` next to the
+  helper, then the helper's directory (a relative `--ffmpeg-dir` is resolved against the
+  current directory first; the helper reads its arguments from the wide command line, so the
+  path may hold any Unicode character); loaded by full path with
+  `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`; majors 62 / 60 required
+  (the vendored FFmpeg 8.1 headers' struct layouts). Missing: `unavailable.lavc` says where it
+  looked and that `install-host.ps1 -InstallLibavcodec` provides them.
+- Licensing: `-InstallLibavcodec` downloads BtbN's LGPL shared build
+  (`ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip`, the oldest 8.x release build listed,
+  SHA-256 checked against the release's `checksums.sha256` like the FFmpeg download) and keeps
+  only `avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll` and `LICENSE.txt` (LGPL v3; libvpl,
+  which QSV needs, is MIT and built into `avcodec-62.dll`). The GPL static `ffmpeg.exe` stays the
+  FFmpeg command-line path; the helper never loads it. The helper links nothing of FFmpeg
+  (`native/third_party/ffmpeg`: 30 public headers, LGPL 2.1+).
+- Input: the converter's NV12 textures mapped into QSV surfaces without a copy (a D3D11VA device
+  context on the capture's device, a derived QSV device, dynamic D3D11 and QSV frame pools,
+  `av_hwframe_map`), 16x16-aligned textures with the picture's edge repeated into the padding;
+  fallback (encoder does not open that way, or `zeroCopy` false): read back into system memory,
+  into frames laid out as qsvenc takes them without a copy of its own (`submit_frame` copies
+  any frame whose height is not the surface height, whose pitch is not a multiple of its width
+  alignment, or whose CbCr plane does not follow the luma rows directly, which is every
+  `av_frame_get_buffer` frame): one buffer, pitch a multiple of 32, `AVFrame.height` = the
+  surface height (16-aligned for H.264, 32 for HEVC / AV1; the converter pads the picture,
+  the encoder crops to it).
+- Settings (Sunshine's quicksync encoder): `async_depth` 1, `low_delay_brc` 1, look-ahead off,
+  no B frames, `forced_idr` 1, `low_power` 1 with a retry at 0, `adaptive_i` 0, GOP 65535 (the
+  longest QSV takes), `rc` cbr = VBR with the peak at the target (`CBR_WITH_VBR`), no VBV size
+  (`NO_RC_BUF_LIMIT`). Forced IDR = `AVFrame.pict_type` I + `AV_FRAME_FLAG_KEY`.
+- Caps: recovery `none` (a loss costs an IDR), `maxLtr` 0, no ROI / SVC / intra refresh / HDR10;
+  `liveBitrate` and `liveFps` `flush` (`assumed`). **Live bitrate in FFmpeg 8.1** (checked in
+  `libavcodec/qsvenc.c`, release/8.1): `update_parameters` notices a changed `bit_rate`,
+  `rc_max_rate`, `rc_buffer_size` or `framerate` on the open encoder, drains it and calls
+  `MFXVideoENCODE_Reset`; it passes no `mfxExtEncoderResetOption`, so whether the runtime starts
+  a new sequence (IDR) is up to the runtime. So the bitrate does change in the running encoder
+  (not `restart`, as GUIDE 3.8 assumed), but whether that costs an IDR is runtime behaviour:
+  the backend forces one in `flush` mode (the default, deterministic), and `start`'s
+  `liveBitrate` `seamless` leaves it out so the hardware check below can measure the runtime.
+- Selection: `--backend=lavc`; `auto` tries it first when adapter 0 is Intel, else after AMF
+  and NVENC. When another backend is chosen, `unavailable.lavc` comes from a light probe (DLLs
+  and an Intel adapter; no QSV encoder opened), so helper restarts on AMD / NVIDIA hosts with
+  an Intel iGPU stay fast.
+- Protocol (additive, version stays 1): caps `backend` `lavc`, `unavailable.lavc` /
+  `lavc-h264` / `lavc-hevc` / `lavc-av1` (when no encoder opens there is no backend, and
+  `unavailable.lavc` lists each encoder's error); `started.encoder` (`hevc_qsv`, ...), with
+  `rateControl` `vbr_capped` / `vbr`, `usage` `low_power` / `default`, `preset`, `zeroCopy`.
+  Go: `Options.FFmpegDir`, `Started.Encoder`.
+
+Sources: FFmpeg release/8.1 `libavcodec/qsvenc.c` (`update_parameters`, `update_bitrate`,
+`update_frame_rate`, `encode_frame`'s `MFX_FRAMETYPE_IDR` for `pict_type` I with `forced_idr`,
+`select_rc_mode`, `ff_qsv_enc_init`'s IOPattern for hw frames), `qsvenc_h264.c` /
+`qsvenc_hevc.c` / `qsvenc_av1.c` / `qsvenc.h` (options), `libavcodec/qsv.c`
+(`ff_qsv_init_session_frames`, `qsv_frame_get_hdl` for dynamic pools), `libavutil/hwcontext_qsv.c`
+(`qsv_dynamic_frames_derive_to`, `qsv_dynamic_pool_map_to`, `qsv_init_surface`'s 16-pixel
+alignment), `libavutil/hwcontext_d3d11va.c` (dynamic pools, `d3d11va_device_init`),
+`libavutil/hwcontext.c` (`av_hwframe_map`, `ff_hwframe_map_create`); Sunshine `src/video.cpp`
+(the `quicksync` encoder: options, `CBR_WITH_VBR`, `NO_RC_BUF_LIMIT`, the `low_power` fallback,
+the GOP); oneVPL `mfxExtEncoderResetOption::StartNewSequence`.
+
+### Verified in the sandbox
+
+- verified (sandbox): dynamic loading, frame submission, forced IDRs, rate changes and the
+  output path end to end with BtbN's FFmpeg 8.1 GPL shared build (n8.1.3-14-g330caae0c1,
+  libavcodec 62.28.103) under Wine 9.0: `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64
+  FFMPEG_DIR=<its bin>` runs `TestHelperIntegrationLavc` with `--lavc-test-encoder=libx264`:
+  no DLLs in `FFmpegDir` = caps `none` with `unavailable.lavc` naming `avcodec-62.dll` and start
+  `unavailable`; caps `lavc` (h264: recovery none, liveBitrate / liveFps flush assumed, maxLtr 0);
+  refusals (hevc without an encoder, ltrSlots, hdr, intraRefreshFrames: `unsupported`); start
+  (`started.encoder` libx264, flush, bt709); key frame 1 with SPS / PPS / IDR; no unasked key
+  frame in the next 10; `forceIdr` -> key frame at once; `setRate` (flush) -> key frame of a new
+  gen; `recover` -> key frame; `SetFPS` (flush) -> key frame of a new gen; `setRoi` ->
+  `unsupported`; the whole stream decodes cleanly with the build's ffmpeg.exe; `seamless`: 20
+  frames after a rate change without a key frame and in gen 0; `synthetic-gpu` with the barcode:
+  the converter's frames read back (Wine has no NV12 render targets: the planar Y / CbCr path),
+  45 frames encoded, decoded by ffmpeg.exe and every decoded frame's barcode = its frame id
+  (since the merge with step 3.1b: its sequence number, frame id - 1, in GUIDE 0.2's format). Every
+  other helper test still passes (also headless, where the GPU subtest skips).
+- verified (sandbox): the encode test through the backend: `recon-encoder.exe
+  --encode-test=x264.h264 --backend=lavc --ffmpeg-dir=<bin> --lavc-test-encoder=libx264
+  --codec=h264 --capture=synthetic --frames=150 --at=20:idr --at=40:loss --at=70:rate=2000
+  --at=100:fps=30`: "encode-test: ok", key frames 1 21 41 71 101, the loss "recovered at 41 by
+  an IDR"; the file decodes cleanly (`ffmpeg -v error -i x264.h264 -f null -` on Linux) with
+  color_range tv, bt709, chroma_location left. libsvtav1 (`--lavc-test-encoder=libx264,libsvtav1`)
+  reports `unavailable.lavc-av1` ("Invalid argument": it takes no NV12), as intended.
+- verified (sandbox, review fixes): `TestHelperIntegrationLavc` "Reasons":
+  `--lavc-test-encoder=libopenh264,nosuch` (libopenh264 takes no NV12) gives caps `none` with
+  `unavailable.lavc` "nosuch is not in this FFmpeg build; libopenh264: avcodec_open2 320x180:
+  Invalid argument (AVERROR -22) (libavcodec ...)" (the a71562c build: "nosuch is not in this
+  FFmpeg build" alone, and "no usable encoder (libavcodec ...)" for libopenh264 alone);
+  `libx264,libopenh264` starts with `started.encoder` libx264. "Paths": `FFmpegDir`
+  "ffmpeg-ü-ж" relative to the working directory loads the libraries (both subtests fail
+  against the a71562c build; by hand under Wine it gave "cannot load bin\avutil-60.dll:
+  Invalid parameter (error 87)" for `--ffmpeg-dir=bin` and "not found in ...ffmpeg-�-?" for
+  the non-ASCII directory). Wine passes such arguments and creates such directories only
+  under a UTF-8 Unix locale: `make helper-test` runs it with `LANG=C.UTF-8`, and the subtest
+  skips under Wine without one.
+- verified (sandbox, review fixes): system-memory frame layout: the GPU subtest (320x180 read
+  back from 320x192 textures) and the Flush / Seamless subtests (pattern frames) pass; the
+  encode test with `--capture=synthetic` at 1280x720, 1366x768 and 1920x1080 (H.264 frames
+  1376 x 768 and 1920 x 1088: pitch and height padded) decodes to the test pattern (mean luma
+  error 0.10-0.17 at 200 Mbps, the last 8 rows and columns no worse, chroma exactly 128), and
+  `--capture=synthetic-gpu` at 1366x768 ("padded to 1376x768") and 1920x1080 ("padded to
+  1920x1088") decodes cleanly at the picture size with intact right and bottom edges.
+  qsvenc's no-copy condition itself is QSV-only: checked against FFmpeg release/8.1
+  `qsvenc.c` `submit_frame` / `init_video_param` (`height_align` 16 for H.264, 32 for HEVC /
+  AV1) and `libavutil/frame.c` `get_video_buffer` (CbCr at `linesize * FFALIGN(h, 32)` plus
+  plane padding, so every `av_frame_get_buffer` frame was copied).
+- verified (sandbox): mutation checks: without `pict_type` I the Flush subtest fails ("forceIdr:
+  no key frame within 10 frames"); without the parameter-set insertion (libx264 with
+  `AV_CODEC_FLAG_GLOBAL_HEADER` keeps SPS / PPS out of the stream) it fails ("key frame 1
+  without SPS / PPS / IDR") and the GPU subtest's decode fails ("non-existing PPS 0").
+- verified (sandbox): the LGPL shared build (`fab88c80...` = BtbN's published SHA-256) loads
+  under Wine ("LGPL version 3 or later") and the QSV probe answers "no Intel adapter" (Wine's
+  adapter reports vendor NVIDIA; overriding Wine's `VideoPciVendorID` did not change DXGI's
+  VendorId, so the QSV code beyond adapter selection did not run).
+- verified (sandbox): install-host.ps1 parses (pwsh 7); its `Get-BtbNChecksums` /
+  `Select-BtbNBuild` / `Expand-BtbNBuild` functions, run against BtbN's live `checksums.sha256`,
+  pick `ffmpeg-n8.1-latest-win64-gpl-8.1.zip` (FFmpeg path, unchanged choice) and
+  `ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip`, accept the real archive (avcodec-62, avutil-60,
+  swresample-6 found) and refuse a wrong hash; with only a 9.0 build listed the libraries are
+  not selected (the helper needs 8.x). The CI step that fetches the GPL shared build for the
+  Windows job was dry-run the same way (checksum check, `RECON_FFMPEG_DIR`; tampered file refused).
+- Not run here: anything on Quick Sync (no Intel GPU, no QSV runtime under Wine): the probe on
+  an Intel adapter, the zero-copy mapping, the readback fallback into a QSV session, the
+  low_power retry, AV1 / HEVC output, rate changes on the runtime; the MSVC build (CI job
+  `helper-windows`, which now also runs `TestHelperIntegrationLavc` with the GPL shared build).
+
+### Hardware checks
+
+On an Intel host (12th gen Core or newer with Iris Xe / UHD 7xx, or an Arc card; Arc and Core
+Ultra for AV1), after `install-host.ps1 -InstallLibavcodec` and a current Intel graphics driver:
+
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (install): `C:\Program
+  Files\KlouditRecon\ffmpeg-lgpl` holds `avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll`,
+  `LICENSE.txt`; running the installer again does not download again, `-UpdateFFmpeg` does.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (caps): `recon-encoder.exe
+  --print-caps --backend=auto --log-level=debug`: `"backend":"lavc","vendor":"intel"`, codecs
+  `h264` and `hevc` (and `av1` on Arc / Core Ultra; elsewhere `unavailable.lavc-av1` with
+  FFmpeg's error); the log says "lavc: libavcodec 62... LGPL version 3 or later" and the probe
+  time ("lavc probe: N ms", record it). A "without low_power" line names a GPU without VDENC for
+  that codec: record which.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (zero copy, HEVC):
+  `recon-encoder.exe --encode-test=out.hevc --backend=lavc --codec=hevc --capture=dda --fps=60
+  --kbps=20000 --frames=600 --at=120:idr --at=200:loss --at=300:rate=8000 --at=400:rate=30000
+  --at=500:fps=30`. The started line has `"encoder":"hevc_qsv","zeroCopy":true,"usage":"low_power"`
+  (if `zeroCopy` is false the log says why: "cannot take the converter's textures (...)"; record
+  the driver / runtime); "encode-test: ok", key frames at 1, 121, the loss frame, 301, 401, 501
+  (flush); submit->output p50 below 5 ms at 1080p60 (record p50 / p95; compare with
+  `--zero-copy=0`, the readback path, which should be slower); `ffmpeg -v error -i out.hevc -f
+  null -` prints nothing; `ffprobe -show_streams out.hevc`: 1920x1080 (not 1088: the crop in the
+  SPS), color_range tv, bt709; the P-frame bitrate lines follow 8000 / 30000 kbps. The same with
+  `--codec=h264` (High profile, `max_dec_frame_buffering` 1 in the VUI: `ffmpeg -bsf:v
+  trace_headers`).
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (readback without qsvenc's
+  copy): the zero-copy test with `--zero-copy=0` at 1920x1080 for `--codec=h264` and
+  `--codec=hevc` (frames 1088 rows high: H.264 16-, HEVC 32-aligned) and once at 1366x768:
+  "encode-test: ok", the file decodes cleanly at the picture size with intact right and bottom
+  edges (`ffmpeg -i out.hevc -frames:v 1 last.png`), no "map frame to surface failed" in the
+  debug log; record submit->output p50 / p95 against the zero-copy run.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (live bitrate without the
+  forced IDR): the zero-copy test with `--live-bitrate=seamless`: the rate lines say "no key
+  frame" if the runtime resets without a new sequence; then the bitrate follows within a few
+  frames and caps `liveBitrate` / `liveFps` can become `seamless` for QSV (step 3.6's
+  qualification records it per codec). "key frame N follows" means the runtime starts a new
+  sequence on `MFXVideoENCODE_Reset`: keep `flush`.
+- Intel (Arc / Core Ultra): unverified (no Intel host available). Test (AV1): the zero-copy test
+  with `--codec=av1 --encode-test=out.ivf`: decodes cleanly; `ffprobe -show_streams out.ivf`
+  reports 1920x1080 (VERIFY: the AV1 frame size comes from the surface's CropW / CropH, not
+  the 16-aligned 1088), key frames as above.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (hybrid laptop, Intel iGPU +
+  NVIDIA dGPU): `--print-caps` picks `lavc` when adapter 0 is the iGPU; a `start` on an output of
+  the NVIDIA GPU is refused ("Quick Sync Video encodes on an Intel adapter"); record which
+  backend `auto` should prefer there.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (soak): a 30-minute
+  `--encode-test` (`--frames=108000`) with `--at=` IDRs every 600 frames: no "encoder is behind"
+  warnings (the mapped textures go back to the converter's pool), the helper's private bytes
+  (Task Manager / `Get-Process recon-encoder`) flat after the first minute.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with `-InstallLibavcodec` done, `recon-encoder.exe
+  --print-caps --log-level=debug` still says `"backend":"amf"` and `unavailable.lavc` "no Intel
+  adapter ..." (with an Intel iGPU enabled: no `lavc` entry and no "lavc probe" line: the light
+  probe opened nothing); the caps come as fast as without the libraries.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD test with `"backend":"nvenc"`.
+
+### Session integration (for the session rewrite)
+
+The pipeline selection of step 3.1b is not in this worktree's base, so `internal/host/session.go`
+is unchanged; the Go API is `internal/host/encoder`:
+
+- No session change is needed for the backend to be used: `Launch` with `Backend` "auto" picks
+  `lavc` on an Intel primary adapter when the libraries are installed (default directory next
+  to the helper); `Caps.Usable()` then holds and the 3.1b selection (helper when the caps
+  handshake succeeds, else FFmpeg) applies unchanged. `Options.FFmpegDir` only for a host.json
+  override (e.g. `"helperFFmpegDir"`); leave it empty normally.
+- Behaviour from caps, not vendor names: `CodecCaps.Recovery` "none" -> a confirmed loss is
+  `ForceIDR` (or `Recover`, which does the same); `LiveBitrate` / `Started.LiveBitrate` "flush"
+  -> rate changes cost an IDR: change less often (as 3.6's flush handling); `ROI` "none" -> no
+  `SetROI`; `MaxLTR` 0 -> `LTRSlots` 0; `HDR10` false -> no `HDR`.
+- Log `Started.Encoder`, `Usage` and `ZeroCopy` with the session start (an Intel host without
+  zero copy reads frames back: a few ms more latency).
+- The FFmpeg command-line path (GPL `ffmpeg.exe`, hevc_qsv through `hwmap`) stays the fallback
+  when the helper is not usable.

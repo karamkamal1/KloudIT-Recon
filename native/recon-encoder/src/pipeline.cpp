@@ -1,5 +1,6 @@
 #include "pipeline.hpp"
 
+#include "capture/dirty.hpp"
 #include "platform/platform.hpp"
 
 namespace recon {
@@ -21,8 +22,9 @@ void Pipeline::dump(const d3d::ConvertedFrame& f, uint64_t frameId) {
         const bool ok = WriteFile(file, data.data(), DWORD(data.size()), &wrote, nullptr) && wrote == data.size();
         CloseHandle(file);
         if (ok) {
-            logf(LogLevel::Info, "dumped frame %llu (%ux%u NV12) to %s", static_cast<unsigned long long>(frameId),
-                 opt_.converter->width(), opt_.converter->height(), opt_.dumpPath.c_str());
+            logf(LogLevel::Info, "dumped frame %llu (%ux%u %s) to %s", static_cast<unsigned long long>(frameId),
+                 opt_.converter->width(), opt_.converter->height(),
+                 opt_.converter->format() == d3d::Nv12Converter::Format::P010 ? "P010" : "NV12", opt_.dumpPath.c_str());
             return;
         }
     }
@@ -55,7 +57,7 @@ Status Pipeline::setRate(const RateParams& r) {
     if (!s.ok) return s;
     if (r.fps > 0) cap_.setFps(r.fps);
     std::lock_guard<std::mutex> lock(rateMu_);
-    rate_.kbps = r.kbps;
+    if (r.kbps > 0) rate_.kbps = r.kbps;
     if (r.vbvFrames > 0) rate_.vbvFrames = r.vbvFrames;
     if (r.fps > 0) rate_.fps = r.fps;
     return s;
@@ -70,6 +72,10 @@ void Pipeline::captureLoop() {
     uint64_t seqBase = 1, idrServed = 0;
     bool firstPending = true;
     int64_t lastPoolWarn = 0, lastBusyWarn = 0;
+    // The dirty share of captures dropped before the encoder took them: the
+    // next encoded frame references an older image, so it carries their
+    // changes too (like the pacer's merged deliveries).
+    float droppedDirty = 0;
     while (!stop_) {
         CapturedFrame frame;
         Status err;
@@ -99,7 +105,8 @@ void Pipeline::captureLoop() {
         info.presentQpc = frame.presentQpc;
         info.captureQpc = frame.captureQpc;
         info.repeat = frame.repeat;
-        info.dirtyPct = frame.dirtyPct;
+        info.dirty = mergeDirty(droppedDirty, frame.dirty);
+        droppedDirty = info.dirty;  // until the encoder takes the frame
         const uint64_t idrWanted = idrRequests_.load();
         bool idr = idrWanted != idrServed;
         if (idr) {
@@ -139,7 +146,12 @@ void Pipeline::captureLoop() {
                 rep_.error(cs, "");
                 continue;
             }
-            ef.nv12 = cf.nv12 ? cf.nv12 : cf.y;  // planar test mode (stream.cpp): the luma plane stands in
+            ef.nv12 = cf.nv12;
+            ef.y = cf.nv12 ? nullptr : cf.y;
+            ef.uv = cf.nv12 ? nullptr : cf.uv;
+            // Planar test mode for backends that read nothing (stream.cpp):
+            // the luma plane stands in for the NV12 texture.
+            if (!ef.nv12 && opt_.lumaStandsIn) ef.nv12 = cf.y;
             ef.hold = cf.hold;
             ef.poolIndex = cf.index;
             if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);
@@ -161,6 +173,7 @@ void Pipeline::captureLoop() {
             continue;
         }
         ++nextId;
+        if (s.ok) droppedDirty = 0;
         if (s.ok && info.seqStart) {
             seqBase = info.frameId;
             firstPending = false;
@@ -212,7 +225,12 @@ void Pipeline::outputLoop() {
         st.key = f.key;
         st.recovery = f.recovery;
         st.repeat = f.info.repeat;
-        st.dirtyPct = f.info.dirtyPct;
+        st.dirty = f.info.dirty;
+        st.discardable = f.discardable;
+        st.reencoded = f.reencoded;
+        st.oversizeBytes = f.oversizeBytes;
+        st.slices = f.slices;
+        st.firstSliceQpc = f.firstSliceQpc;
         st.bytes = f.size;
         st.presentQpc = f.info.presentQpc;
         st.captureQpc = f.info.captureQpc;

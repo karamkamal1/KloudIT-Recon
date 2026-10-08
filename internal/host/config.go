@@ -11,6 +11,7 @@ import (
 	"runtime"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
 
@@ -40,6 +41,13 @@ type Config struct {
 	// recon-host.exe, Windows) when it starts, can encode the negotiated codec
 	// and the session needs nothing only FFmpeg offers; else FFmpeg.
 	Pipeline string `json:"pipeline,omitempty"`
+	// VirtualDisplay gives a session a virtual monitor matched to the client
+	// (resolution and frame rate) through an installed IddCx driver
+	// (internal/host/vdisplay): off | auto | on ("" = off).
+	VirtualDisplay string `json:"virtualDisplay,omitempty"`
+	// VirtualDisplayLayout places the virtual monitor: primary | extend | only
+	// ("" = primary).
+	VirtualDisplayLayout string `json:"virtualDisplayLayout,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -144,6 +152,14 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: pipeline must be %q, %q or %q, not %q", path, pipelineAuto, media.PipelineHelper,
 			media.PipelineFFmpeg, c.Pipeline)
 	}
+	if !vdisplay.ValidPolicy(c.VirtualDisplay) {
+		return nil, fmt.Errorf("%s: virtualDisplay must be %q, %q or %q, not %q", path,
+			vdisplay.PolicyOff, vdisplay.PolicyAuto, vdisplay.PolicyOn, c.VirtualDisplay)
+	}
+	if !vdisplay.ValidLayout(c.VirtualDisplayLayout) {
+		return nil, fmt.Errorf("%s: virtualDisplayLayout must be %q, %q or %q, not %q", path,
+			vdisplay.LayoutPrimary, vdisplay.LayoutExtend, vdisplay.LayoutOnly, c.VirtualDisplayLayout)
+	}
 	c.path = path
 	return c, nil
 }
@@ -177,6 +193,26 @@ func (c *Config) gpuPriority() string {
 		return media.GPUPriorityAuto
 	}
 	return c.GPUPriority
+}
+
+// virtualDisplayOptions are the vdisplay.Options of this config: policy and
+// layout, the restore journal next to the config file, and the host id as the
+// virtual monitor's identity. The caller adds RenderAdapter, Linger and Log.
+func (c *Config) virtualDisplayOptions() vdisplay.Options {
+	o := vdisplay.Options{Policy: c.VirtualDisplay, Layout: c.VirtualDisplayLayout, MonitorID: c.HostID}
+	if o.Policy == "" {
+		o.Policy = vdisplay.PolicyOff
+	}
+	if o.Layout == "" {
+		o.Layout = vdisplay.LayoutPrimary
+	}
+	if o.MonitorID == "" {
+		o.MonitorID = c.Name
+	}
+	if c.path != "" {
+		o.StateDir = filepath.Dir(c.path)
+	}
+	return o
 }
 
 // Save writes the config with owner-only permissions (it contains the host token).

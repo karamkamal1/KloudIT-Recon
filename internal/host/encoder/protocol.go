@@ -5,7 +5,10 @@
 //
 // recon-host starts one helper per streaming session (Launch), reads its
 // capabilities (Caps), starts the stream (Start), steers it at run time
-// (ForceIDR, Recover, SetRate, SetROI) and reads encoded frames (Frames).
+// (ForceIDR, Recover, SetRate, SetFPS, SetROI) and reads encoded frames (Frames).
+// Phase 5 helpers: FocusROI (cursor / crosshair regions, focus.go),
+// ActivityMeter (a static desktop from the dirty share, activity.go),
+// Frame.Droppable (temporal SVC), LowerFPS and EncoderInstanceFor (adapt.go).
 // Restarting a helper that exited or reported a fatal error is the caller's
 // job: Launch a new one and Start it (its first frame is an IDR).
 package encoder
@@ -35,9 +38,14 @@ type StartParams struct {
 	VBVFrames float64 `json:"vbvFrames,omitempty"` // VBV buffer in frame intervals (default 1)
 	RC        string  `json:"rc,omitempty"`        // cbr (default) | vbr (AMF LATENCY_CONSTRAINED_VBR) | vbr_peak (AMF PEAK_CONSTRAINED_VBR; NVENC VBR)
 	Quality   string  `json:"quality,omitempty"`   // speed (default) | balanced | quality
-	HDR       bool    `json:"hdr,omitempty"`
-	LTRSlots  int     `json:"ltrSlots,omitempty"`  // long-term reference slots (ACK-based recovery)
-	SVCLayers int     `json:"svcLayers,omitempty"` // temporal layers (default 1)
+	// HDR asks for HDR10 (opt-in, GUIDE 3.9): when the captured output is in
+	// Windows HDR mode (Output.HDR) the stream is 10-bit BT.2020 PQ with HDR
+	// metadata (Started.HDR); an SDR output still gives an SDR stream. Only
+	// with a codec whose CodecCaps.HDR10 is true (hevc, av1), else Start fails
+	// with "unsupported".
+	HDR       bool `json:"hdr,omitempty"`
+	LTRSlots  int  `json:"ltrSlots,omitempty"`  // long-term reference slots (ACK-based recovery)
+	SVCLayers int  `json:"svcLayers,omitempty"` // temporal layers (default 1)
 
 	// Monitor selection, in this order: HMonitor; AdapterLUID + Monitor (output
 	// index on that adapter); Monitor alone (output index on DXGI adapter 0,
@@ -62,6 +70,15 @@ type StartParams struct {
 	// live-bitrate qualification (step 3.6): presents without pauses, every
 	// image new (a scrolling pattern under full-frame noise).
 	Motion bool `json:"motion,omitempty"`
+
+	// Phase 5 experiments (zero = off). ReencodeOversized: a non-key frame
+	// larger than this many average frames (bitrate / fps) is encoded again at
+	// a higher QP before it goes out (1.5..100; only with CodecCaps.Reencode,
+	// NVENC). SliceOutput: slices / tiles per frame handed out one by one by
+	// the encoder (AMF, CodecCaps.SliceOutput); frames still arrive whole,
+	// Stats.FirstSliceQPC says when their first part was ready.
+	ReencodeOversized float64 `json:"reencodeOversized,omitempty"`
+	SliceOutput       int     `json:"sliceOutput,omitempty"`
 }
 
 // Barcode places the frame barcode of GUIDE 0.2 into every encoded frame,
@@ -93,7 +110,7 @@ type ROIRect struct {
 type Caps struct {
 	V             int                  `json:"v"`
 	HelperVersion string               `json:"helperVersion"`
-	Backend       string               `json:"backend"` // amf | nvenc | mock | none
+	Backend       string               `json:"backend"` // amf | nvenc | lavc | mock | none
 	Vendor        string               `json:"vendor"`  // amd | nvidia | intel | other | mock
 	AdapterLUID   string               `json:"adapterLuid"`
 	AdapterName   string               `json:"adapterName"`
@@ -122,6 +139,14 @@ type Output struct {
 	Height       int    `json:"height"`
 	Rotation     int    `json:"rotation"` // 0 | 90 | 180 | 270
 	Attached     bool   `json:"attached"`
+	// Colour (IDXGIOutput6::GetDesc1; older helpers and Wine: zero): HDR is
+	// Windows HDR on for this output; the luminance values are the panel's, in
+	// cd/m2 (EDID or the Windows HDR calibration).
+	HDR                   bool    `json:"hdr"`
+	BitsPerColor          int     `json:"bitsPerColor"`
+	MinLuminance          float64 `json:"minLuminance"`
+	MaxLuminance          float64 `json:"maxLuminance"`
+	MaxFullFrameLuminance float64 `json:"maxFullFrameLuminance"`
 }
 
 // CodecCaps describes one codec of the selected backend.
@@ -145,6 +170,19 @@ type CodecCaps struct {
 	// DynamicResolution: the running encoder can change its coded size
 	// without a new session (NVENC); no control message uses it yet.
 	DynamicResolution bool `json:"dynamicResolution"`
+	// HDR10: StartParams.HDR can produce HDR10 with this codec (10-bit P010
+	// input, Main10 / AV1 10-bit, BT.2020 PQ and HDR metadata; step 3.9).
+	HDR10 bool `json:"hdr10"`
+	// Phase 5 (older helpers omit them: "" / false). LiveFPS: how SetFPS (a
+	// frame-rate change) is applied by default, seamless | flush | restart,
+	// like LiveBitrate (a start with LiveBitrate "flush" makes it flush:
+	// Started.LiveFPS is what the stream does). InstanceSelect:
+	// StartParams.EncoderInstance picks the hardware engine (AMF); false:
+	// leave it nil (NVENC spreads its work over its engines). Reencode:
+	// StartParams.ReencodeOversized works.
+	LiveFPS        string `json:"liveFps"`
+	InstanceSelect bool   `json:"instanceSelect"`
+	Reencode       bool   `json:"reencode"`
 	// Assumed names the fields above that are documented or default values,
 	// not detected on this GPU (e.g. AMF AV1 "roi"; "liveBitrate", which
 	// recon-host qualify measures: internal/host/qualify); omitted when
@@ -193,7 +231,10 @@ func (c *Caps) IntraRefreshFrames(codec string, fps int) int {
 
 // Started answers a successful Start with what the encoder actually does.
 type Started struct {
-	Backend       string `json:"backend"`
+	Backend string `json:"backend"`
+	// Encoder is the FFmpeg encoder of the libavcodec backend (h264_qsv,
+	// hevc_qsv, av1_qsv; step 3.8), "" for the others and older helpers.
+	Encoder       string `json:"encoder"`
 	Capture       string `json:"capture"`
 	Codec         string `json:"codec"`
 	Width         int    `json:"width"`
@@ -240,17 +281,48 @@ type Started struct {
 	Preset      string `json:"preset"`
 	AsyncEncode bool   `json:"asyncEncode"`
 	RefFrames   int    `json:"refFrames"`
+	// HDR10 (step 3.9): HDR is true when the stream is 10-bit BT.2020 PQ
+	// (ColorSpace "bt2020-pq", BitDepth 10) with HDRMetadata; otherwise 8-bit
+	// "bt709". Older helpers omit them (zero values: treat as 8-bit BT.709).
+	HDR         bool         `json:"hdr"`
+	BitDepth    int          `json:"bitDepth"`
+	ColorSpace  string       `json:"colorSpace"`
+	HDRMetadata *HDRMetadata `json:"hdrMetadata,omitempty"`
+	// Phase 5 (older helpers omit them): the temporal layers the encoder runs
+	// (1 = no SVC; 0 from an older helper means 1), how SetFPS is applied,
+	// the re-encode threshold and the slices / tiles per frame in use (0 = off).
+	SVCLayers         int     `json:"svcLayers"`
+	LiveFPS           string  `json:"liveFps"`
+	ReencodeOversized float64 `json:"reencodeOversized"`
+	SliceOutput       int     `json:"sliceOutput"`
+}
+
+// HDRMetadata is an HDR10 stream's static metadata as the encoder writes it
+// (HEVC mastering display colour volume and content light level SEI, AV1
+// metadata OBUs): the mastering display's primaries and white point (CIE 1931
+// xy; BT.2020 / D65) and luminance range, MaxCLL and MaxFALL. The helper takes
+// the luminance values from the captured output (the host display's limits).
+type HDRMetadata struct {
+	DisplayPrimaries [3][2]float64 `json:"displayPrimaries"` // red, green, blue
+	WhitePoint       [2]float64    `json:"whitePoint"`
+	MaxLuminance     float64       `json:"maxLuminance"` // cd/m2
+	MinLuminance     float64       `json:"minLuminance"`
+	MaxCLL           int           `json:"maxCll"` // cd/m2, 0 = unknown
+	MaxFALL          int           `json:"maxFall"`
 }
 
 // CaptureChanged reports a change of the capture source. Reason "resized":
 // new size or rotation (the stream keeps its encoded size, scaled; restart the
 // helper to follow); "lost": capture unavailable for now (secure desktop,
-// output gone, mode switch), the last image is repeated; "restored".
+// output gone, mode switch), the last image is repeated; "restored"; "hdr":
+// Windows HDR was turned on or off for the output (HDR says which; the stream
+// keeps its format, restart the helper to follow).
 type CaptureChanged struct {
 	Reason   string `json:"reason"`
 	Width    int    `json:"width"`
 	Height   int    `json:"height"`
 	Rotation int    `json:"rotation"`
+	HDR      bool   `json:"hdr"` // the output is in HDR mode now (dda; amd-direct: as at the start)
 	Text     string `json:"text"`
 }
 
@@ -258,14 +330,27 @@ type CaptureChanged struct {
 // (Dropped, Reason "ringFull" or "tooLarge"). Timestamps are QPC ticks
 // (Caps.QPCFrequency per second).
 type Stats struct {
-	FrameID       uint64  `json:"frameId"`
-	Gen           uint32  `json:"gen"`
-	Dropped       bool    `json:"dropped"`
-	Reason        string  `json:"reason,omitempty"`
-	Key           bool    `json:"key"`
-	Recovery      bool    `json:"recovery"`
-	Repeat        bool    `json:"repeat"`   // idle re-submit of the previous image
-	DirtyPct      int     `json:"dirtyPct"` // share of the image that changed, -1 = unknown
+	FrameID  uint64 `json:"frameId"`
+	Gen      uint32 `json:"gen"`
+	Dropped  bool   `json:"dropped"`
+	Reason   string `json:"reason,omitempty"`
+	Key      bool   `json:"key"`
+	Recovery bool   `json:"recovery"`
+	Repeat   bool   `json:"repeat"`   // idle re-submit of the previous image
+	DirtyPct int    `json:"dirtyPct"` // share of the image that changed in whole percent, rounded up; -1 = unknown
+	// Dirty is the same share as a fraction (0..1, the union of the capture's
+	// dirty rects), -1 = unknown (also from helpers older than Phase 5).
+	Dirty       float64 `json:"dirty"`
+	Discardable bool    `json:"discardable"` // no later frame references it (Frame.Droppable)
+	// Reencoded: encoded a second time at a higher QP (StartParams.
+	// ReencodeOversized); OversizeBytes is the size of the first encode.
+	Reencoded     bool   `json:"reencoded,omitempty"`
+	OversizeBytes uint64 `json:"oversizeBytes,omitempty"`
+	// Slices / FirstSliceQPC (StartParams.SliceOutput): the parts the frame
+	// came out in and when the first one was ready (OutputQPC - FirstSliceQPC
+	// is what sub-frame delivery could gain).
+	Slices        int     `json:"slices,omitempty"`
+	FirstSliceQPC int64   `json:"firstSliceQpc,omitempty"`
 	Bytes         uint64  `json:"bytes"`
 	PresentQPC    int64   `json:"presentQpc"`
 	CaptureQPC    int64   `json:"captureQpc"`
@@ -319,8 +404,8 @@ type recoverMsg struct {
 }
 
 type setRateMsg struct {
-	T         string  `json:"t"` // "setRate"
-	Kbps      int     `json:"kbps"`
+	T         string  `json:"t"`              // "setRate"
+	Kbps      int     `json:"kbps,omitempty"` // 0 = unchanged (SetFPS)
 	VBVFrames float64 `json:"vbvFrames,omitempty"`
 	FPS       int     `json:"fps,omitempty"`
 }
@@ -354,7 +439,7 @@ func decodeMessage(b []byte) (any, error) {
 	case "started":
 		v = &Started{}
 	case "stats":
-		v = &Stats{}
+		v = &Stats{Dirty: -1} // older helpers send no "dirty": unknown
 	case "captureChanged":
 		v = &CaptureChanged{}
 	case "error":

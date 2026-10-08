@@ -114,6 +114,13 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   it) that then admits datagrams from those ports only. The socket itself refuses every other
   QUIC sender that gets through (`CONNECTION_REFUSED`, or Version Negotiation for an unknown
   QUIC version) and never opens a connection or a session for it.
+- The elevated agent adds client modes to the Virtual Display Driver's settings
+  (`C:\VirtualDisplayDriver\vdd_settings.xml`). The installer gives that folder an explicit,
+  non-inherited ACL owned by Administrators (Administrators and SYSTEM full control, Users read),
+  because a folder created under `C:\` lets every signed-in user modify it. The agent writes
+  there only when the folder and the files it writes are not links (reparse points), are owned by
+  Administrators, SYSTEM or TrustedInstaller, and give no one else write, delete or permission
+  rights; otherwise it refuses and names the `icacls` command that fixes the folder.
 
 ## Gateway hardening (systemd)
 

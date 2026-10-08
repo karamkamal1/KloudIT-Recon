@@ -43,6 +43,28 @@ int rotationDegrees(DXGI_MODE_ROTATION r) {
     }
 }
 
+DisplayColor displayColor(IDXGIOutput* output) {
+    DisplayColor c;
+    ComPtr<IDXGIOutput6> o6;
+    DXGI_OUTPUT_DESC1 d{};
+    if (!output || FAILED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(o6.GetAddressOf()))) ||
+        FAILED(o6->GetDesc1(&d))) {
+        return c;
+    }
+    c.known = true;
+    // Sunshine display_base.cpp is_hdr(): Windows composes an HDR desktop in
+    // scRGB and scans it out as BT.2020 PQ.
+    c.hdr = d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    c.bitsPerColor = int(d.BitsPerColor);
+    for (int i = 0; i < 2; ++i) {
+        c.red[i] = d.RedPrimary[i], c.green[i] = d.GreenPrimary[i], c.blue[i] = d.BluePrimary[i], c.white[i] = d.WhitePoint[i];
+    }
+    c.minLuminance = d.MinLuminance;
+    c.maxLuminance = d.MaxLuminance;
+    c.maxFullFrameLuminance = d.MaxFullFrameLuminance;
+    return c;
+}
+
 namespace {
 
 // Walks every adapter and output; fn returns true to stop.
@@ -87,6 +109,7 @@ bool forEachOutput(Fn&& fn) {
             d.height = od.DesktopCoordinates.bottom - od.DesktopCoordinates.top;
             d.rotation = rotationDegrees(od.Rotation);
             d.attached = od.AttachedToDesktop != FALSE;
+            d.color = displayColor(output.Get());
             if (fn(ref)) return true;
         }
     }

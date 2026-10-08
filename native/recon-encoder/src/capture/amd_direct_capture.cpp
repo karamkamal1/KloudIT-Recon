@@ -13,7 +13,7 @@
 //   Streaming SDK's amf_increase_timer_precision() does; the sleep itself is
 //   the high-resolution waitable timer, and the stop event ends it).
 // Per surface: FRAME_FLIP_TIMESTAMP (QPC) is presentQpc, DIRTY_RECTS (an
-// AMFBuffer of AMFRect) gives dirtyPct, DisplayCaptureDCC says whether the
+// AMFBuffer of AMFRect) gives the dirty share, DisplayCaptureDCC says whether the
 // surface is DCC compressed.
 //
 // DUPLICATEOUTPUT: the pipeline keeps a pending and a current surface (newest
@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <vector>
 
 #include <AMF/components/DisplayCapture.h>
 #include <AMF/core/Buffer.h>
@@ -47,6 +48,7 @@
 #include <AMF/core/Surface.h>
 
 #include "amf/amf_runtime.hpp"
+#include "capture/dirty.hpp"
 #include "capture/paced_capture.hpp"
 #include "d3d/device.hpp"
 #include "probes.hpp"
@@ -97,7 +99,7 @@ protected:
 
 private:
     Status initComponent();
-    int dirtyPercent(amf::AMFSurface* s, amf_int32 w, amf_int32 h);
+    float dirtyShare(amf::AMFSurface* s, amf_int32 w, amf_int32 h);
 
     d3d::OutputRef output_;
     d3d::Device dev_;
@@ -134,14 +136,27 @@ Status AmdDirectCapture::init(const StartParams& p) {
     }
     s = initComponent();
     if (!s.ok) return s;
+    const DisplayColor color = d3d::displayColor(output_.output.Get());
+    bool hdr = false;
     {
         std::lock_guard<std::mutex> lock(srcMu_);
         src_.device = dev_.device.Get();
         src_.adapter = output_.adapterInfo;
         src_.amfContext = ctx_.GetPtr();
+        src_.display = color;
+        // HDR10 (step 3.9) from FP16 scRGB surfaces only, which the colour
+        // conversion takes like DDA's. What the component delivers on an HDR
+        // desktop is a VERIFY item (docs/VENDOR_NOTES.md 3.9); anything else
+        // (8-bit, R10G10B10A2) gives an SDR stream.
+        hdr = src_.hdr = p.hdr && color.hdr && src_.amfFormat == amf::AMF_SURFACE_RGBA_F16;
     }
-    logf(LogLevel::Info, "amd-direct: %s (monitor index %d) on %s, AMF runtime %s", output_.desc.name.c_str(),
-         output_.desc.outputIndex, output_.adapterInfo.name.c_str(), rt.versionText.c_str());
+    if (p.hdr && color.hdr && !hdr) {
+        logf(LogLevel::Info, "amd-direct: Windows HDR is on, but the capture surfaces are AMF format %d, not RGBA_F16: SDR",
+             src_.amfFormat);
+    }
+    logf(LogLevel::Info, "amd-direct: %s (monitor index %d) on %s, AMF runtime %s, Windows HDR %s%s", output_.desc.name.c_str(),
+         output_.desc.outputIndex, output_.adapterInfo.name.c_str(), rt.versionText.c_str(),
+         !color.known ? "unknown" : color.hdr ? "on" : "off", hdr ? " (FP16 scRGB capture)" : "");
     startPacing(p, dev_.device.Get());
     return Status::Ok();
 }
@@ -176,7 +191,11 @@ Status AmdDirectCapture::initComponent() {
     return Status::Ok();
 }
 
-int AmdDirectCapture::dirtyPercent(amf::AMFSurface* s, amf_int32 w, amf_int32 h) {
+// The share of the surface its DIRTY_RECTS (an AMFBuffer of AMFRect, the
+// same left / top / right / bottom layout as DirtyRect) cover, each region
+// counted once; -1 when the surface carries none.
+float AmdDirectCapture::dirtyShare(amf::AMFSurface* s, amf_int32 w, amf_int32 h) {
+    static_assert(sizeof(AMFRect) == sizeof(DirtyRect), "AMFRect is four amf_int32");
     amf::AMFInterfacePtr iface;
     if (s->GetProperty(AMF_DISPLAYCAPTURE_DIRTY_RECTS, &iface) != AMF_OK || !iface) return -1;
     amf::AMFBufferPtr buf(iface);
@@ -184,9 +203,9 @@ int AmdDirectCapture::dirtyPercent(amf::AMFSurface* s, amf_int32 w, amf_int32 h)
     const auto* rects = static_cast<const AMFRect*>(buf->GetNative());
     const size_t n = buf->GetSize() / sizeof(AMFRect);
     if (!rects && n) return -1;
-    double area = 0;
-    for (size_t i = 0; i < n; ++i) area += double(rects[i].right - rects[i].left) * double(rects[i].bottom - rects[i].top);
-    return int(std::min(100.0, std::ceil(area * 100.0 / (double(w) * h))));
+    std::vector<DirtyRect> r(n);
+    for (size_t i = 0; i < n; ++i) r[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
+    return float(dirtyFraction(r.data(), r.size(), uint32_t(w), uint32_t(h)));
 }
 
 Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
@@ -214,6 +233,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "restored";
             ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
+            ev.hdr = src_.display.hdr;  // as at the start (DDA follows HDR switches)
             postEvent(ev);
         }
         amf::AMFDataPtr data;
@@ -239,6 +259,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "lost";
             ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
+            ev.hdr = src_.display.hdr;  // as at the start (DDA follows HDR switches)
             ev.text = amfError("QueryOutput", r);
             postEvent(ev);
             continue;
@@ -246,14 +267,13 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         amf::AMFSurfacePtr surface(data);
         // More presents may be queued: keep only the newest (newest wins),
         // adding up the dirty areas of the ones skipped.
-        int dirty = surface ? dirtyPercent(surface, lastW_, lastH_) : -1;
+        float dirty = surface ? dirtyShare(surface, lastW_, lastH_) : -1.0f;
         for (;;) {
             amf::AMFDataPtr more;
             if (comp_->QueryOutput(&more) != AMF_OK || !more) break;
             amf::AMFSurfacePtr newer(more);
             if (!newer) break;
-            const int d = dirtyPercent(newer, lastW_, lastH_);
-            dirty = dirty < 0 || d < 0 ? -1 : std::min(100, dirty + d);
+            dirty = mergeDirty(dirty, dirtyShare(newer, lastW_, lastH_));
             surface = newer;
         }
         amf::AMFPlane* plane = surface ? surface->GetPlaneAt(0) : nullptr;
@@ -266,20 +286,21 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "resized";
             ev.width = int(w), ev.height = int(h), ev.rotation = rotation_;
+            ev.hdr = src_.display.hdr;
             ev.text = "was " + std::to_string(lastW_) + "x" + std::to_string(lastH_);
             postEvent(ev);
             std::lock_guard<std::mutex> lock(srcMu_);
             src_.width = uint32_t(w);
             src_.height = uint32_t(h);
-            dirty = 100;
+            dirty = 1;
         }
-        if (!lastW_) dirty = dirtyPercent(surface, w, h);
+        if (!lastW_) dirty = dirtyShare(surface, w, h);
         lastW_ = w, lastH_ = h;
         amf_int64 flip = 0;
         surface->GetProperty(AMF_DISPLAYCAPTURE_FRAME_FLIP_TIMESTAMP, &flip);
         a.presentQpc = flip;  // QueryPerformanceCounter ticks (AMF_Display_Capture_API.md 2.5)
         a.captureQpc = now;
-        a.dirtyPct = dirty;
+        a.dirty = dirty;
         pending_ = surface;  // an older pending surface is dropped here (newest wins)
         return Next::Frame;
     }

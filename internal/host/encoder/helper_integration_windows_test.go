@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -540,9 +541,11 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--self-test-encoder: %v", err)
 	}
-	// GPU colour conversion on WARP. Wine needs an X display for D3D11 and has
-	// no NV12 render targets (the self-test then checks the same shaders on
-	// separate planes); real Windows must pass in NV12 mode.
+	// GPU colour conversion on WARP (SDR NV12 and HDR10 P010). Wine needs an X
+	// display for D3D11 and has no NV12 / P010 render targets (the self-test
+	// then checks the same shaders on separate planes); real Windows must pass
+	// in NV12 mode (P010 render targets are logged, not required: WARP's are a
+	// VERIFY item, docs/VENDOR_NOTES.md 3.9).
 	out, err = exec.Command(exe, "--self-test-convert").CombinedOutput()
 	t.Logf("%s", out)
 	var ee *exec.ExitError
@@ -552,7 +555,7 @@ func TestHelperIntegrationSelfTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--self-test-convert: %v", err)
 	}
-	if !underWine() && !strings.Contains(string(out), "self-test-convert: ok (mode nv12)") {
+	if !underWine() && !strings.Contains(string(out), "self-test-convert: ok (mode nv12;") {
 		t.Fatal("conversion not tested on NV12 render targets")
 	}
 }
@@ -633,6 +636,18 @@ func TestHelperIntegrationEncodeTest(t *testing.T) {
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) || ee.ExitCode() != 2 || !strings.Contains(string(b), "fps out of range") {
 		t.Fatalf("bad encode test options: %v %s", err, b)
+	}
+	// --hdr (step 3.9) on the GPU test source, which plays an HDR output: the
+	// started line says HDR10 (the hardware check runs it with --backend=amf /
+	// nvenc and --capture=dda on an HDR desktop).
+	b, err = exec.Command(exe, "--encode-test="+out, "--backend=mock", "--codec=h264", "--capture=synthetic-gpu", "--hdr=1",
+		"--frames=10").CombinedOutput()
+	if errors.As(err, &ee) && ee.ExitCode() == 2 && underWine() && strings.Contains(string(b), "D3D11") {
+		t.Logf("--hdr skipped: no D3D11 device under Wine (needs an X display): %s", b)
+		return
+	}
+	if err != nil || !strings.Contains(string(b), `"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq"`) {
+		t.Fatalf("--encode-test --hdr=1: %v %s", err, b)
 	}
 }
 
@@ -810,6 +825,78 @@ func TestHelperIntegrationWGC(t *testing.T) {
 	captureCheck(t, "wgc", StartParams{Width: 640, Height: 360})
 }
 
+// Phase 5 through the mock: the engine choice (EncoderInstanceFor
+// "dedicated": engine 1 of the mock's two), the refusals of what the mock
+// cannot do (SVC, re-encode, sub-frame output, a third engine: unsupported,
+// and the helper keeps running), SetFPS (the capture re-paces at once, the
+// stats report it, no key frame follows), and the synthetic source's unknown
+// dirty share.
+func TestHelperIntegrationPhase5(t *testing.T) {
+	h := launchMock(t)
+	cc := h.Caps().Codecs["h264"]
+	if cc.LiveFPS != "seamless" || !cc.InstanceSelect || cc.HWInstances != 2 || cc.Reencode || cc.MaxTemporalLayers != 1 {
+		t.Fatalf("mock caps %+v", cc)
+	}
+	two := 2
+	for _, p := range []StartParams{
+		{Codec: "h264", FPS: 60, Kbps: 4000, SVCLayers: 2},
+		{Codec: "h264", FPS: 60, Kbps: 4000, ReencodeOversized: 3},
+		{Codec: "h264", FPS: 60, Kbps: 4000, SliceOutput: 2},
+		{Codec: "h264", FPS: 60, Kbps: 4000, EncoderInstance: &two},
+	} {
+		var he *HelperError
+		if _, err := h.Start(p); !errors.As(err, &he) || he.Code != "unsupported" || he.Fatal {
+			t.Fatalf("start %+v: %v, want unsupported", p, err)
+		}
+	}
+	var he *HelperError
+	if _, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000, ReencodeOversized: 1.2}); !errors.As(err, &he) || he.Code != "bad_message" {
+		t.Fatalf("reencodeOversized 1.2: %v, want bad_message", err)
+	}
+	inst, err := EncoderInstanceFor("dedicated", cc)
+	if err != nil || inst == nil || *inst != 1 {
+		t.Fatalf("EncoderInstanceFor: %v %v", inst, err)
+	}
+	st, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000, EncoderInstance: inst})
+	if err != nil || st.EncoderInstance != 1 || st.HWInstances != 2 || st.LiveFPS != "seamless" || st.SVCLayers != 1 || st.SliceOutput != 0 {
+		t.Fatalf("start: %+v %v", st, err)
+	}
+	var before []*Frame
+	for t0 := time.Now(); time.Since(t0) < time.Second; {
+		before = append(before, nextFrame(t, h))
+	}
+	if err := h.SetFPS(20); err != nil {
+		t.Fatal(err)
+	}
+	var after []*Frame
+	for t0 := time.Now(); time.Since(t0) < 2*time.Second; {
+		after = append(after, nextFrame(t, h))
+	}
+	qpc := h.QPCFrequency()
+	late := after[len(after)/4:] // well after the change
+	rateBefore, rateAfter := maxPerSecond(before, qpc), maxPerSecond(late, qpc)
+	t.Logf("%d frames/s at 60 fps, %d at 20 fps", rateBefore, rateAfter)
+	if rateBefore < 48 || rateAfter > 22 || rateAfter < 16 {
+		t.Fatalf("SetFPS(20): %d frames per second before, %d after", rateBefore, rateAfter)
+	}
+	for _, f := range append(before, after...) {
+		// Key frames only where the mock's 60-frame clip starts over: the
+		// frame-rate change forced none.
+		if f.Key != ((f.FrameID-1)%60 == 0) || f.Dirty != -1 || f.Discardable {
+			t.Fatalf("frame %d: key %v, dirty %v, discardable %v", f.FrameID, f.Key, f.Dirty, f.Discardable)
+		}
+	}
+	sawFPS := false
+	for deadline := time.After(2 * time.Second); !sawFPS; {
+		select {
+		case s := <-h.Stats():
+			sawFPS = s.FPS == 20 && s.Kbps == 4000 && s.Dirty == -1
+		case <-deadline:
+			t.Fatal("no stats with fps 20 (and the bitrate unchanged)")
+		}
+	}
+}
+
 // The present-driven capture path end to end on the GPU test source: a
 // simulated game presents at twice the stream's fps for 1 s, then pauses
 // 0.6 s. Frames must be capped at the fps, repeats must fill the pauses
@@ -819,7 +906,7 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	dump := t.TempDir() + `\frame30.nv12`
 	h := launchMock(t, "--dump-nv12="+dump)
 	const w, hgt, fps = 320, 180, 30
-	_, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000,
+	st, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000,
 		Barcode: &Barcode{Cell: proto.BarcodeCell}})
 	var he *HelperError
 	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
@@ -827,6 +914,9 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("start: %v", err)
+	}
+	if st.HDR || st.BitDepth != 8 || st.ColorSpace != "bt709" || st.HDRMetadata != nil {
+		t.Fatalf("an SDR stream reports hdr %v, bitDepth %d, colorSpace %q", st.HDR, st.BitDepth, st.ColorSpace)
 	}
 	// A forced IDR after frame 10 starts a new sequence: the barcodes from it
 	// on count from 0 again.
@@ -863,6 +953,11 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 		}
 		if f.Repeat {
 			repeats++
+		}
+		// The test source changes the whole image with every present (Phase 5
+		// dirty share 1); an idle repeat changes nothing.
+		if want := map[bool]float64{false: 1, true: 0}[f.Repeat]; f.Dirty != want {
+			t.Fatalf("frame %d (repeat %v): dirty %v, want %v", f.FrameID, f.Repeat, f.Dirty, want)
 		}
 	}
 	maxInSecond = maxPerSecond(frames, qpc)
@@ -955,4 +1050,349 @@ func TestHelperIntegrationMotionSource(t *testing.T) {
 	if avg := float64(diff) / float64(n); avg < 8 {
 		t.Fatalf("mean neighbour difference %.1f: not the high-motion picture", avg)
 	}
+}
+
+// HDR10 end to end on the GPU test source (step 3.9): with hdr it plays an
+// output in Windows HDR mode (FP16 scRGB frames, a 1000 cd/m2 panel), the
+// mock asks for P010, and the dumped frame must be P010 with BT.2020 PQ codes:
+// the 10-bit code in the high bits of every 16-bit sample, the barcode cells
+// at 64 / 940 (reading as the frame's sequence number), the source's 1000 cd/m2 patch (top right) at PQ code 723 with
+// neutral chroma.
+func TestHelperIntegrationHDRPipeline(t *testing.T) {
+	dump := t.TempDir() + `\frame30.p010`
+	h := launchMock(t, "--dump-nv12="+dump)
+	const w, hgt, fps = 320, 180, 30
+	st, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000, HDR: true,
+		Barcode: &Barcode{Cell: proto.BarcodeCell}})
+	var he *HelperError
+	if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+		t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+	}
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	m := st.HDRMetadata
+	if !st.HDR || st.BitDepth != 10 || st.ColorSpace != "bt2020-pq" || m == nil || m.MaxLuminance != 1000 || m.MinLuminance != 0.005 ||
+		m.MaxCLL != 1000 || m.MaxFALL != 400 || m.DisplayPrimaries[0] != [2]float64{0.708, 0.292} {
+		t.Fatalf("started: hdr %v, bitDepth %d, colorSpace %q, metadata %+v", st.HDR, st.BitDepth, st.ColorSpace, m)
+	}
+	for i := 0; i < 32; i++ {
+		nextFrame(t, h)
+	}
+	b, err := os.ReadFile(dump)
+	if err != nil || len(b) != w*hgt*3 {
+		t.Fatalf("dump: %d bytes (want %d: P010), %v", len(b), w*hgt*3, err)
+	}
+	sample := func(i int) int { return int(b[2*i]) | int(b[2*i+1])<<8 }
+	for i := 0; i < len(b)/2; i++ {
+		if sample(i)&63 != 0 {
+			t.Fatalf("P010 sample %d = %#04x: the low 6 bits are not zero", i, sample(i))
+		}
+	}
+	code := func(i int) int { return sample(i) >> 6 }
+	// The barcode (top left): every cell 64 or 940 at its centre, and read
+	// as the browser reads it (the codes / 4 as 8-bit luma) frame 30's
+	// sequence number, 29 (the sequence from frame 1).
+	for k := 0; k < proto.BarcodeBits; k++ {
+		x, y := (k%proto.BarcodeCols)*proto.BarcodeCell+proto.BarcodeCell/2, (k/proto.BarcodeCols)*proto.BarcodeCell+proto.BarcodeCell/2
+		if v := code(y*w + x); v != 64 && v != 940 {
+			t.Fatalf("barcode cell %d luma %d, want 64 or 940", k, v)
+		}
+	}
+	luma := make([]byte, w*hgt)
+	for i := range luma {
+		luma[i] = byte(code(i) >> 2)
+	}
+	if v, ok := proto.BarcodeReadLuma(luma, w, proto.BarcodeCell); !ok || v != 29 {
+		t.Fatalf("barcode of the dumped frame reads %d (valid %v), want 29", v, ok)
+	}
+	// The 1000 cd/m2 patch: Y 723 (64 + 876 x PQ(1000 cd/m2) = 722.6), Cb Cr 512.
+	x, y := 312, 8
+	cb, cr := code(w*hgt+(y/2)*w+x), code(w*hgt+(y/2)*w+x+1)
+	if yy := code(y*w + x); yy < 722 || yy > 724 || cb < 511 || cb > 513 || cr < 511 || cr > 513 {
+		t.Fatalf("1000 cd/m2 patch: YCbCr %d,%d,%d, want 723,512,512", yy, cb, cr)
+	}
+}
+
+// The libavcodec backend (native/recon-encoder/src/lavc, step 3.8). Without
+// FFmpeg's DLLs it is unavailable with the reason. With RECON_FFMPEG_DIR set to
+// the bin directory of an FFmpeg 8.x shared build that has libx264 (BtbN's
+// ffmpeg-n8.1-latest-win64-gpl-shared-8.1; make helper-test FFMPEG_DIR=...),
+// --lavc-test-encoder=libx264 drives that software encoder through the
+// backend's code path in place of Quick Sync Video: the DLLs loaded at run
+// time, frames submitted (the synthetic source's test pattern, and the GPU
+// test source's converted frames read back, barcode included), forced IDRs,
+// rate and frame-rate changes, the packets through the ring. The bitstream
+// must decode cleanly (the build's ffmpeg.exe, when it is there).
+func TestHelperIntegrationLavc(t *testing.T) {
+	exe := helperExe(t)
+	h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := h.Caps()
+	if c.Backend != "none" || !strings.Contains(c.Unavailable["lavc"], "avcodec-62.dll") {
+		t.Fatalf("lavc without DLLs: backend %q, unavailable %v", c.Backend, c.Unavailable)
+	}
+	var he *HelperError
+	if _, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000}); !errors.As(err, &he) || he.Code != "unavailable" {
+		t.Fatalf("start without DLLs: %v", err)
+	}
+	h.Close()
+
+	dir := os.Getenv("RECON_FFMPEG_DIR")
+	if dir == "" {
+		t.Skip("set RECON_FFMPEG_DIR to the bin directory of an FFmpeg 8.x shared build with libx264 for the stream checks")
+	}
+	launch := func(t *testing.T) *Helper {
+		h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, LogLevel: "debug", Args: []string{"--lavc-test-encoder=libx264"},
+			Log: slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		t.Cleanup(func() { h.Close() })
+		return h
+	}
+	// decode runs the build's ffmpeg.exe on a bitstream (args: its output
+	// options) and returns stdout; nil when the build has no ffmpeg.exe.
+	decode := func(t *testing.T, stream []byte, args ...string) []byte {
+		ff := dir + `\ffmpeg.exe`
+		if _, err := os.Stat(ff); err != nil {
+			t.Logf("no %s: bitstream not decoded", ff)
+			return nil
+		}
+		file := t.TempDir() + `\stream.h264`
+		if err := os.WriteFile(file, stream, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(ff, append([]string{"-v", "error", "-i", file}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil || stderr.Len() > 0 {
+			t.Fatalf("ffmpeg %v: %v %s", args, err, stderr.Bytes())
+		}
+		return out
+	}
+	hasNAL := func(au []byte, want ...byte) bool {
+		types := nalTypes(au)
+		for _, w := range want {
+			if bytes.IndexByte(types, w) < 0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	// No encoder opens (libopenh264 takes no NV12): unavailable.lavc carries
+	// every encoder's error. Two encoders of one codec: the first that opens.
+	t.Run("Reasons", func(t *testing.T) {
+		h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, Args: []string{"--lavc-test-encoder=libopenh264,nosuch"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := h.Caps()
+		h.Close()
+		why := c.Unavailable["lavc"]
+		if c.Backend != "none" || !strings.Contains(why, "libopenh264: avcodec_open2") || !strings.Contains(why, "nosuch is not in") {
+			t.Fatalf("no encoder opens: backend %q, unavailable %v", c.Backend, c.Unavailable)
+		}
+		t.Logf("unavailable.lavc: %s", why)
+		h, err = Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, Args: []string{"--lavc-test-encoder=libx264,libopenh264"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		st, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 1000})
+		if err != nil || st.Encoder != "libx264" {
+			t.Fatalf("libx264 and libopenh264: start %+v %v, caps unavailable %v", st, err, h.Caps().Unavailable)
+		}
+	})
+
+	// FFmpegDir relative to the working directory, with characters the
+	// ANSI command line cannot carry as UTF-8 (or at all).
+	t.Run("Paths", func(t *testing.T) {
+		base := t.TempDir()
+		const name = "ffmpeg-ü-ж"
+		if err := os.Mkdir(filepath.Join(base, name), 0o755); err != nil {
+			if underWine() {
+				t.Skipf("%v (Wine stores such names only under a UTF-8 Unix locale: LANG=C.UTF-8)", err)
+			}
+			t.Fatal(err)
+		}
+		for _, dll := range []string{"avcodec-62.dll", "avutil-60.dll", "swresample-6.dll"} {
+			from, to := filepath.Join(dir, dll), filepath.Join(base, name, dll)
+			if os.Link(from, to) != nil {
+				b, err := os.ReadFile(from)
+				if err == nil {
+					err = os.WriteFile(to, b, 0o644)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		t.Chdir(base)
+		h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: name, Args: []string{"--lavc-test-encoder=libx264"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := h.Caps()
+		h.Close()
+		if c.Backend != "lavc" || c.Codecs["h264"].MaxW == 0 {
+			t.Fatalf("FFmpegDir %q in %s: backend %q, unavailable %v", name, base, c.Backend, c.Unavailable)
+		}
+	})
+
+	t.Run("Flush", func(t *testing.T) {
+		h := launch(t)
+		c := h.Caps()
+		cc := c.Codecs["h264"]
+		if c.Backend != "lavc" || !c.Usable() || !cc.ForceIDR || cc.Recovery != "none" || cc.MaxLTR != 0 || cc.LiveBitrate != "flush" ||
+			cc.LiveFPS != "flush" || !cc.IsAssumed("liveBitrate") || cc.ROI != "none" || cc.HDR10 || cc.InstanceSelect {
+			t.Fatalf("caps %+v", c)
+		}
+		// What the backend cannot do is refused (a failed start may be followed by another).
+		for _, p := range []StartParams{
+			{Capture: "synthetic", Codec: "hevc", FPS: 60, Kbps: 4000},
+			{Capture: "synthetic", Codec: "h264", FPS: 60, Kbps: 4000, LTRSlots: 2},
+			{Capture: "synthetic", Codec: "h264", FPS: 60, Kbps: 4000, HDR: true},
+			{Capture: "synthetic", Codec: "h264", FPS: 60, Kbps: 4000, IntraRefreshFrames: 30},
+		} {
+			var he *HelperError
+			if _, err := h.Start(p); !errors.As(err, &he) || he.Code != "unsupported" || he.Fatal {
+				t.Fatalf("start %+v: %v, want unsupported", p, err)
+			}
+		}
+		st, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 1000})
+		if err != nil || st.Backend != "lavc" || st.Encoder != "libx264" || st.LiveBitrate != "flush" || st.LiveFPS != "flush" ||
+			st.ZeroCopy || st.Width != 320 || st.BitDepth != 8 || st.ColorSpace != "bt709" {
+			t.Fatalf("start: %+v %v", st, err)
+		}
+		var stream []byte
+		next := func() *Frame {
+			f := nextFrame(t, h)
+			if f.DroppedBefore > 0 {
+				t.Fatalf("frame %d: %d frames dropped before it", f.FrameID, f.DroppedBefore)
+			}
+			stream = append(stream, f.Data...)
+			return f
+		}
+		waitKey := func(what string) *Frame {
+			for i := 0; i < 10; i++ {
+				if f := next(); f.Key {
+					if !hasNAL(f.Data, 7, 8, 5) {
+						t.Fatalf("%s: key frame %d without SPS / PPS / IDR (NAL types %v)", what, f.FrameID, nalTypes(f.Data))
+					}
+					t.Logf("%s: key frame %d (gen %d)", what, f.FrameID, f.Gen)
+					return f
+				}
+			}
+			t.Fatalf("%s: no key frame within 10 frames", what)
+			return nil
+		}
+		first := waitKey("start")
+		if first.FrameID != 1 || first.Width != 320 || first.Height != 180 {
+			t.Fatalf("first frame %+v", first)
+		}
+		for i := 0; i < 10; i++ {
+			if f := next(); f.Key {
+				t.Fatalf("frame %d: a key frame nobody asked for", f.FrameID)
+			}
+		}
+		if err := h.ForceIDR(); err != nil {
+			t.Fatal(err)
+		}
+		k := waitKey("forceIdr")
+		if err := h.SetRate(400, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		// liveBitrate flush: the frame with the new rate is an IDR of a new generation.
+		if r := waitKey("setRate (flush)"); r.Gen != k.Gen+1 {
+			t.Fatalf("setRate: gen %d after %d, want a new generation", r.Gen, k.Gen)
+		}
+		if err := h.Recover(k.FrameID+20, nil); err != nil {
+			t.Fatal(err)
+		}
+		waitKey("recover (recovery none: IDR)")
+		if err := h.SetFPS(30); err != nil {
+			t.Fatal(err)
+		}
+		waitKey("setRate fps (flush)")
+		if err := h.SetROI([]ROIRect{{X: 0, Y: 0, W: 64, H: 64, Weight: 5}}); err != nil {
+			t.Fatal(err)
+		}
+		if e := waitHelperError(t, h, "unsupported"); e.Re != "setRoi" || e.Fatal {
+			t.Fatalf("setRoi: %+v", e)
+		}
+		for i := 0; i < 10; i++ {
+			next()
+		}
+		decode(t, stream, "-f", "null", "-")
+	})
+
+	t.Run("Seamless", func(t *testing.T) {
+		h := launch(t)
+		st, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 1000,
+			LiveBitrate: "seamless"})
+		if err != nil || st.LiveBitrate != "seamless" || st.LiveFPS != "seamless" {
+			t.Fatalf("start: %+v %v", st, err)
+		}
+		if f := nextFrame(t, h); !f.Key {
+			t.Fatal("the first frame is not a key frame")
+		}
+		for i := 0; i < 5; i++ {
+			nextFrame(t, h)
+		}
+		if err := h.SetRate(400, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 20; i++ {
+			if f := nextFrame(t, h); f.Key || f.Gen != 0 {
+				t.Fatalf("frame %d after a seamless rate change: key %v, gen %d", f.FrameID, f.Key, f.Gen)
+			}
+		}
+	})
+
+	// The GPU test source through the colour conversion: the converted
+	// frames are read back (Wine: as separate Y / CbCr textures), encoded,
+	// and every decoded frame's barcode reads its sequence number (no forced
+	// IDR: its frame id - 1).
+	t.Run("GPU", func(t *testing.T) {
+		h := launch(t)
+		const w, hgt = 320, 180
+		st, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: 30, Kbps: 2000,
+			Barcode: &Barcode{Cell: proto.BarcodeCell}})
+		var he *HelperError
+		if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+			t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+		}
+		if err != nil || !st.Barcode || st.ZeroCopy || st.Encoder != "libx264" {
+			t.Fatalf("start: %+v %v", st, err)
+		}
+		var frames []*Frame
+		var stream []byte
+		for len(frames) < 45 {
+			f := nextFrame(t, h)
+			if f.DroppedBefore > 0 || f.FrameID != uint64(len(frames)+1) {
+				t.Fatalf("frame %d after %d frames (%d dropped before it)", f.FrameID, len(frames), f.DroppedBefore)
+			}
+			frames = append(frames, f)
+			stream = append(stream, f.Data...)
+		}
+		raw := decode(t, stream, "-f", "rawvideo", "-pix_fmt", "gray", "-")
+		if raw == nil {
+			return
+		}
+		if len(raw) != len(frames)*w*hgt {
+			t.Fatalf("decoded %d bytes, want %d frames of %dx%d", len(raw), len(frames), w, hgt)
+		}
+		for i, f := range frames {
+			y := raw[i*w*hgt : (i+1)*w*hgt]
+			if v, ok := proto.BarcodeReadLuma(y, w, proto.BarcodeCell); !ok || uint64(v) != f.FrameID-1 {
+				t.Fatalf("decoded frame %d: barcode reads %d (valid %v), want %d (frame id %d)", i, v, ok, f.FrameID-1, f.FrameID)
+			}
+		}
+		t.Logf("%d frames decoded, every barcode reads its sequence number", len(frames))
+	})
 }

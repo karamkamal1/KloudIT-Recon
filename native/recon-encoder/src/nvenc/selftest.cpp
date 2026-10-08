@@ -11,7 +11,11 @@
 // - no DLL: the NVIDIA driver (System32's nvEncodeAPI64.dll), the hardware
 //   check of docs/VENDOR_NOTES.md 3.4: key frames exactly where forced, loss
 //   recovery by invalidation without an IDR, rate changes without one, the
-//   flush mode, every codec and preset the GPU has.
+//   flush mode, every codec and preset the GPU has; and of 3.9: HDR10 streams
+//   (P010 input, Main10 / AV1 10-bit, the HDR metadata); and of Phase 5:
+//   temporal SVC (layers, discardable frames, recovery with layers), encodes
+//   without state advance committed by NvEncRestoreEncoderState (the test
+//   double also re-encodes an oversized frame), the cursor / crosshair ROI.
 // Exit code 0 ok, 1 failed, 77 could not run (no D3D11 device, no NVENC runtime
 // or no NVIDIA adapter).
 #include <algorithm>
@@ -28,6 +32,7 @@
 
 #include "backend.hpp"
 #include "codec/bitstream.hpp"
+#include "codec/hdr.hpp"
 #include "d3d/device.hpp"
 #include "nvenc/nvenc_policy.hpp"
 #include "nvenc/nvenc_runtime.hpp"
@@ -104,8 +109,16 @@ struct Got {
     bool key = false, recovery = false;
     uint64_t refFloor = 0;
     uint32_t gen = 0;
+    uint32_t temporalLayer = 0;
+    bool discardable = false;
+    bool reencoded = false;
+    size_t oversizeBytes = 0;
     std::string data;
 };
+
+// The frame a test double's frame was predicted from (its NVFAKE marker), or
+// ~0 without a marker.
+uint64_t refOf(const Got& g);
 
 // One encoder backend fed like the pipeline feeds it: init() and the control
 // calls on the calling (main) thread, submit() on a capture thread of its
@@ -125,7 +138,8 @@ public:
         }
     }
 
-    bool start(const StartParams& p, Started& st, Status& s) {
+    // hdrSource: the source is an output in Windows HDR mode (a 1000 cd/m2 panel).
+    bool start(const StartParams& p, Started& st, Status& s, bool hdrSource = false) {
         backend_ = createNvencBackend(s);
         if (!backend_) return false;
         SourceInfo src;
@@ -133,19 +147,25 @@ public:
         src.height = uint32_t(p.height);
         src.device = device_;
         src.adapter = adapter_;
+        if (hdrSource) {
+            src.hdr = true;
+            src.display.known = src.display.hdr = true;
+            src.display.minLuminance = 0.005, src.display.maxLuminance = 1000, src.display.maxFullFrameLuminance = 400;
+        }
         InputSpec in;
         s = backend_->init(p, src, in, st);
         if (!s.ok) {
             backend_.reset();
             return false;
         }
-        if (in.format != InputSpec::Format::Nv12 || in.width != src.width || in.height != src.height) {
+        const InputSpec::Format want = st.hdr ? InputSpec::Format::P010 : InputSpec::Format::Nv12;
+        if (in.format != want || in.width != src.width || in.height != src.height) {
             s = Status::Error("test", "the backend asked for an unexpected input");
             return false;
         }
-        // Pool textures like the converter's (d3d/convert.cpp): NV12, render
-        // target + shader resource. The test double takes any texture where
-        // the device has no NV12 (Wine).
+        // Pool textures like the converter's (d3d/convert.cpp): NV12 (P010 for
+        // HDR10), render target + shader resource. The test double takes any
+        // texture where the device has no NV12 / P010 (Wine).
         for (int i = 0; i < 6; ++i) {
             D3D11_TEXTURE2D_DESC td{};
             td.Width = in.width;
@@ -153,16 +173,18 @@ public:
             td.MipLevels = td.ArraySize = 1;
             td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_DEFAULT;
-            td.Format = DXGI_FORMAT_NV12;
+            td.Format = st.hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
             td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             ComPtr<ID3D11Texture2D> t;
             HRESULT hr = device_->CreateTexture2D(&td, nullptr, t.GetAddressOf());
             if (FAILED(hr)) {
                 td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 hr = device_->CreateTexture2D(&td, nullptr, t.GetAddressOf());
-                static bool warned = false;
-                if (!warned) std::printf("  (no NV12 textures on this device: BGRA stand-ins for the test double)\n");
-                warned = true;
+                static bool warned[2] = {false, false};
+                if (!warned[st.hdr]) {
+                    std::printf("  (no %s textures on this device: BGRA stand-ins for the test double)\n", st.hdr ? "P010" : "NV12");
+                }
+                warned[st.hdr] = true;
             }
             if (FAILED(hr)) {
                 s = Status::Error("test", "CreateTexture2D: " + d3d::hrText(hr));
@@ -278,6 +300,10 @@ private:
                 g.recovery = f.recovery;
                 g.refFloor = f.refFloor;
                 g.gen = f.gen;
+                g.temporalLayer = f.temporalLayer;
+                g.discardable = f.discardable;
+                g.reencoded = f.reencoded;
+                g.oversizeBytes = f.oversizeBytes;
                 g.data.assign(reinterpret_cast<const char*>(f.data), f.size);
                 backend_->releaseOutput(f);
                 std::lock_guard<std::mutex> lock(mu_);
@@ -323,6 +349,11 @@ struct Ctx {
         return it != caps.codecs.end() && int(w) <= it->second.maxW && int(h) <= it->second.maxH;
     }
 };
+
+uint64_t refOf(const Got& g) {
+    const size_t marker = g.data.find("NVFAKE");
+    return marker == std::string::npos ? ~uint64_t(0) : num(field(g.data.substr(marker), "ref"));
+}
 
 std::string idList(const std::vector<uint64_t>& v) {
     std::string out;
@@ -508,6 +539,91 @@ void testStream(Ctx& c, const std::string& codec, uint32_t w, uint32_t h) {
     report(name, before);
 }
 
+// HDR10 (step 3.9): from an HDR source, HEVC Main10 / AV1 10-bit with P010
+// input, the BT.2020 PQ colour description and the HDR metadata with every
+// picture; forced IDRs and a loss still work. The test double also checks
+// the refusals (H.264, no 10-bit encoding, no P010 input) and that an SDR
+// source gives an SDR stream.
+void testHdr(Ctx& c, const std::string& codec) {
+    const std::string name = "HDR10 " + codec;
+    const int before = failures;
+    if (!c.has(codec, 1280, 720) || !c.caps.codecs[codec].hdr10) {
+        std::printf("  %-44s skipped (no HDR10 %s on this GPU)\n", name.c_str(), codec.c_str());
+        return;
+    }
+    Harness hs(c.device, c.adapter);
+    StartParams p;
+    p.codec = codec;
+    p.width = 1280;
+    p.height = 720;
+    p.fps = 60;
+    p.kbps = 20000;
+    p.hdr = true;
+    Started st;
+    Status s;
+    if (!hs.start(p, st, s, true)) {
+        expect(false, name, "start: " + s.code + ": " + s.text);
+        return;
+    }
+    const HdrMetadata& m = st.hdrMetadata ? *st.hdrMetadata : HdrMetadata{};
+    expect(st.hdr && st.bitDepth == 10 && st.colorSpace == "bt2020-pq" && st.hdrMetadata && m.maxLuminance == 1000 && m.minLuminance == 0.005 &&
+               m.maxCll == 1000 && m.maxFall == 400 && m.red[0] == 0.708 && m.white[1] == 0.3290,
+           name, "started: hdr " + std::to_string(st.hdr) + ", bitDepth " + std::to_string(st.bitDepth) + ", " + st.colorSpace);
+    Backend& b = hs.backend();
+    for (uint64_t id = 1; id <= 30; ++id) {
+        expect(hs.submit(id).ok, name, "submit " + std::to_string(id));
+        if (id == 10) b.forceIdr();
+        if (id == 20) {
+            expect(hs.waitFor(20), name, "frame 20 did not come out");
+            b.recover(19, std::nullopt);
+        }
+        Sleep(DWORD(c.delayMs));
+    }
+    expect(hs.waitFor(30), name, "frame 30 did not come out");
+    hs.stop();
+    std::vector<uint64_t> keys;
+    for (const Got& g : hs.got()) {
+        if (g.key) keys.push_back(g.frameId);
+    }
+    expect(hs.got().size() == 30 && keys.size() >= 2 && keys[0] == 1 && keys[1] == 11, name, "keys " + idList(keys));
+    expect(hs.errors().empty(), name, hs.errors().empty() ? "" : "output error: " + hs.errors().front().text);
+    if (c.fake) {
+        const std::string in = c.driver.log("init ").empty() ? "" : c.driver.log("init ").back();
+        expect(field(in, "bitdepth") == "10" && field(in, "hdrsei") == "1/1" && field(in, "vui") == "1" &&
+                   field(in, "profile") == (codec == "hevc" ? "main10" : "set"),
+               name, "init: " + in);
+        // Every picture with the metadata, in the codec's units.
+        const MasteringCodes mc = masteringCodes(m, codec == "av1");
+        char want[128];
+        std::snprintf(want, sizeof(want), "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", mc.green[0], mc.green[1], mc.blue[0], mc.blue[1], mc.red[0],
+                      mc.red[1], mc.white[0], mc.white[1], mc.maxLuminance, mc.minLuminance);
+        const std::vector<std::string> enc = c.driver.log("encode ");
+        expect(enc.size() == 30, name, "encodes: " + std::to_string(enc.size()));
+        for (const std::string& l : enc) {
+            if (field(l, "md") != want || field(l, "cll") != "1000,400") {
+                expect(false, name, "picture without the HDR metadata (want md=" + std::string(want) + " cll=1000,400): " + l);
+                break;
+            }
+        }
+        expectClean(c, name);
+
+        // An SDR source: an SDR stream (8-bit, no metadata), not an error.
+        Harness sdr(c.device, c.adapter);
+        if (sdr.start(p, st, s, false)) {
+            expect(!st.hdr && st.bitDepth == 8 && st.colorSpace == "bt709" && !st.hdrMetadata, name, "SDR source: started hdr");
+            expect(sdr.submit(1).ok && sdr.waitFor(1), name, "SDR source: frame 1");
+            sdr.stop();
+            const std::string in8 = c.driver.log("init ").empty() ? "" : c.driver.log("init ").back();
+            expect(field(in8, "bitdepth") == "8" && field(in8, "hdrsei") == "0/0" && field(in8, "profile") == "set", name, "SDR source: " + in8);
+            expect(!contains(c.driver.encodeLine(1), " md="), name, "SDR source: metadata with a picture");
+        } else {
+            expect(false, name, "SDR source: start: " + s.text);
+        }
+        expectClean(c, name);
+    }
+    report(name, before);
+}
+
 // Output by polling NvEncLockBitstream (no async support), and the flush mode.
 void testModes(Ctx& c) {
     std::string name = "sync output (no async encode support)";
@@ -674,15 +790,20 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     Caps caps = probeNvencCaps();
     const CodecCaps& h = caps.codecs["hevc"];
     expect(caps.backend == "nvenc" && caps.vendor == "nvidia" && caps.codecs.size() == 3, name, "backend / codecs");
-    // maxLtr: the slots start's ltrSlots may ask for (none; the double reports 8 LTR frames).
+    // maxLtr: the slots start's ltrSlots may ask for (none; the double reports 8 LTR frames);
+    // sliceOutput likewise (none; the double reports SUPPORT_SUBFRAME_READBACK).
     expect(h.maxW == 8192 && h.maxH == 8192 && h.tenBit && h.yuv444 && h.forceIdr && h.recovery == "invalidate" && h.maxLtr == 0 &&
-               h.intraRefresh && h.liveBitrate == "seamless" && h.maxTemporalLayers == 4 && h.roi == "emphasis" && h.sliceOutput &&
+               h.intraRefresh && h.liveBitrate == "seamless" && h.maxTemporalLayers == 4 && h.roi == "emphasis" && !h.sliceOutput &&
                h.hwInstances == 2 && !h.queryTimeout && h.alignW == 1 && h.alignH == 1 && h.dynamicResolution,
            name, "hevc caps");
     expect(std::find(h.assumed.begin(), h.assumed.end(), "liveBitrate") != h.assumed.end() &&
                std::find(h.assumed.begin(), h.assumed.end(), "roi") != h.assumed.end(),
            name, "assumed");
     expect(!caps.codecs["av1"].yuv444, name, "av1 yuv444");
+    // Phase 5: frame rate with the bitrate's reconfiguration, no engine
+    // choice (split-frame), re-encoding with DISABLE_ENC_STATE_ADVANCE.
+    expect(h.liveFps == "seamless" && h.isAssumed("liveFps") && !h.instanceSelect && h.reencode, name, "hevc Phase 5 caps");
+    expect(h.hdr10 && caps.codecs["av1"].hdr10 && !caps.codecs["h264"].hdr10, name, "hdr10: hevc / av1 yes, h264 no");
     c.driver.call("set av1=0 multiRef=0 dynBitrate=0 engines=3 dynRes=0");
     caps = probeNvencCaps();
     bool av1Why = false;
@@ -690,9 +811,42 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     const CodecCaps& h2 = caps.codecs["hevc"];
     expect(!caps.codecs.count("av1") && av1Why, name, "av1 missing without its reason");
     expect(h2.recovery == "none" && h2.liveBitrate == "restart" && h2.hwInstances == 3 && !h2.dynamicResolution &&
-               std::find(h2.assumed.begin(), h2.assumed.end(), "liveBitrate") == h2.assumed.end(),
+               std::find(h2.assumed.begin(), h2.assumed.end(), "liveBitrate") == h2.assumed.end() && h2.liveFps == "restart" &&
+               !h2.isAssumed("liveFps"),
            name, "hevc caps without multiple references / live bitrate");
     c.driver.call("reset");
+    c.driver.call("set stateAdvance=0");
+    expect(!probeNvencCaps().codecs["hevc"].reencode, name, "reencode without NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE");
+    c.driver.call("reset");
+    c.driver.call("set p010=0");
+    expect(!probeNvencCaps().codecs["hevc"].hdr10, name, "hdr10 without YUV420_10BIT input");
+    c.driver.call("set p010=1 tenBit=0");
+    caps = probeNvencCaps();
+    expect(!caps.codecs["hevc"].hdr10 && !caps.codecs["hevc"].tenBit, name, "hdr10 without 10-bit encoding");
+    c.driver.call("reset");
+    report(name, before);
+
+    // From an HDR and from an SDR output alike: the answer must not depend on
+    // whether Windows HDR is on at the moment.
+    name = "HDR10 refusals";
+    before = failures;
+    for (const bool hdrSource : {true, false}) {
+        for (const auto& [codec, setting] : std::vector<std::pair<std::string, std::string>>{{"h264", ""}, {"hevc", "tenBit=0"}, {"av1", "p010=0"}}) {
+            if (!setting.empty()) c.driver.call("set " + setting);
+            Harness hs(c.device, c.adapter);
+            StartParams p;
+            p.codec = codec;
+            p.width = 640;
+            p.height = 360;
+            p.hdr = true;
+            Started st;
+            Status s;
+            expect(!hs.start(p, st, s, hdrSource) && s.code == "unsupported" && contains(s.text, "hdr10"), name,
+                   codec + (setting.empty() ? "" : " with " + setting) + (hdrSource ? ", HDR" : ", SDR") + " source: " +
+                       (s.ok ? "started" : s.code + ": " + s.text));
+            c.driver.call("reset");
+        }
+    }
     report(name, before);
 
     name = "no invalidation: recovery by IDR";
@@ -894,13 +1048,22 @@ void testFakeOnly(Ctx& c, HMODULE module) {
         p.encoderInstance = 1;
         expect(!hs.start(p, st, s) && s.code == "unsupported", name, "encoderInstance 1 accepted: " + s.text);
         p.encoderInstance = -1;
+        p.sliceOutput = 2;
+        expect(!hs.start(p, st, s) && s.code == "unsupported" && contains(s.text, "sliceOutput"), name, "sliceOutput accepted: " + s.text);
+        p.sliceOutput = 0;
+        c.driver.call("set stateAdvance=0");
+        p.reencodeOversized = 3;
+        expect(!hs.start(p, st, s) && s.code == "unsupported" && contains(s.text, "reencodeOversized"), name,
+               "reencodeOversized without the cap accepted: " + s.text);
+        c.driver.call("set stateAdvance=1");
+        p.reencodeOversized = 0;
         p.intraRefreshFrames = 30;
         p.svcLayers = 2;
         if (hs.start(p, st, s)) {
             expect(st.intraRefreshFrames == 30, name, "started.intraRefreshFrames");
             hs.stop();
             const std::string in = c.driver.log("init ").empty() ? "" : c.driver.log("init ").back();
-            expect(field(in, "ir") == "30/29" && field(in, "layers") == "2", name, "intra refresh / layers: " + in);
+            expect(field(in, "ir") == "30/29" && field(in, "layers") == "2" && field(in, "states") == "0", name, "intra refresh / layers: " + in);
         } else {
             expect(false, name, "start with intra refresh: " + s.text);
         }
@@ -909,7 +1072,209 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     report(name, before);
 }
 
+// Temporal SVC with 2 layers (GUIDE 5): every odd position after the key
+// frame is the enhancement layer, reported with its temporal id and flagged
+// discardable; losses of a base-layer and of an enhancement-layer frame
+// recover by invalidation. The test double also checks what each frame was
+// predicted from: an enhancement frame from the base frame before it, a base
+// frame from the previous base frame, nothing from an invalidated one.
+void testSvc(Ctx& c, const std::string& codec) {
+    const std::string name = "temporal SVC " + codec;
+    const int before = failures;
+    if (!c.has(codec, 640, 360) || c.caps.codecs[codec].maxTemporalLayers < 2) {
+        std::printf("  %-44s skipped (no temporal SVC for %s on this GPU)\n", name.c_str(), codec.c_str());
+        return;
+    }
+    Harness hs(c.device, c.adapter);
+    StartParams p;
+    p.codec = codec;
+    p.width = 640;
+    p.height = 360;
+    p.svcLayers = 2;
+    Started st;
+    Status s;
+    if (!hs.start(p, st, s)) {
+        expect(false, name, "start: " + s.code + ": " + s.text);
+        return;
+    }
+    expect(st.svcLayers == 2, name, "started.svcLayers " + std::to_string(st.svcLayers));
+    const bool rfi = c.caps.codecs[codec].recovery == "invalidate";
+    for (uint64_t id = 1; id <= 20; ++id) {
+        expect(hs.submit(id).ok, name, "submit " + std::to_string(id));
+        if (id == 13 || id == 16) {
+            // 13: a base-layer frame; 16: an enhancement-layer frame.
+            expect(hs.waitFor(id), name, "frame " + std::to_string(id) + " did not come out");
+            hs.backend().recover(id, std::nullopt);
+        }
+        Sleep(DWORD(c.delayMs));
+    }
+    expect(hs.waitFor(20), name, "frame 20 did not come out");
+    hs.stop();
+    const std::vector<Got> got = hs.got();
+    expect(got.size() == 20, name, std::to_string(got.size()) + " frames out");
+    std::vector<uint64_t> keys, recoveries, discardable;
+    for (const Got& g : got) {
+        if (g.key) keys.push_back(g.frameId);
+        if (g.recovery) recoveries.push_back(g.frameId);
+        if (g.discardable) discardable.push_back(g.frameId);
+        const uint32_t layer = uint32_t((g.frameId - 1) % 2);
+        expect(g.temporalLayer == layer, name, "frame " + std::to_string(g.frameId) + " in layer " + std::to_string(g.temporalLayer));
+        expect(g.discardable == (layer == 1), name, "frame " + std::to_string(g.frameId) + " discardable " + std::to_string(g.discardable));
+    }
+    expect(keys == std::vector<uint64_t>{1}, name, "key frames " + idList(keys));
+    if (rfi) expect(recoveries == std::vector<uint64_t>{14, 17}, name, "recovery frames " + idList(recoveries) + ", expected 14,17");
+    if (c.fake) {
+        for (const Got& g : got) {
+            // The double's references: 14 (enhancement, the recovery) and 15
+            // (base) skip the invalidated base frame 13; 17 recovers from 15.
+            uint64_t want = g.key ? 0 : g.frameId % 2 == 0 ? g.frameId - 1 : g.frameId - 2;
+            if (g.frameId == 14 || g.frameId == 15) want = 11;
+            expect(refOf(g) == want, name, "frame " + std::to_string(g.frameId) + " predicted from " + std::to_string(refOf(g)) +
+                                               ", expected " + std::to_string(want));
+            expect(!g.recovery || refOf(g) <= g.refFloor, name, "recovery frame " + std::to_string(g.frameId) + " beyond its refFloor");
+        }
+        const std::string in = c.driver.log("init ").empty() ? "" : c.driver.log("init ").back();
+        expect(field(in, "layers") == "2", name, "init layers=" + field(in, "layers"));
+        expectClean(c, name);
+    }
+    report(name, before);
+}
+
+// Re-encoding oversized frames (start reencodeOversized): every non-key
+// frame is encoded without advancing the encoder state and committed with
+// NvEncRestoreEncoderState; the test double's frame 8 comes out 200 kB (a
+// scene change) and must be encoded again at a higher QP, the ROI map
+// included, and frame 9 must be predicted from that second encode. With the
+// driver: the encodes and commits work and nothing is lost (no frame is large
+// enough to be re-encoded there).
+void testReencode(Ctx& c) {
+    const char* name = "re-encode oversized frames";
+    const int before = failures;
+    if (!c.has("hevc", 640, 360) || !c.caps.codecs["hevc"].reencode) {
+        std::printf("  %-44s skipped (no encode without state advance on this GPU)\n", name);
+        return;
+    }
+    for (const bool async : {true, false}) {
+        if (!async && !c.fake) break;
+        const std::string mode = async ? "" : " (sync)";
+        if (c.fake) c.driver.call(std::string("set bigTs=8 bigBytes=200000") + (async ? "" : " async=0"));
+        Harness hs(c.device, c.adapter);
+        StartParams p;
+        p.codec = "hevc";
+        p.width = 640;
+        p.height = 360;
+        p.fps = 60;
+        p.kbps = 2000;
+        p.reencodeOversized = 4;
+        Started st;
+        Status s;
+        if (!hs.start(p, st, s)) {
+            expect(false, name, "start" + mode + ": " + s.code + ": " + s.text);
+            continue;
+        }
+        expect(st.reencodeOversized == 4, name, "started.reencodeOversized");
+        Backend& b = hs.backend();
+        for (uint64_t id = 1; id <= 20; ++id) {
+            if (id == 6) b.setRoi({RoiRect{0, 0, 64, 64, 10}});
+            expect(hs.submit(id).ok, name, "submit " + std::to_string(id) + mode);
+            if (id == 12) b.forceIdr();
+            if (id == 15) {
+                expect(hs.waitFor(15), name, "frame 15 did not come out");
+                b.recover(15, std::nullopt);
+            }
+            Sleep(DWORD(c.delayMs));
+        }
+        expect(hs.waitFor(20), name, "frame 20 did not come out" + mode);
+        hs.stop();
+        const std::vector<Got> got = hs.got();
+        std::vector<uint64_t> keys, reencoded;
+        for (const Got& g : got) {
+            if (g.key) keys.push_back(g.frameId);
+            if (g.reencoded) reencoded.push_back(g.frameId);
+        }
+        expect(got.size() == 20 && keys == std::vector<uint64_t>{1, 13}, name, "frames " + std::to_string(got.size()) + ", keys " + idList(keys) + mode);
+        expect(hs.errors().empty(), name, hs.errors().empty() ? "" : "output error: " + hs.errors().front().text);
+        if (!c.fake) {
+            expect(reencoded.empty(), name, "a frame was re-encoded: " + idList(reencoded));
+            continue;
+        }
+        expect(reencoded == std::vector<uint64_t>{8}, name, "re-encoded " + idList(reencoded) + ", expected 8" + mode);
+        const size_t limit = nvenc::oversizeLimit(2000, 60, 4);
+        for (const Got& g : got) {
+            const uint64_t want = g.key ? 0 : g.frameId == 16 ? 14 : g.frameId - 1;
+            expect(refOf(g) == want, name, "frame " + std::to_string(g.frameId) + " predicted from " + std::to_string(refOf(g)) + mode);
+            if (g.frameId == 8) {
+                expect(g.oversizeBytes > 200000 && g.data.size() < g.oversizeBytes / 2 && g.data.size() > limit, name,
+                       "frame 8: " + std::to_string(g.oversizeBytes) + " -> " + std::to_string(g.data.size()) + " bytes" + mode);
+            }
+        }
+        // The calls: two encodes of frame 8 (state buffers 0 and 1, the second
+        // with the ROI map + 12 QP), one commit per non-key frame (buffer 1
+        // for frame 8), key frames encoded normally.
+        int noadv = 0;
+        std::string first8, second8;
+        for (const std::string& l : c.driver.log("encode ")) {
+            const uint64_t ts = num(field(l, "ts"));
+            noadv += field(l, "noadv") == "1";
+            expect((field(l, "noadv") == "1") == (ts != 1 && ts != 13), name, "frame " + std::to_string(ts) + " noadv " + field(l, "noadv") + mode);
+            if (ts == 8) (first8.empty() ? first8 : second8) = l;
+        }
+        expect(noadv == 19, name, std::to_string(noadv) + " encodes without state advance, expected 19" + mode);
+        expect(field(first8, "state") == "0" && field(second8, "state") == "1", name, "frame 8 state buffers: " + first8 + " / " + second8);
+        const nvenc::QpMap roi = nvenc::roiQpDeltaMap(Codec::Hevc, 640, 360, {RoiRect{0, 0, 64, 64, 10}});
+        const std::string wantMap = std::to_string(roi.values.size()) + "/" + std::to_string(roi.values.size()) + "/0";
+        expect(field(second8, "qpmap") == wantMap && field(first8, "qpmap") != wantMap, name,
+               "frame 8 QP maps: " + field(first8, "qpmap") + " then " + field(second8, "qpmap") + ", expected " + wantMap + " (ROI + 12)");
+        std::vector<std::string> restores = c.driver.log("restore ");
+        int toOne = 0;
+        for (const std::string& r : restores) {
+            if (field(r, "idx") == "1") {
+                ++toOne;
+                expect(field(r, "ts") == "8", name, "a commit of buffer 1 for another frame: " + r);
+            }
+        }
+        expect(restores.size() == 18 && toOne == 1, name, std::to_string(restores.size()) + " commits (" + std::to_string(toOne) + " of buffer 1)" + mode);
+        expectClean(c, name);
+    }
+    report(name, before);
+}
+
 }  // namespace
+
+// The ROI of encoder.FocusROI for a 1920x1080 stream (the pointer at 100,
+// 100, Background -2; codec/selftest.cpp checks the same rects' maps): every
+// block of the QP delta map set (background +2), the crosshair's -8 the lowest.
+void testFocusRoi(Ctx& c) {
+    const char* name = "cursor / crosshair ROI";
+    const int before = failures;
+    const std::vector<RoiRect> focus = {RoiRect{0, 0, 1920, 1080, -2}, RoiRect{33, 33, 135, 135, 6}, RoiRect{870, 450, 180, 180, 8}};
+    for (const char* codec : {"h264", "hevc", "av1"}) {
+        if (!c.has(codec, 1920, 1080)) continue;
+        Harness hs(c.device, c.adapter);
+        StartParams p;
+        p.codec = codec;
+        p.width = 1920;
+        p.height = 1080;
+        Started st;
+        Status s;
+        if (!hs.start(p, st, s)) {
+            expect(false, name, std::string(codec) + ": start: " + s.text);
+            continue;
+        }
+        expect(hs.submit(1).ok, name, "submit 1");
+        expect(hs.backend().setRoi(focus).ok, name, "setRoi");
+        expect(hs.submit(2).ok && hs.waitFor(2), name, "frame 2");
+        hs.stop();
+        Codec cc{};
+        parseCodec(codec, cc);
+        const nvenc::QpMap m = nvenc::roiQpDeltaMap(cc, 1920, 1080, focus);
+        const std::string want = std::to_string(m.values.size()) + "/" + std::to_string(m.values.size()) + "/" + std::to_string(nvenc::qpDeltaFor(cc, 8));
+        expect(field(c.driver.encodeLine(2), "qpmap") == want, name, std::string(codec) + ": qpmap " + field(c.driver.encodeLine(2), "qpmap") +
+                                                                       ", expected " + want);
+        expectClean(c, name);
+    }
+    report(name, before);
+}
 
 int runNvencSelfTest(const std::wstring& testDouble) {
     failures = 0;
@@ -971,10 +1336,19 @@ int runNvencSelfTest(const std::wstring& testDouble) {
         return c.fake ? 1 : kSelfTestSkip;
     }
     std::printf("self-test-nvenc: %s, %s\n", c.fake ? "test double" : c.adapter.name.c_str(), rt.versionText.c_str());
-    if (c.fake) testFakeOnly(c, rt.module);
+    if (c.fake) {
+        testFakeOnly(c, rt.module);
+        testFocusRoi(c);
+    }
     testStream(c, "hevc", 1920, 1080);
     testStream(c, "h264", 1920, 1080);
     testStream(c, "av1", 1920, 1080);
+    testHdr(c, "hevc");
+    testHdr(c, "av1");
+    testSvc(c, "hevc");
+    testSvc(c, "h264");
+    testSvc(c, "av1");
+    testReencode(c);
     testModes(c);
     testPresets(c);
     std::printf("self-test-nvenc: %s\n", failures ? "FAIL" : "ok");

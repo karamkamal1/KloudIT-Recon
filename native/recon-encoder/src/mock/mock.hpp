@@ -45,10 +45,13 @@ private:
 // every frame with H.264 filler data to the target bitrate (key frames to three
 // times a P frame), applied from the next submitted frame (rateLag frames
 // later), so frame sizes follow it as a CBR encoder's would. With start's
-// liveBitrate "flush" a setRate restarts the clip with an IDR and a new gen
-// (MockOptions::idrOnRate: an IDR in seamless mode too). With a GPU capture (dda, amd-direct,
-// wgc) it asks for NV12 input, so capture and the colour conversion run for
-// real on a host without an encoder backend; the converted frames are ignored.
+// liveBitrate "flush" a setRate (also one of the frame rate alone) restarts
+// the clip with an IDR and a new gen (MockOptions::idrOnRate: an IDR in
+// seamless mode too). With a GPU capture (dda, amd-direct, wgc) it asks for
+// NV12 input (P010 with hdr from an HDR source: started then describes an
+// HDR10 stream although the canned one is 8-bit H.264), so capture and the
+// colour conversion run for real on a host without an encoder backend; the
+// converted frames are ignored.
 // It enforces the init() / release() contract: an init() after a start that
 // failed after init() succeeded fails unless release() was called in between.
 class ReplayEncoder : public Backend {
@@ -75,6 +78,7 @@ public:
     static constexpr int kClipWidth = 320;
     static constexpr int kClipHeight = 180;
     static constexpr size_t kClipFrames = 60;
+    static constexpr int kInstances = 2;  // "hardware engines" for start's encoderInstance
 
 private:
     MockOptions opt_;

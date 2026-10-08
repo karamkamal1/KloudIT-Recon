@@ -52,9 +52,16 @@ helper:
 # needs an X display with 24-bit colour: run under xvfb-run -a -s "-screen 0 1280x720x24"
 # (Mesa llvmpipe) to include the GPU conversion self-test, the synthetic-gpu pipeline
 # tests and the NVENC test; headless they skip.
+# FFMPEG_DIR=<bin directory of an FFmpeg 8.x shared build with libx264> (BtbN
+# ffmpeg-n8.1-latest-win64-gpl-shared-8.1) adds the libavcodec backend's stream tests.
+# LANG=C.UTF-8: Wine stores non-ASCII file names (the Unicode path test) only under a
+# UTF-8 Unix locale.
+FFMPEG_DIR ?=
 HELPER_TEST_ENV = RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
 	RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
-	$(if $(WIN_FFMPEG),RECON_FFMPEG='$(WIN_FFMPEG)')
+	$(if $(WIN_FFMPEG),RECON_FFMPEG='$(WIN_FFMPEG)') \
+	$(if $(FFMPEG_DIR),RECON_FFMPEG_DIR='Z:$(subst /,\,$(abspath $(FFMPEG_DIR)))') \
+	LANG=C.UTF-8
 # WIN_FFMPEG (optional): a Windows ffmpeg.exe (Wine path, e.g. Z:\opt\ffmpeg\bin\ffmpeg.exe) for
 # the qualification tests' decode checks (internal/host/qualify). All three test binaries run
 # even when one fails; the target fails at the end, naming them.

@@ -87,4 +87,17 @@ struct QpMap {
 // highest weight; rects are clipped to the picture.
 QpMap roiQpDeltaMap(Codec c, uint32_t width, uint32_t height, const std::vector<RoiRect>& rects);
 
+// Re-encoding oversized frames (GUIDE 9, start reencodeOversized): a non-key
+// frame larger than oversizeLimit bytes (factor x the average frame, kbps / 8
+// / fps) is encoded once more, at the same QP map plus reencodeQpDelta, which
+// is about 6 QP per halving of the size (H.264 / HEVC: the quantizer step
+// doubles every 6 QP; AV1 quantizer index: 4 x, as qpDeltaFor), at least 2 (8)
+// and at most 12 (48), so one more encode is enough and the picture does not
+// collapse. offsetQpMap is the map for that second encode: the ROI map (or
+// none) with delta added to every block, within the delta range of the codec
+// (H.264 / HEVC +-51, AV1 +-127: the map holds signed bytes).
+size_t oversizeLimit(int kbps, int fps, double factor);
+int reencodeQpDelta(Codec c, double ratio);
+QpMap offsetQpMap(Codec c, uint32_t width, uint32_t height, const QpMap* roi, int delta);
+
 }  // namespace recon::nvenc

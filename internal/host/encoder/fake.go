@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,6 +83,12 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	if w.droppedPending > 0 {
 		flags |= FlagDroppedBefore
 	}
+	if f.Dirty >= 0 {
+		flags |= FlagDirty
+	}
+	if f.Discardable {
+		flags |= FlagDiscardable
+	}
 	le.PutUint64(s[slotSeq:], w.written)
 	le.PutUint64(s[slotFrameID:], f.FrameID)
 	le.PutUint32(s[slotFlags:], flags)
@@ -99,6 +106,9 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	le.PutUint32(s[slotDroppedBefore:], w.droppedPending)
 	le.PutUint32(s[slotWidth:], f.Width)
 	le.PutUint32(s[slotHeight:], f.Height)
+	if f.Dirty >= 0 {
+		le.PutUint32(s[slotDirtyPPM:], uint32(math.Round(min(1, f.Dirty)*1e6)))
+	}
 	copy(s[slotHeaderSize:], f.Data)
 	if mangle != nil {
 		mangle(s)

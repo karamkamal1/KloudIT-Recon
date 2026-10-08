@@ -21,7 +21,7 @@ struct EncodeTestOptions {
     StartParams start;         // codec, capture, size, rate, LTR, ... (defaults: hevc, 60 fps, 20000 kbps)
     int frames = 300;          // stop after this frame id
     int ackDelay = 2;          // an LTR frame is acknowledged this many frames after it was received
-    std::vector<std::string> events;  // "N:idr" | "N:loss" | "N:rate=KBPS" | "N:fps=FPS" | "N:roi=X,Y,W,H,W" | "N:roi=off"
+    std::vector<std::string> events;  // "N:idr" | "N:loss" | "N:rate=KBPS" | "N:fps=FPS" | "N:roi=X,Y,W,H,W[+X,Y,W,H,W...]" | "N:roi=off"
     bool dxgiGate = true;      // --dxgi-gate=0: d3d::DxgiGate off (the A/B measurement of docs/VENDOR_NOTES.md 3.4)
     // --rate-schedule=K1[,K2...]:N (the live-bitrate qualification, step 3.6):
     // every N frames the next rate of the list (cyclically), set on the

@@ -30,8 +30,13 @@ public:
 struct PipelineOptions {
     // Converts every GPU frame to NV12 before Backend::submit (InputSpec::Nv12).
     std::unique_ptr<d3d::Nv12Converter> converter;
+    // The converter makes separate planes (no NV12 / P010 render targets) for
+    // a backend that reads nothing (the mock, the NVENC test double): its
+    // EncoderFrame::nv12 is the luma plane (stream.cpp).
+    bool lumaStandsIn = false;
     // --dump-nv12: writes the converted frame with id kDumpFrameId (or the
-    // first one after it) to this file, raw NV12, then logs it.
+    // first one after it) to this file, raw NV12 (P010 in an HDR10 stream),
+    // then logs it.
     std::string dumpPath;
     // Called on the capture thread right before a frame is submitted, with its
     // frame id (again with the same id after the encoder refused it as busy).

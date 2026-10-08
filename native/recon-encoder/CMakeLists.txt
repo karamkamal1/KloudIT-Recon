@@ -45,6 +45,7 @@ add_executable(recon-encoder
     src/d3d/device.cpp
     src/d3d/convert.cpp
     src/d3d/selftest.cpp
+    src/capture/dirty.cpp
     src/capture/pacer.cpp
     src/capture/paced_capture.cpp
     src/mock/replay_encoder.cpp
@@ -52,13 +53,17 @@ add_executable(recon-encoder
     src/amf/amf_backend.cpp
     src/amf/amf_runtime.cpp
     src/codec/bitstream.cpp
+    src/codec/hdr.cpp
     src/codec/ltr.cpp
     src/codec/rfi.cpp
+    src/codec/slices.cpp
     src/codec/selftest.cpp
     src/nvenc/nvenc_backend.cpp
     src/nvenc/nvenc_policy.cpp
     src/nvenc/nvenc_runtime.cpp
     src/nvenc/selftest.cpp
+    src/lavc/lavc_backend.cpp
+    src/lavc/lavc_runtime.cpp
     src/capture/dda_capture.cpp
     src/capture/amd_direct_capture.cpp
     src/capture/wgc_capture.cpp
@@ -70,6 +75,7 @@ target_include_directories(recon-encoder SYSTEM PRIVATE
     ${THIRD_PARTY}/amf/include
     ${THIRD_PARTY}/nv-codec-headers/include
     ${THIRD_PARTY}/nlohmann/include
+    ${THIRD_PARTY}/ffmpeg/include
 )
 # D3D10_ARBITRARY_HEADER_ORDERING: d3d/convert.hpp includes d3d10.h (for
 # ID3D10Multithread) before d3d11.h, which in the Windows SDK pulls in
@@ -80,7 +86,7 @@ target_compile_definitions(recon-encoder PRIVATE
     D3D10_ARBITRARY_HEADER_ORDERING
     RECON_ENCODER_VERSION="${PROJECT_VERSION}"
 )
-target_link_libraries(recon-encoder PRIVATE d3d11 dxgi)
+target_link_libraries(recon-encoder PRIVATE d3d11 dxgi shell32)
 
 # Windows.Graphics.Capture is written against C++/WinRT: part of the Windows
 # SDK for MSVC (linked through WindowsApp.lib). mingw-w64 has no C++/WinRT

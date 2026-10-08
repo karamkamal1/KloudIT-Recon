@@ -7,7 +7,7 @@ import (
 )
 
 // Exactly what recon-encoder.exe --backend=mock --print-caps prints (under Wine).
-const mockCapsJSON = `{"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock","adapterLuid":"","adapterName":"","hagsEnabled":null,"codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,"recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless","maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":1,"queryTimeout":false,"alignW":1,"alignH":1}},"capture":["synthetic"],"cursorInVideo":false,"outputs":[],"unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module not found (error 126)","dda":"no DXGI output is attached to the desktop (no display, or a session without one)","amd-direct":"no display output on an AMD adapter","wgc":"this build has no C++/WinRT headers (mingw-w64 build): use the MSVC build for Windows.Graphics.Capture"},"qpcFrequency":10000000}`
+const mockCapsJSON = `{"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock","adapterLuid":"","adapterName":"","hagsEnabled":null,"codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,"recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless","maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":2,"queryTimeout":false,"alignW":1,"alignH":1,"dynamicResolution":false,"hdr10":false,"liveFps":"seamless","instanceSelect":true,"reencode":false}},"capture":["synthetic"],"cursorInVideo":false,"outputs":[],"unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module not found (error 126)","dda":"no DXGI output is attached to the desktop (no display, or a session without one)","amd-direct":"no display output on an AMD adapter","wgc":"this build has no C++/WinRT headers (mingw-w64 build): use the MSVC build for Windows.Graphics.Capture"},"qpcFrequency":10000000}`
 
 func TestDecodeCaps(t *testing.T) {
 	m, err := decodeMessage([]byte(mockCapsJSON))
@@ -21,6 +21,7 @@ func TestDecodeCaps(t *testing.T) {
 	h := c.Codecs["h264"]
 	if c.V != 1 || c.Backend != "mock" || c.Vendor != "mock" || !c.Usable() || c.QPCFrequency != 10_000_000 ||
 		h.MaxW != 320 || !h.ForceIDR || h.Recovery != "none" || h.LiveBitrate != "seamless" || h.AlignW != 1 ||
+		h.LiveFPS != "seamless" || !h.InstanceSelect || h.HWInstances != 2 || h.Reencode ||
 		len(c.Capture) != 1 || c.Capture[0] != "synthetic" || c.Unavailable["dda"] == "" || c.HAGSEnabled != nil ||
 		c.CursorInVideo || c.Outputs == nil || len(c.Outputs) != 0 {
 		t.Fatalf("caps %+v", c)
@@ -65,8 +66,14 @@ func TestDecodeCaps(t *testing.T) {
 
 func TestDecodeMessages(t *testing.T) {
 	m, err := decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"synthetic","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000}`))
-	if s, ok := m.(*Started); err != nil || !ok || s.Width != 320 || s.Capture != "synthetic" {
+	if s, ok := m.(*Started); err != nil || !ok || s.Width != 320 || s.Capture != "synthetic" || s.Encoder != "" {
 		t.Fatalf("started: %+v %v", m, err)
+	}
+	// The libavcodec backend (step 3.8) names its FFmpeg encoder.
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"lavc","encoder":"hevc_qsv","capture":"dda","codec":"hevc","width":1920,"height":1080,"fps":60,"kbps":20000,"liveBitrate":"flush","rateControl":"vbr_capped","usage":"low_power","preset":"veryfast","zeroCopy":true}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.Backend != "lavc" || s.Encoder != "hevc_qsv" || !s.ZeroCopy ||
+		s.LiveBitrate != "flush" || s.RateControl != "vbr_capped" || s.Usage != "low_power" || s.Preset != "veryfast" {
+		t.Fatalf("started (lavc): %+v %v", m, err)
 	}
 	m, err = decodeMessage([]byte(`{"t":"stats","frameId":7,"gen":0,"dropped":true,"key":false,"recovery":false,"bytes":512,"presentQpc":1,"captureQpc":2,"submitQpc":3,"outputQpc":4,"ltrSlot":-1,"temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1.5,"fps":60,"ringDropped":3,"reason":"ringFull"}`))
 	if s, ok := m.(*Stats); err != nil || !ok || s.FrameID != 7 || !s.Dropped || s.Reason != "ringFull" || s.LTRSlot != -1 || s.VBVFrames != 1.5 || s.RingDropped != 3 {
@@ -95,6 +102,27 @@ func TestDecodeMessages(t *testing.T) {
 		!c.Codecs["av1"].IsAssumed("roi") {
 		t.Fatalf("caps (nvenc): %+v %v", m, err)
 	}
+	// HDR10 (step 3.9): an HEVC Main10 stream with its metadata, and the caps that announce it.
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"amf","capture":"dda","codec":"hevc","width":2560,"height":1440,"fps":120,"kbps":60000,"hdr":true,"bitDepth":10,"colorSpace":"bt2020-pq","hdrMetadata":{"displayPrimaries":[[0.708,0.292],[0.17,0.797],[0.131,0.046]],"whitePoint":[0.3127,0.329],"maxLuminance":1000,"minLuminance":0.005,"maxCll":1000,"maxFall":400}}`))
+	if s, ok := m.(*Started); err != nil || !ok || !s.HDR || s.BitDepth != 10 || s.ColorSpace != "bt2020-pq" || s.HDRMetadata == nil ||
+		s.HDRMetadata.DisplayPrimaries[1] != [2]float64{0.17, 0.797} || s.HDRMetadata.WhitePoint[0] != 0.3127 ||
+		s.HDRMetadata.MaxLuminance != 1000 || s.HDRMetadata.MinLuminance != 0.005 || s.HDRMetadata.MaxCLL != 1000 || s.HDRMetadata.MaxFALL != 400 {
+		t.Fatalf("started (hdr10): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"nvenc","capture":"dda","codec":"hevc","width":1920,"height":1080,"fps":60,"kbps":20000,"hdr":false,"bitDepth":8,"colorSpace":"bt709"}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.HDR || s.BitDepth != 8 || s.ColorSpace != "bt709" || s.HDRMetadata != nil {
+		t.Fatalf("started (sdr): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"caps","v":1,"backend":"amf","vendor":"amd","codecs":{"hevc":{"maxW":7680,"maxH":4320,"tenBit":true,"hdr10":true},"h264":{"maxW":4096,"maxH":2160,"hdr10":false}},"outputs":[{"index":0,"name":"\\\\.\\DISPLAY1","width":2560,"height":1440,"attached":true,"hdr":true,"bitsPerColor":10,"minLuminance":0.005,"maxLuminance":1015.5,"maxFullFrameLuminance":400}]}`))
+	if c, ok := m.(*Caps); err != nil || !ok || !c.Codecs["hevc"].HDR10 || c.Codecs["h264"].HDR10 || len(c.Outputs) != 1 || !c.Outputs[0].HDR ||
+		c.Outputs[0].BitsPerColor != 10 || c.Outputs[0].MaxLuminance != 1015.5 || c.Outputs[0].MinLuminance != 0.005 ||
+		c.Outputs[0].MaxFullFrameLuminance != 400 {
+		t.Fatalf("caps (hdr): %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"captureChanged","reason":"hdr","width":2560,"height":1440,"rotation":0,"hdr":false,"text":"Windows HDR turned off for the output; the stream stays HDR10"}`))
+	if c, ok := m.(*CaptureChanged); err != nil || !ok || c.Reason != "hdr" || c.HDR || c.Width != 2560 {
+		t.Fatalf("captureChanged (hdr): %+v %v", m, err)
+	}
 	m, err = decodeMessage([]byte(`{"t":"started","backend":"mock","capture":"wgc","codec":"h264","width":320,"height":180,"fps":60,"kbps":4000,"cursorInVideo":true}`))
 	if s, ok := m.(*Started); err != nil || !ok || !s.CursorInVideo {
 		t.Fatalf("started (wgc with the pointer): %+v %v", m, err)
@@ -102,6 +130,25 @@ func TestDecodeMessages(t *testing.T) {
 	m, err = decodeMessage([]byte(`{"t":"stats","frameId":8,"gen":0,"dropped":false,"key":false,"recovery":false,"repeat":true,"dirtyPct":0,"bytes":40,"presentQpc":0,"captureQpc":2,"submitQpc":3,"outputQpc":4,"ltrSlot":-1,"temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1,"fps":60,"ringDropped":0}`))
 	if s, ok := m.(*Stats); err != nil || !ok || !s.Repeat || s.DirtyPct != 0 || s.PresentQPC != 0 {
 		t.Fatalf("repeat stats: %+v %v", m, err)
+	}
+	if s, ok := m.(*Stats); !ok || s.Dirty != -1 || s.Discardable || s.Reencoded || s.Slices != 0 {
+		t.Fatalf("stats of an older helper: dirty %v (want unknown)", s.Dirty)
+	}
+	// Phase 5: the dirty share, an SVC enhancement frame, a re-encoded frame,
+	// sub-frame output; the caps and started fields.
+	m, err = decodeMessage([]byte(`{"t":"stats","frameId":9,"gen":0,"dropped":false,"key":false,"recovery":false,"repeat":false,"dirtyPct":1,"dirty":1.9e-05,"discardable":true,"bytes":900,"presentQpc":1,"captureQpc":2,"submitQpc":3,"outputQpc":9,"ltrSlot":-1,"temporalLayer":1,"refLtrMask":0,"kbps":4000,"vbvFrames":1,"fps":60,"ringDropped":0,"reencoded":true,"oversizeBytes":200046,"slices":4,"firstSliceQpc":6}`))
+	if s, ok := m.(*Stats); err != nil || !ok || s.Dirty != 1.9e-05 || s.DirtyPct != 1 || !s.Discardable || s.TemporalLayer != 1 || !s.Reencoded ||
+		s.OversizeBytes != 200046 || s.Slices != 4 || s.FirstSliceQPC != 6 {
+		t.Fatalf("phase 5 stats: %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"started","backend":"nvenc","capture":"dda","codec":"hevc","width":1920,"height":1080,"fps":120,"kbps":30000,"svcLayers":2,"liveFps":"seamless","reencodeOversized":4,"sliceOutput":0}`))
+	if s, ok := m.(*Started); err != nil || !ok || s.SVCLayers != 2 || s.LiveFPS != "seamless" || s.ReencodeOversized != 4 || s.SliceOutput != 0 {
+		t.Fatalf("phase 5 started: %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"caps","v":1,"backend":"amf","vendor":"amd","codecs":{"av1":{"maxW":8192,"maxH":4352,"maxTemporalLayers":4,"sliceOutput":true,"hwInstances":2,"liveFps":"seamless","instanceSelect":true,"reencode":false,"assumed":["liveFps"]}}}`))
+	if c, ok := m.(*Caps); err != nil || !ok || c.Codecs["av1"].LiveFPS != "seamless" || !c.Codecs["av1"].InstanceSelect || c.Codecs["av1"].Reencode ||
+		!c.Codecs["av1"].IsAssumed("liveFps") || !c.Codecs["av1"].SliceOutput {
+		t.Fatalf("phase 5 caps: %+v %v", m, err)
 	}
 	m, err = decodeMessage([]byte(`{"t":"captureChanged","reason":"resized","width":1920,"height":1080,"rotation":90,"text":"was 2560x1440 rotation 0"}`))
 	if c, ok := m.(*CaptureChanged); err != nil || !ok || c.Reason != "resized" || c.Width != 1920 || c.Rotation != 90 {
@@ -148,6 +195,9 @@ func TestEncodeMessages(t *testing.T) {
 		{recoverMsg{T: "recover", LostFromFrameID: 42}, `{"t":"recover","lostFromFrameId":42}`},
 		{recoverMsg{T: "recover", LostFromFrameID: 42, AckedLTRFrameID: &acked}, `{"t":"recover","lostFromFrameId":42,"ackedLtrFrameId":40}`},
 		{setRateMsg{T: "setRate", Kbps: 20000, VBVFrames: 1, FPS: 90}, `{"t":"setRate","kbps":20000,"vbvFrames":1,"fps":90}`},
+		{setRateMsg{T: "setRate", FPS: 60}, `{"t":"setRate","fps":60}`}, // SetFPS: kbps unchanged
+		{startMsg{T: "start", StartParams: StartParams{Codec: "hevc", FPS: 120, Kbps: 30000, SVCLayers: 2, ReencodeOversized: 4, SliceOutput: 4}},
+			`{"t":"start","monitor":0,"codec":"hevc","fps":120,"kbps":30000,"svcLayers":2,"reencodeOversized":4,"sliceOutput":4}`},
 		{setROIMsg{T: "setRoi", Rects: []ROIRect{{X: 1, Y: 2, W: 3, H: 4, Weight: 5}}}, `{"t":"setRoi","rects":[{"x":1,"y":2,"w":3,"h":4,"weight":5}]}`},
 	} {
 		b, err := json.Marshal(c.v)

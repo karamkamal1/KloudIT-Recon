@@ -11,11 +11,19 @@
 // per present under full-frame noise (about +-40 per channel). Scaled to a
 // 1080p stream that is far more than any bitrate the qualification asks for,
 // so the encoder's rate control always decides the frame sizes.
+//
+// With start's hdr it plays an output in Windows HDR mode (GUIDE 3.9): FP16
+// scRGB textures with values far above SDR white (up to 4000 cd/m2), a
+// 1000 cd/m2 grey patch in the top-right 32x32 corner (PQ code 723 in the
+// P010 output) and display metadata of a 1000 cd/m2 panel, so the HDR10
+// conversion runs end to end too. The high-motion source has no HDR mode: a
+// start with both motion and hdr is refused.
 #include <algorithm>
 #include <mutex>
 #include <vector>
 
 #include "capture/paced_capture.hpp"
+#include "d3d/convert.hpp"
 #include "d3d/device.hpp"
 #include "probes.hpp"
 
@@ -43,12 +51,15 @@ protected:
 private:
     void drawPattern();
     void drawMotion();
+    void drawHdr();
 
     d3d::Device dev_;
     ComPtr<ID3D11Texture2D> slots_[2];
     int cur_ = 0;
     SourceInfo src_;
+    uint32_t bytesPerPixel_ = 4;
     std::vector<uint8_t> pixels_;
+    std::vector<uint16_t> hdrRed_, hdrGreen_;  // HDR: FP16 gradients by column / row
     int64_t start_ = 0, presentPeriod_ = 0, nextPresent_ = 0;
     uint64_t presents_ = 0;
     bool motion_ = false;
@@ -68,12 +79,24 @@ Status GpuTestCapture::init(const StartParams& p) {
     src_.device = dev_.device.Get();
     src_.width = 640;
     src_.height = 360;
+    if (p.motion && p.hdr) return Status::Error("unsupported", "the high-motion test source (motion) has no HDR mode");
+    if (p.hdr) {
+        // A 1000 cd/m2 HDR panel with P3-like primaries.
+        DisplayColor& d = src_.display;
+        d.known = d.hdr = true;
+        d.bitsPerColor = 10;
+        d.red[0] = 0.680, d.red[1] = 0.320, d.green[0] = 0.265, d.green[1] = 0.690;
+        d.blue[0] = 0.150, d.blue[1] = 0.060, d.white[0] = 0.3127, d.white[1] = 0.3290;
+        d.minLuminance = 0.005, d.maxLuminance = 1000, d.maxFullFrameLuminance = 400;
+        src_.hdr = true;
+        bytesPerPixel_ = 8;
+    }
     D3D11_TEXTURE2D_DESC td{};
     td.Width = src_.width;
     td.Height = src_.height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = src_.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -81,7 +104,11 @@ Status GpuTestCapture::init(const StartParams& p) {
         const HRESULT hr = dev_.device->CreateTexture2D(&td, nullptr, t.GetAddressOf());
         if (FAILED(hr)) return Status::Error("init_failed", "creating the test texture failed: " + d3d::hrText(hr));
     }
-    pixels_.resize(size_t(td.Width) * td.Height * 4);
+    pixels_.resize(size_t(td.Width) * td.Height * bytesPerPixel_);
+    if (src_.hdr) {
+        for (uint32_t x = 0; x < src_.width; ++x) hdrRed_.push_back(d3d::toHalf(12.5f * float(x) / float(src_.width)));
+        for (uint32_t y = 0; y < src_.height; ++y) hdrGreen_.push_back(d3d::toHalf(2.0f * float(y) / float(src_.height)));
+    }
     motion_ = p.motion;
     const int64_t freq = qpcFrequency();
     presentPeriod_ = freq / std::min(240, 2 * p.fps);
@@ -107,12 +134,13 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
         nextPresent_ += presentPeriod_;
         if (qpcNow() - present > presentPeriod_ * 4) nextPresent_ = qpcNow();  // fell behind (debugger): resync
         ++presents_;
-        if (motion_) drawMotion();
+        if (src_.hdr) drawHdr();
+        else if (motion_) drawMotion();
         else drawPattern();
-        dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, pixels_.data(), src_.width * 4, 0);
+        dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, pixels_.data(), src_.width * bytesPerPixel_, 0);
         a.presentQpc = present;
         a.captureQpc = qpcNow();
-        a.dirtyPct = 100;
+        a.dirty = 1;  // the whole test image changes
         return Next::Frame;
     }
 }
@@ -146,6 +174,27 @@ void GpuTestCapture::drawMotion() {
                 px[c] = uint8_t(std::clamp(base + n * 5 / 16, 0, 255));
             }
             px[3] = 255;
+        }
+    }
+}
+
+// HDR: scRGB (1.0 = 80 cd/m2): gradients up to 12.5 (1000 cd/m2), a
+// 4000 cd/m2 bar, the fixed 1000 cd/m2 patch top right.
+void GpuTestCapture::drawHdr() {
+    const uint32_t w = src_.width, h = src_.height, bar = uint32_t(presents_ * 7 % (w - 64));
+    const uint16_t patch = d3d::toHalf(12.5f), bright = d3d::toHalf(50.0f), one = d3d::toHalf(1.0f);
+    const uint16_t blue = d3d::toHalf(float(presents_ * 3 % 256) / 255.0f);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            auto* px = reinterpret_cast<uint16_t*>(&pixels_[(size_t(y) * w + x) * 8]);
+            if (x >= w - 32 && y < 32) {
+                px[0] = px[1] = px[2] = patch;
+            } else if (x >= bar && x < bar + 16) {
+                px[0] = px[1] = px[2] = bright;
+            } else {
+                px[0] = hdrRed_[x], px[1] = hdrGreen_[y], px[2] = blue;
+            }
+            px[3] = one;
         }
     }
 }

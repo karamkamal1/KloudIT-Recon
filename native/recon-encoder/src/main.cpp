@@ -5,7 +5,9 @@
 // (length-prefixed JSON), and restarts it if it exits or reports a fatal error.
 // The protocol is specified in docs/HELPER_PROTOCOL.md.
 #include <windows.h>
+#include <shellapi.h>  // CommandLineToArgvW
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -15,11 +17,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "backend.hpp"
 #include "control.hpp"
 #include "d3d/convert.hpp"
 #include "encode_test.hpp"
+#include "lavc/lavc_runtime.hpp"
 #include "nvenc/nvenc_runtime.hpp"
 #include "pipeline.hpp"
 #include "platform/platform.hpp"
@@ -34,7 +38,7 @@ namespace {
 
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
-    "       recon-encoder --print-caps [--backend=B]\n"
+    "       recon-encoder --print-caps [--backend=B] [--ffmpeg-dir=DIR]\n"
     "       recon-encoder --gpu-priority-table\n"
     "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder | --self-test-nvenc[=DLL]\n"
     "       recon-encoder --encode-test=FILE [--backend=B] [--nvenc-test-dll=DLL] [encode test options]\n"
@@ -45,7 +49,12 @@ const char kUsage[] =
     "  --ring-handle=H      inherited handle of the frame ring file mapping (0x... or decimal)\n"
     "  --ring-size=N        size of the mapping in bytes\n"
     "  --event-handle=H     inherited handle of the auto-reset frame-ready event\n"
-    "  --backend=B          auto (default) | amf | nvenc | mock\n"
+    "  --backend=B          auto (default) | amf | nvenc | lavc | mock\n"
+    "  --ffmpeg-dir=DIR     lavc: load avcodec-62.dll / avutil-60.dll (FFmpeg 8.x shared build) from DIR only\n"
+    "                       (relative: from the current directory; default: ffmpeg-lgpl\\ next to the helper,\n"
+    "                       then the helper's directory)\n"
+    "  --lavc-test-encoder=NAME[,NAME]  test only, needs --backend=lavc: drive these libavcodec encoders (e.g.\n"
+    "                       libx264 of a GPL shared build) instead of Quick Sync Video, on system-memory frames\n"
     "  --log-level=L        error | warn | info (default) | debug   (logs go to stderr)\n"
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
@@ -56,7 +65,7 @@ const char kUsage[] =
     "  --mock-idr-on-rate   mock only: every setRate also makes an IDR (an encoder that fails the seamless check)\n"
     "  --nvenc-test-dll=DLL --encode-test and --print-caps only: load DLL (the test double recon-fake-nvenc.dll)\n"
     "                       as the NVENC runtime\n"
-    "  --dump-nv12=PATH     write converted frame 30 (raw NV12, encoded size) to PATH\n"
+    "  --dump-nv12=PATH     write converted frame 30 (raw NV12, P010 in an HDR10 stream; encoded size) to PATH\n"
     "  --print-caps         print the capabilities JSON and exit\n"
     "  --gpu-priority-table print the GPU priority decision for every mode x vendor x HAGS state (JSON lines)\n"
     "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
@@ -73,9 +82,13 @@ const char kUsage[] =
     "  --width=W --height=H (0 = capture size)  --fps=N (60)  --kbps=N (20000)  --rc=cbr|vbr|vbr_peak\n"
     "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
     "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
+    "  --hdr=0|1 (HDR10 when the output is in Windows HDR mode; synthetic-gpu plays one)\n"
+    "  --svc=N (temporal layers; also writes FILE without the discardable frames as FILE.base)\n"
+    "  --reencode=F (NVENC: re-encode frames above F average frames)  --slices=N (AMF: slice / tile output)\n"
     "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
     "  --dxgi-gate=0|1 (1)  0: DDA and NVENC's Lock/UnlockBitstream not serialized (docs/VENDOR_NOTES.md 3.4 A/B)\n"
-    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n"
+    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT[+X,Y,W,H,WEIGHT...] | roi=off\n"
+    "               (repeatable)\n"
     "  --rate-schedule=K1[,K2...]:N  every N frames the next rate of the list (cyclically), set right before the\n"
     "                       frame is submitted (frame 1+k*N is the first at the k-th new rate; step 3.6)\n"
     "  --barcode=X,Y,CELL   draw the frame barcode (GUIDE 0.2)  --motion=0|1  synthetic-gpu: high-motion source\n"
@@ -99,6 +112,7 @@ struct Args {
     uint64_t ringHandle = 0, ringSize = 0, eventHandle = 0;
     LogLevel logLevel = LogLevel::Info;
     MockOptions mock;
+    LavcOptions lavc;
 };
 
 bool parseNumber(const std::string& s, uint64_t& out) {
@@ -109,9 +123,23 @@ bool parseNumber(const std::string& s, uint64_t& out) {
     return errno == 0 && end && *end == '\0';
 }
 
-bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+// The arguments as UTF-8, from the wide command line: main's argv is in the
+// ANSI code page, which cannot hold every path (the path options are decoded
+// with fromUtf8). argv only if the wide command line cannot be split.
+std::vector<std::string> utf8Arguments(int argc, char** argv) {
+    int n = 0;
+    if (LPWSTR* w = CommandLineToArgvW(GetCommandLineW(), &n)) {
+        std::vector<std::string> out;
+        for (int i = 0; i < n; ++i) out.push_back(toUtf8(w[i]));
+        LocalFree(w);
+        if (n == argc) return out;
+    }
+    return std::vector<std::string>(argv, argv + argc);
+}
+
+bool parseArgs(const std::vector<std::string>& args, Args& a, std::string& err) {
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
         std::string key = arg, val;
         const size_t eq = arg.find('=');
         if (eq != std::string::npos) {
@@ -139,6 +167,16 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         else if (key == "--version") a.version = true;
         else if (key == "--help" || key == "-h") a.help = true;
         else if (key == "--backend") a.backend = val;
+        else if (key == "--ffmpeg-dir") ok = !(a.lavc.dir = fromUtf8(val)).empty();
+        else if (key == "--lavc-test-encoder") {
+            size_t from = 0;
+            while (from <= val.size()) {
+                const size_t comma = std::min(val.find(',', from), val.size());
+                if (comma > from) a.lavc.testEncoders.push_back(val.substr(from, comma - from));
+                from = comma + 1;
+            }
+            ok = !a.lavc.testEncoders.empty();
+        }
         else if (key == "--ring-handle") ok = parseNumber(val, a.ringHandle) && a.ringHandle != 0;
         else if (key == "--ring-size") ok = parseNumber(val, a.ringSize);
         else if (key == "--event-handle") ok = parseNumber(val, a.eventHandle) && a.eventHandle != 0;
@@ -159,7 +197,7 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
             return false;
         }
     }
-    if (a.backend != "auto" && a.backend != "amf" && a.backend != "nvenc" && a.backend != "mock") {
+    if (a.backend != "auto" && a.backend != "amf" && a.backend != "nvenc" && a.backend != "lavc" && a.backend != "mock") {
         err = "unknown backend " + a.backend;
         return false;
     }
@@ -171,6 +209,10 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
     if (!a.nvencTestDll.empty() && a.encodeTest.output.empty() && !a.printCaps) {
         // Never in the mode recon-host runs: a DLL loaded by path is for tests only.
         err = "--nvenc-test-dll needs --encode-test or --print-caps";
+        return false;
+    }
+    if (!a.lavc.testEncoders.empty() && a.backend != "lavc") {
+        err = "--lavc-test-encoder needs --backend=lavc";
         return false;
     }
     if (a.encodeTest.used && a.encodeTest.output.empty()) {
@@ -255,7 +297,7 @@ int main(int argc, char** argv) {
 
     Args a;
     std::string err;
-    if (!parseArgs(argc, argv, a, err)) {
+    if (!parseArgs(utf8Arguments(argc, argv), a, err)) {
         std::fprintf(stderr, "recon-encoder: %s\n\n%s", err.c_str(), kUsage);
         return kExitUsage;
     }
@@ -303,6 +345,7 @@ int main(int argc, char** argv) {
             return kExitUsage;
         }
     }
+    setLavcOptions(a.lavc);
     BackendChoice choice = chooseBackend(a.backend, a.mock);
     if (!a.encodeTest.output.empty()) return runEncodeTest(a.encodeTest, choice);
     if (a.printCaps) {

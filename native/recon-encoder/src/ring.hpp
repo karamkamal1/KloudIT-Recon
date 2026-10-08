@@ -59,12 +59,16 @@ constexpr size_t kSlotRefLtrMask = 80;     // u32
 constexpr size_t kSlotDroppedBefore = 84;  // u32 frames dropped right before this one
 constexpr size_t kSlotWidth = 88;          // u32
 constexpr size_t kSlotHeight = 92;         // u32
+constexpr size_t kSlotDirtyPpm = 96;       // u32 dirty share in parts per million (valid with kFlagDirty; Phase 5)
 
 constexpr uint32_t kFlagKey = 1u << 0;
 constexpr uint32_t kFlagRecovery = 1u << 1;
 constexpr uint32_t kFlagDroppedBefore = 1u << 2;
 constexpr uint32_t kFlagRepeat = 1u << 3;  // idle re-submit of the previous image
 constexpr uint32_t kFlagSeqStart = 1u << 4;  // key frame starting a sequence (stream start, or answering forceIdr)
+// Phase 5 (additive: older helpers leave them 0).
+constexpr uint32_t kFlagDirty = 1u << 5;        // kSlotDirtyPpm is valid (the capture reports dirty regions)
+constexpr uint32_t kFlagDiscardable = 1u << 6;  // no later frame references this one (top SVC layer / non-reference)
 }  // namespace ring
 
 enum class WriteResult { Written, Full, TooLarge, Corrupt };

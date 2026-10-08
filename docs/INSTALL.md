@@ -183,6 +183,22 @@ Anyone with physical access to the PC then gets your desktop. Decide whether tha
    powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -PairingCode "recon1:..." -InstallViGEm
    ```
 
+Optional: add `-InstallVirtualDisplay` to also install the Virtual Display Driver (a pinned,
+SHA-256-verified release). It is for streaming a virtual monitor at the browser's resolution
+and frame rate, e.g. 2560x1440 at 120 fps although the PC's monitor is 1080p60 (sessions do
+not use it yet; `recon-host.exe vdisplay`, under Useful commands, tests it). Windows asks once
+whether to install software from "SignPath Foundation": choose **Install**. The installer leaves
+the driver's device disabled, so there is no extra monitor: a session enables it only while it
+streams. It also restricts `C:\VirtualDisplayDriver` to administrators (users can read it).
+Skip it if Apollo is installed (its SudoVDA driver is used instead).
+
+Optional, for Intel graphics: add `-InstallLibavcodec` to also download FFmpeg's LGPL shared
+libraries (BtbN's FFmpeg 8.1 LGPL shared build, about 80 MB, SHA-256 verified) into
+`C:\Program Files\KlouditRecon\ffmpeg-lgpl`. The native encoder helper uses them to encode
+with Intel Quick Sync Video on GPUs that have no AMD AMF or NVIDIA NVENC encoder (see
+`docs/HELPER_PROTOCOL.md`, "libavcodec encoder backend"); without them the helper reports
+that backend unavailable. The FFmpeg command-line path keeps using the GPL `ffmpeg.exe`.
+
 The installer:
 
 1. Copies the agent to `C:\Program Files\KlouditRecon`.
@@ -319,7 +335,8 @@ pick up the old files.
 
 - **PC**, in an administrator PowerShell:
   `powershell -ExecutionPolicy Bypass -File "$env:ProgramFiles\KlouditRecon\uninstall-host.ps1"`.
-  Add `-KeepConfig` to keep the pairing.
+  Add `-KeepConfig` to keep the pairing, `-RemoveVirtualDisplay` to also remove the Virtual
+  Display Driver.
 - **Gateway**: `pct stop 210 && pct destroy 210` on the Proxmox node.
 
 ## Useful commands
@@ -333,4 +350,5 @@ pick up the old files.
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), monitors, controllers |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 70 min on AMD, 25 on NVIDIA; `-quality balanced` a third of that; no stream running); sessions use the results (`live-bitrate.json`) |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" vdisplay -mode 2560x1440@120 -hold 30s` | Create a virtual display for 30 s and restore the displays (stop the agent first) |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" pair "recon1:..."` | Re-pair. The running agent picks up the new code within seconds. |

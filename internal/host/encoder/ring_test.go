@@ -107,6 +107,39 @@ func TestRingRoundTrip(t *testing.T) {
 	}
 }
 
+// Phase 5 slot fields: the dirty share (parts per million, valid with
+// FlagDirty) and FlagDiscardable; a slot from an older helper (neither set,
+// the reserved bytes 0) reads as unknown / not discardable.
+func TestRingDirtyAndDiscardable(t *testing.T) {
+	r, w := newTestRing(t, 4, 64<<10)
+	for _, f := range []*Frame{
+		{FrameID: 1, Key: true, Dirty: 1, Data: []byte{1}},
+		{FrameID: 2, Dirty: 0.25, Discardable: true, TemporalLayer: 1, Data: []byte{2}},
+		{FrameID: 3, Dirty: 40.0 / (1920 * 1080), Data: []byte{3}}, // a text caret: 19 ppm
+		{FrameID: 4, Dirty: -1, Data: []byte{4}},
+	} {
+		w.write(f)
+	}
+	want := []struct {
+		dirty       float64
+		discardable bool
+	}{{1, false}, {0.25, true}, {0.000019, false}, {-1, false}}
+	for i, x := range want {
+		f, err := r.Next()
+		if err != nil || f == nil || f.Dirty != x.dirty || f.Discardable != x.discardable {
+			t.Fatalf("frame %d: %+v %v, want dirty %v discardable %v", i+1, f, err, x.dirty, x.discardable)
+		}
+	}
+	w.write(&Frame{FrameID: 5, Data: []byte{5}})
+	le := binary.LittleEndian
+	s := w.slot(4)
+	le.PutUint32(s[slotFlags:], 0) // an older helper's slot
+	le.PutUint32(s[slotDirtyPPM:], 0)
+	if f, _ := r.Next(); f.Dirty != -1 || f.Discardable {
+		t.Fatalf("older slot: %+v", f)
+	}
+}
+
 func TestRingCopiesData(t *testing.T) {
 	r, w := newTestRing(t, 2, 64<<10)
 	w.write(&Frame{FrameID: 1, Data: []byte{1, 2, 3}})
