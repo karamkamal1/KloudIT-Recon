@@ -811,6 +811,96 @@ func TestStreamingPaths(t *testing.T) {
 	})
 }
 
+// udpForward forwards UDP datagrams from a socket on listenIP to target, with
+// one upstream socket per sender (like a NAT), and returns its address.
+func udpForward(t *testing.T, listenIP, target string) string {
+	t.Helper()
+	ln, err := net.ListenPacket("udp", net.JoinHostPort(listenIP, "0"))
+	if err != nil {
+		t.Skipf("no %s here: %v", listenIP, err)
+	}
+	dst, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	ups := map[string]*net.UDPConn{}
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range ups {
+			c.Close()
+		}
+	})
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, from, err := ln.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			up := ups[from.String()]
+			if up == nil {
+				if up, err = net.DialUDP("udp", nil, dst); err != nil {
+					mu.Unlock()
+					continue
+				}
+				ups[from.String()] = up
+				go func() {
+					b := make([]byte, 64<<10)
+					for {
+						n, err := up.Read(b)
+						if errors.Is(err, net.ErrClosed) {
+							return
+						}
+						if err == nil {
+							ln.WriteTo(b[:n], from)
+						}
+					}
+				}()
+			}
+			mu.Unlock()
+			up.Write(buf[:n])
+		}
+	}()
+	return ln.LocalAddr().String()
+}
+
+// A firewall in front of the gateway that lets only the main port through:
+// the host's bind never reaches the relay port. The gateway answers the
+// allocation with 504 after its bind wait (the client then skips the UDP relay
+// for a while, as when its own datagrams get no answer), and the splice relay
+// still works.
+func TestUDPRelayHostCannotBind(t *testing.T) {
+	// The host reaches the gateway through a forwarder on another loopback
+	// address, so it sends its binds there, where no relay port listens.
+	e := setup(t, func(c *host.Config) { c.Gateway = udpForward(t, "127.0.0.2", c.Gateway) })
+	from := e.logs.Len()
+	tk := e.connectInfo()
+	t0 := time.Now()
+	_, err := e.allocRelay(tk.Relay.UDP)
+	took := time.Since(t0)
+	if err == nil || !strings.Contains(err.Error(), "504") {
+		t.Fatalf("allocation without the host's bind: %v", err)
+	}
+	if took > 3500*time.Millisecond { // the gateway waits 2 s for the bind
+		t.Fatalf("the allocation failed only after %s", took)
+	}
+	t.Logf("allocation failed after %s: %v", took.Round(time.Millisecond), err)
+	for deadline := time.Now().Add(3 * time.Second); len(e.logs.lines(from, "the gateway's relay port did not answer")) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("the host did not try to bind")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	r := runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 1, 2*time.Second)
+	if !r.welcome || r.frames < 60 || r.keyframes < 1 {
+		t.Fatalf("splice relay: %+v", r)
+	}
+}
+
 // Host config "congestion": "media": the direct server, the UDP relay server
 // and the relay data connection run the media congestion controller.
 func TestStreamingMediaCongestion(t *testing.T) {

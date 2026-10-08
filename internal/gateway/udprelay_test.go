@@ -295,6 +295,7 @@ func TestUDPRelayForwardsQUIC(t *testing.T) {
 // that, only those two addresses are forwarded between.
 func TestUDPRelayRefusesStrangers(t *testing.T) {
 	r := newTestRelay(t, 1)
+	r.bindWait = 10 * time.Second // the wrong-token bind below takes 2 s
 	serverTLS, clientTLS := relayTLS(t)
 	host := newRelayHost(t, serverTLS, transport.QUICConfig())
 	a := allocate(t, r, "u")

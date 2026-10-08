@@ -273,7 +273,7 @@ untouched, so you keep WebTransport and the direct path. Other options:
 | `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP); the container's IPs and hostname are always included |
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
 | `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
-| `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40031,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. `off`: relay only through the QUIC splice on 8443 |
+| `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40015,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. The page's CSP lists each port; with more than 32 it allows any port on the gateway's name. `off`: relay only through the QUIC splice on 8443 |
 | `-trust-proxy` | none | CIDR of a reverse proxy whose `X-Forwarded-For` is trusted |
 
 On a Linux/LXC install the settings live in `/etc/kloudit-recon/gateway.env` (one
@@ -336,8 +336,9 @@ command: `recon-host.exe -v probe`.
   gateway, or your browser lacks WebTransport. Check your firewall, port forwarding or proxy.
 - **The overlay's Transport row says `relay-splice` instead of `relay`.** The relay ports (UDP
   8444–8459) don't reach the gateway from the browser or the PC, so the client fell back to the
-  splice on 8443, which runs a second congestion controller on the gateway. Open or forward the
-  range, or set `-relay-ports` to ports that are open. The gateway log says
+  splice on 8443, which runs a second congestion controller on the gateway (and keeps using it
+  for 10 minutes or until you reload the page). Open or forward the range, or set
+  `-relay-ports` to ports that are open. The gateway log says
   `udp relay: the browser never arrived` (browser side) and the PC's host.log
   `the gateway's relay port did not answer` (PC side).
 - **The direct path is never used.** Allow UDP 47998 on the PC (the installer adds a

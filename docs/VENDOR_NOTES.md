@@ -2916,6 +2916,24 @@ Verified in the sandbox (Linux, no GPU, loopback; IPv4 only, the sandbox has no 
   browser to a port outside `-relay-ports`, and Chromium refused it by the CSP's
   `connect-src` ("violates the document's Content Security Policy"), which confirms the worker's
   WebTransport is subject to the gateway's CSP and the relay ports must be listed there.
+- Review fix, the host's bind blocked (a firewall in front of the gateway that lets only 8443
+  through, with the PC outside the gateway's LAN): the gateway used to wait 5 s for the bind and
+  answer the allocation with 503, which the client did not count as a blocked relay, so every
+  connect paid the wait again. Now the gateway waits 2 s (the host binds within a round trip)
+  and answers 504, the host stops sending binds after 2 s as well, and the client treats a 504
+  like a relay port that does not answer: splice at once, the UDP relay skipped for 10 minutes
+  of the page. `internal/e2e` `TestUDPRelayHostCannotBind`: the host reaches the gateway
+  through a UDP forwarder on 127.0.0.2, so it sends its binds to 127.0.0.2:<relay port>, where
+  nothing listens; the allocation fails with 504 after 2.003 s, the host logs `the gateway's
+  relay port did not answer`, the splice relay streams. Browser E2E "UDP relay, host cannot
+  bind" (Playwright answers the allocation with the gateway's 504): the client logs `relay
+  failed: relay allocation: the host did not reach the relay port`, connects as
+  `relay-splice`, and the drawer's Reconnect in the same page goes to the splice without a
+  second allocation request.
+- Review fix, `TestUDPRelayLifetimes` flake: an allocation closed `done` before it left the port
+  table. Reproduced every time with a 20 ms sleep between the two ("1 allocations left"); it
+  now leaves the table first (the test passes with sleeps on both sides). `go test -race` of
+  `internal/gateway`, `internal/host` and `internal/e2e` clean.
 - Windows: the relay tests built for Windows cannot run under Wine 9.0: every Go UDP socket
   fails there (`WSAIoctl(SIO_UDP_CONNRESET)`, error 10045). `GOOS=windows go vet ./...` passes.
 
@@ -2943,7 +2961,10 @@ Not verified (needs real networks or Windows):
   addresses (SLAAC + temporary + ULA) and `-listen :8443`; a client on IPv6: the relay session
   works (answers leave from the address the client targeted, `IPV6_PKTINFO`).
 - Docker (`network_mode: host`) and Proxmox firewall: unverified. Test: with the Proxmox
-  firewall on, add an IN rule for UDP 8444-8459 next to 8443; the relay session works.
+  firewall on, add an IN rule for UDP 8444-8459 next to 8443; the relay session works. Without
+  that rule and with the PC outside the gateway's LAN: the client connects as `relay-splice`
+  about 2 s after the direct attempt (browser console `relay failed: relay allocation: the host
+  did not reach the relay port`), and a Reconnect within 10 minutes goes straight to the splice.
 - Other browsers: unverified. Test: Edge and Firefox (WebTransport with
   `serverCertificateHashes` to the gateway on a relay port); Safari 26.4: whether it supports
   `serverCertificateHashes` at all (else it uses the splice or WebSocket as before).

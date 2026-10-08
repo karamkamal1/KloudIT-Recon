@@ -44,9 +44,11 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **WebSocket / WebTransport / UDP relay allocation:** need a same-origin `Origin` and a
   **single-use ticket** (192-bit, 60 s, bound to user and host, stored only as a hash).
 - **Headers:** a strict CSP (`script-src 'self'`, no inline script or style,
-  `frame-ancestors 'none'`, `connect-src` limited to self plus known direct endpoints), COOP/COEP
-  (cross-origin isolation), CORP, `nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options:
-  DENY`, Permissions-Policy, and HSTS when a real certificate is configured.
+  `frame-ancestors 'none'`, `connect-src` limited to self, the hosts' known direct endpoints and
+  the UDP relay ports on the name the page was loaded from; with more than 32 relay ports, any
+  port on that name), COOP/COEP (cross-origin isolation), CORP, `nosniff`,
+  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, Permissions-Policy, and HSTS when a
+  real certificate is configured.
 - **Input limits:** JSON bodies are capped at 64 KiB with unknown fields rejected; control
   messages at 1 MiB, input events at 64 KiB, frames at 32 MiB, datagrams at 1200 B; strict parsing
   of every binary event.
@@ -89,7 +91,7 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
     the handshake completes, the host's QUIC stack limits what it sends to an unvalidated
     address to 3 × what it received (RFC 9000 anti-amplification). Forwarding is rate limited
     (browser → host 32 Mbit/s, host → browser 1 Gbit/s).
-  - **Lifetimes and quotas:** the host must bind within 5 s, the browser must arrive within
+  - **Lifetimes and quotas:** the host must bind within 2 s, the browser must arrive within
     20 s, and an allocation ends after 30 s without a datagram or when the host releases it. A
     user may hold at most 4 allocations the browser has not reached yet; the port range caps
     the total. Starts and ends are audited (`stream_start` / `stream_end` "via udp relay").
@@ -107,8 +109,11 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   which blocks filter injection such as `movie=`.
 - The host config holding the token is created in the user's profile with owner-only ACLs.
 - The firewall rule for the direct path covers only the Private and Domain profiles and only the
-  agent executable. The UDP relay needs no inbound rule: the host's relay socket only answers the
-  gateway's allocation ports it sent to first.
+  agent executable. The UDP relay needs no inbound rule: the host's relay socket sends to the
+  gateway's allocation ports first, and it is the PC's stateful firewall (and a NAT in front of
+  it) that then admits datagrams from those ports only. The socket itself refuses every other
+  QUIC sender that gets through (`CONNECTION_REFUSED`, or Version Negotiation for an unknown
+  QUIC version) and never opens a connection or a session for it.
 
 ## Gateway hardening (systemd)
 

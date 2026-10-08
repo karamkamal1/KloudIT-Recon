@@ -37,7 +37,7 @@ import (
 // datagrams are forwarded between exactly these two addresses, unmodified.
 
 const (
-	relayBindWait   = 5 * time.Second  // host bind after the allocation
+	relayBindWait   = 2 * time.Second  // host bind after the allocation (usually one round trip)
 	relayLockWait   = 20 * time.Second // browser's first Initial after the bind
 	relayIdle       = 30 * time.Second // no datagram either way (QUIC idles out after 20 s)
 	relayMaxPending = 4                // allocations per user the browser has not reached yet
@@ -231,12 +231,13 @@ func (a *allocation) serve() {
 	up := tokenBucket{rate: relayUpRate, burst: relayUpBurst, tokens: relayUpBurst, ts: last}
 	down := tokenBucket{rate: relayDownRate, burst: relayDownBurst, tokens: relayDownBurst, ts: last}
 	defer func() {
-		a.close()
+		// Out of the table before the allocation reports its end (a.done).
 		r.mu.Lock()
 		if r.allocs[a.port] == a {
 			delete(r.allocs, a.port)
 		}
 		r.mu.Unlock()
+		a.close()
 		if a.locked.Load() {
 			a.stats.Last = last
 			r.log.Info("udp relay: session ended", "port", a.port, "host", a.req.hostID, "user", a.req.user,

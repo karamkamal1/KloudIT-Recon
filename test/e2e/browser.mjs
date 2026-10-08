@@ -438,6 +438,43 @@ async function lossRun(name, faults, seconds) {
   };
 }
 
+// The host cannot reach the relay port (a firewall in front of the gateway
+// that lets only the main port through): the gateway answers the allocation
+// with 504 (internal/e2e TestUDPRelayHostCannotBind drops a real host's bind;
+// here Playwright answers for the gateway). The client falls back to the
+// splice at once and skips the UDP relay on the next connect of the page.
+async function checkUdpRelayHostBlocked() {
+  let allocations = 0;
+  const route = (r) => { allocations++; return r.fulfill({ status: 504, json: { error: 'the host did not reach the relay port' } }); };
+  await page.goto(`${base}/`);
+  await page.evaluate(() => localStorage.setItem('recon.prefs.v1', JSON.stringify({ path: 'relay' })));
+  await ctx.route('**/api/relay/udp*', route);
+  try {
+    const con0 = consoleLines.length;
+    await page.click('.host.online a.btn-primary');
+    await page.waitForURL(/\/stream\?host=/);
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.click('#btn-start');
+    await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    const first = await page.evaluate(() => window.__recon.conn.path);
+    const why = (consoleLines.slice(con0).find((l) => l.includes('relay failed:')) || '').replace(/^.*?relay failed/, 'relay failed');
+    check('UDP relay, host cannot bind: falls back to the splice', first === 'relay-splice' && allocations === 1 &&
+      /^relay failed: relay allocation: the host did not reach the relay port/.test(why), `${first}; ${why.slice(0, 160)}`);
+    // Reconnect in the same page (the drawer's Reconnect button).
+    await page.evaluate(() => {
+      window.__recon.conn = null;
+      [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Reconnect')).click();
+    });
+    await page.waitForFunction(() => window.__recon.streaming && window.__recon.conn, null, { timeout: 30000 });
+    const second = await page.evaluate(() => window.__recon.conn.path);
+    check('UDP relay, host cannot bind: the next connect skips the UDP relay', second === 'relay-splice' && allocations === 1,
+      `${second}, ${allocations} allocation request(s)`);
+  } finally {
+    await page.evaluate(() => { window.__recon.userClosed = true; }).catch(() => {});
+    await ctx.unroute('**/api/relay/udp*', route);
+  }
+}
+
 async function checkLossHandling() {
   // The scenarios so far ran on a clean loopback link ("lan"): no gap may
   // have been taken for a loss. Restarts for other reasons (settings changes,
@@ -809,6 +846,8 @@ try {
     }
     await page.evaluate(() => { window.__recon.userClosed = true; });
   }
+
+  await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
 
   // 3a. Loss handling with the host's fault-injection hook --------------------
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));

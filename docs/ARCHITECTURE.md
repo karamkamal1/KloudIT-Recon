@@ -341,14 +341,17 @@ browser ──QUIC (host cert, pinned)──► gateway :8444 ──same datagra
    allocation; `path=relay` in the host log. When the connection has ended, the host sends
    `release` (`u8 0x03 | "RLY" | token`) and the gateway frees the port.
 
-Lifetimes: the host must bind within 5 s, the browser must arrive within 20 s, and an
+Lifetimes: the host must bind within 2 s, the browser must arrive within 20 s, and an
 allocation with no datagram either way for 30 s ends (QUIC itself idles out after 20 s and sends
 keep-alives every 5 s). A user may hold at most 4 allocations the browser has not reached yet.
 Forwarding is rate limited per direction (browser → host 32 Mbit/s, which carries ACKs, input
 and pings; host → browser 1 Gbit/s). A browser that changes its address (network switch)
 loses the connection and reconnects; the gateway does not follow migrations. If the relay port
-does not answer within 3 s (typically a firewall that only lets 8443 through), the client falls
-back to the splice and skips the UDP relay for the next 10 minutes of that page.
+is blocked (typically a firewall that only lets 8443 through), the client falls back to the
+splice and skips the UDP relay for the next 10 minutes of that page: when the browser's
+WebTransport connection to the port does not succeed within 3 s, or when the host's `bind`
+does not reach the port within 2 s, in which case the gateway answers the allocation with
+`504` and the client goes on to the splice at once.
 
 Overhead: on loopback the relay adds 20–40 µs to the median round trip (direct about 210 µs,
 relayed about 250 µs) and forwards about 1 Gbit/s on one core (the direct path: 2.3 Gbit/s).

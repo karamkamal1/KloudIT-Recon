@@ -292,16 +292,21 @@ async function openWebSocket(url) {
 async function allocateRelay(url) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 8000);
+  let r, body;
   try {
-    const r = await fetch(url, { method: 'POST', credentials: 'same-origin', signal: ac.signal });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
-    return body;
+    r = await fetch(url, { method: 'POST', credentials: 'same-origin', signal: ac.signal });
+    body = await r.json().catch(() => ({}));
   } catch (e) {
     throw new Error(`relay allocation: ${e.name === 'AbortError' ? 'timed out' : e.message}`);
   } finally {
     clearTimeout(t);
   }
+  if (!r.ok) {
+    const e = new Error(`relay allocation: ${body.error || `HTTP ${r.status}`}`);
+    e.portBlocked = r.status === 504; // the host's bind did not reach the relay port
+    throw e;
+  }
+  return body;
 }
 
 async function connect(ep) {
@@ -312,11 +317,14 @@ async function connect(ep) {
   }
   if (wtOK && ep.relay.udp && prefs.path !== 'direct' && !prefs.skipUdpRelay) {
     attempts.push(['relay', async () => {
-      const a = await allocateRelay(ep.relay.udp);
+      let a;
       try {
+        a = await allocateRelay(ep.relay.udp);
         return { t: await openWebTransport(a.url, a.hashes, 'relay', 3000), ticket: a.ticket };
       } catch (e) {
-        post('udpRelayFailed', {}); // the relay ports are probably blocked: skip them for a while
+        // The relay ports are probably blocked, for the browser or for the host:
+        // skip them for a while.
+        if (a || e.portBlocked) post('udpRelayFailed', {});
         throw e;
       }
     }]);

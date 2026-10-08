@@ -339,8 +339,11 @@ func (s *Server) handleUDPRelay(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case <-a.bound:
-	case <-a.done: // the host did not bind in time
-		jsonError(w, http.StatusServiceUnavailable, "the host did not reach the relay port")
+	case <-a.done:
+		// The host's bind did not arrive in time, typically because a firewall in
+		// front of the gateway lets only 8443 through. 504 tells the client to
+		// skip the UDP relay for a while, as when its own datagrams get no answer.
+		jsonError(w, http.StatusGatewayTimeout, "the host did not reach the relay port")
 		return
 	case <-r.Context().Done():
 		a.close()

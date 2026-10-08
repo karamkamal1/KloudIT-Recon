@@ -36,7 +36,7 @@ import (
 // allocation (verifyTicket).
 
 const (
-	relayBindTimeout  = 5 * time.Second
+	relayBindTimeout  = 2 * time.Second // the gateway's wait for the bind
 	relayBindResend   = 200 * time.Millisecond
 	relayUnusedTTL    = 30 * time.Second // the gateway gives the browser 20 s after the bind
 	relayReleaseDelay = 2 * time.Second  // after the connection ended: about 3 PTO of draining
