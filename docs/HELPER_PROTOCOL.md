@@ -1096,10 +1096,11 @@ the cells, `qualify.Results.Choose`). Version 1 files (no `quality` / `ltrSlots`
   the 3.6 winner), else `cbr` with its `flush` / `restart`. Fixed-bitrate sessions run `vbr`
   with its own mode.
 * recon-host sends the chosen `rc` and `liveBitrate` in `start` (`restart`: no
-  `liveBitrate`, and a `setRate` becomes a new helper). The session's rate controller lets
-  changes on a qualified `seamless` encoder follow each other after 2 s (the qualification's
-  step); a `flush` one (a key frame per change), an unqualified one and FFmpeg keep 10 s
-  between changes. host.log: `live-bitrate qualification ... choice="hevc speed: adaptive
+  `liveBitrate`, and a `setRate` becomes a new helper). The session's rate controller (GUIDE
+  2.2, docs/ARCHITECTURE.md "Rate control") changes a qualified `seamless` encoder every 250 ms,
+  an unqualified one every second, a `flush` one (a key frame per change) every 2 s upwards
+  and 250 ms after the last change downwards; at its floor it also lowers `fps` (`setRate` with
+  `fps`: 120 → 90 → 60). host.log: `live-bitrate qualification ... choice="hevc speed: adaptive
   cbr/seamless, fixed vbr/seamless; ..."` when a session opens the helper,
   `live_bitrate_from=qualification` on `encoder helper started`.
 

@@ -47,15 +47,16 @@ const (
 
 // Datagram types (first byte of every datagram).
 const (
-	DgAudio     byte = 0x10 // host->client: audio packet
-	DgCursorPos byte = 0x11 // host->client: cursor position/visibility
-	DgMouseRel  byte = 0x20 // client->host: cumulative relative motion
-	DgMouseAbs  byte = 0x21 // client->host: absolute position (normalised)
-	DgGamepad   byte = 0x22 // client->host: full gamepad state snapshot
-	DgRumble    byte = 0x23 // host->client: force feedback
-	DgPing      byte = 0x30 // client->host
-	DgPong      byte = 0x31 // host->client
-	DgFrameAck  byte = 0x40 // client->host
+	DgAudio      byte = 0x10 // host->client: audio packet
+	DgCursorPos  byte = 0x11 // host->client: cursor position/visibility
+	DgMouseRel   byte = 0x20 // client->host: cumulative relative motion
+	DgMouseAbs   byte = 0x21 // client->host: absolute position (normalised)
+	DgGamepad    byte = 0x22 // client->host: full gamepad state snapshot
+	DgRumble     byte = 0x23 // host->client: force feedback
+	DgPing       byte = 0x30 // client->host
+	DgPong       byte = 0x31 // host->client
+	DgFrameAck   byte = 0x40 // client->host
+	DgRateReport byte = 0x41 // client->host: receive report for the rate controller (RateReport)
 )
 
 // Input stream event types.
@@ -401,6 +402,89 @@ func ParseFrameAck(b []byte) (FrameAck, bool) {
 		OWDUs:    int32(binary.LittleEndian.Uint32(b[8:])),
 		DecodeUs: binary.LittleEndian.Uint32(b[12:]),
 	}, true
+}
+
+// FeatureRateReport is the Welcome.Features entry of hosts that run the
+// delay-based rate controller (GUIDE 2.2): the client sends a RateReport
+// every 20-50 ms and leaves the one-way delay to the host (no delay-based
+// "congestion" messages; the decoder's still go). Clients that do not know
+// it keep their own delay detection and the 0x40 acks, which the host then
+// reads instead.
+const FeatureRateReport = "rate-report"
+
+// RateReportLen is the size of a RateReport datagram.
+const RateReportLen = 40
+
+// RateReport flags.
+const (
+	RateReportOWD   byte = 1 // OWDP50Us / OWDMaxUs are valid: clock synced and frames since the previous report
+	RateReportFrame byte = 2 // Gen / LastSeq name a frame: one was received
+)
+
+// RateReport is the client's receive report for the host's rate controller
+// (DgRateReport, every 20-50 ms):
+//
+//	u8 type 0x41 | u8 flags | u8 gen | u8 0 | u32 timeMs | u32 lastSeq |
+//	u32 frames | u32 bytes | i32 owdP50Us | i32 owdMaxUs | u32 lost |
+//	u32 audio | u16 decodeQueue | u16 0
+//
+// The counters are cumulative since the client connected (they wrap), so a
+// lost report loses nothing but its delay samples: the host takes the
+// difference to the last report it got. The one-way delays are those of the
+// frames received since the previous report (last byte received minus the
+// frame's encodeDoneUs, or SendUs without the extension, on the client's
+// synchronised clock: the same measure as the 0x40 ack).
+type RateReport struct {
+	Flags   byte
+	Gen     uint8  // generation of LastSeq
+	TimeMs  uint32 // client clock in ms (wraps): when the report was made
+	LastSeq uint32 // newest frame of Gen received
+	Frames  uint32 // video frames received (complete frame streams)
+	Bytes   uint32 // their bytes, headers included (wraps)
+	// One-way delay p50 and maximum of the frames received since the
+	// previous report, µs (RateReportOWD).
+	OWDP50Us, OWDMaxUs int32
+	Lost               uint32 // frames lost on the way (gap timeout; not those the host reported dropped) + audio packets lost
+	Audio              uint32 // audio packets received
+	DecodeQueue        uint16 // frames handed to the decoder and not yet out of it
+}
+
+// ParseRateReport decodes a DgRateReport datagram.
+func ParseRateReport(b []byte) (RateReport, bool) {
+	if len(b) < RateReportLen || b[0] != DgRateReport {
+		return RateReport{}, false
+	}
+	le := binary.LittleEndian
+	return RateReport{
+		Flags: b[1], Gen: b[2],
+		TimeMs:      le.Uint32(b[4:]),
+		LastSeq:     le.Uint32(b[8:]),
+		Frames:      le.Uint32(b[12:]),
+		Bytes:       le.Uint32(b[16:]),
+		OWDP50Us:    int32(le.Uint32(b[20:])),
+		OWDMaxUs:    int32(le.Uint32(b[24:])),
+		Lost:        le.Uint32(b[28:]),
+		Audio:       le.Uint32(b[32:]),
+		DecodeQueue: le.Uint16(b[36:]),
+	}, true
+}
+
+// Marshal encodes the report as a DgRateReport datagram (tests and the Go
+// reference client; web/static/js/protocol.js rateReport mirrors it).
+func (r RateReport) Marshal() []byte {
+	b := make([]byte, RateReportLen)
+	le := binary.LittleEndian
+	b[0], b[1], b[2] = DgRateReport, r.Flags, r.Gen
+	le.PutUint32(b[4:], r.TimeMs)
+	le.PutUint32(b[8:], r.LastSeq)
+	le.PutUint32(b[12:], r.Frames)
+	le.PutUint32(b[16:], r.Bytes)
+	le.PutUint32(b[20:], uint32(r.OWDP50Us))
+	le.PutUint32(b[24:], uint32(r.OWDMaxUs))
+	le.PutUint32(b[28:], r.Lost)
+	le.PutUint32(b[32:], r.Audio)
+	le.PutUint16(b[36:], r.DecodeQueue)
+	return b
 }
 
 // Input events ---------------------------------------------------------------

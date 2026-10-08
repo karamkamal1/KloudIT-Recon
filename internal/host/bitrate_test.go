@@ -1,433 +1,878 @@
 package host
 
 import (
+	"math"
+	"math/rand/v2"
 	"testing"
 	"time"
+
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
-// rateHarness drives a rateController on a fake clock the way a session does:
-// a frame acknowledged every frame interval, an evaluation every rateTick.
-type rateHarness struct {
-	t     *testing.T
-	clock time.Time
-	r     *rateController
-	start time.Time
+// ctlHarness drives a rateController on a fake clock the way a session does,
+// with a perfect seamless encoder (a change is live at once and the encoder
+// hits its target) and a client that receives every frame: a frame every
+// 1/fps, a report every 25 ms with the frames' bytes and a queueing delay of
+// qd(t), a tick every rateTick.
+type ctlHarness struct {
+	t       *testing.T
+	clock   time.Time
+	start   time.Time
+	r       *rateController
+	fps     int
+	share   float64      // received share of the encoder's output (1: everything)
+	fill    float64      // the encoder's output as a share of its target (1: hits it)
+	stalled bool         // tick's stalled
+	decodeQ int          // reports' decoder backlog
+	changes []rateChange // applied changes, in order
+	at      []time.Duration
 }
 
-func newRateHarness(t *testing.T, ceiling int) *rateHarness {
-	h := &rateHarness{t: t, clock: time.Unix(1_000_000, 0)}
+func newCtl(t *testing.T, ceiling, fps int, p applyPolicy) *ctlHarness {
+	h := &ctlHarness{t: t, clock: time.Unix(1_000_000, 0), fps: fps, share: 1, fill: 1}
 	h.start = h.clock
 	h.r = &rateController{now: func() time.Time { return h.clock }}
-	if got := h.r.target(ceiling); got != ceiling {
-		t.Fatalf("first generation at %d kbps, want the ceiling %d", got, ceiling)
+	h.r.setPolicy(p)
+	h.r.setPath(true)
+	kbps, f := h.r.target(ceiling, fps)
+	if kbps != ceiling || f != fps {
+		t.Fatalf("first generation at %d kbps %d fps, want the settings %d %d", kbps, f, ceiling, fps)
 	}
+	h.r.live(kbps, f)
 	return h
 }
 
-// raise is a bitrate change by tick, at the time since the harness started.
-type raise struct {
-	at       time.Duration
-	from, to int
+func (h *ctlHarness) elapsed() time.Duration { return h.clock.Sub(h.start) }
+
+func (h *ctlHarness) apply(c rateChange) {
+	h.changes = append(h.changes, c)
+	h.at = append(h.at, h.elapsed())
+	h.r.live(c.toKbps, c.toFPS)
+	h.fps = c.toFPS
 }
 
-// run advances the clock by d: a frame sent and acknowledged every 1/60 s
-// with the one-way delay owd(t) (nil: a still desktop, nothing sent), t since
-// the start of the harness, and a tick every rateTick. It returns the raises.
-func (h *rateHarness) run(d time.Duration, owd func(t time.Duration) time.Duration) []raise {
-	return h.frames(d, owd != nil, owd)
-}
-
-// stalled advances the clock by d with a frame sent every 1/60 s and none
-// acknowledged (a stalled path, or a client that never acknowledges).
-func (h *rateHarness) stalled(d time.Duration) []raise { return h.frames(d, true, nil) }
-
-func (h *rateHarness) frames(d time.Duration, send bool, owd func(t time.Duration) time.Duration) []raise {
-	const frame = time.Second / 60
-	var out []raise
+// run advances the clock by d; qd(t) is the queueing delay the reports carry
+// (t since the harness started; nil: no frames, a still desktop).
+func (h *ctlHarness) run(d time.Duration, qd func(t time.Duration) time.Duration) {
 	end := h.clock.Add(d)
-	nextTick := h.clock.Add(rateTick)
+	nextFrame, nextReport, nextTick := h.clock, h.clock.Add(25*time.Millisecond), h.clock.Add(rateTick)
+	var bytes int64
+	frames := 0
 	for h.clock.Before(end) {
-		h.clock = h.clock.Add(frame)
-		if send {
-			h.r.sent()
+		h.clock = h.clock.Add(time.Millisecond)
+		if qd != nil && !h.clock.Before(nextFrame) {
+			nextFrame = nextFrame.Add(time.Second / time.Duration(h.fps))
+			cur, _ := h.r.kbps()
+			n := int(float64(cur*1000/8/h.fps) * h.fill)
+			h.r.output(n)
+			bytes += int64(float64(n) * h.share)
+			frames++
 		}
-		if owd != nil {
-			h.r.ack(owd(h.clock.Sub(h.start)))
+		if !h.clock.Before(nextReport) {
+			nextReport = nextReport.Add(25 * time.Millisecond)
+			fb := feedback{at: h.clock, frames: frames, bytes: bytes, interval: 25 * time.Millisecond, decodeQ: h.decodeQ}
+			if frames > 0 {
+				fb.owdValid, fb.qd = true, qd(h.elapsed())
+				fb.owd = fb.qd + 10*time.Millisecond
+			}
+			frames, bytes = 0, 0
+			if c, ok := h.r.report(fb); ok {
+				h.apply(c)
+			}
 		}
 		if !h.clock.Before(nextTick) {
 			nextTick = nextTick.Add(rateTick)
-			if from, to, ok := h.r.tick(); ok {
-				out = append(out, raise{h.clock.Sub(h.start), from, to})
+			if c, ok := h.r.tick(h.stalled); ok {
+				h.apply(c)
 			}
+		}
+	}
+}
+
+func (h *ctlHarness) cur() int {
+	c, _ := h.r.kbps()
+	return c
+}
+
+// decreases returns the decreases applied since change i.
+func (h *ctlHarness) decreases(i int) []rateChange {
+	var out []rateChange
+	for _, c := range h.changes[i:] {
+		if c.down {
+			out = append(out, c)
 		}
 	}
 	return out
 }
 
-// wait advances the clock by d without frames or ticks.
-func (h *rateHarness) wait(d time.Duration) { h.clock = h.clock.Add(d) }
+func flat(d time.Duration) func(time.Duration) time.Duration {
+	return func(time.Duration) time.Duration { return d }
+}
 
-// cut sends a congestion signal: an emergency (a queue overflow) or a delay
-// report.
-func (h *rateHarness) cut(emergency bool, wantFrom, wantTo int, wantOK bool) {
-	h.t.Helper()
-	sig := signalDelay
-	if emergency {
-		sig = signalOverflow
-	}
-	from, to, ok := h.r.congestion(sig)
-	if ok != wantOK || (ok && (from != wantFrom || to != wantTo)) {
-		h.t.Fatalf("at %v: congestion(emergency %v) = %d -> %d, %v; want %d -> %d, %v",
-			h.clock.Sub(h.start), emergency, from, to, ok, wantFrom, wantTo, wantOK)
+// after returns qd: base until t0, then over.
+func after(t0, base, over time.Duration) func(time.Duration) time.Duration {
+	return func(t time.Duration) time.Duration {
+		if t >= t0 {
+			return over
+		}
+		return base
 	}
 }
 
-func (h *rateHarness) cur() int {
-	cur, _ := h.r.kbps()
-	return cur
+var seamless = ratePolicy(seamlessCaps)
+
+// TestRateDelayDecrease: a queueing delay over the base (the 2 s minimum)
+// plus 8 ms for three reports in a row decreases the bitrate to 0.85 x;
+// two reports do not. The next decrease waits until the first is live plus
+// the policy's hold (150 ms seamless), and none comes while the delay falls
+// (the queue drains).
+func TestRateDelayDecrease(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	if len(h.changes) != 0 {
+		t.Fatalf("changes on a steady path: %+v", h.changes)
+	}
+	// 9 ms over the base for two reports: nothing.
+	h.run(50*time.Millisecond, flat(29*time.Millisecond))
+	h.run(time.Second, flat(20*time.Millisecond))
+	if len(h.changes) != 0 {
+		t.Fatalf("two reports over the target decreased: %+v", h.changes)
+	}
+	// Over the target from now on (a standing queue): the third report
+	// decreases, to 0.85 x 20000 (the client receives everything: the
+	// delivered rate is the target).
+	h.run(80*time.Millisecond, flat(29*time.Millisecond))
+	if len(h.changes) != 1 || !h.changes[0].down || h.changes[0].toKbps != 17000 || h.changes[0].why != "delay" {
+		t.Fatalf("changes %+v, want one delay decrease to 17000", h.changes)
+	}
+	// It is live at once; the next one comes after the hold and three
+	// more reports over the target.
+	first := h.at[0]
+	h.run(time.Second, flat(29*time.Millisecond))
+	if len(h.changes) < 2 || h.changes[1].toKbps != 14450 || h.at[1]-first < seamless.hold {
+		t.Fatalf("changes %+v at %v, want a second decrease to 14450 at least %v after the first", h.changes, h.at, seamless.hold)
+	}
+	// A queue that appears at once decreases once; while it then drains
+	// (the delay falls, over the target for most of a second) nothing more.
+	h = newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	t0 := h.elapsed()
+	drain := func(t time.Duration) time.Duration { return max(20*time.Millisecond, 70*time.Millisecond-(t-t0)/16) }
+	h.run(2*time.Second, drain)
+	if d := h.decreases(0); len(d) != 1 {
+		t.Fatalf("decreases %+v, want one (the queue drains after it)", d)
+	}
 }
 
-const steadyOWD = 20 * time.Millisecond
-
-func steady(time.Duration) time.Duration { return steadyOWD }
-
-// TestRateRecovers: after a cut, 10 s without a congestion signal and with
-// the one-way delay at its minimum raise the bitrate by 15 %, then again
-// every 10 s, up to the ceiling and no further.
-func TestRateRecovers(t *testing.T) {
-	h := newRateHarness(t, 20000)
-	h.run(5*time.Second, steady)
-	h.cut(false, 20000, 15000, true)
-	cutAt := h.clock.Sub(h.start)
-	if r := h.run(9500*time.Millisecond, steady); len(r) != 0 {
-		t.Fatalf("raised within 10 s of the cut: %+v", r)
+// TestRateDecreaseFromDelivered: a decrease starts from what the path
+// delivered when that is less than the target (the client receives half of
+// what the encoder produces: 0.85 x 10000), but from at least half the
+// target, and an encoder that undershoots its target (fill 0.8) does not
+// count as a path that carries less.
+func TestRateDecreaseFromDelivered(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.share = 0.5
+	h.run(time.Second, flat(20*time.Millisecond))
+	h.run(100*time.Millisecond, flat(40*time.Millisecond))
+	if len(h.changes) != 1 || h.changes[0].toKbps < 8400 || h.changes[0].toKbps > 8600 {
+		t.Fatalf("changes %+v, want a decrease to about 8500 (0.85 x the delivered 10000)", h.changes)
 	}
-	got := h.run(60*time.Second, steady)
-	want := []raise{{10 * time.Second, 15000, 17250}, {20 * time.Second, 17250, 19837}, {30 * time.Second, 19837, 20000}}
-	if len(got) != len(want) {
-		t.Fatalf("raises %+v, want %d", got, len(want))
+	if h.r.lastGood < 9800 || h.r.lastGood > 10200 {
+		t.Fatalf("last known-good %.0f, want about 10000", h.r.lastGood)
 	}
-	for i, w := range want {
-		g := got[i]
-		// A raise comes with the first tick after it is due: each up to one
-		// tick (plus the frame the tick falls on) after the previous one.
-		if late := g.at - cutAt - w.at; g.from != w.from || g.to != w.to || late < 0 || late > time.Duration(i+1)*(rateTick+time.Second/60) {
-			t.Fatalf("raise %d: %d -> %d at cut + %v, want %d -> %d at cut + %v", i, g.from, g.to, g.at-cutAt, w.from, w.to, w.at)
+	// A path that delivers a tenth (a stall): at most a halving, 0.85 x
+	// 10000.
+	h = newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.share = 0.1
+	h.run(time.Second, flat(20*time.Millisecond))
+	h.run(100*time.Millisecond, flat(40*time.Millisecond))
+	if len(h.changes) != 1 || h.changes[0].toKbps != 8500 {
+		t.Fatalf("changes %+v, want a decrease to 8500 (0.85 x half the target)", h.changes)
+	}
+	// An encoder at 80 % of its target whose output all arrives: 0.85 x
+	// the target, not x the 16000 received.
+	h = newCtl(t, 20000, 60, seamless)
+	h.fill = 0.8
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.run(100*time.Millisecond, flat(30*time.Millisecond))
+	if len(h.changes) != 1 || h.changes[0].toKbps < 16800 || h.changes[0].toKbps > 17200 {
+		t.Fatalf("changes %+v, want a decrease to about 17000", h.changes)
+	}
+}
+
+// TestRatePendingFrame: frames that stop arriving (the oldest frame the
+// client lacks is far over the target: 300 ms against a 20 ms base) decrease
+// on the second such report in a row, without waiting for overReports; one
+// such report followed by a normal one does nothing (a stall of the client
+// itself), nor does a report that comes more than pendingStallGap after the
+// previous one.
+func TestRatePendingFrame(t *testing.T) {
+	setup := func() *ctlHarness {
+		h := newCtl(t, 20000, 60, seamless)
+		h.run(3*time.Second, flat(20*time.Millisecond))
+		return h
+	}
+	report := func(h *ctlHarness, interval, pending time.Duration) (rateChange, bool) {
+		h.clock = h.clock.Add(interval)
+		return h.r.report(feedback{at: h.clock, frames: 1, bytes: 40000, interval: interval, owdValid: true,
+			qd: 20 * time.Millisecond, owd: 30 * time.Millisecond, pendingValid: pending > 0, pending: pending})
+	}
+	h := setup()
+	if c, ok := report(h, 25*time.Millisecond, 300*time.Millisecond); ok {
+		t.Fatalf("one report with a pending frame decreased: %+v", c)
+	}
+	if c, ok := report(h, 25*time.Millisecond, 300*time.Millisecond); !ok || !c.down || c.why != "delay" {
+		t.Fatalf("second report in a row: %+v %v, want a delay decrease", c, ok)
+	}
+
+	h = setup()
+	for i := 0; i < 10; i++ {
+		p := time.Duration(0)
+		if i%2 == 0 {
+			p = 300 * time.Millisecond
+		}
+		if c, ok := report(h, 25*time.Millisecond, p); ok {
+			t.Fatalf("report %d (pending frames every other report) decreased: %+v", i, c)
 		}
 	}
-	if h.cur() != 20000 {
-		t.Fatalf("target %d, want the ceiling 20000", h.cur())
-	}
-	// A restart (key frame, encoder failure) stays at the target.
-	if got := h.r.target(20000); got != 20000 {
-		t.Fatalf("restart at %d kbps", got)
-	}
-}
-
-// TestRateHighDelayHolds: while the one-way delay stays more than 10 ms over
-// its 2 s minimum (a queue builds), nothing is raised; the quiet period
-// starts when the delay is back down. A lone late frame (a key frame) does
-// not count: the test is the median of the frames since the last tick.
-func TestRateHighDelayHolds(t *testing.T) {
-	h := newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	cutAt := h.clock.Sub(h.start)
-	// The delay climbs 10 ms per second for 30 s (a queue builds, the 2 s
-	// minimum trails 20 ms behind), then falls back to the base.
-	ramp := func(t time.Duration) time.Duration {
-		if t -= cutAt; t < 30*time.Second {
-			return steadyOWD + t/100
-		}
-		return steadyOWD
-	}
-	if r := h.run(30*time.Second, ramp); len(r) != 0 {
-		t.Fatalf("raised while the delay grew: %+v", r)
-	}
-	r := h.run(15*time.Second, ramp)
-	if len(r) != 1 || r[0].at-cutAt < 40*time.Second || r[0].at-cutAt > 40*time.Second+rateTick || r[0].to != 17250 {
-		t.Fatalf("raises %+v, want 15000 -> 17250 10 s after the delay went down (cut + 40 s)", r)
-	}
-
-	// A full bottleneck: the queue fills in 3 s (15 ms per second), drops
-	// and fills again.
-	h = newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	saw := func(t time.Duration) time.Duration { return steadyOWD + (t%(3*time.Second))*15/1000 }
-	if r := h.run(30*time.Second, saw); len(r) != 0 {
-		t.Fatalf("raised on a full bottleneck: %+v", r)
-	}
-
-	// Jitter within 10 ms and one key frame 80 ms late every 2 s.
-	h = newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	n := 0
-	jitter := func(time.Duration) time.Duration {
-		n++
-		if n%120 == 0 {
-			return steadyOWD + 80*time.Millisecond
-		}
-		return steadyOWD + time.Duration(n%7)*time.Millisecond
-	}
-	if r := h.run(10*time.Second+rateTick, jitter); len(r) != 1 || r[0].to != 17250 {
-		t.Fatalf("jitter and lone late frames held the bitrate: raises %+v", r)
-	}
-}
-
-// TestRateCeiling: the bitrate never goes above the ceiling (the settings'
-// bitrate); a lower ceiling caps the target at once.
-func TestRateCeiling(t *testing.T) {
-	h := newRateHarness(t, 3000)
-	if r := h.run(30*time.Second, steady); len(r) != 0 {
-		t.Fatalf("raised above the ceiling: %+v", r)
-	}
-	h.cut(false, 3000, 2250, true)
-	r := h.run(32*time.Second, steady)
-	if len(r) != 3 || r[0].to != 2587 || r[1].to != 2975 || r[2].to != 3000 {
-		t.Fatalf("raises %+v, want 2250 -> 2587 -> 2975 -> 3000 (the ceiling, not 3421)", r)
-	}
-	if r := h.run(30*time.Second, steady); len(r) != 0 || h.cur() != 3000 {
-		t.Fatalf("raises %+v at the ceiling, target %d", r, h.cur())
-	}
-	if got := h.r.target(2500); got != 2500 {
-		t.Fatalf("target %d under a 2500 kbps ceiling", got)
-	}
-}
-
-// TestRateLimit: at most one change per 10 s. A delay report within 10 s of
-// a cut or a raise cuts nothing but holds off the next raise; emergencies
-// (queue overflow, decoder flush) cut within 10 s, but at most every 2 s.
-func TestRateLimit(t *testing.T) {
-	h := newRateHarness(t, 40000)
-	h.cut(false, 40000, 30000, true)
-	h.run(5*time.Second, steady)
-	h.cut(false, 0, 0, false) // 5 s after the cut
-	if h.cur() != 30000 {
-		t.Fatalf("target %d after a refused cut", h.cur())
-	}
-	// The refused report restarted the quiet period: no raise at cut + 10 s.
-	r := h.run(10*time.Second, steady)
-	if len(r) != 1 || r[0].at < 15*time.Second || r[0].to != 34500 {
-		t.Fatalf("raises %+v, want one 10 s after the refused report", r)
-	}
-	h.run(3*time.Second, steady)
-	h.cut(false, 0, 0, false) // 3 s after the raise
-	h.run(7*time.Second, steady)
-	h.cut(false, 34500, 25875, true) // 10 s after the raise
-
-	// Emergencies: within 10 s of the delay cut, but 2 s after any cut.
-	h.run(time.Second, steady)
-	h.cut(true, 0, 0, false)
-	h.run(time.Second, steady)
-	h.cut(true, 25875, 19406, true)
-	h.run(1500*time.Millisecond, steady)
-	h.cut(true, 0, 0, false)
-	h.run(500*time.Millisecond, steady)
-	h.cut(true, 19406, 14554, true)
-	// The emergency counts as a change: a delay report 5 s later cuts nothing.
-	h.run(5*time.Second, steady)
-	h.cut(false, 0, 0, false)
-
-	// Raises at least 10 s apart even with the quiet period long over.
-	h = newRateHarness(t, 100000)
-	h.cut(false, 100000, 75000, true)
-	h.wait(2 * time.Second)
-	h.cut(true, 75000, 56250, true)
-	h.wait(2 * time.Second)
-	h.cut(true, 56250, 42187, true)
-	r = h.run(45*time.Second, steady)
-	if len(r) != 4 {
-		t.Fatalf("raises %+v, want 4 in 45 s", r)
-	}
-	for i := 1; i < len(r); i++ {
-		if d := r[i].at - r[i-1].at; d < 10*time.Second {
-			t.Fatalf("raises %d and %d %v apart", i-1, i, d)
+	for i := 0; i < 5; i++ {
+		if c, ok := report(h, 150*time.Millisecond, 300*time.Millisecond); ok {
+			t.Fatalf("reports %v apart decreased on their pending frame: %+v", 150*time.Millisecond, c)
 		}
 	}
 }
 
-// TestRateSeamlessGap: on an encoder qualified to change its bitrate
-// seamlessly (setGap(rateSeamlessGap)) changes may follow each other after
-// 2 s instead of 10 s; the quiet period before the first raise stays 10 s,
-// emergencies keep their own 2 s, and a gap above the period (a shortened
-// test period) is the period.
-func TestRateSeamlessGap(t *testing.T) {
-	h := newRateHarness(t, 40000)
-	h.r.setGap(rateSeamlessGap)
-	h.cut(false, 40000, 30000, true)
-	h.wait(1500 * time.Millisecond)
-	h.cut(false, 0, 0, false) // 1.5 s after the cut
-	h.wait(2 * time.Second)
-	h.cut(false, 30000, 22500, true) // 3.5 s: the 2 s gap is over
-	cutAt := h.clock.Sub(h.start)
-	r := h.run(20*time.Second, steady)
-	if len(r) < 3 || r[0].from != 22500 || r[0].at-cutAt < 10*time.Second {
-		t.Fatalf("raises %+v: the first 10 s after the last cut", r)
-	}
-	for i := 1; i < len(r); i++ {
-		if d := r[i].at - r[i-1].at; d < rateSeamlessGap || d > rateSeamlessGap+rateTick+time.Second/60 {
-			t.Fatalf("raises %d and %d %v apart, want 2 s", i-1, i, d)
-		}
-	}
-	if h.cur() != 40000 {
-		t.Fatalf("target %d, want back at the ceiling 40000", h.cur())
-	}
-	// Back to the full period (a flushing encoder, FFmpeg): 10 s again.
-	h.r.setGap(0)
-	h.wait(10 * time.Second)
-	h.cut(false, 40000, 30000, true)
-	h.wait(3 * time.Second)
-	h.cut(false, 0, 0, false)
-	// A gap longer than a shortened period is the period.
-	r2 := &rateController{now: func() time.Time { return h.clock }, period: time.Second}
-	r2.setGap(rateSeamlessGap)
-	if g := r2.changeGap(); g != time.Second {
-		t.Fatalf("gap %v with a 1 s period", g)
+// TestRateQueueGrowth: a queue that grows fast (a capacity drop: 0.5 s of
+// delay per second) decreases from the capacity its growth implies (sending
+// 20000 into a path that carries 20000 / 1.5); a slower growth (0.1 s/s),
+// or a fast one that stands less than 20 ms over the base, from the target.
+func TestRateQueueGrowth(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		per  time.Duration // growth per 25 ms report
+		top  time.Duration // over the base at most (0: no limit)
+		want int
+	}{
+		{"0.5 s/s", 12500 * time.Microsecond, 0, 11333},
+		{"0.1 s/s", 2500 * time.Microsecond, 0, 17000},
+		{"0.5 s/s, under 20 ms", 12500 * time.Microsecond, 15 * time.Millisecond, 17000},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newCtl(t, 20000, 60, seamless)
+			h.run(3*time.Second, flat(20*time.Millisecond))
+			t0 := h.elapsed()
+			grow := func(t time.Duration) time.Duration {
+				over := time.Duration((t-t0)/(25*time.Millisecond)) * c.per
+				if c.top > 0 {
+					over = min(over, c.top)
+				}
+				return 20*time.Millisecond + over
+			}
+			h.run(200*time.Millisecond, grow)
+			d := h.decreases(0)
+			if len(d) != 1 || math.Abs(float64(d[0].toKbps-c.want)) > float64(c.want)/50 {
+				t.Fatalf("decreases %+v, want one to about %d", d, c.want)
+			}
+		})
 	}
 }
 
-// TestRateDecrease: cuts are 25 %, stop at 2 Mbit/s (or at a lower ceiling),
-// and need a generation; a settings change (reset) drops the back-off.
-func TestRateDecrease(t *testing.T) {
-	r := &rateController{}
-	if _, _, ok := r.congestion(signalOverflow); ok {
+// TestRateLoss: more than 2 % of at least 100 packets lost in the last second
+// decreases ("loss"); 1 % does not, nor do fewer packets; the losses detected
+// within lossSettle after a decrease is live are not counted.
+func TestRateLoss(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	report := func(lost, total int64) (rateChange, bool) {
+		h.clock = h.clock.Add(25 * time.Millisecond)
+		return h.r.report(feedback{at: h.clock, frames: 1, bytes: 40000, interval: 25 * time.Millisecond, owdValid: true,
+			qd: 20 * time.Millisecond, owd: 30 * time.Millisecond, lost: lost, total: total})
+	}
+	for i := 0; i < 40; i++ { // 1 %: 1 of 100 per report
+		if c, ok := report(1, 100); ok {
+			t.Fatalf("1 %% loss decreased: %+v", c)
+		}
+	}
+	h.clock = h.clock.Add(2 * time.Second)
+	for i := 0; i < 30; i++ { // 5 % of 60 packets: too few in the window at first
+		if c, ok := report(3, 60); ok {
+			if i < 1 {
+				t.Fatalf("decreased on %d packets: %+v", 60*(i+1), c)
+			}
+			if c.why != "loss" || c.toKbps != 17000 {
+				t.Fatalf("change %+v, want a loss decrease to 17000", c)
+			}
+			h.apply(c)
+			break
+		}
+	}
+	if len(h.changes) != 1 {
+		t.Fatalf("no loss decrease at 5 %%: %+v", h.changes)
+	}
+	// Losses right after the decrease are of packets sent before it.
+	for i := 0; i < 10; i++ { // 250 ms
+		if c, ok := report(10, 100); ok {
+			t.Fatalf("decreased again on losses within lossSettle: %+v", c)
+		}
+	}
+}
+
+// TestRateIncrease: after a decrease the target climbs +5 %/s just below the
+// last known-good rate, faster far below it (up to +25 %/s), accelerating
+// above it, and never above the ceiling.
+func TestRateIncrease(t *testing.T) {
+	growth := func(t *testing.T, lastGood, from float64, d time.Duration) float64 {
+		h := newCtl(t, 100000, 60, seamless)
+		h.r.mu.Lock()
+		h.r.est, h.r.applied, h.r.lastGood = from, int(from), lastGood
+		h.r.mu.Unlock()
+		h.r.live(int(from), 60)
+		h.run(d, flat(20*time.Millisecond))
+		return float64(h.cur()) / from
+	}
+	// One second near (5 % below) the last known-good rate: +5 %.
+	if g := growth(t, 20000, 19000, time.Second); math.Abs(g-1.05) > 0.01 {
+		t.Fatalf("near the last known-good rate: x%.3f in 1 s, want about x1.05", g)
+	}
+	// Half of it: +25 %/s (the encoder takes it every 250 ms).
+	if g := growth(t, 20000, 10000, time.Second); g < 1.2 || g > 1.3 {
+		t.Fatalf("far below the last known-good rate: x%.3f in 1 s, want about x1.25", g)
+	}
+	// Above it the rate accelerates: the third second grows more than the first.
+	h := newCtl(t, 100000, 60, seamless)
+	h.r.mu.Lock()
+	h.r.est, h.r.applied, h.r.lastGood = 10000, 10000, 10000
+	h.r.mu.Unlock()
+	h.r.live(10000, 60)
+	var at []int
+	for i := 0; i < 4; i++ {
+		at = append(at, h.cur())
+		h.run(time.Second, flat(20*time.Millisecond))
+	}
+	g1, g3 := float64(at[1])/float64(at[0]), float64(at[3])/float64(at[2])
+	if g1 > 1.08 || g3 < g1+0.05 {
+		t.Fatalf("above the last known-good rate: x%.3f in the first second, x%.3f in the third, want ~x1.05 then faster", g1, g3)
+	}
+	// Up to the ceiling, not beyond.
+	h = newCtl(t, 3000, 60, seamless)
+	h.r.mu.Lock()
+	h.r.est, h.r.applied, h.r.lastGood = 2000, 2000, 2000
+	h.r.mu.Unlock()
+	h.r.live(2000, 60)
+	h.run(20*time.Second, flat(20*time.Millisecond))
+	if h.cur() != 3000 {
+		t.Fatalf("target %d after 20 s, want the ceiling 3000", h.cur())
+	}
+	for _, c := range h.changes {
+		if c.toKbps > 3000 {
+			t.Fatalf("raised above the ceiling: %+v", c)
+		}
+	}
+}
+
+// TestRateIncreaseCap: increases stop at 1.2 x the delivered rate (here the
+// client receives 60 % of the encoder's output), and at the decoder's cap.
+func TestRateIncreaseCap(t *testing.T) {
+	// 10000 is the setting while the receive rate is measured, then the
+	// setting goes up (target is what every generation start calls).
+	h := newCtl(t, 10000, 60, seamless)
+	h.share = 0.6
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	h.r.target(50000, 60)
+	h.r.mu.Lock()
+	h.r.lastGood = 40000
+	h.r.mu.Unlock()
+	h.run(10*time.Second, flat(20*time.Millisecond))
+	// Each step at most 1.2 x 0.6 of the encoder's rate: it cannot climb.
+	if h.cur() > 10000 {
+		t.Fatalf("target %d with 60 %% delivered, want no increase above 1.2 x the delivered 6000", h.cur())
+	}
+	h.share = 1
+	h.r.mu.Lock()
+	h.r.decoderCap = 15000
+	h.r.mu.Unlock()
+	h.run(20*time.Second, flat(20*time.Millisecond))
+	if h.cur() != 15000 {
+		t.Fatalf("target %d, want the decoder's cap 15000", h.cur())
+	}
+}
+
+// TestRateIncreaseHolds: nothing increases without fresh reports (a still
+// desktop), on a stalled path, with the decoder behind, or with the delay
+// over the target.
+func TestRateIncreaseHolds(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(h *ctlHarness)
+		qd   func(time.Duration) time.Duration
+	}{
+		{"still desktop", func(*ctlHarness) {}, nil},
+		{"stalled", func(h *ctlHarness) { h.stalled = true }, flat(20 * time.Millisecond)},
+		{"decoder behind", func(h *ctlHarness) { h.decodeQ = 7 }, flat(20 * time.Millisecond)}, // over max(4, 60/10)
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newCtl(t, 20000, 60, seamless)
+			h.run(3*time.Second, flat(20*time.Millisecond))
+			h.r.mu.Lock()
+			h.r.est, h.r.applied, h.r.lastGood = 10000, 10000, 20000
+			h.r.mu.Unlock()
+			h.r.live(10000, 60)
+			c.set(h)
+			// The last report with frames counts for feedbackFresh.
+			h.run(feedbackFresh+100*time.Millisecond, c.qd)
+			held, _, _, _ := h.r.state()
+			h.run(5*time.Second, c.qd)
+			if est, _, _, _ := h.r.state(); est != held || held > 11400 {
+				t.Fatalf("target %.0f, then %.0f: want it held from 10000", held, est)
+			}
+		})
+	}
+}
+
+// TestRatePolicyGaps: a restart policy (FFmpeg) takes an increase at most
+// once per second and in steps of at least 5 %; near the last known-good rate
+// in steps of at most 5 %; a decrease no sooner than 500 ms after the last
+// change (tick applies it then), overlapped, unless it cuts to 75 % or less:
+// then at once, urgent.
+func TestRatePolicyGaps(t *testing.T) {
+	h := newCtl(t, 40000, 60, ratePolicy(restartCaps))
+	h.r.mu.Lock()
+	h.r.est, h.r.applied, h.r.lastGood = 10000, 10000, 30000
+	h.r.mu.Unlock()
+	h.r.live(10000, 60)
+	h.run(20*time.Second, flat(20*time.Millisecond))
+	if len(h.changes) < 5 || h.cur() != 40000 {
+		t.Fatalf("%d changes, target %d: want the climb to the ceiling 40000", len(h.changes), h.cur())
+	}
+	for i, c := range h.changes {
+		if i > 0 && h.at[i]-h.at[i-1] < time.Second {
+			t.Fatalf("increases %v apart: %v", h.at[i]-h.at[i-1], h.at)
+		}
+		near := float64(c.fromKbps) >= (1-nearBelow)*30000 && float64(c.fromKbps) <= (1+nearAbove)*30000
+		if step := float64(c.toKbps) / float64(c.fromKbps); step < 1.05-1e-3 && c.toKbps != 40000 || near && step > 1+nearStep+1e-3 {
+			t.Fatalf("change %d %+v: step x%.3f (near the last known-good rate: %v)", i, c, step, near)
+		}
+	}
+	// A decrease 200 ms after an increase waits for the 500 ms gap.
+	h.r.mu.Lock()
+	h.r.est, h.r.applied, h.r.lastApply = 30000, 30000, h.clock
+	h.r.mu.Unlock()
+	h.r.live(30000, 60)
+	n := len(h.changes)
+	h.run(200*time.Millisecond, flat(20*time.Millisecond))
+	h.run(time.Second, flat(30*time.Millisecond))
+	d := h.decreases(n)
+	if len(d) == 0 || h.at[n]-h.at[n-1] < 500*time.Millisecond || d[0].urgent {
+		t.Fatalf("decreases %+v at %v, want the first at least 500 ms after the last change, overlapped", d, h.at[n-1:])
+	}
+	// A cut to 75 % or less (the path carries half of what the encoder
+	// makes: a capacity drop) is urgent, and does not wait for the gap.
+	h = newCtl(t, 30000, 60, ratePolicy(restartCaps))
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.share = 0.5
+	h.run(time.Second, flat(20*time.Millisecond))
+	h.r.mu.Lock()
+	h.r.lastApply = h.clock
+	h.r.mu.Unlock()
+	h.run(150*time.Millisecond, flat(40*time.Millisecond))
+	if d := h.decreases(0); len(d) != 1 || !d[0].urgent || d[0].toKbps > 30000*3/4 {
+		t.Fatalf("decreases %+v, want one urgent cut to about 0.85 x 15000 within 150 ms of the last change", d)
+	}
+}
+
+// TestRateEmergency: a frame-queue overflow cuts at once by 25 %, urgent; not
+// within 2 s of any decrease; a decoder flush also caps increases at 85 % of
+// the bitrate it cut from; nothing below the floor or before the first
+// generation.
+func TestRateEmergency(t *testing.T) {
+	var r rateController
+	if _, ok := r.congestion(signalOverflow); ok {
 		t.Fatal("cut before the first generation")
 	}
-	h := newRateHarness(t, 4000)
-	h.cut(false, 4000, 3000, true)
-	h.wait(10 * time.Second)
-	h.cut(true, 3000, 2250, true)
-	h.wait(10 * time.Second)
-	h.cut(false, 2250, 2000, true) // the floor, not 1687
-	h.wait(10 * time.Second)
-	h.cut(false, 0, 0, false)
-	h.cut(true, 0, 0, false)
-
-	h = newRateHarness(t, 1500) // a ceiling below the floor: nothing to cut
-	h.cut(true, 0, 0, false)
-	h.wait(10 * time.Second)
-	h.cut(false, 0, 0, false)
-
-	h = newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	h.r.reset()
-	if got := h.r.target(25000); got != 25000 {
-		t.Fatalf("after a settings change: %d kbps, want the new setting 25000", got)
+	h := newCtl(t, 20000, 60, seamless)
+	c, ok := h.r.congestion(signalOverflow)
+	if !ok || !c.urgent || !c.down || c.toKbps != 15000 || c.why != "overflow" {
+		t.Fatalf("overflow: %+v %v, want an urgent cut to 15000", c, ok)
 	}
-	h.cut(false, 25000, 18750, true) // no rate limit left from before the reset
-}
-
-// TestRateQuietWithoutAcks: ticks with nothing sent (a still desktop), and
-// frames that a client which never acknowledges (no clock sync, a v1 client)
-// was sent, neither break nor prove the quiet; a pause (hold) restarts it.
-func TestRateQuietWithoutAcks(t *testing.T) {
-	h := newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	if r := h.stalled(10*time.Second + rateTick); len(r) != 1 || r[0].to != 17250 {
-		t.Fatalf("raises %+v for a client that never acknowledges, want 15000 -> 17250", r)
+	h.apply(c)
+	h.clock = h.clock.Add(time.Second)
+	if c, ok := h.r.congestion(signalDecoder); ok {
+		t.Fatalf("emergency 1 s after a cut: %+v", c)
 	}
-	h = newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	if r := h.run(10*time.Second+rateTick, nil); len(r) != 1 || r[0].to != 17250 {
-		t.Fatalf("raises %+v without acknowledgements, want 15000 -> 17250", r)
+	h.clock = h.clock.Add(1500 * time.Millisecond)
+	c, ok = h.r.congestion(signalDecoder)
+	if !ok || c.toKbps != 11250 || h.r.decoderLimit() != 12750 {
+		t.Fatalf("decoder flush: %+v %v cap %d, want 11250 and a cap of 12750", c, ok, h.r.decoderLimit())
 	}
-	h.run(6*time.Second, nil)
-	h.r.hold()
-	if r := h.run(9*time.Second, nil); len(r) != 0 {
-		t.Fatalf("raised within 10 s of a pause: %+v", r)
+	h.apply(c)
+	h.run(30*time.Second, flat(20*time.Millisecond))
+	if h.cur() != 12750 {
+		t.Fatalf("target %d after the decoder flush, want the cap 12750", h.cur())
 	}
-	if r := h.run(2*time.Second, nil); len(r) != 1 {
-		t.Fatalf("raises %+v, want one 10 s after the pause", r)
+	// The floor.
+	h = newCtl(t, 2500, 60, seamless)
+	c, ok = h.r.congestion(signalOverflow)
+	if !ok || c.toKbps != 2000 {
+		t.Fatalf("cut %+v %v, want the floor 2000", c, ok)
 	}
-	// The kept acknowledgements stay bounded however fast they come.
-	for range 3 * owdMaxSamples {
-		h.r.ack(steadyOWD)
-	}
-	if n := len(h.r.owd); n > owdMaxSamples {
-		t.Fatalf("%d acknowledgements kept", n)
+	h.apply(c)
+	h.clock = h.clock.Add(3 * time.Second)
+	if c, ok := h.r.congestion(signalOverflow); ok {
+		t.Fatalf("cut below the floor: %+v", c)
 	}
 }
 
-// TestRateStalledPath: frames go out but a client that acknowledged frames
-// before acknowledges none (the gateway's leg to the client stalls; the
-// gateway buffers the frames, so the host's queue does not overflow): no
-// raise however long it lasts, and a delay report when it ends can still cut.
-// Once acknowledgements resume, the raise needs a whole quiet period; a gap
-// in the acknowledgements shorter than ackTimeout changes nothing.
-func TestRateStalledPath(t *testing.T) {
-	h := newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	h.run(8*time.Second, steady)
-	if r := h.stalled(30 * time.Second); len(r) != 0 {
-		t.Fatalf("raised while no frame was acknowledged: %+v", r)
+// TestRateFPSLadder: at the floor a decrease lowers the frame rate a rung
+// (120 -> 90 -> 60) instead, and nothing below 60; once the bitrate is well
+// above the floor again the frame rate goes back up a rung every 5 s.
+func TestRateFPSLadder(t *testing.T) {
+	h := newCtl(t, 10000, 120, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.r.mu.Lock()
+	h.r.est, h.r.applied = 2000, 2000
+	h.r.mu.Unlock()
+	h.r.live(2000, 120)
+	h.run(1500*time.Millisecond, flat(40*time.Millisecond))
+	var fps []int
+	for _, c := range h.changes {
+		if !c.down || c.toKbps != 2000 {
+			t.Fatalf("change %+v at the floor, want frame-rate decreases at 2000", c)
+		}
+		fps = append(fps, c.toFPS)
 	}
-	resumed := h.clock.Sub(h.start)
-	r := h.run(11*time.Second, steady)
-	if len(r) != 1 || r[0].to != 17250 || r[0].at-resumed < 10*time.Second-ackTimeout-rateTick {
-		t.Fatalf("raises %+v, want 15000 -> 17250 about 10 s after the acknowledgements resumed (at %v)", r, resumed)
+	if len(fps) != 2 || fps[0] != 90 || fps[1] != 60 {
+		t.Fatalf("frame rates %v, want 90, 60", fps)
 	}
-
-	// The stall covers the moment the raise is due; the delay report that
-	// follows it cuts. (A stall that starts less than ackTimeout before the
-	// raise is due does not stop that raise.)
-	h = newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	h.run(8*time.Second, steady)
-	if r := h.stalled(5 * time.Second); len(r) != 0 {
-		t.Fatalf("raised during the stall: %+v", r)
+	h.changes = nil
+	h.run(20*time.Second, flat(20*time.Millisecond))
+	var up []int
+	for _, c := range h.changes {
+		if c.toFPS != c.fromFPS {
+			up = append(up, c.toFPS)
+		}
 	}
-	h.cut(false, 15000, 11250, true)
-
-	// Acknowledgements 900 ms apart (lost datagrams) do not hold the bitrate
-	// (each stretch has one tick, 500 ms in, so the raise comes up to one
-	// stretch late).
-	h = newRateHarness(t, 20000)
-	h.cut(false, 20000, 15000, true)
-	r = nil
-	for range 12 {
-		r = append(r, h.stalled(900*time.Millisecond-time.Second/60)...)
-		r = append(r, h.run(time.Second/60, steady)...)
-	}
-	if len(r) != 1 || r[0].to != 17250 || r[0].at < 10*time.Second || r[0].at > 11*time.Second {
-		t.Fatalf("raises %+v with acknowledgements 900 ms apart, want 15000 -> 17250 10 s after the cut", r)
+	if len(up) != 2 || up[0] != 90 || up[1] != 120 || h.fps != 120 {
+		t.Fatalf("frame rates back %v (now %d), want 90 then 120", up, h.fps)
 	}
 }
 
-// TestRateDecoderCap: a cut for a client that flushed its decoder caps the
-// raises at 85 % of the bitrate the decoder fell behind at, so a client that
-// cannot decode the setting does not go through flush, cut and raise again
-// and again; a lower flush lowers the cap, a settings change drops it.
-func TestRateDecoderCap(t *testing.T) {
-	h := newRateHarness(t, 20000)
-	if from, to, ok := h.r.congestion(signalDecoder); !ok || from != 20000 || to != 15000 {
-		t.Fatalf("decoder flush: %d -> %d, %v; want 20000 -> 15000", from, to, ok)
+// TestRateAdaptiveOff: with adaptive bitrate off the delay and losses decide
+// nothing; an emergency still cuts.
+func TestRateAdaptiveOff(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.r.setAdaptive(false)
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	h.run(2*time.Second, flat(80*time.Millisecond))
+	if len(h.changes) != 0 {
+		t.Fatalf("changes with adaptive bitrate off: %+v", h.changes)
 	}
-	if lim := h.r.decoderLimit(); lim != 17000 {
-		t.Fatalf("decoder limit %d, want 17000", lim)
+	if _, ok := h.r.congestion(signalOverflow); !ok {
+		t.Fatal("no emergency cut with adaptive bitrate off")
 	}
-	r := h.run(40*time.Second, steady)
-	if len(r) != 1 || r[0].from != 15000 || r[0].to != 17000 || h.cur() != 17000 {
-		t.Fatalf("raises %+v, want 15000 -> 17000 (85 %% of 20000) and no more", r)
+}
+
+// TestRateNoFeedback: a client that sends no feedback (no reports, no acks)
+// decreases only on its own delay reports ({"t":"congestion"}), and gets
+// increases (+5 %/s) 10 s after the last decrease.
+func TestRateNoFeedback(t *testing.T) {
+	h := newCtl(t, 20000, 60, ratePolicy(restartCaps))
+	h.clock = h.clock.Add(time.Second) // past the policy's gap since the generation started
+	c, ok := h.r.congestion(signalDelay)
+	if !ok || c.urgent || c.toKbps != 17000 || c.why != "client" {
+		t.Fatalf("client delay report: %+v %v, want a non-urgent decrease to 17000", c, ok)
 	}
-	// It falls behind again at 17000: the cap goes down with it.
-	if _, to, ok := h.r.congestion(signalDecoder); !ok || to != 12750 || h.r.decoderLimit() != 14450 {
-		t.Fatalf("second flush: to %d (%v), limit %d; want 12750, 14450", to, ok, h.r.decoderLimit())
+	h.apply(c)
+	tick := func(d time.Duration) {
+		for end := h.clock.Add(d); h.clock.Before(end); {
+			h.clock = h.clock.Add(rateTick)
+			if c, ok := h.r.tick(false); ok {
+				h.apply(c)
+			}
+		}
 	}
-	if r := h.run(40*time.Second, steady); len(r) != 1 || r[0].to != 14450 {
-		t.Fatalf("raises %+v, want 12750 -> 14450", r)
+	tick(9500 * time.Millisecond)
+	if h.cur() != 17000 {
+		t.Fatalf("target %d within 10 s, want 17000", h.cur())
 	}
-	// Overflows and delay reports cut without moving the cap.
-	h.cut(true, 14450, 10837, true)
-	if r := h.run(40*time.Second, steady); len(r) != 3 || r[2].to != 14450 || h.r.decoderLimit() != 14450 {
-		t.Fatalf("raises %+v, limit %d; want 10837 -> 12462 -> 14331 -> 14450", r, h.r.decoderLimit())
+	tick(10 * time.Second)
+	if h.cur() < 19000 {
+		t.Fatalf("target %d 20 s after the decrease, want the climb back", h.cur())
+	}
+}
+
+// TestRateReset: a settings change drops the back-off, the decoder's cap and
+// the frame-rate ladder; a restart keeps them.
+func TestRateReset(t *testing.T) {
+	h := newCtl(t, 20000, 120, seamless)
+	h.r.mu.Lock()
+	h.r.est, h.r.fps, h.r.decoderCap = 9000, 90, 12000
+	h.r.mu.Unlock()
+	if kbps, fps := h.r.target(20000, 120); kbps != 9000 || fps != 90 {
+		t.Fatalf("restart at %d kbps %d fps, want 9000 at 90", kbps, fps)
 	}
 	h.r.reset()
-	if got := h.r.target(20000); got != 20000 || h.r.decoderLimit() != 0 {
-		t.Fatalf("after a settings change: %d kbps, limit %d; want 20000, none", got, h.r.decoderLimit())
+	if kbps, fps := h.r.target(25000, 60); kbps != 25000 || fps != 60 || h.r.decoderLimit() != 0 {
+		t.Fatalf("after reset %d kbps %d fps cap %d, want the new settings and no cap", kbps, fps, h.r.decoderLimit())
 	}
-	// A flush that cuts nothing (2 s after a cut) sets no cap.
-	h.cut(true, 20000, 15000, true)
-	h.wait(time.Second)
-	if _, _, ok := h.r.congestion(signalDecoder); ok || h.r.decoderLimit() != 0 {
-		t.Fatalf("flush within 2 s of a cut: cut %v, limit %d", ok, h.r.decoderLimit())
+}
+
+// TestRateJitter: Wi-Fi-like jitter (each report 0-15 ms over the base,
+// uniformly) widens the target margin and decreases nothing in a minute;
+// the same path with a queue that grows 20 ms/s on top is still caught.
+func TestRateJitter(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 7))
+	jitter := func(time.Duration) time.Duration {
+		return 20*time.Millisecond + time.Duration(rng.IntN(15000))*time.Microsecond
+	}
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(60*time.Second, jitter)
+	if len(h.changes) != 0 {
+		t.Fatalf("decreases on jitter alone: %+v", h.changes)
+	}
+	if _, _, m, _ := h.r.state(); m <= queueMargin {
+		t.Fatalf("margin %v, want wider than %v", m, queueMargin)
+	}
+	growing := func(t time.Duration) time.Duration {
+		return jitter(t) + max(0, t-62*time.Second)/50
+	}
+	h.run(3*time.Second, growing)
+	if d := h.decreases(0); len(d) == 0 {
+		t.Fatal("a growing queue under jitter decreased nothing")
+	}
+}
+
+// TestSendTrack: the pacer's share of a frame's sending time follows the
+// fluid model (backlog less the burst, at the video pacing rate), at most the
+// measured encodeDone -> written time; a key frame delays itself and the
+// frames behind it, decaying; cover returns the median of the frames it
+// covers; pending is the age of the oldest frame not covered.
+func TestSendTrack(t *testing.T) {
+	var tr sendTrack
+	const pace = 24e6 // bit/s for video
+	rate := pace * (1 - paceOverhead) / 8
+	us := func(d time.Duration) uint64 { return uint64(d.Microseconds()) + 1_000_000 }
+	frame := time.Second / 60
+	// A 41.7 kB frame (20 Mbit/s at 60 fps) every frame interval, written
+	// 20 ms after encodeDone (measured), a 200 kB key frame at seq 10.
+	var comps []time.Duration
+	for i := 0; i < 30; i++ {
+		size := 41700
+		if i == 10 {
+			size = 200000
+		}
+		enc := time.Duration(i) * frame
+		tr.sent(1, uint32(i), us(enc), us(enc+200*time.Millisecond), size, pace)
+		c, n := tr.cover(1, uint32(i))
+		if n != 1 {
+			t.Fatalf("frame %d: covered %d", i, n)
+		}
+		comps = append(comps, c)
+	}
+	want0 := time.Duration((41700 - max(rate*0.002, minPaceBurst)) / rate * float64(time.Second))
+	if d := comps[0] - want0; d < -time.Millisecond || d > time.Millisecond {
+		t.Fatalf("first frame's pacer share %v, want about %v", comps[0], want0)
+	}
+	if comps[10] < 50*time.Millisecond || comps[11] >= comps[10] || comps[11] < comps[5] || comps[29] > comps[11] {
+		t.Fatalf("pacer shares around the key frame %v: want it large, then decaying", comps[8:16])
+	}
+	// The measured time bounds it.
+	tr.sent(1, 30, us(30*frame), us(30*frame+time.Millisecond), 200000, pace)
+	if c, _ := tr.cover(1, 30); c != time.Millisecond {
+		t.Fatalf("share %v, want the measured 1 ms", c)
+	}
+	// Without the media congestion controller nothing is attributed.
+	tr.sent(1, 31, us(31*frame), us(31*frame+50*time.Millisecond), 200000, 0)
+	if c, _ := tr.cover(1, 31); c != 0 {
+		t.Fatalf("share %v without pacing, want 0", c)
+	}
+	// cover: the median of the frames it covers; pending: the oldest
+	// uncovered one's age less its share.
+	for i := 32; i < 37; i++ {
+		tr.sent(1, uint32(i), us(time.Duration(i)*frame), us(time.Duration(i)*frame), 1000, 0)
+	}
+	if p, ok := tr.pending(us(32*frame + 70*time.Millisecond)); !ok || p != 70*time.Millisecond {
+		t.Fatalf("pending %v %v, want 70 ms", p, ok)
+	}
+	if _, n := tr.cover(1, 34); n != 3 {
+		t.Fatalf("covered %d, want 3", n)
+	}
+	if _, n := tr.cover(1, 33); n != 0 {
+		t.Fatalf("covered %d of a frame already covered", n)
+	}
+	if at, ok := tr.uncoveredSince(); !ok || at != us(35*frame) {
+		t.Fatalf("uncovered since %d %v", at, ok)
+	}
+	if f, ok := tr.frame(1, 36); !ok || f.seq != 36 {
+		t.Fatalf("frame 36: %+v %v", f, ok)
+	}
+	if _, ok := tr.uncoveredSince(); ok {
+		t.Fatal("an acked frame left frames uncovered")
+	}
+}
+
+// TestRateFeedback: reports become differences of their counters (also
+// across the wrap), the client's own losses count only without the media
+// congestion controller, whose counters restart with a new path; acks of
+// clients without reports become one report per call.
+func TestRateFeedback(t *testing.T) {
+	var f rateFeedback
+	now := time.Unix(1_000_000, 0)
+	r := proto.RateReport{Flags: proto.RateReportOWD, TimeMs: 0xffffffff - 10, Frames: 100, Bytes: 0xffffff00, OWDP50Us: 25000,
+		OWDMaxUs: 40000, Lost: 2, Audio: 1000}
+	if fb := f.fromReport(r, now, 0, ccCounters{}); fb.frames != 0 || !fb.owdValid || fb.qd != 25*time.Millisecond {
+		t.Fatalf("first report: %+v", fb)
+	}
+	r.TimeMs, r.Frames, r.Bytes, r.Lost, r.Audio = 15, 103, 0x100, 3, 1003
+	fb := f.fromReport(r, now.Add(25*time.Millisecond), 5*time.Millisecond, ccCounters{})
+	if fb.frames != 3 || fb.bytes != 0x200 || fb.interval != 26*time.Millisecond || fb.lost != 1 || fb.total != 7 ||
+		fb.qd != 20*time.Millisecond || fb.owd != 25*time.Millisecond {
+		t.Fatalf("second report: %+v", fb)
+	}
+	cc := ccCounters{ok: true, lost: 10, total: 1000, acked: 1e6, nonVideoKbps: 360}
+	f.fromReport(r, now.Add(50*time.Millisecond), 0, cc)
+	cc.lost, cc.total, cc.acked = 12, 1100, 1.1e6
+	fb = f.fromReport(r, now.Add(75*time.Millisecond), 0, cc)
+	if fb.lost != 2 || fb.total != 100 || !fb.ackedValid || fb.acked != 100000 || fb.nonVideoKbps != 360 {
+		t.Fatalf("media congestion controller deltas: %+v", fb)
+	}
+	cc.lost, cc.total, cc.acked = 1, 10, 1000 // a new path's controller
+	if fb := f.fromReport(r, now.Add(100*time.Millisecond), 0, cc); fb.total != 0 || fb.ackedValid {
+		t.Fatalf("after a path change: %+v", fb)
+	}
+	var a rateFeedback
+	if _, ok := a.fromAcks(now, ccCounters{}); ok {
+		t.Fatal("a report from no acks")
+	}
+	for i, owd := range []int{30, 10, 20} {
+		a.ack(time.Duration(owd)*time.Millisecond, time.Duration(i)*time.Millisecond, 1000, now)
+	}
+	fb, ok := a.fromAcks(now.Add(100*time.Millisecond), ccCounters{})
+	if !ok || fb.frames != 3 || fb.bytes != 3000 || fb.interval != 100*time.Millisecond || fb.owd != 20*time.Millisecond ||
+		fb.owdMax != 30*time.Millisecond || fb.qd != 18*time.Millisecond {
+		t.Fatalf("acks: %+v %v", fb, ok)
+	}
+	if p50, p95, mx, n := a.stats(); n != 1 || p50 != 20*time.Millisecond || p95 != 20*time.Millisecond || mx != 30*time.Millisecond {
+		t.Fatalf("stats %v %v %v %d", p50, p95, mx, n)
+	}
+}
+
+// The simulations (ratesim_test.go): the GUIDE 2.2 acceptance on netem.sh's
+// capdrop profile (50 -> 15 -> 50 Mbit/s, 20 s steps, 50 ms queue) at a
+// 30 Mbit/s setting: no host frame-queue overflow, one-way delay p95 during
+// the dip under the baseline's + 30 ms, the bitrate back within 15 % of the
+// setting within 10 s of capacity returning; and the other profiles.
+
+func TestRateSimCapdrop(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		policy    applyPolicy
+		fill      float64
+		relay     bool
+		overflows int           // allowed: at the drop, before a restart can take over
+		recover   time.Duration // to 85 % of the setting
+	}{
+		{"seamless", seamless, 1, false, 0, 10 * time.Second},
+		{"seamless, encoder at 80 %", seamless, 0.8, false, 0, 10 * time.Second},
+		{"seamless, relay", seamless, 1, true, 1, 10 * time.Second},
+		{"restart (FFmpeg)", ratePolicy(restartCaps), 1, false, 0, 10 * time.Second},
+		{"restart (FFmpeg), encoder at 80 %", ratePolicy(restartCaps), 0.8, false, 0, 10 * time.Second},
+		{"flush", ratePolicy(flushCaps), 1, false, 1, 10 * time.Second},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := runSim(simConfig{dur: 60 * time.Second, fps: 60, ceiling: 30000, capacity: capdropRates(1), queue: 50 * time.Millisecond,
+				prop: time.Millisecond, policy: c.policy, applyDelay: 400 * time.Millisecond, keyFactor: 2, fill: c.fill, audioKbps: 160,
+				relay: c.relay, seed: 1})
+			base, dip := s.owdPct(5*time.Second, 20*time.Second, 0.95), s.owdPct(20*time.Second, 40*time.Second, 0.95)
+			back := s.firstAtLeast(40*time.Second, 30000*85/100)
+			t.Logf("overflows %v, one-way delay p95 %v before, %v during the dip; back at 85 %% %v after capacity returned; decreases %v\n%s",
+				s.overflows, base, dip, back-40*time.Second, s.decreases(0, s.cfg.dur), s.trace())
+			if len(s.overflows) > c.overflows {
+				t.Errorf("%d frame-queue overflows, want at most %d", len(s.overflows), c.overflows)
+			}
+			if dip >= base+30*time.Millisecond {
+				t.Errorf("one-way delay p95 %v during the dip, want under %v + 30 ms", dip, base)
+			}
+			if back < 0 || back-40*time.Second > c.recover {
+				t.Errorf("bitrate back within 15 %% of the setting %v after capacity returned, want %v", back-40*time.Second, c.recover)
+			}
+			if s.appliedAt(19*time.Second) != 30000 || s.appliedAt(59*time.Second) != 30000 {
+				t.Errorf("target %d before the dip, %d at the end, want the setting", s.appliedAt(19*time.Second), s.appliedAt(59*time.Second))
+			}
+			if dec := s.decreases(0, 20*time.Second); len(dec) > 0 {
+				t.Errorf("decreases before the dip: %v", dec)
+			}
+		})
+	}
+}
+
+// TestRateSimProfiles: the other netem profiles at a 20 Mbit/s setting over
+// a 50 Mbit/s link: wifi (a gate that opens every 0.5-15 ms, 1 % loss) and
+// wan (20 ms each way, 0.5 % loss) keep the bitrate (no more than one
+// decrease a minute, 95 % of the setting on average); 5 % loss is
+// congestion by the guide's rule (> 2 %) and backs off.
+func TestRateSimProfiles(t *testing.T) {
+	link := func(time.Duration) int64 { return 50e6 }
+	cfg := func(seed uint64) simConfig {
+		return simConfig{dur: 60 * time.Second, fps: 60, ceiling: 20000, capacity: link, queue: 50 * time.Millisecond,
+			prop: time.Millisecond, policy: seamless, applyDelay: 400 * time.Millisecond, keyFactor: 2, audioKbps: 160, seed: seed}
+	}
+	for _, c := range []struct {
+		name string
+		set  func(*simConfig)
+	}{
+		{"wifi", func(c *simConfig) { c.wifi, c.loss = true, 0.01 }},
+		{"wifi, restart", func(c *simConfig) { c.wifi, c.loss, c.policy = true, 0.01, ratePolicy(restartCaps) }},
+		{"wan", func(c *simConfig) { c.prop, c.loss = 20*time.Millisecond, 0.005 }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sc := cfg(2)
+			c.set(&sc)
+			s := runSim(sc)
+			dec, mean := s.decreases(0, sc.dur), s.meanApplied(5*time.Second, sc.dur)
+			t.Logf("decreases %v, mean target %.0f, one-way delay p50/p95 %v/%v", dec, mean, s.owdPct(0, sc.dur, 0.5), s.owdPct(0, sc.dur, 0.95))
+			n := 0
+			for _, v := range dec {
+				n += v
+			}
+			if n > 1 || mean < 0.95*20000 || len(s.overflows) > 0 {
+				t.Errorf("%d decreases %v, mean %.0f, %d overflows: want at most one, >= 19000, none\n%s", n, dec, mean, len(s.overflows), s.trace())
+			}
+		})
+	}
+	t.Run("loss 5%", func(t *testing.T) {
+		sc := cfg(4)
+		sc.dur, sc.loss = 20*time.Second, 0.05
+		s := runSim(sc)
+		if d := s.decreases(0, sc.dur); d["loss"] == 0 || s.appliedAt(sc.dur) > 10000 {
+			t.Errorf("decreases %v, target %d at the end: want loss decreases to at most half\n%s", d, s.appliedAt(sc.dur), s.trace())
+		}
+	})
+}
+
+// TestRateSimKeyFrames: an FFmpeg session restarted for a key frame every
+// 3 s (4 x a frame each, paced out at 1.2 x the target) on a clean link keeps
+// its bitrate: sendTrack takes the key frames' own sending time out of the
+// delay. Without it the same run backs off again and again.
+func TestRateSimKeyFrames(t *testing.T) {
+	cfg := simConfig{dur: 60 * time.Second, fps: 60, ceiling: 20000, capacity: func(time.Duration) int64 { return 50e6 },
+		queue: 50 * time.Millisecond, prop: time.Millisecond, policy: ratePolicy(restartCaps), applyDelay: 400 * time.Millisecond,
+		keyFactor: 4, keyEvery: 3 * time.Second, audioKbps: 160, seed: 5}
+	s := runSim(cfg)
+	t.Logf("with the pacer's share: decreases %v, mean target %.0f, one-way delay p95 %v", s.decreases(0, cfg.dur),
+		s.meanApplied(0, cfg.dur), s.owdPct(0, cfg.dur, 0.95))
+	if d := s.decreases(0, cfg.dur); len(d) > 0 || s.meanApplied(0, cfg.dur) != 20000 {
+		t.Errorf("decreases %v, mean %.0f: want none\n%s", d, s.meanApplied(0, cfg.dur), s.trace())
+	}
+	cfg.noComp = true
+	s = runSim(cfg)
+	t.Logf("without it: decreases %v, mean target %.0f over the last 30 s", s.decreases(0, cfg.dur), s.meanApplied(30*time.Second, cfg.dur))
+	n := 0
+	for _, v := range s.decreases(0, cfg.dur) {
+		n += v
+	}
+	if n < 5 || s.meanApplied(30*time.Second, cfg.dur) > 10000 {
+		t.Errorf("without the pacer's share: %d decreases, mean %.0f; the comparison wants a spiral down", n, s.meanApplied(30*time.Second, cfg.dur))
 	}
 }

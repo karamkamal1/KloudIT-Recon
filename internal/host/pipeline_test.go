@@ -216,10 +216,11 @@ func TestOpenPipeline(t *testing.T) {
 // TestSessionLiveBitrateQualified: a session on the helper reads the
 // live-bitrate qualification next to host.json (recon-host qualify) and
 // starts the stream with the live-bitrate mode it chose for the codec and rate
-// control: flush where seamless failed (bitrate changes then keep the full
-// period between them), seamless where it passed (changes may come every
-// 2 s); results of another GPU, or measured with another quality preset than
-// the session's, are not used; without a file the helper's defaults apply.
+// control: flush where seamless failed (the rate controller's flush policy:
+// changes seconds apart), seamless where it passed (every 250 ms); results of
+// another GPU, or measured with another quality preset than the session's,
+// are not used; without a file the helper's defaults apply (seamless, only
+// assumed: a change per second).
 func TestSessionLiveBitrateQualified(t *testing.T) {
 	// Run as the session starts H.264 here: no preset (the helper's
 	// default, speed), two LTR slots (recovery ltr).
@@ -236,17 +237,17 @@ func TestSessionLiveBitrateQualified(t *testing.T) {
 		results  *qualify.Results
 		wantLive any // the start's liveBitrate
 		wantLog  string
-		gap      time.Duration
+		policy   string // ratePolicy
 	}{
 		{"flush", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
-			Cells: cells("fail")}, "flush", "choice=\"h264 speed: adaptive cbr/flush, fixed vbr/-\"", 0},
+			Cells: cells("fail")}, "flush", "choice=\"h264 speed: adaptive cbr/flush, fixed vbr/-\"", "flush"},
 		{"seamless", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
-			Cells: cells("pass")}, "seamless", "h264 speed: adaptive cbr/seamless", rateSeamlessGap},
+			Cells: cells("pass")}, "seamless", "h264 speed: adaptive cbr/seamless", "seamless"},
 		{"other preset", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT",
-			Cells: balanced}, nil, "h264 balanced: adaptive cbr/seamless", 0},
+			Cells: balanced}, nil, "h264 balanced: adaptive cbr/seamless", "seamless (assumed)"},
 		{"other GPU", &qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 6800",
-			Cells: cells("fail")}, nil, "live-bitrate qualification not used", 0},
-		{"none", nil, nil, "no live-bitrate qualification", 0},
+			Cells: cells("fail")}, nil, "live-bitrate qualification not used", "seamless (assumed)"},
+		{"none", nil, nil, "no live-bitrate qualification", "seamless (assumed)"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -301,8 +302,8 @@ func TestSessionLiveBitrateQualified(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("no frame")
 			}
-			if g := rateGap(s.vid().Capabilities()); g != c.gap {
-				t.Fatalf("rate gap %v, want %v (capabilities %+v)", g, c.gap, s.vid().Capabilities())
+			if p := ratePolicy(s.vid().Capabilities()); p.name != c.policy {
+				t.Fatalf("rate policy %+v, want %s (capabilities %+v)", p, c.policy, s.vid().Capabilities())
 			}
 		})
 	}
@@ -395,9 +396,10 @@ func TestSessionOnHelper(t *testing.T) {
 		t.Fatalf("forced key frame %+v", fr)
 	}
 
-	// A delay report: the bitrate changes in the encoder, the client hears of it.
+	// A delay report (from a client without rate reports): the bitrate
+	// changes in the encoder (x0.85), the client hears of it.
 	s.congestion(120, signalDelay)
-	if m := expectFakeMsg(t, f, "setRate"); m["kbps"] != float64(3000) {
+	if m := expectFakeMsg(t, f, "setRate"); m["kbps"] != float64(3400) {
 		t.Fatalf("setRate %v", m)
 	}
 
@@ -418,7 +420,7 @@ func TestSessionOnHelper(t *testing.T) {
 		t.Fatal("a second helper started a stream")
 	default:
 	}
-	waitMsg(t, ctrl, `"t":"rate"`, `"gen":2`, `"bitrate":3000`, `"fps":30`)
+	waitMsg(t, ctrl, `"t":"rate"`, `"gen":2`, `"bitrate":3400`, `"fps":30`)
 	waitMsg(t, ctrl, `"t":"dropped"`, `"gen":2`, `"fromSeq":1`, `"count":2`) // sent asynchronously
 	waitMsg(t, ctrl, `"t":"video"`, `"gen":2`, `"encoder":"h264_amf_helper"`)
 

@@ -172,7 +172,24 @@ missing reference can make the next frames undecodable, not just blurred).
 | `0x21` mouse abs | C→H | u32 seq, u16 x, u16 y | latest wins |
 | `0x22` gamepad | C→H | idx, connected, u32 seq, XInput state | full snapshot, re-sent every 100 ms |
 | `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, (u64 host µs) | NTP-style clock sync, minimum-RTT sample |
-| `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, bitrate recovery, and the ACKs of reference recovery |
+| `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, the ACKs of reference recovery, and the rate controller's feedback from clients without rate reports |
+| `0x41` rate report | C→H | flags, gen, 0, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
+
+**Rate report** (`proto.RateReport`, 40 bytes, GUIDE 2.2). Flags: bit 0 the delays are valid
+(clock synced, frames since the previous report), bit 1 `gen`/`lastSeq` name a frame. `time` is
+the client's clock (ms, wraps); `lastSeq` the newest frame of generation `gen` received; `frames`,
+`bytes` (frame streams received, headers included), `lost` (frames lost on the way, i.e. gaps
+that outlasted the late-frame wait and that the host did not report dropped, plus audio datagrams
+lost) and `audio` (audio datagrams received) are cumulative since the connection started and
+wrap, so a lost report loses only its delays: the host takes the difference to the last report it
+got. The delays are those of the frames received since the previous report (last byte received
+minus `encodeDoneUs`, or `send_us` without the extension: the 0x40 ack's measure), p50 and maximum;
+`decodeQueue` is the number of frames handed to the decoder and not yet out of it. Hosts list
+`rate-report` in `welcome.features`; clients that see it send the report and stop sending their
+own delay-based `{"t":"congestion"}` (the decoder's `reason:"decoder"` one stays). Older hosts
+never see a 0x41 (the client sends it only on the feature); older clients keep their own delay
+detection and their 0x40 acks, which the host's rate controller reads instead (every 100 ms
+as one report, without losses or the decoder's backlog).
 
 For mouse motion, the client keeps running totals and the host applies `total − last_total`
 for each datagram it accepts (stale sequence numbers are ignored). After motion stops, the
@@ -222,35 +239,92 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   The switch happens on *n+1*'s first key frame. Urgent restarts (a key frame for a confirmed
   loss or a decoder error, host frame-queue overflow, a client that flushed its decoder) kill *n*
   immediately instead.
-- **Congestion:** if the per-session frame queue overflows (the network can't keep up), the host
-  drops the backlog (and reports it, `{"t":"dropped"}`), lowers the bitrate by 25 % and restarts
-  with a key frame at once. Such emergency cuts are at most one every 2 s, the urgent restart is
-  not limited: an overflow within 2 s of a cut restarts at once at the already lowered bitrate.
-  The browser also reports sustained growth in one-way delay (`{"t":"congestion"}`) before
-  queues get deep; that back-off restarts overlapped, so the picture keeps moving (if the old
-  generation overflows the queue meanwhile, it stops and the starting one takes over), and it
-  needs 10 s since the last bitrate change. A browser whose decoder fell behind flushes it and
-  sends `{"t":"congestion","reason":"decoder"}`, an emergency like the overflow: it restarts at
-  once (the client discards the old generation anyway), with a key-frame restart when the
-  bitrate cannot be cut. A back-off stays in effect for every later restart (key frames, encoder
-  failures) until the bitrate recovers or the user changes the video settings.
-- **Bitrate recovery** (`internal/host/bitrate.go`, the interim before a delay-gradient rate
-  controller): the client acknowledges every decoded frame with its one-way delay (`0x40`). When
-  10 s have passed without a congestion signal and with the delay low (every 500 ms the median
-  delay of the frames acknowledged since the last check is within 10 ms of the minimum of the
-  last 2 s, and acknowledgements keep coming while frames go out: a frame sent 1 s ago with no
-  acknowledgement since means a stalled path, which on the relay paths shows only that way,
-  since the gateway buffers what its client leg cannot carry), the host raises the bitrate by
-  15 %, up to the settings' bitrate (or the host default), with an overlapped restart; after a
-  decoder flush only up to 85 % of the bitrate the decoder fell behind at, until the settings
-  change. Every change, up or down, is at most one per 10 s; only the emergency cuts above may
-  come sooner. Each `video` config carries the target (`bitrate`) and the setting
-  (`maxBitrate`); the stats overlay shows "target … of … Mbps (backed off)".
+- **Rate control** (`internal/host/bitrate.go`, GUIDE 2.2): a delay-based rate controller in the
+  style of GCC and SCReAM v2 owns the session's video bitrate. Its input: the client's rate
+  reports (or the acks of older clients), the frames the host sent, and the packet losses and
+  acknowledged bytes of the media congestion controller.
+  - *Queueing delay.* A report's one-way delay p50, less the share of the frames' sending time
+    the host's own pacer explains (`internal/host/ratefeedback.go`: the media congestion
+    controller paces at 1.2 × the target, so a key frame takes several frame intervals to go out
+    and delays itself and the frames behind it, with no network queue at all; the share is a
+    fluid model of the pacer, at most the measured encodeDone → written time, so a host queue the
+    congestion window causes stays in the signal). The target is the minimum of the last 2 s plus
+    8 ms, wider on a jittery path (4 × the mean change between reports, at most 50 ms: Wi-Fi's
+    bursts are not a queue). Frames that stop arriving altogether (a capacity drop: the queue
+    fills, the frames wait for retransmissions, nothing completes) are seen from the oldest
+    frame the client lacks: far over the target (40 ms, and more than a frame that waits for one
+    retransmission) it decides on the second report in a row (one such report alone may follow a
+    stall of the client itself, whose own socket holds what it lacks; a report more than 100 ms
+    after the previous one, by the client's clock, is not judged by it at all). The first second
+    of a session's delay samples decides nothing (the base needs them).
+  - *Decrease* ×0.85 when the delay stays over the target for 3 reports in a row and is not
+    falling (a queue that drains needs no second decrease), or when more than 2 % of the
+    packets of the last second were lost; from the rate the path delivered when that is lower
+    than the target: on the direct path the connection's acknowledged bytes of the last 100 ms
+    (less audio and overhead), else the client's receive rate of the last 250 ms or 1 s, divided
+    by the encoder's fill (its output as a share of its target over the last second: encoders do
+    not hit their target exactly). A delay decrease also starts from the capacity the queue's
+    growth implies when the queue grows by 0.25 s per second or more and stands 20 ms over the
+    base (sending at R into a path of capacity C grows the queue by (R − C) / C per second, so
+    C = R / (1 + growth)): it sees a capacity drop at once, while the delivered rates still hold
+    the time before it. A decrease starts from at least half the target, whatever these say (a
+    tenth of a second's stall leaves next to nothing acknowledged). The next decrease waits until this one is in the encoder
+    (its config went live, or the helper's encoder announced the rate) and the policy's hold
+    more (150 ms for a qualified seamless encoder, 300 ms for one assumed seamless, 500 ms for a
+    flushing one, 1 s for an FFmpeg restart: its key frame and start-up); losses count again
+    300 ms after that.
+  - *Increase* continuously: +5 %/s near the last known-good rate (what the path delivered at the
+    last decrease), up to +25 %/s far below it (more than 10 % below: linearly to 40 % below),
+    and accelerating by 5 %/s per second once above it (the capacity grew); never above the
+    setting, the decoder's cap, or 1.2 × the delivered rate (the receive rate of the last second
+    divided by the encoder's fill), and only with fresh reports (frames covered in the last
+    500 ms: a still desktop has nothing to judge), the delay under the target, the client's
+    decoder keeping up (a backlog over max(4, fps/10) frames holds) and no stalled path (a frame
+    sent 1 s ago that no report covered, from a client that reports: on the relay paths the
+    gateway buffers what its client leg cannot carry).
+  - *Emergencies* as before: a host frame-queue overflow (the backlog is dropped and reported,
+    `{"t":"dropped"}`) or a client that flushed its decoder (`{"t":"congestion","reason":
+    "decoder"}`) cuts at once by 25 % (an overflow at least to 0.85 × the delivered rate) with
+    an urgent restart, but not within 2 s of any other decrease (the old generation that still
+    streams is what overflows: the starting one takes over at once); a decoder flush also caps
+    later increases at 85 % of the bitrate it cut from, until the settings change. An older
+    client's delay report (`{"t":"congestion"}`) decreases like the controller's own decision.
+  - *Frame rate.* At the floor (2 Mbit/s, or the setting if lower) a decrease lowers the frame
+    rate a rung instead, 120 → 90 → 60, and nothing below 60 (resolution is not changed); the
+    frame rate goes back up a rung every 5 s once the bitrate is 1.5 × the floor and nothing
+    decreased for 5 s.
+  - *Applying it.* The continuous target reaches the encoder as often as its pipeline takes
+    changes (`ratePolicy`): an encoder qualified to change seamlessly (`recon-host qualify`)
+    every 250 ms in steps of 2 % or more; one only assumed seamless every second; a flushing
+    one (a key frame per change) decreases after 250 ms and increases every 2 s; FFmpeg (a new
+    generation per change, overlapped) decreases after 500 ms and increases every second; an
+    FFmpeg delay or loss cut to 75 % or less (a capacity drop) is an urgent restart at once instead (the old
+    generation, which would stream on at the old rate until the new one takes over, stops
+    immediately: overlapped, it overflows the host's frame queue). The slower ones step by at
+    most 5 % from 15 % below to 5 % above the last known-good rate (an overshoot there fills the
+    queue until the next change). The media congestion controller
+    then paces at 1.2 × the encoder's bitrate; during an overlapped FFmpeg restart at the
+    bitrate of the generation that still streams, until the new one is live (pacing its frames
+    slower would only queue them at the host, and overflow its frame queue on a path that
+    carries them). A back-off stays in effect for every restart (key
+    frames, encoder failures, resume) until the controller raises it or the video settings
+    change. "Adaptive bitrate" off in the client: the delay and losses decide nothing.
+  - Each `video` config carries the target (`bitrate`) and the setting (`maxBitrate`); the stats
+    overlay shows "target … of … Mbps (backed off)". host.log has every decision
+    (`congestion: lowering bitrate from=… to=… why=delay|loss|client|overflow|decoder`,
+    `bitrate recovery: raising bitrate`) and, every 10 s in `stream stats`, the reports' one-way
+    delay (`report_owd_p50_ms`, `_p95_ms`, `_max_ms`), the continuous target (`kbps_est`), the
+    frame rate (`fps_target`), the margin (`queue_margin_ms`) and the loss (`loss_pct`). The
+    controller's tests include a millisecond simulation of the whole path (encoder, frame
+    queue, pacer, bottleneck, Wi-Fi gate, client reports: `internal/host/ratesim_test.go`) and
+    a capdrop run between network namespaces (`test/netem/capdrop.sh`); docs/VENDOR_NOTES.md 2.2
+    has the numbers.
 - **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
   `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
   (see `third_party/README.md`). Host config `congestion` picks it for the direct path and the
   relay data connection (host → gateway; the gateway → browser leg of a relay session always
-  uses NewReno): `reno` (default, quic-go's NewReno) or `media` (`internal/transport/cc`):
+  uses NewReno): `media` (`internal/transport/cc`, the default since the rate controller backs
+  off for it) or `reno` (quic-go's NewReno):
   pacing = 1.2 × the session's send rate (encoder bitrate + audio bitrate + 200 kbit/s for
   headers and small datagrams; re-applied with every frame, since a path migration replaces
   the controller), window = pacing × (min RTT + 2 frame intervals), no window cut on a single
@@ -318,9 +392,10 @@ P-frame sizes at the new target within 3 frames, frame-id and barcode gaps and a
 The results (`live-bitrate.json` next to host.json) are read when a session opens the helper:
 it starts each stream (cells of its codec, preset and LTR slots only) with `seamless` where that
 passed, else `flush`, else a new helper per bitrate change where `seamless` failed, and
-adaptive-bitrate streams with the rate-control mode that changed seamlessly (CBR first). The rate controller then lets bitrate changes on a qualified seamless encoder come
-every 2 s, others keep 10 s between changes (a flush costs a key frame). Without results the
-helper's caps defaults apply.
+adaptive-bitrate streams with the rate-control mode that changed seamlessly (CBR first). The rate
+controller then changes the bitrate of a qualified seamless encoder every 250 ms, of others less
+often (a flush costs a key frame; see "Rate control"). Without results the helper's caps defaults
+apply.
 
 **Lifecycle.** The helper the session launched to read its caps starts the stream; while a stream
 is live a spare helper is kept launched (caps read, nothing started), so a restart skips the

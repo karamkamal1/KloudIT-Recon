@@ -18,6 +18,7 @@ export const DG_RUMBLE = 0x23;
 export const DG_PING = 0x30;
 export const DG_PONG = 0x31;
 export const DG_FRAME_ACK = 0x40;
+export const DG_RATE_REPORT = 0x41;
 
 export const IN_KEY = 1;
 export const IN_MOUSE_BUTTON = 2;
@@ -39,6 +40,12 @@ export const EXT_TAGS = {
 // handles reference recovery (VideoConfig.recovery "ltr" / "invalidate").
 export const HELLO_VERSION = 3;
 export const FEATURE_FRAME_EXT = 'frame-ext';
+// Hosts with the delay-based rate controller (GUIDE 2.2) list this feature:
+// the client sends a rate report (DG_RATE_REPORT) every 20-50 ms and no
+// delay-based "congestion" messages (the decoder's still go).
+export const FEATURE_RATE_REPORT = 'rate-report';
+export const RATE_REPORT_OWD = 1; // owdP50Us / owdMaxUs valid
+export const RATE_REPORT_FRAME = 2; // gen / lastSeq name a received frame
 
 export const AUDIO_OPUS = 1;
 export const AUDIO_PCM = 2;
@@ -188,6 +195,31 @@ export function frameAck(gen, seq, owdUs, decodeUs) {
   v.setUint32(4, seq >>> 0, true);
   v.setInt32(8, Math.max(-2147483648, Math.min(2147483647, Math.round(owdUs))), true);
   v.setUint32(12, Math.max(0, Math.min(4294967295, Math.round(decodeUs))), true);
+  return b;
+}
+
+/**
+ * The rate report datagram (mirror of proto.RateReport, 40 bytes): the
+ * counters (frames, bytes, lost, audio) are cumulative and wrap at 2^32; the
+ * one-way delays (µs) are those of the frames since the previous report.
+ */
+export function rateReport(r) {
+  const b = new Uint8Array(40);
+  const v = new DataView(b.buffer);
+  const u32 = (x) => Math.floor(x) >>> 0;
+  const i32 = (x) => Math.max(-2147483648, Math.min(2147483647, Math.round(x)));
+  b[0] = DG_RATE_REPORT;
+  b[1] = r.flags & 0xff;
+  b[2] = r.gen & 0xff;
+  v.setUint32(4, u32(r.timeMs), true);
+  v.setUint32(8, u32(r.lastSeq), true);
+  v.setUint32(12, u32(r.frames), true);
+  v.setUint32(16, u32(r.bytes % 4294967296), true);
+  v.setInt32(20, i32(r.owdP50Us), true);
+  v.setInt32(24, i32(r.owdMaxUs), true);
+  v.setUint32(28, u32(r.lost), true);
+  v.setUint32(32, u32(r.audio), true);
+  v.setUint16(36, Math.max(0, Math.min(65535, r.decodeQueue | 0)), true);
   return b;
 }
 

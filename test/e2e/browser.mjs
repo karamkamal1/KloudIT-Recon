@@ -562,18 +562,20 @@ async function checkLossHandling() {
 }
 
 // ---------------------------------------------------------------------------
-// Bitrate recovery (guide step 1.5). A congestion report cuts the bitrate by
-// 25 %; while the client's frame acknowledgements show a steady one-way
-// delay, the host raises it 15 % at a time back to the setting, each step an
-// overlapped (non-urgent) restart, and the overlay shows the target. The
-// host's test-only hook shortens the controller's 10 s quiet period and rate
-// limit to 2 s. Back-offs of this CPU-only machine's own (decoder backlog)
+// Bitrate recovery (guide steps 1.5 and 2.2). A congestion report (as older
+// clients send it; this one sends rate reports, so the host's rate
+// controller judges the delay) cuts the bitrate x0.85, or to 0.85 x what the
+// connection delivered; while the client's rate reports show the one-way
+// delay back at its base, the rate controller raises it back to the setting,
+// each step an overlapped (non-urgent) restart at least a second apart, and
+// the overlay shows the target. Back-offs of this CPU-only machine's own
+// (decoder backlog, or the delay of a software decoder that falls behind)
 // may add cuts; the climb back to the setting must still happen, or, after a
 // decoder flush, to the cap the host then logs (85 % of the bitrate the
 // decoder fell behind at).
 
 async function checkBitrateRecovery() {
-  const host = await restartHost({ RECON_TEST_FAULTS: 'rate-period=2s' }, 'host-rate');
+  const host = await restartHost({}, 'host-rate');
   await startStream({ path: 'auto', transport: 'auto', bitrate: 8 });
   await sleep(4000); // decoder warm-up
   const log0 = host.log.length;
@@ -604,15 +606,16 @@ async function checkBitrateRecovery() {
   // Freezes (the client's "freeze: N ms" log): recorded, not checked; on this
   // CPU-only machine every switch also runs a second software encoder.
   const freezes = consoleLines.slice(con0).map((l) => +(l.match(/freeze: (\d+) ms/) || [])[1]).filter((v) => v > 0);
-  check('bitrate recovery: a congestion cut, then 15 % raises back to the setting with overlapped restarts; overlay shows the target',
-    cuts.length >= 1 && raises.length >= (limit < 8000 ? 1 : 2) && raises.every(([a, b]) => b > a && b <= Math.floor(a * 1.15) + 1) &&
+  const reports = (await page.evaluate(() => window.__recon.lastStats))?.rateReports ?? 0;
+  check('bitrate recovery: a congestion cut, then rate-controller raises back to the setting with overlapped restarts; overlay shows the target; rate reports flow',
+    cuts.length >= 1 && raises.length >= 1 && raises.every(([a, b]) => b > a && b <= Math.floor(a * 1.25) + 1) &&
       raises[raises.length - 1][1] === limit && cfg?.bitrate === limit && cfg?.maxBitrate === 8000 &&
       (restarts['bitrate recovery'] || 0) === raises.length && !restarts['bitrate recovery (urgent)'] &&
-      /of 8\.0 Mbps \(backed off\)/.test(target),
-    `cuts ${cuts.map(([a, b]) => `${a}→${b}`).join(', ')}; raises ${raises.map(([a, b]) => `${a}→${b}`).join(', ')}; ` +
+      /of 8\.0 Mbps \(backed off\)/.test(target) && reports > 100,
+    `${reports} rate reports; cuts ${cuts.map(([a, b]) => `${a}→${b}`).join(', ')}; raises ${raises.map(([a, b]) => `${a}→${b}`).join(', ')}; ` +
       `configs ${seen.join(' → ')} kbps (max ${cfg?.maxBitrate}${limit < 8000 ? `, decoder limit ${limit}` : ''}); overlay while backed off: "${target}"; restarts: ${counts(restarts)}; ` +
       `freezes > 100 ms: ${freezes.length ? freezes.join(', ') + ' ms' : 'none'}`);
-  results.push({ bitrateRecovery: { cuts, raises, configs: seen, decoderLimit: limit < 8000 ? limit : null, restarts, freezes } });
+  results.push({ bitrateRecovery: { cuts, raises, configs: seen, decoderLimit: limit < 8000 ? limit : null, restarts, freezes, reports } });
   await page.evaluate(() => { window.__recon.userClosed = true; });
 }
 
@@ -739,6 +742,9 @@ try {
     check(`${sc.name}: video decoding`, st && st.fps > 45, `${st?.fps.toFixed(1)} fps, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}`);
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
+    // GUIDE 2.2: the welcome asks for rate reports; the worker sends one
+    // every 25 ms on every path (datagrams; WebSocket: channel messages).
+    check(`${sc.name}: rate reports to the host's rate controller`, st && st.rateReports > 100, `${st?.rateReports} sent`);
     await checkStages(sc.name, st);
     await checkCrop(sc.name);
     const pr = await checkProbe(sc.name);

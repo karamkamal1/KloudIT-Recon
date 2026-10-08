@@ -43,7 +43,7 @@ type Config struct {
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
-	Congestion string `json:"congestion,omitempty"` // QUIC congestion control of video connections: reno | media ("" = default)
+	Congestion string `json:"congestion,omitempty"` // QUIC congestion control of video connections: media | reno ("" = media)
 
 	DefaultKbps int  `json:"defaultKbps"`
 	MaxKbps     int  `json:"maxKbps"`
@@ -149,11 +149,12 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // congestion returns the congestion controller for the direct server and the
-// relay data connections. The default stays empty in the file, so a later
-// release can change it.
+// relay data connections: media by default since the rate controller (GUIDE
+// 2.2) backs off for it; reno stays selectable. The default stays empty in the
+// file, so a later release can change it.
 func (c *Config) congestion() string {
 	if c.Congestion == "" {
-		return transport.CongestionReno
+		return transport.CongestionMedia
 	}
 	return c.Congestion
 }

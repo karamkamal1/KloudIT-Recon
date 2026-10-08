@@ -307,6 +307,7 @@ type result struct {
 	extFrames, stamped, badFrames     int  // frames with the header extension, with ordered stage stamps, unparsable
 	welcome, extFeature               bool // welcome received; it advertised the frame header extension
 	barcodeFeature                    bool // welcome advertised the test pattern's frame barcode
+	rateReportFeature                 bool // welcome asked for rate reports (GUIDE 2.2)
 	wallOffsetUs                      int64
 	firstFrameLatency                 time.Duration
 	recovery                          []string           // VideoConfig.Recovery of each config
@@ -334,6 +335,7 @@ func (r *result) control(m []byte) {
 	case "welcome":
 		r.welcome = true
 		r.extFeature = slices.Contains(x.Features, proto.FeatureFrameExt)
+		r.rateReportFeature = slices.Contains(x.Features, proto.FeatureRateReport)
 		r.barcodeFeature = slices.Contains(x.Features, proto.FeatureBarcodeSeq)
 		r.wallOffsetUs = x.WallOffsetUs
 	case "video":
@@ -441,9 +443,21 @@ func runWTCtl(t *testing.T, e *env, rawURL string, hashes []string, ticket strin
 
 // wtOpts are the optional parts of a streaming run.
 type wtOpts struct {
-	mid       func(ctrl transport.BidiStream) // runs halfway through with the control stream
-	ackOWD    time.Duration                   // > 0: acknowledge every frame (DgFrameAck) with this one-way delay, as a browser does
-	ackTilMid bool                            // stop acknowledging (still taking every frame) when mid runs
+	mid func(ctrl transport.BidiStream) // runs halfway through with the control stream
+	// ackOWD > 0: acknowledge every frame (DgFrameAck) as a browser does,
+	// with its one-way delay measured as the browser does (rate reports
+	// below) plus ackOWD - 1 ns: a fixed extra the test makes up.
+	ackOWD    time.Duration
+	ackTilMid bool // stop acknowledging (still taking every frame) when mid runs
+	// reportOWD (if set): send a rate report (DgRateReport) every 25 ms, as
+	// a browser does for hosts with the rate-report feature: the frames' one-way
+	// delay measured as the browser does (last byte received minus the
+	// frame's encodeDoneUs, on a clock synchronised by pings) plus
+	// reportOWD(time since the run started), a queue the test makes up.
+	reportOWD func(time.Duration) time.Duration
+	// onFrame (if set) is called for every complete frame with its one-way
+	// delay as measured for the reports (0 before the clock sync).
+	onFrame func(gen uint8, owd time.Duration, bytes int)
 }
 
 func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs,
@@ -476,6 +490,13 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 	var mu sync.Mutex
 	var r result
 	var acksOff atomic.Bool
+	var rep proto.RateReport // the client's rate report counters (mu)
+	var owds []time.Duration // one-way delays since the last report (mu)
+	// Clock sync as the browser does it: host clock minus local clock (µs)
+	// from the ping with the shortest round trip (mu).
+	syncOffset, syncRTT := int64(0), time.Duration(-1)
+	pings := map[uint32]time.Time{}
+	newFrames := false
 	go func() {
 		for {
 			m, err := proto.ReadMsg(ctrl, proto.MaxControlMsg)
@@ -496,6 +517,19 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 			if d[0] == proto.DgAudio {
 				mu.Lock()
 				r.audio++
+				rep.Audio++
+				mu.Unlock()
+			}
+			if d[0] == proto.DgPong && len(d) >= 24 {
+				id := binary.LittleEndian.Uint32(d[4:])
+				mu.Lock()
+				if t0, ok := pings[id]; ok {
+					rtt := time.Since(t0)
+					if syncRTT < 0 || rtt < syncRTT {
+						host := int64(binary.LittleEndian.Uint64(d[16:]))
+						syncRTT, syncOffset = rtt, host-t0.Add(rtt/2).Sub(start).Microseconds()
+					}
+				}
 				mu.Unlock()
 			}
 		}
@@ -515,12 +549,73 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 				r.firstFrameLatency = time.Since(start)
 			}
 			r.countFrame(b)
-			mu.Unlock()
-			if h, _, _, err := proto.ParseFrame(b); err == nil && opts.ackOWD > 0 && !acksOff.Load() {
-				c.SendDatagram(frameAck(h.Gen, h.Seq, opts.ackOWD))
+			if h, ext, _, err := proto.ParseFrame(b); err == nil {
+				sent := h.SendUs
+				if v, ok := ext.Get(proto.ExtEncodeDoneUs); ok {
+					sent = v
+				}
+				owd := time.Duration(time.Since(start).Microseconds()+syncOffset-int64(sent)) * time.Microsecond
+				if syncRTT >= 0 && opts.reportOWD != nil {
+					owds = append(owds, owd)
+				}
+				if opts.onFrame != nil {
+					o := owd
+					if syncRTT < 0 {
+						o = 0
+					}
+					opts.onFrame(h.Gen, o, len(b))
+				}
+				if syncRTT >= 0 && opts.ackOWD > 0 && !acksOff.Load() {
+					c.SendDatagram(frameAck(h.Gen, h.Seq, owd+opts.ackOWD-time.Nanosecond))
+				}
+				rep.Frames++
+				rep.Bytes += uint32(len(b))
+				newer := h.Gen != rep.Gen && (h.Gen-rep.Gen)&0x80 == 0
+				if rep.Flags&proto.RateReportFrame == 0 || newer || h.Gen == rep.Gen && h.Seq > rep.LastSeq {
+					rep.Flags |= proto.RateReportFrame
+					rep.Gen, rep.LastSeq = h.Gen, h.Seq
+				}
+				newFrames = true
 			}
+			mu.Unlock()
 		}
 	}()
+	if opts.reportOWD != nil || opts.ackOWD > 0 {
+		go func() {
+			t := time.NewTicker(25 * time.Millisecond)
+			defer t.Stop()
+			for n := uint32(0); ; n++ {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+				mu.Lock()
+				if n%20 == 0 { // a ping every 500 ms
+					id := n / 20
+					pings[id] = time.Now()
+					c.SendDatagram(proto.PingDatagram(id, 0))
+				}
+				if opts.reportOWD == nil {
+					mu.Unlock()
+					continue
+				}
+				m := rep
+				m.TimeMs = uint32(time.Since(start).Milliseconds())
+				m.Flags &^= proto.RateReportOWD
+				if newFrames && len(owds) > 0 {
+					slices.Sort(owds)
+					extra := opts.reportOWD(time.Since(start))
+					m.Flags |= proto.RateReportOWD
+					m.OWDP50Us = int32((owds[(len(owds)-1)/2] + extra).Microseconds())
+					m.OWDMaxUs = int32((owds[len(owds)-1] + extra).Microseconds())
+				}
+				owds, newFrames = owds[:0], false
+				mu.Unlock()
+				c.SendDatagram(m.Marshal())
+			}
+		}()
+	}
 	// Input: a key press and relative mouse motion with one "lost" datagram.
 	time.Sleep(dur / 2)
 	proto.WriteMsg(in, proto.KeyEvent(0x1e, false, true)) // 'A' down
@@ -604,9 +699,11 @@ func TestStreamingPaths(t *testing.T) {
 		checkInput(t, e.logPath)
 	})
 
-	// Default host config "congestion": reno on both paths.
-	if l := e.logs.lines(0, `msg="media congestion control"`); len(l) > 0 {
-		t.Errorf("reno host set a media congestion target: %s", l[0])
+	// Default host config "congestion": media on both paths (GUIDE 2.2).
+	for _, path := range []string{"relay", "direct"} {
+		if l := e.logs.lines(0, `msg="media congestion control"`, "path="+path); len(l) == 0 {
+			t.Errorf("default host set no media congestion target on the %s path", path)
+		}
 	}
 
 	t.Run("direct-ticket-replay-rejected", func(t *testing.T) {
@@ -844,53 +941,67 @@ func TestStreamingFrameLoss(t *testing.T) {
 	}
 }
 
-// Guide step 1.5: the bitrate recovers after a congestion back-off. A client
-// congestion report cuts it by 25 % with an overlapped restart; frames
-// acknowledged with a steady one-way delay then raise it 15 % at a time back
-// to the setting, each with an overlapped restart, and every video config
-// carries the target and the setting. The test hook shortens the
-// controller's 10 s quiet period and rate limit to 1 s.
+// rateChanges returns the from -> to pairs of the host's log lines msg
+// ("congestion: lowering bitrate", "bitrate recovery: raising bitrate")
+// logged after offset from, and their why= (decreases).
+func rateChanges(t *testing.T, e *env, from int, msg string) (pairs [][2]int, why []string) {
+	t.Helper()
+	for _, l := range e.logs.lines(from, `msg="`+msg+`"`) {
+		var c [2]int
+		if _, err := fmt.Sscanf(l[strings.Index(l, " from=")+1:], "from=%d to=%d", &c[0], &c[1]); err != nil {
+			t.Fatalf("%v: %s", err, l)
+		}
+		pairs = append(pairs, c)
+		if i := strings.Index(l, " why="); i >= 0 {
+			why = append(why, strings.Fields(l[i+5:])[0])
+		}
+	}
+	return pairs, why
+}
+
+// Guide step 2.2 with a client that only acknowledges frames (0x40, clients
+// before rate reports): its congestion report decreases the bitrate x0.85
+// (or to 0.85 x what the connection delivered, if less) with an overlapped
+// restart; the acknowledgements, with a steady one-way delay, then let the
+// rate controller raise it back to the setting, each step an overlapped
+// restart at least a second apart (FFmpeg), and every video config carries
+// the target and the setting.
 func TestStreamingBitrateRecovery(t *testing.T) {
-	t.Setenv(host.TestFaultsEnv, "rate-period=1s")
 	e := setup(t)
 	tk := e.connectInfo()
 	from := e.logs.Len()
-	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 10*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 16*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
 		wtOpts{ackOWD: 5 * time.Millisecond, mid: func(ctrl transport.BidiStream) {
 			proto.WriteMsg(ctrl, []byte(`{"t":"congestion","delayMs":80}`))
 		}})
 	t.Logf("%d frames, configs (bitrate, max) %v", r.frames, r.bitrates)
-	changes := func(msg string) [][2]int {
-		var out [][2]int
-		for _, l := range e.logs.lines(from, `msg="`+msg+`"`) {
-			var c [2]int
-			if _, err := fmt.Sscanf(l[strings.Index(l, " from=")+1:], "from=%d to=%d", &c[0], &c[1]); err != nil {
-				t.Fatalf("%v: %s", err, l)
-			}
-			out = append(out, c)
+	cuts, why := rateChanges(t, e, from, "congestion: lowering bitrate")
+	raises, _ := rateChanges(t, e, from, "bitrate recovery: raising bitrate")
+	t.Logf("cuts %v (%v), raises %v", cuts, why, raises)
+	if len(cuts) != 1 || cuts[0][0] != 4000 || cuts[0][1] > 3400 || cuts[0][1] < 2000 || why[0] != "client" {
+		t.Fatalf("cuts %v %v, want one client cut from 4000 to at most 3400", cuts, why)
+	}
+	if len(raises) == 0 || raises[0][0] != cuts[0][1] || raises[len(raises)-1][1] != 4000 {
+		t.Fatalf("raises %v, want from %d back to 4000", raises, cuts[0][1])
+	}
+	for i, c := range raises {
+		if c[1] <= c[0] || c[1] > 4000 || float64(c[1]) > 1.25*float64(c[0]) || i > 0 && c[0] != raises[i-1][1] {
+			t.Fatalf("raises %v: each up, at most +25 %%, to at most 4000", raises)
 		}
-		return out
-	}
-	cuts, raises := changes("congestion: lowering bitrate"), changes("bitrate recovery: raising bitrate")
-	if !slices.Equal(cuts, [][2]int{{4000, 3000}}) {
-		t.Fatalf("cuts %v, want 4000 -> 3000 for the report", cuts)
-	}
-	if want := [][2]int{{3000, 3450}, {3450, 3967}, {3967, 4000}}; !slices.Equal(raises, want) {
-		t.Fatalf("raises %v, want %v (15 %% at a time up to the setting)", raises, want)
 	}
 	for _, l := range e.logs.lines(from, `msg="restarting video"`) {
 		if !strings.Contains(l, "urgent=false") {
 			t.Fatalf("urgent restart: %s", l)
 		}
 	}
-	if n := len(e.logs.lines(from, `msg="restarting video"`, `reason="bitrate recovery"`)); n != 3 {
-		t.Fatalf("%d bitrate recovery restarts, want 3", n)
+	if n := len(e.logs.lines(from, `msg="restarting video"`, `reason="bitrate recovery"`)); n != len(raises) {
+		t.Fatalf("%d bitrate recovery restarts, want %d", n, len(raises))
 	}
 	// The configs: the setting, the back-off, then only up, ending at the
 	// setting; maxBitrate is the setting throughout.
-	low := slices.IndexFunc(r.bitrates, func(b [2]int) bool { return b[0] == 3000 })
+	low := slices.IndexFunc(r.bitrates, func(b [2]int) bool { return b[0] == cuts[0][1] })
 	if !r.welcome || len(r.bitrates) < 3 || r.bitrates[0][0] != 4000 || low < 0 || r.bitrates[len(r.bitrates)-1][0] != 4000 {
-		t.Fatalf("configs (bitrate, max) %v: want 4000, 3000, ..., 4000", r.bitrates)
+		t.Fatalf("configs (bitrate, max) %v: want 4000, %d, ..., 4000", r.bitrates, cuts[0][1])
 	}
 	for i, b := range r.bitrates {
 		if b[1] != 4000 || (i > low && b[0] < r.bitrates[i-1][0]) {
@@ -903,27 +1014,73 @@ func TestStreamingBitrateRecovery(t *testing.T) {
 // acknowledged frames before, acknowledges none (a stalled gateway-to-client
 // leg on the relay paths, where the gateway buffers the frames: here the
 // client keeps taking every frame and stops acknowledging): the congestion
-// report cuts, and no raise follows in the 5 s that would see one 3 s after
-// the cut (the period is longer than the 1 s the host waits for an
-// acknowledgement, as the real 10 s is).
+// report cuts, and no raise follows in the 6 s after it.
 func TestStreamingBitrateStalledAcks(t *testing.T) {
-	t.Setenv(host.TestFaultsEnv, "rate-period=3s")
 	e := setup(t)
 	tk := e.connectInfo()
 	from := e.logs.Len()
-	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 10*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 12*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
 		wtOpts{ackOWD: 5 * time.Millisecond, ackTilMid: true, mid: func(ctrl transport.BidiStream) {
 			proto.WriteMsg(ctrl, []byte(`{"t":"congestion","delayMs":80}`))
 		}})
 	t.Logf("%d frames, configs (bitrate, max) %v", r.frames, r.bitrates)
-	if n := len(e.logs.lines(from, `msg="congestion: lowering bitrate"`, "from=4000 to=3000")); n != 1 {
-		t.Fatalf("%d cuts 4000 -> 3000, want 1", n)
+	cuts, _ := rateChanges(t, e, from, "congestion: lowering bitrate")
+	if len(cuts) != 1 || cuts[0][0] != 4000 || cuts[0][1] > 3400 {
+		t.Fatalf("cuts %v, want one from 4000", cuts)
 	}
 	if l := e.logs.lines(from, `msg="bitrate recovery: raising bitrate"`); len(l) != 0 {
 		t.Fatalf("raised while no frame was acknowledged: %q", l)
 	}
-	if !r.welcome || len(r.bitrates) == 0 || r.bitrates[len(r.bitrates)-1][0] != 3000 {
-		t.Fatalf("configs (bitrate, max) %v: want the last at 3000", r.bitrates)
+	if !r.welcome || len(r.bitrates) == 0 || r.bitrates[len(r.bitrates)-1][0] != cuts[0][1] {
+		t.Fatalf("configs (bitrate, max) %v: want the last at %d", r.bitrates, cuts[0][1])
+	}
+}
+
+// Guide step 2.2 with a client that sends rate reports (0x41) and no acks:
+// the welcome asks for them; a queue (the reported one-way delay 50 ms over
+// what the client measures, for half a second) decreases the bitrate
+// ("why=delay"), and once the delay is back the controller raises it to the
+// setting again; the host logs the reports' delays with its stream stats.
+func TestStreamingRateReports(t *testing.T) {
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	owd := func(t time.Duration) time.Duration {
+		if t >= 4*time.Second && t < 4500*time.Millisecond {
+			return 50 * time.Millisecond
+		}
+		return 0
+	}
+	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3, 16*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+		wtOpts{reportOWD: owd})
+	cuts, why := rateChanges(t, e, from, "congestion: lowering bitrate")
+	raises, _ := rateChanges(t, e, from, "bitrate recovery: raising bitrate")
+	t.Logf("%d frames, configs (bitrate, max) %v, cuts %v (%v), raises %v", r.frames, r.bitrates, cuts, why, raises)
+	if !r.welcome || !r.rateReportFeature {
+		t.Fatalf("welcome %v, rate-report feature %v", r.welcome, r.rateReportFeature)
+	}
+	if len(cuts) == 0 || cuts[0][0] != 4000 || why[0] != "delay" {
+		t.Fatalf("cuts %v %v, want a delay decrease from 4000", cuts, why)
+	}
+	if len(raises) == 0 || raises[len(raises)-1][1] != 4000 || r.bitrates[len(r.bitrates)-1][0] != 4000 {
+		t.Fatalf("raises %v, configs %v: want the bitrate back at 4000", raises, r.bitrates)
+	}
+	if l := e.logs.lines(from, `msg="stream stats"`, "report_owd_p50_ms="); len(l) == 0 {
+		t.Fatalf("no stream stats with the reports' delays: %q", e.logs.lines(from, `msg="stream stats"`))
+	}
+}
+
+// Host config "congestion": "reno" (selectable since the default became
+// media): no media congestion target; the rate controller still runs.
+func TestStreamingRenoCongestion(t *testing.T) {
+	e := setup(t, func(c *host.Config) { c.Congestion = transport.CongestionReno })
+	tk := e.connectInfo()
+	r := runWTPrefs(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 2*time.Second, defaultPrefs)
+	if !r.welcome || r.frames < 60 || !r.rateReportFeature {
+		t.Fatalf("unexpected result %+v", r)
+	}
+	if l := e.logs.lines(0, `msg="media congestion control"`); len(l) > 0 {
+		t.Errorf("reno host set a media congestion target: %s", l[0])
 	}
 }
 

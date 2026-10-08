@@ -24,6 +24,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
+	"github.com/karamkamal1/kloudit-recon/internal/transport/cc"
 )
 
 // SessionMeta describes how a connection reached the host.
@@ -71,13 +72,20 @@ type Session struct {
 	paused   atomic.Bool
 	lastKick time.Time // last key-frame restart (any reason)
 	kickMu   sync.Mutex
-	rate     rateController // video bitrate: congestion back-off and recovery
-	videoUp  atomic.Bool
-	failures int
-	tried    map[string]bool   // encoders excluded after failing
-	usage    map[string]string // encoder -> usage it is retried with (media.RetryUsage)
-	encFails map[string]int    // encoder -> its own start failures since a generation last went live
-	triedMu  sync.Mutex        // guards tried, usage and encFails
+	rate     rateController // video bitrate: the delay-based rate controller (bitrate.go)
+	track    sendTrack      // frames sent, for the rate controller's feedback (ratefeedback.go)
+	fb       rateFeedback   // the client's receive reports (or acks), turned into feedback
+	noticeAt atomic.Int64   // unix ns of the last congestion notice to the user (rate limited)
+	// rateChanges carries the rate controller's decisions on the client's
+	// reports from the datagram loop to rateLoop, which applies them in
+	// order with its own (an FFmpeg restart must not hold up input).
+	rateChanges chan rateChange
+	videoUp     atomic.Bool
+	failures    int
+	tried       map[string]bool   // encoders excluded after failing
+	usage       map[string]string // encoder -> usage it is retried with (media.RetryUsage)
+	encFails    map[string]int    // encoder -> its own start failures since a generation last went live
+	triedMu     sync.Mutex        // guards tried, usage and encFails
 
 	// Recovery "skip" bounded in time (watchHeal), guarded by healMu: the
 	// live generation, how many frames after a lost one it needs to heal it
@@ -121,14 +129,15 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 	s := &Session{
 		a: a, c: c, meta: meta, id: auth.RandomToken(6),
 		ctx: ctx, cancel: cancel,
-		frameQ:   make(chan *media.Frame, 6),
-		pipeSwap: make(chan struct{}, 1),
-		tried:    map[string]bool{},
-		usage:    map[string]string{},
-		encFails: map[string]int{},
+		frameQ:      make(chan *media.Frame, 6),
+		pipeSwap:    make(chan struct{}, 1),
+		tried:       map[string]bool{},
+		usage:       map[string]string{},
+		encFails:    map[string]int{},
+		rateChanges: make(chan rateChange, 16),
 	}
 	s.log = a.log.With("session", s.id, "path", meta.Path)
-	s.rate.period = a.faults.ratePeriod
+	s.rate.setPath(meta.Path == "direct")
 	return s
 }
 
@@ -307,7 +316,7 @@ func (s *Session) sendWelcome() error {
 	for _, e := range s.encoders() {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
-	w.Features = s.a.features()
+	w.Features = append(s.a.features(), proto.FeatureRateReport)
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
@@ -676,7 +685,7 @@ func (a *Agent) backendFor(prefs proto.Prefs) string {
 
 // startVideo starts a new encoder generation. urgent discards the current one
 // immediately (used when the client needs a key frame right away). The
-// bitrate is the rate controller's target, at most the settings' bitrate: a
+// bitrate and frame rate are the rate controller's, at most the settings': a
 // congestion back-off stays in effect for every restart until the controller
 // raises the bitrate again or a video settings change resets it, so a
 // key-frame restart after a loss does not go back to the full bitrate.
@@ -686,11 +695,20 @@ func (s *Session) startVideo(urgent bool, reason string) error {
 	if err != nil {
 		return err
 	}
-	p.BitrateKbps = s.rate.target(p.BitrateKbps)
+	s.rate.setAdaptive(p.Adaptive)
+	p.BitrateKbps, p.FPS = s.rate.target(p.BitrateKbps, p.FPS)
 	if reason != "" {
 		s.log.Info("restarting video", "reason", reason, "urgent", urgent)
 	}
-	s.setCongestionTarget(p)
+	// An overlapped start leaves the active generation streaming at its
+	// bitrate until the new one is live (its VideoConfig sets the target
+	// then): pacing below that would queue its frames at the host, which on
+	// a path that carries them overflows the frame queue for nothing.
+	pace := p
+	if a, ok := s.vid().Active(); ok && !urgent && a.BitrateKbps > pace.BitrateKbps {
+		pace.BitrateKbps = a.BitrateKbps
+	}
+	s.setCongestionTarget(pace)
 	return s.vid().Start(p, urgent)
 }
 
@@ -765,6 +783,7 @@ func (s *Session) videoEvents() {
 		case ev.Rate != nil:
 			// The live generation's encoder changed its bitrate or frame
 			// rate in place: the client's config of it is updated.
+			s.rate.live(ev.Rate.Kbps, ev.Rate.FPS)
 			_, ceiling := s.rate.kbps()
 			s.sendJSON(proto.Rate{T: "rate", Gen: ev.Rate.Gen, BitrateKbps: ev.Rate.Kbps, FPS: ev.Rate.FPS, MaxBitrateKbps: ceiling})
 		case ev.Config != nil:
@@ -781,6 +800,8 @@ func (s *Session) videoEvents() {
 				c.Recovery = r
 			}
 			_, c.MaxBitrateKbps = s.rate.kbps()
+			s.rate.live(c.BitrateKbps, c.FPS)
+			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
 			s.sendJSON(&c)
 		case ev.Frame != nil:
@@ -791,6 +812,7 @@ func (s *Session) videoEvents() {
 				continue // test hook: a still desktop, the source sends nothing
 			}
 			s.healFrame(ev.Frame)
+			s.rate.output(len(ev.Frame.Data))
 			select {
 			case s.frameQ <- ev.Frame:
 			default:
@@ -1125,54 +1147,56 @@ func (s *Session) encoderFailed(p media.Params) {
 	}
 }
 
-// congestion lowers the bitrate by 25 % (rateController.congestion) with a
-// new encoder generation and reports whether it did. An emergency discards
-// the current generation at once: the host's frame queue overflowed (its
-// frames were dropped), or the client flushed its decoder; such cuts are at
-// most 2 s apart, and a decoder flush also caps later raises. Otherwise (the
-// client saw the delay grow) the restart is overlapped: the current
-// generation streams on until the new one's first key frame; such a cut
-// needs 10 s since the last change of the bitrate (2 s on an encoder
-// qualified to change seamlessly: rateGap). A signal that cuts nothing still
-// holds off the next raise.
+// congestion handles a congestion signal from outside the rate reports
+// (rateController.congestion) and reports whether it cut the bitrate. An
+// emergency discards the current generation at once: the host's frame queue
+// overflowed (its frames were dropped), or the client flushed its decoder;
+// such cuts are at most 2 s apart, and a decoder flush also caps later
+// increases. An older client's delay report ({"t":"congestion"} from clients
+// without rate reports) decreases like the controller's own delay decision,
+// overlapped: the current generation streams on until the new one's first key
+// frame.
 func (s *Session) congestion(delayMs int, sig rateSignal) bool {
-	urgent := sig != signalDelay
-	s.rate.setGap(rateGap(s.vid().Capabilities()))
-	from, to, ok := s.rate.congestion(sig)
+	s.rate.setPolicy(ratePolicy(s.vid().Capabilities()))
+	c, ok := s.rate.congestion(sig)
 	if !ok {
-		s.log.Debug("congestion: bitrate kept", "kbps", from, "delayMs", delayMs, "urgent", urgent)
+		s.log.Debug("congestion: bitrate kept", "delayMs", delayMs, "signal", sig)
 		return false
 	}
-	s.kickMu.Lock()
-	s.lastKick = time.Now() // the restart below also delivers a key frame
-	s.kickMu.Unlock()
-	s.log.Warn("congestion: lowering bitrate", "from", from, "to", to, "delayMs", delayMs, "urgent", urgent)
 	if sig == signalDecoder {
 		s.log.Info("bitrate recovery limited by the client's decoder", "max", s.rate.decoderLimit())
 	}
-	s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(to)/1000))
-	if err := s.setRate(to, urgent, "congestion"); err != nil {
-		s.log.Warn("restart after congestion failed", "err", err)
-	}
+	s.applyRate(c, delayMs)
 	return true
 }
 
-// rateGap is the minimum time between two bitrate changes for the pipeline
-// that streams: rateSeamlessGap where the encoder was qualified to change its
-// bitrate seamlessly (recon-host qualify, GUIDE 3.6: no key frame, no
-// restart); otherwise 0, the full period: a flushing encoder (a key frame per
-// change, GUIDE 3.6 "change less often"), one whose live change is only
-// assumed, and FFmpeg's restarts.
-func rateGap(c media.PipelineCaps) time.Duration {
-	if c.LiveBitrate && c.LiveBitrateMeasured && !c.LiveBitrateFlush {
-		return rateSeamlessGap
+// applyRate puts a change of the rate controller into effect (setRate) and
+// logs it; decreases also tell the user, at most once per 30 s.
+func (s *Session) applyRate(c rateChange, delayMs int) {
+	s.kickMu.Lock()
+	s.lastKick = time.Now() // a restart below also delivers a key frame
+	s.kickMu.Unlock()
+	_, ceiling := s.rate.kbps()
+	reason := "bitrate recovery"
+	if c.down {
+		reason = "congestion"
+		s.log.Warn("congestion: lowering bitrate", "from", c.fromKbps, "to", c.toKbps, "why", c.why, "fps", c.toFPS,
+			"delayMs", delayMs, "urgent", c.urgent)
+		if now, last := time.Now().UnixNano(), s.noticeAt.Load(); now-last >= int64(30*time.Second) && s.noticeAt.CompareAndSwap(last, now) {
+			s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(c.toKbps)/1000))
+		}
+	} else {
+		s.log.Info("bitrate recovery: raising bitrate", "from", c.fromKbps, "to", c.toKbps, "fps", c.toFPS, "max", ceiling)
 	}
-	return 0
+	if err := s.setRate(c.toKbps, c.toFPS, c.urgent, reason); err != nil {
+		s.log.Warn("bitrate change failed", "reason", reason, "err", err)
+	}
 }
 
-// rateLoop raises the bitrate after a congestion back-off once the network
-// has been quiet (rateController.tick): an overlapped restart at the new
-// bitrate, like a settings change.
+// rateLoop advances the rate controller every rateTick: increases, changes
+// the encoder could not take yet (its policy's gap), the acks of clients
+// without rate reports turned into feedback, and the stalled-path check. It
+// also applies the decisions on the client's reports (rateChanges).
 func (s *Session) rateLoop() {
 	t := time.NewTicker(rateTick)
 	defer t.Stop()
@@ -1180,26 +1204,84 @@ func (s *Session) rateLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
+		case c := <-s.rateChanges:
+			s.applyRate(c, 0)
+			continue
 		case <-t.C:
 		}
 		if _, live := s.vid().Active(); !live || s.paused.Load() {
 			s.rate.hold() // nothing streams (paused, or the encoder is starting or failing): nothing to judge
 			continue
 		}
-		s.rate.setGap(rateGap(s.vid().Capabilities()))
-		from, to, ok := s.rate.tick()
-		if !ok {
-			continue
+		s.rate.setPolicy(ratePolicy(s.vid().Capabilities()))
+		now := time.Now()
+		if !s.fb.reportsActive(now) {
+			if fb, ok := s.fb.fromAcks(now, s.ccCounters()); ok {
+				if c, ok := s.rate.report(fb); ok {
+					s.applyRate(c, int(fb.qd.Milliseconds()))
+				}
+			}
 		}
-		s.kickMu.Lock()
-		s.lastKick = time.Now() // the restart below also delivers a key frame
-		s.kickMu.Unlock()
-		_, ceiling := s.rate.kbps()
-		s.log.Info("bitrate recovery: raising bitrate", "from", from, "to", to, "max", ceiling)
-		if err := s.setRate(to, false, "bitrate recovery"); err != nil {
-			s.log.Warn("restart after bitrate recovery failed", "err", err)
+		if c, ok := s.rate.tick(s.stalled()); ok {
+			s.applyRate(c, 0)
 		}
 	}
+}
+
+// stalled reports whether a frame went out ackTimeout ago or longer and no
+// feedback has covered it, from a client that sends feedback: the path to
+// the client stalls.
+func (s *Session) stalled() bool {
+	at, ok := s.track.uncoveredSince()
+	return ok && s.a.clock()-at >= uint64(ackTimeout.Microseconds())
+}
+
+// ccCounters returns the media congestion controller's packet and byte
+// counters (ok false with another controller).
+func (s *Session) ccCounters() ccCounters {
+	m := transport.MediaControl(s.c)
+	if m == nil {
+		return ccCounters{}
+	}
+	st := m.Stats()
+	return ccCounters{ok: true, lost: st.LostPackets, total: st.LostPackets + st.AckedPackets, acked: st.AckedBytes,
+		nonVideoKbps: int(s.audioKbps.Load() + ccOverheadKbps)}
+}
+
+// rateReport feeds a client's receive report to the rate controller.
+func (s *Session) rateReport(r proto.RateReport) {
+	var comp time.Duration
+	if r.Flags&proto.RateReportFrame != 0 {
+		comp, _ = s.track.cover(r.Gen, r.LastSeq)
+	}
+	fb := s.fb.fromReport(r, time.Now(), comp, s.ccCounters())
+	fb.pending, fb.pendingValid = s.track.pending(s.a.clock())
+	before := s.rate.decreasedAt()
+	c, ok := s.rate.report(fb)
+	if ok || !s.rate.decreasedAt().Equal(before) {
+		// A decrease on this report (applied now, or when the policy's
+		// gap since the last change has passed: deferred).
+		s.log.Debug("rate report decision", "why", c.why, "deferred", !ok, "qd_ms", fb.qd.Milliseconds(),
+			"owd_ms", fb.owd.Milliseconds(), "pending_ms", fb.pending.Milliseconds(), "interval_ms", fb.interval.Milliseconds())
+	}
+	if ok {
+		select {
+		case s.rateChanges <- c:
+		default:
+			s.log.Warn("rate change dropped: the rate loop is behind")
+		}
+	}
+}
+
+// videoPacingBps is the pacing rate available to video frames (bit/s): the
+// media congestion controller's pacing less audio and the overhead allowance
+// (setCongestionTarget); 0 with another controller.
+func (s *Session) videoPacingBps() float64 {
+	m := transport.MediaControl(s.c)
+	if m == nil {
+		return 0
+	}
+	return max(0, float64(m.TargetBitrate())*cc.PacingGain-float64((s.audioKbps.Load()+ccOverheadKbps)*1000))
 }
 
 // urgentRestart discards the current generation at the current bitrate, for
@@ -1259,18 +1341,23 @@ func (s *Session) keyframe(reason string) error {
 	return s.startVideo(true, reason)
 }
 
-// setRate puts the rate controller's new target into effect: in the running
-// encoder where the pipeline can (Capabilities().LiveBitrate: the native
-// helper), else as a new generation (overlapped unless urgent). urgent: the
-// client also needs a key frame (frames were dropped, or it flushed its
-// decoder).
-func (s *Session) setRate(kbps int, urgent bool, reason string) error {
+// setRate puts the rate controller's new bitrate and frame rate into effect:
+// in the running encoder where the pipeline can (Capabilities().LiveBitrate:
+// the native helper), else as a new generation (overlapped unless urgent).
+// urgent: at once, and the client also needs a key frame (frames were
+// dropped, or it flushed its decoder), or the old FFmpeg generation must stop
+// now (a large cut: applyPolicy.cutUrgent).
+func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	v := s.vid()
 	if !v.Capabilities().LiveBitrate {
 		return s.startVideo(urgent, reason)
 	}
-	s.log.Info("changing the bitrate in the encoder", "reason", reason, "kbps", kbps, "urgent", urgent)
-	if err := v.SetRate(kbps, 0); err != nil {
+	newFPS := 0
+	if cur, ok := v.Current(); ok && fps > 0 && fps != cur.FPS {
+		newFPS = fps
+	}
+	s.log.Info("changing the bitrate in the encoder", "reason", reason, "kbps", kbps, "fps", newFPS, "urgent", urgent)
+	if err := v.SetRate(kbps, newFPS); err != nil {
 		s.log.Warn("bitrate change in the encoder failed, restarting", "err", err)
 		return s.startVideo(urgent, reason)
 	}
@@ -1344,7 +1431,7 @@ func (s *Session) sendFrame(st transport.SendStream, f *media.Frame, h proto.Fra
 		return
 	}
 	st.Close()
-	s.rate.sent()
+	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), len(b), s.videoPacingBps())
 	s.stats.frames.Add(1)
 	s.stats.bytes.Add(int64(len(b)))
 	if h.Flags&proto.FrameFlagExt != 0 {
@@ -1499,11 +1586,21 @@ func (s *Session) datagrams() {
 			if g, ok := proto.ParseGamepad(d); ok && g.Index < 4 && s.padGates[g.Index].Accept(g.Seq) {
 				s.gamepad(g)
 			}
+		case proto.DgRateReport:
+			if r, ok := proto.ParseRateReport(d); ok {
+				s.rateReport(r)
+			}
 		case proto.DgFrameAck:
 			if a, ok := proto.ParseFrameAck(d); ok {
 				s.vid().Ack(a.Gen, a.Seq)
 				s.hostStages.acked(a.Gen, a.Seq, s.a.clock())
-				s.rate.ack(time.Duration(a.OWDUs) * time.Microsecond)
+				// Clients without rate reports: their acks are the rate
+				// controller's feedback (rateLoop).
+				if now := time.Now(); !s.fb.reportsActive(now) {
+					if f, ok := s.track.frame(a.Gen, a.Seq); ok {
+						s.fb.ack(time.Duration(a.OWDUs)*time.Microsecond, time.Duration(f.comp)*time.Microsecond, f.bytes, now)
+					}
+				}
 				s.stats.acks.Add(1)
 				owd := int64(a.OWDUs)
 				s.stats.owdSum.Add(owd)
@@ -1823,8 +1920,19 @@ func (s *Session) statsLoop() {
 			avg = owdSum / acks
 		}
 		target, ceiling := s.rate.kbps()
-		s.log.Info("stream stats", "fps", float64(frames)/10, "mbps", float64(bytes)*8/10/1e6,
-			"owd_avg_ms", float64(avg)/1000, "owd_max_ms", float64(owdMax)/1000, "kbps_target", target,
-			"kbps_max", ceiling, "dropped", dropped, "recovered", recovered, "recovered_by_key", byKey)
+		est, fpsTarget, margin, loss := s.rate.state()
+		args := []any{"fps", float64(frames) / 10, "mbps", float64(bytes) * 8 / 10 / 1e6,
+			"owd_avg_ms", float64(avg) / 1000, "owd_max_ms", float64(owdMax) / 1000, "kbps_target", target,
+			"kbps_max", ceiling, "dropped", dropped, "recovered", recovered, "recovered_by_key", byKey}
+		// The rate controller's view: the one-way delay of the client's
+		// reports (p50/p95 of their p50s, the largest maximum), the
+		// continuous target, the frame rate, the queueing-delay margin and
+		// the packet loss of the last second.
+		if p50, p95, mx, n := s.fb.stats(); n > 0 {
+			args = append(args, "report_owd_p50_ms", p50.Milliseconds(), "report_owd_p95_ms", p95.Milliseconds(), "report_owd_max_ms", mx.Milliseconds())
+		}
+		args = append(args, "kbps_est", int(est), "fps_target", fpsTarget, "queue_margin_ms", margin.Milliseconds(),
+			"loss_pct", fmt.Sprintf("%.2f", loss*100))
+		s.log.Info("stream stats", args...)
 	}
 }

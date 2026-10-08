@@ -3351,3 +3351,240 @@ stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` an
   the `drop=every:300` run and both `wifi` T5 runs above on the RTX host; expect
   `by="recovery frame"` for losses within the encoder's reference window (up to 5 frames, 4 at 4K
   H.264/HEVC: 3.4) and `by="key frame"` beyond it; pass T5 >= 0.9.
+
+## 2.2 Media congestion control and rate controller
+
+Vendor-neutral (transport and session logic): what needs real hardware is the encoders' live
+bitrate changes under the controller, and real networks.
+
+What changed:
+
+- **Feedback datagram `0x41`** (`proto.RateReport`, mirrored in `protocol.js`; layout in
+  docs/ARCHITECTURE.md "Datagrams"): every 25 ms the browser reports cumulative frames, bytes,
+  losses (gap-timeout frames the host did not report, plus lost audio datagrams) and audio
+  packets, the one-way delay p50 and maximum of the frames since the last report (the 0x40
+  ack's measure: last byte minus `encodeDoneUs`, clock-synced), the newest frame (gen, seq), its
+  clock and the decoder's backlog (frames handed to the decoder and not out of it). Hosts list
+  `rate-report` in `welcome.features`; clients that see it send reports and stop their own
+  delay-based `{"t":"congestion"}`. v1/v2 clients and older hosts are unaffected: older clients
+  keep their delay message and the host reads their 0x40 acks as reports (every 100 ms);
+  clients never send 0x41 to hosts without the feature.
+- **Rate controller** (`internal/host/bitrate.go`, replacing 1.5's interim; the plumbing stays:
+  `target` per generation, `setRate` in the encoder or as an overlapped restart, the decoder
+  cap, the emergency cuts): the rules are in docs/ARCHITECTURE.md "Rate control". Its feedback
+  (`internal/host/ratefeedback.go`): `sendTrack` keeps each frame sent with the share of its
+  encodeDone → written time the host's pacer explains; `rateFeedback` turns reports (or acks)
+  into differences, the delay less that share, and the media congestion controller's lost /
+  acknowledged packets and bytes. host.log: every change (`congestion: lowering bitrate ...
+  why=delay|loss|client|overflow|decoder urgent=...`, `bitrate recovery: raising bitrate`), at
+  debug level the report each delay or loss decision was made on (`rate report decision qd_ms=
+  owd_ms= pending_ms= interval_ms= deferred=`), and in `stream stats` `report_owd_p50_ms`,
+  `_p95_ms`, `_max_ms`, `kbps_est`, `fps_target`, `queue_margin_ms`, `loss_pct`.
+- **Applying it**: the media congestion controller's target follows every change
+  (`transport.MediaControl(conn).SetTarget`, pacing 1.2 × (video + audio + 200 kbit/s)); during
+  an overlapped FFmpeg restart it stays at the generation that still streams until the new one
+  is live. The helper changes its encoder live (`setRate` with `kbps` and, at the floor, `fps`)
+  as often as its qualified mode allows; FFmpeg restarts overlapped (a decrease 500 ms after the
+  last change at the earliest, an increase at most once a second), except a delay or loss cut to
+  75 % or less, which is an urgent restart at once.
+- **Default `congestion`: `media`** (host.json without the key; `reno` stays selectable; the log
+  line is `direct WebTransport endpoint listening ... congestion=media`).
+- The 1.5 test hook `RECON_TEST_FAULTS=rate-period=D` is gone (the controller's own periods are
+  short enough for the tests).
+- **Acceptance harness**: `sudo test/netem/capdrop.sh [OUTDIR]` (docs/NETEM.md "In network
+  namespaces") runs `deploy/netem/netem.sh capdrop` between two network namespaces: the gateway
+  and the host agent in one (`internal/e2e TestNetemCapdrop`: test pattern 1280×720 at 60 fps,
+  libx264, a 30 Mbit/s setting, `congestion` media, direct WebTransport), a Go client that
+  reports like the browser (rate reports every 25 ms with the one-way delays it measures on a
+  ping-synchronised clock; `TestNetemClient`) in the other, the profile on the client's veth in
+  both directions. It writes `summary.txt` (overflows, one-way delay before / during / after the
+  dip, recovery time, the target's changes, the received rate per second), `host.log` and
+  `client.json`, and fails unless there is no frame-queue overflow, the delay p95 during the dip
+  is under the 15 s before's + 30 ms, and the target is back within 15 % of the setting within
+  10 s of the capacity's return.
+
+Deviations from the guide's wording, and why:
+
+- *Delay signal less the host's pacer.* The guide's queueing delay is the reported one-way delay
+  over its 2 s minimum. With the media congestion controller pacing at 1.2 × the target, a frame
+  larger than the average (every key frame; every FFmpeg bitrate change is a new generation with
+  one) takes several frame intervals to leave the host and delays the frames behind it, with no
+  network queue: read as a queue, every key frame decreases the bitrate, and on FFmpeg every
+  decrease brings another key frame. In the simulation (below) a key-frame restart every 3 s on a
+  clean 50 Mbit/s link spirals from 20 to about 4.5 Mbit/s (15 decreases in 60 s) without the
+  correction, and keeps 20 Mbit/s with it.
+- *Target margin.* 8 ms (the guide's 5–10 ms) on a steady path, widened to 4 × the mean change
+  between reports (at most 50 ms) on a jittery one: Wi-Fi's 0–15 ms bursts alone would otherwise
+  decrease the bitrate every few seconds.
+- *Decrease from the delivered rate.* ×0.85 applies to the rate the path delivered when that is
+  lower than the target (GCC's rule; the guide's "×0.85" of the target takes eight steps from
+  50 to 15 Mbit/s while the queue overflows): on the direct path the connection's acknowledged
+  bytes of the last 100 ms, else the client's receive rate. A delay decrease also starts from
+  the capacity the queue's growth implies (C = R / (1 + growth) when the queue grows by 0.25 s
+  per second or more and stands 20 ms over the base; at most a halving): right after a capacity
+  drop the delivered rates still hold the time before it, and in the namespace run a first cut
+  from them alone (30 → 25.3 Mbit/s, 64 ms after the drop) let the host's frame queue overflow
+  four times. Frames that stop arriving altogether are detected from the oldest frame the client
+  lacks, on the second report in a row (one report alone can follow a stall of the client
+  itself; the browser E2E drew most of its false decreases from single reports like that).
+- *FFmpeg cuts of 25 % or more are urgent.* The guide's "rate-limited overlapped restarts": an
+  overlapped restart keeps the old generation streaming at the old rate for its start-up
+  (100–250 ms with libx264), and after a capacity drop that alone overflows the frame queue
+  (namespace run before this rule: 2 overflows, one of them the new generation's key frame).
+  Such a cut now restarts at once (a short freeze instead of the overflow, its dropped frames
+  and the key-frame restart after them). An older client's congestion report still restarts
+  overlapped.
+- *"Measured receive rate + 20 %"* is the receive rate divided by the encoder's fill (its output
+  as a share of its target over the last second): libx264 gives about 76 % of 30 Mbit/s on the
+  test pattern, so the raw receive rate + 20 % would hold the target below what the encoder is
+  asked for, and push it down step by step.
+- *Increase.* "Faster when far below the last known-good rate": +5 %/s down to 10 % below it,
+  linearly up to +25 %/s at 40 % below; above it accelerating by 5 %/s per second (CUBIC-like:
+  the capacity grew). Encoders that take changes seconds apart (flush, FFmpeg restarts) step by
+  at most 5 % from 15 % below to 5 % above the last known-good rate: each of their steps is a
+  key frame, and an overshoot fills the queue until the next change (in the simulation it takes
+  1–8 ms off the dip's delay p95 and recovers as fast or faster; numbers below).
+- *Holds.* After a decrease is in the encoder, 150 ms (seamless), 300 ms (assumed seamless),
+  500 ms (flush) or 1 s (FFmpeg: the new generation's key frame and start-up) before the next
+  delay decision; losses count again 300 ms after it (those detected before were of packets sent
+  at the old rate); the first second of a session's delay samples decides nothing.
+- *Loss.* "Loss > 2 %" is the media congestion controller's packet loss over the last second
+  (at least 100 packets): on relay sessions that is the host → gateway leg; losses on the
+  gateway → browser leg show up as delay there. With `reno` the client's count (frames + audio)
+  is used.
+- *Decoder backlog* holds increases above max(4, fps/10) frames (the client's own flush
+  threshold); the decoder's flush stays the emergency cut it was.
+- *Frame-rate ladder* (optional in the guide): implemented, 120 → 90 → 60 at the 2 Mbit/s floor,
+  back up a rung every 5 s at 1.5 × the floor; resolution is never changed.
+- *Report fields.* Beyond the guide's list (frames, bytes, OWD p50/max, loss count,
+  decodeQueueSize) the report carries the newest frame (to know which frames it covers: the
+  pacer correction and the stall check), the client's clock (rates over lost reports; a report
+  late on it is not judged by its pending frame) and the audio count (to turn the client's loss
+  count into a rate).
+- *The end-to-end run uses a Go client, not the browser*, in the client's namespace: the same
+  reports and clock sync as `stream-worker.js`, without a display server in the namespace. The
+  browser's reports are covered by the browser E2E (below) on the loopback.
+
+Verified in the sandbox (Linux, 4 CPUs shared with other jobs, no GPU: FFmpeg's libx264 and
+libsvtav1, i.e. the restart policy; the helper's seamless and flush policies only in the
+simulation):
+
+- `internal/proto TestRateReport`: the 40-byte layout round-trips, short and foreign datagrams
+  are rejected, and `protocol.js`'s `rateReport` (run under node) builds the same bytes.
+- `internal/host` controller tests on a fake clock (`bitrate_test.go`): three reports 9 ms over
+  the 2 s minimum decrease ×0.85, two do not, a draining queue decreases once
+  (`TestRateDelayDecrease`); a decrease starts from the delivered rate (half received: 8500 of
+  20000), from at least half the target (a tenth received: 8500), and an encoder at 80 % of its
+  target whose output all arrives is not a slower path (`TestRateDecreaseFromDelivered`); a
+  pending frame decides on the second report in a row, not on every other report nor on reports
+  150 ms apart (`TestRatePendingFrame`); a queue growing 0.5 s/s decreases to 0.85 × 20000 / 1.5,
+  one growing 0.1 s/s or standing under 20 ms over the base from the target
+  (`TestRateQueueGrowth`); losses: 1 % nothing, 5 % of fewer than 100 packets nothing, then a
+  decrease, losses within 300 ms of it not counted (`TestRateLoss`); increase rates near, far
+  below and above the last known-good rate (`TestRateIncrease`) and their caps: setting, decoder
+  cap, 1.2 × delivered (`TestRateIncreaseCap`); no increase on a still desktop, stalled acks or a
+  decoder backlog (`TestRateIncreaseHolds`); FFmpeg's gaps, 5 % steps near the last known-good
+  rate, an overlapped decrease 500 ms after a change, an urgent one at once for a cut to 75 % or
+  less (`TestRatePolicyGaps`); emergencies, frame-rate ladder, adaptive off, clients without
+  feedback, settings reset, Wi-Fi-like jitter (no decrease, the margin widens), `sendTrack`'s
+  pacer share and coverage, report and ack conversion. Session tests: the helper's live change
+  and its `rate` message, the policy from the qualification results, overflow escalation.
+- Simulation (`internal/host/ratesim_test.go`, 1 ms steps; the controller and feedback code under
+  test): encoder (fill, key frames twice a frame's size, FFmpeg restarts after 400 ms), the
+  host's 6-frame queue and frame sender, the media congestion controller's pacer and window, a
+  bottleneck with a byte-limited FIFO (netem.sh's htb + 50 ms bfifo), random loss,
+  retransmissions, a Wi-Fi-like gate, client reports every 25 ms. capdrop at a 30 Mbit/s setting
+  (frame-queue overflows; one-way delay p95 before → during the dip; target back within 15 % of
+  the setting after the capacity's return), all within the guide's numbers except the overflow
+  at the drop where noted:
+  - qualified seamless (helper): 0; 15 → 30 ms; 2.8 s
+  - seamless, encoder at 80 % of its target: 0; 12 → 24 ms; 2.3 s
+  - seamless, relay path (no acknowledgements from the client): 1, at the drop; 15 → 24 ms; 6.3 s
+  - FFmpeg restarts: 0; 15 → 29 ms; 5.6 s
+  - FFmpeg restarts, encoder at 80 %: 0; 12 → 26 ms; 4.9 s
+  - flush (a key frame per change): 1, at the drop; 15 → 29 ms; 9.4 s
+
+  Without the slow policies' 5 % steps near the last known-good rate: FFmpeg 30 ms / 5.6 s, FFmpeg
+  at 80 % 34 ms / 6.9 s, flush 35 ms / 9.7 s. wifi (gate 0–15 ms, 1 % loss) at 20 Mbit/s over
+  50: no decrease in 60 s, seamless and FFmpeg (one-way delay p50/p95 16/24 ms); wan (20 ms each
+  way, 0.5 % loss): none (31/75 ms); 5 % loss decreases (the guide's > 2 %). A key-frame restart
+  every 3 s on a clean link: no decrease with the pacer share; without it 15 decreases and a mean
+  of 4.5 Mbit/s over the last 30 s.
+- Go end-to-end (`internal/e2e`, gateway + host agent + Go WebTransport client on the loopback):
+  `TestStreamingPaths` (default `media`: both paths log `media congestion control`),
+  `TestStreamingRateReports` (a client with reports and no acks: a 50 ms queue for half a second
+  decreases `why=delay`, the controller climbs back to the setting, the reports' delays in
+  `stream stats`), `TestStreamingBitrateRecovery` (an ack-only client's congestion report: one
+  overlapped cut, raises at most +25 % a second apart back to 4000),
+  `TestStreamingBitrateStalledAcks` (no raise while the client stops acknowledging),
+  `TestStreamingRenoCongestion` (`reno` still selectable, no media target). Under heavy load from other jobs on the machine (load average
+  ~10 on 4 CPUs) two full runs each had one low-bitrate localhost session overflow its frame
+  queue (`TestStreamingPaths` at 3 Mbit/s, `TestStreamingIntraRefresh` at 1.5 Mbit/s: media's
+  window, at least 32 packets, stops the sender while the client does not acknowledge for
+  ~0.1 s; reno's grown window did not); the whole `internal/e2e` package passed on both reruns,
+  at load 2 and at load 10.
+- Namespace run (`sudo test/netem/capdrop.sh`, capdrop at a 30 Mbit/s setting, libx264
+  1280×720 60 fps, FFmpeg restarts; the guide's three criteria; load average from other jobs in
+  brackets). The final code, eight runs: six pass, e.g. 0 overflows, one-way delay p95 9.9 →
+  21.9 ms during the dip, back in 5.6 s [2–3]; 9.8 → 21.8 ms, 5.8 s [2–5]; 10.2 → 26.7 ms,
+  5.1 s [3–7]; 15.1 → 19.9 ms, 6.5 s [5–12]; 22.7 → 25.2 ms, 8.7 s [9–11]; 25.0 → 43.4 ms,
+  7.5 s [1–9] (its two overflows came at 62.0 s, after the client had stopped reading; the test
+  now ignores those). Two fail, at load 7–12: back in 10.1 s (0 overflows, 20.4 → 28.4 ms) [9–12]; and one
+  overflow at the capacity's return, when the frames stopped for 0.33 s while netem.sh
+  reconfigured the shaper (its four `tc` calls took 0.4 s at that load), 13.0 → 23.7 ms, back in
+  11.1 s [7–11]. Before the halving bound, three runs at load ~2 passed: 0 overflows, 10.0 →
+  26.2, 9.8 → 22.3, 10.0 → 25.3 ms, 5.8, 4.1, 4.4 s. How the rules came about: the first version
+  (overlapped FFmpeg cuts, decreases from the delivered rates only) failed all three criteria
+  (2 overflows, one of them the new generation's key frame; 9.7 → 63 ms; 13.3 s) → urgent large
+  cuts; then two runs passed and one failed (first cut 64 ms after the drop, 30 → 25.3 Mbit/s,
+  4 overflows, 74 ms) → the queue-growth capacity; then a run cut 30 → 6.4 Mbit/s before the dip
+  after frames stopped for 0.1 s (next to nothing acknowledged in 100 ms) → at most a halving.
+  The urgent restarts: 1–4 per run, each a freeze of one FFmpeg start-up (70–220 ms here).
+- Browser E2E (`make build && node test/e2e/browser.mjs`, headless Chromium on the loopback,
+  libsvtav1): 80/80 checks in each of four runs across the controller's last four versions,
+  the last with the final code. Every scenario's worker sent 315–319 rate reports in its
+  measurement (more than 100 required). Bitrate-recovery scenario (a congestion message as an
+  older client sends it, injected, then the controller): cuts 6384 → 5066 (the message,
+  overlapped) and 5866 → 3886 (the controller's, urgent), raises back to 8000 kbit/s (5 % steps
+  near the last known-good rate, then up to +19 %), no freeze over 100 ms. Decreases in the
+  whole run: 17 `why=delay` (7 urgent, in the loss scenarios whose test fault holds frames back
+  200 ms), 1 `client`, 1 `decoder`, 1 `overflow`. The version before the two-report rule for
+  pending frames and the overlapped pacing failed 2 checks with more than 30 delay decreases,
+  most on a single report after a stall of the browser or of the CPU-starved encoders (load ~6).
+
+Hardware checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (acceptance, native helper): run
+  `recon-host qualify -quality balanced` once (3.6) so sessions change the bitrate seamlessly
+  (host.log `live-bitrate qualification ... adaptive cbr/seamless`). Stream the relay path as in
+  0.4 (Network path "Relay via gateway", overlay Transport `· relay`), HEVC 1920×1080 60 fps,
+  Bitrate 30 Mbps, constant motion. On the Proxmox node run
+  `./netem.sh apply capdrop --ct 210 --host CLIENT_IP`, wait 70 s, `./netem.sh status --ct 210`
+  (note T15 and T50, the times of the 15 and 50 Mbit/s steps), `./netem.sh clear --ct 210`. On the
+  PC: `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|stream stats' | Select-Object -Last 80`.
+  Pass: no `frames dropped why="queue overflow"`; `report_owd_p95_ms` of the `stream stats` lines
+  between T15 and T50 below the one before T15 + 30; a `bitrate recovery: raising bitrate ...
+  to=` of at least 25500 within 10 s after T50; the changes are `changing the bitrate in the
+  encoder` (no `restarting video reason=congestion`). Record the decreases (`why=`), the
+  `stream stats` lines and the overlay's capture→drawn p95 during the dip. Repeat on the direct
+  path (netem on a Linux client: `./netem.sh apply capdrop --iface <nic> --port 47998`), where
+  the decreases start from the connection's acknowledged rate, and with `pipeline` `ffmpeg`
+  (hevc_amf, restarts: expect `congestion: lowering bitrate ... urgent=true` at the drop and the
+  target back in 5–9 s, as in the namespace run with libx264).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (wifi / wan, no false back-off): same stream at
+  20 Mbps, `./netem.sh apply wifi --ct 210 --host CLIENT_IP` for 10 minutes, then `wan`. Pass:
+  at most one `congestion: lowering bitrate` per minute (`why=delay` or `why=loss`), `kbps_target`
+  in `stream stats` at 20000 most of the time; record `queue_margin_ms` (the jitter-widened
+  margin), `loss_pct` and `report_owd_p95_ms`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (frame-rate ladder, helper `setRate fps`): HEVC
+  2560×1440 120 fps at 10 Mbps, `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates
+  50,2,50`. Pass: `congestion: lowering bitrate from=2000 to=2000 ... fps=90`, then `fps=60`, the
+  client's overlay frame rate follows (`rate` messages), and after the step the frame rate goes
+  back up (90, then 120, 5 s apart) with the bitrate.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (media vs reno, latency cost of pacing): on `lan`,
+  10 minutes each with `"congestion": "media"` (the default) and `"congestion": "reno"` in
+  host.json; compare the overlay's capture→drawn p50/p95 and the `queue` stage (key frames are
+  paced at 1.2 × the target with media).
+- NVIDIA: unverified (no NVIDIA host available). Test: the four AMD tests above with hevc_nvenc
+  (and h264_nvenc, av1_nvenc on RTX 40+) on the native helper (NvEncReconfigureEncoder for the
+  bitrate and frame rate) and with `pipeline` `ffmpeg`, same steps and pass criteria.

@@ -412,3 +412,51 @@ console.log(JSON.stringify(JSON.parse(process.argv[2]).map(({ cfg, f }) => P.vis
 		}
 	}
 }
+
+// TestRateReport: the rate report round-trips, refuses short or foreign
+// datagrams, and protocol.js builds exactly what Go parses (counters wrap,
+// delays clamp to i32; needs node for the JS half).
+func TestRateReport(t *testing.T) {
+	r := RateReport{Flags: RateReportOWD | RateReportFrame, Gen: 7, TimeMs: 0xfffffff0, LastSeq: 123456, Frames: 4000000000,
+		Bytes: 0xdeadbeef, OWDP50Us: 12345, OWDMaxUs: -5, Lost: 9, Audio: 77, DecodeQueue: 3}
+	b := r.Marshal()
+	if len(b) != RateReportLen || b[0] != DgRateReport {
+		t.Fatalf("marshal: % x", b)
+	}
+	if got, ok := ParseRateReport(b); !ok || got != r {
+		t.Fatalf("round trip: %+v %v, want %+v", got, ok, r)
+	}
+	if _, ok := ParseRateReport(b[:RateReportLen-1]); ok {
+		t.Fatal("short report accepted")
+	}
+	b[0] = DgFrameAck
+	if _, ok := ParseRateReport(b); ok {
+		t.Fatal("foreign datagram accepted")
+	}
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	script := `
+const P = await import(process.argv[1]);
+const b = P.rateReport({ flags: P.RATE_REPORT_OWD | P.RATE_REPORT_FRAME, gen: 263, timeMs: 2 ** 32 + 5.7, lastSeq: 42, frames: 1000,
+  bytes: 2 ** 32 * 3 + 1234, owdP50Us: 8000.4, owdMaxUs: 1e12, lost: 3, audio: 500, decodeQueue: 70000 });
+console.log(Buffer.from(b).toString('hex'));`
+	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js)).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	jb, err := hex.DecodeString(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ParseRateReport(jb)
+	want := RateReport{Flags: RateReportOWD | RateReportFrame, Gen: 7, TimeMs: 5, LastSeq: 42, Frames: 1000, Bytes: 1234,
+		OWDP50Us: 8000, OWDMaxUs: 2147483647, Lost: 3, Audio: 500, DecodeQueue: 65535}
+	if !ok || len(jb) != RateReportLen || got != want {
+		t.Fatalf("protocol.js rateReport: %+v (%d bytes), want %+v", got, len(jb), want)
+	}
+}

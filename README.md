@@ -64,11 +64,15 @@ Techniques used (most of them are new to browser-based game streaming):
   from the picture: it reads a frame barcode (the test pattern's frame number, or the wall clock
   drawn by `tools/latency-test/index.html` on the PC) and builds a capture → drawn histogram you
   can export as JSON.
-- **Self-protecting under load.** Delay-gradient congestion detection lowers the bitrate before
-  queues build up, and the bitrate climbs back to your setting (15 % every 10 s) once the
-  network is quiet again. A decoder backlog gets flushed and resynced from a fresh key frame, so
-  latency can't grow without bound; the bitrate then climbs back only to 85 % of where the
-  decoder fell behind.
+- **Self-protecting under load.** A delay-based rate controller on the host (GCC / SCReAM style)
+  reads the browser's receive reports every 25 ms: it lowers the bitrate as soon as a queue
+  builds on the path (or packets get lost), to what the path still delivers, and climbs back to
+  your setting once the delay is down (+5 %/s near the last good rate, up to +25 %/s far below
+  it), in the encoder at once on the native helper, with overlapped restarts on FFmpeg (an
+  immediate one after a capacity drop). At the 2 Mbit/s floor it lowers the frame rate
+  (120 → 90 → 60) instead. A decoder backlog gets
+  flushed and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
+  then climbs back only to 85 % of where the decoder fell behind.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
   drops, and the client recovers at once: it skips the frame when the encoder heals the picture
@@ -294,7 +298,7 @@ The new password (at least 10 characters) is read from stdin.
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
 | `directAddr` | auto | Address to advertise for the direct path |
-| `congestion` | `reno` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
+| `congestion` | `media` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss: the rate controller backs off instead) or `reno` (quic-go's NewReno, the default before the rate controller) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency. With `capture` `amf` the FFmpeg chain keeps that wall-clock pts (`vsrc_amf`'s own pts are rounded to 1/fps), and `off` only stops sending capture stamps to the client |
 | `gpuPriority` | `auto` | GPU scheduling priority of the capture/encode process (FFmpeg, or the native helper, which applies the same rules to itself), so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
@@ -328,8 +332,8 @@ the new target within 3 frames, no frame or frame barcode is missing and the str
 cleanly (about 70 minutes on AMD, 25 on NVIDIA, with FFmpeg for the decode checks; `-quality
 balanced` measures only the client's default preset, in a third of the time). It prints a table
 and saves `live-bitrate.json` next to `host.json`; sessions on the helper then use `seamless`
-where it passed (bitrate changes as often as every 2 s), else `flush` (a key frame per change,
-changes at most every 10 s), else a new helper per change, and adaptive-bitrate sessions use the
+where it passed (bitrate changes as often as every 250 ms), else `flush` (a key frame per change,
+increases at most every 2 s), else a new helper per change, and adaptive-bitrate sessions use the
 rate-control mode that changed seamlessly (CBR first). Without the file, or for a preset it did
 not measure, the helper's defaults apply. `recon-host qualify -h`
 lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") and
@@ -409,9 +413,8 @@ NVENC runs, so the host announces `skip` from its real encoder arguments, `ref-r
 FFmpeg pipeline stand in for the native helper's ACK-based recovery (a key frame every few frames,
 sent as a P-frame, and after a loss the next one flagged as the recovery frame; the host announces
 `invalidate`), and `still=after:N` sends only the first N frames of every encoder generation, like
-a desktop that stops changing, and `rate-period=2s` shortens the bitrate controller's 10 s quiet
-period and rate limit so a test sees the bitrate recover within seconds
-(`internal/host/faults.go`). Never set it on a real host; the agent logs a warning when it is set.
+a desktop that stops changing (`internal/host/faults.go`). Never set it on a real host; the agent
+logs a warning when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·

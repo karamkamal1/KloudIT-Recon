@@ -67,8 +67,9 @@ func TestConfigCongestion(t *testing.T) {
 		}
 		return LoadConfig(p)
 	}
+	// media by default since the rate controller (GUIDE 2.2).
 	c, err := load(`{}`)
-	if err != nil || c.congestion() != "reno" {
+	if err != nil || c.congestion() != "media" {
 		t.Fatalf("default: %v %q", err, c.congestion())
 	}
 	// The default is not written back, so a later release can change it.
@@ -80,6 +81,9 @@ func TestConfigCongestion(t *testing.T) {
 	}
 	if c, err := load(`{"congestion":"media"}`); err != nil || c.congestion() != "media" {
 		t.Fatalf("media: %v", err)
+	}
+	if c, err := load(`{"congestion":"reno"}`); err != nil || c.congestion() != "reno" {
+		t.Fatalf("reno: %v", err)
 	}
 	if _, err := load(`{"congestion":"bbr"}`); err == nil {
 		t.Fatal("unknown congestion controller accepted")

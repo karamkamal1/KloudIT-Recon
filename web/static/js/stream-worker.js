@@ -92,6 +92,48 @@ function freezeStall(meta, sent, presented) {
 
 const congestion = { owdHist: [], over: 0, lastSent: 0 };
 
+// Rate reports (GUIDE 2.2): to hosts that list P.FEATURE_RATE_REPORT the
+// client reports every RATE_REPORT_MS what it received (cumulative frames,
+// bytes, losses, audio packets; the one-way delays of the frames since the
+// last report; the newest frame; the decoder's backlog), and the host's rate
+// controller decides the bitrate from them. Counters are cumulative so a lost
+// report costs only its delay samples.
+const RATE_REPORT_MS = 25;
+const fb = { on: false, timer: 0, sent: 0, frames: 0, bytes: 0, lost: 0, audio: 0, owd: [], gen: -1, lastSeq: 0 };
+
+function sendRateReport() {
+  if (!transport) return;
+  let flags = 0;
+  let p50 = 0;
+  let max = 0;
+  if (fb.owd.length) {
+    const o = fb.owd.sort((a, b) => a - b);
+    p50 = o[(o.length - 1) >> 1];
+    max = o[o.length - 1];
+    flags |= P.RATE_REPORT_OWD;
+    fb.owd = [];
+  }
+  if (fb.gen >= 0) flags |= P.RATE_REPORT_FRAME;
+  fb.sent++;
+  transport.sendDatagram(P.rateReport({
+    flags, gen: Math.max(0, fb.gen), timeMs: now(), lastSeq: fb.lastSeq, frames: fb.frames, bytes: fb.bytes,
+    owdP50Us: p50 * 1000, owdMaxUs: max * 1000, lost: fb.lost, audio: fb.audio, decodeQueue: video.inflight.size,
+  }));
+}
+
+// A complete frame (parsed header h, buf.length bytes, last byte at recv).
+function rateReportFrame(h, bytes, recv) {
+  fb.frames++;
+  fb.bytes += bytes;
+  if (clock.offset !== null && fb.owd.length < 1000) fb.owd.push(recv - hostToLocal(sentUs(h)));
+  if (fb.gen < 0 || isNewerGen(h.gen, fb.gen)) {
+    fb.gen = h.gen;
+    fb.lastSeq = h.seq;
+  } else if (h.gen === fb.gen && h.seq > fb.lastSeq) {
+    fb.lastSeq = h.seq;
+  }
+}
+
 const audio = { cfg: null, decoder: null, ring: null, port: null, lastSeq: -1, L: null, R: null };
 
 // ---------------------------------------------------------------------------
@@ -657,6 +699,7 @@ function onFrameBytes(buf, recv, first = recv) {
   h.first = first || recv;
   stats.bytes += buf.length;
   freezeSeen(h.gen, h.seq);
+  rateReportFrame(h, buf.length, recv);
   checkCongestion(recv - hostToLocal(sentUs(h)));
   onFrame(h);
 }
@@ -739,6 +782,7 @@ function frameLost(reason) {
   if (to === from) to = Math.min(...video.reorder.keys());
   const missing = to - from;
   stats.dropped += missing;
+  if (!reported) fb.lost += missing; // lost on the way (the host knows its own drops)
   const mode = P.recoveryOf(video.cfg);
   const decoding = !video.waitingKey && video.decoder?.state === 'configured';
   if (decoding && mode === P.RECOVERY_SKIP) {
@@ -1314,9 +1358,10 @@ function probeSummary(full) {
 
 // Delay-based congestion detection: if one-way delay rises well above its
 // recent minimum for a sustained period, the path is queueing. Ask the host to
-// back off before latency balloons.
+// back off before latency balloons. Hosts with the rate controller (rate
+// reports) judge the delay themselves.
 function checkCongestion(owd) {
-  if (clock.offset === null || !isFinite(owd)) return;
+  if (fb.on || clock.offset === null || !isFinite(owd)) return;
   const t = now();
   const h = congestion.owdHist;
   h.push([t, owd]);
@@ -1400,9 +1445,10 @@ function onAudioPacket(d) {
   const payload = d.subarray(8);
   const frameSamples = 48 * audio.cfg.frameMs;
   stats.audioPackets++;
+  fb.audio++;
   if (audio.lastSeq >= 0) {
     const gap = (seq - audio.lastSeq - 1) & 0xffff;
-    if (gap > 0 && gap < 4) { stats.audioLost += gap; silence(gap * frameSamples); }
+    if (gap > 0 && gap < 4) { stats.audioLost += gap; fb.lost += gap; silence(gap * frameSamples); }
     else if (gap >= 0x8000) return; // late/duplicate
   }
   audio.lastSeq = seq;
@@ -1428,6 +1474,8 @@ function onControl(m) {
   switch (m.t) {
     case 'welcome':
       probe.features = m.features || [];
+      fb.on = probe.features.includes(P.FEATURE_RATE_REPORT);
+      if (fb.on && !fb.timer) fb.timer = setInterval(sendRateReport, RATE_REPORT_MS);
       probe.wallOffsetUs = m.wallOffsetUs ?? null;
       updateProbeMode();
       post('welcome', { info: m });
@@ -1503,6 +1551,7 @@ function postStats() {
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
     audioMs,
+    rateReports: fb.on ? fb.sent : null, // rate reports sent so far (null: the host does not want them)
     queue: video.decoder ? video.decoder.decodeQueueSize : 0,
     hw: video.hw,
     synced: clock.offset !== null,
@@ -1554,6 +1603,8 @@ async function start(msg) {
   clearInterval(pingTimer);
   clearInterval(statsTimer);
   clearInterval(watchdogTimer);
+  clearInterval(fb.timer);
+  fb.timer = 0;
   transport = null;
   // A deliberate "bye" (e.g. another device took over) must not trigger an
   // automatic reconnect, or two clients would keep stealing the session.

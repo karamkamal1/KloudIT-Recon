@@ -189,6 +189,20 @@ client.
   Run `clear` afterwards to remove the leftover ifb device and state.
 - `--dry-run` prints the commands without running them.
 
+### On one Linux machine, between network namespaces (rate controller check)
+
+`test/netem/capdrop.sh` (root, Go and FFmpeg with libx264) runs the GUIDE 2.2 acceptance of the
+rate controller without a second machine: it joins two network namespaces with a veth pair, runs
+the gateway and the host agent in one (the test pattern at 1280×720, 60 fps, libx264, a 30 Mbit/s
+setting) and a Go client that reports like the browser (direct WebTransport, rate reports with
+the one-way delays it measures on a ping-synchronised clock) in the other, applies `capdrop` to
+the client's interface (both directions) once the stream runs, and writes
+`test/netem/results/summary.txt`: frame-queue overflows, the one-way delay before, during and
+after the 15 Mbit/s step, how long the bitrate target takes to get back within 15 % of the
+setting, the target's changes and the received rate per second. The host and the shaper share one
+machine, so the host runs with `QUIC_GO_DISABLE_GSO=true` (see above). It checks the FFmpeg path
+(restarts), not the native helper. Results: `docs/VENDOR_NOTES.md`, 2.2.
+
 ## Windows (clumsy)
 
 [clumsy 0.3](https://jagt.github.io/clumsy/) impairs packets on Windows through WinDivert. Run

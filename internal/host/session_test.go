@@ -424,18 +424,19 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		go s.videoEvents()
 		return s, logs
 	}
-	// keepCutWindowOpen moves the last cut (a change of the bitrate) ahead
-	// so that a slow machine cannot leave the 2 s window before the overflow.
+	// keepCutWindowOpen moves the last decrease ahead so that a slow
+	// machine cannot leave the 2 s window before the overflow, and holds
+	// further delay decreases.
 	keepCutWindowOpen := func(s *Session) {
 		s.rate.mu.Lock()
-		s.rate.lastCut = time.Now().Add(time.Hour)
-		s.rate.lastChange = s.rate.lastCut
+		s.rate.lastDecrease = time.Now().Add(time.Hour)
+		s.rate.holdUntil = s.rate.lastDecrease
 		s.rate.mu.Unlock()
 	}
-	// backOff sets the controller's target as a cut would.
+	// backOff sets the controller's target as a decrease would.
 	backOff := func(s *Session, kbps int) {
 		s.rate.mu.Lock()
-		s.rate.cur = kbps
+		s.rate.est = float64(kbps)
 		s.rate.mu.Unlock()
 	}
 	target := func(s *Session) int {
@@ -467,13 +468,18 @@ func TestQueueOverflowEscalates(t *testing.T) {
 			}
 		}
 		s.a.caps.FFmpeg = stall // the next generation stays starting
+		// The generation has streamed for longer than the FFmpeg policy's
+		// gap between changes (else the next rate-loop tick applies it).
+		s.rate.mu.Lock()
+		s.rate.lastApply = time.Now().Add(-time.Second)
+		s.rate.mu.Unlock()
 		s.congestion(120, signalDelay)
 		keepCutWindowOpen(s)
 		if _, ok := s.video.Active(); !ok {
 			t.Fatal("overlapped back-off stopped the active generation")
 		}
-		if p, _ := s.video.Current(); p.BitrateKbps != 3000 || target(s) != 3000 {
-			t.Fatalf("back-off to %d kbps (starting %d), want 3000", target(s), p.BitrateKbps)
+		if p, _ := s.video.Current(); p.BitrateKbps != 3400 || target(s) != 3400 {
+			t.Fatalf("back-off to %d kbps (starting %d), want 3400 (x0.85)", target(s), p.BitrateKbps)
 		}
 		// The client stops taking frames: generation 1 overflows the queue.
 		line := waitFor(t, logs, `msg="restarting video" reason="queue overflow" urgent=true`)
@@ -483,8 +489,8 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		if _, ok := s.video.Active(); ok {
 			t.Fatal("the old generation still streams after the overflow")
 		}
-		if p, ok := s.video.Current(); !ok || p.BitrateKbps != 3000 || target(s) != 3000 {
-			t.Fatalf("after the overflow: starting %v at %d kbps, target %d, want 3000 (no second cut)", ok, p.BitrateKbps, target(s))
+		if p, ok := s.video.Current(); !ok || p.BitrateKbps != 3400 || target(s) != 3400 {
+			t.Fatalf("after the overflow: starting %v at %d kbps, target %d, want 3400 (no second cut)", ok, p.BitrateKbps, target(s))
 		}
 		if n := len(logs.lines(`msg="starting encoder"`)); n != 2 {
 			t.Fatalf("%d encoder starts, want 2 (the starting generation is kept)", n)
@@ -569,7 +575,7 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		}
 
 		s.rate.mu.Lock()
-		s.rate.lastCut, s.rate.lastChange = time.Time{}, time.Time{}
+		s.rate.lastDecrease, s.rate.holdUntil = time.Time{}, time.Time{}
 		s.rate.mu.Unlock()
 		control(proto.ClientMsg{T: "congestion", Reason: proto.CongestionDecoder})
 		if l := logs.lines(`msg="congestion: lowering bitrate"`); len(l) != 1 || !strings.Contains(l[0], "from=3000 to=2250") || !strings.Contains(l[0], "urgent=true") {
