@@ -11,7 +11,10 @@
 // hook), and reports the measured latencies. The test pattern carries 16 rows
 // of white padding below it (host "testPad"), announced in the video config
 // like the padding of an AV1 encoder on RDNA3: every scenario checks the
-// client crops it.
+// client crops it. Decoder hygiene (step 4.1): every scenario checks the
+// decode queue bound, that flush() is never called and that no VideoFrame is
+// left open; the startup decoder self-test is checked on the real decoders
+// and, with a wrapper that holds frames back, on its logic.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -192,6 +195,123 @@ async function checkCrop(name) {
       `bottom rows (screenshot ${shots}) at 5/12 rgb(${px.yellow}) (yellow bar), at 7/12 rgb(${px.blue}) (blue bar); log: ${logLine.replace(/^\S+ /, '')}`);
 }
 
+// Decoder hygiene (step 4.1). The stream worker's VideoDecoder calls are
+// counted by patching VideoDecoder.prototype in the worker itself (Playwright
+// evaluates in workers), independent of the worker's own bookkeeping:
+// decodeQueueSize right after every decode() (the client keeps it at 2 or
+// less) and flush() calls (never while streaming). Returns a function that
+// reads the counts.
+async function watchDecoder() {
+  const w = page.workers().filter((x) => x.url().endsWith('/js/stream-worker.js')).pop();
+  if (!w) return null;
+  await w.evaluate(() => {
+    const h = { decodes: 0, maxQueue: 0, flushes: 0 };
+    self.__decoderCalls = h;
+    const { decode, flush } = VideoDecoder.prototype;
+    VideoDecoder.prototype.decode = function (chunk) {
+      decode.call(this, chunk);
+      h.decodes++;
+      h.maxQueue = Math.max(h.maxQueue, this.decodeQueueSize);
+    };
+    VideoDecoder.prototype.flush = function () { h.flushes++; return flush.call(this); };
+  });
+  return () => w.evaluate(() => self.__decoderCalls).catch(() => null);
+}
+
+// The counts above plus the worker's VideoFrame count (read from the frames:
+// a closed frame has coded width 0): at most 5 open at once (the new output,
+// one waiting to be drawn, the WebGPU renderer's previous frame, two latency
+// probe clones), none leaked.
+async function checkHygiene(name, calls, st) {
+  const c = calls ? await calls() : null;
+  const vf = st?.videoFrames;
+  const ok = !!c && c.decodes >= 50 && c.maxQueue <= 2 && c.flushes === 0 && !!vf && vf.leaked === 0 && vf.max <= 5 && vf.open <= 4;
+  check(`${name}: decoder hygiene: decodeQueueSize <= 2, no flush(), every VideoFrame closed`, ok,
+    `${c ? `${c.decodes} decode() calls, decodeQueueSize max ${c.maxQueue}, ${c.flushes} flush()` : 'worker not instrumented'}; ` +
+      `VideoFrames open ${vf?.open}, max ${vf?.max}, leaked ${vf?.leaked}; chunks waiting max ${st?.waitingMax}; superseded ${st?.superseded}; output lag ${st?.outputLag}`);
+  results.push({ hygiene: name, calls: c, videoFrames: vf, waitingMax: st?.waitingMax, superseded: st?.superseded, outputLag: st?.outputLag });
+  return c;
+}
+
+// The startup decoder self-test on this browser's real decoders: every family
+// it decodes outputs the first frame of the P-only clip after one chunk and
+// holds nothing back; the overlay lists the results.
+async function checkSelfTest(cfg) {
+  const tests = await page.evaluate(() => window.__recon.decoderTest);
+  const res = (t) => t.hw || t.sw;
+  const ok = tests?.length >= 1 && tests.some((t) => t.family === cfg?.family) &&
+    tests.every((t) => res(t)?.ok && res(t).firstAfter === 1 && res(t).held === 0 && res(t).outputs === res(t).frames && !t.software);
+  check('decoder self-test at startup: first output after one chunk on every family this browser decodes', ok,
+    tests ? tests.map((t) => `${t.text} (${res(t)?.accel}: first after ${res(t)?.firstAfter}, held ${res(t)?.held}, ${res(t)?.outputs}/${res(t)?.frames} out, first ${res(t)?.firstMs} ms)`).join('; ') : 'no result');
+  const overlay = await page.textContent('#stats').catch(() => '');
+  check('overlay shows the decoder self-test, queue and VideoFrame rows', overlay.includes('Decoder self-test') && overlay.includes('Decoder queue') && overlay.includes('VideoFrames open'));
+  results.push({ selfTest: tests });
+}
+
+// The self-test's logic on a decoder that holds frames back: a wrapper around
+// this browser's VideoDecoder that outputs frame i only once frame i + hold is
+// out (claiming hardware support; with hwOnly it holds only when configured
+// prefer-hardware). Also how deep a burst of the clip's chunks gets into the
+// bare decoder's queue (why the client bounds it).
+async function checkSelfTestLogic() {
+  const ctx2 = await browser.newContext({ ignoreHTTPSErrors: true });
+  try {
+    const p = await ctx2.newPage();
+    await p.goto(`${base}/login`);
+    const res = await p.evaluate(async () => {
+      const T = await import('/js/decoder-selftest.js');
+      const cfgOf = (f) => ({ codec: T.CLIPS[f].codec, codedWidth: T.CLIPS[f].width, codedHeight: T.CLIPS[f].height, optimizeForLatency: true });
+      let fam = null;
+      for (const f of ['av1', 'h264', 'hevc']) {
+        if ((await VideoDecoder.isConfigSupported(cfgOf(f)).catch(() => ({}))).supported) { fam = f; break; }
+      }
+      if (!fam) return { error: 'no clip decodable' };
+      const fake = (hold, hwOnly = false) => class {
+        static async isConfigSupported(c) { return { supported: true, config: c }; }
+        constructor({ output, error }) {
+          this.held = [];
+          this.d = new VideoDecoder({ output: (f) => { this.held.push(f); while (this.held.length > this.hold) output(this.held.shift()); }, error });
+        }
+        configure(c) {
+          this.hold = !hwOnly || c.hardwareAcceleration === 'prefer-hardware' ? hold : 0;
+          this.d.configure({ ...c, hardwareAcceleration: 'no-preference' });
+        }
+        decode(c) { this.d.decode(c); }
+        close() { for (const f of this.held) f.close(); this.d.close(); }
+      };
+      const good = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(0) });
+      const hold1 = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(1) });
+      const hold2 = await T.selfTestDecoder(fam, ['prefer-hardware'], { Decoder: fake(2) });
+      const [choice] = await T.runSelfTests([{ family: fam, hw: true }], true, { Decoder: fake(1, true) });
+      // Burst: all ten chunks at once into a bare decoder.
+      const d = new VideoDecoder({ output: (f) => f.close(), error: () => {} });
+      d.configure(cfgOf(fam));
+      await new Promise((r) => setTimeout(r, 200));
+      let burst = 0;
+      T.CLIPS[fam].frames.forEach((b, i) => {
+        const data = Uint8Array.from(atob(b), (ch) => ch.charCodeAt(0));
+        d.decode(new EncodedVideoChunk({ type: i ? 'delta' : 'key', timestamp: i, data }));
+        burst = Math.max(burst, d.decodeQueueSize);
+      });
+      d.close();
+      return { fam, good, hold1, hold2, choice, burst };
+    });
+    if (res.error) { check('decoder self-test logic', false, res.error); return; }
+    const { good, hold1, hold2, choice } = res;
+    const row = (r) => `ok ${r.ok}, first output after ${r.firstAfter}, held ${r.held}, ${r.outputs}/${r.sent} out`;
+    check('decoder self-test logic: passes a decoder that outputs at once, catches one that holds 1 or 2 frames back',
+      good.ok && good.firstAfter === 1 && good.held === 0 && good.outputs === 10 &&
+        !hold1.ok && hold1.firstAfter === 2 && hold1.held === 1 && !hold2.ok && hold2.firstAfter === 3 && hold2.held === 2,
+      `${res.fam}: outputs at once: ${row(good)}; holds 1: ${row(hold1)}; holds 2: ${row(hold2)}`);
+    check('decoder self-test decision: a hardware decoder that holds frames back is reported as no hardware decoder; the family decodes in software',
+      choice.software === true && choice.reportHW === false && choice.hw?.held === 1 && choice.sw?.ok === true, choice.text);
+    console.log(`- the clip's 10 chunks at once into a bare decoder (${res.fam}) reach decodeQueueSize ${res.burst}`);
+    results.push({ selfTestLogic: res });
+  } finally {
+    await ctx2.close();
+  }
+}
+
 let testPage = null; // headed browser showing tools/latency-test (wallclock scenario)
 
 // Starts an X server and returns its display (":N").
@@ -266,13 +386,26 @@ for (const cfg of [{ width: 64, height: 32, codedWidth: 64, codedHeight: 40, cro
     r.prev?.close();
   }
 }
-return out;
+// Frames the renderer leaves open after drawing three in a row (closed: coded width 0).
+const keep = [];
+for (const kind of ['2d', 'webgpu']) {
+  let r;
+  try {
+    r = kind === '2d' ? new Canvas2DRenderer(new OffscreenCanvas(1, 1)) : await WebGPURenderer.create(new OffscreenCanvas(1, 1));
+  } catch (e) { keep.push({ kind, error: e.message }); continue; }
+  const fs = [0, 1, 2].map((i) => new VideoFrame(src, { timestamp: i }));
+  for (const f of fs) r.draw(f, null, P.visibleArea(null, 64, 40, 64, 40));
+  if (kind === 'webgpu') await r.device.queue.onSubmittedWorkDone();
+  keep.push({ kind, open: fs.map((f, i) => (f.codedWidth ? i : -1)).filter((i) => i >= 0), prevIsLast: r.prev === fs[2] });
+  r.prev?.close();
+}
+return { out, keep };
 })()`;
   const ctx2 = await b.newContext({ ignoreHTTPSErrors: true });
   try {
     const p = await ctx2.newPage();
     await p.goto(`${base}/login`);
-    const res = await p.evaluate(expr);
+    const { out: res, keep } = await p.evaluate(expr);
     for (const kind of ['2d', 'webgpu']) {
       const rows = res.filter((x) => x.kind === kind);
       const skipped = kind === 'webgpu' && !haveX && rows.every((x) => x.error);
@@ -282,6 +415,13 @@ return out;
       else {
         check(`renderer crop (${kind}): draws only the visible area announced by the video config`, ok,
           rows.map((x) => (x.error ? x.error : `${x.cfg.width}x${x.cfg.height} of 64x40: canvas ${x.w}x${x.h}, ${x.white} white, ${x.grey} grey px`)).join('; '));
+      }
+      // Step 4.1: every frame closed once drawn; WebGPU keeps exactly the last (this.prev).
+      const k = keep.find((x) => x.kind === kind);
+      if (!skipped) {
+        check(`renderer (${kind}) closes every frame it drew${kind === 'webgpu' ? ' except the last (this.prev)' : ''}`,
+          !k.error && (kind === '2d' ? k.open.length === 0 : k.open.length === 1 && k.open[0] === 2 && k.prevIsLast),
+          k.error || `of 3 frames drawn, open: [${k.open}]${kind === 'webgpu' ? `, prev is the last: ${k.prevIsLast}` : ''}`);
       }
     }
   } finally {
@@ -404,6 +544,7 @@ async function startStream(prefs) {
 async function lossRun(name, faults, seconds) {
   const host = await restartHost({ RECON_TEST_FAULTS: faults }, name);
   await startStream({ path: 'auto', transport: 'auto' });
+  const calls = await watchDecoder();
   await sleep(4000); // decoder warm-up
   const st0 = await page.evaluate(() => window.__recon.lastStats);
   const log0 = host.log.length;
@@ -427,6 +568,7 @@ async function lossRun(name, faults, seconds) {
     client: { keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped') },
     // The decoder's own error lines, not the key-frame requests they cause.
     decoderErrors: con.filter((l) => l.includes('decoder error:')).length,
+    calls, st,
   };
 }
 
@@ -475,6 +617,9 @@ async function checkLossHandling() {
     k.delayed >= 5 && !k.keyRequestReasons['frame lost'] && kfRestarts <= kRequests,
     `${k.delayed} frames delayed 200 ms, ${k.dropped} dropped; client key-frame requests: ${counts(k.keyRequestReasons)}; ` +
       `host restarts: ${counts(k.restarts)}`);
+  // The late frames release bursts of the frames buffered behind them: the
+  // decode queue bound must hold there too.
+  await checkHygiene('late frames (bursts)', k.calls, k.st);
   check('dropped frames are reported ("dropped") and recovered with a key frame (recovery "keyframe")',
     k.cfg?.recovery === 'keyframe' && k.dropped >= 3 && k.client.hostDropped >= k.dropped - 1 &&
       (k.keyRequestReasons['dropped by host'] || 0) >= 1 && kfRestarts >= 1 && k.fps >= 10,
@@ -660,6 +805,7 @@ try {
     const firstFrameMs = Date.now() - t0;
     const conn = await page.evaluate(() => window.__recon.conn);
     check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1], `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
+    const calls = await watchDecoder();
 
     // Wait for steady state (software decoders need a moment to warm up on
     // small CI machines), then measure a fresh stats window.
@@ -683,6 +829,8 @@ try {
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
     await checkStages(sc.name, st);
     await checkCrop(sc.name);
+    await checkHygiene(sc.name, calls, st);
+    if (sc === scenarios[0]) await checkSelfTest(cfg);
     const pr = await checkProbe(sc.name);
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
@@ -775,6 +923,7 @@ try {
   // 3b. Renderer crop (unit) ----------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
   await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
+  await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
 
   // 3c. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a

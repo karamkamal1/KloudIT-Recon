@@ -2851,3 +2851,126 @@ Hardware checks (on the host, elevated PowerShell, the CI-built MSVC `recon-enco
   stream exits the helper within 500 ms (no watchdog exit code 4); a driver reset during a
   stream (Win+Ctrl+Shift+B) ends the helper with the fatal `device_lost` and recon-host's
   restart begins with an IDR.
+
+## 4.1 Decoder hygiene
+
+What changed (browser client only; no protocol change: the hello's per-family `hw` flag now
+also says that the hardware decoder passed the self-test below):
+
+- Decoder configuration as before: `hardwareAcceleration: 'prefer-hardware'` (unless the user
+  picked software, or the self-test below moved the family to software) and
+  `optimizeForLatency: true`. `flush()` is never called while streaming (it waits for every
+  output and makes the next chunk a key frame); the backlog recovery and decoder errors reset
+  and reconfigure. It was not called before either; it is now a stated rule and checked.
+- Decode queue bound: at most 2 chunks wait inside the decoder (`decodeQueueSize` after a
+  `decode()`, `MAX_DECODE_QUEUE`); later chunks wait in front of it (`video.queue`) and are fed
+  on the decoder's `dequeue` event, after each output, with the next frame and from the 250 ms
+  watchdog (browsers without the event). There the client can still act on them: a key frame
+  makes the queued chunks before it unnecessary (dropped, counted as superseded), and the
+  backlog recovery (unchanged thresholds: more than max(4, fps/10) chunks for 500 ms) counts
+  the chunks in the decoder and in front of it, and drops both.
+- Presentation: a decoded frame is drawn one task after its output (a `MessageChannel` hop,
+  p50 < 0.1 ms, p95 0.2 ms, p99 0.8 ms in the sandbox's headless Chromium while the E2E ran);
+  outputs already waiting by then (a burst after a stall, a decoder that releases frames
+  together) supersede each other: only the newest is drawn, the older ones are closed unseen
+  (stats `superseded`; still acknowledged as decoded, `0x40`). Deviation from the guide's
+  wording "if two frames finish before a present opportunity": in the default lowest-latency
+  mode the present opportunity is the worker's next turn to draw, not the next vsync: holding
+  a frame for the next `requestAnimationFrame` would show a newer frame one refresh later than
+  drawing it at once. Vsync-paced coalescing belongs to step 4.4's "Smooth" mode.
+- `VideoFrame` lifetime: every frame is closed as soon as it is drawn (2D: right after
+  `drawImage`); the WebGPU renderer keeps exactly one (`this.prev`, the previous frame, until the
+  next draw: the GPU must not sample a closed frame); probe clones are closed after the corner
+  readback. The worker counts open frames from the frames themselves (a closed frame has coded
+  width 0, independent of the code that closes them): stats `videoFrames {open, max, leaked}`;
+  a frame still open after 16 newer ones is a leak: it is closed, counted and logged once.
+  Bound by construction: at most 5 open at once (the new output, one waiting for its draw, the
+  WebGPU renderer's previous frame, two latency-probe clones).
+- Startup decoder self-test (`web/static/js/decoder-selftest.js`, run while connecting, the
+  hello waits for it): every family the browser decodes gets a 10-frame clip
+  (`web/static/js/decoder-selftest-clips.js`: 640x360, a key frame with its parameter sets,
+  then P frames only, decode order = display order, generated from FFmpeg as the host sends a
+  stream by `RECON_UPDATE_CLIPS=1 go test ./internal/codec -run TestDecoderSelfTestClips`; the
+  test without the variable checks the committed clips) fed one chunk at a time, each waiting
+  for its output (up to 1 s for the first, 100 ms after). Pass: first output after one chunk,
+  nothing held back, no error. A decoder that holds k frames back lags by k after every chunk;
+  three equal lags in a row settle it (about 1.3 s; the families run in parallel, a passing
+  decoder takes ten frame decodes). A slow first output that then keeps up is reported as a
+  slow start, a decoder error as an error: neither is acted on. A hardware decoder that holds
+  frames back is reported to the host as no hardware decoder (`hw: false`: the host then
+  prefers a family the browser decodes in hardware without delay), and the family decodes in
+  software when its software decoder passed (`prefer-software`); if that software decoder falls
+  behind (backlog recovery), the session goes back to the hardware decoder. Results: overlay
+  rows "Decoder self-test" (one line per family, e.g. "HEVC HW ✓ 1.4 ms/frame" or "H.264 HW holds
+  1 frame back, SW ✓ 2.1 ms/frame → decoding in software"), `window.__recon.decoderTest`, and
+  the log ("decoder self-test: ...").
+- Live output lag: for every output, the chunks submitted after it before it came out; the
+  smallest per 0.5 s is stats `outputLag` and the overlay row "Decoder output lag". 0 on a
+  decoder that outputs at once; a decoder that holds frames back on the actual stream never
+  gets below its hold. This covers what the clip cannot: the clips signal zero reorder frames
+  (x264 writes the VUI `bitstream_restriction` with `max_num_reorder_frames` 0; HEVC carries
+  `sps_max_num_reorder_pics` in the SPS; SVT-AV1 low-delay has no hidden frames), and an H.264
+  stream without that VUI (some hardware encoders) can make a decoder that passed the test
+  hold frames for reordering on the real stream.
+- Overlay: "Decoder queue" (now, max; waiting in front of the decoder now, max), "Decoder output
+  lag", "VideoFrames open" (now, max, leaked), "Decoder self-test", and "superseded" in the
+  "Frames dropped" row.
+
+Verified in the sandbox (headless Chromium from Playwright, software decoders; it decodes AV1
+only, so the E2E streams libsvtav1):
+
+- verified (sandbox): `internal/codec` `TestDecoderSelfTestClips`: the committed clips per
+  family have 10 frames at 640x360, the first with its parameter sets and the codec string the
+  host's `Params` derives from them (`avc1.64001f`, `hev1.1.6.L90.90`, `av01.0.04M.08`), no
+  later one with parameter sets; FFmpeg decodes each into frame types `IPPPPPPPPP` with
+  `has_b_frames` 0 (no reorder delay); 1.8 / 3.3 / 1.2 kB.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, 84 checks passed). Per streaming
+  scenario (WebTransport direct / relay, WebSocket relay, WebGPU renderer setting), with
+  `VideoDecoder.prototype.decode` / `flush` patched inside the stream worker (Playwright
+  evaluates in workers; independent of the worker's own counters): about 510 `decode()` calls
+  per 8 s, `decodeQueueSize` right after each at most 2 (max 2 in the first scenario, 1 in the
+  others), 0 `flush()` calls; VideoFrames open 0 at the end, at most 2 at once, 0 leaked; 1-2
+  outputs superseded per scenario; output lag 0. Late frames (host fault hook: every 97th frame
+  200 ms late, so about 12 frames are released at once): over 20 s 1419 `decode()` calls,
+  `decodeQueueSize` at most 2 while up to 11 chunks waited in front of the decoder, 38 outputs
+  superseded, VideoFrames at most 2 open, 0 leaked; the same ten chunks submitted at once to a
+  bare decoder reach `decodeQueueSize` 8 here (the bound is needed). Startup self-test on the
+  real decoder (AV1, dav1d via `no-preference`; this Chromium has no H.264 or HEVC decoder):
+  first output after 1 chunk (3.1 ms after configure), 0 held, 10 of 10 out, 1.0 ms/frame; the
+  overlay shows the "Decoder self-test", "Decoder queue" and "VideoFrames open" rows. Self-test
+  logic with a wrapper around the real decoder that holds frames back: passes it holding none
+  (first output after 1, 10/10), catches a hold of 1 (first output after 2, held 1, stopped
+  after 4 chunks) and of 2 (first after 3, held 2); with the hold only under
+  `prefer-hardware`: hello `hw` false, `prefer-software` passes, the family decodes in
+  software. Renderers (unit, the worker's own classes): of three frames drawn, the 2D renderer
+  leaves none open, the WebGPU renderer (headed Chromium on Xvfb, SwiftShader) exactly the last
+  one, which is its `prev`. All earlier checks (stage latency, crop, probe, loss handling,
+  bitrate recovery) still pass.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (self-test and output lag on the AMD host's streams):
+  stream from the AMD host to Chrome on a Windows client (any GPU) once per codec (drawer:
+  Codec H.264, HEVC, AV1; FFmpeg path and, once Phase 3 is the default, the helper path), with
+  the overlay open (Ctrl+Alt+Shift+S): "Decoder self-test" shows each family the client decodes
+  with "HW ✓" (record the ms/frame), "Decoder output lag" stays at 0 frames during motion, and
+  "Decoder queue" max stays at 2 or less. Record any family with "holds N frames back" and any
+  output lag of 1 or more with the client's GPU, driver and browser version. For an H.264 output
+  lag, check the AMD encoder's SPS: capture the stream (`ffmpeg -f gdigrab -i desktop -frames:v
+  60 -c:v h264_amf -usage ultralowlatency -bf 0 amf.h264`, the session's arguments from the host
+  log's `starting encoder` line) and run `ffmpeg -v error -i amf.h264 -c copy -bsf:v trace_headers
+  -f null - 2>&1 | findstr "bitstream_restriction_flag max_num_reorder_frames"`: without
+  `bitstream_restriction_flag = 1` and `max_num_reorder_frames = 0` the client's hardware decoder
+  may hold frames for reordering; record it (the fix is host-side: write the VUI as Sunshine does).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same as for AMD with the NVIDIA host's
+  streams (h264_nvenc / hevc_nvenc / av1_nvenc and the helper's NVENC backend), including the
+  H.264 SPS check with `-c:v h264_nvenc -tune ull -bf 0`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (client decoders, AMD GPU in the client): Chrome and
+  Edge on a Windows PC with a Radeon GPU (D3D11 video decoder), then Firefox: the overlay's
+  "Decoder self-test" line per family; then a 10-minute stream with the WebGPU renderer at
+  1440p120 (or the client's highest): "VideoFrames open" max at most 5 and 0 leaked, "Freezes"
+  0, no "VideoFrame leak" in `__recon.logs`, and no console warning "A VideoFrame was garbage
+  collected without being closed". Repeat with the 2D renderer.
+- NVIDIA: unverified (no NVIDIA host available). Test: the client-decoder test above on a
+  Windows PC with a GeForce GPU (D3D11 / NVDEC through Chrome), and on a Mac (VideoToolbox) and
+  an Android phone (MediaCodec) if available: record the "Decoder self-test" lines; a decoder
+  that holds frames back must show "→ decoding in software" (when a software decoder exists for
+  that family) and the host must then pick another codec family under "Auto" (host log
+  `starting encoder ... encoder=`).

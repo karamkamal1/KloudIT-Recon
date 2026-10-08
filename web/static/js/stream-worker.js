@@ -3,11 +3,12 @@
 // input handling) can delay a frame.
 //
 //   WebTransport (per-frame QUIC streams + datagrams) or WebSocket fallback
-//     -> reorder by sequence -> VideoDecoder (optimizeForLatency)
+//     -> reorder by sequence -> VideoDecoder (optimizeForLatency, at most 2 queued)
 //     -> immediate draw on a desynchronized 2D canvas or WebGPU external texture
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
+import { runSelfTests } from './decoder-selftest.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -38,6 +39,12 @@ const video = {
   keyRequested: 0,
   waitSince: 0,
   hostDropped: new Set(), // seqs of the current generation the host reported dropped
+  queue: [], // chunks waiting for room in the decoder (feedDecoder)
+  submitted: 0, // chunks submitted to this decoder
+  queueMax: 0, // highest decodeQueueSize after a decode() this session
+  waitingMax: 0, // most chunks waiting in video.queue at once this session
+  selfTest: [], // decoder self-test per family (decoder-selftest.js)
+  softwareFor: new Set(), // families decoded in software: their hardware decoder held frames back
 };
 
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
@@ -45,7 +52,7 @@ const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 }
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
-  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0,
+  audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, lagMin: Infinity,
 };
 
 // Freezes: the picture stood still more than FREEZE_MS longer than the
@@ -536,14 +543,23 @@ async function makeRenderer() {
 
 const isNewerGen = (a, b) => { const d = (a - b) & 0xff; return d > 0 && d < 128; };
 
+// Decoder hygiene (guide step 4.1): prefer-hardware + optimizeForLatency;
+// flush() is never called while streaming (it waits for every output and
+// makes the next chunk a key frame): the backlog recovery and decoder errors
+// reset and reconfigure instead. A family whose hardware decoder held frames
+// back in the startup self-test decodes in software when that passed.
 async function configureDecoder(cfg) {
   video.ready = false;
   if (video.decoder && video.decoder.state !== 'closed') {
     try { video.decoder.close(); } catch {}
   }
   video.inflight.clear();
+  video.queue = [];
+  video.submitted = 0;
   const base = { codec: cfg.codec, optimizeForLatency: true, codedWidth: cfg.codedWidth || cfg.width, codedHeight: cfg.codedHeight || cfg.height };
-  const wantHW = prefs.decoder !== 'software';
+  const avoidHW = video.softwareFor.has(cfg.family);
+  const wantHW = prefs.decoder !== 'software' && !avoidHW;
+  if (avoidHW && prefs.decoder !== 'software') post('log', { text: `${cfg.codec}: decoding in software, the hardware decoder held frames back in the self-test` });
   let config = { ...base, hardwareAcceleration: wantHW ? 'prefer-hardware' : 'prefer-software' };
   let support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
   video.hw = wantHW && support.supported;
@@ -557,6 +573,7 @@ async function configureDecoder(cfg) {
   }
   if (cfg !== video.cfg) return false; // superseded while awaiting
   video.decoder = new VideoDecoder({ output: onDecoded, error: onDecodeError });
+  video.decoder.ondequeue = feedDecoder; // room in the decoder (browsers without the event: see feedDecoder)
   video.decoder.configure(config);
   video.ready = true;
   return true;
@@ -589,6 +606,7 @@ function requestKeyframe(reason, send = true) {
 // more than a second, ask again. A request can be dropped by the host's rate
 // limits or lost with a connection hiccup; this guarantees video resumes.
 function videoWatchdog() {
+  feedDecoder();
   if (!transport || !video.cfg) return;
   const waiting = video.waitingKey || video.lostGen === video.cfg.gen;
   const t = now();
@@ -731,14 +749,17 @@ function onDropped(m) {
 }
 
 // If the decoder cannot keep up (slow device, software decode), frames queue
-// and latency grows without bound. Detect a sustained backlog, drop it, and
-// restart from a fresh key frame (and ask the host to back off).
+// and latency grows without bound. Detect a sustained backlog (chunks in the
+// decoder and waiting in front of it), drop it, and restart from a fresh key
+// frame (and ask the host to back off). Software decoding chosen only because
+// the hardware decoder held frames back goes back to hardware: a frame or
+// two held back costs less than a decoder that cannot keep up.
 const overload = { since: 0, warned: false };
 function checkDecoderBacklog() {
   const d = video.decoder;
   if (!d || d.state !== 'configured') return false;
   const fps = video.cfg?.fps || 60;
-  const backlog = video.inflight.size;
+  const backlog = video.inflight.size + video.queue.length;
   if (backlog <= Math.max(4, fps / 10)) { overload.since = 0; return false; }
   const t = now();
   if (!overload.since) overload.since = t;
@@ -746,6 +767,9 @@ function checkDecoderBacklog() {
   overload.since = 0;
   try { d.reset(); } catch {}
   video.inflight.clear();
+  if (video.softwareFor.delete(video.cfg.family)) {
+    post('log', { text: 'software decoder fell behind: back to the hardware decoder (it holds frames back)' });
+  }
   configureDecoder(video.cfg).then(() => drainEarly());
   // One message: the host's congestion response lowers the bitrate *and*
   // restarts with a key frame, at once for this reason (other congestion
@@ -775,25 +799,121 @@ function decodeFrame(f) {
     setTimeout(finishDropTest, DROP_TEST_MS);
     return;
   }
-  video.inflight.set(f.ptsUs, {
-    recv: f.recv, first: f.first, sendUs: f.sendUs, ext: f.ext, seq: f.seq, gen: f.gen, t: now(),
-  });
-  if (video.inflight.size > 120) video.inflight.delete(video.inflight.keys().next().value);
-  try {
-    d.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.ptsUs, data: f.data }));
-  } catch (e) {
-    onDecodeError(e);
+  if (f.key && video.queue.length) {
+    // Decoding the frames before a key frame would only delay it: nothing
+    // after it refers to them.
+    stats.superseded += video.queue.length;
+    video.queue = [];
+  }
+  video.queue.push(f);
+  feedDecoder();
+  video.waitingMax = Math.max(video.waitingMax, video.queue.length);
+}
+
+// At most MAX_DECODE_QUEUE chunks wait inside the decoder (decodeQueueSize:
+// submitted, not yet taken by the codec); later ones wait in video.queue,
+// where the client can still act on them (a key frame supersedes them, the
+// backlog recovery drops them), until the decoder has room: its 'dequeue'
+// event, an output, the next frame or the watchdog (browsers without the
+// event).
+const MAX_DECODE_QUEUE = 2;
+
+function feedDecoder() {
+  const d = video.decoder;
+  while (video.queue.length && d?.state === 'configured' && d.decodeQueueSize < MAX_DECODE_QUEUE) {
+    const f = video.queue.shift();
+    video.inflight.set(f.ptsUs, {
+      recv: f.recv, first: f.first, sendUs: f.sendUs, ext: f.ext, seq: f.seq, gen: f.gen, t: now(), n: video.submitted++,
+    });
+    if (video.inflight.size > 120) video.inflight.delete(video.inflight.keys().next().value);
+    try {
+      d.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.ptsUs, data: f.data }));
+      video.queueMax = Math.max(video.queueMax, d.decodeQueueSize);
+    } catch (e) {
+      onDecodeError(e);
+      return;
+    }
   }
 }
 
 let firstFrame = true;
 
+// Every VideoFrame the worker holds (decoder outputs, probe clones) until it
+// is closed. An open frame pins one of the decoder's output buffers, and a
+// hardware decoder whose pool runs dry stalls (w3c/webcodecs#680), so each is
+// closed as soon as it is drawn (the WebGPU renderer keeps exactly one,
+// this.prev, until the next draw). Counted from the frames themselves (a
+// closed frame has a coded width of 0), not from the code that closes them:
+// frames.max is the most open at once; a frame still open after
+// FRAME_LEAK_LIMIT newer ones is a leak: closed here and counted.
+const FRAME_LEAK_LIMIT = 16;
+const frames = { open: new Set(), max: 0, leaked: 0 };
+
+function openFrames() {
+  for (const f of frames.open) if (!f.codedWidth) frames.open.delete(f);
+  for (const f of frames.open) {
+    if (frames.open.size <= FRAME_LEAK_LIMIT) break;
+    frames.open.delete(f);
+    f.close();
+    if (!frames.leaked++) post('log', { text: 'VideoFrame leak: a frame was never closed (closed now)' });
+  }
+  return frames.open.size;
+}
+
+function trackFrame(f) {
+  frames.open.add(f);
+  frames.max = Math.max(frames.max, openFrames());
+}
+
+// Draw on decode, one task after the output: outputs already queued behind
+// it (a burst after a stall or a backlog, a decoder that releases frames
+// together) supersede it, and only the newest is drawn; the older ones are
+// closed unseen (counted in stats.superseded, acknowledged as decoded).
+const present = { pending: null, scheduled: false, channel: new MessageChannel() };
+present.channel.port1.onmessage = () => {
+  present.scheduled = false;
+  const p = present.pending;
+  present.pending = null;
+  if (p) drawFrame(p.frame, p.meta, p.decoded);
+};
+
 function onDecoded(frame) {
+  trackFrame(frame);
   const meta = video.inflight.get(frame.timestamp);
   video.inflight.delete(frame.timestamp);
   const dt = dropTest.run;
   if (dt && meta && meta.gen === dt.gen && meta.seq > dt.seq) dt.decoded++;
   const decoded = now();
+  if (meta) {
+    // Output lag: chunks submitted after this one before it came out (a
+    // decoder that holds frames back never gets below its hold).
+    stats.lagMin = Math.min(stats.lagMin, video.submitted - meta.n - 1);
+    stats.decodeSum += decoded - meta.t;
+    stats.decodeN++;
+  }
+  feedDecoder();
+  const old = present.pending;
+  if (old) {
+    old.frame.close();
+    stats.superseded++;
+    if (old.meta) ackFrame(old.meta, old.decoded);
+  }
+  present.pending = { frame, meta, decoded };
+  if (!present.scheduled) {
+    present.scheduled = true;
+    present.channel.port2.postMessage(null);
+  }
+}
+
+// Frame acknowledgement (0x40): one-way delay and decode time of a decoded frame.
+function ackFrame(meta, decoded) {
+  if (clock.offset === null) return null;
+  const owd = meta.recv - hostToLocal(sentUs(meta));
+  transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, (decoded - meta.t) * 1000));
+  return owd;
+}
+
+function drawFrame(frame, meta, decoded) {
   // Padding the host announced (VideoConfig crop) is not shown.
   const vr = frame.visibleRect;
   const vis = P.visibleArea(video.cfg, vr ? vr.width : frame.displayWidth, vr ? vr.height : frame.displayHeight, frame.displayWidth, frame.displayHeight);
@@ -814,6 +934,7 @@ function onDecoded(frame) {
     post('log', { text: `render error: ${e.message}` });
   }
   const presented = now();
+  if (req?.clone) trackFrame(req.clone);
   if (req) probeSample(req, presented);
   stats.frames++;
   if (meta) {
@@ -830,22 +951,15 @@ function onDecoded(frame) {
     firstFrame = false;
     post('firstFrame', { renderer: renderer.name });
   }
-  if (!meta) return;
-  const decodeMs = decoded - meta.t;
-  stats.decodeSum += decodeMs;
-  stats.decodeN++;
-  if (clock.offset !== null) {
-    const owd = meta.recv - hostToLocal(sentUs(meta));
-    const rec = recordStages(meta, decoded, presented);
-    stats.owdSum += owd;
-    stats.owdN++;
-    stats.totalSum += rec.e2e;
-    stats.sendSum += rec.e2eSend;
-    stats.totalN++;
-    stats.totalMin = Math.min(stats.totalMin, rec.e2e);
-    stats.totalMax = Math.max(stats.totalMax, rec.e2e);
-    transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, decodeMs * 1000));
-  }
+  if (!meta || clock.offset === null) return;
+  const rec = recordStages(meta, decoded, presented);
+  stats.owdSum += ackFrame(meta, decoded);
+  stats.owdN++;
+  stats.totalSum += rec.e2e;
+  stats.sendSum += rec.e2eSend;
+  stats.totalN++;
+  stats.totalMin = Math.min(stats.totalMin, rec.e2e);
+  stats.totalMax = Math.max(stats.totalMax, rec.e2e);
 }
 
 // Debug toggle for the decoder check in docs/VENDOR_NOTES.md (1.4): does this
@@ -1343,11 +1457,21 @@ function postStats() {
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
     audioMs,
+    // Decoder hygiene (4.1): decodeQueueSize now and its maximum (bound
+    // MAX_DECODE_QUEUE), chunks waiting in front of the decoder, decoded
+    // frames closed unseen for a newer one, the smallest output lag in this
+    // period (frames), the VideoFrames open now / at most / leaked.
     queue: video.decoder ? video.decoder.decodeQueueSize : 0,
+    queueMax: video.queueMax,
+    waiting: video.queue.length,
+    waitingMax: video.waitingMax,
+    superseded: stats.superseded,
+    outputLag: isFinite(stats.lagMin) ? stats.lagMin : null,
+    videoFrames: { open: openFrames(), max: frames.max, leaked: frames.leaked },
     hw: video.hw,
     synced: clock.offset !== null,
   });
-  Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0 });
+  Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0, lagMin: Infinity });
 }
 
 async function probeDecoders() {
@@ -1363,6 +1487,27 @@ async function probeDecoders() {
   return out;
 }
 
+// Startup decoder self-test (decoder-selftest.js): results for the overlay
+// (main thread: decoderTest) and the log; families whose hardware decoder
+// holds frames back go to the host as without a hardware decoder (it prefers
+// a family the browser decodes in hardware) and decode in software when that
+// passed. Returns the hello's decoders.
+async function selfTestDecoders(decoders) {
+  let tests = [];
+  try {
+    tests = await runSelfTests(decoders, prefs.decoder !== 'software');
+  } catch (e) {
+    post('log', { text: `decoder self-test failed: ${e.message}` });
+  }
+  video.selfTest = tests;
+  for (const t of tests) {
+    if (t.software) video.softwareFor.add(t.family);
+    post('log', { text: `decoder self-test: ${t.text}` });
+  }
+  post('decoderTest', { tests });
+  return decoders.map((d) => ({ ...d, hw: tests.find((t) => t.family === d.family)?.reportHW ?? d.hw }));
+}
+
 async function start(msg) {
   prefs = msg.prefs || {};
   canvas = msg.canvas;
@@ -1371,6 +1516,7 @@ async function start(msg) {
   renderer = await makeRenderer();
   const decoders = await probeDecoders();
   post('decoders', { decoders });
+  const tested = selfTestDecoders(decoders); // while connecting
   let conn;
   try {
     conn = await connect(msg.endpoints);
@@ -1384,7 +1530,7 @@ async function start(msg) {
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   transport.sendControl({
     t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
-    client: msg.client, decoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
+    client: msg.client, decoders: await tested, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
   });
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
   const pingTimer = setInterval(sendPing, 1000);

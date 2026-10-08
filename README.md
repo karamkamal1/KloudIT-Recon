@@ -40,9 +40,11 @@ Techniques used (most of them are new to browser-based game streaming):
 - **Overlapped encoder restarts.** Changing bitrate, resolution, codec or display starts a new
   encoder *while the old one keeps streaming*, then switches on the new key frame. You get no freeze.
 - **The entire media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`
-  (`optimizeForLatency`) → an **OffscreenCanvas** that draws each frame the instant it decodes.
-  It uses a **desynchronized** (front-buffer) 2D canvas, or **WebGPU `importExternalTexture`**
-  zero-copy rendering after a built-in self-test. The main thread can't stall a frame.
+  (`optimizeForLatency`, at most 2 chunks queued, never flushed) → an **OffscreenCanvas** that
+  draws each frame the instant it decodes and closes it at once. It uses a **desynchronized**
+  (front-buffer) 2D canvas, or **WebGPU `importExternalTexture`** zero-copy rendering after a
+  built-in self-test. The main thread can't stall a frame. A startup self-test catches decoders
+  that hold frames back and avoids them.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
@@ -66,7 +68,7 @@ Techniques used (most of them are new to browser-based game streaming):
   can export as JSON.
 - **Self-protecting under load.** Delay-gradient congestion detection lowers the bitrate before
   queues build up, and the bitrate climbs back to your setting (15 % every 10 s) once the
-  network is quiet again. A decoder backlog gets flushed and resynced from a fresh key frame, so
+  network is quiet again. A decoder backlog gets dropped and resynced from a fresh key frame, so
   latency can't grow without bound; the bitrate then climbs back only to 85 % of where the
   decoder fell behind.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence

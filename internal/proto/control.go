@@ -24,7 +24,10 @@ type ClientInfo struct {
 // DecoderInfo reports what the browser can decode via WebCodecs.
 type DecoderInfo struct {
 	Family string `json:"family"` // h264 | hevc | av1
-	HW     bool   `json:"hw"`     // hardware decoder available
+	// HW: a hardware decoder is available. Clients with the decoder
+	// self-test (step 4.1) report false when the hardware decoder holds
+	// frames back, so that a family decoded in hardware without delay wins.
+	HW bool `json:"hw"`
 }
 
 type AudioCaps struct {
