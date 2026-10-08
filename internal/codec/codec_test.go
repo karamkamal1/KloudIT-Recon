@@ -109,6 +109,48 @@ func decodeCount(t *testing.T, format string, data []byte) (int, string) {
 	return n, stderr.String()
 }
 
+// checkParamSetsLen: the prefix ParamSetsLen marks in an encoder's key frame
+// holds all its parameter sets and the rest none.
+func checkParamSetsLen(t *testing.T, p *Params, key []byte) {
+	t.Helper()
+	n := ParamSetsLen(p.Family, key)
+	if n <= 0 || n >= len(key) || !p.hasParamSets(key[:n]) || p.hasParamSets(key[n:]) {
+		t.Fatalf("%s key frame of %d bytes: parameter-set prefix %d bytes", p.Family, len(key), n)
+	}
+}
+
+// ParamSetsLen on hand-made frames: delimiters and SEI in front count, the
+// prefix ends with the last parameter set before the coded picture, and a
+// parameter set after it does not extend it.
+func TestParamSetsLen(t *testing.T) {
+	sc := []byte{0, 0, 0, 1}
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	h264 := cat(sc, []byte{0x09, 0xf0}, sc, []byte{0x06, 5, 1, 0x80}, sc, []byte{0x67, 0x64, 0, 0x1f}, []byte{0, 0, 1}, []byte{0x68, 0xee}, sc, []byte{0x65, 0x88, 0x84}, sc, []byte{0x68, 0xee})
+	hevc := cat(sc, []byte{0x46, 0x01, 0x50}, sc, []byte{0x40, 0x01, 0x0c}, sc, []byte{0x42, 0x01, 0x01}, sc, []byte{0x44, 0x01, 0xc1}, sc, []byte{0x4e, 0x01, 0x05}, sc, []byte{0x26, 0x01, 0xaf})
+	obu := func(typ byte, payload ...byte) []byte {
+		return append([]byte{typ<<3 | 0x02, byte(len(payload))}, payload...)
+	}
+	av1 := cat(obu(obuTemporalDelimiter), obu(obuSequenceHeader, 0, 0, 0), obu(5, 1), obu(6, 0x10, 0x20, 0x30))
+	for _, tc := range []struct {
+		name, family string
+		data         []byte
+		want         int
+	}{
+		{"h264 aud sei sps pps idr", H264, h264, len(h264) - 2*len(sc) - 5},
+		{"h264 p-frame", H264, cat(sc, []byte{0x09, 0x30}, sc, []byte{0x41, 0x9a}), 0},
+		{"hevc aud vps sps pps sei idr", HEVC, hevc, len(hevc) - 2*len(sc) - 6},
+		{"hevc no start code", HEVC, []byte{0x40, 0x01}, 0},
+		{"av1 td seq metadata frame", AV1, av1, 2 + 5},
+		{"av1 frame only", AV1, cat(obu(obuTemporalDelimiter), obu(6, 1)), 0},
+		{"av1 truncated", AV1, []byte{0x0a, 0x05, 0}, 0},
+		{"unknown family", "vp9", h264, 0},
+	} {
+		if got := ParamSetsLen(tc.family, tc.data); got != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestH264GlobalHeaderKeyframes(t *testing.T) {
 	pkts := encodeNUT(t, "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "40",
 		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "high", "-g", "15")
@@ -144,6 +186,7 @@ func TestH264GlobalHeaderKeyframes(t *testing.T) {
 			if !p.hasParamSets(d) {
 				t.Fatal("key frame still lacks parameter sets")
 			}
+			checkParamSetsLen(t, p, d)
 		}
 		es.Write(d)
 		frames++
@@ -175,6 +218,7 @@ func TestHEVCKeyframes(t *testing.T) {
 		d := pk.Data
 		if pk.Key {
 			d = p.PrepareKeyFrame(d)
+			checkParamSetsLen(t, p, d)
 		}
 		es.Write(d)
 		frames++
@@ -197,6 +241,7 @@ func TestAV1Keyframes(t *testing.T) {
 			if !p.hasParamSets(d) {
 				t.Fatal("AV1 key frame without sequence header")
 			}
+			checkParamSetsLen(t, p, d)
 		}
 	}
 	if !strings.HasPrefix(p.Codec, "av01.0.") || !strings.HasSuffix(p.Codec, "M.08") {

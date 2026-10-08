@@ -348,6 +348,9 @@ type result struct {
 	received                          map[[2]uint32]bool // gen, seq of every complete frame
 	payloads                          map[[2]uint32][]byte
 	refFloors                         map[[2]uint32]uint32 // gen, seq of every recovery frame: its refFloor
+	// resets: gen, seq of every frame stream the host reset whose header
+	// arrived (partial delivery, GUIDE 2.4): the bytes it delivered.
+	resets map[[2]uint32]int
 }
 
 // control counts one control message.
@@ -584,6 +587,15 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 			}
 			b, err := io.ReadAll(u)
 			if err != nil {
+				var h proto.FrameHeader
+				if h.Unmarshal(b) == nil {
+					mu.Lock()
+					if r.resets == nil {
+						r.resets = map[[2]uint32]int{}
+					}
+					r.resets[[2]uint32{uint32(h.Gen), h.Seq}] = len(b)
+					mu.Unlock()
+				}
 				continue
 			}
 			mu.Lock()
@@ -1169,13 +1181,25 @@ func TestStreamingDeadlineDrop(t *testing.T) {
 	if len(cancels) < 4 || len(cancels) < len(held)-1 {
 		t.Fatalf("%d held streams, %d cancelled: %q", len(held), len(cancels), cancels)
 	}
+	// Partial delivery (GUIDE 2.4): webtransport-go negotiates
+	// RESET_STREAM_AT, so the host marks every frame stream's header
+	// reliable, and each cancelled stream still delivers exactly that.
+	if l := e.logs.lines(from, `msg="session started"`, "path=direct", "reset_stream_at=yes"); len(l) != 1 {
+		t.Fatalf("session line without reset_stream_at=yes: %q", e.logs.lines(from, `msg="session started"`))
+	}
 	for _, l := range cancels {
-		var age, deadline int
-		if _, err := fmt.Sscanf(l[strings.Index(l, " age_ms=")+1:], "age_ms=%d deadline_ms=%d", &age, &deadline); err != nil {
+		var age, deadline, gen, seq, rel int
+		if _, err := fmt.Sscanf(l[strings.Index(l, " reliable_bytes=")+1:], "reliable_bytes=%d age_ms=%d deadline_ms=%d", &rel, &age, &deadline); err != nil {
 			t.Fatalf("%v: %s", err, l)
 		}
 		if deadline < 60 || deadline > 80 || age < deadline || age > deadline+100 {
 			t.Errorf("cancelled at %d ms with a deadline of %d ms, want at two frame intervals: %s", age, deadline, l)
+		}
+		if _, err := fmt.Sscanf(l[strings.Index(l, " gen=")+1:], "gen=%d seq=%d", &gen, &seq); err != nil {
+			t.Fatalf("%v: %s", err, l)
+		}
+		if n, ok := r.resets[[2]uint32{uint32(gen), uint32(seq)}]; !ok || n != rel || rel <= proto.FrameHeaderLen {
+			t.Errorf("cancelled frame %d/%d: the client got %d bytes of it (delivered: %v), the host marked %d reliable", gen, seq, n, ok, rel)
 		}
 	}
 	// Generation 1 in order: after each loss the frames that went out while
@@ -1232,8 +1256,9 @@ func TestStreamingDeadlineDrop(t *testing.T) {
 			t.Fatalf("%q", l)
 		}
 	}
-	t.Logf("%d streams held, %d cancelled at their deadline, %d losses recovered by a recovery frame, %d frames reported dropped, "+
-		"%d frames sent while a lost frame's stream was held", len(held), len(cancels), recovered, len(dropped), early)
+	t.Logf("%d streams held, %d cancelled at their deadline (%d delivered their header), %d losses recovered by a recovery frame, "+
+		"%d frames reported dropped, %d frames sent while a lost frame's stream was held", len(held), len(cancels), len(r.resets), recovered,
+		len(dropped), early)
 }
 
 // rateChanges returns the from -> to pairs of the host's log lines msg

@@ -70,18 +70,24 @@ func TestParseTestFaults(t *testing.T) {
 
 // fakeConn hands out recording frame streams; nothing else is used. The
 // streams numbered in stall (from 0, in the order they are opened) stand
-// still: their writes block until CancelWrite or release.
+// still: their writes block until CancelWrite or release. partial: the peer
+// negotiated RESET_STREAM_AT (transport.PartialDelivery); a stalled stream
+// then takes the writes before its reliable boundary at once, as quic-go
+// takes a small write whatever holds the rest back.
 type fakeConn struct {
 	transport.Conn
 	mu      sync.Mutex
 	streams []*fakeStream
 	stall   map[int]bool
+	partial bool
 }
+
+func (c *fakeConn) PartialDelivery() bool { return c.partial }
 
 func (c *fakeConn) OpenUniStreamSync(context.Context) (transport.SendStream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st := &fakeStream{}
+	st := &fakeStream{partial: c.partial, streamState: streamState{boundary: -1}}
 	if c.stall[len(c.streams)] {
 		st.release, st.reset = make(chan struct{}), make(chan struct{})
 	}
@@ -113,6 +119,7 @@ func (c *fakeConn) snapshot() []streamState {
 type fakeStream struct {
 	mu sync.Mutex
 	streamState
+	partial        bool
 	release, reset chan struct{} // a stalled stream (fakeConn.stall)
 	resetOnce      sync.Once
 }
@@ -121,10 +128,28 @@ type streamState struct {
 	data              []byte
 	closed, cancelled bool
 	doneAt            time.Time // closed or cancelled
+	// boundary: the bytes marked reliable by the last SetReliableBoundary
+	// (-1: never called), in calls.
+	boundary, boundaries int
+}
+
+// delivered is what the peer gets of a finished stream: all of it, or of a
+// cancelled one the part marked reliable under partial delivery.
+func (x streamState) delivered(partial bool) []byte {
+	switch {
+	case x.closed:
+		return x.data
+	case partial && x.boundary > 0:
+		return x.data[:x.boundary]
+	}
+	return nil
 }
 
 func (s *fakeStream) Write(b []byte) (int, error) {
-	if s.release != nil {
+	s.mu.Lock()
+	buffered := s.partial && s.boundary < 0
+	s.mu.Unlock()
+	if s.release != nil && !buffered {
 		select {
 		case <-s.release:
 		case <-s.reset:
@@ -151,6 +176,12 @@ func (s *fakeStream) CancelWrite() {
 	}
 }
 func (s *fakeStream) SetWriteDeadline(time.Time) error { return nil }
+func (s *fakeStream) SetReliableBoundary() {
+	s.mu.Lock()
+	s.boundary = len(s.data)
+	s.boundaries++
+	s.mu.Unlock()
+}
 
 // fakeCtrl collects the control messages the host sends.
 type fakeCtrl struct {

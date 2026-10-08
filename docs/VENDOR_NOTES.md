@@ -4017,6 +4017,128 @@ Not verified (needs real networks or Windows):
 - PMTU: unverified on real paths. The forwarder sets DF and drops oversized datagrams like a
   router; on a path with a smaller MTU than the host's probe, quic-go's DPLPMTUD should settle
   below it (watch for stalls after the first seconds on PPPoE / VPN client links).
+## 2.4 RESET_STREAM_AT partial reliability for key frames
+
+Transport-only change: no encoder or GPU code is involved, so AMD and NVIDIA hosts behave the
+same; what decides is the client's QUIC stack.
+
+What changed (GUIDE 2.4; docs/ARCHITECTURE.md "The loss-recovery ladder", rung 1, "Partial
+delivery"):
+
+- Detection per session: `transport.PartialDelivery(c)` reports whether both ends negotiated the
+  `reset_stream_at` transport parameter (draft-ietf-quic-reliable-stream-reset;
+  `quic.ConnectionState.SupportsStreamResetPartialDelivery` Local and Remote; quic-go sends and
+  accepts both the draft-09 ID 0x1d and the draft-07 ID 0x17f7586d2cb571). `transport.QUICConfig` already enabled it on
+  every endpoint here (webtransport-go requires it locally for its own stream header). The host
+  uses it only on the paths that end at the client (direct, UDP relay); the splice's peer is the
+  gateway, which forwards a reset frame stream as a plain reset. host.log `session started ...
+  reset_stream_at=yes|no|n/a`.
+- Host, where negotiated: frameSender writes each frame stream in two writes, header + extension
+  first, `SetReliableBoundary`, then the payload; a key frame's reliable prefix also takes its
+  parameter sets (H.264 SPS / PPS / SPS extension / subset SPS, HEVC VPS / SPS / PPS, the AV1
+  sequence header OBU, with delimiters / SEI / metadata before them: `codec.ParamSetsLen`). A
+  cancel (rung 1, a discarded or failed stream) then goes out as RESET_STREAM_AT with that
+  reliable size: the client still gets the prefix (quic-go retransmits it if lost), the rest
+  never. host.log `frame stream cancelled ... reliable_bytes=N` (0 without partial delivery).
+  Cost: with two writes the header can leave in a small packet of its own (at most one extra
+  packet per frame), and a cancelled stream's header is retransmitted if lost. Not negotiated:
+  one write per frame and plain RESET_STREAM, byte for byte as before.
+- Client (`stream-worker.js`): a frame stream that ends in a reset now hands what arrived to
+  `onFrameReset`; with a whole header it treats the frame as one the host dropped, at once (it
+  joins `hostDropped`, as a `dropped` report would; the report still comes and finds it done),
+  counted in `__recon.lastStats.streamResets`. This also catches headers read before a plain
+  reset, so it works with Chromium today on the test hook's half-written frames.
+- Deviation, webtransport-go: `webtransport.SendStream` does not export `SetReliableBoundary`
+  (v0.13.0, also its master at c2f41033 of 2026-09-21); it marks only its own WebTransport stream
+  header reliable. `internal/transport` reaches the QUIC stream under it (the unexported field
+  `str`, a `*quic.SendStream` / `*quic.Stream`) by reflection; if a webtransport-go version
+  drops the field, WebTransport sessions report no partial delivery (no regression), and
+  `TestPartialDeliveryWebTransport` fails so the update is noticed. No webtransport-go fork.
+- Deviation, the splice keeps plain resets: the gateway splices cut-through and never parses
+  frames, so it cannot know a reliable prefix to carry onto the browser leg (forwarding
+  "everything received before the reset" reliably would retransmit the cancelled payload on the
+  congested leg, the opposite of the cancel). The UDP relay is end to end, so it has the
+  feature wherever the browser has it.
+- Answer to "does Chrome's WebTransport negotiate it": **no** (Chromium 141.0.7390.37, the
+  Playwright 1.56.1 build, headless and headed). Probe (a quic-go WebTransport server with
+  `EnableStreamResetPartialDelivery`, Chromium connecting with `serverCertificateHashes`):
+  `SessionState().ConnectionState.SupportsStreamResetPartialDelivery` = {Remote: false, Local:
+  true}; a stream with a 24-byte header marked reliable then cancelled delivered 0 bytes to a
+  reader that started 600 ms later (`WebTransportError: Received RESET_STREAM.`). The binary has
+  QUICHE's RESET_STREAM_AT frame code (`QuicResetStreamAtFrame`, `reliable_stream_reset`) but no
+  feature, switch or QUICHE flag string that turns it on for WebTransport. The browser E2E
+  records the host's `reset_stream_at` per path in its results (`resetStreamAt`,
+  `partialDelivery`).
+
+Verified in the sandbox (Linux, no GPU, loopback):
+
+- `internal/transport` `TestPartialDeliveryQUIC`: a real quic-go client/server pair, the client
+  with and without the extension. Negotiated: `PartialDelivery` true on both ends, and a stream
+  whose 39-byte header was marked reliable, then cut short (8 MiB payload stalled on flow
+  control, `CancelWrite`) delivers exactly the header, then the peer's reset (code 1). Negotiated
+  without a boundary: nothing. Not negotiated (client `EnableStreamResetPartialDelivery` false):
+  `PartialDelivery` false on both ends, `SetReliableBoundary` has no effect, nothing delivered.
+  (A marker stream written after the cancel and read first makes it deterministic: on the
+  in-order loopback the reset has arrived when the reader starts.)
+- `TestPartialDeliveryWebTransport`: webtransport-go server and client through
+  `FromWebTransportOver` / `FromWebTransport`: `PartialDelivery` true, the cancelled stream
+  delivers exactly the application header (the boundary covers webtransport-go's stream header
+  and ours). Fails (0 bytes) when the boundary call is removed, i.e. the reflection does reach
+  the QUIC stream.
+- `internal/host` `TestFrameSenderPartialDelivery` (frameSender against recording fake streams):
+  with partial delivery a P-frame's boundary is at its header + extension, an HEVC key frame's at
+  header + VPS/SPS/PPS; a stream stalled past its deadline (rung 1) is cancelled with exactly its
+  header delivered and logged `reliable_bytes=<header length>`; the test hook's delayed frames
+  have their header out at once and its half-written frames deliver their header. Without
+  partial delivery no boundary is ever set and a cancelled stream delivers nothing
+  (`reliable_bytes=0`). `TestReliablePrefix`: the parameter sets are found by the frame's own
+  generation's family. `internal/codec` `TestParamSetsLen` (hand-made H.264 / HEVC / AV1 frames,
+  P-frames, garbage) and the prefix check on real libx264, libx265 and libaom key frames: the
+  prefix holds all parameter sets, the rest none.
+- `internal/e2e` `TestStreamingDeadlineDrop` (real gateway and host agent, a webtransport-go
+  client, which negotiates RESET_STREAM_AT; test hook `delay=every:23:150ms,ref-recovery`): the
+  host logs `reset_stream_at=yes` for the direct session, and every frame stream cancelled at its
+  deadline delivered exactly the `reliable_bytes` the host logged (the header with its extension)
+  to the client: 7 streams held, 7 cancelled at their deadline, all 7 delivered their 46 bytes
+  (24-byte header + 22-byte extension), 7 losses recovered by a recovery frame. The other
+  sessions of `internal/e2e` log `reset_stream_at=yes` (direct, UDP relay: webtransport-go
+  clients) and `n/a` (splice) and pass as before.
+- Browser E2E (Chromium 141, software encoders): every WebTransport scenario records the host's
+  value: `reset_stream_at=no` on direct and UDP relay (headless and the headed WebGL2 / WebGPU /
+  FSR scenarios), `n/a` on the splice (results `resetStreamAt`). The loss scenarios record the
+  client's `streamResets`: no partial delivery, so the 15 frame streams cancelled at their
+  deadline in the reference-recovery run were plain resets; the client still read the header of
+  10 reset streams before their reset (the hook's half-written frames and streams cut mid-write),
+  2 and 2 in the keyframe and skip runs, i.e. `onFrameReset` runs in Chromium today and those
+  runs pass as before. Totals (two runs under the shared E2E lock, load average 6-8 on the 4
+  cores from the other agents' work): 220/231 and 225/231. Every 2.4 check passed in both; the
+  failures were frame-rate checks (steady playback, video decoding, pacing windows at 25-45 fps
+  of 60), one headed fullscreen toolbar click, the bitrate-recovery climb, and the two
+  reference-recovery checks (client recoveries 16 of 21 and 15 of 18 losses, the drop test's
+  "0 decoded" after a rate-controller restart). Those fail the same way in runs of the
+  integration branch without this step under the same load (more frames cancelled by the
+  stalled CPU, rate-controller restarts ending generations mid-wait; e.g. 18 losses, 12-13
+  recovered), and with Chromium nothing changes on the wire (`reset_stream_at=no`: one write
+  per frame, plain resets).
+
+Not verified (needs other browsers or real networks):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: on the Windows host with the agent from this build,
+  connect from Chrome and Edge (stable, Windows) on the direct path and through the UDP relay;
+  host.log `session started ... reset_stream_at=` says whether each browser negotiates it.
+  Expected today: `no` (as Chromium 141 here); then nothing changes on the wire. If a browser
+  says `yes`: Settings > Recovery on the helper pipeline (AMF `ltr`), the netem "wifi" profile
+  (docs/NETEM.md) for 10 minutes: host.log `frame stream cancelled ... reliable_bytes=` > 0 for
+  every cancel, the overlay's stats (`streamResets` in `__recon.lastStats`) grow with them, and
+  no freeze or key frame more than the same run with `reset_stream_at=no`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same as AMD with NVENC
+  (`invalidate`); nothing in this step depends on the GPU.
+- Other browsers: unverified. Test: Firefox (neqo) and Safari 26.4 on the direct path: the
+  host's `reset_stream_at` value per browser and version, recorded here. A browser that says
+  `yes` must still play through the browser E2E's loss scenarios unchanged (point
+  `test/e2e/browser.mjs` at it where Playwright supports it): its "partial delivery" check then
+  requires every cancelled frame stream to deliver its header.
+
 ## 3.7 Virtual display matched to the client
 
 `internal/host/vdisplay` gives a session a virtual monitor through an installed IddCx (indirect

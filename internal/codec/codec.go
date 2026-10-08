@@ -622,6 +622,88 @@ func (p *Params) PrepareKeyFrame(data []byte) []byte {
 	return append(out, data...)
 }
 
+// ParamSetsLen returns the length of the leading part of a frame (an
+// Annex-B access unit, an AV1 temporal unit) that ends with its last
+// parameter set before the coded picture: H.264 SPS / PPS / SPS extension /
+// subset SPS, HEVC VPS / SPS / PPS, the AV1 sequence header OBU. Delimiters,
+// SEI and metadata in front of them are included. 0 when no parameter set
+// comes before the first slice / frame data (or the data does not parse).
+// The host marks this prefix of a key frame reliable on its stream (GUIDE
+// 2.4), so it arrives even when the frame is cancelled.
+func ParamSetsLen(family string, data []byte) int {
+	switch family {
+	case H264, HEVC:
+		end := 0
+		for _, u := range annexBUnits(data) {
+			n := data[u[0]:u[1]]
+			if len(n) == 0 {
+				continue
+			}
+			var vcl, set bool
+			if family == H264 {
+				t := h264Type(n)
+				vcl = (t >= 1 && t <= 5) || t == 14 || (t >= 19 && t <= 21) // slices, prefix NAL, auxiliary / extension slices
+				set = t == 7 || t == 8 || t == 13 || t == 15
+			} else {
+				t := hevcType(n)
+				vcl = t < 32
+				set = t >= 32 && t <= 34
+			}
+			if vcl {
+				break
+			}
+			if set {
+				end = u[1]
+			}
+		}
+		return end
+	case AV1:
+		obus, err := SplitOBUs(data)
+		if err != nil {
+			return 0
+		}
+		end, off := 0, 0
+		for _, o := range obus {
+			off += len(o.raw)
+			switch o.typ {
+			case obuSequenceHeader:
+				end = off
+			case 3, 4, 6, 7, 8: // frame header, tile group, frame, redundant frame header, tile list
+				return end
+			}
+		}
+		return end
+	}
+	return 0
+}
+
+// annexBUnits returns the [start, end) offsets of the NAL units in an
+// Annex-B buffer, start codes excluded (as SplitAnnexB: trailing zeros
+// belong to the next start code).
+func annexBUnits(b []byte) [][2]int {
+	var units [][2]int
+	start := -1
+	for i := 0; i+2 < len(b); {
+		if b[i] != 0 || b[i+1] != 0 || b[i+2] != 1 {
+			i++
+			continue
+		}
+		if start >= 0 {
+			end := i
+			for end > start && b[end-1] == 0 {
+				end--
+			}
+			units = append(units, [2]int{start, end})
+		}
+		i += 3
+		start = i
+	}
+	if start >= 0 && start < len(b) {
+		units = append(units, [2]int{start, len(b)})
+	}
+	return units
+}
+
 // ---------------------------------------------------------------------------
 
 type bitReader struct {

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/auth"
+	"github.com/karamkamal1/kloudit-recon/internal/codec"
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
@@ -44,6 +45,13 @@ type Session struct {
 	meta SessionMeta
 	id   string
 	log  *slog.Logger
+	// partial: frame streams mark their header (and a key frame's parameter
+	// sets) reliable, so a cancelled frame still delivers them (GUIDE 2.4:
+	// the client's QUIC endpoint negotiated RESET_STREAM_AT); resetStreamAt:
+	// that negotiation for the session log ("yes", "no"; "n/a" on the splice,
+	// whose peer is the gateway).
+	partial       bool
+	resetStreamAt string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -113,6 +121,9 @@ type Session struct {
 	healFrames   int
 	heal         *healWatch
 	liveRecovery string
+	// genFamily: each generation's codec family (VideoConfig.Family, by
+	// gen), for the parameter sets of its key frames (reliablePrefix).
+	genFamily [256]string
 
 	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
 	audioKbps atomic.Int64             // audio bitrate while audio runs
@@ -172,7 +183,16 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 	s.log = a.log.With("session", s.id, "path", meta.Path)
 	// The direct path and the UDP relay end at the client; the splice relay
 	// (relay-splice, also WebSocket) ends at the gateway.
-	s.rate.setPath(meta.Path == "direct" || meta.Path == "relay")
+	atClient := meta.Path == "direct" || meta.Path == "relay"
+	s.rate.setPath(atClient)
+	// Partial delivery (GUIDE 2.4) where the client's QUIC endpoint
+	// negotiated it. The splice's peer is the gateway, which passes a reset
+	// frame stream on as a plain reset (relay.go): nothing to gain there.
+	s.resetStreamAt = "n/a"
+	if atClient {
+		s.partial = transport.PartialDelivery(c)
+		s.resetStreamAt = map[bool]string{true: "yes", false: "no"}[s.partial]
+	}
 	return s
 }
 
@@ -242,7 +262,7 @@ func (s *Session) run() error {
 		}
 	}
 	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80),
-		"decoders", decoderSummary(s.hello.Decoders))
+		"decoders", decoderSummary(s.hello.Decoders), "reset_stream_at", s.resetStreamAt)
 
 	// One active session per host: a new connection takes over.
 	s.a.setActive(s)
@@ -989,6 +1009,7 @@ func (s *Session) healConfig(c *proto.VideoConfig, healFrames int) {
 	s.healMu.Lock()
 	defer s.healMu.Unlock()
 	s.healGen, s.healFrames, s.heal, s.liveRecovery = c.Gen, 0, nil, c.Recovery
+	s.genFamily[c.Gen] = c.Family
 	if c.Recovery == proto.RecoverySkip {
 		s.healFrames = healFrames
 	}
@@ -1233,7 +1254,9 @@ func (s *Session) checkOut() {
 			continue
 		}
 		s.stats.cancelled.Add(1)
-		s.log.Info("frame stream cancelled", "gen", f.Gen, "seq", f.Seq, "why", c.step.why,
+		// reliable_bytes: what the reset still delivers (GUIDE 2.4: the
+		// header where the client has partial delivery and it was written).
+		s.log.Info("frame stream cancelled", "gen", f.Gen, "seq", f.Seq, "why", c.step.why, "reliable_bytes", c.of.relSent.Load(),
 			"age_ms", c.age.Milliseconds(), "deadline_ms", c.of.deadline.Milliseconds())
 		// The loss first: the reset frees frameSender, whose next frames
 		// must find the wait for the answer to it.
@@ -1679,11 +1702,14 @@ func (s *Session) frameSender() {
 		if ladder(in).act == actCancel {
 			of.timer = time.AfterFunc(of.deadline, s.checkOut)
 		}
+		if s.partial { // GUIDE 2.4: the prefix a cancel still delivers (writeFrame)
+			of.reliable = s.reliablePrefix(f, len(buf)-len(f.Data))
+		}
 		s.send.register(of)
 		if drop, delay := faults.at(n); drop {
 			// Test hook: the stream fails mid-frame.
 			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
-			_, _ = st.Write(buf[:len(buf)/2])
+			_ = s.writeFrame(of, buf[:len(buf)/2])
 			if s.send.finish(of, outCancelled) {
 				st.CancelWrite()
 				s.lostFrame(f, "test fault")
@@ -1695,6 +1721,12 @@ func (s *Session) frameSender() {
 			// it as a write the transport holds back).
 			s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay)
 			late := append([]byte(nil), buf...)
+			if of.reliable > 0 {
+				// quic-go takes a small write at once, whatever holds
+				// the rest back: the header goes out now.
+				_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				_ = s.writeFrame(of, late[:of.reliable])
+			}
 			time.AfterFunc(delay, func() { s.sendFrame(of, h, late) })
 			continue
 		}
@@ -1725,7 +1757,7 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 		return // cancelled while the test hook held it
 	}
 	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	if _, err := st.Write(b); err != nil {
+	if err := s.writeFrame(of, b); err != nil {
 		if s.send.finish(of, outCancelled) {
 			st.CancelWrite()
 			if s.ctx.Err() == nil {
@@ -1744,6 +1776,39 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 	if h.Flags&proto.FrameFlagExt != 0 {
 		s.hostStages.sentFrame(f, h.SendUs)
 	}
+}
+
+// reliablePrefix is how much of frame f's stream (its header and extension:
+// hdrLen bytes, then f.Data) a cancel must still deliver under partial
+// delivery (GUIDE 2.4): the header, so the client learns at once which
+// frame it will not get, and of a key frame also its parameter sets
+// (codec.ParamSetsLen), the part of a new generation's first frame that
+// describes the stream.
+func (s *Session) reliablePrefix(f *media.Frame, hdrLen int) int {
+	if !f.Key {
+		return hdrLen
+	}
+	s.healMu.Lock()
+	family := s.genFamily[f.Gen]
+	s.healMu.Unlock()
+	return hdrLen + codec.ParamSetsLen(family, f.Data)
+}
+
+// writeFrame writes b, a frame stream's data from its start (or the first
+// part of it), to the frame's stream. Under partial delivery (GUIDE 2.4) the
+// reliable prefix goes first, once, and is marked reliable: a CancelWrite
+// after that (rung 1, a failed write) still delivers it, the rest of the
+// frame not. Without it, one write as before.
+func (s *Session) writeFrame(of *outFrame, b []byte) error {
+	if n := min(of.reliable, len(b)); n > 0 && of.relSent.Load() == 0 {
+		if _, err := of.st.Write(b[:n]); err != nil {
+			return err
+		}
+		of.st.SetReliableBoundary()
+		of.relSent.Store(int32(n))
+	}
+	_, err := of.st.Write(b[of.relSent.Load():])
+	return err
 }
 
 // videoHeader builds a video frame's header, plus the extension for clients

@@ -267,8 +267,13 @@ type takenFrame struct {
 // outFrame is a frame whose stream frameSender opened and is writing (or,
 // test hook, will write late).
 type outFrame struct {
-	f        *media.Frame
-	st       transport.SendStream
+	f  *media.Frame
+	st transport.SendStream
+	// Partial delivery (GUIDE 2.4, Session.writeFrame): the prefix of the
+	// stream to mark reliable (0: none, the connection has no partial
+	// delivery) and how much of it was written and marked.
+	reliable int
+	relSent  atomic.Int32
 	n        uint64 // its number among the frames taken: a frame taken later is newer
 	opened   time.Time
 	deadline time.Duration // from opened (frameDeadline)

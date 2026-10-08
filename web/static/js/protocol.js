@@ -27,6 +27,7 @@ export const IN_RELEASE_ALL = 4;
 export const IN_TEXT = 5;
 
 export const FRAME_HEADER_LEN = 24;
+export const FRAME_TYPE_VIDEO = 1;
 export const FRAME_FLAG_KEY = 1;
 export const FRAME_FLAG_EXT = 0x80; // TLV extension block after the header
 

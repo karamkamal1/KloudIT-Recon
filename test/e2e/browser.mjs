@@ -2307,7 +2307,11 @@ async function lossRun(name, faults, seconds, prefs = {}) {
       keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped'),
       recovered: delta('recovered'), recoveredByKey: delta('recoveredByKey'), discarded: delta('recoveryDiscarded'),
       rejected: delta('recoveryRejected'), keyFrames: delta('keyFrames'), freezes: delta('freezes'),
+      // Frame streams the host reset whose header arrived (GUIDE 2.4).
+      streamResets: delta('streamResets'),
     },
+    // Whether the browser negotiated RESET_STREAM_AT (the host's session line).
+    resetStreamAt: ((host.log.match(/msg="session started"[^\n]*/g) || []).pop()?.match(/ reset_stream_at=(\S+)/) || [])[1] ?? null,
     // Reference recovery on the host: losses it asked the encoder to recover,
     // and how the encoder answered (recovery frame, key frame).
     recovering: (hl.match(/msg="recovering from a loss"/g) || []).length,
@@ -2483,6 +2487,24 @@ async function checkLossHandling() {
       `recoveries: ${r.recoveredByFrame} by recovery frame, ${r.recoveredByKey} by key frame; IDRs: ${r.client.keyFrames} decoded by the client ` +
       `(1 = the generation's first), ${r.forcedKeys} forced by the host; encoder restarts: ${restartsAll} (${counts(r.restarts)}); ` +
       `client freezes > 100 ms: ${r.client.freezes}`);
+  // Partial delivery (GUIDE 2.4) on the same run: where the browser
+  // negotiated RESET_STREAM_AT, the host marks each frame stream's header
+  // reliable before its payload (the hook's held streams too: quic-go takes
+  // the small header write at once), so every stream cancelled at its
+  // deadline still delivers its header and the client learns of the loss
+  // in-band (streamResets). Where it did not (Chromium 141: docs/VENDOR_NOTES.md
+  // 2.4) a cancel is a plain reset of a stream with nothing written, and the
+  // client learns of it from the "dropped" report alone. Headers of the
+  // hook's half-written (dropped) frames may arrive either way: read before
+  // the reset.
+  const partialOK = r.resetStreamAt === 'yes' ? r.client.streamResets >= r.cancelled - 1 : r.resetStreamAt === 'no';
+  check('partial delivery (RESET_STREAM_AT): detected per session; where negotiated, cancelled frame streams deliver their header',
+    partialOK && r.cancelled >= 1,
+    `Chromium ${browser.version()}: reset_stream_at=${r.resetStreamAt}; ${r.cancelled} frame streams cancelled at their deadline, ` +
+      `reset streams whose header the client read: ${r.client.streamResets} (keyframe run ${k.client.streamResets}, skip run ${s.client.streamResets}, ` +
+      `of ${k.dropped} / ${s.dropped} / ${r.dropped} half-written by the hook)`);
+  results.push({ partialDelivery: { browser: browser.version(), resetStreamAt: r.resetStreamAt, cancelled: r.cancelled,
+    streamResets: { keyframe: k.client.streamResets, skip: s.client.streamResets, ref: r.client.streamResets } } });
   await checkProbe('reference recovery');
   // The drop test under reference recovery: the client drops a frame itself,
   // reports it ({"t":"lost"}), and the host answers with a recovery frame.
@@ -2721,6 +2743,8 @@ try {
     if (sc.blockUdpRelay) await ctx.route('**/api/relay/udp*', blockRoute);
     const gwLog0 = gw.log.length;
     const con0 = consoleLines.length;
+    const hostRun = procs.find((p) => p.spawnargs.includes('run'));
+    const hostLog0 = hostRun.log.length;
     await page.click('.host.online a.btn-primary');
     await page.waitForURL(/\/stream\?host=/);
     await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
@@ -2732,6 +2756,18 @@ try {
     const conn = await page.evaluate(() => window.__recon.conn);
     check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1] && conn.renderer === sc.prefs.renderer,
       `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
+    if (conn.transport === 'webtransport') {
+      // GUIDE 2.4: the host logs per session whether the browser's QUIC
+      // endpoint negotiated RESET_STREAM_AT (partial delivery: a cancelled
+      // frame stream still delivers its header); on the splice its peer is
+      // the gateway ("n/a"). Recorded for this browser.
+      const line = (hostRun.log.slice(hostLog0).match(/msg="session started"[^\n]*/g) || []).pop() || '';
+      const rsa = (line.match(/ reset_stream_at=(\S+)/) || [])[1];
+      const want = conn.path === 'relay-splice' ? ['n/a'] : ['yes', 'no'];
+      check(`${sc.name}: the host records whether the browser negotiated RESET_STREAM_AT (partial delivery)`, want.includes(rsa),
+        `Chromium ${browser.version()}: reset_stream_at=${rsa}`);
+      results.push({ resetStreamAt: { scenario: sc.name, path: conn.path, value: rsa ?? null, browser: browser.version() } });
+    }
     if (sc.blockUdpRelay) {
       // The allocation worked; the WebTransport connection to the port did not.
       const why = consoleLines.slice(con0).find((l) => l.includes('relay failed:')) || '';
