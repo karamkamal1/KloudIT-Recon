@@ -120,12 +120,15 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 	if err != nil {
 		return nil, err
 	}
-	var names []string
+	var names, refresh []string
 	for _, e := range caps.Encoders {
 		names = append(names, e.Name)
+		if ir := caps.IntraRefresh(e.Name); ir != "" {
+			refresh = append(refresh, e.Name+"="+ir)
+		}
 	}
 	log.Info("ffmpeg ready", "version", caps.Version, "encoders", strings.Join(names, ","),
-		"ddagrab", caps.Filters["ddagrab"], "gfxcapture", caps.Filters["gfxcapture"])
+		"ddagrab", caps.Filters["ddagrab"], "gfxcapture", caps.Filters["gfxcapture"], "intra_refresh", strings.Join(refresh, ","))
 	be, err := input.NewBackend()
 	if err != nil {
 		return nil, err
@@ -145,6 +148,9 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 	if v := os.Getenv(TestFaultsEnv); v != "" {
 		if a.faults, err = parseTestFaults(v); err != nil {
 			return nil, fmt.Errorf("%s: %w", TestFaultsEnv, err)
+		}
+		if a.faults.intraRefresh && !caps.UseIntraRefresh("libx264") {
+			return nil, fmt.Errorf("%s: intra-refresh needs libx264", TestFaultsEnv)
 		}
 		log.Warn("TEST fault injection is on: video frames are delayed and dropped on purpose", TestFaultsEnv, v)
 	}

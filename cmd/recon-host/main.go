@@ -110,7 +110,11 @@ func main() {
 		fmt.Printf("ffmpeg:     %s\n            %s\n", ff, caps.Version)
 		fmt.Printf("capture:    ddagrab=%v gfxcapture=%v\n", caps.Filters["ddagrab"], caps.Filters["gfxcapture"])
 		for _, e := range caps.Encoders {
-			fmt.Printf("encoder:    %-12s %-5s %s\n", e.Name, e.Family, e.Vendor)
+			ir := ""
+			if m := caps.IntraRefresh(e.Name); m != "" {
+				ir = " intra-refresh=" + m
+			}
+			fmt.Printf("encoder:    %-12s %-5s %s%s\n", e.Name, e.Family, e.Vendor, ir)
 		}
 		rejected := make([]string, 0, len(caps.Rejected))
 		for name := range caps.Rejected {

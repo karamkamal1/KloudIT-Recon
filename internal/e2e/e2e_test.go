@@ -35,6 +35,7 @@ import (
 
 	"github.com/karamkamal1/kloudit-recon/internal/gateway"
 	"github.com/karamkamal1/kloudit-recon/internal/host"
+	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
@@ -297,8 +298,11 @@ type result struct {
 	wallOffsetUs                      int64
 	firstFrameLatency                 time.Duration
 	recovery                          []string           // VideoConfig.Recovery of each config
+	gens                              []uint8            // VideoConfig.Gen of each config
 	dropped                           []proto.Dropped    // the host's "dropped" reports
+	configAt, droppedAt               []time.Time        // when each config and "dropped" report arrived
 	received                          map[[2]uint32]bool // gen, seq of every complete frame
+	payloads                          map[[2]uint32][]byte
 }
 
 // control counts one control message.
@@ -308,6 +312,7 @@ func (r *result) control(m []byte) {
 		Features     []string
 		WallOffsetUs int64
 		Recovery     string
+		Gen          uint8
 	}
 	json.Unmarshal(m, &x)
 	switch x.T {
@@ -319,26 +324,30 @@ func (r *result) control(m []byte) {
 	case "video":
 		r.configs++
 		r.recovery = append(r.recovery, x.Recovery)
+		r.gens = append(r.gens, x.Gen)
+		r.configAt = append(r.configAt, time.Now())
 	case "dropped":
 		var d proto.Dropped
 		json.Unmarshal(m, &d)
 		r.dropped = append(r.dropped, d)
+		r.droppedAt = append(r.droppedAt, time.Now())
 	}
 }
 
 // countFrame parses one frame stream and checks its stage timestamps:
 // capture <= encodeDone <= send, all in the host clock.
 func (r *result) countFrame(b []byte) {
-	h, ext, _, err := proto.ParseFrame(b)
+	h, ext, payload, err := proto.ParseFrame(b)
 	if err != nil {
 		r.badFrames++
 		return
 	}
 	r.frames++
 	if r.received == nil {
-		r.received = map[[2]uint32]bool{}
+		r.received, r.payloads = map[[2]uint32]bool{}, map[[2]uint32][]byte{}
 	}
 	r.received[[2]uint32{uint32(h.Gen), h.Seq}] = true
+	r.payloads[[2]uint32{uint32(h.Gen), h.Seq}] = payload
 	if h.Flags&proto.FrameFlagKey != 0 {
 		r.keyframes++
 	}
@@ -798,5 +807,188 @@ func TestStreamingFrameLoss(t *testing.T) {
 	}
 	if l := e.logs.lines(from, `msg="test fault: delaying frame"`); len(l) < 10 {
 		t.Fatalf("%d delayed frames logged", len(l))
+	}
+}
+
+// Guide step 1.2 with the software encoder standing in for NVENC: the hook's
+// intra-refresh rule runs libx264 with periodic intra refresh (-intra-refresh 1,
+// -g = the refresh period), which the host must announce as recovery "skip"
+// from the encoder arguments it passes (nothing forced). The client side of
+// skip: decoding the received frames in order without the dropped ones gives
+// pictures that carry their own frame barcode again at the latest two refresh
+// periods after each drop, with no IDR in between (libx264 flags each wave's
+// recovery point as a key frame; NVENC flags only IDRs).
+func TestStreamingIntraRefresh(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	const fps, dropEvery = 30, 50
+	t.Setenv(host.TestFaultsEnv, fmt.Sprintf("drop=every:%d,intra-refresh", dropEvery))
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	r := runWTCtl(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 6*time.Second, proto.Prefs{FPS: fps, BitrateKbps: 1500}, nil)
+	t.Logf("received %d frames in %d configs, %d dropped reports, recovery %q", r.frames, r.configs, len(r.dropped), r.recovery)
+	if !r.welcome || r.configs != 1 || r.recovery[0] != proto.RecoverySkip {
+		t.Fatalf("want one generation announcing recovery skip, got %+v", r)
+	}
+	if l := e.logs.lines(from, `msg="encoder ready"`, "recovery=skip"); len(l) != 1 {
+		t.Fatalf("host log: %q", e.logs.lines(from, `msg="encoder ready"`))
+	}
+	period := 15 // media.IntraRefreshPeriod(30): half a second
+	// Generation 1 as the client decodes it: every received frame in order.
+	var seqs []uint32
+	var es bytes.Buffer
+	last := uint32(0)
+	for k := range r.received {
+		if k[0] == 1 {
+			last = max(last, k[1])
+		}
+	}
+	drops := map[uint32]bool{}
+	for _, d := range r.dropped {
+		if d.Gen == 1 {
+			drops[d.FromSeq] = true
+		}
+	}
+	for seq := uint32(0); seq <= last; seq++ {
+		if b, ok := r.payloads[[2]uint32{1, seq}]; ok {
+			seqs = append(seqs, seq)
+			es.Write(b)
+		} else if !drops[seq] {
+			t.Fatalf("seq %d neither received nor reported dropped", seq)
+		}
+	}
+	if len(drops) < 2 || last < 3*dropEvery {
+		t.Fatalf("%d frames dropped in %d frames: too few to check", len(drops), last+1)
+	}
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-flags2", "+showall", "-f", "h264", "-i", "pipe:0",
+		"-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1")
+	cmd.Stdin = &es
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	const w, h = 640, 360
+	shown := map[uint32]bool{} // seqs whose own barcode a decoded picture carries
+	for ; len(out) >= w*h; out = out[w*h:] {
+		if v, ok := proto.BarcodeReadLuma(out[:w*h], w, proto.BarcodeCell); ok {
+			shown[uint32(v)] = true
+		}
+	}
+	checked, healed, within, early := 0, 0, 0, 0
+	lastDrop := -1 // the last dropped seq before the frame
+	for _, seq := range seqs {
+		for d := range drops {
+			if d < seq && int(d) > lastDrop {
+				lastDrop = int(d)
+			}
+		}
+		switch since := int(seq) - lastDrop; {
+		case lastDrop < 0 || since > 2*period:
+			checked++
+			if lastDrop >= 0 {
+				healed++
+			}
+			if !shown[seq] {
+				t.Errorf("seq %d (%d frames after the drop of seq %d) does not show its barcode", seq, since, lastDrop)
+			}
+		default:
+			within++
+			if shown[seq] {
+				early++
+			}
+		}
+	}
+	for v := range shown {
+		if !r.received[[2]uint32{1, v}] {
+			t.Errorf("a decoded picture carries the barcode of seq %d, which was not received", v)
+		}
+	}
+	t.Logf("%d drops (refresh period %d frames): all %d frames before the first drop or over two periods after one (%d) show their barcode; "+
+		"%d of the %d frames within two periods (barcode corner refreshed early or not damaged); %d key frames (libx264 flags each wave's start)",
+		len(drops), period, checked, healed, early, within, r.keyframes)
+	if healed < dropEvery-2*period {
+		t.Fatalf("only %d frames checked over two periods after a drop", healed)
+	}
+	if early == within {
+		t.Fatal("no drop damaged the barcode corner: the test shows nothing")
+	}
+}
+
+// Guide step 1.2, recovery "skip" bounded in time: ddagrab and gfxcapture send
+// a frame only when the screen changes, so after a loss on a desktop that then
+// stops changing, intra refresh gets no frames to heal with. The hook's still
+// rule sends the first 60 frames of every generation (2 s at 30 fps) and drops
+// every 30th: seq 29 of each generation heals by seq 59, two refresh periods
+// later, which the encoder still produces; seq 59 never heals. The host must
+// restart the encoder (overlapped) media.MaxHeal after reporting seq 59, and
+// not after seq 29; the client then gets a key frame within the restart time.
+func TestStreamingIntraRefreshStill(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	const fps, still, dropEvery = 30, 60, 30 // media.IntraRefreshPeriod(30) = 15: heals in 30 frames
+	t.Setenv(host.TestFaultsEnv, fmt.Sprintf("drop=every:%d,intra-refresh,still=after:%d", dropEvery, still))
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	r := runWTCtl(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 2, 10*time.Second, proto.Prefs{FPS: fps, BitrateKbps: 1500}, nil)
+	t.Logf("received %d frames (%d key frames) in %d configs %v, %d dropped reports", r.frames, r.keyframes, r.configs, r.gens, len(r.dropped))
+	if !r.welcome || r.configs < 2 {
+		t.Fatalf("want a restart for the loss that cannot heal, got welcome %v, dropped %+v", r.welcome, r.dropped)
+	}
+	for _, rec := range r.recovery {
+		if rec != proto.RecoverySkip {
+			t.Fatalf("recovery %q, want skip from the encoder arguments", r.recovery)
+		}
+	}
+	// Host side, from its log: every restart is the heal bound's, MaxHeal
+	// after the report of a generation's seq 59 (seq 29's watch ended when
+	// the encoder produced seq 59).
+	logTime := func(line string) time.Time {
+		f, _, _ := strings.Cut(strings.TrimPrefix(line, "time="), " ")
+		at, err := time.Parse(time.RFC3339Nano, f)
+		if err != nil {
+			t.Fatalf("log time in %q: %v", line, err)
+		}
+		return at
+	}
+	restarts := e.logs.lines(from, `msg="restarting video"`)
+	healed := e.logs.lines(from, `msg="restarting video"`, `reason="loss not healed"`, "urgent=false")
+	if len(restarts) != len(healed) || len(healed) < r.configs-1 {
+		t.Fatalf("%d configs, restarts: %q", r.configs, restarts)
+	}
+	for i, line := range healed {
+		gen := r.gens[0] + uint8(i)
+		drops := e.logs.lines(from, `msg="frames dropped"`, fmt.Sprintf(" gen=%d ", gen))
+		if len(drops) != 2 || !strings.Contains(drops[0], " from_seq=29 ") || !strings.Contains(drops[1], " from_seq=59 ") {
+			t.Fatalf("generation %d: drops %q, want seq 29 and 59", gen, drops)
+		}
+		if after := logTime(line).Sub(logTime(drops[1])); after < media.MaxHeal-10*time.Millisecond || after > media.MaxHeal+500*time.Millisecond {
+			t.Errorf("generation %d: restart %v after the report of seq 59 (seq 29: %v), want %v",
+				gen, after, logTime(line).Sub(logTime(drops[0])), media.MaxHeal)
+		}
+	}
+	// Client side: each generation sent seq 0-59 without 29 and 59, nothing
+	// later, and the next one went live within the bound plus a restart.
+	for i := 1; i < r.configs; i++ {
+		prev := uint32(r.gens[i-1])
+		var last time.Time
+		for j, d := range r.dropped {
+			if uint32(d.Gen) == prev {
+				last = r.droppedAt[j]
+			}
+		}
+		for seq := uint32(0); seq <= still; seq++ {
+			if want := seq < still && seq != 29 && seq != 59; r.received[[2]uint32{prev, seq}] != want {
+				t.Errorf("generation %d seq %d: received %v, want %v", prev, seq, !want, want)
+			}
+		}
+		if wait := r.configAt[i].Sub(last); last.IsZero() || wait < media.MaxHeal-300*time.Millisecond || wait > media.MaxHeal+3*time.Second {
+			t.Errorf("generation %d went live %v after generation %d's last drop report, want %v plus a restart", r.gens[i], wait, prev, media.MaxHeal)
+		} else {
+			t.Logf("generation %d: damaged picture replaced %v after the unhealed loss was reported", r.gens[i], wait.Round(time.Millisecond))
+		}
 	}
 }

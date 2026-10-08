@@ -70,7 +70,7 @@ Techniques used (most of them are new to browser-based game streaming):
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
   drops, and the client recovers at once: it skips the frame when the encoder heals the picture
-  with intra refresh, otherwise it asks for a key frame.
+  with intra refresh (NVENC H.264 and HEVC), otherwise it asks for a key frame.
 - **Virtual Xbox controllers** through the ViGEmBus driver's IOCTL interface (no
   ViGEmClient.dll), fed by the browser Gamepad API at 250 Hz.
 
@@ -372,8 +372,11 @@ On Linux the host agent streams a test pattern (`capture: test`) or an X11 displ
 video stream on purpose, so the tests can check the loss handling: for example
 `RECON_TEST_FAULTS="delay=every:97:200ms,drop=every:193"` sends every 97th frame 200 ms late and
 drops every 193rd (reported to the client like a real drop); `recovery=skip|keyframe` overrides
-the recovery mode the host announces (`internal/host/faults.go`). Never set it on a real host;
-the agent logs a warning when it is set.
+the recovery mode the host announces, `intra-refresh` runs libx264 with periodic intra
+refresh, as NVENC runs, so the host announces `skip` from its real encoder arguments, and
+`still=after:N` sends only the first N frames of every encoder generation, like a desktop that
+stops changing (`internal/host/faults.go`). Never set it on a real host; the agent logs a warning
+when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·

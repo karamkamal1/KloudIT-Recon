@@ -472,3 +472,57 @@ type scriptedCtrl struct {
 }
 
 func (c *scriptedCtrl) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// TestHealWatch checks which reported losses the session bounds in time
+// (recovery "skip" from an encoder that heals, HealFrames > 0) and when a
+// watch ends: once the encoder has produced the frame HealFrames after the
+// latest loss, or with a new generation (its key frame). The restart when a
+// watch outlasts media.MaxHeal: internal/e2e TestStreamingIntraRefreshStill.
+func TestHealWatch(t *testing.T) {
+	s, _, _ := testSession(t, testFaults{})
+	until := func() (uint32, bool) {
+		s.healMu.Lock()
+		defer s.healMu.Unlock()
+		if s.heal == nil {
+			return 0, false
+		}
+		return s.heal.seq, true
+	}
+	drop := func(gen uint8, seqs ...uint32) {
+		var fs []*media.Frame
+		for _, seq := range seqs {
+			fs = append(fs, &media.Frame{Gen: gen, Seq: seq})
+		}
+		s.reportDropped(fs, "test")
+	}
+	expect := func(after string, seq uint32, watching bool) {
+		t.Helper()
+		if got, ok := until(); ok != watching || got != seq {
+			t.Fatalf("after %s: watching %v until seq %d, want %v until %d", after, ok, got, watching, seq)
+		}
+	}
+	// Not watched: a skip forced by the test hook on an encoder without intra
+	// refresh (nothing heals it), and recovery keyframe (the client asks).
+	s.healConfig(&proto.VideoConfig{Gen: 1, Recovery: proto.RecoverySkip}, 0)
+	drop(1, 5)
+	expect("a forced skip", 0, false)
+	s.healConfig(&proto.VideoConfig{Gen: 2, Recovery: proto.RecoveryKeyframe}, 30)
+	drop(2, 5)
+	expect("recovery keyframe", 0, false)
+
+	s.healConfig(&proto.VideoConfig{Gen: 3, Recovery: proto.RecoverySkip}, 30)
+	drop(2, 9) // an earlier generation's frame left in the queue
+	expect("a superseded generation's loss", 0, false)
+	drop(3, 10)
+	expect("a loss", 40, true)
+	s.healFrame(&media.Frame{Gen: 3, Seq: 39})
+	expect("seq 39", 40, true)
+	drop(3, 20, 21) // later losses move the frame on, not the deadline
+	expect("two more losses", 51, true)
+	s.healFrame(&media.Frame{Gen: 3, Seq: 51})
+	expect("seq 51", 0, false)
+	drop(3, 60)
+	expect("another loss", 90, true)
+	s.healConfig(&proto.VideoConfig{Gen: 4, Recovery: proto.RecoverySkip}, 30)
+	expect("a new generation", 0, false)
+}

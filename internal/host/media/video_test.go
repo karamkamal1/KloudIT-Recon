@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -367,6 +368,39 @@ func TestVideoFailureEvent(t *testing.T) {
 	ev = failure("live failure")
 	if ev.Failed == nil || ev.Failed.Encoder.Name != enc.Name || !ev.Live || ev.EncoderFault {
 		t.Fatalf("live failure: %v: failed %+v live %v fault %v, want %s, live, no encoder fault", ev.Err, ev.Failed, ev.Live, ev.EncoderFault, enc.Name)
+	}
+
+	// Never sends a key frame (a wrapper drops them from FFmpeg's output):
+	// the generation cannot go live and must fail instead of hanging, as an
+	// encoder fault (the session excludes an encoder after two).
+	if runtime.GOOS == "windows" {
+		return
+	}
+	wrapper := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\n# all arguments but the last (pipe:1), then drop the key frames\n" +
+		"n=$#; i=0; for a in \"$@\"; do i=$((i+1)); [ $i -lt $n ] && set -- \"$@\" \"$a\"; done; shift $n\n" +
+		"exec " + caps.FFmpeg + " \"$@\" -bsf:v noise=drop=key pipe:1\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	noKeys := *caps
+	noKeys.FFmpeg = wrapper
+	v2 := NewVideo(&noKeys, nil, func() uint64 { return uint64(time.Since(start).Microseconds()) })
+	defer v2.Stop()
+	if err := v2.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-v2.Events():
+		if ev.Err == nil || !strings.Contains(ev.Err.Error(), "without a key frame") || ev.Failed == nil || ev.Live || !ev.EncoderFault {
+			t.Fatalf("no key frames: event %+v", ev)
+		}
+		t.Logf("no key frames: %v", ev.Err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("no key frames: no failure event")
+	}
+	if _, ok := v2.Current(); ok {
+		t.Fatal("the generation without key frames is still current")
 	}
 }
 

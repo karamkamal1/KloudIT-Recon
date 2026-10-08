@@ -20,6 +20,14 @@ import (
 //	                  written, as if it had failed, and report it ({"t":"dropped"})
 //	recovery=skip|keyframe  announce this recovery mode in every VideoConfig
 //	                  instead of the encoder's
+//	intra-refresh     run libx264 with periodic intra refresh, as the probe
+//	                  enables it for NVENC: the host then announces the
+//	                  recovery from the real encoder arguments (skip)
+//	still=after:N     only the first N frames of every generation go out, as
+//	                  from a desktop that stops changing (ddagrab and
+//	                  gfxcapture send frames only on change); the session
+//	                  discards the encoder's later frames before anything else
+//	                  sees them
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -32,9 +40,15 @@ type testFaults struct {
 	delay      time.Duration
 	dropEvery  int
 	recovery   string
+	// intraRefresh makes libx264 use periodic intra refresh (NewAgent:
+	// media.Caps.UseIntraRefresh).
+	intraRefresh bool
+	stillAfter   int // frames of a generation before its source goes still
 }
 
-func (f testFaults) active() bool { return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" }
+func (f testFaults) active() bool {
+	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.stillAfter > 0
+}
 
 // at returns what happens to the nth frame (n from 1).
 func (f testFaults) at(n int) (drop bool, delay time.Duration) {
@@ -84,8 +98,19 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: want recovery=%s|%s", rule, proto.RecoverySkip, proto.RecoveryKeyframe)
 			}
 			f.recovery = val
+		case "intra-refresh":
+			if val != "" {
+				return f, fmt.Errorf("%s: intra-refresh takes no value", rule)
+			}
+			f.intraRefresh = true
+		case "still":
+			n, err := strconv.Atoi(strings.TrimPrefix(val, "after:"))
+			if !strings.HasPrefix(val, "after:") || err != nil || n < 1 {
+				return f, fmt.Errorf("%s: want still=after:N", rule)
+			}
+			f.stillAfter = n
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, still)", rule)
 		}
 	}
 	return f, nil

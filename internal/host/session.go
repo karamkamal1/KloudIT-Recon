@@ -67,6 +67,14 @@ type Session struct {
 	encFails map[string]int    // encoder -> its own start failures since a generation last went live
 	triedMu  sync.Mutex        // guards tried, usage and encFails
 
+	// Recovery "skip" bounded in time (watchHeal), guarded by healMu: the
+	// live generation, how many frames after a lost one it needs to heal it
+	// (0: it announced "keyframe"), and its reported loss not yet healed.
+	healMu     sync.Mutex
+	healGen    uint8
+	healFrames int
+	heal       *healWatch
+
 	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
 	audioKbps atomic.Int64             // audio bitrate while audio runs
 
@@ -562,11 +570,16 @@ func (s *Session) videoEvents() {
 				c.Recovery = r
 				ev.Config = &c
 			}
+			s.healConfig(ev.Config, ev.HealFrames)
 			s.sendJSON(ev.Config)
 		case ev.Frame != nil:
 			if s.paused.Load() {
 				continue
 			}
+			if n := s.a.faults.stillAfter; n > 0 && ev.Frame.Seq >= uint32(n) {
+				continue // test hook: a still desktop, the source sends nothing
+			}
+			s.healFrame(ev.Frame)
 			select {
 			case s.frameQ <- ev.Frame:
 			default:
@@ -619,11 +632,92 @@ func (s *Session) reportDropped(frames []*media.Frame, why string) {
 	for _, m := range msgs {
 		s.log.Info("frames dropped", "why", why, "gen", m.Gen, "from_seq", m.FromSeq, "count", m.Count)
 	}
+	s.watchHeal(frames)
 	go func() {
 		for _, m := range msgs {
 			s.sendJSON(m)
 		}
 	}()
+}
+
+// healWatch is a reported loss in a generation with recovery "skip": the
+// picture is whole again once the encoder has produced frame seq.
+type healWatch struct{ seq uint32 }
+
+// healConfig notes the generation going live. Its losses heal by themselves
+// when it announces recovery "skip" from an encoder that refreshes
+// (healFrames > 0; a skip forced by the test hook on an encoder without intra
+// refresh never heals and is not watched). Its key frame also ends the damage
+// of an earlier generation's loss.
+func (s *Session) healConfig(c *proto.VideoConfig, healFrames int) {
+	s.healMu.Lock()
+	defer s.healMu.Unlock()
+	s.healGen, s.healFrames, s.heal = c.Gen, 0, nil
+	if c.Recovery == proto.RecoverySkip {
+		s.healFrames = healFrames
+	}
+}
+
+// watchHeal bounds the damage of dropped frames (the client skips them under
+// recovery "skip") in time. Intra refresh restores the picture healFrames
+// frames after a loss, but the capture sources send a frame only when the
+// screen changes (ddagrab without dup_frames, gfxcapture), so on a still
+// desktop that never happens, and a game rendering below the stream's rate
+// takes longer than the frame count assumes. When the encoder has not
+// produced that frame within media.MaxHeal of the first loss that has not
+// healed (later losses only move the frame on), healDue restarts it.
+func (s *Session) watchHeal(frames []*media.Frame) {
+	s.healMu.Lock()
+	defer s.healMu.Unlock()
+	for _, f := range frames {
+		if s.healFrames == 0 || f.Gen != s.healGen {
+			continue
+		}
+		seq := f.Seq + uint32(s.healFrames)
+		if w := s.heal; w != nil {
+			w.seq = max(w.seq, seq)
+			continue
+		}
+		w := &healWatch{seq: seq}
+		s.heal = w
+		time.AfterFunc(media.MaxHeal, func() { s.healDue(w) })
+	}
+}
+
+// healFrame ends the watch when the encoder produces the frame from which the
+// picture is whole again.
+func (s *Session) healFrame(f *media.Frame) {
+	s.healMu.Lock()
+	if w := s.heal; w != nil && f.Gen == s.healGen && f.Seq >= w.seq {
+		s.heal = nil
+	}
+	s.healMu.Unlock()
+}
+
+// healDue runs media.MaxHeal after watch w opened: if it is still open, the
+// picture has not healed, and an overlapped restart delivers a key frame (the
+// damaged picture stays on screen until then instead of freezing). A restart
+// under way already delivers one.
+func (s *Session) healDue(w *healWatch) {
+	s.healMu.Lock()
+	due := s.heal == w
+	if due {
+		s.heal = nil
+	}
+	s.healMu.Unlock()
+	if !due || s.ctx.Err() != nil || s.paused.Load() {
+		return
+	}
+	s.kickMu.Lock()
+	if time.Since(s.lastKick) < 500*time.Millisecond {
+		s.kickMu.Unlock()
+		return
+	}
+	s.lastKick = time.Now()
+	s.kickMu.Unlock()
+	if err := s.startVideo(false, "loss not healed"); err != nil {
+		s.log.Warn("restart after an unhealed loss failed", "err", err)
+	}
 }
 
 // encoderLive resets the failure counts when a generation goes live: capture

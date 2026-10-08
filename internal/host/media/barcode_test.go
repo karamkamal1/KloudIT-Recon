@@ -139,8 +139,9 @@ func TestBarcodeFilter(t *testing.T) {
 }
 
 // decodeLuma decodes a generation's frames in order with FFmpeg (H.264 as
-// Annex B, AV1 in IVF) and returns each picture's luma plane.
-func decodeLuma(t *testing.T, ffmpeg, family string, frames []*Frame, w, h int) [][]byte {
+// Annex B, AV1 in IVF) and returns each picture's luma plane. decOpts are
+// decoder options.
+func decodeLuma(t *testing.T, ffmpeg, family string, frames []*Frame, w, h int, decOpts ...string) [][]byte {
 	t.Helper()
 	var in bytes.Buffer
 	format := "h264"
@@ -172,8 +173,9 @@ func decodeLuma(t *testing.T, ffmpeg, family string, frames []*Frame, w, h int) 
 		t.Fatalf("no decoder set up for %s", family)
 	}
 	var out, stderr bytes.Buffer
-	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", format, "-i", "pipe:0",
-		"-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1")
+	args := append([]string{"-hide_banner", "-loglevel", "error"}, decOpts...)
+	args = append(args, "-f", format, "-i", "pipe:0", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1")
+	cmd := exec.Command(ffmpeg, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = &in, &out, &stderr
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("decoding: %v: %s", err, stderr.String())

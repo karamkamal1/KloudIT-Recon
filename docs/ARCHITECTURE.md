@@ -108,6 +108,21 @@ What the client does about a lost frame depends on `recovery` in the `video` mes
   most 1 s, so a skipped loss heals within 2 s: NVENC `-intra-refresh 1` (FFmpeg then uses `-g`
   as the refresh period: `-g` ≤ fps) or AMF H.264 `-intra_refresh_mb N` (macroblocks per frame:
   ceil(macroblocks per picture / N) ≤ fps).
+  Today that is h264_nvenc and hevc_nvenc: the probe test-encodes them with the host's NVENC
+  arguments plus `-intra-refresh 1 -single-slice-intra-refresh 1`, then with `-intra-refresh 1`
+  alone, over two refresh waves (FFmpeg refuses to open NVENC with a mode the GPU lacks), and the
+  host passes the first mode that works with `-g` = half a second of frames
+  (`media.IntraRefreshPeriod`), so a skipped loss heals within 0.5-1 s. `-forced-idr 1` stays,
+  and the first frame of every generation is still an IDR with the parameter sets in front of it.
+  av1_nvenc keeps `keyframe`: an AV1 frame also inherits entropy-coding state and motion-vector
+  candidates from its references, which intra refresh does not restore. AMF keeps `keyframe` too
+  (`-intra_refresh_mb` on h264_amf is unverified, see docs/VENDOR_NOTES.md 1.2).
+  Those bounds count frames, and ddagrab and gfxcapture send a frame only when the screen
+  changes, so a desktop that goes still after a loss would keep the damage. The host therefore
+  also bounds it in time: when the encoder has not produced the frame two refresh periods after
+  a loss it reported (`media.HealFrames`) within 2 s (`media.MaxHeal`), it restarts the encoder,
+  overlapped, and the new generation's first frame (an IDR of the current picture) replaces the
+  damaged one.
 - `keyframe` (everything else, and hosts before the field): the client asks for a key frame
   (`{"t":"keyframe"}`), which on the FFmpeg path is a new encoder generation.
 

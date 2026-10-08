@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,7 +47,36 @@ type Caps struct {
 
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
+	// intraRefresh holds the periodic intra refresh mode (IntraRefreshOn,
+	// IntraRefreshSingleSlice) of the encoders that run with one.
+	intraRefresh map[string]string
 }
+
+// Periodic intra refresh modes (Caps.IntraRefresh).
+const (
+	IntraRefreshOn          = "on"           // a refreshing frame may have several slices
+	IntraRefreshSingleSlice = "single-slice" // one slice per frame (NVENC -single-slice-intra-refresh)
+)
+
+// intraRefreshEncoders are the encoders the probe tries periodic intra refresh
+// on, so a lost frame heals without a key frame (recovery "skip"). Not:
+//   - av1_nvenc: an AV1 frame inherits more than pixels from its references:
+//     the entropy coding state (CDFs), segmentation and loop filter deltas of
+//     its primary reference frame, and saved motion vectors that decide how
+//     many symbols the decoder reads. A refresh restores the pixels, not that
+//     state, so after a skipped frame the decoder can misread every later
+//     frame until a key frame (never, with an infinite GOP) unless the
+//     encoder codes frames error resilient, which NVENC has no switch for;
+//     dav1d rejected 7 of 12 skips in step 1.4. AV1 recovers with key frames
+//     until an NVIDIA host shows otherwise (docs/VENDOR_NOTES.md, 1.2). H.264
+//     and HEVC start entropy coding afresh in every slice and read a fixed
+//     number of candidate symbols: a missing reference only damages pixels.
+//   - h264_amf (-intra_refresh_mb): AMF does not document whether refreshed
+//     macroblocks may predict from not yet refreshed ones (then the picture
+//     need not heal), nor how it combines with ultra low latency and an
+//     infinite GOP. Unverified on hardware, so AMD keeps key frames; Phase 3
+//     recovers from long-term references instead.
+var intraRefreshEncoders = map[string]bool{"h264_nvenc": true, "hevc_nvenc": true}
 
 // candidate encoders in preference order within a family.
 var candidates = []EncoderInfo{
@@ -100,7 +130,7 @@ func quietCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 // Probe inspects the ffmpeg build and test-encodes with every candidate encoder.
 func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) {
 	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{},
-		optValues: map[string]map[string]map[string]bool{}}
+		optValues: map[string]map[string]map[string]bool{}, intraRefresh: map[string]string{}}
 	out, err := quietCmd(ctx, ffmpeg, "-hide_banner", "-version").Output()
 	if err != nil {
 		return nil, fmt.Errorf("running ffmpeg: %w", err)
@@ -157,9 +187,23 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			defer wg.Done()
 			opts, vals := encoderOptions(ctx, ffmpeg, e.Name)
 			err := testEncode(ctx, ffmpeg, e)
+			ir := ""
+			if err == nil && intraRefreshEncoders[e.Name] {
+				// After the plain test, in this goroutine: at most one test
+				// session per encoder at a time (NVENC session limits).
+				ir = probeIntraRefresh(e, opts, vals, func(frames int, extra ...string) error {
+					return testEncodeFrames(ctx, ffmpeg, e, frames, extra...)
+				})
+				if ir == "" && log != nil {
+					log.Info("intra refresh unavailable: lost frames need key frames", "encoder", e.Name)
+				}
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			c.options[e.Name], c.optValues[e.Name] = opts, vals
+			if ir != "" {
+				c.intraRefresh[e.Name] = ir
+			}
 			if err == nil {
 				ok[e.Name] = true
 			} else {
@@ -182,20 +226,29 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	return c, nil
 }
 
+// testEncode encodes three frames with an encoder.
 func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
+	return testEncodeFrames(ctx, ffmpeg, e, 3)
+}
+
+// testEncodeFrames encodes frames black 640x360 frames at testEncodeFPS with
+// an encoder and its extra arguments.
+func testEncodeFrames(ctx context.Context, ffmpeg string, e EncoderInfo, frames int, extra ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
 	if e.Vendor == "vaapi" {
 		args = append(args, "-vaapi_device", vaapiDevice())
 	}
-	args = append(args, "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30", "-frames:v", "3")
+	args = append(args, "-f", "lavfi", "-i", "color=c=black:s=640x360:r="+strconv.Itoa(testEncodeFPS), "-frames:v", strconv.Itoa(frames))
 	if e.Vendor == "vaapi" {
 		args = append(args, "-vf", "format=nv12,hwupload")
 	} else {
 		args = append(args, "-pix_fmt", "yuv420p")
 	}
-	args = append(args, "-c:v", e.Name, "-f", "null", "-")
+	args = append(args, "-c:v", e.Name)
+	args = append(args, extra...)
+	args = append(args, "-f", "null", "-")
 	var stderr bytes.Buffer
 	cmd := quietCmd(ctx, ffmpeg, args...)
 	cmd.Stderr = &stderr
@@ -203,6 +256,41 @@ func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 		return fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
 	}
 	return nil
+}
+
+// testEncodeFPS is the frame rate of the probe's test encodes.
+const testEncodeFPS = 30
+
+// probeIntraRefresh returns the periodic intra refresh mode encoder e (with
+// these options and option values) runs with ("" = none); test runs the
+// probe's test encode over frames frames with extra arguments. FFmpeg refuses
+// to open NVENC with intra refresh or single slice intra refresh where the GPU
+// lacks it (NV_ENC_CAPS_SUPPORT_INTRA_REFRESH,
+// NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH), so the test encode is the
+// capability check. It runs the encoder arguments the host passes in that mode
+// (encoderArgs, the refresh period as -g) over two refresh waves, so a
+// combination the driver rejects, or a refreshing frame FFmpeg cannot handle,
+// costs the mode here instead of failing every stream. Single slice first:
+// every frame stays one slice, which codes better than the extra slices of a
+// refreshing frame (Sunshine prefers it too).
+func probeIntraRefresh(e EncoderInfo, opts map[string]bool, vals map[string]map[string]bool, test func(frames int, extra ...string) error) string {
+	if !opts["intra-refresh"] {
+		return ""
+	}
+	works := func(mode string) bool {
+		c := &Caps{options: map[string]map[string]bool{e.Name: opts}, optValues: map[string]map[string]map[string]bool{e.Name: vals},
+			intraRefresh: map[string]string{e.Name: mode}}
+		period := IntraRefreshPeriod(testEncodeFPS)
+		p := Params{Encoder: e, FPS: testEncodeFPS, BitrateKbps: 2000}
+		return test(2*period+2, c.encoderArgs(p, 100, period)...) == nil
+	}
+	if opts["single-slice-intra-refresh"] && works(IntraRefreshSingleSlice) {
+		return IntraRefreshSingleSlice
+	}
+	if works(IntraRefreshOn) {
+		return IntraRefreshOn
+	}
+	return ""
 }
 
 // testCaptureClock runs the exact capture-clock filter and encoder time base
@@ -307,6 +395,40 @@ func (c *Caps) Families() map[string]EncoderInfo {
 		}
 	}
 	return m
+}
+
+// IntraRefresh returns the periodic intra refresh mode an encoder runs with
+// (IntraRefreshOn, IntraRefreshSingleSlice), or "" when it has none and a lost
+// frame needs a key frame.
+func (c *Caps) IntraRefresh(enc string) string { return c.intraRefresh[enc] }
+
+// UseIntraRefresh makes enc run with periodic intra refresh as if the probe
+// had found it. TESTS ONLY (host RECON_TEST_FAULTS intra-refresh): libx264's
+// -intra-refresh with -g as the period behaves like NVENC's, so the software
+// encoder exercises the recovery "skip" path. Reports whether enc has the
+// option.
+func (c *Caps) UseIntraRefresh(enc string) bool {
+	if !c.HasOption(enc, "intra-refresh") {
+		return false
+	}
+	if c.intraRefresh == nil {
+		c.intraRefresh = map[string]string{}
+	}
+	c.intraRefresh[enc] = IntraRefreshOn
+	return true
+}
+
+// intraRefreshSeconds is the periodic intra refresh period. A frame lost at a
+// random point heals after one to two periods (see Recovery), so half a
+// second heals within 0.5-1 s; a shorter period costs more bits on every
+// frame (each frame intra-codes 1/(period - 1) of the picture).
+const intraRefreshSeconds = 0.5
+
+// IntraRefreshPeriod returns the intra refresh period in frames at fps, which
+// is -g with intra refresh: at least 2 (NVENC refreshes over period - 1
+// frames).
+func IntraRefreshPeriod(fps int) int {
+	return max(2, int(math.Round(float64(fps)*intraRefreshSeconds)))
 }
 
 // HasOption reports whether an encoder exposes a private AVOption.
@@ -544,6 +666,13 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	case "intel":
 		gop = min(gop, 65535)
 	}
+	if c.intraRefresh[e.Name] != "" {
+		// Periodic intra refresh instead of key frames: FFmpeg's NVENC (and
+		// libx264) take -g as the refresh period and send no IDR after the
+		// first frame. With intra refresh, an hour of frames would also be an
+		// hour of damage after a loss.
+		gop = IntraRefreshPeriod(p.FPS)
+	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)
 	if p.CaptureClock {
@@ -587,6 +716,20 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 		opt("no-scenecut", "1")
 		opt("forced-idr", "1")
 		opt("strict_gop", "1")
+		if ir := c.intraRefresh[e.Name]; ir != "" {
+			// Heal a lost frame without a key frame (recovery "skip"). FFmpeg
+			// 8.1 nvenc.c then makes the GOP and IDR period infinite and uses
+			// -g (BuildArgs: IntraRefreshPeriod) as intraRefreshPeriod,
+			// refreshing over -g - 1 frames; the first frame stays an IDR
+			// with the parameter sets in the extradata, which
+			// PrepareKeyFrame puts in front of it. forced-idr keeps a forced
+			// key frame an IDR (without it NVENC would start a refresh wave,
+			// which the host cannot switch generations on).
+			opt("intra-refresh", "1")
+			if ir == IntraRefreshSingleSlice {
+				opt("single-slice-intra-refresh", "1")
+			}
+		}
 		if p.Quality != "speed" {
 			opt("spatial-aq", "1")
 		}
@@ -667,6 +810,9 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 			}
 			opt("preset", preset)
 			opt("tune", "zerolatency")
+			if c.intraRefresh[e.Name] != "" {
+				opt("intra-refresh", "1") // tests only (UseIntraRefresh)
+			}
 			a = append(a, common...)
 		case "libsvtav1":
 			opt("preset", "12")
@@ -703,23 +849,33 @@ func RetryUsage(e EncoderInfo) string {
 // the loss are predicted from the lost frame afterwards, so they are clean
 // again only after the next whole wave. The refresh period must therefore be
 // at most maxHealSeconds / 2 (1 s: -g <= fps for NVENC).
+//
+// Periods count encoded frames, and the source need not deliver the stream's
+// frame rate: ddagrab (dup_frames=0) and gfxcapture send a frame only when the
+// screen changes, so a still desktop sends none, and a game may render below
+// the stream's rate. So the session also bounds the damage in time (MaxHeal).
 const maxHealSeconds = 2
 
-// Recovery returns how a client recovers from a lost frame of a generation
-// encoded with these encoder arguments at w×h and fps (proto.VideoConfig
-// Recovery). Skipping the frame needs an encoder that heals the picture by
-// itself, with intra refresh whose worst case (two periods) stays within
-// maxHealSeconds:
+// MaxHeal is maxHealSeconds as a duration: when the encoder has not produced
+// the HealFrames frames after a lost one within MaxHeal of the loss, the
+// session restarts it, and the new generation starts with a key frame.
+const MaxHeal = maxHealSeconds * time.Second
+
+// HealFrames returns how many frames after a lost one an encoder with these
+// encoder arguments at w×h needs to restore the whole picture by itself: two
+// periods of its intra refresh, or 0 without intra refresh (a lost frame needs
+// a key frame).
 //   - NVENC -intra-refresh 1: FFmpeg makes the GOP infinite and uses -g as
 //     the refresh period (intraRefreshPeriod = -g, spread over -g - 1 frames),
 //     so -g must be short; the default (an hour of frames) heals nothing.
+//     BuildArgs sets IntraRefreshPeriod (half a second) wherever the probe
+//     found intra refresh; libx264's -intra-refresh (tests) works the same.
 //   - AMF H.264 -intra_refresh_mb N > 0: N macroblocks per frame, a period of
 //     ceil(macroblocks per picture / N) frames, repeated continuously.
 //
 // The arguments are the ones actually passed (encoderArgs drops options the
-// encoder lacks), so this follows what the encoder can do. Anything else
-// needs a key frame.
-func Recovery(args []string, w, h, fps int) string {
+// encoder lacks), so this follows what the encoder can do.
+func HealFrames(args []string, w, h int) int {
 	val := func(name string) (int, bool) {
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "-"+name {
@@ -735,17 +891,26 @@ func Recovery(args []string, w, h, fps int) string {
 		}
 		return 0, false
 	}
-	maxFrames := maxHealSeconds * max(fps, 1) / 2 // longest refresh period
 	if on, ok := val("intra-refresh"); ok && on == 1 {
-		if g, ok := val("g"); ok && g > 0 && g <= maxFrames {
-			return proto.RecoverySkip
+		if g, ok := val("g"); ok && g > 0 {
+			return 2 * g
 		}
 	}
 	if n, ok := val("intra_refresh_mb"); ok && n > 0 && w > 0 && h > 0 {
 		mbs := ((w + 15) / 16) * ((h + 15) / 16)
-		if (mbs+n-1)/n <= maxFrames {
-			return proto.RecoverySkip
-		}
+		return 2 * ((mbs + n - 1) / n)
+	}
+	return 0
+}
+
+// Recovery returns how a client recovers from a lost frame of a generation
+// encoded with these encoder arguments at w×h and fps (proto.VideoConfig
+// Recovery). Skipping the frame needs an encoder that heals the picture by
+// itself (HealFrames) within maxHealSeconds at fps; anything else needs a key
+// frame.
+func Recovery(args []string, w, h, fps int) string {
+	if n := HealFrames(args, w, h); n > 0 && n <= maxHealSeconds*max(fps, 1) {
+		return proto.RecoverySkip
 	}
 	return proto.RecoveryKeyframe
 }

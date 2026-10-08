@@ -50,6 +50,10 @@ type VideoEvent struct {
 	Failed       *Params
 	Live         bool
 	EncoderFault bool
+	// HealFrames, with Config: how many frames after a lost one the
+	// generation's encoder needs to restore the picture by itself
+	// (HealFrames of its arguments; 0: a lost frame needs a key frame).
+	HealFrames int
 }
 
 // encoderFault reports whether an encoder process's stderr shows that the
@@ -250,6 +254,7 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 	var wallOff int64 // CaptureClock: wall clock minus host clock (µs)
 	var wallOffAt uint64
 	warnedStamp := false
+	noKey := 0 // frames before the generation's first key frame
 	defer func() {
 		select {
 		case <-pr.errDone:
@@ -329,8 +334,22 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 		switch {
 		case v.pending == pr:
 			if !f.Key {
+				// Cannot switch on a non-key frame. Every encoder starts with
+				// one (NVENC with intra refresh too: only later frames
+				// refresh instead of an IDR), so a generation that sends
+				// none would otherwise hang unnoticed: it fails, as an
+				// encoder fault (the source delivers frames).
+				if noKey++; noKey < max(2*pr.params.FPS, 30) {
+					v.mu.Unlock()
+					continue
+				}
+				v.pending = nil
+				pr.kill()
 				v.mu.Unlock()
-				continue // cannot switch on a non-key frame
+				failed := pr.params
+				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s sent %d frames without a key frame", pr.params.Encoder.Name, noKey), Failed: &failed,
+					EncoderFault: true})
+				return
 			}
 			if v.active != nil {
 				v.active.kill()
@@ -347,7 +366,7 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 					"startup", time.Since(pr.started).Round(time.Millisecond), "recovery", cfg.Recovery)
 			}
 			v.mu.Unlock()
-			v.emit(VideoEvent{Config: cfg})
+			v.emit(VideoEvent{Config: cfg, HealFrames: HealFrames(pr.args, st.Width, st.Height)})
 			v.emit(VideoEvent{Frame: f})
 		case v.active == pr:
 			v.mu.Unlock()

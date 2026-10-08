@@ -3,11 +3,13 @@ package media
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -208,29 +210,144 @@ func TestAMDEncoderArgs(t *testing.T) {
 }
 
 // TestNVIDIAEncoderArgs checks that the NVENC arguments survive the value
-// filtering against FFmpeg 8.1's option lists unchanged.
+// filtering against FFmpeg 8.1's option lists unchanged, without intra refresh
+// (a GPU without it) and with each mode the probe can find (guide step 1.2):
+// -intra-refresh 1 (and -single-slice-intra-refresh 1) with -g = the refresh
+// period of half a second, forced-idr kept.
 func TestNVIDIAEncoderArgs(t *testing.T) {
-	c := ffmpeg81Caps(t)
 	for _, tc := range []struct {
 		enc     string
 		profile string
-	}{{"hevc_nvenc", "main"}, {"h264_nvenc", "high"}, {"av1_nvenc", ""}} {
-		got := encoderArgMap(t, c, Params{Encoder: encoderNamed(tc.enc), FPS: 60, BitrateKbps: 20000, Quality: "balanced"})
+		ir      string // intra refresh mode found by the probe
+		fps     int
+		g       string
+	}{
+		{"hevc_nvenc", "main", "", 60, "216000"},
+		{"h264_nvenc", "high", "", 60, "216000"},
+		{"av1_nvenc", "", "", 60, "216000"},
+		{"hevc_nvenc", "main", IntraRefreshSingleSlice, 60, "30"},
+		{"h264_nvenc", "high", IntraRefreshSingleSlice, 120, "60"},
+		{"hevc_nvenc", "main", IntraRefreshOn, 144, "72"},
+		{"h264_nvenc", "high", IntraRefreshOn, 30, "15"},
+	} {
+		c := ffmpeg81Caps(t)
+		if tc.ir != "" {
+			c.intraRefresh = map[string]string{tc.enc: tc.ir}
+		}
+		got := encoderArgMap(t, c, Params{Encoder: encoderNamed(tc.enc), FPS: tc.fps, BitrateKbps: 20000, Quality: "balanced"})
 		want := map[string]string{
 			"preset": "p3", "tune": "ull", "rc": "cbr", "multipass": "disabled", "zerolatency": "1", "delay": "0",
 			"rc-lookahead": "0", "no-scenecut": "1", "forced-idr": "1", "strict_gop": "1", "spatial-aq": "1",
-			"b:v": "20000k", "maxrate": "20000k", "bufsize": "500k", "g": "216000", "bf": "0",
+			"b:v": "20000k", "maxrate": "20000k", "bufsize": strconv.Itoa(20000*3/2/tc.fps) + "k", "g": tc.g, "bf": "0",
 		}
 		if tc.profile != "" {
 			want["profile"] = tc.profile
 		}
+		if tc.ir != "" {
+			want["intra-refresh"] = "1"
+		}
+		if tc.ir == IntraRefreshSingleSlice {
+			want["single-slice-intra-refresh"] = "1"
+		}
 		for k, v := range want {
 			if got[k] != v {
-				t.Errorf("%s: -%s %q, want %q", tc.enc, k, got[k], v)
+				t.Errorf("%s (intra refresh %q, %d fps): -%s %q, want %q", tc.enc, tc.ir, tc.fps, k, got[k], v)
 			}
 		}
 		if len(got) != len(want) {
-			t.Errorf("%s: %d arguments, want %d: %v", tc.enc, len(got), len(want), got)
+			t.Errorf("%s (intra refresh %q): %d arguments, want %d: %v", tc.enc, tc.ir, len(got), len(want), got)
+		}
+	}
+}
+
+// TestIntraRefreshEncoders checks which encoders the probe tries intra refresh
+// on and how it picks the mode: single slice where the encoder has the option
+// and the test encode passes, else plain, else none (a GPU without
+// NV_ENC_CAPS_SUPPORT_INTRA_REFRESH fails both test encodes). Each test encode
+// runs the host's NVENC arguments in that mode over two refresh waves.
+func TestIntraRefreshEncoders(t *testing.T) {
+	c := ffmpeg81Caps(t)
+	for enc, want := range map[string]bool{"h264_nvenc": true, "hevc_nvenc": true, "av1_nvenc": false,
+		"h264_amf": false, "hevc_amf": false, "av1_amf": false, "libx264": false} {
+		if intraRefreshEncoders[enc] != want {
+			t.Errorf("probe tries intra refresh on %s: %v, want %v", enc, !want, want)
+		}
+	}
+	// FFmpeg 8.1: single slice intra refresh only for H.264 and HEVC.
+	for enc, want := range map[string]bool{"h264_nvenc": true, "hevc_nvenc": true, "av1_nvenc": false} {
+		if !c.HasOption(enc, "intra-refresh") || c.HasOption(enc, "single-slice-intra-refresh") != want {
+			t.Errorf("%s: -intra-refresh %v, -single-slice-intra-refresh %v", enc, c.HasOption(enc, "intra-refresh"),
+				c.HasOption(enc, "single-slice-intra-refresh"))
+		}
+	}
+	errNo := errors.New("Intra refresh not supported by the device")
+	for _, tc := range []struct {
+		enc          string
+		single, mode error // test encode results with single slice / plain intra refresh
+		want         string
+		tries        int
+	}{
+		{"hevc_nvenc", nil, nil, IntraRefreshSingleSlice, 1},
+		{"h264_nvenc", errNo, nil, IntraRefreshOn, 2},
+		{"hevc_nvenc", errNo, errNo, "", 2},
+		{"av1_nvenc", nil, nil, IntraRefreshOn, 1}, // no single slice option: not tried
+		{"hevc_amf", nil, nil, "", 0},              // no -intra-refresh
+	} {
+		var tries [][]string
+		got := probeIntraRefresh(encoderNamed(tc.enc), c.options[tc.enc], c.optValues[tc.enc], func(frames int, extra ...string) error {
+			tries = append(tries, extra)
+			// The host's own arguments in the mode, -g = the refresh period
+			// at the test encode's 30 fps, over two refresh waves.
+			m := map[string]string{}
+			for i := 0; i+1 < len(extra); i += 2 {
+				m[strings.TrimPrefix(extra[i], "-")] = extra[i+1]
+			}
+			single := m["single-slice-intra-refresh"] == "1"
+			if m["intra-refresh"] != "1" || m["g"] != "15" || m["bf"] != "0" || m["tune"] != "ull" || m["forced-idr"] != "1" ||
+				frames <= 2*15 || single != (len(tries) == 1 && c.HasOption(tc.enc, "single-slice-intra-refresh")) {
+				t.Errorf("%s: test encode of %d frames with %q", tc.enc, frames, extra)
+			}
+			if single {
+				return tc.single
+			}
+			return tc.mode
+		})
+		if got != tc.want || len(tries) != tc.tries {
+			t.Errorf("%s: mode %q after %d test encodes %q, want %q after %d", tc.enc, got, len(tries), tries, tc.want, tc.tries)
+		}
+	}
+	// The test hook: libx264 only where it has the option.
+	c.options["libx264"] = map[string]bool{"intra-refresh": true}
+	if c.UseIntraRefresh("libsvtav1") || !c.UseIntraRefresh("libx264") || c.IntraRefresh("libx264") != IntraRefreshOn {
+		t.Error("UseIntraRefresh")
+	}
+}
+
+// TestIntraRefreshPeriod checks the refresh period (half a second, -g with
+// intra refresh) and that every frame rate the host streams at gets recovery
+// skip from it: two periods within maxHealSeconds.
+func TestIntraRefreshPeriod(t *testing.T) {
+	for fps, want := range map[int]int{1: 2, 3: 2, 10: 5, 30: 15, 60: 30, 75: 38, 120: 60, 144: 72, 240: 120} {
+		if got := IntraRefreshPeriod(fps); got != want {
+			t.Errorf("IntraRefreshPeriod(%d) = %d, want %d", fps, got, want)
+		}
+	}
+	c := ffmpeg81Caps(t)
+	c.intraRefresh = map[string]string{"hevc_nvenc": IntraRefreshSingleSlice, "h264_nvenc": IntraRefreshOn}
+	for _, enc := range []string{"hevc_nvenc", "h264_nvenc"} {
+		for fps := 10; fps <= 240; fps++ {
+			for _, size := range [][2]int{{1280, 720}, {1920, 1080}, {3840, 2160}} {
+				args, err := c.BuildArgs(Params{Source: Source{Backend: "ddagrab"}, Encoder: encoderNamed(enc), FPS: fps, BitrateKbps: 20000})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if r := Recovery(args, size[0], size[1], fps); r != proto.RecoverySkip {
+					t.Fatalf("%s at %d fps %dx%d: recovery %q, want skip", enc, fps, size[0], size[1], r)
+				}
+				if n := HealFrames(args, size[0], size[1]); n != 2*IntraRefreshPeriod(fps) {
+					t.Fatalf("%s at %d fps: HealFrames %d, want two periods", enc, fps, n)
+				}
+			}
 		}
 	}
 }
@@ -255,36 +372,50 @@ func TestRecovery(t *testing.T) {
 			}
 		}
 	}
-	// Today's arguments: no intra refresh anywhere, so every encoder needs key frames.
-	for enc := range c.options {
-		args, err := c.BuildArgs(Params{Source: Source{Backend: "ddagrab"}, Encoder: encoderNamed(enc), FPS: 60, BitrateKbps: 20000})
-		if err != nil {
-			t.Fatal(err)
+	// The host's arguments: skip where the probe found intra refresh (step
+	// 1.2: h264_nvenc and hevc_nvenc), key frames everywhere else, also on a
+	// GPU without intra refresh.
+	for _, found := range []bool{false, true} {
+		c.intraRefresh = nil
+		if found {
+			c.intraRefresh = map[string]string{"hevc_nvenc": IntraRefreshSingleSlice, "h264_nvenc": IntraRefreshOn}
 		}
-		if r := Recovery(args, 1920, 1080, 60); r != proto.RecoveryKeyframe {
-			t.Errorf("%s: recovery %q, want keyframe", enc, r)
+		for enc := range c.options {
+			args, err := c.BuildArgs(Params{Source: Source{Backend: "ddagrab"}, Encoder: encoderNamed(enc), FPS: 60, BitrateKbps: 20000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := proto.RecoveryKeyframe
+			if found && intraRefreshEncoders[enc] {
+				want = proto.RecoverySkip
+			}
+			if r := Recovery(args, 1920, 1080, 60); r != want {
+				t.Errorf("%s (intra refresh found %v): recovery %q, want %q", enc, found, r, want)
+			}
 		}
 	}
+	c.intraRefresh = nil
 	for _, tc := range []struct {
 		args       string
 		w, h, fps  int
 		want, why  string
 		withNVENCg bool
+		heal       int // HealFrames: two refresh periods
 	}{
-		{"-intra-refresh 1 -g 60", 1920, 1080, 60, proto.RecoverySkip, "1 s refresh period: heals within 2 s", false},
-		{"-intra-refresh 1 -g 61", 1920, 1080, 60, proto.RecoveryKeyframe, "period over 1 s: two periods over 2 s", false},
-		{"-intra-refresh 1 -g 120", 1920, 1080, 60, proto.RecoveryKeyframe, "2 s refresh period: up to 4 s damaged", false},
-		{"-intra-refresh 1", 1920, 1080, 60, proto.RecoveryKeyframe, "NVENC with the default GOP (an hour): heals nothing", true},
-		{"-intra-refresh true -g 30", 1280, 720, 30, proto.RecoverySkip, "boolean spelled out", false},
-		{"-intra-refresh 0 -g 60", 1920, 1080, 60, proto.RecoveryKeyframe, "off", false},
-		{"-g 30", 1920, 1080, 60, proto.RecoveryKeyframe, "no intra refresh", false},
+		{"-intra-refresh 1 -g 60", 1920, 1080, 60, proto.RecoverySkip, "1 s refresh period: heals within 2 s", false, 120},
+		{"-intra-refresh 1 -g 61", 1920, 1080, 60, proto.RecoveryKeyframe, "period over 1 s: two periods over 2 s", false, 122},
+		{"-intra-refresh 1 -g 120", 1920, 1080, 60, proto.RecoveryKeyframe, "2 s refresh period: up to 4 s damaged", false, 240},
+		{"-intra-refresh 1", 1920, 1080, 60, proto.RecoveryKeyframe, "NVENC with the default GOP (an hour): heals nothing", true, 432000},
+		{"-intra-refresh true -g 30", 1280, 720, 30, proto.RecoverySkip, "boolean spelled out", false, 60},
+		{"-intra-refresh 0 -g 60", 1920, 1080, 60, proto.RecoveryKeyframe, "off", false, 0},
+		{"-g 30", 1920, 1080, 60, proto.RecoveryKeyframe, "no intra refresh", false, 0},
 		// 1920x1080 = 120 x 68 = 8160 macroblocks.
-		{"-intra_refresh_mb 255", 1920, 1080, 60, proto.RecoverySkip, "32 frames", false},
-		{"-intra_refresh_mb 136", 1920, 1080, 60, proto.RecoverySkip, "60 frames", false},
-		{"-intra_refresh_mb 135", 1920, 1080, 60, proto.RecoveryKeyframe, "61 frames", false},
-		{"-intra_refresh_mb 68", 1920, 1080, 60, proto.RecoveryKeyframe, "120 frames: up to 4 s damaged", false},
-		{"-intra_refresh_mb -1", 1920, 1080, 60, proto.RecoveryKeyframe, "FFmpeg's default: off", false},
-		{"-intra_refresh_mb 255", 0, 0, 60, proto.RecoveryKeyframe, "size unknown", false},
+		{"-intra_refresh_mb 255", 1920, 1080, 60, proto.RecoverySkip, "32 frames", false, 64},
+		{"-intra_refresh_mb 136", 1920, 1080, 60, proto.RecoverySkip, "60 frames", false, 120},
+		{"-intra_refresh_mb 135", 1920, 1080, 60, proto.RecoveryKeyframe, "61 frames", false, 122},
+		{"-intra_refresh_mb 68", 1920, 1080, 60, proto.RecoveryKeyframe, "120 frames: up to 4 s damaged", false, 240},
+		{"-intra_refresh_mb -1", 1920, 1080, 60, proto.RecoveryKeyframe, "FFmpeg's default: off", false, 0},
+		{"-intra_refresh_mb 255", 0, 0, 60, proto.RecoveryKeyframe, "size unknown", false, 0},
 	} {
 		args := strings.Fields(tc.args)
 		if tc.withNVENCg {
@@ -297,6 +428,9 @@ func TestRecovery(t *testing.T) {
 		}
 		if got := Recovery(args, tc.w, tc.h, tc.fps); got != tc.want {
 			t.Errorf("%s (%s): %q, want %q", tc.args, tc.why, got, tc.want)
+		}
+		if got := HealFrames(args, tc.w, tc.h); got != tc.heal {
+			t.Errorf("%s (%s): HealFrames %d, want %d", tc.args, tc.why, got, tc.heal)
 		}
 	}
 }
@@ -326,32 +460,42 @@ func TestEncoderArgsNotDropped(t *testing.T) {
 		"hevc_amf": "frame_skipping", "av1_amf": "frame_skipping", "h264_amf": "header_insertion_mode skip_frame",
 		"hevc_nvenc": "", "h264_nvenc": "", "av1_nvenc": "",
 	}
+	// and with single-slice intra refresh (the probe tries it on h264/hevc_nvenc only)
+	notOnSingleSlice := map[string]string{"av1_nvenc": "single-slice-intra-refresh"}
 	for enc := range c.options {
 		e := encoderNamed(enc)
-		for _, q := range []string{"", "speed", "balanced", "quality"} {
-			for _, adaptive := range []bool{false, true} {
-				for _, usage := range usages(e) {
-					p := Params{Encoder: e, FPS: 120, BitrateKbps: 50000, Quality: q, Adaptive: adaptive, Usage: usage}
-					got, want := encoderArgMap(t, c, p), encoderArgMap(t, wide, p)
-					var dropped []string
-					for k, v := range want {
-						if g, ok := got[k]; !ok {
-							dropped = append(dropped, k)
-							if c.HasOption(enc, k) {
-								t.Errorf("%s (quality %q adaptive %v usage %q): -%s %s dropped: FFmpeg 8.1 does not take the value", enc, q, adaptive, usage, k, v)
+		for _, ir := range []string{"", IntraRefreshOn, IntraRefreshSingleSlice} {
+			c.intraRefresh = map[string]string{enc: ir}
+			wide.intraRefresh = c.intraRefresh
+			wantNot := notOn[enc]
+			if ir == IntraRefreshSingleSlice {
+				wantNot = strings.TrimSpace(wantNot + " " + notOnSingleSlice[enc])
+			}
+			for _, q := range []string{"", "speed", "balanced", "quality"} {
+				for _, adaptive := range []bool{false, true} {
+					for _, usage := range usages(e) {
+						p := Params{Encoder: e, FPS: 120, BitrateKbps: 50000, Quality: q, Adaptive: adaptive, Usage: usage}
+						got, want := encoderArgMap(t, c, p), encoderArgMap(t, wide, p)
+						var dropped []string
+						for k, v := range want {
+							if g, ok := got[k]; !ok {
+								dropped = append(dropped, k)
+								if c.HasOption(enc, k) {
+									t.Errorf("%s (quality %q adaptive %v usage %q intra refresh %q): -%s %s dropped: FFmpeg 8.1 does not take the value", enc, q, adaptive, usage, ir, k, v)
+								}
+							} else if g != v {
+								t.Errorf("%s (quality %q adaptive %v usage %q intra refresh %q): -%s %s, want %s", enc, q, adaptive, usage, ir, k, g, v)
 							}
-						} else if g != v {
-							t.Errorf("%s (quality %q adaptive %v usage %q): -%s %s, want %s", enc, q, adaptive, usage, k, g, v)
 						}
-					}
-					for k := range got {
-						if _, ok := want[k]; !ok {
-							t.Errorf("%s (quality %q adaptive %v usage %q): unexpected -%s", enc, q, adaptive, usage, k)
+						for k := range got {
+							if _, ok := want[k]; !ok {
+								t.Errorf("%s (quality %q adaptive %v usage %q intra refresh %q): unexpected -%s", enc, q, adaptive, usage, ir, k)
+							}
 						}
-					}
-					sort.Strings(dropped)
-					if d := strings.Join(dropped, " "); d != notOn[enc] {
-						t.Errorf("%s (quality %q adaptive %v usage %q): options not passed %q, want %q", enc, q, adaptive, usage, d, notOn[enc])
+						sort.Strings(dropped)
+						if d := strings.Join(dropped, " "); d != wantNot {
+							t.Errorf("%s (quality %q adaptive %v usage %q intra refresh %q): options not passed %q, want %q", enc, q, adaptive, usage, ir, d, wantNot)
+						}
 					}
 				}
 			}
@@ -367,6 +511,98 @@ var ffmpegOptionError = regexp.MustCompile(`Error applying encoder options|Error
 // comes only after all options were accepted.
 var amfRuntimeError = regexp.MustCompile(`amfrt64\S* failed to open|hardware device context \(AMF\)`)
 
+// runFFmpeg runs ffmpeg and returns its stderr.
+func runFFmpeg(ff string, args []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	cmd := quietCmd(ctx, ff, args...)
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return strings.ReplaceAll(stderr.String(), "\r", ""), err
+}
+
+// limitFrames makes a command line stop after a few frames and discards its
+// output.
+func limitFrames(args []string) []string {
+	out := append([]string{}, args[:len(args)-1]...)
+	return append(out, "-frames:v", "5", "-")
+}
+
+// nvencRuntimeError matches the NVIDIA driver or GPU missing, which FFmpeg
+// reports only after all options were accepted.
+var nvencRuntimeError = regexp.MustCompile(`Cannot load (nvcuda\.dll|libcuda\.so|nvEncodeAPI)|No capable devices found|No NVENC capable devices found|Driver does not support the required nvenc API version`)
+
+// TestNVENCArgsAccepted runs the NVENC command lines the host builds (guide
+// step 1.2: with each intra refresh mode) with the local FFmpeg: in the sandbox
+// FFmpeg 6.1 on Linux and the FFmpeg 8.1 Windows build under Wine (the
+// cross-compiled test binary). With an NVIDIA GPU (the encoder passed the
+// probe) the probe's own mode must encode; elsewhere every mode must get past
+// option parsing to the missing driver.
+func TestNVENCArgsAccepted(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	caps, err := Probe(context.Background(), ff, nil)
+	if err != nil && caps == nil {
+		t.Skipf("probe: %v", err)
+	}
+	tested := 0
+	for _, name := range []string{"av1_nvenc", "hevc_nvenc", "h264_nvenc"} {
+		if caps.options[name] == nil {
+			t.Logf("%s: not in this ffmpeg build", name)
+			continue
+		}
+		tested++
+		works := false // passed the probe's test encode: an NVIDIA GPU
+		for _, w := range caps.Encoders {
+			works = works || w.Name == name
+		}
+		modes := []string{caps.IntraRefresh(name)}
+		if !works && intraRefreshEncoders[name] {
+			modes = []string{"", IntraRefreshOn, IntraRefreshSingleSlice}
+		}
+		for _, ir := range modes {
+			c := *caps
+			c.intraRefresh = map[string]string{name: ir}
+			p := Params{Source: Source{Backend: "test", NativeW: 1280, NativeH: 720}, Encoder: encoderNamed(name), FPS: 60,
+				BitrateKbps: 20000, CaptureClock: caps.CanStampCapture()}
+			args, err := c.BuildArgs(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (ir != "") != strings.Contains(strings.Join(args, " "), "-intra-refresh 1 ") {
+				t.Fatalf("%s (intra refresh %q): %q", name, ir, args)
+			}
+			stderr, err := runFFmpeg(ff, limitFrames(args))
+			switch {
+			case ffmpegOptionError.MatchString(stderr):
+				t.Errorf("%s (intra refresh %q): ffmpeg refused an option: %s\nargs: %q", name, ir, causeLines(stderr, 4), args)
+			case err == nil:
+				t.Logf("%s (intra refresh %q): encoded", name, ir)
+			case works:
+				t.Errorf("%s (intra refresh %q) passed the probe but failed: %v: %s", name, ir, err, causeLines(stderr, 4))
+			case nvencRuntimeError.MatchString(stderr):
+				t.Logf("%s (intra refresh %q): options accepted, then: %s", name, ir, nvencRuntimeError.FindString(stderr))
+			default:
+				t.Errorf("%s (intra refresh %q): unexpected failure: %v: %s", name, ir, err, causeLines(stderr, 4))
+			}
+		}
+	}
+	if tested == 0 {
+		t.Skip("ffmpeg has no NVENC encoders")
+	}
+	// Control: a value FFmpeg refuses is caught before the driver loads.
+	if caps.options["hevc_nvenc"] != nil {
+		bad := []string{"-hide_banner", "-nostdin", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=60", "-frames:v", "5",
+			"-pix_fmt", "yuv420p", "-c:v", "hevc_nvenc", "-intra-refresh", "2", "-g", "30", "-f", "null", "-"}
+		if stderr, _ := runFFmpeg(ff, bad); !ffmpegOptionError.MatchString(stderr) {
+			t.Errorf("-intra-refresh 2 not refused: %s", causeLines(stderr, 4))
+		}
+	}
+}
+
 // TestAMFArgsAccepted runs the AMF command lines the host builds with an FFmpeg
 // that has the AMF encoders (Windows builds; in the sandbox the FFmpeg 8.1
 // build under Wine, via the cross-compiled test binary). On an AMD GPU every
@@ -381,20 +617,8 @@ func TestAMFArgsAccepted(t *testing.T) {
 	if err != nil && caps == nil {
 		t.Skipf("probe: %v", err)
 	}
-	run := func(args []string) (string, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		var stderr bytes.Buffer
-		cmd := quietCmd(ctx, ff, args...)
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		return strings.ReplaceAll(stderr.String(), "\r", ""), err
-	}
-	// limit makes a command line stop after a few frames and discards its output.
-	limit := func(args []string) []string {
-		out := append([]string{}, args[:len(args)-1]...)
-		return append(out, "-frames:v", "5", "-")
-	}
+	run := func(args []string) (string, error) { return runFFmpeg(ff, args) }
+	limit := limitFrames
 	tested := 0
 	for _, name := range []string{"av1_amf", "hevc_amf", "h264_amf"} {
 		if caps.options[name] == nil {

@@ -989,3 +989,215 @@ Hardware checks:
 - NVIDIA: unverified (no NVIDIA host available). Test: the lan and wifi acceptance runs above
   with hevc_nvenc (and after 1.2, with recovery `skip`, where the wifi run should show no
   key-frame restarts at all, only "skipping" lines for frames the host dropped).
+
+## 1.2 NVIDIA intra refresh
+
+What changed:
+
+- h264_nvenc and hevc_nvenc run with periodic intra refresh where the GPU has it, so a lost frame
+  heals without a key frame and the host announces recovery `skip` (1.4) for them. The probe
+  (`media.Probe`, after the plain test encode of each encoder) test-encodes the host's own NVENC
+  arguments in each mode over two refresh waves (32 black 640×360 frames at 30 fps, `-g 15`):
+  first `-intra-refresh 1 -single-slice-intra-refresh 1`, then `-intra-refresh 1` alone. FFmpeg
+  8.1 `nvenc.c` refuses to open the encoder where the GPU lacks the mode
+  (`NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH`, `NV_ENC_CAPS_SUPPORT_INTRA_REFRESH`: "Intra refresh
+  not supported by the device"), and running two waves also catches a refreshing frame FFmpeg
+  cannot handle (its output switch knows only IDR/I/P/B/BI picture types and fails the encode on
+  any other). The first mode that encodes is used; single slice is preferred (one slice per frame
+  codes better than the extra slices of a refreshing frame; Sunshine prefers it too). No mode
+  works: `intra refresh unavailable: lost frames need key frames` in the log, and that encoder
+  keeps recovery `keyframe`. `recon-host probe` prints `intra-refresh=single-slice|on` after the
+  encoder (`encoder:    hevc_nvenc   hevc  nvidia intra-refresh=single-slice`), the agent's
+  `ffmpeg ready` log line `intra_refresh=hevc_nvenc=single-slice,...`.
+- Refresh period: with `-intra-refresh 1` FFmpeg 8.1 sets `intraRefreshPeriod = -g`,
+  `intraRefreshCnt = -g - 1` and makes the GOP and IDR period infinite (`NVENC_INFINITE_GOPLENGTH`;
+  H.264 also gets a recovery point SEI). With the session's `-g` (an hour of frames) a loss would
+  heal after an hour, so the host passes `-g` = half a second of frames
+  (`media.IntraRefreshPeriod`: round(fps / 2), at least 2; 30 at 60 fps, 60 at 120 fps). A loss
+  heals within one to two periods (0.5-1 s): the waves run back to back, and the regions the
+  current wave refreshed before the loss are predicted from the lost frame afterwards, so they are
+  clean only after the next wave. Each frame intra-codes 1/(period - 1) of the picture (about
+  3.4 % at 60 fps). hevc_nvenc at 60 fps, 20 Mbit/s, preset balanced:
+
+  ```
+  -preset p3 -tune ull -rc cbr -multipass disabled -zerolatency 1 -delay 0 -rc-lookahead 0
+  -no-scenecut 1 -forced-idr 1 -strict_gop 1 -intra-refresh 1 -single-slice-intra-refresh 1
+  -spatial-aq 1 -profile main -b:v 20000k -maxrate 20000k -bufsize 500k -g 30 -bf 0
+  ```
+
+- Healing bounded in time, not only in frames. The periods count encoded frames, but the capture
+  sources send a frame only when the screen changes: ddagrab runs with `dup_frames=0` (FFmpeg 8.1
+  `vsrc_ddagrab.c` loops on `AcquireNextFrame` until the desktop changes) and gfxcapture sends
+  what Windows Graphics Capture delivers (`FrameArrived`). After a loss during a scroll or a
+  window drag that then stops, the picture would stay damaged until enough later desktop updates
+  arrive (a blinking caret: 15-30 s), or for good; a game rendering below the stream's rate takes
+  longer than the frame count assumes (144 fps stream, 72-frame period, game at 60 fps: 144
+  frames = 2.4 s). So the session watches every loss it reports in a generation that announced
+  `skip` from a refreshing encoder (`media.HealFrames`: two refresh periods; a `skip` forced by
+  the test hook is not watched): the encoder must produce the frame `HealFrames` after the latest
+  loss within `media.MaxHeal` (2 s) of the first loss not yet healed. Otherwise the host restarts
+  the encoder overlapped (`restarting video reason="loss not healed" urgent=false`): the damaged
+  picture stays on screen, not frozen, until the new generation's first frame, an IDR of the
+  current desktop (a new duplication's first frame is the desktop image even when nothing
+  changes, as every stream start on a still desktop relies on), replaces it. A loss that heals
+  costs nothing; one that cannot costs a restart 2 s later (before 1.2: a restart at once).
+  Not covered: a frame the client gives up on as late without a `dropped` report (its gap
+  outlasted max(250 ms, 4 × RTT) while later frames arrived; rare on reliable streams, see 1.4):
+  the host does not learn of that skip.
+- Kept: `-forced-idr 1` (a forced key frame stays an IDR; on the FFmpeg path a key frame is a new
+  generation anyway). The first frame of every generation is still an IDR (NVENC starts every
+  session with one; only later frames refresh instead of IDRs), and as before `PrepareKeyFrame`
+  puts the parameter sets from the NUT extradata in front of it (NUT is a global-header format,
+  so NVENC writes no in-band SPS/PPS: `repeatSPSPPS = 0`). New guard in `media.Video`: a
+  generation that sends `max(2 × fps, 30)` frames without a key frame fails as an encoder fault
+  (`encoder hevc_nvenc sent 120 frames without a key frame`; the session restarts it and excludes
+  the encoder after two such failures) instead of never going live.
+- Not on av1_nvenc (deviation from the guide's "add `-intra-refresh 1` for NVENC", although FFmpeg
+  8.1 exposes the option there): an AV1 frame inherits the entropy-coding state (CDFs), loop
+  filter and segmentation deltas of its primary reference frame and reads motion-vector
+  candidates from it; intra refresh restores pixels, not that state, so after a skipped frame the
+  decoder can misread every later frame until a key frame, which with intra refresh never comes
+  (infinite GOP). Step 1.4 saw dav1d reject 7 of 12 skips on software AV1. av1_nvenc keeps
+  `keyframe` until the NVIDIA check below shows its frames decode after a skip.
+- AMD unchanged (recovery `keyframe`): FFmpeg exposes AMF intra refresh only on h264_amf
+  (`-intra_refresh_mb`, macroblocks per slot), AMF does not document whether refreshed macroblocks
+  may predict from not yet refreshed ones (then the picture need not heal) or how it combines
+  with ultra low latency and an infinite GOP, and H.264 is not the AMD default codec. Phase 3
+  recovers from long-term references instead. `media.Recovery` already announces `skip` for
+  `-intra_refresh_mb` with a period ≤ 1 s, should a later step pass it.
+- Test-only hook: `RECON_TEST_FAULTS=...,intra-refresh` runs libx264 with `-intra-refresh 1` and
+  the same `-g` (`media.Caps.UseIntraRefresh`), so the software encoder runs the same refresh
+  period and recovery decision as NVENC: the host announces `skip` from its real arguments, not
+  forced.
+
+Verified in the sandbox:
+
+- verified (sandbox): arguments on the real FFmpeg 8.1 option lists (testdata
+  `ffmpeg81-h-*_nvenc.txt`): `TestNVIDIAEncoderArgs` (exact NVENC argument sets without intra
+  refresh, with `on` and with `single-slice` at 30/60/120/144 fps: `-g` 15/30/60/72, forced-idr
+  kept), `TestEncoderArgsNotDropped` (no value dropped by the option filtering in any mode; on
+  av1_nvenc, which has no single-slice option, exactly that option), `TestIntraRefreshEncoders`
+  (the probe tries h264/hevc_nvenc only; single slice first, then plain, then none; each test
+  encode is the host's NVENC arguments in that mode over more than two waves),
+  `TestIntraRefreshPeriod` (every fps from 10 to 240 at 720p/1080p/2160p gives recovery `skip`
+  with intra refresh), `TestRecovery` (`skip` exactly for h264/hevc_nvenc when the probe found
+  intra refresh, `keyframe` for every encoder without it), `TestVideoFailureEvent` (a generation
+  whose key frames a wrapper drops fails as an encoder fault after 60 frames at 30 fps).
+- verified (sandbox): FFmpeg 8.1 (BtbN win64 GPL) under Wine accepts every NVENC command line
+  up to the missing driver: `TestNVENCArgsAccepted` in the cross-compiled `media.test.exe`
+  (`WINEPATH` = the FFmpeg `bin` folder) builds the host's lines for av1_nvenc, hevc_nvenc and
+  h264_nvenc without intra refresh and, for h264/hevc_nvenc, in both modes (test source, 1280×720
+  at 60 fps) and runs 5 frames each: all 7 reach `Cannot load nvcuda.dll`. The probe's 32-frame
+  test encode (hevc_nvenc, single slice) also reaches `Cannot load nvcuda.dll`; the ddagrab line
+  above passes option parsing and stops at ddagrab's `Failed to create Direct3D device`. Controls:
+  `-intra-refresh 2` and `-single-slice-intra-refresh 2` stop at `Unable to parse ... as boolean`
+  / `Error applying encoder options`, before the device opens; av1_nvenc ignores
+  `-single-slice-intra-refresh` ("has not been used for any stream"). The same test on the
+  sandbox's FFmpeg 6.1.1 (Linux) reaches `Cannot load libcuda.so` for all 7. FFmpeg 8.1 also warns
+  `-profile is ambiguous` for the (pre-1.2) `-profile main`; it still applies to the only stream.
+- verified (sandbox), healing with the software stand-in: `TestIntraRefreshHeals` (libx264 with
+  the host's intra refresh arguments, test pattern 640×360 at 30 fps, period 15 frames, frames as
+  `media.Video` delivers them): skipping any one frame of a whole refresh wave and decoding on
+  (FFmpeg H.264 decoder, `-flags2 +showall`) damages the picture and gives the exact undamaged
+  picture again after 15-29 frames on FFmpeg 6.1.1 (Linux; at most two periods, 0.97 s, longest
+  when the lost frame starts a wave) and 15-24 frames on FFmpeg 8.1 under Wine (0.80 s), with no
+  IDR in between (asserted: only the first frame has an IDR NAL unit, type 5); every frame before
+  the loss is unchanged. libx264 does flag the first frame of every refresh wave, its recovery
+  point, as a key frame (7 key frames in 105, one IDR), so those go out with the key flag and the
+  parameter sets in front; NVENC flags only IDRs (`nvenc.c`: `AV_PKT_FLAG_KEY` for
+  `NV_ENC_PIC_TYPE_IDR`).
+  Go integration test `internal/e2e` `TestStreamingIntraRefresh` (real gateway and agent, direct
+  WebTransport, `RECON_TEST_FAULTS="drop=every:50,intra-refresh"`, 30 fps, 6 s): the host announces
+  `skip` itself (`encoder ready ... recovery=skip`, one generation, no restart); decoding the
+  received frames in order without the dropped ones, every frame more than two refresh periods
+  after a drop (and every frame before the first) carries its own frame barcode, frames within
+  two periods of a drop do not all (the drop did damage the picture), and no picture shows a
+  barcode of a frame that was not received.
+- verified (sandbox), the time bound: `TestStreamingIntraRefreshStill` (same setup,
+  `RECON_TEST_FAULTS="drop=every:30,intra-refresh,still=after:60"`, 10 s; the hook's `still` rule
+  sends only the first 60 frames of every generation, as from a desktop that stops changing):
+  in each generation seq 29 heals by seq 59 (no restart for it) and seq 59 cannot heal; the host
+  log has `restarting video reason="loss not healed" urgent=false` 2.000-2.001 s after the report
+  of seq 59 and no other restart, and the next generation reaches the client 2.05 s after that
+  report (3 configs in 10 s). With the watch removed the stream stays damaged (one config); with
+  the healed seq 29 not ending its watch the restarts come 1 s after seq 59: both fail the test.
+  `TestHealWatch` (which losses are watched, extended and ended), `TestRecovery` and
+  `TestIntraRefreshPeriod` (`HealFrames` = two periods for every case and frame rate). Unchanged
+  with continuous frames: `TestStreamingIntraRefresh` still runs one generation (no restart).
+- Not run in the browser: Playwright's Chromium has no H.264 or HEVC decoder
+  (`VideoDecoder.isConfigSupported` false for `avc1.42E01E`, `avc1.64002A`, `hvc1.1.6.L93.B0`,
+  true for `av01.0.08M.08`), and AV1 is the codec without intra refresh, so the browser E2E keeps
+  its 1.4 loss runs (software AV1, `keyframe` and forced `skip`). It passed 62 of 62 with this
+  step; its drop test again saw dav1d reject 2 of 3 skipped AV1 frames (`Decoding error.`), as
+  expected for AV1 above.
+
+Hardware checks:
+
+- NVIDIA: unverified (no NVIDIA host available). Test: (probe) on an NVIDIA host (RTX 20/30/40/50)
+  run `& 'C:\Program Files\KlouditRecon\recon-host.exe' probe`. Expect
+  `encoder:    hevc_nvenc   hevc  nvidia intra-refresh=single-slice` and the same for h264_nvenc
+  (`=on` if the GPU lacks single slice intra refresh), none on av1_nvenc. No suffix on
+  h264/hevc_nvenc: run `& 'C:\Program Files\KlouditRecon\ffmpeg\bin\ffmpeg.exe' -hide_banner -f
+  lavfi -i color=c=black:s=640x360:r=30 -frames:v 32 -pix_fmt yuv420p -c:v hevc_nvenc -tune ull
+  -intra-refresh 1 -g 15 -bf 0 -f null -` and record its error, driver version and GPU. (`ffmpeg`
+  below is that same `ffmpeg.exe`.)
+- NVIDIA: unverified (no NVIDIA host available). Test: (first frame, parameter sets, restarts)
+  stream with Codec HEVC, then H.264, at 1920×1080 60 fps: the picture appears within about a
+  second, host.log (`$env:APPDATA\KlouditRecon\host.log`) has `encoder ready ... recovery=skip`
+  and no `without a key frame`, the stats overlay (Ctrl+Alt+Shift+S) shows "Loss recovery: skip
+  frame (intra refresh)" and `(HW)` on the Codec row. Change the bitrate in Stream settings twice:
+  each change gives a new `encoder ready ... recovery=skip` line and the picture continues (the new
+  generation starts with an IDR and its parameter sets). `__recon.logs` has no `decoder error`.
+- NVIDIA: unverified (no NVIDIA host available). Test: (guide acceptance: a dropped frame heals
+  without an IDR, and the VERIFY: Chrome's decoder accepts P-frames after a skipped frame)
+  `Stop-ScheduledTask 'KloudIT Recon Host'`, then in a PowerShell window
+  `$env:RECON_TEST_FAULTS='drop=every:600'; & 'C:\Program Files\KlouditRecon\recon-host.exe' run`
+  (the 1.4 test hook: one frame dropped and reported every 10 s at 60 fps). Stream hevc_nvenc at
+  1920×1080 60 fps from a scene with constant motion (a game, or a video playing full screen) for
+  2 minutes, recording the client screen with a 240 fps phone camera or OBS. In DevTools on the
+  stream page run `__recon.logs.filter((l) => /skipping|decoder error|requesting key frame/.test(l))`:
+  expect one `skipping 1 lost frame(s) ... the encoder heals the picture` per drop (12), no
+  `decoder error` and no `requesting key frame`; host.log has `frames dropped ... why="test
+  fault"` per drop and no `restarting video` line. In the recording, each drop may show a smear
+  or blocks; count the frames from the first damaged frame to a clean picture: pass when every
+  drop heals within two refresh periods (60 frames, 1 s at 60 fps; expect most within 30 frames,
+  0.5 s) with no full-picture refresh (IDR) in between. Repeat with Codec H.264, and with an AMD
+  or Intel client GPU (Chrome hardware decoder, `(HW)` on the Codec row): record per decoder any
+  `decoder error` (then `skip` is unsafe on it: the fallback is reset + key frame) and the longest
+  heal. Afterwards close that window and `Start-ScheduledTask 'KloudIT Recon Host'`.
+- NVIDIA: unverified (no NVIDIA host available). Test: (time bound on a still desktop) as above
+  with `$env:RECON_TEST_FAULTS='drop=every:20'` and `"capture": "ddagrab"` in `host.json`, stream
+  hevc_nvenc at 1920×1080 60 fps of the desktop: scroll a long web page with the mouse wheel for about a second, then stop
+  and keep the mouse still for 5 s; repeat 10 times, recording the client screen. Each scroll
+  drops a frame or more (`frames dropped ... why="test fault"` in host.log). Pass: every damaged
+  picture is clean again at most about 2.5 s after the scroll stops (MaxHeal plus a restart), with
+  `restarting video reason="loss not healed" urgent=false` in host.log after the scrolls whose
+  last drop came within 60 frames of the stop, and no `restarting video` line for the others; the
+  stream never freezes. Repeat with `"capture": "gfxcapture"`.
+- NVIDIA: unverified (no NVIDIA host available). Test: (time bound with a game below the stream's
+  rate) on a 144 Hz monitor stream at 144 fps (refresh period 72 frames) with
+  `$env:RECON_TEST_FAULTS='drop=every:600'` and a game capped at 60 fps (in-game limiter or
+  RTSS): each drop shows `restarting video reason="loss not healed"` about 2 s after its `frames
+  dropped` line (144 frames take 2.4 s at 60 fps) and the picture is clean within about 2.5 s;
+  with the game uncapped (100 fps or more), no such restarts and every drop heals within 2 s.
+- NVIDIA: unverified (no NVIDIA host available). Test: (cost of intra refresh) with a 1080p60
+  gameplay clip `clip.mp4` on the NVIDIA host run the host's hevc_nvenc arguments twice,
+  `ffmpeg -i clip.mp4 -t 30 -c:v hevc_nvenc -preset p3 -tune ull -rc cbr -multipass disabled
+  -zerolatency 1 -delay 0 -rc-lookahead 0 -no-scenecut 1 -forced-idr 1 -strict_gop 1 -spatial-aq 1
+  -profile:v main -b:v 20000k -maxrate 20000k -bufsize 500k -bf 0 <X> ir.mkv` with
+  `<X>` = `-g 216000` (before 1.2) and `-intra-refresh 1 -single-slice-intra-refresh 1 -g 30`,
+  then `ffmpeg -i ir.mkv -i clip.mp4 -t 30 -lavfi psnr -f null -` for each: record both PSNR
+  averages. Expect the intra refresh run within about 0.5 dB; a larger loss is a reason to
+  lengthen the period (`intraRefreshSeconds` in `internal/host/media/ffmpeg.go`, at most 1 s).
+- NVIDIA: unverified (no NVIDIA host available). Test: (whether av1_nvenc could use `skip`; RTX
+  40/50) `ffmpeg -f lavfi -i testsrc2=s=1920x1080:r=60 -t 10 -c:v av1_nvenc -tune ull
+  -intra-refresh 1 -g 30 -bf 0 -bsf:v "noise=drop=eq(n\,100)" -f ivf drop.ivf`, the same without
+  `-bsf:v ...` to `full.ivf`, then `ffmpeg -c:v libdav1d -i drop.ivf -f null -` (record any decode
+  error) and `ffmpeg -c:v libdav1d -i drop.ivf -c:v libdav1d -i full.ivf -lavfi
+  "psnr=stats_file=psnr.log" -f null -` (frames are matched by timestamp; the per-frame PSNR in
+  psnr.log must be `inf`, identical, again within 60 frames after frame 100 if the picture heals).
+  Only if every frame decodes and the picture heals, add av1_nvenc to `intraRefreshEncoders` and
+  repeat the browser drop check above with Codec AV1.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (unchanged by 1.2) `recon-host.exe probe` prints no
+  `intra-refresh=` on any `*_amf` encoder, and a stream's host.log line is `encoder ready ...
+  recovery=keyframe`.

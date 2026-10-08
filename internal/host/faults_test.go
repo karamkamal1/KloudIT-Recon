@@ -41,8 +41,15 @@ func TestParseTestFaults(t *testing.T) {
 	if f, err := parseTestFaults(""); err != nil || f.active() {
 		t.Fatalf("empty: %+v %v", f, err)
 	}
+	if f, err := parseTestFaults("drop=every:45, intra-refresh"); err != nil || f != (testFaults{dropEvery: 45, intraRefresh: true}) || !f.active() {
+		t.Fatalf("intra-refresh: %+v %v", f, err)
+	}
+	if f, err := parseTestFaults("still=after:60"); err != nil || f != (testFaults{stillAfter: 60}) || !f.active() {
+		t.Fatalf("still: %+v %v", f, err)
+	}
 	for _, bad := range []string{"delay=every:97", "delay=every:0:10ms", "delay=every:5:-1ms", "delay=every:5:1h",
-		"drop=every:x", "drop=sometimes:3", "drop=every:3:4", "recovery=maybe", "loss=1%"} {
+		"drop=every:x", "drop=sometimes:3", "drop=every:3:4", "recovery=maybe", "loss=1%", "intra-refresh=1",
+		"still", "still=60", "still=after:0", "still=after:x", "still=every:60"} {
 		if _, err := parseTestFaults(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
