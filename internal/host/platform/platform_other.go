@@ -11,6 +11,9 @@ func Monitors() ([]Monitor, error) {
 	return []Monitor{{Index: 0, Name: "Display", W: 1280, H: 720, Primary: true, Hz: 60, DXGIOutput: -1}}, nil
 }
 
+// PrimaryAdapter is unsupported outside Windows.
+func PrimaryAdapter() (Adapter, error) { return Adapter{}, ErrUnsupported }
+
 // GetCursor is unsupported outside Windows.
 func GetCursor() (CursorState, error) { return CursorState{}, ErrUnsupported }
 

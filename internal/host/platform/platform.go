@@ -15,6 +15,27 @@ type Monitor struct {
 	DXGIOutput int    // output index on adapter 0 (ddagrab output_idx=), -1 if unknown
 }
 
+// Adapter describes a GPU adapter (DXGI_ADAPTER_DESC1).
+type Adapter struct {
+	Vendor   string // nvidia, amd, intel or other, from VendorID
+	VendorID uint32 // PCI vendor ID
+	LUID     uint64 // AdapterLuid: HighPart<<32 | LowPart
+	Name     string
+}
+
+// adapterVendor names a PCI vendor ID as the native helper does.
+func adapterVendor(id uint32) string {
+	switch id {
+	case 0x1002:
+		return "amd"
+	case 0x10DE:
+		return "nvidia"
+	case 0x8086:
+		return "intel"
+	}
+	return "other"
+}
+
 // CursorShape is a cursor image in RGBA.
 type CursorShape struct {
 	ID         uint64

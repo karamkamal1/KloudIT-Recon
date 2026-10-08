@@ -2,7 +2,32 @@
 
 package platform
 
-import "testing"
+import (
+	"testing"
+	"unsafe"
+)
+
+// TestPrimaryAdapter reads adapter 0's DXGI_ADAPTER_DESC1 (layout as in
+// dxgi.h on x64: VendorId at 256, AdapterLuid at 296, 312 bytes).
+func TestPrimaryAdapter(t *testing.T) {
+	var d dxgiAdapterDesc1
+	if unsafe.Offsetof(d.vendorID) != 256 || unsafe.Offsetof(d.luid) != 296 || unsafe.Sizeof(d) != 312 {
+		t.Fatalf("DXGI_ADAPTER_DESC1 layout: VendorId at %d, AdapterLuid at %d, size %d", unsafe.Offsetof(d.vendorID), unsafe.Offsetof(d.luid), unsafe.Sizeof(d))
+	}
+	a, err := PrimaryAdapter()
+	if err != nil {
+		t.Skipf("no DXGI adapter: %v", err)
+	}
+	t.Logf("adapter 0: %q vendor %s (%#x) luid %#x", a.Name, a.Vendor, a.VendorID, a.LUID)
+	if a.Vendor != adapterVendor(a.VendorID) || a.Name == "" {
+		t.Fatalf("bad adapter %+v", a)
+	}
+	for id, want := range map[uint32]string{0x10DE: "nvidia", 0x1002: "amd", 0x8086: "intel", 0x1414: "other"} {
+		if got := adapterVendor(id); got != want {
+			t.Errorf("vendor %#x: %s, want %s", id, got, want)
+		}
+	}
+}
 
 func TestMonitorsAndCursor(t *testing.T) {
 	EnableDPIAwareness()

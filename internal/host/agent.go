@@ -111,6 +111,13 @@ func (a *Agent) reloadPairing() bool {
 func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error) {
 	platform.EnableDPIAwareness()
 	platform.RaisePriority()
+	if cfg.gpuPriority() != media.GPUPriorityOff {
+		// REALTIME GPU priority for the encoder needs this privilege.
+		if err := media.EnableGPUPriorityPrivilege(); err != nil {
+			log.Info("SeIncreaseBasePriorityPrivilege not enabled, encoders get high instead of realtime GPU priority (run elevated)", "err", err)
+		}
+		media.LogGPUHost(log)
+	}
 	ff, err := media.FindFFmpeg(cfg.FFmpeg)
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg not found (install FFmpeg 7.1+ or set \"ffmpeg\" in the config): %w", err)

@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"syscall"
@@ -112,6 +113,10 @@ func refreshRate(device []uint16) int {
 
 type comObj struct{ vtbl *[64]uintptr }
 
+// call calls method slot. Arguments may be pointers converted to uintptr in
+// the call expression: uintptrescapes keeps their memory in place.
+//
+//go:uintptrescapes
 func (o *comObj) call(slot int, args ...uintptr) uintptr {
 	all := append([]uintptr{uintptr(unsafe.Pointer(o))}, args...)
 	r, _, _ := syscall.SyscallN(o.vtbl[slot], all...)
@@ -127,21 +132,57 @@ type dxgiOutputDesc struct {
 	monitor    uintptr
 }
 
-// dxgiOutputs returns the HMONITOR of each output of adapter 0, in order.
-func dxgiOutputs() []uint64 {
-	if procCreateDXGIFactory1.Find() != nil {
-		return nil
+type dxgiAdapterDesc1 struct {
+	description                                                     [128]uint16
+	vendorID, deviceID, subSysID, revision                          uint32
+	dedicatedVideoMemory, dedicatedSystemMemory, sharedSystemMemory uintptr
+	luid                                                            windows.LUID
+	flags                                                           uint32
+}
+
+// dxgiAdapter0 opens adapter 0 of a new DXGI factory (what ddagrab
+// enumerates); release frees both.
+func dxgiAdapter0() (adapter *comObj, release func(), err error) {
+	if err := procCreateDXGIFactory1.Find(); err != nil {
+		return nil, nil, err
 	}
 	var factory *comObj
 	if r, _, _ := procCreateDXGIFactory1.Call(uintptr(unsafe.Pointer(&iidIDXGIFactory1)), uintptr(unsafe.Pointer(&factory))); int32(r) < 0 || factory == nil {
-		return nil
+		return nil, nil, fmt.Errorf("CreateDXGIFactory1: HRESULT %#x", uint32(r))
 	}
-	defer factory.release()
-	var adapter *comObj
 	if r := factory.call(12 /*EnumAdapters1*/, 0, uintptr(unsafe.Pointer(&adapter))); int32(r) < 0 || adapter == nil {
+		factory.release()
+		return nil, nil, fmt.Errorf("IDXGIFactory1::EnumAdapters1(0): HRESULT %#x", uint32(r))
+	}
+	return adapter, func() { adapter.release(); factory.release() }, nil
+}
+
+// PrimaryAdapter describes adapter 0, the GPU that ddagrab captures on.
+func PrimaryAdapter() (Adapter, error) {
+	adapter, release, err := dxgiAdapter0()
+	if err != nil {
+		return Adapter{}, err
+	}
+	defer release()
+	var d dxgiAdapterDesc1
+	if r := adapter.call(10 /*GetDesc1*/, uintptr(unsafe.Pointer(&d))); int32(r) < 0 {
+		return Adapter{}, fmt.Errorf("IDXGIAdapter1::GetDesc1: HRESULT %#x", uint32(r))
+	}
+	return Adapter{
+		Vendor:   adapterVendor(d.vendorID),
+		VendorID: d.vendorID,
+		LUID:     uint64(uint32(d.luid.HighPart))<<32 | uint64(d.luid.LowPart),
+		Name:     windows.UTF16ToString(d.description[:]),
+	}, nil
+}
+
+// dxgiOutputs returns the HMONITOR of each output of adapter 0, in order.
+func dxgiOutputs() []uint64 {
+	adapter, release, err := dxgiAdapter0()
+	if err != nil {
 		return nil
 	}
-	defer adapter.release()
+	defer release()
 	var out []uint64
 	for i := uintptr(0); i < 16; i++ {
 		var output *comObj

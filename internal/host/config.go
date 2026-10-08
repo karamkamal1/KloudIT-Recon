@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
 
@@ -29,6 +30,9 @@ type Config struct {
 	// CaptureTimestamps "off" stops stamping frames with their capture time
 	// (FFmpeg setpts=time(0)*1000000 + a µs encoder time base); default auto = on.
 	CaptureTimestamps string `json:"captureTimestamps,omitempty"`
+	// GPUPriority is the GPU scheduling priority of the encoder process
+	// (Windows): auto | high | realtime | off ("" = auto).
+	GPUPriority string `json:"gpuPriority,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -119,6 +123,10 @@ func LoadConfig(path string) (*Config, error) {
 	if !transport.ValidCongestion(c.Congestion) {
 		return nil, fmt.Errorf("%s: congestion must be %q or %q, not %q", path, transport.CongestionReno, transport.CongestionMedia, c.Congestion)
 	}
+	if !media.ValidGPUPriority(c.GPUPriority) {
+		return nil, fmt.Errorf("%s: gpuPriority must be %q, %q, %q or %q, not %q", path,
+			media.GPUPriorityAuto, media.GPUPriorityHigh, media.GPUPriorityRealtime, media.GPUPriorityOff, c.GPUPriority)
+	}
 	c.path = path
 	return c, nil
 }
@@ -131,6 +139,14 @@ func (c *Config) congestion() string {
 		return transport.CongestionReno
 	}
 	return c.Congestion
+}
+
+// gpuPriority returns the encoder's GPU scheduling priority mode.
+func (c *Config) gpuPriority() string {
+	if c.GPUPriority == "" {
+		return media.GPUPriorityAuto
+	}
+	return c.GPUPriority
 }
 
 // Save writes the config with owner-only permissions (it contains the host token).

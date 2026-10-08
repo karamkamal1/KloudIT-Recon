@@ -89,6 +89,8 @@ type Video struct {
 	active  *encProc
 	pending *encProc
 	closed  bool
+
+	gpuLogged string // last GPU priority outcome logged at Info (logGPUPriority)
 }
 
 type encProc struct {
@@ -156,7 +158,8 @@ func (v *Video) Start(p Params, urgent bool) error {
 		cancel()
 		return fmt.Errorf("starting ffmpeg: %w", err)
 	}
-	raisePriority(cmd)
+	gpu, host, gerr := raisePriority(cmd, p.Encoder.Vendor, p.GPUPriority)
+	v.logGPUPriority(pr.gen, p.Encoder.Vendor, p.GPUPriority, gpu, host, gerr)
 	go func() {
 		pr.stderr.consume(bufio.NewReader(stderrPipe))
 		close(pr.errDone)
