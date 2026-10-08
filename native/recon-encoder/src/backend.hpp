@@ -37,7 +37,9 @@ struct CapturedFrame {
     // Idle re-submit of the previous image: nothing new was presented for
     // StartParams::idleRepeatMs (see the pacing policy in capture/pacer.hpp).
     bool repeat = false;
-    int dirtyPct = -1;  // share of the image that changed since the previous frame (dirty rects), -1 = unknown
+    // Share of the image that changed since the previous delivered frame
+    // (union area of the dirty and move rects, 0..1; capture/dirty.hpp), -1 = unknown.
+    float dirty = -1;
 
     ID3D11Texture2D* texture = nullptr;  // nullptr for the synthetic source
     // Clockwise rotation (0/90/180/270) from the texture to the displayed
@@ -132,7 +134,7 @@ struct SubmitInfo {
     uint64_t frameId = 0;
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0;
     bool repeat = false;
-    int dirtyPct = -1;
+    float dirty = -1;
 };
 
 // EncodedFrame is one access unit / temporal unit. data stays valid until
@@ -147,7 +149,12 @@ struct EncodedFrame {
     uint64_t refFloor = 0;
     int32_t ltrSlot = -1;  // LTR slot this frame was marked into, -1 = none
     uint32_t temporalLayer = 0;
+    bool discardable = false;  // no later frame references it (codec/bitstream.hpp isDiscardable)
     uint32_t refLtrMask = 0;  // LTR slots this frame references
+    bool reencoded = false;    // encoded a second time at a higher QP (oversizeBytes: the first encode)
+    size_t oversizeBytes = 0;
+    int slices = 0;            // sliceOutput: parts it came out in
+    int64_t firstSliceQpc = 0;
     uint32_t width = 0, height = 0;
     const uint8_t* data = nullptr;
     size_t size = 0;

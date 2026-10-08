@@ -65,9 +65,12 @@ const char kUsage[] =
     "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
     "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
     "  --hdr=0|1 (HDR10 when the output is in Windows HDR mode; synthetic-gpu plays one)\n"
+    "  --svc=N (temporal layers; also writes FILE without the discardable frames as FILE.base)\n"
+    "  --reencode=F (NVENC: re-encode frames above F average frames)  --slices=N (AMF: slice / tile output)\n"
     "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
     "  --dxgi-gate=0|1 (1)  0: DDA and NVENC's Lock/UnlockBitstream not serialized (docs/VENDOR_NOTES.md 3.4 A/B)\n"
-    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n";
+    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT[+X,Y,W,H,WEIGHT...] | roi=off\n"
+    "               (repeatable)\n";
 
 struct Args {
     bool printCaps = false;

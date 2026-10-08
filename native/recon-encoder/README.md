@@ -21,11 +21,13 @@ src/amf/                  AMF encoder backend (H.264 / HEVC / AV1; amf_props.hpp
 src/nvenc/                NVENC backend (H.264 / HEVC / AV1): nvenc_runtime (nvEncodeAPI64.dll
                           loader, API version negotiation), nvenc_policy (preset by pixel rate,
                           rate values, QP delta maps), selftest (--self-test-nvenc)
-src/codec/                encoder-independent logic: LTR and reference-invalidation recovery
-                          policies, parameter sets, ROI maps, HDR10 metadata (hdr.hpp)
-                          (--self-test-encoder)
+src/codec/                encoder-independent logic: LTR (with temporal SVC) and
+                          reference-invalidation recovery policies, parameter sets, temporal
+                          layers / discardable frames, ROI maps, HDR10 metadata (hdr.hpp),
+                          the sub-frame output assembler (slices.hpp) (--self-test-encoder)
 src/capture/              DDA, AMD Direct Capture, WGC (C++/WinRT, MSVC), synthetic-gpu test
-                          source; paced_capture + pacer: frame pacing shared by all of them
+                          source; paced_capture + pacer: frame pacing shared by all of them;
+                          dirty.hpp: the changed share of an image from its dirty rects
 src/d3d/                  output selection, D3D11 device, output colour (Windows HDR),
                           BGRA -> NV12 and scRGB -> P010 BT.2020 PQ (HDR10) shaders + barcode,
                           --self-test-convert; dxgiGate (DDA vs NVENC bitstream locks)
@@ -43,5 +45,6 @@ mingw build has no Windows.Graphics.Capture: C++/WinRT comes with the Windows SD
 Self-tests without a GPU: `recon-encoder.exe --self-test-convert` (WARP),
 `--self-test-pacer`, `--self-test-encoder` and `--self-test-nvenc=<build>/bin/recon-fake-nvenc.dll`
 (the NVENC backend against its test double; without `=DLL` against the NVIDIA driver). On a GPU host, `--encode-test=FILE` encodes
-one stream with scripted IDR / loss / rate events (docs/HELPER_PROTOCOL.md "Encode test"). Third-party headers are in `native/third_party` (see its README for
+one stream with scripted IDR / loss / rate / fps / ROI events (docs/HELPER_PROTOCOL.md "Encode test";
+the Phase 5 features are in its "Phase 5 features"). Third-party headers are in `native/third_party` (see its README for
 versions and licenses).

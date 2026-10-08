@@ -57,6 +57,7 @@
 #include <mutex>
 #include <vector>
 
+#include "capture/dirty.hpp"
 #include "capture/paced_capture.hpp"
 #include "d3d/device.hpp"
 #include "probes.hpp"
@@ -128,7 +129,7 @@ private:
     void releaseHeld();
     void lose(const std::string& why, bool report = true);
     Status copyIn(ID3D11Texture2D* tex);
-    int dirtyPercent(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h);
+    float dirtyShare(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h);
 
     d3d::OutputRef output_;
     DisplayColor color_;      // the output's colour as of the last duplication
@@ -147,6 +148,7 @@ private:
     SlotInfo info_[2];
     int cur_ = 0;  // slot of the current (last delivered) image; the pending one is 1 - cur_
     std::vector<uint8_t> meta_;
+    std::vector<DirtyRect> rects_;  // dirtyShare's scratch
     mutable std::mutex srcMu_;
     SourceInfo src_;
 };
@@ -319,28 +321,31 @@ Status DdaCapture::copyIn(ID3D11Texture2D* tex) {
     return Status::Ok();
 }
 
-int DdaCapture::dirtyPercent(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h) {
-    if (!fi.TotalMetadataBufferSize || !w || !h) return fi.TotalMetadataBufferSize ? -1 : 0;
+// The share of the image this frame changed: the union of the move rects'
+// destinations and the dirty rects (GetFrameMoveRects / GetFrameDirtyRects, in
+// the desktop texture's own, unrotated coordinates like w x h), each region
+// counted once (capture/dirty.hpp). 0 when the frame has no metadata (only the
+// first frame of a duplication), -1 when it cannot be read.
+float DdaCapture::dirtyShare(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h) {
+    if (!fi.TotalMetadataBufferSize || !w || !h) return fi.TotalMetadataBufferSize ? -1.0f : 0.0f;
     meta_.resize(fi.TotalMetadataBufferSize);
+    rects_.clear();
     UINT used = 0;
-    double area = 0;
     std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
-    // Move rects first (their destinations changed), then dirty rects.
     if (FAILED(dup_->GetFrameMoveRects(UINT(meta_.size()), reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(meta_.data()), &used))) {
         return -1;
     }
     const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(meta_.data());
     for (UINT i = 0; i < used / sizeof(DXGI_OUTDUPL_MOVE_RECT); ++i) {
-        area += double(moves[i].DestinationRect.right - moves[i].DestinationRect.left) *
-                double(moves[i].DestinationRect.bottom - moves[i].DestinationRect.top);
+        const RECT& d = moves[i].DestinationRect;
+        rects_.push_back({int32_t(d.left), int32_t(d.top), int32_t(d.right), int32_t(d.bottom)});
     }
     if (FAILED(dup_->GetFrameDirtyRects(UINT(meta_.size()), reinterpret_cast<RECT*>(meta_.data()), &used))) return -1;
     const auto* rects = reinterpret_cast<const RECT*>(meta_.data());
     for (UINT i = 0; i < used / sizeof(RECT); ++i) {
-        area += double(rects[i].right - rects[i].left) * double(rects[i].bottom - rects[i].top);
+        rects_.push_back({int32_t(rects[i].left), int32_t(rects[i].top), int32_t(rects[i].right), int32_t(rects[i].bottom)});
     }
-    // Overlaps are counted twice: an upper bound, capped at 100.
-    return int(std::min(100.0, std::ceil(area * 100.0 / (double(w) * h))));
+    return float(dirtyFraction(rects_.data(), rects_.size(), w, h));
 }
 
 Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
@@ -431,7 +436,7 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         tex->GetDesc(&td);
         a.presentQpc = fi.LastPresentTime.QuadPart;
         a.captureQpc = now;
-        a.dirtyPct = dirtyPercent(fi, td.Width, td.Height);
+        a.dirty = dirtyShare(fi, td.Width, td.Height);
         return Next::Frame;
     }
 }

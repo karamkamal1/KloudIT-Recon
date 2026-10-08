@@ -831,6 +831,78 @@ func TestHelperIntegrationWGC(t *testing.T) {
 // 0.6 s. Frames must be capped at the fps, repeats must fill the pauses
 // every 100 ms, and the frame dumped after conversion must carry its frame
 // id in the barcode.
+// Phase 5 through the mock: the engine choice (EncoderInstanceFor
+// "dedicated": engine 1 of the mock's two), the refusals of what the mock
+// cannot do (SVC, re-encode, sub-frame output, a third engine: unsupported,
+// and the helper keeps running), SetFPS (the capture re-paces at once, the
+// stats report it, no key frame follows), and the synthetic source's unknown
+// dirty share.
+func TestHelperIntegrationPhase5(t *testing.T) {
+	h := launchMock(t)
+	cc := h.Caps().Codecs["h264"]
+	if cc.LiveFPS != "seamless" || !cc.InstanceSelect || cc.HWInstances != 2 || cc.Reencode || cc.MaxTemporalLayers != 1 {
+		t.Fatalf("mock caps %+v", cc)
+	}
+	two := 2
+	for _, p := range []StartParams{
+		{Codec: "h264", FPS: 60, Kbps: 4000, SVCLayers: 2},
+		{Codec: "h264", FPS: 60, Kbps: 4000, ReencodeOversized: 3},
+		{Codec: "h264", FPS: 60, Kbps: 4000, SliceOutput: 2},
+		{Codec: "h264", FPS: 60, Kbps: 4000, EncoderInstance: &two},
+	} {
+		var he *HelperError
+		if _, err := h.Start(p); !errors.As(err, &he) || he.Code != "unsupported" || he.Fatal {
+			t.Fatalf("start %+v: %v, want unsupported", p, err)
+		}
+	}
+	var he *HelperError
+	if _, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000, ReencodeOversized: 1.2}); !errors.As(err, &he) || he.Code != "bad_message" {
+		t.Fatalf("reencodeOversized 1.2: %v, want bad_message", err)
+	}
+	inst, err := EncoderInstanceFor("dedicated", cc)
+	if err != nil || inst == nil || *inst != 1 {
+		t.Fatalf("EncoderInstanceFor: %v %v", inst, err)
+	}
+	st, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000, EncoderInstance: inst})
+	if err != nil || st.EncoderInstance != 1 || st.HWInstances != 2 || st.LiveFPS != "seamless" || st.SVCLayers != 1 || st.SliceOutput != 0 {
+		t.Fatalf("start: %+v %v", st, err)
+	}
+	var before []*Frame
+	for t0 := time.Now(); time.Since(t0) < time.Second; {
+		before = append(before, nextFrame(t, h))
+	}
+	if err := h.SetFPS(20); err != nil {
+		t.Fatal(err)
+	}
+	var after []*Frame
+	for t0 := time.Now(); time.Since(t0) < 2*time.Second; {
+		after = append(after, nextFrame(t, h))
+	}
+	qpc := h.QPCFrequency()
+	late := after[len(after)/4:] // well after the change
+	rateBefore, rateAfter := maxPerSecond(before, qpc), maxPerSecond(late, qpc)
+	t.Logf("%d frames/s at 60 fps, %d at 20 fps", rateBefore, rateAfter)
+	if rateBefore < 48 || rateAfter > 22 || rateAfter < 16 {
+		t.Fatalf("SetFPS(20): %d frames per second before, %d after", rateBefore, rateAfter)
+	}
+	for _, f := range append(before, after...) {
+		// Key frames only where the mock's 60-frame clip starts over: the
+		// frame-rate change forced none.
+		if f.Key != ((f.FrameID-1)%60 == 0) || f.Dirty != -1 || f.Discardable {
+			t.Fatalf("frame %d: key %v, dirty %v, discardable %v", f.FrameID, f.Key, f.Dirty, f.Discardable)
+		}
+	}
+	sawFPS := false
+	for deadline := time.After(2 * time.Second); !sawFPS; {
+		select {
+		case s := <-h.Stats():
+			sawFPS = s.FPS == 20 && s.Kbps == 4000 && s.Dirty == -1
+		case <-deadline:
+			t.Fatal("no stats with fps 20 (and the bitrate unchanged)")
+		}
+	}
+}
+
 func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	dump := t.TempDir() + `\frame30.nv12`
 	h := launchMock(t, "--dump-nv12="+dump)
@@ -863,6 +935,11 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 		}
 		if f.Repeat {
 			repeats++
+		}
+		// The test source changes the whole image with every present (Phase 5
+		// dirty share 1); an idle repeat changes nothing.
+		if want := map[bool]float64{false: 1, true: 0}[f.Repeat]; f.Dirty != want {
+			t.Fatalf("frame %d (repeat %v): dirty %v, want %v", f.FrameID, f.Repeat, f.Dirty, want)
 		}
 	}
 	maxInSecond = maxPerSecond(frames, qpc)

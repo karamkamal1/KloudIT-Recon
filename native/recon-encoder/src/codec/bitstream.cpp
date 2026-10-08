@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 
 namespace recon {
@@ -320,6 +321,55 @@ std::string levelText(Codec c, int levelIdc) {
     if (c == Codec::H264) return levelIdc == 9 ? "1b" : std::to_string(levelIdc / 10) + "." + std::to_string(levelIdc % 10);
     if (c == Codec::Hevc) return std::to_string(levelIdc / 30) + "." + std::to_string(levelIdc % 30 / 3);
     return std::to_string(levelIdc);
+}
+
+LayerInfo layerInfo(Codec c, const uint8_t* data, size_t size, int highestTemporalId) {
+    LayerInfo li;
+    if (!data || !size) return li;
+    bool ok = false;
+    const std::vector<Unit> us = units(c, data, size, ok);
+    if (!ok) return li;
+    for (const Unit& u : us) {
+        const uint8_t* h = data + u.header;
+        const size_t left = u.end - u.header;
+        if (c == Codec::Av1) {
+            // OBU_FRAME_HEADER 3, OBU_TILE_GROUP 4, OBU_FRAME 6 with obu_extension_flag.
+            if ((u.type == 3 || u.type == 4 || u.type == 6) && (h[0] & 0x04) && left >= 2) {
+                li.temporalId = h[1] >> 5;
+                return li;
+            }
+            continue;
+        }
+        if (c == Codec::H264) {
+            if (u.type == 14 && left >= 4 && (h[1] & 0x80) && li.temporalId < 0) li.temporalId = h[3] >> 5;  // svc_extension_flag
+            if (u.type == 1 || u.type == 5) {
+                li.reference = (h[0] & 0x60) ? 1 : 0;  // nal_ref_idc
+                return li;
+            }
+            continue;
+        }
+        // HEVC VCL NAL units: types 0..31.
+        if (u.type <= 31 && left >= 2) {
+            li.temporalId = int(h[1] & 0x07) - 1;
+            const bool subLayerNonRef = u.type <= 14 && u.type % 2 == 0;
+            li.reference = subLayerNonRef && li.temporalId >= highestTemporalId ? 0 : 1;
+            return li;
+        }
+    }
+    return li;
+}
+
+bool isDiscardable(bool key, const LayerInfo& bits, int svcLayers, uint32_t temporalLayer) {
+    if (key) return false;
+    if (bits.reference >= 0) return bits.reference == 0;
+    return svcLayers > 1 && temporalLayer == uint32_t(svcLayers - 1);
+}
+
+bool writeRoiPlane(const RoiMap& m, uint8_t* base, size_t pitch) {
+    const size_t row = size_t(m.cols) * sizeof(uint32_t);
+    if (!base || pitch < row || m.values.size() != size_t(m.cols) * m.rows) return false;
+    for (uint32_t y = 0; y < m.rows; ++y) std::memcpy(base + size_t(y) * pitch, &m.values[size_t(y) * m.cols], row);
+    return true;
 }
 
 RoiMap roiImportanceMap(uint32_t width, uint32_t height, uint32_t block, const std::vector<RoiRect>& rects) {

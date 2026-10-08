@@ -70,6 +70,7 @@ public:
     static constexpr int kClipWidth = 320;
     static constexpr int kClipHeight = 180;
     static constexpr size_t kClipFrames = 60;
+    static constexpr int kInstances = 2;  // "hardware engines" for start's encoderInstance
 
 private:
     MockOptions opt_;

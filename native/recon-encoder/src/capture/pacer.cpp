@@ -5,6 +5,7 @@
 #include <limits>
 #include <vector>
 
+#include "capture/dirty.hpp"
 #include "selftest.hpp"
 
 namespace recon {
@@ -150,10 +151,43 @@ void common(const char* name, const std::vector<int64_t>& presents, const std::v
                 static_cast<long long>(minGap));
 }
 
+// The dirty-area share of capture/dirty.hpp (GUIDE 5: the rate controller
+// cuts the bitrate on a static desktop): union, clipping, the long-list
+// fallback and merging two deliveries.
+void testDirty() {
+    const char* name = "dirty area (union of rects)";
+    const auto near = [](double a, double b) { return a > b - 1e-9 && a < b + 1e-9; };
+    const DirtyRect quarter{0, 0, 960, 540};
+    expect(dirtyFraction(nullptr, 0, 1920, 1080) == 0 && dirtyFraction(&quarter, 1, 0, 1080) == 0, name, "empty list / picture not 0");
+    expect(near(dirtyFraction(&quarter, 1, 1920, 1080), 0.25), name, "one quarter rect");
+    const DirtyRect twice[] = {quarter, quarter};
+    expect(near(dirtyFraction(twice, 2, 1920, 1080), 0.25), name, "the same rect twice counted twice");
+    // Overlapping (a move rect's destination that is also dirty): 100x100 +
+    // 100x100 overlapping in 50x50 = 17500 pixels.
+    const DirtyRect overlap[] = {{0, 0, 100, 100}, {50, 50, 150, 150}};
+    expect(near(dirtyFraction(overlap, 2, 200, 200), 17500.0 / 40000.0), name, "overlap counted twice");
+    // An L shape and a rect inside it, clipping, empty / inverted rects.
+    const DirtyRect shapes[] = {{0, 0, 100, 10}, {0, 0, 10, 100}, {5, 5, 8, 8}, {-50, 90, 5, 150}, {60, 60, 60, 80}, {70, 70, 40, 90}};
+    expect(near(dirtyFraction(shapes, 6, 100, 100), (1000.0 + 900.0) / 10000.0), name, "L shape, nested, clipped, empty");
+    // A text caret: tiny but not 0 (stats dirtyPct reports it as 1).
+    const DirtyRect caret{500, 300, 502, 320};
+    const double c = dirtyFraction(&caret, 1, 1920, 1080);
+    expect(c > 0 && near(c, 40.0 / (1920.0 * 1080.0)), name, "caret");
+    // More rects than kMaxDirtyUnionRects: summed (an upper bound), at most 1.
+    std::vector<DirtyRect> many(kMaxDirtyUnionRects + 1, DirtyRect{0, 0, 100, 100});
+    expect(dirtyFraction(many.data(), many.size(), 200, 200) == 1.0, name, "long list not capped at 1");
+    many.assign(kMaxDirtyUnionRects + 1, DirtyRect{0, 0, 1, 1});
+    expect(near(dirtyFraction(many.data(), many.size(), 1000, 1000), double(kMaxDirtyUnionRects + 1) / 1e6), name, "long list not summed");
+    expect(mergeDirty(0.25f, 0.5f) == 0.75f && mergeDirty(0.75f, 0.5f) == 1.0f && mergeDirty(-1, 0.5f) == -1 && mergeDirty(0, 0) == 0, name,
+           "merging two deliveries");
+    std::printf("  %-36s ok\n", name);
+}
+
 }  // namespace
 
 int runPacerSelfTest() {
     failures = 0;
+    testDirty();
     const int64_t sec = 1000000;
     {
         const char* name = "144 Hz game at 120 fps";

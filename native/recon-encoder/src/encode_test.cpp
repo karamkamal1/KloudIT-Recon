@@ -78,6 +78,9 @@ const OptionField kStartOptions[] = {
     {"--zero-copy", "zeroCopy", Kind::Bool},
     {"--hdr", "hdr", Kind::Bool},
     {"--intra-refresh", "intraRefreshFrames", Kind::Int},
+    {"--svc", "svcLayers", Kind::Int},
+    {"--reencode", "reencodeOversized", Kind::Num},
+    {"--slices", "sliceOutput", Kind::Int},
     {"--monitor", "monitor", Kind::Int},
     {"--hmonitor", "hmonitor", Kind::Hex},
 };
@@ -160,7 +163,7 @@ public:
 
     struct Slot {
         uint64_t frameId = 0, refFloor = 0;
-        uint32_t flags = 0, droppedBefore = 0, refLtrMask = 0, width = 0, height = 0, gen = 0;
+        uint32_t flags = 0, droppedBefore = 0, refLtrMask = 0, width = 0, height = 0, gen = 0, temporalLayer = 0, dirtyPpm = 0;
         int32_t ltrSlot = -1;
         int64_t captureQpc = 0, submitQpc = 0, outputQpc = 0;
         size_t bytes = 0;
@@ -194,6 +197,8 @@ public:
             x.droppedBefore = get<uint32_t>(s + kSlotDroppedBefore);
             x.width = get<uint32_t>(s + kSlotWidth);
             x.height = get<uint32_t>(s + kSlotHeight);
+            x.temporalLayer = get<uint32_t>(s + kSlotTemporalLayer);
+            x.dirtyPpm = get<uint32_t>(s + kSlotDirtyPpm);
             x.bytes = size;
             x.payload.assign(s + off, s + off + size);
             out.push_back(std::move(x));
@@ -223,9 +228,18 @@ private:
 class TestReporter : public Reporter {
 public:
     void stats(const FrameStats& s) override {
-        if (s.dropped) {
-            std::lock_guard<std::mutex> lock(mu_);
-            ++dropped_;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (s.dropped) ++dropped_;
+        if (s.reencoded) {
+            ++reencoded_;
+            largestFirst_ = std::max<uint64_t>(largestFirst_, s.oversizeBytes);
+            reencodedBytes_.push_back({s.oversizeBytes, s.bytes});
+        }
+        if (s.slices > 0 && s.firstSliceQpc && s.outputQpc >= s.firstSliceQpc) {
+            slicesTotal_ += uint64_t(s.slices);
+            ++slicedFrames_;
+            firstSliceMs_.push_back(double(s.outputQpc - s.firstSliceQpc) * 1000.0 / double(qpcFrequency()));
+            if (s.submitQpc) firstPartMs_.push_back(double(s.firstSliceQpc - s.submitQpc) * 1000.0 / double(qpcFrequency()));
         }
     }
     void error(const Status& s, std::string_view re) override {
@@ -249,11 +263,24 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         return dropped_;
     }
+    // Phase 5: re-encoded frames (first encode size, sent size), sub-frame output timing.
+    struct Phase5 {
+        uint64_t reencoded = 0, largestFirst = 0, slicesTotal = 0, slicedFrames = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> reencodedBytes;
+        std::vector<double> firstSliceMs, firstPartMs;
+    };
+    Phase5 phase5() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return {reencoded_, largestFirst_, slicesTotal_, slicedFrames_, reencodedBytes_, firstSliceMs_, firstPartMs_};
+    }
 
 private:
     std::mutex mu_;
     int errors_ = 0;
     uint64_t dropped_ = 0;
+    uint64_t reencoded_ = 0, largestFirst_ = 0, slicesTotal_ = 0, slicedFrames_ = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> reencodedBytes_;
+    std::vector<double> firstSliceMs_, firstPartMs_;
     std::atomic<bool> fatal_{false};
 };
 
@@ -261,7 +288,7 @@ struct Event {
     uint64_t at = 0;
     std::string what;  // idr | loss | rate | fps | roi | roi-off
     int value = 0;
-    RoiRect rect;
+    std::vector<RoiRect> rects;
     bool done = false;
     uint64_t firedAt = 0;  // frame id it fired at
     // loss outcome
@@ -285,17 +312,28 @@ bool parseEvent(const std::string& s, Event& e) {
         return isInt(v) && e.value > 0;
     }
     if (w.rfind("roi=", 0) == 0) {
+        // X,Y,W,H,WEIGHT, several joined with '+' (e.g. the cursor / crosshair
+        // rects of encoder.FocusROI).
         e.what = "roi";
-        int* fields[] = {&e.rect.x, &e.rect.y, &e.rect.w, &e.rect.h, &e.rect.weight};
-        size_t pos = 4;
-        for (size_t i = 0; i < 5; ++i) {
-            const size_t comma = w.find(',', pos);
-            const std::string v = w.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            if (!isInt(v) || (i < 4) == (comma == std::string::npos)) return false;
-            *fields[i] = std::atoi(v.c_str());
-            pos = comma + 1;
+        std::string list = w.substr(4);
+        for (size_t start = 0; start <= list.size();) {
+            const size_t plus = list.find('+', start);
+            const std::string one = list.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+            RoiRect r;
+            int* fields[] = {&r.x, &r.y, &r.w, &r.h, &r.weight};
+            size_t pos = 0;
+            for (size_t i = 0; i < 5; ++i) {
+                const size_t comma = one.find(',', pos);
+                const std::string v = one.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!isInt(v) || (i < 4) == (comma == std::string::npos)) return false;
+                *fields[i] = std::atoi(v.c_str());
+                pos = comma + 1;
+            }
+            e.rects.push_back(r);
+            if (plus == std::string::npos) break;
+            start = plus + 1;
         }
-        return true;
+        return !e.rects.empty() && e.rects.size() <= 256;
     }
     return false;
 }
@@ -390,6 +428,28 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
     }
     const uint32_t codedW = uint32_t(st.codedWidth ? st.codedWidth : st.width), codedH = uint32_t(st.codedHeight ? st.codedHeight : st.height);
     if (codec == Codec::Av1) ivfHeader(file, codedW, codedH, uint32_t(p.fps), 0);
+    // Temporal SVC: a second file with the frames a congested recon-host
+    // would keep (the discardable ones left out), which must decode cleanly.
+    std::FILE* baseFile = nullptr;
+    std::string basePath;
+    if (st.svcLayers > 1) {
+        const size_t slash = o.output.find_last_of("/\\"), dot = o.output.find_last_of('.');
+        basePath = dot != std::string::npos && (slash == std::string::npos || dot > slash) ? o.output.substr(0, dot) + ".base" + o.output.substr(dot)
+                                                                                           : o.output + ".base";
+        if (_wfopen_s(&baseFile, fromUtf8(basePath).c_str(), L"wb") != 0) baseFile = nullptr;
+        if (baseFile && codec == Codec::Av1) ivfHeader(baseFile, codedW, codedH, uint32_t(p.fps), 0);
+    }
+    uint64_t baseWritten = 0;
+    const auto writeFrame = [&](std::FILE* to, const std::vector<uint8_t>& payload, uint64_t index) {
+        if (codec == Codec::Av1) {
+            uint8_t h[12];
+            const uint32_t n = uint32_t(payload.size());
+            for (int b = 0; b < 4; ++b) h[b] = uint8_t(n >> (8 * b));
+            for (int b = 0; b < 8; ++b) h[4 + b] = uint8_t(index >> (8 * b));
+            std::fwrite(h, 1, sizeof(h), to);
+        }
+        std::fwrite(payload.data(), 1, payload.size(), to);
+    };
     std::fflush(stdout);
 
     sr.pipeline->start();
@@ -431,9 +491,10 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                     kbps = e.value;
                     es = sr.pipeline->setRate(RateParams{kbps, 0, 0});
                 } else if (e.what == "fps") {
-                    es = sr.pipeline->setRate(RateParams{kbps, 0, e.value});
+                    // A frame-rate change alone (kbps 0 = unchanged): "FPS before resolution".
+                    es = sr.pipeline->setRate(RateParams{0, 0, e.value});
                 } else if (e.what == "roi") {
-                    es = choice.backend->setRoi({e.rect});
+                    es = choice.backend->setRoi(e.rects);
                 } else if (e.what == "roi-off") {
                     es = choice.backend->setRoi({});
                 }
@@ -456,16 +517,9 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
                 }
             }
             // The "client" decodes it: write it, acknowledge LTR frames later.
-            if (codec == Codec::Av1) {
-                uint8_t h[12];
-                const uint32_t n = uint32_t(f.payload.size());
-                const uint64_t pts = written;
-                for (int b = 0; b < 4; ++b) h[b] = uint8_t(n >> (8 * b));
-                for (int b = 0; b < 8; ++b) h[4 + b] = uint8_t(pts >> (8 * b));
-                std::fwrite(h, 1, sizeof(h), file);
-            }
-            std::fwrite(f.payload.data(), 1, f.payload.size(), file);
+            writeFrame(file, f.payload, written);
             ++written;
+            if (baseFile && !(f.flags & ring::kFlagDiscardable)) writeFrame(baseFile, f.payload, baseWritten++);
             if (f.ltrSlot >= 0) pendingAcks.emplace_back(f.frameId, f.frameId + uint64_t(o.ackDelay));
             for (auto it = pendingAcks.begin(); it != pendingAcks.end();) {
                 if (it->second <= f.frameId) {
@@ -490,6 +544,13 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
         ivfHeader(file, codedW, codedH, uint32_t(p.fps), uint32_t(written));
     }
     std::fclose(file);
+    if (baseFile) {
+        if (codec == Codec::Av1) {
+            std::fseek(baseFile, 0, SEEK_SET);
+            ivfHeader(baseFile, codedW, codedH, uint32_t(p.fps), uint32_t(baseWritten));
+        }
+        std::fclose(baseFile);
+    }
 
     // --- Summary ---------------------------------------------------------------
     // Sizes come from the stats-free ring copy: recompute from the frames kept.
@@ -515,6 +576,51 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
     for (uint64_t k : keys) keyList += (keyList.empty() ? "" : " ") + std::to_string(k);
     std::printf("encode-test: key frames at %s; %llu recovery frames; %llu LTR marks\n", keyList.c_str(),
                 static_cast<unsigned long long>(recoveries), static_cast<unsigned long long>(marks));
+    // Phase 5: temporal layers, dirty share, re-encoded frames, sub-frame output.
+    {
+        uint64_t layers[4] = {}, discardable = 0, dirtyKnown = 0, dirtyZero = 0;
+        double dirtySum = 0, dirtyMax = 0;
+        for (const auto& f : all) {
+            layers[std::min<uint32_t>(f.temporalLayer, 3)]++;
+            discardable += (f.flags & ring::kFlagDiscardable) != 0;
+            if (f.flags & ring::kFlagDirty) {
+                const double d = double(f.dirtyPpm) / 1e6;
+                ++dirtyKnown;
+                dirtySum += d;
+                dirtyMax = std::max(dirtyMax, d);
+                dirtyZero += f.dirtyPpm == 0;
+            }
+        }
+        if (st.svcLayers > 1) {
+            std::printf("encode-test: temporal layers: %llu / %llu / %llu / %llu frames in layer 0 / 1 / 2 / 3, %llu discardable; %llu frames "
+                        "without them in %s (check: ffmpeg -v error -i %s -f null -)\n",
+                        static_cast<unsigned long long>(layers[0]), static_cast<unsigned long long>(layers[1]),
+                        static_cast<unsigned long long>(layers[2]), static_cast<unsigned long long>(layers[3]),
+                        static_cast<unsigned long long>(discardable), static_cast<unsigned long long>(baseWritten), basePath.c_str(),
+                        basePath.c_str());
+        }
+        if (dirtyKnown) {
+            std::printf("encode-test: dirty share: mean %.4f, max %.4f, %llu of %llu frames unchanged (%zu frames without dirty "
+                        "information)\n",
+                        dirtySum / double(dirtyKnown), dirtyMax, static_cast<unsigned long long>(dirtyZero),
+                        static_cast<unsigned long long>(dirtyKnown), all.size() - size_t(dirtyKnown));
+        }
+        const TestReporter::Phase5 p5 = rep.phase5();
+        if (p.reencodeOversized > 0) {
+            std::string list;
+            for (size_t i = 0; i < p5.reencodedBytes.size() && i < 8; ++i) {
+                list += (list.empty() ? "" : ", ") + std::to_string(p5.reencodedBytes[i].first) + " -> " + std::to_string(p5.reencodedBytes[i].second);
+            }
+            std::printf("encode-test: re-encoded %llu frames above %.1f average frames (bytes: %s)\n",
+                        static_cast<unsigned long long>(p5.reencoded), p.reencodeOversized, list.empty() ? "none" : list.c_str());
+        }
+        if (p.sliceOutput > 0) {
+            std::printf("encode-test: sub-frame output: %.1f parts per frame; first part -> whole frame ms p50 %.2f p95 %.2f; submit -> "
+                        "first part ms p50 %.2f\n",
+                        p5.slicedFrames ? double(p5.slicesTotal) / double(p5.slicedFrames) : 0.0, percentile(p5.firstSliceMs, 0.5),
+                        percentile(p5.firstSliceMs, 0.95), percentile(p5.firstPartMs, 0.5));
+        }
+    }
     bool ok = !rep.fatalRaised() && !timedOut && !all.empty() && !keys.empty() && keys.front() == all.front().frameId;
     if (timedOut) std::printf("encode-test: FAIL timed out\n");
     if (!keys.empty() && !all.empty() && keys.front() != all.front().frameId) std::printf("encode-test: FAIL the first frame is not a key frame\n");

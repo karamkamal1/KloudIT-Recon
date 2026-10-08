@@ -30,7 +30,7 @@ protected:
     struct Acquired {
         int64_t presentQpc = 0;  // 0 = unknown
         int64_t captureQpc = 0;
-        int dirtyPct = -1;
+        float dirty = -1;  // share of the image that changed (capture/dirty.hpp), -1 = unknown
     };
 
     // Waits up to timeoutMs (0 = just look) for a new image. On Frame the

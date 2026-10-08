@@ -5,7 +5,10 @@
 //
 // recon-host starts one helper per streaming session (Launch), reads its
 // capabilities (Caps), starts the stream (Start), steers it at run time
-// (ForceIDR, Recover, SetRate, SetROI) and reads encoded frames (Frames).
+// (ForceIDR, Recover, SetRate, SetFPS, SetROI) and reads encoded frames (Frames).
+// Phase 5 helpers: FocusROI (cursor / crosshair regions, focus.go),
+// ActivityMeter (a static desktop from the dirty share, activity.go),
+// Frame.Droppable (temporal SVC), LowerFPS and EncoderInstanceFor (adapt.go).
 // Restarting a helper that exited or reported a fatal error is the caller's
 // job: Launch a new one and Start it (its first frame is an IDR).
 package encoder
@@ -63,6 +66,15 @@ type StartParams struct {
 	LTRInterval        int    `json:"ltrInterval,omitempty"`        // frames between LTR marks; 0 = fps/10
 	IntraRefreshFrames int    `json:"intraRefreshFrames,omitempty"` // intra refresh cycle in frames; 0 = off (not with LTRSlots)
 	ZeroCopy           *bool  `json:"zeroCopy,omitempty"`           // AMD Direct Capture surfaces straight into AMF when possible; nil = true
+
+	// Phase 5 experiments (zero = off). ReencodeOversized: a non-key frame
+	// larger than this many average frames (bitrate / fps) is encoded again at
+	// a higher QP before it goes out (1.5..100; only with CodecCaps.Reencode,
+	// NVENC). SliceOutput: slices / tiles per frame handed out one by one by
+	// the encoder (AMF, CodecCaps.SliceOutput); frames still arrive whole,
+	// Stats.FirstSliceQPC says when their first part was ready.
+	ReencodeOversized float64 `json:"reencodeOversized,omitempty"`
+	SliceOutput       int     `json:"sliceOutput,omitempty"`
 }
 
 // Barcode places the frame id as a block barcode into every encoded frame
@@ -158,6 +170,14 @@ type CodecCaps struct {
 	// HDR10: StartParams.HDR can produce HDR10 with this codec (10-bit P010
 	// input, Main10 / AV1 10-bit, BT.2020 PQ and HDR metadata; step 3.9).
 	HDR10 bool `json:"hdr10"`
+	// Phase 5 (older helpers omit them: "" / false). LiveFPS: how SetFPS (a
+	// frame-rate change) is applied, seamless | flush | restart, like
+	// LiveBitrate. InstanceSelect: StartParams.EncoderInstance picks the
+	// hardware engine (AMF); false: leave it nil (NVENC spreads its work over
+	// its engines). Reencode: StartParams.ReencodeOversized works.
+	LiveFPS        string `json:"liveFps"`
+	InstanceSelect bool   `json:"instanceSelect"`
+	Reencode       bool   `json:"reencode"`
 	// Assumed names the fields above that are documented or default values,
 	// not detected on this GPU (e.g. AMF AV1 "roi", "liveBitrate" until the
 	// step 3.6 qualification); omitted when everything was detected.
@@ -233,6 +253,13 @@ type Started struct {
 	BitDepth    int          `json:"bitDepth"`
 	ColorSpace  string       `json:"colorSpace"`
 	HDRMetadata *HDRMetadata `json:"hdrMetadata,omitempty"`
+	// Phase 5 (older helpers omit them): the temporal layers the encoder runs
+	// (1 = no SVC; 0 from an older helper means 1), how SetFPS is applied,
+	// the re-encode threshold and the slices / tiles per frame in use (0 = off).
+	SVCLayers         int     `json:"svcLayers"`
+	LiveFPS           string  `json:"liveFps"`
+	ReencodeOversized float64 `json:"reencodeOversized"`
+	SliceOutput       int     `json:"sliceOutput"`
 }
 
 // HDRMetadata is an HDR10 stream's static metadata as the encoder writes it
@@ -268,14 +295,27 @@ type CaptureChanged struct {
 // (Dropped, Reason "ringFull" or "tooLarge"). Timestamps are QPC ticks
 // (Caps.QPCFrequency per second).
 type Stats struct {
-	FrameID       uint64  `json:"frameId"`
-	Gen           uint32  `json:"gen"`
-	Dropped       bool    `json:"dropped"`
-	Reason        string  `json:"reason,omitempty"`
-	Key           bool    `json:"key"`
-	Recovery      bool    `json:"recovery"`
-	Repeat        bool    `json:"repeat"`   // idle re-submit of the previous image
-	DirtyPct      int     `json:"dirtyPct"` // share of the image that changed, -1 = unknown
+	FrameID  uint64 `json:"frameId"`
+	Gen      uint32 `json:"gen"`
+	Dropped  bool   `json:"dropped"`
+	Reason   string `json:"reason,omitempty"`
+	Key      bool   `json:"key"`
+	Recovery bool   `json:"recovery"`
+	Repeat   bool   `json:"repeat"`   // idle re-submit of the previous image
+	DirtyPct int    `json:"dirtyPct"` // share of the image that changed in whole percent, rounded up; -1 = unknown
+	// Dirty is the same share as a fraction (0..1, the union of the capture's
+	// dirty rects), -1 = unknown (also from helpers older than Phase 5).
+	Dirty       float64 `json:"dirty"`
+	Discardable bool    `json:"discardable"` // no later frame references it (Frame.Droppable)
+	// Reencoded: encoded a second time at a higher QP (StartParams.
+	// ReencodeOversized); OversizeBytes is the size of the first encode.
+	Reencoded     bool   `json:"reencoded,omitempty"`
+	OversizeBytes uint64 `json:"oversizeBytes,omitempty"`
+	// Slices / FirstSliceQPC (StartParams.SliceOutput): the parts the frame
+	// came out in and when the first one was ready (OutputQPC - FirstSliceQPC
+	// is what sub-frame delivery could gain).
+	Slices        int     `json:"slices,omitempty"`
+	FirstSliceQPC int64   `json:"firstSliceQpc,omitempty"`
 	Bytes         uint64  `json:"bytes"`
 	PresentQPC    int64   `json:"presentQpc"`
 	CaptureQPC    int64   `json:"captureQpc"`
@@ -329,8 +369,8 @@ type recoverMsg struct {
 }
 
 type setRateMsg struct {
-	T         string  `json:"t"` // "setRate"
-	Kbps      int     `json:"kbps"`
+	T         string  `json:"t"`              // "setRate"
+	Kbps      int     `json:"kbps,omitempty"` // 0 = unchanged (SetFPS)
 	VBVFrames float64 `json:"vbvFrames,omitempty"`
 	FPS       int     `json:"fps,omitempty"`
 }
@@ -364,7 +404,7 @@ func decodeMessage(b []byte) (any, error) {
 	case "started":
 		v = &Started{}
 	case "stats":
-		v = &Stats{}
+		v = &Stats{Dirty: -1} // older helpers send no "dirty": unknown
 	case "captureChanged":
 		v = &CaptureChanged{}
 	case "error":

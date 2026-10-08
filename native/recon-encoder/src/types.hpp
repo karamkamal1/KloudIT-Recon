@@ -122,9 +122,21 @@ struct StartParams {
     int ltrInterval = 0;         // frames between LTR marks, 0 = fps/10 (about 100 ms)
     int intraRefreshFrames = 0;  // intra refresh cycle in frames, 0 = off (not with ltrSlots or svcLayers > 1)
     bool zeroCopy = true;        // AMD Direct Capture surfaces go to the AMF encoder unconverted when possible
+    // Phase 5 experiments (optional, off by default; caps say where they work).
+    // reencodeOversized: a non-key frame larger than this many average frames
+    // (bitrate / fps) is encoded once more at a higher QP before it goes out
+    // (NVENC NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE + NvEncRestoreEncoderState;
+    // caps reencode), 0 = off.
+    double reencodeOversized = 0;
+    // sliceOutput: slices (H.264 / HEVC) or tiles (AV1) per frame that the
+    // encoder hands out one by one (AMF OUTPUT_MODE SLICE / TILE; caps
+    // sliceOutput); the helper still publishes whole frames and reports when
+    // the first part was ready (stats firstSliceQpc). 0 = off.
+    int sliceOutput = 0;
 };
 
-// RateParams is the "setRate" control message; fps 0 = unchanged.
+// RateParams is the "setRate" control message; 0 = unchanged (kbps 0 since
+// Phase 5: a frame-rate change alone, "FPS before resolution").
 struct RateParams {
     int kbps = 0;
     double vbvFrames = 0;
@@ -167,8 +179,19 @@ struct CodecCaps {
     int alignW = 1, alignH = 1;  // required coded-size alignment (AV1 on RDNA3: 64x16)
     // The running encoder can change its coded size without a new session
     // (NVENC NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE; the helper has no control
-    // message for it yet: GUIDE 5 "FPS before resolution").
+    // message for it yet: GUIDE 5 "FPS before resolution" changes the frame
+    // rate first, see liveFps).
     bool dynamicResolution = false;
+    // How setRate's fps is applied (Phase 5 "FPS before resolution"):
+    // "seamless" (from the next frame, no IDR: AMF FRAMERATE, NVENC
+    // NvEncReconfigureEncoder) | "flush" (as liveBitrate flush) | "restart".
+    std::string liveFps = "restart";
+    // start's encoderInstance picks the hardware engine (AMF INSTANCE_INDEX);
+    // false: the encoder spreads its work over its engines itself (NVENC
+    // split-frame) and encoderInstance must stay unset.
+    bool instanceSelect = false;
+    // start's reencodeOversized works (NVENC NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE).
+    bool reencode = false;
     // start with hdr can produce HDR10 with this codec: 10-bit 4:2:0 input
     // (P010), Main10 / AV1 Main 10-bit, BT.2020 PQ signalling and HDR metadata
     // (GUIDE 3.9; HEVC and AV1 only).
@@ -177,6 +200,13 @@ struct CodecCaps {
     // on this GPU (e.g. AMF AV1 "roi": there is no ROI cap; "liveBitrate" until
     // step 3.6 measures it). Sent only when not empty.
     std::vector<std::string> assumed;
+
+    bool isAssumed(const std::string& field) const {
+        for (const std::string& a : assumed) {
+            if (a == field) return true;
+        }
+        return false;
+    }
 };
 
 // Caps is sent once, right after start-up (GUIDE Arch-2 shape plus diagnostics).
@@ -227,6 +257,13 @@ struct Started {
     bool zeroCopy = false;       // capture surfaces go to the encoder without the NV12 conversion
     int intraRefreshFrames = 0;
     std::string preset;          // NVENC preset "p1".."p7" ("" for other backends)
+    // Phase 5: temporal layers in use (1 = no SVC), how setRate's fps is
+    // applied, the re-encode threshold and the slices / tiles per frame in use
+    // (0 = off).
+    int svcLayers = 1;
+    std::string liveFps;
+    double reencodeOversized = 0;
+    int sliceOutput = 0;
     bool asyncEncode = false;    // NVENC: completion events (async mode), false = polled output (sync mode)
     int refFrames = 0;           // reference frames the encoder is configured to keep (NVENC DPB size; 0 = not reported)
     // HDR10 (step 3.9): the stream is 10-bit BT.2020 PQ (colorSpace
@@ -261,7 +298,15 @@ struct FrameStats {
     bool key = false;
     bool recovery = false;
     bool repeat = false;  // idle re-submit of the previous image (nothing new on screen)
-    int dirtyPct = -1;    // share of the image the capture reported as changed, -1 = unknown
+    float dirty = -1;     // share of the image the capture reported as changed (union of the dirty rects, 0..1), -1 = unknown
+    // No later frame references this one: it can be left out without
+    // breaking the decoding of any other (the top temporal layer of an SVC
+    // stream, a non-reference frame).
+    bool discardable = false;
+    bool reencoded = false;     // re-encoded at a higher QP (start reencodeOversized); oversizeBytes = the first encode's size
+    uint64_t oversizeBytes = 0;
+    int slices = 0;             // parts the encoder delivered the frame in (start sliceOutput), 0 = whole frame
+    int64_t firstSliceQpc = 0;  // when the first part came out
     uint64_t bytes = 0;
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0, outputQpc = 0;
     uint64_t refFloor = 0;

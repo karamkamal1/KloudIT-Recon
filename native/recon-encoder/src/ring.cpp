@@ -1,6 +1,8 @@
 #include "ring.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <bit>
 #include <cstring>
 
@@ -30,6 +32,8 @@ std::atomic_ref<uint64_t> counter(uint8_t* base, size_t off) {
 }
 
 Status ringError(const std::string& text) { return Status::Error("ring", text, true); }
+
+uint32_t dirtyPpm(float dirty) { return uint32_t(std::lround(std::clamp(double(dirty), 0.0, 1.0) * 1e6)); }
 
 }  // namespace
 
@@ -94,6 +98,8 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (f.recovery) flags |= kFlagRecovery;
     if (droppedPending_) flags |= kFlagDroppedBefore;
     if (f.info.repeat) flags |= kFlagRepeat;
+    if (f.info.dirty >= 0) flags |= kFlagDirty;
+    if (f.discardable) flags |= kFlagDiscardable;
     store<uint64_t>(s + kSlotSeq, written_);
     store<uint64_t>(s + kSlotFrameId, f.info.frameId);
     store<uint32_t>(s + kSlotFlags, flags);
@@ -111,6 +117,7 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     store<uint32_t>(s + kSlotDroppedBefore, droppedPending_);
     store<uint32_t>(s + kSlotWidth, f.width);
     store<uint32_t>(s + kSlotHeight, f.height);
+    if (f.info.dirty >= 0) store<uint32_t>(s + kSlotDirtyPpm, dirtyPpm(f.info.dirty));
     if (f.size) std::memcpy(s + kSlotHeaderSize, f.data, f.size);
 
     // Publish: everything above happens-before recon-host's acquire load of writeCount.

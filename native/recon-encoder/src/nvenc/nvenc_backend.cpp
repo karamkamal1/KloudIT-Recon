@@ -55,6 +55,16 @@
 // NVENC documents the two-thread model but not which other calls may overlap.
 // Lock order: d3d::dxgiGate(), then sessionMu_, then flightMu_ / ctlMu_.
 //
+// Phase 5 (GUIDE 9): temporal SVC reports NV_ENC_LOCK_BITSTREAM::temporalId
+// and the discardable flag (codec/bitstream.hpp); setRate's fps goes through
+// NvEncReconfigureEncoder (caps liveFps); with start reencodeOversized
+// (NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE) every non-key frame is encoded
+// without advancing the encoder state (stateBufferIdx 0), read back at once on
+// the capture thread, encoded a second time at a higher QP (stateBufferIdx 1)
+// when it is larger than the limit, and committed with
+// NvEncRestoreEncoderState(the chosen buffer) before the next frame
+// (encodeInline): one frame in the encoder at a time in that mode.
+//
 // HDR10 (GUIDE 3.9; start hdr from an HDR source, HEVC and AV1): P010 input
 // from the colour conversion registered as NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
 // HEVC Main10 / AV1 Main with input and output bit depth 10, BT.2020 / SMPTE
@@ -94,6 +104,7 @@ constexpr int kMaxErrors = 10;        // consecutive failures before giving up (
 constexpr int64_t kHangMs = 2000;     // a frame not finished after this long: the encoder hangs (fatal)
 constexpr int kDrainBeforeInvalidateMs = 50;
 constexpr int kTeardownMs = 200;      // release(): waiting for frames still in the encoder
+constexpr uint32_t kStateBuffers = 2; // reencodeOversized: the first encode of a frame and its second one
 
 bool sameGuid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
 
@@ -173,7 +184,7 @@ struct CodecDetails {
     bool multiRef = false;       // NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES
     bool cabac = false;          // NV_ENC_CAPS_SUPPORT_CABAC (H.264)
     bool emphasisMap = false;    // NV_ENC_CAPS_SUPPORT_EMPHASIS_LEVEL_MAP (H.264 only, not with AQ)
-    bool stateAdvance = false;   // NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE (Phase 5 hook)
+    bool stateAdvance = false;   // NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE (start reencodeOversized)
     bool dynBitrate = false;     // NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE
     bool singleSliceIntraRefresh = false;
     bool nv12 = false;           // NV_ENC_BUFFER_FORMAT_NV12 in NvEncGetInputFormats
@@ -238,6 +249,14 @@ CodecDetails readDetails(const NV_ENCODE_API_FUNCTION_LIST& nv, void* enc, Codec
     d.cabac = cap(NV_ENC_CAPS_SUPPORT_CABAC) != 0;
     d.stateAdvance = cap(NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE) != 0;
     d.singleSliceIntraRefresh = cap(NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH) != 0;
+    // Phase 5: the frame rate changes with the bitrate's NvEncReconfigureEncoder
+    // (frameRateNum; no cap of its own: assumed, like liveBitrate); NVENC picks
+    // its engines itself (split-frame encoding), so encoderInstance is not a
+    // choice; re-encoding needs encodes that do not advance the state.
+    cc.liveFps = d.dynBitrate ? "seamless" : "restart";
+    if (d.dynBitrate) cc.assumed.push_back("liveFps");
+    cc.instanceSelect = false;
+    cc.reencode = d.stateAdvance;
     uint32_t n = 0;
     if (nv.nvEncGetInputFormatCount(enc, g, &n) == NV_ENC_SUCCESS && n) {
         std::vector<NV_ENC_BUFFER_FORMAT> f(n);
@@ -378,6 +397,14 @@ private:
         uint64_t refFloor = 0;
         uint32_t gen = 0;
         bool signaled = false;                         // async: its event fired (consumed) already
+        // Re-encode mode (encodeInline): the frame is finished and read back
+        // already; receive() only hands out data.
+        bool done = false;
+        std::vector<uint8_t> data;
+        NV_ENC_PIC_TYPE picType = NV_ENC_PIC_TYPE_P;
+        uint32_t temporalId = 0;
+        bool reencoded = false;
+        size_t oversizeBytes = 0;
     };
 
     Status validate(const StartParams& p);
@@ -390,6 +417,9 @@ private:
     void unmap(NV_ENC_INPUT_PTR mapped);
     bool waitInFlightDone(int maxMs);
     NVENCSTATUS lockFront(const InFlight& f, NV_ENC_LOCK_BITSTREAM& lk, bool copy);
+    NVENCSTATUS lockSlot(int slot, bool signaled, NV_ENC_LOCK_BITSTREAM& lk, std::vector<uint8_t>* copy);
+    Status encodeAndRead(NV_ENC_PIC_PARAMS& pic, int slot, std::vector<uint8_t>& data, NV_ENC_LOCK_BITSTREAM& lk);
+    Status encodeInline(NV_ENC_PIC_PARAMS& pic, InFlight& f);
     Status submitFailed(NVENCSTATUS s, const char* what);
     void sendEos(int64_t deadline);
     void warnOnce(const std::string& key, const std::string& text);
@@ -409,6 +439,9 @@ private:
     bool flushMode_ = false;
     int refs_ = nvenc::kDpbFrames;
     int intraRefresh_ = 0;
+    double reencodeFactor_ = 0;  // start reencodeOversized (0 = off): encodeInline for every frame
+    uint64_t reencodes_ = 0, trialFrames_ = 0, restoreFailures_ = 0;
+    PreciseTimer submitTimer_;   // the capture thread's polling sleeps (encodeInline in sync mode)
     std::optional<HdrMetadata> hdr_;   // HDR10 stream: its metadata
     MASTERING_DISPLAY_INFO mastering_{};  // passed with every picture of an HDR10 stream
     CONTENT_LIGHT_LEVEL lightLevel_{};
@@ -526,6 +559,7 @@ void NvencEncoder::release() {
             left.swap(flight_);
         }
         for (InFlight& f : left) {
+            if (f.done) continue;  // read back and unmapped already (encodeInline)
             if (async_ && !f.signaled) {
                 // Signaled: lockFront's lock returns at once; else it polls
                 // until the deadline (a hung encoder).
@@ -549,6 +583,11 @@ void NvencEncoder::release() {
                 nv_.nvEncUnregisterAsyncEvent(enc_, &ep);
             }
             if (b.bitstream) nv_.nvEncDestroyBitstreamBuffer(enc_, b.bitstream);
+        }
+        if (reencodeFactor_ > 0) {
+            logf(LogLevel::Info, "nvenc: re-encoded %llu of %llu frames (limit %.1f average frames), %llu failed commits",
+                 static_cast<unsigned long long>(reencodes_), static_cast<unsigned long long>(trialFrames_), reencodeFactor_,
+                 static_cast<unsigned long long>(restoreFailures_));
         }
         const NVENCSTATUS s = nv_.nvEncDestroyEncoder(enc_);
         if (s != NV_ENC_SUCCESS) logf(LogLevel::Warn, "nvenc: %s", nvError("NvEncDestroyEncoder", s).c_str());
@@ -596,6 +635,14 @@ Status NvencEncoder::validate(const StartParams& p) {
                                                  : !cc.tenBit      ? std::string("NV_ENC_CAPS_SUPPORT_10BIT_ENCODE 0")
                                                                    : std::string("no YUV420_10BIT input")) +
                                                 ")");
+    }
+    if (p.sliceOutput > 0) {
+        return Status::Error("unsupported", "sliceOutput: the NVENC backend has no sub-frame output yet (caps sliceOutput is the "
+                                            "GPU's NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK; the experiment is AMF's)");
+    }
+    if (p.reencodeOversized > 0 && !det_.stateAdvance) {
+        return Status::Error("unsupported", "reencodeOversized: this encoder cannot encode without advancing its state "
+                                            "(NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE 0; caps reencode false)");
     }
     if (p.encoderInstance > 0) {
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) +
@@ -798,14 +845,11 @@ Status NvencEncoder::configure() {
     // splitEncodeMode stays NV_ENC_SPLIT_AUTO_MODE: the driver splits a frame
     // over several engines where it helps (4K on GPUs with two or three NVENCs).
     //
-    // Phase 5 hook (GUIDE 9 "Re-encode oversized frames: NVENC
-    // DISABLE_ENC_STATE_ADVANCE + restore"), not implemented: needs
-    // NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE (det_.stateAdvance, logged below),
-    // init_.numStateBuffers > 0, per frame NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE
-    // with stateBufferIdx and frameIdx (monotonic from 0: encodeCount_ already
-    // is), and when the output is too large NvEncRestoreEncoderState after all
-    // earlier encodes finished, then the same input again at a lower QP (NVENC
-    // guide "encoding the same frame multiple times").
+    // Re-encoding oversized frames (GUIDE 9; start reencodeOversized): "Number
+    // of state buffers to allocate to save encoder state. Set this to value
+    // greater than zero to enable encoding without advancing the encoder
+    // state": one for a frame's first encode, one for its second (encodeInline).
+    init_.numStateBuffers = reencodeFactor_ > 0 ? kStateBuffers : 0;
     return Status::Ok();
 }
 
@@ -897,6 +941,8 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     async_ = det_.async;
     refs_ = det_.multiRef ? nvenc::dpbFramesFor(codec_, width_, height_) : 1;
     intraRefresh_ = p.intraRefreshFrames > 0 ? std::max(2, p.intraRefreshFrames) : 0;  // period, count = period - 1
+    reencodeFactor_ = p.reencodeOversized;
+    reencodes_ = trialFrames_ = restoreFailures_ = 0;
     preset_ = nvenc::presetFor(width_, height_, fps_, p.quality);
     if (vbvFrames_ < 1.0 || vbvFrames_ > 1.5) logf(LogLevel::Info, "nvenc: vbvFrames %.2f (GUIDE 10: one frame for NVIDIA)", vbvFrames_);
 
@@ -953,15 +999,20 @@ Status NvencEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec
     out.preset = "p" + std::to_string(preset_);
     out.asyncEncode = async_;
     out.refFrames = refs_;
+    out.svcLayers = std::max(1, p.svcLayers);
+    out.liveFps = !det_.dynBitrate ? "restart" : flushMode_ ? "flush" : "seamless";
+    out.reencodeOversized = reencodeFactor_;
+    out.sliceOutput = 0;
     describeColor(out, hdr_);
     logf(LogLevel::Info,
          "nvenc: %s %ux%u %d fps %d kbps %s vbv %.2f frames (%u bits), preset P%d ultra-low-latency, %s output, %d reference frames, "
          "recovery %s, live bitrate %s, two-pass quarter resolution, spatial AQ, key frame scale %u, intra refresh %d, %d engine(s), "
-         "dynamic resolution %s (max %ux%u), emphasis map cap %d, state-advance cap %d, LTR frames cap %d (unused), %s on %s",
+         "dynamic resolution %s (max %ux%u), emphasis map cap %d, state-advance cap %d, LTR frames cap %d (unused), temporal layers %d, "
+         "re-encode above %.1f average frames (0 = off), %s on %s",
          p.codec.c_str(), width_, height_, fps_, kbps_, out.rateControl.c_str(), vbvFrames_, config_.rcParams.vbvBufferSize, preset_,
          async_ ? "async (events)" : "sync (polled)", refs_, cc.recovery.c_str(), out.liveBitrate.c_str(), nvenc::kKeyFrameScale,
          intraRefresh_, cc.hwInstances, cc.dynamicResolution ? "yes" : "no", init_.maxEncodeWidth, init_.maxEncodeHeight,
-         int(det_.emphasisMap), int(det_.stateAdvance), det_.ltrFrames, rt_.versionText.c_str(),
+         int(det_.emphasisMap), int(det_.stateAdvance), det_.ltrFrames, out.svcLayers, reencodeFactor_, rt_.versionText.c_str(),
          src.adapter.found ? src.adapter.name.c_str() : "the capture device");
     if (hdr_) {
         logf(LogLevel::Info, "nvenc: HDR10: %s, P010 input, BT.2020 PQ; mastering display %.0f / %.4f cd/m2, MaxCLL %d, MaxFALL %d",
@@ -1256,23 +1307,6 @@ Status NvencEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
         pic.codecPicParams.av1PicParams.pMasteringDisplay = &mastering_;
         pic.codecPicParams.av1PicParams.pMaxCll = &lightLevel_;
     }
-    NVENCSTATUS s;
-    {
-        std::lock_guard<std::mutex> lock(sessionMu_);
-        s = nv_.nvEncEncodePicture(enc_, &pic);
-    }
-    if (s == NV_ENC_ERR_NEED_MORE_INPUT) {
-        // Only with B frames or lookahead, both off: the frame is queued and
-        // its event comes later, in order, like any other.
-        warnOnce("needmore", "NvEncEncodePicture answered NV_ENC_ERR_NEED_MORE_INPUT (no B frames are configured)");
-    } else if (s != NV_ENC_SUCCESS) {
-        unmap(mapped);
-        if (s == NV_ENC_ERR_ENCODER_BUSY) return Status::Error("encoder_busy", "NVENC is busy (NV_ENC_ERR_ENCODER_BUSY)");
-        return submitFailed(s, "NvEncEncodePicture");
-    }
-    nextSlot_ = (slot + 1) % kOutputBuffers;
-    ++encodeCount_;
-    submitErrors_ = 0;
     InFlight f;
     f.info = info;
     f.slot = slot;
@@ -1284,6 +1318,35 @@ Status NvencEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
     f.recovery = plan.recovery;
     f.refFloor = plan.refFloor;
     f.gen = gen_;
+    if (reencodeFactor_ > 0) {
+        // Encoded, read back (and maybe encoded again) right here: the frame
+        // goes to the output thread finished, its input is free again.
+        Status es = encodeInline(pic, f);
+        unmap(mapped);  // after its NvEncLockBitstream (or a failed encode)
+        f.mapped = nullptr;
+        f.hold.reset();
+        f.texture.Reset();
+        f.qpMap.reset();
+        if (!es.ok) return es;
+    } else {
+        NVENCSTATUS s;
+        {
+            std::lock_guard<std::mutex> lock(sessionMu_);
+            s = nv_.nvEncEncodePicture(enc_, &pic);
+        }
+        if (s == NV_ENC_ERR_NEED_MORE_INPUT) {
+            // Only with B frames or lookahead, both off: the frame is queued and
+            // its event comes later, in order, like any other.
+            warnOnce("needmore", "NvEncEncodePicture answered NV_ENC_ERR_NEED_MORE_INPUT (no B frames are configured)");
+        } else if (s != NV_ENC_SUCCESS) {
+            unmap(mapped);
+            if (s == NV_ENC_ERR_ENCODER_BUSY) return Status::Error("encoder_busy", "NVENC is busy (NV_ENC_ERR_ENCODER_BUSY)");
+            return submitFailed(s, "NvEncEncodePicture");
+        }
+    }
+    nextSlot_ = (slot + 1) % kOutputBuffers;
+    ++encodeCount_;
+    submitErrors_ = 0;
     {
         std::lock_guard<std::mutex> lock(flightMu_);
         flight_.push_back(std::move(f));
@@ -1309,21 +1372,144 @@ Status NvencEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
 // few milliseconds"), and release() polls a frame whose event did not come
 // within its deadline, so a hung encoder cannot block the teardown.
 NVENCSTATUS NvencEncoder::lockFront(const InFlight& f, NV_ENC_LOCK_BITSTREAM& lk, bool copy) {
+    return lockSlot(f.slot, f.signaled, lk, copy ? &outBuf_ : nullptr);
+}
+
+NVENCSTATUS NvencEncoder::lockSlot(int slot, bool signaled, NV_ENC_LOCK_BITSTREAM& lk, std::vector<uint8_t>* copy) {
     std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
     std::lock_guard<std::mutex> lock(sessionMu_);
     lk = {};
     lk.version = NV_ENC_LOCK_BITSTREAM_VER;
-    lk.outputBitstream = out_[size_t(f.slot)].bitstream;
-    lk.doNotWait = async_ && f.signaled ? 0 : 1;
+    lk.outputBitstream = out_[size_t(slot)].bitstream;
+    lk.doNotWait = async_ && signaled ? 0 : 1;
     const NVENCSTATUS s = nv_.nvEncLockBitstream(enc_, &lk);
     if (s != NV_ENC_SUCCESS) return s;
     if (copy) {
         const auto* p = static_cast<const uint8_t*>(lk.bitstreamBufferPtr);
-        outBuf_.assign(p, p + lk.bitstreamSizeInBytes);
+        copy->assign(p, p + lk.bitstreamSizeInBytes);
     }
     const NVENCSTATUS u = nv_.nvEncUnlockBitstream(enc_, lk.outputBitstream);
     if (u != NV_ENC_SUCCESS) warnOnce("unlock", nvError("NvEncUnlockBitstream", u));
     return s;
+}
+
+// One encode of pic into its output buffer, waited for and read back on the
+// capture thread (re-encode mode). Async mode waits for the completion event
+// and locks with doNotWait 0 (as the output thread does); sync mode polls the
+// lock. The caller unmaps the input afterwards.
+Status NvencEncoder::encodeAndRead(NV_ENC_PIC_PARAMS& pic, int slot, std::vector<uint8_t>& data, NV_ENC_LOCK_BITSTREAM& lk) {
+    NVENCSTATUS s;
+    {
+        std::lock_guard<std::mutex> lock(sessionMu_);
+        s = nv_.nvEncEncodePicture(enc_, &pic);
+    }
+    if (s == NV_ENC_ERR_ENCODER_BUSY) return Status::Error("encoder_busy", "NVENC is busy (NV_ENC_ERR_ENCODER_BUSY)");
+    if (s != NV_ENC_SUCCESS) return submitFailed(s, "NvEncEncodePicture");  // NEED_MORE_INPUT too: no output would come
+    const int64_t hang = qpcNow() + kHangMs * freq_ / 1000;
+    if (async_) {
+        // No stop event here: the frame must be read back before release()
+        // (it is in no queue), and it takes one encode time.
+        const DWORD w = WaitForSingleObject(out_[size_t(slot)].event, DWORD(kHangMs));
+        if (w != WAIT_OBJECT_0) {
+            Status d;
+            if (d3d::deviceRemoved(device_.Get(), "nvenc: waiting for frame " + std::to_string(pic.inputTimeStamp), d)) return d;
+            return Status::Error("encode_failed", "NVENC did not finish frame " + std::to_string(pic.inputTimeStamp) + " within " +
+                                                      std::to_string(kHangMs) + " ms",
+                                 true);
+        }
+    }
+    for (;;) {
+        s = lockSlot(slot, true, lk, &data);
+        if (s == NV_ENC_SUCCESS) return Status::Ok();
+        if (s != NV_ENC_ERR_LOCK_BUSY) {
+            Status d;
+            if (d3d::deviceRemoved(device_.Get(), nvError("nvenc: NvEncLockBitstream", s), d)) return d;
+            return Status::Error("encode_failed", nvError("NvEncLockBitstream for frame " + std::to_string(pic.inputTimeStamp), s));
+        }
+        const int64_t now = qpcNow();
+        if (now > hang) {
+            return Status::Error("encode_failed", "NVENC did not finish frame " + std::to_string(pic.inputTimeStamp) + " within " +
+                                                      std::to_string(kHangMs) + " ms",
+                                 true);
+        }
+        submitTimer_.sleepUntil(now + freq_ / 1000, stopEvent_);  // sync mode: "retry ... after few milliseconds"
+    }
+}
+
+// Re-encode mode (start reencodeOversized, GUIDE 9 "re-encode oversized frames
+// (NVENC DISABLE_ENC_STATE_ADVANCE + restore)"): a non-key frame is encoded
+// with NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE into state buffer 0 and read
+// back at once. Larger than the limit (nvenc::oversizeLimit), the same input
+// is encoded again, still without advancing, into state buffer 1 with the QP
+// map raised by nvenc::reencodeQpDelta. NvEncRestoreEncoderState(the encode
+// that goes out, NV_ENC_STATE_RESTORE_FULL) then commits it: the encoder's
+// reference pictures and rate control continue from that encode ("The client
+// must call this function after all previous encodes have finished", which
+// they have). All on the capture thread, which is also the thread every
+// NvEncEncodePicture runs on (NvEncGetSequenceParams' rule). Key frames are
+// encoded normally (their size is lowDelayKeyFrameScale's business). A failed
+// second encode sends the first; a failed commit forces an IDR (the encoder
+// still stands before this frame, which the client decodes).
+Status NvencEncoder::encodeInline(NV_ENC_PIC_PARAMS& pic, InFlight& f) {
+    const bool trial = !(pic.encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR);
+    if (trial) {
+        pic.encodePicFlags |= NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE;
+        pic.stateBufferIdx = 0;
+        ++trialFrames_;
+    }
+    NV_ENC_LOCK_BITSTREAM lk{};
+    Status s = encodeAndRead(pic, f.slot, f.data, lk);
+    if (!s.ok) return s;
+    f.done = true;
+    f.signaled = true;
+    f.picType = lk.pictureType;
+    f.temporalId = lk.temporalId;
+    if (!trial) return Status::Ok();
+    uint32_t chosen = 0;
+    const size_t limit = nvenc::oversizeLimit(kbps_, fps_, reencodeFactor_);
+    if (lk.pictureType != NV_ENC_PIC_TYPE_IDR && f.data.size() > limit) {
+        const double ratio = double(f.data.size()) / double(limit);
+        const int delta = nvenc::reencodeQpDelta(codec_, ratio);
+        const nvenc::QpMap m = nvenc::offsetQpMap(codec_, width_, height_, f.qpMap.get(), delta);
+        pic.qpDeltaMap = const_cast<int8_t*>(m.values.data());
+        pic.qpDeltaMapSize = uint32_t(m.values.size());
+        pic.stateBufferIdx = 1;
+        std::vector<uint8_t> second;
+        NV_ENC_LOCK_BITSTREAM lk2{};
+        Status s2 = encodeAndRead(pic, f.slot, second, lk2);
+        if (s2.ok) {
+            logf(LogLevel::Debug, "nvenc: frame %llu re-encoded: %zu -> %zu bytes (limit %zu, QP %+d)",
+                 static_cast<unsigned long long>(f.info.frameId), f.data.size(), second.size(), limit, delta);
+            f.oversizeBytes = f.data.size();
+            f.data.swap(second);
+            f.reencoded = true;
+            f.picType = lk2.pictureType;
+            f.temporalId = lk2.temporalId;
+            chosen = 1;
+            ++reencodes_;
+        } else if (s2.fatal) {
+            return s2;
+        } else {
+            warnOnce("reencode", "a second encode failed (" + s2.text + "): the oversized first one goes out");
+        }
+    }
+    NV_ENC_RESTORE_ENCODER_STATE_PARAMS rp{};
+    rp.version = NV_ENC_RESTORE_ENCODER_STATE_PARAMS_VER;
+    rp.bufferIdx = chosen;
+    rp.state = NV_ENC_STATE_RESTORE_FULL;
+    NVENCSTATUS rs;
+    {
+        std::lock_guard<std::mutex> lock(sessionMu_);
+        rs = nv_.nvEncRestoreEncoderState(enc_, &rp);
+    }
+    if (rs != NV_ENC_SUCCESS) {
+        // NV_ENC_ERR_NEED_MORE_OUTPUT (AV1 overlay frames) only comes with B frames.
+        ++restoreFailures_;
+        warnOnce("restore", nvError("NvEncRestoreEncoderState(" + std::to_string(chosen) + ")", rs) +
+                                ": the encoder did not advance past the frame, so the next one is an IDR");
+        forceIdr();
+    }
+    return Status::Ok();
 }
 
 Next NvencEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
@@ -1342,6 +1528,12 @@ Next NvencEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
                                    [this] { return !flight_.empty() || stopped_; });
                 if (stopped_) return Next::Stopped;
                 if (flight_.empty()) return Next::Timeout;
+            }
+            if (flight_.front().done) {
+                // Finished and read back by encodeInline (re-encode mode).
+                front = std::move(flight_.front());
+                flight_.pop_front();
+                break;
             }
             front = flight_.front();  // the oldest: outputs come in submission order
         }
@@ -1401,9 +1593,15 @@ Next NvencEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         }
         return Next::Error;
     }
-    lockErrors_ = 0;
-    unmap(front.mapped);  // after the successful lock, as the API requires; outside the gate (guide 6.3 names Lock / Unlock only)
-    {
+    NV_ENC_PIC_TYPE picType = lk.pictureType;
+    uint32_t temporalId = lk.temporalId;
+    if (front.done) {
+        outBuf_.swap(front.data);
+        picType = front.picType;
+        temporalId = front.temporalId;
+    } else {
+        lockErrors_ = 0;
+        unmap(front.mapped);  // after the successful lock, as the API requires; outside the gate (guide 6.3 names Lock / Unlock only)
         std::lock_guard<std::mutex> lock(flightMu_);
         if (!flight_.empty()) flight_.pop_front();
     }
@@ -1413,21 +1611,34 @@ Next NvencEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     out.info = front.info;
     out.outputQpc = qpcNow();
     out.gen = front.gen;
-    out.key = lk.pictureType == NV_ENC_PIC_TYPE_IDR;
+    out.key = picType == NV_ENC_PIC_TYPE_IDR;
     if (out.key && !front.forcedIdr) rfi_.unplannedKey(front.info.frameId);
     if (front.forcedIdr && !out.key) {
-        warnOnce("notidr", "a forced IDR came out as picture type " + std::to_string(int(lk.pictureType)) + ": forcing another");
+        warnOnce("notidr", "a forced IDR came out as picture type " + std::to_string(int(picType)) + ": forcing another");
         forceIdr();
     }
     out.recovery = front.recovery && !out.key;
     out.refFloor = front.refFloor;
     out.ltrSlot = -1;
-    out.temporalLayer = lk.temporalId;
+    out.temporalLayer = temporalId;
     out.refLtrMask = 0;
     out.width = width_;
     out.height = height_;
     out.data = outBuf_.data();
     out.size = outBuf_.size();
+    out.reencoded = front.reencoded;
+    out.oversizeBytes = front.oversizeBytes;
+    if (start_.svcLayers > 1) {
+        // Temporal SVC: whether a later frame can reference it (the bitstream
+        // where it says; codec/bitstream.hpp), and the bitstream's temporal id
+        // as a check of NV_ENC_LOCK_BITSTREAM::temporalId.
+        const LayerInfo li = layerInfo(codec_, out.data, out.size, start_.svcLayers - 1);
+        if (li.temporalId >= 0 && uint32_t(li.temporalId) != temporalId) {
+            warnOnce("layer", "NV_ENC_LOCK_BITSTREAM::temporalId " + std::to_string(temporalId) + " but the bitstream says " +
+                                  std::to_string(li.temporalId) + " (frame " + std::to_string(front.info.frameId) + ")");
+        }
+        out.discardable = isDiscardable(out.key, li, start_.svcLayers, temporalId);
+    }
     if (out.key && !hasParameterSets(codec_, out.data, out.size)) {
         // A key frame must be a decoder entry point (ring flag KEY).
         std::lock_guard<std::mutex> lock(extraMu_);

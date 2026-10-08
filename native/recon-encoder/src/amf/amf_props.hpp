@@ -69,6 +69,13 @@ struct AmfCodecProps {
     // and the profile of a 10-bit stream (HEVC Main10; AV1 Main covers it).
     const wchar_t* inputHdrMetadata = nullptr;
     amf_int64 profile10Value = -1;
+    // Sub-frame output (Phase 5 experiment): OUTPUT_MODE SLICE (H.264 / HEVC)
+    // / TILE (AV1), the slices / tiles per frame, AV1 one tile per tile group
+    // OBU (so each tile is a unit of its own).
+    const wchar_t* outputMode = nullptr;
+    amf_int64 outputModeParts = 0;
+    const wchar_t* slicesPerFrame = nullptr;
+    const wchar_t* tileGroupObu = nullptr;  // AV1
 
     // Dynamic (any time; applied before the next SubmitInput).
     const wchar_t* frameRate = nullptr;
@@ -103,6 +110,8 @@ struct AmfCodecProps {
     const wchar_t* outputRefLtr = nullptr;
     const wchar_t* outputTemporalLayer = nullptr;  // H.264, HEVC
     const wchar_t* extradata = nullptr;
+    const wchar_t* outputBufferType = nullptr;     // sub-frame output: FRAME / SLICE (TILE) / SLICE_LAST (TILE_LAST)
+    amf_int64 bufferFrame = 0, bufferPart = 1, bufferLast = 2;
 
     // AMFCaps.
     const wchar_t* capMaxBitrate = nullptr;
@@ -189,6 +198,13 @@ inline const AmfCodecProps& amfH264Props() {
         c.outputRefLtr = AMF_VIDEO_ENCODER_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD;
         c.outputTemporalLayer = AMF_VIDEO_ENCODER_OUTPUT_TEMPORAL_LAYER;
         c.extradata = AMF_VIDEO_ENCODER_EXTRADATA;
+        c.outputMode = AMF_VIDEO_ENCODER_OUTPUT_MODE;
+        c.outputModeParts = AMF_VIDEO_ENCODER_OUTPUT_MODE_SLICE;
+        c.slicesPerFrame = AMF_VIDEO_ENCODER_SLICES_PER_FRAME;
+        c.outputBufferType = AMF_VIDEO_ENCODER_OUTPUT_BUFFER_TYPE;
+        c.bufferFrame = AMF_VIDEO_ENCODER_OUTPUT_BUFFER_TYPE_FRAME;
+        c.bufferPart = AMF_VIDEO_ENCODER_OUTPUT_BUFFER_TYPE_SLICE;
+        c.bufferLast = AMF_VIDEO_ENCODER_OUTPUT_BUFFER_TYPE_SLICE_LAST;
         c.capMaxBitrate = AMF_VIDEO_ENCODER_CAP_MAX_BITRATE;
         c.capHwInstances = AMF_VIDEO_ENCODER_CAP_NUM_OF_HW_INSTANCES;
         c.capMaxTemporalLayers = AMF_VIDEO_ENCODER_CAP_MAX_TEMPORAL_LAYERS;
@@ -274,6 +290,13 @@ inline const AmfCodecProps& amfHevcProps() {
         c.outputRefLtr = AMF_VIDEO_ENCODER_HEVC_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD;
         c.outputTemporalLayer = AMF_VIDEO_ENCODER_HEVC_OUTPUT_TEMPORAL_LAYER;
         c.extradata = AMF_VIDEO_ENCODER_HEVC_EXTRADATA;
+        c.outputMode = AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE;
+        c.outputModeParts = AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_SLICE;
+        c.slicesPerFrame = AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME;
+        c.outputBufferType = AMF_VIDEO_ENCODER_HEVC_OUTPUT_BUFFER_TYPE;
+        c.bufferFrame = AMF_VIDEO_ENCODER_HEVC_OUTPUT_BUFFER_TYPE_FRAME;
+        c.bufferPart = AMF_VIDEO_ENCODER_HEVC_OUTPUT_BUFFER_TYPE_SLICE;
+        c.bufferLast = AMF_VIDEO_ENCODER_HEVC_OUTPUT_BUFFER_TYPE_SLICE_LAST;
         c.capMaxBitrate = AMF_VIDEO_ENCODER_HEVC_CAP_MAX_BITRATE;
         c.capHwInstances = AMF_VIDEO_ENCODER_HEVC_CAP_NUM_OF_HW_INSTANCES;
         c.capMaxTemporalLayers = AMF_VIDEO_ENCODER_HEVC_CAP_MAX_TEMPORAL_LAYERS;
@@ -367,6 +390,14 @@ inline const AmfCodecProps& amfAv1Props() {
         c.outputMarkedLtr = AMF_VIDEO_ENCODER_AV1_OUTPUT_MARKED_LTR_INDEX;
         c.outputRefLtr = AMF_VIDEO_ENCODER_AV1_OUTPUT_REFERENCED_LTR_INDEX_BITFIELD;
         c.extradata = AMF_VIDEO_ENCODER_AV1_EXTRA_DATA;
+        c.outputMode = AMF_VIDEO_ENCODER_AV1_OUTPUT_MODE;
+        c.outputModeParts = AMF_VIDEO_ENCODER_AV1_OUTPUT_MODE_TILE;
+        c.slicesPerFrame = AMF_VIDEO_ENCODER_AV1_TILES_PER_FRAME;
+        c.tileGroupObu = AMF_VIDEO_ENCODER_AV1_TILE_GROUP_OBU;
+        c.outputBufferType = AMF_VIDEO_ENCODER_AV1_OUTPUT_BUFFER_TYPE;
+        c.bufferFrame = AMF_VIDEO_ENCODER_AV1_OUTPUT_BUFFER_TYPE_FRAME;
+        c.bufferPart = AMF_VIDEO_ENCODER_AV1_OUTPUT_BUFFER_TYPE_TILE;
+        c.bufferLast = AMF_VIDEO_ENCODER_AV1_OUTPUT_BUFFER_TYPE_TILE_LAST;
         c.capMaxBitrate = AMF_VIDEO_ENCODER_AV1_CAP_MAX_BITRATE;
         c.capHwInstances = AMF_VIDEO_ENCODER_AV1_CAP_NUM_OF_HW_INSTANCES;
         c.capMaxTemporalLayers = AMF_VIDEO_ENCODER_AV1_CAP_MAX_NUM_TEMPORAL_LAYERS;

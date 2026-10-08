@@ -156,7 +156,7 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
         dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, pixels_.data(), w * bytesPerPixel_, 0);
         a.presentQpc = present;
         a.captureQpc = qpcNow();
-        a.dirtyPct = 100;
+        a.dirty = 1;  // the whole test image changes
         return Next::Frame;
     }
 }

@@ -11,7 +11,10 @@
 //   bitstreams locked in submission order and, in async mode, only after their
 //   completion event, a buffer or event not reused while its frame is pending,
 //   everything released and EOS sent before NvEncDestroyEncoder), parameters
-//   that cannot be reconfigured, resetEncoder without forceIDR,
+//   that cannot be reconfigured, resetEncoder without forceIDR, encodes without
+//   state advance (NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE) without state
+//   buffers or followed by another frame before NvEncRestoreEncoderState
+//   committed them, a restore before the encodes finished,
 //   NvEncGetSequenceParams from another thread than NvEncEncodePicture, a QP
 //   delta map of the wrong size, input of another bit depth than the config's
 //   (NV12 for 8 bits, YUV420_10BIT for 10), 10-bit HEVC without the Main10
@@ -19,7 +22,17 @@
 // - a reference model of the DPB and NvEncInvalidateRefFrames: each P frame
 //   references the newest frame still valid in the DPB (maxNumRefFrames
 //   frames; invalidation also invalidates frames predicted from an invalid
-//   one), an intra frame when none is left;
+//   one), an intra frame when none is left; with temporal SVC (numTemporalLayers
+//   > 1) the dyadic hierarchical-P pattern after each key frame: a frame
+//   references the newest valid frame of a lower layer (the base layer: of the
+//   base layer), top-layer frames are not references (not kept in the DPB),
+//   and temporalId / the bitstream say the layer (H.264 nal_ref_idc 0, HEVC
+//   TRAIL_N + nuh_temporal_id_plus1, AV1 OBU extension);
+// - encodes without state advance: the DPB and the SVC position that encode
+//   would leave are saved in its state buffer, and NvEncRestoreEncoderState
+//   makes them the encoder's (bigTs=N: frame N comes out bigBytes larger,
+//   halved per 6 QP of the QP delta map's average, so a re-encode at a higher
+//   QP is smaller);
 // - a log line per call with the values the self-test asserts on.
 //
 // Bitstreams are structurally valid (H.264 / HEVC NAL units with parameter sets
@@ -40,6 +53,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -68,6 +82,8 @@ struct Config {
     int encodeUs = 1500;    // simulated encode time
     uint64_t failEncodeTs = 0;  // NvEncEncodePicture fails (NV_ENC_ERR_GENERIC) for this inputTimeStamp
     int keepRefs = 0;       // > 0: keep at most this many reference frames (DPB and SPS), whatever was asked
+    uint64_t bigTs = 0;     // this frame comes out bigBytes larger (scaled down by a positive QP delta map)
+    int bigBytes = 60000;
 };
 
 struct Frame {
@@ -80,6 +96,9 @@ struct Frame {
     NV_ENC_PIC_TYPE type = NV_ENC_PIC_TYPE_P;
     uint64_t ref = 0;
     uint32_t frameIdx = 0;
+    uint32_t layer = 0;      // temporal layer (SVC)
+    bool reference = true;   // kept in the DPB (not a top-layer SVC frame)
+    size_t pad = 0;          // extra payload bytes (bigTs)
     std::string data;
 };
 
@@ -87,6 +106,15 @@ struct DpbEntry {
     uint64_t ts;
     uint64_t ref;  // 0 = intra
     bool invalid;
+    uint32_t layer;
+};
+
+// What an encode without state advance would leave (NvEncRestoreEncoderState).
+struct SavedState {
+    bool saved = false;
+    std::deque<DpbEntry> dpb;
+    uint64_t sinceKey = 0;
+    uint64_t ts = 0;
 };
 
 struct Session {
@@ -102,6 +130,10 @@ struct Session {
     std::map<void*, void*> mapped;   // mapped handle -> registered handle
     std::deque<Frame> pending;       // submitted, not unlocked yet (submission order)
     std::deque<DpbEntry> dpb;
+    uint32_t layers = 1;           // numTemporalLayers with enableTemporalSVC
+    uint64_t sinceKey = 0;         // the next frame's position after the last key frame
+    std::vector<SavedState> states;  // numStateBuffers
+    uint64_t uncommittedTs = 0;    // encoded without state advance, not committed by a restore yet
     bool forceIdrNext = false;
     bool eos = false;
     uint64_t encoded = 0;
@@ -314,26 +346,55 @@ std::string parameterSets(const Session& s) {
     return out;
 }
 
+std::string leb128(size_t v) {
+    std::string out;
+    do {
+        uint8_t b = uint8_t(v & 0x7f);
+        v >>= 7;
+        if (v) b |= 0x80;
+        out += char(b);
+    } while (v);
+    return out;
+}
+
+// The temporal layer at position pos after a key frame: the dyadic pattern
+// (the base layer every 2^(layers-1) frames, the top layer on odd positions).
+uint32_t layerAt(uint64_t pos, uint32_t layers) {
+    if (layers <= 1) return 0;
+    uint64_t r = pos % (uint64_t(1) << (layers - 1));
+    if (!r) return 0;
+    uint32_t tz = 0;
+    while (!(r & 1)) r >>= 1, ++tz;
+    return layers - 1 - tz;
+}
+
 std::string bitstream(const Session& s, const Frame& f, bool withHeaders) {
     char marker[96];
     const char* t = f.type == NV_ENC_PIC_TYPE_IDR ? "IDR" : f.type == NV_ENC_PIC_TYPE_I ? "I" : "P";
-    std::snprintf(marker, sizeof(marker), "NVFAKE ts=%llu ref=%llu t=%s", static_cast<unsigned long long>(f.ts),
-                  static_cast<unsigned long long>(f.ref), t);
+    std::snprintf(marker, sizeof(marker), "NVFAKE ts=%llu ref=%llu t=%s tl=%u", static_cast<unsigned long long>(f.ts),
+                  static_cast<unsigned long long>(f.ref), t, f.layer);
     const bool idr = f.type == NV_ENC_PIC_TYPE_IDR;
+    const std::string payload = std::string(marker) + std::string(f.pad, 'x');  // no zero bytes: no start codes
     std::string out;
     if (s.codec == Codec::Av1) {
         out += std::string("\x12\x00", 2);  // temporal delimiter
         if (idr && withHeaders) out += parameterSets(s);
-        const std::string payload = marker;
-        out += char(0x32);  // OBU_FRAME, has_size
-        out += char(payload.size());
+        if (s.layers > 1) {
+            out += char(0x36);           // OBU_FRAME, extension, has_size
+            out += char(f.layer << 5);   // temporal_id, spatial_id 0
+        } else {
+            out += char(0x32);  // OBU_FRAME, has_size
+        }
+        out += leb128(payload.size());
         out += payload;
         return out;
     }
     if (idr && withHeaders) out += parameterSets(s);
-    if (s.codec == Codec::H264) out += std::string("\0\0\0\1", 4) + char(idr ? 0x65 : 0x41);
-    else out += std::string("\0\0\0\1", 4) + char(idr ? 19 << 1 : 1 << 1) + char(1);
-    out += marker;
+    // Non-reference pictures: H.264 nal_ref_idc 0; HEVC TRAIL_N (sub-layer
+    // non-reference) with nuh_temporal_id_plus1 = layer + 1.
+    if (s.codec == Codec::H264) out += std::string("\0\0\0\1", 4) + char(idr ? 0x65 : f.reference ? 0x41 : 0x01);
+    else out += std::string("\0\0\0\1", 4) + char(idr ? 19 << 1 : (f.reference ? 1 : 0) << 1) + char(f.layer + 1);
+    out += payload;
     return out;
 }
 
@@ -524,11 +585,13 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
     const bool main10 = !std::memcmp(&cfg.profileGUID, &NV_ENC_HEVC_PROFILE_MAIN10_GUID, sizeof(GUID));
     if (c == Codec::Hevc && (outDepth == 10) != main10) violation("HEVC output bit depth %u with%s the Main10 profile", outDepth, main10 ? "" : "out");
     if ((hdrSei || cll) && outDepth != 10) violation("HDR metadata (mastering display %u, MaxCLL %u) in an 8-bit stream", hdrSei, cll);
+    if (ip->numStateBuffers && !g_cfg.stateAdvance) violation("numStateBuffers %u without NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE", ip->numStateBuffers);
     s->initialized = true;
     s->init = *ip;
     s->config = cfg;
     s->init.encodeConfig = &s->config;
     s->codec = c;
+    s->states.assign(ip->numStateBuffers, SavedState{});
     uint32_t idrPeriod = 0, refs = 0, l0 = 0, repeat = 0, vuiOk = 0, irPeriod = 0, irCnt = 0, layers = 0, level = 0;
     if (c == Codec::H264) {
         const NV_ENC_CONFIG_H264& h = cfg.encodeCodecConfig.h264Config;
@@ -566,10 +629,12 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
         layers = a.enableTemporalSVC ? a.numTemporalLayers : 1;
         level = a.level;
     }
+    if (layers > 1 && (!g_cfg.svc || int(layers) > g_cfg.maxLayers)) violation("%u temporal layers (svc cap %d, max %d)", layers, g_cfg.svc, g_cfg.maxLayers);
+    s->layers = std::max<uint32_t>(1, layers);
     const NV_ENC_RC_PARAMS& rc = cfg.rcParams;
     logLine("init codec=%s preset=%d tuning=%d async=%u ptd=%u size=%ux%u maxsize=%ux%u fps=%u/%u gop=%s pint=%d rc=%s avg=%u max=%u "
             "vbv=%u ldkfs=%u aq=%u taq=%u qpmap=%d zrd=%u la=%u mp=%d idr=%s refs=%u l0=%u repeat=%u vui=%u ir=%u/%u layers=%u "
-            "level=%u profile=%s bitdepth=%u hdrsei=%u/%u",
+            "level=%u profile=%s bitdepth=%u hdrsei=%u/%u states=%u",
             codecName(c), presetNumber(ip->presetGUID), int(ip->tuningInfo), ip->enableEncodeAsync, ip->enablePTD, ip->encodeWidth,
             ip->encodeHeight, ip->maxEncodeWidth, ip->maxEncodeHeight, ip->frameRateNum, ip->frameRateDen,
             cfg.gopLength == NVENC_INFINITE_GOPLENGTH ? "inf" : "finite", cfg.frameIntervalP,
@@ -580,7 +645,7 @@ NVENCSTATUS NVENCAPI initializeEncoder(void* enc, NV_ENC_INITIALIZE_PARAMS* ip) 
             main10                                                                      ? "main10"
             : std::memcmp(&cfg.profileGUID, &NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID, sizeof(GUID)) ? "set"
                                                                                         : "auto",
-            outDepth, hdrSei, cll);
+            outDepth, hdrSei, cll, ip->numStateBuffers);
     return NV_ENC_SUCCESS;
 }
 
@@ -773,13 +838,27 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
     }
     if (async && !s->events.count(static_cast<HANDLE>(p->completionEvent))) violation("async mode: completion event not registered");
     if (!async && p->completionEvent) violation("sync mode with a completion event");
-    if (p->inputTimeStamp <= s->lastTs) violation("inputTimeStamp %llu not increasing", static_cast<unsigned long long>(p->inputTimeStamp));
+    // Encodes without state advance (iterative encoding): state buffers
+    // needed; the same frame may be encoded again, but the next one only after
+    // NvEncRestoreEncoderState committed one of its encodes.
+    const bool noAdvance = (p->encodePicFlags & NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE) != 0;
+    if (noAdvance && (s->states.empty() || p->stateBufferIdx >= s->states.size())) {
+        violation("DISABLE_ENC_STATE_ADVANCE with stateBufferIdx %u and %zu state buffers", p->stateBufferIdx, s->states.size());
+        return NV_ENC_ERR_INVALID_PARAM;
+    }
+    const bool again = s->uncommittedTs && p->inputTimeStamp == s->uncommittedTs;
+    if (s->uncommittedTs && !again) {
+        violation("frame %llu encoded before frame %llu (encoded without state advance) was committed by NvEncRestoreEncoderState",
+                  static_cast<unsigned long long>(p->inputTimeStamp), static_cast<unsigned long long>(s->uncommittedTs));
+    }
+    if (!again && p->inputTimeStamp <= s->lastTs) violation("inputTimeStamp %llu not increasing", static_cast<unsigned long long>(p->inputTimeStamp));
     if (p->inputWidth != s->init.encodeWidth || p->inputHeight != s->init.encodeHeight || p->bufferFmt != inputFormat(*s) ||
         p->pictureStruct != NV_ENC_PIC_STRUCT_FRAME) {
         violation("NvEncEncodePicture: input %ux%u format %d structure %d", p->inputWidth, p->inputHeight, int(p->bufferFmt),
                   int(p->pictureStruct));
     }
     int qpNonZero = 0, qpMin = 0;
+    double qpMean = 0;
     if (p->qpDeltaMap) {
         const uint32_t b = qpBlock(s->codec);
         const uint32_t need = ((s->init.encodeWidth + b - 1) / b) * ((s->init.encodeHeight + b - 1) / b);
@@ -788,7 +867,9 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
         for (uint32_t i = 0; i < std::min(need, p->qpDeltaMapSize); ++i) {
             qpNonZero += p->qpDeltaMap[i] != 0;
             qpMin = std::min(qpMin, int(p->qpDeltaMap[i]));
+            qpMean += p->qpDeltaMap[i];
         }
+        if (need) qpMean /= double(std::min(need, p->qpDeltaMapSize));
     }
     // HDR metadata with the picture (HEVC SEI / AV1 metadata OBUs), in the
     // codec's units: logged as "md=Gx,Gy,Bx,By,Rx,Ry,Wx,Wy,max,min cll=MaxCLL,MaxFALL".
@@ -828,13 +909,20 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
     s->lastDone = f.doneAt;
     const bool forced = (p->encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR) || s->forceIdrNext || s->encoded == 0;
     s->forceIdrNext = false;
+    // The DPB and SVC position after this frame: the encoder's own, or (no
+    // state advance) saved for NvEncRestoreEncoderState.
+    std::deque<DpbEntry> next = s->dpb;
+    const uint64_t pos = forced ? 0 : s->sinceKey;
+    f.layer = layerAt(pos, s->layers);
+    f.reference = s->layers <= 1 || f.layer + 1 < s->layers;
     if (forced) {
         f.type = NV_ENC_PIC_TYPE_IDR;
-        s->dpb.clear();
+        next.clear();
     } else {
         f.type = NV_ENC_PIC_TYPE_I;
-        for (auto it = s->dpb.rbegin(); it != s->dpb.rend(); ++it) {
-            if (!it->invalid) {
+        for (auto it = next.rbegin(); it != next.rend(); ++it) {
+            // SVC: a frame references a lower layer (the base layer: the base layer).
+            if (!it->invalid && (f.layer == 0 ? it->layer == 0 : it->layer < f.layer)) {
                 f.type = NV_ENC_PIC_TYPE_P;
                 f.ref = it->ts;
                 break;
@@ -842,8 +930,22 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
         }
         if (f.type == NV_ENC_PIC_TYPE_I) logLine("intra fallback ts=%llu: no valid reference left", static_cast<unsigned long long>(f.ts));
     }
-    s->dpb.push_back({f.ts, f.ref, false});
-    while (s->dpb.size() > std::max<uint32_t>(1, dpbSize(*s))) s->dpb.pop_front();
+    if (f.reference) next.push_back({f.ts, f.ref, false, f.layer});
+    while (next.size() > std::max<uint32_t>(1, dpbSize(*s))) next.pop_front();
+    if (noAdvance) {
+        s->states[p->stateBufferIdx] = SavedState{true, next, pos + 1, f.ts};
+        s->uncommittedTs = f.ts;
+    } else {
+        s->dpb = std::move(next);
+        s->sinceKey = pos + 1;
+        s->uncommittedTs = 0;
+    }
+    if (g_cfg.bigTs && f.ts == g_cfg.bigTs) {
+        // A scene change: much larger, halved per 6 QP of the map's average
+        // (AV1: per 24 quantizer index steps).
+        const double halvings = qpMean / (s->codec == Codec::Av1 ? 24.0 : 6.0);
+        f.pad = size_t(std::max(0.0, double(g_cfg.bigBytes) * std::pow(2.0, -halvings)));
+    }
     const bool headers = f.type == NV_ENC_PIC_TYPE_IDR &&
                          ((p->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) ||
                           (s->codec == Codec::H264 && s->config.encodeCodecConfig.h264Config.repeatSPSPPS) ||
@@ -852,9 +954,11 @@ NVENCSTATUS NVENCAPI encodePicture(void* enc, NV_ENC_PIC_PARAMS* p) {
     f.data = bitstream(*s, f, headers);
     ++s->encoded;
     s->history.push_back(f.ts);
-    logLine("encode ts=%llu flags=%u idx=%u type=%s ref=%llu qpmap=%u/%d/%d%s", static_cast<unsigned long long>(f.ts), p->encodePicFlags,
-            p->frameIdx, f.type == NV_ENC_PIC_TYPE_IDR ? "IDR" : f.type == NV_ENC_PIC_TYPE_I ? "I" : "P",
-            static_cast<unsigned long long>(f.ref), p->qpDeltaMap ? p->qpDeltaMapSize : 0u, qpNonZero, qpMin, hdrText);
+    logLine("encode ts=%llu flags=%u idx=%u type=%s ref=%llu qpmap=%u/%d/%d%s layer=%u noadv=%d state=%u bytes=%zu qpmean=%.1f",
+            static_cast<unsigned long long>(f.ts), p->encodePicFlags, p->frameIdx,
+            f.type == NV_ENC_PIC_TYPE_IDR ? "IDR" : f.type == NV_ENC_PIC_TYPE_I ? "I" : "P", static_cast<unsigned long long>(f.ref),
+            p->qpDeltaMap ? p->qpDeltaMapSize : 0u, qpNonZero, qpMin, hdrText, f.layer, int(noAdvance), noAdvance ? p->stateBufferIdx : 0u,
+            f.data.size(), qpMean);
     if (async) schedule(f.doneAt, f.event);
     s->pending.push_back(std::move(f));
     return NV_ENC_SUCCESS;
@@ -904,7 +1008,7 @@ NVENCSTATUS NVENCAPI lockBitstream(void* enc, NV_ENC_LOCK_BITSTREAM* p) {
     p->pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     p->outputTimeStamp = it->ts;
     p->frameIdx = it->frameIdx;
-    p->temporalId = 0;
+    p->temporalId = it->layer;
     logLine("lock ts=%llu donotwait=%u", static_cast<unsigned long long>(it->ts), p->doNotWait);
     return NV_ENC_SUCCESS;
 }
@@ -980,6 +1084,35 @@ NVENCSTATUS NVENCAPI reconfigureEncoder(void* enc, NV_ENC_RECONFIGURE_PARAMS* p)
     return NV_ENC_SUCCESS;
 }
 
+NVENCSTATUS NVENCAPI restoreEncoderState(void* enc, NV_ENC_RESTORE_ENCODER_STATE_PARAMS* p) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    Session* s = session(enc);
+    if (!s) return NV_ENC_ERR_INVALID_ENCODERDEVICE;
+    if (!p) return NV_ENC_ERR_INVALID_PTR;
+    if (p->version != NV_ENC_RESTORE_ENCODER_STATE_PARAMS_VER) {
+        violation("NvEncRestoreEncoderState: struct version %08x", p->version);
+        return NV_ENC_ERR_INVALID_VERSION;
+    }
+    if (p->bufferIdx >= s->states.size() || !s->states[p->bufferIdx].saved) {
+        violation("NvEncRestoreEncoderState(%u): no encode without state advance saved there (%zu state buffers)", p->bufferIdx,
+                  s->states.size());
+        return NV_ENC_ERR_INVALID_PARAM;
+    }
+    if (p->state != NV_ENC_STATE_RESTORE_FULL) violation("NvEncRestoreEncoderState type %d (only FULL is modelled)", int(p->state));
+    // "The client must call this function after all previous encodes have finished."
+    const int64_t t = now();
+    for (const Frame& f : s->pending) {
+        if (t < f.doneAt) violation("NvEncRestoreEncoderState while frame %llu is still encoding", static_cast<unsigned long long>(f.ts));
+    }
+    const SavedState& st = s->states[p->bufferIdx];
+    s->dpb = st.dpb;
+    s->sinceKey = st.sinceKey;
+    s->uncommittedTs = 0;
+    logLine("restore idx=%u ts=%llu", p->bufferIdx, static_cast<unsigned long long>(st.ts));
+    for (SavedState& x : s->states) x = SavedState{};
+    return NV_ENC_SUCCESS;
+}
+
 NVENCSTATUS NVENCAPI getSequenceParams(void* enc, NV_ENC_SEQUENCE_PARAM_PAYLOAD* p) {
     std::lock_guard<std::mutex> lock(g_mu);
     Session* s = session(enc);
@@ -1013,6 +1146,10 @@ NVENCSTATUS NVENCAPI destroyEncoder(void* enc) {
     if (!s->events.empty()) violation("NvEncDestroyEncoder with %zu registered events", s->events.size());
     if (!s->regs.empty()) violation("NvEncDestroyEncoder with %zu registered resources", s->regs.size());
     if (!s->mapped.empty()) violation("NvEncDestroyEncoder with %zu mapped inputs", s->mapped.size());
+    if (s->uncommittedTs) {
+        violation("NvEncDestroyEncoder with frame %llu encoded without state advance and never committed",
+                  static_cast<unsigned long long>(s->uncommittedTs));
+    }
     logLine("destroy encoded=%llu", static_cast<unsigned long long>(s->encoded));
     g_sessions.erase(s);
     delete s;
@@ -1040,6 +1177,10 @@ bool setKey(const std::string& k, const std::string& v) {
         g_cfg.failEncodeTs = std::strtoull(v.c_str(), nullptr, 10);
         return true;
     }
+    if (k == "bigTs") {
+        g_cfg.bigTs = std::strtoull(v.c_str(), nullptr, 10);
+        return true;
+    }
     const std::pair<const char*, int*> ints[] = {
         {"h264", &g_cfg.h264}, {"hevc", &g_cfg.hevc}, {"av1", &g_cfg.av1}, {"async", &g_cfg.async}, {"rfi", &g_cfg.rfi},
         {"multiRef", &g_cfg.multiRef}, {"dynBitrate", &g_cfg.dynBitrate}, {"dynRes", &g_cfg.dynRes}, {"svc", &g_cfg.svc},
@@ -1047,7 +1188,7 @@ bool setKey(const std::string& k, const std::string& v) {
         {"tenBit", &g_cfg.tenBit}, {"yuv444", &g_cfg.yuv444}, {"customVbv", &g_cfg.customVbv}, {"intraRefresh", &g_cfg.intraRefresh},
         {"cabac", &g_cfg.cabac}, {"subframe", &g_cfg.subframe}, {"stateAdvance", &g_cfg.stateAdvance}, {"maxW", &g_cfg.maxW},
         {"maxH", &g_cfg.maxH}, {"minW", &g_cfg.minW}, {"minH", &g_cfg.minH}, {"encodeUs", &g_cfg.encodeUs},
-        {"keepRefs", &g_cfg.keepRefs}, {"p010", &g_cfg.p010},
+        {"keepRefs", &g_cfg.keepRefs}, {"p010", &g_cfg.p010}, {"bigBytes", &g_cfg.bigBytes},
     };
     for (const auto& [name, ptr] : ints) {
         if (k == name) return i(*ptr);
@@ -1107,6 +1248,7 @@ NVENCSTATUS NVENCAPI NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTION_LIST* list
     list->nvEncInvalidateRefFrames = invalidateRefFrames;
     list->nvEncReconfigureEncoder = reconfigureEncoder;
     list->nvEncGetSequenceParams = getSequenceParams;
+    list->nvEncRestoreEncoderState = restoreEncoderState;
     list->nvEncDestroyEncoder = destroyEncoder;
     list->nvEncGetLastErrorString = lastError;
     return NV_ENC_SUCCESS;

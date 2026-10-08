@@ -56,7 +56,7 @@ Status Pipeline::setRate(const RateParams& r) {
     if (!s.ok) return s;
     if (r.fps > 0) cap_.setFps(r.fps);
     std::lock_guard<std::mutex> lock(rateMu_);
-    rate_.kbps = r.kbps;
+    if (r.kbps > 0) rate_.kbps = r.kbps;
     if (r.vbvFrames > 0) rate_.vbvFrames = r.vbvFrames;
     if (r.fps > 0) rate_.fps = r.fps;
     return s;
@@ -94,7 +94,7 @@ void Pipeline::captureLoop() {
         info.presentQpc = frame.presentQpc;
         info.captureQpc = frame.captureQpc;
         info.repeat = frame.repeat;
-        info.dirtyPct = frame.dirtyPct;
+        info.dirty = frame.dirty;
         EncoderFrame ef;
         ef.captured = &frame;
         if (opt_.converter && frame.texture) {
@@ -186,7 +186,12 @@ void Pipeline::outputLoop() {
         st.key = f.key;
         st.recovery = f.recovery;
         st.repeat = f.info.repeat;
-        st.dirtyPct = f.info.dirtyPct;
+        st.dirty = f.info.dirty;
+        st.discardable = f.discardable;
+        st.reencoded = f.reencoded;
+        st.oversizeBytes = f.oversizeBytes;
+        st.slices = f.slices;
+        st.firstSliceQpc = f.firstSliceQpc;
         st.bytes = f.size;
         st.presentQpc = f.info.presentQpc;
         st.captureQpc = f.info.captureQpc;

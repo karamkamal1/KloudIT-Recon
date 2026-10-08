@@ -26,6 +26,22 @@
 // What a slot holds is taken from the encoder's output (AMF
 // OUTPUT_MARKED_LTR_INDEX), not from the request, so a mark the encoder moved
 // (SVC: only base-layer frames can be LTR) or dropped is tracked correctly.
+//
+// Temporal SVC (Config::layers > 1, GUIDE 5): "only base temporal layer
+// pictures can be coded as LTR ... the request to mark the current picture as
+// LTR would be delayed to the next base temporal layer picture"
+// (AMF_Video_Encode_API.md, MARK_CURRENT_WITH_LTR_INDEX), and a recovery frame
+// must be a base-layer frame too: FORCE_LTR_REFERENCE_BITFIELD only applies to
+// the frame it is set on, and the next base-layer frame references the previous
+// base-layer frame, so a recovery coded as an enhancement frame (which no
+// frame references) would leave the next base frame predicted from a lost one.
+// The tracker predicts each submitted frame's layer from its position since
+// the last key frame in the hierarchical-P pattern (layerAt: with 2 layers
+// even positions are the base layer) and plans marks and recoveries only on
+// predicted base-layer frames; the encoder's reported layer (AMF
+// OUTPUT_TEMPORAL_LAYER, or the bitstream's temporal id) re-synchronizes the
+// prediction (an unplanned key frame restarts the encoder's pattern), and a
+// recovery frame that came out in an enhancement layer is rejected (IDR).
 // Thread-safe: plan/submitted run on the capture thread, output on the output
 // thread, ack/recover on the control thread.
 #pragma once
@@ -34,6 +50,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace recon {
@@ -44,6 +61,7 @@ public:
         int slots = 0;            // LTR slots the encoder was configured with; 0 = LTR off
         int interval = 6;         // frames between marks
         int64_t ackTimeout = 0;   // how long an unACKed mark is kept from being overwritten (clock units)
+        int layers = 1;           // temporal layers (SVC); marks and recoveries only on base-layer frames
     };
 
     // What to set on the next frame.
@@ -53,6 +71,7 @@ public:
         bool recovery = false; // refers only to an acknowledged LTR (refFloor)
         uint64_t refFloor = 0;
         bool idr = false;      // encode as IDR / key frame
+        int layer = 0;         // predicted temporal layer (0 without SVC)
     };
 
     // What the encoder did with a frame.
@@ -62,13 +81,23 @@ public:
         int markedSlot = -1;   // slot it was stored in, -1 = none
         uint32_t refMask = 0;  // LTR slots it referenced
         bool clearsSlots = false;  // not a key frame, but the encoder emptied every slot (AV1 switch frame)
+        int temporalLayer = -1;    // the layer it was coded in, -1 = unknown
     };
 
     struct Stats {
         uint64_t marks = 0, acked = 0, ltrRecoveries = 0, idrFallbacks = 0, failedRecoveries = 0;
+        uint64_t layerResyncs = 0;  // the encoder's layers differed from the prediction
     };
 
+    // The temporal layer of the frame at position pos after a key frame (pos
+    // 0) in the dyadic hierarchical-P pattern of `layers` layers: base layer
+    // every 2^(layers-1) frames, the top layer on every odd position.
+    static int layerAt(uint64_t pos, int layers);
+
     void reset(const Config& c);
+    // A new mark interval (a frame-rate change keeps it at about 100 ms)
+    // without forgetting the slots.
+    void setInterval(int interval);
     bool enabled() const;
     int slotCount() const;
 
@@ -125,6 +154,11 @@ private:
     bool recoveryPending_ = false;
     int recoverySlot_ = -1;
     uint64_t recoveryFrame_ = 0, recoveryLostFrom_ = 0;
+    // SVC layer prediction: the next frame's position after the last key
+    // frame, the correction learnt from the encoder's output, and the positions
+    // of the frames in the encoder.
+    uint64_t pos_ = 0, phase_ = 0;
+    std::deque<std::pair<uint64_t, uint64_t>> positions_;  // frame id, position
     Stats stats_;
 };
 

@@ -417,7 +417,7 @@ Next WgcCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         const int64_t t100ns = frame.SystemRelativeTime().count();
         a.presentQpc = t100ns > 0 ? int64_t(double(t100ns) * double(qpcFrequency()) / 1e7) : 0;
         a.captureQpc = now;
-        a.dirtyPct = -1;
+        a.dirty = -1;  // WGC reports no dirty regions (Windows 11 24H2's DirtyRegions not used yet)
         frame.Close();
         if (content.Width != poolSize_.Width || content.Height != poolSize_.Height) {
             // Recreate the pool at the new size (WGC sample guidance); the

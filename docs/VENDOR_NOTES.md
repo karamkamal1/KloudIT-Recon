@@ -3302,3 +3302,256 @@ internal/host/session.go is unchanged; the Go API is in `internal/host/encoder`:
 - The in-band barcode (0.2) uses codes 64 / 940 in HDR10 streams, i.e. 16 / 235 after an 8-bit
   conversion: barcode readers that threshold 8-bit luma at mid-grey work unchanged. The
   FFmpeg path stays SDR.
+
+## Phase 5 (helper features)
+
+GUIDE 9's differentiators on the helper and Go-client side (recon-encoder.exe and
+`internal/host/encoder`; `internal/host/session.go` is unchanged, see "Session integration"
+below). docs/HELPER_PROTOCOL.md "Phase 5 features" is the reference. All protocol changes are
+additive (version stays 1): caps `liveFps`, `instanceSelect`, `reencode`; start
+`reencodeOversized`, `sliceOutput`; started `svcLayers`, `liveFps`, `reencodeOversized`,
+`sliceOutput`; stats `dirty`, `discardable`, `reencoded` / `oversizeBytes`, `slices` /
+`firstSliceQpc`; `setRate` without `kbps` (a frame-rate change alone); ring slot flags DIRTY
+(bit 4) and DISCARDABLE (bit 5) and `dirtyPpm` at offset 96 (formerly reserved, written 0 by
+older helpers).
+
+- (a) Temporal SVC, 2 layers: AMF sets `MAX_NUM_TEMPORAL_LAYERS` before `Init` and
+  `NUM_TEMPORAL_LAYERS` (H.264 `NUM_TEMPORAL_ENHANCMENT_LAYERS`), reads it back for
+  `started.svcLayers`, and re-reads the caps with the maximum set (AV1's LTR count depends on
+  it); intra refresh stays refused with SVC. The LTR policy (`src/codec/ltr.hpp`) plans marks
+  and recovery frames only on base-layer frames (AMF: "only base temporal layer pictures can be
+  coded as LTR"; a recovery frame in the enhancement layer would leave the next base frame
+  predicted from a lost one), predicting the layer from the position after the last key frame
+  and re-synchronizing from the encoder's reported layers; a recovery frame that comes out in
+  layer 1 is refused (IDR). NVENC already configured `enableTemporalSVC` (step 3.4); its
+  `NV_ENC_LOCK_BITSTREAM::temporalId` is now reported. Each frame's layer is checked against
+  the bitstream and gets the `discardable` flag (`src/codec/bitstream.hpp` `layerInfo`: H.264
+  `nal_ref_idc` 0 and the SVC prefix NAL unit, HEVC sub-layer non-reference NAL types at the top
+  layer and `nuh_temporal_id_plus1`, AV1 the OBU extension's `temporal_id`; AV1 has no
+  reference flag in reach, so its top layer counts as discardable: VERIFY). Go:
+  `Frame.Discardable`, `Frame.Droppable()` (discardable, not key, not recovery),
+  `Stats.Discardable`.
+- (b) ROI: Go `FocusROI` builds the background / pointer / crosshair rects; the helper's
+  existing maps (AMF GRAY32 importance per 64x64 block, H.264 16x16; NVENC QP delta per
+  16 / 32 / 64 block) now fill the AMF plane through the tested `writeRoiPlane`.
+- (c) Dirty share: DDA (move-rect destinations + dirty rects) and AMD Direct Capture
+  (`DIRTY_RECTS`) now report the union area as a fraction (`src/capture/dirty.hpp`;
+  previously a percent with overlaps counted twice) in stats `dirty` / `dirtyPct` and in the
+  ring (`dirtyPpm`, so it survives dropped stats). Go: `Frame.Dirty`, `Stats.Dirty`,
+  `ActivityMeter` (static desktop detection, `SuggestKbps`).
+- (d) FPS before resolution: `setRate` with `fps` alone (Go `SetFPS`, `LowerFPS` /
+  `RaiseFPS`); caps `liveFps`. AMF sets `FRAMERATE` before the next `SubmitInput` and moves the
+  default LTR interval along; a key frame right after the change is logged ("the frame-rate
+  change at frame N made a key frame"). NVENC reconfigures `frameRateNum` with `resetEncoder`
+  0 / `forceIDR` 0 (step 3.4 already did; the pipeline now keeps the bitrate when `kbps` is 0).
+- (e) Dedicated encode engine: `encoderInstance` (AMF `INSTANCE_INDEX`, read back) existed;
+  caps `instanceSelect` now says whether it can be used (AMF yes, NVENC no), Go
+  `EncoderInstanceFor("default" | "dedicated" | "N", caps)` turns a config choice into it; the
+  mock reports two engines so the plumbing is tested.
+- (f) NVENC re-encode of oversized frames behind `start` `reencodeOversized` (caps
+  `reencode` = `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`): `numStateBuffers` 2; every non-key
+  frame encoded with `NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE` into state buffer 0 and read
+  back on the capture thread; above the limit encoded again into state buffer 1 with the QP map
+  raised (about 6 QP per halving of the excess, 2..12, AV1 x 4, ROI kept); committed with
+  `NvEncRestoreEncoderState(chosen buffer, NV_ENC_STATE_RESTORE_FULL)` before the next frame.
+  AMF: not possible (`reencode` false, GUIDE "AMD skip").
+- (g) AMF slice / tile output experiment behind `start` `sliceOutput` N (caps
+  `sliceOutput`): `OUTPUT_MODE` `SLICE` (AV1 `TILE`, `TILE_GROUP_OBU` true) and
+  `SLICES_PER_FRAME` / `TILES_PER_FRAME`; the parts (`OUTPUT_BUFFER_TYPE`) are put back
+  together (`src/codec/slices.hpp`) and published as whole frames; stats `firstSliceQpc` say
+  when the first part was ready. NVENC answers `unsupported` (not implemented).
+
+Sources: AMF_Video_Encode_API.md / _HEVC_API.md / _AV1_API.md (GPUOpen AMF master, read
+2026-10-08: SVC "NUM_TEMPORAL_LAYERS is a dynamic property ... MAX_NUM_TEMPORAL_LAYERS needs to
+be set before initializing", "only base temporal layer pictures can be coded as LTR ... the
+request ... would be delayed to the next base temporal layer picture", "Intra-refresh feature is
+not supported with SVC", AV1 `CAP_MAX_NUM_LTR_FRAMES` "calculated based on current value of
+MAX_NUM_TEMPORAL_LAYERS", `TILES_PER_FRAME` "treated as suggestion", `OUTPUT_MODE` /
+`OUTPUT_BUFFER_TYPE`, `INSTANCE_INDEX`, `FRAMERATE` dynamic), the vendored AMF 1.5.3 headers
+(property names and enums), nvEncodeAPI.h 13.0 (`NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE`,
+`numStateBuffers`, `stateBufferIdx`, `NvEncRestoreEncoderState` "after all previous encodes have
+finished", `NV_ENC_STATE_RESTORE_FULL`, `temporalId`, `NvEncGetSequenceParams` on the
+EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit), HEVC 7.4.2.2
+(sub-layer non-reference pictures), AV1 5.3.3 (OBU extension).
+
+### Verified in the sandbox
+
+- verified (sandbox): build: `make helper` (mingw-w64 GCC, -Wall -Wextra) without warnings;
+  every changed or new helper source (dirty, slices, ltr, bitstream, selftests, pacer,
+  paced_capture, dda / amd_direct capture, amf_backend, nvenc_backend / _policy / selftest,
+  protocol, ring, pipeline, encode_test, replay_encoder, main, the test double) passes
+  `clang++ --target=x86_64-w64-mingw32 -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic
+  -Wshadow -Wconversion` without warnings. The MSVC build is not verified here (CI job
+  `helper-windows`).
+- verified (sandbox): `--self-test-encoder` under Wine 9.0: "SVC: LTR marks / recovery on base
+  layer" (layerAt pattern for 2-4 layers; 41 frames with 2 layers: every planned mark on a
+  base-layer frame; a loss at 40/41: the enhancement frame 42 not used as the recovery, base
+  frame 43 recovers from the newest ACKed LTR), "SVC: layer prediction follows the encoder" (an
+  encoder that makes a key frame on its own at an odd position, one frame in flight: resync,
+  marks stay on base-layer frames, a recovery in layer 1 refused), "temporal layers /
+  discardable frames" (H.264 prefix NAL temporal_id 1 + `nal_ref_idc` 0 discardable, a
+  reference frame in layer 1 not; HEVC `TRAIL_N` at the top layer discardable, `TRAIL_N` below
+  it and `TRAIL_R` not, an IDR after a VPS; AV1 OBU extension with a two-byte leb128 size),
+  "sub-frame output: slices put together", "ROI maps of the cursor / crosshair rects" (AMF HEVC
+  9 / 12 blocks at importance 8 / 9 and 489 at 4, H.264 81 / 144 macroblocks, NVENC HEVC 25 / 36
+  blocks at -6 / -8 and +2 elsewhere, AV1 -24 / -32 / +8, the corner-clipped pointer square, the
+  pitched GRAY32 plane with untouched padding), "NVENC re-encode limits and QP maps".
+- verified (sandbox): `--self-test-pacer`: "dirty area (union of rects)" (a quarter, the same
+  rect twice, overlap 17500 / 40000, L shape + nested + clipped + empty + inverted, a caret
+  40 px, 257 rects summed and capped, merging two deliveries).
+- verified (sandbox): `--self-test-nvenc=recon-fake-nvenc.dll` under Wine + Xvfb: "temporal
+  SVC hevc / h264 / av1" (frames 1..20: layer (id-1) % 2, discardable exactly the layer-1
+  frames, keys 1 only, recovery frames 14 and 17 after losses at the base frame 13 and the
+  enhancement frame 16, every frame predicted as the hierarchical-P DPB model says: 14 and 15
+  from 11, 17 from 15), "re-encode oversized frames" (async and sync: 19 encodes without state
+  advance for 18 non-key frames, frame 8 (about 204 kB) encoded again to about 51 kB with the ROI
+  map + 12 QP into state buffer 1, 18 commits, frame 9 predicted from the committed second encode, the forced IDR 13
+  encoded normally, the loss at 15 recovered by frame 16 from 14; no rule violations: no frame
+  before the commit, no restore before the encodes finished, nothing uncommitted at destroy),
+  "cursor / crosshair ROI" (the QP map NVENC receives for H.264 / HEVC / AV1), caps `liveFps`
+  seamless (assumed) / restart without dynamic bitrate, `instanceSelect` false, `reencode` from
+  the cap, and the refusals (`sliceOutput`, `reencodeOversized` without the cap); every earlier
+  scenario unchanged.
+- verified (sandbox): mutation checks: planning marks on enhancement-layer frames, skipping
+  `NvEncRestoreEncoderState`, and summing overlapping dirty rects each make the self-tests above
+  fail.
+- verified (sandbox): `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64`:
+  `TestHelperIntegrationPhase5` (mock: `EncoderInstanceFor("dedicated")` = engine 1 reported
+  in `started`, engine 2 / SVC / re-encode / sub-frame output `unsupported` and
+  `reencodeOversized` 1.2 `bad_message` with the helper still running, `SetFPS(20)` re-paces
+  from 61 to 21 frames per second with no forced key frame and stats fps 20 at 4000 kbps, the
+  synthetic source's dirty share unknown), `TestHelperIntegrationGPUPipeline` (synthetic-gpu:
+  every new image dirty 1, every idle repeat 0, through the ring), every earlier integration
+  test; `go test ./internal/host/encoder` (TestFocusROI pins the rects of the C++ test,
+  TestActivityMeter, TestDroppable, TestFPSSteps, TestEncoderInstanceFor,
+  TestRingDirtyAndDiscardable incl. an older helper's slot, the Phase 5 decode / encode cases,
+  SetFPS without `kbps`). A mock `--encode-test` with `--instance=1 --at=50:fps=30` and a
+  three-rect `roi=` event runs clean ("fps 30 at 50: no key frame").
+- Not run here: anything on AMF (no AMD GPU: SVC, FRAMERATE, INSTANCE_INDEX, slice / tile
+  output), the NVIDIA driver, DDA dirty rects (Wine's `DuplicateOutput` answers E_NOTIMPL),
+  AMD Direct Capture dirty rects, Chrome decoding a stream with the discardable frames left out.
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC caps): `recon-encoder.exe --print-caps
+  --backend=amf`: record `maxTemporalLayers` for h264 / hevc / av1 (>= 2 expected on VCN 4)
+  and whether `maxLtr` changes for AV1 when a start asks for `svcLayers` 2 (log line "amf: ...
+  LTR ..." of the start).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC stream): for each codec run
+  `recon-encoder.exe --encode-test=svc.hevc --backend=amf --codec=hevc --capture=dda --svc=2
+  --fps=60 --kbps=20000 --frames=600` (AV1: `svc.ivf`) on a moving desktop / game. The started
+  line has `"svcLayers":2`; the summary "temporal layers: ~300 / ~300 frames in layer 0 / 1,
+  ~300 discardable"; the log has no "OUTPUT_TEMPORAL_LAYER ... but the bitstream says" and no
+  "SVC frames carry no temporal layer". `ffmpeg -v error -i svc.hevc -f null -` and
+  `ffmpeg -v error -i svc.base.hevc -f null -` print nothing (the base-only file plays at
+  30 fps without artifacts: check it in mpv). Record the NAL types:
+  `ffmpeg -i svc.hevc -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E
+  "nal_unit_type|nuh_temporal_id_plus1" | head -40`: layer-1 frames must be `TRAIL_N` (0) with
+  `nuh_temporal_id_plus1` 2; if AMF writes `TRAIL_R` the discardable count is 0 (nothing can be
+  dropped safely): record it. H.264: `nal_ref_idc` 0 on layer-1 slices. AV1:
+  `... trace_headers ... | grep -E "temporal_id|refresh_frame_flags"`: layer-1 frames must
+  have `refresh_frame_flags` 0 (the discardable rule assumes it).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC + LTR recovery): the SVC run with
+  `--ltr-slots=2 --at=200:loss --at=401:loss`: both losses "recovered ... from an LTR (no
+  IDR)", the recovery frames on even layer-0 frame ids (`ffprobe -show_frames` /
+  the summary), `ffmpeg -v error -i svc.hevc -f null -` clean; the log never says "recovery
+  frame ... did not reference LTR slot mask ... as a base-layer frame".
+- AMD RDNA3 (RX 7900 XT): unverified. Test (ROI): two runs on the same busy game scene at a
+  starved bitrate, `--capture=dda --codec=hevc --kbps=3000 --frames=600`, one with
+  `--at=30:roi=0,0,1920,1080,-2+33,33,135,135,6+870,450,180,180,8`: the crosshair region is
+  visibly sharper and the background softer with ROI (crop both files with
+  `ffmpeg -i roi.hevc -vf crop=180:180:870:450 -frames:v 1 c.png`); no "per-frame property not
+  accepted: ...ROI..." warning. Same for `--codec=av1` (AV1 has no ROI cap: confirm it works)
+  and `--codec=h264`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (dirty share, DDA): `--encode-test=d.hevc
+  --backend=amf --codec=hevc --capture=dda --frames=600` on an idle desktop with a blinking
+  caret in Notepad: the summary "dirty share: mean < 0.001, max < 0.002"; repeat while dragging a
+  window: max > 0.05. On a rotated (portrait) display the share must stay in 0..1 (rects are in
+  the unrotated desktop texture).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (dirty share, AMD Direct Capture): the same with
+  `--capture=amd-direct`: the summary has a dirty line (not "N frames without dirty
+  information"), i.e. the driver delivers `AMF_DISPLAYCAPTURE_DIRTY_RECTS`; record whether a
+  full-screen game reports 1.0 per frame.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (FPS change, VERIFY no IDR): per codec and
+  `--rc=cbr|vbr`: `--encode-test=f.hevc --backend=amf --codec=hevc --capture=synthetic-gpu
+  --fps=120 --kbps=30000 --frames=900 --at=300:fps=60 --at=600:fps=120`: both lines say "no key
+  frame" and the log has no "the frame-rate change at frame N made a key frame"; the P-frame
+  bitrate per frame doubles at 60 fps (the summary's kbps over 30 frames stays near 30000);
+  `ffmpeg -v error` clean. With `--live-bitrate=flush` a key frame follows (expected). If a
+  key frame follows in seamless mode, record codec / driver: caps `liveFps` must then become
+  `flush` for it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (dedicated engine): `--print-caps --backend=amf`:
+  record `hwInstances` per codec (two VCN engines on Navi 31 expected) and `instanceSelect`
+  true. With Adrenalin Instant Replay recording, run `--encode-test=e0.hevc --backend=amf
+  --codec=hevc --capture=dda --fps=120 --kbps=40000 --frames=1200 --instance=0` and the same
+  with `--instance=1`: `started.encoderInstance` reads back 0 / 1; compare the summary's
+  submit -> output p95; Task Manager > Performance > GPU "Video Encode 0 / 1" shows which engine
+  each run and Instant Replay load. Record which engine Adrenalin uses (the GUIDE assumes 0);
+  `EncoderInstanceFor("dedicated")` picks 1.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (slice / tile output experiment): `--print-caps`:
+  record `sliceOutput` per codec. Where true: `--encode-test=s.hevc --backend=amf --codec=hevc
+  --capture=dda --fps=120 --kbps=40000 --frames=600 --slices=4` (AV1 `--slices=4`, H.264 too):
+  `started.sliceOutput` (the count the encoder took), the summary "sub-frame output: 4.0 parts
+  per frame; first part -> whole frame ms p50 X p95 Y" (X = what a sub-frame transport could
+  gain), key frames where requested (the frame type comes from the parts: check `--at=100:idr`
+  gives "key frame 101"), no "slices of an unfinished frame dropped", `ffmpeg -v error` clean.
+  Record the compression cost: the P-frame bitrate is set by the rate control, so compare
+  picture quality (VMAF) at equal kbps with and without `--slices`.
+- AMD RDNA3 (RX 7900 XT): unverified (not applicable: AMF has no encode without state advance).
+  Test: `--encode-test=r.hevc --backend=amf --reencode=3` must fail to start with
+  "reencodeOversized: AMF cannot encode a frame without advancing its state".
+- NVIDIA: unverified (no NVIDIA host available). Test (driver self-test):
+  `recon-encoder.exe --self-test-nvenc`: "temporal SVC hevc / h264 / av1" ok where the GPU has
+  temporal SVC (layers alternate 0 / 1, the layer-1 frames discardable: if NVENC uses another
+  pattern the test fails: record the pattern from `ffprobe`), "re-encode oversized frames" ok
+  (encodes without state advance and `NvEncRestoreEncoderState` accepted by the driver on every
+  frame; nothing is large enough to be re-encoded there), "self-test-nvenc: ok".
+- NVIDIA: unverified (no NVIDIA host available). Test (SVC stream): the AMD SVC test with
+  `--backend=nvenc` (no `--ltr-slots`; add `--at=200:loss --at=401:loss`: "by reference
+  invalidation (no IDR)"); the base-only file decodes clean; HEVC layer-1 NAL types `TRAIL_N`.
+- NVIDIA: unverified (no NVIDIA host available). Test (re-encode on a scene change):
+  `--encode-test=r.hevc --backend=nvenc --codec=hevc --capture=dda --fps=60 --kbps=10000
+  --frames=1200 --reencode=3` while switching every 2 s between two very different full-screen
+  photos (alt-tab): the summary "re-encoded N frames (bytes: A -> B, ...)" with B well below A;
+  the frames after a re-encoded one show no artifacts (mpv, `ffmpeg -v error` clean); compare
+  the submit -> output p50 / p95 with and without `--reencode` (inline mode waits for each
+  encode on the capture thread) and record both; record whether the driver ever refuses
+  `NvEncRestoreEncoderState` (log "the next frame is an IDR").
+- NVIDIA: unverified (no NVIDIA host available). Test (FPS change): the AMD FPS test with
+  `--backend=nvenc`: "no key frame" at both changes (reconfigure with `forceIDR` 0).
+- NVIDIA: unverified (no NVIDIA host available). Test (ROI, dirty share): the AMD ROI test
+  with `--backend=nvenc` (QP delta maps; AQ stays on) and the DDA dirty-share test.
+- NVIDIA: unverified (not applicable: NVENC spreads frames over its engines itself). Test:
+  `--print-caps --backend=nvenc`: `instanceSelect` false; `--instance=1` refused.
+
+### Session integration (for the session rewrite)
+
+`internal/host/session.go` is unchanged; the Go API is in `internal/host/encoder`:
+
+- Temporal SVC: start with `SVCLayers: 2` where `CodecCaps.MaxTemporalLayers >= 2` (on AMF
+  not together with `IntraRefreshFrames`; `LTRSlots` 2 still works). Under congestion (queue
+  growth, OWD rising: the rate controller of 2.2) leave out frames with `f.Droppable()` before
+  they get a sequence number: the client sees no gap, nothing is lost, the frame rate halves at
+  once and comes back with the next frame sent; do not `Recover` for them and do not count
+  them as losses in the 2.3 ladder (a lost base frame still is one). Fill the frame header TLV
+  tag 7 (temporalLayer) from `Frame.TemporalLayer`. Prefer thinning to a bitrate cut for
+  short spikes (instant, no encoder change). The client needs no change if dropped frames get
+  no sequence number; Chrome decoding the thinned stream is a check for that step.
+- ROI: whenever the pointer moves by more than a block (and for games at start: the centre),
+  `SetROI(FocusROI(started.CaptureWidth, started.CaptureHeight, started.Width, started.Height,
+  pointer, FocusOptions{Background: -2}))` where `CodecCaps.ROI != "none"`; rate-limit to about
+  10 per second (each change allocates a map); `SetROI(nil)` when it returns nil.
+- Dirty share: `ActivityMeter.Add(now, frame)` for every frame; cap the rate controller's
+  target with `SuggestKbps(now, target, floor)` through `SetRate` (seamless codecs only); the
+  FFmpeg path reports no dirty share (the meter then never lowers anything).
+- FPS before resolution: at the rate controller's bitrate floor `SetFPS(LowerFPS(fps, 30))`
+  where `CodecCaps.LiveFPS == "seamless"` (else it costs an IDR or a restart: skip), and
+  `RaiseFPS(fps, requested)` once the bitrate has recovered; resolution changes only below the
+  lowest step.
+- Dedicated engine: a host config `encoderInstance` = `default` | `dedicated` | `N` ->
+  `EncoderInstanceFor(choice, caps)` -> `StartParams.EncoderInstance`; `default` until the
+  hardware check above says which engine Adrenalin uses.
+- Re-encode and slice output are experiments: expose them as config switches
+  (`StartParams.ReencodeOversized` where `CodecCaps.Reencode`, `StartParams.SliceOutput` where
+  the backend supports it) and log `Stats.Reencoded` / `OversizeBytes` and
+  `OutputQPC - FirstSliceQPC` for the overlay; off by default.

@@ -45,6 +45,7 @@ add_executable(recon-encoder
     src/d3d/device.cpp
     src/d3d/convert.cpp
     src/d3d/selftest.cpp
+    src/capture/dirty.cpp
     src/capture/pacer.cpp
     src/capture/paced_capture.cpp
     src/mock/replay_encoder.cpp
@@ -55,6 +56,7 @@ add_executable(recon-encoder
     src/codec/hdr.cpp
     src/codec/ltr.cpp
     src/codec/rfi.cpp
+    src/codec/slices.cpp
     src/codec/selftest.cpp
     src/nvenc/nvenc_backend.cpp
     src/nvenc/nvenc_policy.cpp

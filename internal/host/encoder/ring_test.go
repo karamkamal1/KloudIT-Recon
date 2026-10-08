@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 	"sync/atomic"
 	"testing"
 	"unsafe"
@@ -68,6 +69,12 @@ func (w *testWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	if w.droppedPending > 0 {
 		flags |= FlagDroppedBefore
 	}
+	if f.Dirty >= 0 {
+		flags |= FlagDirty
+	}
+	if f.Discardable {
+		flags |= FlagDiscardable
+	}
 	le.PutUint64(s[slotSeq:], w.written)
 	le.PutUint64(s[slotFrameID:], f.FrameID)
 	le.PutUint32(s[slotFlags:], flags)
@@ -85,6 +92,9 @@ func (w *testWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	le.PutUint32(s[slotDroppedBefore:], w.droppedPending)
 	le.PutUint32(s[slotWidth:], f.Width)
 	le.PutUint32(s[slotHeight:], f.Height)
+	if f.Dirty >= 0 {
+		le.PutUint32(s[slotDirtyPPM:], uint32(math.Round(min(1, f.Dirty)*1e6)))
+	}
 	copy(s[slotHeaderSize:], f.Data)
 	if mangle != nil {
 		mangle(s)
@@ -185,6 +195,39 @@ func TestRingRoundTrip(t *testing.T) {
 	// The slot was released and the data copied: overwriting it does not change the frame.
 	if got := atomic.LoadUint64(w.counter(offReadCount)); got != 4 {
 		t.Fatalf("readCount %d", got)
+	}
+}
+
+// Phase 5 slot fields: the dirty share (parts per million, valid with
+// FlagDirty) and FlagDiscardable; a slot from an older helper (neither set,
+// the reserved bytes 0) reads as unknown / not discardable.
+func TestRingDirtyAndDiscardable(t *testing.T) {
+	r, w := newTestRing(t, 4, 64<<10)
+	for _, f := range []*Frame{
+		{FrameID: 1, Key: true, Dirty: 1, Data: []byte{1}},
+		{FrameID: 2, Dirty: 0.25, Discardable: true, TemporalLayer: 1, Data: []byte{2}},
+		{FrameID: 3, Dirty: 40.0 / (1920 * 1080), Data: []byte{3}}, // a text caret: 19 ppm
+		{FrameID: 4, Dirty: -1, Data: []byte{4}},
+	} {
+		w.write(f)
+	}
+	want := []struct {
+		dirty       float64
+		discardable bool
+	}{{1, false}, {0.25, true}, {0.000019, false}, {-1, false}}
+	for i, x := range want {
+		f, err := r.Next()
+		if err != nil || f == nil || f.Dirty != x.dirty || f.Discardable != x.discardable {
+			t.Fatalf("frame %d: %+v %v, want dirty %v discardable %v", i+1, f, err, x.dirty, x.discardable)
+		}
+	}
+	w.write(&Frame{FrameID: 5, Data: []byte{5}})
+	le := binary.LittleEndian
+	s := w.slot(4)
+	le.PutUint32(s[slotFlags:], 0) // an older helper's slot
+	le.PutUint32(s[slotDirtyPPM:], 0)
+	if f, _ := r.Next(); f.Dirty != -1 || f.Discardable {
+		t.Fatalf("older slot: %+v", f)
 	}
 }
 
