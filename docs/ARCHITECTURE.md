@@ -481,17 +481,29 @@ The rungs, in order (GUIDE 3.8; `chooseHelper` in `internal/host/pipeline.go`):
 
 The first launch lets the helper pick its backend (`auto`: the primary display adapter's
 vendor first; libavcodec last, or first on an Intel primary adapter, whose outputs AMF and NVENC
-cannot encode). Each backend encodes only captures of its own GPU (`caps.adapterLuid`), so a
-monitor whose output (`caps.outputs`, by HMONITOR) is on another GPU, a laptop's external port
-on the discrete GPU for instance, rules that backend out; so do `helperLibavcodec` `off` and a
-negotiated codec that is not one of its codecs. Then the next backend in the order that the
-caps did not report unavailable is launched explicitly (`--backend=...`), until one fits or none
-is left. The codec is negotiated at the stream's real size (as `buildParams` does), so the
-decode-time choice (step 4.2) cannot differ. The chosen backend is pinned for the session: its
-restarts and the spare helper launch with it. host.log has one `video pipeline` line per session
-with the choice, the reason and why each rung before it was skipped (`skipped="amf: AMF runtime
-... not found; nvenc: ...; lavc: its FFmpeg libraries are not installed: ..."`), and at start
-`native encoder helper installed ... libavcodec=libraries in ...` (or why not).
+cannot encode). Two exceptions: a helper encoder forced in host.json (`encoder`
+`<codec>_<backend>_helper`) launches its backend first, and with `helperLibavcodec` `off` the
+vendor backends are launched by name (`auto` would choose, and probe the Quick Sync encoders of,
+the libavcodec backend on an Intel adapter 0). The helper captures on the output's own GPU and
+every backend encodes on that capture's device, taking any GPU of its own vendor (`caps.vendor`;
+the helper checks the same at start): a monitor whose output (`caps.outputs`, by HMONITOR) is on
+another vendor's GPU, a hybrid laptop's external port on the discrete GPU for instance, rules
+that backend out. A second GPU of the same vendor (a Ryzen iGPU next to a Radeon, two GeForce
+cards) stays on the same backend: `caps.adapterLuid` is only the GPU its probe read the caps on,
+so a codec of the caps that the other GPU lacks (AV1, say) makes the helper refuse the start, and
+HelperVideo's failure fallback applies. A negotiated codec that is not one of the backend's
+codecs rules it out too. Then the next backend in the order that no launch reported unavailable
+is launched by name (`--backend=...`), until one fits or none is left. A helper that does not
+start with its own choice is launched with the vendor backends by name (not libavcodec: its
+probe may be what failed); a second failed start ends the selection. The codec is negotiated
+at the stream's real size (as `buildParams` does), so the decode-time choice (step 4.2) cannot
+differ. The chosen backend is pinned for the session: its restarts and the spare helper launch
+with it. host.log has one `video pipeline` line per session with the choice, the reason and why
+each rung before it was skipped (`skipped="amf: AMF runtime ... not found; nvenc: ...; lavc: its
+FFmpeg libraries are not installed: ..."`, `auto: it did not start: ...` first when the helper's
+own choice did not start), `host config encoder not used` when the chosen helper has not got
+a forced helper encoder, and at start `native encoder helper installed ... libavcodec=libraries
+in ...` (or why not).
 
 **Generations on the helper.** The helper numbers frames itself (frame ids; a gap is a lost
 frame). A generation starts at a key frame flagged SEQ_START (the stream's first frame, and the IDR

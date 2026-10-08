@@ -1166,9 +1166,13 @@ helper with `--ffmpeg-dir` = host config `helperFFmpegDir` (default `ffmpeg-lgpl
 recon-host.exe, which is where the helper looks by default too; a relative value is taken from
 that directory) and checks at start that `avcodec-62.dll` and `avutil-60.dll` are there. A session
 takes this backend when the helper's `auto` choice falls to it (no AMF / NVENC encoder, or an
-Intel primary adapter) or when the vendor backend cannot serve it (another GPU's monitor, a codec
-it lacks: then recon-host relaunches the helper with `--backend=lavc`), unless
-`helperLibavcodec` is `off`; the backend is then pinned for the session's restarts and spare.
+Intel primary adapter) or when the vendor backend cannot serve it (a monitor on another vendor's
+GPU, a codec it lacks: then recon-host relaunches the helper with `--backend=lavc`), or first
+when host.json forces one of its encoders (`h264_lavc_helper`, ...); the backend is then pinned
+for the session's restarts and spare. With `helperLibavcodec` `off` recon-host never launches
+`auto` (it would choose this backend on an Intel adapter 0) but `--backend=amf` / `nvenc`, so no
+Quick Sync encoder is opened; the light probe for `unavailable` still loads the libraries when
+they are installed.
 From the caps: `recover` is never sent (recovery `none`: the session forces an IDR, the client
 is told recovery `keyframe`), `start` carries no `ltrSlots` / `intraRefreshFrames` / `svcLayers`,
 and `liveBitrate` `flush` (a key frame per `setRate`; the rate controller's flush policy) unless

@@ -4894,14 +4894,24 @@ What changed (session side of 3.8; the helper's backend is unchanged):
   `adapterBlocker`; docs/ARCHITECTURE.md "Two pipelines") tries, in order: the helper with a
   vendor backend (AMF, NVENC), the helper's libavcodec backend, FFmpeg's command line. The first
   launch is the helper's `auto` (vendor of adapter 0 first, `lavc` last, or first on an Intel
-  adapter 0); when the backend it chose cannot serve the session for a reason of its own (its
-  `adapterLuid` is not the captured monitor's adapter in `caps.outputs`; `lavc` with
-  `helperLibavcodec` `off`; the negotiated codec is not one of its codecs) recon-host launches the
-  next backend of that order the caps did not report unavailable, with `--backend=...`. The
-  chosen backend is pinned for the session (restarts, spare). host.log: one `video pipeline` line
-  with `backend=` and `skipped="amf: ...; nvenc: ...; lavc: ..."` (why each earlier rung was not
-  used); `native encoder helper: trying another backend backend=... instead_of=... reason=...`
-  per relaunch; at agent start `native encoder helper installed ... libavcodec="libraries in
+  adapter 0), except that a helper encoder forced in host.json (`<codec>_<backend>_helper`)
+  launches its backend first and `helperLibavcodec` `off` launches `amf` / `nvenc` by name (never
+  `auto`, which on an Intel adapter 0 would choose `lavc` and open its Quick Sync encoders). When
+  the backend cannot serve the session for a reason of its own (not usable; the captured
+  monitor's output in `caps.outputs` is on another vendor's GPU than `caps.vendor`; the
+  negotiated codec is not one of its codecs) recon-host launches the next backend of that order
+  no launch reported unavailable, with `--backend=...`. A second GPU of the backend's own vendor
+  is not ruled out: the helper encodes on the capture's device and checks only the vendor
+  (`caps.adapterLuid` is just the GPU its probe read the caps on; a codec that GPU has and the
+  other lacks makes the helper refuse the start, and HelperVideo's failure fallback applies, as
+  before this step). When `auto` does not start, `amf` and `nvenc` are launched by name (not
+  `lavc`: its probe may be what failed); a second failed start ends the selection. The chosen
+  backend is pinned for the session (restarts, spare). host.log: one `video pipeline` line with
+  `backend=` and `skipped="auto: ...; amf: ...; nvenc: ...; lavc: ..."` (why each earlier rung
+  was not used); `native encoder helper: trying another backend backend=... instead_of=...
+  reason=...` per relaunch; `host config encoder not used encoder=... reason=...` when the chosen
+  helper has not got a forced helper encoder (the codec is then chosen automatically); at agent
+  start `native encoder helper installed ... libavcodec="libraries in
   <dir>"` or `"not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec
   installs FFmpeg's LGPL libraries there)"` or `off (host config "helperLibavcodec")`.
 - Host config: `helperFFmpegDir` (default `<install>\ffmpeg-lgpl`, relative paths from the
@@ -4927,17 +4937,39 @@ What changed (session side of 3.8; the helper's backend is unchanged):
 
 ### Verified in the sandbox
 
-- verified (sandbox): selection order with fake helpers (`go test ./internal/host -run
-  'PipelineSelection|AdapterBlocker|SessionOnLavcHelper|OpenPipeline'`): AMF chosen with
-  nothing skipped; NVENC with `skipped="amf: ..."`; `lavc` when no vendor backend is usable
-  (`skipped` lists AMF's and NVENC's reasons); helper present but libavcodec libraries missing
-  -> FFmpeg, `reason="it has no usable encoder"`, `skipped=... lavc: its FFmpeg libraries are
-  not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec installs ...)`;
-  `helperLibavcodec` `off` with NVENC usable -> relaunch with `nvenc` (launches `""`, `nvenc`);
-  `off` with nothing else -> FFmpeg; a codec only the libavcodec backend has (AV1 client, AMF
-  without AV1) -> relaunch with `lavc`; a codec no backend has -> FFmpeg with every backend's
-  reason. A monitor on another GPU than the backend's rules it out (DDA, AMD Direct Capture, WGC
-  monitor capture); window and test captures are not checked.
+- verified (sandbox): selection order with fake helpers and caps (`go test ./internal/host -run
+  'PipelineSelection|PipelineMonitorSwitch|AdapterBlocker|SessionOnLavcHelper|OpenPipeline'`):
+  AMF chosen with nothing skipped; NVENC with `skipped="amf: ..."`; `lavc` when no vendor
+  backend is usable (`skipped` lists AMF's and NVENC's reasons); helper present but libavcodec
+  libraries missing -> FFmpeg, `reason="it has no usable encoder"`, `skipped=... lavc: its FFmpeg
+  libraries are not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec
+  installs ...)`; `helperLibavcodec` `off` with NVENC usable -> launches `amf`, `nvenc` (never
+  `auto`); `off` with nothing else -> launches `amf` only, FFmpeg, `reason="its amf backend is not
+  usable (...)"`, `skipped=... lavc: off (...)`; a codec only the libavcodec backend has (AV1
+  client, AMF without AV1) -> relaunch with `lavc`; a codec no backend has -> FFmpeg with every
+  backend's reason; `auto` not starting -> `amf`, `nvenc` by name (`skipped="auto: it did not
+  start: ...; amf: ..."`), never `lavc` (`lavc: not launched: ...`), and a second failed start
+  ends it (launches `""`, `amf`); a forced `h264_lavc_helper` on an AMD host with an Intel iGPU
+  -> launches `lavc` only; a forced `hevc_nvenc_helper` without NVENC -> `nvenc`, then `amf`,
+  `host config encoder not used`; a forced lavc encoder with `off` -> `amf`, the same log line.
+  Monitors from a test seam (`Agent.listMonitors`) with capture `ddagrab`: a hybrid laptop
+  (outputs on an Intel and an NVIDIA adapter) streams its panel on `lavc` (one launch) and an
+  external monitor on the dGPU on `nvenc` (launches `""`, `nvenc`, `skipped=... lavc: its lavc
+  encoder runs on intel GPUs (...), the monitor (\\.\DISPLAY2) is on NVIDIA ...`); a monitor on
+  a second AMD GPU (Ryzen iGPU next to a Radeon) stays on `amf` with one launch; a running session
+  switching to the other vendor's monitor leaves the helper for FFmpeg in `buildParams` (`video
+  pipeline pipeline=ffmpeg was=helper reason="its lavc encoder runs on ..."`), to the same
+  vendor's second GPU it stays. `adapterBlocker` alone: DDA, AMD Direct Capture and WGC monitor
+  captures are checked; window and test captures and monitors the caps do not list are not.
+  Mutation checks (`go test -overlay`): removing the adapter check from `helperFits` or from
+  `buildParams`, comparing LUIDs instead of vendors, ignoring the forced backend, launching
+  `auto` with `off`, or dropping the `host config encoder not used` line each fails a test.
+  The same tests pass as a Windows binary under Wine 9.0 (`GOOS=windows go test -c
+  ./internal/host`, run with `-test.run 'PipelineSelection|PipelineMonitorSwitch|AdapterBlocker|
+  OpenPipeline|SessionOnLavcHelper'`: client-side cursor, so `drawCursor` false) and with
+  `-race -count=3`. After these review fixes `xvfb-run -a make helper-test` still passes (the
+  `lavc` Wine tests skipped: only the static GPL FFmpeg build was in the sandbox then; the fixes
+  do not touch the helper, its Go client or the qualification).
 - verified (sandbox): a session on a fake helper with the libavcodec backend's real caps
   (`TestSessionOnLavcHelper`): start without LTR / intra refresh / SVC, rc `cbr`; VideoConfig
   `encoder` `h264_lavc_helper`, `recovery` `keyframe` for a hello-v3 client; capabilities
@@ -5004,8 +5036,11 @@ Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe
   ..."` and streams with FFmpeg's `hevc_qsv` (`msg="starting encoder"`). Rename it back.
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (`helperLibavcodec` off):
   add `"helperLibavcodec": "off"` to host.json, restart: `libavcodec="off (host config
-  \"helperLibavcodec\")"`; a stream logs `pipeline=ffmpeg reason="its libavcodec backend is off
-  (host config \"helperLibavcodec\")"`. Remove it again.
+  \"helperLibavcodec\")"`; a stream logs `pipeline=ffmpeg reason="its amf backend is not usable
+  (...)" skipped="nvenc: ...; lavc: off (host config \"helperLibavcodec\")"`, the helper's start
+  banner says `backend=amf` (requested by name) and no `lavc:` / `h264_qsv` line appears in
+  host.log (no Quick Sync encoder opened). On a hybrid laptop the stream runs on `backend=nvenc`
+  after the `amf` launch. Remove it again.
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (losses: an IDR in the
   running encoder, no restart): start the agent for this test only with
   `Stop-ScheduledTask 'KloudIT Recon Host'; $env:RECON_TEST_FAULTS="drop=every:300"; &
@@ -5032,7 +5067,8 @@ Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe
   the iGPU; `skipped` has no nvenc entry, or `nvenc: usable, not tried (the helper chose lavc
   for Intel...)`). Then choose an external monitor wired to the dGPU in the client's monitor
   setting: `native encoder helper: trying another backend backend=nvenc instead_of=lavc
-  reason="its lavc encoder runs on Intel(R) ..., the monitor (\\.\DISPLAYn) is on NVIDIA ..."`
+  reason="its lavc encoder runs on intel GPUs (Intel(R) ...), the monitor (\\.\DISPLAYn) is on
+  NVIDIA ..."`
   and `video pipeline pipeline=helper backend=nvenc` (for an already running session: `video
   pipeline pipeline=ffmpeg was=helper reason="its lavc encoder runs on ..."`, the session moves to
   FFmpeg). Record which outputs DXGI lists on which adapter (`recon-encoder.exe --print-caps`
@@ -5045,6 +5081,24 @@ Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe
   iGPU's outputs (if any) logs `trying another backend backend=lavc` and streams on Quick Sync.
 - NVIDIA: unverified (no NVIDIA host available). Test: the AMD test with `backend=nvenc`
   (`skipped="amf: AMF runtime ... not found ..."` is expected there).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (second AMD GPU, review fix): on a Ryzen with its
+  iGPU enabled and a monitor wired to the motherboard (or an APU laptop with a Radeon dGPU),
+  choose that monitor in the client's monitor setting: `video pipeline pipeline=helper
+  backend=amf` with no `trying another backend` line (one launch), `encoder helper started`
+  without an error, and the picture is that monitor's. Record the `adapter=` of the caps (the
+  probed dGPU) and whether a codec of the caps that the iGPU lacks (AV1 on a pre-RDNA3 iGPU) makes
+  the start fail (`encoder helper failed ... the capture runs on ...` or `unsupported`) and the
+  session fall back as HelperVideo's failure path does. Same test on NVIDIA with two GeForce
+  cards (NVIDIA: unverified, no NVIDIA host available) and on an Intel iGPU next to an Arc card
+  (Intel: unverified, no Intel host available).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (forced helper encoder, review fix): on a host with
+  an Intel iGPU and `-InstallLibavcodec`, set host.json `"encoder": "h264_lavc_helper"` and
+  restart: a stream logs one launch, `video pipeline pipeline=helper backend=lavc
+  encoders=...h264_lavc_helper skipped="amf: usable, not tried (host.json forces
+  h264_lavc_helper); ..."` and `codec choice encoder=h264_lavc_helper reason="forced in the host
+  config"`. Then `"encoder": "hevc_nvenc_helper"` (no NVIDIA GPU): `trying another backend
+  backend=amf instead_of=nvenc`, `host config encoder not used encoder=hevc_nvenc_helper`, the
+  stream on `amf`. Remove the setting again.
 
 ## 4.1 Decoder hygiene
 

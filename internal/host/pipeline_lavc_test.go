@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -47,108 +48,258 @@ const (
 	noLavcDLL = `"lavc":"libavcodec (avcodec-62.dll, avutil-60.dll of FFmpeg 8.x) not found in C:\\KR\\ffmpeg-lgpl"`
 )
 
+// onGPUs returns caps message msg with these outputs (JSON array members)
+// and the cursor in the video, so that a monitor capture passes helperBlocker
+// on Linux too (no client-side cursor there: the video must carry it).
+func onGPUs(msg, outputs string) string {
+	msg = strings.Replace(msg, `"cursorInVideo":false`, `"cursorInVideo":true`, 1)
+	return strings.Replace(msg, `"outputs":[]`, `"outputs":[`+outputs+`]`, 1)
+}
+
+// output returns a caps output (JSON) on an adapter.
+func output(name string, hmon uint64, luid, adapter, vendor string) string {
+	b, _ := json.Marshal(encoder.Output{Name: name, HMonitor: hmon, AdapterLUID: luid, AdapterName: adapter, Vendor: vendor})
+	return string(b)
+}
+
+// Two monitors: the built-in panel (0x101) and an external one (0x202).
+var twoMonitors = []platform.Monitor{
+	{Index: 0, Name: "Built-in", W: 1920, H: 1080, Hz: 60, Primary: true, HMonitor: 0x101, DXGIOutput: 0},
+	{Index: 1, Name: "External", X: 1920, W: 2560, H: 1440, Hz: 60, HMonitor: 0x202, DXGIOutput: 1},
+}
+
+// A hybrid laptop: the panel on the Intel iGPU (adapter 0), the external port
+// on the NVIDIA dGPU. A desktop with an AMD dGPU and a Ryzen iGPU: the second
+// monitor on the iGPU, same vendor.
+var (
+	hybridOutputs = output(`\\.\DISPLAY1`, 0x101, "00000000:0000a1b2", "Intel(R) UHD Graphics 770", "intel") + "," +
+		output(`\\.\DISPLAY2`, 0x202, "00000000:0000c3d4", "NVIDIA GeForce RTX 4070 Laptop GPU", "nvidia")
+	twoAMDOutputs = output(`\\.\DISPLAY1`, 0x101, "00000000:0000a1b2", "AMD Radeon RX 7900 XT", "amd") + "," +
+		output(`\\.\DISPLAY2`, 0x202, "00000000:0000c3d4", "AMD Radeon(TM) Graphics", "amd")
+)
+
+// selectionCase is one pipeline selection (host config "pipeline" "helper"):
+// the host config, the fake helpers per launched backend, the browser's
+// decoders, the system's monitors and the session's prefs; and what it should
+// end on.
+type selectionCase struct {
+	name        string
+	libavcodec  string // host config helperLibavcodec
+	encoder     string // host config encoder
+	capture     string // host config capture ("" = test)
+	lavcMissing bool
+	byBackend   map[string]string
+	errs        map[string]error
+	decoders    []proto.DecoderInfo
+	mons        []platform.Monitor // nil: the test pattern's
+	prefs       proto.Prefs
+	backend     string   // the helper backend the session runs, "" = FFmpeg
+	launches    []string // backends launched in order ("" = auto)
+	log         []string // in the video pipeline line
+	noLog       []string
+	logAll      []string // anywhere in the log
+}
+
+// runSelection opens the pipeline of a session for c and checks the result.
+func runSelection(t *testing.T, c selectionCase) (*Session, *lockedLog) {
+	t.Helper()
+	ffmpegCaps := &media.Caps{Encoders: []media.EncoderInfo{{Name: "libx264", Family: "h264", Vendor: "software"},
+		{Name: "libsvtav1", Family: "av1", Vendor: "software"}}}
+	capture := c.capture
+	if capture == "" {
+		capture = "test"
+	}
+	cfg := Config{Capture: capture, Pipeline: "helper", HelperLibavcodec: c.libavcodec, Encoder: c.encoder}
+	cfg.Defaults()
+	logs := &lockedLog{}
+	l := &fakeLauncher{byBackend: c.byBackend, errs: c.errs}
+	a := &Agent{cfg: &cfg, caps: ffmpegCaps, inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch}
+	if c.mons != nil {
+		a.listMonitors = func() []platform.Monitor { return c.mons }
+	}
+	if c.lavcMissing {
+		a.lavcMissing = encoder.LavcMissing(t.TempDir())
+	}
+	s := &Session{a: a, hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: c.decoders}, prefs: c.prefs,
+		tried: map[string]bool{}, usage: map[string]string{}, ctx: context.Background(), ctrl: &fakeCtrl{},
+		log: slog.New(slog.NewTextHandler(logs, nil))}
+	notice := s.openPipeline()
+	t.Cleanup(func() { s.vid().Stop() })
+	lines := logs.lines(`msg="video pipeline"`)
+	if len(lines) != 1 {
+		t.Fatalf("log %q", lines)
+	}
+	for _, want := range c.log {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("log %s\nwithout %s", lines[0], want)
+		}
+	}
+	for _, bad := range c.noLog {
+		if strings.Contains(lines[0], bad) {
+			t.Errorf("log %s\nwith %s", lines[0], bad)
+		}
+	}
+	for _, want := range c.logAll {
+		if !strings.Contains(strings.Join(logs.lines(""), "\n"), want) {
+			t.Errorf("log without %s:\n%s", want, strings.Join(logs.lines(""), "\n"))
+		}
+	}
+	on, _, hc := s.onHelper()
+	if _, isHelper := s.vid().(*media.HelperVideo); isHelper != (c.backend != "") || on != isHelper || hc.Backend != c.backend {
+		t.Fatalf("helper pipeline %v, backend %q; want %q", isHelper, hc.Backend, c.backend)
+	}
+	if (c.backend == "") != (notice != "") {
+		t.Fatalf("notice %q", notice)
+	}
+	l.mu.Lock()
+	launches := slices.Clone(l.backends)
+	l.mu.Unlock()
+	if !slices.Equal(launches, c.launches) {
+		t.Fatalf("launches %q, want %q", launches, c.launches)
+	}
+	return s, logs
+}
+
 // TestPipelineSelection: the order the session tries its video pipelines
 // in, and the "video pipeline" log line that names the choice and why the
 // rungs before it were skipped.
 func TestPipelineSelection(t *testing.T) {
-	ffmpegCaps := &media.Caps{Encoders: []media.EncoderInfo{{Name: "libx264", Family: "h264", Vendor: "software"},
-		{Name: "libsvtav1", Family: "av1", Vendor: "software"}}}
 	h264, av1 := []proto.DecoderInfo{{Family: "h264", HW: true}}, []proto.DecoderInfo{{Family: "av1", HW: true}}
 	amf := capsMsg("amf", "amd", "AMD Radeon RX 7900 XT", fakeH264+","+fakeHEVC, noNVENC+","+noIntel)
 	amfLavcUsable := capsMsg("amf", "amd", "AMD Radeon RX 7900 XT", fakeH264, noNVENC)
 	nvenc := capsMsg("nvenc", "nvidia", "NVIDIA GeForce RTX 4080", nvencH264, noAMF+","+noIntel)
 	lavc := capsMsg("lavc", "intel", "Intel(R) UHD Graphics 770", lavcH264, noAMF+","+noNVENC)
-	lavcNVENCUsable := capsMsg("lavc", "intel", "Intel(R) UHD Graphics 770", lavcH264, noAMF) // a hybrid laptop
 	lavcAV1Caps := capsMsg("lavc", "intel", "Intel(R) Arc A770", lavcAV1+","+lavcH264, noNVENC)
+	lavcOnAMDHost := capsMsg("lavc", "intel", "Intel(R) UHD Graphics 770", lavcH264, noNVENC) // --backend=lavc, AMD + Intel iGPU
 	none := capsMsg("none", "intel", "Intel(R) UHD Graphics 770", "", noAMF+","+noNVENC+","+noLavcDLL)
+	// --backend=amf where it is not usable: the caps of no backend.
+	noAMFHybrid := capsMsg("", "intel", "Intel(R) UHD Graphics 770", "", noAMF)            // Intel iGPU + NVIDIA dGPU
+	noAMFIntel := capsMsg("", "intel", "Intel(R) UHD Graphics 770", "", noAMF+","+noNVENC) // Intel only
+	noAMFNVIDIA := capsMsg("", "nvidia", "NVIDIA GeForce RTX 4080", "", noAMF+","+noIntel) // NVIDIA only
+	noNVENCAMD := capsMsg("", "amd", "AMD Radeon RX 7900 XT", "", noNVENC+","+noIntel)
+	// The hybrid laptop with its outputs: auto chooses lavc (Intel adapter 0).
+	hybridLavc := onGPUs(capsMsg("lavc", "intel", "Intel(R) UHD Graphics 770", lavcH264, noAMF), hybridOutputs)
+	hybridNVENC := onGPUs(capsMsg("nvenc", "nvidia", "NVIDIA GeForce RTX 4070 Laptop GPU", nvencH264, noAMF), hybridOutputs)
+	twoAMD := onGPUs(amf, twoAMDOutputs)
+	crash := errors.New("encoder helper: no caps within 5s")
+	for _, c := range []selectionCase{
+		{name: "vendor backend", byBackend: map[string]string{"": amf}, decoders: h264, backend: "amf", launches: []string{""},
+			log: []string{"pipeline=helper", "backend=amf", "encoders=hevc_amf_helper,h264_amf_helper"}, noLog: []string{"skipped"}},
+		{name: "second vendor backend", byBackend: map[string]string{"": nvenc}, decoders: h264, backend: "nvenc", launches: []string{""},
+			log: []string{"pipeline=helper", "backend=nvenc", `skipped="amf: AMF runtime (amfrt64.dll) not found in System32"`}},
+		{name: "libavcodec without a vendor backend", byBackend: map[string]string{"": lavc}, decoders: h264, backend: "lavc",
+			launches: []string{""}, log: []string{"pipeline=helper", "backend=lavc", "encoders=h264_lavc_helper",
+				`skipped="amf: AMF runtime (amfrt64.dll) not found in System32; nvenc: NVENC runtime (nvEncodeAPI64.dll) not found in System32"`}},
+		{name: "libavcodec libraries missing", lavcMissing: true, byBackend: map[string]string{"": none}, decoders: h264,
+			launches: []string{""}, log: []string{"pipeline=ffmpeg", `reason="it has no usable encoder"`, "amf: AMF runtime", "nvenc: NVENC runtime",
+				"lavc: its FFmpeg libraries are not installed: ", "has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec installs"}},
+		// Off: the helper never chooses the libavcodec backend ("auto" is
+		// not launched: on an Intel adapter 0 it would probe Quick Sync).
+		{name: "libavcodec off, vendor backend usable", libavcodec: "off", byBackend: map[string]string{"amf": noAMFHybrid, "nvenc": nvenc},
+			decoders: h264, backend: "nvenc", launches: []string{"amf", "nvenc"},
+			log: []string{"pipeline=helper", "backend=nvenc", `skipped="amf: AMF runtime (amfrt64.dll) not found in System32"`}},
+		{name: "libavcodec off, nothing else", libavcodec: "off", byBackend: map[string]string{"amf": noAMFIntel}, decoders: h264,
+			launches: []string{"amf"}, log: []string{"pipeline=ffmpeg", `reason="its amf backend is not usable (AMF runtime (amfrt64.dll) not found in System32)"`,
+				"nvenc: NVENC runtime", `lavc: off (host config \"helperLibavcodec\")`}},
+		{name: "codec only in the libavcodec backend", byBackend: map[string]string{"": amfLavcUsable, "lavc": lavcAV1Caps}, decoders: av1,
+			backend: "lavc", launches: []string{"", "lavc"},
+			log: []string{"pipeline=helper", "backend=lavc", "encoders=av1_lavc_helper,h264_lavc_helper",
+				"amf: the codec negotiated with this browser (libsvtav1) is not one of the helper's (h264_amf_helper)", "nvenc: NVENC runtime"}},
+		{name: "codec in no backend", byBackend: map[string]string{"": amf}, decoders: av1, launches: []string{""},
+			log: []string{"pipeline=ffmpeg", `reason="the codec negotiated with this browser (libsvtav1) is not one of the helper's`,
+				"nvenc: NVENC runtime", "lavc: no Intel adapter"}},
+		{name: "codec in no backend, libavcodec not installed", lavcMissing: true, byBackend: map[string]string{"": amfLavcUsable}, decoders: av1,
+			launches: []string{""}, log: []string{"pipeline=ffmpeg", "lavc: its FFmpeg libraries are not installed"}},
+		// The helper did not start with its own choice: the vendor
+		// backends by name (not libavcodec: its probe may be what failed),
+		// until a second start fails.
+		{name: "auto did not start, vendor backend by name", errs: map[string]error{"": crash},
+			byBackend: map[string]string{"amf": noAMFNVIDIA, "nvenc": nvenc}, decoders: h264, backend: "nvenc", launches: []string{"", "amf", "nvenc"},
+			log: []string{"pipeline=helper", "backend=nvenc",
+				`skipped="auto: it did not start: encoder helper: no caps within 5s; amf: AMF runtime (amfrt64.dll) not found in System32"`}},
+		{name: "auto did not start, no vendor backend", errs: map[string]error{"": crash}, byBackend: map[string]string{"amf": noAMFIntel},
+			decoders: h264, launches: []string{"", "amf"},
+			log: []string{"pipeline=ffmpeg", `reason="its amf backend is not usable (AMF runtime`, "auto: it did not start", "nvenc: NVENC runtime",
+				"lavc: not launched: the helper did not start with its own choice of backend"}},
+		{name: "two failed starts", errs: map[string]error{"": crash, "amf": crash}, decoders: h264, launches: []string{"", "amf"},
+			log: []string{"pipeline=ffmpeg", `reason="it did not start with backend amf: encoder helper: no caps within 5s"`,
+				"auto: it did not start", "nvenc: not tried"}},
+		// A helper encoder forced in host.json launches its backend first.
+		{name: "forced encoder of another backend", encoder: "h264_lavc_helper", byBackend: map[string]string{"": amfLavcUsable, "lavc": lavcOnAMDHost},
+			decoders: h264, backend: "lavc", launches: []string{"lavc"},
+			log: []string{"pipeline=helper", "backend=lavc", "encoders=h264_lavc_helper",
+				`amf: usable, not tried (host.json forces h264_lavc_helper)`, "nvenc: NVENC runtime"}},
+		{name: "forced encoder, its backend not usable", encoder: "hevc_nvenc_helper", byBackend: map[string]string{"nvenc": noNVENCAMD, "amf": amf},
+			decoders: h264, backend: "amf", launches: []string{"nvenc", "amf"},
+			log:    []string{"pipeline=helper", "backend=amf", `skipped="nvenc: NVENC runtime (nvEncodeAPI64.dll) not found in System32"`},
+			logAll: []string{`msg="host config encoder not used" encoder=hevc_nvenc_helper`, "(amf: hevc_amf_helper,h264_amf_helper); choosing automatically"}},
+		{name: "forced libavcodec encoder, libavcodec off", libavcodec: "off", encoder: "h264_lavc_helper", byBackend: map[string]string{"amf": amf},
+			decoders: h264, backend: "amf", launches: []string{"amf"},
+			logAll: []string{`msg="host config encoder not used" encoder=h264_lavc_helper`}},
+		// Monitors on two GPUs: a backend encodes the GPUs of its vendor.
+		{name: "hybrid laptop, panel on the iGPU", capture: "ddagrab", mons: twoMonitors, byBackend: map[string]string{"": hybridLavc, "nvenc": hybridNVENC},
+			decoders: h264, backend: "lavc", launches: []string{""},
+			log: []string{"pipeline=helper", "backend=lavc", "nvenc: usable, not tried (the helper chose lavc for Intel(R) UHD Graphics 770)"}},
+		{name: "hybrid laptop, external monitor on the dGPU", capture: "ddagrab", mons: twoMonitors, prefs: proto.Prefs{Monitor: 1},
+			byBackend: map[string]string{"": hybridLavc, "nvenc": hybridNVENC}, decoders: h264, backend: "nvenc", launches: []string{"", "nvenc"},
+			log: []string{"pipeline=helper", "backend=nvenc", "amf: AMF runtime",
+				"lavc: its lavc encoder runs on intel GPUs (Intel(R) UHD Graphics 770), the monitor (", `DISPLAY2) is on NVIDIA GeForce RTX 4070 Laptop GPU`},
+			logAll: []string{`msg="native encoder helper: trying another backend" backend=nvenc instead_of=lavc reason="its lavc encoder runs on intel GPUs`}},
+		{name: "second GPU of the same vendor", capture: "ddagrab", mons: twoMonitors, prefs: proto.Prefs{Monitor: 1},
+			byBackend: map[string]string{"": twoAMD}, decoders: h264, backend: "amf", launches: []string{""},
+			log: []string{"pipeline=helper", "backend=amf"}, noLog: []string{"skipped"}},
+	} {
+		t.Run(c.name, func(t *testing.T) { runSelection(t, c) })
+	}
+}
+
+// TestPipelineMonitorSwitch: a running session that switches to a monitor on
+// another vendor's GPU leaves the helper for FFmpeg (buildParams); one on a
+// second GPU of the backend's vendor stays.
+func TestPipelineMonitorSwitch(t *testing.T) {
+	h264 := []proto.DecoderInfo{{Family: "h264", HW: true}}
 	for _, c := range []struct {
-		name        string
-		libavcodec  string // host config helperLibavcodec
-		lavcMissing bool
-		byBackend   map[string]string
-		decoders    []proto.DecoderInfo
-		backend     string   // the helper backend the session runs, "" = FFmpeg
-		launches    []string // backends launched in order ("" = auto)
-		log         []string // in the video pipeline line
-		noLog       []string
+		name  string
+		caps  string
+		stays bool
+		log   string
 	}{
-		{"vendor backend", "", false, map[string]string{"": amf}, h264, "amf", []string{""},
-			[]string{"pipeline=helper", "backend=amf", "encoders=hevc_amf_helper,h264_amf_helper"}, []string{"skipped"}},
-		{"second vendor backend", "", false, map[string]string{"": nvenc}, h264, "nvenc", []string{""},
-			[]string{"pipeline=helper", "backend=nvenc", `skipped="amf: AMF runtime (amfrt64.dll) not found in System32"`}, nil},
-		{"libavcodec without a vendor backend", "", false, map[string]string{"": lavc}, h264, "lavc", []string{""},
-			[]string{"pipeline=helper", "backend=lavc", "encoders=h264_lavc_helper",
-				`skipped="amf: AMF runtime (amfrt64.dll) not found in System32; nvenc: NVENC runtime (nvEncodeAPI64.dll) not found in System32"`}, nil},
-		{"libavcodec libraries missing", "", true, map[string]string{"": none}, h264, "", []string{""},
-			[]string{"pipeline=ffmpeg", `reason="it has no usable encoder"`, "amf: AMF runtime", "nvenc: NVENC runtime",
-				"lavc: its FFmpeg libraries are not installed: ", "has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec installs"}, nil},
-		{"libavcodec off, vendor backend usable", "off", false, map[string]string{"": lavcNVENCUsable, "nvenc": nvenc}, h264, "nvenc",
-			[]string{"", "nvenc"},
-			[]string{"pipeline=helper", "backend=nvenc", `amf: AMF runtime`, `lavc: its libavcodec backend is off (host config \"helperLibavcodec\")`}, nil},
-		{"libavcodec off, nothing else", "off", false, map[string]string{"": lavc}, h264, "", []string{""},
-			[]string{"pipeline=ffmpeg", `reason="its libavcodec backend is off (host config \"helperLibavcodec\")"`, "amf: AMF runtime",
-				"nvenc: NVENC runtime"}, nil},
-		{"codec only in the libavcodec backend", "", false, map[string]string{"": amfLavcUsable, "lavc": lavcAV1Caps}, av1, "lavc",
-			[]string{"", "lavc"},
-			[]string{"pipeline=helper", "backend=lavc", "encoders=av1_lavc_helper,h264_lavc_helper",
-				"amf: the codec negotiated with this browser (libsvtav1) is not one of the helper's (h264_amf_helper)", "nvenc: NVENC runtime"}, nil},
-		{"codec in no backend", "", false, map[string]string{"": amf}, av1, "", []string{""},
-			[]string{"pipeline=ffmpeg", `reason="the codec negotiated with this browser (libsvtav1) is not one of the helper's`,
-				"nvenc: NVENC runtime", "lavc: no Intel adapter"}, nil},
-		{"codec in no backend, libavcodec not installed", "", true, map[string]string{"": amfLavcUsable}, av1, "", []string{""},
-			[]string{"pipeline=ffmpeg", "lavc: its FFmpeg libraries are not installed"}, nil},
+		{"other vendor", onGPUs(capsMsg("lavc", "intel", "Intel(R) UHD Graphics 770", lavcH264, noAMF), hybridOutputs), false,
+			`msg="video pipeline" pipeline=ffmpeg was=helper reason="its lavc encoder runs on intel GPUs (Intel(R) UHD Graphics 770), the monitor (`},
+		{"same vendor", onGPUs(capsMsg("amf", "amd", "AMD Radeon RX 7900 XT", fakeH264, noNVENC+","+noIntel), twoAMDOutputs), true, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			cfg := Config{Capture: "test", Pipeline: "helper", HelperLibavcodec: c.libavcodec}
-			cfg.Defaults()
-			logs := &lockedLog{}
-			l := &fakeLauncher{byBackend: c.byBackend}
-			a := &Agent{cfg: &cfg, caps: ffmpegCaps, hostClock: media.NewHostClock(), launchHelper: l.launch}
-			if c.lavcMissing {
-				a.lavcMissing = encoder.LavcMissing(t.TempDir())
+			backend := map[bool]string{true: "amf", false: "lavc"}[c.stays]
+			s, logs := runSelection(t, selectionCase{capture: "ddagrab", mons: twoMonitors, byBackend: map[string]string{"": c.caps},
+				decoders: h264, backend: backend, launches: []string{""}})
+			p, err := s.buildParams(proto.Prefs{})
+			if err != nil || !p.Encoder.Helper {
+				t.Fatalf("monitor 0: %s (%v)", p.Encoder.Name, err)
 			}
-			s := &Session{a: a, hello: proto.Hello{Decoders: c.decoders}, tried: map[string]bool{}, usage: map[string]string{},
-				ctx: context.Background(), ctrl: &fakeCtrl{}, log: slog.New(slog.NewTextHandler(logs, nil))}
-			notice := s.openPipeline()
-			defer s.vid().Stop()
-			lines := logs.lines(`msg="video pipeline"`)
-			if len(lines) != 1 {
-				t.Fatalf("log %q", lines)
+			p, err = s.buildParams(proto.Prefs{Monitor: 1})
+			if err != nil {
+				t.Fatal(err)
 			}
-			for _, want := range c.log {
-				if !strings.Contains(lines[0], want) {
-					t.Errorf("log %s\nwithout %s", lines[0], want)
-				}
+			_, isHelper := s.vid().(*media.HelperVideo)
+			if p.Encoder.Helper != c.stays || isHelper != c.stays {
+				t.Fatalf("monitor 1: encoder %s, helper pipeline %v; want helper %v", p.Encoder.Name, isHelper, c.stays)
 			}
-			for _, bad := range c.noLog {
-				if strings.Contains(lines[0], bad) {
-					t.Errorf("log %s\nwith %s", lines[0], bad)
-				}
-			}
-			on, _, hc := s.onHelper()
-			if _, isHelper := s.vid().(*media.HelperVideo); isHelper != (c.backend != "") || on != isHelper || hc.Backend != c.backend {
-				t.Fatalf("helper pipeline %v, backend %q; want %q", isHelper, hc.Backend, c.backend)
-			}
-			if (c.backend == "") != (notice != "") {
-				t.Fatalf("notice %q", notice)
-			}
-			l.mu.Lock()
-			launches := slices.Clone(l.backends)
-			l.mu.Unlock()
-			if !slices.Equal(launches, c.launches) {
-				t.Fatalf("launches %q, want %q", launches, c.launches)
+			if c.log != "" && !strings.Contains(strings.Join(logs.lines(""), "\n"), c.log) {
+				t.Fatalf("log without %s:\n%s", c.log, strings.Join(logs.lines(""), "\n"))
 			}
 		})
 	}
 }
 
-// TestAdapterBlocker: every helper backend encodes only captures of its own
-// GPU, so a monitor on another GPU needs another backend (or FFmpeg).
+// TestAdapterBlocker: a helper backend encodes the GPUs of its own vendor
+// (any of them), so a monitor on another vendor's GPU needs another backend
+// (or FFmpeg).
 func TestAdapterBlocker(t *testing.T) {
-	c := encoder.Caps{Backend: "lavc", AdapterLUID: "00000000:0000a1b2", AdapterName: "Intel(R) UHD Graphics",
+	c := encoder.Caps{Backend: "lavc", Vendor: "intel", AdapterLUID: "00000000:0000a1b2", AdapterName: "Intel(R) UHD Graphics",
 		Outputs: []encoder.Output{
-			{Name: `\\.\DISPLAY1`, HMonitor: 0x101, AdapterLUID: "00000000:0000A1B2", AdapterName: "Intel(R) UHD Graphics"},
-			{Name: `\\.\DISPLAY2`, HMonitor: 0x202, AdapterLUID: "00000000:0000c3d4", AdapterName: "NVIDIA GeForce RTX 4070 Laptop GPU"}}}
+			{Name: `\\.\DISPLAY1`, HMonitor: 0x101, AdapterLUID: "00000000:0000A1B2", AdapterName: "Intel(R) UHD Graphics", Vendor: "intel"},
+			{Name: `\\.\DISPLAY2`, HMonitor: 0x202, AdapterLUID: "00000000:0000c3d4", AdapterName: "NVIDIA GeForce RTX 4070 Laptop GPU", Vendor: "nvidia"},
+			{Name: `\\.\DISPLAY3`, HMonitor: 0x404, AdapterLUID: "00000000:0000e5f6", AdapterName: "Intel(R) Arc A380", Vendor: "intel"}}}
 	for _, tc := range []struct {
 		name    string
 		capture string
@@ -157,10 +308,12 @@ func TestAdapterBlocker(t *testing.T) {
 		want    string
 	}{
 		{"same GPU", "auto", proto.Prefs{}, 0x101, ""},
-		{"other GPU", "auto", proto.Prefs{}, 0x202, `its lavc encoder runs on Intel(R) UHD Graphics, the monitor (\\.\DISPLAY2) is on NVIDIA`},
-		{"other GPU, AMD Direct Capture", "amf", proto.Prefs{}, 0x202, "the monitor"},
+		{"other vendor's GPU", "auto", proto.Prefs{}, 0x202,
+			`its lavc encoder runs on intel GPUs (Intel(R) UHD Graphics), the monitor (\\.\DISPLAY2) is on NVIDIA`},
+		{"other GPU of the same vendor", "auto", proto.Prefs{}, 0x404, ""},
+		{"other vendor's GPU, AMD Direct Capture", "amf", proto.Prefs{}, 0x202, "the monitor"},
 		{"window capture", "auto", proto.Prefs{Window: "Notepad"}, 0x202, ""},
-		{"other GPU, WGC monitor capture", "gfxcapture", proto.Prefs{}, 0x202, "the monitor"},
+		{"other vendor's GPU, WGC monitor capture", "gfxcapture", proto.Prefs{}, 0x202, "the monitor"},
 		{"test source", "test", proto.Prefs{}, 0x202, ""},
 		{"unknown monitor", "auto", proto.Prefs{}, 0x303, ""},
 		{"no monitor handle", "auto", proto.Prefs{}, 0, ""},

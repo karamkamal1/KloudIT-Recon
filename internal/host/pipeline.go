@@ -168,19 +168,21 @@ func (s *Session) openPipeline() (notice string) {
 }
 
 // helperSkips collects why the pipeline selection passed over each of the
-// helper's backends (backend -> why), for the "video pipeline" log line.
+// helper's backends (backend -> why; "auto": the helper's own choice, when
+// it did not start), for the "video pipeline" log line.
 type helperSkips map[string]string
 
-// String lists them in the selection order ("amf: ...; nvenc: ...").
+// String lists them in the selection order ("auto: ...; amf: ...; nvenc:
+// ...").
 func (k helperSkips) String() string {
 	var parts []string
-	for _, b := range helperBackends {
+	for _, b := range append([]string{"auto"}, helperBackends...) {
 		if why, ok := k[b]; ok {
 			parts = append(parts, b+": "+why)
 		}
 	}
 	for _, b := range slices.Sorted(maps.Keys(k)) {
-		if !slices.Contains(helperBackends, b) {
+		if b != "auto" && !slices.Contains(helperBackends, b) {
 			parts = append(parts, b+": "+k[b])
 		}
 	}
@@ -191,103 +193,178 @@ func (k helperSkips) String() string {
 // the session (helperFits), else nil and why not. The first launch lets the
 // helper choose its backend ("auto": the primary display adapter's vendor
 // encoder first, libavcodec last, or first on an Intel primary adapter, whose
-// outputs AMF and NVENC cannot encode); when that backend cannot serve the
-// session for a reason of its own (its encoder runs on another adapter than
-// the monitor's, the libavcodec backend is off, the codec negotiated with
-// this browser is not one of its codecs), the next backend in the selection
-// order (helperBackends) the helper reported usable is launched instead.
-// skipped gets why each backend before the one chosen (all of them, when
-// none is, except the last one tried: its reason is returned) was passed
-// over.
+// outputs AMF and NVENC cannot encode), except that a helper encoder forced
+// in host.json (<codec>_<backend>_helper) launches its backend first, and
+// that with the libavcodec backend off the vendor backends are launched by
+// name (so the helper never chooses that backend or opens its Quick Sync
+// encoders). When a backend cannot serve the session for a reason of its own
+// (it is not usable, its encoder runs on another vendor's GPU than the
+// monitor, the libavcodec backend is off, the codec negotiated with this
+// browser is not one of its codecs) or the helper did not start, the next
+// backend in the selection order (helperBackends) no launch reported
+// unavailable is launched instead; after a failed "auto" launch only the
+// vendor backends (the libavcodec backend's probe may be what failed), and a
+// second failed start ends the selection. skipped gets why each backend
+// before the one chosen (all of them, when none is, except the last one
+// tried: its reason is returned) was passed over.
 func (s *Session) chooseHelper(prefs proto.Prefs, drawCursor bool, skipped helperSkips) (*encoder.Helper, string) {
+	cfg := s.a.cfg
 	mon := s.a.monitorFor(prefs)
 	tried := map[string]bool{}
 	unavailable := map[string]string{} // over every launch
-	choice := ""                       // the helper's own choice of backend, for the log
+	choice := ""                       // why the first launch was not of an earlier backend, for the log
+	gotCaps := false                   // a launch reported which backends are usable
+	autoFailed := false                // the "auto" launch did not start
+	// lavcOut says why the libavcodec backend is not launched by name, or "".
+	lavcOut := func() string {
+		switch {
+		case !cfg.libavcodecOn():
+			return `off (host config "helperLibavcodec")`
+		case s.a.lavcMissing != "":
+			return "its FFmpeg libraries are not installed: " + s.a.lavcMissing
+		case autoFailed:
+			return "not launched: the helper did not start with its own choice of backend, which may have been this one"
+		}
+		return ""
+	}
+	next := func() string {
+		for _, b := range helperBackends {
+			if !tried[b] && unavailable[b] == "" && (b != backendLavc || lavcOut() == "") {
+				return b
+			}
+		}
+		return ""
+	}
 	// fill notes why the backends before index upTo of helperBackends were
 	// not used where no launch said so: unavailable, turned off, not
-	// installed, or usable but not the helper's choice.
+	// installed, usable but not the first launch's choice, or not tried
+	// (no launch reported caps).
 	fill := func(upTo int, except string) {
 		for _, b := range helperBackends[:upTo] {
 			if _, done := skipped[b]; done || b == except {
 				continue
 			}
 			switch {
-			case b == backendLavc && !s.a.cfg.libavcodecOn():
-				skipped[b] = `off (host config "helperLibavcodec")`
-			case b == backendLavc && s.a.lavcMissing != "":
-				skipped[b] = "its FFmpeg libraries are not installed: " + s.a.lavcMissing
+			case b == backendLavc && lavcOut() != "":
+				skipped[b] = lavcOut()
 			case unavailable[b] != "":
 				skipped[b] = unavailable[b]
 			case tried[b]:
 				skipped[b] = "not usable"
-			default:
+			case !gotCaps:
+				skipped[b] = "not tried"
+			case choice != "":
 				skipped[b] = "usable, not tried (" + choice + ")"
+			default:
+				skipped[b] = "usable, not tried"
 			}
 		}
 	}
 	backend := "" // auto
+	switch fb := forcedHelperBackend(cfg.Encoder); {
+	case fb != "" && (fb != backendLavc || lavcOut() == ""):
+		backend, choice = fb, "host.json forces "+cfg.Encoder
+	case !cfg.libavcodecOn():
+		backend = next()
+	}
+	failures := 0
 	for {
+		name := backend // what was launched, for skipped and the log
+		if name == "" {
+			name = "auto"
+		}
+		why, skip, backendOnly := "", "", true // skip: why, for skipped
 		h, err := s.a.launchHelper(s.log, backend)
 		if err != nil {
-			if backend == "" {
-				return nil, "it did not start: " + err.Error()
-			}
+			failures++
 			tried[backend] = true
-			fill(len(helperBackends), backend)
-			return nil, fmt.Sprintf("it did not start with backend %s: %v", backend, err)
-		}
-		c := h.Caps()
-		tried[backend], tried[c.Backend] = true, true
-		for k, v := range c.Unavailable {
-			if unavailable[k] == "" {
-				unavailable[k] = v
+			autoFailed = autoFailed || backend == ""
+			why, skip = "it did not start: "+err.Error(), "it did not start: "+err.Error()
+			if backend != "" {
+				why = fmt.Sprintf("it did not start with backend %s: %v", backend, err)
 			}
-		}
-		if choice == "" {
-			choice = "the helper chose " + c.Backend
-			if c.AdapterName != "" {
-				choice += " for " + c.AdapterName
+			backendOnly = failures < 2 // twice: the helper itself fails
+		} else {
+			c := h.Caps()
+			tried[backend], tried[c.Backend], gotCaps = true, true, true
+			for k, v := range c.Unavailable {
+				if unavailable[k] == "" {
+					unavailable[k] = v
+				}
 			}
-		}
-		why, backendOnly := s.helperFits(prefs, drawCursor, mon, &c)
-		if why == "" {
-			if i := slices.Index(helperBackends, c.Backend); i > 0 {
-				fill(i, "")
+			if backend == "" && choice == "" {
+				choice = "the helper chose " + c.Backend
+				if c.AdapterName != "" {
+					choice += " for " + c.AdapterName
+				}
 			}
-			return h, ""
-		}
-		go h.Close()
-		switch {
-		case !c.Usable() && backend != "":
-			fill(len(helperBackends), backend)
-			why := c.Unavailable[backend]
+			why, backendOnly = s.helperFits(prefs, drawCursor, mon, &c)
 			if why == "" {
-				why = "no encoder"
+				if i := slices.Index(helperBackends, c.Backend); i > 0 {
+					fill(i, "")
+				}
+				s.forcedHelperEncoder(c)
+				return h, ""
 			}
-			return nil, fmt.Sprintf("its %s backend is not usable (%s)", backend, why)
-		case !c.Usable():
-			fill(len(helperBackends), "")
-			return nil, why
-		case !backendOnly:
-			return nil, why // the session needs something no backend changes
-		}
-		next := ""
-		for _, b := range helperBackends {
-			usable := unavailable[b] == "" && (b != backendLavc || s.a.cfg.libavcodecOn() && s.a.lavcMissing == "")
-			if !tried[b] && usable {
-				next = b
-				break
+			go h.Close()
+			switch {
+			case !c.Usable() && backend == "":
+				fill(len(helperBackends), "")
+				return nil, why // no backend in the helper's own order is usable
+			case !c.Usable():
+				skip = c.Unavailable[backend]
+				if skip == "" {
+					skip = "no encoder"
+				}
+				why, backendOnly = fmt.Sprintf("its %s backend is not usable (%s)", backend, skip), true
+			case !backendOnly:
+				return nil, why // the session needs something no backend changes
+			default:
+				name, skip = c.Backend, why
 			}
 		}
-		if next == "" {
-			fill(len(helperBackends), c.Backend)
+		nb := ""
+		if backendOnly {
+			nb = next()
+		}
+		if nb == "" {
+			fill(len(helperBackends), name)
 			return nil, why
 		}
-		skipped[c.Backend] = why
-		s.log.Info("native encoder helper: trying another backend", "backend", next, "instead_of", c.Backend, "reason", why)
-		backend = next
+		skipped[name] = skip
+		s.log.Info("native encoder helper: trying another backend", "backend", nb, "instead_of", name, "reason", why)
+		backend = nb
 	}
+}
+
+// forcedHelperBackend returns the helper backend of a helper encoder forced
+// in host.json ("encoder" <codec>_<backend>_helper, e.g. hevc_nvenc_helper),
+// or "".
+func forcedHelperBackend(enc string) string {
+	name, ok := strings.CutSuffix(enc, "_helper")
+	if !ok {
+		return ""
+	}
+	if _, b, ok := strings.Cut(name, "_"); ok && slices.Contains(helperBackends, b) {
+		return b
+	}
+	return ""
+}
+
+// forcedHelperEncoder logs, once per session, that the helper encoder forced
+// in host.json is not one of the chosen helper's (caps c): the codec is then
+// chosen automatically among them (negotiateEncoder).
+func (s *Session) forcedHelperEncoder(c encoder.Caps) {
+	enc := s.a.cfg.Encoder
+	if !strings.HasSuffix(enc, "_helper") {
+		return
+	}
+	encs := media.HelperEncoders(c)
+	if slices.ContainsFunc(encs, func(e media.EncoderInfo) bool { return e.Name == enc }) {
+		return
+	}
+	s.log.Info("host config encoder not used", "encoder", enc,
+		"reason", fmt.Sprintf("not one of the encoders of the helper backend chosen (%s: %s); choosing automatically", c.Backend, encoderNames(encs)))
 }
 
 // helperFits returns why the helper with caps c cannot serve a session with
@@ -323,20 +400,25 @@ func (s *Session) helperFits(prefs proto.Prefs, drawCursor bool, mon platform.Mo
 }
 
 // adapterBlocker returns why the helper with caps c cannot encode monitor
-// mon, or "": every backend encodes on one GPU (c.AdapterLUID) and takes only
-// captures of that GPU's outputs (the helper captures on the output's own
-// GPU: DXGI Desktop Duplication, AMD Direct Capture and its WGC device alike),
-// so a monitor on another GPU (a laptop's external port on the discrete GPU,
-// a desktop with monitors on two) needs another backend. A window capture
-// (its monitor is not known here) and the test source are not checked, nor a
-// monitor the caps do not list.
+// mon, or "". The helper captures on the output's own GPU (DXGI Desktop
+// Duplication, AMD Direct Capture and its WGC device alike) and every backend
+// encodes on that capture's device, taking only GPUs of its own vendor
+// (caps.vendor; the helper checks the same at start): a monitor whose output
+// (caps.outputs, by HMONITOR) is on another vendor's GPU (a hybrid laptop's
+// external port on the discrete GPU, a desktop with monitors on an iGPU and
+// a dGPU) needs another backend. A second GPU of the same vendor is the same
+// backend's (caps.adapterLuid is only the GPU its probe read the caps on;
+// should that GPU lack a codec of the caps, the helper refuses the start and
+// HelperVideo's failure fallback applies). A window capture (its monitor is
+// not known here) and the test source are not checked, nor a monitor the
+// caps do not list.
 func (s *Session) adapterBlocker(prefs proto.Prefs, mon platform.Monitor, c *encoder.Caps) string {
-	if prefs.Window != "" || s.a.cfg.Capture == "test" || mon.HMonitor == 0 || c.AdapterLUID == "" {
+	if prefs.Window != "" || s.a.cfg.Capture == "test" || mon.HMonitor == 0 || c.Vendor == "" {
 		return ""
 	}
 	for _, o := range c.Outputs {
-		if o.HMonitor == mon.HMonitor && o.AdapterLUID != "" && !strings.EqualFold(o.AdapterLUID, c.AdapterLUID) {
-			return fmt.Sprintf("its %s encoder runs on %s, the monitor (%s) is on %s", c.Backend, c.AdapterName, o.Name, o.AdapterName)
+		if o.HMonitor == mon.HMonitor && o.Vendor != "" && !strings.EqualFold(o.Vendor, c.Vendor) {
+			return fmt.Sprintf("its %s encoder runs on %s GPUs (%s), the monitor (%s) is on %s", c.Backend, c.Vendor, c.AdapterName, o.Name, o.AdapterName)
 		}
 	}
 	return ""

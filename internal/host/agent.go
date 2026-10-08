@@ -53,6 +53,8 @@ type Agent struct {
 	launchHelper  func(log *slog.Logger, backend string) (*encoder.Helper, error)
 	helperMissing string
 	lavcMissing   string
+	// listMonitors replaces the system's monitors in monitors() (tests).
+	listMonitors func() []platform.Monitor
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -187,6 +189,9 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 func (a *Agent) clock() uint64 { return a.hostClock.Now() }
 
 func (a *Agent) monitors() []platform.Monitor {
+	if a.listMonitors != nil {
+		return a.listMonitors()
+	}
 	mons, err := platform.Monitors()
 	if err != nil || len(mons) == 0 {
 		return []platform.Monitor{{W: a.cfg.TestWidth, H: a.cfg.TestHeight, Primary: true, Name: "Display", DXGIOutput: -1}}
