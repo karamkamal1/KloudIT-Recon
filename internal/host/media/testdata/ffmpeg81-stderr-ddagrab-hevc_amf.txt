@@ -1,0 +1,10 @@
+[D3D11VA @ 00007fffff3b1ec0] Failed to create Direct3D device (887a0004)
+[Parsed_ddagrab_0 @ 00007fffff3b9a80] Failed to create D3D11VA device.
+[Parsed_ddagrab_0 @ 00007fffff3b9a80] Failed to configure output pad on Parsed_ddagrab_0
+[fc#0 @ 00007fffff369e40] Error configuring filter graph: Unknown error occurred
+[fc#0 @ 00007fffff369e40] Task finished with error code: -1313558101 (Unknown error occurred)
+[vost#0:0/hevc_amf @ 00007fffff36d540] [enc:hevc_amf @ 00007fffff36dc00] Could not open encoder before EOF
+[vost#0:0/hevc_amf @ 00007fffff36d540] Task finished with error code: -22 (Invalid argument)
+[fc#0 @ 00007fffff369e40] Terminating thread with return code -1313558101 (Unknown error occurred)
+[vost#0:0/hevc_amf @ 00007fffff36d540] Terminating thread with return code -22 (Invalid argument)
+[out#0/nut @ 00007fffff36b3c0] Nothing was written into output file, because at least one of its streams received no packets.

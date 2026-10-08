@@ -1,0 +1,6 @@
+[av1_amf @ 00007fffff36dc00] [Eval @ 00007ffffe2fd5d0] Undefined constant or missing '(' in 'idr'
+[av1_amf @ 00007fffff36dc00] Unable to parse "header_insertion_mode" option value "idr"
+[av1_amf @ 00007fffff36dc00] Error setting option header_insertion_mode to value idr.
+[vost#0:0/av1_amf @ 00007fffff36d480] Error applying encoder options: Invalid argument
+Error opening output file NUL.
+Error opening output files: Invalid argument

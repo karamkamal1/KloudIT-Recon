@@ -1,0 +1,9 @@
+[Parsed_testsrc2_0 @ 00007fffff3b9c40] [IMGUTILS @ 00007fffffa4f4a0] Picture size 40000x40000 is invalid
+[Parsed_testsrc2_0 @ 00007fffff3b9c40] Failed to configure output pad on Parsed_testsrc2_0
+[fc#0 @ 00007fffff369c40] Error configuring filter graph: Invalid argument
+[fc#0 @ 00007fffff369c40] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/libx264 @ 00007fffff36d380] [enc:libx264 @ 00007fffff36da80] Could not open encoder before EOF
+[vost#0:0/libx264 @ 00007fffff36d380] Task finished with error code: -22 (Invalid argument)
+[fc#0 @ 00007fffff369c40] Terminating thread with return code -22 (Invalid argument)
+[vost#0:0/libx264 @ 00007fffff36d380] Terminating thread with return code -22 (Invalid argument)
+[out#0/nut @ 00007fffff36b1c0] Nothing was written into output file, because at least one of its streams received no packets.

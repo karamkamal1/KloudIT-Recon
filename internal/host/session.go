@@ -64,7 +64,8 @@ type Session struct {
 	failures int
 	tried    map[string]bool   // encoders excluded after failing
 	usage    map[string]string // encoder -> usage it is retried with (media.RetryUsage)
-	triedMu  sync.Mutex        // guards tried and usage
+	encFails map[string]int    // encoder -> its own start failures since a generation last went live
+	triedMu  sync.Mutex        // guards tried, usage and encFails
 
 	ccTarget  atomic.Pointer[ccTarget] // media congestion controller (setCongestionTarget)
 	audioKbps atomic.Int64             // audio bitrate while audio runs
@@ -93,9 +94,10 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 	s := &Session{
 		a: a, c: c, meta: meta, id: auth.RandomToken(6),
 		ctx: ctx, cancel: cancel,
-		frameQ: make(chan *media.Frame, 6),
-		tried:  map[string]bool{},
-		usage:  map[string]string{},
+		frameQ:   make(chan *media.Frame, 6),
+		tried:    map[string]bool{},
+		usage:    map[string]string{},
+		encFails: map[string]int{},
 	}
 	s.log = a.log.With("session", s.id, "path", meta.Path)
 	return s
@@ -553,7 +555,7 @@ func (s *Session) videoEvents() {
 		case ev.Err != nil:
 			s.handleEncoderFailure(ev)
 		case ev.Config != nil:
-			s.failures = 0
+			s.encoderLive()
 			s.videoUp.Store(true)
 			if r := s.a.faults.recovery; r != "" {
 				c := *ev.Config
@@ -624,13 +626,27 @@ func (s *Session) reportDropped(frames []*media.Frame, why string) {
 	}()
 }
 
+// encoderLive resets the failure counts when a generation goes live: capture
+// and encoder work again, so earlier failures no longer count.
+func (s *Session) encoderLive() {
+	s.failures = 0
+	s.triedMu.Lock()
+	clear(s.encFails)
+	s.triedMu.Unlock()
+}
+
 // handleEncoderFailure handles a failure event (ev.Err) of the video manager.
+// Only a generation that failed to start because of its encoder counts
+// against the encoder (encoderFailed). A generation that had gone live, or
+// whose capture source failed, does not: a capture outage of a few seconds
+// (a UAC prompt, the lock screen, a display mode change) fails every restart
+// until it ends and must not move the session to another encoder or usage.
 func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	err := ev.Err
 	s.failures++
-	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live)
-	if ev.Failed != nil {
-		s.encoderFailed(*ev.Failed, s.failures, ev.Live)
+	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live, "encoder_fault", ev.EncoderFault)
+	if ev.Failed != nil && ev.EncoderFault && !ev.Live {
+		s.encoderFailed(*ev.Failed)
 	}
 	if s.failures > 6 {
 		s.notice("error", "Video encoder keeps failing: "+err.Error())
@@ -647,25 +663,25 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	})
 }
 
-// encoderFailed decides how the next start treats the encoder of a failed
-// generation (attempt: failures in a row; live: the generation had gone live).
-// An encoder with a fallback usage (media.RetryUsage) that fails to start is
-// retried once with that usage, kept until the video settings change; a live
-// generation that fails (e.g. its capture after a display mode change) had no
-// init problem and keeps its usage. Otherwise a failure after another one
-// excludes the encoder and chooseEncoder falls back to the next.
-func (s *Session) encoderFailed(p media.Params, attempt int, live bool) {
+// encoderFailed decides how the next start treats the encoder of a generation
+// that failed to start because of the encoder. An encoder with a fallback usage
+// (media.RetryUsage) is retried once with that usage (AMF issue #410, an init
+// failure), kept until the video settings change. Otherwise the encoder's
+// second such failure since a generation last went live excludes it, and
+// chooseEncoder falls back to the next encoder, which gets two tries too.
+func (s *Session) encoderFailed(p media.Params) {
 	name := p.Encoder.Name
 	s.triedMu.Lock()
 	defer s.triedMu.Unlock()
-	if u := media.RetryUsage(p.Encoder); u != "" && !live {
+	s.encFails[name]++
+	if u := media.RetryUsage(p.Encoder); u != "" {
 		if _, retried := s.usage[name]; !retried {
 			s.usage[name] = u
 			s.log.Info("retrying encoder with another usage", "encoder", name, "usage", u)
 			return
 		}
 	}
-	if attempt >= 2 {
+	if s.encFails[name] >= 2 {
 		s.tried[name] = true
 	}
 }
@@ -1076,6 +1092,7 @@ func (s *Session) controlLoop() error {
 				s.triedMu.Lock()
 				s.tried = map[string]bool{}
 				s.usage = map[string]string{}
+				clear(s.encFails)
 				s.triedMu.Unlock()
 				if err := s.startVideo(false, "settings"); err != nil {
 					s.notice("error", "Could not apply settings: "+err.Error())

@@ -301,22 +301,57 @@ func TestRecovery(t *testing.T) {
 	}
 }
 
-// TestEncoderArgsAccepted checks every option the host passes to a hardware
-// encoder against FFmpeg 8.1's option list: the option exists for that
-// encoder and takes the value.
-func TestEncoderArgsAccepted(t *testing.T) {
+// TestEncoderArgsNotDropped checks that the option filtering (opt in
+// encoderArgs) drops no option the host means to pass to an AMD or NVIDIA
+// encoder for a reason other than the encoder lacking it: for every preset,
+// adaptive on/off and usage it builds the arguments with FFmpeg 8.1's option
+// lists and with lists that take every option of the vendor's encoders with
+// any value. An option missing from the first must be one the encoder does
+// not have, and exactly the ones listed below: a value FFmpeg 8.1 does not
+// name (a typo, or a value the build lacks) would be dropped silently.
+func TestEncoderArgsNotDropped(t *testing.T) {
 	c := ffmpeg81Caps(t)
-	generic := map[string]bool{"b:v": true, "maxrate": true, "bufsize": true, "g": true, "bf": true, "flags": true}
+	wide := &Caps{Filters: c.Filters, options: map[string]map[string]bool{}}
 	for enc := range c.options {
+		wide.options[enc] = map[string]bool{}
+		for other, opts := range c.options {
+			if encoderNamed(other).Vendor == encoderNamed(enc).Vendor {
+				for o := range opts {
+					wide.options[enc][o] = true
+				}
+			}
+		}
+	}
+	notOn := map[string]string{ // options the host asks for that the encoder does not have
+		"hevc_amf": "frame_skipping", "av1_amf": "frame_skipping", "h264_amf": "header_insertion_mode skip_frame",
+		"hevc_nvenc": "", "h264_nvenc": "", "av1_nvenc": "",
+	}
+	for enc := range c.options {
+		e := encoderNamed(enc)
 		for _, q := range []string{"", "speed", "balanced", "quality"} {
 			for _, adaptive := range []bool{false, true} {
-				e := encoderNamed(enc)
 				for _, usage := range usages(e) {
 					p := Params{Encoder: e, FPS: 120, BitrateKbps: 50000, Quality: q, Adaptive: adaptive, Usage: usage}
-					for k, v := range encoderArgMap(t, c, p) {
-						if !generic[k] && (!c.HasOption(enc, k) || !c.acceptsValue(enc, k, v)) {
-							t.Errorf("%s (quality %q adaptive %v usage %q): -%s %s not accepted", enc, q, adaptive, usage, k, v)
+					got, want := encoderArgMap(t, c, p), encoderArgMap(t, wide, p)
+					var dropped []string
+					for k, v := range want {
+						if g, ok := got[k]; !ok {
+							dropped = append(dropped, k)
+							if c.HasOption(enc, k) {
+								t.Errorf("%s (quality %q adaptive %v usage %q): -%s %s dropped: FFmpeg 8.1 does not take the value", enc, q, adaptive, usage, k, v)
+							}
+						} else if g != v {
+							t.Errorf("%s (quality %q adaptive %v usage %q): -%s %s, want %s", enc, q, adaptive, usage, k, g, v)
 						}
+					}
+					for k := range got {
+						if _, ok := want[k]; !ok {
+							t.Errorf("%s (quality %q adaptive %v usage %q): unexpected -%s", enc, q, adaptive, usage, k)
+						}
+					}
+					sort.Strings(dropped)
+					if d := strings.Join(dropped, " "); d != notOn[enc] {
+						t.Errorf("%s (quality %q adaptive %v usage %q): options not passed %q, want %q", enc, q, adaptive, usage, d, notOn[enc])
 					}
 				}
 			}

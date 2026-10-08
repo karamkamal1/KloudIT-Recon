@@ -1,0 +1,4 @@
+[vost#0:0 @ 00007fffff36ca80] Unknown encoder 'recon_no_such_encoder'
+[vost#0:0 @ 00007fffff36ca80] Error selecting an encoder
+Error opening output file NUL.
+Error opening output files: Encoder not found

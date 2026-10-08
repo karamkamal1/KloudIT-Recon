@@ -1,0 +1,9 @@
+[hevc_nvenc @ 00007fffff36dbc0] Cannot load nvcuda.dll
+[vost#0:0/hevc_nvenc @ 00007fffff36d440] [enc:hevc_nvenc @ 00007fffff36db00] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[fc#0 @ 00007fffff369dc0] Error sending frames to consumers: Operation not permitted
+[fc#0 @ 00007fffff369dc0] Task finished with error code: -1 (Operation not permitted)
+[fc#0 @ 00007fffff369dc0] Terminating thread with return code -1 (Operation not permitted)
+[vost#0:0/hevc_nvenc @ 00007fffff36d440] [enc:hevc_nvenc @ 00007fffff36db00] Could not open encoder before EOF
+[vost#0:0/hevc_nvenc @ 00007fffff36d440] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/hevc_nvenc @ 00007fffff36d440] Terminating thread with return code -22 (Invalid argument)
+[out#0/nut @ 00007fffff36b340] Nothing was written into output file, because at least one of its streams received no packets.

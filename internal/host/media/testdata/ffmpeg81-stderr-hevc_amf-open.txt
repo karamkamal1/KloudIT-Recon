@@ -1,0 +1,10 @@
+[AMF @ 00007fffff3b1980] DLL amfrt64.dll failed to open
+[hevc_amf @ 00007fffff36e000] Failed to create  hardware device context (AMF) : Unknown error occurred
+[vost#0:0/hevc_amf @ 00007fffff36d4c0] [enc:hevc_amf @ 00007fffff36db80] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[fc#0 @ 00007fffff369e40] Error sending frames to consumers: Unknown error occurred
+[fc#0 @ 00007fffff369e40] Task finished with error code: -1313558101 (Unknown error occurred)
+[fc#0 @ 00007fffff369e40] Terminating thread with return code -1313558101 (Unknown error occurred)
+[vost#0:0/hevc_amf @ 00007fffff36d4c0] [enc:hevc_amf @ 00007fffff36db80] Could not open encoder before EOF
+[vost#0:0/hevc_amf @ 00007fffff36d4c0] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/hevc_amf @ 00007fffff36d4c0] Terminating thread with return code -22 (Invalid argument)
+[out#0/nut @ 00007fffff36b3c0] Nothing was written into output file, because at least one of its streams received no packets.

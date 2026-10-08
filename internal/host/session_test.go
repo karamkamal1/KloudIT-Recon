@@ -54,14 +54,18 @@ func TestVideoHeader(t *testing.T) {
 }
 
 // TestEncoderFailureFallback drives the failure handler with the video
-// manager's failure events: the first start failure of h264_amf retries it
-// with the low-latency usage (AMF issue #410) and the next one excludes it,
-// while a generation that fails after going live keeps its usage; an encoder
-// without another usage is excluded when it fails after another failure. The
-// client's adaptive bitrate setting reaches the encoder.
+// manager's failure events. Only an encoder failing to start counts against
+// it: a capture outage (UAC prompt, lock screen: the first restart fails
+// after a live generation, then every restart until it ends) and a live
+// generation that fails keep the encoder and its usage. An encoder fault
+// retries h264_amf once with the low-latency usage (AMF issue #410) and
+// otherwise excludes an encoder at its second one, counted per encoder and
+// reset when a generation goes live. The client's adaptive bitrate setting
+// reaches the encoder.
 func TestEncoderFailureFallback(t *testing.T) {
 	caps := &media.Caps{Encoders: []media.EncoderInfo{
 		{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+		{Name: "av1_amf", Family: "av1", Vendor: "amd", HW: true},
 		{Name: "h264_amf", Family: "h264", Vendor: "amd", HW: true},
 		{Name: "libx264", Family: "h264", Vendor: "software"},
 	}}
@@ -70,60 +74,89 @@ func TestEncoderFailureFallback(t *testing.T) {
 	cancel() // the handler's delayed restarts do nothing
 	s := &Session{
 		a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
-		hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}, {Family: "hevc", HW: true}}},
-		tried: map[string]bool{}, usage: map[string]string{},
+		hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}, {Family: "hevc", HW: true}, {Family: "av1", HW: true}}},
+		tried: map[string]bool{}, usage: map[string]string{}, encFails: map[string]int{},
 		ctx: ctx, cancel: cancel,
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	next := func(prefs proto.Prefs) media.Params {
+	// expect builds the next generation's parameters and checks its encoder and usage.
+	expect := func(prefs proto.Prefs, enc, usage, after string) media.Params {
 		t.Helper()
 		p, err := s.buildParams(prefs)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if p.Encoder.Name != enc || p.Usage != usage {
+			t.Fatalf("after %s: %s usage %q, want %s usage %q", after, p.Encoder.Name, p.Usage, enc, usage)
+		}
 		return p
 	}
-	fail := func(p media.Params, live bool) {
+	// fail feeds the failure of p's generation to the handler. live: it had
+	// gone live; fault: the encoder failed (else e.g. its capture source).
+	fail := func(p media.Params, live, fault bool) {
 		if live {
-			s.failures = 0 // the generation went live (videoEvents on its config)
+			s.encoderLive() // videoEvents on the generation's config
 		}
-		s.handleEncoderFailure(media.VideoEvent{Err: errors.New("encoder " + p.Encoder.Name + " exited"), Failed: &p, Live: live})
+		s.handleEncoderFailure(media.VideoEvent{Err: errors.New("encoder " + p.Encoder.Name + " exited"), Failed: &p, Live: live, EncoderFault: fault})
 	}
-	h264 := proto.Prefs{Codec: "h264"}
-	p := next(h264)
-	if p.Encoder.Name != "h264_amf" || p.Usage != "" || !p.Adaptive {
-		t.Fatalf("start: %s usage %q adaptive %v", p.Encoder.Name, p.Usage, p.Adaptive)
-	}
-	fail(p, true)
-	if p = next(h264); p.Encoder.Name != "h264_amf" || p.Usage != "" {
-		t.Fatalf("after a failure while live: %s usage %q, want h264_amf with its usage", p.Encoder.Name, p.Usage)
-	}
-	fail(p, false)
-	if p = next(h264); p.Encoder.Name != "h264_amf" || p.Usage != "lowlatency" {
-		t.Fatalf("after a start failure: %s usage %q, want h264_amf lowlatency", p.Encoder.Name, p.Usage)
-	}
-	fail(p, false)
-	if p = next(h264); p.Encoder.Name != "libx264" || p.Usage != "" {
-		t.Fatalf("after the retry failed: %s usage %q, want libx264", p.Encoder.Name, p.Usage)
-	}
+	auto, h264 := proto.Prefs{}, proto.Prefs{Codec: "h264"}
 
-	s.failures = 0
-	auto := proto.Prefs{}
-	if p = next(auto); p.Encoder.Name != "hevc_amf" {
-		t.Fatalf("auto: %s, want hevc_amf", p.Encoder.Name)
+	// Capture outage of about 4.5 s: the live generation loses the desktop,
+	// then five restarts fail to capture (backing off 300 ms more each time).
+	p := expect(auto, "hevc_amf", "", "start")
+	fail(p, true, false)
+	for i := range 5 {
+		p = expect(auto, "hevc_amf", "", "capture failures")
+		fail(p, false, false)
+		if i == 4 && s.failures != 6 {
+			t.Fatalf("%d failures in a row, want 6", s.failures)
+		}
 	}
-	fail(p, false)
-	if p = next(auto); p.Encoder.Name != "hevc_amf" || p.Usage != "" {
-		t.Fatalf("after one failure: %s usage %q, want hevc_amf again", p.Encoder.Name, p.Usage)
-	}
-	fail(p, false)
-	if p = next(auto); p.Encoder.Name != "libx264" {
-		t.Fatalf("after two failures: %s, want libx264", p.Encoder.Name)
-	}
+	expect(auto, "hevc_amf", "", "a capture outage")
+	s.encoderLive()
+
+	// h264_amf: neither a capture failure nor a failure while live is the
+	// init failure the low-latency usage works around.
+	p = expect(h264, "h264_amf", "", "start")
+	fail(p, false, false)
+	p = expect(h264, "h264_amf", "", "a capture failure")
+	fail(p, true, true)
+	p = expect(h264, "h264_amf", "", "an encoder failure while live")
+	fail(p, false, true)
+	p = expect(h264, "h264_amf", "lowlatency", "a start failure")
+	fail(p, false, true)
+	expect(h264, "libx264", "", "the retry failed")
+
+	// Counted per encoder: av1_amf gets two tries after hevc_amf used up its
+	// own, although every start in between failed.
+	p = expect(auto, "hevc_amf", "", "start")
+	fail(p, false, true)
+	p = expect(auto, "hevc_amf", "", "one encoder failure")
+	fail(p, false, true)
+	p = expect(auto, "av1_amf", "", "two hevc_amf failures")
+	fail(p, false, true)
+	p = expect(auto, "av1_amf", "", "one av1_amf failure")
+	fail(p, false, true)
+	expect(auto, "libx264", "", "two av1_amf failures (h264_amf excluded above)")
+
+	// A generation going live resets the count (as a settings change does).
+	s.tried, s.usage = map[string]bool{}, map[string]string{}
+	s.encoderLive()
+	p = expect(auto, "hevc_amf", "", "a reset")
+	fail(p, false, true)
+	s.encoderLive()
+	p = expect(auto, "hevc_amf", "", "a failure, then a live generation")
+	fail(p, false, true)
+	p = expect(auto, "hevc_amf", "", "a failure since the last live generation")
+	fail(p, false, true)
+	expect(auto, "av1_amf", "", "two failures since the last live generation")
 
 	off := false
-	if next(proto.Prefs{Adaptive: &off}).Adaptive {
-		t.Fatal("adaptive bitrate off in the client, on in the encoder parameters")
+	if p, err := s.buildParams(proto.Prefs{Adaptive: &off}); err != nil || p.Adaptive {
+		t.Fatalf("adaptive bitrate off in the client, on in the encoder parameters (%v)", err)
+	}
+	if p, err := s.buildParams(auto); err != nil || !p.Adaptive {
+		t.Fatalf("adaptive bitrate on by default, off in the encoder parameters (%v)", err)
 	}
 }
 

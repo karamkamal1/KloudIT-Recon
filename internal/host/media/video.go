@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,8 +45,28 @@ type VideoEvent struct {
 	// Failed holds, with Err, the failed generation's parameters (the
 	// generation is already gone from Current). Live is set when that
 	// generation had gone live (sent its first key frame) before it failed.
-	Failed *Params
-	Live   bool
+	// EncoderFault is set when the encoder itself failed (encoderFault), not
+	// e.g. the capture source.
+	Failed       *Params
+	Live         bool
+	EncoderFault bool
+}
+
+// encoderFault reports whether an encoder process's stderr shows that the
+// encoder itself failed: FFmpeg does not have it, refused its options, could
+// not set up or open it, or the encoder logged an error (its own "[<name> @"
+// lines; FFmpeg 8.1's encoder task logs as "[enc:<name> @"). When the capture
+// source fails instead (ddagrab and gfxcapture lose the desktop to a UAC
+// prompt, the lock screen or a display mode change), FFmpeg only adds "Could
+// not open encoder before EOF" for the encoder.
+func encoderFault(stderr, name string) bool {
+	for _, s := range []string{"Unknown encoder", "Error applying encoder options", "Encoding hardware device setup failed",
+		"Error while opening encoder", "[" + name + " @ "} {
+		if strings.Contains(stderr, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // Video manages encoder generations. Restarting (to force a key frame or change
@@ -258,11 +279,13 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				case <-time.After(2 * time.Second):
 				}
 				msg := pr.stderr.String()
+				fault := encoderFault(msg, pr.params.Encoder.Name)
 				if msg == "" {
 					msg = err.Error()
 				}
 				failed := pr.params
-				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg), Failed: &failed, Live: live})
+				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg), Failed: &failed, Live: live,
+					EncoderFault: fault})
 			}
 			return
 		}

@@ -603,9 +603,17 @@ h264_amf: (same up to -forced_idr 1) -frame_skipping 0 -latency 1 -vbaq 1
 `speed` is the default only when no preset is sent). `-rc vbr_latency` replaces `cbr` when the
 client turned off "Adaptive bitrate on congestion" (new `adaptive` field in the client's prefs,
 `media.Params.Adaptive`); the host log's `starting encoder` line shows `adaptive=true|false`.
-When h264_amf first fails to start in a session (a generation that never went live), the host
-retries it with `-usage lowlatency` (AMF issue #410, an init failure) and logs `retrying encoder
-with another usage`; a further failure excludes it, and a video settings change resets both.
+When h264_amf first fails to start in a session because of the encoder (a generation that never
+went live, and FFmpeg's stderr shows the encoder failing: `Error while opening encoder`, refused
+options, or the encoder's own `[h264_amf @` lines), the host retries it with `-usage lowlatency`
+(AMF issue #410, an init failure) and logs `retrying encoder with another usage`; a further
+encoder failure excludes it, and a video settings change resets both. Any other encoder is
+excluded at its second such failure since a generation last went live, counted per encoder.
+Failures of the capture source (ddagrab or gfxcapture losing the desktop to a UAC prompt, the
+lock screen or a display mode change: FFmpeg then only reports `Could not open encoder before
+EOF` for the encoder) and failures after going live count against no encoder: the restarts keep
+the same encoder and usage until the outage ends. As before 1.1, the 7th failure in a row ends
+the session ("Video encoder keeps failing"), so an outage longer than about 7 s still does.
 
 The probe now also reads the named values of each encoder option from
 `ffmpeg -h encoder=<name>`. An option is passed only where the encoder has it and, if it has
@@ -621,10 +629,13 @@ Verified in the sandbox:
   8.1 Windows build the installer downloads (`ffmpeg -h encoder=...` for av1/hevc/h264_amf and
   av1/hevc/h264_nvenc in `internal/host/media/testdata`): `TestParseEncoderHelp`,
   `TestAMDEncoderArgs` (exact argument sets per encoder, vbr_latency without adaptive bitrate,
-  presets, the lowlatency usage; `-v` prints the full command lines), `TestEncoderArgsAccepted`
-  (every option the host passes to the six hardware encoders, for every preset, adaptive on/off
-  and usage, exists for that encoder and takes the value), `TestNVIDIAEncoderArgs` (the NVENC
-  arguments are unchanged by the value filtering).
+  presets, the lowlatency usage; `-v` prints the full command lines), `TestEncoderArgsNotDropped`
+  (for the six hardware encoders, every preset, adaptive on/off and usage: the arguments built
+  with the 8.1 option lists equal those built with lists that take every option of the vendor
+  with any value, except exactly the options the encoder does not have: `frame_skipping` on
+  hevc/av1_amf, `skip_frame` and `header_insertion_mode` on h264_amf, none on NVENC; so no value
+  is dropped silently, e.g. a misspelt `-latency lowest` or an NVENC preset `p8x` fails it),
+  `TestNVIDIAEncoderArgs` (the NVENC arguments are unchanged by the value filtering).
 - verified (sandbox): FFmpeg 8.1 (BtbN win64 GPL) under Wine accepts every new AMF command
   line up to the AMF runtime: `TestAMFArgsAccepted` in the cross-compiled `media.test.exe`
   (`GOOS=windows go test -c ./internal/host/media`, run with `WINEPATH` set to the FFmpeg `bin`
@@ -661,23 +672,37 @@ Verified in the sandbox:
   AMF docs say HEVC GOP size 0 inserts "only the first IDR/CRA (infinite GOP size)", AV1 0 "only
   inserts the first frame" (its value range says `>0`), H.264 IDR period 0 "turns IDR off".
 - verified (sandbox): session logic (`internal/host` `TestEncoderFailureFallback`, which feeds
-  failure events to the session's handler): h264_amf's first start failure restarts it with
-  usage lowlatency, the next failure excludes it (fallback to the next encoder); a failure after
-  the generation went live (capture lost after hours, e.g. on a display mode change) keeps the
-  usage, since AMF issue #410 is an init failure; hevc_amf is retried once, then excluded; a
-  video settings change clears the usage retry as it clears the exclusions; the client's
-  adaptive setting reaches `Params.Adaptive` (`internal/proto` `TestPrefsAdaptive`: missing
-  field = on, as old clients behave). Browser E2E: switching "Adaptive bitrate on congestion" off
+  failure events to the session's handler): a capture outage of about 4.5 s (the live generation
+  fails, then five restarts fail in their source) keeps hevc_amf with its usage (before this fix
+  it went hevc_amf, av1_amf, h264_amf, h264_amf lowlatency, libx264 and stayed there); a capture
+  failure or a failure while live does not trigger h264_amf's usage retry; h264_amf's first
+  encoder failure restarts it with usage lowlatency, the next one excludes it (fallback to the
+  next encoder); failures count per encoder (av1_amf gets two tries after hevc_amf used up its
+  own, although every start in between failed) and a generation going live resets the count; a
+  video settings change clears the usage retry and the counts as it clears the exclusions; the
+  client's adaptive setting reaches `Params.Adaptive` (`internal/proto` `TestPrefsAdaptive`:
+  missing field = on, as old clients behave).
+- verified (sandbox): what counts as the encoder failing (`media.encoderFault`, on the stderr of
+  the failed process): `internal/host/media` `TestEncoderFault` with the stderr of real FFmpeg
+  8.1 (BtbN win64) failures recorded under Wine in `testdata/ffmpeg81-stderr-*.txt`: the AMF
+  runtime and the CUDA driver missing, an option value refused (the pre-1.1 av1_amf line) and an
+  unknown encoder count; ddagrab failing to create its device and a source filter that cannot be
+  configured do not (FFmpeg 8.1 then only logs `[enc:<encoder> @ …] Could not open encoder before
+  EOF`, and neither `Error while opening encoder` nor `[<encoder> @`); a process that died
+  without a message does not. `TestVideoFailureEvent` checks the flag on real failure events
+  (unknown encoder: set; test source of 40000×40000: not set; process killed while live: not
+  set) with the local FFmpeg 6.1 and with the FFmpeg 8.1 Windows build (the cross-compiled
+  `media.test.exe` under Wine, `WINEPATH` = its `bin` folder). Browser E2E: switching "Adaptive bitrate on congestion" off
   and on in the drawer makes the host start an encoder with `adaptive=false`, then
   `adaptive=true` (the check waits for those host log lines, not for any new generation, since
   key-frame restarts also start generations).
 - Found while testing: the encoder fallback never excluded a failing encoder. The failure
   handler looked the failed encoder up with `Video.Current()` after the failed generation had
   already been removed, so a broken encoder was retried until the session gave up after 7
-  failures. The error event now carries the failed generation's parameters and whether it had
-  gone live: `internal/host/media` `TestVideoFailureEvent` (local FFmpeg) checks both for an
-  encoder FFmpeg does not know (not live) and for an encoder process killed after its first key
-  frame (live).
+  failures. The error event now carries the failed generation's parameters, whether it had gone
+  live and whether the encoder itself failed: `internal/host/media` `TestVideoFailureEvent`
+  (local FFmpeg) checks them for an encoder FFmpeg does not know (not live), a source that fails
+  (not live, not the encoder) and an encoder process killed after its first key frame (live).
 
 Hardware checks (FFmpeg path; use `"capture": "ddagrab"` in `%APPDATA%\KlouditRecon\host.json`
 and restart the agent after each edit; `"logLevel": "debug"` adds the `ffmpeg args` line with the
@@ -748,11 +773,25 @@ Ctrl+Alt+Shift+S):
   padding rows at the bottom of the picture. Control: 2560×1440 shows no band.
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (H.264 usage retry; any AMD GPU)
   `"encoder": "h264_amf"`. If the ultra low latency usage fails on this GPU/driver, `host.log`
-  shows `encoder failed ... live=false`, then
+  shows `encoder failed ... live=false encoder_fault=true`, then
   `retrying encoder with another usage encoder=h264_amf usage=lowlatency`, then `encoder ready`;
-  if it works, neither line appears. Record which, with the driver version. A failure while
-  streaming (`encoder failed ... live=true`, e.g. after switching the host display mode) must not
-  be followed by the `retrying encoder with another usage` line.
+  if it works, neither line appears. Record which, with the driver version, and the `err=` text
+  of the failure (it must contain `Error while opening encoder` or `[h264_amf @`, else the
+  classification misses this AMF failure). A failure while streaming (`encoder failed ...
+  live=true`, e.g. after switching the host display mode) must not be followed by the
+  `retrying encoder with another usage` line.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: (capture outage keeps the encoder) stream with
+  `"capture": "ddagrab"`, codec auto (hevc_amf), then on the host press Win+L and log back in
+  within about 4 s; repeat with a UAC prompt (e.g. `Start-Process powershell -Verb RunAs`,
+  answer it within about 4 s) and with a display mode change (resolution or refresh rate in
+  Windows display settings). Pass: `host.log` shows `encoder failed ... encoder_fault=false`
+  lines (their `err=` mentions ddagrab, e.g. `AcquireNextFrame failed` or `Desktop duplication
+  access denied`, or only `Could not open encoder before EOF`), no `retrying encoder with another
+  usage`, and the next `starting encoder` and `encoder ready` lines name `hevc_amf`; the overlay
+  still shows `Encoder hevc_amf` after the outage. Repeat with `"encoder": "h264_amf"`: the
+  `starting encoder` lines after the outage must not be followed by a `-usage lowlatency`
+  (`"logLevel": "debug"`, `ffmpeg args`). An outage longer than about 7 s ends the session after
+  7 failures (unchanged; reconnect).
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (step 1.1 acceptance) capture→packet about one frame
   interval lower at 60 fps (A1); AV1 at 2560×1440 streams (A3); no periodic IDR spikes in
   10 minutes (A4); no encoder-skipped frames under capdrop (A5); the checks above.
@@ -762,6 +801,13 @@ Ctrl+Alt+Shift+S):
   as before 1.1 (`-preset p3 -tune ull -rc cbr -multipass disabled -zerolatency 1 -delay 0
   -rc-lookahead 0 -no-scenecut 1 -forced-idr 1 -strict_gop 1 -spatial-aq 1 -profile main` for the
   balanced preset) and the stream must start; repeat with h264_nvenc and av1_nvenc (RTX 40+).
+- NVIDIA: unverified (no NVIDIA host available). Test: (capture outage keeps the encoder) as the
+  AMD check above with hevc_nvenc: after Win+L, a UAC prompt or a display mode change of about
+  4 s the session resumes on `hevc_nvenc` (`encoder failed ... encoder_fault=false`, then
+  `starting encoder ... encoder=hevc_nvenc` and `encoder ready`). Also start more NVENC sessions
+  than the GPU's limit allows if one applies (GeForce: e.g. several OBS NVENC recordings first):
+  the failing start must log `encoder_fault=true` (`OpenEncodeSessionEx failed` in `err=`) and
+  fall back to the next encoder after two such failures.
 
 ## 1.4 Stop false loss restarts
 

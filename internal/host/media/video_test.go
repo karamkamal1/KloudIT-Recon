@@ -1,10 +1,12 @@
 package media
 
 import (
+	"bufio"
 	"context"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -288,7 +290,8 @@ func TestVideoGenerations(t *testing.T) {
 
 // TestVideoFailureEvent: a failing generation's error event carries its
 // parameters (the session decides the encoder fallback from them, after the
-// generation is gone from Current) and whether it had gone live.
+// generation is gone from Current), whether it had gone live and whether the
+// encoder itself failed.
 func TestVideoFailureEvent(t *testing.T) {
 	caps := probeOrSkip(t)
 	enc, ok := caps.Best("h264")
@@ -320,15 +323,27 @@ func TestVideoFailureEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev := failure("start failure")
-	if ev.Failed == nil || ev.Failed.Encoder.Name != bad.Name || ev.Live {
-		t.Fatalf("start failure: %v: failed %+v live %v, want %s, not live", ev.Err, ev.Failed, ev.Live, bad.Name)
+	if ev.Failed == nil || ev.Failed.Encoder.Name != bad.Name || ev.Live || !ev.EncoderFault {
+		t.Fatalf("start failure: %v: failed %+v live %v fault %v, want %s, not live, encoder fault", ev.Err, ev.Failed, ev.Live, ev.EncoderFault, bad.Name)
 	}
 	if _, ok := v.Current(); ok {
 		t.Fatal("the failed generation is still current")
 	}
 
-	// Fails while live: the encoder process dies after its first key frame.
+	// Fails to start in its source (the filter graph cannot be configured,
+	// as when ddagrab cannot duplicate the desktop): not the encoder's fault.
 	p.Encoder = enc
+	p.Source.NativeW, p.Source.NativeH = 40000, 40000
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	ev = failure("source failure")
+	if ev.Failed == nil || ev.Failed.Encoder.Name != enc.Name || ev.Live || ev.EncoderFault {
+		t.Fatalf("source failure: %v: failed %+v live %v fault %v, want %s, not live, no encoder fault", ev.Err, ev.Failed, ev.Live, ev.EncoderFault, enc.Name)
+	}
+	p.Source.NativeW, p.Source.NativeH = 320, 180
+
+	// Fails while live: the encoder process dies after its first key frame.
 	if err := v.Start(p, false); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +365,38 @@ func TestVideoFailureEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev = failure("live failure")
-	if ev.Failed == nil || ev.Failed.Encoder.Name != enc.Name || !ev.Live {
-		t.Fatalf("live failure: %v: failed %+v live %v, want %s, live", ev.Err, ev.Failed, ev.Live, enc.Name)
+	if ev.Failed == nil || ev.Failed.Encoder.Name != enc.Name || !ev.Live || ev.EncoderFault {
+		t.Fatalf("live failure: %v: failed %+v live %v fault %v, want %s, live, no encoder fault", ev.Err, ev.Failed, ev.Live, ev.EncoderFault, enc.Name)
+	}
+}
+
+// TestEncoderFault classifies the stderr of real FFmpeg 8.1 (BtbN win64)
+// failures, recorded under Wine (no GPU) in testdata/ffmpeg81-stderr-*.txt,
+// as the encoder process's stderr ring holds it.
+func TestEncoderFault(t *testing.T) {
+	for _, tc := range []struct {
+		file, enc string
+		want      bool
+	}{
+		{"hevc_amf-open", "hevc_amf", true},     // AMF runtime missing: the encoder cannot open
+		{"hevc_nvenc-open", "hevc_nvenc", true}, // CUDA driver missing
+		{"av1_amf-option", "av1_amf", true},     // an option value refused (the pre-1.1 av1 arguments)
+		{"unknown-encoder", "recon_no_such_encoder", true},
+		{"ddagrab-hevc_amf", "hevc_amf", false}, // ddagrab cannot create its device
+		{"source-libx264", "libx264", false},    // the source filter fails to configure
+	} {
+		f, err := os.Open(filepath.Join("testdata", "ffmpeg81-stderr-"+tc.file+".txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := &stderrRing{}
+		r.consume(bufio.NewReader(f))
+		f.Close()
+		if got := encoderFault(r.String(), tc.enc); got != tc.want {
+			t.Errorf("%s: encoder fault %v, want %v: %s", tc.file, got, tc.want, r.String())
+		}
+	}
+	if encoderFault("EOF", "hevc_amf") || encoderFault("", "hevc_amf") {
+		t.Error("a process that died without a message counted as an encoder fault")
 	}
 }
