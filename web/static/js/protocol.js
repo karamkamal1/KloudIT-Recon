@@ -210,6 +210,32 @@ export function parseFrameHeader(buf) {
 }
 
 // ---------------------------------------------------------------------------
+// Video config crop (mirror of proto.VideoConfig codedWidth, codedHeight,
+// cropRight, cropBottom; omitted when there is no padding). An encoder that
+// codes in blocks pads the picture at the right and bottom (AV1 on RDNA3 codes
+// 1920x1080 as 1920x1082) and AV1 has no cropping window, so the decoder
+// outputs the padding; the host announces it and the client shows only the
+// top-left width x height pixels.
+
+/**
+ * The part of a decoded frame to show. frameW x frameH is the decoded picture
+ * (VideoFrame.visibleRect), displayW x displayH its display size. Returns
+ * { w, h } in display units (drawImage source coordinates) and { fx, fy }, the
+ * visible share of the frame's width and height (texture coordinate scale).
+ * Only what the decoder still outputs is cropped: a frame already at the
+ * visible size is shown whole.
+ */
+export function visibleArea(cfg, frameW, frameH, displayW, displayH) {
+  let fx = 1;
+  let fy = 1;
+  if (cfg && (cfg.cropRight > 0 || cfg.cropBottom > 0) && cfg.width > 0 && cfg.height > 0 && frameW > 0 && frameH > 0) {
+    fx = Math.min(1, cfg.width / frameW);
+    fy = Math.min(1, cfg.height / frameH);
+  }
+  return { w: displayW * fx, h: displayH * fy, fx, fy };
+}
+
+// ---------------------------------------------------------------------------
 // Frame barcode (mirror of internal/proto/barcode.go): a 16-bit value and its
 // CRC-8 drawn as an 8x3 grid of black/white cells in the picture's top-left
 // corner, row-major, most significant bit first (cell k shows bit 23-k of

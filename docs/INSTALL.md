@@ -328,6 +328,6 @@ pick up the old files.
 | Proxmox node | `pct exec 210 -- journalctl -u recon-gateway -n 50 --no-pager` | Gateway log |
 | Proxmox node | `pct enter 210` | Shell inside the container (it has no root password) |
 | PC | `Get-Content "$env:APPDATA\KlouditRecon\host.log" -Tail 30` | Agent log |
-| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | Encoders, monitors, controllers |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), monitors, controllers |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" pair "recon1:..."` | Re-pair. The running agent picks up the new code within seconds. |

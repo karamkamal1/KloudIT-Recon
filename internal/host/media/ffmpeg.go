@@ -21,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/codec"
+	"github.com/karamkamal1/kloudit-recon/internal/nut"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -45,11 +47,31 @@ type Caps struct {
 	// gop, frame.
 	optValues map[string]map[string]map[string]bool
 
+	// VersionInfo is "ffmpeg -version" without the configure line: version
+	// (= Version), compiler and library versions.
+	VersionInfo []string
+
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
 	// intraRefresh holds the periodic intra refresh mode (IntraRefreshOn,
 	// IntraRefreshSingleSlice) of the encoders that run with one.
 	intraRefresh map[string]string
+
+	align map[string]Alignment // encoders that pad the coded picture
+}
+
+// Alignment is the coded-size alignment of an encoder that pads pictures to
+// a block size: the picture it codes is w x h rounded up to multiples of W x
+// H (or larger), and the padding rows and columns reach the decoder's output
+// unless the codec can signal a crop. AV1 cannot: RDNA3's AV1 encoder codes
+// 1920x1080 as 1920x1082 (AMF docs: 64x16 alignment) and FFmpeg's av1_amf
+// reports the crop only as stream side data (AV_PKT_DATA_FRAME_CROPPING),
+// which NUT does not carry.
+type Alignment struct {
+	W, H int
+	// ProbeW x ProbeH is the picture the probe encoded and CodedW x CodedH
+	// the size the bitstream coded it at.
+	ProbeW, ProbeH, CodedW, CodedH int
 }
 
 // Periodic intra refresh modes (Caps.IntraRefresh).
@@ -130,17 +152,22 @@ func quietCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 // Probe inspects the ffmpeg build and test-encodes with every candidate encoder.
 func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) {
 	c := &Caps{FFmpeg: ffmpeg, Filters: map[string]bool{}, Rejected: map[string]string{}, options: map[string]map[string]bool{},
-		optValues: map[string]map[string]map[string]bool{}, intraRefresh: map[string]string{}}
+		optValues: map[string]map[string]map[string]bool{}, intraRefresh: map[string]string{}, align: map[string]Alignment{}}
 	out, err := quietCmd(ctx, ffmpeg, "-hide_banner", "-version").Output()
 	if err != nil {
 		return nil, fmt.Errorf("running ffmpeg: %w", err)
 	}
-	c.Version = strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	c.Version, c.VersionInfo = parseVersion(out)
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
-	for _, f := range []string{"ddagrab", "gfxcapture", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime", "testsrc2", "settb", "setpts", "drawbox"} {
-		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
-			c.Filters[f] = true
+	c.Filters = parseFilters(out)
+	if c.Filters["vsrc_amf"] {
+		help, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-h", "filter=vsrc_amf").Output()
+		if err := checkAMFCapture(help, c.Filters); err != nil {
+			c.Filters["vsrc_amf"] = false
+			if log != nil {
+				log.Info("AMD Direct Capture (vsrc_amf) unusable", "err", err)
+			}
 		}
 	}
 	if c.Filters["settb"] && c.Filters["setpts"] {
@@ -187,10 +214,11 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			defer wg.Done()
 			opts, vals := encoderOptions(ctx, ffmpeg, e.Name)
 			err := testEncode(ctx, ffmpeg, e)
+			// The follow-up probes run after the plain test, in this
+			// goroutine: at most one test session per encoder at a time
+			// (NVENC session limits).
 			ir := ""
 			if err == nil && intraRefreshEncoders[e.Name] {
-				// After the plain test, in this goroutine: at most one test
-				// session per encoder at a time (NVENC session limits).
 				ir = probeIntraRefresh(e, opts, vals, func(frames int, extra ...string) error {
 					return testEncodeFrames(ctx, ffmpeg, e, frames, extra...)
 				})
@@ -198,11 +226,27 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 					log.Info("intra refresh unavailable: lost frames need key frames", "encoder", e.Name)
 				}
 			}
+			var al Alignment
+			var alErr error
+			if err == nil && e.HW && e.Family == "av1" {
+				al, alErr = probeAlignment(ctx, ffmpeg, e)
+				if alErr != nil && log != nil {
+					log.Info("coded size probe failed, assuming no padding", "encoder", e.Name, "err", alErr)
+				}
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			c.options[e.Name], c.optValues[e.Name] = opts, vals
 			if ir != "" {
 				c.intraRefresh[e.Name] = ir
+			}
+			if al.W > 1 || al.H > 1 {
+				c.align[e.Name] = al
+				if log != nil {
+					log.Info("encoder pads the coded picture", "encoder", e.Name,
+						"probe", fmt.Sprintf("%dx%d", al.ProbeW, al.ProbeH), "coded", fmt.Sprintf("%dx%d", al.CodedW, al.CodedH),
+						"alignment", fmt.Sprintf("%dx%d", al.W, al.H))
+				}
 			}
 			if err == nil {
 				ok[e.Name] = true
@@ -231,23 +275,12 @@ func testEncode(ctx context.Context, ffmpeg string, e EncoderInfo) error {
 	return testEncodeFrames(ctx, ffmpeg, e, 3)
 }
 
-// testEncodeFrames encodes frames black 640x360 frames at testEncodeFPS with
-// an encoder and its extra arguments.
+// testEncodeFrames encodes frames black 640x360 frames with an encoder and its
+// extra arguments.
 func testEncodeFrames(ctx context.Context, ffmpeg string, e EncoderInfo, frames int, extra ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
-	if e.Vendor == "vaapi" {
-		args = append(args, "-vaapi_device", vaapiDevice())
-	}
-	args = append(args, "-f", "lavfi", "-i", "color=c=black:s=640x360:r="+strconv.Itoa(testEncodeFPS), "-frames:v", strconv.Itoa(frames))
-	if e.Vendor == "vaapi" {
-		args = append(args, "-vf", "format=nv12,hwupload")
-	} else {
-		args = append(args, "-pix_fmt", "yuv420p")
-	}
-	args = append(args, "-c:v", e.Name)
-	args = append(args, extra...)
+	args := append(blackFramesArgs(e, 640, 360, frames), extra...)
 	args = append(args, "-f", "null", "-")
 	var stderr bytes.Buffer
 	cmd := quietCmd(ctx, ffmpeg, args...)
@@ -293,6 +326,86 @@ func probeIntraRefresh(e EncoderInfo, opts map[string]bool, vals map[string]map[
 	return ""
 }
 
+// blackFramesArgs returns the arguments that encode frames black w x h frames
+// at testEncodeFPS with e, without the output.
+func blackFramesArgs(e EncoderInfo, w, h, frames int) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
+	if e.Vendor == "vaapi" {
+		args = append(args, "-vaapi_device", vaapiDevice())
+	}
+	args = append(args, "-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=%d", w, h, testEncodeFPS), "-frames:v", strconv.Itoa(frames))
+	if e.Vendor == "vaapi" {
+		args = append(args, "-vf", "format=nv12,hwupload")
+	} else {
+		args = append(args, "-pix_fmt", "yuv420p")
+	}
+	return append(args, "-c:v", e.Name)
+}
+
+// alignProbeW x alignProbeH is the picture probeAlignment encodes: the most
+// common desktop size, and one that RDNA3's AV1 encoder pads.
+const alignProbeW, alignProbeH = 1920, 1080
+
+// probeAlignment encodes three black 1920x1080 frames with an AV1 encoder and
+// reads the coded size from the sequence header: the NUT stream header only
+// repeats the configured size. An encoder that codes the picture larger pads
+// it; the result is then the documented RDNA3 alignment of 64x16, or a
+// coarser one if the measured padding needs it. W, H = 1, 1: no padding.
+func probeAlignment(ctx context.Context, ffmpeg string, e EncoderInfo) (Alignment, error) {
+	cw, ch, err := codedSize(ctx, ffmpeg, blackFramesArgs(e, alignProbeW, alignProbeH, 3))
+	if err != nil {
+		return Alignment{W: 1, H: 1}, err
+	}
+	a := Alignment{W: 1, H: 1, ProbeW: alignProbeW, ProbeH: alignProbeH, CodedW: cw, CodedH: ch}
+	if cw != alignProbeW || ch != alignProbeH {
+		a.W, a.H = alignmentFor(alignProbeW, cw, 64), alignmentFor(alignProbeH, ch, 16)
+	}
+	return a, nil
+}
+
+// alignmentFor returns the smallest power-of-two multiple of def whose
+// rounding up of n reaches the measured coded size (RDNA3 special-cases
+// 1080 rows: coded as 1082, not 1088, which def covers).
+func alignmentFor(n, coded, def int) int {
+	a := def
+	for a < 1<<16 && (n+a-1)/a*a < coded {
+		a *= 2
+	}
+	return a
+}
+
+// codedSize runs ffmpeg with args (input and encoder, see blackFramesArgs)
+// into NUT and returns the coded frame size of the AV1 stream it writes.
+func codedSize(ctx context.Context, ffmpeg string, args []string) (int, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	cmd := quietCmd(ctx, ffmpeg, append(args, "-f", "nut", "-write_index", "0", "pipe:1")...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return 0, 0, fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
+	}
+	d := nut.NewDemuxer(&stdout, proto.MaxFrameSize)
+	for {
+		pkt, err := d.ReadPacket()
+		if err != nil {
+			break
+		}
+		st := d.Streams()[pkt.Stream]
+		if st == nil || st.Class != nut.ClassVideo {
+			continue
+		}
+		// The sequence header is in the extradata, the key frame, or both.
+		if w, h, ok := codec.AV1FrameSize(st.Extradata); ok {
+			return w, h, nil
+		}
+		if w, h, ok := codec.AV1FrameSize(pkt.Data); ok {
+			return w, h, nil
+		}
+	}
+	return 0, 0, errors.New("no AV1 sequence header in the encoder output")
+}
+
 // testCaptureClock runs the exact capture-clock filter and encoder time base
 // BuildArgs uses, so a build that rejects them loses only the capture stamps.
 func testCaptureClock(ctx context.Context, ffmpeg, filter string) error {
@@ -334,6 +447,56 @@ func testBarcode(ctx context.Context, ffmpeg string) error {
 		}
 	}
 	return nil
+}
+
+// probeFilters are the filters BuildArgs may use.
+var probeFilters = []string{"ddagrab", "gfxcapture", "vsrc_amf", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime",
+	"testsrc2", "settb", "setpts", "drawbox", "select"}
+
+// parseFilters returns which of probeFilters "ffmpeg -filters" lists.
+func parseFilters(out []byte) map[string]bool {
+	m := map[string]bool{}
+	for _, f := range probeFilters {
+		if regexp.MustCompile(`(?m)^\s*\S+\s+` + regexp.QuoteMeta(f) + `\s`).Match(out) {
+			m[f] = true
+		}
+	}
+	return m
+}
+
+// checkAMFCapture checks that BuildArgs can use vsrc_amf: "ffmpeg -h
+// filter=vsrc_amf" (help) lists the options and the capture mode it sets, and
+// the build has select for framePacer and settb/setpts for the capture clock,
+// which every vsrc_amf chain carries.
+func checkAMFCapture(help []byte, filters map[string]bool) error {
+	for _, o := range []string{"monitor_index", "framerate", "duplicate_output", "capture_mode", "wait_for_present"} {
+		if !regexp.MustCompile(`(?m)^\s+` + o + `\s`).Match(help) {
+			return fmt.Errorf("vsrc_amf has no %s", o)
+		}
+	}
+	for _, f := range []string{"select", "settb", "setpts"} {
+		if !filters[f] {
+			return fmt.Errorf("no %s filter", f)
+		}
+	}
+	return nil
+}
+
+// parseVersion returns the first line of "ffmpeg -version" and its lines
+// without the (very long) configure line, blank lines and the "Exiting with
+// exit code" line FFmpeg 8 prints to stdout after -version.
+func parseVersion(out []byte) (first string, info []string) {
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "configuration:") || strings.HasPrefix(line, "Exiting with exit code") {
+			continue
+		}
+		info = append(info, line)
+	}
+	if len(info) > 0 {
+		first = info[0]
+	}
+	return first, info
 }
 
 var (
@@ -448,18 +611,43 @@ func (c *Caps) acceptsValue(enc, opt, val string) bool {
 	return err == nil
 }
 
+// Alignment returns the coded-size alignment the probe measured for an
+// encoder (W, H = 1, 1: it codes any size as is).
+func (c *Caps) Alignment(enc string) Alignment {
+	if a, ok := c.align[enc]; ok {
+		return a
+	}
+	return Alignment{W: 1, H: 1}
+}
+
+// SetAlignment records an encoder's coded-size alignment (the probe does;
+// tests, and an encoder backend that knows its alignment factors).
+func (c *Caps) SetAlignment(enc string, a Alignment) {
+	if c.align == nil {
+		c.align = map[string]Alignment{}
+	}
+	c.align[enc] = a
+}
+
+// Pads reports whether an encoder pads a w x h picture: w or h is not a
+// multiple of its alignment. An unknown size (0) is not checked.
+func (c *Caps) Pads(enc string, w, h int) bool {
+	a := c.Alignment(enc)
+	return w > 0 && h > 0 && (a.W > 1 && w%a.W != 0 || a.H > 1 && h%a.H != 0)
+}
+
 // ---------------------------------------------------------------------------
 // Argument construction
 
 // Source selects what is captured.
 type Source struct {
-	Backend  string // ddagrab | gfxcapture | x11grab | test
-	Output   int    // ddagrab output index (adapter 0)
+	Backend  string // ddagrab | gfxcapture | amf | x11grab | test
+	Output   int    // ddagrab output_idx / amf monitor_index: DXGI output index on adapter 0
 	HMonitor uint64 // gfxcapture monitor handle
 	Window   string // gfxcapture window title regex (optional)
 	Display  string // x11grab display, e.g. ":0.0"
 	X, Y     int    // x11grab offset
-	NativeW  int    // native size of the captured surface (x11grab/test)
+	NativeW  int    // native size of the captured surface (x11grab/test; ddagrab and gfxcapture: the monitor's, informational)
 	NativeH  int
 }
 
@@ -484,7 +672,8 @@ type Params struct {
 	// CaptureClock stamps every frame with its wall-clock capture time: pts
 	// become the wall clock in µs right after the source (CaptureClockFilter)
 	// and the encoder runs at a µs time base (it still gets the frame rate for
-	// rate control). Video turns them into Frame.CaptureUs.
+	// rate control). Video turns them into Frame.CaptureUs. Capture "amf"
+	// gets that pts and time base also without it (BuildArgs), unreported.
 	CaptureClock bool
 	// Barcode draws the frame barcode of each frame's index (= Frame.Seq) into
 	// the top-left corner (BarcodeFilter; test source only).
@@ -492,6 +681,56 @@ type Params struct {
 	// GPUPriority is the GPU scheduling priority of the FFmpeg process
 	// (GPUPriorityAuto, …; "" = auto; Windows only).
 	GPUPriority string
+	// TestPad adds that many rows of white below the test pattern and
+	// announces them as padding to crop (VideoConfig cropBottom), as for an
+	// encoder that pads the coded picture (AV1 on RDNA3). Test source only:
+	// tests of the client's crop path without such a GPU.
+	TestPad int
+}
+
+// OutputSize returns the size of the picture BuildArgs hands the encoder
+// for p, or 0, 0 when only the capture knows it (a window).
+func (p Params) OutputSize() (w, h int) {
+	switch p.Source.Backend {
+	case "test":
+		w, h = p.Source.NativeW, p.Source.NativeH
+		if w == 0 {
+			w, h = 1280, 720
+		}
+		return w, h + p.TestPad
+	case "x11grab":
+		w, h = p.Source.NativeW, p.Source.NativeH
+		if p.Width > 0 && p.Height > 0 && w > 0 && h > 0 {
+			// scale=W:H:force_original_aspect_ratio=decrease:force_divisible_by=2,
+			// as libavfilter/scale_eval.c computes it (av_rescale rounds to
+			// the nearest multiple of 2, then down).
+			rescale := func(a, b, c int) int { return (a*b + c/2) / c }
+			fw, fh := min(p.Width, rescale(p.Height, w, h*2)*2), min(p.Height, rescale(p.Width, h, w*2)*2)
+			return fw &^ 1, fh &^ 1
+		}
+		return w, h
+	case "gfxcapture":
+		if p.Width > 0 && p.Height > 0 {
+			return p.Width, p.Height // width/height force the frame size
+		}
+		if p.Source.Window != "" {
+			return 0, 0
+		}
+	}
+	return p.Source.NativeW, p.Source.NativeH
+}
+
+// CanCaptureAMF reports why AMD Direct Capture (Source.Backend "amf") cannot
+// feed enc, or nil: this build needs a usable vsrc_amf (Probe checks its
+// options), and its AMF surfaces only go to the AMF encoders.
+func (c *Caps) CanCaptureAMF(enc EncoderInfo) error {
+	if !c.Filters["vsrc_amf"] {
+		return errors.New("this ffmpeg build has no usable vsrc_amf filter (AMD Direct Capture: FFmpeg >= 8.1 with AMF)")
+	}
+	if !strings.HasSuffix(enc.Name, "_amf") {
+		return fmt.Errorf("AMD Direct Capture only feeds AMF encoders, not %s", enc.Name)
+	}
+	return nil
 }
 
 // CaptureClockFilter sets each frame's pts to the wall clock (av_gettime())
@@ -539,6 +778,29 @@ func BarcodeFilter(cell int) string {
 	return strings.Join(parts, ",")
 }
 
+// framePacer returns a select filter that passes at most fps frames a second
+// on average from a source that delivers frames at its own pace: vsrc_amf in
+// wait_for_present mode returns every present of DWM or a fullscreen game,
+// whatever its framerate option says (the AMF Display Capture API defines
+// that only for keep_framerate mode). The encoder's rate control assumes fps
+// frames a second: a 144 Hz display streamed at 60 fps would get 2.4 times
+// the bitrate.
+//
+// The clock is time(0), the wall clock in seconds when the frame arrives.
+// ld(0) is the time the next frame is due and ld(1) the clock minus it. A
+// frame passes when it is due, and the next one is due one interval later;
+// a late frame keeps up to one interval of credit, so a source a little
+// faster than fps still yields fps (after a late frame two may pass back to
+// back), and one at fps loses no frame to jitter below half an interval. A
+// clock that jumped back by more than two intervals (a wall-clock step) passes
+// the frame and restarts the schedule instead of stalling the stream. FFmpeg
+// evaluates both operands of a binary operator in order (libavutil/eval.c), so
+// st(1) is stored before ld(1) reads it; the quotes keep the commas inside the
+// filter's argument.
+func framePacer(fps int) string {
+	return fmt.Sprintf("select='if(gte(st(1,time(0)-ld(0)),0)+lt(ld(1),-2/%[1]d),1+0*st(0,ld(0)+ld(1)+1/%[1]d-clip(ld(1),0,1/%[1]d)),0)'", fps)
+}
+
 var safeRegex = regexp.MustCompile(`^[A-Za-z0-9 _.\-()*+?^$|\[\]]{1,128}$`)
 
 // escapeFilterValue quotes a value for use inside a filtergraph option.
@@ -560,7 +822,8 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	e := p.Encoder
 	args := []string{"-hide_banner", "-loglevel", "warning", "-nostdin"}
-	gpuFrames := false // source produces D3D11 frames
+	gpuFrames := false      // source produces D3D11 frames (amf: AMF surfaces)
+	clock := p.CaptureClock // pts = wall-clock capture time in µs
 	var chain string
 	cursor := "0"
 	if p.DrawCursor {
@@ -575,7 +838,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		gpuFrames = true
 	case "gfxcapture":
 		if !c.Filters["gfxcapture"] {
-			return nil, errors.New("this ffmpeg build lacks the gfxcapture filter (need FFmpeg >= 8.0)")
+			return nil, errors.New("this ffmpeg build lacks the gfxcapture filter (need FFmpeg >= 8.1)")
 		}
 		opts := []string{fmt.Sprintf("max_framerate=%d", p.FPS), "capture_cursor=" + cursor}
 		if p.Source.Window != "" {
@@ -591,6 +854,31 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		}
 		chain = "gfxcapture=" + strings.Join(opts, ":")
 		gpuFrames = true
+	case "amf":
+		// AMD Direct Capture (experimental): vsrc_amf returns AMF surfaces
+		// (AV_PIX_FMT_AMF_SURFACE) on its own AMF device, and amfenc encodes
+		// them in place on that device: zero copy, no hwmap. duplicate_output
+		// hands out a copy of the captured surface, which may be
+		// DCC-compressed and then cannot go to the encoder (AMF Display
+		// Capture API). The filter has no cursor option.
+		if err := c.CanCaptureAMF(e); err != nil {
+			return nil, err
+		}
+		if p.DrawCursor {
+			return nil, errors.New("AMD Direct Capture cannot draw the cursor")
+		}
+		if p.Source.Output < 0 || p.Source.Output > 8 {
+			return nil, fmt.Errorf("AMD Direct Capture: monitor index %d out of range 0-8", p.Source.Output)
+		}
+		chain = fmt.Sprintf("vsrc_amf=monitor_index=%d:framerate=%d:capture_mode=wait_for_present:duplicate_output=1,%s",
+			p.Source.Output, p.FPS, framePacer(p.FPS))
+		gpuFrames = true
+		// vsrc_amf rounds each frame's AMF capture time to its 1/framerate
+		// time base, so two frames the pacer passes less than an interval
+		// apart can share a pts (the muxer then shifts one with a
+		// "Non-monotonic DTS" warning). The wall clock in µs keeps them
+		// apart, also when the client gets no capture stamps.
+		clock = true
 	case "x11grab":
 		args = append(args, "-f", "x11grab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor)
 		if p.Source.NativeW > 0 {
@@ -610,7 +898,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unknown capture backend %q", p.Source.Backend)
 	}
-	if p.CaptureClock {
+	if clock {
 		// Evaluated as the frame leaves the source (after realtime pacing for
 		// the test source), before any conversion or encoding.
 		chain += "," + CaptureClockFilter
@@ -620,11 +908,15 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		// BarcodeCell pixels in the encoded picture.
 		chain += "," + BarcodeFilter(proto.BarcodeCell)
 	}
+	if p.TestPad > 0 && p.Source.Backend == "test" {
+		chain += fmt.Sprintf(",pad=w=iw:h=ih+%d:x=0:y=0:color=white", p.TestPad)
+	}
 
 	// Convert into what the encoder accepts.
 	switch {
 	case gpuFrames && (e.Vendor == "nvidia" || e.Vendor == "amd"):
-		// NVENC and AMF consume D3D11 textures directly: zero copy.
+		// NVENC and AMF consume D3D11 textures directly, AMF also vsrc_amf's
+		// AMF surfaces: zero copy.
 	case gpuFrames && e.Vendor == "intel" && c.Filters["vpp_qsv"]:
 		// QSV turns BGRA input into 4:4:4 HEVC, which browsers cannot decode:
 		// convert to NV12 on the GPU first.
@@ -678,7 +970,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)
-	if p.CaptureClock {
+	if clock {
 		// Keep µs precision through the encoder; its frame rate still comes
 		// from the source (checked: libx264/libsvtav1 bitrate and fps unchanged).
 		args = append(args, "-enc_time_base", "1:1000000")
@@ -819,7 +1111,13 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 			a = append(a, common...)
 		case "libsvtav1":
 			opt("preset", "12")
-			opt("svtav1-params", "pred-struct=1:lookahead=0:scd=0")
+			// rc=2: CBR. FFmpeg's wrapper asks for VBR unless -maxrate equals
+			// -b:v; with low-delay prediction (pred-struct=1) SVT-AV1 1.7
+			// forces CBR with a warning, but 4.x fails ("VBR Rate control is
+			// currently not supported for LOW_DELAY, use CBR mode"). -maxrate
+			// = -b:v fails on 1.7 ("Max Bitrate must be greater than Target
+			// Bitrate"); rc=2 works on both.
+			opt("svtav1-params", "pred-struct=1:lookahead=0:scd=0:rc=2")
 			a = append(a, "-b:v", br, "-g", strconv.Itoa(gop))
 		case "libaom-av1":
 			opt("usage", "realtime")

@@ -360,13 +360,18 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 			v.active, v.pending = pr, nil
 			cfg := &proto.VideoConfig{
 				T: "video", Gen: pr.gen, Family: params.Family, Codec: params.Codec,
-				Width: st.Width, Height: st.Height, FPS: pr.params.FPS, BitrateKbps: pr.params.BitrateKbps,
+				FPS: pr.params.FPS, BitrateKbps: pr.params.BitrateKbps,
 				Encoder: pr.params.Encoder.Name, Capture: pr.params.Source.Backend,
 				Recovery: Recovery(pr.args, st.Width, st.Height, pr.params.FPS),
 			}
+			cfg.SetCrop(visibleSize(st, params, pr.params))
 			if v.log != nil {
-				v.log.Info("encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", st.Width, st.Height),
+				v.log.Info("encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height),
 					"startup", time.Since(pr.started).Round(time.Millisecond), "recovery", cfg.Recovery)
+				if cfg.CropRight > 0 || cfg.CropBottom > 0 {
+					v.log.Info("coded picture is padded, client crops", "gen", pr.gen,
+						"coded", fmt.Sprintf("%dx%d", cfg.CodedWidth, cfg.CodedHeight), "crop_right", cfg.CropRight, "crop_bottom", cfg.CropBottom)
+				}
 			}
 			v.mu.Unlock()
 			v.emit(VideoEvent{Config: cfg, HealFrames: HealFrames(pr.args, st.Width, st.Height)})
@@ -378,6 +383,21 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 			v.mu.Unlock() // superseded generation, drain until killed
 		}
 	}
+}
+
+// visibleSize returns the picture to show (w, h) and the coded picture the
+// decoder outputs (codedW, codedH) for a generation. NUT carries the size the
+// encoder was configured with; an AV1 encoder that pads codes a larger frame,
+// which only its sequence header tells (FFmpeg's av1_amf reports the crop
+// as stream side data, which NUT does not store). TestPad rows below the
+// test pattern are padding by definition.
+func visibleSize(st *nut.Stream, params *codec.Params, p Params) (w, h, codedW, codedH int) {
+	w, h = st.Width, st.Height
+	codedW, codedH = max(w, params.CodedWidth), max(h, params.CodedHeight)
+	if p.Source.Backend == "test" && p.TestPad > 0 && p.TestPad < h {
+		h -= p.TestPad
+	}
+	return w, h, codedW, codedH
 }
 
 func (v *Video) emit(ev VideoEvent) {

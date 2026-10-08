@@ -8,7 +8,10 @@
 // streaming over direct WebTransport, relayed WebTransport and WebSocket.
 // Verifies decoded video, audio, keyboard/mouse delivery to the host, the
 // loss handling (late and dropped frames from the host's fault-injection
-// hook), and reports the measured latencies.
+// hook), and reports the measured latencies. The test pattern carries 16 rows
+// of white padding below it (host "testPad"), announced in the video config
+// like the padding of an AV1 encoder on RDNA3: every scenario checks the
+// client crops it.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -97,6 +100,8 @@ async function checkStages(name, st) {
     lat ? `${lat.from}→draw ${p(lat.e2e)} ms; ${STAGES.map((k) => `${k} ${p(lat.stages[k])}`).join(', ')}${missing.length ? '; missing ' + missing : ''}${negative.length ? '; negative ' + negative : ''}` : 'no stage stats');
   const overlay = await page.textContent('#stats').catch(() => '');
   check(`${name}: overlay shows the stage table`, overlay.includes('End-to-end (capture→draw)') && overlay.includes('host queue') && overlay.includes('display (est.)'));
+  const pill = await page.getAttribute('#latency', 'title').catch(() => '');
+  check(`${name}: latency pill labelled capture→draw`, pill.startsWith('End-to-end latency (capture→draw)'), pill);
 
   await page.evaluate(() => { window.__recon.stageDump = null; window.__recon.worker.postMessage({ type: 'stageDump' }); });
   const dump = await until(() => page.evaluate(() => window.__recon.stageDump), 3000, 'stage dump').catch(() => []);
@@ -137,19 +142,157 @@ async function checkProbe(name) {
   return pr;
 }
 
+// Coded-size crop (step 1.7): the host pads the 960x540 test pattern with
+// TEST_PAD white rows and announces them (video config cropBottom). The client
+// must show exactly 960x540: the bottom rows on screen are the pattern's
+// colour bars (yellow at 5/12, blue at 7/12 of the width; x outside the stats
+// overlay and the toasts), not white padding, and not the bars squeezed
+// together with the padding. testsrc2's moving shape crosses those rows for
+// single frames (13 of 2400): up to five screenshots 200 ms apart, one must
+// show both bars.
+const TEST_PAD = 16;
+async function checkCrop(name) {
+  const cfg = await page.evaluate(() => window.__recon.videoCfg);
+  const vid = await page.evaluate(() => window.__recon.video);
+  const renderer = await page.evaluate(() => window.__recon.conn?.renderer);
+  const r = await page.evaluate(() => { const b = document.getElementById('screen').getBoundingClientRect(); return { x: b.x, y: b.y, w: b.width, h: b.height }; });
+  const scale = Math.min(r.w / vid.w, r.h / vid.h); // object-fit: contain
+  const cw = vid.w * scale;
+  const ch = vid.h * scale;
+  const clip = { x: r.x + (r.w - cw) / 2, y: r.y + (r.h - ch) / 2 + ch - 4, width: cw, height: 3 };
+  let px = null;
+  let bars = false;
+  let shots = 0;
+  while (!bars && shots < 5) {
+    if (shots++) await sleep(200);
+    const png = await page.screenshot({ clip });
+    px = await page.evaluate(async (bytes) => {
+      const bmp = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: 'image/png' }));
+      const g = new OffscreenCanvas(bmp.width, bmp.height).getContext('2d');
+      g.drawImage(bmp, 0, 0);
+      const d = g.getImageData(0, 0, bmp.width, bmp.height).data;
+      const at = (fx) => {
+        const x = Math.floor(fx * bmp.width);
+        const sum = [0, 0, 0];
+        for (let y = 0; y < bmp.height; y++) for (let c = 0; c < 3; c++) sum[c] += d[(y * bmp.width + x) * 4 + c];
+        return sum.map((v) => Math.round(v / bmp.height));
+      };
+      return { yellow: at(5 / 12), blue: at(7 / 12) };
+    }, [...png]);
+    const [yr, yg, yb] = px.yellow;
+    const [br, bg, bb] = px.blue;
+    bars = yr > 150 && yg > 150 && yb < 110 && br < 110 && bg < 110 && bb > 150;
+  }
+  // The worker logs what the decoder outputs for a padded stream.
+  const logLine = (await page.evaluate(() => window.__recon.logs)).filter((l) => l.includes('padded picture:')).pop() || '';
+  check(`${name}: padded picture cropped to the announced size (video config crop)`,
+    cfg?.cropBottom === TEST_PAD && cfg.codedHeight === cfg.height + TEST_PAD && vid.w === cfg.width && vid.h === cfg.height && bars &&
+      logLine.includes(`decoder output ${cfg.codedWidth}x${cfg.codedHeight}`),
+    `config ${cfg?.width}x${cfg?.height} coded ${cfg?.codedWidth}x${cfg?.codedHeight} cropBottom ${cfg?.cropBottom}; shown ${vid.w}x${vid.h} (${renderer}); ` +
+      `bottom rows (screenshot ${shots}) at 5/12 rgb(${px.yellow}) (yellow bar), at 7/12 rgb(${px.blue}) (blue bar); log: ${logLine.replace(/^\S+ /, '')}`);
+}
+
 let testPage = null; // headed browser showing tools/latency-test (wallclock scenario)
 
-async function checkWallclockProbe() {
-  // An X display with the test page full-screen (kiosk, no automation info bar).
+// Starts an X server and returns its display (":N").
+async function startXvfb() {
   const xvfb = spawn('Xvfb', ['-displayfd', '3', '-screen', '0', '1280x720x24', '-nolisten', 'tcp'], { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
   xvfb.log = '';
   procs.push(xvfb);
-  const disp = await new Promise((res, rej) => {
+  return new Promise((res, rej) => {
     let b = '';
     xvfb.stdio[3].on('data', (d) => { b += d; if (b.includes('\n')) res(`:${b.trim()}`); });
     xvfb.on('exit', () => rej(new Error('Xvfb exited')));
     setTimeout(() => rej(new Error('Xvfb did not start')), 10000);
   });
+}
+
+// Renderer crop at unit level (step 1.7): the worker's own Canvas2DRenderer
+// and WebGPURenderer (their source, cut out of stream-worker.js) draw a 64x40
+// frame whose top-left 48x32 holds four colour quadrants, columns 48-63 grey
+// and rows 32-39 white, with the area protocol.js visibleArea() computes for
+// a video config that crops the bottom 8 rows, and for one that also crops
+// the right 16 columns. The canvas must be exactly the visible size, with no
+// white (and, for the second, no grey). WebGPU runs in a headed browser on
+// Xvfb: in headless Chromium here SwiftShader rejects
+// queue.onSubmittedWorkDone() ("A valid external Instance reference no longer
+// exists."), so the app's WebGPU self-test fails and the E2E WebGPU scenario
+// draws with the 2D renderer.
+async function checkRendererCrop(haveX) {
+  let b = browser;
+  if (haveX) {
+    const disp = await startXvfb();
+    b = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: disp }, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
+  }
+  const workerSrc = readFileSync(join(root, 'web', 'static', 'js', 'stream-worker.js'), 'utf8');
+  const start = workerSrc.indexOf('// Rendering');
+  const end = workerSrc.indexOf('async function makeRenderer');
+  const fn = workerSrc.indexOf('function withTimeout(');
+  if (start < 0 || end < 0 || fn < 0) throw new Error('renderer code not found in stream-worker.js');
+  // Evaluated through the DevTools protocol, which the page's CSP does not
+  // restrict; protocol.js comes from the gateway like in the app.
+  const expr = `(async () => {
+const P = await import('/js/protocol.js');
+const post = () => {};
+${workerSrc.slice(fn, workerSrc.indexOf('\n}\n', fn) + 3)}
+${workerSrc.slice(start, end)}
+const src = new OffscreenCanvas(64, 40);
+const g = src.getContext('2d');
+g.fillStyle = '#fff'; g.fillRect(0, 0, 64, 40);
+g.fillStyle = '#808080'; g.fillRect(48, 0, 16, 32);
+[['#f00', '#0f0'], ['#00f', '#ff0']].forEach((row, y) => row.forEach((c, x) => { g.fillStyle = c; g.fillRect(x * 24, y * 16, 24, 16); }));
+const out = [];
+for (const cfg of [{ width: 64, height: 32, codedWidth: 64, codedHeight: 40, cropBottom: 8 },
+  { width: 48, height: 32, codedWidth: 64, codedHeight: 40, cropRight: 16, cropBottom: 8 }]) {
+  for (const kind of ['2d', 'webgpu']) {
+    const canvas = new OffscreenCanvas(1, 1);
+    let r;
+    try {
+      r = kind === '2d' ? new Canvas2DRenderer(canvas) : await WebGPURenderer.create(canvas);
+    } catch (e) { out.push({ kind, cfg, error: e.message }); continue; }
+    const frame = new VideoFrame(src, { timestamp: 0 });
+    r.draw(frame, null, P.visibleArea(cfg, frame.visibleRect.width, frame.visibleRect.height, frame.displayWidth, frame.displayHeight));
+    if (kind === 'webgpu') await r.device.queue.onSubmittedWorkDone();
+    const bmp = canvas.transferToImageBitmap();
+    const c2 = new OffscreenCanvas(bmp.width, bmp.height).getContext('2d');
+    c2.drawImage(bmp, 0, 0);
+    const d = c2.getImageData(0, 0, bmp.width, bmp.height).data;
+    let white = 0, grey = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i] > 200 && d[i + 1] > 200 && d[i + 2] > 200) white++;
+      if (Math.abs(d[i] - 128) < 30 && Math.abs(d[i + 1] - 128) < 30 && Math.abs(d[i + 2] - 128) < 30) grey++;
+    }
+    out.push({ kind, cfg, w: bmp.width, h: bmp.height, white, grey });
+    r.prev?.close();
+  }
+}
+return out;
+})()`;
+  const ctx2 = await b.newContext({ ignoreHTTPSErrors: true });
+  try {
+    const p = await ctx2.newPage();
+    await p.goto(`${base}/login`);
+    const res = await p.evaluate(expr);
+    for (const kind of ['2d', 'webgpu']) {
+      const rows = res.filter((x) => x.kind === kind);
+      const skipped = kind === 'webgpu' && !haveX && rows.every((x) => x.error);
+      const ok = rows.length === 2 && rows.every((x) => !x.error && x.w === x.cfg.width && x.h === x.cfg.height && x.white === 0 &&
+        (x.cfg.width === 64 ? x.grey === 16 * 32 : x.grey === 0));
+      if (skipped) console.log(`- renderer crop (${kind}): skipped, WebGPU needs a headed browser (Xvfb) here: ${rows[0].error}`);
+      else {
+        check(`renderer crop (${kind}): draws only the visible area announced by the video config`, ok,
+          rows.map((x) => (x.error ? x.error : `${x.cfg.width}x${x.cfg.height} of 64x40: canvas ${x.w}x${x.h}, ${x.white} white, ${x.grey} grey px`)).join('; '));
+      }
+    }
+  } finally {
+    await ctx2.close();
+    if (b !== browser) await b.close();
+  }
+}
+
+async function checkWallclockProbe() {
+  // An X display with the test page full-screen (kiosk, no automation info bar).
+  const disp = await startXvfb();
   testPage = await chromium.launchPersistentContext(join(dir, 'testpage-profile'), {
     headless: false, viewport: null, ignoreDefaultArgs: ['--enable-automation'],
     env: { ...process.env, DISPLAY: disp }, args: ['--kiosk', '--window-position=0,0', '--window-size=1280,720'],
@@ -462,7 +605,7 @@ try {
   check('pairing code issued', code.startsWith('recon1:'));
 
   const cfgPath = join(dir, 'host.json');
-  const hostCfg = { capture: 'test', testWidth: 960, testHeight: 540, directPort, directAddr: '127.0.0.1', audio: true, logLevel: 'debug' };
+  const hostCfg = { capture: 'test', testWidth: 960, testHeight: 540, testPad: TEST_PAD, directPort, directAddr: '127.0.0.1', audio: true, logLevel: 'debug' };
   if (process.env.E2E_HOST_FFMPEG) hostCfg.ffmpeg = process.env.E2E_HOST_FFMPEG;
   writeFileSync(cfgPath, JSON.stringify(hostCfg));
   const pair = run('recon-host', ['-config', cfgPath, 'pair', code], {}, 'pair');
@@ -539,6 +682,7 @@ try {
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
     await checkStages(sc.name, st);
+    await checkCrop(sc.name);
     const pr = await checkProbe(sc.name);
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
@@ -628,7 +772,11 @@ try {
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
   await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
 
-  // 3b. Latency probe, wallclock mode -----------------------------------------
+  // 3b. Renderer crop (unit) ----------------------------------------------------
+  const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
+  await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
+
+  // 3c. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a
   // second, headed Chromium; the client (latency probe enabled) reads the
   // page's wall-clock barcode back and converts it with the host's wall-clock

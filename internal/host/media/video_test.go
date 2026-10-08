@@ -2,7 +2,9 @@ package media
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -13,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/karamkamal1/kloudit-recon/internal/nut"
 )
 
 func probeOrSkip(t *testing.T) *Caps {
@@ -290,9 +294,9 @@ func TestVideoGenerations(t *testing.T) {
 }
 
 // TestVideoFailureEvent: a failing generation's error event carries its
-// parameters (the session decides the encoder fallback from them, after the
-// generation is gone from Current), whether it had gone live and whether the
-// encoder itself failed.
+// parameters (the session decides the encoder fallback and the fallback from
+// capture "amf" from them, after the generation is gone from Current),
+// whether it had gone live and whether the encoder itself failed.
 func TestVideoFailureEvent(t *testing.T) {
 	caps := probeOrSkip(t)
 	enc, ok := caps.Best("h264")
@@ -324,7 +328,7 @@ func TestVideoFailureEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev := failure("start failure")
-	if ev.Failed == nil || ev.Failed.Encoder.Name != bad.Name || ev.Live || !ev.EncoderFault {
+	if ev.Failed == nil || ev.Failed.Encoder.Name != bad.Name || ev.Failed.Source.Backend != "test" || ev.Live || !ev.EncoderFault {
 		t.Fatalf("start failure: %v: failed %+v live %v fault %v, want %s, not live, encoder fault", ev.Err, ev.Failed, ev.Live, ev.EncoderFault, bad.Name)
 	}
 	if _, ok := v.Current(); ok {
@@ -432,5 +436,152 @@ func TestEncoderFault(t *testing.T) {
 	}
 	if encoderFault("EOF", "hevc_amf") || encoderFault("", "hevc_amf") {
 		t.Error("a process that died without a message counted as an encoder fault")
+	}
+}
+
+// TestAlignment checks the alignment derived from a probe measurement and
+// which sizes pad: RDNA3's AV1 alignment of 64x16 keeps 2560x1440, 3840x2160,
+// 1280x720 and 2560x1600, and pads 1920x1080 (height) and 3440x1440 (width).
+func TestAlignment(t *testing.T) {
+	for _, c := range []struct{ n, coded, def, want int }{
+		{1920, 1920, 64, 64}, {1080, 1082, 16, 16}, {1080, 1088, 16, 16}, {3440, 3456, 64, 64},
+		{1920, 2048, 64, 256}, {1080, 1152, 16, 128},
+	} {
+		if got := alignmentFor(c.n, c.coded, c.def); got != c.want {
+			t.Errorf("alignmentFor(%d, %d, %d) = %d, want %d", c.n, c.coded, c.def, got, c.want)
+		}
+	}
+	c := &Caps{}
+	if a := c.Alignment("av1_amf"); a.W != 1 || a.H != 1 || c.Pads("av1_amf", 1920, 1080) {
+		t.Fatalf("unprobed encoder: %+v", a)
+	}
+	c.SetAlignment("av1_amf", Alignment{W: 64, H: 16})
+	for _, s := range []struct {
+		w, h int
+		pads bool
+	}{
+		{2560, 1440, false}, {3840, 2160, false}, {1280, 720, false}, {2560, 1600, false},
+		{1920, 1080, true}, {3440, 1440, true}, {0, 0, false},
+	} {
+		if c.Pads("av1_amf", s.w, s.h) != s.pads {
+			t.Errorf("%dx%d: pads %v, want %v", s.w, s.h, !s.pads, s.pads)
+		}
+	}
+	if c.Pads("hevc_amf", 1920, 1080) {
+		t.Fatal("hevc_amf has no alignment")
+	}
+}
+
+// TestOutputSize compares Params.OutputSize with the size FFmpeg actually
+// encodes: the x11grab scale (aspect ratio kept, even sizes) runs through a
+// real ffmpeg on a source of the native size.
+func TestOutputSize(t *testing.T) {
+	for _, c := range []struct {
+		p    Params
+		w, h int
+	}{
+		{Params{Source: Source{Backend: "test"}}, 1280, 720},
+		{Params{Source: Source{Backend: "test", NativeW: 960, NativeH: 540}, TestPad: 16}, 960, 556},
+		{Params{Source: Source{Backend: "ddagrab", NativeW: 1920, NativeH: 1080}}, 1920, 1080},
+		{Params{Source: Source{Backend: "gfxcapture", NativeW: 3440, NativeH: 1440}}, 3440, 1440},
+		{Params{Source: Source{Backend: "gfxcapture", NativeW: 3440, NativeH: 1440}, Width: 2560, Height: 1440}, 2560, 1440},
+		{Params{Source: Source{Backend: "gfxcapture", Window: "Game", NativeW: 3440, NativeH: 1440}}, 0, 0},
+		{Params{Source: Source{Backend: "x11grab", NativeW: 1920, NativeH: 1080}}, 1920, 1080},
+	} {
+		if w, h := c.p.OutputSize(); w != c.w || h != c.h {
+			t.Errorf("%+v: %dx%d, want %dx%d", c.p, w, h, c.w, c.h)
+		}
+	}
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	for _, s := range [][4]int{{3440, 1440, 1920, 1080}, {1920, 1080, 1280, 720}, {1366, 768, 1280, 720}, {2560, 1080, 1920, 1080},
+		{1280, 1024, 1920, 1080}, {1920, 1200, 1600, 900}, {1001, 777, 640, 480}, {1001, 777, 1920, 1080}} {
+		p := Params{Source: Source{Backend: "x11grab", NativeW: s[0], NativeH: s[1]}, Width: s[2], Height: s[3]}
+		w, h := p.OutputSize()
+		// The chain BuildArgs uses for x11grab with a software encoder.
+		cmd := exec.Command(ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", fmt.Sprintf("color=s=%dx%d", s[0], s[1]),
+			"-frames:v", "1", "-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p", s[2], s[3]),
+			"-c:v", "rawvideo", "-f", "nut", "pipe:1")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := nut.NewDemuxer(bytes.NewReader(out), 64<<20)
+		if _, err := d.ReadPacket(); err != nil {
+			t.Fatal(err)
+		}
+		if st := d.Streams()[0]; st.Width != w || st.Height != h {
+			t.Errorf("x11grab %dx%d scaled into %dx%d: ffmpeg %dx%d, OutputSize %dx%d", s[0], s[1], s[2], s[3], st.Width, st.Height, w, h)
+		}
+	}
+}
+
+// TestProbeAlignment runs the coded-size probe on a real AV1 encoder
+// (SVT-AV1, which codes any size as is), then on the same encoder with its
+// output padded to 1920x1082 the way RDNA3 codes 1080p: the sequence header
+// shows the padding although the probe asked for 1920x1080.
+func TestProbeAlignment(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	svt := EncoderInfo{"libsvtav1", "av1", "software", false}
+	if err := testEncode(context.Background(), ff, svt); err != nil {
+		t.Skipf("libsvtav1: %v", err)
+	}
+	a, err := probeAlignment(context.Background(), ff, svt)
+	if err != nil || a != (Alignment{W: 1, H: 1, ProbeW: 1920, ProbeH: 1080, CodedW: 1920, CodedH: 1080}) {
+		t.Fatalf("libsvtav1: %+v %v", a, err)
+	}
+	w, h, err := codedSize(context.Background(), ff, append(blackFramesArgs(svt, 1920, 1080, 3), "-vf", "pad=iw:ih+2"))
+	if err != nil || w != 1920 || h != 1082 {
+		t.Fatalf("padded: %dx%d %v", w, h, err)
+	}
+	if aw, ah := alignmentFor(1920, w, 64), alignmentFor(1080, h, 16); aw != 64 || ah != 16 {
+		t.Fatalf("padded: alignment %dx%d", aw, ah)
+	}
+	// Not AV1: no sequence header to read.
+	if _, _, err := codedSize(context.Background(), ff, blackFramesArgs(EncoderInfo{"libx264", "h264", "software", false}, 64, 64, 3)); err == nil {
+		t.Fatal("coded size of an H.264 stream")
+	}
+}
+
+// TestVideoCrop runs the test source with TestPad through the Video manager:
+// the coded picture is 16 rows taller, VideoConfig announces the crop and
+// keeps the visible size as Width x Height (H.264 and AV1).
+func TestVideoCrop(t *testing.T) {
+	caps := probeOrSkip(t)
+	for _, fam := range []string{"h264", "av1"} {
+		enc, ok := caps.Best(fam)
+		if !ok || enc.HW {
+			continue
+		}
+		t.Run(enc.Name, func(t *testing.T) {
+			start := time.Now()
+			v := NewVideo(caps, nil, func() uint64 { return uint64(time.Since(start).Microseconds()) })
+			defer v.Stop()
+			if err := v.Start(Params{Source: Source{Backend: "test", NativeW: 640, NativeH: 360}, Encoder: enc, FPS: 30, BitrateKbps: 2000, TestPad: 16}, false); err != nil {
+				t.Fatal(err)
+			}
+			timeout := time.After(20 * time.Second)
+			for {
+				select {
+				case ev := <-v.Events():
+					if ev.Err != nil {
+						t.Fatal(ev.Err)
+					}
+					if c := ev.Config; c != nil {
+						if c.Width != 640 || c.Height != 360 || c.CodedWidth != 640 || c.CodedHeight != 376 || c.CropRight != 0 || c.CropBottom != 16 {
+							t.Fatalf("config %+v", c)
+						}
+						return
+					}
+				case <-timeout:
+					t.Fatal("no video config")
+				}
+			}
+		})
 	}
 }

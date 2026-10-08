@@ -23,6 +23,7 @@ import (
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -150,7 +151,18 @@ func TestEncoderFailureFallback(t *testing.T) {
 	fail(p, false, true)
 	p = expect(auto, "hevc_amf", "", "a failure since the last live generation")
 	fail(p, false, true)
-	expect(auto, "av1_amf", "", "two failures since the last live generation")
+	p = expect(auto, "av1_amf", "", "two failures since the last live generation")
+
+	// A generation that captured with AMD Direct Capture takes the session
+	// off it; its failures, encoder faults too, do not count against the
+	// encoder, which the restarts on ddagrab test.
+	p.Source.Backend = "amf"
+	fail(p, false, true)
+	fail(p, false, true)
+	expect(auto, "av1_amf", "", "two AMD Direct Capture failures")
+	if !s.amfFailed.Load() {
+		t.Fatal("a failed AMD Direct Capture generation left the session on it")
+	}
 
 	off := false
 	if p, err := s.buildParams(proto.Prefs{Adaptive: &off}); err != nil || p.Adaptive {
@@ -295,6 +307,34 @@ func (l *lockedLog) lines(substr string) []string {
 	for _, line := range strings.Split(l.buf.String(), "\n") {
 		if strings.Contains(line, substr) {
 			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// ctrlRecorder is a control stream that keeps what the host writes.
+type ctrlRecorder struct{ bytes.Buffer }
+
+func (*ctrlRecorder) Read([]byte) (int, error)         { return 0, io.EOF }
+func (*ctrlRecorder) Close() error                     { return nil }
+func (*ctrlRecorder) CancelRead()                      {}
+func (*ctrlRecorder) CancelWrite()                     {}
+func (*ctrlRecorder) SetReadDeadline(time.Time) error  { return nil }
+func (*ctrlRecorder) SetWriteDeadline(time.Time) error { return nil }
+
+// notices returns the texts of the notices written so far.
+func (r *ctrlRecorder) notices(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for r.Len() > 0 {
+		b, err := proto.ReadMsg(&r.Buffer, proto.MaxControlMsg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n proto.Notice
+		json.Unmarshal(b, &n)
+		if n.T == "notice" {
+			out = append(out, n.Msg)
 		}
 	}
 	return out
@@ -593,4 +633,253 @@ func TestHealWatch(t *testing.T) {
 	expect("another loss", 90, true)
 	s.healConfig(&proto.VideoConfig{Gen: 4, Recovery: proto.RecoverySkip}, 30)
 	expect("a new generation", 0, false)
+}
+
+// TestAlignmentGuard checks the encoder choice for an encoder that pads the
+// coded picture (step 1.7): AV1 on RDNA3 (probed alignment 64x16) gives way
+// to HEVC at 1920x1080, asked for by the client or chosen automatically,
+// with one notice; at aligned sizes AV1 stays. Without HEVC end-to-end H.264
+// takes over; with nothing else, or forced in the host config, AV1 stays
+// (the client crops).
+func TestAlignmentGuard(t *testing.T) {
+	caps := &media.Caps{Encoders: []media.EncoderInfo{
+		{Name: "av1_amf", Family: "av1", Vendor: "amd", HW: true},
+		{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+		{Name: "h264_amf", Family: "h264", Vendor: "amd", HW: true},
+		{Name: "libx264", Family: "h264", Vendor: "software"},
+	}}
+	caps.SetAlignment("av1_amf", media.Alignment{W: 64, H: 16, ProbeW: 1920, ProbeH: 1080, CodedW: 1920, CodedH: 1082})
+	all := []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc", HW: true}, {Family: "h264", HW: true}}
+	newSession := func(w, h int, decoders []proto.DecoderInfo, forced string) (*Session, *ctrlRecorder) {
+		cfg := &Config{Capture: "test", TestWidth: w, TestHeight: h, Encoder: forced}
+		cfg.Defaults()
+		rec := &ctrlRecorder{}
+		return &Session{
+			a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+			hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: decoders},
+			ctrl:  rec, tried: map[string]bool{},
+			log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}, rec
+	}
+	av1 := proto.Prefs{Codec: "av1"}
+	const notice = "AV1 on this GPU needs 64×16-aligned sizes; using HEVC"
+	for _, c := range []struct {
+		name     string
+		w, h     int
+		decoders []proto.DecoderInfo
+		prefs    proto.Prefs
+		forced   string
+		want     string
+		notice   string
+	}{
+		{"forced AV1 at 1920x1080", 1920, 1080, all, av1, "", "hevc_amf", notice},
+		// An encoder forced in host.json is kept (VideoConfig announces the crop).
+		{"host forces av1_amf at 1920x1080", 1920, 1080, all, proto.Prefs{}, "av1_amf", "av1_amf", ""},
+		{"forced AV1 at 2560x1440", 2560, 1440, all, av1, "", "av1_amf", ""},
+		{"forced AV1 at 3840x2160", 3840, 2160, all, av1, "", "av1_amf", ""},
+		{"forced AV1 at 1280x720", 1280, 720, all, av1, "", "av1_amf", ""},
+		{"forced AV1 at 3440x1440", 3440, 1440, all, av1, "", "hevc_amf", notice},
+		{"auto, AV1 the only hardware decoder", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc"}, {Family: "h264"}},
+			proto.Prefs{}, "", "hevc_amf", notice},
+		{"no HEVC in the browser", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "h264", HW: true}}, av1, "", "h264_amf",
+			"AV1 on this GPU needs 64×16-aligned sizes; using H.264"},
+		{"only AV1 in the browser", 1920, 1080, []proto.DecoderInfo{{Family: "av1", HW: true}}, av1, "", "av1_amf", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, rec := newSession(c.w, c.h, c.decoders, c.forced)
+			p, err := s.buildParams(c.prefs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := rec.notices(t)
+			if p.Encoder.Name != c.want || (c.notice == "") != (len(got) == 0) || (c.notice != "" && (len(got) != 1 || got[0] != c.notice)) {
+				t.Fatalf("encoder %s, notices %q; want %s, %q", p.Encoder.Name, got, c.want, c.notice)
+			}
+			// Restarts at the same size do not repeat the notice.
+			if p, _ = s.buildParams(c.prefs); p.Encoder.Name != c.want || len(rec.notices(t)) != 0 {
+				t.Fatalf("restart: encoder %s or a repeated notice", p.Encoder.Name)
+			}
+		})
+	}
+
+	// A session that switches to an aligned size gets AV1 back, and the
+	// notice again when it returns to 1920x1080.
+	s, rec := newSession(2560, 1440, all, "")
+	for i, sz := range [][2]int{{1920, 1080}, {1280, 720}, {1920, 1080}} {
+		p, err := s.buildParams(proto.Prefs{Codec: "av1", Width: sz[0], Height: sz[1]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, notices := "av1_amf", 0
+		if sz[0] == 1920 {
+			want, notices = "hevc_amf", 1
+		}
+		if p.Encoder.Name != want || len(rec.notices(t)) != notices {
+			t.Fatalf("step %d %dx%d: encoder %s", i, sz[0], sz[1], p.Encoder.Name)
+		}
+	}
+}
+
+// TestAMFCaptureBackend checks the opt-in AMD Direct Capture backend (step
+// 1.6): only configured, never automatic; used only with an AMF encoder,
+// without a cursor in the video and for a monitor on DXGI adapter 0, else
+// ddagrab with one log line per change; after a failure the session stays on
+// ddagrab.
+func TestAMFCaptureBackend(t *testing.T) {
+	caps := &media.Caps{Filters: map[string]bool{"ddagrab": true, "gfxcapture": true, "vsrc_amf": true, "select": true},
+		Encoders: []media.EncoderInfo{
+			{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+			{Name: "libx264", Family: "h264", Vendor: "software"},
+		}}
+	var logs bytes.Buffer
+	newSession := func(capture string) *Session {
+		cfg := &Config{Capture: capture}
+		cfg.Defaults()
+		logs.Reset()
+		return &Session{
+			a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+			hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{{Family: "hevc", HW: true}, {Family: "h264", HW: true}}},
+			ctrl:  &ctrlRecorder{}, tried: map[string]bool{},
+			log: slog.New(slog.NewTextHandler(&logs, nil)),
+		}
+	}
+	fallbacks := func() int { return strings.Count(logs.String(), "not used, capturing with ddagrab") }
+
+	// Never chosen automatically, only when configured.
+	if b := newSession("auto").a.backendFor(proto.Prefs{}); b != "ddagrab" {
+		t.Fatalf("auto picks %s", b)
+	}
+	if b := newSession("amf").a.backendFor(proto.Prefs{}); b != "amf" {
+		t.Fatalf("configured amf: %s", b)
+	}
+
+	hevc, x264 := caps.Encoders[0], caps.Encoders[1]
+	mon := platform.Monitor{Index: 1, W: 2560, H: 1440, DXGIOutput: 2}
+	for _, c := range []struct {
+		name    string
+		enc     media.EncoderInfo
+		cursor  bool
+		mon     platform.Monitor
+		filters bool
+		want    string // "" = usable
+	}{
+		{"AMF encoder", hevc, false, mon, true, ""},
+		{"software encoder", x264, false, mon, true, "only feeds AMF encoders, not libx264"},
+		{"cursor in the video", hevc, true, mon, true, "cursor"},
+		{"monitor on another adapter", hevc, false, platform.Monitor{Index: 1, DXGIOutput: -1}, true, "not output 0-8 of DXGI adapter 0"},
+		{"rotated monitor", hevc, false, platform.Monitor{Index: 1, W: 1440, H: 2560, DXGIOutput: 2, Rotated: true}, true, "monitor 1 is rotated"},
+		{"FFmpeg without vsrc_amf", hevc, false, mon, false, "vsrc_amf"},
+	} {
+		caps.Filters["vsrc_amf"] = c.filters
+		got := newSession("amf").a.amfCaptureBlocker(c.enc, c.cursor, c.mon)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+	caps.Filters["vsrc_amf"] = true
+
+	// The switch from ddagrab to amf keeps the monitor's output index.
+	s := newSession("amf")
+	dda := media.Params{Source: media.Source{Backend: "ddagrab", Output: 2, NativeW: 2560, NativeH: 1440}, Encoder: hevc}
+	p := dda
+	s.useAMFCapture(&p, mon)
+	if p.Source != (media.Source{Backend: "amf", Output: 2, NativeW: 2560, NativeH: 1440}) || fallbacks() != 0 {
+		t.Fatalf("source %+v, log %s", p.Source, logs.String())
+	}
+	// A fallback is logged once while its reason stays, again when it changes.
+	for i, c := range []struct {
+		cursor bool
+		logs   int
+	}{{true, 1}, {true, 1}, {false, 1}, {true, 2}} {
+		p = dda
+		p.DrawCursor = c.cursor
+		s.useAMFCapture(&p, mon)
+		if wantAMF := !c.cursor; (p.Source.Backend == "amf") != wantAMF || fallbacks() != c.logs {
+			t.Fatalf("step %d: source %s, %d fallback lines", i, p.Source.Backend, fallbacks())
+		}
+	}
+
+	// A client that wants the cursor in the video keeps a whole buildParams
+	// on ddagrab, with the reason in the log once.
+	s = newSession("amf")
+	for i := 0; i < 2; i++ {
+		p, err := s.buildParams(proto.Prefs{Cursor: "video"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Source.Backend != "ddagrab" || p.Encoder.Name != "hevc_amf" || fallbacks() != 1 {
+			t.Fatalf("buildParams: %+v, log %s", p, logs.String())
+		}
+	}
+
+	// A failed amf generation moves the rest of the session to ddagrab.
+	s = newSession("amf")
+	s.noteCaptureFailure(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Failed to initialize capture component: 3"),
+		Failed: &media.Params{Source: media.Source{Backend: "ddagrab"}}})
+	p = dda
+	if s.useAMFCapture(&p, mon); p.Source.Backend != "amf" {
+		t.Fatal("a ddagrab failure turned AMD Direct Capture off")
+	}
+	s.noteCaptureFailure(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Failed to initialize capture component: 3"),
+		Failed: &media.Params{Source: media.Source{Backend: "amf"}}})
+	p = dda
+	if s.useAMFCapture(&p, mon); p.Source.Backend != "ddagrab" || !strings.Contains(logs.String(), "AMD Direct Capture failed") ||
+		!strings.Contains(logs.String(), "failed earlier in this session") {
+		t.Fatalf("after a failure: %s, log %s", p.Source.Backend, logs.String())
+	}
+}
+
+// TestProbeSample checks that "recon-host probe" prints command lines for the
+// session the agent builds (buildParams) when a browser client at its default
+// settings (stream.js DEFAULTS) streams with that encoder, whatever the host's
+// capture setting: the test pattern at testWidth x testHeight with its
+// padding, ddagrab, gfxcapture or x11grab of the first monitor, AMD Direct
+// Capture only where the agent would use it.
+func TestProbeSample(t *testing.T) {
+	caps := &media.Caps{Filters: map[string]bool{"ddagrab": true, "gfxcapture": true, "vsrc_amf": true},
+		Encoders: []media.EncoderInfo{
+			{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+			{Name: "h264_nvenc", Family: "h264", Vendor: "nvidia", HW: true},
+			{Name: "libx264", Family: "h264", Vendor: "software"},
+		}}
+	browser := proto.Prefs{Codec: "auto", BitrateKbps: 30000, FPS: 60, Cursor: "local", Quality: "balanced"}
+	newConfig := func(capture string, drawCursor bool) *Config {
+		cfg := &Config{Capture: capture, TestWidth: 1600, TestHeight: 900, TestPad: 8, MaxFPS: 50, DrawCursor: drawCursor}
+		cfg.Defaults()
+		return cfg
+	}
+	for _, capture := range []string{"auto", "ddagrab", "gfxcapture", "amf", "x11grab", "test"} {
+		for _, drawCursor := range []bool{false, true} {
+			cfg := newConfig(capture, drawCursor)
+			sample := ProbeSample(cfg, caps)
+			for _, enc := range caps.Encoders {
+				cfg.Encoder = enc.Name
+				s := &Session{
+					a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+					hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{{Family: "hevc", HW: true}, {Family: "h264", HW: true}}},
+					ctrl:  &ctrlRecorder{}, tried: map[string]bool{},
+					log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				}
+				want, err := s.buildParams(browser)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := sample(enc); got != want {
+					t.Errorf("capture %s, drawCursor %v, %s:\nprobe %+v\nagent %+v", capture, drawCursor, enc.Name, got, want)
+				}
+			}
+		}
+	}
+	// capture "amf" on a monitor of DXGI adapter 0: AMD Direct Capture for the
+	// AMF encoder only, on Windows (elsewhere the video carries the cursor).
+	sample := (&Agent{cfg: newConfig("amf", false), caps: caps}).probeSample(platform.Monitor{W: 2560, H: 1440, Hz: 144, DXGIOutput: 1})
+	if amf, x264 := sample(caps.Encoders[0]).Source, sample(caps.Encoders[2]).Source; (amf.Backend == "amf") != (runtime.GOOS == "windows") ||
+		amf.Output != 1 || x264 != (media.Source{Backend: "ddagrab", Output: 1, NativeW: 2560, NativeH: 1440}) {
+		t.Fatalf("capture amf: %s %+v, %s %+v", caps.Encoders[0].Name, amf, caps.Encoders[2].Name, x264)
+	}
+	// The Linux default is the configured test pattern, not a fixed 1920x1080.
+	if p := ProbeSample(newConfig("test", false), caps)(caps.Encoders[2]); p.Source != (media.Source{Backend: "test", NativeW: 1600, NativeH: 900}) ||
+		p.TestPad != 8 || p.FPS != 50 || p.BitrateKbps != 30000 || p.Quality != "balanced" {
+		t.Fatalf("test pattern sample %+v", p)
+	}
 }

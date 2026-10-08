@@ -287,7 +287,7 @@ The new password (at least 10 characters) is read from stdin.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `capture` | `auto` | `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture` |
+| `capture` | `auto` | `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion; never chosen by `auto`. The agent uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6) |
 | `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
@@ -295,16 +295,26 @@ The new password (at least 10 characters) is read from stdin.
 | `directAddr` | auto | Address to advertise for the direct path |
 | `congestion` | `reno` | QUIC congestion control of the host's video connections (direct path and the host → gateway relay data connection; the gateway → browser leg of a relay session stays `reno`): `reno` (quic-go default) or `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss; experimental) |
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
-| `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency |
+| `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency. With `capture` `amf` the FFmpeg chain keeps that wall-clock pts (`vsrc_amf`'s own pts are rounded to 1/fps), and `off` only stops sending capture stamps to the client |
 | `gpuPriority` | `auto` | GPU scheduling priority of the FFmpeg capture/encode process, so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
 
 Edit `host.json` with Notepad, then restart the agent: `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`.
 
-Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the detected encoders
-(and why any GPU encoder is unusable), capture backends, monitors and gamepad support. Flags go
-before the command: `recon-host.exe -v probe`.
+Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the FFmpeg version, the
+detected encoders (and why any GPU encoder is unusable), capture backends, monitors and gamepad
+support. Under each encoder it prints the exact FFmpeg command line the agent runs with that
+encoder when a browser streams the first monitor at the default settings (native resolution,
+60 fps, 30 Mbit/s, balanced quality, adaptive bitrate) under this `host.json`; an encoder that
+heals lost frames with periodic intra refresh shows `intra-refresh=` after its name. The
+`session:` line above it says how that session captures: with the default `"capture": "auto"`
+that is ddagrab (other resolutions and window capture use gfxcapture). To try an encoder by hand,
+open PowerShell in the folder of `ffmpeg.exe` (the `ffmpeg:` line) and paste its line as
+`.\ffmpeg ...` with `pipe:1` replaced by `-stats -frames:v 600 -y $env:TEMP\test.nut`. ddagrab
+only delivers a frame when the screen or the mouse pointer changes, so keep something moving
+(move the mouse, play a video) until the `frame=` counter reaches 600. Flags go before the
+command: `recon-host.exe -v probe`.
 
 ## Troubleshooting
 

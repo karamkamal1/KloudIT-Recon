@@ -157,9 +157,20 @@ units, high resolution) · `4` release-all · `5` UTF-8 text (typed as Unicode k
 
 ```
 ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + vpp_qsv → NV12)
+vsrc_amf (opt-in)     ──AMF surface────►  AMF only
      │ (no CPU copy)                          │
      └────────── ffmpeg child process ────────┴──► NUT on stdout ──► Go demuxer ──► frame queue
 ```
+
+- **AMD Direct Capture (experimental, `capture: "amf"`):** FFmpeg 8.1's `vsrc_amf` in
+  `wait_for_present` mode delivers each present of DWM or a fullscreen game as an AMF surface on
+  its own AMF device. `*_amf` encoders take that frames context and encode the surfaces in place
+  (no hwmap, no copy beyond the capture's own `duplicate_output` copy). A `select` expression
+  caps the rate at the session's fps: the AMF docs define the `framerate` option only for
+  `keep_framerate` mode.
+  The session uses it only with an AMF encoder, without the cursor in the video and for an
+  unrotated monitor on DXGI adapter 0. Otherwise, and for the rest of a session after it failed
+  once, it captures with ddagrab (see `docs/VENDOR_NOTES.md`, 1.6).
 
 - **Why NUT:** a frame is forwarded as soon as its last byte is written (see
   `internal/nut/nut_test.go: TestStreamingLatency`). Raw Annex-B has no boundaries, and
@@ -172,7 +183,10 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
   while the client's adaptive bitrate is off (`docs/VENDOR_NOTES.md`, 1.1). Encoder options and
   their named values are filtered against `ffmpeg -h encoder=…`, so any FFmpeg build works.
 - **Probing:** at startup every candidate encoder test-encodes a few frames. The best working
-  one per codec family is used, with hardware preferred.
+  one per codec family is used, with hardware preferred. Hardware AV1 encoders also encode three
+  black 1920×1080 frames, and the frame size in the AV1 sequence header tells whether they pad
+  the coded picture: RDNA3 codes 1080p as 1920×1082 (64×16 alignment; NUT's stream header only
+  repeats the configured size, and FFmpeg reports the crop as side data NUT drops).
 - **Overlapped restarts:** a settings change starts generation *n+1* while *n* keeps streaming.
   The switch happens on *n+1*'s first key frame. Urgent restarts (a key frame for a confirmed
   loss or a decoder error, host frame-queue overflow, a client that flushed its decoder) kill *n*
@@ -216,6 +230,13 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
 Codec negotiation: the browser reports per family whether it can decode with hardware
 (`VideoDecoder.isConfigSupported` with `prefer-hardware`). The host picks the first family with
 hardware on both ends, in the order HEVC → AV1 → H.264, then any hardware encoder, then software.
+An encoder that would pad the session's picture size (probed alignment, above) gives way to HEVC,
+else H.264, with a notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when
+the client asks for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded
+picture is streamed anyway (a host-forced encoder, nothing else decodes, or a size only the
+capture knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom`
+and the client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle;
+WebGPU: scaled texture coordinates).
 
 ## The browser pipeline
 

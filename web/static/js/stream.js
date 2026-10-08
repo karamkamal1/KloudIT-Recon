@@ -595,6 +595,12 @@ function onStats(st) {
   if (st.total !== null && st.total !== undefined) {
     pill.textContent = `${Math.round(st.total)} ms`;
     pill.className = `pill ${st.total < 25 ? '' : st.total < 50 ? 'mid' : 'high'}`;
+    // The worker gives st.total in the span st.stages.from names: capture->draw
+    // needs the host's capture stamps (frame-ext) on every frame of the stage
+    // window; otherwise the number starts when the frame leaves the host.
+    pill.title = st.stages?.from === 'capture'
+      ? 'End-to-end latency (capture→draw): from capture on the host until the frame is drawn on this screen'
+      : 'Stream latency (send→draw): from the frame leaving the host until it is drawn on this screen';
     S.history.push(st.total);
     if (S.history.length > 120) S.history.shift();
   }
@@ -621,7 +627,7 @@ function onStats(st) {
     row('Frame rate', `${st.fps.toFixed(1)} fps`),
     row('Bitrate', `${st.mbps.toFixed(1)} Mbps`),
     targetRow(v, row),
-    row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}`),
+    row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}${v.cropRight || v.cropBottom ? ` (coded ${v.codedWidth}×${v.codedHeight}, cropped)` : ''}`),
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Loss recovery', v.recovery === 'skip' ? 'skip frame (intra refresh)' : 'key frame'),

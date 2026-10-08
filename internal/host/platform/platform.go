@@ -13,6 +13,7 @@ type Monitor struct {
 	Hz         int
 	HMonitor   uint64 // Windows HMONITOR (gfxcapture hmonitor=)
 	DXGIOutput int    // output index on adapter 0 (ddagrab output_idx=), -1 if unknown
+	Rotated    bool   // the DXGI output is rotated 90, 180 or 270 degrees
 }
 
 // Adapter describes a GPU adapter (DXGI_ADAPTER_DESC1).

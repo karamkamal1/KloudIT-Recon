@@ -47,10 +47,13 @@ type Session struct {
 	ctrlMu sync.Mutex
 	ctrl   transport.BidiStream
 
-	hello   proto.Hello
-	prefsMu sync.Mutex // guards prefs and monitor
-	prefs   proto.Prefs
-	monitor platform.Monitor
+	hello       proto.Hello
+	prefsMu     sync.Mutex // guards prefs, monitor, alignNotice and amfFallback
+	prefs       proto.Prefs
+	monitor     platform.Monitor
+	alignNotice string // last coded-size alignment notice, sent once
+	amfFallback string // why the last generation did not use capture "amf", logged once
+	amfFailed   atomic.Bool
 
 	video    *media.Video
 	audio    *media.Audio
@@ -324,18 +327,77 @@ func (s *Session) currentPrefs() proto.Prefs {
 }
 
 // chooseEncoder negotiates the codec between the browser's decoders and the
-// host's encoders.
-func (s *Session) chooseEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
+// host's encoders for a w x h picture (0, 0: size unknown). An encoder that
+// would pad that size (Caps.Pads; AV1 on RDNA3 at 1920x1080) gives way to
+// HEVC, else H.264, also when the client asks for its codec; notice tells
+// the user why ("" when nothing changed). An encoder forced in the host
+// config is kept: its padding is announced for the client to crop.
+func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, notice string, err error) {
+	e, err = s.negotiateEncoder(prefs)
 	caps := s.a.caps
+	if err != nil || !caps.Pads(e.Name, w, h) {
+		return e, "", err
+	}
+	if e.Name == s.a.cfg.Encoder {
+		s.log.Debug("forced encoder pads this size, the client crops", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h))
+		return e, "", nil
+	}
+	// Hardware encoders first, HEVC before H.264.
+	for _, hwOnly := range []bool{true, false} {
+		for _, fam := range []string{"hevc", "h264"} {
+			if alt, ok := s.pickEncoder(fam, hwOnly, func(c media.EncoderInfo) bool { return !caps.Pads(c.Name, w, h) }); ok {
+				a := caps.Alignment(e.Name)
+				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
+					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
+				return alt, fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
+					familyNames[e.Family], a.W, a.H, familyNames[alt.Family]), nil
+			}
+		}
+	}
+	// Nothing else works end-to-end: keep it, VideoConfig announces the crop.
+	return e, "", nil
+}
+
+// familyNames are the codec families as users know them.
+var familyNames = map[string]string{"h264": "H.264", "hevc": "HEVC", "av1": "AV1"}
+
+// clientDecoders returns the browser's decoders by family.
+func (s *Session) clientDecoders() map[string]proto.DecoderInfo {
 	client := map[string]proto.DecoderInfo{}
 	for _, d := range s.hello.Decoders {
 		client[d.Family] = d
 	}
-	usable := func(e media.EncoderInfo) bool {
-		s.triedMu.Lock()
-		defer s.triedMu.Unlock()
-		return !s.tried[e.Name]
+	return client
+}
+
+// usableEncoder reports whether an encoder has not been excluded after
+// failing in this session.
+func (s *Session) usableEncoder(e media.EncoderInfo) bool {
+	s.triedMu.Lock()
+	defer s.triedMu.Unlock()
+	return !s.tried[e.Name]
+}
+
+// pickEncoder returns the host's preferred usable encoder of a family the
+// browser decodes (only hardware encoders if hwOnly) that also passes ok.
+func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo) bool) (media.EncoderInfo, bool) {
+	if _, dec := s.clientDecoders()[fam]; !dec {
+		return media.EncoderInfo{}, false
 	}
+	for _, e := range s.a.caps.Encoders {
+		if e.Family == fam && (!hwOnly || e.HW) && s.usableEncoder(e) && (ok == nil || ok(e)) {
+			return e, true
+		}
+	}
+	return media.EncoderInfo{}, false
+}
+
+// negotiateEncoder picks the encoder by configuration, preference and the
+// browser's decoders.
+func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
+	caps := s.a.caps
+	client := s.clientDecoders()
+	usable := s.usableEncoder
 	if s.a.cfg.Encoder != "" {
 		for _, e := range caps.Encoders {
 			if e.Name == s.a.cfg.Encoder {
@@ -345,17 +407,7 @@ func (s *Session) chooseEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
 			}
 		}
 	}
-	pick := func(fam string, hwOnly bool) (media.EncoderInfo, bool) {
-		if _, ok := client[fam]; !ok {
-			return media.EncoderInfo{}, false
-		}
-		for _, e := range caps.Encoders {
-			if e.Family == fam && (!hwOnly || e.HW) && usable(e) {
-				return e, true
-			}
-		}
-		return media.EncoderInfo{}, false
-	}
+	pick := func(fam string, hwOnly bool) (media.EncoderInfo, bool) { return s.pickEncoder(fam, hwOnly, nil) }
 	if prefs.Codec != "" && prefs.Codec != "auto" {
 		if e, ok := pick(prefs.Codec, false); ok {
 			return e, nil
@@ -383,22 +435,13 @@ func (s *Session) chooseEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
 	return media.EncoderInfo{}, errors.New("no codec is supported by both this browser and the host")
 }
 
-func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
-	cfg := s.a.cfg
-	enc, err := s.chooseEncoder(prefs)
-	if err != nil {
-		return media.Params{}, err
-	}
-	mons := s.a.monitors()
-	mon := mons[0]
-	if prefs.Monitor >= 0 && prefs.Monitor < len(mons) {
-		mon = mons[prefs.Monitor]
-	}
-	s.prefsMu.Lock()
-	s.monitor = mon
-	s.prefsMu.Unlock()
-	s.a.inj.SetTarget(input.Rect{X: mon.X, Y: mon.Y, W: mon.W, H: mon.H})
-
+// sessionParams is the encoder-independent part of buildParams for prefs on
+// monitor mon: frame rate and bitrate within the host's limits, cursor,
+// capture timestamps (frameExt: the client parses the frame extension) and
+// the capture source of backendFor(prefs), which it also returns.
+func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, frameExt bool) (media.Params, string) {
+	cfg := a.cfg
+	backend := a.backendFor(prefs)
 	fps := prefs.FPS
 	if fps <= 0 {
 		fps = cfg.DefaultFPS
@@ -406,7 +449,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	if fps > cfg.MaxFPS {
 		fps = cfg.MaxFPS
 	}
-	if mon.Hz > 0 && fps > mon.Hz && s.a.backendFor(prefs) != "test" {
+	if mon.Hz > 0 && fps > mon.Hz && backend != "test" {
 		fps = mon.Hz // capturing faster than the display refreshes only duplicates frames
 	}
 	if fps < 10 {
@@ -423,20 +466,14 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		kbps = 500
 	}
 	p := media.Params{
-		Encoder:     enc,
-		FPS:         fps,
-		BitrateKbps: kbps,
-		Quality:     prefs.Quality,
-		Adaptive:    prefs.AdaptiveBitrate(),
-		DrawCursor:  cfg.DrawCursor || prefs.Cursor == "video" || !s.a.cursorSupported(),
-		// Capture timestamps only reach clients that parse the frame extension.
-		CaptureClock: s.hello.V >= proto.HelloVersionFrameExt && cfg.CaptureTimestamps != "off" && s.a.caps.CanStampCapture(),
+		FPS:          fps,
+		BitrateKbps:  kbps,
+		Quality:      prefs.Quality,
+		Adaptive:     prefs.AdaptiveBitrate(),
+		DrawCursor:   cfg.DrawCursor || prefs.Cursor == "video" || !a.cursorSupported(),
+		CaptureClock: frameExt && cfg.CaptureTimestamps != "off" && a.caps.CanStampCapture(),
 		GPUPriority:  cfg.gpuPriority(),
 	}
-	s.triedMu.Lock()
-	p.Usage = s.usage[enc.Name]
-	s.triedMu.Unlock()
-	backend := s.a.backendFor(prefs)
 	w, h := prefs.Width, prefs.Height
 	if w > 0 && h > 0 && (w >= mon.W && h >= mon.H) {
 		w, h = 0, 0 // never upscale
@@ -447,29 +484,141 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		if w > 0 && h > 0 {
 			p.Source.NativeW, p.Source.NativeH = w&^1, h&^1
 		}
+		p.TestPad = cfg.TestPad
 	case "x11grab":
 		p.Source = media.Source{Backend: "x11grab", Display: cfg.X11Display, X: mon.X, Y: mon.Y, NativeW: mon.W, NativeH: mon.H}
 		p.Width, p.Height = w, h
 	case "gfxcapture":
-		p.Source = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window}
+		p.Source = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window, NativeW: mon.W, NativeH: mon.H}
 		p.Width, p.Height = w, h
-	case "ddagrab":
+	case "ddagrab", "amf":
+		// "amf" needs the encoder: buildParams (useAMFCapture) decides. Both
+		// capture the whole monitor at its native size.
 		out := mon.DXGIOutput
 		if out < 0 {
 			out = mon.Index
 		}
-		p.Source = media.Source{Backend: "ddagrab", Output: out}
+		p.Source = media.Source{Backend: "ddagrab", Output: out, NativeW: mon.W, NativeH: mon.H}
 	}
 	// The test pattern carries each frame's Seq as a barcode (welcome feature
 	// barcode-seq): the client checks the picture it draws against the header.
-	p.Barcode = backend == "test" && s.a.caps.CanDrawBarcode()
+	p.Barcode = backend == "test" && a.caps.CanDrawBarcode()
+	return p, backend
+}
+
+func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
+	mons := s.a.monitors()
+	mon := mons[0]
+	if prefs.Monitor >= 0 && prefs.Monitor < len(mons) {
+		mon = mons[prefs.Monitor]
+	}
+	s.prefsMu.Lock()
+	s.monitor = mon
+	s.prefsMu.Unlock()
+	s.a.inj.SetTarget(input.Rect{X: mon.X, Y: mon.Y, W: mon.W, H: mon.H})
+
+	// Capture timestamps only reach clients that parse the frame extension.
+	p, backend := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
+	outW, outH := p.OutputSize()
+	enc, notice, err := s.chooseEncoder(prefs, outW, outH)
+	if err != nil {
+		return media.Params{}, err
+	}
+	p.Encoder = enc
+	s.triedMu.Lock()
+	p.Usage = s.usage[enc.Name]
+	s.triedMu.Unlock()
+	if backend == "amf" {
+		s.useAMFCapture(&p, mon)
+	}
+	// Once per change: buildParams runs again for every restart.
+	s.prefsMu.Lock()
+	repeat := notice == s.alignNotice
+	s.alignNotice = notice
+	s.prefsMu.Unlock()
+	if notice != "" && !repeat {
+		s.log.Info("coded-size alignment", "notice", notice, "size", fmt.Sprintf("%dx%d", outW, outH), "encoder", enc.Name)
+		s.notice("info", notice)
+	}
 	return p, nil
 }
 
-// backendFor picks the capture backend for the requested preferences.
+// ProbeSample returns, per encoder, the parameters of the session "recon-host
+// probe" prints the ffmpeg command line for: a current browser client at its
+// default settings (the first monitor at its native size, 60 fps, 30 Mbit/s,
+// balanced quality, local cursor) on this host's configuration, by the
+// agent's own rules. Call platform.EnableDPIAwareness first, as the agent does.
+func ProbeSample(cfg *Config, caps *media.Caps) func(media.EncoderInfo) media.Params {
+	a := &Agent{cfg: cfg, caps: caps}
+	return a.probeSample(a.monitors()[0])
+}
+
+func (a *Agent) probeSample(mon platform.Monitor) func(media.EncoderInfo) media.Params {
+	p, backend := a.sessionParams(proto.Prefs{FPS: 60, BitrateKbps: 30000, Quality: "balanced", Cursor: "local"}, mon, true)
+	return func(enc media.EncoderInfo) media.Params {
+		q := p
+		q.Encoder = enc
+		if backend == "amf" && a.amfCaptureBlocker(enc, q.DrawCursor, mon) == "" { // as useAMFCapture
+			q.Source.Backend = "amf"
+		}
+		return q
+	}
+}
+
+// useAMFCapture switches p from ddagrab to AMD Direct Capture of the same
+// monitor (capture "amf", experimental) unless amfCaptureBlocker or an
+// earlier failure in this session rules it out; then p stays on ddagrab and
+// the reason is logged once per change.
+func (s *Session) useAMFCapture(p *media.Params, mon platform.Monitor) {
+	why := s.a.amfCaptureBlocker(p.Encoder, p.DrawCursor, mon)
+	if why == "" && s.amfFailed.Load() {
+		why = "it failed earlier in this session"
+	}
+	s.prefsMu.Lock()
+	repeat := why == s.amfFallback
+	s.amfFallback = why
+	s.prefsMu.Unlock()
+	if why == "" {
+		p.Source.Backend = "amf" // Output: the monitor's DXGI output index
+		return
+	}
+	if !repeat {
+		s.log.Info("AMD Direct Capture (capture \"amf\") not used, capturing with ddagrab", "reason", why)
+	}
+}
+
+// amfCaptureBlocker returns why AMD Direct Capture cannot capture mon for enc,
+// or "" if it can. vsrc_amf hands AMF surfaces to the encoder, which only an
+// AMF encoder takes (CanCaptureAMF); it has no cursor option, so a video that
+// must carry the cursor stays on ddagrab (draw_mouse) until the driver is
+// shown to include it (docs/VENDOR_NOTES.md 1.6). Its monitor_index is taken
+// to be the DXGI output index on adapter 0, on whose device FFmpeg opens AMF
+// (VERIFY): a monitor that is not an output of adapter 0 (another GPU, an
+// IddCx virtual display) has none. vsrc_amf ignores the capture's rotation
+// (AMF leaves it to the consumer; ddagrab rotates), so a rotated monitor
+// stays on ddagrab.
+func (a *Agent) amfCaptureBlocker(enc media.EncoderInfo, drawCursor bool, mon platform.Monitor) string {
+	if err := a.caps.CanCaptureAMF(enc); err != nil {
+		return err.Error()
+	}
+	switch {
+	case drawCursor:
+		return "the video must carry the cursor"
+	case mon.DXGIOutput < 0 || mon.DXGIOutput > 8:
+		return fmt.Sprintf("monitor %d is not output 0-8 of DXGI adapter 0", mon.Index)
+	case mon.Rotated:
+		return fmt.Sprintf("monitor %d is rotated", mon.Index)
+	}
+	return ""
+}
+
+// backendFor picks the capture backend for the requested preferences. AMD
+// Direct Capture ("amf") is opt-in, never chosen automatically, and is only
+// a request: buildParams falls back to ddagrab when amfCaptureBlocker rules it
+// out for the session's encoder.
 func (a *Agent) backendFor(prefs proto.Prefs) string {
 	switch a.cfg.Capture {
-	case "ddagrab", "gfxcapture", "x11grab", "test":
+	case "ddagrab", "gfxcapture", "x11grab", "test", "amf":
 		return a.cfg.Capture
 	}
 	gfx := a.caps.Filters["gfxcapture"]
@@ -735,11 +884,14 @@ func (s *Session) encoderLive() {
 // whose capture source failed, does not: a capture outage of a few seconds
 // (a UAC prompt, the lock screen, a display mode change) fails every restart
 // until it ends and must not move the session to another encoder or usage.
+// Nor does a generation that captured with AMD Direct Capture: the session
+// leaves that capture (noteCaptureFailure), and the restart on ddagrab tests
+// the encoder.
 func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	err := ev.Err
 	s.failures++
 	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live, "encoder_fault", ev.EncoderFault)
-	if ev.Failed != nil && ev.EncoderFault && !ev.Live {
+	if !s.noteCaptureFailure(ev) && ev.Failed != nil && ev.EncoderFault && !ev.Live {
 		s.encoderFailed(*ev.Failed)
 	}
 	if s.failures > 6 {
@@ -755,6 +907,20 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 			}
 		}
 	})
+}
+
+// noteCaptureFailure takes the session off AMD Direct Capture when a
+// generation that used it failed, and reports whether it had: the
+// experimental capture is suspected before the encoder, and the restart that
+// follows uses ddagrab.
+func (s *Session) noteCaptureFailure(ev media.VideoEvent) bool {
+	if ev.Failed == nil || ev.Failed.Source.Backend != "amf" {
+		return false
+	}
+	if !s.amfFailed.Swap(true) {
+		s.log.Warn("AMD Direct Capture failed, using ddagrab for this session", "err", ev.Err)
+	}
+	return true
 }
 
 // encoderFailed decides how the next start treats the encoder of a generation

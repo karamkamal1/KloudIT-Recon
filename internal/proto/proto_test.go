@@ -289,3 +289,77 @@ func TestPrefsAdaptive(t *testing.T) {
 		}
 	}
 }
+
+// TestVideoConfigCrop checks the crop fields the host announces for a padded
+// coded picture, and that protocol.js shows exactly the announced visible
+// part of the frames a decoder outputs (needs node for that part).
+func TestVideoConfigCrop(t *testing.T) {
+	var c VideoConfig
+	c.SetCrop(1920, 1080, 1920, 1080)
+	b, _ := json.Marshal(c)
+	if c.Width != 1920 || c.Height != 1080 || strings.Contains(string(b), "crop") || strings.Contains(string(b), "coded") {
+		t.Fatalf("no padding: %s", b)
+	}
+	c.SetCrop(1920, 1080, 1920, 1082) // RDNA3 AV1 1080p
+	b, _ = json.Marshal(c)
+	if !strings.Contains(string(b), `"width":1920,"height":1080`) ||
+		!strings.Contains(string(b), `"codedWidth":1920,"codedHeight":1082,"cropBottom":2`) || strings.Contains(string(b), "cropRight") {
+		t.Fatalf("1080p: %s", b)
+	}
+	c.SetCrop(3440, 1440, 3456, 1440)
+	if c.CodedWidth != 3456 || c.CodedHeight != 1440 || c.CropRight != 16 || c.CropBottom != 0 {
+		t.Fatalf("3440x1440: %+v", c)
+	}
+	c.SetCrop(1280, 720, 1280, 720) // a later generation without padding clears the fields
+	if c.CodedWidth != 0 || c.CropRight != 0 || c.CropBottom != 0 {
+		t.Fatalf("cleared: %+v", c)
+	}
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	type frame struct{ W, H, DW, DH float64 }
+	cases := []struct {
+		name             string
+		w, h, codW, codH int
+		f                frame
+		wantW, wantH     float64
+		wantFx, wantFy   float64
+	}{
+		{"no crop", 1920, 1080, 1920, 1080, frame{1920, 1080, 1920, 1080}, 1920, 1080, 1, 1},
+		{"av1 1080p padded", 1920, 1080, 1920, 1082, frame{1920, 1082, 1920, 1082}, 1920, 1080, 1, 1080.0 / 1082},
+		{"width padded", 3440, 1440, 3456, 1440, frame{3456, 1440, 3456, 1440}, 3440, 1440, 3440.0 / 3456, 1},
+		{"decoder already cropped", 1920, 1080, 1920, 1082, frame{1920, 1080, 1920, 1080}, 1920, 1080, 1, 1},
+		{"display size differs (render size)", 1920, 1080, 1920, 1082, frame{1920, 1082, 1920, 1080}, 1920, 1080.0 * 1080 / 1082, 1, 1080.0 / 1082},
+		{"test pad", 960, 540, 960, 556, frame{960, 556, 960, 556}, 960, 540, 1, 540.0 / 556},
+	}
+	var in []any
+	for _, c := range cases {
+		var v VideoConfig
+		v.SetCrop(c.w, c.h, c.codW, c.codH)
+		j, _ := json.Marshal(v)
+		in = append(in, map[string]any{"cfg": json.RawMessage(j), "f": c.f})
+	}
+	vec, _ := json.Marshal(in)
+	script := `
+const P = await import(process.argv[1]);
+console.log(JSON.stringify(JSON.parse(process.argv[2]).map(({ cfg, f }) => P.visibleArea(cfg, f.W, f.H, f.DW, f.DH))));`
+	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js), string(vec)).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var got []struct{ W, H, Fx, Fy float64 }
+	if err := json.Unmarshal(out, &got); err != nil || len(got) != len(cases) {
+		t.Fatalf("%v: %s", err, out)
+	}
+	near := func(a, b float64) bool { return a-b < 1e-9 && b-a < 1e-9 }
+	for i, c := range cases {
+		g := got[i]
+		if !near(g.W, c.wantW) || !near(g.H, c.wantH) || !near(g.Fx, c.wantFx) || !near(g.Fy, c.wantFy) {
+			t.Errorf("%s: visibleArea %+v, want w %v h %v fx %v fy %v", c.name, g, c.wantW, c.wantH, c.wantFx, c.wantFy)
+		}
+	}
+}

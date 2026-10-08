@@ -3,7 +3,7 @@
 //
 //	recon-host pair <code>   store the pairing code shown by the gateway
 //	recon-host run           connect to the gateway and serve streams
-//	recon-host probe         list usable encoders / capture backends
+//	recon-host probe         show ffmpeg, its encoders and their command lines
 package main
 
 import (
@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
 
@@ -30,7 +29,8 @@ func usage() {
 Usage:
   recon-host [flags] pair <pairing-code>   pair this PC with a gateway
   recon-host [flags] run                   run the agent (default)
-  recon-host [flags] probe                 show encoders, capture backends and monitors
+  recon-host [flags] probe                 show ffmpeg, encoders (with their ffmpeg
+                                           command lines), capture backends and monitors
   recon-host version
 
 Flags:
@@ -107,27 +107,11 @@ func main() {
 		if caps == nil {
 			fatal(fmt.Errorf("cannot run %s: %w", ff, err))
 		}
-		fmt.Printf("ffmpeg:     %s\n            %s\n", ff, caps.Version)
-		fmt.Printf("capture:    ddagrab=%v gfxcapture=%v\n", caps.Filters["ddagrab"], caps.Filters["gfxcapture"])
-		for _, e := range caps.Encoders {
-			ir := ""
-			if m := caps.IntraRefresh(e.Name); m != "" {
-				ir = " intra-refresh=" + m
-			}
-			fmt.Printf("encoder:    %-12s %-5s %s%s\n", e.Name, e.Family, e.Vendor, ir)
-		}
-		rejected := make([]string, 0, len(caps.Rejected))
-		for name := range caps.Rejected {
-			rejected = append(rejected, name)
-		}
-		sort.Strings(rejected)
-		for _, name := range rejected {
-			fmt.Printf("unusable:   %-12s %s\n", name, caps.Rejected[name])
-		}
+		platform.EnableDPIAwareness()
+		caps.WriteReport(os.Stdout, host.ProbeSample(cfg, caps))
 		if err != nil {
 			fmt.Println("error:", err)
 		}
-		platform.EnableDPIAwareness()
 		mons, _ := platform.Monitors()
 		for _, m := range mons {
 			fmt.Printf("monitor %d:  %s %dx%d@%dHz at (%d,%d) primary=%v dxgi=%d\n", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.DXGIOutput)

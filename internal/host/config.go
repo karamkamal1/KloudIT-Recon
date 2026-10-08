@@ -23,12 +23,14 @@ type Config struct {
 	Token      string `json:"token"`
 
 	FFmpeg     string `json:"ffmpeg,omitempty"`
-	Capture    string `json:"capture"` // auto | ddagrab | gfxcapture | x11grab | test
+	Capture    string `json:"capture"` // auto | ddagrab | gfxcapture | x11grab | test | amf (AMD Direct Capture, experimental, opt-in)
 	X11Display string `json:"x11Display,omitempty"`
 	Encoder    string `json:"encoder,omitempty"` // force an encoder, e.g. hevc_nvenc
 	DrawCursor bool   `json:"drawCursor"`        // bake the cursor into the video instead of local rendering
 	// CaptureTimestamps "off" stops stamping frames with their capture time
 	// (FFmpeg setpts=time(0)*1000000 + a µs encoder time base); default auto = on.
+	// Capture "amf" keeps that wall-clock pts in the FFmpeg chain (vsrc_amf's
+	// own pts are rounded to 1/fps); there "off" only stops sending the stamps.
 	CaptureTimestamps string `json:"captureTimestamps,omitempty"`
 	// GPUPriority is the GPU scheduling priority of the encoder process
 	// (Windows): auto | high | realtime | off ("" = auto).
@@ -46,9 +48,13 @@ type Config struct {
 	AudioKbps   int  `json:"audioKbps"`
 	Gamepad     bool `json:"gamepad"`
 
-	TestWidth  int    `json:"testWidth,omitempty"`
-	TestHeight int    `json:"testHeight,omitempty"`
-	LogLevel   string `json:"logLevel,omitempty"`
+	TestWidth  int `json:"testWidth,omitempty"`
+	TestHeight int `json:"testHeight,omitempty"`
+	// TestPad: rows of padding below the test pattern that clients must crop
+	// (VideoConfig cropBottom), as an encoder that pads the coded picture
+	// produces; the browser E2E checks the client's crop with it.
+	TestPad  int    `json:"testPad,omitempty"`
+	LogLevel string `json:"logLevel,omitempty"`
 
 	path string // file it was loaded from; the agent re-reads it to pick up a new pairing
 }
