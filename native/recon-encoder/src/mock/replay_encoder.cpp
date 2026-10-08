@@ -74,10 +74,22 @@ Caps ReplayEncoder::caps() {
     return c;
 }
 
-Status ReplayEncoder::init(const StartParams& p, Started& out) {
+Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) {
     if (!clipError_.empty()) return Status::Error("unavailable", clipError_);
     if (p.codec != "h264") return Status::Error("unsupported", "the mock backend only encodes h264, not " + p.codec);
+    in = InputSpec{};
+    if (src.device) {
+        in.format = InputSpec::Format::Nv12;
+        in.width = uint32_t(p.width ? p.width : int(src.width)) & ~1u;
+        in.height = uint32_t(p.height ? p.height : int(src.height)) & ~1u;
+    }
     std::lock_guard<std::mutex> lock(mu_);
+    if (initialized_) {
+        // Only a start that failed after init() leads here (a running stream
+        // answers already_started): stream.cpp must have called release().
+        return Status::Error("init_failed", "mock: init() again without release() after a failed start (Backend contract)");
+    }
+    initialized_ = true;
     pos_ = 0;
     idrPending_ = false;
     stopped_ = false;
@@ -88,10 +100,17 @@ Status ReplayEncoder::init(const StartParams& p, Started& out) {
     out.height = kClipHeight;
     out.fps = p.fps;
     out.kbps = p.kbps;
+    out.liveBitrate = "seamless";  // recorded only: the canned stream does not change
     return Status::Ok();
 }
 
-Status ReplayEncoder::submit(const CapturedFrame&, const SubmitInfo& info) {
+void ReplayEncoder::release() {
+    std::lock_guard<std::mutex> lock(mu_);
+    initialized_ = false;
+    queue_.clear();
+}
+
+Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
     if (opt_.hangAt && info.frameId == opt_.hangAt) {
         logf(LogLevel::Warn, "mock: hanging in submit at frame %llu", static_cast<unsigned long long>(info.frameId));
         for (;;) Sleep(INFINITE);

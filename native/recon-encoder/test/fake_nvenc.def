@@ -1,0 +1,7 @@
+; Exports of recon-fake-nvenc.dll (test/fake_nvenc.cpp): the two entry points
+; of the NVIDIA driver's nvEncodeAPI64.dll, and the self-test's control.
+LIBRARY recon-fake-nvenc
+EXPORTS
+    NvEncodeAPIGetMaxSupportedVersion
+    NvEncodeAPICreateInstance
+    ReconFakeNvencControl

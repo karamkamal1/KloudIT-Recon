@@ -6,6 +6,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "platform/platform.hpp"
+
 namespace recon {
 
 using json = nlohmann::ordered_json;  // keeps "t" first in every message
@@ -57,15 +59,55 @@ bool inRange(int v, int lo, int hi) { return v >= lo && v <= hi; }
 
 Status bad(std::string text) { return Status::Error("bad_message", std::move(text)); }
 
+Status parseBarcode(const json& j, BarcodeLayout& b) {
+    if (!j.is_object()) return bad("barcode must be an object");
+    std::string err;
+    if (!optField(j, "x", b.x, err) || !optField(j, "y", b.y, err) || !optField(j, "blockW", b.blockW, err) ||
+        !optField(j, "blockH", b.blockH, err) || !optField(j, "cols", b.cols, err) || !optField(j, "bits", b.bits, err) ||
+        !optField(j, "msbFirst", b.msbFirst, err)) {
+        return bad("barcode: " + err);
+    }
+    // Even positions and sizes: every block covers whole 4:2:0 chroma samples.
+    if (!inRange(b.x, 0, 16384) || !inRange(b.y, 0, 16384) || (b.x & 1) || (b.y & 1)) return bad("barcode x/y must be even, 0..16384");
+    if (!inRange(b.blockW, 2, 256) || !inRange(b.blockH, 2, 256) || (b.blockW & 1) || (b.blockH & 1)) {
+        return bad("barcode blockW/blockH must be even, 2..256");
+    }
+    if (!inRange(b.cols, 1, 64) || !inRange(b.bits, 1, 64)) return bad("barcode cols and bits must be 1..64");
+    b.enabled = true;
+    return Status::Ok();
+}
+
 Status parseStart(const json& j, StartParams& p) {
     std::string err;
+    if (!optField(j, "hmonitor", p.hmonitor, err) || !optField(j, "adapterLuid", p.adapterLuid, err) ||
+        !optField(j, "window", p.window, err) || !optField(j, "windowTitle", p.windowTitle, err) ||
+        !optField(j, "gpuPriority", p.gpuPriority, err) || !optField(j, "idleRepeatMs", p.idleRepeatMs, err)) {
+        return bad(err);
+    }
+    if (auto it = j.find("barcode"); it != j.end() && !it->is_null()) {
+        Status bs = parseBarcode(*it, p.barcode);
+        if (!bs.ok) return bs;
+    }
+    if (p.gpuPriority.empty()) p.gpuPriority = "auto";
+    if (p.gpuPriority != "auto" && p.gpuPriority != "high" && p.gpuPriority != "realtime" && p.gpuPriority != "off") {
+        return bad("gpuPriority must be auto, high, realtime or off");
+    }
+    if (p.idleRepeatMs == 0) p.idleRepeatMs = 100;
+    if (!inRange(p.idleRepeatMs, 20, 2000)) return bad("idleRepeatMs out of range (20..2000)");
+    if (p.windowTitle.size() > 512) return bad("windowTitle too long");
+    if (!p.adapterLuid.empty()) {
+        LUID l;
+        if (!parseLuid(p.adapterLuid, l)) return bad("adapterLuid must look like 0000abcd:00001234");
+    }
     if (!optField(j, "capture", p.capture, err) || !optField(j, "monitor", p.monitor, err) ||
         !optField(j, "codec", p.codec, err) || !optField(j, "width", p.width, err) ||
         !optField(j, "height", p.height, err) || !optField(j, "fps", p.fps, err) ||
         !optField(j, "kbps", p.kbps, err) || !optField(j, "vbvFrames", p.vbvFrames, err) ||
         !optField(j, "rc", p.rc, err) || !optField(j, "quality", p.quality, err) ||
         !optField(j, "hdr", p.hdr, err) || !optField(j, "ltrSlots", p.ltrSlots, err) ||
-        !optField(j, "svcLayers", p.svcLayers, err)) {
+        !optField(j, "svcLayers", p.svcLayers, err) || !optField(j, "liveBitrate", p.liveBitrate, err) ||
+        !optField(j, "encoderInstance", p.encoderInstance, err) || !optField(j, "ltrInterval", p.ltrInterval, err) ||
+        !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err)) {
         return bad(err);
     }
     if (p.codec != "h264" && p.codec != "hevc" && p.codec != "av1") return bad("codec must be h264, hevc or av1");
@@ -78,6 +120,15 @@ Status parseStart(const json& j, StartParams& p) {
     if (p.quality != "speed" && p.quality != "balanced" && p.quality != "quality") return bad("unknown quality");
     if (!inRange(p.ltrSlots, 0, 8)) return bad("ltrSlots out of range");
     if (!inRange(p.svcLayers, 1, 4)) return bad("svcLayers out of range");
+    if (!p.liveBitrate.empty() && p.liveBitrate != "seamless" && p.liveBitrate != "flush") {
+        return bad("liveBitrate must be seamless or flush");
+    }
+    if (!inRange(p.encoderInstance, -1, 15)) return bad("encoderInstance out of range (-1..15)");
+    if (!inRange(p.ltrInterval, 0, 1000)) return bad("ltrInterval out of range (0..1000)");
+    if (!inRange(p.intraRefreshFrames, 0, 1000)) return bad("intraRefreshFrames out of range (0..1000)");
+    if ((p.window || !p.windowTitle.empty()) && !p.capture.empty() && p.capture != "wgc") {
+        return bad("window capture needs capture \"wgc\"");
+    }
     return Status::Ok();
 }
 
@@ -90,6 +141,11 @@ Status parseControl(std::string_view text, ControlMsg& m) {
     if (!optField(j, "t", m.type, err)) return bad(err);
     if (m.type == "start") return parseStart(j, m.start);
     if (m.type == "forceIdr" || m.type == "shutdown") return Status::Ok();
+    if (m.type == "ack") {
+        if (!j.contains("frameId")) return bad("ack needs frameId");
+        if (!optField(j, "frameId", m.ackFrameId, err)) return bad(err);
+        return Status::Ok();
+    }
     if (m.type == "recover") {
         if (!j.contains("lostFromFrameId")) return bad("recover needs lostFromFrameId");
         uint64_t acked = 0;
@@ -150,10 +206,31 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"queryTimeout", cc.queryTimeout},
             {"alignW", cc.alignW},
             {"alignH", cc.alignH},
+            {"dynamicResolution", cc.dynamicResolution},
         };
+        if (!cc.assumed.empty()) codecs[name]["assumed"] = cc.assumed;
     }
     json unavailable = json::object();
     for (const auto& [name, why] : c.unavailable) unavailable[name] = why;
+    json outputs = json::array();
+    for (const OutputDesc& o : c.outputs) {
+        outputs.push_back({
+            {"index", o.index},
+            {"adapterIndex", o.adapterIndex},
+            {"outputIndex", o.outputIndex},
+            {"adapterLuid", o.adapterLuid},
+            {"adapterName", o.adapterName},
+            {"vendor", o.vendor},
+            {"name", o.name},
+            {"hmonitor", o.hmonitor},
+            {"x", o.x},
+            {"y", o.y},
+            {"width", o.width},
+            {"height", o.height},
+            {"rotation", o.rotation},
+            {"attached", o.attached},
+        });
+    }
     json j = {
         {"t", "caps"},
         {"v", kProtocolVersion},
@@ -165,6 +242,8 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
         {"hagsEnabled", c.hagsEnabled ? json(*c.hagsEnabled) : json(nullptr)},
         {"codecs", codecs},
         {"capture", c.capture},
+        {"cursorInVideo", c.cursorInVideo},
+        {"outputs", outputs},
         {"unavailable", unavailable},
         {"qpcFrequency", qpcFrequency},
     };
@@ -173,10 +252,49 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
 
 std::string encodeStarted(const Started& s) {
     json j = {
-        {"t", "started"}, {"backend", s.backend}, {"capture", s.capture}, {"codec", s.codec},
-        {"width", s.width}, {"height", s.height}, {"fps", s.fps}, {"kbps", s.kbps},
+        {"t", "started"},
+        {"backend", s.backend},
+        {"capture", s.capture},
+        {"codec", s.codec},
+        {"width", s.width},
+        {"height", s.height},
+        {"fps", s.fps},
+        {"kbps", s.kbps},
+        {"captureWidth", s.captureWidth},
+        {"captureHeight", s.captureHeight},
+        {"adapterLuid", s.adapterLuid},
+        {"adapterName", s.adapterName},
+        {"vendor", s.vendor},
+        {"hagsEnabled", s.hagsEnabled ? json(*s.hagsEnabled) : json(nullptr)},
+        {"gpuPriority", s.gpuPriority},
+        {"idleRepeatMs", s.idleRepeatMs},
+        {"barcode", s.barcode},
+        {"cursorInVideo", s.cursorInVideo},
+        {"codedWidth", s.codedWidth ? s.codedWidth : s.width},
+        {"codedHeight", s.codedHeight ? s.codedHeight : s.height},
+        {"cropRight", s.codedWidth ? s.codedWidth - s.width : 0},
+        {"cropBottom", s.codedHeight ? s.codedHeight - s.height : 0},
+        {"liveBitrate", s.liveBitrate},
+        {"rateControl", s.rateControl},
+        {"usage", s.usage},
+        {"ltrSlots", s.ltrSlots},
+        {"ltrInterval", s.ltrInterval},
+        {"encoderInstance", s.encoderInstance},
+        {"hwInstances", s.hwInstances},
+        {"queryTimeoutMs", s.queryTimeoutMs},
+        {"zeroCopy", s.zeroCopy},
+        {"intraRefreshFrames", s.intraRefreshFrames},
+        {"preset", s.preset},
+        {"asyncEncode", s.asyncEncode},
+        {"refFrames", s.refFrames},
     };
-    return j.dump();
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+std::string encodeCaptureEvent(const CaptureEvent& e) {
+    json j = {{"t", "captureChanged"}, {"reason", e.reason}, {"width", e.width},
+              {"height", e.height}, {"rotation", e.rotation}, {"text", e.text}};
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 std::string encodeStats(const FrameStats& s) {
@@ -187,6 +305,8 @@ std::string encodeStats(const FrameStats& s) {
         {"dropped", s.dropped},
         {"key", s.key},
         {"recovery", s.recovery},
+        {"repeat", s.repeat},
+        {"dirtyPct", s.dirtyPct},
         {"bytes", s.bytes},
         {"presentQpc", s.presentQpc},
         {"captureQpc", s.captureQpc},

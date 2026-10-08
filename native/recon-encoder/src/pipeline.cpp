@@ -6,6 +6,28 @@ namespace recon {
 
 namespace {
 constexpr int kPollMs = 100;  // how often the threads look at the stop flag when idle
+constexpr uint64_t kDumpFrameId = 30;
+}
+
+void Pipeline::dump(const d3d::ConvertedFrame& f, uint64_t frameId) {
+    dumped_ = true;
+    std::vector<uint8_t> data;
+    Status s = opt_.converter->readback(f, data);
+    HANDLE file = s.ok ? CreateFileW(fromUtf8(opt_.dumpPath).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                     FILE_ATTRIBUTE_NORMAL, nullptr)
+                       : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        const bool ok = WriteFile(file, data.data(), DWORD(data.size()), &wrote, nullptr) && wrote == data.size();
+        CloseHandle(file);
+        if (ok) {
+            logf(LogLevel::Info, "dumped frame %llu (%ux%u NV12) to %s", static_cast<unsigned long long>(frameId),
+                 opt_.converter->width(), opt_.converter->height(), opt_.dumpPath.c_str());
+            return;
+        }
+    }
+    logf(LogLevel::Warn, "could not dump frame %llu to %s: %s", static_cast<unsigned long long>(frameId), opt_.dumpPath.c_str(),
+         s.ok ? "write failed" : s.text.c_str());
 }
 
 void Pipeline::start() {
@@ -41,13 +63,20 @@ Status Pipeline::setRate(const RateParams& r) {
 
 void Pipeline::captureLoop() {
     uint64_t nextId = 1;
+    int64_t lastPoolWarn = 0, lastBusyWarn = 0;
     while (!stop_) {
         CapturedFrame frame;
         Status err;
-        switch (cap_.next(frame, kPollMs, err)) {
+        const Next r = cap_.next(frame, kPollMs, err);
+        CaptureEvent ev;
+        while (cap_.takeEvent(ev)) rep_.captureChanged(ev);
+        switch (r) {
         case Next::Timeout:
             continue;
         case Next::Stopped:
+            // Only stop() may end capture: anything else would leave a
+            // started helper without frames and without an error.
+            if (!stop_) rep_.fatal(Status::Error("capture_failed", std::string("capture ") + cap_.name() + " ended unexpectedly", true));
             return;
         case Next::Error:
             if (err.fatal) {
@@ -60,12 +89,56 @@ void Pipeline::captureLoop() {
             break;
         }
         SubmitInfo info;
-        info.frameId = nextId++;
+        info.frameId = nextId;
         info.presentQpc = frame.presentQpc;
         info.captureQpc = frame.captureQpc;
+        info.repeat = frame.repeat;
+        info.dirtyPct = frame.dirtyPct;
+        EncoderFrame ef;
+        ef.captured = &frame;
+        if (opt_.converter && frame.texture) {
+            d3d::ConvertedFrame cf;
+            Status cs = opt_.converter->convert(frame.texture, frame.rotation, info.frameId, cf);
+            if (!cs.ok) {
+                cap_.release(frame);
+                if (cs.code == "pool_exhausted") {
+                    // The encoder still holds every converted frame: drop this
+                    // capture before it gets a frame id (never wait for the encoder).
+                    const int64_t now = qpcNow();
+                    if (now - lastPoolWarn > qpcFrequency()) {
+                        logf(LogLevel::Warn, "encoder is behind: dropping captured frames before encoding");
+                        lastPoolWarn = now;
+                    }
+                    continue;
+                }
+                if (cs.fatal) {
+                    rep_.fatal(cs);
+                    return;
+                }
+                rep_.error(cs, "");
+                continue;
+            }
+            ef.nv12 = cf.nv12;
+            ef.hold = cf.hold;
+            ef.poolIndex = cf.index;
+            if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);
+        }
         info.submitQpc = qpcNow();
-        Status s = enc_.submit(frame, info);
+        Status s = enc_.submit(ef, info);
+        ef = EncoderFrame{};  // the backend kept its own reference if it needs one
         cap_.release(frame);
+        if (s.code == "encoder_busy") {
+            // The encoder did not take the frame (its input queue is full, or
+            // an idle repeat of an image it is still encoding): drop it without
+            // using up the frame id, so no gap looks like a loss.
+            const int64_t now = qpcNow();
+            if (now - lastBusyWarn > qpcFrequency()) {
+                logf(LogLevel::Warn, "encoder is behind: dropping a captured frame (%s)", s.text.c_str());
+                lastBusyWarn = now;
+            }
+            continue;
+        }
+        ++nextId;
         if (!s.ok) {
             if (s.fatal) {
                 rep_.fatal(s);
@@ -84,6 +157,7 @@ void Pipeline::outputLoop() {
         case Next::Timeout:
             continue;
         case Next::Stopped:
+            if (!stop_) rep_.fatal(Status::Error("encode_failed", std::string("encoder ") + enc_.name() + " stopped unexpectedly", true));
             return;
         case Next::Error:
             if (err.fatal) {
@@ -110,6 +184,8 @@ void Pipeline::outputLoop() {
         st.dropReason = wr == WriteResult::Full ? "ringFull" : wr == WriteResult::TooLarge ? "tooLarge" : "";
         st.key = f.key;
         st.recovery = f.recovery;
+        st.repeat = f.info.repeat;
+        st.dirtyPct = f.info.dirtyPct;
         st.bytes = f.size;
         st.presentQpc = f.info.presentQpc;
         st.captureQpc = f.info.captureQpc;

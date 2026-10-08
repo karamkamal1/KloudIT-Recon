@@ -25,10 +25,12 @@ windows:
 
 # Native capture/encode helper recon-encoder.exe (native/recon-encoder), cross-compiled
 # with mingw-w64 (apt-get install mingw-w64 cmake). Skipped when the toolchain is missing,
-# unless HELPER_REQUIRED=1 (CI release builds).
+# unless HELPER_REQUIRED=1. The mingw build has no Windows.Graphics.Capture (no C++/WinRT):
+# releases ship the MSVC build from CI instead (make release HELPER_EXE=path/to/recon-encoder.exe).
 MINGW_CXX       ?= x86_64-w64-mingw32-g++
 HELPER_BUILD     = $(DIST)/obj/recon-encoder
 HELPER_REQUIRED ?= 0
+HELPER_EXE      ?=
 WINE            ?= wine
 
 helper:
@@ -43,10 +45,14 @@ helper:
 		echo "helper: mingw-w64 ($(MINGW_CXX)) or cmake not found, skipping recon-encoder.exe"; \
 	fi
 
-# Helper integration tests (mock backend) under Wine, against the mingw build.
+# Helper integration tests (mock backend, the NVENC backend against its test double
+# recon-fake-nvenc.dll) under Wine, against the mingw build. Wine's D3D11 needs an X
+# display: run under xvfb-run (Mesa llvmpipe) to include the GPU conversion self-test,
+# the synthetic-gpu pipeline test and the NVENC test; headless they skip.
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
+		RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
 		$(WINE) ./encoder.test.exe -test.v -test.count=1
 
 # third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests
@@ -86,7 +92,11 @@ release: clean
 		tar -C $(DIST) -czf $(DIST)/kloudit-recon-$(VERSION)-$$d.tar.gz $$d; \
 	done
 	$(MAKE) windows
-	$(MAKE) helper
+	@if [ -n "$(HELPER_EXE)" ]; then \
+		echo "helper: using $(HELPER_EXE)"; cp "$(HELPER_EXE)" $(DIST)/windows/recon-encoder.exe; \
+	else \
+		$(MAKE) helper; \
+	fi
 	cd $(DIST) && mv windows host-windows-amd64 && zip -qr kloudit-recon-$(VERSION)-host-windows-amd64.zip host-windows-amd64
 	cd $(DIST) && sha256sum *.tar.gz *.zip > SHA256SUMS
 

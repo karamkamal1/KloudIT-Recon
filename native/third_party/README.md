@@ -15,8 +15,9 @@ Notes
 - The AMF directory is laid out as `include/AMF/{core,components}` so sources include
   `<AMF/core/Factory.h>`, as FFmpeg does. `amf/LICENSE.txt` also contains AMD's notice
   about codec patents; the headers themselves are MIT.
-- NVENC API 13.0 needs an NVIDIA driver 570 or newer. The NVENC backend (3.4) should ask
-  `NvEncodeAPIGetMaxSupportedVersion` and report an old driver in caps (the 3.1 probe
-  already does) rather than failing at session time.
+- NVENC API 13.0 needs an NVIDIA driver 570 or newer. The NVENC backend asks
+  `NvEncodeAPIGetMaxSupportedVersion` and reports an older driver in caps
+  (`unavailable.nvenc`, naming the driver to install) rather than failing at session time
+  (`src/nvenc/nvenc_runtime.cpp`).
 - To update: replace the files from the new upstream tag, update this table, rebuild
   (`make helper`) and run the helper tests (`make helper-test`, CI job `helper-windows`).

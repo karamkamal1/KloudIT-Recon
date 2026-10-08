@@ -3,11 +3,14 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <thread>
 
 #include "backend.hpp"
+#include "d3d/convert.hpp"
 #include "ring.hpp"
 
 namespace recon {
@@ -20,12 +23,21 @@ public:
     virtual void error(const Status& s, std::string_view re) = 0;
     // Sends the fatal error and makes the main thread shut the helper down.
     virtual void fatal(const Status& s) = 0;
+    virtual void captureChanged(const CaptureEvent& ev) = 0;
+};
+
+struct PipelineOptions {
+    // Converts every GPU frame to NV12 before Backend::submit (InputSpec::Nv12).
+    std::unique_ptr<d3d::Nv12Converter> converter;
+    // --dump-nv12: writes the converted frame with id kDumpFrameId (or the
+    // first one after it) to this file, raw NV12, then logs it.
+    std::string dumpPath;
 };
 
 class Pipeline {
 public:
-    Pipeline(Backend& enc, Capture& cap, RingWriter& ring, Reporter& rep, const RateParams& rate)
-        : enc_(enc), cap_(cap), ring_(ring), rep_(rep), rate_(rate) {}
+    Pipeline(Backend& enc, Capture& cap, RingWriter& ring, Reporter& rep, const RateParams& rate, PipelineOptions opt = {})
+        : enc_(enc), cap_(cap), ring_(ring), rep_(rep), rate_(rate), opt_(std::move(opt)) {}
     ~Pipeline() { stop(); }
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
@@ -44,6 +56,7 @@ private:
     void captureLoop();
     void outputLoop();
     RateParams rate();
+    void dump(const d3d::ConvertedFrame& f, uint64_t frameId);
 
     Backend& enc_;
     Capture& cap_;
@@ -52,6 +65,8 @@ private:
 
     std::mutex rateMu_;
     RateParams rate_;
+    PipelineOptions opt_;
+    bool dumped_ = false;
 
     std::atomic<bool> stop_{false};
     std::thread capture_;

@@ -1,6 +1,5 @@
-// Real capture methods and encoder backends. In this skeleton (step 3.1) they
-// only probe for their runtime and report "not available"; steps 3.2 (capture),
-// 3.3 (AMF) and 3.4 (NVENC) implement them behind the same factories.
+// Real capture methods and encoder backends behind factories: the capture
+// methods (step 3.2), the AMF encoder (3.3) and the NVENC encoder (3.4).
 #pragma once
 
 #include <windows.h>
@@ -24,11 +23,17 @@ Fn procAddress(HMODULE m, const char* name) {
     return reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(m, name)));
 }
 
-// Encoders (amf/amf_backend.cpp, nvenc/nvenc_backend.cpp).
+// Encoders (amf/amf_backend.cpp, nvenc/nvenc_backend.cpp). probeAmf creates
+// each AMF encoder once on the first AMD adapter and reads its caps, probeNvenc
+// opens one NVENC session on the first NVIDIA adapter and reads every codec's
+// caps (both cached for the process).
 Probe probeAmf();
 std::unique_ptr<Backend> createAmfBackend(Status& err);
 Probe probeNvenc();
 std::unique_ptr<Backend> createNvencBackend(Status& err);
+// The NVENC caps from a new probe rather than the cached one (--self-test-nvenc
+// changes its test double's capabilities between probes).
+Caps probeNvencCaps();
 
 // Capture (capture/*.cpp).
 Probe probeDdaCapture();
@@ -37,5 +42,7 @@ Probe probeAmdDirectCapture();
 std::unique_ptr<Capture> createAmdDirectCapture(Status& err);
 Probe probeWgcCapture();
 std::unique_ptr<Capture> createWgcCapture(Status& err);
+// Test source: a simulated game presenting into a D3D11 texture (capture/test_capture.cpp).
+std::unique_ptr<Capture> createGpuTestCapture(Status& err);
 
 }  // namespace recon

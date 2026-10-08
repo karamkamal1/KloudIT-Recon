@@ -19,6 +19,13 @@ Status SyntheticCapture::init(const StartParams& p) {
     return Status::Ok();
 }
 
+SourceInfo SyntheticCapture::source() const {
+    SourceInfo s;
+    s.width = width_;
+    s.height = height_;
+    return s;
+}
+
 Next SyntheticCapture::next(CapturedFrame& out, int timeoutMs, Status&) {
     if (WaitForSingleObject(stop_, 0) == WAIT_OBJECT_0) return Next::Stopped;
     int64_t deadline;

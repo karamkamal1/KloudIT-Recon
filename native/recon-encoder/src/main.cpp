@@ -18,10 +18,14 @@
 
 #include "backend.hpp"
 #include "control.hpp"
+#include "d3d/convert.hpp"
+#include "encode_test.hpp"
 #include "pipeline.hpp"
 #include "platform/platform.hpp"
 #include "protocol.hpp"
 #include "ring.hpp"
+#include "selftest.hpp"
+#include "stream.hpp"
 
 using namespace recon;
 
@@ -30,6 +34,8 @@ namespace {
 const char kUsage[] =
     "usage: recon-encoder --ring-handle=H --ring-size=N --event-handle=H [options]\n"
     "       recon-encoder --print-caps [--backend=B]\n"
+    "       recon-encoder --self-test-convert | --self-test-pacer | --self-test-encoder | --self-test-nvenc[=DLL]\n"
+    "       recon-encoder --encode-test=FILE [--backend=B] [encode test options]\n"
     "       recon-encoder --version\n"
     "\n"
     "Started by recon-host; speaks the protocol in docs/HELPER_PROTOCOL.md on stdin/stdout.\n"
@@ -42,10 +48,36 @@ const char kUsage[] =
     "  --mock-error-at=N    mock only: report a non-fatal error when frame N is submitted\n"
     "  --mock-fatal-at=N    mock only: fail fatally when frame N is submitted\n"
     "  --mock-hang-at=N     mock only: never return from submitting frame N (a call stuck in the driver)\n"
-    "  --print-caps         print the capabilities JSON and exit\n";
+    "  --dump-nv12=PATH     write converted frame 30 (raw NV12, encoded size) to PATH\n"
+    "  --print-caps         print the capabilities JSON and exit\n"
+    "  --self-test-convert[=warp|hw]  check the GPU colour conversion on a WARP device (default) or\n"
+    "                       the default hardware adapter (exit 0 ok, 1 failed, 77 no device)\n"
+    "  --self-test-pacer    check the frame pacing policy on simulated presents (exit 0 ok, 1 failed)\n"
+    "  --self-test-encoder  check the encoder logic: LTR and invalidation recovery policies, parameter sets, ROI maps,\n"
+    "                       NVENC settings (exit 0 / 1)\n"
+    "  --self-test-nvenc[=DLL]  drive the NVENC backend: against DLL (the test double recon-fake-nvenc.dll, no GPU\n"
+    "                       needed) or, without DLL, the NVIDIA driver (exit 0 ok, 1 failed, 77 no device / runtime)\n"
+    "\n"
+    "Encode test: one stream through the real capture, conversion, encoder and ring, without\n"
+    "recon-host; the bitstream goes to FILE (Annex-B for h264/hevc, IVF for av1), a summary to stdout:\n"
+    "  --codec=hevc|h264|av1  --capture=dda|amd-direct|wgc|synthetic-gpu|synthetic  --frames=N (300)\n"
+    "  --width=W --height=H (0 = capture size)  --fps=N (60)  --kbps=N (20000)  --rc=cbr|vbr\n"
+    "  --quality=speed|balanced|quality  --vbv=FRAMES (1.0)  --ltr-slots=N  --ltr-interval=N\n"
+    "  --live-bitrate=seamless|flush  --instance=N  --zero-copy=0|1  --intra-refresh=N\n"
+    "  --monitor=N  --hmonitor=H  --ack-delay=N (frames until an LTR frame is acknowledged, 2)\n"
+    "  --dxgi-gate=0|1 (1)  0: DDA and NVENC's Lock/UnlockBitstream not serialized (docs/VENDOR_NOTES.md 3.4 A/B)\n"
+    "  --at=N:EVENT  at frame id N: idr | loss | rate=KBPS | fps=FPS | roi=X,Y,W,H,WEIGHT | roi=off (repeatable)\n";
 
 struct Args {
     bool printCaps = false;
+    bool selfTestConvert = false;
+    bool selfTestHardware = false;
+    bool selfTestPacer = false;
+    bool selfTestEncoder = false;
+    bool selfTestNvenc = false;
+    std::string selfTestNvencDll;  // --self-test-nvenc=DLL (test double), empty = the driver
+    EncodeTestOptions encodeTest;
+    std::string dumpNv12;
     bool version = false;
     bool help = false;
     std::string backend = "auto";
@@ -73,6 +105,21 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         }
         bool ok = true;
         if (key == "--print-caps") a.printCaps = true;
+        else if (key == "--self-test-convert") {
+            a.selfTestConvert = true;
+            ok = val.empty() || val == "warp" || val == "hw";
+            a.selfTestHardware = val == "hw";
+        }
+        else if (key == "--self-test-pacer") a.selfTestPacer = true;
+        else if (key == "--self-test-encoder") a.selfTestEncoder = true;
+        else if (key == "--self-test-nvenc") {
+            a.selfTestNvenc = true;
+            a.selfTestNvencDll = val;
+        }
+        else if (key == "--encode-test") ok = !(a.encodeTest.output = val).empty();
+        else if (encodeTestOption(key, val, a.encodeTest, ok)) {
+        }
+        else if (key == "--dump-nv12") ok = !(a.dumpNv12 = val).empty();
         else if (key == "--version") a.version = true;
         else if (key == "--help" || key == "-h") a.help = true;
         else if (key == "--backend") a.backend = val;
@@ -100,7 +147,14 @@ bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
         err = "--mock-* options need --backend=mock";
         return false;
     }
-    if (!a.printCaps && !a.version && !a.help && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
+    if (a.encodeTest.used && a.encodeTest.output.empty()) {
+        err = "encode test options need --encode-test=FILE";
+        return false;
+    }
+    const bool standalone =
+        a.printCaps || a.version || a.help || a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder || a.selfTestNvenc ||
+        !a.encodeTest.output.empty();
+    if (!standalone && (!a.ringHandle || !a.ringSize || !a.eventHandle)) {
         err = "--ring-handle, --ring-size and --event-handle are required";
         return false;
     }
@@ -138,6 +192,7 @@ public:
         logf(LogLevel::Warn, "%s: %s", s.code.c_str(), s.text.c_str());
         c_.send(encodeError(s, re));
     }
+    void captureChanged(const CaptureEvent& ev) override { c_.send(encodeCaptureEvent(ev)); }
     void fatal(const Status& s) override {
         if (!fatal_.exchange(true)) {
             logf(LogLevel::Error, "fatal: %s: %s", s.code.c_str(), s.text.c_str());
@@ -155,13 +210,15 @@ private:
     std::atomic<bool> fatal_{false};
 };
 
-std::string joinUnavailable(const Caps& caps) {
-    std::string out;
-    for (const auto& [name, why] : caps.unavailable) {
-        if (!out.empty()) out += "; ";
-        out += name + ": " + why;
-    }
-    return out;
+// Desktop coordinates in physical pixels, and IDXGIOutput5::DuplicateOutput1
+// needs a per-monitor DPI aware process (Sunshine display_base.cpp sets the
+// same before display init). user32 entry point of Windows 10 1703+.
+void setDpiAwareness() {
+    using Fn = BOOL(WINAPI*)(HANDLE);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto fn = user32 ? reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")))
+                     : nullptr;
+    if (fn) fn(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)));  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 }
 
 }  // namespace
@@ -185,8 +242,30 @@ int main(int argc, char** argv) {
         return kExitOk;
     }
     setLogLevel(a.logLevel);
+    setDpiAwareness();
+    if (a.selfTestNvenc) {
+        // Alone: it must choose the NVENC runtime before anything loads it.
+        const int rc = runNvencSelfTest(fromUtf8(a.selfTestNvencDll));
+        std::fflush(stdout);
+        return rc;
+    }
+    if (a.selfTestConvert || a.selfTestPacer || a.selfTestEncoder) {
+        int rc = 0;
+        if (a.selfTestPacer) rc = runPacerSelfTest();
+        if (a.selfTestEncoder) {
+            const int e = runEncoderSelfTest();
+            if (rc == 0) rc = e;
+        }
+        if (a.selfTestConvert) {
+            const int c = runConvertSelfTest(a.selfTestHardware);
+            if (rc == 0) rc = c;
+        }
+        std::fflush(stdout);
+        return rc;
+    }
 
     BackendChoice choice = chooseBackend(a.backend, a.mock);
+    if (!a.encodeTest.output.empty()) return runEncodeTest(a.encodeTest, choice);
     if (a.printCaps) {
         std::printf("%s\n", encodeCaps(choice.caps, qpcFrequency()).c_str());
         return kExitOk;
@@ -255,43 +334,24 @@ int main(int argc, char** argv) {
                 rep.error(Status::Error("already_started", "the helper encodes one stream; restart it to change"), m.type);
                 continue;
             }
-            if (!choice.backend) {
-                rep.error(Status::Error("unavailable", "no usable encoder backend: " + joinUnavailable(choice.caps)), m.type);
-                continue;
-            }
-            std::string capName = m.start.capture;
-            if (capName.empty()) capName = choice.caps.capture.empty() ? "dda" : choice.caps.capture.front();
-            Status cs;
-            capture = createCapture(capName, cs);
-            if (capture) cs = capture->init(m.start);
-            if (!capture || !cs.ok) {
-                capture.reset();
-                rep.error(cs, m.type);
-                continue;
-            }
+            StartResult sr;
             Started st;
-            Status es = choice.backend->init(m.start, st);
-            if (!es.ok) {
-                capture->shutdown();
-                capture.reset();
-                if (es.fatal) {
-                    rep.fatal(es);
+            Status ss = startStream(m.start, choice, ring, rep, a.dumpNv12, sr, st);
+            if (!ss.ok) {
+                if (ss.fatal) {
+                    rep.fatal(ss);
                     exitCode = kExitFatal;
                     break;
                 }
-                rep.error(es, m.type);
+                rep.error(ss, m.type);
                 continue;
             }
-            st.capture = capName;
+            capture = std::move(sr.capture);
+            pipeline = std::move(sr.pipeline);
             control->send(encodeStarted(st));
-            RateParams rate;
-            rate.kbps = m.start.kbps;
-            rate.vbvFrames = m.start.vbvFrames;
-            rate.fps = m.start.fps;
-            pipeline = std::make_unique<Pipeline>(*choice.backend, *capture, ring, rep, rate);
             pipeline->start();
-            logf(LogLevel::Info, "started: %s %dx%d@%d %d kbps, capture %s", st.codec.c_str(), st.width, st.height,
-                 st.fps, st.kbps, capName.c_str());
+            logf(LogLevel::Info, "started: %s %dx%d@%d %d kbps, capture %s %dx%d", st.codec.c_str(), st.width, st.height,
+                 st.fps, st.kbps, st.capture.c_str(), st.captureWidth, st.captureHeight);
             continue;
         }
         if (!pipeline) {
@@ -303,6 +363,7 @@ int main(int argc, char** argv) {
         else if (m.type == "recover") s = choice.backend->recover(m.lostFromFrameId, m.ackedLtrFrameId);
         else if (m.type == "setRate") s = pipeline->setRate(m.rate);
         else if (m.type == "setRoi") s = choice.backend->setRoi(m.rects);
+        else if (m.type == "ack") s = choice.backend->ack(m.ackFrameId);
         if (!s.ok) {
             if (s.fatal) {
                 rep.fatal(s);
