@@ -585,3 +585,60 @@ func TestVideoCrop(t *testing.T) {
 		})
 	}
 }
+
+// TestVideoDiscardable: the FFmpeg path marks the frames no other frame
+// references (Frame.Discardable, for temporal SVC thinning) from the
+// bitstream: SVT-AV1's low-delay structure has them (every second frame),
+// x264's zero-latency stream none; never a key frame.
+func TestVideoDiscardable(t *testing.T) {
+	caps := probeOrSkip(t)
+	for _, c := range []struct {
+		name     string
+		min, max int // discardable frames of the 40 after the key frame
+	}{{"libsvtav1", 10, 20}, {"libx264", 0, 0}} {
+		var enc EncoderInfo
+		for _, e := range caps.Encoders {
+			if e.Name == c.name {
+				enc = e
+			}
+		}
+		if enc.Name == "" {
+			t.Logf("%s not available", c.name)
+			continue
+		}
+		t.Run(c.name, func(t *testing.T) {
+			v := NewVideo(caps, nil, NewClock())
+			defer v.Stop()
+			if err := v.Start(Params{Source: Source{Backend: "test", NativeW: 320, NativeH: 180}, Encoder: enc, FPS: 60, BitrateKbps: 2000}, false); err != nil {
+				t.Fatal(err)
+			}
+			n, disc := 0, 0
+			deadline := time.After(30 * time.Second)
+			for n < 41 {
+				select {
+				case ev := <-v.Events():
+					if ev.Err != nil {
+						t.Fatal(ev.Err)
+					}
+					f := ev.Frame
+					if f == nil {
+						continue
+					}
+					if f.Discardable && (f.Key || f.Seq == 0) {
+						t.Fatalf("key frame %d discardable", f.Seq)
+					}
+					if f.Discardable {
+						disc++
+					}
+					n++
+				case <-deadline:
+					t.Fatalf("timeout after %d frames", n)
+				}
+			}
+			if disc < c.min || disc > c.max {
+				t.Fatalf("%d of %d frames discardable, want %d..%d", disc, n, c.min, c.max)
+			}
+			t.Logf("%s: %d of %d frames discardable", c.name, disc, n)
+		})
+	}
+}

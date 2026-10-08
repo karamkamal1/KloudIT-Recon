@@ -231,11 +231,21 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 		if cur.sp.FPS != sp.FPS {
 			fps = sp.FPS
 		}
-		rate := cur.sp.Kbps != sp.Kbps || fps > 0
-		if !rate || v.liveBitrate(cur) {
+		vbv := 0.0
+		if cur.sp.VBVFrames != sp.VBVFrames {
+			vbv = sp.VBVFrames
+			if vbv <= 0 {
+				vbv = 1 // back to the helper's default
+			}
+		}
+		rate := cur.sp.Kbps != sp.Kbps || fps > 0 || vbv > 0
+		if !rate || v.liveBitrate(cur) && (fps == 0 || v.liveFPS(cur)) {
 			h, starting := cur.h, cur.started.Codec == ""
+			// A frame-rate change alone goes out as one (Phase 5 setRate
+			// with fps only), to helpers that know it.
+			fpsOnly := fps > 0 && vbv == 0 && cur.sp.Kbps == sp.Kbps && cur.started.LiveFPS != ""
 			sp.LTRSlots, sp.ZeroCopy, sp.RC, sp.LiveBitrate = cur.sp.LTRSlots, cur.sp.ZeroCopy, cur.sp.RC, cur.sp.LiveBitrate // as withCaps made them
-			sp.IntraRefreshFrames = cur.sp.IntraRefreshFrames
+			sp.IntraRefreshFrames, sp.SVCLayers = cur.sp.IntraRefreshFrames, cur.sp.SVCLayers
 			cur.params, cur.sp = p, sp
 			if urgent && cur == v.pending && v.active != nil {
 				v.kill(v.active) // the starting stream takes over at its first key frame
@@ -246,7 +256,13 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 				return nil // run starts it with sp, or sets the rate right after its start
 			}
 			if rate {
-				if err := h.SetRate(sp.Kbps, 0, fps); err != nil {
+				var err error
+				if fpsOnly {
+					err = h.SetFPS(fps)
+				} else {
+					err = h.SetRate(sp.Kbps, vbv, fps)
+				}
+				if err != nil {
 					return err
 				}
 				v.mu.Lock()
@@ -275,14 +291,15 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 }
 
 // sameHelperStream reports whether two starts describe the same stream apart
-// from bitrate and frame rate (which SetRate changes) and what withCaps adds
-// (the rate-control mode follows from Params.Adaptive, which the caller
-// compares).
+// from bitrate, frame rate and VBV size (which SetRate changes) and what
+// withCaps adds or takes away (the rate-control mode follows from
+// Params.Adaptive, which the caller compares; the temporal layers from the
+// session's settings, constant for a session).
 func sameHelperStream(a, b encoder.StartParams) bool {
 	bc := a.Barcode == nil && b.Barcode == nil || a.Barcode != nil && b.Barcode != nil && *a.Barcode == *b.Barcode
 	for _, sp := range []*encoder.StartParams{&a, &b} {
-		sp.Kbps, sp.FPS, sp.LTRSlots, sp.ZeroCopy, sp.Barcode, sp.EncoderInstance = 0, 0, 0, nil, nil, nil
-		sp.RC, sp.LiveBitrate, sp.IntraRefreshFrames = "", "", 0
+		sp.Kbps, sp.FPS, sp.VBVFrames, sp.LTRSlots, sp.ZeroCopy, sp.Barcode, sp.EncoderInstance = 0, 0, 0, 0, nil, nil, nil
+		sp.RC, sp.LiveBitrate, sp.IntraRefreshFrames, sp.SVCLayers = "", "", 0, 0
 	}
 	return bc && a == b
 }
@@ -315,6 +332,19 @@ func (v *HelperVideo) liveMode(pr *helperProc) string {
 	return lb
 }
 
+// liveFPS reports whether the proc's encoder changes its frame rate in place
+// (as its started liveFps says; helpers before Phase 5 apply a frame rate
+// sent with the bitrate as they apply the bitrate). Called with v.mu held.
+func (v *HelperVideo) liveFPS(pr *helperProc) bool {
+	switch pr.started.LiveFPS {
+	case "seamless", "flush":
+		return true
+	case "":
+		return true // as liveBitrate, which the caller checks too
+	}
+	return false // restart: a new helper
+}
+
 // startParams turns a generation's parameters into the helper's start
 // message: capture method and monitor from the source, rate control CBR when
 // the rate controller may change the bitrate (else the encoder's low-latency
@@ -331,6 +361,10 @@ func (v *HelperVideo) startParams(p Params) (encoder.StartParams, error) {
 		RC:          "vbr",
 		Quality:     p.Quality,
 		GPUPriority: p.GPUPriority,
+		VBVFrames:   p.VBVFrames,
+	}
+	if p.SVCLayers > 1 {
+		sp.SVCLayers = p.SVCLayers
 	}
 	if p.Adaptive {
 		sp.RC = "cbr"
@@ -381,6 +415,24 @@ type liveChoice struct {
 // held.
 func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encoder.Caps) (encoder.StartParams, liveChoice) {
 	sp.LTRSlots = caps.LTRSlots(sp.Codec)
+	// Temporal SVC (Phase 5) where the session asks for it and the encoder
+	// has the layers; only from a Phase 5 helper (its caps have liveFps):
+	// older ones may mark LTR frames in the enhancement layer, which the
+	// session leaves out under congestion.
+	if sp.SVCLayers > 1 {
+		cc := caps.Codecs[sp.Codec]
+		why := ""
+		switch {
+		case cc.MaxTemporalLayers < sp.SVCLayers:
+			why = fmt.Sprintf("the %s encoder has %d temporal layers", sp.Codec, cc.MaxTemporalLayers)
+		case cc.LiveFPS == "":
+			why = "a helper before Phase 5 (LTR marks may fall on enhancement-layer frames)"
+		}
+		if why != "" {
+			v.log.Info("temporal SVC not used", "codec", sp.Codec, "reason", why)
+			sp.SVCLayers = 0
+		}
+	}
 	// The loss-recovery ladder's safety net (GUIDE 2.3, rung 3): intra
 	// refresh, over half a second of frames as on the FFmpeg path, where
 	// the encoder has it and it does not conflict: not with LTR slots or
@@ -513,9 +565,13 @@ func (v *HelperVideo) run(pr *helperProc) {
 		"size", fmt.Sprintf("%dx%d", st.Width, st.Height), "fps", st.FPS, "kbps", st.Kbps, "adapter", st.AdapterName,
 		"vendor", st.Vendor, "gpu_priority", st.GPUPriority, "live_bitrate", st.LiveBitrate, "rate_control", st.RateControl,
 		"live_bitrate_from", liveSource(pr), "ltr_slots", st.LTRSlots, "intra_refresh", st.IntraRefreshFrames, "zero_copy", st.ZeroCopy,
-		"barcode", st.Barcode, "cursor_in_video", st.CursorInVideo)
-	if later.Kbps != sp.Kbps || later.FPS != sp.FPS {
-		_ = h.SetRate(later.Kbps, 0, later.FPS)
+		"barcode", st.Barcode, "cursor_in_video", st.CursorInVideo, "svc_layers", max(1, st.SVCLayers), "live_fps", st.LiveFPS)
+	if later.Kbps != sp.Kbps || later.FPS != sp.FPS || later.VBVFrames != sp.VBVFrames {
+		vbv := later.VBVFrames
+		if vbv <= 0 && sp.VBVFrames > 0 {
+			vbv = 1 // back to the helper's default
+		}
+		_ = h.SetRate(later.Kbps, vbv, later.FPS)
 	}
 	v.read(pr)
 }
@@ -706,6 +762,15 @@ func (v *HelperVideo) convert(pr *helperProc, f *encoder.Frame, data []byte, cap
 	}
 	pr.acks.add(f.FrameID, ltr, f.Key)
 	fr.TemporalLayer = uint8(min(f.TemporalLayer, 255))
+	// Only frames the client cannot miss stay: a recovery frame whose
+	// refFloor was not usable is no recovery frame for the client either.
+	fr.Discardable = f.Droppable() && !fr.Recovery
+	if f.Dirty >= 0 {
+		fr.Dirty, fr.HasDirty = min(f.Dirty, 1), true
+		if f.Repeat {
+			fr.Dirty = 0
+		}
+	}
 	return fr
 }
 
@@ -929,6 +994,8 @@ func (v *HelperVideo) Capabilities() PipelineCaps {
 	c.LiveBitrate = v.liveBitrate(pr)
 	c.LiveBitrateFlush = c.LiveBitrate && v.liveMode(pr) == "flush"
 	c.LiveBitrateMeasured = pr.liveMeasured
+	c.LiveFPS = c.LiveBitrate && pr.started.LiveFPS == "seamless"
+	c.SVCLayers = pr.started.SVCLayers
 	c.CursorInVideo = pr.started.CursorInVideo
 	c.IntraRefresh = pr.started.IntraRefreshFrames > 0
 	c.Recovery = pr.recovery()
@@ -966,10 +1033,12 @@ func (v *HelperVideo) ForceKeyframe() error {
 	return pr.h.ForceIDR()
 }
 
-// SetRate changes the bitrate (and frame rate, fps > 0) of the stream: in the
-// running encoder with live bitrate (seamless, or flush: an encoder flush
-// with an IDR), else with a new helper (overlapped).
-func (v *HelperVideo) SetRate(kbps, fps int) error {
+// SetRate changes the bitrate (and frame rate, fps > 0; and the VBV size,
+// vbvFrames > 0 or 0 for the helper's default) of the stream: in the running
+// encoder with live bitrate (seamless, or flush: an encoder flush with an
+// IDR; a frame-rate change also needs the helper's liveFps), else with a new
+// helper (overlapped).
+func (v *HelperVideo) SetRate(kbps, fps int, vbvFrames float64) error {
 	p, ok := v.Current()
 	if !ok {
 		return errors.New("video: no encoder helper streams")
@@ -978,6 +1047,7 @@ func (v *HelperVideo) SetRate(kbps, fps int) error {
 	if fps > 0 {
 		p.FPS = fps
 	}
+	p.VBVFrames = vbvFrames
 	return v.Start(p, false)
 }
 

@@ -1163,13 +1163,16 @@ production (the installed LGPL build has no libx264).
 
 ## Phase 5 features
 
-GUIDE 9's differentiators, helper and Go client side (`internal/host/encoder`); the session
-does not use them yet (docs/VENDOR_NOTES.md "Phase 5 (helper features)" has the integration
-notes and the hardware checks). All additive: older helpers omit the new fields.
+GUIDE 9's differentiators, helper and Go client side (`internal/host/encoder`). Sessions use
+temporal SVC (thinning), the dirty share (static desktop bitrate) and frame-rate changes
+(`SetFPS`) since Phase 5 wiring A (docs/ARCHITECTURE.md "Rate control"; docs/VENDOR_NOTES.md
+"Phase 5 wiring A"); ROI, the engine choice, re-encoding and slice output not yet
+(docs/VENDOR_NOTES.md "Phase 5 (helper features)" has the integration notes and the hardware
+checks). All additive: older helpers omit the new fields.
 
 | Feature | Control | Caps | Reported | AMF | NVENC | mock |
 |---|---|---|---|---|---|---|
-| temporal SVC | `start` `svcLayers` 2 (up to `maxTemporalLayers`) | `maxTemporalLayers` | `started.svcLayers`; per frame `temporalLayer`, `discardable` (stats, ring) | yes | where `SUPPORT_TEMPORAL_SVC` | no |
+| temporal SVC | `start` `svcLayers` 2 (up to `maxTemporalLayers`) | `maxTemporalLayers` | `started.svcLayers`; per frame `temporalLayer`, `discardable` (stats, ring) | yes | where `SUPPORT_TEMPORAL_SVC` | 2 layers (non-reference copies) |
 | cursor / crosshair ROI | `setRoi` (Go `FocusROI`) | `roi` | | importance map | QP delta map | ignored |
 | dirty share | | | stats `dirty`, `dirtyPct`; ring `dirtyPpm` + DIRTY | (any capture: DDA, AMD Direct Capture) | | |
 | FPS before resolution | `setRate` `fps` alone (Go `SetFPS`) | `liveFps` | `started.liveFps`; stats `fps` | `FRAMERATE` (VERIFY no IDR) | `NvEncReconfigureEncoder` | pacing only |
@@ -1431,8 +1434,14 @@ clip's IDR every 60 frames limits seamless runs to 59 frames. Caps: vendor `mock
 recovery `none`, liveBitrate `seamless` (`flush` with start's `liveBitrate` `flush`), `hdr10`
 false; Phase 5: `liveFps` as `liveBitrate` (the capture re-paces; with `flush` the clip jumps
 back to the IDR with a new `gen`, as for a bitrate change), `hwInstances` 2 with
-`instanceSelect` (`encoderInstance` 0 or 1 is reported back, 2 is `unsupported`), no SVC,
-re-encode or sub-frame output (`unsupported`). With a GPU capture (`dda`, `amd-direct`, `wgc`,
+`instanceSelect` (`encoderInstance` 0 or 1 is reported back, 2 is `unsupported`),
+`maxTemporalLayers` 2: with `svcLayers` 2 every canned P frame is preceded by a non-reference
+copy of itself (`h264AsNonReference`, `src/codec/bitstream.hpp`: `nal_ref_idc` 0, its
+`dec_ref_pic_marking()` left out; layer 1, `discardable`), which decodes to the same picture
+(the same references) and which no frame references, so the stream is key frame, then copy / P
+pairs, and the stream without the discardable frames decodes to the same base-layer pictures
+(`TestHelperIntegrationSVC` checks both with a Windows FFmpeg); no re-encode or sub-frame output
+(`unsupported`). With a GPU capture (`dda`, `amd-direct`, `wgc`,
 `synthetic-gpu`) the mock asks for NV12 input, so capture, pacing, GPU priority and the
 colour conversion run for real on a host without an encoder backend (the converted frames
 are ignored; `--dump-nv12` shows one). With `hdr` from an HDR source it asks for P010, so

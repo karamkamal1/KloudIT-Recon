@@ -37,10 +37,12 @@ type Pipeline interface {
 	// which starts a new generation (same parameters, a new VideoConfig);
 	// otherwise a new generation starts urgently with the current parameters.
 	ForceKeyframe() error
-	// SetRate changes the bitrate (and the frame rate, fps > 0): with
-	// Capabilities().LiveBitrate in the running encoder, otherwise as an
-	// overlapped restart with the current parameters.
-	SetRate(kbps, fps int) error
+	// SetRate changes the bitrate (and the frame rate, fps > 0; and the VBV
+	// size in frame intervals, vbvFrames > 0, else the encoder's default):
+	// with Capabilities().LiveBitrate in the running encoder (a frame-rate
+	// change alone with Capabilities().LiveFPS), otherwise as an overlapped
+	// restart with the current parameters.
+	SetRate(kbps, fps int, vbvFrames float64) error
 	// Recover reports that the frames of generation gen from seq lostFrom on
 	// were lost: with Capabilities().Recovery "ltr" or "invalidate" the
 	// encoder codes the next frame from frames the client still has (ltr: an
@@ -74,6 +76,13 @@ type PipelineCaps struct {
 	// (recon-host qualify, GUIDE 3.6) rather than assumed from the encoder's
 	// defaults.
 	LiveBitrateMeasured bool
+	// LiveFPS: SetRate changes the frame rate in the running encoder without
+	// a key frame (the native helper's started liveFps "seamless"), so the
+	// rate controller may step it finely (Phase 5 "FPS before resolution").
+	LiveFPS bool
+	// SVCLayers: the temporal layers the stream runs (native helper svcLayers;
+	// 0 or 1: none). Its enhancement-layer frames are Frame.Discardable.
+	SVCLayers int
 	// ForceIDR: ForceKeyframe forces an IDR in the running encoder.
 	ForceIDR bool
 	// IntraRefresh: the encoder runs periodic intra refresh.

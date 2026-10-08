@@ -71,6 +71,7 @@ The **extension** carries per-frame stage timestamps and recovery metadata:
 | 5 | `refFloor` | u32 | newest earlier frame (`seq` of this generation) that a recovery frame, or any frame after it, may reference: no frame between `refFloor` and the recovery frame is referenced; present exactly on recovery frames |
 | 6 | `ltrSlot` | u8 | long-term reference slot the frame is marked into |
 | 7 | `temporalLayer` | u8 | temporal layer id |
+| 8 | `thinned` | u32 | frames of this generation the host left out on purpose among the 32 before this one (bit *i*: `seq - 1 - i`): temporal SVC thinning, `hello.v >= 4` only, present when non-zero (below) |
 
 All timestamps, including `send_us` and the pong's host time, are the **host clock**: monotonic
 µs since the agent started (QueryPerformanceCounter on Windows, where Go's own monotonic clock
@@ -78,7 +79,8 @@ only advances with the timer tick). Readers skip unknown tags (`len` says how fa
 1–8 byte values for known tags; a block that overruns `ext_len` or the frame is rejected.
 
 Compatibility: the host sets bit 7 only for clients whose `hello` has `v >= 2`, and advertises
-`frame-ext` in their `welcome.features`. v1 clients get the byte-identical 24-byte header with
+`frame-ext` in their `welcome.features`. Tag 8 goes only to clients with `v >= 4`, the only ones
+the host thins. v1 clients get the byte-identical 24-byte header with
 the old `send_us`, and no `frame-ext` feature. The gateway
 never parses frames (UDP relay: encrypted end to end; QUIC splice: stream splice; WebSocket: one
 `0x02` message per stream), so the extension passes unchanged on every path.
@@ -103,6 +105,23 @@ when the host says so or when the gap outlasts that wait. The host reports every
 (frame-queue overflow, or a frame stream that failed or was cancelled) on the control stream with
 `{"t":"dropped","gen":g,"fromSeq":s,"count":n}`, and the client acts on it at once. Old clients
 ignore the message; with an old host the client relies on the gap timeout.
+
+**Thinned frames** (temporal SVC, Phase 5; `internal/host/thin.go`). A frame that no other frame
+references (the enhancement layer of the native helper's two-layer SVC stream; on the FFmpeg path
+a non-reference frame read from the bitstream: SVT-AV1's low-delay structure codes every second
+frame with `refresh_frame_flags` 0, x264 and the hardware encoders behind FFmpeg's command line
+none) can be left out without breaking the decoding of any other frame. Under congestion the host
+does so before the frame is sent: the frame rate drops for the moment (halves with two layers),
+nothing is corrupted, no key frame is needed and the encoder does not change. Congestion is any of:
+the rate controller's last two reports over its delay target (or a frame far over it that does not
+arrive), two or more frames waiting in the frame queue behind the one being sent, a frame stream
+still being written past its deadline (or the last one written that slowly). A thinned frame gets
+no `dropped` report, no recovery and no acknowledgement; every frame sent after it carries the
+`thinned` mask, so the client skips its seq at once, neither waiting for it nor taking it for a
+loss (frame-to-frame freeze accounting treats the frames around it as consecutive). A loss the
+client reports from a thinned seq (`lost`, when the frames carrying the mask were lost too) is the
+loss of the next frame sent. Only clients with `hello.v >= 4` are thinned (an older one would take
+the gap for a loss), and only with host config `svc` `auto` (the default).
 
 What the client does about a lost frame depends on `recovery` in the `video` message:
 
@@ -344,10 +363,41 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     one takes over at once); a decoder flush also caps
     later increases at 85 % of the bitrate it cut from, until the settings change. An older
     client's delay report (`{"t":"congestion"}`) decreases like the controller's own decision.
-  - *Frame rate.* At the floor (2 Mbit/s, or the setting if lower) a decrease lowers the frame
-    rate a rung instead, 120 → 90 → 60, and nothing below 60 (resolution is not changed); the
-    frame rate goes back up a rung every 5 s once the bitrate is 1.5 × the floor (or at the
-    setting or the decoder's cap, where that is lower) and nothing decreased for 5 s.
+  - *Frame rate* (GUIDE 9 "FPS before resolution"). At the floor (2 Mbit/s, or the setting if
+    lower) a decrease lowers the frame rate a rung instead (resolution is not changed); the frame
+    rate goes back up a rung once the bitrate is 1.5 × the floor (or at the setting or the
+    decoder's cap, where that is lower) and nothing decreased for a while. One ladder, two step
+    tables by the pipeline's capabilities: where each change costs a key frame or a restart
+    (FFmpeg, a flushing helper encoder, a helper before Phase 5) 120 → 90 → 60, nothing below 60,
+    5 s apart; where the encoder changes its frame rate in place without a key frame (the native
+    helper's `started.liveFps` `seamless`: AMF `FRAMERATE`, NVENC reconfigure) the finer
+    `encoder.FPSSteps` (240, 165, 144, 120, 100, 90, 75, 60, 50, 45, 30) down to host config
+    `fpsFloor` (default 30), 2 s apart, each sent to the helper as a frame-rate change alone
+    (`setRate` with `fps` only, Go `SetFPS`).
+  - *Thinning* (temporal SVC, above): the instant answer to a spike, before the bitrate's. While
+    frames are being thinned (until 250 ms after the last), nothing increases; thinning that goes
+    on for a second (frames thinned at most 250 ms apart) decreases ×0.85 like the delay
+    (`why=thinning`), and again after each further second: a lasting shortage is the bitrate's to
+    answer. Helper streams start with two temporal layers (`svcLayers` 2) where the codec's caps
+    have them (`maxTemporalLayers`) and the helper is a Phase 5 one (its LTR marks fall on
+    base-layer frames only), for clients that can be thinned; SVC takes the place of intra
+    refresh as the safety net (AMF cannot combine them; NVENC loses it with SVC too, invalidation
+    still answers losses).
+  - *Static desktop* (`internal/host/activity.go`, GUIDE 9 "dirty rects"): the native helper's
+    captures report the share of the picture that changed with every frame (DDA and AMD Direct
+    Capture dirty rects; `media.Frame.Dirty`). While at most 0.2 % changed per frame over the last
+    second (a caret, a clock; the pointer is not in the helper's video) the encoder's target goes
+    down to host config `staticKbps` (default a quarter of the rate controller's target, at least
+    2 Mbit/s), linearly back towards the target between 0.2 % and 5 %, at most once a second; the
+    first frame that changes gives the full target back at once, before that frame is queued (so
+    it goes out at the full pacing rate). It caps what the encoder is told, never what the rate
+    controller decides (the lower of the two: it cannot fight the congestion control; a restore
+    needs no ramp), and keeps the VBV at one frame of the full target (`vbvFrames` target / cap)
+    so the first frame with motion, encoded before anyone knows it moved, is not starved. Only on
+    a seamless live bitrate (a cap that costs key frames is worth nothing); FFmpeg reports no
+    dirty share, and an unknown share never lowers anything. Host config `staticBitrate` `off`
+    turns it off; host.log logs `static desktop: lowering the bitrate` and `desktop changes: full
+    bitrate back`, and `stream stats` `static_desktop` and `thinned`.
   - *Applying it.* The continuous target reaches the encoder as often as its pipeline takes
     changes (`ratePolicy`): an encoder qualified to change seamlessly (`recon-host qualify`)
     every 250 ms in steps of 2 % or more; one only assumed seamless every second; a flushing
@@ -452,7 +502,10 @@ the pipeline's `Capabilities`, never from a vendor:
 | process | one `ffmpeg` per generation | one `recon-encoder.exe` per session (docs/HELPER_PROTOCOL.md) |
 | key frame for the client | a new generation, started at once (urgent restart) | an IDR in the running encoder (`ForceIDR`): a new generation without a new process |
 | bitrate change | an overlapped restart (rate limited, see above) | in the running encoder (`LiveBitrate`: AMF/NVENC seamless, or an encoder flush with an IDR), as the live-bitrate qualification measured it (below) |
-| loss recovery | key frame (a restart), or skip with intra refresh | a recovery frame (`ltr` / `invalidate`, see above), an IDR where the encoder has neither; intra refresh as a safety net where it does not conflict with LTR |
+| loss recovery | key frame (a restart), or skip with intra refresh | a recovery frame (`ltr` / `invalidate`, see above), an IDR where the encoder has neither; intra refresh as a safety net where it does not conflict with LTR or SVC |
+| frame-rate change | a restart (the 2.2 rungs) | in the running encoder (`liveFps` `seamless`: fine steps, `SetFPS`) |
+| thinning (temporal SVC) | non-reference frames from the bitstream (SVT-AV1's low-delay structure) | two temporal layers where the encoder has them, the enhancement layer `Discardable` |
+| static desktop | (no dirty share) | the capture's dirty share caps the bitrate (seamless live bitrate) |
 | stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly) |
 
 **Choosing** (host config `pipeline`: `auto` | `helper` | `ffmpeg`, once per session, logged as

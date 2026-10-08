@@ -1,11 +1,13 @@
 package host
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
 	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -573,6 +575,120 @@ func TestRateFPSLadder(t *testing.T) {
 		}
 		if len(up) != 2 || up[0] != 90 || up[1] != 120 || h.fps != 120 {
 			t.Fatalf("setting %d: frame rates back %v (now %d), want 90 then 120", ceiling, up, h.fps)
+		}
+	}
+}
+
+// TestRateFPSLadderLive: an encoder that changes its frame rate in place
+// (PipelineCaps.LiveFPS: the native helper's liveFps seamless) steps through
+// encoder.FPSSteps at the floor (60 -> 50 -> 45 -> 30, nothing below the
+// floor of 30, or host config "fpsFloor") and back up 2 s apart.
+func TestRateFPSLadderLive(t *testing.T) {
+	live := ratePolicy(media.PipelineCaps{LiveBitrate: true, LiveBitrateMeasured: true, LiveFPS: true})
+	if !live.fineFPS || ratePolicy(seamlessCaps).fineFPS || ratePolicy(media.PipelineCaps{LiveBitrate: true, LiveBitrateFlush: true, LiveFPS: true}).fineFPS {
+		t.Fatal("fine steps only for a seamless live frame rate")
+	}
+	for _, c := range []struct {
+		floor int
+		down  string
+		up    string
+	}{{0, "[50 45 30]", "[45 50 60]"}, {45, "[50 45]", "[50 60]"}} {
+		h := newCtl(t, 10000, 60, live)
+		h.r.setFPSFloor(c.floor)
+		h.run(3*time.Second, flat(20*time.Millisecond))
+		h.r.mu.Lock()
+		h.r.est, h.r.applied = 2000, 2000
+		h.r.mu.Unlock()
+		h.r.live(2000, 60)
+		h.run(1500*time.Millisecond, flat(40*time.Millisecond)) // within the 2 s the base needs to take the new delay
+		var fps []int
+		for _, ch := range h.changes {
+			if !ch.down || ch.toKbps != 2000 {
+				t.Fatalf("floor %d: change %+v at the floor, want frame-rate decreases at 2000", c.floor, ch)
+			}
+			fps = append(fps, ch.toFPS)
+		}
+		if fmt.Sprint(fps) != c.down {
+			t.Fatalf("floor %d: frame rates %v, want %s", c.floor, fps, c.down)
+		}
+		h.changes, h.at = nil, nil
+		h.run(20*time.Second, flat(20*time.Millisecond))
+		var up []int
+		var at []time.Duration
+		for i, ch := range h.changes {
+			if ch.toFPS != ch.fromFPS {
+				up, at = append(up, ch.toFPS), append(at, h.at[i])
+			}
+		}
+		if fmt.Sprint(up) != c.up || h.fps != 60 {
+			t.Fatalf("floor %d: frame rates back %v (now %d), want %s", c.floor, up, h.fps, c.up)
+		}
+		// Decided fpsHoldLive apart; an increase of the bitrate just before
+		// can delay a step's application by the policy's gap (250 ms).
+		for i := 1; i < len(at); i++ {
+			if at[i]-at[i-1] < fpsHoldLive-live.incGap {
+				t.Fatalf("floor %d: frame-rate steps %v apart", c.floor, at[i]-at[i-1])
+			}
+		}
+	}
+}
+
+// TestRateThinning: frames thinned under congestion (thin.go) hold the
+// increases for thinQuiet; thinning that lasts thinSustain decreases the
+// bitrate ("thinning"); overTarget follows the last report.
+func TestRateThinning(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.r.mu.Lock()
+	h.r.est, h.r.applied = 10000, 10000
+	h.r.mu.Unlock()
+	h.r.live(10000, 60)
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	if len(h.changes) == 0 || h.changes[len(h.changes)-1].down {
+		t.Fatalf("no increase on a clean path: %+v", h.changes)
+	}
+	if h.r.overTarget() {
+		t.Fatal("over the target on a clean path")
+	}
+	// Thinning for 0.6 s: no increase meanwhile nor within thinQuiet after.
+	h.changes, h.at = nil, nil
+	for i := 0; i < 12; i++ {
+		h.r.thinned()
+		h.run(50*time.Millisecond, flat(20*time.Millisecond))
+	}
+	h.run(thinQuiet-100*time.Millisecond, flat(20*time.Millisecond)) // the loop's last run was 50 ms after the last thinned frame
+	if len(h.changes) != 0 {
+		t.Fatalf("changes while thinning: %+v", h.changes)
+	}
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	if len(h.changes) == 0 || h.changes[0].down {
+		t.Fatalf("no increase after thinning stopped: %+v", h.changes)
+	}
+	// Thinning that lasts: a decrease after thinSustain.
+	h.changes, h.at = nil, nil
+	start := h.elapsed()
+	for i := 0; i < 40 && len(h.decreases(0)) == 0; i++ {
+		h.r.thinned()
+		h.run(50*time.Millisecond, flat(20*time.Millisecond))
+	}
+	d := h.decreases(0)
+	if len(d) != 1 || d[0].why != "thinning" || h.at[0]-start < thinSustain {
+		t.Fatalf("decreases %+v at %v (thinning from %v)", d, h.at, start)
+	}
+	// overTarget: two reports in a row over the delay target (one can be a
+	// burst), also across the decreases they cause.
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	h.run(30*time.Millisecond, flat(80*time.Millisecond))
+	if h.r.overTarget() {
+		t.Fatal("one report over the target counts as congestion")
+	}
+	h.run(25*time.Millisecond, flat(80*time.Millisecond))
+	if !h.r.overTarget() {
+		t.Fatal("not over the target after two reports 60 ms up")
+	}
+	for i := 0; i < 20; i++ {
+		h.run(25*time.Millisecond, flat(80*time.Millisecond))
+		if !h.r.overTarget() {
+			t.Fatalf("congestion ended %d reports later (a decrease reset it?)", i+1)
 		}
 	}
 }

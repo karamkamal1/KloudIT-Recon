@@ -4647,7 +4647,9 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
 
 ### Session integration (for the session rewrite)
 
-`internal/host/session.go` is unchanged; the Go API is in `internal/host/encoder`:
+Temporal SVC, the dirty share and FPS before resolution are wired since "Phase 5 wiring A"
+(below); ROI, the dedicated engine, re-encode and slice output are not yet. The Go API is in
+`internal/host/encoder`:
 
 - Temporal SVC: start with `SVCLayers: 2` where `CodecCaps.MaxTemporalLayers >= 2` (on AMF
   not together with `IntraRefreshFrames`; `LTRSlots` 2 still works). Under congestion (queue
@@ -5773,3 +5775,226 @@ with libx264 / libsvtav1):
   family went untimed on the first (no "timed 1080p" on its line: the clip came too late).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same four-profile check streaming
   from the NVIDIA host.
+
+## Phase 5 wiring A Rate and frame control (temporal SVC thinning, FPS before resolution, static desktop)
+
+The session now uses three of the Phase 5 helper features (docs/ARCHITECTURE.md "Thinned frames"
+and "Rate control"; decisions from the pipeline's capabilities, never from a vendor; every new
+behaviour has a host config switch with a safe default):
+
+- **Temporal SVC thinning** (`internal/host/thin.go`, host config `svc` `auto` | `off`, default
+  auto). Helper streams of clients with `hello.v >= 4` start with `svcLayers` 2 where the codec's
+  caps have `maxTemporalLayers >= 2` and the helper is a Phase 5 one (caps `liveFps` present: its
+  LTR marks fall on base-layer frames only, so AMF's LTR recovery keeps working; NVENC's
+  invalidation needs nothing); otherwise none, logged once per helper start (`temporal SVC not
+  used` with the reason; `encoder helper started ... svc_layers=`). Under congestion (two rate
+  reports in a row over the delay target or a frame far over it that does not arrive, two
+  frames waiting behind the one being sent, a frame stream past its deadline) frameSender leaves
+  out `media.Frame.Discardable` frames (the helper's `Frame.Droppable`; on the FFmpeg path the
+  bitstream's non-reference frames, `codec.Params.Discardable`: AV1 `refresh_frame_flags` 0,
+  H.264 `nal_ref_idc` 0; never a key or recovery frame). No `dropped` report, no `Recover`, no
+  ladder rung; every frame sent after one carries the new frame extension tag 8 `thinned` (u32
+  mask of the 32 seqs before it), and the client (`stream-worker.js` `skipThinned`) skips those
+  seqs at once: no gap wait, no loss count, no `lost` report, no recovery wait, no key-frame
+  request; its freeze accounting treats the frames around a thinned one as consecutive. A
+  client `lost` from a thinned seq is moved to the next frame sent. Hello version 4 (protocol.js
+  `HELLO_VERSION`, Go `proto.HelloVersionThinned`): older clients are never thinned and get no
+  tag (the extension parsers skip unknown tags anyway). The rate controller holds its increases
+  while frames are being thinned (until 250 ms after the last; a hold of a second after each
+  episode can keep the bitrate down where a loaded client's own delay starts short episodes every
+  few seconds, as on the E2E machine) and decreases (`why=thinning`) when thinning lasts 1 s:
+  thinning answers spikes, the bitrate a lasting shortage. Episodes are logged at start
+  (`thinning: leaving out discardable frames under congestion` with the reason) and end
+  (`thinning ended frames=N`), the count every 10 s (`stream stats thinned=`), and the client
+  overlay's "Frames dropped" row adds "thinned N" (in that row: the overlay does not scroll, and
+  in a 720 px high window a row of its own pushed "Export latency data" off the screen, which the
+  browser E2E caught).
+  The Phase 5 helper notes above suggested leaving droppable frames out before they get a
+  sequence number, so that the client needs no change. Not done: a frame's seq is assigned by
+  the pipeline when it reads the frame, and the loss-recovery bookkeeping keys on it
+  (`refFloor`, the helper's ack ring, the client's `lost` and `dropped` reports, the 2.3
+  ladder), so thinned frames keep their seqs and the client learns of them from the mask. Clients
+  that cannot read the mask (`hello.v < 4`) are never thinned.
+- **FPS before resolution** (`internal/host/bitrate.go`, host config `fpsFloor`, default 0):
+  the 2.2 frame-rate ladder at the bitrate floor is one ladder with two step tables by the
+  pipeline's capabilities: FFmpeg, flushing encoders and pre-Phase-5 helpers keep 120 / 90 /
+  60 (5 s apart; a change there costs a restart or a key frame); a helper whose started
+  `liveFps` is `seamless` (`PipelineCaps.LiveFPS`) steps through `encoder.LowerFPS` /
+  `RaiseFPS` (`FPSSteps` down to `fpsFloor`, default 30), 2 s apart, each sent as a frame-rate
+  change alone (`HelperVideo` -> `Helper.SetFPS`: `setRate` with `fps` only; to a pre-Phase-5
+  helper with the bitrate, which it requires). A helper whose `liveFps` is `restart` gets a new
+  helper for a frame-rate change.
+- **Static desktop bitrate** (`internal/host/activity.go`, host config `staticBitrate` `auto` |
+  `off` and `staticKbps`, defaults auto and 0 = a quarter of the target, at least 2000 kbit/s):
+  `media.Frame.Dirty` (the ring's `dirtyPpm`, which carries `Stats.Dirty`) feeds an
+  `encoder.ActivityMeter` (new `AddShare`); a static picture for 1 s lowers what the encoder is
+  told (never what the rate controller decides: min of both) at most once a second, with the VBV
+  kept at one full-target frame (`vbvFrames` target / cap; `Pipeline.SetRate` and
+  `media.Params` gained a VBV size, the helper's `setRate` `vbvFrames`); the first frame that
+  changes restores the full target in the encoder and the media congestion controller's pacing
+  at once, before that frame is queued. Only on seamless live bitrate (`LiveBitrate` without
+  flush); the FFmpeg path reports no dirty share.
+
+The mock backend gained two temporal layers (the task assumed it had them: it had not; Phase 5
+had given it no SVC). With `svcLayers` 2 each canned P frame is preceded by a non-reference
+copy of itself (`h264AsNonReference` in `src/codec/bitstream.cpp`: `nal_ref_idc` 0 and the one
+`dec_ref_pic_marking()` bit left out, the rest of the RBSP shifted, trailing bits and emulation
+prevention redone; refused for IDRs, CABAC, field coding, slice groups, weighted prediction,
+B/SP/SI slices, POC types 0/1 and MMCOs). It decodes to the same picture as the frame after it
+and no frame references it. Its caps now say `maxTemporalLayers` 2.
+
+### Verified in the sandbox
+
+- verified (sandbox): unit tests, `go test ./...` (the e2e package under the shared lock):
+  `internal/codec` `TestDiscardableSVT` (SVT-AV1 1.7 with the FFmpeg path's arguments,
+  `pred-struct=1:lookahead=0:scd=0:rc=2`: 24 of 48 frames discardable; the stream without them
+  decodes with dav1d to bit-identical pictures for every frame kept, frame MD5s),
+  `TestDiscardableAV1Headers` (crafted frame headers through every branch before
+  `refresh_frame_flags`: decoder model with buffer removal times per operating point, frame ids,
+  order hint, screen content tools chosen per frame, error resilient, intra-only, switch, hidden
+  and show-existing frames, truncation), `TestDiscardableH264` (x264 zero-latency: none);
+  `internal/host/media` `TestVideoDiscardable` (the FFmpeg path marks 20 of 41 libsvtav1 frames,
+  0 of libx264's), `TestHelperVideoPhase5` (SVC asked for only of a Phase 5 helper with layers;
+  `Discardable` only for the helper's droppable frames, never key / recovery; the dirty share and
+  repeats; `SetFPS` without kbps vs `setRate` kbps + fps for an older helper; VBV 4 and back to
+  1; a `liveFps` `restart` helper replaced for a frame-rate change), `TestHelperStartParams`
+  (SVC vs intra refresh); `internal/host` `TestThinState`, `TestFrameSenderThinning` (only
+  discardable frames under pressure, never a recovery frame, masks exact, no `dropped`; v3
+  clients and `svc` off never), `TestThinPressure` (each signal; a stream within its deadline is
+  no pressure), `TestSessionThinning` (fake helper: start `svcLayers` 2 and no intra refresh,
+  enhancement frames left out only under congestion, no `recover` / `forceIdr` / `dropped`, a
+  client `lost` from thinned seq 13 recovered from frame 15; v3 client, `svc` off and a
+  pre-Phase-5 helper start no SVC), `TestSessionLiveFPS` (fine steps and `SetFPS` for a Phase 5
+  helper, rungs and kbps + fps for an older one), `TestRateFPSLadderLive` (60 -> 50 -> 45 -> 30,
+  floor 45 stops there, back up 45 / 50 / 60 about 2 s apart; the 2.2 `TestRateFPSLadder`
+  unchanged), `TestRateThinning` (no increase while thinning and 250 ms after, a `thinning` decrease
+  after 1 s of it, one report over the target is no congestion, a decrease does not end it),
+  `TestStaticCap` (cut after 1 s static to 5000 of 20000 with VBV 4, full target at once on 30 %
+  change, re-cut 1 s after the motion left the window, linear partial activity, `staticKbps`,
+  the VBV bound 30, nothing for an unknown share / not live / off / a target under the floor, a
+  generation restarted capped, a bitrate the pipeline announces as changed in place (anyone's
+  change) taken as the encoder's and cut again 1 s later), `TestSessionStaticDesktop` (fake
+  helper and clock: `setRate` 5000 / VBV 4 after 1.5 s of a caret, the congestion target
+  follows, the rate controller keeps 20000; its own change to 16000 stays capped at 4000; a
+  40 % change restores 16000 / VBV 1 before the frame is sent), `TestVideoHeader` (tag 8 only
+  to v4 clients, only when non-zero), `TestConfigPhase5Rate`; `internal/proto` `TestThinnedJS`
+  (protocol.js reads the masks Go writes, the hello version), `TestLossRecoveryJS` (hello
+  version 4).
+- verified (sandbox): `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64
+  WIN_FFMPEG=<FFmpeg 8.1 win64 ffmpeg.exe>` (Wine 9.0, mingw build): `--self-test-encoder`
+  "non-reference copies of the mock clip" (all 59 P frames convert, `nal_ref_idc` 0, a hand-made
+  slice loses exactly its marking bit, MMCOs / IDR / no parameter sets refused);
+  `TestHelperIntegrationSVC` (mock, `svcLayers` 2: started 2, key frame then copy (layer 1,
+  discardable, `Droppable`) / P (layer 0) pairs through the ring flags and the stats, a forced
+  IDR restarts the pattern; the Windows FFmpeg decodes the 50 frames clean and the 25 base-layer
+  frames alone to the same pictures); `TestHelperIntegrationPhase5` (mock caps now
+  `maxTemporalLayers` 2; three layers refused); the new `TestSessionHelperMockPhase5` (host
+  package under Wine, a v4 session on the real helper's mock backend and synthetic GPU source:
+  `svcLayers` 2 and `liveFps` seamless; with the hook `thin=every:40:for:20` 35 of 150 frames
+  thinned, every thinned seq announced in the masks of the frames after it and never sent, every
+  seq sent or announced, no `dropped`; the source's 0.6 s pauses (idle repeats, dirty 0; the
+  activity window shortened to 300 ms for them) cut the bitrate to the 2000 kbps floor and its
+  next present restores it; a frame-rate change to 20 fps stays in the running encoder, no new
+  generation); every earlier helper test unchanged.
+- verified (sandbox): the mock's SVC stream with Linux FFmpeg 6.1:
+  `recon-encoder.exe --encode-test=svc.h264 --backend=mock --codec=h264 --capture=synthetic
+  --svc=2 --frames=240` ("temporal layers: 121 / 119 frames in layer 0 / 1, 119 discardable");
+  `ffmpeg -v error` prints nothing for `svc.h264` and `svc.base.h264`; every copy decodes to the
+  same frame MD5 as the base frame after it, and the base-only file's 121 frames equal the
+  whole stream's base frames.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, headless Chromium, libsvtav1
+  software AV1 encode and decode, recovery "keyframe"), new scenario "temporal SVC thinning":
+  the hook `thin=every:120:for:40` (simulated congestion: the last 40 of every 120 frames under
+  pressure; adaptive bitrate off and 8 Mbit/s, so that this machine's own delay does not restart
+  the encoder in the window), 15 s: 5 to 8 episodes started by the hook, 164 to 201 frames left
+  out by the host (libsvtav1's frames with `refresh_frame_flags` 0), 149 to 183 skipped by the
+  client as thinned (the window's edges), lost 0, host-dropped 0, key requests 0, recoveries 0,
+  decoder errors 0, freezes 0, 41 to 49 fps mean of 60; frame barcodes 26 to 32 of 26 to 32 =
+  seq (the frames after a left-out one decode to the right pictures). Passed in all 5 runs since
+  the scenario took adaptive bitrate off. The real signals thin in the other scenarios too on
+  this loaded 4-core machine (host.log: episodes `why=delay` / `queue` / `deadline`, 2 to 10 % of
+  the frames per 10 s under load), so the steady-playback and video-decoding checks count the
+  thinned frames' rate with the frames drawn (a frame the host leaves out on purpose is no
+  failure to play in real time; their detail shows "+ N thinned/s"). Whole runs: 186 of 187
+  before the overlay change (the one failure: "Export latency data", above); with the final
+  code 183 of 187: the failures were the
+  WebGPU renderer's input and barcode checks, the renderer bake-off and reference recovery (13
+  of 16 losses answered by a recovery frame, 14 needed), checks that fail now and then in the
+  other branches' runs on this machine as well and that involve no thinning. Runs while other
+  work loaded the machine (load 8 to 11 on 4 cores) failed frame-rate checks (20 to 49 fps
+  drawn, 0.6 to 5.7 thinned per second) and passed the thinning scenario. Its episode count
+  now counts every episode in the window (one the machine's delay started goes on through the
+  hook's window under that name) with at least 3 started by the hook; checked by replaying the
+  last run's host log.
+  `go test ./internal/e2e/...` (under the lock): ok; one earlier run under heavy load failed
+  `TestStreamingRateReports` (a second delay cut, no climb back in time; its client is hello v3
+  on libx264, nothing is thinned there; the same failure is in another branch's log).
+- Not run here: anything on AMF / NVENC hardware (SVC layer patterns, `FRAMERATE` /
+  reconfigure without IDR, the VBV change in a running encoder, DDA / AMD Direct Capture dirty
+  rects in a session), Chrome's hardware decoders on a thinned stream, real congestion (the
+  sandbox's 0.4 profiles need root netns; the E2E simulates the congestion with the hook).
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC in a session): host.json default (`svc` auto),
+  `pipeline` auto, a current Chrome; connect and play a game. host.log `encoder helper started
+  ... svc_layers=2 live_fps=seamless` (else the `temporal SVC not used` reason). Apply
+  `make netem PROFILE=capdrop` (docs/NETEM.md) for a minute: host.log has `thinning: leaving
+  out discardable frames under congestion why=delay|queue|deadline` episodes and `thinning
+  ended frames=N`, `stream stats thinned=` > 0; the overlay's "Frames dropped" row shows
+  "thinned N" rising, its dropped count and "key req" not rising for them, no "Loss recovery"
+  activity, no visible corruption; the frame rate dips to about half during an episode. Repeat
+  for HEVC, AV1 and H.264 (client codec setting). If `thinned=0` throughout although episodes
+  are logged: AMF writes the enhancement layer as reference pictures (`TRAIL_R`, `nal_ref_idc`
+  != 0, AV1 refresh flags) and nothing is discardable: run the Phase 5 "SVC stream" check above
+  and record the NAL types.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD SVC session check with NVENC
+  (host.log `svc_layers=2` where `NV_ENC_CAPS_SUPPORT_TEMPORAL_SVC`); also note that intra
+  refresh is off with SVC (`intra_refresh=0` in the started line) and a loss is still answered
+  by invalidation (`loss recovered ... by="recovery frame"`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Chrome hardware decoders on a thinned stream,
+  VERIFY): in the SVC session above with capdrop, the client console must show no `decoder
+  error` after an episode; record per codec (HEVC, AV1, H.264) and the client GPU (AMD and
+  NVIDIA clients). A decoder error right after an episode means that decoder does not take a
+  frame whose predecessor in decode order was left out: then set `svc` `off` on that host and
+  report it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (FPS before resolution, no IDR): 120 fps stream at
+  `bitrate` 2500 (the floor 2000 is then close), `make netem PROFILE=capdrop` with the low
+  step at 1.5 Mbit/s: host.log `congestion: lowering bitrate ... fps=100`, then 90, 75, 60, 50,
+  45, 30 at least 2 s apart, `changing the bitrate in the encoder ... fps=N`; the helper's log
+  has no `the frame-rate change at frame N made a key frame`; the overlay's key-frame count
+  does not rise and the frame rate follows; once capacity returns the frame rate climbs back
+  2 s per step. With `fpsFloor` 60 it stops at 60. Per codec.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with NVENC (reconfigure with
+  `frameRateNum`, `forceIDR` 0): no key frame at any step.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (static desktop bitrate): 30000 kbit/s setting,
+  `capture` dda, an idle desktop with Notepad's caret blinking: within about 2 s host.log
+  `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`, the overlay's
+  Mbps drops (bytes on the wire) and the helper's stats report kbps 7500 (debug log); then drag
+  a window: `desktop changes: full bitrate back kbps=30000` on the first changed frame; take a
+  screenshot of the first frame after the drag starts (the overlay's frame barcode probe or a
+  screen capture) and compare its sharpness with the steady state: no visible blur (the VBV kept
+  at one full-rate frame). Also check AMF accepts `vbvFrames` 4 in a running encoder without a
+  key frame (no key frame in the overlay at the cut or the restore) and record the driver.
+  Repeat with `capture` amf (AMD Direct Capture dirty rects) and with a full-screen game
+  (expect no cut).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same static-desktop check with NVENC
+  (`vbvBufferSize` via `NvEncReconfigureEncoder`, no key frame).
+
+### Integration notes (merging)
+
+- Protocol: frame extension tag 8 and hello version 4 are new here; another branch that also
+  bumps the hello version must take the next number and keep `v >= 4` meaning "reads tag 8".
+- `media.Pipeline.SetRate(kbps, fps, vbvFrames)` (was `(kbps, fps)`), new `media.Params`
+  fields `SVCLayers` / `VBVFrames`, `media.Frame` fields `Discardable` / `Dirty` / `HasDirty`,
+  `PipelineCaps` `LiveFPS` / `SVCLayers`; `videoHeader` takes the thinned mask.
+- The mock backend's caps changed (`maxTemporalLayers` 2): tests that start it with
+  `svcLayers` 2 now succeed. `make helper-test` also runs `host.test.exe -test.run
+  SessionHelperMock` under Wine.
+- `test/e2e/browser.mjs`: the steady-playback and video-decoding checks add the thinned
+  frames' rate (`lastStats.thinned`) to the frames drawn; a branch that edits those checks keeps
+  that. New `checkThinning` after `checkLossHandling`; `lossRun` reports `client.thinned`.
+- Thinning is on by default (`svc` auto) for every v4 client, also on the FFmpeg path with
+  libsvtav1: scenarios elsewhere that count frames per second on a loaded machine see the
+  thinned frames as fewer frames drawn (they are in `lastStats.thinned` and the host's `stream
+  stats thinned=`); host config `svc` `off` turns it off.

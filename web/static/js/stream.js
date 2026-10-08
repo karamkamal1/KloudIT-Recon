@@ -836,7 +836,9 @@ function onStats(st) {
     pacingRow(st.pacing, row),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     ...decoderRows(st, row),
-    row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · superseded ${st.superseded ?? 0} (+${st.supersededChunks ?? 0} undecoded) · key req ${st.keyRequests}`, st.dropped ? 'warn' : ''),
+    // thinned: frames the host left out under congestion (temporal SVC thinning), no loss; in this row, not a
+    // row of its own, so the overlay (which does not scroll) keeps its height.
+    row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · superseded ${st.superseded ?? 0} (+${st.supersededChunks ?? 0} undecoded) · key req ${st.keyRequests}${st.thinned ? ` · thinned ${st.thinned}` : ''}`, st.dropped ? 'warn' : ''),
     st.recovered || st.recoveredByKey ? row('  recovered', `${st.recovered} by recovery frame · ${st.recoveredByKey} by key frame · ${st.recoveryDiscarded} frames waited out`) : null,
     row('Freezes > 100 ms', st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0', st.freezes ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),

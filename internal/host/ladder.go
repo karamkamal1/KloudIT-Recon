@@ -245,6 +245,9 @@ type sendState struct {
 	out    []*outFrame // streams being written, oldest first
 	recent [recentFrames]takenFrame
 	wait   lossWait
+	// lastSlow: the last frame stream written to the end took longer than
+	// its deadline (slow).
+	lastSlow bool
 }
 
 // recentFrames is how many taken frames sendState keeps (by taken count):
@@ -320,8 +323,31 @@ func (s *sendState) finish(of *outFrame, state int32) bool {
 	if !of.state.CompareAndSwap(outWriting, state) {
 		return false
 	}
+	if state == outDone {
+		s.lastSlow = time.Since(of.opened) > of.deadline
+	}
 	s.remove(of)
 	return true
+}
+
+// slow reports the loss-recovery ladder's deadline pressure, for thinning
+// (thin.go): a frame stream still being written past its deadline (where
+// rung 1 does not cancel it: key frames, recovery "skip" or "keyframe"), or
+// the last one written taking that long. A large frame's deadline includes
+// its own sending time (frameDeadline), so a key frame paced out in time is
+// no pressure.
+func (s *sendState) slow(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastSlow {
+		return true
+	}
+	for _, of := range s.out {
+		if now.Sub(of.opened) > of.deadline {
+			return true
+		}
+	}
+	return false
 }
 
 // remove takes a frame stream out of the list and stops its timer. Called

@@ -40,7 +40,10 @@ private:
 
 // ReplayEncoder outputs the canned clip: frame 0 is an IDR, 1..59 are P frames,
 // and it loops back to the IDR. forceIdr (and recover, which has no LTR to use)
-// jumps back to frame 0. setRate is accepted (recon-host sees it in the stats)
+// jumps back to frame 0. With start's svcLayers 2 every canned P frame is
+// preceded by a non-reference copy of itself (h264AsNonReference: layer 1,
+// discardable; it decodes to the same picture), so the stream has a
+// two-layer temporal structure: key 0, then copy / P pairs. setRate is accepted (recon-host sees it in the stats)
 // but cannot change the canned pictures; with MockOptions::followRate it pads
 // every frame with H.264 filler data to the target bitrate (key frames to three
 // times a P frame), applied from the next submitted frame (rateLag frames
@@ -84,6 +87,8 @@ private:
     MockOptions opt_;
     std::vector<std::pair<size_t, size_t>> aus_;  // offset, size into the clip
     std::string clipError_;
+    std::vector<std::vector<uint8_t>> nonRef_;  // non-reference copies of the P frames (SVC), [0] unused
+    std::string svcError_;                      // why there are none
 
     std::mutex mu_;
     std::condition_variable cv_;
@@ -99,6 +104,8 @@ private:
     bool flush_ = false, ratePending_ = false;
     RateParams pendingRate_;
     uint32_t gen_ = 0;
+    bool svc_ = false;       // svcLayers 2
+    bool copyNext_ = false;  // the next frame is the copy of the next canned P frame
 };
 
 }  // namespace recon

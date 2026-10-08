@@ -48,6 +48,21 @@ std::string levelText(Codec c, int levelIdc);  // "5.1"
 
 inline uint32_t alignUp(uint32_t v, uint32_t a) { return a > 1 ? (v + a - 1) / a * a : v; }
 
+// An H.264 access unit of a non-IDR picture (Annex-B) recoded as a
+// non-reference picture: nal_ref_idc 0 on its slices, whose
+// dec_ref_pic_marking() (adaptive_ref_pic_marking_mode_flag 0) is left out;
+// the other NAL units unchanged. Decoded in the original's place (the same
+// references before it) it gives the original's picture, and no later frame
+// references it: the mock backend's temporal SVC enhancement layer (the
+// frame before each canned P frame is a non-reference copy of it).
+// paramSets: Annex-B data with the stream's SPS and PPS. Empty when the
+// picture is not one this handles: an IDR, data partitions, CABAC (slice
+// data must stay byte-aligned), field coding, slice groups, weighted
+// prediction, B / SP / SI slices, pic_order_cnt_type 0 or 1 (the copy would
+// share the original's picture order count; type 2 derives it from
+// nal_ref_idc), memory management control operations.
+std::vector<uint8_t> h264AsNonReference(const uint8_t* au, size_t n, const uint8_t* paramSets, size_t paramSize);
+
 // Temporal scalability as an access unit / temporal unit signals it (GUIDE 5
 // temporal SVC: recon-host may leave out frames no other frame references).
 struct LayerInfo {

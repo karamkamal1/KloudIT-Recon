@@ -88,6 +88,10 @@ type Session struct {
 	// send: the frame streams being written and the loss the client waits
 	// on, for the loss-recovery ladder (ladder.go).
 	send sendState
+	// thinning: discardable frames left out under congestion (thin.go);
+	// static: the encoder's bitrate on a static desktop (activity.go).
+	thinning thinState
+	static   staticCap
 
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
@@ -138,6 +142,8 @@ type sessionStats struct {
 	// a loss before them, key frames asked of the pipeline (rung 4: IDRs in
 	// the encoder, or new generations).
 	cancelled, discarded, keyframes atomic.Int64
+	// thinned: discardable frames left out under congestion (thin.go).
+	thinned atomic.Int64
 }
 
 var errClosed = errors.New("session closed")
@@ -158,6 +164,8 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 	// The direct path and the UDP relay end at the client; the splice relay
 	// (relay-splice, also WebSocket) ends at the gateway.
 	s.rate.setPath(meta.Path == "direct" || meta.Path == "relay")
+	s.rate.setFPSFloor(a.cfg.FPSFloor)
+	s.static.on, s.static.kbps = a.cfg.staticBitrate(), a.cfg.StaticKbps
 	return s
 }
 
@@ -611,6 +619,12 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
 	s.triedMu.Unlock()
+	if s.thinOK() {
+		// Temporal SVC (Phase 5): two layers where the native helper's
+		// encoder has them (HelperVideo.withCaps decides and logs), so
+		// frameSender can thin the enhancement layer under congestion.
+		p.SVCLayers = 2
+	}
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()
 	choice := enc.Name + " " + why
@@ -825,7 +839,8 @@ func (s *Session) videoEvents() {
 			// The live generation's encoder changed its bitrate or frame
 			// rate in place: the client's config of it is updated.
 			s.rate.live(ev.Rate.Kbps, ev.Rate.FPS)
-			_, ceiling := s.rate.kbps()
+			target, ceiling := s.rate.kbps()
+			s.static.rate(s.static.clock(), ev.Rate.Kbps, target)
 			s.sendJSON(proto.Rate{T: "rate", Gen: ev.Rate.Gen, BitrateKbps: ev.Rate.Kbps, FPS: ev.Rate.FPS, MaxBitrateKbps: ceiling})
 		case ev.Config != nil:
 			s.encoderLive()
@@ -840,8 +855,10 @@ func (s *Session) videoEvents() {
 			if r := s.a.faults.recovery; r != "" {
 				c.Recovery = r
 			}
-			_, c.MaxBitrateKbps = s.rate.kbps()
+			target, ceiling := s.rate.kbps()
+			c.MaxBitrateKbps = ceiling
 			s.rate.live(c.BitrateKbps, c.FPS)
+			s.static.generation(s.static.clock(), c.BitrateKbps, target)
 			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
 			s.sendJSON(&c)
@@ -854,6 +871,7 @@ func (s *Session) videoEvents() {
 			}
 			s.healFrame(ev.Frame)
 			s.rate.output(len(ev.Frame.Data))
+			s.staticFrame(ev.Frame)
 			select {
 			case s.frameQ <- ev.Frame:
 				// A newer frame is ready: a frame stream past its deadline
@@ -1549,8 +1567,21 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	if cur, ok := v.Current(); ok && fps > 0 && fps != cur.FPS {
 		newFPS = fps
 	}
-	s.log.Info("changing the bitrate in the encoder", "reason", reason, "kbps", kbps, "fps", newFPS, "urgent", urgent)
-	if err := v.SetRate(kbps, newFPS); err != nil {
+	// A static desktop keeps the encoder below the target (activity.go).
+	now := s.static.clock()
+	s.static.mu.Lock()
+	enc, vbv := s.static.want(now, kbps, !c.LiveBitrateFlush)
+	attrs := []any{"reason", reason, "kbps", enc, "fps", newFPS, "urgent", urgent}
+	if enc < kbps {
+		attrs = append(attrs, "target", kbps, "static_desktop", true)
+	}
+	s.log.Info("changing the bitrate in the encoder", attrs...)
+	err := v.SetRate(enc, newFPS, vbv)
+	if err == nil {
+		s.static.applied(now, enc, kbps)
+	}
+	s.static.mu.Unlock()
+	if err != nil {
 		s.log.Warn("bitrate change in the encoder failed, restarting", "err", err)
 		s.kicked()
 		return s.startVideo(urgent, reason)
@@ -1587,6 +1618,9 @@ func (s *Session) frameSender() {
 			s.discard(f, step)
 			continue
 		}
+		if s.thin(f, num) {
+			continue // left out under congestion: no loss (thin.go)
+		}
 		s.sendOpening.Store(true)
 		s.sendSince.Store(time.Now().UnixNano())
 		s.applyCongestionTarget()
@@ -1602,7 +1636,7 @@ func (s *Session) frameSender() {
 			s.lostFrame(f, "stream failed")
 			continue
 		}
-		h, ext := videoHeader(f, s.hello.V, s.a.clock())
+		h, ext := videoHeader(f, s.hello.V, s.a.clock(), s.thinning.mask(f.Gen, f.Seq))
 		buf = buf[:proto.FrameHeaderLen]
 		h.Marshal(buf)
 		if h.Flags&proto.FrameFlagExt != 0 {
@@ -1685,8 +1719,10 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 }
 
 // videoHeader builds a video frame's header, plus the extension for clients
-// that parse it. now is the host clock as the frame goes to the transport.
-func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, proto.FrameExt) {
+// that parse it. now is the host clock as the frame goes to the transport;
+// thinned is the frame's ExtThinned mask (thinState.mask; sent to clients
+// that read it only).
+func videoHeader(f *media.Frame, helloV int, now uint64, thinned uint32) (proto.FrameHeader, proto.FrameExt) {
 	h := proto.FrameHeader{Type: proto.FrameTypeVideo, Gen: f.Gen, Seq: f.Seq, PtsUs: uint64(f.PtsUs)}
 	if f.Key {
 		h.Flags |= proto.FrameFlagKey
@@ -1723,6 +1759,9 @@ func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, pro
 	}
 	if f.TemporalLayer != 0 {
 		ext.Set(proto.ExtTemporalLayer, uint64(f.TemporalLayer))
+	}
+	if thinned != 0 && helloV >= proto.HelloVersionThinned {
+		ext.Set(proto.ExtThinned, uint64(thinned))
 	}
 	return h, ext
 }
@@ -2004,8 +2043,10 @@ func (s *Session) controlLoop() error {
 			s.requestKeyframe("keyframe request")
 		case proto.MsgLost:
 			// A loss only the client saw (a gap that outlasted its wait),
-			// under reference recovery: it waits for the recovery frame.
-			s.loss(lossConfirmed, m.Gen, m.FromSeq, "client")
+			// under reference recovery: it waits for the recovery frame. A
+			// frame left out on purpose is none (thin.go): the loss starts
+			// at the next frame sent.
+			s.loss(lossConfirmed, m.Gen, s.thinning.firstSent(m.Gen, m.FromSeq), "client")
 		case "stages":
 			s.logStages(m.Stages, m.Renderer, m.Pacing)
 		case "congestion":
@@ -2190,6 +2231,7 @@ func (s *Session) statsLoop() {
 		dropped := s.stats.dropped.Swap(0)
 		recovered, byKey := s.stats.recovered.Swap(0), s.stats.recoveredByKey.Swap(0)
 		cancelled, discarded, keyframes := s.stats.cancelled.Swap(0), s.stats.discarded.Swap(0), s.stats.keyframes.Swap(0)
+		thinned := s.stats.thinned.Swap(0)
 		avg := int64(0)
 		if acks > 0 {
 			avg = owdSum / acks
@@ -2203,7 +2245,11 @@ func (s *Session) statsLoop() {
 			// past their deadline (rung 1), frames not sent while the client
 			// waited for a recovery or key frame, key frames asked of the
 			// pipeline (rung 4).
-			"deadline_drops", cancelled, "discarded", discarded, "key_frames", keyframes}
+			"deadline_drops", cancelled, "discarded", discarded, "key_frames", keyframes,
+			// Phase 5: discardable frames left out under congestion
+			// (thin.go), and the encoder's bitrate held down on a static
+			// desktop (activity.go).
+			"thinned", thinned, "static_desktop", s.static.isCapped()}
 		// The rate controller's view: the one-way delay of the client's
 		// reports (p50/p95 of their p50s, the largest maximum), the
 		// continuous target, the frame rate, the queueing-delay margin and

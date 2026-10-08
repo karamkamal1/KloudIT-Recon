@@ -36,12 +36,12 @@ func TestVideoHeader(t *testing.T) {
 	f := &media.Frame{Gen: 3, Seq: 7, Key: true, PtsUs: 1000, CaptureUs: 900, EncodeDoneUs: 5000}
 	const now = 7500 // frame waited 2.5 ms in the host queue
 
-	h, ext := videoHeader(f, 1, now)
+	h, ext := videoHeader(f, 1, now, 0)
 	if h.SendUs != f.EncodeDoneUs || h.Flags != proto.FrameFlagKey || !ext.Empty() {
 		t.Fatalf("v1: send %d flags %#x ext %v, want send = encodeDone %d, key only", h.SendUs, h.Flags, !ext.Empty(), f.EncodeDoneUs)
 	}
 
-	h, ext = videoHeader(f, proto.HelloVersionFrameExt, now)
+	h, ext = videoHeader(f, proto.HelloVersionFrameExt, now, 0)
 	done, _ := ext.Get(proto.ExtEncodeDoneUs)
 	capture, _ := ext.Get(proto.ExtCaptureUs)
 	if h.SendUs != now || h.Flags != proto.FrameFlagKey|proto.FrameFlagExt || done != f.EncodeDoneUs || capture != f.CaptureUs {
@@ -49,7 +49,7 @@ func TestVideoHeader(t *testing.T) {
 	}
 
 	f.CaptureUs = 0
-	_, ext = videoHeader(f, proto.HelloVersionFrameExt, now)
+	_, ext = videoHeader(f, proto.HelloVersionFrameExt, now, 0)
 	if _, ok := ext.Get(proto.ExtCaptureUs); ok {
 		t.Fatal("capture tag sent without a capture stamp")
 	}
@@ -64,7 +64,7 @@ func TestVideoHeader(t *testing.T) {
 	// the wire format; v1 clients still get the plain header.
 	f = &media.Frame{Gen: 4, Seq: 9, PresentUs: 800, CaptureUs: 900, SubmitUs: 1200, EncodeDoneUs: 5000,
 		Recovery: true, RefFloor: 0, MarkedLTR: true, LTRSlot: 1, TemporalLayer: 1, Data: []byte{1, 2, 3}}
-	h, ext = videoHeader(f, proto.HelloVersionFrameExt, now)
+	h, ext = videoHeader(f, proto.HelloVersionFrameExt, now, 0)
 	b := make([]byte, proto.FrameHeaderLen)
 	h.Marshal(b)
 	b = append(ext.Append(b), f.Data...)
@@ -79,7 +79,7 @@ func TestVideoHeader(t *testing.T) {
 		}
 	}
 	f.Recovery, f.MarkedLTR, f.TemporalLayer = false, false, 0
-	if _, ext = videoHeader(f, proto.HelloVersionFrameExt, now); !func() bool {
+	if _, ext = videoHeader(f, proto.HelloVersionFrameExt, now, 0); !func() bool {
 		_, r := ext.Get(proto.ExtRefFloor)
 		_, l := ext.Get(proto.ExtLTRSlot)
 		_, tl := ext.Get(proto.ExtTemporalLayer)
@@ -87,8 +87,24 @@ func TestVideoHeader(t *testing.T) {
 	}() {
 		t.Fatal("recovery tags on a frame without recovery metadata")
 	}
-	if h, ext = videoHeader(f, 1, now); h.Flags&proto.FrameFlagExt != 0 || !ext.Empty() {
+	if h, ext = videoHeader(f, 1, now, 0); h.Flags&proto.FrameFlagExt != 0 || !ext.Empty() {
 		t.Fatal("v1 client got the extension")
+	}
+	// The thinned mask (Phase 5): only to clients that read it, only when
+	// frames were left out.
+	if _, ext = videoHeader(f, proto.HelloVersionThinned, now, 0b101); !func() bool {
+		v, ok := ext.Get(proto.ExtThinned)
+		return ok && v == 0b101
+	}() {
+		t.Fatal("thinned mask missing for a v4 client")
+	}
+	for _, v := range []int{proto.HelloVersionRecovery, proto.HelloVersionFrameExt} {
+		if _, ext = videoHeader(f, v, now, 0b101); func() bool { _, ok := ext.Get(proto.ExtThinned); return ok }() {
+			t.Fatalf("thinned mask sent to a v%d client", v)
+		}
+	}
+	if _, ext = videoHeader(f, proto.HelloVersionThinned, now, 0); func() bool { _, ok := ext.Get(proto.ExtThinned); return ok }() {
+		t.Fatal("empty thinned mask sent")
 	}
 }
 

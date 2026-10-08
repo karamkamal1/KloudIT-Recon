@@ -108,6 +108,16 @@ func TestActivityMeter(t *testing.T) {
 	if _, ok := lin.Activity(t0); ok || lin.SuggestKbps(t0, 20000, 0) != 20000 {
 		t.Fatal("unknown share not reported as unknown")
 	}
+	// AddShare: the share alone, as recon-host's frames carry it.
+	var sh ActivityMeter
+	sh.AddShare(t0, 0.001)
+	if !sh.Static(t0) || sh.SuggestKbps(t0, 20000, 2000) != 5000 {
+		t.Fatal("AddShare: static share not static")
+	}
+	sh.AddShare(t0.Add(10*time.Millisecond), -1)
+	if _, ok := sh.Activity(t0.Add(10 * time.Millisecond)); ok {
+		t.Fatal("AddShare: negative share not unknown")
+	}
 }
 
 func TestDroppable(t *testing.T) {

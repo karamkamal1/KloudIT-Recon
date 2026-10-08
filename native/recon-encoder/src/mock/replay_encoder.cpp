@@ -2,6 +2,7 @@
 #include <chrono>
 #include <string>
 
+#include "codec/bitstream.hpp"
 #include "codec/hdr.hpp"
 #include "mock/mock.hpp"
 
@@ -73,6 +74,14 @@ ReplayEncoder::ReplayEncoder(const MockOptions& opt) : opt_(opt) {
             return;
         }
     }
+    // Temporal SVC (start svcLayers 2): the enhancement-layer frame before
+    // each canned P frame is a non-reference copy of it, which decodes to
+    // the same picture (same references) and which no frame references.
+    nonRef_.resize(aus_.size());
+    for (size_t i = 1; i < aus_.size() && svcError_.empty(); ++i) {
+        nonRef_[i] = h264AsNonReference(kMockClip + aus_[i].first, aus_[i].second, first, aus_[0].second);
+        if (nonRef_[i].empty()) svcError_ = "mock clip frame " + std::to_string(i) + " cannot be recoded as a non-reference frame";
+    }
 }
 
 ReplayEncoder::~ReplayEncoder() {
@@ -93,12 +102,14 @@ Caps ReplayEncoder::caps() {
     h264.forceIdr = true;
     h264.recovery = "none";
     h264.liveBitrate = "seamless";
-    // Phase 5 plumbing checks: setRate's fps re-paces the capture, and two
+    // Phase 5 plumbing checks: setRate's fps re-paces the capture, two
     // "engines" so start's encoderInstance can be exercised (it only shows in
-    // started); no SVC, re-encode or sub-frame output (a canned stream).
+    // started), two temporal layers (the enhancement layer: non-reference
+    // copies of the canned frames); no re-encode or sub-frame output.
     h264.liveFps = "seamless";
     h264.hwInstances = kInstances;
     h264.instanceSelect = true;
+    h264.maxTemporalLayers = svcError_.empty() ? 2 : 1;
     c.codecs["h264"] = h264;
     c.capture = {"synthetic"};
     return c;
@@ -111,7 +122,8 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) + ": the mock has " +
                                                 std::to_string(kInstances) + " engines");
     }
-    if (p.svcLayers > 1) return Status::Error("unsupported", "svcLayers " + std::to_string(p.svcLayers) + ": the encoder supports 1");
+    if (p.svcLayers > 2) return Status::Error("unsupported", "svcLayers " + std::to_string(p.svcLayers) + ": the mock supports 2");
+    if (p.svcLayers == 2 && !svcError_.empty()) return Status::Error("unsupported", "svcLayers 2: " + svcError_);
     if (p.reencodeOversized > 0) return Status::Error("unsupported", "reencodeOversized: the mock cannot re-encode (caps reencode false)");
     if (p.sliceOutput > 0) return Status::Error("unsupported", "sliceOutput: the mock has no slice output (caps sliceOutput false)");
     in = InputSpec{};
@@ -141,6 +153,8 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     flush_ = p.liveBitrate == "flush";
     ratePending_ = false;
     gen_ = 0;
+    svc_ = p.svcLayers == 2;
+    copyNext_ = false;
     out.backend = name();
     out.codec = "h264";
     out.width = kClipWidth;  // the canned stream has one size, whatever was asked
@@ -152,7 +166,7 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     out.liveFps = out.liveBitrate;  // the capture follows it; with flush also an IDR and a new gen
     out.encoderInstance = std::max(0, p.encoderInstance);
     out.hwInstances = kInstances;
-    out.svcLayers = 1;
+    out.svcLayers = svc_ ? 2 : 1;
     describeColor(out, hdr ? std::optional<HdrMetadata>(hdrMetadataFor(src.display)) : std::nullopt);
     return Status::Ok();
 }
@@ -195,12 +209,23 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
         }
         EncodedFrame e;
         e.info = info;
-        e.key = pos_ == 0;
         e.gen = gen_;
         e.width = kClipWidth;
         e.height = kClipHeight;
-        e.data = kMockClip + aus_[pos_].first;
-        e.size = aus_[pos_].second;
+        // SVC: after a base-layer frame the non-reference copy of the next
+        // canned P frame (layer 1, discardable); never before the IDR.
+        const bool copy = svc_ && copyNext_ && pos_ != 0;
+        if (copy) {
+            e.data = nonRef_[pos_].data();
+            e.size = nonRef_[pos_].size();
+            e.temporalLayer = 1;
+            e.discardable = true;
+        } else {
+            e.key = pos_ == 0;
+            e.data = kMockClip + aus_[pos_].first;
+            e.size = aus_[pos_].second;
+        }
+        copyNext_ = svc_ && !copy;
         if (opt_.followRate) {
             const int kbps = lagLeft_ > 0 ? lagKbps_ : kbps_;
             if (lagLeft_ > 0) --lagLeft_;
@@ -209,7 +234,7 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
             e.size = buf->size();
             e.token = buf;
         }
-        pos_ = (pos_ + 1) % aus_.size();
+        if (!copy) pos_ = (pos_ + 1) % aus_.size();
         queue_.push_back(e);
     }
     cv_.notify_one();

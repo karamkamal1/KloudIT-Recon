@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 )
 
@@ -53,7 +54,17 @@ import (
 //     restart, but not within rateEmergencyGap of any other decrease.
 //   - At the floor, the frame rate goes down a rung (120 -> 90 -> 60) before
 //     anything else, and back up once the bitrate is well above the floor
-//     (1.5 x, or at the limit where that is lower).
+//     (1.5 x, or at the limit where that is lower). An encoder that changes
+//     its frame rate in place without a key frame (the native helper's
+//     liveFps "seamless": PipelineCaps.LiveFPS) steps through
+//     encoder.FPSSteps instead (LowerFPS / RaiseFPS: 120 -> 100 -> 90 -> ...
+//     down to fpsFloor, 30 by default), each step 2 s apart rather than 5
+//     (GUIDE 9 "FPS before resolution").
+//   - Thinning (Phase 5 temporal SVC, thin.go): the session leaves out
+//     discardable frames under congestion at once, a short spike's answer;
+//     while it does nothing increases (thinQuiet), and thinning that goes on
+//     for thinSustain decreases like the delay ("thinning"): a lasting
+//     shortage is the bitrate's to answer, not the frame rate's.
 //
 // The continuous target reaches the encoder at most as often as its pipeline
 // can take changes (ratePolicy): a qualified seamless encoder every 250 ms, a
@@ -150,12 +161,32 @@ const (
 	// few frames in flight normally (frame threading).
 	decodeQueueMin = 4
 	// fpsHold is the minimum time between frame-rate changes, and from a
-	// decrease to a frame-rate increase.
-	fpsHold = 5 * time.Second
+	// decrease to a frame-rate increase; fpsHoldLive the same for an
+	// encoder that changes its frame rate in place (no key frame, no
+	// restart: finer and faster steps).
+	fpsHold     = 5 * time.Second
+	fpsHoldLive = 2 * time.Second
+	// fpsFloorLive is the lowest frame rate the fine steps go to by default
+	// (host config "fpsFloor" overrides it).
+	fpsFloorLive = 30
+
+	// Thinning (thin.go). thinQuiet: no increase this long after a frame
+	// was thinned (while an episode lasts: frames thinned at most
+	// thinEpisodeGap apart; not longer, or the frequent short episodes of a
+	// loaded client would hold the bitrate down). thinSustain: thinning
+	// that lasts this long decreases the bitrate.
+	thinEpisodeGap = 250 * time.Millisecond
+	thinQuiet      = thinEpisodeGap
+	thinSustain    = time.Second
+	// thinOverReports: consecutive reports over the delay target that count
+	// as congestion for thinning (one report alone can be a burst).
+	thinOverReports = 2
 )
 
 // fpsRungs are the frame rates the controller steps down through at the
-// bitrate floor (GUIDE 2.2, AMD Streaming SDK QoS), before resolution.
+// bitrate floor (GUIDE 2.2, AMD Streaming SDK QoS), before resolution, where
+// every change costs a key frame or a restart; encoders that change their
+// frame rate in place use encoder.FPSSteps (applyPolicy.fineFPS).
 var fpsRungs = []int{120, 90, 60}
 
 // rateSignal is the kind of a congestion signal from outside the reports.
@@ -193,6 +224,10 @@ type applyPolicy struct {
 	// overflows the host's frame queue; an urgent restart stops it at once,
 	// and the decrease does not wait for decGap.
 	cutUrgent float64
+	// fineFPS: the encoder changes its frame rate in place without a key
+	// frame (PipelineCaps.LiveFPS): the frame-rate ladder at the floor
+	// steps through encoder.FPSSteps, fpsHoldLive apart.
+	fineFPS bool
 }
 
 // ratePolicy picks the apply policy for the pipeline that streams: a live
@@ -202,15 +237,16 @@ type applyPolicy struct {
 // often") and a restart (an FFmpeg generation: a new process, a key frame and
 // an overlapped switch; or a helper that cannot change live) far less often.
 func ratePolicy(c media.PipelineCaps) applyPolicy {
+	fine := c.LiveFPS && c.LiveBitrate && !c.LiveBitrateFlush
 	switch {
 	case c.LiveBitrate && !c.LiveBitrateFlush && c.LiveBitrateMeasured:
-		return applyPolicy{"seamless", 0, 250 * time.Millisecond, 0.02, 150 * time.Millisecond, 0}
+		return applyPolicy{"seamless", 0, 250 * time.Millisecond, 0.02, 150 * time.Millisecond, 0, fine}
 	case c.LiveBitrate && !c.LiveBitrateFlush:
-		return applyPolicy{"seamless (assumed)", 0, time.Second, 0.03, 300 * time.Millisecond, 0}
+		return applyPolicy{"seamless (assumed)", 0, time.Second, 0.03, 300 * time.Millisecond, 0, fine}
 	case c.LiveBitrate:
-		return applyPolicy{"flush", 250 * time.Millisecond, 2 * time.Second, 0.05, 500 * time.Millisecond, 0}
+		return applyPolicy{"flush", 250 * time.Millisecond, 2 * time.Second, 0.05, 500 * time.Millisecond, 0, false}
 	}
-	return applyPolicy{"restart", 500 * time.Millisecond, time.Second, 0.05, time.Second, 0.75}
+	return applyPolicy{"restart", 500 * time.Millisecond, time.Second, 0.05, time.Second, 0.75, false}
 }
 
 // feedback is one receive report as the controller reads it.
@@ -286,6 +322,7 @@ type rateController struct {
 	policy    applyPolicy // zero: ratePolicy of FFmpeg (setPolicy)
 	ceiling   int         // kbps: the settings' bitrate, never exceeded
 	fpsMax    int         // the settings' frame rate
+	fpsFloor  int         // host config "fpsFloor": the frame-rate ladder's lowest step (0: default)
 	est       float64     // kbps: the continuous target (0 until the first generation)
 	fps       int         // the frame rate the ladder allows (<= fpsMax)
 	applied   int         // kbps the encoder was told (0 before the first generation)
@@ -302,7 +339,8 @@ type rateController struct {
 	firstQD   time.Time  // the first delay sample (owdWarmup)
 	strongN   int        // consecutive reports with a pending frame far over the target
 	qdOver    bool       // the last report's delay was over the target
-	over      int        // consecutive reports over the target
+	over      int        // consecutive reports over the target (reset by a decrease)
+	overRun   int        // ... not reset by a decrease (thinning: overTarget)
 	recentQD  []qdSample // the last overReports+1 samples, oldest first
 	recv      []timedCount
 	out       []timedCount // encoder output: n bytes, total the bytes its target asked for
@@ -326,6 +364,9 @@ type rateController struct {
 	decoderCap    int       // kbps: increases stop here after a decoder flush; 0: none
 	lastFPSChange time.Time
 	lastTick      time.Time
+	// Thinning (thinned): the current run of thinned frames started at
+	// thinSince, the newest was thinned at thinLast.
+	thinSince, thinLast time.Time
 
 	// Feedback.
 	everFeedback bool      // the client has sent feedback
@@ -343,6 +384,15 @@ func (r *rateController) clock() time.Time {
 func (r *rateController) setPolicy(p applyPolicy) {
 	r.mu.Lock()
 	r.policy = p
+	r.mu.Unlock()
+}
+
+// setFPSFloor sets the lowest frame rate the ladder at the bitrate floor
+// steps down to (host config "fpsFloor"; 0: 30 for an encoder that changes
+// its frame rate in place, the rungs' 60 for the others).
+func (r *rateController) setFPSFloor(fps int) {
+	r.mu.Lock()
+	r.fpsFloor = fps
 	r.mu.Unlock()
 }
 
@@ -417,7 +467,7 @@ func (r *rateController) hold() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
-	r.over, r.qdOver = 0, false
+	r.over, r.overRun, r.qdOver = 0, 0, false
 	r.lastTick = now
 	if r.holdUntil.Before(now) {
 		r.holdUntil = now
@@ -502,8 +552,41 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 		return r.decrease(now, "delay")
 	case r.lossFraction() > lossThreshold:
 		return r.decrease(now, "loss")
+	case r.thinSustained(now):
+		return r.decrease(now, "thinning")
 	}
 	return rateChange{}, false
+}
+
+// overTarget reports whether the path is congested now by the delay: the
+// queueing delay (or the bound of a frame that does not arrive) was over the
+// target in the last thinOverReports reports, or a frame far over it does not
+// arrive. Thinning (thin.go) acts on it at once; the bitrate waits for
+// overReports in a row (and a decrease does not end it: the queue is still
+// there).
+func (r *rateController) overTarget() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.overRun >= thinOverReports || r.strongN > 0
+}
+
+// thinned records that the session left out a frame under congestion
+// (temporal SVC thinning): no increase for thinQuiet, and thinning that goes
+// on for thinSustain decreases the bitrate (report).
+func (r *rateController) thinned() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	if r.thinLast.IsZero() || now.Sub(r.thinLast) > thinEpisodeGap {
+		r.thinSince = now
+	}
+	r.thinLast = now
+}
+
+// thinSustained reports whether frames have been thinned for thinSustain
+// without a pause of thinEpisodeGap, up to now. Called with r.mu held.
+func (r *rateController) thinSustained(now time.Time) bool {
+	return !r.thinLast.IsZero() && now.Sub(r.thinLast) <= thinEpisodeGap && now.Sub(r.thinSince) >= thinSustain
 }
 
 // delay takes a report's queueing delay: the base window and the jitter
@@ -529,7 +612,7 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 		r.firstQD = now
 	}
 	if now.Sub(r.firstQD) < owdWarmup {
-		r.over, r.qdOver, r.strongN = 0, false, 0
+		r.over, r.overRun, r.qdOver, r.strongN = 0, 0, false, 0
 		return
 	}
 	base, raw := r.base[0].d, r.base[0].raw
@@ -562,6 +645,11 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 	}
 	r.recentQD = append(r.recentQD, qdSample{at: now, d: qd, own: fb.qd, ownOK: fb.owdValid && qd == fb.qd})
 	r.qdOver = qd > base+r.margin()
+	if r.qdOver {
+		r.overRun++
+	} else {
+		r.overRun = 0
+	}
 	switch {
 	case strong:
 		r.over = max(r.over+1, overReports)
@@ -704,6 +792,7 @@ func (r *rateController) decrease(now time.Time, why string) (rateChange, bool) 
 	cur = max(cur, r.est*decreaseMinShare)
 	r.lastGood, r.passedGood = cur, time.Time{}
 	r.over, r.loss, r.lastDecrease, r.recentQD = 0, r.loss[:0], now, r.recentQD[:0]
+	r.thinSince = now // thinning that goes on decreases again only after another thinSustain
 	to := max(r.floor(), cur*rateDecreaseFactor)
 	if to >= r.est && !r.fpsDown(now) {
 		return rateChange{}, false // at the floor, and at the lowest frame rate
@@ -749,28 +838,55 @@ func (r *rateController) queueCapacity() (float64, bool) {
 	return float64(r.liveKbps) / (1 + min(g, queueGrowthMax)), true
 }
 
-// fpsDown lowers the frame rate a rung, if the ladder has one below. Called
-// with r.mu held.
+// fpsDown lowers the frame rate a rung, if the ladder has one below (the
+// policy's: encoder.FPSSteps down to fpsFloor for an encoder that changes
+// its frame rate in place, else fpsRungs). Called with r.mu held.
 func (r *rateController) fpsDown(now time.Time) bool {
-	for _, f := range fpsRungs {
-		if f < r.fps {
-			r.fps, r.lastFPSChange = f, now
-			return true
+	next := r.fps
+	if r.pol().fineFPS {
+		floor := r.fpsFloor
+		if floor <= 0 {
+			floor = fpsFloorLive
+		}
+		next = encoder.LowerFPS(r.fps, floor)
+	} else {
+		for _, f := range fpsRungs {
+			if f < r.fps && f >= r.fpsFloor {
+				next = f
+				break
+			}
 		}
 	}
-	return false
+	if next >= r.fps {
+		return false
+	}
+	r.fps, r.lastFPSChange = next, now
+	return true
 }
 
-// fpsUp raises the frame rate a rung towards the settings' rate. Called with
-// r.mu held.
+// fpsUp raises the frame rate a rung towards the settings' rate (the
+// policy's ladder, as fpsDown). Called with r.mu held.
 func (r *rateController) fpsUp(now time.Time) {
 	next := r.fpsMax
-	for _, f := range fpsRungs {
-		if f > r.fps && f < next {
-			next = f
+	if r.pol().fineFPS {
+		next = encoder.RaiseFPS(r.fps, r.fpsMax)
+	} else {
+		for _, f := range fpsRungs {
+			if f > r.fps && f < next {
+				next = f
+			}
 		}
 	}
 	r.fps, r.lastFPSChange = next, now
+}
+
+// fpsHold is the time between frame-rate changes of the policy's ladder.
+// Called with r.mu held.
+func (r *rateController) fpsHold() time.Duration {
+	if r.pol().fineFPS {
+		return fpsHoldLive
+	}
+	return fpsHold
 }
 
 // congestion handles a congestion signal from outside the reports and
@@ -855,8 +971,8 @@ func (r *rateController) tick(stalled bool) (rateChange, bool) {
 	if r.mayIncrease(now, stalled) {
 		r.increase(now, dt)
 	}
-	if r.fps < r.fpsMax && r.mayIncrease(now, stalled) && r.est >= min(1.5*r.floor(), r.limit()) &&
-		now.Sub(r.lastDecrease) >= fpsHold && now.Sub(r.lastFPSChange) >= fpsHold {
+	if hold := r.fpsHold(); r.fps < r.fpsMax && r.mayIncrease(now, stalled) && r.est >= min(1.5*r.floor(), r.limit()) &&
+		now.Sub(r.lastDecrease) >= hold && now.Sub(r.lastFPSChange) >= hold {
 		r.fpsUp(now)
 	}
 	return r.decide(now)
@@ -868,7 +984,7 @@ func (r *rateController) tick(stalled bool) (rateChange, bool) {
 // keeping up, no stalled path; a client that never sent feedback gets
 // increases noFeedbackQuiet after the last decrease. Called with r.mu held.
 func (r *rateController) mayIncrease(now time.Time, stalled bool) bool {
-	if r.waitLive || now.Before(r.holdUntil) {
+	if r.waitLive || now.Before(r.holdUntil) || !r.thinLast.IsZero() && now.Sub(r.thinLast) < thinQuiet {
 		return false
 	}
 	if !r.everFeedback {

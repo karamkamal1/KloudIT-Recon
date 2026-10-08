@@ -237,7 +237,30 @@ type AV1SequenceHeader struct {
 	// has no cropping window: an encoder that codes in blocks (RDNA3: 64x16)
 	// writes the padded size here and decoders output the padding rows.
 	MaxWidth, MaxHeight int
+
+	// What parsing a frame header up to refresh_frame_flags needs
+	// (av1Discardable).
+	hdr av1HeaderInfo
 }
+
+// av1HeaderInfo is the part of a sequence header that the uncompressed frame
+// header depends on up to refresh_frame_flags (AV1 5.9.2).
+type av1HeaderInfo struct {
+	reduced              bool   // reduced_still_picture_header
+	decoderModel         bool   // decoder_model_info_present_flag
+	equalPictureInterval bool   // timing_info's equal_picture_interval
+	presentationTimeLen  uint32 // frame_presentation_time_length_minus_1 + 1
+	removalTimeLen       uint32 // buffer_removal_time_length_minus_1 + 1
+	opIdc                []uint32
+	opDecoderModel       []bool
+	frameIDLen           uint32 // 0: frame_id_numbers_present_flag is 0
+	forceSCT             uint32 // seq_force_screen_content_tools (av1Select: per frame)
+	forceIntegerMV       uint32 // seq_force_integer_mv (av1Select: per frame)
+	orderHintBits        uint32
+}
+
+// av1Select is SELECT_SCREEN_CONTENT_TOOLS / SELECT_INTEGER_MV.
+const av1Select = 2
 
 // ParseAV1SequenceHeader parses a sequence header OBU payload up to its
 // color_config bit depth.
@@ -247,6 +270,9 @@ func ParseAV1SequenceHeader(seqHdr []byte) (AV1SequenceHeader, error) {
 	profile := br.u(3)
 	br.u(1) // still_picture
 	reduced := br.u(1)
+	hi := &h.hdr
+	hi.reduced = reduced == 1
+	hi.forceSCT, hi.forceIntegerMV = av1Select, av1Select
 	var level, tier uint32
 	if reduced == 1 {
 		level = br.u(5)
@@ -258,32 +284,37 @@ func ParseAV1SequenceHeader(seqHdr []byte) (AV1SequenceHeader, error) {
 			br.u(32)          // num_units_in_display_tick
 			br.u(32)          // time_scale
 			if br.u(1) == 1 { // equal_picture_interval
+				hi.equalPictureInterval = true
 				br.uvlc()
 			}
 			decoderModel = br.u(1)
 			if decoderModel == 1 {
+				hi.decoderModel = true
 				bufferDelayLen = br.u(5) + 1
-				br.u(32) // num_units_in_decoding_tick
-				br.u(5)  // buffer_removal_time_length_minus_1
-				br.u(5)  // frame_presentation_time_length_minus_1
+				br.u(32)                             // num_units_in_decoding_tick
+				hi.removalTimeLen = br.u(5) + 1      // buffer_removal_time_length_minus_1
+				hi.presentationTimeLen = br.u(5) + 1 // frame_presentation_time_length_minus_1
 			}
 		}
 		initialDisplayDelay := br.u(1)
 		opCount := br.u(5) + 1
 		for i := uint32(0); i < opCount; i++ {
-			br.u(12) // operating_point_idc
+			hi.opIdc = append(hi.opIdc, br.u(12)) // operating_point_idc
 			l := br.u(5)
 			t := uint32(0)
 			if l > 7 {
 				t = br.u(1)
 			}
+			model := false
 			if decoderModel == 1 {
 				if br.u(1) == 1 {
+					model = true
 					br.u(bufferDelayLen) // decoder_buffer_delay
 					br.u(bufferDelayLen) // encoder_buffer_delay
 					br.u(1)              // low_delay_mode_flag
 				}
 			}
+			hi.opDecoderModel = append(hi.opDecoderModel, model)
 			if initialDisplayDelay == 1 {
 				if br.u(1) == 1 {
 					br.u(4)
@@ -304,8 +335,9 @@ func ParseAV1SequenceHeader(seqHdr []byte) (AV1SequenceHeader, error) {
 		frameIDs = br.u(1)
 	}
 	if frameIDs == 1 {
-		br.u(4)
-		br.u(3)
+		delta := br.u(4)      // delta_frame_id_length_minus_2
+		additional := br.u(3) // additional_frame_id_length_minus_1
+		hi.frameIDLen = additional + delta + 3
 	}
 	br.u(1) // use_128x128_superblock
 	br.u(1) // enable_filter_intra
@@ -320,17 +352,18 @@ func ParseAV1SequenceHeader(seqHdr []byte) (AV1SequenceHeader, error) {
 			br.u(1) // jnt_comp
 			br.u(1) // ref_frame_mvs
 		}
-		forceSCT := uint32(2)
+		forceSCT := uint32(av1Select)
 		if br.u(1) == 0 { // seq_choose_screen_content_tools
 			forceSCT = br.u(1)
 		}
+		hi.forceSCT = forceSCT
 		if forceSCT > 0 {
 			if br.u(1) == 0 { // seq_choose_integer_mv
-				br.u(1)
+				hi.forceIntegerMV = br.u(1)
 			}
 		}
 		if orderHint == 1 {
-			br.u(3)
+			hi.orderHintBits = br.u(3) + 1
 		}
 	}
 	br.u(1) // enable_superres
@@ -402,6 +435,7 @@ type Params struct {
 	// window themselves).
 	CodedWidth, CodedHeight int
 	sets                    []byte // Annex-B parameter sets (H.264/HEVC) or OBUs (AV1)
+	av1Seq                  *AV1SequenceHeader
 }
 
 // NewParams seeds the parameter cache from container extradata (may be empty).
@@ -539,6 +573,7 @@ func (p *Params) updateCodec(data []byte) bool {
 				if h, err := ParseAV1SequenceHeader(o.body); err == nil {
 					p.Codec = h.CodecString()
 					p.CodedWidth, p.CodedHeight = h.MaxWidth, h.MaxHeight
+					p.av1Seq = &h
 					return true
 				}
 			}

@@ -167,3 +167,32 @@ func TestConfigVirtualDisplay(t *testing.T) {
 		t.Fatalf("unknown virtualDisplayLayout: %v", err)
 	}
 }
+
+// TestConfigPhase5Rate: svc and staticBitrate default to auto, take auto or
+// off; staticKbps is not negative; fpsFloor is 0 or 10..240.
+func TestConfigPhase5Rate(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load(`{}`)
+	if err != nil || !c.svc() || !c.staticBitrate() || c.StaticKbps != 0 || c.FPSFloor != 0 {
+		t.Fatalf("defaults: %v svc %v static %v", err, c.svc(), c.staticBitrate())
+	}
+	if c, err := load(`{"svc":"off","staticBitrate":"off","staticKbps":1500,"fpsFloor":45}`); err != nil || c.svc() || c.staticBitrate() ||
+		c.StaticKbps != 1500 || c.FPSFloor != 45 {
+		t.Fatalf("off: %v", err)
+	}
+	if c, err := load(`{"svc":"auto","staticBitrate":"auto"}`); err != nil || !c.svc() || !c.staticBitrate() {
+		t.Fatalf("auto: %v", err)
+	}
+	for _, bad := range []string{`{"svc":"on"}`, `{"staticBitrate":"2000"}`, `{"staticKbps":-1}`, `{"fpsFloor":5}`, `{"fpsFloor":480}`} {
+		if _, err := load(bad); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+}

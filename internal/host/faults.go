@@ -42,6 +42,12 @@ import (
 //	                  reports: no stage-hold in the welcome, and a report is
 //	                  logged only with at most nine rows and without a hold
 //	                  row (stageNamesBeforeHold), as those hosts did
+//	thin=every:N:for:M  simulated congestion for temporal SVC thinning (Phase
+//	                  5): the last M frames of every N count as taken under
+//	                  pressure, so the session leaves out the discardable ones
+//	                  among them (thin.go) exactly as on a congested path; the
+//	                  frames themselves are the encoder's (SVT-AV1's low-delay
+//	                  non-reference frames on the software path)
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -62,11 +68,19 @@ type testFaults struct {
 	refRecovery  bool
 	stillAfter   int  // frames of a generation before its source goes still
 	preStageHold bool // sendWelcome, logStages
+	// thinEvery, thinFor: simulated congestion (thinPressure).
+	thinEvery, thinFor int
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold
+		f.preStageHold || f.thinEvery > 0
+}
+
+// thinAt reports whether the nth frame (n from 1) is taken under the
+// simulated congestion of thin=every:N:for:M.
+func (f testFaults) thinAt(n uint64) bool {
+	return f.thinEvery > 0 && int(n%uint64(f.thinEvery)) >= f.thinEvery-f.thinFor
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -138,8 +152,18 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: pre-stage-hold takes no value", rule)
 			}
 			f.preStageHold = true
+		case "thin":
+			if len(parts) != 4 || parts[0] != "every" || parts[2] != "for" {
+				return f, fmt.Errorf("%s: want thin=every:N:for:M", rule)
+			}
+			n, err1 := strconv.Atoi(parts[1])
+			m, err2 := strconv.Atoi(parts[3])
+			if err1 != nil || err2 != nil || n < 2 || m < 1 || m >= n {
+				return f, fmt.Errorf("%s: want thin=every:N:for:M with 1 <= M < N", rule)
+			}
+			f.thinEvery, f.thinFor = n, m
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, thin)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

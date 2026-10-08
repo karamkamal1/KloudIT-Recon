@@ -54,6 +54,27 @@ type Config struct {
 	// after measuring this host's AV1 encoder: Phase 0 latency and VMAF).
 	AV1 string `json:"av1,omitempty"`
 
+	// SVC is temporal SVC (Phase 5): "auto" ("" = auto) starts native-helper
+	// streams with two temporal layers where the encoder has them (to
+	// clients that can be thinned), and leaves out the frames no other frame
+	// references (the enhancement layer; on the FFmpeg path non-reference
+	// frames) under congestion: the frame rate halves for a moment, no
+	// corruption, no key frame; "off": neither.
+	SVC string `json:"svc,omitempty"`
+	// StaticBitrate "auto" ("" = auto) lowers the encoder's bitrate while the
+	// desktop is static (the native helper's dirty rects; a seamless live
+	// bitrate only) to StaticKbps and gives the full bitrate back with the
+	// first frame that changes; "off": never.
+	StaticBitrate string `json:"staticBitrate,omitempty"`
+	// StaticKbps is a static desktop's bitrate (0 = a quarter of the rate
+	// controller's target, at least 2000 kbit/s; never above the target).
+	StaticKbps int `json:"staticKbps,omitempty"`
+	// FPSFloor is the lowest frame rate the rate controller lowers to at its
+	// bitrate floor before anything else (0 = 30 where the encoder changes
+	// its frame rate in place, the native helper; FFmpeg keeps its rungs
+	// 120 / 90 / 60).
+	FPSFloor int `json:"fpsFloor,omitempty"`
+
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
 	Congestion string `json:"congestion,omitempty"` // QUIC congestion control of video connections: media | reno ("" = media)
@@ -160,6 +181,17 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: pipeline must be %q, %q or %q, not %q", path, pipelineAuto, media.PipelineHelper,
 			media.PipelineFFmpeg, c.Pipeline)
 	}
+	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}} {
+		if v.val != "" && v.val != settingAuto && v.val != settingOff {
+			return nil, fmt.Errorf("%s: %s must be %q or %q, not %q", path, v.key, settingAuto, settingOff, v.val)
+		}
+	}
+	if c.StaticKbps < 0 {
+		return nil, fmt.Errorf("%s: staticKbps must not be negative, not %d", path, c.StaticKbps)
+	}
+	if c.FPSFloor != 0 && (c.FPSFloor < 10 || c.FPSFloor > 240) {
+		return nil, fmt.Errorf("%s: fpsFloor must be 0 (default) or 10..240, not %d", path, c.FPSFloor)
+	}
 	if !vdisplay.ValidPolicy(c.VirtualDisplay) {
 		return nil, fmt.Errorf("%s: virtualDisplay must be %q, %q or %q, not %q", path,
 			vdisplay.PolicyOff, vdisplay.PolicyAuto, vdisplay.PolicyOn, c.VirtualDisplay)
@@ -194,6 +226,19 @@ func (c *Config) pipeline() string {
 	}
 	return c.Pipeline
 }
+
+// Values of the auto | off settings (svc, staticBitrate).
+const (
+	settingAuto = "auto"
+	settingOff  = "off"
+)
+
+// svc reports whether temporal SVC thinning is on (Phase 5): "svc" auto.
+func (c *Config) svc() bool { return c.SVC != settingOff }
+
+// staticBitrate reports whether a static desktop lowers the bitrate:
+// "staticBitrate" auto.
+func (c *Config) staticBitrate() bool { return c.StaticBitrate != settingOff }
 
 // av1 returns the AV1 policy of the automatic codec choice.
 func (c *Config) av1() string {

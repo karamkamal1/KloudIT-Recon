@@ -668,7 +668,7 @@ func TestSessionRefRecovery(t *testing.T) {
 		if fr.Seq != 5 || !fr.Recovery || fr.RefFloor != 1 {
 			t.Fatalf("recovery frame %+v", fr)
 		}
-		h, ext := videoHeader(fr, proto.HelloVersionRecovery, 100)
+		h, ext := videoHeader(fr, proto.HelloVersionRecovery, 100, 0)
 		if v, ok := ext.Get(proto.ExtRefFloor); !ok || v != 1 || h.Flags&proto.FrameFlagKey != 0 {
 			t.Fatalf("recovery frame header %+v ext %v", h, ext)
 		}

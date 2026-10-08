@@ -224,7 +224,7 @@ func TestHelperVideoStream(t *testing.T) {
 	}
 
 	// Live bitrate: no new helper.
-	if err := v.SetRate(12000, 0); err != nil {
+	if err := v.SetRate(12000, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if m := expectMsg(t, f, "setRate"); m["kbps"] != float64(12000) || m["fps"] != nil {
@@ -609,7 +609,7 @@ func TestHelperVideoFailures(t *testing.T) {
 	f1.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: h264Key, CaptureQPC: qpcAt(clock, 1_000_000)})
 	nextEvent(t, v)
 	nextEvent(t, v)
-	if err := v.SetRate(9000, 0); err != nil {
+	if err := v.SetRate(9000, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	expectMsg(t, f1, "setRate")
@@ -748,7 +748,7 @@ func TestHelperVideoKeepsStartingHelper(t *testing.T) {
 	if err := v.Start(p, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := v.SetRate(12000, 0); err != nil {
+	if err := v.SetRate(12000, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -879,7 +879,7 @@ func TestHelperVideoLiveBitrateQualified(t *testing.T) {
 			if pc.LiveBitrate != c.live || pc.LiveBitrateFlush != c.flush || pc.LiveBitrateMeasured != c.measured {
 				t.Fatalf("capabilities %+v", pc)
 			}
-			if err := v.SetRate(15000, 0); err != nil {
+			if err := v.SetRate(15000, 0, 0); err != nil {
 				t.Fatal(err)
 			}
 			if c.helpersAfter == 1 {
@@ -1098,23 +1098,36 @@ func TestHelperStartParams(t *testing.T) {
 	// refresh over half a second of frames where the codec has it and it
 	// does not conflict with LTR slots (AMF): NVENC beside reference
 	// invalidation, AMF H.264 without LTR; never with LTR slots or SVC.
+	// Temporal SVC (Phase 5) where the session asks for it, the encoder has
+	// the layers and the helper is a Phase 5 one (caps liveFps: LTR marks
+	// on base-layer frames only); else none, and intra refresh as without.
+	svcCaps := encoder.CodecCaps{Recovery: "invalidate", IntraRefresh: true, MaxTemporalLayers: 2, LiveFPS: "seamless"}
+	oldHelper := svcCaps
+	oldHelper.LiveFPS = ""
+	noLayers := svcCaps
+	noLayers.MaxTemporalLayers = 1
 	for _, c := range []struct {
-		name string
-		cc   encoder.CodecCaps
-		svc  int
-		want int
+		name    string
+		cc      encoder.CodecCaps
+		svc     int
+		want    int
+		wantSVC int
 	}{
-		{"NVENC", encoder.CodecCaps{Recovery: "invalidate", IntraRefresh: true}, 0, 30},
-		{"AMF with LTR", encoder.CodecCaps{Recovery: "ltr", MaxLTR: 2, IntraRefresh: true}, 0, 0},
-		{"AMF H.264 without LTR", encoder.CodecCaps{Recovery: "none", IntraRefresh: true}, 0, 30},
-		{"SVC", encoder.CodecCaps{Recovery: "invalidate", IntraRefresh: true}, 2, 0},
-		{"no intra refresh", encoder.CodecCaps{Recovery: "invalidate"}, 0, 0},
+		{"NVENC", encoder.CodecCaps{Recovery: "invalidate", IntraRefresh: true}, 0, 30, 0},
+		{"AMF with LTR", encoder.CodecCaps{Recovery: "ltr", MaxLTR: 2, IntraRefresh: true}, 0, 0, 0},
+		{"AMF H.264 without LTR", encoder.CodecCaps{Recovery: "none", IntraRefresh: true}, 0, 30, 0},
+		{"SVC", svcCaps, 2, 0, 2},
+		{"SVC with LTR", encoder.CodecCaps{Recovery: "ltr", MaxLTR: 2, MaxTemporalLayers: 4, LiveFPS: "seamless"}, 2, 0, 2},
+		{"SVC asked of an encoder without layers", noLayers, 2, 30, 0},
+		{"SVC asked of a helper before Phase 5", oldHelper, 2, 30, 0},
+		{"no intra refresh", encoder.CodecCaps{Recovery: "invalidate"}, 0, 0, 0},
 	} {
-		sp, _ := v.startParams(helperParams())
-		sp.SVCLayers = c.svc
+		p := helperParams()
+		p.SVCLayers = c.svc
+		sp, _ := v.startParams(p)
 		sp, _ = v.withCaps(sp, true, encoder.Caps{Codecs: map[string]encoder.CodecCaps{"h264": c.cc}})
-		if sp.IntraRefreshFrames != c.want {
-			t.Errorf("%s: intraRefreshFrames %d, want %d", c.name, sp.IntraRefreshFrames, c.want)
+		if sp.IntraRefreshFrames != c.want || sp.SVCLayers != c.wantSVC {
+			t.Errorf("%s: intraRefreshFrames %d svcLayers %d, want %d %d", c.name, sp.IntraRefreshFrames, sp.SVCLayers, c.want, c.wantSVC)
 		}
 	}
 	// Half a second of frames, as on the FFmpeg path.
@@ -1163,4 +1176,129 @@ func TestClockFromQPC(t *testing.T) {
 			t.Errorf("FromQPC(%d, %d) = %d %v, want %d %v", x.ticks, x.freq, us, ok, x.us, x.ok)
 		}
 	}
+}
+
+// fakeSVCCaps: a Phase 5 helper (caps liveFps) whose H.264 has two temporal
+// layers; liveFps is filled in per test.
+func fakeSVCCaps(liveFPS string) string {
+	return `{"t":"caps","v":1,"helperVersion":"test","backend":"nvenc","vendor":"nvidia","adapterLuid":"00000000:0000c3a1",
+"adapterName":"NVIDIA GeForce RTX 4080","hagsEnabled":true,
+"codecs":{"h264":{"maxW":4096,"maxH":2304,"forceIdr":true,"recovery":"invalidate","liveBitrate":"seamless","liveFps":"` + liveFPS + `",
+"maxTemporalLayers":2,"alignW":1,"alignH":1}},
+"capture":["dda"],"cursorInVideo":false,"outputs":[],"qpcFrequency":10000000}`
+}
+
+// Phase 5 wiring (part A): SVC asked for in the start; a frame-rate change
+// alone goes to a Phase 5 helper as one (SetFPS: no kbps), to an older one
+// with the bitrate; the VBV size goes along and back to the default; a
+// helper whose frame rate changes only with a restart gets a new helper for
+// it; the frames carry Discardable (the helper's Droppable: never a key or
+// recovery frame) and the dirty share.
+func TestHelperVideoPhase5(t *testing.T) {
+	start := func(t *testing.T, caps, liveFPS string) (*HelperVideo, *fakeHelpers, *encoder.Fake, map[string]any) {
+		clock := testClock()
+		fh := newFakeHelpers(t, caps, func(f *encoder.Fake, m map[string]any) {
+			svc, _ := m["svcLayers"].(float64)
+			f.Send(encoder.Started{Backend: "nvenc", Capture: "dda", Codec: "h264", Width: 1920, Height: 1080, FPS: 60, Kbps: 20000,
+				LiveBitrate: "seamless", LiveFPS: liveFPS, SVCLayers: int(svc)})
+		})
+		v := NewHelperVideo(HelperOptions{Launch: fh.launch, Clock: clock})
+		t.Cleanup(v.Stop)
+		p := helperParams()
+		p.SVCLayers = 2
+		if err := v.Start(p, false); err != nil {
+			t.Fatal(err)
+		}
+		f := fh.nextStarted()
+		m := expectMsg(t, f, "start")
+		f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, Discardable: true, LTRSlot: -1, Dirty: 1, Data: h264Key,
+			CaptureQPC: qpcAt(clock, 1_000_000)})
+		if c := nextEvent(t, v).Config; c == nil {
+			t.Fatal("no config")
+		}
+		if fr := nextEvent(t, v).Frame; fr == nil || fr.Discardable || !fr.HasDirty || fr.Dirty != 1 {
+			t.Fatalf("key frame %+v", fr)
+		}
+		return v, fh, f, m
+	}
+	t.Run("Phase 5 helper", func(t *testing.T) {
+		v, fh, f, m := start(t, fakeSVCCaps("seamless"), "seamless")
+		if m["svcLayers"] != float64(2) {
+			t.Fatalf("start %v", m)
+		}
+		if c := v.Capabilities(); !c.LiveFPS || c.SVCLayers != 2 {
+			t.Fatalf("capabilities %+v", c)
+		}
+		for i, fr := range []encoder.Frame{
+			{FrameID: 2, TemporalLayer: 1, Discardable: true, Dirty: 0.25},
+			{FrameID: 3, Dirty: -1},
+			{FrameID: 4, TemporalLayer: 1, Discardable: true, Repeat: true, Dirty: 0.5},
+			{FrameID: 5, TemporalLayer: 1, Discardable: true, Recovery: true, RefFloor: 3, Dirty: 0},
+		} {
+			fr.LTRSlot, fr.Data = -1, h264P
+			f.Publish(&fr)
+			got := nextEvent(t, v).Frame
+			want := []struct {
+				disc, has bool
+				dirty     float64
+			}{{true, true, 0.25}, {false, false, 0}, {true, true, 0}, {false, true, 0}}[i]
+			if got == nil || got.Discardable != want.disc || got.HasDirty != want.has || got.Dirty != want.dirty || got.TemporalLayer != uint8(fr.TemporalLayer) {
+				t.Fatalf("frame %d: %+v, want discardable %v dirty %v/%v", fr.FrameID, got, want.disc, want.has, want.dirty)
+			}
+		}
+		if err := v.SetRate(20000, 45, 0); err != nil {
+			t.Fatal(err)
+		}
+		if m := expectMsg(t, f, "setRate"); m["fps"] != float64(45) || m["kbps"] != nil || m["vbvFrames"] != nil {
+			t.Fatalf("frame-rate change %v: want fps alone", m)
+		}
+		if err := v.SetRate(5000, 0, 4); err != nil {
+			t.Fatal(err)
+		}
+		if m := expectMsg(t, f, "setRate"); m["kbps"] != float64(5000) || m["vbvFrames"] != float64(4) || m["fps"] != nil {
+			t.Fatalf("capped change %v", m)
+		}
+		if err := v.SetRate(20000, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if m := expectMsg(t, f, "setRate"); m["kbps"] != float64(20000) || m["vbvFrames"] != float64(1) {
+			t.Fatalf("restore %v: want the default VBV back", m)
+		}
+		if p, _ := v.Current(); p.FPS != 45 || p.BitrateKbps != 20000 || fh.launched() != 1 {
+			t.Fatalf("current %+v (%d helpers)", p, fh.launched())
+		}
+	})
+	t.Run("older helper", func(t *testing.T) {
+		v, _, f, m := start(t, fakeAMDCaps, "")
+		if m["svcLayers"] != nil {
+			t.Fatalf("start %v: SVC from a helper before Phase 5", m)
+		}
+		if c := v.Capabilities(); c.LiveFPS || c.SVCLayers != 0 {
+			t.Fatalf("capabilities %+v", c)
+		}
+		if err := v.SetRate(20000, 45, 0); err != nil {
+			t.Fatal(err)
+		}
+		if m := expectMsg(t, f, "setRate"); m["fps"] != float64(45) || m["kbps"] != float64(20000) {
+			t.Fatalf("frame-rate change %v: want it with the bitrate", m)
+		}
+	})
+	t.Run("frame rate by restart", func(t *testing.T) {
+		v, fh, f, _ := start(t, fakeSVCCaps("restart"), "restart")
+		if c := v.Capabilities(); c.LiveFPS {
+			t.Fatalf("capabilities %+v", c)
+		}
+		if err := v.SetRate(15000, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if m := expectMsg(t, f, "setRate"); m["kbps"] != float64(15000) || fh.launched() != 1 {
+			t.Fatalf("bitrate change %v", m)
+		}
+		if err := v.SetRate(15000, 45, 0); err != nil {
+			t.Fatal(err)
+		}
+		if m := expectMsg(t, fh.nextStarted(), "start"); m["fps"] != float64(45) || fh.launched() != 2 {
+			t.Fatalf("frame-rate change: start %v (%d helpers), want a new helper", m, fh.launched())
+		}
+	})
 }

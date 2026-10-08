@@ -47,7 +47,8 @@ helper:
 
 # Helper integration tests (mock backend, the NVENC backend against its test double
 # recon-fake-nvenc.dll) under Wine, against the mingw build, the session's pipeline
-# on it (media: HelperVideo, the GPU priority table shared with the helper) and the
+# on it (media: HelperVideo, the GPU priority table shared with the helper), a session
+# on it (host: the Phase 5 wiring, temporal SVC thinning, static desktop, frame rate) and the
 # live-bitrate qualification (qualify: recon-host qualify's runs and checks). Wine's D3D11
 # needs an X display with 24-bit colour: run under xvfb-run -a -s "-screen 0 1280x720x24"
 # (Mesa llvmpipe) to include the GPU conversion self-test, the synthetic-gpu pipeline
@@ -63,15 +64,18 @@ HELPER_TEST_ENV = RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/reco
 	$(if $(FFMPEG_DIR),RECON_FFMPEG_DIR='Z:$(subst /,\,$(abspath $(FFMPEG_DIR)))') \
 	LANG=C.UTF-8
 # WIN_FFMPEG (optional): a Windows ffmpeg.exe (Wine path, e.g. Z:\opt\ffmpeg\bin\ffmpeg.exe) for
-# the qualification tests' decode checks (internal/host/qualify). All three test binaries run
-# even when one fails; the target fails at the end, naming them.
+# the qualification tests' decode checks (internal/host/qualify) and the mock's temporal layers
+# (internal/host/encoder TestHelperIntegrationSVC). All four test binaries run even when one
+# fails; the target fails at the end, naming them.
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/media.test.exe ./internal/host/media
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/qualify.test.exe ./internal/host/qualify
+	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/host.test.exe ./internal/host
 	cd $(DIST)/obj && failed=; \
 	$(HELPER_TEST_ENV) $(WINE) ./encoder.test.exe -test.v -test.count=1 || failed="$$failed encoder"; \
 	$(HELPER_TEST_ENV) $(WINE) ./media.test.exe -test.v -test.count=1 -test.run 'Helper|GPUPriority|ClockFromQPC' || failed="$$failed media"; \
+	$(HELPER_TEST_ENV) $(WINE) ./host.test.exe -test.v -test.count=1 -test.run 'SessionHelperMock' || failed="$$failed host"; \
 	$(HELPER_TEST_ENV) $(WINE) ./qualify.test.exe -test.v -test.count=1 -test.run 'Qualify' || failed="$$failed qualify"; \
 	if [ -n "$$failed" ]; then echo "helper-test: FAIL:$$failed" >&2; exit 1; fi
 

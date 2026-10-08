@@ -174,7 +174,7 @@ func TestHelperVideoIntegration(t *testing.T) {
 		t.Fatalf("forced key frame %+v", f)
 	}
 	t.Logf("forced key frame %v after the request", time.Since(t0).Round(time.Millisecond))
-	if err := v.SetRate(2500, 0); err != nil {
+	if err := v.SetRate(2500, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if p, _ := v.Current(); p.BitrateKbps != 2500 || launched() != 1 {
