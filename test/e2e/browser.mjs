@@ -19,8 +19,9 @@
 // checks (frames drawn, crop, frame barcode) run with WebGL2 and, in a headed
 // browser on Xvfb, WebGPU; every renderer scenario checks the canvas is sized
 // to device pixels with nothing on top of it, and element fullscreen; the
-// renderer "auto" bake-off runs on the live stream and its stored winner is
-// used by the next connection.
+// renderer "auto" bake-off runs on the live stream, its stored pick is used
+// by the next connection and given up for the 2D canvas when it stops
+// drawing; Auto's pick rule is checked on made-up numbers.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -288,49 +289,104 @@ async function checkFullscreen(name) {
 
 // Renderer "auto" (step 4.3). Without a stored result the first connection
 // runs the bake-off on the live stream: every path that works here takes
-// turns (two rounds), its draw and display stages are measured, the winner
-// keeps drawing on the only canvas left and is stored for this browser
-// (localStorage); the overlay lists the paths. The next connection uses the
-// stored winner at once; "Measure renderers again" clears it. In the headed
-// browser (Xvfb) when there is one, where all three paths work; headless,
-// WebGPU is unavailable and the bake-off runs with the other two.
+// turns (two rounds, A B C C B A), its draw and display stages are measured,
+// Auto's pick (renderers.js pickPath: a desynchronized context first, the 2D
+// default unless another path draws clearly faster in every round) keeps
+// drawing on the only canvas left and is stored for this browser
+// (localStorage); the overlay lists the paths. While it runs nothing covers
+// the canvas (start-up toolbar and game-mode hint come with the result), and
+// the host logs the stage window as renderer=bakeoff (it mixes paths). The
+// next connection uses the stored pick at once; "Measure renderers again"
+// clears it. A stored WebGL2 pick whose context is lost while drawing is
+// given up: forgotten, reconnected with the 2D canvas. In the headed browser
+// (Xvfb) when there is one, where all three paths work; headless, WebGPU is
+// unavailable and the bake-off runs with the other two.
+const PRESENT_KEY = 'recon.present.v2';
+
 async function checkBakeoff() {
   const mainPage = page;
   page = (await headedPage().catch(() => null)) || mainPage;
+  const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
   try {
     const all = page === mainPage ? ['canvas2d', 'webgl2'] : ['canvas2d', 'webgl2', 'webgpu'];
     await page.goto(`${base}/`);
-    await page.evaluate(() => localStorage.removeItem('recon.present.v1'));
-    await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
+    await page.evaluate((k) => localStorage.removeItem(k), PRESENT_KEY);
+    await page.mouse.move(200, 200); // away from the top edge (toolbar)
+    const log0 = hostProc.log.length;
+    await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30, mouse: 'game' });
     const calls = await watchDecoder();
     const t0 = Date.now();
-    const result = await until(() => page.evaluate(() => window.__recon.bakeoff), 60000, 'bake-off result').catch(() => null);
+    // Until the result: the start-up toolbar or game-mode hint over the
+    // canvas while the paths are measured? (Other toasts, e.g. a decoder
+    // warning on a loaded machine, are listed, not failed.)
+    const covered = [];
+    const other = new Set();
+    let samples = 0;
+    const result = await until(async () => {
+      const x = await page.evaluate(() => ({
+        r: window.__recon.bakeoff, bake: window.__recon.lastStats?.renderer?.bake,
+        bar: !document.getElementById('toolbar').classList.contains('hide'), toasts: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent),
+      }));
+      if (x.r) return x.r;
+      if (x.bake && !x.bake.done && !x.bake.warming) {
+        samples++;
+        const hint = x.toasts.some((t) => t.startsWith('Game mode'));
+        if (x.bar || hint) covered.push(`${x.bar ? 'toolbar ' : ''}${hint ? 'game-mode hint ' : ''}in slot ${x.bake.slot}`);
+        for (const t of x.toasts) if (!t.startsWith('Game mode')) other.add(t);
+      }
+      return null;
+    }, 60000, 'bake-off result').catch(() => null);
     const took = (Date.now() - t0) / 1000;
+    const after = await page.evaluate(() => ({
+      bar: !document.getElementById('toolbar').classList.contains('hide'),
+      toasts: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent),
+    }));
+    check('renderer auto: the start-up toolbar and game-mode hint stay off the canvas while the bake-off measures and follow its result',
+      !!result && samples >= 5 && !covered.length && after.bar && after.toasts.some((t) => t.startsWith('Game mode')) && after.toasts.some((t) => t.startsWith('Renderer:')),
+      `${samples} samples while measuring${covered.length ? `, covered: ${covered.slice(0, 3).join('; ')}` : ''}${other.size ? `, other toasts: ${JSON.stringify([...other])}` : ''}; ` +
+        `after the result: toolbar ${after.bar ? 'shown' : 'hidden'}, toasts ${JSON.stringify(after.toasts)}`);
     // The winner takes over with its next frame, then the other canvases go.
     await until(() => page.evaluate(() => document.querySelectorAll('#stage canvas').length === 1), 5000, 'one canvas').catch(() => {});
     await sleep(600); // a stats update from the winner
     const st = await page.evaluate(() => window.__recon.lastStats);
-    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('recon.present.v1') || 'null'));
+    const stored = await page.evaluate((k) => JSON.parse(localStorage.getItem(k) || 'null'), PRESENT_KEY);
     const canvases = await page.evaluate(() => [...document.querySelectorAll('#stage canvas')].map((c) => `${c.dataset.path}${c.hidden ? ' (hidden)' : ''}`));
     const overlay = await page.textContent('#stats').catch(() => '');
     const res = result?.results || {};
+    const rule = result?.rule || {};
     const row = (p) => (res[p]?.error ? `${p}: unavailable (${res[p].error})`
-      : `${p}: draw p50/p95 ${res[p]?.draw?.p50}/${res[p]?.draw?.p95} ms (n ${res[p]?.draw?.n}), display ${res[p]?.display?.p50}/${res[p]?.display?.p95} ms (n ${res[p]?.display?.n}), ` +
-        `${res[p]?.fps} fps${res[p]?.slow ? ' (drops frames)' : ''}, score ${res[p]?.score}, desynchronized ${res[p]?.desynchronized}`);
-    // The rule: the lowest score among the paths that kept the frame rate
-    // (ties within tieMs: desynchronized first, then the PATHS order).
-    const ok = all.filter((p) => res[p]?.score !== undefined && !res[p].slow);
-    const best = Math.min(...ok.map((p) => res[p].score));
-    const near = ok.filter((p) => res[p].score <= best + (result?.tieMs ?? 1));
-    const want = near.find((p) => res[p].desynchronized === true) || near[0];
-    check(`renderer auto: bake-off on the live stream measures draw and display of ${all.join(', ')}, the winner keeps drawing and is stored`,
-      !!result?.winner && result.winner === want && ok.length >= 2 && all.every((p) => res[p]?.draw?.n >= 30 && res[p].display.n >= 1) &&
-        st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && canvases.length === 1 &&
-        canvases[0] === result.winner && overlay.includes('bake-off') && overlay.includes('★ ') && st.fps > 20,
-      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: winner ${result?.winner}; ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
+      : `${p}: draw p50/p95 ${res[p]?.draw?.p50}/${res[p]?.draw?.p95} ms (n ${res[p]?.draw?.n}, rounds ${res[p]?.drawRounds?.join('/')}), ` +
+        `display p50 ${res[p]?.display?.p50} ms (n ${res[p]?.display?.n}), ${res[p]?.fps} fps, ${res[p]?.errors} errors, desynchronized ${res[p]?.desynchronized}` +
+        `${res[p]?.out ? `, out: ${res[p].out}` : ''}`);
+    // The rule, from the numbers: out (lost, errors, too few samples, < minShare
+    // of the best fps, display p50 more than a refresh above the best), then
+    // desynchronized first, then the first path unless another's draw p50 is
+    // lower by more than marginMs in every round.
+    const measured = all.filter((p) => res[p] && !res[p].lost && !res[p].errors && res[p].draw?.n >= rule.minDraw && res[p].display?.n >= rule.minDisplay);
+    let pool = measured;
+    const fps = Math.max(0, ...pool.map((p) => res[p].fps));
+    if (fps >= 10) pool = pool.filter((p) => res[p].fps >= rule.minShare * fps);
+    const disp = Math.min(...pool.map((p) => res[p].display.p50));
+    pool = pool.filter((p) => res[p].display.p50 <= disp + rule.refreshMs);
+    if (pool.some((p) => res[p].desynchronized === true)) pool = pool.filter((p) => res[p].desynchronized === true);
+    const def = pool[0];
+    const d = res[def]?.drawRounds || [];
+    const clear = pool.filter((p) => p !== def && res[p].drawRounds.every((v, i) => v !== null && d[i] !== null && v + rule.marginMs < d[i]))
+      .sort((a, b) => res[a].draw.p50 - res[b].draw.p50);
+    const want = clear[0] || def;
+    check(`renderer auto: bake-off on the live stream measures ${all.join(', ')} in two rounds, Auto's pick keeps drawing and is stored`,
+      !!result?.winner && result.winner === want && measured.length >= 2 && all.every((p) => res[p]?.draw?.n >= 30 && res[p].drawRounds?.length === 2 && res[p].display.n >= 1) &&
+        !!result.why && st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && stored.why === result.why &&
+        canvases.length === 1 && canvases[0] === result.winner && overlay.includes('bake-off') && overlay.includes('★ ') && overlay.includes(result.why) && st.fps > 20,
+      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: ${result?.winner} (${result?.why}; rule wants ${want}); ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
         `canvases left: ${canvases.join(', ')}; stored key ${stored?.key}; ${st?.fps?.toFixed(1)} fps after`);
     await checkHygiene('renderer auto (bake-off switches)', calls, st);
     results.push({ bakeoff: result, stored });
+    // The client's first stage report (10 s after the worker started) falls
+    // in the bake-off: its frames come from several paths.
+    const stagesLine = await until(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]*/) || [])[0], 12000, 'stage line').catch(() => '');
+    check('renderer auto: the host logs a stage window that mixes paths as renderer=bakeoff', / renderer=bakeoff /.test(stagesLine),
+      stagesLine.replace(/^.*?msg=/, '').slice(0, 200));
     await page.evaluate(() => { window.__recon.userClosed = true; });
 
     await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
@@ -341,8 +397,35 @@ async function checkBakeoff() {
       !!stored && st2?.renderer?.name === stored.winner && st2.renderer.mode === 'auto' && !st2.renderer.bake && canvases2 === 1 && st2.fps > 20,
       `${st2?.renderer?.name} (mode ${st2?.renderer?.mode}, bake-off ${JSON.stringify(st2?.renderer?.bake)}), ${canvases2} canvas, ${st2?.fps?.toFixed(1)} fps`);
     await page.evaluate(() => [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Measure renderers again')).click());
-    const cleared = await page.evaluate(() => localStorage.getItem('recon.present.v1'));
+    const cleared = await page.evaluate((k) => localStorage.getItem(k), PRESENT_KEY);
     check('renderer auto: "Measure renderers again" clears the stored result', cleared === null);
+    await page.evaluate(() => { window.__recon.userClosed = true; });
+
+    // A stored WebGL2 pick that stops drawing (its context lost: the worker's
+    // test hook) is given up after 30 failed draws in a row.
+    if (res.webgl2?.error || !stored) return;
+    await page.goto(`${base}/`);
+    await page.evaluate(([k, rec]) => localStorage.setItem(k, JSON.stringify(rec)), [PRESENT_KEY, { ...stored, winner: 'webgl2', why: 'set by the test' }]);
+    await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
+    const gl = await until(() => page.evaluate(() => (window.__recon.lastStats?.renderer?.name === 'webgl2' ? window.__recon.lastStats : null)), 10000, 'webgl2 drawing').catch(() => null);
+    await page.evaluate(() => window.__recon.worker.postMessage({ type: 'loseContext' }));
+    const t1 = Date.now();
+    const back = await until(() => page.evaluate(() => {
+      const r = window.__recon;
+      return r.streaming && r.lastStats?.renderer?.name === 'canvas2d' && r.lastStats.fps > 0 ? r.lastStats : null;
+    }), 20000, '2D after the lost context').catch(() => null);
+    const took2 = (Date.now() - t1) / 1000;
+    await sleep(1500);
+    const st3 = await page.evaluate(() => window.__recon.lastStats);
+    const after3 = await page.evaluate((k) => ({
+      stored: localStorage.getItem(k), canvases: document.querySelectorAll('#stage canvas').length, present: window.__recon.present,
+      log: window.__recon.logs.filter((l) => /render error|reconnecting with the 2D canvas/.test(l)).map((l) => l.replace(/^\S+ /, '')),
+    }), PRESENT_KEY);
+    check('renderer auto: a picked path that stops drawing (WebGL2 context lost) is forgotten and the client reconnects with the 2D canvas',
+      !!gl && !!back && after3.stored === null && after3.canvases === 1 && after3.present?.mode === 'auto' && st3?.renderer?.name === 'canvas2d' && st3.fps > 20 &&
+        after3.log.some((l) => l.includes('reconnecting with the 2D canvas')),
+      `before: ${gl ? `webgl2 at ${gl.fps?.toFixed(1)} fps` : 'webgl2 not drawing'}; 2D after ${took2.toFixed(1)} s at ${st3?.fps?.toFixed(1)} fps, stored ${after3.stored}, ` +
+        `${after3.canvases} canvas; log: ${after3.log.slice(0, 2).join(' | ')}`);
     await page.evaluate(() => { window.__recon.userClosed = true; });
   } finally {
     page = mainPage;
@@ -630,6 +713,42 @@ return { out, keep };
   } finally {
     await ctx2.close();
     if (b !== browser) await b.close();
+  }
+}
+
+// Auto's pick at unit level (step 4.3, renderers.js pickPath) on made-up
+// bake-off numbers, among them the review run's (WebGL2 drew 0.2 ms faster
+// and its display estimate was 2.6 ms lower by a few outliers: noise, the 2D
+// canvas is desynchronized and stays).
+async function checkPickRule() {
+  const cases = await page.evaluate(async () => {
+    const R = await import('/js/renderers.js');
+    const mk = (o) => ({ desynchronized: true, draw: { p50: 0.6, n: 70 }, display: { p50: 11.5, n: 60 }, drawRounds: [0.6, 0.6], fps: 30, errors: 0, lost: false, ...o });
+    const list = [
+      ["the review run: WebGL2 0.2 ms faster but not desynchronized, WebGPU's display p50 more than a refresh behind", 'canvas2d', { webgpu: 'display lags' }, {
+        canvas2d: mk({ draw: { p50: 0.66, n: 65 }, drawRounds: [0.64, 0.68], display: { p50: 11.91, n: 65 } }),
+        webgl2: mk({ desynchronized: false, draw: { p50: 0.47, n: 73 }, drawRounds: [0.45, 0.49], display: { p50: 11.52, n: 73 } }),
+        webgpu: mk({ desynchronized: null, display: { p50: 37, n: 12 } }) }],
+      ['both desynchronized, WebGL2 0.19 ms faster: a near tie keeps the 2D default', 'canvas2d', {}, {
+        canvas2d: mk({ drawRounds: [0.7, 0.7] }), webgl2: mk({ draw: { p50: 0.51, n: 70 }, drawRounds: [0.51, 0.51] }), webgpu: { error: 'WebGPU unavailable' } }],
+      ['both desynchronized, WebGL2 3 ms faster in both rounds', 'webgl2', {}, {
+        canvas2d: mk({ draw: { p50: 4.1, n: 70 }, drawRounds: [4.0, 4.2] }), webgl2: mk({ draw: { p50: 0.9, n: 70 }, drawRounds: [0.8, 1.0] }) }],
+      ['WebGL2 3 ms faster in one round only', 'canvas2d', {}, {
+        canvas2d: mk({ draw: { p50: 2.5, n: 70 }, drawRounds: [4.0, 1.0] }), webgl2: mk({ draw: { p50: 1.1, n: 70 }, drawRounds: [1.0, 1.2] }) }],
+      ['the fastest path failed draws', 'canvas2d', { webgl2: 'draw errors' }, {
+        canvas2d: mk({ draw: { p50: 4.1, n: 70 }, drawRounds: [4.0, 4.2] }), webgl2: mk({ draw: { p50: 0.1, n: 70 }, drawRounds: [0.1, 0.1], errors: 3 }) }],
+      ['the fastest path lost its context', 'canvas2d', { webgl2: 'context lost' }, {
+        canvas2d: mk({ draw: { p50: 4.1, n: 70 }, drawRounds: [4.0, 4.2] }), webgl2: mk({ draw: { p50: 0.1, n: 70 }, drawRounds: [0.1, 0.1], lost: true }) }],
+      ['the 2D canvas drops frames: WebGL2 although not desynchronized', 'webgl2', { canvas2d: 'drops frames' }, {
+        canvas2d: mk({ fps: 12 }), webgl2: mk({ desynchronized: false }) }],
+      ['too few samples everywhere', null, { canvas2d: 'too few samples', webgl2: 'too few samples' }, {
+        canvas2d: mk({ draw: { p50: 0.6, n: 10 } }), webgl2: mk({ display: { n: 0 } }) }],
+    ];
+    return list.map(([name, want, out, res]) => ({ name, want, out, got: R.pickPath(res, 1000 / 60) }));
+  });
+  for (const c of cases) {
+    const outOK = Object.entries(c.out).every(([p, why]) => c.got.out[p] === why) && Object.keys(c.got.out).length === Object.keys(c.out).length;
+    check(`Auto's pick (unit): ${c.name}`, c.got.winner === c.want && outOK, `${c.got.winner} (${c.got.why}); out ${JSON.stringify(c.got.out)}`);
   }
 }
 
@@ -1166,6 +1285,7 @@ try {
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
   await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
+  await checkPickRule().catch((e) => check("Auto's pick (unit)", false, e.message));
   await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
 
   // 3d. Latency probe, wallclock mode -----------------------------------------

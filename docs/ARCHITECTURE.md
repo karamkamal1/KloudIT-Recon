@@ -273,24 +273,33 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   opacity on the canvas or its ancestors. Fullscreen is element fullscreen of the player (canvas
   stage and stream UI) with `navigationUI: "hide"`. Input (pointer lock, focus, events) goes to
   the stage that holds the canvas.
-- **Auto** measures instead of assuming: the first connection in a browser without a stored
-  result gets a canvas per path (a canvas keeps its context type) and the worker runs a
-  bake-off on the live stream after 2 s of warm-up: the paths that work take turns, A B C A B C,
-  1.5 s each (the first 250 ms after a switch do not count), while display marks are taken as
-  often as the main thread answers. Score per path: mean *draw* + mean *display* (the Phase 0
-  stages: decoder output → drawn, drawn → the main thread's next animation frame). A path that
-  drew fewer than 80 % of the best path's frames per second is out (it cannot keep up). The
-  lowest score wins; within 1 ms a path whose context reports desynchronized wins (front-buffer
-  presentation saves time this estimate cannot see), else the order 2D, WebGL2, WebGPU. The winner keeps
-  drawing, the other canvases go, and the main thread stores the winner and every path's
-  numbers in `localStorage` (`recon.present.v1`) for this browser major version and OS; the
-  next connections use it on a single canvas (a stored winner that no longer works falls back to
-  2D and is forgotten). The overlay lists the per-path draw/display p50/p95 and scores; Settings
-  → *Measure renderers again* clears it. The in-browser numbers cannot see the compositor's
-  presentation (Composed vs Independent Flip): the click-to-photon rig (step 0.3) and PresentMon
-  decide on real clients, and a path chosen in Settings overrides Auto. The client's stage
-  report to the host names the path (`renderer`), so the host log keeps the draw and display
-  rows per renderer.
+- **Auto** tries the paths instead of assuming one: the first connection in a browser without a
+  stored result gets a canvas per path (a canvas keeps its context type) and the worker runs a
+  bake-off on the live stream after 2 s of warm-up: the paths that work take turns, A B C C B A
+  (no path always measured first), 1.5 s each (the first 250 ms after a switch do not count),
+  while display marks are taken as often as the main thread answers; the start-up toolbar and
+  game-mode hint wait for the result, so nothing of the app's covers the canvas meanwhile. Per
+  path: the Phase 0 *draw* (decoder output → drawn) and *display* (drawn → the main thread's
+  next animation frame) stages, the draw p50 per round, the frames per second drawn and the
+  failed draws. The pick (`renderers.js` `pickPath`) is a heuristic, not a measurement of
+  presentation: a worker's canvas reaches the compositor without the main thread, so the
+  display estimate is the same for every path unless one holds the page's frames back, and the
+  draw stage is only the worker's draw call. Out: a path with failed draws or a lost context,
+  too few samples, fewer than 80 % of the best path's frames per second, or a display p50 more
+  than one refresh above the best. Then a context that reports desynchronized (front-buffer
+  presentation) comes first, and the first path (the 2D default) stays unless another draws
+  more than 1 ms faster (p50) in every round: a near tie keeps the default. The pick keeps
+  drawing, the other canvases go, and the main thread stores it with why and every path's
+  numbers in `localStorage` (`recon.present.v2`) for this browser major version and OS; the
+  next connections use it on a single canvas. A stored pick that no longer starts falls back to
+  2D on its canvas and is forgotten; a pick that fails 30 draws in a row (a lost context, frames
+  that do not upload) is forgotten and the client reconnects with the 2D canvas. The overlay
+  lists the per-path draw p50/p95, display p50, fps and why a path is out, and the reason for
+  the pick; Settings → *Measure renderers again* clears it. The click-to-photon rig (step 0.3)
+  and PresentMon decide on real clients, and a path chosen in Settings overrides Auto. The
+  client's stage report to the host names the path that drew the window's frames
+  (`renderer`; `bakeoff` for a window with several), so the host log keeps the draw and
+  display rows per renderer.
 - Decoder hygiene: `prefer-hardware` + `optimizeForLatency`; `flush()` is never called while
   streaming (it waits for every output and makes the next chunk a key frame; recovery resets and
   reconfigures instead). At most 2 chunks wait inside the decoder (`decodeQueueSize`); later ones

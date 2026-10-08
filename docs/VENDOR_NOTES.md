@@ -3025,21 +3025,35 @@ What changed (browser client; the host only logs one more field):
   default, saved with every settings change) and now read as Auto; an explicit WebGPU stays.
 - **Auto**: without a stored result for this browser, the first connection gets one canvas per
   path and the worker runs a bake-off on the live stream. After 2 s of streaming the paths that
-  work take turns, A B C A B C, 1.5 s each (the first 250 ms after a switch do not count; the
-  main thread shows the active path's canvas). Meanwhile display marks are taken as often as
-  the main thread answers. Per path: the Phase 0 *draw* stage (decoder output → drawn) and
-  *display* stage (drawn → the main thread's next animation frame), p50/p95/mean, and the frames
-  per second it drew. Score = mean draw + mean display, from ≥ 30 draw and ≥ 8 display samples.
-  A path that drew fewer than 80 % of the best path's frames per second is out (from 10 fps up).
-  The lowest score wins; within 1 ms a path whose context reports desynchronized wins (its
-  front-buffer presentation saves time this estimate cannot see), else the order 2D, WebGL2,
-  WebGPU. The winner keeps drawing, the other canvases and contexts go, and the main thread
-  stores the winner with every path's numbers in `localStorage` (`recon.present.v1`, keyed by
-  browser major version and OS, e.g. `Chrome 141 · Linux`: a browser update measures again).
-  Later connections draw with the stored winner on a single canvas; a stored winner that no
-  longer works falls back to 2D and is forgotten. The overlay lists the per-path rows (★ the
-  winner); *Measure renderers again* (settings) clears the result. An inconclusive bake-off (a
-  still picture: too few frames) stores nothing and runs again next time.
+  work take turns, A B C C B A (no path is always measured first), 1.5 s each (the first 250 ms
+  after a switch do not count; the main thread shows the active path's canvas). Meanwhile
+  display marks are taken as often as the main thread answers, and the start-up toolbar and
+  game-mode hint wait for the result (the toolbar's backdrop filter over the canvas would force
+  composition for whichever path is measured first). Per path: the Phase 0 *draw* stage
+  (decoder output → drawn) and *display* stage (drawn → the main thread's next animation
+  frame), p50/p95/mean, the draw p50 per round, the frames per second drawn and the failed draws
+  (a failed draw is not a sample). Auto's pick (`renderers.js` `pickPath`) is a heuristic: a
+  transferred canvas reaches the compositor without the main thread, so the display estimate is
+  the same whichever path drew (only CPU or GPU contention moves it), and the draw stage is the
+  worker's draw call. So: out are a path with failed draws or a lost context, fewer than 30
+  draw / 8 display samples, fewer than 80 % of the best path's frames per second (from 10 fps
+  up) or a display p50 more than one refresh above the best (it holds the page's frames back,
+  like WebGPU on the emulated GPU here); then a context that reports desynchronized comes first;
+  then the 2D canvas (the first path) stays unless another path's draw p50 is more than 1 ms
+  lower in both rounds (a near tie keeps the default, and is stored as such so the bake-off
+  does not repeat on every connection). The pick keeps drawing, the other canvases and contexts
+  go, and the main thread stores it with the reason and every path's numbers in `localStorage`
+  (`recon.present.v2`, keyed by browser major version and OS, e.g. `Chrome 141 · Linux`: a
+  browser update measures again; the v1 results of the earlier mean-based score are dropped).
+  Later connections draw with the stored pick on a single canvas; a stored pick that no longer
+  starts falls back to 2D and is forgotten, and a pick that fails 30 draws in a row while
+  streaming (a lost context, decoder frames that do not upload; WebGL2 now fails every draw
+  after its first-frame upload check fails, WebGPU after `device.lost`) is forgotten and the
+  client reconnects with the 2D canvas. A path picked in the settings stays (its errors show in
+  the overlay). The overlay lists the per-path rows (★ the pick, why a path is out) and the
+  reason for the pick; *Measure renderers again* (settings) clears it. An inconclusive bake-off
+  (a still picture: too few frames) stores nothing and runs again next time. The host log
+  labels a stage window that mixes paths (the bake-off) `renderer=bakeoff`.
 - Canvas sized to device pixels: the main thread observes the stage's
   `devicePixelContentBoxSize` (or its CSS size times `devicePixelRatio`) and posts it to the
   worker; every renderer sizes its canvas backing store to it and scales the picture to fit,
@@ -3086,7 +3100,8 @@ Found in the sandbox (Chromium 141 from Playwright 1.56, Linux, no GPU):
 
 Verified in the sandbox:
 
-- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, 114 of 114 checks passed; the run
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, 114 of 114 checks passed, 125 of 125
+  after the review fixes; the run
   before failed only the known shared-CPU "steady real-time playback" dip, WebSocket relay,
   while jobs in other checkouts loaded the 4-core machine to a load average of ~8). The
   transport scenarios (WebTransport direct / relay, WebSocket relay) draw with the 2D canvas in
@@ -3114,15 +3129,38 @@ Verified in the sandbox:
   in about 11.5 s (2 s warm-up + 6 slots of 1.5 s) with all three paths, each with 74-81 draw
   samples at 28-30 fps; WebGPU's display marks came back slowly (display p50 37-137 ms: the
   CPU-emulated GPU delays the page's frames while WebGPU presents), so it got 4-23 display
-  samples and scored worst (e.g. 73.6, 95.4) or had too few; the winner was 2D in four of seven
-  runs (e.g. score 35.2 vs WebGL2 46.8; 9.45 vs 9.68, a tie the desynchronized 2D canvas wins
-  anyway) and WebGL2 in the other three (e.g. 8.3 vs 2D 12.0, draw p50 0.39 vs 0.59 ms, display
-  p50 7.4 vs 10.5 ms): on emulated GPUs the two are within the run-to-run noise of the display
-  estimate, which is why the rig decides on hardware. The winner kept drawing, the other two
-  canvases and contexts were released (about 0.5 s later on the loaded headed page), the result
-  was stored under `Chrome 141 · Linux`, the next connection drew with it at once on one canvas
-  without a bake-off, *Measure renderers again* cleared it, and the hygiene checks held across
-  the switches (0 leaked, at most 3 open).
+  samples. With the first rule (lowest mean draw + mean display, 1 ms tie window) the winner was
+  2D in four of seven runs and WebGL2 in the other three (e.g. 8.3 vs 2D 12.0, draw p50 0.39 vs
+  0.59 ms, display p50 7.4 vs 10.5 ms; in the review's run 10.2 vs 12.98 from a few display
+  outliers, draw means 0.51 vs 0.70 ms): the display estimate does not depend on the path (a
+  transferred canvas does not go through the main thread's frames), so noise picked the winner
+  and stored it. With the rule after the review (`pickPath`, E2E run of 125 of 125 checks):
+  2D draw p50 0.57 ms (rounds 0.64/0.52), display p50 8.71 ms, 30 fps, desynchronized true;
+  WebGL2 draw p50 0.40 ms (rounds 0.43/0.38), display p50 7.91 ms, 30.2 fps, desynchronized
+  false; WebGPU draw p50 0.67 ms, display p50 109.9 ms (n 13): out, *display lags*; pick: 2D,
+  "the only desynchronized context" (WebGL2 in this worker never reports desynchronized, so 2D
+  is Auto's pick here whatever the noise). The pick kept drawing, the other two canvases and
+  contexts were released, the result was stored under `Chrome 141 · Linux` with its reason, the
+  next connection drew with it at once on one canvas without a bake-off, *Measure renderers
+  again* cleared it, and the hygiene checks held across the switches (0 leaked, at most 2
+  open). While the paths were measured (58 samples) neither the start-up toolbar nor the
+  game-mode hint was on the canvas; both appeared with the result. The host's first stage line
+  of that session (its 10 s window spans several paths) reads `renderer=bakeoff`.
+- verified (sandbox): Auto's pick at unit level (`pickPath` on made-up numbers, E2E): the
+  review's run (WebGL2 0.2 ms faster to draw, not desynchronized; WebGPU's display a refresh
+  behind) → 2D, WebGPU out; both desynchronized and WebGL2 0.19 ms faster → 2D (near tie keeps
+  the default); WebGL2 3 ms faster in both rounds → WebGL2; faster in one round only → 2D; the
+  fastest path with failed draws or a lost context → out; 2D at 12 of 30 fps → WebGL2 although
+  not desynchronized; too few samples everywhere → no pick (nothing stored).
+- verified (sandbox): a stored WebGL2 pick whose context is lost while streaming (the worker's
+  `loseContext` test hook: `WEBGL_lose_context`): every later draw throws, after 30 failed
+  draws in a row the client forgot the stored pick and reconnected with the 2D canvas (1.7 s
+  after the loss at 10.9 fps of WebGL2 here; 30 fps on 2D after), one canvas, log
+  `presentation: webgl2 failed 30 draws in a row (WebGL2 context lost); reconnecting with the
+  2D canvas`. Failed draws make no stage record (draw, display, end-to-end) and count as errors
+  in the bake-off; frames are still acknowledged to the host. Not reproducible here: a WebGL2
+  upload that fails only for hardware decoder frames (the first-frame `getError` check), and a
+  WebGPU device loss (`device.lost`; the hook calls `device.destroy()`, not run in the E2E).
 - Not verifiable here: presentation on a real GPU (the sandbox has SwiftShader and llvmpipe),
   front-buffer behaviour of `desynchronized`, the compositor's present mode, real DPR scaling
   (only DevTools emulation), and browsers other than Chromium: the hardware checks below.
@@ -3146,10 +3184,11 @@ codec and the frame timing):
   PresentMode shares per path (expect *Hardware: Independent Flip* or *Hardware Composed:
   Independent Flip* for the best path in fullscreen with the overlay closed; *Composed: Flip*
   costs about a refresh). Then set Renderer to *Auto*, click *Measure renderers again*,
-  reconnect, wait ~15 s and record the overlay's bake-off rows and the ★ winner: pass if the
-  rig's fastest path (median click→client) is Auto's pick or within 1 ms of it; otherwise
-  record both (Auto cannot see the compositor) and the PresentMon modes that explain the
-  difference. Repeat in Edge (`msedge.exe`) and Firefox (`firefox.exe`; Firefox reports no
+  reconnect, wait ~15 s and record the overlay's bake-off rows, the ★ pick and its reason:
+  pass if the rig's fastest path (median click→client) is Auto's pick or within 1 ms of it;
+  otherwise record both (Auto is a heuristic and cannot see the compositor) and the PresentMon
+  modes that explain the difference, and whether the rule should change (e.g. prefer WebGL2
+  where it reports desynchronized and the rig agrees). Repeat in Edge (`msedge.exe`) and Firefox (`firefox.exe`; Firefox reports no
   `desynchronized`).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same procedure streaming from an
   RTX 20/30/40/50 host (labels ending in `-nvidia`, baseline
@@ -3178,3 +3217,14 @@ codec and the frame timing):
   (expected; record it).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same fullscreen and PresentMon check
   on a client with a GeForce GPU.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Auto gives up a pick that stops drawing): on a
+  Windows client with a Radeon GPU, Renderer *Auto*, after one bake-off (so a result with this
+  browser's key is stored) set its pick to WebGL2 in the DevTools console:
+  `localStorage.setItem('recon.present.v2', JSON.stringify({...JSON.parse(localStorage.getItem('recon.present.v2')), winner: 'webgl2'}))`,
+  reconnect, check the overlay shows WebGL2, then force a GPU reset (`dxcap -forcetdr` from the Windows Graphics
+  Tools, admin prompt): look for the log line `presentation: webgl2 failed 30 draws in a row`
+  and a reconnect drawing with the 2D canvas within ~2 s, `recon.present.v2` removed; if the
+  browser restores the context within 30 frames instead, the stream continues on WebGL2
+  (record which). Repeat with `winner: 'webgpu'` (expect `WebGPU device lost` in the log).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same GPU-reset check on a client with
+  a GeForce GPU.

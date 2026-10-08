@@ -18,17 +18,65 @@
 //
 // Interface: name (the path), desynchronized (what getContextAttributes()
 // reports: true / false, or null when the context has no such attribute or
-// mode), gpu (the adapter or GL renderer, '' if unknown), canvasSize(),
-// draw(frame, req, vis), resize(w, h), redraw() (after a resize, where the
-// last picture is still at hand), idle() (another renderer takes over),
-// destroy(). draw() fills req (a latency probe sample, stream-worker.js) with
-// either a clone of the frame (req.clone) or a promise of the barcode cells'
-// mean luma read back from the GPU (req.luma).
+// mode), gpu (the adapter or GL renderer, '' if unknown), lost (the context
+// or device is gone), canvasSize(), draw(frame, req, vis), resize(w, h),
+// redraw() (after a resize, where the last picture is still at hand), idle()
+// (another renderer takes over), destroy(), loseContext() (test hook: as if
+// the GPU context were lost). draw() fills req (a latency probe sample,
+// stream-worker.js) with either a clone of the frame (req.clone) or a
+// promise of the barcode cells' mean luma read back from the GPU (req.luma);
+// it throws when nothing could be drawn (the frame is closed then).
 
 import * as P from './protocol.js';
 
 export const PATHS = ['canvas2d', 'webgl2', 'webgpu'];
 export const LABELS = { canvas2d: '2D canvas', webgl2: 'WebGL2', webgpu: 'WebGPU' };
+
+// Auto's pick from a bake-off (stream-worker.js), per path: draw and display
+// ({ p50, n }), drawRounds (draw p50 per round), fps, desynchronized, errors
+// (failed draws), lost (context gone). A heuristic, not a measurement of
+// presentation: the display stage is the main thread's next animation frame,
+// which a worker's canvas does not go through (it is the same for every path
+// unless one holds the page's frames back), and the draw stage is the
+// worker's draw call. The latency rig (step 0.3) decides on real clients.
+//
+//   out    failed or skipped draws, a lost context, too few samples, fewer
+//          than minShare of the best path's frames per second (from 10 fps
+//          up), or a display p50 more than a refresh above the best
+//   then   a context that reports desynchronized (front-buffer
+//          presentation) before one that does not
+//   then   the first in PATHS (the 2D default) unless another path's draw
+//          p50 is lower by more than marginMs in every round (a near tie
+//          keeps the default)
+//
+// Returns { winner (null: none measured), why, out: { path: reason } }.
+export const PICK = { minDraw: 30, minDisplay: 8, minShare: 0.8, marginMs: 1 };
+
+export function pickPath(results, refreshMs = 1000 / 60, rule = PICK) {
+  const out = {};
+  let pool = PATHS.filter((p) => results[p] && !results[p].error);
+  const drop = (test) => { for (const p of pool) { const why = test(results[p]); if (why) out[p] = why; } pool = pool.filter((p) => !out[p]); };
+  drop((x) => (x.lost ? 'context lost' : x.errors ? 'draw errors' : x.draw?.n >= rule.minDraw && x.display?.n >= rule.minDisplay ? '' : 'too few samples'));
+  const fps = Math.max(0, ...pool.map((p) => results[p].fps));
+  if (fps >= 10) drop((x) => (x.fps < rule.minShare * fps ? 'drops frames' : ''));
+  const disp = Math.min(...pool.map((p) => results[p].display.p50));
+  drop((x) => (x.display.p50 > disp + refreshMs ? 'display lags' : ''));
+  if (!pool.length) return { winner: null, why: 'no path measured', out };
+  const desync = pool.filter((p) => results[p].desynchronized === true);
+  const byDesync = desync.length > 0 && desync.length < pool.length;
+  if (byDesync) pool = desync;
+  const def = pool[0];
+  const d = results[def].drawRounds || [];
+  const faster = (p) => {
+    const r = results[p].drawRounds || [];
+    return r.length > 0 && r.length === d.length && r.every((v, i) => v !== null && d[i] !== null && v + rule.marginMs < d[i]);
+  };
+  const clear = pool.filter((p) => p !== def && faster(p)).sort((a, b) => results[a].draw.p50 - results[b].draw.p50);
+  if (clear.length) return { winner: clear[0], why: `draws over ${rule.marginMs} ms faster than ${LABELS[def]} in every round`, out };
+  let why = pool.length > 1 ? `no other path draws over ${rule.marginMs} ms faster` : 'the only path left';
+  if (byDesync) why = pool.length > 1 ? `desynchronized; ${why}` : 'the only desynchronized context';
+  return { winner: def, why, out };
+}
 
 export function withTimeout(p, ms, what) {
   let t;
@@ -70,6 +118,7 @@ class Renderer {
     this.rect = null; // where the picture went last
     this.desynchronized = null;
     this.gpu = '';
+    this.lost = false;
   }
   resize(w, h) {
     this.box = w > 0 && h > 0 ? [Math.round(w), Math.round(h)] : null;
@@ -96,6 +145,7 @@ class Renderer {
   redraw() {}
   idle() {}
   destroy() {}
+  loseContext() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +316,7 @@ export class WebGL2Renderer extends Renderer {
     this.name = 'webgl2';
     this.desynchronized = attr(gl, 'desynchronized');
     this.gpu = glRendererName(gl);
-    this.lost = false;
+    this.failed = ''; // the decoder's frames do not upload: every draw throws
     c.addEventListener?.('webglcontextlost', (e) => { e.preventDefault(); this.lost = true; log('WebGL2 context lost'); });
     c.addEventListener?.('webglcontextrestored', () => {
       try { this.init(); this.lost = false; log('WebGL2 context restored'); } catch (e) { log(`WebGL2 context not restored: ${e.message}`); }
@@ -317,9 +367,9 @@ export class WebGL2Renderer extends Renderer {
 
   draw(frame, req, vis) {
     const gl = this.gl;
-    if (this.lost) {
+    if (this.lost || this.failed) {
       frame.close();
-      return;
+      throw new Error(this.failed || 'WebGL2 context lost');
     }
     const probe = req && this.probeProg && this.probeBufs.length;
     if (req && !probe) req.clone = frame.clone();
@@ -331,10 +381,14 @@ export class WebGL2Renderer extends Renderer {
       if (!this.checked) {
         // Once per renderer (getError waits for the GPU process): the upload
         // path works for the decoder's frames (hardware frames may differ
-        // from the self-test's).
+        // from the self-test's). If not, the texture stays empty (black):
+        // every later draw fails too.
         this.checked = true;
         const err = gl.getError();
-        if (err) throw new Error(`WebGL2 error 0x${err.toString(16)} uploading a ${frame.format || 'opaque'} frame`);
+        if (err) {
+          this.failed = `WebGL2 error 0x${err.toString(16)} uploading a ${frame.format || 'opaque'} frame`;
+          throw new Error(this.failed);
+        }
       }
     } finally {
       frame.close(); // the texture holds the picture now
@@ -408,6 +462,10 @@ export class WebGL2Renderer extends Renderer {
   }
 
   destroy() {
+    this.gl.getExtension('WEBGL_lose_context')?.loseContext();
+  }
+
+  loseContext() {
     this.gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
 }
@@ -524,6 +582,11 @@ export class WebGPURenderer extends Renderer {
     });
     r.crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     r.cropKey = '';
+    // A lost device draws nothing and reports no error: draw() throws then.
+    device.lost.then((info) => {
+      r.lost = true;
+      if (info.reason !== 'destroyed') log(`WebGPU device lost (${info.message || info.reason})`);
+    });
     try {
       device.pushErrorScope('validation');
       const pm = device.createShaderModule({ code: PROBE_WGSL });
@@ -545,6 +608,10 @@ export class WebGPURenderer extends Renderer {
   }
 
   draw(frame, req, vis) {
+    if (this.lost) {
+      frame.close();
+      throw new Error('WebGPU device lost');
+    }
     const buf = this.present(frame, vis, req);
     if (buf) req.luma = this.probeRead(buf);
     else if (req) req.clone = frame.clone();
@@ -635,6 +702,10 @@ export class WebGPURenderer extends Renderer {
       f?.close();
       this.device.destroy();
     });
+  }
+
+  loseContext() {
+    this.device.destroy(); // device.lost follows
   }
 }
 

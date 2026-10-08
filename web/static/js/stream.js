@@ -68,6 +68,7 @@ const S = {
   present: null, // presentPlan() of this connection
   renderer: null, // the worker's active renderer (info)
   bakeoff: null, // this session's presentation bake-off result
+  present2D: false, // Auto's path failed while drawing: the 2D canvas for this page
   connected: false,
   streaming: false,
   userClosed: false,
@@ -155,14 +156,16 @@ async function audioChannel() {
 }
 
 // ---------------------------------------------------------------------------
-// Presentation (guide step 4.3). Renderer "auto" picks the path measured
-// fastest on this browser and OS: the first connection without a stored
-// result gives the worker a canvas per path and it runs the bake-off on the
-// live stream (stream-worker.js); the winner and the numbers are stored here
-// (localStorage, per browser major version and OS: a browser update measures
-// again). A path chosen in the settings is used as is.
+// Presentation (guide step 4.3). Renderer "auto": the first connection
+// without a stored result gives the worker a canvas per path and it runs the
+// bake-off on the live stream (stream-worker.js; the pick is a heuristic,
+// renderers.js pickPath: the 2D default unless another path is clearly
+// better); the pick and the numbers are stored here (localStorage, per
+// browser major version and OS: a browser update measures again). A path
+// chosen in the settings is used as is.
 
-const PRESENT_KEY = 'recon.present.v1';
+const PRESENT_KEY = 'recon.present.v2';
+try { localStorage.removeItem('recon.present.v1'); } catch {} // picked by a noisier rule
 
 function deviceKey() {
   const ua = navigator.userAgent;
@@ -193,6 +196,7 @@ function storePresent(rec) {
 
 function presentPlan() {
   if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [prefs.renderer] };
+  if (S.present2D) return { mode: 'auto', paths: ['canvas2d'] };
   const s = storedPresent();
   if (s) return { mode: 'auto', paths: [s.winner] };
   return { mode: 'bakeoff', paths: [...PATHS] };
@@ -237,13 +241,25 @@ function onCanvasGone(slot) {
 
 function onBakeoff(result) {
   S.bakeoff = result;
+  streamHints();
   if (!result.winner) return;
   const v = S.videoCfg;
   storePresent({
-    key: deviceKey(), winner: result.winner, at: new Date().toISOString(), results: result.results,
+    key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results,
     video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
   });
-  toast(`Renderer: ${LABELS[result.winner]} measured fastest in this browser (Settings → Pipeline).`, 'info', 4000);
+  toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
+}
+
+// Auto's path failed draw after draw (the worker gave up on it): forget it
+// and reconnect with the 2D canvas (a canvas keeps its context type).
+function onPresentFailed(m) {
+  storePresent(null);
+  S.present2D = true;
+  toast(`Renderer: ${LABELS[m.path] || m.path} stopped drawing (${m.reason}); reconnecting with the 2D canvas.`, 'warn', 5000);
+  teardown();
+  S.attempts = 0;
+  connect();
 }
 
 // The canvas box in device pixels: the renderers size their canvas to it, so
@@ -288,8 +304,9 @@ async function connect() {
   const canvases = stageCanvases(S.present.paths);
   const w = new Worker('/js/stream-worker.js', { type: 'module', name: 'recon-stream' });
   S.worker = w;
-  w.onmessage = (ev) => onWorker(ev.data);
-  w.onerror = (e) => onClosed(`worker error: ${e.message}`, true);
+  // A worker being torn down (reconnect) still posts its last messages.
+  w.onmessage = (ev) => { if (S.worker === w) onWorker(ev.data); };
+  w.onerror = (e) => { if (S.worker === w) onClosed(`worker error: ${e.message}`, true); };
   const transfer = Object.values(canvases);
   if (port) transfer.push(port);
   w.postMessage({
@@ -359,8 +376,10 @@ function onWorker(m) {
       S.attempts = 0;
       $('splash').classList.add('hidden');
       S.surface.focus();
-      showToolbar(3000);
-      if (prefs.mouse === 'game') toast('Game mode: click the screen to capture the mouse (Esc releases it).', 'info', 5000);
+      // During the bake-off nothing covers the canvas (the toolbar has a
+      // backdrop filter), so every path is measured alike: the start-up
+      // toolbar and hint come with its result.
+      if (S.present?.mode !== 'bakeoff') streamHints();
       break;
     case 'cursor': onCursorShape(m.shape); break;
     case 'cursorPos': onCursorPos(m); break;
@@ -369,6 +388,7 @@ function onWorker(m) {
     case 'renderer': onRenderer(m.info); break;
     case 'gone': onCanvasGone(m.slot); break;
     case 'bakeoff': onBakeoff(m.result); break;
+    case 'presentFailed': onPresentFailed(m); break;
     case 'drawn': onDrawnMark(m); break;
     case 'stageDump': S.stageDump = m.recs; break;
     case 'dropTest': S.dropTest = m.result; break;
@@ -377,6 +397,12 @@ function onWorker(m) {
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
   }
+}
+
+// Shown once the stream is up: the toolbar for a moment, the game-mode hint.
+function streamHints() {
+  showToolbar(3000);
+  if (prefs.mouse === 'game') toast('Game mode: click the screen to capture the mouse (Esc releases it).', 'info', 5000);
 }
 
 // Display estimate for the worker's per-stage latency: the first animation
@@ -790,8 +816,8 @@ function targetRow(v, row) {
 
 // Presentation (step 4.3): the active path, what its context reports
 // (getContextAttributes().desynchronized) and the canvas size in device
-// pixels, then the bake-off's draw and display stages per path (this
-// session's, or the result stored for this browser).
+// pixels, then the bake-off's draw and display stages per path and why Auto
+// picked its path (this session's, or the result stored for this browser).
 const desyncText = (r) => (r.desynchronized === true ? 'desynchronized ✓' : r.desynchronized === false ? 'desynchronized ✗ (not granted)'
   : r.name === 'webgpu' ? 'no low-latency mode' : 'desynchronized not reported');
 
@@ -806,14 +832,14 @@ function presentRows(st, row) {
   ];
   const res = b?.done ? b : storedPresent();
   if (res?.results) {
-    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}`, 'draw · display p50/p95 · fps · score'));
+    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}`, 'draw p50/p95 · display p50 · fps'));
     for (const p of PATHS) {
       const x = res.results[p];
       if (!x) continue;
-      const v = x.error ? 'unavailable' : `${x.draw.p50 ?? '—'}/${x.draw.p95 ?? '—'} · ${x.display.p50 ?? '—'}/${x.display.p95 ?? '—'} · ${x.fps ?? '—'} · ` +
-        `${x.score ?? 'too few'}${x.slow ? ' (drops frames)' : ''}`;
-      rows.push(row(`  ${p === res.winner ? '★ ' : ''}${LABELS[p]}`, v, p === res.winner ? 'good' : ''));
+      const v = x.error ? 'unavailable' : `${x.draw.p50 ?? '—'}/${x.draw.p95 ?? '—'} · ${x.display.p50 ?? '—'} · ${x.fps ?? '—'}${x.out ? ` · ${x.out}` : ''}`;
+      rows.push(row(`  ${p === res.winner ? '★ ' : ''}${LABELS[p]}`, v, p === res.winner ? 'good' : x.out ? 'warn' : ''));
     }
+    if (res.why) rows.push(row('  pick', res.why));
   }
   return rows;
 }
@@ -926,9 +952,11 @@ function toggleDrawer() {
 
 function presentHint() {
   const s = storedPresent();
-  if (!s) return 'Auto tries each renderer on the live stream for about 10 s on the first connection and keeps the fastest.';
-  const x = s.results?.[s.winner];
-  return `Auto: ${LABELS[s.winner]}, measured ${s.at.slice(0, 10)}${x?.score !== undefined ? ` (draw + display ${x.score} ms)` : ''}.`;
+  if (!s) {
+    return 'Auto tries each renderer on the live stream for about 10 s on the first connection: a desynchronized context first, the 2D canvas ' +
+      'unless another draws clearly faster. A heuristic: the latency rig decides.';
+  }
+  return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}.`;
 }
 
 function field(label, control, hint) {

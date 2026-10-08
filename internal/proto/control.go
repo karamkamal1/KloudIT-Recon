@@ -195,8 +195,9 @@ type ClientMsg struct {
 	Reason  string      `json:"reason,omitempty"` // "congestion": CongestionDecoder, or "" (one-way delay grew)
 	Stages  []StageStat `json:"stages,omitempty"` // "stages": the client's latency summary
 	// Renderer ("stages"): the presentation path that drew the frames
-	// (canvas2d | webgl2 | webgpu; step 4.3): the draw and display rows
-	// depend on it. Empty from clients before it.
+	// (canvas2d | webgl2 | webgpu, or bakeoff for a window with several;
+	// step 4.3): the draw and display rows depend on it. Empty from clients
+	// before it.
 	Renderer string `json:"renderer,omitempty"`
 }
 

@@ -10,7 +10,7 @@
 
 import * as P from './protocol.js';
 import { runSelfTests } from './decoder-selftest.js';
-import { createRenderer, LABELS, PATHS, withTimeout } from './renderers.js';
+import { createRenderer, LABELS, PATHS, PICK, pickPath, withTimeout } from './renderers.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -316,8 +316,13 @@ async function connect(ep) {
 //             winner's canvas (2D on it if the winner no longer works)
 //   bakeoff   renderer "auto" without one: a canvas per path; the paths that
 //             work take turns on the live stream, their draw and display
-//             stages (Phase 0) are measured, the winner stays and the main
-//             thread stores it (localStorage) with the numbers
+//             stages (Phase 0) are measured, Auto's pick (pickPath) stays
+//             and the main thread stores it (localStorage) with the numbers
+//
+// A path Auto picked that then fails FAIL_STREAK draws in a row (a lost
+// context, frames that do not upload) is given up: the main thread forgets
+// it and reconnects with the 2D canvas ('presentFailed'; a canvas keeps its
+// context type). A path picked in the settings stays (errors in the overlay).
 //
 // The main thread shows the active renderer's canvas ('renderer', posted
 // after the renderer's first frame), removes the canvases of paths that are
@@ -336,11 +341,16 @@ const pres = {
   bake: null,
   drawErrors: 0,
   lastError: '',
+  failStreak: 0, // draws in a row that failed
+  refreshMs: 1000 / 60, // the display's refresh interval (main thread's measurement)
 };
+
+const FAIL_STREAK = 30;
 
 async function setupRenderers(msg) {
   pres.mode = msg.present?.mode || 'setting';
   if (msg.box?.w > 0 && msg.box?.h > 0) pres.box = [msg.box.w, msg.box.h];
+  if (msg.client?.hz > 0) pres.refreshMs = 1000 / msg.client.hz;
   const log = (text) => post('log', { text });
   for (const [slot, c] of Object.entries(msg.canvases || {})) {
     let r = null;
@@ -368,7 +378,10 @@ async function setupRenderers(msg) {
   if (pres.mode === 'bakeoff') {
     const order = pres.list.map((r) => r.name);
     const per = (v) => Object.fromEntries(order.map((p) => [p, v()]));
-    pres.bake = { order, slot: 0, t0: 0, slotStart: 0, lastT: 0, recs: per(() => []), dur: per(() => 0), done: false, result: null };
+    pres.bake = {
+      order, slot: 0, t0: 0, slotStart: 0, lastT: 0, recs: per(() => Array.from({ length: BAKE.rounds }, () => [])), dur: per(() => 0), errors: per(() => 0),
+      done: false, result: null,
+    };
     post('log', { text: `presentation bake-off: ${order.join(', ')}` });
   }
 }
@@ -389,6 +402,7 @@ function switchRenderer() {
   renderer.idle();
   renderer = r;
   pres.announce = true;
+  pres.failStreak = 0;
 }
 
 function announceRenderer() {
@@ -408,6 +422,16 @@ function renderError(e) {
   pres.lastError = e.message;
 }
 
+// After every draw: Auto gives up on a path it picked once FAIL_STREAK draws
+// in a row failed (see Presentation above).
+function drawResult(ok) {
+  pres.failStreak = ok ? 0 : pres.failStreak + 1;
+  if (pres.failStreak !== FAIL_STREAK || renderer.name === 'canvas2d') return;
+  if (pres.mode !== 'auto' && !(pres.mode === 'bakeoff' && pres.bake?.done)) return;
+  post('log', { text: `presentation: ${renderer.name} failed ${FAIL_STREAK} draws in a row (${pres.lastError}); reconnecting with the 2D canvas` });
+  post('presentFailed', { path: renderer.name, reason: pres.lastError });
+}
+
 function onResize(w, h) {
   if (!(w > 0 && h > 0)) return;
   pres.box = [w, h];
@@ -420,36 +444,39 @@ function onResize(w, h) {
 }
 
 // Presentation bake-off: after BAKE.warmupMs of streaming (decoder warm-up)
-// the paths take turns, A B C A B C, BAKE.slotMs of drawn frames each (the
-// first BAKE.skipMs after a switch do not count). Meanwhile display marks are
-// taken as often as the main thread answers them. Score per path: mean draw
-// + mean display (ms), from at least BAKE.minDraw / BAKE.minDisplay samples.
-// A path that drew fewer than BAKE.minShare of the frames per second the
-// best one drew (from 10 fps up: a still picture sends few frames) is out:
-// drawing that cannot keep up costs frames, not only draw time. The lowest
-// score wins; scores within BAKE.tieMs of it count as equal, and among those
-// a path whose context reports desynchronized wins (its front-buffer
-// presentation saves time the display estimate cannot see), else the
-// earlier one in PATHS.
-const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, tieMs: 1, minDraw: 30, minDisplay: 8, minShare: 0.8 };
+// the paths take turns, A B C C B A (no path always measured first),
+// BAKE.slotMs of drawn frames each (the first BAKE.skipMs after a switch do
+// not count). Meanwhile display marks are taken as often as the main thread
+// answers them. Per path: the draw and display stages (p50, p95, mean), the
+// draw p50 per round, the frames per second it drew and its failed draws
+// (they count for nothing else); renderers.js pickPath() picks from them.
+// The main thread keeps everything off the canvas while this runs.
+const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250 };
 
 const baking = () => !!pres.bake && !pres.bake.done;
 
-// After each drawn frame with a stage record. A slot's time runs from its
-// first frame; the frame rate counts the time between counted frames (gaps
-// capped at 100 ms, so a pause does not count).
-function bakeTick(rec) {
+// Slot i's path: forward in even rounds, backward in odd ones.
+function bakePath(b, i) {
+  const n = b.order.length;
+  const k = i % n;
+  return b.order[Math.floor(i / n) % 2 ? n - 1 - k : k];
+}
+
+// After each draw at time t, with its stage record (null: the draw failed).
+// A slot's time runs from its first frame; the frame rate counts the time
+// between counted frames (gaps capped at 100 ms, so a pause does not count).
+function bakeTick(t, rec) {
   const b = pres.bake;
   if (!b || b.done) return;
-  const t = rec.t;
+  const path = renderer.name;
+  if (!rec && path in b.errors) b.errors[path]++;
   const gap = Math.min(t - b.lastT, 100);
   b.lastT = t;
   if (!b.t0) b.t0 = t;
   if (t - b.t0 < BAKE.warmupMs) return;
   if (!b.slotStart) b.slotStart = t;
-  const path = renderer.name;
-  if (t - b.slotStart >= BAKE.skipMs && b.recs[path]) {
-    b.recs[path].push(rec);
+  if (rec && t - b.slotStart >= BAKE.skipMs && b.recs[path]) {
+    b.recs[path][Math.floor(b.slot / b.order.length)].push(rec);
     b.dur[path] += gap;
   }
   if (t - b.slotStart < BAKE.slotMs) return;
@@ -458,25 +485,12 @@ function bakeTick(rec) {
     bakeFinish();
     return;
   }
-  pres.next = pres.list.find((r) => r.name === b.order[b.slot % b.order.length]);
+  pres.next = pres.list.find((r) => r.name === bakePath(b, b.slot));
 }
 
 function bakeStat(v) {
   const s = pct(v);
   return s ? { p50: s.p50, p95: s.p95, mean: +(v.reduce((a, x) => a + x, 0) / v.length).toFixed(2), n: s.n } : { n: 0 };
-}
-
-function bakeWinner(results) {
-  let scored = PATHS.filter((p) => results[p].score !== undefined);
-  const fps = Math.max(0, ...scored.map((p) => results[p].fps));
-  if (fps >= 10) {
-    for (const p of scored) if (results[p].fps < BAKE.minShare * fps) results[p].slow = true;
-    scored = scored.filter((p) => !results[p].slow);
-  }
-  if (!scored.length) return null;
-  const best = Math.min(...scored.map((p) => results[p].score));
-  const near = scored.filter((p) => results[p].score <= best + BAKE.tieMs);
-  return near.find((p) => results[p].desynchronized === true) || near[0];
 }
 
 function bakeFinish() {
@@ -489,17 +503,24 @@ function bakeFinish() {
       results[path] = { error: pres.errors[path] || 'not tried' };
       continue;
     }
-    const recs = b.recs[path] || [];
+    const recs = b.recs[path].flat();
     const draw = recs.map((x) => x.s[6]);
     const display = recs.filter((x) => x.s[7] !== null).map((x) => x.s[7]);
-    const res = { desynchronized: r.desynchronized, gpu: r.gpu, draw: bakeStat(draw), display: bakeStat(display), fps: b.dur[path] ? +((1000 * recs.length) / b.dur[path]).toFixed(1) : 0 };
-    if (draw.length >= BAKE.minDraw && display.length >= BAKE.minDisplay) res.score = +(res.draw.mean + res.display.mean).toFixed(2);
-    results[path] = res;
+    results[path] = {
+      desynchronized: r.desynchronized, gpu: r.gpu, draw: bakeStat(draw), display: bakeStat(display),
+      drawRounds: b.recs[path].map((v) => pct(v.map((x) => x.s[6]))?.p50 ?? null),
+      fps: b.dur[path] ? +((1000 * recs.length) / b.dur[path]).toFixed(1) : 0, errors: b.errors[path], lost: !!r.lost,
+    };
   }
-  const winner = bakeWinner(results);
-  b.result = { winner, results, rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs, tieMs: BAKE.tieMs };
-  const txt = (p) => (results[p].score !== undefined ? `${results[p].score} ms at ${results[p].fps} fps${results[p].slow ? ' (too slow)' : ''}` : results[p].error || 'too few samples');
-  post('log', { text: `presentation bake-off: ${winner || 'inconclusive'} wins (draw + display mean: ${PATHS.map((p) => `${p} ${txt(p)}`).join(', ')})` });
+  const pick = pickPath(results, pres.refreshMs);
+  for (const [p, why] of Object.entries(pick.out)) results[p].out = why;
+  const winner = pick.winner;
+  b.result = { winner, why: pick.why, results, rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs } };
+  const txt = (p) => {
+    const x = results[p];
+    return x.error ? `${p} unavailable` : `${p} draw p50 ${x.draw.p50 ?? '—'} ms (rounds ${x.drawRounds.join('/')}), display p50 ${x.display.p50 ?? '—'} ms, ${x.fps} fps${x.out ? ` (${x.out})` : ''}`;
+  };
+  post('log', { text: `presentation bake-off: ${winner ? `${winner} (${pick.why})` : 'inconclusive'}; ${PATHS.map(txt).join('; ')}` });
   post('bakeoff', { result: b.result });
   // The winner stays (inconclusive: the first path); the others go once it has drawn.
   const keep = pres.list.find((r) => r.name === winner) || pres.list[0];
@@ -913,9 +934,11 @@ function drawFrame(frame, meta, decoded) {
   }
   if (pres.next) switchRenderer();
   const req = probeStart(frame, meta, vis);
+  let drew = true;
   try {
     renderer.draw(frame, req, vis);
   } catch (e) {
+    drew = false;
     frame.close();
     renderError(e);
   }
@@ -938,11 +961,14 @@ function drawFrame(frame, meta, decoded) {
     post('firstFrame', { renderer: renderer.name });
   }
   if (pres.announce) announceRenderer();
+  drawResult(drew);
   if (!meta || clock.offset === null) return;
-  const rec = recordStages(meta, decoded, presented);
-  bakeTick(rec);
   stats.owdSum += ackFrame(meta, decoded);
   stats.owdN++;
+  // A failed draw put nothing on screen: no stage record (draw, display, e2e).
+  const rec = drew ? recordStages(meta, decoded, presented) : null;
+  bakeTick(presented, rec);
+  if (!rec) return;
   stats.totalSum += rec.e2e;
   stats.sendSum += rec.e2eSend;
   stats.totalN++;
@@ -1001,7 +1027,7 @@ function recordStages(m, decoded, drawn) {
   s[6] = drawn - decoded;
   const fromCapture = s[0] !== null;
   const rec = {
-    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture,
+    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name,
     raw: { captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded, drawn },
   };
   lat.recs.push(rec);
@@ -1068,8 +1094,10 @@ function reportStages(sum) {
   const rows = [];
   for (const name of STAGES) if (sum.stages[name]) rows.push({ name, ...sum.stages[name] });
   rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
-  // The presentation path drawing now (draw and display depend on it).
-  transport.sendControl({ t: 'stages', stages: rows, renderer: renderer?.name });
+  // The presentation path that drew the window's frames (draw and display
+  // depend on it); "bakeoff" for a window with several (the bake-off).
+  const paths = new Set(lat.recs.map((r) => r.path));
+  transport.sendControl({ t: 'stages', stages: rows, renderer: paths.size === 1 ? [...paths][0] : 'bakeoff' });
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1586,7 @@ self.onmessage = (ev) => {
     case 'displayed': onDisplayed(m.id, m.t); break;
     case 'resize': onResize(m.w, m.h); break;
     case 'dropTest': if (!dropTest.run) dropTest.armed = true; break;
+    case 'loseContext': renderer?.loseContext(); break; // test hook: the active path's GPU context is lost
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
       if (transport) { transport.sendControl({ t: 'bye' }); setTimeout(() => transport?.close(), 50); }

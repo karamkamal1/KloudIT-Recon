@@ -375,10 +375,11 @@ one refresh between configurations should line up with a difference in present m
 ### Renderers (step 4.3)
 
 Recon's stream settings (*Pipeline → Renderer*) pick the presentation path: *2D canvas*,
-*WebGL2*, *WebGPU*, or *Auto* (the default), which measures the three on the live stream on the
-first connection in a browser and keeps the one with the lowest draw + display time (Phase 0
-stages). Auto's numbers come from inside the browser and cannot see the compositor; the rig and
-PresentMon can. To compare the paths, set each renderer in turn (reconnect after each change),
+*WebGL2*, *WebGPU*, or *Auto* (the default), which tries the three on the live stream on the
+first connection in a browser and keeps a pick: the desynchronized 2D canvas unless another path
+draws clearly faster (Phase 0 draw stage) or the 2D canvas fails or cannot keep up. Auto's
+numbers come from inside the browser and cannot see the compositor; the rig and PresentMon
+can. To compare the paths, set each renderer in turn (reconnect after each change),
 close the performance overlay (it sits on the canvas and forces composition), go fullscreen and
 measure one label per renderer, for example `recon-hevc-1080p120-lan-chrome-canvas2d`,
 `...-webgl2`, `...-webgpu`, interleaving 100-sample blocks as above. Note for each label the
