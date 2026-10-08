@@ -1556,21 +1556,25 @@ async function probeDecoders() {
 // holds frames back go to the host as without a hardware decoder (it prefers
 // a family the browser decodes in hardware) and decode in software when that
 // passed. Each family's decode time on the 1080p timing clip goes to the host
-// too (timing), which picks the codec family by it (step 4.2). Returns the
-// hello's decoders.
+// too (timing), which picks the codec family by it (step 4.2). The hello
+// waits for all of it: its duration goes to the overlay and the log. Returns
+// the hello's decoders.
 async function selfTestDecoders(decoders) {
   let tests = [];
+  const t0 = performance.now();
   try {
     tests = await runSelfTests(decoders, prefs.decoder !== 'software');
   } catch (e) {
     post('log', { text: `decoder self-test failed: ${e.message}` });
   }
+  const ms = Math.round(performance.now() - t0);
   video.selfTest = tests;
   for (const t of tests) {
     if (t.software) video.softwareFor.add(t.family);
     post('log', { text: `decoder self-test: ${t.text}` });
   }
-  post('decoderTest', { tests });
+  post('log', { text: `decoder self-test took ${ms} ms` });
+  post('decoderTest', { tests, ms });
   return decoders.map((d) => helloDecoder(d, tests.find((t) => t.family === d.family)));
 }
 

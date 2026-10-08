@@ -401,7 +401,7 @@ function onWorker(m) {
     case 'ticks': onTicks(m.on); break;
     case 'stageDump': S.stageDump = m.recs; break;
     case 'dropTest': S.dropTest = m.result; break;
-    case 'decoderTest': S.decoderTest = m.tests; break;
+    case 'decoderTest': S.decoderTest = m.tests; S.decoderTestMs = m.ms; break;
     case 'hello': S.helloDecoders = m.decoders; break;
     case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
@@ -889,14 +889,16 @@ function pacingRow(pc, row) {
 
 // Decoder hygiene (step 4.1): the queue in the decoder (bound 2) and in front
 // of it, the output lag (frames the decoder holds back on this stream), the
-// VideoFrames open, and the startup self-test per codec family.
+// VideoFrames open, and the startup self-test per codec family with how long
+// it took in all (the hello waits for it: hygiene and step 4.2's timing).
 function decoderRows(st, row) {
   const vf = st.videoFrames;
   return [
     row('Decoder queue', `${st.queue} (max ${st.queueMax ?? '—'}) · waiting ${st.waiting ?? 0} (max ${st.waitingMax ?? '—'})`, st.queueMax > 2 ? 'bad' : ''),
     row('Decoder output lag', st.outputLag === null || st.outputLag === undefined ? '—' : `${st.outputLag} frame${st.outputLag === 1 ? '' : 's'}`, st.outputLag > 0 ? 'warn' : ''),
     vf ? row('VideoFrames open', `${vf.open} (max ${vf.max})${vf.leaked ? ` · ${vf.leaked} leaked` : ''}`, vf.leaked ? 'bad' : '') : null,
-    ...(S.decoderTest || []).map((t, i) => row(i ? '' : 'Decoder self-test', t.text, t.software || (t.hw && !t.hw.ok) ? 'warn' : '')),
+    ...(S.decoderTest || []).map((t, i) => row(i ? '' : `Decoder self-test${S.decoderTestMs !== undefined ? ` (${S.decoderTestMs} ms)` : ''}`, t.text,
+      t.software || (t.hw && !t.hw.ok) ? 'warn' : '')),
   ];
 }
 

@@ -518,8 +518,10 @@ async function checkSelfTest(cfg) {
   check('decoder self-test at startup: first output after one chunk on every family this browser decodes', ok,
     tests ? tests.map((t) => `${t.text} (${res(t)?.accel}: first after ${res(t)?.firstAfter}, held ${res(t)?.held}, ${res(t)?.outputs}/${res(t)?.frames} out, first ${res(t)?.firstMs} ms)`).join('; ') : 'no result');
   const overlay = await page.textContent('#stats').catch(() => '');
-  check('overlay shows the decoder self-test, queue and VideoFrame rows', overlay.includes('Decoder self-test') && overlay.includes('Decoder queue') && overlay.includes('VideoFrames open'));
-  results.push({ selfTest: tests });
+  const took = await page.evaluate(() => window.__recon.decoderTestMs);
+  check('overlay shows the decoder self-test with its duration, queue and VideoFrame rows', overlay.includes(`Decoder self-test (${took} ms)`) &&
+    overlay.includes('Decoder queue') && overlay.includes('VideoFrames open'), `self-test took ${took} ms`);
+  results.push({ selfTest: tests, selfTestMs: took });
   await checkHelloTiming(tests, overlay);
 }
 
@@ -599,31 +601,59 @@ async function checkSelfTestLogic() {
       });
       d.close();
       // Timing (step 4.2), on a fake decoder that outputs each frame after a
-      // fixed delay per codec (no real decoding: every family): the median
-      // decode() -> output, one family at a time.
-      const runs = [];
-      const delays = { avc1: 24, hev1: 12, av01: 40 };
-      const pure = class {
+      // fixed delay per codec at 1920x1080 (`small` ms at the hygiene clip's
+      // size; no real decoding: every family): the median decode() ->
+      // output, the families interleaved frame by frame, never two 1080p
+      // decodes at once, within the budget.
+      let order = [];
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const pure = (delays, small = 10) => class {
         static async isConfigSupported(c) { return { supported: true, config: c }; }
         constructor({ output }) { this.output = output; this.closed = false; }
         configure(c) {
-          this.delay = delays[c.codec.slice(0, 4)];
-          this.run = { codec: c.codec, w: c.codedWidth, start: performance.now(), end: null };
-          runs.push(this.run);
+          this.big = c.codedWidth === 1920;
+          this.tag = c.codec.slice(0, 4);
+          this.delay = this.big ? delays[this.tag] : small;
         }
         decode(chunk) {
           const timestamp = chunk.timestamp;
-          setTimeout(() => { if (!this.closed) this.output({ timestamp, close() {} }); }, this.delay);
+          const big = this.big;
+          if (big) { order.push(this.tag); inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); }
+          setTimeout(() => { if (big) inFlight--; if (!this.closed) this.output({ timestamp, close() {} }); }, this.delay);
         }
-        close() { this.closed = true; this.run.end = performance.now(); }
+        close() { this.closed = true; }
       };
-      const one = await T.timeDecoder('av1', 'prefer-hardware', { Decoder: pure });
-      runs.length = 0;
-      const all = await T.runSelfTests(['h264', 'hevc', 'av1'].map((family) => ({ family, hw: true })), true, { Decoder: pure });
-      const timed = runs.filter((r) => r.w === 1920).sort((a, b) => a.start - b.start);
-      const overlap = timed.some((r, i) => i && r.start < timed[i - 1].end);
+      const fams = ['h264', 'hevc', 'av1'];
+      const even = pure({ avc1: 24, hev1: 12, av01: 40 });
+      const one = await T.timeDecoder('av1', 'prefer-hardware', { Decoder: even });
+      order = [];
+      const all = await T.runSelfTests(fams.map((family) => ({ family, hw: true })), true, { Decoder: even });
+      const interleaved = order.length === 24 && new Set(order.slice(0, 3)).size === 3 && order.every((c, i) => i < 3 || c === order[i - 3]);
+      const allOrder = order.join(' ');
+      const allInFlight = maxInFlight;
       const hello = all.map((t) => T.helloDecoder({ family: t.family, hw: true }, t));
-      return { fam, good, slow, hold1, hold2, choice, burst, timing: { one, all: all.map((t) => ({ family: t.family, timing: t.timing, text: t.text })), timedRuns: timed.length, overlap, hello } };
+      // Budget: AV1 at 200 ms per 1080p frame runs out of its 500 ms (key
+      // frame + one P frame); a decoder at 400 ms per frame in every family
+      // (and 50 ms on the hygiene clip) costs at most the timing budget; a
+      // clip import that never finishes costs the budget.
+      let t0 = performance.now();
+      const slowAV1 = await T.timeDecoders(fams.map((family) => ({ family, accel: 'prefer-hardware' })), { Decoder: pure({ avc1: 24, hev1: 12, av01: 200 }) });
+      const slowAV1Ms = Math.round(performance.now() - t0);
+      t0 = performance.now();
+      const allSlow = await T.runSelfTests(fams.map((family) => ({ family, hw: true })), true, { Decoder: pure({ avc1: 400, hev1: 400, av01: 400 }, 50) });
+      const allSlowMs = Math.round(performance.now() - t0);
+      t0 = performance.now();
+      const noClips = await T.timeDecoders([{ family: 'av1', accel: 'prefer-hardware' }], { Decoder: even, timingClips: new Promise(() => {}), timingBudgetMs: 300 });
+      const noClipsMs = Math.round(performance.now() - t0);
+      return {
+        fam, good, slow, hold1, hold2, choice, burst,
+        timing: {
+          one, all: all.map((t) => ({ family: t.family, timing: t.timing, text: t.text })), order: allOrder, interleaved, maxInFlight: allInFlight, hello,
+          slowAV1, slowAV1Ms, allSlow: allSlow.map((t) => ({ family: t.family, ok: (t.hw || t.sw)?.ok, timing: t.timing })), allSlowMs, noClips, noClipsMs,
+          budget: T.TIMING_BUDGET_MS,
+        },
+      };
     });
     if (res.error) { check('decoder self-test logic', false, res.error); return; }
     const { good, slow, hold1, hold2, choice } = res;
@@ -639,10 +669,16 @@ async function checkSelfTestLogic() {
     const tm = res.timing;
     const near = (x, ms) => !!x && x.ms >= ms && x.ms < ms + 15 && x.w === 1920 && x.h === 1080 && x.n === 7;
     const by = (f) => tm.all.find((t) => t.family === f)?.timing;
-    check('decoder timing logic: the median decode() -> output of the 1920x1080 clip, families timed one at a time, times in the hello',
+    check('decoder timing logic: the median decode() -> output of the 1920x1080 clip, families interleaved frame by frame, one decode at a time, times in the hello',
       near(tm.one, 40) && tm.one.accel === 'prefer-hardware' && near(by('h264'), 24) && near(by('hevc'), 12) && near(by('av1'), 40) &&
-        tm.timedRuns === 3 && !tm.overlap && tm.hello.every((d) => d.hw === true && d.timing?.ms === by(d.family)?.ms),
-      `fake decoder 40 ms: ${tm.one?.ms} ms/frame over ${tm.one?.n}; ${tm.all.map((t) => t.text).join('; ')}; ${tm.timedRuns} timing runs, overlapping: ${tm.overlap}`);
+        tm.interleaved && tm.maxInFlight === 1 && tm.hello.every((d) => d.hw === true && d.timing?.ms === by(d.family)?.ms),
+      `fake decoder 40 ms: ${tm.one?.ms} ms/frame over ${tm.one?.n}; ${tm.all.map((t) => t.text).join('; ')}; decode order ${tm.order.slice(0, 29)}…, at most ${tm.maxInFlight} in flight`);
+    const slowOK = near(tm.slowAV1.h264, 24) && near(tm.slowAV1.hevc, 12) && !tm.slowAV1.av1 && tm.slowAV1Ms < tm.budget;
+    const allSlowOK = tm.allSlow.length === 3 && tm.allSlow.every((t) => t.ok && t.timing === null) && tm.allSlowMs < 1000 + tm.budget + 500;
+    check('decoder timing budget: a family over its 500 ms goes untimed, slow decoders cost at most the timing budget, a clip import that never finishes too',
+      slowOK && allSlowOK && Object.keys(tm.noClips).length === 0 && tm.noClipsMs >= 290 && tm.noClipsMs < 600,
+      `AV1 at 200 ms/frame: ${JSON.stringify(tm.slowAV1)} in ${tm.slowAV1Ms} ms; every family 400 ms/frame (50 ms on the hygiene clip): whole self-test ${tm.allSlowMs} ms, ` +
+        `timed ${tm.allSlow.filter((t) => t.timing).length}/3; no clips: ${JSON.stringify(tm.noClips)} after ${tm.noClipsMs} ms`);
     results.push({ selfTestLogic: res });
   } finally {
     await ctx2.close();

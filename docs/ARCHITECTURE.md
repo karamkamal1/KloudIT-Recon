@@ -245,10 +245,14 @@ chooses automatically:
   one at a time like the stream's; absent from clients before it or when the decode failed).
 - *The rule*: the first tier with a family both ends can use: (1) hardware encode and hardware
   decode, in the order HEVC → AV1 → H.264; (2) hardware encode, software decode: H.264 → HEVC →
-  AV1; (3) software encode: H.264 → AV1 → HEVC. In the tier the first family is the default
-  (so HEVC on AMD and NVIDIA hosts alike), and a later one replaces it only when the client
-  decodes it **clearly faster** at the stream's picture size (the sample's time scaled by
-  pixel count; both must be timed): by at least 10 % and 0.5 ms per frame, or, for a family
+  AV1; (3) software encode: H.264 → AV1 → HEVC, always the first (the order is the host's CPU
+  cost of encoding, which the client's decode times do not tell). In tiers 1 and 2 the first
+  family is the default (so HEVC on AMD and NVIDIA hosts alike), and a later one replaces it
+  only when the client decodes it **clearly faster** at the stream's picture size (both must be
+  timed; the sample's times scaled down by pixel count for a smaller picture, never up for a
+  larger one: one sample cannot tell a fixed cost per call, such as a hardware decoder's round
+  trip, from work that grows with the picture, so the gain must hold either way): by at least
+  10 % and 0.5 ms per frame, or, for a family
   that compresses worse (H.264 against HEVC or AV1, roughly a third more bits for the same
   picture), by at least 25 % and 2 ms. AV1 competes on speed only on hosts with
   `"av1": "faster"` in host.json (default `"fallback"`: AV1 only where HEVC does not work
@@ -262,8 +266,11 @@ chooses automatically:
   H.264 to High, AMF encodes 4:2:0 only, QSV gets NV12) and the client asks only for Main
   profile support. Chrome's hardware decode of HEVC Range Extensions 4:4:4 is reported for
   NVIDIA (Chrome 137+, driver 572.16+) and Intel GPUs, not for AMD, so a 4:4:4 stream would
-  split clients by GPU; sharper text on an AMD host is for AV1's screen-content tools (Phase 5),
-  see `docs/VENDOR_NOTES.md` 4.2.
+  split clients by GPU. For text on an AMD host AV1 has screen-content tools (palette mode):
+  the native helper sets AMF's AV1 `SCREEN_CONTENT_TOOLS` and `PALETTE_MODE` on explicitly
+  (documented as on by default); FFmpeg's `av1_amf` has no option for them and keeps the
+  driver's default. Whether the encoder uses them is unverified on hardware
+  (`docs/VENDOR_NOTES.md` 4.2).
 
 An encoder that would pad the session's picture size gives way to HEVC, else H.264, with a
 notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when the client asks
@@ -381,11 +388,17 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   shows the results and the stream's live output lag (chunks submitted after a frame before it
   came out, the smallest per 0.5 s). Then each family is timed (step 4.2) on an 8-frame
   1920×1080 clip of FFmpeg's moving test pattern (`decoder-timing-clips.js`, same generator)
-  with the decoder the stream would use, one family after another so no two compete for the
-  GPU's decode engine or the CPU; the 640×360 clip cannot do this (it mostly measures the fixed
+  with the decoder the stream would use, the families interleaved frame by frame (every key
+  frame, then every family's first P frame, …) with one frame in flight at a time: no two
+  decodes compete for the GPU's decode engine or the CPU, and a change of load during the pass
+  falls on every family alike. The 640×360 clip cannot do this (it mostly measures the fixed
   cost of a call: there a software decoder beats a hardware decoder's round trip). The hello
-  carries the times (codec negotiation, above); the overlay's self-test line shows them
-  ("timed 1080p: 2.1 ms/frame").
+  waits for the self-test on every connection (and the host for the hello, 10 s), so the
+  timing has a budget: 1.5 s in all with the clips' download, 0.5 s per family; a family not
+  timed within it goes untimed (the host keeps its default order for it). The hello carries
+  the times (codec negotiation, above); the overlay's self-test line shows them ("timed 1080p:
+  2.1 ms/frame") and its label how long the whole self-test took ("Decoder self-test (120
+  ms)").
 - If the decoder falls behind (more than max(4, fps/10) frames in the decoder or waiting in front
   of it for 500 ms), it is reset and resynchronised from a fresh key frame, and the host is asked
   to back off. Latency can't grow without bound.

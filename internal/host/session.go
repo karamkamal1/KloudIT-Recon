@@ -403,7 +403,8 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 // browser's decoders, for a w x h picture (0, 0: unknown); why says how, for
 // the log. Automatically: the first tier of autoTiers with a family both ends
 // can use, the family in it by chooseFamily (codec.go: HEVC by default, a
-// family the client decodes clearly faster instead).
+// family the client decodes clearly faster instead), with software encoding
+// the first in its order.
 func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, why string, err error) {
 	caps := s.a.caps
 	client := s.clientDecoders()
@@ -436,7 +437,12 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int) (e media.Encoder
 			}
 		}
 		if len(cands) > 0 {
-			c, why := chooseFamily(cands, policy, w, h)
+			// Software encoding keeps its order: the host's CPU cost, which
+			// the client's decode times do not tell.
+			c, why := cands[0], "first choice"
+			if tier.hwEnc {
+				c, why = chooseFamily(cands, policy, w, h)
+			}
 			return c.enc, "auto, " + tier.name + ": " + why, nil
 		}
 	}

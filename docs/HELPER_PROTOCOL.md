@@ -585,6 +585,7 @@ true.
 | `INPUT_QUEUE_SIZE` | 2 |
 | AV1 `ALIGNMENT_MODE` | `64X16_ONLY` when the alignment is 64x16 (the helper pads itself, see below), else `NO_RESTRICTIONS` |
 | AV1 `SWITCH_FRAME_INSERTION_MODE` | `NONE` (a switch frame clears the LTR slots; the default "depends on USAGE") |
+| AV1 `SCREEN_CONTENT_TOOLS`, `PALETTE_MODE` | true (step 4.2: palette mode for text and UI; documented defaults, set explicitly; best effort). `FORCE_INTEGER_MV` stays at its default false |
 | colour | 8-bit, BT.709 primaries / transfer / matrix, limited range out; NV12 input limited range, RGB input (zero-copy) full range |
 | intra refresh | `intraRefreshFrames` > 0 (required): H.264 `INTRA_REFRESH_NUM_MBS_PER_SLOT` / HEVC `..._CTBS_PER_SLOT` = blocks / frames, AV1 `INTRA_REFRESH_MODE` continuous + `INTRAREFRESH_STRIPES`; 0: explicitly off (per-slot 0, AV1 `DISABLED`), since H.264's ULTRA_LOW_LATENCY / LOW_LATENCY usages default to 255 MBs per slot. `started.intraRefreshFrames` is the cycle read back after `Init` |
 

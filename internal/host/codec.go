@@ -27,10 +27,12 @@ import (
 //
 // The rule: the first tier of autoTiers with a candidate; in it the first
 // family in the tier's order (HEVC on hardware at both ends), unless a later
-// one decodes clearly faster (fasterBy) at the stream's picture size. AV1
-// competes on speed only with Config.AV1 "faster". 4:4:4 is never chosen: the
-// host encodes 4:2:0 only (HEVC Range Extensions decode in Chrome exists on
-// NVIDIA and Intel GPUs, not AMD; docs/VENDOR_NOTES.md 4.2).
+// one decodes clearly faster (fasterBy) at the stream's picture size; in the
+// software encode tier always the first (its order is the host's encode
+// cost, which the client's times do not tell). AV1 competes on speed only
+// with Config.AV1 "faster". 4:4:4 is never chosen: the host encodes 4:2:0
+// only (HEVC Range Extensions decode in Chrome exists on NVIDIA and Intel
+// GPUs, not AMD; docs/VENDOR_NOTES.md 4.2).
 
 // AV1 policies (Config.AV1).
 const (
@@ -57,7 +59,8 @@ var autoTiers = []struct {
 	{"hardware encode and decode", true, true, []string{"hevc", "av1", "h264"}},
 	// The browser decodes in software: H.264 is the cheapest to decode.
 	{"hardware encode, software decode", true, false, []string{"h264", "hevc", "av1"}},
-	// Software encoding: x264 is the cheapest to encode.
+	// Software encoding: x264 is the cheapest to encode. The order is the
+	// host's CPU cost, so decode times do not reorder it (negotiateEncoder).
 	{"software encode", false, false, []string{"h264", "av1", "hevc"}},
 }
 
@@ -100,8 +103,8 @@ func chooseFamily(cands []codecCandidate, policy string, w, h int) (codecCandida
 			continue
 		}
 		if fasterBy(c, pick, w, h) {
-			why = fmt.Sprintf("%s decodes clearly faster than %s (%.2f vs %.2f ms per frame%s)", c.enc.Family, pick.enc.Family,
-				decodeEstimate(c.dec, w, h), decodeEstimate(pick.dec, w, h), atSize(w, h))
+			why = fmt.Sprintf("%s decodes clearly faster than %s (%.2f vs %.2f ms per %dx%d frame)", c.enc.Family, pick.enc.Family,
+				c.dec.Timing.Ms, pick.dec.Timing.Ms, c.dec.Timing.W, c.dec.Timing.H)
 			pick = c
 		}
 	}
@@ -124,26 +127,25 @@ func fasterBy(c, pick codecCandidate, w, h int) bool {
 }
 
 // decodeEstimate returns the client's decode time of a family per frame of a
-// w x h picture (0, 0: unknown, the sample's own size), scaled from its timed
-// sample by pixel count, or 0 when it was not timed. Decoding work grows with
-// the picture (prediction, loop filters, the output copy); the fixed cost of
-// a call does not, so this somewhat overstates sizes above the sample's.
+// w x h picture (0, 0: unknown) as the comparison uses it, or 0 when it was
+// not timed: the timed sample's, scaled down by pixel count for a smaller
+// picture, never up for a larger one. A frame's time is a fixed cost per call
+// (a hardware decoder's round trip to the GPU process) plus work that grows
+// with the picture, and one sample cannot tell them apart. A difference
+// between two families' times shrinks with a smaller picture if it is all
+// per pixel and stays as measured on a larger one if it is all fixed cost;
+// the estimate takes the smaller of the two, so a family replaces another
+// only for a gain it has at the stream's size whatever the split (the share
+// of the pick's time is the same either way).
 func decodeEstimate(d proto.DecoderInfo, w, h int) float64 {
 	t := d.Timing
 	if t == nil || t.Ms <= 0 {
 		return 0
 	}
-	if w > 0 && h > 0 && t.W > 0 && t.H > 0 {
+	if w > 0 && h > 0 && t.W > 0 && t.H > 0 && w*h < t.W*t.H {
 		return t.Ms * float64(w*h) / float64(t.W*t.H)
 	}
 	return t.Ms
-}
-
-func atSize(w, h int) string {
-	if w > 0 && h > 0 {
-		return fmt.Sprintf(" at %dx%d", w, h)
-	}
-	return ""
 }
 
 // decoderSummary describes the hello's decoders for the log, e.g.

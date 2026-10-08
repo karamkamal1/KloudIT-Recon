@@ -3498,12 +3498,24 @@ leave out):
   `av01.0.09M.08`) comes first, then the frames go in one at a time, each after the previous
   one's output (up to 250 ms each), like a stream's. The time is the median from `decode()` to
   the output over the seven P frames (at least four must come out), so it is the decoder's
-  latency per frame, not its throughput. The families are timed one after another (the hygiene
-  tests, which run in parallel, have just warmed every decoder up), so no two compete for the
-  GPU's decode engine or the CPU. The clip module (226 kB) starts loading when the self-test
-  starts and is cached by the browser (the gateway serves it with an ETag). The hello carries
-  per family `timing: {ms, w, h, n, accel}`; the overlay's self-test line adds "timed 1080p:
-  N ms/frame"; `window.__recon.helloDecoders` holds what was sent. Why a separate 1080p clip:
+  latency per frame, not its throughput. The families are interleaved frame by frame (every
+  family's key frame, then every family's first P frame, …; review fix) with one frame in
+  flight at a time (the hygiene tests, which run in parallel, have just warmed every decoder
+  up), so no two compete for the GPU's decode engine or the CPU, and a change of
+  load during the pass falls on every family alike instead of on whichever was timed then.
+  The clip module (226 kB) starts loading when the self-test starts and is cached by the
+  browser (the gateway serves it with an ETag). The hello waits for the self-test on every
+  connection and the host waits 10 s for the hello, so the timing pass has a budget (review
+  fix): 1.5 s in all from the end of the hygiene tests, the wait for the clips included (an
+  import that has not finished by then leaves every family untimed and goes on loading for the
+  next connection), and 0.5 s per family (its frames' `decode()` → output, the key frame's
+  decoder start included); a family whose P frame is not out within 250 ms gets no more
+  frames. A family not timed within the budget goes to the host without a time, and the host
+  keeps its default order for it. The hello carries per family `timing: {ms, w, h, n,
+  accel}`; the overlay's self-test line adds "timed 1080p: N ms/frame" and its label how long
+  the whole self-test took, "Decoder self-test (N ms)" (the console log has `decoder self-test
+  took N ms`);
+  `window.__recon.helloDecoders` holds what was sent. Why a separate 1080p clip:
   the 4.1 clip (640×360, nearly empty P frames) mostly measures the fixed cost of a decode
   call; in this sandbox software AV1 takes 0.3-0.7 ms per frame there and 4.1-4.6 ms on the
   1080p clip, and a hardware decoder's round trip to the GPU process would lose to software
@@ -3519,14 +3531,23 @@ leave out):
 - The rule (also in docs/ARCHITECTURE.md, "Codec negotiation"): host-forced encoder, then the
   client's codec setting, else automatic: the first tier with a family both ends can use:
   (1) hardware encode + hardware decode: HEVC → AV1 → H.264; (2) hardware encode, software
-  decode: H.264 → HEVC → AV1; (3) software encode: H.264 → AV1 → HEVC. In the tier the first
-  family is the default (HEVC on AMD and NVIDIA hosts alike) and a later one replaces it only
-  when the client decodes it clearly faster at the stream's picture size (the 1080p time scaled
-  by pixel count; both timed): at least 10 % and 0.5 ms less per frame, or for a family that
-  compresses worse (H.264 against HEVC or AV1) at least 25 % and 2 ms. AV1 competes on speed
-  only with host.json `"av1": "faster"`; the default `"fallback"` keeps step 1.7's behaviour
-  (AV1 only where HEVC does not work end-to-end). Clients without timings get the tier order
-  alone, which is the order before this step.
+  decode: H.264 → HEVC → AV1; (3) software encode: H.264 → AV1 → HEVC, always the first there
+  (review fix: the order is the host's CPU cost of encoding, which the client's decode times do
+  not tell; before the fix a client that decodes AV1 faster got libsvtav1 instead of libx264
+  with `"av1": "faster"`, also on a GPU host whose hardware encoders had all failed). In tiers
+  1 and 2 the first family is the default (HEVC on AMD and NVIDIA hosts alike) and a later one
+  replaces it only when the client decodes it clearly faster at the stream's picture size (both
+  timed): at least 10 % and 0.5 ms less per frame, or for a family that compresses worse (H.264
+  against HEVC or AV1) at least 25 % and 2 ms. The stream's size (review fix): a frame's time
+  is a fixed cost per call (a hardware decoder's round trip to the GPU process) plus work that
+  grows with the picture, and one 1080p sample cannot tell them apart, so the times are scaled
+  down by pixel count for a smaller picture and never up for a larger one: the gain must hold
+  whatever the split (the share of the default's time is the same either way). Before the fix
+  the 1080p times were scaled up too, so a 0.6 ms difference at 1080p (possibly all fixed cost)
+  became 2.4 ms per 3840×2160 frame and made H.264 replace HEVC at 4K, where its extra bits cost
+  the most. AV1 competes on speed only with host.json `"av1": "faster"`; the default
+  `"fallback"` keeps step 1.7's behaviour (AV1 only where HEVC does not work end-to-end).
+  Clients without timings get the tier order alone, which is the order before this step.
 - Host log: `session started ... decoders="hevc:hw:2.10ms@1920x1080 av1:hw:1.85ms@1920x1080
   h264:hw:1.40ms@1920x1080"` (`hw`: hardware without holding frames back; `-`: not timed), and
   per new choice `codec choice encoder=hevc_amf family=hevc reason="auto, hardware encode and
@@ -3537,14 +3558,25 @@ leave out):
   for the same picture, so it must save a lot. Hardware decoding stays a tier above the
   measurement: the clip is a low-bitrate picture (2-6 kB per P frame), which understates a
   software decoder's cost at streaming bitrates (its entropy decoding grows with the bits), so
-  a software decoder is never preferred to hardware for its sample time. The scaling by pixel
-  count overstates large pictures somewhat (a call's fixed cost does not grow).
+  a software decoder is never preferred to hardware for its sample time. One sample size: the
+  rule cannot see a family that is slower at 1080p but faster at 4K (it keeps the default
+  then); a second size would add to the self-test the hello waits for. "On AMD host use AV1
+  screen-content tools for text" (review fix: neither built nor listed here before): the native
+  helper's AMF AV1 encoder now sets `AMF_VIDEO_ENCODER_AV1_SCREEN_CONTENT_TOOLS` and
+  `AMF_VIDEO_ENCODER_AV1_PALETTE_MODE` to true explicitly (best effort: a driver that refuses
+  them logs "properties not accepted (their defaults stay)"). Both are documented as on by
+  default (`VideoEncoderAV1.h`), so this guards against a usage or driver default rather than
+  changing the documented behaviour. `FORCE_INTEGER_MV` stays off (whole-pixel motion suits
+  scrolling text, not a game's sub-pixel motion). The FFmpeg path cannot set them (FFmpeg 8.1's
+  `av1_amf` has no such option, `internal/host/media/testdata/ffmpeg81-h-av1_amf.txt`) and keeps
+  the driver's default. Whether the encoder codes palette blocks is unverified (hardware test
+  below).
 - 4:4:4 stays off: the host encodes 4:2:0 only (NVENC HEVC pinned to Main and H.264 to High,
   AMF encodes 4:2:0 only, the QSV path converts to NV12), and the client asks only for Main
   profile support. Reported (guide, not checked here): Chrome decodes HEVC Range Extensions
   4:4:4 in hardware on NVIDIA (Chrome 137+, driver 572.16+) and Intel GPUs, not on AMD; a
-  4:4:4 stream would therefore play only on some clients' GPUs. Sharper text on an AMD host is
-  for AV1's screen-content tools (Phase 5, unverified).
+  4:4:4 stream would therefore play only on some clients' GPUs. For text on an AMD host AV1
+  has its screen-content tools instead (previous bullet; unverified).
 
 Verified in the sandbox (no GPU; this Chromium decodes AV1 only, in software; the host encodes
 with libx264 / libsvtav1):
@@ -3553,17 +3585,22 @@ with libx264 / libsvtav1):
   the in-tier rule on made-up times (HEVC default; AV1 replaces it only with `faster` and a
   gain of at least 10 % and 0.5 ms, not with 0.2 ms or 8 %, not when its encoder pads the
   size, not against an untimed HEVC; H.264 not for 1 ms or for 2 ms that are only 20 %, but
-  for 3 ms; the same 0.6 ms per 1080p frame is not enough at 1920×1080 and enough at
-  3840×2160), and host GPU × client GPU through `buildParams`: an RDNA3-like host (av1_amf
-  with the probed 64×16 alignment) picks hevc_amf by default, av1_amf with `faster` at
-  2560×1440 for a client that decodes AV1 faster, hevc_amf at 1920×1080 (no notice); an
-  RDNA2-like and an RTX 30-like host (no AV1 encoder) stay on HEVC; an RTX 40-like host picks
-  av1_nvenc only with `faster`; a client whose HEVC decoder takes 6 ms gets H.264; a browser
+  for 3 ms; after the review fix the same 0.6 ms per 1080p frame is enough neither at
+  1920×1080 nor at 3840×2160, 3 ms is enough at 3840×2160 but not at 1280×720 (1.33 ms there if
+  it is all per pixel), AV1's 0.6 ms is enough at 3840×2160 but not at 1280×720), and host GPU
+  × client GPU through `buildParams`: an RDNA3-like host (av1_amf with the probed 64×16
+  alignment) picks hevc_amf by default, av1_amf with `faster` at 2560×1440 for a client that
+  decodes AV1 faster, hevc_amf at 1920×1080 (no notice); an RDNA2-like and an RTX 30-like
+  host (no AV1 encoder) stay on HEVC; an RTX 40-like host picks av1_nvenc only with `faster`; a client whose HEVC decoder takes 6 ms gets H.264; a browser
   without HEVC gets AV1 before H.264 (RTX 40) or H.264 (RTX 30); AV1 decoded only in software
   never beats hardware HEVC; a client before step 4.2 gets HEVC; the client's codec setting and
   a host-forced encoder still win; one `codec choice` log line per change.
   `TestCodecSelectionFailover`: a failed encoder hands over to the next family by the same
-  rule. `TestHelloTiming`, `TestDecoderSummary`, `TestLoadConfigAV1` (`av1` accepts `fallback`
+  rule. `TestCodecSelectionSoftwareEncode` (review fix): a software-only host and an RTX 40-like
+  host whose three NVENC encoders all failed in the session pick libx264 with `"av1": "faster"`
+  for a client that decodes AV1 in 1.4 ms and H.264 in 2.0 ms per 1080p frame. The review
+  fix's new cases fail against the code before it (h264 at 4K; libsvtav1 in both software
+  cases). `TestHelloTiming`, `TestDecoderSummary`, `TestLoadConfigAV1` (`av1` accepts `fallback`
   and `faster`, rejects anything else). Step 1.7's `TestAlignmentGuard` and the earlier encoder
   failover tests pass unchanged.
 - verified (sandbox): `go test ./internal/host/media -run TestNoYUV444`: with the FFmpeg 8.1
@@ -3593,6 +3630,23 @@ with libx264 / libsvtav1):
   the lan restart count) and once or twice the recovery "skip" check, whose key-frame count
   includes the key frame a decoder backlog asks for when the bitrate cut is rate-limited
   (`congestion` reason `decoder` → `requestKeyframe`); every 4.2 check passed in every run.
+- verified (sandbox), after the review fixes: browser E2E timing logic on the fake decoder
+  (24 / 12 / 40 ms per 1080p frame for H.264 / HEVC / AV1, 10 ms on the hygiene clip): times
+  24.29 / 12.3 / 40.24 ms over 7 P frames each, decode order `avc1 hev1 av01 avc1 hev1 av01 …`
+  (24 decodes, interleaved), never more than one 1080p decode in flight. Budget: AV1 at 200 ms
+  per frame goes untimed while H.264 and HEVC are timed as before (whole pass 804 ms); every
+  family at 400 ms per 1080p frame and 50 ms on the hygiene clip (the review's slowest case,
+  9978 ms before the fix): the whole self-test takes 2005 ms, every family untimed; a clip
+  import that never finishes: nothing timed after 301 ms (budget 300 ms in that test). The same
+  numbers in Node with the same fake decoder for 3 families at 20 / 120 / 260 / 400 ms per 1080p
+  frame: 1000 / 2005 / 2003 / 2005 ms (review's run before the fix: 994 / 3429 / 4406 / 9978 ms).
+  Real decoder (AV1, dav1d): self-test 88 ms in all, timed 4.09 ms per 1080p frame; the overlay
+  label reads "Decoder self-test (88 ms)" (a first version added a row instead, which pushed
+  the overlay's "Export latency data" button below the E2E's 1280x720 viewport). Helper: `make
+  helper` (mingw) builds without warnings with the AV1 screen-content properties; `make
+  helper-test` under Wine/Xvfb passes (AMD paths skip without AMD hardware, as before). Browser
+  E2E 157 of 157 in the final run; one earlier run at a load average of 16 (other checkouts'
+  tests) failed only frame-rate checks and stopped at a screenshot timeout.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (host rules): `& "$env:ProgramFiles\KlouditRecon\recon-host.exe"
   probe` lists `av1_amf`, `hevc_amf`, `h264_amf` as working, and the agent's log at startup has
   `encoder pads the coded picture encoder=av1_amf probe=1920x1080 coded=1920x1082 alignment=64x16`
@@ -3655,12 +3709,36 @@ with libx264 / libsvtav1):
   4:2:0 either way.
 - NVIDIA: unverified (no NVIDIA host available). Test: the 4:4:4 check above covers the NVIDIA
   client; no host-side NVIDIA check (the host never encodes 4:4:4).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AV1 screen-content tools, review fix): open a
+  text-heavy desktop (a code editor and a web page with small text, nothing moving) and record
+  10 s of the helper's AV1 output twice at 2560x1440 60 fps, 10 Mbit/s: `recon-encoder.exe
+  --encode-test=on.ivf --backend=amf --codec=av1 --capture=dda --width=2560 --height=1440
+  --fps=60 --kbps=10000 --frames=600` with the build as is, and `off.ivf` from a build with the
+  two `setBool(..., true)` calls under "AV1 screen content tools" in
+  `native/recon-encoder/src/amf/amf_backend.cpp` changed to `false`. (1) The helper's log has
+  no `properties not accepted ... Av1ScreenContentTools` / `Av1PaletteMode` line.
+  (2) Sequence and frame headers: `ffmpeg -i on.ivf -c copy -bsf:v trace_headers -f null - 2>&1 |
+  findstr /i "screen_content"`: with the tools on expect `seq_choose_screen_content_tools = 1`
+  (each frame header then has `allow_screen_content_tools`: expect 1) or
+  `seq_force_screen_content_tools = 1`; with them off both 0. The headers do not show whether
+  blocks use the palette (FFmpeg does not trace tile data); (3) does. (3) Quality: grab the same desktop losslessly (`ffmpeg -f lavfi -i
+  ddagrab=output_idx=0:framerate=60 -t 10 -vf hwdownload,format=bgra -c:v ffv1 ref.mkv`) and
+  score both streams against it with libvmaf as in the "av1 faster" test above, plus a
+  side-by-side screenshot of 10 px text; record VMAF and the bits per frame. Expected: on is
+  the driver default and sharper (or equal) at the same bitrate. Also stream with the FFmpeg
+  path (`av1_amf`, no option for these) and run (2) on a recording of it to see the driver's
+  default.
+- NVIDIA: unverified (no NVIDIA host available). Test: none needed for this item (the NVENC
+  backend does not set AV1 screen-content tools; NVENC's AV1 encoder decides them itself). For
+  the record, run check (2) above on an `av1_nvenc` recording of the same desktop.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (the four network profiles, step 0.4): the choice
   depends on the client's decoders and the host's encoders, not on the network, so `lan /
   wifi / wan / capdrop` must give the same `codec choice` line for the same client (check under
   each profile, relay path forced as in "How every later step reports the four profiles").
-  Under `wan`, in a fresh browser profile, also record the overlay's "first frame after" on the
-  first connection (the 226 kB timing clip is downloaded once) and on the second (cached):
-  expect at most a few hundred milliseconds more on the first.
+  Under `wan`, in a fresh browser profile, also record the overlay's "Decoder self-test (N ms)"
+  (or the console's `decoder self-test took N ms`) on the
+  first connection (the 226 kB timing clip is downloaded once) and on the second (cached): the
+  timing pass is capped at 1.5 s, so expect at most that much more on the first; note whether a
+  family went untimed on the first (no "timed 1080p" on its line: the clip came too late).
 - NVIDIA: unverified (no NVIDIA host available). Test: the same four-profile check streaming
   from the NVIDIA host.

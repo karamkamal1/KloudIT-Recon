@@ -54,9 +54,15 @@ func TestChooseFamily(t *testing.T) {
 		{"H.264 1 ms faster at 1080p", []codecCandidate{cand(timed("hevc", true, 2.5), false), cand(timed("h264", true, 1.5), false)}, AV1Fallback, 1920, 1080, "hevc"},
 		{"H.264 3 ms faster at 1080p", []codecCandidate{cand(timed("hevc", true, 5), false), cand(timed("h264", true, 2), false)}, AV1Fallback, 1920, 1080, "h264"},
 		{"H.264 2 ms but only 20 % faster", []codecCandidate{cand(timed("hevc", true, 10), false), cand(timed("h264", true, 8), false)}, AV1Fallback, 1920, 1080, "hevc"},
-		// The same 0.6 ms at 1080p is 2.4 ms per 4K frame.
+		// The stream's size: a difference may be all fixed cost (it stays
+		// 0.6 ms per 4K frame) or all per pixel (1.33 ms of the 3 ms per
+		// 720p frame); the margin must hold either way.
 		{"H.264 0.6 ms faster at 1080p, stream 1080p", []codecCandidate{cand(timed("hevc", true, 1.6), false), cand(timed("h264", true, 1.0), false)}, AV1Fallback, 1920, 1080, "hevc"},
-		{"H.264 0.6 ms faster at 1080p, stream 4K", []codecCandidate{cand(timed("hevc", true, 1.6), false), cand(timed("h264", true, 1.0), false)}, AV1Fallback, 3840, 2160, "h264"},
+		{"H.264 0.6 ms faster at 1080p, stream 4K", []codecCandidate{cand(timed("hevc", true, 1.6), false), cand(timed("h264", true, 1.0), false)}, AV1Fallback, 3840, 2160, "hevc"},
+		{"H.264 3 ms faster at 1080p, stream 4K", []codecCandidate{cand(timed("hevc", true, 5), false), cand(timed("h264", true, 2), false)}, AV1Fallback, 3840, 2160, "h264"},
+		{"H.264 3 ms faster at 1080p, stream 720p", []codecCandidate{cand(timed("hevc", true, 5), false), cand(timed("h264", true, 2), false)}, AV1Fallback, 1280, 720, "hevc"},
+		{"AV1 0.6 ms faster at 1080p, stream 4K", []codecCandidate{cand(timed("hevc", true, 2), false), cand(timed("av1", true, 1.4), false)}, AV1Faster, 3840, 2160, "av1"},
+		{"AV1 0.6 ms faster at 1080p, stream 720p", []codecCandidate{cand(timed("hevc", true, 2), false), cand(timed("av1", true, 1.4), false)}, AV1Faster, 1280, 720, "hevc"},
 		{"size unknown: the sample's times", []codecCandidate{cand(timed("hevc", true, 1.6), false), cand(timed("h264", true, 1.0), false)}, AV1Fallback, 0, 0, "hevc"},
 		// Without HEVC AV1 is first; H.264 may still replace it.
 		{"AV1 first without HEVC (fallback)", []codecCandidate{cand(timed("av1", true, 2), false), cand(timed("h264", true, 1.5), false)}, AV1Fallback, 1920, 1080, "av1"},
@@ -195,6 +201,45 @@ func TestCodecSelectionFailover(t *testing.T) {
 	}
 }
 
+// TestCodecSelectionSoftwareEncode: software encoding keeps its order
+// (libx264 first, the cheapest to encode) whatever the client decodes faster,
+// on a host without hardware encoders and on one whose hardware encoders all
+// failed in the session.
+func TestCodecSelectionSoftwareEncode(t *testing.T) {
+	sw := []media.EncoderInfo{{Name: "libx264", Family: "h264", Vendor: "software"}, {Name: "libsvtav1", Family: "av1", Vendor: "software"}}
+	hw := []media.EncoderInfo{
+		{Name: "av1_nvenc", Family: "av1", Vendor: "nvidia", HW: true},
+		{Name: "hevc_nvenc", Family: "hevc", Vendor: "nvidia", HW: true},
+		{Name: "h264_nvenc", Family: "h264", Vendor: "nvidia", HW: true},
+	}
+	for _, c := range []struct {
+		name  string
+		encs  []media.EncoderInfo
+		tried []string
+	}{
+		{"software host", sw, nil},
+		{"RTX 40 host, every hardware encoder failed", append(hw, sw...), []string{"av1_nvenc", "hevc_nvenc", "h264_nvenc"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := &Config{Capture: "test", TestWidth: 2560, TestHeight: 1440, AV1: AV1Faster}
+			cfg.Defaults()
+			s := &Session{
+				a:     &Agent{cfg: cfg, caps: &media.Caps{Encoders: c.encs}, inj: input.NewInjector(nil)},
+				hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{timed("h264", true, 2.0), timed("av1", true, 1.4)}},
+				ctrl:  &ctrlRecorder{}, tried: map[string]bool{},
+				log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			for _, e := range c.tried {
+				s.tried[e] = true
+			}
+			p, err := s.buildParams(proto.Prefs{})
+			if err != nil || p.Encoder.Name != "libx264" {
+				t.Fatalf("got %s (%v), want libx264", p.Encoder.Name, err)
+			}
+		})
+	}
+}
+
 func TestDecoderSummary(t *testing.T) {
 	got := decoderSummary([]proto.DecoderInfo{timed("hevc", true, 2.104), {Family: "h264"}, timed("av1", false, 4.5)})
 	if want := "hevc:hw:2.10ms@1920x1080 h264:sw:- av1:sw:4.50ms@1920x1080"; got != want {
@@ -212,7 +257,11 @@ func TestHelloTiming(t *testing.T) {
 	if tm := h.Decoders[0].Timing; tm == nil || tm.Ms != 4.12 || tm.W != 1920 || tm.H != 1080 || tm.N != 7 || tm.Accel != "no-preference" || h.Decoders[1].Timing != nil {
 		t.Fatalf("%+v", h.Decoders)
 	}
-	if got := decodeEstimate(h.Decoders[0], 3840, 2160); got != 4.12*4 {
+	// Scaled down by pixel count, never up (decodeEstimate).
+	if got := decodeEstimate(h.Decoders[0], 960, 540); got != 4.12/4 {
+		t.Fatalf("960x540 estimate %v", got)
+	}
+	if got := decodeEstimate(h.Decoders[0], 3840, 2160); got != 4.12 {
 		t.Fatalf("4K estimate %v", got)
 	}
 }

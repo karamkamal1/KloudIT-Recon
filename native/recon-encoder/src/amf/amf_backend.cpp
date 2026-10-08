@@ -576,6 +576,15 @@ Status AmfEncoder::createAndConfigure(amf_int64 usage) {
     // 2.2.7), and their insertion "depends on USAGE": off. receive() still
     // treats one as clearing the slots.
     if (P_->switchFrameMode) s.setInt(P_->switchFrameMode, P_->switchFrameNone);
+    // AV1 screen content tools for desktop text (GUIDE 4.2): palette mode
+    // codes a block of few colours (text, UI) as a palette and indices. Both
+    // are documented on by default (VideoEncoderAV1.h); set here so that a
+    // usage or driver default cannot leave them off. Not FORCE_INTEGER_MV:
+    // whole-pixel motion suits scrolling text, not a game's sub-pixel motion.
+    if (P_->screenContentTools) {
+        s.setBool(P_->screenContentTools, true);
+        s.setBool(P_->paletteMode, true);
+    }
     if (P_->alignmentMode && det_.caps.alignW == 64 && det_.caps.alignH == 16) {
         // We pad to 64x16 ourselves (InputSpec::content*), so the strict mode
         // holds and nothing is padded or cropped behind our back.

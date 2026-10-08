@@ -15,10 +15,11 @@
 // Then (step 4.2) every family is timed on a 1920x1080 clip
 // (decoder-timing-clips.js) with the decoder the stream would use: the
 // median time from decode() to the output of its P frames, fed one at a time
-// like the stream's. The hello carries the times (decoders[].timing) and the
-// host picks the codec family by them. The 640x360 clip above cannot do this:
-// it mostly measures the fixed cost of a decode call, where a software
-// decoder beats a hardware decoder's round trip to the GPU process.
+// like the stream's, the families interleaved frame by frame. The hello
+// carries the times (decoders[].timing) and the host picks the codec family
+// by them. The 640x360 clip above cannot do this: it mostly measures the
+// fixed cost of a decode call, where a software decoder beats a hardware
+// decoder's round trip to the GPU process.
 
 import { CLIPS } from './decoder-selftest-clips.js';
 
@@ -39,12 +40,19 @@ const loadTimingClips = () => (timingClips ??= import('./decoder-timing-clips.js
 // holds frames back outputs nothing more (only that counts as holding).
 export const FIRST_OUTPUT_MS = 1000;
 export const NEXT_OUTPUT_MS = 100; // a 640x360 frame
-// Timing: each 1920x1080 frame may take this long before the next goes in
-// (one at a time, as on the stream; a decoder slower than that is timed on
-// overlapping frames, which only makes it look slower). At least
-// MIN_TIMED frames must come out for a time.
+// Timing: each 1920x1080 P frame may take this long; a family whose frame is
+// not out by then gets no more (one frame in flight at a time, as on the
+// stream). At least MIN_TIMED P frames must come out for a time.
 export const TIMING_NEXT_OUTPUT_MS = 250;
 export const MIN_TIMED = 4;
+// The hello waits for the self-test on every connection (and the host waits
+// 10 s for the hello), so the timing has a budget: TIMING_BUDGET_MS in all,
+// the wait for the clips included, and TIMING_FAMILY_MS per family (its
+// frames' decode() -> output, the key frame's decoder start included). A
+// family not timed within them goes to the host without a time; the host then
+// keeps its default order for it.
+export const TIMING_BUDGET_MS = 1500;
+export const TIMING_FAMILY_MS = 500;
 const FRAME_US = 16667;
 
 function b64(s) {
@@ -54,9 +62,23 @@ function b64(s) {
   return out;
 }
 
+function median(xs) {
+  const sorted = [...xs].sort((a, b) => a - b);
+  const m = sorted.length >> 1;
+  return +(sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2).toFixed(2);
+}
+
+// p, or a rejection after ms.
+function within(p, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no answer in ${Math.round(ms)} ms`)), Math.max(0, ms));
+    Promise.resolve(p).then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
 /**
- * Decodes the clip of a family (opts.clip, else its hygiene clip) with the
- * first supported of `accels` (hardwareAcceleration values). Result:
+ * Decodes the hygiene clip of a family with the first supported of `accels`
+ * (hardwareAcceleration values). Result:
  *   supported   false: none of accels is supported (nothing else is set)
  *   accel       the hardwareAcceleration decoded with
  *   firstAfter  chunks submitted when the first output arrived (1: at once; null: no output)
@@ -72,7 +94,7 @@ function b64(s) {
  */
 export async function selfTestDecoder(family, accels, opts = {}) {
   const { Decoder = globalThis.VideoDecoder, Chunk = globalThis.EncodedVideoChunk, firstOutputMs = FIRST_OUTPUT_MS, nextOutputMs = NEXT_OUTPUT_MS } = opts;
-  const clip = opts.clip || CLIPS[family];
+  const clip = CLIPS[family];
   if (!clip || !Decoder) return { family, supported: false };
   let config = null;
   for (const hardwareAcceleration of accels) {
@@ -138,9 +160,7 @@ export async function selfTestDecoder(family, accels, opts = {}) {
   r.timed = times.length;
   if (times.length) {
     r.decodeMs = +(times.reduce((a, b) => a + b, 0) / times.length).toFixed(2);
-    const sorted = [...times].sort((a, b) => a - b);
-    const m = sorted.length >> 1;
-    r.decodeP50 = +(sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2).toFixed(2);
+    r.decodeP50 = median(times);
   }
   r.firstMs = r.firstMs === null ? null : +r.firstMs.toFixed(1);
   r.ok = !r.error && r.firstAfter === 1 && r.held === 0;
@@ -151,18 +171,95 @@ export async function selfTestDecoder(family, accels, opts = {}) {
 export const holdsFrames = (r) => !!r?.supported && !r.error && r.outputs > 0 && r.held > 0;
 
 /**
- * Times a family's decoder (step 4.2): its 1920x1080 timing clip decoded
- * with `accel`, one frame at a time. Returns the hello's timing
+ * Times the decoders of several families (step 4.2): entries [{ family, accel }],
+ * each on its 1920x1080 timing clip with `accel` (hardwareAcceleration). The
+ * families are interleaved one frame at a time: every family's key frame, then
+ * P frame 1 of every family, then P frame 2, ..., each frame going in once the
+ * previous one is out. So no two decodes overlap (as on a stream; nor do two
+ * decoders compete for the GPU's decode engine or the CPU), and a change of
+ * load on the client during the pass falls on every family alike instead of
+ * on whichever was timed then. Returns { [family]: timing }, the hello's
  * { ms, w, h, n, accel } (ms: median decode() -> output of the n P frames
- * that came out), or null when the decoder failed or too few frames came out.
+ * that came out); a family is missing when its config is not supported, its
+ * decoder failed, or fewer than MIN_TIMED P frames came out within its
+ * budget (TIMING_FAMILY_MS, TIMING_BUDGET_MS) or before one was slower than
+ * TIMING_NEXT_OUTPUT_MS.
  */
+export async function timeDecoders(entries, opts = {}) {
+  const { Decoder = globalThis.VideoDecoder, Chunk = globalThis.EncodedVideoChunk } = opts;
+  const familyMs = opts.timingFamilyMs ?? TIMING_FAMILY_MS;
+  const nextMs = opts.timingNextOutputMs ?? TIMING_NEXT_OUTPUT_MS;
+  const now = () => performance.now();
+  const end = now() + (opts.timingBudgetMs ?? TIMING_BUDGET_MS);
+  const out = {};
+  if (!Decoder || !entries.length) return out;
+  const clips = await within(opts.timingClips ?? loadTimingClips(), end - now()).catch(() => null);
+  const runs = [];
+  for (const { family, accel } of entries) {
+    const clip = clips?.[family];
+    if (!clip) continue;
+    const config = { codec: clip.codec, codedWidth: clip.width, codedHeight: clip.height, optimizeForLatency: true, hardwareAcceleration: accel };
+    const s = await within(Promise.resolve().then(() => Decoder.isConfigSupported(config)), end - now()).catch(() => null);
+    if (s?.supported) runs.push({ family, accel, clip, config, data: clip.frames.map(b64), sentAt: [], times: [], outputs: 0, error: null, used: 0, stopped: false });
+  }
+  let wake = null;
+  // Resolves when r has n frames out, on its error, or after ms.
+  const waitFor = (r, n, ms) => new Promise((resolve) => {
+    if (r.outputs >= n || r.error) { resolve(); return; }
+    const done = () => { clearTimeout(timer); wake = null; resolve(); };
+    const timer = setTimeout(done, ms);
+    wake = () => { if (r.outputs >= n || r.error) done(); };
+  });
+  try {
+    for (const r of runs) {
+      try {
+        r.dec = new Decoder({
+          output: (f) => {
+            const i = Math.round(f.timestamp / FRAME_US);
+            f.close();
+            if (i > 0 && r.sentAt[i] !== undefined) r.times.push(now() - r.sentAt[i]);
+            r.outputs++;
+            wake?.();
+          },
+          error: (e) => { r.error = e?.message || String(e); wake?.(); },
+        });
+        r.dec.configure(r.config);
+      } catch (e) {
+        r.error = e?.message || String(e);
+      }
+    }
+    const frames = Math.max(0, ...runs.map((r) => r.data.length));
+    for (let i = 0; i < frames; i++) {
+      for (const r of runs) {
+        if (r.error || r.stopped || i >= r.data.length) continue;
+        const left = Math.min(end - now(), familyMs - r.used);
+        if (left <= 0) { r.stopped = true; continue; }
+        const t = now();
+        r.sentAt[i] = t;
+        try {
+          r.dec.decode(new Chunk({ type: i ? 'delta' : 'key', timestamp: i * FRAME_US, data: r.data[i] }));
+        } catch (e) {
+          r.error = e?.message || String(e);
+          continue;
+        }
+        await waitFor(r, i + 1, Math.min(left, i ? nextMs : FIRST_OUTPUT_MS));
+        r.used += now() - t;
+        if (r.outputs < i + 1) r.stopped = true; // still decoding: the next frame would overlap it
+      }
+    }
+  } finally {
+    // Not flush(): a frame still in flight does not matter.
+    for (const r of runs) { try { r.dec?.close(); } catch {} }
+  }
+  for (const r of runs) {
+    if (!r.error && r.times.length >= MIN_TIMED) out[r.family] = { ms: median(r.times), w: r.clip.width, h: r.clip.height, n: r.times.length, accel: r.accel };
+  }
+  return out;
+}
+
+/** timeDecoders for one family: its timing, or null. */
 export async function timeDecoder(family, accel, opts = {}) {
-  const clips = opts.timingClips || (await loadTimingClips());
-  const clip = clips?.[family];
-  if (!clip) return null;
-  const r = await selfTestDecoder(family, [accel], { ...opts, clip, nextOutputMs: opts.timingNextOutputMs ?? TIMING_NEXT_OUTPUT_MS });
-  if (!r.supported || r.error || r.timed < MIN_TIMED) return null;
-  return { ms: r.decodeP50, w: clip.width, h: clip.height, n: r.timed, accel: r.accel };
+  return (await timeDecoders([{ family, accel }], opts))[family] ?? null;
 }
 
 // The result the stream's decoder of a family corresponds to, or null when
@@ -184,13 +281,13 @@ function streamResult(t) {
  *   software  decode this family in software: its hardware decoder held
  *             frames back and the software decoder passed
  *   reportHW  the hello's hw flag: a hardware decoder that does not hold frames back
- *   timing    the hello's timing (timeDecoder) with the decoder the stream would use, or null
+ *   timing    the hello's timing (timeDecoders) with the decoder the stream would use, or null
  *   text      one line for the overlay and the log
  * The families' hygiene tests run in parallel: a decoder that holds frames back
  * costs about 2 x FIRST_OUTPUT_MS + 3 x NEXT_OUTPUT_MS, the others a few frame
- * decodes. The timing runs follow one family at a time, so no two decoders
- * compete for the GPU's decode engine or the CPU while timed (eight frames
- * each); the hygiene tests just warmed every decoder up.
+ * decodes. Then one timing pass for all of them (interleaved frame by frame, no
+ * two decodes at once; eight frames each, TIMING_BUDGET_MS at most); the
+ * hygiene tests just warmed every decoder up.
  */
 export async function runSelfTests(decoders, preferHW, opts = {}) {
   if (!opts.timingClips) loadTimingClips().catch(() => null); // fetch while the hygiene tests run
@@ -206,9 +303,10 @@ export async function runSelfTests(decoders, preferHW, opts = {}) {
     t.reportHW = !!d.hw && !holdsFrames(t.hw);
     return t;
   }));
+  const entries = tests.map((t) => ({ family: t.family, accel: streamResult(t)?.accel })).filter((e) => e.accel);
+  const timings = await timeDecoders(entries, opts).catch(() => ({}));
   for (const t of tests) {
-    const r = streamResult(t);
-    t.timing = r ? await timeDecoder(t.family, r.accel, opts).catch(() => null) : null;
+    t.timing = timings[t.family] ?? null;
     t.text = describe(t);
   }
   return tests;
