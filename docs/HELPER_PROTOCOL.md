@@ -163,7 +163,7 @@ ignored by recon-host.
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr` \| `vbr_peak`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr` (AMF LATENCY_CONSTRAINED_VBR), `vbr_peak` is AMF's PEAK_CONSTRAINED_VBR (NVENC: VBR, as `vbr`); added in step 3.6, older helpers refuse it; recon-host sends what the live-bitrate qualification chose, see "Live-bitrate qualification"), `quality` (`speed` \| `balanced` \| `quality`), `hdr` (HDR10, opt-in: see "HDR10"), `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots` or `svcLayers` > 1; recon-host asks for half a second of frames wherever the codec's caps have `intraRefresh` and the stream uses no LTR slots and no SVC, the loss-recovery ladder's safety net, GUIDE 2.3 / docs/ARCHITECTURE.md), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible); `motion` (step 3.6, `synthetic-gpu` only, else `bad_message`: its high-motion mode, see "Capture"; not with `hdr`: `unsupported`); Phase 5 experiments (optional, off by default): `reencodeOversized` (0 = off, else 1.5..100: re-encode a non-key frame larger than that many average frames; caps `reencode`), `sliceOutput` (0 = off, else 1..64 slices / tiles per frame handed out one by one; caps `sliceOutput`, AMF only) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
+| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr` \| `vbr_peak`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr` (AMF LATENCY_CONSTRAINED_VBR), `vbr_peak` is AMF's PEAK_CONSTRAINED_VBR (NVENC: VBR, as `vbr`); added in step 3.6, older helpers refuse it; recon-host sends what the live-bitrate qualification chose, see "Live-bitrate qualification"), `quality` (`speed` \| `balanced` \| `quality`), `hdr` (HDR10, opt-in: see "HDR10"), `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots`, nor with `svcLayers` > 1 unless the codec's caps have `intraRefreshSvc`; recon-host asks for half a second of frames wherever the codec's caps have `intraRefresh` and the stream uses no LTR slots and no SVC, or SVC with `intraRefreshSvc`, the loss-recovery ladder's safety net, GUIDE 2.3 / docs/ARCHITECTURE.md), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible); `motion` (step 3.6, `synthetic-gpu` only, else `bad_message`: its high-motion mode, see "Capture"; not with `hdr`: `unsupported`); Phase 5 experiments (optional, off by default): `reencodeOversized` (0 = off, else 1.5..100: re-encode a non-key frame larger than that many average frames; caps `reencode`), `sliceOutput` (0 = off, else 1..64 slices / tiles per frame handed out one by one; caps `sliceOutput`, AMF only) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder), and starts a new sequence: its ring slot has SEQ_START and its barcode value is 0 (step 3.1b; recon-host starts a new stream generation there). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: every frame from `lostFromFrameId` to the newest one is invalidated and the next frame references an older one (`ackedLtrFrameId` is not used); AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without a usable reference an IDR. |
 | `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
@@ -193,7 +193,7 @@ ignored by recon-host.
 {"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock",
  "adapterLuid":"","adapterName":"","hagsEnabled":null,
  "codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,
-   "recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless",
+   "recovery":"none","maxLtr":0,"intraRefresh":false,"intraRefreshSvc":false,"liveBitrate":"seamless",
    "maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":2,
    "queryTimeout":false,"alignW":1,"alignH":1,"dynamicResolution":false,"hdr10":false,
    "liveFps":"seamless","instanceSelect":true,"reencode":false}},
@@ -234,7 +234,10 @@ ignored by recon-host.
   for the stream), `instanceSelect` (`start`'s `encoderInstance` picks the hardware engine:
   AMF `INSTANCE_INDEX`; false for NVENC, which spreads its work over its engines itself),
   `reencode` (`start`'s `reencodeOversized` works: NVENC
-  `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`); `maxTemporalLayers` and `sliceOutput` are what
+  `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`), `intraRefreshSvc` (`start` may combine
+  `intraRefreshFrames` with `svcLayers` > 1: NVENC where it has both, marked `assumed`; false
+  for AMF, which refuses the pair, and wherever `intraRefresh` is false; recon-host keeps intra
+  refresh beside SVC only where it is true); `maxTemporalLayers` and `sliceOutput` are what
   `svcLayers` and `sliceOutput` may ask for (see "Phase 5 features"). Values start as vendor
   defaults; `liveBitrate` is measured per codec, quality preset and rate-control mode by
   `recon-host qualify` (step 3.6, see "Live-bitrate qualification"), whose results recon-host
@@ -755,8 +758,8 @@ and the `INPUT_HDR_METADATA` property: HEVC, AV1), `maxLtr` (AV1
 say, FFmpeg's assumption for RDNA3, marked `assumed`; `start` reads the factors again from
 the initialized encoder, see "AV1 alignment"), `intraRefresh` (the encoder takes the intra
 refresh property after `USAGE` and reads it back on the probe encoder; never with user LTR
-or SVC). `recovery` is `ltr` when at least 2 LTR slots are possible, `liveBitrate` starts
-as `seamless` (the AMD Streaming SDK changes the bitrate without a flush), always marked
+or SVC: `intraRefreshSvc` false). `recovery` is `ltr` when at least 2 LTR slots are possible,
+`liveBitrate` starts as `seamless` (the AMD Streaming SDK changes the bitrate without a flush), always marked
 `assumed`: `recon-host qualify` (step 3.6, "Live-bitrate qualification") measures it per codec,
 quality preset and rate-control mode, and recon-host uses those results over the caps; `forceIdr` is
 true. Phase 5: `liveFps` `seamless` (`FRAMERATE` is dynamic like the bitrate; marked
@@ -907,6 +910,7 @@ with the most video memory), `NvEncGetEncodeGUIDs` and per codec `NvEncGetEncode
 | `recovery` | `invalidate` with `SUPPORT_REF_PIC_INVALIDATION` and `SUPPORT_MULTIPLE_REF_FRAMES` (Sunshine turns RFI off without the latter), else `none` |
 | `maxLtr` | 0: the backend recovers by invalidation and uses no LTR (`start` needs `ltrSlots` 0); `NUM_MAX_LTR_FRAMES` is in the `start` log line |
 | `intraRefresh` | `SUPPORT_INTRA_REFRESH` |
+| `intraRefreshSvc` (Phase 5 wiring) | `intraRefresh` and `maxTemporalLayers` > 1 (no cap bit for the pair; `nvEncodeAPI.h` names no conflict between `enableIntraRefresh` and `enableTemporalSVC`): marked `assumed` |
 | `liveBitrate` | `seamless` with `SUPPORT_DYN_BITRATE_CHANGE` (marked `assumed`: `recon-host qualify` measures it, step 3.6), else `restart` |
 | `maxTemporalLayers` | `NUM_MAX_TEMPORAL_LAYERS` with `SUPPORT_TEMPORAL_SVC`, else 1 |
 | `roi` | `emphasis`, marked `assumed` (QP delta maps; no cap bit exists for them) |
@@ -1091,7 +1095,7 @@ libavcodec has no capability query, so the codec entries are documented or defau
 | `maxW` / `maxH` | 4096 x 4096 (H.264), 8192 x 8192 (HEVC, AV1): Intel's documented limits since Ice Lake / Arc, marked `assumed` |
 | `forceIdr`, `recovery`, `maxLtr` | true, `none`, 0 |
 | `liveBitrate`, `liveFps` | `flush` (`assumed`, below) |
-| `intraRefresh`, `roi`, `maxTemporalLayers`, `sliceOutput`, `hdr10`, `tenBit`, `instanceSelect`, `reencode` | false, `none`, 1, false, false, false, false, false |
+| `intraRefresh`, `intraRefreshSvc`, `roi`, `maxTemporalLayers`, `sliceOutput`, `hdr10`, `tenBit`, `instanceSelect`, `reencode` | false, false, `none`, 1, false, false, false, false, false |
 | `hwInstances`, `alignW` / `alignH` | 1, 1 x 1 (QSV pads to 16 x 16 itself; H.264 / HEVC crop in the SPS) |
 
 When another backend is chosen, `unavailable.lavc` comes from a light probe (DLLs and an

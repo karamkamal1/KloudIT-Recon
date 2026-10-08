@@ -24,10 +24,16 @@ type ctlHarness struct {
 	fps     int
 	share   float64      // received share of the encoder's output (1: everything)
 	fill    float64      // the encoder's output as a share of its target (1: hits it)
+	outKbps int          // > 0: the encoder's output whatever its target (a static picture)
+	loss    float64      // share of the reports' packets lost (50 packets per report)
 	stalled bool         // tick's stalled
 	decodeQ int          // reports' decoder backlog
 	changes []rateChange // applied changes, in order
 	at      []time.Duration
+	// static: a static desktop under the session's cap (activity.go): the
+	// encoder runs at what the cap makes of the controller's target, and
+	// the controller hears of it as the session tells it (videoEvents).
+	static *staticCap
 }
 
 func newCtl(t *testing.T, ceiling, fps int, p applyPolicy) *ctlHarness {
@@ -49,8 +55,30 @@ func (h *ctlHarness) elapsed() time.Duration { return h.clock.Sub(h.start) }
 func (h *ctlHarness) apply(c rateChange) {
 	h.changes = append(h.changes, c)
 	h.at = append(h.at, h.elapsed())
-	h.r.live(c.toKbps, c.toFPS)
 	h.fps = c.toFPS
+	if h.static == nil {
+		h.r.live(c.toKbps, c.toFPS)
+		return
+	}
+	// As Session.setRate: the encoder gets the cap's share of the target;
+	// its announced rate (VideoEvent.Rate) goes through the cap.
+	h.static.mu.Lock()
+	enc, _ := h.static.want(h.clock, c.toKbps, true)
+	h.static.applied(h.clock, enc, c.toKbps)
+	h.static.mu.Unlock()
+	h.r.live(h.static.rate(h.clock, enc, c.toKbps, true), c.toFPS)
+}
+
+// frame feeds a frame of the static desktop to the cap (as staticFrame) and
+// the encoder's rate it calls for to the controller (as videoEvents).
+func (h *ctlHarness) frame() {
+	target, _ := h.r.kbps()
+	h.static.mu.Lock()
+	c, ok := h.static.frame(h.clock, &media.Frame{HasDirty: true}, target, true)
+	h.static.mu.Unlock()
+	if ok {
+		h.r.live(h.static.rate(h.clock, c.kbps, target, true), 0)
+	}
 }
 
 // run advances the clock by d; qd(t) is the queueing delay the reports carry
@@ -66,6 +94,12 @@ func (h *ctlHarness) run(d time.Duration, qd func(t time.Duration) time.Duration
 			nextFrame = nextFrame.Add(time.Second / time.Duration(h.fps))
 			cur, _ := h.r.kbps()
 			n := int(float64(cur*1000/8/h.fps) * h.fill)
+			if h.outKbps > 0 {
+				n = h.outKbps * 1000 / 8 / h.fps
+			}
+			if h.static != nil {
+				h.frame()
+			}
 			h.r.output(n)
 			bytes += int64(float64(n) * h.share)
 			frames++
@@ -73,6 +107,10 @@ func (h *ctlHarness) run(d time.Duration, qd func(t time.Duration) time.Duration
 		if !h.clock.Before(nextReport) {
 			nextReport = nextReport.Add(25 * time.Millisecond)
 			fb := feedback{at: h.clock, frames: frames, bytes: bytes, interval: 25 * time.Millisecond, decodeQ: h.decodeQ}
+			if h.loss > 0 {
+				fb.total = 50
+				fb.lost = int64(math.Round(h.loss * 50))
+			}
 			if frames > 0 {
 				fb.owdValid, fb.qd = true, qd(h.elapsed())
 				fb.owd = fb.qd + 10*time.Millisecond
@@ -581,46 +619,62 @@ func TestRateFPSLadder(t *testing.T) {
 
 // TestRateFPSLadderLive: an encoder that changes its frame rate in place
 // (PipelineCaps.LiveFPS: the native helper's liveFps seamless) steps through
-// encoder.FPSSteps at the floor (60 -> 50 -> 45 -> 30, nothing below the
-// floor of 30, or host config "fpsFloor") and back up 2 s apart.
+// encoder.FPSSteps at the floor under lasting congestion, fpsHoldLive apart
+// down as well as up: 120 -> 100 -> 90 -> 75 -> 60 to the default floor of
+// 60, or host config "fpsFloor" (60 -> 50 -> 45 -> 30 with 30; 45 stops
+// there), and back up.
 func TestRateFPSLadderLive(t *testing.T) {
 	live := ratePolicy(media.PipelineCaps{LiveBitrate: true, LiveBitrateMeasured: true, LiveFPS: true})
 	if !live.fineFPS || ratePolicy(seamlessCaps).fineFPS || ratePolicy(media.PipelineCaps{LiveBitrate: true, LiveBitrateFlush: true, LiveFPS: true}).fineFPS {
 		t.Fatal("fine steps only for a seamless live frame rate")
 	}
 	for _, c := range []struct {
-		floor int
-		down  string
-		up    string
-	}{{0, "[50 45 30]", "[45 50 60]"}, {45, "[50 45]", "[50 60]"}} {
-		h := newCtl(t, 10000, 60, live)
+		floor, fps int
+		down       string
+		up         string
+	}{
+		{0, 120, "[100 90 75 60]", "[75 90 100 120]"},
+		{30, 60, "[50 45 30]", "[45 50 60]"},
+		{45, 60, "[50 45]", "[50 60]"},
+	} {
+		h := newCtl(t, 10000, c.fps, live)
 		h.r.setFPSFloor(c.floor)
 		h.run(3*time.Second, flat(20*time.Millisecond))
 		h.r.mu.Lock()
 		h.r.est, h.r.applied = 2000, 2000
 		h.r.mu.Unlock()
-		h.r.live(2000, 60)
-		h.run(1500*time.Millisecond, flat(40*time.Millisecond)) // within the 2 s the base needs to take the new delay
+		h.r.live(2000, c.fps)
+		// A queue that keeps growing (10 ms per second: over the 2 s
+		// minimum by 20 ms throughout) for 9 s: a decrease every few
+		// reports, all at the floor.
+		t0 := h.elapsed()
+		h.run(9*time.Second, func(t time.Duration) time.Duration { return 40*time.Millisecond + (t-t0)/100 })
 		var fps []int
-		for _, ch := range h.changes {
+		var at []time.Duration
+		for i, ch := range h.changes {
 			if !ch.down || ch.toKbps != 2000 {
 				t.Fatalf("floor %d: change %+v at the floor, want frame-rate decreases at 2000", c.floor, ch)
 			}
-			fps = append(fps, ch.toFPS)
+			fps, at = append(fps, ch.toFPS), append(at, h.at[i])
 		}
 		if fmt.Sprint(fps) != c.down {
 			t.Fatalf("floor %d: frame rates %v, want %s", c.floor, fps, c.down)
 		}
+		for i := 1; i < len(at); i++ {
+			if at[i]-at[i-1] < fpsHoldLive {
+				t.Fatalf("floor %d: frame-rate steps down %v apart, want at least %v", c.floor, at[i]-at[i-1], fpsHoldLive)
+			}
+		}
 		h.changes, h.at = nil, nil
-		h.run(20*time.Second, flat(20*time.Millisecond))
+		h.run(25*time.Second, flat(20*time.Millisecond))
 		var up []int
-		var at []time.Duration
+		at = nil
 		for i, ch := range h.changes {
 			if ch.toFPS != ch.fromFPS {
 				up, at = append(up, ch.toFPS), append(at, h.at[i])
 			}
 		}
-		if fmt.Sprint(up) != c.up || h.fps != 60 {
+		if fmt.Sprint(up) != c.up || h.fps != c.fps {
 			t.Fatalf("floor %d: frame rates back %v (now %d), want %s", c.floor, up, h.fps, c.up)
 		}
 		// Decided fpsHoldLive apart; an increase of the bitrate just before

@@ -23,10 +23,14 @@ import (
 // the session with a fake native helper (encoder.Fake).
 
 const (
-	// An encoder with temporal SVC and a seamless frame rate (a Phase 5
-	// helper's NVENC-like caps).
+	// An encoder with temporal SVC and a seamless frame rate that cannot
+	// combine intra refresh with SVC (a Phase 5 helper's caps without
+	// intraRefreshSvc).
 	fakeSVCH264 = `"h264":{"maxW":4096,"maxH":2304,"forceIdr":true,"recovery":"invalidate","liveBitrate":"seamless","liveFps":"seamless",` +
 		`"maxTemporalLayers":2,"intraRefresh":true,"alignW":1,"alignH":1}`
+	// The same encoder able to combine them (NVENC: intraRefreshSvc).
+	fakeSVCIRH264 = `"h264":{"maxW":4096,"maxH":2304,"forceIdr":true,"recovery":"invalidate","liveBitrate":"seamless","liveFps":"seamless",` +
+		`"maxTemporalLayers":2,"intraRefresh":true,"intraRefreshSvc":true,"alignW":1,"alignH":1}`
 	// The same encoder as a helper before Phase 5 reports it (no liveFps).
 	fakeOldH264 = `"h264":{"maxW":4096,"maxH":2304,"forceIdr":true,"recovery":"invalidate","liveBitrate":"seamless",` +
 		`"maxTemporalLayers":2,"intraRefresh":true,"alignW":1,"alignH":1}`
@@ -254,6 +258,13 @@ func TestSessionThinning(t *testing.T) {
 			t.Fatalf("v3 client thinned: sent %v", seqs)
 		}
 	})
+	t.Run("intra refresh beside SVC", func(t *testing.T) {
+		// GUIDE 2.3 rung 3 stays where the encoder combines the two.
+		r := newP5Rig(t, fakeSVCIRH264, proto.HelloVersionThinned, Config{}, "seamless")
+		if r.start["svcLayers"] != float64(2) || r.start["intraRefreshFrames"] != float64(30) {
+			t.Fatalf("start %v: want svcLayers 2 and 30 frames of intra refresh", r.start)
+		}
+	})
 	t.Run("svc off", func(t *testing.T) {
 		r := newP5Rig(t, fakeSVCH264, proto.HelloVersionThinned, Config{SVC: "off"}, "seamless")
 		if r.start["svcLayers"] != nil {
@@ -284,7 +295,7 @@ func TestSessionLiveFPS(t *testing.T) {
 		{"older helper", fakeOldH264, "", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			r := newP5Rig(t, c.codec, proto.HelloVersionRecovery, Config{}, c.liveFPS)
+			r := newP5Rig(t, c.codec, proto.HelloVersionRecovery, Config{FPSFloor: 30}, c.liveFPS)
 			r.publish(t, svcFrame(1))
 			waitMsg(t, r.ctrl, `"t":"video"`, `"gen":1`)
 			pol := ratePolicy(r.s.vid().Capabilities())
@@ -297,7 +308,8 @@ func TestSessionLiveFPS(t *testing.T) {
 			ok := r.s.rate.fpsDown(time.Now())
 			next := r.s.rate.fps
 			r.s.rate.mu.Unlock()
-			want := map[bool]int{true: 50, false: 60}[c.fine] // 60 fps: LowerFPS 50; the rungs have nothing below 60
+			// 60 fps, fpsFloor 30: LowerFPS 50; the rungs have nothing below 60.
+			want := map[bool]int{true: 50, false: 60}[c.fine]
 			if c.fine != ok || c.fine && next != want {
 				t.Fatalf("fpsDown at 60 fps: %v -> %d", ok, next)
 			}
@@ -327,7 +339,7 @@ func TestStaticCap(t *testing.T) {
 		dirty float64 // < 0: unknown
 	}
 	run := func(c *staticCap, target int, live bool, steps []step) (out []string) {
-		c.generation(t0, target, target)
+		c.generation(t0, target, target, live)
 		for _, s := range steps {
 			f := &media.Frame{Dirty: s.dirty, HasDirty: s.dirty >= 0}
 			c.mu.Lock()
@@ -384,9 +396,15 @@ func TestStaticCap(t *testing.T) {
 		}
 	}
 	// A generation that goes live below the target (a helper restarted at
-	// a capped rate) is capped: the first frame that changes restores it.
+	// a capped rate) is capped (the rate controller hears its target): the
+	// first frame that changes restores it.
 	c := &staticCap{on: true}
-	c.generation(t0, 5000, 20000)
+	if k := (&staticCap{on: true}).generation(t0, 5000, 20000, false); k != 5000 {
+		t.Fatalf("a generation below the target of a pipeline that is not live: the rate controller hears %d", k)
+	}
+	if k := c.generation(t0, 5000, 20000, true); k != 20000 {
+		t.Fatalf("restarted capped: the rate controller hears %d, want its target", k)
+	}
 	c.mu.Lock()
 	ch, ok := c.frame(t0, &media.Frame{Dirty: 0.5, HasDirty: true}, 20000, true)
 	c.mu.Unlock()
@@ -398,7 +416,15 @@ func TestStaticCap(t *testing.T) {
 	// second later on a still static desktop.
 	c = &staticCap{on: true}
 	got = run(c, 20000, true, static(0, 1100, 0))
-	c.rate(t0.Add(1200*time.Millisecond), 20000, 20000)
+	if k := c.rate(t0.Add(1100*time.Millisecond), 5000, 20000, true); k != 20000 {
+		t.Fatalf("the cut announced: the rate controller hears %d, want its target", k)
+	}
+	if k := (&staticCap{on: true}).rate(t0, 5000, 20000, false); k != 5000 {
+		t.Fatalf("a rate below the target from a pipeline that is not live: the rate controller hears %d", k)
+	}
+	if k := c.rate(t0.Add(1200*time.Millisecond), 20000, 20000, true); k != 20000 {
+		t.Fatalf("the change announced: the rate controller hears %d", k)
+	}
 	if c.capped || c.sent != 20000 || fmt.Sprint(got) != "[1000:5000/4.0]" {
 		t.Fatalf("after an announced change: capped %v sent %d (%v)", c.capped, c.sent, got)
 	}
@@ -412,6 +438,57 @@ func TestStaticCap(t *testing.T) {
 	}
 	if fmt.Sprint(again) != "[2200:5000]" {
 		t.Fatalf("cut again: %v", again)
+	}
+}
+
+// TestStaticCapRateController: the static-desktop cap changes what the
+// encoder makes, not what the rate controller measures against: a delay
+// spike, a loss burst or lasting thinning on a static desktop (the encoder
+// makes 500 kbit/s whatever its target) decreases exactly as without the cap,
+// and the target climbs back on a clean path while the desktop stays static.
+func TestStaticCapRateController(t *testing.T) {
+	type result struct{ after, final int }
+	run := func(capped bool, event string) (result, *ctlHarness) {
+		h := newCtl(t, 20000, 60, seamless)
+		h.outKbps = 500
+		if capped {
+			h.static = &staticCap{on: true}
+			h.static.generation(h.clock, 20000, 20000, true)
+		}
+		h.run(3*time.Second, flat(20*time.Millisecond))
+		if capped && (!h.static.isCapped() || h.static.sent != 5000) {
+			t.Fatalf("%s: encoder at %d (capped %v), want the static 5000", event, h.static.sent, h.static.isCapped())
+		}
+		switch event {
+		case "delay":
+			h.run(300*time.Millisecond, flat(45*time.Millisecond))
+		case "loss":
+			h.loss = 0.1
+			h.run(300*time.Millisecond, flat(20*time.Millisecond))
+			h.loss = 0
+		case "thinning":
+			for i := 0; i < 24; i++ {
+				h.r.thinned()
+				h.run(50*time.Millisecond, flat(20*time.Millisecond))
+			}
+		}
+		r := result{after: h.cur()}
+		h.run(10*time.Second, flat(20*time.Millisecond))
+		r.final = h.cur()
+		return r, h
+	}
+	for _, event := range []string{"delay", "loss", "thinning"} {
+		plain, _ := run(false, event)
+		got, h := run(true, event)
+		if plain.after >= 20000 || plain.final != 20000 {
+			t.Fatalf("%s without the cap: %+v, want a decrease and back to 20000", event, plain)
+		}
+		if got != plain {
+			t.Errorf("%s with the cap: %+v, want %+v as without it", event, got, plain)
+		}
+		if want := max(rateFloorKbps, got.final/4); !h.static.isCapped() || h.static.sent != want {
+			t.Errorf("%s: encoder at %d (capped %v) after the climb, want the static %d", event, h.static.sent, h.static.isCapped(), want)
+		}
 	}
 }
 
@@ -448,6 +525,19 @@ func TestSessionStaticDesktop(t *testing.T) {
 	}
 	if l := r.logs.lines(`msg="static desktop: lowering the bitrate"`); len(l) != 1 {
 		t.Fatalf("log %q", l)
+	}
+	// The helper announces the cut with its next frame: the client hears
+	// 5000, the rate controller its own 20000 (its measurements are in
+	// units of its target).
+	r.clock.add(16 * time.Millisecond)
+	id++
+	r.publish(t, frame(id, 0.0001))
+	waitMsg(t, r.ctrl, `"t":"rate"`, `"bitrate":5000`)
+	r.s.rate.mu.Lock()
+	heard := r.s.rate.liveKbps
+	r.s.rate.mu.Unlock()
+	if heard != 20000 {
+		t.Fatalf("the rate controller heard %d kbps of the capped encoder, want its target 20000", heard)
 	}
 	// The rate controller's change while static: capped too (a quarter).
 	r.s.rate.mu.Lock()

@@ -98,7 +98,7 @@ func TestFrameSenderThinning(t *testing.T) {
 		}
 		return fs
 	}
-	run := func(t *testing.T, helloV int, svc string, faults testFaults) ([]uint32, []int64, *Session, *fakeCtrl) {
+	feed := func(t *testing.T, helloV int, svc string, faults testFaults) (*Session, *fakeConn, *fakeCtrl) {
 		s, c, ctrl := testSession(t, faults)
 		s.a.cfg = &Config{SVC: svc}
 		s.hello.V = helloV
@@ -115,6 +115,10 @@ func TestFrameSenderThinning(t *testing.T) {
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
+		return s, c, ctrl
+	}
+	run := func(t *testing.T, helloV int, svc string, faults testFaults) ([]uint32, []int64, *Session, *fakeCtrl) {
+		s, c, ctrl := feed(t, helloV, svc, faults)
 		seqs, masks := sentFrames(t, c)
 		return seqs, masks, s, ctrl
 	}
@@ -159,6 +163,38 @@ func TestFrameSenderThinning(t *testing.T) {
 	t.Run("svc off", func(t *testing.T) {
 		if seqs, _, _, _ := run(t, proto.HelloVersionThinned, "off", pressure); len(seqs) != 12 {
 			t.Fatalf("thinned with svc off: sent %v", seqs)
+		}
+	})
+	t.Run("test faults", func(t *testing.T) {
+		// The hook drops frames 6 and 12 (seqs 5, 11) and delays frame 8
+		// (seq 7): enhancement frames under pressure, yet never thinned
+		// (the faults stay as configured); seq 3 is.
+		f := pressure
+		f.dropEvery, f.delayEvery, f.delay = 6, 8, 5*time.Millisecond
+		s, c, ctrl := feed(t, proto.HelloVersionThinned, "", f)
+		var sent []uint32
+		reset := 0
+		for _, st := range c.snapshot() {
+			if st.cancelled {
+				reset++ // half a frame
+				continue
+			}
+			h, _, _, err := proto.ParseFrame(st.data)
+			if err != nil || !st.closed {
+				t.Fatalf("stream: %v closed %v", err, st.closed)
+			}
+			sent = append(sent, h.Seq)
+		}
+		var dropped []uint32
+		for _, d := range ctrl.dropped(t) {
+			dropped = append(dropped, d.FromSeq)
+		}
+		if fmt.Sprint(sent) != "[0 1 2 4 6 7 8 9 10]" || reset != 2 || fmt.Sprint(dropped) != "[5 11]" {
+			t.Fatalf("sent %v, %d streams reset, dropped %v: want seq 3 thinned, 5 and 11 dropped by the hook, 7 delayed and sent",
+				sent, reset, dropped)
+		}
+		if n := s.stats.thinned.Load(); n != 1 {
+			t.Fatalf("thinned %d, want 1 (seq 3)", n)
 		}
 	})
 	t.Run("no pressure", func(t *testing.T) {

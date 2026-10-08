@@ -435,13 +435,12 @@ func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encod
 	}
 	// The loss-recovery ladder's safety net (GUIDE 2.3, rung 3): intra
 	// refresh, over half a second of frames as on the FFmpeg path, where
-	// the encoder has it and it does not conflict: not with LTR slots or
-	// SVC (AMF); so NVENC (beside reference invalidation) and AMF H.264
-	// without LTR. A picture a recovery leaves damaged heals by itself;
-	// losses are still answered by recovery frames or IDRs.
-	if sp.SVCLayers <= 1 {
-		sp.IntraRefreshFrames = caps.IntraRefreshFrames(sp.Codec, sp.FPS)
-	}
+	// the encoder has it and it does not conflict: not with LTR slots, nor
+	// with SVC where the caps say so (intraRefreshSvc false: AMF); so NVENC
+	// (beside reference invalidation, with or without SVC) and AMF H.264
+	// without LTR or SVC. A picture a recovery leaves damaged heals by
+	// itself; losses are still answered by recovery frames or IDRs.
+	sp.IntraRefreshFrames = caps.IntraRefreshFrames(sp.Codec, sp.FPS, sp.SVCLayers)
 	if v.zeroCopyFails >= 2 {
 		off := false
 		sp.ZeroCopy = &off

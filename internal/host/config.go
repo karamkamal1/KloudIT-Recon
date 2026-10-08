@@ -63,16 +63,19 @@ type Config struct {
 	SVC string `json:"svc,omitempty"`
 	// StaticBitrate "auto" ("" = auto) lowers the encoder's bitrate while the
 	// desktop is static (the native helper's dirty rects; a seamless live
-	// bitrate only) to StaticKbps and gives the full bitrate back with the
-	// first frame that changes; "off": never.
+	// bitrate only) to StaticKbps and raises it again with the first frame
+	// that changes: to the full bitrate from 5 % of the picture changed,
+	// linearly between 0.2 % and 5 %; "off": never.
 	StaticBitrate string `json:"staticBitrate,omitempty"`
 	// StaticKbps is a static desktop's bitrate (0 = a quarter of the rate
 	// controller's target, at least 2000 kbit/s; never above the target).
 	StaticKbps int `json:"staticKbps,omitempty"`
 	// FPSFloor is the lowest frame rate the rate controller lowers to at its
-	// bitrate floor before anything else (0 = 30 where the encoder changes
-	// its frame rate in place, the native helper; FFmpeg keeps its rungs
-	// 120 / 90 / 60).
+	// bitrate floor before anything else (0 = 60, GUIDE 2.2). Where the
+	// encoder changes its frame rate in place (the native helper) in fine
+	// steps down to it, 2 s apart; elsewhere (FFmpeg, flushing encoders,
+	// older helpers) the rungs 120 / 90 / 60 at or above it, nothing below
+	// 60.
 	FPSFloor int `json:"fpsFloor,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)

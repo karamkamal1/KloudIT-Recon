@@ -367,33 +367,41 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     lower) a decrease lowers the frame rate a rung instead (resolution is not changed); the frame
     rate goes back up a rung once the bitrate is 1.5 × the floor (or at the setting or the
     decoder's cap, where that is lower) and nothing decreased for a while. One ladder, two step
-    tables by the pipeline's capabilities: where each change costs a key frame or a restart
-    (FFmpeg, a flushing helper encoder, a helper before Phase 5) 120 → 90 → 60, nothing below 60,
-    5 s apart; where the encoder changes its frame rate in place without a key frame (the native
-    helper's `started.liveFps` `seamless`: AMF `FRAMERATE`, NVENC reconfigure) the finer
-    `encoder.FPSSteps` (240, 165, 144, 120, 100, 90, 75, 60, 50, 45, 30) down to host config
-    `fpsFloor` (default 30), 2 s apart, each sent to the helper as a frame-rate change alone
-    (`setRate` with `fps` only, Go `SetFPS`).
+    tables by the pipeline's capabilities, both down to host config `fpsFloor` (default 60, GUIDE
+    2.2): where each change costs a key frame or a restart (FFmpeg, a flushing helper encoder, a
+    helper before Phase 5) 120 → 90 → 60, nothing below 60, a rung down with each decrease at the
+    floor and back up 5 s apart; where the encoder changes its frame rate in place without a key
+    frame (the native helper's `started.liveFps` `seamless`: AMF `FRAMERATE`, NVENC reconfigure)
+    the finer `encoder.FPSSteps` (240, 165, 144, 120, 100, 90, 75, 60, and with a lower
+    `fpsFloor` 50, 45, 30), 2 s apart down as well as up (at the floor the bitrate stays, so a
+    step does not relieve the path: a step with every decrease would reach the floor within a
+    second), each sent to the helper as a frame-rate change alone (`setRate` with `fps` only, Go
+    `SetFPS`).
   - *Thinning* (temporal SVC, above): the instant answer to a spike, before the bitrate's. While
     frames are being thinned (until 250 ms after the last), nothing increases; thinning that goes
     on for a second (frames thinned at most 250 ms apart) decreases ×0.85 like the delay
     (`why=thinning`), and again after each further second: a lasting shortage is the bitrate's to
     answer. Helper streams start with two temporal layers (`svcLayers` 2) where the codec's caps
     have them (`maxTemporalLayers`) and the helper is a Phase 5 one (its LTR marks fall on
-    base-layer frames only), for clients that can be thinned; SVC takes the place of intra
-    refresh as the safety net (AMF cannot combine them; NVENC loses it with SVC too, invalidation
-    still answers losses).
+    base-layer frames only), for clients that can be thinned. Intra refresh (the 2.3 safety net)
+    stays beside SVC where the caps say the encoder combines them (`intraRefreshSvc`: NVENC,
+    assumed until the hardware check); elsewhere SVC takes its place (AMF refuses the pair, and
+    uses LTR anyway; invalidation or LTR still answers losses).
   - *Static desktop* (`internal/host/activity.go`, GUIDE 9 "dirty rects"): the native helper's
     captures report the share of the picture that changed with every frame (DDA and AMD Direct
     Capture dirty rects; `media.Frame.Dirty`). While at most 0.2 % changed per frame over the last
     second (a caret, a clock; the pointer is not in the helper's video) the encoder's target goes
     down to host config `staticKbps` (default a quarter of the rate controller's target, at least
-    2 Mbit/s), linearly back towards the target between 0.2 % and 5 %, at most once a second; the
-    first frame that changes gives the full target back at once, before that frame is queued (so
-    it goes out at the full pacing rate). It caps what the encoder is told, never what the rate
-    controller decides (the lower of the two: it cannot fight the congestion control; a restore
-    needs no ramp), and keeps the VBV at one frame of the full target (`vbvFrames` target / cap)
-    so the first frame with motion, encoded before anyone knows it moved, is not starved. Only on
+    2 Mbit/s), linearly back towards the target between 0.2 % and 5 %, lower at most once a
+    second; a frame that changes raises it at once, before that frame is queued (so it goes out
+    at the new pacing rate): the full target from 5 % changed, the linear share below that (about
+    37 % of the target at 1 %). It caps what the encoder is told, never what the rate controller
+    decides (the lower of the two: it cannot fight the congestion control; a restore needs no
+    ramp); the controller is told the encoder runs at its target meanwhile (its fill, the
+    delivered rates and the queue's growth are measured in units of its target: told the capped
+    rate, a decrease would start from the cap and no increase could pass 1.2 × the cap). The cap
+    keeps the VBV at one frame of the full target (`vbvFrames` target / cap) so the first frame
+    with motion, encoded before anyone knows it moved, is not starved. Only on
     a seamless live bitrate (a cap that costs key frames is worth nothing); FFmpeg reports no
     dirty share, and an unknown share never lowers anything. Host config `staticBitrate` `off`
     turns it off; host.log logs `static desktop: lowering the bitrate` and `desktop changes: full

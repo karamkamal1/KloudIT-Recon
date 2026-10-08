@@ -5815,14 +5815,16 @@ behaviour has a host config switch with a safe default):
   (`refFloor`, the helper's ack ring, the client's `lost` and `dropped` reports, the 2.3
   ladder), so thinned frames keep their seqs and the client learns of them from the mask. Clients
   that cannot read the mask (`hello.v < 4`) are never thinned.
-- **FPS before resolution** (`internal/host/bitrate.go`, host config `fpsFloor`, default 0):
-  the 2.2 frame-rate ladder at the bitrate floor is one ladder with two step tables by the
-  pipeline's capabilities: FFmpeg, flushing encoders and pre-Phase-5 helpers keep 120 / 90 /
-  60 (5 s apart; a change there costs a restart or a key frame); a helper whose started
-  `liveFps` is `seamless` (`PipelineCaps.LiveFPS`) steps through `encoder.LowerFPS` /
-  `RaiseFPS` (`FPSSteps` down to `fpsFloor`, default 30), 2 s apart, each sent as a frame-rate
-  change alone (`HelperVideo` -> `Helper.SetFPS`: `setRate` with `fps` only; to a pre-Phase-5
-  helper with the bitrate, which it requires). A helper whose `liveFps` is `restart` gets a new
+- **FPS before resolution** (`internal/host/bitrate.go`, host config `fpsFloor`, default 0 =
+  60, GUIDE 2.2's floor): the 2.2 frame-rate ladder at the bitrate floor is one ladder with two
+  step tables by the pipeline's capabilities: FFmpeg, flushing encoders and pre-Phase-5 helpers
+  keep 120 / 90 / 60 (a rung down with each decrease at the floor, back up 5 s apart; a change
+  there costs a restart or a key frame); a helper whose started `liveFps` is `seamless`
+  (`PipelineCaps.LiveFPS`) steps through `encoder.LowerFPS` / `RaiseFPS` (`FPSSteps` down to
+  `fpsFloor`: 120 / 100 / 90 / 75 / 60 by default, on through 50 / 45 / 30 with a lower
+  `fpsFloor`), 2 s apart down as well as up, each sent as a frame-rate change alone
+  (`HelperVideo` -> `Helper.SetFPS`: `setRate` with `fps` only; to a pre-Phase-5 helper with
+  the bitrate, which it requires). A helper whose `liveFps` is `restart` gets a new
   helper for a frame-rate change.
 - **Static desktop bitrate** (`internal/host/activity.go`, host config `staticBitrate` `auto` |
   `off` and `staticKbps`, defaults auto and 0 = a quarter of the target, at least 2000 kbit/s):
@@ -5830,10 +5832,13 @@ behaviour has a host config switch with a safe default):
   `encoder.ActivityMeter` (new `AddShare`); a static picture for 1 s lowers what the encoder is
   told (never what the rate controller decides: min of both) at most once a second, with the VBV
   kept at one full-target frame (`vbvFrames` target / cap; `Pipeline.SetRate` and
-  `media.Params` gained a VBV size, the helper's `setRate` `vbvFrames`); the first frame that
-  changes restores the full target in the encoder and the media congestion controller's pacing
-  at once, before that frame is queued. Only on seamless live bitrate (`LiveBitrate` without
-  flush); the FFmpeg path reports no dirty share.
+  `media.Params` gained a VBV size, the helper's `setRate` `vbvFrames`); a frame that changes
+  raises the encoder's bitrate and the media congestion controller's pacing at once, before that
+  frame is queued: the full target from 5 % of the picture changed, linearly between 0.2 % and
+  5 % (`ActivityMeter.SuggestKbps`: about 37 % of the target at 1 %, typing or a small window
+  update). The rate controller is told the encoder runs at its target while capped
+  (`staticCap.controllerKbps`: it measures in units of its target). Only on seamless live
+  bitrate (`LiveBitrate` without flush); the FFmpeg path reports no dirty share.
 
 The mock backend gained two temporal layers (the task assumed it had them: it had not; Phase 5
 had given it no SVC). With `svcLayers` 2 each canned P frame is preceded by a non-reference
@@ -5865,10 +5870,11 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
   enhancement frames left out only under congestion, no `recover` / `forceIdr` / `dropped`, a
   client `lost` from thinned seq 13 recovered from frame 15; v3 client, `svc` off and a
   pre-Phase-5 helper start no SVC), `TestSessionLiveFPS` (fine steps and `SetFPS` for a Phase 5
-  helper, rungs and kbps + fps for an older one), `TestRateFPSLadderLive` (60 -> 50 -> 45 -> 30,
-  floor 45 stops there, back up 45 / 50 / 60 about 2 s apart; the 2.2 `TestRateFPSLadder`
-  unchanged), `TestRateThinning` (no increase while thinning and 250 ms after, a `thinning` decrease
-  after 1 s of it, one report over the target is no congestion, a decrease does not end it),
+  helper, rungs and kbps + fps for an older one), `TestRateFPSLadderLive` (since the review fixes:
+  120 -> 100 -> 90 -> 75 -> 60 at the default floor, 60 -> 50 -> 45 -> 30 with `fpsFloor` 30, 45
+  stops there; at least 2 s apart down and back up; the 2.2 `TestRateFPSLadder` unchanged),
+  `TestRateThinning` (no increase while thinning and 250 ms after, a `thinning` decrease after
+  1 s of it, one report over the target is no congestion, a decrease does not end it),
   `TestStaticCap` (cut after 1 s static to 5000 of 20000 with VBV 4, full target at once on 30 %
   change, re-cut 1 s after the motion left the window, linear partial activity, `staticKbps`,
   the VBV bound 30, nothing for an unknown share / not live / off / a target under the floor, a
@@ -5949,9 +5955,14 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
   != 0, AV1 refresh flags) and nothing is discardable: run the Phase 5 "SVC stream" check above
   and record the NAL types.
 - NVIDIA: unverified (no NVIDIA host available). Test: the AMD SVC session check with NVENC
-  (host.log `svc_layers=2` where `NV_ENC_CAPS_SUPPORT_TEMPORAL_SVC`); also note that intra
-  refresh is off with SVC (`intra_refresh=0` in the started line) and a loss is still answered
-  by invalidation (`loss recovered ... by="recovery frame"`).
+  (host.log `svc_layers=2` where `NV_ENC_CAPS_SUPPORT_TEMPORAL_SVC`); intra refresh stays on
+  beside SVC (caps `intraRefreshSvc` true, `assumed`; the started line `intra_refresh=N` with N
+  half the frame rate and `svc_layers=2`; VERIFY that `NvEncInitializeEncoder` takes
+  `enableIntraRefresh` with `enableTemporalSVC`: a failed start there names the parameter in the
+  helper's log, and then `intraRefreshSvc` must become false in `nvenc_backend.cpp`); a loss is
+  still answered by invalidation (`loss recovered ... by="recovery frame"`), and a picture a
+  recovery left damaged heals within half a second (the intra refresh wave, visible with the
+  `delay=every:N` hook or a capdrop loss).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (Chrome hardware decoders on a thinned stream,
   VERIFY): in the SVC session above with capdrop, the client console must show no `decoder
   error` after an episode; record per codec (HEVC, AV1, H.264) and the client GPU (AMD and
@@ -5960,11 +5971,12 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
   report it.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (FPS before resolution, no IDR): 120 fps stream at
   `bitrate` 2500 (the floor 2000 is then close), `make netem PROFILE=capdrop` with the low
-  step at 1.5 Mbit/s: host.log `congestion: lowering bitrate ... fps=100`, then 90, 75, 60, 50,
-  45, 30 at least 2 s apart, `changing the bitrate in the encoder ... fps=N`; the helper's log
-  has no `the frame-rate change at frame N made a key frame`; the overlay's key-frame count
-  does not rise and the frame rate follows; once capacity returns the frame rate climbs back
-  2 s per step. With `fpsFloor` 60 it stops at 60. Per codec.
+  step at 1.5 Mbit/s: host.log `congestion: lowering bitrate ... fps=100`, then 90, 75, 60 at
+  least 2 s apart (the default `fpsFloor`, 60), `changing the bitrate in the encoder ... fps=N`;
+  the helper's log has no `the frame-rate change at frame N made a key frame`; the overlay's
+  key-frame count does not rise and the frame rate follows; once capacity returns the frame rate
+  climbs back 2 s per step. With `fpsFloor` 30 it goes on to 50, 45, 30, also 2 s apart. Per
+  codec.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with NVENC (reconfigure with
   `frameRateNum`, `forceIDR` 0): no key frame at any step.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (static desktop bitrate): 30000 kbit/s setting,
@@ -5981,6 +5993,73 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same static-desktop check with NVENC
   (`vbvBufferSize` via `NvEncReconfigureEncoder`, no key frame).
 
+### Review fixes
+
+Five review findings, all confirmed and fixed:
+
+- **Static cap vs the rate controller's units** (major). With the cap on, the helper's
+  `VideoEvent.Rate` carried the capped kbps into `rateController.live`, so `output()`'s
+  per-frame target, `fill()`, the delivered rates and `queueCapacity()` were relative to the
+  cap while `est` / `applied` stayed relative to the full target. Reproduced in
+  `TestStaticCapRateController` (the 2.2 harness with a static picture of 500 kbit/s and the cap
+  wired as the session wires it): uncapped a 300 ms delay spike took 20000 to 10837 and back to
+  20000 within 10 s; capped it took it to 3921 (4014 ten seconds later; the queue's growth read
+  against the 5000 cap); a loss burst or a second of thinning: 17000 and back uncapped, 8500 and
+  stuck capped. Fix: `staticCap.rate` / `generation` return the bitrate the controller hears
+  (`controllerKbps`: its target while the cap holds the encoder below it, else the encoder's),
+  and `videoEvents` passes that to `rate.live`; the client's `rate` message still carries the
+  encoder's rate. Now identical with and without the cap, and the cap follows the recovered
+  target. `TestSessionStaticDesktop` also checks the controller hears 20000 after the announced
+  5000 cut (it heard 5000 before the fix).
+- **Fine frame-rate steps down had no hold.** At the floor every decrease (one per 150 ms
+  policy hold) took a step, so a 120 fps stream reached 30 fps in under a second although the
+  comment, ARCHITECTURE.md and the hardware check above said 2 s apart. `fpsDown` now waits
+  `fpsHoldLive` (2 s) after the last frame-rate change on the fine ladder (the coarse rungs keep
+  their 2.2 behaviour: a rung per decrease, back up 5 s apart; the docs now say so), and the
+  default `fpsFloor` is 60 (GUIDE 2.2's 120 -> 90 -> 60) instead of 30; lower floors stay
+  available by config. `TestRateFPSLadderLive` drives a queue that keeps growing for 9 s and
+  checks every step is at least 2 s from the previous one (it fails without the hold).
+- **Intra refresh with SVC from capabilities.** `withCaps` dropped intra refresh whenever the
+  stream had temporal layers, which with `svc` auto took GUIDE 2.3 rung 3 away from NVENC
+  without a capability reason (only AMF refuses the pair). New caps field `intraRefreshSvc`
+  (helper `CodecCaps`, Go `CodecCaps.IntraRefreshSVC`, additive: older helpers omit it = false,
+  the old behaviour): NVENC sets it where it has intra refresh and more than one temporal layer
+  (marked `assumed`, NVIDIA check above), AMF, lavc and the mock leave it false.
+  `Caps.IntraRefreshFrames(codec, fps, svcLayers)` keeps intra refresh beside SVC only with it.
+  Tests: `TestHelperStartParams` (SVC with and without `intraRefreshSvc`),
+  `TestSessionThinning` "intra refresh beside SVC" (start `svcLayers` 2 and
+  `intraRefreshFrames` 30), `TestDecodeCaps`, the NVENC self-test's caps check (the double
+  already starts intra refresh with two layers).
+- **Thinning swallowed test faults.** `frameSender` thinned before `faults.at(n)`, so the
+  `drop=every:N` / `delay=every:N` frame of the 2.3 / 3.5 loss scenarios was skipped when it was
+  thinned (the review's E2E log: 67 to 110 thinned frames per 10 s in those sessions). A frame
+  the hook drops or delays is now never thinned. `TestFrameSenderThinning` "test faults" (an
+  enhancement frame under pressure due for a drop and one due for a delay: both go through the
+  hook, the third is thinned; it fails with the old order).
+- **README wording.** The `staticBitrate` row (and config.go, activity.go, ARCHITECTURE.md,
+  the paragraph above) said the full bitrate comes back with the first changed frame; it comes
+  back fully only from 5 % changed, linearly between 0.2 % and 5 % (intended: a caret or typing
+  needs a fraction of the target). Reworded.
+
+Checks after the fixes: gofmt, `go vet` (Linux and `GOOS=windows`), `go test ./...` (the e2e
+package under the shared lock: ok); `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64
+WIN_FFMPEG=<FFmpeg 8.1 win64>`: all four test binaries pass, `--self-test-nvenc` on the double
+with the new `intraRefreshSvc` check, `TestSessionHelperMockPhase5`, `TestHelperIntegrationSVC`
+/ `Phase5`; browser E2E (under the lock, machine shared with other agents' runs): run 1 186 of
+187 (the known "WebSocket relay: steady real-time playback" dip, 43 fps for one 0.5 s window),
+the loss scenarios with every hook fault applied (6 dropped by the hook, 9 of 9 delayed frames
+cancelled at their deadline, recovery frames for all 15), the thinning scenario 9 episodes /
+161 frames; run 2 at load average 7.4 on 4 cores: 185 of 187, "frame pacing Smooth" (Chromium's
+own refresh fell to 34 Hz) and "bitrate recovery" (eight delay cuts on the FFmpeg path from the
+machine's load), both passed in run 1 and neither runs code these fixes change (the static cap
+and the fine frame-rate steps act only on a seamless live-bitrate helper, the fault order only on
+the hook's frames); run 3 at load 6.7 to 10: 182 of 187, four frame-rate checks (splice relay,
+WebSocket relay, WebGL2: 20 to 37 fps) and recovery "skip" (a decoder error after a skipped
+reference frame, then one of the hook's drops landed in the key-frame wait that followed and
+counted as a key request for a drop; run 2 had three such decoder errors and passed). Every
+check passed in at least one of the three runs. The hook's 6 drops now happen in every run (before,
+thinning under load could take one of them), as in the scenarios before Phase 5.
+
 ### Integration notes (merging)
 
 - Protocol: frame extension tag 8 and hello version 4 are new here; another branch that also
@@ -5989,7 +6068,9 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
   fields `SVCLayers` / `VBVFrames`, `media.Frame` fields `Discardable` / `Dirty` / `HasDirty`,
   `PipelineCaps` `LiveFPS` / `SVCLayers`; `videoHeader` takes the thinned mask.
 - The mock backend's caps changed (`maxTemporalLayers` 2): tests that start it with
-  `svcLayers` 2 now succeed. `make helper-test` also runs `host.test.exe -test.run
+  `svcLayers` 2 now succeed. Review fixes: caps field `intraRefreshSvc` (all backends),
+  `encoder.Caps.IntraRefreshFrames` takes the stream's `svcLayers` (0 for none), host config
+  `fpsFloor` 0 now means 60. `make helper-test` also runs `host.test.exe -test.run
   SessionHelperMock` under Wine.
 - `test/e2e/browser.mjs`: the steady-playback and video-decoding checks add the thinned
   frames' rate (`lastStats.thinned`) to the frames drawn; a branch that edits those checks keeps

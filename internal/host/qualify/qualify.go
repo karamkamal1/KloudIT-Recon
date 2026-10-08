@@ -255,7 +255,7 @@ func Run(ctx context.Context, o Options) (*Results, error) {
 					// slots and intra refresh (encoder.Caps.LTRSlots and
 					// IntraRefreshFrames, as media.HelperVideo).
 					c := Cell{Codec: codec, Quality: quality, LTRSlots: caps.LTRSlots(codec), RC: rc, LiveBitrate: mode,
-						IntraRefresh: caps.IntraRefreshFrames(codec, o.FPS)}
+						IntraRefresh: caps.IntraRefreshFrames(codec, o.FPS, 0)}
 					if _, ok := caps.Codecs[codec]; !ok {
 						c.Verdict = VerdictError
 						c.Failures = []string{"the helper's encoder has no " + codec + " (" + caps.Unavailable[caps.Backend+"-"+codec] + ")"}

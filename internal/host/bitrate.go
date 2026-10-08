@@ -52,14 +52,18 @@ import (
 //   - Emergencies as in 1.5: a host frame-queue overflow or a client whose
 //     decoder fell behind cuts at once (rateEmergencyFactor) with an urgent
 //     restart, but not within rateEmergencyGap of any other decrease.
-//   - At the floor, the frame rate goes down a rung (120 -> 90 -> 60) before
-//     anything else, and back up once the bitrate is well above the floor
-//     (1.5 x, or at the limit where that is lower). An encoder that changes
-//     its frame rate in place without a key frame (the native helper's
-//     liveFps "seamless": PipelineCaps.LiveFPS) steps through
-//     encoder.FPSSteps instead (LowerFPS / RaiseFPS: 120 -> 100 -> 90 -> ...
-//     down to fpsFloor, 30 by default), each step 2 s apart rather than 5
-//     (GUIDE 9 "FPS before resolution").
+//   - At the floor, the frame rate goes down a rung (120 -> 90 -> 60) with
+//     each decrease before anything else, and back up once the bitrate is
+//     well above the floor (1.5 x, or at the limit where that is lower), a
+//     rung per fpsHold. An encoder that changes its frame rate in place
+//     without a key frame (the native helper's liveFps "seamless":
+//     PipelineCaps.LiveFPS) steps through encoder.FPSSteps instead (LowerFPS
+//     / RaiseFPS: 120 -> 100 -> 90 -> 75 -> 60, down to host config
+//     "fpsFloor", 60 by default as GUIDE 2.2's rungs), each step down and up
+//     fpsHoldLive (2 s) apart (GUIDE 9 "FPS before resolution"): at the
+//     floor the bitrate stays where it is, so a step does not relieve the
+//     path, and a step with every decrease (one per policy hold, 150 ms)
+//     would take 120 fps to the floor within a second.
 //   - Thinning (Phase 5 temporal SVC, thin.go): the session leaves out
 //     discardable frames under congestion at once, a short spike's answer;
 //     while it does nothing increases (thinQuiet), and thinning that goes on
@@ -160,15 +164,16 @@ const (
 	// backlog (stream-worker.js checkDecoderBacklog); software decoders keep a
 	// few frames in flight normally (frame threading).
 	decodeQueueMin = 4
-	// fpsHold is the minimum time between frame-rate changes, and from a
-	// decrease to a frame-rate increase; fpsHoldLive the same for an
-	// encoder that changes its frame rate in place (no key frame, no
-	// restart: finer and faster steps).
+	// fpsHold is the minimum time from a frame-rate change or a decrease to
+	// a frame-rate increase (the rungs go down with each decrease at the
+	// floor); fpsHoldLive the same for an encoder that changes its frame
+	// rate in place (no key frame, no restart: finer and faster steps), and
+	// also between its steps down.
 	fpsHold     = 5 * time.Second
 	fpsHoldLive = 2 * time.Second
-	// fpsFloorLive is the lowest frame rate the fine steps go to by default
-	// (host config "fpsFloor" overrides it).
-	fpsFloorLive = 30
+	// fpsFloorLive is the lowest frame rate the fine steps go to by default:
+	// GUIDE 2.2's 60 (host config "fpsFloor" overrides it).
+	fpsFloorLive = 60
 
 	// Thinning (thin.go). thinQuiet: no increase this long after a frame
 	// was thinned (while an episode lasts: frames thinned at most
@@ -388,8 +393,8 @@ func (r *rateController) setPolicy(p applyPolicy) {
 }
 
 // setFPSFloor sets the lowest frame rate the ladder at the bitrate floor
-// steps down to (host config "fpsFloor"; 0: 30 for an encoder that changes
-// its frame rate in place, the rungs' 60 for the others).
+// steps down to (host config "fpsFloor"; 0: 60, fpsFloorLive; the rungs
+// never go below their 60).
 func (r *rateController) setFPSFloor(fps int) {
 	r.mu.Lock()
 	r.fpsFloor = fps
@@ -840,10 +845,14 @@ func (r *rateController) queueCapacity() (float64, bool) {
 
 // fpsDown lowers the frame rate a rung, if the ladder has one below (the
 // policy's: encoder.FPSSteps down to fpsFloor for an encoder that changes
-// its frame rate in place, else fpsRungs). Called with r.mu held.
+// its frame rate in place, fpsHoldLive after the last change, else fpsRungs).
+// Called with r.mu held.
 func (r *rateController) fpsDown(now time.Time) bool {
 	next := r.fps
 	if r.pol().fineFPS {
+		if !r.lastFPSChange.IsZero() && now.Sub(r.lastFPSChange) < fpsHoldLive {
+			return false
+		}
 		floor := r.fpsFloor
 		if floor <= 0 {
 			floor = fpsFloorLive

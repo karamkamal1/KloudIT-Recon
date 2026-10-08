@@ -7,7 +7,7 @@ import (
 )
 
 // Exactly what recon-encoder.exe --backend=mock --print-caps prints (under Wine).
-const mockCapsJSON = `{"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock","adapterLuid":"","adapterName":"","hagsEnabled":null,"codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,"recovery":"none","maxLtr":0,"intraRefresh":false,"liveBitrate":"seamless","maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":2,"queryTimeout":false,"alignW":1,"alignH":1,"dynamicResolution":false,"hdr10":false,"liveFps":"seamless","instanceSelect":true,"reencode":false}},"capture":["synthetic"],"cursorInVideo":false,"outputs":[],"unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module not found (error 126)","dda":"no DXGI output is attached to the desktop (no display, or a session without one)","amd-direct":"no display output on an AMD adapter","wgc":"this build has no C++/WinRT headers (mingw-w64 build): use the MSVC build for Windows.Graphics.Capture"},"qpcFrequency":10000000}`
+const mockCapsJSON = `{"t":"caps","v":1,"helperVersion":"0.1.0","backend":"mock","vendor":"mock","adapterLuid":"","adapterName":"","hagsEnabled":null,"codecs":{"h264":{"maxW":320,"maxH":180,"tenBit":false,"yuv444":false,"forceIdr":true,"recovery":"none","maxLtr":0,"intraRefresh":false,"intraRefreshSvc":false,"liveBitrate":"seamless","maxTemporalLayers":1,"roi":"none","sliceOutput":false,"hwInstances":2,"queryTimeout":false,"alignW":1,"alignH":1,"dynamicResolution":false,"hdr10":false,"liveFps":"seamless","instanceSelect":true,"reencode":false}},"capture":["synthetic"],"cursorInVideo":false,"outputs":[],"unavailable":{"amf":"AMF runtime (amfrt64.dll) not found in System32: Module not found (error 126)","nvenc":"NVENC runtime (nvEncodeAPI64.dll) not found in System32: Module not found (error 126)","dda":"no DXGI output is attached to the desktop (no display, or a session without one)","amd-direct":"no display output on an AMD adapter","wgc":"this build has no C++/WinRT headers (mingw-w64 build): use the MSVC build for Windows.Graphics.Capture"},"qpcFrequency":10000000}`
 
 func TestDecodeCaps(t *testing.T) {
 	m, err := decodeMessage([]byte(mockCapsJSON))
@@ -147,8 +147,13 @@ func TestDecodeMessages(t *testing.T) {
 	}
 	m, err = decodeMessage([]byte(`{"t":"caps","v":1,"backend":"amf","vendor":"amd","codecs":{"av1":{"maxW":8192,"maxH":4352,"maxTemporalLayers":4,"sliceOutput":true,"hwInstances":2,"liveFps":"seamless","instanceSelect":true,"reencode":false,"assumed":["liveFps"]}}}`))
 	if c, ok := m.(*Caps); err != nil || !ok || c.Codecs["av1"].LiveFPS != "seamless" || !c.Codecs["av1"].InstanceSelect || c.Codecs["av1"].Reencode ||
-		!c.Codecs["av1"].IsAssumed("liveFps") || !c.Codecs["av1"].SliceOutput {
+		!c.Codecs["av1"].IsAssumed("liveFps") || !c.Codecs["av1"].SliceOutput || c.Codecs["av1"].IntraRefreshSVC {
 		t.Fatalf("phase 5 caps: %+v %v", m, err)
+	}
+	m, err = decodeMessage([]byte(`{"t":"caps","v":1,"backend":"nvenc","vendor":"nvidia","codecs":{"hevc":{"intraRefresh":true,"intraRefreshSvc":true,"maxTemporalLayers":4,"assumed":["intraRefreshSvc"]}}}`))
+	if c, ok := m.(*Caps); err != nil || !ok || !c.Codecs["hevc"].IntraRefreshSVC || !c.Codecs["hevc"].IsAssumed("intraRefreshSvc") ||
+		c.IntraRefreshFrames("hevc", 60, 2) != 30 {
+		t.Fatalf("intraRefreshSvc caps: %+v %v", m, err)
 	}
 	m, err = decodeMessage([]byte(`{"t":"captureChanged","reason":"resized","width":1920,"height":1080,"rotation":90,"text":"was 2560x1440 rotation 0"}`))
 	if c, ok := m.(*CaptureChanged); err != nil || !ok || c.Reason != "resized" || c.Width != 1920 || c.Rotation != 90 {

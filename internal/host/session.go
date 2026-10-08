@@ -837,10 +837,12 @@ func (s *Session) videoEvents() {
 			s.captureChanged(ev.Capture)
 		case ev.Rate != nil:
 			// The live generation's encoder changed its bitrate or frame
-			// rate in place: the client's config of it is updated.
-			s.rate.live(ev.Rate.Kbps, ev.Rate.FPS)
+			// rate in place: the client's config of it is updated. The
+			// rate controller hears its own target while a static desktop
+			// caps the encoder (activity.go controllerKbps).
 			target, ceiling := s.rate.kbps()
-			s.static.rate(s.static.clock(), ev.Rate.Kbps, target)
+			pc := s.vid().Capabilities()
+			s.rate.live(s.static.rate(s.static.clock(), ev.Rate.Kbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), ev.Rate.FPS)
 			s.sendJSON(proto.Rate{T: "rate", Gen: ev.Rate.Gen, BitrateKbps: ev.Rate.Kbps, FPS: ev.Rate.FPS, MaxBitrateKbps: ceiling})
 		case ev.Config != nil:
 			s.encoderLive()
@@ -857,8 +859,8 @@ func (s *Session) videoEvents() {
 			}
 			target, ceiling := s.rate.kbps()
 			c.MaxBitrateKbps = ceiling
-			s.rate.live(c.BitrateKbps, c.FPS)
-			s.static.generation(s.static.clock(), c.BitrateKbps, target)
+			pc := s.vid().Capabilities()
+			s.rate.live(s.static.generation(s.static.clock(), c.BitrateKbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), c.FPS)
 			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
 			s.sendJSON(&c)
@@ -1618,7 +1620,10 @@ func (s *Session) frameSender() {
 			s.discard(f, step)
 			continue
 		}
-		if s.thin(f, num) {
+		// A frame the test hook drops or delays is never thinned: the
+		// faults stay as configured, whatever the load.
+		drop, delay := faults.at(n)
+		if !drop && delay == 0 && s.thin(f, num) {
 			continue // left out under congestion: no loss (thin.go)
 		}
 		s.sendOpening.Store(true)
@@ -1652,7 +1657,7 @@ func (s *Session) frameSender() {
 			of.timer = time.AfterFunc(of.deadline, s.checkOut)
 		}
 		s.send.register(of)
-		if drop, delay := faults.at(n); drop {
+		if drop {
 			// Test hook: the stream fails mid-frame.
 			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
 			_, _ = st.Write(buf[:len(buf)/2])

@@ -204,6 +204,7 @@ std::string encodeCaps(const Caps& c, int64_t qpcFrequency) {
             {"recovery", cc.recovery},
             {"maxLtr", cc.maxLtr},
             {"intraRefresh", cc.intraRefresh},
+            {"intraRefreshSvc", cc.intraRefreshSvc},
             {"liveBitrate", cc.liveBitrate},
             {"maxTemporalLayers", cc.maxTemporalLayers},
             {"roi", cc.roi},

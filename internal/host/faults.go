@@ -50,7 +50,8 @@ import (
 //	                  non-reference frames on the software path)
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
-// a frame that is due for both is dropped. Example:
+// a frame that is due for both is dropped, and a frame due for either is never
+// thinned (the loss scenarios get their faults whatever the load). Example:
 // RECON_TEST_FAULTS="delay=every:97:200ms,drop=every:193".
 const TestFaultsEnv = "RECON_TEST_FAULTS"
 

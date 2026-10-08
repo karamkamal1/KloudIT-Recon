@@ -26,11 +26,11 @@ func TestCellArgs(t *testing.T) {
 			t.Errorf("args lack %s: %q", want, args)
 		}
 	}
-	if c.IntraRefresh = caps.IntraRefreshFrames("hevc", o.FPS); c.IntraRefresh != 0 || strings.Contains(strings.Join(args, " "), "--intra-refresh") {
+	if c.IntraRefresh = caps.IntraRefreshFrames("hevc", o.FPS, 0); c.IntraRefresh != 0 || strings.Contains(strings.Join(args, " "), "--intra-refresh") {
 		t.Errorf("hevc with LTR slots got intra refresh: %d %q", c.IntraRefresh, args)
 	}
 	c = &Cell{Codec: "h264", Quality: "speed", LTRSlots: caps.LTRSlots("h264"), RC: "cbr", LiveBitrate: ModeFlush,
-		IntraRefresh: caps.IntraRefreshFrames("h264", 60)}
+		IntraRefresh: caps.IntraRefreshFrames("h264", 60, 0)}
 	if args := strings.Join(cellArgs(o, cr, c, "s.h264", "s.jsonl"), " "); strings.Contains(args, "--ltr-slots") ||
 		!strings.Contains(args, "--quality=speed") || !strings.Contains(args, "--intra-refresh=30") {
 		t.Errorf("h264 (no LTR recovery, intra refresh at 60 fps): %s", args)

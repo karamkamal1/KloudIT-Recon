@@ -803,6 +803,8 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     // Phase 5: frame rate with the bitrate's reconfiguration, no engine
     // choice (split-frame), re-encoding with DISABLE_ENC_STATE_ADVANCE.
     expect(h.liveFps == "seamless" && h.isAssumed("liveFps") && !h.instanceSelect && h.reencode, name, "hevc Phase 5 caps");
+    // Intra refresh with temporal layers: where both exist, assumed.
+    expect(h.intraRefreshSvc && h.isAssumed("intraRefreshSvc"), name, "hevc intraRefreshSvc (assumed)");
     expect(h.hdr10 && caps.codecs["av1"].hdr10 && !caps.codecs["h264"].hdr10, name, "hdr10: hevc / av1 yes, h264 no");
     c.driver.call("set av1=0 multiRef=0 dynBitrate=0 engines=3 dynRes=0");
     caps = probeNvencCaps();

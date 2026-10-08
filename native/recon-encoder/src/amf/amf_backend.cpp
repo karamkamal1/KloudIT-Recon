@@ -286,6 +286,7 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P, int svc
         enc->SetProperty(P.maxRefs, amf_int64(kDefaultRefs));
         c.intraRefresh = enc->SetProperty(prop, want) == AMF_OK && getProp(enc, prop, got) && got == want;
     }
+    c.intraRefreshSvc = false;  // not with SVC either (validate refuses the pair)
     d.available = c.maxW > 0 && c.maxH > 0;
     if (!d.available) d.reason = "the encoder reports no input size range";
     return d;

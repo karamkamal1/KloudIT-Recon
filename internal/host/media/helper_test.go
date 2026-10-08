@@ -1097,7 +1097,8 @@ func TestHelperStartParams(t *testing.T) {
 	// The loss-recovery ladder's safety net (GUIDE 2.3 rung 3): intra
 	// refresh over half a second of frames where the codec has it and it
 	// does not conflict with LTR slots (AMF): NVENC beside reference
-	// invalidation, AMF H.264 without LTR; never with LTR slots or SVC.
+	// invalidation, AMF H.264 without LTR; never with LTR slots, with SVC
+	// only where the caps combine them (intraRefreshSvc: NVENC).
 	// Temporal SVC (Phase 5) where the session asks for it, the encoder has
 	// the layers and the helper is a Phase 5 one (caps liveFps: LTR marks
 	// on base-layer frames only); else none, and intra refresh as without.
@@ -1106,6 +1107,8 @@ func TestHelperStartParams(t *testing.T) {
 	oldHelper.LiveFPS = ""
 	noLayers := svcCaps
 	noLayers.MaxTemporalLayers = 1
+	svcIR := svcCaps
+	svcIR.IntraRefreshSVC = true
 	for _, c := range []struct {
 		name    string
 		cc      encoder.CodecCaps
@@ -1117,6 +1120,8 @@ func TestHelperStartParams(t *testing.T) {
 		{"AMF with LTR", encoder.CodecCaps{Recovery: "ltr", MaxLTR: 2, IntraRefresh: true}, 0, 0, 0},
 		{"AMF H.264 without LTR", encoder.CodecCaps{Recovery: "none", IntraRefresh: true}, 0, 30, 0},
 		{"SVC", svcCaps, 2, 0, 2},
+		{"SVC with intraRefreshSvc", svcIR, 2, 30, 2},
+		{"intraRefreshSvc without SVC asked", svcIR, 0, 30, 0},
 		{"SVC with LTR", encoder.CodecCaps{Recovery: "ltr", MaxLTR: 2, MaxTemporalLayers: 4, LiveFPS: "seamless"}, 2, 0, 2},
 		{"SVC asked of an encoder without layers", noLayers, 2, 30, 0},
 		{"SVC asked of a helper before Phase 5", oldHelper, 2, 30, 0},
@@ -1133,7 +1138,7 @@ func TestHelperStartParams(t *testing.T) {
 	// Half a second of frames, as on the FFmpeg path.
 	nv := encoder.Caps{Codecs: map[string]encoder.CodecCaps{"hevc": {Recovery: "invalidate", IntraRefresh: true}}}
 	for _, fps := range []int{1, 3, 24, 30, 59, 60, 90, 120, 144, 165, 240} {
-		if got, want := nv.IntraRefreshFrames("hevc", fps), IntraRefreshPeriod(fps); got != want {
+		if got, want := nv.IntraRefreshFrames("hevc", fps, 0), IntraRefreshPeriod(fps); got != want {
 			t.Errorf("%d fps: intra refresh %d frames, IntraRefreshPeriod %d", fps, got, want)
 		}
 	}
