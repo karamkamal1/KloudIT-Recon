@@ -526,7 +526,7 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		if err := s.startVideo(false, ""); err != nil {
 			t.Fatal(err)
 		}
-		s.requestKeyframe()
+		s.requestKeyframe("keyframe request")
 		if l := waitFor(t, logs, `msg="starting encoder" gen=2`); !strings.Contains(l, " kbps=3000 ") {
 			t.Fatalf("key-frame restart undid the back-off: %s", l)
 		}
@@ -609,7 +609,7 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		if kb := target(s); kb != 3000 {
 			t.Fatalf("audio-only settings change reset the back-off: target %d kbps, want 3000", kb)
 		}
-		s.requestKeyframe()
+		s.requestKeyframe("keyframe request")
 		if l := waitFor(t, logs, `msg="starting encoder" gen=2`); !strings.Contains(l, " kbps=3000 ") {
 			t.Fatalf("key-frame restart after an audio-only settings change undid the back-off: %s", l)
 		}

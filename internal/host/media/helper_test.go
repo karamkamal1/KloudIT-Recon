@@ -1094,6 +1094,44 @@ func TestHelperStartParams(t *testing.T) {
 	if sp, _ := v.startParams(p); first(v.withCaps(sp, false, h.Caps())).LTRSlots != 0 {
 		t.Errorf("hevc (not in caps) got LTR slots")
 	}
+	// The loss-recovery ladder's safety net (GUIDE 2.3 rung 3): intra
+	// refresh over half a second of frames where the codec has it and it
+	// does not conflict with LTR slots (AMF): NVENC beside reference
+	// invalidation, AMF H.264 without LTR; never with LTR slots or SVC.
+	for _, c := range []struct {
+		name string
+		cc   encoder.CodecCaps
+		svc  int
+		want int
+	}{
+		{"NVENC", encoder.CodecCaps{Recovery: "invalidate", IntraRefresh: true}, 0, 30},
+		{"AMF with LTR", encoder.CodecCaps{Recovery: "ltr", MaxLTR: 2, IntraRefresh: true}, 0, 0},
+		{"AMF H.264 without LTR", encoder.CodecCaps{Recovery: "none", IntraRefresh: true}, 0, 30},
+		{"SVC", encoder.CodecCaps{Recovery: "invalidate", IntraRefresh: true}, 2, 0},
+		{"no intra refresh", encoder.CodecCaps{Recovery: "invalidate"}, 0, 0},
+	} {
+		sp, _ := v.startParams(helperParams())
+		sp.SVCLayers = c.svc
+		sp, _ = v.withCaps(sp, true, encoder.Caps{Codecs: map[string]encoder.CodecCaps{"h264": c.cc}})
+		if sp.IntraRefreshFrames != c.want {
+			t.Errorf("%s: intraRefreshFrames %d, want %d", c.name, sp.IntraRefreshFrames, c.want)
+		}
+	}
+	// Half a second of frames, as on the FFmpeg path.
+	nv := encoder.Caps{Codecs: map[string]encoder.CodecCaps{"hevc": {Recovery: "invalidate", IntraRefresh: true}}}
+	for _, fps := range []int{1, 3, 24, 30, 59, 60, 90, 120, 144, 165, 240} {
+		if got, want := nv.IntraRefreshFrames("hevc", fps), IntraRefreshPeriod(fps); got != want {
+			t.Errorf("%d fps: intra refresh %d frames, IntraRefreshPeriod %d", fps, got, want)
+		}
+	}
+	// It is no reason for a new helper: a frame-rate change stays in place.
+	a, _ := v.startParams(helperParams())
+	b := a
+	a.IntraRefreshFrames, b.FPS = 30, 120
+	if !sameHelperStream(a, b) {
+		t.Error("intra refresh or frame rate makes another stream")
+	}
+
 	// Two zero-copy capture failures: the next helper converts.
 	v.zeroCopyFails = 2
 	if sp, _ := v.startParams(helperParams()); first(v.withCaps(sp, true, h.Caps())).ZeroCopy == nil || *first(v.withCaps(sp, true, h.Caps())).ZeroCopy {

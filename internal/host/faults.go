@@ -15,8 +15,11 @@ import (
 // frames so the loss handling can be checked end to end. Never set it on a
 // real host: it damages the stream on purpose. Comma-separated rules:
 //
-//	delay=every:N:D   send every Nth frame D late (a Go duration, e.g. 200ms);
-//	                  the frames after it go out on time, as after a retransmission
+//	delay=every:N:D   send every Nth frame D late (a Go duration, e.g. 200ms):
+//	                  its stream stands still meanwhile and the frames after it
+//	                  go out on time, as after a retransmission; under
+//	                  reference recovery the loss-recovery ladder cancels it at
+//	                  its deadline (rung 1: a newer frame is ready)
 //	drop=every:N      reset every Nth frame's stream after half of it was
 //	                  written, as if it had failed, and report it ({"t":"dropped"})
 //	recovery=skip|keyframe  announce this recovery mode in every VideoConfig

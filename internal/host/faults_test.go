@@ -61,19 +61,33 @@ func TestParseTestFaults(t *testing.T) {
 	}
 }
 
-// fakeConn hands out recording frame streams; nothing else is used.
+// fakeConn hands out recording frame streams; nothing else is used. The
+// streams numbered in stall (from 0, in the order they are opened) stand
+// still: their writes block until CancelWrite or release.
 type fakeConn struct {
 	transport.Conn
 	mu      sync.Mutex
 	streams []*fakeStream
+	stall   map[int]bool
 }
 
 func (c *fakeConn) OpenUniStreamSync(context.Context) (transport.SendStream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st := &fakeStream{}
+	if c.stall[len(c.streams)] {
+		st.release, st.reset = make(chan struct{}), make(chan struct{})
+	}
 	c.streams = append(c.streams, st)
 	return st, nil
+}
+
+// release lets stream i's blocked write complete.
+func (c *fakeConn) release(i int) {
+	c.mu.Lock()
+	st := c.streams[i]
+	c.mu.Unlock()
+	close(st.release)
 }
 
 func (c *fakeConn) snapshot() []streamState {
@@ -92,6 +106,8 @@ func (c *fakeConn) snapshot() []streamState {
 type fakeStream struct {
 	mu sync.Mutex
 	streamState
+	release, reset chan struct{} // a stalled stream (fakeConn.stall)
+	resetOnce      sync.Once
 }
 
 type streamState struct {
@@ -101,6 +117,13 @@ type streamState struct {
 }
 
 func (s *fakeStream) Write(b []byte) (int, error) {
+	if s.release != nil {
+		select {
+		case <-s.release:
+		case <-s.reset:
+			return 0, errors.New("stream reset")
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data = append(s.data, b...)
@@ -116,6 +139,9 @@ func (s *fakeStream) CancelWrite() {
 	s.mu.Lock()
 	s.cancelled, s.doneAt = true, time.Now()
 	s.mu.Unlock()
+	if s.reset != nil {
+		s.resetOnce.Do(func() { close(s.reset) })
+	}
 }
 func (s *fakeStream) SetWriteDeadline(time.Time) error { return nil }
 

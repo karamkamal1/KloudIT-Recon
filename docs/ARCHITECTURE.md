@@ -151,16 +151,61 @@ What the client does about a lost frame depends on `recovery` in the `video` mes
   latest key frame). The recovery frame, or the key frame the encoder falls back to, is logged
   (`loss recovered ... by="recovery frame"` / `by="key frame"`, counted per 10 s in `stream stats`
   as `recovered` / `recovered_by_key`); a loss nothing can be recovered from (the generation's key
-  frame) gets a key frame in the encoder. A frame-queue overflow keeps its key frame (it also cuts
-  the bitrate).
+  frame) gets a key frame in the encoder. A frame-queue overflow is answered the same way: a
+  recovery frame, and the bitrate cut that comes with it changes a seamless encoder's rate in place
+  without the emergency's IDR (where the encoder cannot recover, the cut keeps its key frame).
 - `keyframe` (everything else, and hosts before the field): the client asks for a key frame
   (`{"t":"keyframe"}`), which on the FFmpeg path is a new encoder generation and on the native
-  helper an IDR in the running encoder.
+  helper an IDR in the running encoder. For a loss the host knows of (it dropped the frame, or the
+  helper did) the host does not wait for that request: the key frame is on its way when it comes.
 
 A loss before the generation's first key frame always asks for a key frame, and so does a decoder
 error (the decoder is reconfigured), which is also the fallback when a decoder rejects a frame
 after a skipped one (an AV1 frame inherits its entropy-coding state from a reference frame, so a
 missing reference can make the next frames undecodable, not just blurred).
+
+**The loss-recovery ladder** (`internal/host/ladder.go`, GUIDE 2.3). One function, `ladder`, makes
+every host decision about a late or lost frame and about key frames, from the frame, the recovery
+mode the client was told for the live generation and whether the pipeline forces IDRs in its
+running encoder (never from a vendor). Its rungs, cheapest first:
+
+1. **Deadline drop.** Each frame stream has a deadline of max(2 frame intervals, 25 ms) from the
+   moment its stream opens; a frame larger than the pacer sends in one frame interval (1.2 × the
+   video bitrate) gets its own sending time plus one interval instead (a scene change is slow on
+   any path, not late). When a frame's stream is still being written past its deadline and a newer
+   frame is ready (queued, or taken after it), the host cancels the stream (`CancelWrite`: the
+   peer gets RESET_STREAM, the bytes not yet sent never are), reports the frame `dropped` and
+   treats it as lost (`frame stream cancelled ... age_ms deadline_ms` in host.log). Only where that
+   loss is cheap: under reference recovery of the live generation. Key frames and recovery frames
+   are never cancelled (another one would have to take their place), and under `skip` and
+   `keyframe` a late frame goes on (its loss would cost a smeared picture or a key frame, a late
+   frame only time). frameSender checks at each stream's deadline and whenever a frame is queued.
+2. **Recover without a key frame** (`ltr` / `invalidate`, above). From the loss until the frame
+   that answers it (a recovery frame with `refFloor` < the lost seq, or a key frame) every frame is
+   useless to the client, which discards them: the host does not send them (or stops their
+   streams) and reports them `dropped` (`why="awaiting recovery frame"`), so the recovery frame
+   does not queue behind them. The host applies the client's rule (`P.endsRecovery`) to the frames
+   it takes; for a loss it learns of late (the client's `lost`) it looks back over the last 256
+   frames it took for an answer already sent, and where they do not reach back that far it
+   discards nothing.
+3. **Intra refresh, as a safety net only.** `skip` (the FFmpeg path's NVENC H.264 / HEVC, where
+   rung 2 does not exist and rung 4 is an encoder restart): the client decodes on and the refresh
+   heals the picture, bounded in time (above). On the native helper intra refresh runs wherever it
+   does not conflict (`intraRefreshFrames` = half a second of frames in `start` when the codec's
+   caps have `intraRefresh` and the stream uses no LTR slots and no SVC: NVENC beside reference
+   invalidation, AMF H.264 without LTR; not AMF HEVC / AV1 with LTR slots), under rungs 2 and 4: a
+   picture a recovery leaves damaged heals by itself, but the client is not told to rely on it.
+4. **Key frame**: on a decoder error or any other key-frame request of the client, at session
+   start (every generation begins with one), for a loss rung 2 cannot answer (`keyframe`, the
+   generation's key frame lost, a `Recover` the pipeline refused), for a frame-queue overflow
+   without rung 2 (with the bitrate cut), and for a `skip` loss intra refresh did not heal in time:
+   an IDR in the running encoder where the pipeline forces one (the helper: never an encoder
+   restart), else a new encoder generation (the FFmpeg path keeps its restart). Under `keyframe` the
+   client gives the generation up, so the host sends nothing more of it either.
+
+`stream stats` counts the ladder's work every 10 s: `deadline_drops` (rung 1), `discarded` (frames
+not sent while the client waited for a recovery or key frame), `recovered` / `recovered_by_key`
+(rung 2's answers) and `key_frames` (rung 4).
 
 ### Datagrams
 
@@ -286,7 +331,9 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   - *Emergencies* as before: a host frame-queue overflow (the backlog is dropped and reported,
     `{"t":"dropped"}`) or a client that flushed its decoder (`{"t":"congestion","reason":
     "decoder"}`) cuts at once by 25 % (an overflow at least to 0.85 × the delivered rate, but
-    from at least half the target, as a decrease) with an urgent restart, but not within 2 s of
+    from at least half the target, as a decrease) with an urgent restart (an overflow under
+    reference recovery on a seamless encoder: the cut in place, the dropped frames answered by a
+    recovery frame; see the loss-recovery ladder), but not within 2 s of
     any other decrease (the old generation that still streams is what overflows: the starting
     one takes over at once); a decoder flush also caps
     later increases at 85 % of the bitrate it cut from, until the settings change. An older
@@ -356,7 +403,7 @@ the pipeline's `Capabilities`, never from a vendor:
 | process | one `ffmpeg` per generation | one `recon-encoder.exe` per session (docs/HELPER_PROTOCOL.md) |
 | key frame for the client | a new generation, started at once (urgent restart) | an IDR in the running encoder (`ForceIDR`): a new generation without a new process |
 | bitrate change | an overlapped restart (rate limited, see above) | in the running encoder (`LiveBitrate`: AMF/NVENC seamless, or an encoder flush with an IDR), as the live-bitrate qualification measured it (below) |
-| loss recovery | key frame, or skip with intra refresh | a recovery frame (`ltr` / `invalidate`, see above), key frame where the encoder has neither |
+| loss recovery | key frame (a restart), or skip with intra refresh | a recovery frame (`ltr` / `invalidate`, see above), an IDR where the encoder has neither; intra refresh as a safety net where it does not conflict with LTR |
 | stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly) |
 
 **Choosing** (host config `pipeline`: `auto` | `helper` | `ffmpeg`, once per session, logged as

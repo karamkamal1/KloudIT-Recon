@@ -8,12 +8,13 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 )
 
-// Each cell's stream starts as a session's: its quality preset, and two LTR
+// Each cell's stream starts as a session's: its quality preset, two LTR
 // slots where the codec recovers from LTR frames (encoder.Caps.LTRSlots, as
-// media.HelperVideo); none otherwise.
+// media.HelperVideo), none otherwise, and intra refresh where the encoder has
+// it and runs no LTR slots (encoder.Caps.IntraRefreshFrames: GUIDE 2.3).
 func TestCellArgs(t *testing.T) {
 	caps := encoder.Caps{Backend: "amf", Codecs: map[string]encoder.CodecCaps{
-		"hevc": {Recovery: "ltr", MaxLTR: 2}, "h264": {Recovery: "none"}}}
+		"hevc": {Recovery: "ltr", MaxLTR: 2, IntraRefresh: true}, "h264": {Recovery: "none", IntraRefresh: true}}}
 	o := Options{}
 	o.defaults()
 	cr := cellRun{backend: "amf", capture: "synthetic-gpu", motion: true, frames: 3600, step: 120}
@@ -25,10 +26,14 @@ func TestCellArgs(t *testing.T) {
 			t.Errorf("args lack %s: %q", want, args)
 		}
 	}
-	c = &Cell{Codec: "h264", Quality: "speed", LTRSlots: caps.LTRSlots("h264"), RC: "cbr", LiveBitrate: ModeFlush}
+	if c.IntraRefresh = caps.IntraRefreshFrames("hevc", o.FPS); c.IntraRefresh != 0 || strings.Contains(strings.Join(args, " "), "--intra-refresh") {
+		t.Errorf("hevc with LTR slots got intra refresh: %d %q", c.IntraRefresh, args)
+	}
+	c = &Cell{Codec: "h264", Quality: "speed", LTRSlots: caps.LTRSlots("h264"), RC: "cbr", LiveBitrate: ModeFlush,
+		IntraRefresh: caps.IntraRefreshFrames("h264", 60)}
 	if args := strings.Join(cellArgs(o, cr, c, "s.h264", "s.jsonl"), " "); strings.Contains(args, "--ltr-slots") ||
-		!strings.Contains(args, "--quality=speed") {
-		t.Errorf("h264 (no LTR recovery): %s", args)
+		!strings.Contains(args, "--quality=speed") || !strings.Contains(args, "--intra-refresh=30") {
+		t.Errorf("h264 (no LTR recovery, intra refresh at 60 fps): %s", args)
 	}
 }
 

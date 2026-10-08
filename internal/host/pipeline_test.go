@@ -389,7 +389,7 @@ func TestSessionOnHelper(t *testing.T) {
 	}
 
 	// A key frame request: an IDR in the running encoder, a new generation.
-	s.requestKeyframe()
+	s.requestKeyframe("keyframe request")
 	expectFakeMsg(t, f, "forceIdr")
 	f.Publish(&encoder.Frame{FrameID: 2, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 3, OutputQPC: 4})
 	if fr := nextFrame(); fr.Gen != 2 || fr.Seq != 0 {
@@ -407,7 +407,7 @@ func TestSessionOnHelper(t *testing.T) {
 	if m := expectFakeMsg(t, f, "setRate"); m["kbps"] != float64(3400) {
 		t.Fatalf("setRate %v", m)
 	}
-	s.requestKeyframe()
+	s.requestKeyframe("keyframe request")
 	expectFakeMsg(t, f, "forceIdr")
 
 	// Frames the helper dropped: reported to the client, and a key frame.
@@ -478,7 +478,7 @@ func TestSessionOnHelper(t *testing.T) {
 	s.kickMu.Lock()
 	s.lastKick = time.Time{}
 	s.kickMu.Unlock()
-	s.requestKeyframe()
+	s.requestKeyframe("keyframe request")
 	select {
 	case <-l.started:
 		t.Fatal("the key frame request started another helper")
@@ -687,6 +687,42 @@ func TestSessionRefRecovery(t *testing.T) {
 		send(t, r, proto.ClientMsg{T: proto.MsgLost, Gen: 1, FromSeq: 0})
 		expectFakeMsg(t, f, "forceIdr")
 		waitLog(t, r.logs, `msg="no recovery frame possible, forcing a key frame" gen=1 from_seq=0`)
+		if l := r.logs.lines(`msg="restarting video"`); len(l) != 0 {
+			t.Fatalf("restarts %q", l)
+		}
+	})
+
+	// A frame-queue overflow (GUIDE 2.3): the dropped frames are answered
+	// with a recovery frame (rung 2), and the bitrate cut changes the
+	// encoder's rate seamlessly, without the emergency's IDR.
+	t.Run("queue overflow", func(t *testing.T) {
+		r := setup(t, proto.HelloVersionRecovery)
+		s, f := r.s, r.f
+		f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+		f.Publish(&encoder.Frame{FrameID: 2, LTRSlot: 0, Data: pFrame, CaptureQPC: 3, OutputQPC: 4})
+		nextFrame(t, s)
+		nextFrame(t, s)
+		waitMsg(t, r.ctrl, `"t":"video"`, `"gen":1`, `"recovery":"ltr"`)
+		s.vid().Ack(1, 1)
+		expectFakeMsg(t, f, "ack")
+		// Nobody takes frames: the 65th overflows the queue (64).
+		for id := uint64(3); id <= 3+64; id++ {
+			for !f.Publish(&encoder.Frame{FrameID: id, LTRSlot: -1, Data: pFrame, CaptureQPC: int64(2 * id), OutputQPC: int64(2*id + 1)}) {
+				time.Sleep(time.Millisecond) // the ring is full until HelperVideo reads it
+			}
+		}
+		waitMsg(t, r.ctrl, `"t":"dropped"`, `"gen":1`, `"fromSeq":2`, `"count":65`)
+		if m := expectFakeMsg(t, f, "recover"); m["lostFromFrameId"] != float64(3) || m["ackedLtrFrameId"] != float64(2) {
+			t.Fatalf("recover %v", m)
+		}
+		if m := expectFakeMsg(t, f, "setRate"); m["kbps"] == nil {
+			t.Fatalf("setRate %v", m)
+		}
+		none(t, f, "forceIdr")
+		waitLog(t, r.logs, `msg="congestion: lowering bitrate"`)
+		if l := r.logs.lines(`msg="congestion: lowering bitrate"`); !strings.Contains(l[0], "why=overflow") || !strings.Contains(l[0], "urgent=false") {
+			t.Fatalf("cut %q", l)
+		}
 		if l := r.logs.lines(`msg="restarting video"`); len(l) != 0 {
 			t.Fatalf("restarts %q", l)
 		}

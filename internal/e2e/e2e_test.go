@@ -317,6 +317,7 @@ type result struct {
 	configAt, droppedAt               []time.Time        // when each config and "dropped" report arrived
 	received                          map[[2]uint32]bool // gen, seq of every complete frame
 	payloads                          map[[2]uint32][]byte
+	refFloors                         map[[2]uint32]uint32 // gen, seq of every recovery frame: its refFloor
 }
 
 // control counts one control message.
@@ -373,6 +374,12 @@ func (r *result) countFrame(b []byte) {
 		return
 	}
 	r.extFrames++
+	if v, ok := ext.Get(proto.ExtRefFloor); ok {
+		if r.refFloors == nil {
+			r.refFloors = map[[2]uint32]uint32{}
+		}
+		r.refFloors[[2]uint32{uint32(h.Gen), h.Seq}] = uint32(v)
+	}
 	capture, ok1 := ext.Get(proto.ExtCaptureUs)
 	done, ok2 := ext.Get(proto.ExtEncodeDoneUs)
 	if ok1 && ok2 && capture > 0 && capture <= done && done <= h.SendUs {
@@ -939,6 +946,112 @@ func TestStreamingFrameLoss(t *testing.T) {
 	if l := e.logs.lines(from, `msg="test fault: delaying frame"`); len(l) < 10 {
 		t.Fatalf("%d delayed frames logged", len(l))
 	}
+}
+
+// Guide step 2.3, the loss-recovery ladder's first two rungs end to end
+// (direct WebTransport, a v3 client): the hook holds every 23rd frame's
+// stream still for 150 ms while the next frames are ready, and the host runs
+// the reference-recovery stand-in (ref-recovery: libx264 with a key frame
+// every 5 frames at 30 fps, sent as P-frames; after a Recover the next one is
+// the recovery frame). Each held stream must be cancelled at its deadline
+// (two frame intervals: 67 ms), never completed, and reported dropped; the
+// encoder recovers (rung 2: "recovering from a loss"), the frames up to the
+// recovery frame are not sent (reported dropped too), and the first frame
+// the client receives after a loss is the recovery frame, whose refFloor
+// is the frame before the loss. No key frame, no new generation.
+func TestStreamingDeadlineDrop(t *testing.T) {
+	const fps, every = 30, 23
+	t.Setenv(host.TestFaultsEnv, fmt.Sprintf("delay=every:%d:150ms,ref-recovery", every))
+	e := setup(t)
+	tk := e.connectInfo()
+	from := e.logs.Len()
+	r := runWTCtl(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, proto.HelloVersionRecovery, 6*time.Second,
+		proto.Prefs{FPS: fps, BitrateKbps: 1500}, nil)
+	t.Logf("received %d frames in %d configs, %d dropped reports, %d recovery frames, recovery %q",
+		r.frames, r.configs, len(r.dropped), len(r.refFloors), r.recovery)
+	if !r.welcome || r.configs != 1 || r.recovery[0] != proto.RecoveryInvalidate {
+		t.Fatalf("want one generation announcing recovery invalidate, got %+v", r)
+	}
+	dropped := map[uint32]bool{}
+	for _, d := range r.dropped {
+		for i := 0; i < d.Count; i++ {
+			k := [2]uint32{uint32(d.Gen), d.FromSeq + uint32(i)}
+			if dropped[k[1]] || r.received[k] {
+				t.Fatalf("frame %v reported dropped twice, or received", k)
+			}
+			dropped[k[1]] = true
+		}
+	}
+	cancels := e.logs.lines(from, `msg="frame stream cancelled"`)
+	held := e.logs.lines(from, `msg="test fault: delaying frame"`)
+	if len(cancels) < 4 || len(cancels) < len(held)-1 {
+		t.Fatalf("%d held streams, %d cancelled: %q", len(held), len(cancels), cancels)
+	}
+	for _, l := range cancels {
+		var age, deadline int
+		if _, err := fmt.Sscanf(l[strings.Index(l, " age_ms=")+1:], "age_ms=%d deadline_ms=%d", &age, &deadline); err != nil {
+			t.Fatalf("%v: %s", err, l)
+		}
+		if deadline < 60 || deadline > 80 || age < deadline || age > deadline+100 {
+			t.Errorf("cancelled at %d ms with a deadline of %d ms, want at two frame intervals: %s", age, deadline, l)
+		}
+	}
+	// Generation 1 in order: after each loss the frames that went out while
+	// the stream was held (at most the deadline's two), then nothing (the
+	// host discards and reports them) until the recovery frame, whose
+	// refFloor is the frame before the loss.
+	last := uint32(0)
+	for k := range r.received {
+		last = max(last, k[1])
+	}
+	lossAt, discarding, early, recovered := -1, false, 0, 0
+	for seq := uint32(0); seq <= last; seq++ {
+		k := [2]uint32{1, seq}
+		switch {
+		case dropped[seq]:
+			if lossAt < 0 {
+				lossAt = int(seq)
+			} else {
+				discarding = true
+			}
+		case !r.received[k]:
+			if seq+5 < last { // the last frames may still be in flight
+				t.Errorf("seq %d neither received nor reported dropped", seq)
+			}
+		case lossAt < 0:
+			if _, ok := r.refFloors[k]; ok {
+				t.Errorf("seq %d: a recovery frame without a loss", seq)
+			}
+		default:
+			rf, ok := r.refFloors[k]
+			switch {
+			case ok && int(rf) == lossAt-1:
+				lossAt, discarding = -1, false
+				recovered++
+			case ok:
+				t.Errorf("seq %d: recovery frame with refFloor %d after the loss at %d, want %d", seq, rf, lossAt, lossAt-1)
+			case discarding:
+				t.Errorf("seq %d received after the host began discarding for the loss at %d", seq, lossAt)
+			case seq-uint32(lossAt) > 3:
+				t.Errorf("seq %d received %d frames after the loss at %d: the host did not discard", seq, seq-uint32(lossAt), lossAt)
+			default:
+				early++ // sent while the lost frame's stream was held
+			}
+		}
+	}
+	if recovered < 4 {
+		t.Fatalf("%d losses recovered, want >= 4", recovered)
+	}
+	if n := len(e.logs.lines(from, `msg="recovering from a loss"`)); n < recovered {
+		t.Fatalf("%d recover requests for %d losses", n, recovered)
+	}
+	for _, bad := range []string{`msg="restarting video"`, `msg="forcing a key frame"`, `msg="no recovery frame possible`} {
+		if l := e.logs.lines(from, bad); len(l) != 0 {
+			t.Fatalf("%q", l)
+		}
+	}
+	t.Logf("%d streams held, %d cancelled at their deadline, %d losses recovered by a recovery frame, %d frames reported dropped, "+
+		"%d frames sent while a lost frame's stream was held", len(held), len(cancels), recovered, len(dropped), early)
 }
 
 // rateChanges returns the from -> to pairs of the host's log lines msg

@@ -235,6 +235,7 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 		if !rate || v.liveBitrate(cur) {
 			h, starting := cur.h, cur.started.Codec == ""
 			sp.LTRSlots, sp.ZeroCopy, sp.RC, sp.LiveBitrate = cur.sp.LTRSlots, cur.sp.ZeroCopy, cur.sp.RC, cur.sp.LiveBitrate // as withCaps made them
+			sp.IntraRefreshFrames = cur.sp.IntraRefreshFrames
 			cur.params, cur.sp = p, sp
 			if urgent && cur == v.pending && v.active != nil {
 				v.kill(v.active) // the starting stream takes over at its first key frame
@@ -281,7 +282,7 @@ func sameHelperStream(a, b encoder.StartParams) bool {
 	bc := a.Barcode == nil && b.Barcode == nil || a.Barcode != nil && b.Barcode != nil && *a.Barcode == *b.Barcode
 	for _, sp := range []*encoder.StartParams{&a, &b} {
 		sp.Kbps, sp.FPS, sp.LTRSlots, sp.ZeroCopy, sp.Barcode, sp.EncoderInstance = 0, 0, 0, nil, nil, nil
-		sp.RC, sp.LiveBitrate = "", ""
+		sp.RC, sp.LiveBitrate, sp.IntraRefreshFrames = "", "", 0
 	}
 	return bc && a == b
 }
@@ -372,13 +373,23 @@ type liveChoice struct {
 }
 
 // withCaps completes a start for the helper that runs it: two LTR slots where
-// the codec recovers from long-term references (GUIDE 3.5), no zero-copy
-// capture after two capture_failed restarts of a zero-copy stream, and the
-// rate-control and live-bitrate modes a qualification of this encoder chose
+// the codec recovers from long-term references (GUIDE 3.5), intra refresh
+// wherever it does not conflict with them (below), no zero-copy capture after
+// two capture_failed restarts of a zero-copy stream, and the rate-control and
+// live-bitrate modes a qualification of this encoder chose
 // (HelperOptions.LiveBitrate; else the helper's defaults). Called with v.mu
 // held.
 func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encoder.Caps) (encoder.StartParams, liveChoice) {
 	sp.LTRSlots = caps.LTRSlots(sp.Codec)
+	// The loss-recovery ladder's safety net (GUIDE 2.3, rung 3): intra
+	// refresh, over half a second of frames as on the FFmpeg path, where
+	// the encoder has it and it does not conflict: not with LTR slots or
+	// SVC (AMF); so NVENC (beside reference invalidation) and AMF H.264
+	// without LTR. A picture a recovery leaves damaged heals by itself;
+	// losses are still answered by recovery frames or IDRs.
+	if sp.SVCLayers <= 1 {
+		sp.IntraRefreshFrames = caps.IntraRefreshFrames(sp.Codec, sp.FPS)
+	}
 	if v.zeroCopyFails >= 2 {
 		off := false
 		sp.ZeroCopy = &off
@@ -501,8 +512,8 @@ func (v *HelperVideo) run(pr *helperProc) {
 	v.log.Info("encoder helper started", "backend", st.Backend, "capture", st.Capture, "codec", st.Codec,
 		"size", fmt.Sprintf("%dx%d", st.Width, st.Height), "fps", st.FPS, "kbps", st.Kbps, "adapter", st.AdapterName,
 		"vendor", st.Vendor, "gpu_priority", st.GPUPriority, "live_bitrate", st.LiveBitrate, "rate_control", st.RateControl,
-		"live_bitrate_from", liveSource(pr), "ltr_slots", st.LTRSlots, "zero_copy", st.ZeroCopy, "barcode", st.Barcode,
-		"cursor_in_video", st.CursorInVideo)
+		"live_bitrate_from", liveSource(pr), "ltr_slots", st.LTRSlots, "intra_refresh", st.IntraRefreshFrames, "zero_copy", st.ZeroCopy,
+		"barcode", st.Barcode, "cursor_in_video", st.CursorInVideo)
 	if later.Kbps != sp.Kbps || later.FPS != sp.FPS {
 		_ = h.SetRate(later.Kbps, 0, later.FPS)
 	}

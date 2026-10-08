@@ -82,6 +82,9 @@ type Session struct {
 	// For the overflow log (logOverflow).
 	sendSince   atomic.Int64
 	sendOpening atomic.Bool
+	// send: the frame streams being written and the loss the client waits
+	// on, for the loss-recovery ladder (ladder.go).
+	send sendState
 
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
@@ -98,7 +101,7 @@ type Session struct {
 	// live generation, how many frames after a lost one it needs to heal it
 	// (0: it announced "keyframe"), and its reported loss not yet healed.
 	// liveRecovery: the recovery mode the client was told for healGen
-	// (VideoConfig.Recovery; reference recovery: recoverLoss).
+	// (VideoConfig.Recovery: the loss-recovery ladder's mode, Session.loss).
 	healMu       sync.Mutex
 	healGen      uint8
 	healFrames   int
@@ -123,10 +126,15 @@ type sessionStats struct {
 	owdSum              atomic.Int64
 	owdMax              atomic.Int64
 	dropped             atomic.Int64 // frames the host discarded (reportDropped)
-	// Losses under reference recovery (recoverLoss): answered with a
+	// Losses under reference recovery (Session.loss): answered with a
 	// recovery frame, or with a key frame (none possible, or the encoder fell
 	// back to one).
 	recovered, recoveredByKey atomic.Int64
+	// The ladder's other work: frame streams cancelled past their deadline
+	// (rung 1), frames not sent because the client waits for the answer to
+	// a loss before them, key frames asked of the pipeline (rung 4: IDRs in
+	// the encoder, or new generations).
+	cancelled, discarded, keyframes atomic.Int64
 }
 
 var errClosed = errors.New("session closed")
@@ -822,16 +830,23 @@ func (s *Session) videoEvents() {
 			s.rate.output(len(ev.Frame.Data))
 			select {
 			case s.frameQ <- ev.Frame:
+				// A newer frame is ready: a frame stream past its deadline
+				// gives way to it (rung 1).
+				s.checkOut()
 			default:
 				// The network cannot keep up: drop what is queued and this
-				// frame (the client is told at once), cut the bitrate and
-				// restart with a fresh key frame right away. Within 2 s of
-				// the last cut the bitrate stays, but the restart does not
-				// wait either: the dropped frames were the newest ones.
+				// frame (the client is told at once) and cut the bitrate.
+				// The loss is answered by the ladder: a recovery frame
+				// where the encoder makes one (the cut then needs no key
+				// frame), else a fresh key frame right away (with the cut:
+				// an urgent restart or an IDR). Within 2 s of the last cut
+				// the bitrate stays, but the key frame does not wait
+				// either: the dropped frames were the newest ones.
 				dropped := append(s.drainQueue(), ev.Frame)
 				s.logOverflow(dropped)
 				s.reportDropped(dropped, "queue overflow")
-				if !s.congestion(0, signalOverflow) {
+				recovered := s.overflowLoss(dropped)
+				if !s.overflowCut(recovered) && !(recovered && s.vid().Capabilities().LiveBitrate) {
 					s.urgentRestart("queue overflow")
 				}
 			}
@@ -986,10 +1001,10 @@ func (s *Session) healDue(w *healWatch) {
 	s.lastKick = time.Now()
 	s.kickMu.Unlock()
 	var err error
-	if s.vid().Capabilities().ForceIDR {
-		err = s.keyframe("loss not healed")
-	} else {
+	if st := ladder(ladderIn{event: lossUnhealed, forceIDR: s.vid().Capabilities().ForceIDR}); st.restart {
 		err = s.startVideo(false, "loss not healed")
+	} else {
+		err = s.keyframe("loss not healed")
 	}
 	if err != nil {
 		s.log.Warn("restart after an unhealed loss failed", "err", err)
@@ -1052,59 +1067,138 @@ func (s *Session) helperFallback(ev media.VideoEvent) {
 // encoderLost handles frames the pipeline lost before they reached the
 // session (the native helper's ring was full: this process fell behind, or
 // an encoder error): the client is told at once, as for frames the session
-// dropped, and the encoder recovers (a recovery frame under reference
-// recovery, else a key frame) unless the generation heals by itself.
+// dropped, and the ladder answers the loss.
 func (s *Session) encoderLost(l *media.LostFrames) {
 	frames := make([]*media.Frame, 0, l.Count)
 	for i := 0; i < l.Count; i++ {
 		frames = append(frames, &media.Frame{Gen: l.Gen, Seq: l.From + uint32(i)})
 	}
 	s.reportDropped(frames, l.Why)
-	if !s.recoverLoss(l.Gen, l.From, l.Why) && s.vid().Capabilities().Recovery != media.RecoverySkip {
-		s.requestKeyframe()
-	}
+	s.loss(lossConfirmed, l.Gen, l.From, l.Why)
 }
 
-// lostFrame handles a frame the session could not send (its stream failed or
-// was cancelled; the test hook's drops): the client is told, and under
-// reference recovery the encoder recovers. Otherwise the client asks for a
-// key frame (recovery "keyframe") or skips the frame ("skip").
+// lostFrame handles a frame the session could not send (rung 1 cancelled
+// it, its stream failed, the test hook's drops): the client is told, and the
+// ladder answers the loss.
 func (s *Session) lostFrame(f *media.Frame, why string) {
 	s.reportDropped([]*media.Frame{f}, why)
-	s.recoverLoss(f.Gen, f.Seq, why)
+	s.loss(lossConfirmed, f.Gen, f.Seq, why)
 }
 
-// recoverLoss answers a confirmed loss of generation gen's frames from seq
-// from on where the client was told reference recovery for that generation
-// (VideoConfig.Recovery ltr / invalidate, GUIDE 3.5; the client then decodes
-// nothing from the lost frame on until a recovery frame or a key frame): the
-// encoder codes its next frame from frames the client still holds
-// (Pipeline.Recover: an acknowledged LTR, or invalidating the lost frames),
-// and where it cannot, the client gets a key frame (an IDR in the running
-// encoder on the helper). It reports whether it handled the loss; otherwise
-// the generation's own recovery applies (skip: nothing; keyframe: the client
-// asks for a key frame).
-func (s *Session) recoverLoss(gen uint8, from uint32, why string) bool {
+// ladderIn returns a ladder question about the live stream: its generation
+// and the recovery mode its client was told.
+func (s *Session) ladderIn(ev lossEvent, gen uint8, seq uint32) ladderIn {
 	s.healMu.Lock()
-	ref := gen == s.healGen && proto.RefRecovery(s.liveRecovery)
-	s.healMu.Unlock()
-	if !ref {
-		return false
-	}
-	err := s.vid().Recover(gen, from)
-	if err == nil {
-		s.log.Info("recovering from a loss", "gen", gen, "from_seq", from, "why", why)
-		return true
-	}
-	s.stats.recoveredByKey.Add(1)
-	s.log.Info("no recovery frame possible, forcing a key frame", "gen", gen, "from_seq", from, "why", why, "err", err)
-	s.requestKeyframe()
-	return true
+	defer s.healMu.Unlock()
+	return ladderIn{event: ev, gen: gen, seq: seq, live: s.healGen, mode: s.liveRecovery}
 }
 
-// lossRecovered logs the encoder's answer to a recoverLoss: the frame that
-// recovered the loss (one per loss: under the "wifi" profile, GUIDE T5 wants
-// >= 90 % of them recovery frames, not key frames).
+// loss answers a confirmed loss of generation gen's frames from seq on (ev
+// lossConfirmed, or lossOverflow; why: what lost them) with the ladder's
+// rung and returns it. Rung 2 (reference recovery, VideoConfig.Recovery ltr /
+// invalidate, GUIDE 3.5): the encoder codes its next frame from frames the
+// client still holds (Pipeline.Recover: an acknowledged LTR, or invalidating
+// the lost frames), and the frames up to it are not sent; where the pipeline
+// cannot, rung 4. Rung 3 ("skip"): nothing, the client skips the frame and
+// the encoder heals it (watchHeal). Rung 4: a key frame (an IDR in the
+// running encoder on the helper, a new generation on FFmpeg), and nothing
+// else of the generation is sent until it; an overflow's key frame comes with
+// the bitrate cut (the caller). A generation the client has left needs
+// nothing.
+func (s *Session) loss(ev lossEvent, gen uint8, seq uint32, why string) ladderStep {
+	in := s.ladderIn(ev, gen, seq)
+	v := s.vid()
+	if v != nil {
+		in.forceIDR = v.Capabilities().ForceIDR
+	}
+	st := ladder(in)
+	if st.act == actRecover {
+		err := v.Recover(gen, seq)
+		if err == nil {
+			s.log.Info("recovering from a loss", "gen", gen, "from_seq", seq, "why", why)
+			s.send.setWait(gen, seq, st.rung, false)
+			s.checkOut()
+			return st
+		}
+		in.recoverFailed = true
+		st = ladder(in)
+		st.why += ": " + err.Error()
+	}
+	if st.act != actKeyframe {
+		return st
+	}
+	ref := proto.RefRecovery(in.mode)
+	if ref {
+		s.stats.recoveredByKey.Add(1)
+		s.log.Info("no recovery frame possible, forcing a key frame", "gen", gen, "from_seq", seq, "why", why, "ladder", st.why)
+	}
+	// Under reference recovery the client waits for a key frame (or a
+	// recovery frame); under "keyframe" it gives the generation up and asks
+	// for a new one. Under "skip" it decodes on until the key frame.
+	if ref || in.mode == proto.RecoveryKeyframe {
+		s.send.setWait(gen, seq, st.rung, !ref)
+		s.checkOut()
+	}
+	if ev != lossOverflow {
+		s.requestKeyframe("frame lost")
+	}
+	return st
+}
+
+// overflowLoss answers a frame-queue overflow's dropped frames (oldest
+// first) with the ladder: it reports whether a recovery frame answers them
+// (rung 2); otherwise the bitrate cut that follows delivers the key frame.
+func (s *Session) overflowLoss(dropped []*media.Frame) bool {
+	in := s.ladderIn(lossOverflow, 0, 0)
+	for _, f := range dropped {
+		if f.Gen == in.live {
+			return s.loss(lossOverflow, f.Gen, f.Seq, "queue overflow").act == actRecover
+		}
+	}
+	return false // frames of a generation the client has left
+}
+
+// checkOut asks the ladder about the frame streams being written: one past
+// its deadline while a newer frame is ready is cancelled and lost (rung 1),
+// one the client would discard (it waits for the answer to a loss before
+// it) is stopped. Runs at a stream's deadline, when a frame is queued and
+// when a wait begins.
+func (s *Session) checkOut() {
+	if s.ctx.Err() != nil {
+		return
+	}
+	for _, c := range s.send.due(s.ladderIn(lossOutgoing, 0, 0), len(s.frameQ) > 0, time.Now()) {
+		f := c.of.f
+		if c.step.act == actDiscard {
+			c.of.st.CancelWrite()
+			s.discard(f, c.step)
+			continue
+		}
+		s.stats.cancelled.Add(1)
+		s.log.Info("frame stream cancelled", "gen", f.Gen, "seq", f.Seq, "why", c.step.why,
+			"age_ms", c.age.Milliseconds(), "deadline_ms", c.of.deadline.Milliseconds())
+		// The loss first: the reset frees frameSender, whose next frames
+		// must find the wait for the answer to it.
+		s.lostFrame(f, "deadline")
+		c.of.st.CancelWrite()
+	}
+}
+
+// discard reports a frame the session does not send (or stops sending)
+// because the client waits for the answer to a loss before it (step: the
+// ladder's, actDiscard): the client would discard it anyway.
+func (s *Session) discard(f *media.Frame, step ladderStep) {
+	s.stats.discarded.Add(1)
+	why := "awaiting recovery frame"
+	if step.rung == 4 {
+		why = "awaiting key frame"
+	}
+	s.reportDropped([]*media.Frame{f}, why)
+}
+
+// lossRecovered logs the encoder's answer to a Recover (Session.loss): the
+// frame that recovered the loss (one per loss: under the "wifi" profile,
+// GUIDE T5 wants >= 90 % of them recovery frames, not key frames).
 func (s *Session) lossRecovered(r *media.Recovered) {
 	by := "recovery frame"
 	if r.Key {
@@ -1204,6 +1298,26 @@ func (s *Session) congestion(delayMs int, sig rateSignal) bool {
 		s.log.Info("bitrate recovery limited by the client's decoder", "max", s.rate.decoderLimit())
 	}
 	s.applyRate(c, delayMs)
+	return true
+}
+
+// overflowCut cuts the bitrate for a frame-queue overflow (congestion with
+// signalOverflow) and reports whether it did. recovered: the ladder answered
+// the dropped frames with a recovery frame (rung 2), so an encoder that
+// changes its bitrate seamlessly takes the cut without the emergency's key
+// frame (GUIDE 2.3: an IDR only where rung 2 is unavailable).
+func (s *Session) overflowCut(recovered bool) bool {
+	caps := s.vid().Capabilities()
+	s.rate.setPolicy(ratePolicy(caps))
+	c, ok := s.rate.congestion(signalOverflow)
+	if !ok {
+		s.log.Debug("congestion: bitrate kept", "signal", signalOverflow)
+		return false
+	}
+	if recovered && caps.LiveBitrate && !caps.LiveBitrateFlush {
+		c.urgent = false
+	}
+	s.applyRate(c, 0)
 	return true
 }
 
@@ -1352,10 +1466,11 @@ func (s *Session) kicked() {
 	s.kickMu.Unlock()
 }
 
-// requestKeyframe gets a key frame to a client that needs one (a confirmed
-// loss under recovery "keyframe", a decoder error, or its watchdog), at most
-// one every 500 ms.
-func (s *Session) requestKeyframe() {
+// requestKeyframe gets a key frame to a client that needs one (the client's
+// request: a decoder error, a loss under recovery "keyframe", its watchdog;
+// or the ladder's rung 4 for a loss the host knows of), at most one every
+// 500 ms.
+func (s *Session) requestKeyframe(reason string) {
 	s.kickMu.Lock()
 	if time.Since(s.lastKick) < 500*time.Millisecond {
 		s.kickMu.Unlock()
@@ -1363,18 +1478,20 @@ func (s *Session) requestKeyframe() {
 	}
 	s.lastKick = time.Now()
 	s.kickMu.Unlock()
-	if err := s.keyframe("keyframe request"); err != nil {
+	if err := s.keyframe(reason); err != nil {
 		s.log.Warn("keyframe restart failed", "err", err)
 	}
 }
 
-// keyframe makes the next frame a key frame of a new generation: in the
-// running encoder where the pipeline can force one (Capabilities().ForceIDR:
-// the native helper), else with a new generation started at once (FFmpeg's
-// command line cannot force one), built afresh from the settings.
+// keyframe makes the next frame a key frame of a new generation (the
+// ladder's rung 4): in the running encoder where the pipeline can force one
+// (Capabilities().ForceIDR: the native helper, never a restart), else with a
+// new generation started at once (FFmpeg's command line cannot force one),
+// built afresh from the settings.
 func (s *Session) keyframe(reason string) error {
 	v := s.vid()
-	if v.Capabilities().ForceIDR {
+	s.stats.keyframes.Add(1)
+	if !ladder(ladderIn{event: lossKeyRequest, forceIDR: v.Capabilities().ForceIDR}).restart {
 		err := v.ForceKeyframe()
 		if err == nil {
 			s.log.Info("forcing a key frame", "reason", reason)
@@ -1423,6 +1540,11 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	return nil
 }
 
+// frameSender sends the queued frames, each on its own stream, oldest first.
+// The ladder decides about every frame (ladder.go): a frame the client would
+// discard anyway (it waits for the answer to a loss before it) is not sent,
+// and a frame stream still being written past its deadline while a newer
+// frame is ready is cancelled (checkOut, rung 1).
 func (s *Session) frameSender() {
 	buf := make([]byte, 0, 1<<20)
 	faults := s.a.faults
@@ -1433,6 +1555,11 @@ func (s *Session) frameSender() {
 		case <-s.ctx.Done():
 			return
 		case f = <-s.frameQ:
+		}
+		num, step := s.send.take(f)
+		if step.act == actDiscard {
+			s.discard(f, step)
+			continue
 		}
 		s.sendOpening.Store(true)
 		s.sendSince.Store(time.Now().UnixNano())
@@ -1456,34 +1583,71 @@ func (s *Session) frameSender() {
 			buf = ext.Append(buf)
 		}
 		buf = append(buf, f.Data...)
+		of := &outFrame{f: f, st: st, n: num, opened: time.Now(), deadline: s.frameDeadline(len(buf))}
+		// A frame the ladder may cancel when it is late: look again at
+		// its deadline (a newer frame queued later looks too).
+		in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
+		in.key, in.recovery, in.age, in.deadline, in.newer = f.Key, f.Recovery, of.deadline, of.deadline, true
+		if ladder(in).act == actCancel {
+			of.timer = time.AfterFunc(of.deadline, s.checkOut)
+		}
+		s.send.register(of)
 		if drop, delay := faults.at(n); drop {
 			// Test hook: the stream fails mid-frame.
 			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
 			_, _ = st.Write(buf[:len(buf)/2])
-			st.CancelWrite()
-			s.lostFrame(f, "test fault")
+			if s.send.finish(of, outCancelled) {
+				st.CancelWrite()
+				s.lostFrame(f, "test fault")
+			}
 			continue
 		} else if delay > 0 {
-			// Test hook: this frame arrives late, the next ones on time.
+			// Test hook: this frame arrives late, the next ones on time
+			// (its stream stands still meanwhile, as when its packets wait
+			// for retransmissions).
 			s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay)
 			late := append([]byte(nil), buf...)
-			time.AfterFunc(delay, func() { s.sendFrame(st, f, h, late) })
+			time.AfterFunc(delay, func() { s.sendFrame(of, h, late) })
 			continue
 		}
-		s.sendFrame(st, f, h, buf)
+		s.sendFrame(of, h, buf)
 	}
 }
 
+// frameDeadline is the deadline of a frame stream of the given size (rung 1:
+// frameDeadline) at the session's frame rate and video pacing rate (the
+// media congestion controller's, else 1.2 x the video bitrate).
+func (s *Session) frameDeadline(bytes int) time.Duration {
+	interval, pacing := time.Second/60, s.videoPacingBps()
+	if t := s.ccTarget.Load(); t != nil {
+		interval = t.frameInterval
+		if pacing <= 0 {
+			pacing = float64(t.videoKbps) * 1000 * cc.PacingGain
+		}
+	}
+	return frameDeadline(interval, bytes, pacing)
+}
+
 // sendFrame writes a frame (header h, encoded as b) to its stream; a frame
-// that cannot be written is reported dropped.
-func (s *Session) sendFrame(st transport.SendStream, f *media.Frame, h proto.FrameHeader, b []byte) {
+// that cannot be written is reported dropped. A frame the ladder cancelled
+// meanwhile (checkOut) is lost already.
+func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
+	st, f := of.st, of.f
+	if of.state.Load() != outWriting {
+		return // cancelled while the test hook held it
+	}
 	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if _, err := st.Write(b); err != nil {
-		st.CancelWrite()
-		if s.ctx.Err() == nil {
-			s.lostFrame(f, "stream failed")
+		if s.send.finish(of, outCancelled) {
+			st.CancelWrite()
+			if s.ctx.Err() == nil {
+				s.lostFrame(f, "stream failed")
+			}
 		}
 		return
+	}
+	if !s.send.finish(of, outDone) {
+		return // cancelled as its write completed: reported lost
 	}
 	st.Close()
 	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), len(b), s.videoPacingBps())
@@ -1811,11 +1975,11 @@ func (s *Session) controlLoop() error {
 				s.startAudio()
 			}
 		case "keyframe":
-			s.requestKeyframe()
+			s.requestKeyframe("keyframe request")
 		case proto.MsgLost:
 			// A loss only the client saw (a gap that outlasted its wait),
 			// under reference recovery: it waits for the recovery frame.
-			s.recoverLoss(m.Gen, m.FromSeq, "client")
+			s.loss(lossConfirmed, m.Gen, m.FromSeq, "client")
 		case "stages":
 			s.logStages(m.Stages)
 		case "congestion":
@@ -1825,7 +1989,7 @@ func (s *Session) controlLoop() error {
 			if m.Reason != proto.CongestionDecoder {
 				s.congestion(m.DelayMs, signalDelay)
 			} else if !s.congestion(m.DelayMs, signalDecoder) {
-				s.requestKeyframe()
+				s.requestKeyframe("keyframe request")
 			}
 		case "pause":
 			if !s.paused.Swap(true) {
@@ -1970,6 +2134,7 @@ func (s *Session) statsLoop() {
 		owdMax := s.stats.owdMax.Swap(0)
 		dropped := s.stats.dropped.Swap(0)
 		recovered, byKey := s.stats.recovered.Swap(0), s.stats.recoveredByKey.Swap(0)
+		cancelled, discarded, keyframes := s.stats.cancelled.Swap(0), s.stats.discarded.Swap(0), s.stats.keyframes.Swap(0)
 		avg := int64(0)
 		if acks > 0 {
 			avg = owdSum / acks
@@ -1978,7 +2143,12 @@ func (s *Session) statsLoop() {
 		est, fpsTarget, margin, loss := s.rate.state()
 		args := []any{"fps", float64(frames) / 10, "mbps", float64(bytes) * 8 / 10 / 1e6,
 			"owd_avg_ms", float64(avg) / 1000, "owd_max_ms", float64(owdMax) / 1000, "kbps_target", target,
-			"kbps_max", ceiling, "dropped", dropped, "recovered", recovered, "recovered_by_key", byKey}
+			"kbps_max", ceiling, "dropped", dropped, "recovered", recovered, "recovered_by_key", byKey,
+			// The loss-recovery ladder (GUIDE 2.3): frame streams cancelled
+			// past their deadline (rung 1), frames not sent while the client
+			// waited for a recovery or key frame, key frames asked of the
+			// pipeline (rung 4).
+			"deadline_drops", cancelled, "discarded", discarded, "key_frames", keyframes}
 		// The rate controller's view: the one-way delay of the client's
 		// reports (p50/p95 of their p50s, the largest maximum), the
 		// continuous target, the frame rate, the queueing-delay margin and

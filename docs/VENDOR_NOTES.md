@@ -3658,3 +3658,171 @@ Hardware checks:
 - NVIDIA: unverified (no NVIDIA host available). Test: the four AMD tests above with hevc_nvenc
   (and h264_nvenc, av1_nvenc on RTX 40+) on the native helper (NvEncReconfigureEncoder for the
   bitrate and frame rate) and with `pipeline` `ffmpeg`, same steps and pass criteria.
+
+## 2.3 Loss-recovery ladder
+
+Vendor-neutral (session logic): what needs hardware is a real network's stalls and losses, the
+helper encoders' recovery frames and intra refresh under the ladder, and the T3/T4 acceptance.
+
+What changed (GUIDE 2.3; docs/ARCHITECTURE.md "The loss-recovery ladder"):
+
+- One function, `ladder` (`internal/host/ladder.go`), decides about every late or lost frame and
+  every key frame, from the frame, the recovery mode the client was told for the live generation
+  (`VideoConfig.recovery`) and `PipelineCaps.ForceIDR`, never from a vendor. Every loss path goes
+  through it (`Session.loss`): frames the session cancelled or could not send, frames the helper
+  dropped, the client's `lost`, frame-queue overflows, key-frame requests (`keyframe()`) and
+  `skip` losses intra refresh did not heal in time (`healDue`).
+- Rung 1, deadline drop (`frameSender`, `Session.checkOut`, `sendState`): a frame stream's
+  deadline is max(2 frame intervals, 25 ms) from the moment its stream opens (`frameDeadline`); a
+  frame larger than the pacer sends in one frame interval (1.2 × the video bitrate) gets its own
+  sending time plus one interval. A stream still being written past it while a newer frame is
+  ready (queued, or taken after it) is cancelled (`CancelWrite`), reported `dropped` and lost:
+  host.log `frame stream cancelled gen=… seq=… why="past its deadline" age_ms=… deadline_ms=…`.
+  frameSender checks at each stream's deadline (a timer, armed only for frames the ladder may
+  cancel) and whenever a frame is queued. Only under reference recovery (`ltr` / `invalidate`) of
+  the live generation, never for key frames or recovery frames.
+- Rung 2 as in 3.5 (`Pipeline.Recover`), plus: from the loss until its answer (a recovery frame
+  with `refFloor` < the lost seq, or a key frame: the client's `P.endsRecovery`) the host sends
+  nothing (the client would discard it; reported `dropped`, `why="awaiting recovery frame"`), also
+  stopping streams being written; for a loss it learns late (the client's `lost`) it looks back
+  over the last 256 frames it took for an answer already sent. A frame-queue overflow under
+  reference recovery is answered by a recovery frame and the bitrate cut changes a seamless
+  encoder's rate in place: no IDR (before 2.3 an overflow always forced one).
+- Rung 3: the helper's `start` asks for intra refresh (`intraRefreshFrames` = half a second of
+  frames, `encoder.Caps.IntraRefreshFrames`) where the codec's caps have `intraRefresh` and the
+  stream runs no LTR slots and no SVC: NVENC beside reference invalidation, AMF H.264 without LTR;
+  not AMF with LTR slots (AMF: intra refresh does not work with user LTR). The client is not told
+  `skip` on the helper: its losses still get recovery frames or IDRs. host.log `encoder helper
+  started ... ltr_slots=… intra_refresh=…`. A frame-rate change keeps the running helper.
+  `recon-host qualify` starts its streams the same way (cell field `intraRefresh`, not matched).
+  The FFmpeg path's `skip` (1.2) is unchanged.
+- Rung 4: `keyframe()` asks the ladder: an IDR in the running encoder where the pipeline forces one
+  (the helper: never a restart), else a new generation (FFmpeg). Under `keyframe` the host now
+  acts at once on the losses it knows of (`forcing a key frame reason="frame lost"` on the helper,
+  `restarting video reason="frame lost" urgent=true` on FFmpeg) instead of waiting a round trip
+  for the client's request, which then finds the key frame on its way (500 ms guard), and sends
+  nothing more of the generation the client gave up (`why="awaiting key frame"`).
+- `stream stats` every 10 s: `deadline_drops`, `discarded`, `key_frames`, beside `dropped`,
+  `recovered` and `recovered_by_key`. No protocol change; the client is unchanged (its gap
+  handling of 1.4, recovery wait of 3.5 and key-frame requests are its side of rungs 2–4).
+- Deviations: (1) rung 1 runs only where rung 2 answers the loss (GUIDE 2.3 states it without a
+  condition): under `keyframe` a cancelled frame would cost a key frame (on FFmpeg a ~450 ms
+  restart) for a frame that is only late, under `skip` a smeared picture for up to a second, and
+  rung 3 is "only a safety net". (2) The deadline counts from the frame's stream opening, not
+  from its encode: from the encode, the frames that waited behind a large key frame would all be
+  cancelled at once; the frame queue's overflow (6 frames) still bounds that wait. (3) The
+  large-frame extension of the deadline and (4) not sending the frames up to a loss's answer are
+  additions. (5) A late frame of a generation the client has left is not cancelled (one frame at
+  a switch; it keeps 1.4's rule that only frames the host drops are reported). (6) Rung 1 sees
+  what holds up the host's own frame streams: on the direct path the path to the browser; on the
+  relay paths (until 2.6 makes them one connection) the host → gateway leg, and a stall of the
+  gateway → browser leg only once the gateway's stream receive window is full (the splice stops
+  reading), so it acts later there.
+
+Verified in the sandbox:
+
+- verified (sandbox): `internal/host` `TestLadder` (every decision: rung 1 at and after the
+  deadline only with a newer frame, under `ltr`/`invalidate` of the live generation, never key or
+  recovery frames, never under `keyframe`/`skip`/nothing live; the wait's discards, its end at a
+  recovery frame with `refFloor` < the loss or a key frame, nothing ending a `keyframe` wait;
+  confirmed losses: rung 2, rung 4 after a refused `Recover` or for the key frame, rung 3 under
+  `skip`, rung 4 under `keyframe`, nothing for another generation; overflows; key requests and
+  unhealed losses: an IDR with `ForceIDR`, a restart without); `TestFrameDeadline` (2 frame
+  intervals, the 25 ms floor, large frames, unknown pacing or frame rate);
+  `TestSendStateWait` (discards up to the answer, a late loss answered by a frame already sent, a
+  new wait after an answer, an older loss widening it, a newer generation ending it, a loss
+  older than the 256 kept frames discarding nothing); `TestFrameSenderLadder` (frameSender with
+  fake streams whose writes stand still: under `invalidate` the stalled stream is reset at its
+  deadline (33 ms at 60 fps), seq 2 reported, `Recover 1/2`, seq 3–4 not sent and reported, the
+  recovery frame and the frames after it sent; stalled key and recovery frames go on; under
+  `keyframe`/`skip` a stalled frame goes on and nothing is reported; the test hook's delay is
+  cancelled and never written afterwards; a refused `Recover` gives one IDR, no restart; under
+  `keyframe` a dropped frame gives an IDR at once and nothing more of the generation, not even an
+  in-stream key frame); `TestSessionRefRecovery/queue_overflow` (fake AMF helper, 65 frames
+  nobody takes: `recover lostFromFrameId=3 ackedLtrFrameId=2`, `setRate`, no `forceIdr`, cut
+  `why=overflow urgent=false`, no restart); `TestSessionOnHelper` (v2 client: a helper drop gives
+  `forceIdr`); `internal/host/media` `TestHelperStartParams` (intra refresh for NVENC and AMF H.264
+  without LTR, none with LTR slots, SVC or without caps; equal to `IntraRefreshPeriod` from 1 to
+  240 fps; no new helper for it); `internal/host/qualify` `TestCellArgs` (`--intra-refresh=30`
+  where a session would run it).
+- verified (sandbox): `internal/e2e` `TestStreamingDeadlineDrop` (real gateway, host agent and
+  WebTransport client, v3, libx264 reference-recovery stand-in at 30 fps, the hook holding every
+  23rd frame's stream for 150 ms): 7 of 7 held streams cancelled at `age_ms` 66–67 for a
+  `deadline_ms` of 66–67, each reported and recovered by a recovery frame with `refFloor` = the
+  frame before the loss; between them only the frames that went out while the stream was held
+  (10) and frames reported dropped (18 in all); no key frame, no new generation, no restart.
+  `TestStreamingFrameLoss` (`skip`: only the hook's drops reported) unchanged.
+- verified (sandbox), browser E2E (`test/e2e/browser.mjs`, headless Chromium, libsvtav1 960×540
+  60 fps, software AV1 decode, direct WebTransport), 81 of 81 checks passed. Scenario
+  `host-faults-ref` (`delay=every:97:200ms,drop=every:193,ref-recovery`, 20 s), counts: frame
+  streams cancelled 8 (the 7 the hook held 200 ms, and one that stalled past its deadline on this
+  CPU-bound loopback), dropped by the hook 6; recoveries: 14 asked of the encoder, 13 answered by
+  a recovery frame (the last one still in flight), 0 by a key frame; the client recovered 13 by
+  recovery frame and 0 by key frame and was told of 78 frames, 64 of them not sent while it
+  waited (the stand-in's recovery frame is its next key frame, up to 10 frames on); IDRs: 0 forced
+  by the host, 11 decoded by the client, one per generation of the 11 rate-controller restarts
+  (congestion (urgent) 3, congestion 2, bitrate recovery 6: this software encoder falls behind on
+  its own); encoder restarts for a loss: 0; no decoder error, no `frame lost`, frame barcode = seq
+  on 42 of 42 sampled frames; 52.7 fps mean; 9 freezes > 100 ms (each loss waits for the
+  stand-in's next key frame, ~100–170 ms; a real encoder answers with its next frame). Scenario
+  `host-faults` (`keyframe`): 13 frames delayed 200 ms, 0 cancelled; 6 dropped, each answered by
+  `restarting video reason="frame lost" urgent=true` (6) and the client's 6 requests found the key
+  frame on its way. `host-faults-skip`: 0 cancelled, 6 skipped. The ladder's unit tests passed
+  20 times in a row, and with `-race`.
+- verified (sandbox): `make helper-test` under Wine (xvfb-run, a private copy of the shared
+  prefix: with the shared one D3D11 failed, `DXGI_ERROR_UNSUPPORTED`, while another agent's Wine
+  tests held its wineserver): encoder, media and qualify packages 67 passed, 0 failed; the
+  NVENC test double's qualification (6 cells, now started with `--intra-refresh=30` where caps
+  have `intraRefresh`) passed; `encoder helper started ... ltr_slots=0 intra_refresh=0` for the
+  mock backend (no intra refresh in its caps). The media binary was killed after its PASS line
+  when the X display it shared with another agent's run went away; rerun alone on a private
+  display: exit 0, all passed. Skipped as before: AMD Direct Capture, WGC, AMF failed start, the
+  NVENC driver subtest, `TestLaunchUnsupported`, `TestVideoGPUPriorityLog`.
+- Not run: the 0.4 `wifi` profile (no `sch_netem` in the sandbox kernel: `tc qdisc add ... netem`
+  answers "Specified qdisc kind is unknown"); T3 and T4 are hardware checks below.
+
+Hardware checks (host.json `"pipeline": "auto"` with recon-encoder.exe next to recon-host.exe
+unless a test says otherwise; overlay Ctrl+Alt+Shift+S; host log
+`$env:APPDATA\KlouditRecon\host.log`; the client's `__recon.lastStats` and `__recon.logs`):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (T3, wifi: freezes > 100 ms < 1 per 10 min): stream
+  hevc_amf_helper at 1920×1080 60 fps, 20 Mbps, adaptive bitrate on, over the relay path (Network
+  path "Relay via gateway", Transport row `· relay`) with `./netem.sh apply wifi --ct 210 --host
+  CLIENT_IP` (0.4), 10 minutes of constant motion (a game or a video); note `__recon.lastStats.freezes`
+  (overlay `Freezes > 100 ms`) at the start and the end. Pass: the difference is 0. Record from
+  host.log the sums over the run of the `stream stats` fields `deadline_drops`, `discarded`,
+  `dropped`, `recovered`, `recovered_by_key` and `key_frames`
+  (`Select-String host.log -Pattern 'msg="stream stats"'`), the `frame stream cancelled` lines
+  (`age_ms` ≥ `deadline_ms`, each followed by `recovering from a loss ... why=deadline` and
+  `loss recovered ... by="recovery frame"`), and any `restarting video` or `forcing a key frame`
+  (there should be none after the session start). Repeat with AV1 at 2560×1440 and H.264, and
+  once on `lan` (expect `deadline_drops=0`, no freezes).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (T4, zero encoder restarts with the helper): the same
+  stream for 30 minutes under each of `lan`, `wifi`, `wan` and `capdrop` (0.4), after
+  `recon-host qualify` (3.6) so that bitrate changes stay in the encoder. Pass: one
+  `encoder helper started` per session (plus resizes you caused), no `restarting video`, no
+  `Video encoder restarted` notice; `key_frames` may be > 0 only for decoder errors or key-frame
+  requests the client logged (`requesting key frame (...)`), never `reason="frame lost"` while
+  `ltr` recovery is announced.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (rung 1 on a real stall, and what it costs): under
+  `wifi`, compare 10 minutes with and without the deadline drop: the drop cannot be switched off
+  in host.json, so run the second half with `"pipeline": "ffmpeg"` (hevc_amf, recovery `keyframe`:
+  rung 1 off) and compare freezes and the overlay's capture→drawn p95. Expected: fewer and
+  shorter freezes on the helper; record both.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (rung 3 on AMD): `encoder helper started` for
+  hevc/av1/h264 shows `ltr_slots=2 intra_refresh=0` (LTR recovery, no intra refresh). If an
+  Adrenalin version reports H.264 `maxLtr` < 2 in `recon-encoder.exe --print-caps`, it must show
+  `ltr_slots=0 intra_refresh=30` at 60 fps and `"intraRefreshFrames":30` in `started` (AMF reads it
+  back); then run the drop tests of 3.5: losses get key frames (IDRs), and a picture smeared by a
+  decoder that accepted a damaged reference heals within 1 s.
+- NVIDIA: unverified (no NVIDIA host available). Test (rung 3 beside rung 2: intra refresh and
+  reference invalidation together): hevc_nvenc_helper and h264_nvenc_helper (av1_nvenc_helper on
+  RTX 40+) at 60 fps: `encoder helper started ... ltr_slots=0 intra_refresh=30`; the 10 drop tests
+  of 3.5 per codec: each answered by a recovery frame (`refFloor` = the frame before the drop),
+  no decoder error, no smear after the recovery (`"capture": "test", "pipeline": "helper"`: the
+  overlay's Frame barcode row stays at 0 mismatched / 0 invalid), and no periodic quality pulse
+  from the refresh waves (watch a still desktop for 30 s).
+- NVIDIA: unverified (no NVIDIA host available). Test: `recon-host qualify` again (its cells now
+  run with `intraRefresh` like sessions); record whether `seamless` still passes for CBR.
+- NVIDIA: unverified (no NVIDIA host available). Test (T3 and T4): the two AMD tests above with
+  hevc_nvenc_helper (and h264, av1 on RTX 40+), same steps and pass criteria.

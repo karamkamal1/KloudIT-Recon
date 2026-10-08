@@ -176,6 +176,21 @@ func (c *Caps) LTRSlots(codec string) int {
 	return 0
 }
 
+// IntraRefreshFrames returns the intra refresh cycle a stream of codec at fps
+// starts with (StartParams.IntraRefreshFrames): half a second of frames (as
+// media.IntraRefreshPeriod) where the encoder has intra refresh and the
+// stream uses no LTR slots (LTRSlots: AMF cannot combine them; nor SVC, which
+// streams with svcLayers > 1 must leave out too), else 0. It is the
+// loss-recovery ladder's safety net (GUIDE 2.3): losses are still answered by
+// recovery frames or IDRs. Sessions and the live-bitrate qualification both
+// start their streams this way.
+func (c *Caps) IntraRefreshFrames(codec string, fps int) int {
+	if cc, ok := c.Codecs[codec]; !ok || !cc.IntraRefresh || c.LTRSlots(codec) > 0 {
+		return 0
+	}
+	return max(2, (fps+1)/2)
+}
+
 // Started answers a successful Start with what the encoder actually does.
 type Started struct {
 	Backend       string `json:"backend"`

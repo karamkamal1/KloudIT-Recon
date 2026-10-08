@@ -424,10 +424,16 @@ async function lossRun(name, faults, seconds, prefs = {}) {
     dropped: (hl.match(/msg="frames dropped".*? why="test fault"/g) || []).length,
     restarts: restartsByReason(hl),
     keyRequestReasons: keyRequestsByReason(con),
+    // The loss-recovery ladder (GUIDE 2.3): frame streams cancelled past
+    // their deadline (rung 1), frames the host did not send while the client
+    // waited for a recovery or key frame, IDRs forced in the encoder.
+    cancelled: (hl.match(/msg="frame stream cancelled"/g) || []).length,
+    hostDiscarded: (hl.match(/msg="frames dropped".*? why="awaiting (recovery|key) frame"/g) || []).length,
+    forcedKeys: (hl.match(/msg="forcing a key frame"/g) || []).length,
     client: {
       keyRequests: delta('keyRequests'), hostDropped: delta('hostDropped'), skipped: delta('skipped'), lost: delta('dropped'),
       recovered: delta('recovered'), recoveredByKey: delta('recoveredByKey'), discarded: delta('recoveryDiscarded'),
-      rejected: delta('recoveryRejected'), keyFrames: delta('keyFrames'),
+      rejected: delta('recoveryRejected'), keyFrames: delta('keyFrames'), freezes: delta('freezes'),
     },
     // Reference recovery on the host: losses it asked the encoder to recover,
     // and how the encoder answered (recovery frame, key frame).
@@ -477,15 +483,20 @@ async function checkLossHandling() {
 
   // Recovery "keyframe" (the software encoders have no intra refresh).
   const k = await lossRun('host-faults', LOSS_FAULTS, 20);
-  const kfRestarts = k.restarts['keyframe request (urgent)'] || 0;
+  // Key-frame restarts: for a client's request, or (the ladder's rung 4)
+  // for a loss the host knows of, at once (the client's request for the
+  // same loss then finds the key frame on its way).
+  const kfRestarts = (k.restarts['keyframe request (urgent)'] || 0) + (k.restarts['frame lost (urgent)'] || 0);
   // A late frame that outlasted the gap timeout would show as "frame lost";
-  // every key-frame restart needs a client request with a logged reason (the
-  // drops, a decoder error, the watchdog). Other restarts (congestion) are
+  // every key-frame restart needs a logged reason (the drops, a client
+  // request: a decoder error, the watchdog). Other restarts (congestion) are
   // listed, not checked: this CPU-only machine also falls behind on its own.
+  // Under "keyframe" a late frame is never cancelled (its loss would cost a
+  // key frame; GUIDE 2.3 rung 1 only where rung 2 answers the loss).
   const kRequests = Object.values(k.keyRequestReasons).reduce((a, b) => a + b, 0);
-  check('late frames (200 ms) cause no key-frame request ("frame lost"); every key-frame restart answers a logged request',
-    k.delayed >= 5 && !k.keyRequestReasons['frame lost'] && kfRestarts <= kRequests,
-    `${k.delayed} frames delayed 200 ms, ${k.dropped} dropped; client key-frame requests: ${counts(k.keyRequestReasons)}; ` +
+  check('late frames (200 ms) cause no key-frame request ("frame lost") and are not cancelled; every key-frame restart answers a loss or a logged request',
+    k.delayed >= 5 && !k.keyRequestReasons['frame lost'] && k.cancelled === 0 && kfRestarts <= kRequests + k.dropped,
+    `${k.delayed} frames delayed 200 ms (${k.cancelled} cancelled), ${k.dropped} dropped; client key-frame requests: ${counts(k.keyRequestReasons)}; ` +
       `host restarts: ${counts(k.restarts)}`);
   check('dropped frames are reported ("dropped") and recovered with a key frame (recovery "keyframe")',
     k.cfg?.recovery === 'keyframe' && k.dropped >= 3 && k.client.hostDropped >= k.dropped - 1 &&
@@ -504,8 +515,8 @@ async function checkLossHandling() {
   // frame) needs nothing at all, so not every report is a skip.
   const s = await lossRun('host-faults-skip', `${LOSS_FAULTS},recovery=skip`, 20);
   const skipRestarts = s.restarts['keyframe request (urgent)'] || 0;
-  check('dropped frames skipped (recovery "skip"): no key-frame request for the loss itself, playback continues',
-    s.cfg?.recovery === 'skip' && s.dropped >= 3 && s.client.hostDropped >= s.dropped - 1 && s.client.skipped >= 1 &&
+  check('dropped frames skipped (recovery "skip"): no key-frame request for the loss itself, late frames not cancelled, playback continues',
+    s.cfg?.recovery === 'skip' && s.dropped >= 3 && s.client.hostDropped >= s.dropped - 1 && s.client.skipped >= 1 && s.cancelled === 0 &&
       !s.keyRequestReasons['dropped by host'] && !s.keyRequestReasons['frame lost'] &&
       skipRestarts <= (s.keyRequestReasons['decoder error'] || 0) + (s.keyRequestReasons.watchdog || 0) && s.fps >= 10,
     `${s.cfg?.encoder} recovery ${s.cfg?.recovery}: host dropped ${s.dropped}, client told ${s.client.hostDropped}, skipped ${s.client.skipped}, ` +
@@ -521,25 +532,43 @@ async function checkLossHandling() {
   // must be answered by such a frame: the client decodes nothing from the
   // lost frame until it (the last good picture stays), resumes with it, and
   // asks for no key frame; the host starts no new generation for a loss.
-  // Late frames still wait (no "frame lost"), except those before a buffered
-  // recovery frame (all discarded anyway). The client counts the key frames
-  // (IDRs) it decoded and the frames it waited out.
+  // No late frame outlasts the gap timeout ("frame lost"). The client counts
+  // the key frames (IDRs) it decoded and the frames it waited out.
+  //
+  // The loss-recovery ladder (GUIDE 2.3) on the same run: each frame the
+  // hook delays has its stream stand still for 200 ms while the next frames
+  // are ready, past its deadline (two frame intervals, 33 ms at 60 fps), so
+  // the host cancels it (rung 1: "frame stream cancelled") and treats it as
+  // lost; the encoder answers with a recovery frame (rung 2), and the host
+  // does not send the frames up to it (the client would discard them; they
+  // are reported dropped). Counted: cancelled frames, recoveries, IDRs (the
+  // client's key frames, the host's forced ones) and encoder restarts.
   const r = await lossRun('host-faults-ref', `${LOSS_FAULTS},ref-recovery`, 20);
-  const refRestarts = r.restarts['keyframe request (urgent)'] || 0;
+  const refRestarts = (r.restarts['keyframe request (urgent)'] || 0) + (r.restarts['frame lost (urgent)'] || 0);
   const lossKeys = ['dropped by host', 'frame lost', 'no recovery frame'].reduce((a, k) => a + (r.keyRequestReasons[k] || 0), 0);
   const hostRec = r.recoveredByFrame + r.recoveredByKey;
-  check('reference recovery (software stand-in): dropped frames recovered by a recovery frame, frames up to it discarded, no key-frame request or restart for a loss',
-    r.cfg?.recovery === 'invalidate' && r.dropped >= 3 && r.client.hostDropped >= r.dropped - 1 &&
-      r.recoveredByFrame >= r.dropped - 1 && r.recoveredByFrame >= 0.9 * hostRec &&
-      r.client.recovered >= r.dropped - 1 && r.client.discarded > 0 && r.client.rejected === 0 && r.decoderErrors === 0 &&
+  const losses = r.dropped + r.cancelled;
+  check('reference recovery (software stand-in): dropped frames recovered by a recovery frame, frames up to it not decoded, no key-frame request or restart for a loss',
+    r.cfg?.recovery === 'invalidate' && r.dropped >= 3 && r.client.hostDropped >= losses - 1 &&
+      r.recoveredByFrame >= losses - 2 && r.recoveredByFrame >= 0.9 * hostRec &&
+      r.client.recovered >= losses - 2 && r.client.discarded + r.hostDiscarded > 0 && r.client.rejected === 0 && r.decoderErrors === 0 &&
       lossKeys === 0 && refRestarts <= (r.keyRequestReasons['decoder error'] || 0) + (r.keyRequestReasons.watchdog || 0) &&
       !r.keyRequestReasons['frame lost'] && r.fps >= 10,
-    `${r.cfg?.encoder} recovery ${r.cfg?.recovery}: host dropped ${r.dropped} (${r.delayed} delayed 200 ms), asked the encoder to recover ${r.recovering}, ` +
-      `answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}; client told ${r.client.hostDropped}, ` +
+    `${r.cfg?.encoder} recovery ${r.cfg?.recovery}: host dropped ${r.dropped} and cancelled ${r.cancelled} (of ${r.delayed} delayed 200 ms), ` +
+      `asked the encoder to recover ${r.recovering}, answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}; ` +
+      `client told ${r.client.hostDropped} (${r.hostDiscarded} not sent while it waited), ` +
       `recovered ${r.client.recovered} by recovery frame and ${r.client.recoveredByKey} by key frame, ${r.client.discarded} frames discarded meanwhile ` +
       `(${r.lateSkips} times without waiting for a late frame before the recovery frame), ` +
       `${r.client.keyFrames} IDRs decoded, decoder errors ${r.decoderErrors}; client key-frame requests: ${counts(r.keyRequestReasons)}; ` +
       `host restarts: ${counts(r.restarts)}; ${r.fps.toFixed(1)} fps mean over ${r.seconds} s`);
+  const restartsAll = Object.values(r.restarts).reduce((a, b) => a + b, 0);
+  check('loss-recovery ladder: frames held past their deadline are cancelled (rung 1) and recovered without a key frame (rung 2): no IDR, no restart for a loss',
+    r.delayed >= 5 && r.cancelled >= r.delayed - 2 && r.recoveredByFrame >= r.cancelled - 1 && r.recoveredByKey === 0 &&
+      r.forcedKeys === 0 && refRestarts === 0 && r.client.keyFrames <= 1 + restartsAll,
+    `${r.delayed} streams held 200 ms, ${r.cancelled} cancelled at their deadline, ${r.dropped} dropped by the hook; ` +
+      `recoveries: ${r.recoveredByFrame} by recovery frame, ${r.recoveredByKey} by key frame; IDRs: ${r.client.keyFrames} decoded by the client ` +
+      `(1 = the generation's first), ${r.forcedKeys} forced by the host; encoder restarts: ${restartsAll} (${counts(r.restarts)}); ` +
+      `client freezes > 100 ms: ${r.client.freezes}`);
   await checkProbe('reference recovery');
   // The drop test under reference recovery: the client drops a frame itself,
   // reports it ({"t":"lost"}), and the host answers with a recovery frame.

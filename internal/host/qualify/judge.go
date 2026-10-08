@@ -128,7 +128,11 @@ type Cell struct {
 	// session starts this codec on this encoder (Choose matches on both).
 	Quality  string `json:"quality"`
 	LTRSlots int    `json:"ltrSlots"`
-	Verdict  string `json:"verdict"`
+	// IntraRefresh: the intra refresh cycle the stream started with, as a
+	// session's (encoder.Caps.IntraRefreshFrames: the loss-recovery ladder's
+	// safety net, GUIDE 2.3); 0 off. Not matched by Choose.
+	IntraRefresh int    `json:"intraRefresh,omitempty"`
+	Verdict      string `json:"verdict"`
 	// Failures say why a cell failed (or is inconclusive / an error).
 	Failures []string `json:"failures,omitempty"`
 	// Notes: checks that were skipped and why, other observations.

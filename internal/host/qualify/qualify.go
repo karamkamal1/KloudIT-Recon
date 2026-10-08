@@ -251,9 +251,11 @@ func Run(ctx context.Context, o Options) (*Results, error) {
 					if err := ctx.Err(); err != nil {
 						return nil, err
 					}
-					// Started as a session starts this codec: its preset and
-					// LTR slots (encoder.Caps.LTRSlots, as media.HelperVideo).
-					c := Cell{Codec: codec, Quality: quality, LTRSlots: caps.LTRSlots(codec), RC: rc, LiveBitrate: mode}
+					// Started as a session starts this codec: its preset, LTR
+					// slots and intra refresh (encoder.Caps.LTRSlots and
+					// IntraRefreshFrames, as media.HelperVideo).
+					c := Cell{Codec: codec, Quality: quality, LTRSlots: caps.LTRSlots(codec), RC: rc, LiveBitrate: mode,
+						IntraRefresh: caps.IntraRefreshFrames(codec, o.FPS)}
 					if _, ok := caps.Codecs[codec]; !ok {
 						c.Verdict = VerdictError
 						c.Failures = []string{"the helper's encoder has no " + codec + " (" + caps.Unavailable[caps.Backend+"-"+codec] + ")"}
@@ -303,6 +305,9 @@ func cellArgs(o Options, cr cellRun, c *Cell, stream, frameLog string) []string 
 		fmt.Sprintf("--rate-schedule=%d,%d:%d", o.LowKbps, o.HighKbps, cr.step)}
 	if c.LTRSlots > 0 {
 		args = append(args, fmt.Sprintf("--ltr-slots=%d", c.LTRSlots))
+	}
+	if c.IntraRefresh > 0 {
+		args = append(args, fmt.Sprintf("--intra-refresh=%d", c.IntraRefresh))
 	}
 	if o.Width > 0 && o.Height > 0 {
 		args = append(args, fmt.Sprintf("--width=%d", o.Width), fmt.Sprintf("--height=%d", o.Height))
