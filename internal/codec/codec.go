@@ -170,6 +170,7 @@ func HEVCCodecString(sps []byte) (string, error) {
 const (
 	obuSequenceHeader    = 1
 	obuTemporalDelimiter = 2
+	obuMetadata          = 5
 )
 
 type obu struct {
@@ -237,6 +238,11 @@ type AV1SequenceHeader struct {
 	// has no cropping window: an encoder that codes in blocks (RDNA3: 64x16)
 	// writes the padded size here and decoders output the padding rows.
 	MaxWidth, MaxHeight int
+	// The colour description of color_config (ISO/IEC 23091-4 codes; 2 =
+	// unspecified when absent): e.g. 9 / 16 / 9 for BT.2020 primaries, SMPTE
+	// ST 2084, BT.2020 NCL (HDR10), and whether the range is full.
+	ColorPrimaries, TransferCharacteristics, MatrixCoefficients int
+	FullRange                                                   bool
 }
 
 // ParseAV1SequenceHeader parses a sequence header OBU payload up to its
@@ -347,11 +353,48 @@ func ParseAV1SequenceHeader(seqHdr []byte) (AV1SequenceHeader, error) {
 	} else if highBitDepth == 1 {
 		depth = 10
 	}
+	mono := uint32(0)
+	if profile != 1 {
+		mono = br.u(1)
+	}
+	cp, tc, mc := uint32(2), uint32(2), uint32(2)
+	if br.u(1) == 1 { // color_description_present_flag
+		cp, tc, mc = br.u(8), br.u(8), br.u(8)
+	}
+	full := true // sRGB (BT.709 primaries, sRGB transfer, identity matrix) is full range
+	if mono == 1 || !(cp == 1 && tc == 13 && mc == 0) {
+		full = br.u(1) == 1
+	}
 	if br.err {
 		return h, errors.New("codec: truncated AV1 sequence header")
 	}
 	h.Profile, h.Level, h.Tier, h.BitDepth = int(profile), int(level), int(tier), depth
+	h.ColorPrimaries, h.TransferCharacteristics, h.MatrixCoefficients, h.FullRange = int(cp), int(tc), int(mc), full
 	return h, nil
+}
+
+// AV1 metadata OBU types (metadata_type) of HDR10's static metadata.
+const (
+	AV1MetadataHDRCLL  = 1 // content light level (MaxCLL, MaxFALL)
+	AV1MetadataHDRMDCV = 2 // mastering display colour volume
+)
+
+// AV1MetadataTypes returns the metadata_type of every metadata OBU in a
+// low-overhead AV1 bitstream (a temporal unit).
+func AV1MetadataTypes(data []byte) []int {
+	obus, err := SplitOBUs(data)
+	if err != nil {
+		return nil
+	}
+	var out []int
+	for _, o := range obus {
+		if o.typ == obuMetadata {
+			if t, _, err := leb128(o.body); err == nil {
+				out = append(out, int(t))
+			}
+		}
+	}
+	return out
 }
 
 // CodecString returns the WebCodecs codec string "av01.P.LLT.DD".
@@ -376,18 +419,38 @@ func AV1CodecString(seqHdr []byte) (string, error) {
 // low-overhead AV1 bitstream (a temporal unit, or sequence header OBUs as
 // extradata).
 func AV1FrameSize(data []byte) (w, h int, ok bool) {
+	sh, ok := FindAV1SequenceHeader(data)
+	return sh.MaxWidth, sh.MaxHeight, ok
+}
+
+// FindAV1SequenceHeader returns the first sequence header in a low-overhead
+// AV1 bitstream (a temporal unit, or sequence header OBUs as extradata).
+func FindAV1SequenceHeader(data []byte) (AV1SequenceHeader, bool) {
 	obus, err := SplitOBUs(data)
 	if err != nil {
-		return 0, 0, false
+		return AV1SequenceHeader{}, false
 	}
 	for _, o := range obus {
 		if o.typ == obuSequenceHeader {
 			if sh, err := ParseAV1SequenceHeader(o.body); err == nil {
-				return sh.MaxWidth, sh.MaxHeight, true
+				return sh, true
 			}
 		}
 	}
-	return 0, 0, false
+	return AV1SequenceHeader{}, false
+}
+
+// TenBit reports whether a WebCodecs codec string names a 10-bit profile the
+// HDR10 path uses: HEVC Main 10 (profile 2, "hev1.2." / "hvc1.2.") or AV1 at
+// bit depth 10 ("av01.P.LLT.10").
+func TenBit(codec string) bool {
+	switch {
+	case strings.HasPrefix(codec, "hev1.2.") || strings.HasPrefix(codec, "hvc1.2."):
+		return true
+	case strings.HasPrefix(codec, "av01."):
+		return strings.HasSuffix(codec, ".10")
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

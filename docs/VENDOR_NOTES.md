@@ -4451,7 +4451,9 @@ Turn Windows HDR on for the monitor (Settings > System > Display > Use HDR, or W
 
 ### Session integration (for the session rewrite and step 4.5)
 
-internal/host/session.go is unchanged; the Go API is in `internal/host/encoder`:
+(Done in step 3.9/4.5: see "3.9/4.5 HDR end to end" below; the notes here are the helper
+side's.) internal/host/session.go was unchanged by this step; the Go API is in
+`internal/host/encoder`:
 
 - Ask for HDR (`StartParams.HDR`) only when the client can present it (step 4.5: an HDR
   canvas and a decoder for HEVC Main10 / AV1 10-bit, `VideoDecoder.isConfigSupported` with
@@ -6043,3 +6045,218 @@ host's only through the codec; each check below names its client):
 - NVIDIA: unverified (no NVIDIA host available). Test: the same click-to-photon comparison on a
   client with a GeForce GPU (labels ending in `-nvidia`), streaming from the RX 7900 XT host or
   an NVIDIA host when there is one.
+
+## 3.9/4.5 HDR end to end
+
+HDR10 from the host's capture to the browser's screen, opt-in at both ends (GUIDE 3.9 "Client
+4.5. Opt-in." and 4.5). docs/ARCHITECTURE.md "HDR10" is the reference. What changed:
+
+- Host config `"hdr": "off" | "auto"` (default off). Negotiation (`internal/host/hdr.go`,
+  `decideHDR`): HDR10 only when the host config allows it, the client offers it (hello /
+  settings `prefs.hdr`: setting Auto, an HDR display, a WebGPU canvas whose `getConfiguration()`
+  confirms `rgba16float` + `toneMapping: "extended"`, a 10-bit decoder of the codec family),
+  the codec is HEVC or AV1 (the codec choice is not changed for HDR) and the pipeline can make
+  it (the native helper with caps `hdr10`; FFmpeg only for the test pattern with libsvtav1).
+  Else SDR exactly as before; for clients that offered HDR the video config's `hdrNote` says
+  why. Welcome feature `hdr10`; old clients never send `prefs.hdr` and get byte-identical
+  video configs.
+- Video config: `hdr`, `bitDepth` 10, `colorSpace` (WebCodecs `VideoColorSpaceInit`: bt2020 /
+  pq / bt2020-ncl / limited), `hdrMetadata` (from the helper's `started`, or the test
+  pattern's); the codec string from the bitstream (`hev1.2.4…`, `av01.0.xxM.10`). The helper's
+  `start` gets `hdr`; its `captureChanged` `hdr` under a stream started with `hdr` restarts
+  the stream with a new helper (new generation, new video config).
+- FFmpeg test path (`capture: "test"`): `media.HDRTestGraph`, testsrc2 at the 203 cd/m2
+  reference white through `zscale` into 10-bit BT.2020 PQ, a strip with the barcode at codes 64
+  / 940 and nine patches of known codes, libsvtav1 `yuv420p10le` with the colour description
+  and SVT-AV1's `mastering-display` / `content-light` metadata OBUs, preset 10.
+- Browser (`web/static/js/hdr.js`, the WebGPU renderer, the worker, the overlay and Settings →
+  Pipeline → *HDR* / *HDR: SDR white*): the decoded planes copied (`copyTo` + `writeTexture`
+  into `r16uint` textures) instead of `importExternalTexture`, a convert pass (BT.2020 NCL
+  Y'CbCr → PQ R'G'B' in an `rgba16float` intermediate) and an output pass (PQ EOTF, BT.2020 →
+  sRGB / Display P3, then extended range with SDR white = 1.0, or BT.2390 tone mapping to SDR);
+  FSR off for HDR frames (reason in the overlay); the barcode read from the copy; the copy
+  counted in the draw stage and shown in the overlay.
+- The overlay's *Export latency data* button moved from the bottom to the top of the overlay:
+  the *HDR* row (shown for every stream, with why not) made the 2D canvas's overlay one row
+  taller than the E2E's 1280x720 page, and the button below its bottom edge could not be
+  clicked (the overlay is fixed and does not scroll; 4.2 and the FSR step avoided new rows for
+  this reason). Only the button takes pointer events, so the strip next to the toolbar stays
+  click-through.
+
+Choices (and why):
+
+- **HDR on Windows is the native helper's; the FFmpeg path stays SDR there.** FFmpeg 8.1
+  (`release/8.1` sources and `-h filter=ddagrab`, `-h encoder=hevc_amf/hevc_nvenc/av1_*` of the
+  Windows build under Wine) cannot make a correct HDR10 stream from the desktop:
+  `vsrc_ddagrab.c` tags its `10bit` / `x2bgr10` output (R10G10B10A2) as sRGB BT.709 ("According
+  to MSDN, all integer formats contain sRGB image data": DWM's SDR conversion), so real HDR
+  content is only its `16bit` / `rgbaf16` (scRGB linear) output; NVENC lists no FP16 input
+  format; `scale_d3d11` (FFmpeg 8.0+, `format=p010`) runs the D3D11 video processor without any
+  colour-space call, so it does not apply PQ; `amfenc_hevc.c` sets the output transfer /
+  primaries only for NV12 / P010 input (an RGBAF16 surface's input transfer is never set) and
+  `amfenc.c` writes `INPUT_HDR_METADATA` only from mastering display side data, which ddagrab
+  does not attach. A CPU path (`hwdownload` + `zscale`) would be correct but costs ~7 ms per
+  720p frame here, far too slow at 1440p / 4K. The helper converts scRGB → PQ P010 in its own
+  tested shader (3.9).
+- **Not negotiated with the 2D canvas or WebGL2.** Only the WebGPU renderer can configure an
+  extended-range canvas; the client offers HDR only when the renderer that draws is WebGPU
+  (Renderer *WebGPU*, or Auto's stored WebGPU pick; not during the bake-off). Renderer Auto
+  keeps the desynchronized 2D canvas in Chrome, so HDR needs Renderer *WebGPU* chosen, like
+  FSR (the setting's hint and the overlay say so).
+- **FSR off for HDR frames**, with the reason in the overlay: FSR 1's RCAS limiter and EASU's
+  clamp assume SDR-range input, an HDR FSR (on the PQ intermediate, or FSR 1's reversible
+  tonemapper around it) adds two `rgba16float` passes per frame, and it would need its own
+  verification against the reference; the output pass scales bilinearly.
+- **Tone mapping**: ITU-R BT.2390 EETF (the Hermite knee in PQ space, black at 0) on
+  max(R, G, B), hue preserved, from the stream's peak (MaxCLL, else the mastering display's,
+  else 1000 cd/m2) to the SDR white (203 cd/m2 by default), clipped to the SDR gamut.
+- **Plane textures `r16uint`** (`textureLoad`, manual bilinear chroma): `r16unorm` needs
+  `chromium-experimental-unorm16-texture-formats` here.
+
+Found in the sandbox (Chromium 141 from Playwright 1.56, headed on Xvfb, WebGPU on SwiftShader;
+FFmpeg 6.1.1 with SVT-AV1 1.7.0 and libzimg):
+
+- `matchMedia("(dynamic-range: high)")` is false on Xvfb (an SDR display): the E2E's HDR
+  scenario plays an HDR display with a test hook (localStorage `e2e.hdrDisplay` makes the page's
+  `matchMedia` match), everything else is real.
+- An `rgba16float` canvas with `toneMapping: {mode: "extended"}` configures and
+  `getConfiguration()` reports it back (`srgb` and `display-p3`), on SwiftShader too.
+- The canvas reads its float values sRGB-encoded (extended): 0.5 written shows as 128 in a 2D
+  canvas, 0.214 as 55; 2.0 is clipped to 255 there (SDR compositing on Xvfb).
+- dav1d decodes the 10-bit AV1 to `I420P10` frames with `colorSpace` bt2020 / pq / bt2020-ncl /
+  limited; `copyTo` of a 480x270 frame takes about 0.2 ms.
+- `importExternalTexture` of a 10-bit PQ frame does not keep HDR: Chrome tone-maps it into SDR.
+  Read back into an `rgba16float` target, the greys of 100, 203, 1000, 4000 and 10000 cd/m2
+  come out 0.739, 0.786, 0.880, 0.956 and 0.998 (sRGB-encoded; linear about 0.51, 0.58, 0.75,
+  0.90 and 1.0), where extended range with SDR white = 1.0 has 0.49, 1.0, 4.9, 19.7 and 49
+  (linear): the whole 0-10000 cd/m2 range is squeezed into 0-1, reference white at 0.58.
+  Colours outside sRGB do keep extended values (BT.2020 red at 1000 cd/m2: 1.10 / -0.34 /
+  -0.06). So `importExternalTexture` cannot show HDR here and the HDR path copies the planes
+  (`copyTo`); the E2E's HDR unit section logs this record on every run (a later Chrome that
+  keeps the range will show there).
+- FFmpeg 6.1's `drawbox` draws in 8 bits only (a `format=yuv420p10le,drawbox` chain converts
+  down and back), so the test pattern's strip is drawn at 8 bits and converted exactly (codes
+  x 4), and overlaid (`overlay=format=yuv420p10`, both branches split from one source, so they
+  pair by pts).
+- SVT-AV1 1.7 at presets 11 and 12 (`pred-struct=1`) leaves changed 16x16 barcode cells inside
+  the strip's static black area as they were in the reference frame: 2 (preset 11) and 11
+  (preset 12) of 150 frames at 480x270 decoded with a stale or half-updated barcode; preset 10
+  none in 150 (8-bit encodes of the same picture fail alike at 12, so it is the static area,
+  not 10-bit). The HDR test path uses preset 10 (960x540 10-bit: 4.9 s CPU per 150 frames vs
+  2.9 at preset 12).
+
+Verified in the sandbox:
+
+- verified (sandbox): negotiation matrix, Go `TestDecideHDR` (host config off / default /
+  auto x client before HDR, setting off, SDR display, no extended canvas with and without its
+  reason, no 10-bit decoder of the family x H.264 / HEVC / AV1 x a pipeline that cannot: HDR
+  only when all say yes, the first reason otherwise, none for old clients),
+  `TestHDRPipeline` (helper codecs with and without `hdr10`; FFmpeg test pattern with libsvtav1
+  probed / not probed, libaom-av1, ddagrab, gfxcapture), `TestHDRPrefsChange` (a changed setting,
+  display, canvas or decoder list restarts the video), `TestVideoConfigHDR` (an SDR config has
+  none of the new fields; the HDR one's JSON; `CanPresent`).
+- verified (sandbox): `TestSessionHDRChoice` (buildParams on the FFmpeg test path: HDR10 with
+  AV1 for an HDR client; the automatic choice stays H.264 and SDR with the reason; host config
+  off; a client before HDR: SDR, no log line), each decision logged once.
+- verified (sandbox): `TestSessionHelperHDR` (fake helper): `start` with `hdr`; `started`'s HDR
+  fields become the video config (`hvc1.2.4.L153.B0`, bitDepth 10, the colour space, the
+  display's metadata, no note); `captureChanged` `hdr` false → a new helper, generation 2 SDR
+  with `hdrNote` "the host display is not in Windows HDR mode"; `hdr` true again → generation 3
+  HDR10; the client's setting Off → a new helper without `hdr`, the note "HDR is off in the
+  client's settings".
+- verified (sandbox): FFmpeg test path, `TestHDRBuildArgs` (the graph, the colour arguments, the
+  metadata parameters, preset 10; HDR with ddagrab or libx264 refused; SDR args unchanged),
+  `TestHDRTestPatches` (codes, PQ luminance), `TestHDRTestStream` (real libsvtav1 through the
+  Video manager: the probe ran the pattern; the video config's HDR fields and a 10-bit codec
+  string; the AV1 sequence header: 10 bits, colour primaries 9, transfer 16, matrix 9, limited
+  range; the key frame's metadata OBUs HDR_CLL and HDR_MDCV; 20 decoded 10-bit frames with
+  their seq as barcode at codes 64 / 940 and every patch within 8 codes, red off by 5 at
+  3 Mbit/s).
+- verified (sandbox, browser E2E scenario `WebGPU HDR10`: headed Chromium 141 on Xvfb, WebGPU
+  on SwiftShader, the HDR display emulated as above, Renderer WebGPU, codec AV1, the host's
+  test pattern at 480x270 / 15 fps, four runs): the client offers HDR (display, canvas, AV1
+  10-bit) and the host logs `hdr choice hdr=true encoder=libsvtav1`; the video config has
+  `hdr`, bitDepth 10, `av01.0.00M.10`, bt2020 / pq / bt2020-ncl / limited and the pattern's
+  metadata (MaxCLL 10000, mastering 10000 / 0.0001 cd/m2); dav1d outputs `I420P10` frames with
+  that colour space; path extended on an `extended:srgb` canvas (304-306 HDR frames per run),
+  FSR off with its reason although the picture is shown 2x; the canvas pixels at the nine
+  patches (black, 100-10000 cd/m2 greys, BT.2020 red / green / blue) match the CPU reference
+  of the codes the frame carried within 0.0032, and those codes equal the host's (off by 0);
+  the barcode probe reads every sampled frame from the copied planes (`copyTo I420P10 (HDR
+  planes)`, 10 of 10 = seq); the plane copy costs p50 0.25 ms, p95 0.47-1.44 ms (CPU, 0.41
+  MB per frame), inside the draw stage (draw p50 0.7-0.8 ms); 14-16 fps of 15, no key-frame
+  requests, no VideoFrame leaked, stage bookkeeping exact; the overlay shows the *HDR*,
+  *colour*, *metadata*, *decoded* and *copy* rows. Then *HDR* Off live: the running HDR stream
+  is tone-mapped at once (pixels = the reference within 0.46 levels of 255, bgra8unorm
+  canvas), and the host moves to a new SDR generation (`av01.0.04M.08`, no colour fields,
+  `hdrNote` "HDR is off in the client's settings"; overlay `off · HDR is off in the client's
+  settings`), the canvas back to SDR.
+- verified (sandbox, browser E2E `HDR shader (unit)`, the renderer's passes on fabricated
+  10-bit frames read back from the canvas texture, against an independent JS reference: matrix,
+  PQ EOTF, primaries by solving the xy primaries, BT.2390): `getConfiguration()` confirms
+  `rgba16float` + extended; extended range on an sRGB canvas at SDR white 203 worst 0.0030 and
+  on a Display P3 canvas at white 100 worst 0.0036 (half-float precision; black, 1 / 100 / 203
+  / 1000 / 4000 / 10000 cd/m2, a code above 940, BT.2020 primaries at 1000 and 10000 cd/m2);
+  tone mapped from peaks 1000 and 10000 to SDR worst 0.33 / 0.43 levels of 255; I420P12,
+  I444P10 and NV12 frames worst 0.0030 / 0.0030 / 0.0032; 4:2:0 chroma siting
+  (`chroma_sample_loc_type` 0, bilinear) worst 0.0011; and the `importExternalTexture` record
+  above.
+- verified (sandbox): the SDR scenarios unchanged with `"hdr": "auto"` on the host: the full
+  browser E2E 240 of 240 (load average 5-6; their clients send `prefs.hdr` and get SDR: 2D
+  canvas and WebGL2 say "HDR needs the WebGPU renderer", WebGPU here "the display is not in HDR
+  mode"), and the Go integration test (`internal/e2e`). Two earlier full runs (load average 6-9
+  from other checkouts' jobs) failed the known load-sensitive checks (real-time frame rates,
+  the bake-off's fps after, the software reference-recovery count), the *Export latency data*
+  click fixed above, and once the dashboard's API answered 401 so the host-online waits after
+  host restarts timed out (also in another checkout's run of the base commit).
+
+Hardware checks (the host GPU encodes, the client GPU decodes and presents; HDR needs both an
+HDR display on the host, in Windows HDR mode, and on the client):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (end to end): host.json `"hdr": "auto"` with the
+  native helper (pipeline auto), Windows HDR on for the streamed monitor (Win+Alt+B), an HDR
+  game or the Windows HDR Calibration app's test patterns full screen. Client: a Windows PC with
+  an HDR display in HDR mode, Chrome or Edge 131+, Settings → Pipeline → Renderer *WebGPU*,
+  Reconnect, *HDR* Auto. host.log: `hdr choice hdr=true encoder=hevc_amf_helper`, the
+  `encoder helper started` line with `hdr=true bit_depth=10 color_space=bt2020-pq`; the overlay
+  (Ctrl+Alt+Shift+S): *HDR* `HDR10 · extended range (rgba16float, srgb, SDR white 203 cd/m²)`,
+  *colour* `bt2020/pq/bt2020-ncl/limited · 10-bit`, *metadata* with the host display's peak as
+  mastering max and MaxCLL, *decoded* format and colour space (record the format Chrome's
+  hardware HEVC decoder gives: `P010`, `I420P10` or an opaque frame that falls back to
+  `importExternalTexture`, said in the *HDR* row). Look: specular highlights and the
+  calibration app's bright patches brighter than the desktop's white, with detail (not clipped
+  flat), the desktop and taskbar as bright as the client's SDR content, no washed-out or
+  oversaturated colours; compare side by side with the host's own display.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (copy cost on the client GPU): in the same session
+  at 1920x1080, 2560x1440 and 3840x2160 (Resolution setting), 60 and 120 fps, record the
+  overlay's *copy (copyTo + upload)* p50 / p95 and MB/frame, and the latency table's *draw* row
+  with HDR Auto and HDR Off (SDR: `importExternalTexture`). Pass: copy p95 below 2 ms at 1440p
+  (expect 3 bytes per pixel: 11 MB per 1440p frame; a hardware decoder's frame needs a GPU
+  readback in `copyTo`). If it is too slow at 4K, record it: the follow-up is
+  `importExternalTexture` once Chrome keeps HDR there, or a GPU-side plane import.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (MaxCLL metadata): with the stream running,
+  `recon-encoder.exe --encode-test=hdr.hevc --backend=amf --codec=hevc --capture=dda --hdr=1
+  --frames=300` as in 3.9, then `ffprobe -show_frames -read_intervals %+#1 hdr.hevc`: the
+  content light level `max_content` equals the overlay's MaxCLL and the display's peak.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Windows HDR toggled during a session): press
+  Win+Alt+B on the host while streaming: host.log `capture changed reason=hdr hdr=false`, then
+  `restarting video reason="Windows HDR turned off"`; the client gets a new generation with the
+  overlay *HDR* `off · the host display is not in Windows HDR mode` and correct SDR colours; on
+  again: back to HDR10. No freeze longer than the restart (overlay *Freezes*).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (tone mapping): with an HDR stream running set *HDR*
+  Off: the picture is tone-mapped at once (highlights compressed, not clipped white; the
+  overlay says `tone-mapped to SDR (BT.2390, …)` until the new SDR generation), then SDR;
+  switch the client's Windows HDR off during an HDR stream: the same, through the display
+  change.
+- NVIDIA: unverified (no NVIDIA host available). Test: the end-to-end, copy-cost, MaxCLL and
+  toggle checks above with an RTX host (`hevc_nvenc_helper`; AV1 on RTX 40/50 with the codec
+  set to AV1) and, as a client, a GeForce PC with an HDR display (Chrome's NVIDIA hardware
+  decoder: record the frame format and the copy cost).
+- Browser matrix: unverified. Record per browser and display: Chrome / Edge 131+ on Windows 11
+  with an HDR display in HDR mode (expected: HDR offered, extended range); the same browser with
+  Windows HDR off (expected: not offered, "the client's display is not in HDR mode"); Chrome on
+  macOS with an XDR / HDR display (MacBook Pro): `dynamic-range: high` and the extended canvas
+  expected, Display P3 (`color-gamut: p3`) as the canvas colour space, HEVC Main 10 via
+  VideoToolbox; Firefox and Safari: expected not offered (no WebGPU extended-range canvas or
+  no `getConfiguration`), the reason in the overlay. For each: the overlay's *HDR* rows and a
+  photo of a 1000 cd/m2 patch next to SDR white.

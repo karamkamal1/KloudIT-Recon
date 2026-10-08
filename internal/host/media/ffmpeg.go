@@ -56,6 +56,7 @@ type Caps struct {
 
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
+	hdrTest      bool // HDRTestGraph and libsvtav1's 10-bit HDR10 encode work
 	// intraRefresh holds the periodic intra refresh mode (IntraRefreshOn,
 	// IntraRefreshSingleSlice) of the encoders that run with one.
 	intraRefresh map[string]string
@@ -205,6 +206,19 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			mu.Unlock()
 			if err != nil && log != nil {
 				log.Info("test pattern frame barcode unavailable", "err", err)
+			}
+		}()
+	}
+	if available["libsvtav1"] && hdrTestFilters(c.Filters) {
+		wg.Add(1)
+		go func() { // alongside the encoder tests, like the barcode's
+			defer wg.Done()
+			err := testHDRTest(ctx, ffmpeg)
+			mu.Lock()
+			c.hdrTest = err == nil
+			mu.Unlock()
+			if err != nil && log != nil {
+				log.Info("HDR10 test pattern unavailable", "err", err)
 			}
 		}()
 	}
@@ -383,13 +397,20 @@ func alignmentFor(n, coded, def int) int {
 // codedSize runs ffmpeg with args (input and encoder, see blackFramesArgs)
 // into NUT and returns the coded frame size of the AV1 stream it writes.
 func codedSize(ctx context.Context, ffmpeg string, args []string) (int, int, error) {
+	sh, err := av1Header(ctx, ffmpeg, args)
+	return sh.MaxWidth, sh.MaxHeight, err
+}
+
+// av1Header runs ffmpeg with args (input and encoder) into NUT and returns
+// the first sequence header of the AV1 stream it writes.
+func av1Header(ctx context.Context, ffmpeg string, args []string) (codec.AV1SequenceHeader, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var stdout, stderr bytes.Buffer
 	cmd := quietCmd(ctx, ffmpeg, append(args, "-f", "nut", "-write_index", "0", "pipe:1")...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return 0, 0, fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
+		return codec.AV1SequenceHeader{}, fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
 	}
 	d := nut.NewDemuxer(&stdout, proto.MaxFrameSize)
 	for {
@@ -402,14 +423,14 @@ func codedSize(ctx context.Context, ffmpeg string, args []string) (int, int, err
 			continue
 		}
 		// The sequence header is in the extradata, the key frame, or both.
-		if w, h, ok := codec.AV1FrameSize(st.Extradata); ok {
-			return w, h, nil
+		if sh, ok := codec.FindAV1SequenceHeader(st.Extradata); ok {
+			return sh, nil
 		}
-		if w, h, ok := codec.AV1FrameSize(pkt.Data); ok {
-			return w, h, nil
+		if sh, ok := codec.FindAV1SequenceHeader(pkt.Data); ok {
+			return sh, nil
 		}
 	}
-	return 0, 0, errors.New("no AV1 sequence header in the encoder output")
+	return codec.AV1SequenceHeader{}, errors.New("no AV1 sequence header in the encoder output")
 }
 
 // testCaptureClock runs the exact capture-clock filter and encoder time base
@@ -457,7 +478,7 @@ func testBarcode(ctx context.Context, ffmpeg string) error {
 
 // probeFilters are the filters BuildArgs may use.
 var probeFilters = []string{"ddagrab", "gfxcapture", "vsrc_amf", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime",
-	"testsrc2", "settb", "setpts", "drawbox", "select"}
+	"testsrc2", "settb", "setpts", "drawbox", "select", "split", "crop", "overlay", "zscale"}
 
 // parseFilters returns which of probeFilters "ffmpeg -filters" lists.
 func parseFilters(out []byte) map[string]bool {
@@ -710,6 +731,13 @@ type Params struct {
 	// encoder that pads the coded picture (AV1 on RDNA3). Test source only:
 	// tests of the client's crop path without such a GPU.
 	TestPad int
+	// HDR asks for an HDR10 generation (the session's decision, GUIDE 3.9 /
+	// 4.5): on the FFmpeg path only the test source with libsvtav1 makes one
+	// (HDRTestGraph, CanHDRTest); the native helper makes one when the
+	// captured output is in Windows HDR mode. HDRNote says why the generation
+	// is not HDR, for clients that asked (VideoConfig.HDRNote).
+	HDR     bool
+	HDRNote string
 }
 
 // OutputSize returns the size of the picture BuildArgs hands the encoder
@@ -853,6 +881,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	e := p.Encoder
 	args := []string{"-hide_banner", "-loglevel", "warning", "-nostdin"}
 	gpuFrames := false      // source produces D3D11 frames (amf: AMF surfaces)
+	var testW, testH int    // the test source's size
 	clock := p.CaptureClock // pts = wall-clock capture time in µs
 	var chain string
 	cursor := "0"
@@ -917,23 +946,30 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		args = append(args, "-i", fmt.Sprintf("%s+%d,%d", p.Source.Display, p.Source.X, p.Source.Y))
 		chain = "[0:v]null"
 	case "test":
-		w, h := p.Source.NativeW, p.Source.NativeH
-		if w == 0 {
-			w, h = 1280, 720
+		testW, testH = p.Source.NativeW, p.Source.NativeH
+		if testW == 0 {
+			testW, testH = 1280, 720
 		}
-		chain = fmt.Sprintf("testsrc2=s=%dx%d:r=%d", w, h, p.FPS)
+		chain = fmt.Sprintf("testsrc2=s=%dx%d:r=%d", testW, testH, p.FPS)
 		if c.Filters["realtime"] {
 			chain += ",realtime"
 		}
 	default:
 		return nil, fmt.Errorf("unknown capture backend %q", p.Source.Backend)
 	}
+	if p.HDR && (p.Source.Backend != "test" || e.Name != HDRTestEncoder) {
+		return nil, errHDRSource
+	}
 	if clock {
 		// Evaluated as the frame leaves the source (after realtime pacing for
 		// the test source), before any conversion or encoding.
 		chain += "," + CaptureClockFilter
 	}
-	if p.Barcode && p.Source.Backend == "test" {
+	switch {
+	case p.HDR:
+		// HDR10 (10 bits from here on), the barcode in its strip.
+		chain = HDRTestGraph(chain, testW, testH, p.Barcode)
+	case p.Barcode && p.Source.Backend == "test":
 		// The test pattern is generated at the output size: cells stay
 		// BarcodeCell pixels in the encoded picture.
 		chain += "," + BarcodeFilter(proto.BarcodeCell)
@@ -956,6 +992,8 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	case e.Vendor == "vaapi":
 		args = append([]string{"-vaapi_device", vaapiDevice()}, args...)
 		chain += ",format=nv12,hwupload"
+	case p.HDR:
+		chain += ",format=yuv420p10le"
 	default:
 		if p.Width > 0 && p.Height > 0 && !gpuFrames {
 			chain += fmt.Sprintf(",scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", p.Width, p.Height)
@@ -1003,6 +1041,9 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	}
 	args = append(args, "-c:v", e.Name)
 	args = append(args, c.encoderArgs(p, bufKbits, gop)...)
+	if p.HDR {
+		args = append(args, HDRColorArgs...)
+	}
 	if clock {
 		// Keep µs precision through the encoder; its frame rate still comes
 		// from the source (checked: libx264/libsvtav1 bitrate and fps unchanged).
@@ -1143,14 +1184,29 @@ func (c *Caps) encoderArgs(p Params, bufKbits, gop int) []string {
 			}
 			a = append(a, common...)
 		case "libsvtav1":
-			opt("preset", "12")
+			// HDR10 test pattern: preset 10. At 11 and 12 SVT-AV1 1.7
+			// leaves some changed 16x16 barcode cells in its static black
+			// strip as they were in the reference frame (2 and 11 of 150
+			// frames at 480x270 here; docs/VENDOR_NOTES.md 3.9/4.5).
+			preset := "12"
+			if p.HDR {
+				preset = "10"
+			}
+			opt("preset", preset)
 			// rc=2: CBR. FFmpeg's wrapper asks for VBR unless -maxrate equals
 			// -b:v; with low-delay prediction (pred-struct=1) SVT-AV1 1.7
 			// forces CBR with a warning, but 4.x fails ("VBR Rate control is
 			// currently not supported for LOW_DELAY, use CBR mode"). -maxrate
 			// = -b:v fails on 1.7 ("Max Bitrate must be greater than Target
 			// Bitrate"); rc=2 works on both.
-			opt("svtav1-params", "pred-struct=1:lookahead=0:scd=0:rc=2")
+			params := "pred-struct=1:lookahead=0:scd=0:rc=2"
+			if p.HDR {
+				// HDR10 metadata OBUs (FFmpeg's wrapper only passes the
+				// side data of decoded frames, which the test pattern has
+				// none of).
+				params += ":" + svtav1HDRParams(HDRTestMetadata)
+			}
+			opt("svtav1-params", params)
 			a = append(a, "-b:v", br, "-g", strconv.Itoa(gop))
 		case "libaom-av1":
 			opt("usage", "realtime")

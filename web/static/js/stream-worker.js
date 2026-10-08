@@ -9,12 +9,14 @@
 //     -> desynchronized 2D canvas, WebGL2 texture upload or WebGPU external
 //        texture (renderers.js), on a canvas sized to device pixels; WebGPU
 //        upscales a picture shown larger than it streams with FSR 1 (fsr1.js)
+//        and draws HDR10 streams from a copy of the decoded planes (hdr.js)
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
 import { runSelfTests, helloDecoder } from './decoder-selftest.js';
 import { createRenderer, LABELS, PATHS, PICK, pickPath, Samples, withTimeout } from './renderers.js';
 import { Pacer } from './pacing.js';
+import { HDR_CODECS, HDR_WHITE, hdrWhite, sourcePeak } from './hdr.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -501,6 +503,7 @@ function rendererInfo() {
     name: r.name, slot: r.slot, mode: pres.mode, desynchronized: r.desynchronized, gpu: r.gpu, canvas: r.canvasSize(),
     errors: pres.errors, drawErrors: pres.drawErrors, bake: bakeState(),
     upscale: { ...r.upscaleInfo(), cpu: { fsr: drawUp.fsr.summary(), plain: drawUp.plain.summary() } },
+    hdr: r.hdrInfo(),
   };
 }
 
@@ -511,6 +514,129 @@ function applyUpscale() {
   } catch (e) {
     renderError(e);
   }
+}
+
+// ---------------------------------------------------------------------------
+// HDR10 (guide step 4.5, hdr.js). The client offers HDR to the host (hello
+// and settings prefs.hdr) when the user's setting is Auto, the display is in
+// HDR mode (the main thread's matchMedia "(dynamic-range: high)"), the
+// renderer that draws is WebGPU (not during Auto's bake-off: the 2D canvas
+// and WebGL2 never get HDR streams) and its canvas keeps extended range
+// (WebGPURenderer.hdrCanvasCheck), and lists its 10-bit decoders
+// (isConfigSupported of HEVC Main 10 / AV1 10-bit); the host decides
+// (internal/host/hdr.go). Frames of an HDR10 generation are copied plane by
+// plane before the frame pacer (hdrPrepare: one copy at a time, a newer frame
+// supersedes one waiting for it; the copy counts in the draw stage) and drawn
+// with extended range, or tone-mapped to SDR while the setting is Off, the
+// display is not HDR or the canvas lacks extended range (until the host's SDR
+// generation comes).
+
+const hdr = {
+  mode: 'auto', display: false, white: HDR_WHITE, space: 'srgb',
+  canvas: { ok: false, why: 'no renderer yet' }, // the drawing renderer's extended-range check
+  decoders: [], // 10-bit decoders: [{ family, hw }]
+  hostOffers: false, // welcome feature hdr10 (host config "hdr": "auto")
+  copying: false, next: null, // hdrPrepare's copy and the frame waiting for it
+  check: null, // test hook (hdrCheck): canvas pixels and decoded codes at points
+  failedLog: new Set(),
+};
+
+// Why this client cannot present HDR ('' when it can).
+function hdrWhy() {
+  if (!hdr.canvas.ok) return hdr.canvas.why;
+  if (!hdr.decoders.length) return 'no 10-bit decoder (HEVC Main 10 or AV1 10-bit) in this browser';
+  if (!hdr.display) return 'the display is not in HDR mode';
+  if (hdr.mode !== 'auto') return 'HDR is Off in the settings';
+  return '';
+}
+
+// The prefs.hdr the host gets (hello and every settings message).
+const hdrPrefs = () => ({ mode: hdr.mode, display: hdr.display, canvas: hdr.canvas.ok, decoders: hdr.decoders.map((d) => d.family), why: hdrWhy() });
+
+// The renderer's output for HDR frames: extended range when the client could
+// ask for HDR now, else tone mapping (and why).
+function applyHdr(redraw = true) {
+  const why = hdrWhy();
+  for (const r of pres.list) r.setHdr({ want: !why, why, white: hdr.white, space: hdr.space, peak: sourcePeak(video.cfg?.hdrMetadata) });
+  if (!redraw) return;
+  try {
+    renderer?.redraw(); // a still HDR picture shows the change at once
+  } catch (e) {
+    renderError(e);
+  }
+}
+
+// 10-bit decoders of the HDR10 codecs (prefer-hardware first, as the stream's).
+async function hdrDecoders() {
+  const out = [];
+  for (const [family, codec] of Object.entries(HDR_CODECS)) {
+    const q = (hardwareAcceleration) => VideoDecoder.isConfigSupported({ codec, codedWidth: 1920, codedHeight: 1080, hardwareAcceleration })
+      .then((r) => r.supported).catch(() => false);
+    const hw = prefs.decoder !== 'software' && (await q('prefer-hardware'));
+    if (hw || (await q('no-preference'))) out.push({ family, hw });
+  }
+  return out;
+}
+
+// Copies an HDR10 frame's planes (renderer.prepare), then hands it to the
+// pacer; one copy at a time, a newer frame replaces the one waiting.
+function hdrPrepare(item) {
+  if (hdr.copying) {
+    if (hdr.next) dropFrame(hdr.next, 'superseded');
+    hdr.next = item;
+    return;
+  }
+  hdr.copying = true;
+  const r = renderer;
+  const f = item.frame;
+  const fmt = f.format;
+  const check = hdr.check;
+  hdr.check = null;
+  r.prepare(f, (buf, layout, planes) => {
+    // The latency probe reads the barcode from the copy (the staging buffer is reused).
+    const vr = f.visibleRect;
+    const cell = probe.mode === 'seq' ? P.BARCODE_CELL : P.visibleArea(video.cfg, vr.width, vr.height, f.displayWidth, f.displayHeight).w / P.BARCODE_WALLCLOCK_CELLS;
+    const p0 = plane0(fmt);
+    if (probe.mode !== 'off' && p0 && P.BARCODE_COLS * cell <= vr.width && P.BARCODE_ROWS * cell <= vr.height) {
+      planes.luma = lumaFromPixels(buf, layout[0].offset, layout[0].stride, p0, cell);
+      planes.lumaMethod = `copyTo ${fmt} (HDR planes)`;
+    }
+    if (check) planes.capture = { points: check.points, codes: hdrCodes(buf, layout, planes.layout, check.points), resolve: (res) => post('hdrCheck', { result: { ...res, codes: planes.capture.codes, format: fmt, frameColorSpace: f.colorSpace?.toJSON?.() } }) };
+  }).then((planes) => {
+    item.planes = planes;
+    item.copied = now();
+  }, (e) => {
+    // This format has no working plane path: its frames draw through
+    // importExternalTexture (Chrome's SDR conversion) from now on.
+    if (!r.destroyed && !r.lost) r.hdr.failed[fmt] = e.message;
+    if (!hdr.failedLog.has(fmt)) {
+      hdr.failedLog.add(fmt);
+      post('log', { text: `HDR: copying ${fmt || 'opaque'} frames failed (${e.message}); drawing them through importExternalTexture` });
+    }
+    if (check) hdr.check = check;
+  }).finally(() => {
+    hdr.copying = false;
+    if (f.codedWidth) pacer.offer(item);
+    else item.planes?.release(); // closed meanwhile (teardown)
+    const n = hdr.next;
+    hdr.next = null;
+    if (n) hdrPrepare(n);
+  });
+}
+
+// The 10-bit codes [Y, Cb, Cr] at points of a copied frame (nearest chroma sample; test hook).
+function hdrCodes(buf, layout, L, points) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const bytes = L.planes[0].format.startsWith('r8') || L.planes[0].format.startsWith('rg8') ? 1 : 2;
+  const at = (i, x, y, k = 0, n = 1) => {
+    const o = layout[i].offset + y * layout[i].stride + (x * n + k) * bytes;
+    return (bytes === 2 ? dv.getUint16(o, true) : dv.getUint8(o)) * L.scale;
+  };
+  return points.map(([x, y]) => {
+    const cx = Math.floor(x / L.sub[0]);
+    const cy = Math.floor(y / L.sub[1]);
+    return L.semi ? [at(0, x, y), at(1, cx, cy, 0, 2), at(1, cx, cy, 1, 2)] : [at(0, x, y), at(1, cx, cy), at(2, cx, cy)];
+  });
 }
 
 // The next renderer takes over before a draw; it is announced after it.
@@ -679,6 +805,7 @@ async function configureDecoder(cfg) {
   video.queue = [];
   video.submitted = 0;
   const base = { codec: cfg.codec, optimizeForLatency: true, codedWidth: cfg.codedWidth || cfg.width, codedHeight: cfg.codedHeight || cfg.height };
+  if (cfg.hdr && cfg.colorSpace) base.colorSpace = cfg.colorSpace; // HDR10: BT.2020 PQ (the bitstream says so too)
   const avoidHW = video.softwareFor.has(cfg.family);
   const wantHW = prefs.decoder !== 'software' && !avoidHW;
   if (avoidHW && prefs.decoder !== 'software') post('log', { text: `${cfg.codec}: decoding in software, the hardware decoder held frames back in the self-test` });
@@ -770,6 +897,7 @@ async function onVideoConfig(cfg) {
   video.lostGen = -1;
   video.recover = null;
   post('video', { cfg });
+  applyHdr(false); // the stream's peak for tone mapping
   if (await configureDecoder(cfg)) drainEarly();
 }
 
@@ -1107,6 +1235,15 @@ function trackFrame(f) {
   frames.max = Math.max(frames.max, openFrames());
 }
 
+// A decoded frame closed unseen (superseded, or stale in Smooth): its HDR
+// planes are free again, and it counts as decoded.
+function dropFrame(it, why) {
+  it.planes?.release();
+  it.frame.close();
+  if (why === 'superseded') stats.superseded++;
+  if (it.meta) ackFrame(it.meta, it.decoded);
+}
+
 // Frame pacing (step 4.4, pacing.js; prefs.pacing, applied live). Lowest
 // latency draws on decode, one task after the output: outputs already queued
 // behind it (a burst after a stall or a backlog, a decoder that releases
@@ -1117,11 +1254,7 @@ function trackFrame(f) {
 // frames: pacer.counts.stale). The wait is the "hold" stage.
 const pacer = new Pacer({
   draw: (it) => drawFrame(it.frame, it.meta, it.decoded, it),
-  drop: (it, why) => {
-    it.frame.close();
-    if (why === 'superseded') stats.superseded++;
-    if (it.meta) ackFrame(it.meta, it.decoded);
-  },
+  drop: dropFrame,
   newerComing: () => video.inflight.size + video.queue.length > 0,
   refreshMs: () => pres.refreshMs, // until its ticks show the interval
   // Read on every request (a browser without it in workers: the main thread's ticks).
@@ -1146,7 +1279,10 @@ function onDecoded(frame) {
     stats.decodeN++;
   }
   feedDecoder();
-  pacer.offer({ frame, meta, decoded });
+  const item = { frame, meta, decoded };
+  // HDR10 on the WebGPU renderer: the planes are copied first (hdrPrepare).
+  if (renderer?.hdrDraws(frame, video.cfg)) hdrPrepare(item);
+  else pacer.offer(item);
 }
 
 // Frame acknowledgement (0x40): one-way delay and decode time of a decoded frame.
@@ -1175,9 +1311,19 @@ function drawFrame(frame, meta, decoded, pace) {
   }
   if (pres.next) switchRenderer();
   const req = probeStart(frame, meta, vis);
+  // HDR planes copied for this renderer (another one took over: drawn as usual).
+  let planes = pace?.planes;
+  if (planes && planes.renderer !== renderer) {
+    planes.release();
+    planes = null;
+  }
+  if (req && planes?.luma) {
+    req.luma = Promise.resolve(planes.luma);
+    req.method = planes.lumaMethod;
+  }
   let drew = true;
   try {
-    renderer.draw(frame, req, vis);
+    renderer.draw(frame, req, vis, planes);
   } catch (e) {
     drew = false;
     frame.close();
@@ -1289,8 +1435,11 @@ function recordStages(m, decoded, start, drawn, pace) {
   s[3] = m.recv - m.first;
   s[4] = m.t - m.recv;
   s[5] = decoded - m.t;
-  s[ST.hold] = start - decoded;
-  s[ST.draw] = drawn - start;
+  // An HDR frame's plane copy (between the decoder's output and the pacer)
+  // counts in the draw stage: hold stays the pacing wait.
+  const copy = pace?.copied ? pace.copied - decoded : 0;
+  s[ST.hold] = start - decoded - copy;
+  s[ST.draw] = drawn - start + copy;
   const fromCapture = s[0] !== null;
   const pacing = pace?.via === 'hop' ? 'latency' : 'smooth';
   const up = renderer.upscaled; // FSR drew it: its passes are in the draw stage
@@ -1301,6 +1450,7 @@ function recordStages(m, decoded, start, drawn, pace) {
       presentUs: presUs, captureUs: capUs, encodeSubmitUs: subUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset,
       first: m.first, last: m.recv, submit: m.t, output: decoded,
       drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null, refresh: pace?.refresh ?? null, upscaled: up,
+      copied: pace?.copied ?? null,
     },
   };
   lat.recs.push(rec);
@@ -1450,7 +1600,7 @@ function probeStart(frame, meta, vis) {
 function probeSample(req, drawn) {
   const luma = req.clone ? readCornerLuma(req.clone, req.cell) : req.luma;
   if (!luma) { probe.skipped++; return; }
-  if (!req.clone) probe.method = `${req.via} readback`;
+  if (!req.clone) probe.method = req.method || `${req.via} readback`;
   probe.inflight++;
   luma.then((l) => probeResult(req, drawn, l), (e) => {
     if (e?.message !== probe.lastError) post('log', { text: `latency probe readback failed: ${e?.message}` });
@@ -1463,6 +1613,7 @@ function probeSample(req, drawn) {
 // bits), or RGB channel offsets.
 function plane0(fmt) {
   if (fmt === 'RGBA' || fmt === 'RGBX') return { px: 4, r: 0, g: 1, b: 2 };
+  if (fmt === 'P010') return { px: 2, shift: 8 }; // 10 bits at the top of 16
   if (fmt === 'BGRA' || fmt === 'BGRX') return { px: 4, r: 2, g: 1, b: 0 };
   if (fmt === 'NV12' || /^I4(20|22|44)A?$/.test(fmt || '')) return { px: 1, shift: 0 };
   const m = /^I4(20|22|44)A?P(10|12)$/.exec(fmt || '');
@@ -1714,6 +1865,7 @@ function onControl(m) {
       fb.on = hostFeatures.includes(P.FEATURE_RATE_REPORT);
       if (fb.on && !fb.timer) fb.timer = setInterval(sendRateReport, RATE_REPORT_MS);
       probe.wallOffsetUs = m.wallOffsetUs ?? null;
+      hdr.hostOffers = hostFeatures.includes(P.FEATURE_HDR);
       updateProbeMode();
       post('welcome', { info: m });
       break;
@@ -1806,6 +1958,8 @@ function postStats() {
     // Presentation (4.3): the active path, what its context reports, the
     // canvas size (device pixels) and the bake-off's progress or result.
     renderer: renderer ? rendererInfo() : null,
+    // HDR10 (4.5): what this client offers the host and why not.
+    hdr: { ...hdrPrefs(), decoderInfo: hdr.decoders, hostOffers: hdr.hostOffers, white: hdr.white, space: hdr.space },
     // Frame pacing (4.4): the mode, where Smooth's refresh ticks come from,
     // the refresh interval it works with (its ticks' or the page-load
     // measurement), the draws per source and Smooth's stale (dropped) and
@@ -1863,6 +2017,13 @@ async function start(msg) {
   if (msg.audioSab) audio.ring = new RingWriter(msg.audioSab);
   if (msg.audioPort) audio.port = msg.audioPort;
   await setupRenderers(msg);
+  hdr.mode = prefs.hdr === 'off' ? 'off' : 'auto';
+  hdr.display = !!prefs.hdrDisplay;
+  hdr.white = hdrWhite(prefs.hdrWhite);
+  hdr.space = prefs.gamutP3 ? 'display-p3' : 'srgb';
+  hdr.canvas = renderer.name !== 'webgpu' ? { ok: false, why: `HDR needs the WebGPU renderer (this connection draws with ${LABELS[renderer.name] || renderer.name})` }
+    : pres.mode === 'bakeoff' ? { ok: false, why: 'HDR needs Renderer WebGPU (Auto is measuring the renderers)' } : renderer.hdrCanvasOk;
+  const hdrDecs = renderer.name === 'webgpu' ? hdrDecoders() : Promise.resolve([]);
   const decoders = await probeDecoders();
   post('decoders', { decoders });
   const tested = selfTestDecoders(decoders); // while connecting
@@ -1878,9 +2039,12 @@ async function start(msg) {
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   const helloDecoders = await tested;
+  hdr.decoders = await hdrDecs;
+  applyHdr(false);
+  post('log', { text: `HDR: ${hdrWhy() || 'offered to the host'} (canvas ${hdr.canvas.ok ? 'extended range' : 'SDR'}, 10-bit decoders ${hdr.decoders.map((d) => `${d.family}${d.hw ? ' hw' : ''}`).join(', ') || 'none'})` });
   transport.sendControl({
     t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
-    client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
+    client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: { ...msg.hostPrefs, hdr: hdrPrefs() },
   });
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
@@ -1907,6 +2071,7 @@ self.onmessage = (ev) => {
     case 'dg': transport?.sendDatagram(m.b); break;
     case 'ctl':
       if (m.m?.t === 'pause' || m.m?.t === 'resume') freeze.drawn = 0; // not a freeze
+      if (m.m?.t === 'settings' && m.m.prefs) m.m.prefs = { ...m.m.prefs, hdr: hdrPrefs() }; // what this client can present now
       transport?.sendControl(m.m);
       break;
     case 'prefs':
@@ -1914,7 +2079,16 @@ self.onmessage = (ev) => {
       updateProbeMode();
       pacer.setMode(prefs.pacing); // live
       if (['upscale', 'sharpness', 'fsrDenoise', 'fsrInput'].some((k) => k in m.prefs)) applyUpscale(); // live
+      if (['hdr', 'hdrWhite', 'hdrDisplay'].some((k) => k in m.prefs)) {
+        // Live: an HDR stream is tone-mapped at once when HDR is no longer
+        // wanted (the main thread's settings message moves the host to SDR).
+        hdr.mode = prefs.hdr === 'off' ? 'off' : 'auto';
+        hdr.display = !!prefs.hdrDisplay;
+        hdr.white = hdrWhite(prefs.hdrWhite);
+        applyHdr();
+      }
       break;
+    case 'hdrCheck': hdr.check = { points: m.points }; break; // test hook: the next HDR frame's canvas pixels and codes
     case 'tick': pacer.tick(m.t - performance.timeOrigin, 'main'); break; // the main thread's animation frame (absolute ms)
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;

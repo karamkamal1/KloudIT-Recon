@@ -56,6 +56,7 @@ type Session struct {
 	prefs       proto.Prefs
 	monitor     platform.Monitor
 	codecWhy    string // last codec choice and its reason, logged once
+	hdrChoice   string // last HDR10 decision (chooseHDR), logged once
 	alignNotice string // last coded-size alignment notice, sent once
 	amfFallback string // why the last generation did not use capture "amf", logged once
 	amfFailed   atomic.Bool
@@ -346,6 +347,9 @@ func (s *Session) sendWelcome() error {
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		w.Features = append(w.Features, proto.FeatureFrameExt)
 	}
+	if s.a.cfg.hdr() == proto.HDRAuto {
+		w.Features = append(w.Features, proto.FeatureHDR)
+	}
 	// The test pattern's frames carry their seq as a barcode: FFmpeg's
 	// drawbox chain, or the native helper's conversion shader.
 	if helper, _, _ := s.onHelper(); s.a.backendFor(s.prefs) == "test" && (s.a.caps.CanDrawBarcode() || helper) {
@@ -610,6 +614,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	case backend == "amf":
 		s.useAMFCapture(&p, mon)
 	}
+	s.chooseHDR(&p, prefs)
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
 	s.triedMu.Unlock()
@@ -1279,7 +1284,7 @@ const resizeSettle = 300 * time.Millisecond
 // (secure desktop, mode switch) is shown to the user. Called by videoEvents
 // only.
 func (s *Session) captureChanged(c *media.CaptureChange) {
-	s.log.Info("capture changed", "reason", c.Reason, "size", fmt.Sprintf("%dx%d", c.Width, c.Height), "rotation", c.Rotation, "text", c.Text)
+	s.log.Info("capture changed", "reason", c.Reason, "size", fmt.Sprintf("%dx%d", c.Width, c.Height), "rotation", c.Rotation, "hdr", c.HDR, "text", c.Text)
 	switch c.Reason {
 	case "resized":
 		if s.resizeTimer != nil {
@@ -1296,6 +1301,20 @@ func (s *Session) captureChanged(c *media.CaptureChange) {
 		})
 	case "lost":
 		s.notice("info", "Screen capture is paused ("+trunc(c.Text, 120)+"); the last picture stays until it is back.")
+	case "hdr":
+		// An HDR10 stream follows Windows HDR: a new helper (a new
+		// generation and video config) in the output's new mode.
+		if c.Restart {
+			why := fmt.Sprintf("Windows HDR turned %s", map[bool]string{true: "on", false: "off"}[c.HDR])
+			go func() {
+				if s.ctx.Err() != nil || s.paused.Load() {
+					return // resume starts afresh
+				}
+				if err := s.startVideo(false, why); err != nil {
+					s.log.Warn("restart after a Windows HDR change failed", "err", err)
+				}
+			}()
+		}
 	}
 }
 
@@ -2029,7 +2048,7 @@ func (s *Session) controlLoop() error {
 			videoChanged := old.Codec != m.Prefs.Codec || old.BitrateKbps != m.Prefs.BitrateKbps || old.FPS != m.Prefs.FPS ||
 				old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.Monitor != m.Prefs.Monitor ||
 				old.Window != m.Prefs.Window || old.Quality != m.Prefs.Quality || old.Cursor != m.Prefs.Cursor ||
-				old.AdaptiveBitrate() != m.Prefs.AdaptiveBitrate()
+				old.AdaptiveBitrate() != m.Prefs.AdaptiveBitrate() || !proto.SameHDR(old.HDR, m.Prefs.HDR)
 			if videoChanged {
 				s.triedMu.Lock()
 				s.tried = map[string]bool{}

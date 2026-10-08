@@ -49,6 +49,12 @@ export const RATE_REPORT_FRAME = 2; // gen / lastSeq name a received frame
 // The host takes the "hold" row (frame pacing wait) in the client's stage
 // report; without it the client reports hold and draw as one draw row.
 export const FEATURE_STAGE_HOLD = 'stage-hold';
+// Hosts whose configuration allows HDR10 streams ("hdr": "auto"; step 4.5).
+// The client offers HDR in its prefs (hello / settings prefs.hdr: { mode,
+// display, canvas, decoders, why }); an HDR10 video config carries hdr,
+// bitDepth 10, colorSpace (VideoColorSpaceInit) and hdrMetadata, and hdrNote
+// says why a generation is not HDR to clients that offered it.
+export const FEATURE_HDR = 'hdr10';
 
 export const AUDIO_OPUS = 1;
 export const AUDIO_PCM = 2;
