@@ -62,6 +62,9 @@
 // dynamic loading, frame submission, forced IDRs, rate changes and the output
 // path run end to end under Wine (docs/VENDOR_NOTES.md 3.8).
 #include <d3d10.h>  // ID3D10Multithread
+// Before the extern "C" block below: hwcontext_d3d11va.h includes d3d11.h, whose
+// C++ operator overloads (D3D11_RECT, D3D11_BOX) MSVC refuses with C linkage.
+#include <d3d11.h>
 
 #include <algorithm>
 #include <atomic>
