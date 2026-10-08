@@ -798,21 +798,26 @@ void testFakeOnly(Ctx& c, HMODULE module) {
     c.driver.call("reset");
     report(name, before);
 
+    // From an HDR and from an SDR output alike: the answer must not depend on
+    // whether Windows HDR is on at the moment.
     name = "HDR10 refusals";
     before = failures;
-    for (const auto& [codec, setting] : std::vector<std::pair<std::string, std::string>>{{"h264", ""}, {"hevc", "tenBit=0"}, {"av1", "p010=0"}}) {
-        if (!setting.empty()) c.driver.call("set " + setting);
-        Harness hs(c.device, c.adapter);
-        StartParams p;
-        p.codec = codec;
-        p.width = 640;
-        p.height = 360;
-        p.hdr = true;
-        Started st;
-        Status s;
-        expect(!hs.start(p, st, s, true) && s.code == "unsupported" && contains(s.text, "hdr10"), name,
-               codec + (setting.empty() ? "" : " with " + setting) + ": " + (s.ok ? "started" : s.code + ": " + s.text));
-        c.driver.call("reset");
+    for (const bool hdrSource : {true, false}) {
+        for (const auto& [codec, setting] : std::vector<std::pair<std::string, std::string>>{{"h264", ""}, {"hevc", "tenBit=0"}, {"av1", "p010=0"}}) {
+            if (!setting.empty()) c.driver.call("set " + setting);
+            Harness hs(c.device, c.adapter);
+            StartParams p;
+            p.codec = codec;
+            p.width = 640;
+            p.height = 360;
+            p.hdr = true;
+            Started st;
+            Status s;
+            expect(!hs.start(p, st, s, hdrSource) && s.code == "unsupported" && contains(s.text, "hdr10"), name,
+                   codec + (setting.empty() ? "" : " with " + setting) + (hdrSource ? ", HDR" : ", SDR") + " source: " +
+                       (s.ok ? "started" : s.code + ": " + s.text));
+            c.driver.call("reset");
+        }
     }
     report(name, before);
 

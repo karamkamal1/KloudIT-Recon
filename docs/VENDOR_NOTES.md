@@ -3156,9 +3156,10 @@ is step 4.5). docs/HELPER_PROTOCOL.md "HDR10" is the reference. In short:
   input, VUI / AV1 colour config BT.2020 / SMPTE 2084 / BT.2020 NCL, `outputMasteringDisplay`
   and `outputMaxCll` with `pMasteringDisplay` / `pMaxCll` on every picture (HEVC units x 50000
   / x 10000, AV1 0.16 / 24.8 / 18.14 fixed point as FFmpeg's nvenc.c converts).
-- Metadata (Sunshine's choice): BT.2020 primaries with D65, the output's DXGI luminance range as
-  the mastering display's, MaxCLL = its peak, MaxFALL = its full-frame luminance; unknown or
-  implausible values (peak outside 80..10000 cd/m2) fall back to a 1000 cd/m2 display.
+- Metadata: as Sunshine, BT.2020 primaries with D65 and the output's DXGI luminance range as
+  the mastering display's; this helper's own choice (Sunshine sends 0 = unknown): MaxCLL = the
+  output's peak, MaxFALL = its full-frame luminance; unknown or implausible values (peak
+  outside 80..10000 cd/m2) fall back to a 1000 cd/m2 display.
 - Caps (additive, protocol version stays 1): `codecs.*.hdr10`, `outputs[].hdr`,
   `bitsPerColor`, `minLuminance`, `maxLuminance`, `maxFullFrameLuminance`; `started.hdr`,
   `bitDepth`, `colorSpace` (`bt709` | `bt2020-pq`), `hdrMetadata`; `captureChanged` field
@@ -3199,7 +3200,8 @@ CTA-861.3; HEVC D.2.28 / D.2.35, AV1 6.7.3 / 6.7.4.
 - verified (sandbox): `--self-test-nvenc=recon-fake-nvenc.dll`: "HDR10 hevc" and "HDR10 av1"
   (Main10 / AV1 Main with bit depth 10, the BT.2020 PQ colour description, P010 registered as
   `YUV420_10BIT`, the metadata codes with each of 30 pictures, forced IDR and a loss, an SDR
-  source giving an 8-bit stream), "HDR10 refusals" (H.264; `tenBit=0`; no P010 input), caps
+  source giving an 8-bit stream), "HDR10 refusals" (H.264; `tenBit=0`; no P010 input; each
+  from an HDR and from an SDR output), caps
   `hdr10`; the test double flags input formats that do not match the bit depth, 10-bit HEVC
   without Main10 and metadata in 8-bit streams.
 - verified (sandbox): `TestHelperIntegrationHDRPipeline` (Go client, mock backend,

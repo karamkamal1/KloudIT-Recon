@@ -603,15 +603,16 @@ Pipeline:
   `pMaxCll` on every picture. No zero-copy (AMD Direct Capture surfaces) in HDR10 streams.
   GUIDE 3.9 also names R10G10B10A2 input: both encoders take P010, which keeps the matrix
   and chroma siting in the helper's own (tested) shader, so R10G10B10A2 is not used.
-- **Metadata** (`src/codec/hdr.hpp`, Sunshine's choice): mastering display primaries BT.2020
+- **Metadata** (`src/codec/hdr.hpp`): as Sunshine, mastering display primaries BT.2020
   with a D65 white point (the stream's container; Sunshine found the panel primaries DXGI
-  reports unreliable), the output's `MaxLuminance` / `MinLuminance` as the mastering
-  display's luminance, `MaxLuminance` as MaxCLL and `MaxFullFrameLuminance` as MaxFALL
-  (the content as the host's display showed it: games tone-map to DXGI's MaxLuminance). A
-  peak outside 80..10000 cd/m2 or an unknown one (e.g. some virtual displays) gives a
-  1000 cd/m2 display with black 0. Encoder units: HEVC SEI and AMF's `AMFHDRMetadata`
-  chromaticity x 50000 and luminance x 10000 (0.0001 cd/m2); AV1 (NVENC) chromaticity 0.16,
-  maximum luminance 24.8 and minimum luminance 18.14 fixed point (FFmpeg's `nvenc.c`).
+  reports unreliable) and the output's `MaxLuminance` / `MinLuminance` as the mastering
+  display's luminance; this helper's own choice (Sunshine sends 0 = unknown): `MaxLuminance`
+  as MaxCLL and `MaxFullFrameLuminance` as MaxFALL (the content as the host's display showed
+  it: games tone-map to DXGI's MaxLuminance). A peak outside 80..10000 cd/m2 or an unknown
+  one (e.g. some virtual displays) gives a 1000 cd/m2 display with black 0. Encoder units:
+  HEVC SEI and AMF's `AMFHDRMetadata` chromaticity x 50000 and luminance x 10000 (0.0001
+  cd/m2); AV1 (NVENC) chromaticity 0.16, maximum luminance 24.8 and minimum luminance 18.14
+  fixed point (FFmpeg's `nvenc.c`).
   `started.hdrMetadata` has the values in plain units for the client (GUIDE 4.5).
 - **Changes during the stream**: the stream keeps the format it started with. Turning HDR
   off gives `captureChanged` `hdr` (false) and the SDR desktop at 203 cd/m2 in the PQ
@@ -945,9 +946,10 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   bitrate, a failing `NvEncEncodePicture`, the start checks, HDR10 (step 3.9: HEVC Main10
   and AV1 with input / output bit depth 10, the BT.2020 PQ colour description, P010 input
   registered as `YUV420_10BIT`, the mastering display and MaxCLL codes with every picture,
-  an SDR source giving an 8-bit stream, and the refusals: H.264, no 10-bit encoding, no
-  P010 input; the double flags a bit depth that does not match the input format or the
-  profile, and metadata in an 8-bit stream), and that the teardown leaves
+  an SDR source giving an 8-bit stream, and the refusals, from an HDR and an SDR output
+  alike: H.264, no 10-bit encoding, no P010 input; the double flags a bit depth that does
+  not match the input format or the profile, and metadata in an 8-bit stream), and that the
+  teardown leaves
   nothing behind. It needs a D3D11 device (WARP; Wine: an X display). Without `=DLL` it
   runs the same streams against the NVIDIA driver (77 without one): the hardware check of
   docs/VENDOR_NOTES.md 3.4 and 3.9.

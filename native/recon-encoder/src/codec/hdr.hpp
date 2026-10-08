@@ -14,14 +14,15 @@ namespace recon {
 // one, e.g. some virtual displays): a common HDR monitor class.
 constexpr double kDefaultHdrPeak = 1000.0;
 
-// The HDR metadata of a stream captured from an output with colour d, as
+// The HDR metadata of a stream captured from an output with colour d. As
 // Sunshine fills it (display_base.cpp get_hdr_metadata): BT.2020 primaries
 // with a D65 white point (the stream's container; Sunshine found the panel
-// primaries DXGI reports unreliable, and clients mostly ignore them), the
-// output's luminance range as the mastering display's, and its peak and
-// full-frame luminance as MaxCLL / MaxFALL: the content as the host's display
-// showed it (games tone-map to DXGI's MaxLuminance). Missing or implausible
-// values fall back to a kDefaultHdrPeak display with a black level of 0.
+// primaries DXGI reports unreliable, and clients mostly ignore them) and the
+// output's luminance range as the mastering display's. This helper's own
+// choice (Sunshine sends 0 = unknown): the output's peak and full-frame
+// luminance as MaxCLL / MaxFALL, the content as the host's display showed it
+// (games tone-map to DXGI's MaxLuminance). Missing or implausible values fall
+// back to a kDefaultHdrPeak display with a black level of 0.
 HdrMetadata hdrMetadataFor(const DisplayColor& d);
 
 // The mastering display colour volume as codes.

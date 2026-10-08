@@ -756,7 +756,9 @@ Status AmfEncoder::validate(const StartParams& p) {
         return Status::Error("unsupported", "encoderInstance " + std::to_string(p.encoderInstance) + ": the GPU has " +
                                                 std::to_string(cc.hwInstances) + " " + p.codec + " encoder(s)");
     }
-    if (hdr_ && !cc.hdr10) {
+    // Whatever the source: the same request gets the same answer whether or
+    // not Windows HDR is on at the moment.
+    if (p.hdr && !cc.hdr10) {
         return Status::Error("unsupported", "hdr: the " + p.codec + " encoder cannot make HDR10 here (caps hdr10 false: " +
                                                 (p.codec == "h264" ? "HDR10 needs hevc or av1" : "no 10-bit P010 input") + ")");
     }

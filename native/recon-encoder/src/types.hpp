@@ -111,7 +111,8 @@ struct StartParams {
     std::string quality = "speed";  // "speed" | "balanced" | "quality"
     // HDR10 (opt-in, GUIDE 3.9): when the captured output is in HDR mode, the
     // stream is 10-bit BT.2020 PQ with HDR metadata (hevc / av1 with caps
-    // hdr10); an SDR output still gives an SDR stream (Started::hdr false).
+    // hdr10, else "unsupported" whatever the output); an SDR output still
+    // gives an SDR stream (Started::hdr false).
     bool hdr = false;
     int ltrSlots = 0;   // long-term reference slots to reserve (ACK-based recovery, 3.5)
     int svcLayers = 1;  // temporal layers

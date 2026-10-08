@@ -588,7 +588,9 @@ Status NvencEncoder::validate(const StartParams& p) {
     if (p.intraRefreshFrames > 0 && !cc.intraRefresh) {
         return Status::Error("unsupported", "the " + p.codec + " encoder has no intra refresh (NV_ENC_CAPS_SUPPORT_INTRA_REFRESH 0)");
     }
-    if (hdr_ && !cc.hdr10) {
+    // Whatever the source: the same request gets the same answer whether or
+    // not Windows HDR is on at the moment.
+    if (p.hdr && !cc.hdr10) {
         return Status::Error("unsupported", "hdr: the " + p.codec + " encoder cannot make HDR10 here (caps hdr10 false: " +
                                                 (p.codec == "h264" ? std::string("HDR10 needs hevc or av1")
                                                  : !cc.tenBit      ? std::string("NV_ENC_CAPS_SUPPORT_10BIT_ENCODE 0")
