@@ -11,9 +11,10 @@ import (
 
 // WriteReport prints what Probe found, as "recon-host probe" shows it: the
 // ffmpeg binary and version, the capture filters, every usable encoder with
-// the ffmpeg command line BuildArgs builds for it in the sample session, and
-// the encoders whose test encode failed.
-func (c *Caps) WriteReport(w io.Writer, sample Params) {
+// the ffmpeg command line BuildArgs builds for it in its sample session
+// (described in a "session:" line wherever it changes), and the encoders
+// whose test encode failed.
+func (c *Caps) WriteReport(w io.Writer, sample func(EncoderInfo) Params) {
 	fmt.Fprintf(w, "ffmpeg:     %s\n", c.FFmpeg)
 	version := c.VersionInfo
 	if len(version) == 0 && c.Version != "" {
@@ -23,13 +24,14 @@ func (c *Caps) WriteReport(w io.Writer, sample Params) {
 		fmt.Fprintf(w, "            %s\n", l)
 	}
 	fmt.Fprintf(w, "capture:    ddagrab=%v gfxcapture=%v vsrc_amf=%v\n", c.Filters["ddagrab"], c.Filters["gfxcapture"], c.Filters["vsrc_amf"])
-	if len(c.Encoders) > 0 {
-		fmt.Fprintf(w, "session:    %s (command line under each encoder)\n", describeSample(sample))
-	}
+	session := ""
 	for _, e := range c.Encoders {
+		p := sample(e)
+		if s := describeSample(p); s != session {
+			session = s
+			fmt.Fprintf(w, "session:    %s (command lines below)\n", s)
+		}
 		fmt.Fprintf(w, "encoder:    %-12s %-5s %s\n", e.Name, e.Family, e.Vendor)
-		p := sample
-		p.Encoder = e
 		if args, err := c.BuildArgs(p); err != nil {
 			fmt.Fprintf(w, "            no command line: %v\n", err)
 		} else {
@@ -56,6 +58,10 @@ func describeSample(p Params) string {
 	switch p.Source.Backend {
 	case "ddagrab":
 		src = fmt.Sprintf("ddagrab output %d at its native size", p.Source.Output)
+	case "amf":
+		src = fmt.Sprintf("AMD Direct Capture (vsrc_amf) of output %d at its native size", p.Source.Output)
+	case "gfxcapture", "x11grab":
+		src = fmt.Sprintf("%s of a %dx%d monitor", p.Source.Backend, p.Source.NativeW, p.Source.NativeH)
 	case "test":
 		src = fmt.Sprintf("test pattern %dx%d", p.Source.NativeW, p.Source.NativeH)
 	default:

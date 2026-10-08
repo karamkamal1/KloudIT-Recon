@@ -421,18 +421,13 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error)
 	return media.EncoderInfo{}, errors.New("no codec is supported by both this browser and the host")
 }
 
-func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
-	cfg := s.a.cfg
-	mons := s.a.monitors()
-	mon := mons[0]
-	if prefs.Monitor >= 0 && prefs.Monitor < len(mons) {
-		mon = mons[prefs.Monitor]
-	}
-	s.prefsMu.Lock()
-	s.monitor = mon
-	s.prefsMu.Unlock()
-	s.a.inj.SetTarget(input.Rect{X: mon.X, Y: mon.Y, W: mon.W, H: mon.H})
-
+// sessionParams is the encoder-independent part of buildParams for prefs on
+// monitor mon: frame rate and bitrate within the host's limits, cursor,
+// capture timestamps (frameExt: the client parses the frame extension) and
+// the capture source of backendFor(prefs), which it also returns.
+func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, frameExt bool) (media.Params, string) {
+	cfg := a.cfg
+	backend := a.backendFor(prefs)
 	fps := prefs.FPS
 	if fps <= 0 {
 		fps = cfg.DefaultFPS
@@ -440,7 +435,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	if fps > cfg.MaxFPS {
 		fps = cfg.MaxFPS
 	}
-	if mon.Hz > 0 && fps > mon.Hz && s.a.backendFor(prefs) != "test" {
+	if mon.Hz > 0 && fps > mon.Hz && backend != "test" {
 		fps = mon.Hz // capturing faster than the display refreshes only duplicates frames
 	}
 	if fps < 10 {
@@ -457,14 +452,12 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		kbps = 500
 	}
 	p := media.Params{
-		FPS:         fps,
-		BitrateKbps: kbps,
-		Quality:     prefs.Quality,
-		DrawCursor:  cfg.DrawCursor || prefs.Cursor == "video" || !s.a.cursorSupported(),
-		// Capture timestamps only reach clients that parse the frame extension.
-		CaptureClock: s.hello.V >= proto.HelloVersionFrameExt && cfg.CaptureTimestamps != "off" && s.a.caps.CanStampCapture(),
+		FPS:          fps,
+		BitrateKbps:  kbps,
+		Quality:      prefs.Quality,
+		DrawCursor:   cfg.DrawCursor || prefs.Cursor == "video" || !a.cursorSupported(),
+		CaptureClock: frameExt && cfg.CaptureTimestamps != "off" && a.caps.CanStampCapture(),
 	}
-	backend := s.a.backendFor(prefs)
 	w, h := prefs.Width, prefs.Height
 	if w > 0 && h > 0 && (w >= mon.W && h >= mon.H) {
 		w, h = 0, 0 // never upscale
@@ -483,8 +476,8 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		p.Source = media.Source{Backend: "gfxcapture", HMonitor: mon.HMonitor, Window: prefs.Window, NativeW: mon.W, NativeH: mon.H}
 		p.Width, p.Height = w, h
 	case "ddagrab", "amf":
-		// "amf" needs the encoder: useAMFCapture decides below. Both capture
-		// the whole monitor at its native size.
+		// "amf" needs the encoder: buildParams (useAMFCapture) decides. Both
+		// capture the whole monitor at its native size.
 		out := mon.DXGIOutput
 		if out < 0 {
 			out = mon.Index
@@ -493,8 +486,23 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	}
 	// The test pattern carries each frame's Seq as a barcode (welcome feature
 	// barcode-seq): the client checks the picture it draws against the header.
-	p.Barcode = backend == "test" && s.a.caps.CanDrawBarcode()
+	p.Barcode = backend == "test" && a.caps.CanDrawBarcode()
+	return p, backend
+}
 
+func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
+	mons := s.a.monitors()
+	mon := mons[0]
+	if prefs.Monitor >= 0 && prefs.Monitor < len(mons) {
+		mon = mons[prefs.Monitor]
+	}
+	s.prefsMu.Lock()
+	s.monitor = mon
+	s.prefsMu.Unlock()
+	s.a.inj.SetTarget(input.Rect{X: mon.X, Y: mon.Y, W: mon.W, H: mon.H})
+
+	// Capture timestamps only reach clients that parse the frame extension.
+	p, backend := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
 	outW, outH := p.OutputSize()
 	enc, notice, err := s.chooseEncoder(prefs, outW, outH)
 	if err != nil {
@@ -514,6 +522,28 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		s.notice("info", notice)
 	}
 	return p, nil
+}
+
+// ProbeSample returns, per encoder, the parameters of the session "recon-host
+// probe" prints the ffmpeg command line for: a current browser client at its
+// default settings (the first monitor at its native size, 60 fps, 30 Mbit/s,
+// balanced quality, local cursor) on this host's configuration, by the
+// agent's own rules. Call platform.EnableDPIAwareness first, as the agent does.
+func ProbeSample(cfg *Config, caps *media.Caps) func(media.EncoderInfo) media.Params {
+	a := &Agent{cfg: cfg, caps: caps}
+	return a.probeSample(a.monitors()[0])
+}
+
+func (a *Agent) probeSample(mon platform.Monitor) func(media.EncoderInfo) media.Params {
+	p, backend := a.sessionParams(proto.Prefs{FPS: 60, BitrateKbps: 30000, Quality: "balanced", Cursor: "local"}, mon, true)
+	return func(enc media.EncoderInfo) media.Params {
+		q := p
+		q.Encoder = enc
+		if backend == "amf" && a.amfCaptureBlocker(enc, q.DrawCursor, mon) == "" { // as useAMFCapture
+			q.Source.Backend = "amf"
+		}
+		return q
+	}
 }
 
 // useAMFCapture switches p from ddagrab to AMD Direct Capture of the same

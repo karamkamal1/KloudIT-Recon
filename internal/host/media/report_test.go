@@ -93,8 +93,13 @@ func TestWriteReport(t *testing.T) {
 	// What the probe measures on RDNA3 (step 1.7).
 	c.SetAlignment("av1_amf", Alignment{W: 64, H: 16, ProbeW: 1920, ProbeH: 1080, CodedW: 1920, CodedH: 1082})
 	sample := Params{Source: Source{Backend: "ddagrab"}, FPS: 60, BitrateKbps: 30000, Quality: "balanced", CaptureClock: true}
+	each := func(e EncoderInfo) Params {
+		p := sample
+		p.Encoder = e
+		return p
+	}
 	var buf bytes.Buffer
-	c.WriteReport(&buf, sample)
+	c.WriteReport(&buf, each)
 	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
 	t.Logf("report:\n%s", buf.String())
 
@@ -104,7 +109,7 @@ func TestWriteReport(t *testing.T) {
 	}
 	want = append(want,
 		"capture:    ddagrab=true gfxcapture=true vsrc_amf=true",
-		"session:    ddagrab output 0 at its native size, 60 fps, 30 Mbit/s, quality balanced, capture timestamps (command line under each encoder)")
+		"session:    ddagrab output 0 at its native size, 60 fps, 30 Mbit/s, quality balanced, capture timestamps (command lines below)")
 	if len(lines) < len(want) || !slices.Equal(lines[:len(want)], want) {
 		t.Fatalf("report head:\n%s\nwant:\n%s", strings.Join(lines[:min(len(lines), len(want))], "\n"), strings.Join(want, "\n"))
 	}
@@ -113,9 +118,7 @@ func TestWriteReport(t *testing.T) {
 		if len(lines) < 2 || !strings.HasPrefix(lines[0], "encoder:    "+e.Name+" ") {
 			t.Fatalf("expected %s, got %q", e.Name, lines)
 		}
-		p := sample
-		p.Encoder = e
-		args, err := c.BuildArgs(p)
+		args, err := c.BuildArgs(each(e))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,10 +154,37 @@ func TestWriteReport(t *testing.T) {
 		}
 	}
 
+	// A sample whose source differs between encoders (capture "amf": AMD
+	// Direct Capture for the AMF encoders) gets a session line per group.
+	buf.Reset()
+	c.WriteReport(&buf, func(e EncoderInfo) Params {
+		p := each(e)
+		if c.CanCaptureAMF(e) == nil {
+			p.Source.Backend = "amf"
+		}
+		return p
+	})
+	var groups []string
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if s, ok := strings.CutPrefix(l, "session:    "); ok {
+			groups = append(groups, s[:strings.Index(s, ",")])
+		} else if s, ok := strings.CutPrefix(l, "encoder:    "); ok {
+			groups = append(groups, strings.Fields(s)[0])
+		}
+	}
+	if want := []string{"ddagrab output 0 at its native size", "av1_nvenc", "hevc_nvenc", "h264_nvenc",
+		"AMD Direct Capture (vsrc_amf) of output 0 at its native size", "av1_amf", "hevc_amf", "h264_amf",
+		"ddagrab output 0 at its native size", "libx264", "libsvtav1"}; !slices.Equal(groups, want) {
+		t.Fatalf("session lines and encoders %q, want %q", groups, want)
+	}
+	if !strings.Contains(buf.String(), "encoder:    hevc_amf     hevc  amd\n            ffmpeg -hide_banner") || !strings.Contains(buf.String(), "vsrc_amf=") {
+		t.Fatalf("no AMD Direct Capture command line:\n%s", buf.String())
+	}
+
 	// A build without the sample's capture filter says why instead.
 	c.Filters["ddagrab"] = false
 	buf.Reset()
-	c.WriteReport(&buf, sample)
+	c.WriteReport(&buf, each)
 	if !strings.Contains(buf.String(), "encoder:    av1_amf      av1   amd\n            no command line: this ffmpeg build lacks the ddagrab filter") {
 		t.Fatalf("report without ddagrab:\n%s", buf.String())
 	}
@@ -166,7 +196,10 @@ func TestWriteReport(t *testing.T) {
 	}
 
 	// The Linux sample: test pattern, no capture stamps, cursor drawn.
-	if s := describeSample(Params{Source: Source{Backend: "test", NativeW: 1920, NativeH: 1080}, FPS: 60, BitrateKbps: 2500, DrawCursor: true}); s != "test pattern 1920x1080, 60 fps, 2.5 Mbit/s, quality default, cursor drawn" {
+	if s := describeSample(Params{Source: Source{Backend: "test", NativeW: 1280, NativeH: 720}, FPS: 60, BitrateKbps: 2500, DrawCursor: true}); s != "test pattern 1280x720, 60 fps, 2.5 Mbit/s, quality default, cursor drawn" {
+		t.Fatalf("describeSample: %q", s)
+	}
+	if s := describeSample(Params{Source: Source{Backend: "gfxcapture", NativeW: 2560, NativeH: 1440}, FPS: 60, BitrateKbps: 30000, Quality: "balanced"}); s != "gfxcapture of a 2560x1440 monitor, 60 fps, 30 Mbit/s, quality balanced" {
 		t.Fatalf("describeSample: %q", s)
 	}
 }
@@ -217,6 +250,19 @@ func TestCommandLineShells(t *testing.T) {
 	var sets [][]string
 	for _, e := range c.Encoders {
 		args, err := c.BuildArgs(Params{Source: Source{Backend: "ddagrab"}, Encoder: e, FPS: 60, BitrateKbps: 30000, CaptureClock: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sets = append(sets, args)
+	}
+	// The other sources the probe's sample can have.
+	for _, p := range []Params{
+		{Source: Source{Backend: "test", NativeW: 1280, NativeH: 720}, Encoder: c.Encoders[6], Barcode: true, TestPad: 8},
+		{Source: Source{Backend: "gfxcapture", HMonitor: 65537, NativeW: 2560, NativeH: 1440}, Encoder: c.Encoders[1]},
+		{Source: Source{Backend: "amf", Output: 1}, Encoder: c.Encoders[4]},
+	} {
+		p.FPS, p.BitrateKbps, p.CaptureClock = 60, 30000, true
+		args, err := c.BuildArgs(p)
 		if err != nil {
 			t.Fatal(err)
 		}

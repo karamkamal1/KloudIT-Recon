@@ -296,13 +296,15 @@ Edit `host.json` with Notepad, then restart the agent: `Stop-ScheduledTask 'Klou
 
 Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` to see the FFmpeg version, the
 detected encoders (and why any GPU encoder is unusable), capture backends, monitors and gamepad
-support. Under each encoder it prints the exact FFmpeg command line the agent would run for it in
-a 60 fps, 30 Mbit/s session captured with ddagrab from display output 0. To try an encoder by
-hand, open PowerShell in the folder of `ffmpeg.exe` (the `ffmpeg:` line) and paste its line as
-`.\ffmpeg ...` with `pipe:1` replaced by `-stats -frames:v 600 -y $env:TEMP\test.nut`. ddagrab
-only delivers a frame when the screen or the mouse pointer changes, so keep something moving (move
-the mouse, play a video) until the `frame=` counter reaches 600. Flags go before the command:
-`recon-host.exe -v probe`.
+support. Under each encoder it prints the exact FFmpeg command line the agent runs with that
+encoder when a browser streams the first monitor at the default settings (native resolution,
+60 fps, 30 Mbit/s, balanced quality) under this `host.json`. The `session:` line above it says how
+that session captures: with the default `"capture": "auto"` that is ddagrab (other resolutions and
+window capture use gfxcapture). To try an encoder by hand, open PowerShell in the folder of
+`ffmpeg.exe` (the `ffmpeg:` line) and paste its line as `.\ffmpeg ...` with `pipe:1` replaced by
+`-stats -frames:v 600 -y $env:TEMP\test.nut`. ddagrab only delivers a frame when the screen or the
+mouse pointer changes, so keep something moving (move the mouse, play a video) until the `frame=`
+counter reaches 600. Flags go before the command: `recon-host.exe -v probe`.
 
 ## Troubleshooting
 

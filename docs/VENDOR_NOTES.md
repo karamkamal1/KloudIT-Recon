@@ -590,10 +590,11 @@ Verified in the sandbox:
 
 - verified (sandbox): `recon-host probe` prints the `ffmpeg -version` header in full (version,
   compiler and library lines; not the configure line or the "Exiting with exit code 0" line
-  FFmpeg 8 adds) and, under each usable encoder, the exact command line `BuildArgs` returns for a
-  sample session: the browser client's defaults (60 fps, 30 Mbit/s, balanced) within the host's
-  `maxFps`/`maxKbps`, capture timestamps when the build supports them, ddagrab output 0 on
-  Windows and the 1920×1080 test pattern elsewhere. `internal/host/media` `TestWriteReport`
+  FFmpeg 8 adds) and, under each usable encoder, the exact command line `BuildArgs` returns for
+  the session the agent builds with that encoder for a browser at its defaults (first monitor at
+  its native size, 60 fps, 30 Mbit/s, balanced) under the host's config (`capture`, test pattern
+  size, `maxFps`/`maxKbps`, the monitor's refresh rate, cursor, capture timestamps when the build
+  supports them), described by a `session:` line. `internal/host/media` `TestWriteReport`
   builds the report from the real `-version` and `-h encoder=` output of the FFmpeg 8.1.3 Windows
   build (`testdata/ffmpeg81-*.txt`: av1/hevc/h264_amf, av1/hevc/h264_nvenc, libx264, libsvtav1;
   parsed by the same functions as the probe) and checks that every printed command line splits
@@ -640,8 +641,27 @@ Verified in the sandbox:
   (send→draw)" whenever capture→draw is unavailable (some frame in the 10 s window without
   capture stamps, e.g. `"captureTimestamps": "off"` or a v1 client, or no stage statistics). The
   toolbar's latency pill had a fixed tooltip ("from the frame leaving the host encoder"), wrong
-  since Phase 0 made its number capture→draw: it now names the span it shows. The browser E2E
-  checks that it says capture→draw on all four paths.
+  since Phase 0 made its number capture→draw: it now names the span it shows, and the number is
+  in that span: the worker posts the period's mean capture→draw only while the stage window is
+  capture→draw, else send→draw (before the review fix one frame without a capture stamp switched
+  the label for 10 s while the number stayed capture→draw). The browser E2E checks that it says
+  capture→draw on all four paths.
+- verified (sandbox), review fix: the probe's sample is the agent's own (`host.ProbeSample`, built
+  by the `sessionParams` that `buildParams` uses, plus `amfCaptureBlocker` per encoder). Before,
+  it was ddagrab output 0 on Windows whatever `capture` said and a 1920×1080 test pattern without
+  the frame barcode on Linux, where the agent runs the configured 1280×720 one with it.
+  `TestProbeSample` checks that the sample equals `buildParams`' parameters for the browser's
+  defaults with each encoder, for `capture` auto, ddagrab, gfxcapture, amf, x11grab and test,
+  with and without `drawCursor`. `TestWriteReport` checks one `session:` line per group of
+  encoders with the same source (capture "amf": AMD Direct Capture for the AMF encoders, ddagrab
+  for the others); `TestCommandLineShells` also passes the test pattern (barcode, padding),
+  gfxcapture and vsrc_amf lines through sh and PowerShell 7. Real runs: Linux `recon-host probe`
+  with the default config prints the 1280×720 test pattern with the barcode, and the printed
+  libx264 line writes 30 1280×720 H.264 frames (ffprobe); `recon-host.exe probe` under Wine with
+  FFmpeg 8.1.3 prints ddagrab for `capture` auto and amf (no AMF encoder is usable without a GPU)
+  and `gfxcapture=…:hmonitor=1` for gfxcapture. The AMD Direct Capture branch of the sample (AMF
+  encoder, cursor not in the video) only runs on Windows (elsewhere the video carries the cursor):
+  `TestProbeSample` built for Windows passes under Wine, and fails there with that branch removed.
 - AV1 on AMD with the current arguments: under Wine with FFmpeg 8.1.3, `av1_amf` with the
   printed options fails before opening the device ("Unable to parse "header_insertion_mode"
   option value "idr""), with `-header_insertion_mode gop` it gets as far as loading the AMF
@@ -652,7 +672,9 @@ Hardware checks:
 - AMD RDNA3 (RX 7900 XT): unverified. Test: run
   `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`. Look for: version lines starting
   `ffmpeg version n8.1`; `hevc_amf`, `h264_amf` and `av1_amf` as `encoder:` lines, each followed
-  by a command line with `ddagrab=output_idx=0:framerate=60` and `-c:v <encoder>`. Open
+  by a command line with `ddagrab=output_idx=0:framerate=60` (default `capture`; the primary
+  monitor, at least 60 Hz) and `-c:v <encoder>`; with `"capture": "amf"` the AMF encoders' lines
+  capture with `vsrc_amf=monitor_index=0` under a `session:` line saying AMD Direct Capture. Open
   PowerShell in the folder of `ffmpeg.exe`, paste the `hevc_amf` line as `.\ffmpeg ...` with
   `pipe:1` replaced by `-stats -frames:v 600 -y $env:TEMP\test.nut` and keep the mouse moving or
   a video playing while it records (ddagrab runs with `dup_frames=0`: an unchanged screen

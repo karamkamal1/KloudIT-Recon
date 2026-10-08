@@ -42,7 +42,7 @@ const video = {
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0 };
 
 const stats = {
-  frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, totalN: 0,
+  frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
   dropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
   audioPackets: 0, audioLost: 0,
 };
@@ -714,13 +714,14 @@ function onDecoded(frame) {
   stats.decodeN++;
   if (clock.offset !== null) {
     const owd = meta.recv - hostToLocal(sentUs(meta));
-    const total = recordStages(meta, decoded, presented);
+    const rec = recordStages(meta, decoded, presented);
     stats.owdSum += owd;
     stats.owdN++;
-    stats.totalSum += total;
+    stats.totalSum += rec.e2e;
+    stats.sendSum += rec.e2eSend;
     stats.totalN++;
-    stats.totalMin = Math.min(stats.totalMin, total);
-    stats.totalMax = Math.max(stats.totalMax, total);
+    stats.totalMin = Math.min(stats.totalMin, rec.e2e);
+    stats.totalMax = Math.max(stats.totalMax, rec.e2e);
     transport?.sendDatagram(P.frameAck(meta.gen, meta.seq, owd * 1000, decodeMs * 1000));
   }
 }
@@ -770,7 +771,7 @@ function recordStages(m, decoded, drawn) {
     rec.mark = ++lat.markId;
     post('drawn', { id: rec.mark, t: performance.timeOrigin + drawn });
   }
-  return rec.e2e;
+  return rec;
 }
 
 // Main thread: absolute time of its first requestAnimationFrame after the draw.
@@ -1186,7 +1187,9 @@ function postStats() {
     rtt: clock.rtt,
     owd: avg(stats.owdSum, stats.owdN),
     decode: avg(stats.decodeSum, stats.decodeN),
-    total: avg(stats.totalSum, stats.totalN),
+    // In the span the stage summary names (stages.from): capture->draw only
+    // if every frame of its 10 s window, which covers this period, had it.
+    total: avg(stages?.from === 'send' ? stats.sendSum : stats.totalSum, stats.totalN),
     totalMin: isFinite(stats.totalMin) ? stats.totalMin : null,
     totalMax: stats.totalMax || null,
     dropped: stats.dropped,
@@ -1198,7 +1201,7 @@ function postStats() {
     hw: video.hw,
     synced: clock.offset !== null,
   });
-  Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0 });
+  Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0 });
 }
 
 async function probeDecoders() {

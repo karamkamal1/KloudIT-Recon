@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
 
@@ -108,11 +107,11 @@ func main() {
 		if caps == nil {
 			fatal(fmt.Errorf("cannot run %s: %w", ff, err))
 		}
-		caps.WriteReport(os.Stdout, probeSample(cfg, caps))
+		platform.EnableDPIAwareness()
+		caps.WriteReport(os.Stdout, host.ProbeSample(cfg, caps))
 		if err != nil {
 			fmt.Println("error:", err)
 		}
-		platform.EnableDPIAwareness()
 		mons, _ := platform.Monitors()
 		for _, m := range mons {
 			fmt.Printf("monitor %d:  %s %dx%d@%dHz at (%d,%d) primary=%v dxgi=%d\n", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.DXGIOutput)
@@ -145,26 +144,6 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-}
-
-// probeSample is the session "recon-host probe" shows each encoder's ffmpeg
-// command line for: the browser client's defaults (60 fps, 30 Mbit/s,
-// balanced quality) within the host's limits, a client that takes capture
-// timestamps, ddagrab on the first output on Windows and the 1920x1080 test
-// pattern elsewhere.
-func probeSample(cfg *host.Config, caps *media.Caps) media.Params {
-	p := media.Params{
-		Source:       media.Source{Backend: "test", NativeW: 1920, NativeH: 1080},
-		FPS:          min(60, cfg.MaxFPS),
-		BitrateKbps:  min(30000, cfg.MaxKbps),
-		Quality:      "balanced",
-		DrawCursor:   cfg.DrawCursor,
-		CaptureClock: cfg.CaptureTimestamps != "off" && caps.CanStampCapture(),
-	}
-	if runtime.GOOS == "windows" {
-		p.Source = media.Source{Backend: "ddagrab", Output: 0}
-	}
-	return p
 }
 
 // tolerantMulti writes to every writer, ignoring individual failures. The

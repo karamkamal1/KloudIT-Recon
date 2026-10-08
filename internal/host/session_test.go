@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -383,5 +384,60 @@ func TestAMFCaptureBackend(t *testing.T) {
 	if s.useAMFCapture(&p, mon); p.Source.Backend != "ddagrab" || !strings.Contains(logs.String(), "AMD Direct Capture failed") ||
 		!strings.Contains(logs.String(), "failed earlier in this session") {
 		t.Fatalf("after a failure: %s, log %s", p.Source.Backend, logs.String())
+	}
+}
+
+// TestProbeSample checks that "recon-host probe" prints command lines for the
+// session the agent builds (buildParams) when a browser client at its default
+// settings (stream.js DEFAULTS) streams with that encoder, whatever the host's
+// capture setting: the test pattern at testWidth x testHeight with its
+// padding, ddagrab, gfxcapture or x11grab of the first monitor, AMD Direct
+// Capture only where the agent would use it.
+func TestProbeSample(t *testing.T) {
+	caps := &media.Caps{Filters: map[string]bool{"ddagrab": true, "gfxcapture": true, "vsrc_amf": true},
+		Encoders: []media.EncoderInfo{
+			{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true},
+			{Name: "h264_nvenc", Family: "h264", Vendor: "nvidia", HW: true},
+			{Name: "libx264", Family: "h264", Vendor: "software"},
+		}}
+	browser := proto.Prefs{Codec: "auto", BitrateKbps: 30000, FPS: 60, Cursor: "local", Quality: "balanced"}
+	newConfig := func(capture string, drawCursor bool) *Config {
+		cfg := &Config{Capture: capture, TestWidth: 1600, TestHeight: 900, TestPad: 8, MaxFPS: 50, DrawCursor: drawCursor}
+		cfg.Defaults()
+		return cfg
+	}
+	for _, capture := range []string{"auto", "ddagrab", "gfxcapture", "amf", "x11grab", "test"} {
+		for _, drawCursor := range []bool{false, true} {
+			cfg := newConfig(capture, drawCursor)
+			sample := ProbeSample(cfg, caps)
+			for _, enc := range caps.Encoders {
+				cfg.Encoder = enc.Name
+				s := &Session{
+					a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+					hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{{Family: "hevc", HW: true}, {Family: "h264", HW: true}}},
+					ctrl:  &ctrlRecorder{}, tried: map[string]bool{},
+					log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				}
+				want, err := s.buildParams(browser)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := sample(enc); got != want {
+					t.Errorf("capture %s, drawCursor %v, %s:\nprobe %+v\nagent %+v", capture, drawCursor, enc.Name, got, want)
+				}
+			}
+		}
+	}
+	// capture "amf" on a monitor of DXGI adapter 0: AMD Direct Capture for the
+	// AMF encoder only, on Windows (elsewhere the video carries the cursor).
+	sample := (&Agent{cfg: newConfig("amf", false), caps: caps}).probeSample(platform.Monitor{W: 2560, H: 1440, Hz: 144, DXGIOutput: 1})
+	if amf, x264 := sample(caps.Encoders[0]).Source, sample(caps.Encoders[2]).Source; (amf.Backend == "amf") != (runtime.GOOS == "windows") ||
+		amf.Output != 1 || x264 != (media.Source{Backend: "ddagrab", Output: 1, NativeW: 2560, NativeH: 1440}) {
+		t.Fatalf("capture amf: %s %+v, %s %+v", caps.Encoders[0].Name, amf, caps.Encoders[2].Name, x264)
+	}
+	// The Linux default is the configured test pattern, not a fixed 1920x1080.
+	if p := ProbeSample(newConfig("test", false), caps)(caps.Encoders[2]); p.Source != (media.Source{Backend: "test", NativeW: 1600, NativeH: 900}) ||
+		p.TestPad != 8 || p.FPS != 50 || p.BitrateKbps != 30000 || p.Quality != "balanced" {
+		t.Fatalf("test pattern sample %+v", p)
 	}
 }
