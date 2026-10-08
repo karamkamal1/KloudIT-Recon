@@ -19,6 +19,15 @@
 // is false, the frames are read back into system memory instead (a staging
 // texture; qsvenc uploads them): started.zeroCopy says which. Without a GPU
 // capture (the synthetic source) the backend draws a moving test pattern.
+// System-memory frames come in the layout qsvenc passes on as it is (qsvenc.c
+// submit_frame copies any other frame into a buffer of its own first): one
+// buffer with the CbCr rows right after the luma rows, a pitch that is a
+// multiple of 32 (qsvenc's width alignment: 16, 32 for HEVC on runtimes before
+// API 1.19) and the height of the encoder's surfaces (FrameInfo.Height: 16
+// aligned for H.264, 32 for HEVC / AV1), which AVFrame.height then carries
+// (libavcodec does not compare it with the codec context's; the encoder crops
+// to the picture). The converter pads the picture to that size (its edge
+// repeated, as qsvenc's copy would).
 //
 // Encoder settings (as Sunshine's quicksync encoder, video.cpp): async_depth 1,
 // low_delay_brc 1, look-ahead off, no B frames, forced_idr 1, low_power 1
@@ -86,6 +95,7 @@ constexpr int kGopFrames = 65535;  // QSV GopPicSize is 16-bit: the longest GOP 
 constexpr int kMaxErrors = 10;     // consecutive failures before giving up (fatal)
 constexpr size_t kMaxQueued = 1;   // frames waiting for the encoder thread
 constexpr uint32_t kQsvAlign = 16; // QSV surfaces are 16x16 aligned (hwcontext_qsv.c qsv_init_surface)
+constexpr uint32_t kSysPitchAlign = 32;  // system-memory frames: qsvenc's widest width alignment
 constexpr int kProbeWidth = 1280, kProbeHeight = 720, kProbeFps = 60, kProbeKbps = 8000;
 constexpr int kTestProbeWidth = 320, kTestProbeHeight = 180;
 
@@ -356,7 +366,17 @@ LavcProbe runLavcProbe() {
             d.available = ctx != nullptr;
             d.reason = err;
             if (ctx) rt.avcodec_free_context(&ctx);
-            p.codecs[c] = d;
+            // Several encoders of one codec: the first that opens is the
+            // codec's; the errors of the others are kept with it.
+            auto it = p.codecs.find(c);
+            if (it == p.codecs.end()) {
+                p.codecs[c] = d;
+            } else if (!it->second.available) {
+                if (!d.available) d.reason = it->second.reason + "; " + d.reason;
+                it->second = d;
+            } else if (!d.available) {
+                logf(LogLevel::Info, "lavc: %s (%s is used for %s)", err.c_str(), it->second.encoder.c_str(), codecName(c));
+            }
             p.ok = p.ok || d.available;
         }
     } else {
@@ -405,7 +425,15 @@ LavcProbe runLavcProbe() {
         rt.av_buffer_unref(&d3dDev);
     }
     logf(LogLevel::Debug, "lavc probe: %lld ms", static_cast<long long>((qpcNow() - t0) * 1000 / qpcFrequency()));
-    if (!p.ok && p.reason.empty()) p.reason = "no usable encoder (" + rt.versionText + ")";
+    if (!p.ok) {
+        // No backend, so no caps.unavailable.lavc-<codec> entries: each
+        // encoder's error goes into unavailable.lavc (they start with its name).
+        std::string why = p.reason;
+        for (const auto& [codec, d] : p.codecs) {
+            if (!d.reason.empty()) why += std::string(why.empty() ? "" : "; ") + d.reason;
+        }
+        p.reason = (why.empty() ? std::string("no usable encoder") : why) + " (" + rt.versionText + ")";
+    }
     return p;
 }
 
@@ -518,6 +546,7 @@ private:
     CodecDetails det_;
     Mode mode_ = Mode::Pattern;
     uint32_t width_ = 0, height_ = 0;  // the picture
+    uint32_t frameW_ = 0, frameH_ = 0;  // system-memory frames: pitch and height (the picture padded, above)
     bool cbr_ = true;
     bool flushMode_ = true;
     bool lowPower_ = false;
@@ -632,6 +661,8 @@ Status LavcEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec&
         return s;
     }
     extradata_.assign(enc_->extradata, enc_->extradata + std::max(0, enc_->extradata_size));
+    frameW_ = alignUp(width_, kSysPitchAlign);
+    frameH_ = alignUp(height_, codec_ == Codec::H264 ? 16u : 32u);
 
     in = InputSpec{};
     if (mode_ == Mode::ZeroCopy) {
@@ -642,9 +673,12 @@ Status LavcEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec&
         in.contentWidth = width_;
         in.contentHeight = height_;
     } else if (mode_ == Mode::Readback) {
+        // Read into the system-memory frame as it is (padded, above).
         in.format = InputSpec::Format::Nv12;
-        in.width = width_;
-        in.height = height_;
+        in.width = frameW_;
+        in.height = frameH_;
+        in.contentWidth = width_;
+        in.contentHeight = height_;
         in.planarOk = true;  // read on the CPU: separate Y / CbCr planes do too (Wine)
     }
 
@@ -786,27 +820,33 @@ Status LavcEncoder::makeFrame(const EncoderFrame& ef, const SubmitInfo& info, AV
     if (mode_ == Mode::ZeroCopy) return mapTexture(ef, out);
     AVFrame* f = rt_.av_frame_alloc();
     if (!f) return Status::Error("encode_failed", "lavc: av_frame_alloc failed");
+    // One buffer, CbCr after the luma rows, frameW_ x frameH_ (the layout
+    // qsvenc takes without copying, above).
+    const size_t lumaBytes = size_t(frameW_) * frameH_;
+    f->buf[0] = rt_.av_buffer_alloc(lumaBytes + lumaBytes / 2);
+    if (!f->buf[0]) {
+        rt_.av_frame_free(&f);
+        return Status::Error("encode_failed", "lavc: av_buffer_alloc failed");
+    }
     f->format = AV_PIX_FMT_NV12;
     f->width = int(width_);
-    f->height = int(height_);
-    int r = rt_.av_frame_get_buffer(f, 0);
-    if (r < 0) {
-        rt_.av_frame_free(&f);
-        return Status::Error("encode_failed", "lavc: av_frame_get_buffer: " + rt_.errorText(r));
-    }
+    f->height = int(frameH_);
+    f->data[0] = f->buf[0]->data;
+    f->data[1] = f->data[0] + lumaBytes;
+    f->linesize[0] = f->linesize[1] = int(frameW_);
     Status s;
     if (mode_ == Mode::Readback) {
         s = readback(ef, f);
     } else {
         // A moving diagonal gradient on neutral chroma: every frame differs,
         // so the encoder has work (the synthetic source has no image; the
-        // barcode needs the GPU conversion).
+        // barcode needs the GPU conversion). The padding too.
         const unsigned shift = unsigned(info.frameId * 4);
-        for (uint32_t y = 0; y < height_; ++y) {
+        for (uint32_t y = 0; y < frameH_; ++y) {
             uint8_t* row = f->data[0] + size_t(y) * size_t(f->linesize[0]);
-            for (uint32_t x = 0; x < width_; ++x) row[x] = uint8_t(16 + ((x + y + shift) & 0xff) * 219 / 255);
+            for (uint32_t x = 0; x < frameW_; ++x) row[x] = uint8_t(16 + ((x + y + shift) & 0xff) * 219 / 255);
         }
-        for (uint32_t y = 0; y < height_ / 2; ++y) std::memset(f->data[1] + size_t(y) * size_t(f->linesize[1]), 128, width_);
+        std::memset(f->data[1], 128, size_t(f->linesize[1]) * (frameH_ / 2));
     }
     if (!s.ok) {
         rt_.av_frame_free(&f);
@@ -890,6 +930,14 @@ Status LavcEncoder::readTexture(ID3D11Texture2D* tex, ComPtr<ID3D11Texture2D>& s
         if (d3d::deviceRemoved(device_.Get(), "lavc: reading a frame back", s)) return s;
         return Status::Error("encode_failed", "lavc: Map of the staging texture: " + d3d::hrText(hr));
     }
+    const uint32_t mappedRows = d.Format == DXGI_FORMAT_NV12 ? d.Height + d.Height / 2 : d.Height;
+    for (int i = 0; i < count; ++i) {
+        if (planes[i].rowBytes > m.RowPitch || planes[i].rowsBefore + planes[i].rows > mappedRows) {
+            context_->Unmap(staging.Get(), 0);
+            return Status::Error("encode_failed", "lavc: the converted frame (" + std::to_string(d.Width) + "x" + std::to_string(d.Height) +
+                                                      ") is smaller than the encoder's input");
+        }
+    }
     for (int i = 0; i < count; ++i) {
         const PlaneCopy& pc = planes[i];
         const uint8_t* base = static_cast<const uint8_t*>(m.pData) + size_t(pc.rowsBefore) * m.RowPitch;
@@ -902,20 +950,21 @@ Status LavcEncoder::readTexture(ID3D11Texture2D* tex, ComPtr<ID3D11Texture2D>& s
 }
 
 Status LavcEncoder::readback(const EncoderFrame& ef, AVFrame* f) {
-    const PlaneCopy luma{f->data[0], f->linesize[0], width_, height_, 0};
+    // The converter's output is frameW_ x frameH_ (the padded frame).
+    const PlaneCopy luma{f->data[0], f->linesize[0], frameW_, frameH_, 0};
     if (ef.nv12) {
         // NV12: the chroma rows follow the texture's luma rows (D3D11 maps
         // both planes of a planar format as one subresource).
         D3D11_TEXTURE2D_DESC d{};
         ef.nv12->GetDesc(&d);
-        const PlaneCopy planes[] = {luma, PlaneCopy{f->data[1], f->linesize[1], width_, height_ / 2, d.Height}};
+        const PlaneCopy planes[] = {luma, PlaneCopy{f->data[1], f->linesize[1], frameW_, frameH_ / 2, d.Height}};
         return readTexture(ef.nv12, stagingY_, planes, 2);
     }
     if (ef.y && ef.uv) {
         // Planar conversion (devices without NV12 render targets: Wine): R8
         // luma, R8G8 chroma (interleaved Cb Cr, the NV12 layout).
         Status s = readTexture(ef.y, stagingY_, &luma, 1);
-        const PlaneCopy chroma{f->data[1], f->linesize[1], width_, height_ / 2, 0};
+        const PlaneCopy chroma{f->data[1], f->linesize[1], frameW_, frameH_ / 2, 0};
         if (s.ok) s = readTexture(ef.uv, stagingUv_, &chroma, 1);
         return s;
     }

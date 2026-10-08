@@ -7,7 +7,7 @@
 // pointers below, so the binary links nothing of FFmpeg and runs without it.
 //
 // Where the DLLs are looked for, in this order: --ffmpeg-dir=DIR when given
-// (only there); else <helper dir>\ffmpeg-lgpl (where install-host.ps1
+// (only there; a relative DIR from the current directory); else <helper dir>\ffmpeg-lgpl (where install-host.ps1
 // -InstallLibavcodec puts BtbN's LGPL shared build), then the helper's own
 // directory. Both are under the install directory, which only administrators
 // can change. Each DLL is loaded by its full path with
@@ -46,7 +46,7 @@ struct LavcRuntime {
     decltype(&::av_strerror) av_strerror = nullptr;
     decltype(&::av_frame_alloc) av_frame_alloc = nullptr;
     decltype(&::av_frame_free) av_frame_free = nullptr;
-    decltype(&::av_frame_get_buffer) av_frame_get_buffer = nullptr;
+    decltype(&::av_buffer_alloc) av_buffer_alloc = nullptr;
     decltype(&::av_buffer_create) av_buffer_create = nullptr;
     decltype(&::av_buffer_ref) av_buffer_ref = nullptr;
     decltype(&::av_buffer_unref) av_buffer_unref = nullptr;

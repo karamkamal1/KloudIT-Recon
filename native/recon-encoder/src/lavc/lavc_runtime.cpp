@@ -32,6 +32,20 @@ std::wstring helperDirectory() {
     return slash == std::wstring::npos ? L"" : s.substr(0, slash);
 }
 
+// A fully qualified path (LoadLibraryExW with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+// refuses a relative one): a relative --ffmpeg-dir is taken from the current
+// directory.
+std::wstring fullPath(const std::wstring& path) {
+    const DWORD n = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (!n) return path;
+    std::wstring out(n, L'\0');
+    const DWORD m = GetFullPathNameW(path.c_str(), n, out.data(), nullptr);
+    if (!m || m >= n) return path;
+    out.resize(m);
+    while (out.size() > 3 && (out.back() == L'\\' || out.back() == L'/')) out.pop_back();
+    return out;
+}
+
 bool fileExists(const std::wstring& path) {
     const DWORD a = GetFileAttributesW(path.c_str());
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
@@ -65,7 +79,7 @@ LavcRuntime load(const LavcOptions& opt) {
     LavcRuntime rt;
     std::vector<std::wstring> dirs;
     if (!opt.dir.empty()) {
-        dirs.push_back(opt.dir);
+        dirs.push_back(fullPath(opt.dir));
     } else if (const std::wstring here = helperDirectory(); !here.empty()) {
         dirs.push_back(here + L"\\ffmpeg-lgpl");
         dirs.push_back(here);
@@ -109,7 +123,7 @@ LavcRuntime load(const LavcOptions& opt) {
     resolve(u, "av_strerror", rt.av_strerror, missing);
     resolve(u, "av_frame_alloc", rt.av_frame_alloc, missing);
     resolve(u, "av_frame_free", rt.av_frame_free, missing);
-    resolve(u, "av_frame_get_buffer", rt.av_frame_get_buffer, missing);
+    resolve(u, "av_buffer_alloc", rt.av_buffer_alloc, missing);
     resolve(u, "av_buffer_create", rt.av_buffer_create, missing);
     resolve(u, "av_buffer_ref", rt.av_buffer_ref, missing);
     resolve(u, "av_buffer_unref", rt.av_buffer_unref, missing);

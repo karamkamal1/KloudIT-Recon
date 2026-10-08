@@ -3589,7 +3589,9 @@ docs/HELPER_PROTOCOL.md "libavcodec encoder backend" is the reference. In short:
 
 - Runtime: `avutil-60.dll` + `avcodec-62.dll` (+ `swresample-6.dll`) of an FFmpeg 8.x shared
   build, from `--ffmpeg-dir` (Go: `encoder.Options.FFmpegDir`) or `ffmpeg-lgpl\` next to the
-  helper, then the helper's directory; loaded by full path with
+  helper, then the helper's directory (a relative `--ffmpeg-dir` is resolved against the
+  current directory first; the helper reads its arguments from the wide command line, so the
+  path may hold any Unicode character); loaded by full path with
   `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`; majors 62 / 60 required
   (the vendored FFmpeg 8.1 headers' struct layouts). Missing: `unavailable.lavc` says where it
   looked and that `install-host.ps1 -InstallLibavcodec` provides them.
@@ -3603,7 +3605,13 @@ docs/HELPER_PROTOCOL.md "libavcodec encoder backend" is the reference. In short:
 - Input: the converter's NV12 textures mapped into QSV surfaces without a copy (a D3D11VA device
   context on the capture's device, a derived QSV device, dynamic D3D11 and QSV frame pools,
   `av_hwframe_map`), 16x16-aligned textures with the picture's edge repeated into the padding;
-  fallback (encoder does not open that way, or `zeroCopy` false): read back into system memory.
+  fallback (encoder does not open that way, or `zeroCopy` false): read back into system memory,
+  into frames laid out as qsvenc takes them without a copy of its own (`submit_frame` copies
+  any frame whose height is not the surface height, whose pitch is not a multiple of its width
+  alignment, or whose CbCr plane does not follow the luma rows directly, which is every
+  `av_frame_get_buffer` frame): one buffer, pitch a multiple of 32, `AVFrame.height` = the
+  surface height (16-aligned for H.264, 32 for HEVC / AV1; the converter pads the picture,
+  the encoder crops to it).
 - Settings (Sunshine's quicksync encoder): `async_depth` 1, `low_delay_brc` 1, look-ahead off,
   no B frames, `forced_idr` 1, `low_power` 1 with a retry at 0, `adaptive_i` 0, GOP 65535 (the
   longest QSV takes), `rc` cbr = VBR with the peak at the target (`CBR_WITH_VBR`), no VBV size
@@ -3622,7 +3630,8 @@ docs/HELPER_PROTOCOL.md "libavcodec encoder backend" is the reference. In short:
   and an Intel adapter; no QSV encoder opened), so helper restarts on AMD / NVIDIA hosts with
   an Intel iGPU stay fast.
 - Protocol (additive, version stays 1): caps `backend` `lavc`, `unavailable.lavc` /
-  `lavc-h264` / `lavc-hevc` / `lavc-av1`; `started.encoder` (`hevc_qsv`, ...), with
+  `lavc-h264` / `lavc-hevc` / `lavc-av1` (when no encoder opens there is no backend, and
+  `unavailable.lavc` lists each encoder's error); `started.encoder` (`hevc_qsv`, ...), with
   `rateControl` `vbr_capped` / `vbr`, `usage` `low_power` / `default`, `preset`, `zeroCopy`.
   Go: `Options.FFmpegDir`, `Started.Encoder`.
 
@@ -3661,6 +3670,29 @@ the GOP); oneVPL `mfxExtEncoderResetOption::StartNewSequence`.
   an IDR"; the file decodes cleanly (`ffmpeg -v error -i x264.h264 -f null -` on Linux) with
   color_range tv, bt709, chroma_location left. libsvtav1 (`--lavc-test-encoder=libx264,libsvtav1`)
   reports `unavailable.lavc-av1` ("Invalid argument": it takes no NV12), as intended.
+- verified (sandbox, review fixes): `TestHelperIntegrationLavc` "Reasons":
+  `--lavc-test-encoder=libopenh264,nosuch` (libopenh264 takes no NV12) gives caps `none` with
+  `unavailable.lavc` "nosuch is not in this FFmpeg build; libopenh264: avcodec_open2 320x180:
+  Invalid argument (AVERROR -22) (libavcodec ...)" (the a71562c build: "nosuch is not in this
+  FFmpeg build" alone, and "no usable encoder (libavcodec ...)" for libopenh264 alone);
+  `libx264,libopenh264` starts with `started.encoder` libx264. "Paths": `FFmpegDir`
+  "ffmpeg-ü-ж" relative to the working directory loads the libraries (both subtests fail
+  against the a71562c build; by hand under Wine it gave "cannot load bin\avutil-60.dll:
+  Invalid parameter (error 87)" for `--ffmpeg-dir=bin` and "not found in ...ffmpeg-�-?" for
+  the non-ASCII directory). Wine passes such arguments and creates such directories only
+  under a UTF-8 Unix locale: `make helper-test` runs it with `LANG=C.UTF-8`, and the subtest
+  skips under Wine without one.
+- verified (sandbox, review fixes): system-memory frame layout: the GPU subtest (320x180 read
+  back from 320x192 textures) and the Flush / Seamless subtests (pattern frames) pass; the
+  encode test with `--capture=synthetic` at 1280x720, 1366x768 and 1920x1080 (H.264 frames
+  1376 x 768 and 1920 x 1088: pitch and height padded) decodes to the test pattern (mean luma
+  error 0.10-0.17 at 200 Mbps, the last 8 rows and columns no worse, chroma exactly 128), and
+  `--capture=synthetic-gpu` at 1366x768 ("padded to 1376x768") and 1920x1080 ("padded to
+  1920x1088") decodes cleanly at the picture size with intact right and bottom edges.
+  qsvenc's no-copy condition itself is QSV-only: checked against FFmpeg release/8.1
+  `qsvenc.c` `submit_frame` / `init_video_param` (`height_align` 16 for H.264, 32 for HEVC /
+  AV1) and `libavutil/frame.c` `get_video_buffer` (CbCr at `linesize * FFALIGN(h, 32)` plus
+  plane padding, so every `av_frame_get_buffer` frame was copied).
 - verified (sandbox): mutation checks: without `pict_type` I the Flush subtest fails ("forceIdr:
   no key frame within 10 frames"); without the parameter-set insertion (libx264 with
   `AV_CODEC_FLAG_GLOBAL_HEADER` keeps SPS / PPS out of the stream) it fails ("key frame 1
@@ -3707,6 +3739,12 @@ Ultra for AV1), after `install-host.ps1 -InstallLibavcodec` and a current Intel 
   SPS), color_range tv, bt709; the P-frame bitrate lines follow 8000 / 30000 kbps. The same with
   `--codec=h264` (High profile, `max_dec_frame_buffering` 1 in the VUI: `ffmpeg -bsf:v
   trace_headers`).
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (readback without qsvenc's
+  copy): the zero-copy test with `--zero-copy=0` at 1920x1080 for `--codec=h264` and
+  `--codec=hevc` (frames 1088 rows high: H.264 16-, HEVC 32-aligned) and once at 1366x768:
+  "encode-test: ok", the file decodes cleanly at the picture size with intact right and bottom
+  edges (`ffmpeg -i out.hevc -frames:v 1 last.png`), no "map frame to surface failed" in the
+  debug log; record submit->output p50 / p95 against the zero-copy run.
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (live bitrate without the
   forced IDR): the zero-copy test with `--live-bitrate=seamless`: the rate lines say "no key
   frame" if the runtime resets without a new sequence; then the bitrate follows within a few

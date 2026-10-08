@@ -51,13 +51,15 @@ helper:
 # the synthetic-gpu pipeline test and the NVENC test; headless they skip.
 # FFMPEG_DIR=<bin directory of an FFmpeg 8.x shared build with libx264> (BtbN
 # ffmpeg-n8.1-latest-win64-gpl-shared-8.1) adds the libavcodec backend's stream tests.
+# LANG=C.UTF-8: Wine stores non-ASCII file names (the Unicode path test) only under a
+# UTF-8 Unix locale.
 FFMPEG_DIR ?=
 helper-test: helper
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(DIST)/obj/encoder.test.exe ./internal/host/encoder
 	cd $(DIST)/obj && RECON_HELPER_EXE='Z:$(subst /,\,$(abspath $(DIST)/windows/recon-encoder.exe))' \
 		RECON_FAKE_NVENC='Z:$(subst /,\,$(abspath $(HELPER_BUILD)/bin/recon-fake-nvenc.dll))' \
 		$(if $(FFMPEG_DIR),RECON_FFMPEG_DIR='Z:$(subst /,\,$(abspath $(FFMPEG_DIR)))') \
-		$(WINE) ./encoder.test.exe -test.v -test.count=1
+		LANG=C.UTF-8 $(WINE) ./encoder.test.exe -test.v -test.count=1
 
 # third_party/quic-go is a separate module (not in ./...): the last line runs the upstream tests
 # of the packages third_party/quic-go.patch changes.

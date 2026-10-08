@@ -5,6 +5,7 @@
 // (length-prefixed JSON), and restarts it if it exits or reports a fatal error.
 // The protocol is specified in docs/HELPER_PROTOCOL.md.
 #include <windows.h>
+#include <shellapi.h>  // CommandLineToArgvW
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "backend.hpp"
 #include "control.hpp"
@@ -47,7 +49,8 @@ const char kUsage[] =
     "  --event-handle=H     inherited handle of the auto-reset frame-ready event\n"
     "  --backend=B          auto (default) | amf | nvenc | lavc | mock\n"
     "  --ffmpeg-dir=DIR     lavc: load avcodec-62.dll / avutil-60.dll (FFmpeg 8.x shared build) from DIR only\n"
-    "                       (default: ffmpeg-lgpl\\ next to the helper, then the helper's directory)\n"
+    "                       (relative: from the current directory; default: ffmpeg-lgpl\\ next to the helper,\n"
+    "                       then the helper's directory)\n"
     "  --lavc-test-encoder=NAME[,NAME]  test only, needs --backend=lavc: drive these libavcodec encoders (e.g.\n"
     "                       libx264 of a GPL shared build) instead of Quick Sync Video, on system-memory frames\n"
     "  --log-level=L        error | warn | info (default) | debug   (logs go to stderr)\n"
@@ -105,9 +108,23 @@ bool parseNumber(const std::string& s, uint64_t& out) {
     return errno == 0 && end && *end == '\0';
 }
 
-bool parseArgs(int argc, char** argv, Args& a, std::string& err) {
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+// The arguments as UTF-8, from the wide command line: main's argv is in the
+// ANSI code page, which cannot hold every path (the path options are decoded
+// with fromUtf8). argv only if the wide command line cannot be split.
+std::vector<std::string> utf8Arguments(int argc, char** argv) {
+    int n = 0;
+    if (LPWSTR* w = CommandLineToArgvW(GetCommandLineW(), &n)) {
+        std::vector<std::string> out;
+        for (int i = 0; i < n; ++i) out.push_back(toUtf8(w[i]));
+        LocalFree(w);
+        if (n == argc) return out;
+    }
+    return std::vector<std::string>(argv, argv + argc);
+}
+
+bool parseArgs(const std::vector<std::string>& args, Args& a, std::string& err) {
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
         std::string key = arg, val;
         const size_t eq = arg.find('=');
         if (eq != std::string::npos) {
@@ -254,7 +271,7 @@ int main(int argc, char** argv) {
 
     Args a;
     std::string err;
-    if (!parseArgs(argc, argv, a, err)) {
+    if (!parseArgs(utf8Arguments(argc, argv), a, err)) {
         std::fprintf(stderr, "recon-encoder: %s\n\n%s", err.c_str(), kUsage);
         return kExitUsage;
     }

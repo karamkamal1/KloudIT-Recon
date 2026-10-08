@@ -62,6 +62,10 @@ recon-encoder.exe --encode-test=FILE [--backend=...] [options]   # one stream to
 recon-encoder.exe --version
 ```
 
+Arguments are read from the wide command line (`GetCommandLineW`), so paths (`--ffmpeg-dir`,
+`--encode-test`, `--dump-nv12`, ...) may hold any Unicode character, not only the ANSI code
+page's.
+
 * `--ring-handle` / `--event-handle`: handle values (hex `0x...` or decimal) of the
   inherited file mapping and frame-ready event (below).
 * `--ring-size`: size of the mapping in bytes; must equal the header's `totalSize`.
@@ -74,8 +78,8 @@ recon-encoder.exe --version
   `--self-test-nvenc=DLL` is the only place a DLL is loaded by path: the NVENC test double,
   for that self-test alone.)
 * `--ffmpeg-dir=DIR` (step 3.8): the libavcodec backend loads `avutil-60.dll` and
-  `avcodec-62.dll` (FFmpeg 8.x shared build; `swresample-6.dll` next to them) from DIR only.
-  Default: `ffmpeg-lgpl\` next to the helper (where `install-host.ps1 -InstallLibavcodec`
+  `avcodec-62.dll` (FFmpeg 8.x shared build; `swresample-6.dll` next to them) from DIR only
+  (a relative DIR is taken from the current directory). Default: `ffmpeg-lgpl\` next to the helper (where `install-host.ps1 -InstallLibavcodec`
   puts them), then the helper's own directory. Without them the backend is unavailable
   (`unavailable.lavc` says where it looked); the helper never needs them otherwise.
 * `--lavc-test-encoder=NAME[,NAME]` (test only, needs `--backend=lavc`): the libavcodec
@@ -1015,7 +1019,8 @@ static `ffmpeg.exe` stays the FFmpeg command-line path, and the helper never loa
 **Caps.** Adapter 0 if it is Intel, else the Intel adapter with the most video memory (an
 Arc card next to an iGPU); no Intel adapter: `unavailable.lavc`. Each encoder is opened once
 at 1280x720 on a QSV session derived from a D3D11 device on that adapter (low power, then
-without); the ones that open are the codecs, the others go to `unavailable.lavc-<codec>`.
+without); the ones that open are the codecs, the others go to `unavailable.lavc-<codec>`
+(when none opens there is no backend: `unavailable.lavc` lists each encoder's error).
 libavcodec has no capability query, so the codec entries are documented or default values:
 
 | caps field | Value |
@@ -1044,7 +1049,10 @@ drops the mapped frame (qsvenc releases it once the encoder has unlocked the sur
 encoder does not open that way (an older runtime without dynamic surfaces), or `start`'s
 `zeroCopy` is false, the frames are read back into system memory instead (a staging texture;
 qsvenc uploads them; `started.zeroCopy` false), still on a QSV session on the capture's
-device. The synthetic capture gets a moving test pattern drawn on the CPU.
+device. Those frames are laid out as qsvenc passes them on without a copy of its own (its
+`submit_frame` copies any other frame first): one buffer with the CbCr rows right after the
+luma rows, the pitch a multiple of 32, the height that of the encoder's surfaces (16-aligned
+for H.264, 32 for HEVC / AV1; the converter pads the picture to that size, edge repeated). The synthetic capture gets a moving test pattern drawn on the CPU.
 
 **Settings** (as Sunshine's `quicksync` encoder, `video.cpp`): `async_depth` 1,
 `low_delay_brc` 1, look-ahead off (`look_ahead` 0, `look_ahead_depth` 0), no B frames,

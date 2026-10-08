@@ -81,7 +81,7 @@ target_compile_definitions(recon-encoder PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00
     RECON_ENCODER_VERSION="${PROJECT_VERSION}"
 )
-target_link_libraries(recon-encoder PRIVATE d3d11 dxgi)
+target_link_libraries(recon-encoder PRIVATE d3d11 dxgi shell32)
 
 # Windows.Graphics.Capture is written against C++/WinRT: part of the Windows
 # SDK for MSVC (linked through WindowsApp.lib). mingw-w64 has no C++/WinRT

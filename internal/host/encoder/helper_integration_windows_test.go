@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -1097,6 +1098,66 @@ func TestHelperIntegrationLavc(t *testing.T) {
 		}
 		return true
 	}
+
+	// No encoder opens (libopenh264 takes no NV12): unavailable.lavc carries
+	// every encoder's error. Two encoders of one codec: the first that opens.
+	t.Run("Reasons", func(t *testing.T) {
+		h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, Args: []string{"--lavc-test-encoder=libopenh264,nosuch"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := h.Caps()
+		h.Close()
+		why := c.Unavailable["lavc"]
+		if c.Backend != "none" || !strings.Contains(why, "libopenh264: avcodec_open2") || !strings.Contains(why, "nosuch is not in") {
+			t.Fatalf("no encoder opens: backend %q, unavailable %v", c.Backend, c.Unavailable)
+		}
+		t.Logf("unavailable.lavc: %s", why)
+		h, err = Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, Args: []string{"--lavc-test-encoder=libx264,libopenh264"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		st, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 1000})
+		if err != nil || st.Encoder != "libx264" {
+			t.Fatalf("libx264 and libopenh264: start %+v %v, caps unavailable %v", st, err, h.Caps().Unavailable)
+		}
+	})
+
+	// FFmpegDir relative to the working directory, with characters the
+	// ANSI command line cannot carry as UTF-8 (or at all).
+	t.Run("Paths", func(t *testing.T) {
+		base := t.TempDir()
+		const name = "ffmpeg-ü-ж"
+		if err := os.Mkdir(filepath.Join(base, name), 0o755); err != nil {
+			if underWine() {
+				t.Skipf("%v (Wine stores such names only under a UTF-8 Unix locale: LANG=C.UTF-8)", err)
+			}
+			t.Fatal(err)
+		}
+		for _, dll := range []string{"avcodec-62.dll", "avutil-60.dll", "swresample-6.dll"} {
+			from, to := filepath.Join(dir, dll), filepath.Join(base, name, dll)
+			if os.Link(from, to) != nil {
+				b, err := os.ReadFile(from)
+				if err == nil {
+					err = os.WriteFile(to, b, 0o644)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		t.Chdir(base)
+		h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: name, Args: []string{"--lavc-test-encoder=libx264"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := h.Caps()
+		h.Close()
+		if c.Backend != "lavc" || c.Codecs["h264"].MaxW == 0 {
+			t.Fatalf("FFmpegDir %q in %s: backend %q, unavailable %v", name, base, c.Backend, c.Unavailable)
+		}
+	})
 
 	t.Run("Flush", func(t *testing.T) {
 		h := launch(t)
