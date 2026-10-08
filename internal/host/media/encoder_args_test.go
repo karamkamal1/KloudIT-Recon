@@ -236,8 +236,9 @@ func TestNVIDIAEncoderArgs(t *testing.T) {
 }
 
 // TestRecovery checks the recovery mode announced to the client (guide step
-// 1.4): skip only with an intra refresh that heals within maxRefreshSeconds,
-// read from the arguments the host really passes (FFmpeg 8.1 option lists).
+// 1.4): skip only with an intra refresh that heals within maxHealSeconds in
+// the worst case (two refresh periods), read from the arguments the host
+// really passes (FFmpeg 8.1 option lists).
 func TestRecovery(t *testing.T) {
 	c := ffmpeg81Caps(t)
 	// The options Recovery reads are the real ones of these encoders.
@@ -270,17 +271,18 @@ func TestRecovery(t *testing.T) {
 		want, why  string
 		withNVENCg bool
 	}{
-		{"-intra-refresh 1 -g 60", 1920, 1080, 60, proto.RecoverySkip, "1 s refresh period", false},
-		{"-intra-refresh 1 -g 120", 1920, 1080, 60, proto.RecoverySkip, "2 s refresh period", false},
-		{"-intra-refresh 1 -g 121", 1920, 1080, 60, proto.RecoveryKeyframe, "period over 2 s", false},
+		{"-intra-refresh 1 -g 60", 1920, 1080, 60, proto.RecoverySkip, "1 s refresh period: heals within 2 s", false},
+		{"-intra-refresh 1 -g 61", 1920, 1080, 60, proto.RecoveryKeyframe, "period over 1 s: two periods over 2 s", false},
+		{"-intra-refresh 1 -g 120", 1920, 1080, 60, proto.RecoveryKeyframe, "2 s refresh period: up to 4 s damaged", false},
 		{"-intra-refresh 1", 1920, 1080, 60, proto.RecoveryKeyframe, "NVENC with the default GOP (an hour): heals nothing", true},
 		{"-intra-refresh true -g 30", 1280, 720, 30, proto.RecoverySkip, "boolean spelled out", false},
 		{"-intra-refresh 0 -g 60", 1920, 1080, 60, proto.RecoveryKeyframe, "off", false},
 		{"-g 30", 1920, 1080, 60, proto.RecoveryKeyframe, "no intra refresh", false},
 		// 1920x1080 = 120 x 68 = 8160 macroblocks.
 		{"-intra_refresh_mb 255", 1920, 1080, 60, proto.RecoverySkip, "32 frames", false},
-		{"-intra_refresh_mb 68", 1920, 1080, 60, proto.RecoverySkip, "120 frames", false},
-		{"-intra_refresh_mb 67", 1920, 1080, 60, proto.RecoveryKeyframe, "122 frames", false},
+		{"-intra_refresh_mb 136", 1920, 1080, 60, proto.RecoverySkip, "60 frames", false},
+		{"-intra_refresh_mb 135", 1920, 1080, 60, proto.RecoveryKeyframe, "61 frames", false},
+		{"-intra_refresh_mb 68", 1920, 1080, 60, proto.RecoveryKeyframe, "120 frames: up to 4 s damaged", false},
 		{"-intra_refresh_mb -1", 1920, 1080, 60, proto.RecoveryKeyframe, "FFmpeg's default: off", false},
 		{"-intra_refresh_mb 255", 0, 0, 60, proto.RecoveryKeyframe, "size unknown", false},
 	} {

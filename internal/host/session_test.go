@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,6 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -233,4 +240,167 @@ func TestMediaTargetSurvivesMigration(t *testing.T) {
 	if got := transport.MediaControl(s.c).TargetBitrate(); got != want {
 		t.Fatalf("target after migration = %d bit/s, want %d", got, want)
 	}
+}
+
+// lockedLog collects a session's log lines for TestQueueOverflowEscalates.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(b)
+}
+
+func (l *lockedLog) lines(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, line := range strings.Split(l.buf.String(), "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// TestQueueOverflowEscalates: a frame-queue overflow within 2 s of a bitrate
+// cut is not swallowed by the cut's rate limit. After a client congestion
+// report (overlapped restart: the old generation streams on at the old
+// bitrate while the new one starts) the old generation stops at once and the
+// starting one takes over; with nothing starting (the overflow dropped the
+// newest generation's key frame) a new generation starts at once. Neither
+// cuts the bitrate again, and both restarts keep the lowered bitrate.
+func TestQueueOverflowEscalates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in encoder is a shell script")
+	}
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	caps, err := media.Probe(context.Background(), ff, nil)
+	if err != nil {
+		t.Skipf("probe: %v", err)
+	}
+	enc, ok := caps.Best("h264")
+	if !ok {
+		t.Skip("no h264 encoder")
+	}
+	// An encoder that starts and never delivers a frame: a generation that
+	// stays "starting" however fast the test runs.
+	stall := filepath.Join(t.TempDir(), "stalled-ffmpeg")
+	if err := os.WriteFile(stall, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session := func(t *testing.T) (*Session, *lockedLog) {
+		c := *caps
+		cfg := &Config{Capture: "test", Encoder: enc.Name, TestWidth: 320, TestHeight: 180, DefaultFPS: 30, MaxFPS: 60,
+			DefaultKbps: 4000, MaxKbps: 100000}
+		ctx, cancel := context.WithCancel(context.Background())
+		logs := &lockedLog{}
+		s := &Session{
+			a:     &Agent{cfg: cfg, caps: &c, inj: input.NewInjector(nil), hostClock: media.NewClock()},
+			hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: enc.Family}}},
+			tried: map[string]bool{}, usage: map[string]string{},
+			ctx: ctx, cancel: cancel, ctrl: &fakeCtrl{}, frameQ: make(chan *media.Frame, 6),
+			log: slog.New(slog.NewTextHandler(logs, nil)),
+		}
+		s.video = media.NewVideo(&c, s.log, s.a.clock)
+		t.Cleanup(func() { cancel(); s.video.Stop() })
+		go s.videoEvents()
+		return s, logs
+	}
+	// keepCutWindowOpen moves the last cut ahead so that a slow machine
+	// cannot leave the 2 s window before the overflow.
+	keepCutWindowOpen := func(s *Session) {
+		s.kickMu.Lock()
+		s.lastCong = time.Now().Add(time.Hour)
+		s.kickMu.Unlock()
+	}
+	waitFor := func(t *testing.T, logs *lockedLog, substr string) string {
+		t.Helper()
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if l := logs.lines(substr); len(l) > 0 {
+				return l[0]
+			}
+		}
+		t.Fatalf("no log line with %s", substr)
+		return ""
+	}
+
+	t.Run("overlapped back-off", func(t *testing.T) {
+		s, logs := session(t)
+		if err := s.startVideo(false, ""); err != nil {
+			t.Fatal(err)
+		}
+		// The client takes frames until generation 1 streams.
+		for n := 0; n < 10; n++ {
+			select {
+			case <-s.frameQ:
+			case <-time.After(20 * time.Second):
+				t.Fatal("generation 1 sends no frames")
+			}
+		}
+		s.a.caps.FFmpeg = stall // the next generation stays starting
+		s.congestion(120, false)
+		keepCutWindowOpen(s)
+		if _, ok := s.video.Active(); !ok {
+			t.Fatal("overlapped back-off stopped the active generation")
+		}
+		if p, _ := s.video.Current(); p.BitrateKbps != 3000 || s.curKbps.Load() != 3000 {
+			t.Fatalf("back-off to %d kbps (starting %d), want 3000", s.curKbps.Load(), p.BitrateKbps)
+		}
+		// The client stops taking frames: generation 1 overflows the queue.
+		line := waitFor(t, logs, `msg="restarting video" reason="queue overflow" urgent=true`)
+		if !strings.Contains(line, "takeover=true") {
+			t.Fatalf("overflow did not hand over to the starting generation: %s", line)
+		}
+		if _, ok := s.video.Active(); ok {
+			t.Fatal("the old generation still streams after the overflow")
+		}
+		if p, ok := s.video.Current(); !ok || p.BitrateKbps != 3000 || s.curKbps.Load() != 3000 {
+			t.Fatalf("after the overflow: starting %v at %d kbps, target %d, want 3000 (no second cut)", ok, p.BitrateKbps, s.curKbps.Load())
+		}
+		if n := len(logs.lines(`msg="starting encoder"`)); n != 2 {
+			t.Fatalf("%d encoder starts, want 2 (the starting generation is kept)", n)
+		}
+		if n := len(logs.lines(`msg="congestion: lowering bitrate"`)); n != 1 {
+			t.Fatalf("%d bitrate cuts, want 1", n)
+		}
+	})
+
+	t.Run("key frame dropped", func(t *testing.T) {
+		s, logs := session(t)
+		s.curKbps.Store(3000) // a cut moments ago
+		keepCutWindowOpen(s)
+		if err := s.startVideo(false, ""); err != nil {
+			t.Fatal(err)
+		}
+		// Nobody takes frames: generation 1's key frame is among the
+		// dropped ones and the client cannot decode anything of it.
+		waitFor(t, logs, `msg="frames dropped" why="queue overflow" gen=1 from_seq=0`)
+		waitFor(t, logs, `msg="restarting video" reason="queue overflow" urgent=true`)
+		if l := waitFor(t, logs, `msg="starting encoder" gen=2`); !strings.Contains(l, " kbps=3000 ") {
+			t.Fatalf("restart not at the lowered bitrate: %s", l)
+		}
+		if n := len(logs.lines(`msg="congestion: lowering bitrate"`)); n != 0 || s.curKbps.Load() != 3000 {
+			t.Fatalf("%d bitrate cuts, target %d kbps, want none and 3000", n, s.curKbps.Load())
+		}
+	})
+
+	// A key-frame request (a confirmed loss) keeps the back-off.
+	t.Run("keyframe request", func(t *testing.T) {
+		s, logs := session(t)
+		s.curKbps.Store(3000)
+		if err := s.startVideo(false, ""); err != nil {
+			t.Fatal(err)
+		}
+		s.requestKeyframe()
+		if l := waitFor(t, logs, `msg="starting encoder" gen=2`); !strings.Contains(l, " kbps=3000 ") {
+			t.Fatalf("key-frame restart undid the back-off: %s", l)
+		}
+	})
 }

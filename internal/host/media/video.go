@@ -141,6 +141,24 @@ func (v *Video) Start(p Params, urgent bool) error {
 	return nil
 }
 
+// Hurry turns an overlapped Start that is still starting into an urgent one:
+// the active generation stops now and the starting one takes over at its
+// first key frame. It reports whether it stopped the active generation and
+// whether a generation is starting (with or without one still active).
+func (v *Video) Hurry() (stopped, starting bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.pending == nil {
+		return false, false
+	}
+	if v.active != nil {
+		v.active.kill()
+		v.active = nil
+		stopped = true
+	}
+	return stopped, true
+}
+
 // Stop terminates all encoder processes.
 func (v *Video) Stop() {
 	v.mu.Lock()

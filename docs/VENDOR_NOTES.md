@@ -778,24 +778,39 @@ What changed (B1, B2):
   only then a loss.
 - `VideoConfig.recovery` (`skip` | `keyframe`), set by the host from the encoder arguments it
   actually passes (`media.Recovery`; the options are filtered against `ffmpeg -h encoder=…`):
-  `skip` only with intra refresh that heals within 2 s, i.e. NVENC `-intra-refresh 1` with `-g` of
-  at most 2 s of frames (FFmpeg makes the GOP infinite and uses `-g` as the refresh period), or
-  h264_amf `-intra_refresh_mb N` with ceil(macroblocks per picture / N) at most 2 s of frames.
-  Everything else is `keyframe`. No encoder runs with intra refresh yet, so today every encoder
-  announces `keyframe` (`encoder ready ... recovery=keyframe` in the host log, "Loss recovery: key
-  frame" in the stats overlay). Step 1.2 has to set `-g` to the refresh period when it turns on
-  `-intra-refresh`; with the session's default `-g` (an hour of frames) the host keeps announcing
-  `keyframe`. On a confirmed loss the client skips the lost frames and decodes on (`skip`) or asks
-  for a key frame (`keyframe`: the restart path as before, now only for confirmed losses). A loss
-  before the generation's first key frame always asks for a key frame, and a decoder error after
-  a skip falls back to reset + key frame.
+  `skip` only with intra refresh that heals within 2 s. A skipped loss heals only after up to two
+  refresh periods (the waves run back to back; the regions the current wave refreshed before the
+  loss are predicted from the lost frame afterwards and are clean again only after the next whole
+  wave), so the period must be at most 1 s: NVENC `-intra-refresh 1` with `-g` ≤ fps (FFmpeg 8.1
+  `nvenc.c` makes the GOP infinite and sets `intraRefreshPeriod = -g`, `intraRefreshCnt = -g - 1`),
+  or h264_amf `-intra_refresh_mb N` with ceil(macroblocks per picture / N) ≤ fps (its refresh
+  cycles also repeat continuously). Everything else is `keyframe`. No encoder runs with intra
+  refresh yet, so today every encoder announces `keyframe` (`encoder ready ... recovery=keyframe`
+  in the host log, "Loss recovery: key frame" in the stats overlay). Step 1.2 has to set `-g` to
+  the refresh period (at most fps, 1 s) when it turns on `-intra-refresh`; with the session's
+  default `-g` (an hour of frames) the host keeps announcing `keyframe`. On a confirmed loss the
+  client skips the lost frames and decodes on (`skip`) or asks for a key frame (`keyframe`: the
+  restart path as before, now only for confirmed losses). A loss before the generation's first key
+  frame always asks for a key frame, and a decoder error after a skip falls back to reset + key
+  frame.
 - Client congestion reports (`{"t":"congestion"}`, one-way delay growth) restart the encoder
-  overlapped (`startVideo(false, …)`); the host's frame-queue overflow stays urgent. Deviation
-  from the guide: a client whose decoder fell behind flushes it and sends
-  `{"t":"congestion","reason":"decoder"}`, which also restarts urgently, because that client
-  discards the old generation's frames anyway (an overlap would only run two encoders, and on a
-  loaded machine the extra encoder delayed the new key frame until the client's 1 s watchdog
-  asked again). Old clients send no reason and get the overlapped restart.
+  overlapped (`startVideo(false, …)`); the host's frame-queue overflow stays urgent, also within
+  2 s of a bitrate cut (the 2 s limit only bounds how often the bitrate is cut): if an overlapped
+  back-off's generation is still starting, the old generation (still at the old bitrate) stops at
+  once and the starting one takes over (`restarting video reason="queue overflow" urgent=true
+  takeover=true`); otherwise a new generation starts at once at the lowered bitrate (`restarting
+  video reason="queue overflow" urgent=true`: the dropped frames include the newest ones, possibly
+  the newest generation's key frame, which the client's own request would not get: the host
+  ignores key-frame requests within 500 ms of a restart). A decoder-backlog report within 2 s of
+  a cut still restarts nothing (the client's watchdog asks for the key frame after 1 s). A
+  back-off now stays in effect for every later restart (key-frame request, encoder failure, resume)
+  until a settings change; before, any restart other than a congestion one went back to the full
+  bitrate, so a key-frame request right after a back-off undid it. Deviation from the guide: a
+  client whose decoder fell behind flushes it and sends `{"t":"congestion","reason":"decoder"}`,
+  which also restarts urgently, because that client discards the old generation's frames anyway (an
+  overlap would only run two encoders, and on a loaded machine the extra encoder delayed the new
+  key frame until the client's 1 s watchdog asked again). Old clients send no reason and get the
+  overlapped restart.
 - Client fix found on the way: a key-frame request within 400 ms of the previous one was not
   sent and also did not mark the generation as abandoned, so its later frames buffered up and
   their gap was taken for a second loss (a second request, often a second restart). The
@@ -811,16 +826,23 @@ Verified in the sandbox:
 
 - verified (sandbox): `internal/host` `TestFrameSenderFaults` (frameSender with the hook over a
   recording transport: every 3rd frame 80 ms late while the frames after it go out on time; every
-  5th reset after half its bytes and reported, exactly those), `TestReportDropped` (one message
-  per run of consecutive frames per generation, as a queue drain produces them),
-  `TestParseTestFaults`; `internal/host/media` `TestRecovery` (on the FFmpeg 8.1 option lists of
-  the six hardware encoders: today's arguments give `keyframe` everywhere; NVENC
-  `-intra-refresh 1` gives `skip` only with `-g` ≤ 2 s of frames and stays `keyframe` with the
-  session's default `-g`; h264_amf `-intra_refresh_mb` 255/68 at 1080p60 give `skip`, 67 (122
-  frames) and the default -1 give `keyframe`; `-intra-refresh` and `-intra_refresh_mb` are the
-  real option names, and hevc_amf/av1_amf have neither); `internal/proto` `TestLossRecoveryJS`
-  (protocol.js parses the Go-encoded `dropped` message and `recovery` field; malformed reports are
-  rejected, a missing count is 1, hosts without the field mean `keyframe`).
+  5th reset after half its bytes and reported, exactly those), `TestReportDropped` (one message per
+  run of consecutive frames per generation, as a queue drain produces them), `TestParseTestFaults`,
+  `TestQueueOverflowEscalates` (libx264 test pattern, a stand-in encoder that never starts for the
+  new generation: a client congestion report gives an overlapped back-off to 75 %, the queue
+  overflow that follows within 2 s stops the old generation and keeps the starting one, with no
+  second cut and no third encoder; an overflow within 2 s of a cut that drops the newest
+  generation's key frame, with nothing starting, restarts at once at the lowered bitrate; a
+  key-frame request keeps a back-off; it fails on the code before these fixes);
+  `internal/host/media` `TestRecovery` (on the FFmpeg 8.1 option lists of the six hardware
+  encoders: today's arguments give `keyframe` everywhere; NVENC `-intra-refresh 1` gives `skip`
+  only with `-g` ≤ fps (60 at 60 fps; 61 and 120 give `keyframe`) and stays `keyframe` with the
+  session's default `-g`; h264_amf `-intra_refresh_mb` 255/136 at 1080p60 (32/60 frames) give
+  `skip`, 135 (61 frames), 68 (120 frames) and the default -1 give `keyframe`; `-intra-refresh` and
+  `-intra_refresh_mb` are the real option names, and hevc_amf/av1_amf have neither);
+  `internal/proto` `TestLossRecoveryJS` (protocol.js parses the Go-encoded `dropped` message and
+  `recovery` field; malformed reports are rejected, a missing count is 1, hosts without the field
+  mean `keyframe`).
 - verified (sandbox): Go integration test `internal/e2e` `TestStreamingFrameLoss` (real gateway
   and agent, libx264, direct WebTransport, `RECON_TEST_FAULTS="delay=every:7:120ms,drop=every:20,
   recovery=skip"`, 4 s): every frame either arrives or is reported dropped, never both; in the
@@ -858,6 +880,11 @@ Verified in the sandbox:
     `skip` on AV1 (av1_nvenc with intra refresh after 1.2) this means a decoder error and a key
     frame after many losses unless the encoder signals frames that do not inherit state; see the
     NVIDIA check below.
+  - After the review fixes (overflow escalation, back-off kept on every restart, refresh period
+    at most 1 s): 62 of 62 passed again. Two earlier runs at a load average of about 7 each failed
+    only "steady real-time playback" and "video decoding" of one scenario (a different one each
+    time) during a decoder-backlog flush. No queue overflow happens on loopback, so the overflow
+    escalation is covered by `TestQueueOverflowEscalates` only.
 - Not run: the 0.4 `wifi` profile on loopback in a network namespace. The sandbox kernel has no
   `sch_netem` (`tc qdisc add dev lo root netem delay 5ms` in `unshare -n`: "Specified qdisc kind
   is unknown"), and the QEMU VM used for 0.4 is software-emulated, too slow to run the streaming
@@ -886,17 +913,24 @@ Hardware checks:
   recovery=skip` in host.log): start the agent for this test only with
   `$env:RECON_TEST_FAULTS="drop=every:600"` (one drop every 10 s at 60 fps) and check that each
   drop shows "skipping 1 lost frame(s)" in `__recon.logs`, no key-frame request, and the picture
-  heals within the refresh period; for av1_nvenc record any `decoder error` (the AV1 entropy
-  state issue above).
+  heals within two refresh periods (2 × `-g` frames, at most 2 s; a drop early in a refresh wave
+  takes longest), never later; for av1_nvenc record any `decoder error` (the AV1 entropy state
+  issue above).
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance, lan) wired client, relay or direct path,
-  no impairment (`./netem.sh clear`), hevc_amf at 1920×1080 60 fps, a game or video with constant
-  motion, 30 minutes without touching the settings. Then in PowerShell on the host:
+  no impairment (`./netem.sh clear --ct <gateway CTID>` on the Proxmox node), hevc_amf at 1920×1080
+  60 fps, a game or video with constant motion, 30 minutes without touching the settings. Then in
+  PowerShell on the host:
   `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="restarting video"' | Select-Object -Last 50`
-  and `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="frames dropped"'`.
-  Pass: no `restarting video` line with `reason="keyframe request"` in the 30 minutes, and no
-  `frames dropped` line; the overlay's "Frames dropped" row stays at `0 (host dropped 0) ·
-  skipped 0`, and its `key req` stays 0 unless `__recon.logs` shows a `decoder backlog` or
-  `decoder error` line (record those separately: they are not loss restarts).
+  and `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="frames dropped"'`. Pass
+  (guide: zero restarts in 30 min): no `restarting video` line in the 30 minutes other than
+  `reason=settings` (none if the settings were not touched; `reason=resume` only right after the
+  stream tab was hidden and shown again), and no `frames dropped` line; the overlay's "Frames
+  dropped" row stays at `0 (host dropped 0) · skipped 0` and its `key req` at 0. Any other restart
+  fails the run until it is explained: record each one with its reason (`congestion` urgent or not,
+  `keyframe request`, `encoder failure`) and the client's `__recon.logs` lines around it
+  (`congestion: +N ms queueing delay`, `decoder backlog`, `decoder error`), and find the cause (a
+  congestion report on a clean LAN means a delay spike on the host or the client, a decoder backlog
+  a client that cannot decode the stream in real time).
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance, wifi: restarts drop by at least 80 %)
   force the relay path (Network path "Relay via gateway"), `./netem.sh apply wifi --ct <gateway
   CTID> --host <client IP>` on the Proxmox node (0.4), hevc_amf 1080p60 at 20 Mbit/s, 10 minutes

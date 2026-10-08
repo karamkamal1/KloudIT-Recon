@@ -697,19 +697,24 @@ func RetryUsage(e EncoderInfo) string {
 	return ""
 }
 
-// maxRefreshSeconds bounds the intra refresh period that counts as healing:
-// a client that skips a lost frame shows a damaged picture until then.
-const maxRefreshSeconds = 2
+// maxHealSeconds bounds how long a client that skips a lost frame shows a
+// damaged picture. With intra refresh that is up to two refresh periods: the
+// waves run back to back, and the regions the current wave refreshed before
+// the loss are predicted from the lost frame afterwards, so they are clean
+// again only after the next whole wave. The refresh period must therefore be
+// at most maxHealSeconds / 2 (1 s: -g <= fps for NVENC).
+const maxHealSeconds = 2
 
 // Recovery returns how a client recovers from a lost frame of a generation
 // encoded with these encoder arguments at w×h and fps (proto.VideoConfig
 // Recovery). Skipping the frame needs an encoder that heals the picture by
-// itself, with intra refresh that completes within maxRefreshSeconds:
+// itself, with intra refresh whose worst case (two periods) stays within
+// maxHealSeconds:
 //   - NVENC -intra-refresh 1: FFmpeg makes the GOP infinite and uses -g as
 //     the refresh period (intraRefreshPeriod = -g, spread over -g - 1 frames),
 //     so -g must be short; the default (an hour of frames) heals nothing.
 //   - AMF H.264 -intra_refresh_mb N > 0: N macroblocks per frame, a period of
-//     ceil(macroblocks per picture / N) frames.
+//     ceil(macroblocks per picture / N) frames, repeated continuously.
 //
 // The arguments are the ones actually passed (encoderArgs drops options the
 // encoder lacks), so this follows what the encoder can do. Anything else
@@ -730,7 +735,7 @@ func Recovery(args []string, w, h, fps int) string {
 		}
 		return 0, false
 	}
-	maxFrames := maxRefreshSeconds * max(fps, 1)
+	maxFrames := maxHealSeconds * max(fps, 1) / 2 // longest refresh period
 	if on, ok := val("intra-refresh"); ok && on == 1 {
 		if g, ok := val("g"); ok && g > 0 && g <= maxFrames {
 			return proto.RecoverySkip

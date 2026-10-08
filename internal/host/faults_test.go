@@ -203,8 +203,14 @@ func TestFrameSenderFaults(t *testing.T) {
 			}
 		}
 	}
+	// Each report goes out on its own goroutine: the two may arrive in
+	// either order (the client does not depend on it).
 	want := []proto.Dropped{{T: "dropped", Gen: 4, FromSeq: 4, Count: 1}, {T: "dropped", Gen: 4, FromSeq: 9, Count: 1}}
-	if got := ctrl.dropped(t); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+	got := ctrl.dropped(t)
+	if len(got) == 2 && got[0].FromSeq > got[1].FromSeq {
+		got[0], got[1] = got[1], got[0]
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("dropped reports %+v, want %+v", got, want)
 	}
 }

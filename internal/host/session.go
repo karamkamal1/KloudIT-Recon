@@ -477,14 +477,17 @@ func (a *Agent) backendFor(prefs proto.Prefs) string {
 }
 
 // startVideo starts a new encoder generation. urgent discards the current one
-// immediately (used when the client needs a key frame right away).
+// immediately (used when the client needs a key frame right away). A
+// congestion back-off (curKbps below the settings' bitrate) stays in effect
+// for every restart until a settings change resets it: a key-frame restart
+// after a loss must not go back to the full bitrate.
 func (s *Session) startVideo(urgent bool, reason string) error {
 	prefs := s.currentPrefs()
 	p, err := s.buildParams(prefs)
 	if err != nil {
 		return err
 	}
-	if kb := s.curKbps.Load(); kb > 0 && reason == "congestion" {
+	if kb := s.curKbps.Load(); kb > 0 && int(kb) < p.BitrateKbps {
 		p.BitrateKbps = int(kb)
 	}
 	s.curKbps.Store(int64(p.BitrateKbps))
@@ -567,9 +570,13 @@ func (s *Session) videoEvents() {
 			default:
 				// The network cannot keep up: drop what is queued and this
 				// frame (the client is told at once), cut the bitrate and
-				// restart with a fresh key frame right away.
+				// restart with a fresh key frame right away. Within 2 s of
+				// the last cut the bitrate stays, but the restart does not
+				// wait either: the dropped frames were the newest ones.
 				s.reportDropped(append(s.drainQueue(), ev.Frame), "queue overflow")
-				s.congestion(0, true)
+				if !s.congestion(0, true) {
+					s.urgentRestart("queue overflow")
+				}
 			}
 		}
 	}
@@ -664,16 +671,16 @@ func (s *Session) encoderFailed(p media.Params, attempt int, live bool) {
 }
 
 // congestion lowers the bitrate by 25 % with a new encoder generation. It is
-// rate-limited to once every two seconds. urgent discards the current
-// generation at once: the host's frame queue overflowed (its frames were
-// dropped), or the client flushed its decoder. Otherwise (the client saw the
-// delay grow) the restart is overlapped: the current generation streams on
-// until the new one's first key frame.
-func (s *Session) congestion(delayMs int, urgent bool) {
+// rate-limited to once every two seconds and reports whether it acted. urgent
+// discards the current generation at once: the host's frame queue overflowed
+// (its frames were dropped), or the client flushed its decoder. Otherwise (the
+// client saw the delay grow) the restart is overlapped: the current generation
+// streams on until the new one's first key frame.
+func (s *Session) congestion(delayMs int, urgent bool) bool {
 	s.kickMu.Lock()
 	if time.Since(s.lastCong) < 2*time.Second {
 		s.kickMu.Unlock()
-		return
+		return false
 	}
 	s.lastCong = time.Now()
 	s.lastKick = s.lastCong // the restart below also delivers a key frame
@@ -688,6 +695,31 @@ func (s *Session) congestion(delayMs int, urgent bool) {
 	s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(next)/1000))
 	if err := s.startVideo(urgent, "congestion"); err != nil {
 		s.log.Warn("restart after congestion failed", "err", err)
+	}
+	return true
+}
+
+// urgentRestart discards the current generation at the current bitrate, for
+// a queue overflow within two seconds of a bitrate cut. After an overlapped
+// back-off (a client congestion report) the old generation streams on at the
+// old bitrate while the new one starts, and keeps overflowing the queue: the
+// starting generation takes over at once and the active one stops. With
+// nothing starting, a new generation starts now: the dropped frames were the
+// newest generation's, possibly its key frame. The client's key-frame request
+// for the dropped frames is then covered (lastKick): the next generation
+// starts with a key frame.
+func (s *Session) urgentRestart(reason string) {
+	s.kickMu.Lock()
+	s.lastKick = time.Now()
+	s.kickMu.Unlock()
+	if stopped, starting := s.video.Hurry(); starting {
+		if stopped {
+			s.log.Info("restarting video", "reason", reason, "urgent", true, "takeover", true)
+		}
+		return
+	}
+	if err := s.startVideo(true, reason); err != nil {
+		s.log.Warn("urgent restart failed", "reason", reason, "err", err)
 	}
 }
 

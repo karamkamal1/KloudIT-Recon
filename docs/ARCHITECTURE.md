@@ -101,9 +101,13 @@ ignore the message; with an old host the client relies on the gap timeout.
 What the client does about a lost frame depends on `recovery` in the `video` message:
 
 - `skip`: the encoder heals the picture by itself with intra refresh, so the client skips the
-  frame and decodes on. The host announces it only when the encoder arguments it actually passes
-  turn intra refresh on with a period of at most 2 s: NVENC `-intra-refresh 1` (FFmpeg then uses
-  `-g` as the refresh period) or AMF H.264 `-intra_refresh_mb N` (macroblocks per frame).
+  frame and decodes on. Healing takes up to two refresh periods: the refresh waves run back to
+  back, and the regions the current wave refreshed before the loss are predicted from the lost
+  frame afterwards, so they are clean only after the next whole wave. The host announces `skip`
+  only when the encoder arguments it actually passes turn intra refresh on with a period of at
+  most 1 s, so a skipped loss heals within 2 s: NVENC `-intra-refresh 1` (FFmpeg then uses `-g`
+  as the refresh period: `-g` ≤ fps) or AMF H.264 `-intra_refresh_mb N` (macroblocks per frame:
+  ceil(macroblocks per picture / N) ≤ fps).
 - `keyframe` (everything else, and hosts before the field): the client asks for a key frame
   (`{"t":"keyframe"}`), which on the FFmpeg path is a new encoder generation.
 
@@ -160,11 +164,14 @@ ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + v
   immediately instead.
 - **Congestion:** if the per-session frame queue overflows (the network can't keep up), the host
   drops the backlog (and reports it, `{"t":"dropped"}`), lowers the bitrate by 25 % and restarts
-  with a key frame at once (rate-limited to once every 2 s). The browser also reports sustained
-  growth in one-way delay (`{"t":"congestion"}`) before queues get deep; that back-off restarts
-  overlapped, so the picture keeps moving. A browser whose decoder fell behind flushes it and
-  sends `{"t":"congestion","reason":"decoder"}`, which restarts at once (it discards the old
-  generation anyway).
+  with a key frame at once. The cut is rate-limited to once every 2 s, the urgent restart is not:
+  an overflow within 2 s of a cut restarts at once at the already lowered bitrate. The browser
+  also reports sustained growth in one-way delay (`{"t":"congestion"}`) before queues get deep;
+  that back-off restarts overlapped, so the picture keeps moving (if the old generation overflows
+  the queue meanwhile, it stops and the starting one takes over). A browser whose decoder fell
+  behind flushes it and sends `{"t":"congestion","reason":"decoder"}`, which restarts at once (it
+  discards the old generation anyway). A back-off stays in effect for every later restart (key
+  frames, encoder failures) until the user changes the video settings.
 - **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
   `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
   (see `third_party/README.md`). Host config `congestion` picks it for the direct path and the
