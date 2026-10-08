@@ -227,18 +227,51 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   (RFC 9002: lost packets whose send times span more than 3 × PTO with no ACK in between)
   collapses the window to two packets.
 
-Codec negotiation: the browser reports per family whether it can decode with hardware
-(`VideoDecoder.isConfigSupported` with `prefer-hardware`, and the client's startup self-test,
-below, did not catch the hardware decoder holding frames back). The host picks the first family
-with hardware on both ends, in the order HEVC → AV1 → H.264, then any hardware encoder, then
-software.
-An encoder that would pad the session's picture size (probed alignment, above) gives way to HEVC,
-else H.264, with a notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when
-the client asks for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded
-picture is streamed anyway (a host-forced encoder, nothing else decodes, or a size only the
-capture knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom`
-and the client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle;
-WebGPU: scaled texture coordinates).
+**Codec negotiation** (host GPU × client GPU, step 4.2; `internal/host/codec.go`). An encoder
+forced in host.json (`encoder`) wins, then the client's codec setting; otherwise the host
+chooses automatically:
+
+- *Host side*, from what the host can encode, not from GPU names: a family is available when
+  an encoder of it passed the probe's test encode and has not failed in this session. A GPU
+  without an AV1 encoder (AMD before RDNA3, NVIDIA before the RTX 40 series) fails `av1_amf`'s
+  or `av1_nvenc`'s test encode, so AV1 is simply absent there (the native helper's caps list a
+  codec only where the GPU can encode it, too). RDNA3's AV1 encoder pads sizes that are not
+  64×16-aligned (the probed alignment, above).
+- *Client side*: the hello's `decoders`, per family `hw` (`VideoDecoder.isConfigSupported`
+  with `prefer-hardware`, and the startup self-test, below, did not catch the hardware decoder
+  holding frames back) and `timing`: the family's decode time on a 1920×1080 sample, timed
+  with the decoder the stream would use (`{"ms":2.1,"w":1920,"h":1080,"n":7,"accel":
+  "prefer-hardware"}`; `ms` is the median from `decode()` to the output over its P frames, fed
+  one at a time like the stream's; absent from clients before it or when the decode failed).
+- *The rule*: the first tier with a family both ends can use: (1) hardware encode and hardware
+  decode, in the order HEVC → AV1 → H.264; (2) hardware encode, software decode: H.264 → HEVC →
+  AV1; (3) software encode: H.264 → AV1 → HEVC. In the tier the first family is the default
+  (so HEVC on AMD and NVIDIA hosts alike), and a later one replaces it only when the client
+  decodes it **clearly faster** at the stream's picture size (the sample's time scaled by
+  pixel count; both must be timed): by at least 10 % and 0.5 ms per frame, or, for a family
+  that compresses worse (H.264 against HEVC or AV1, roughly a third more bits for the same
+  picture), by at least 25 % and 2 ms. AV1 competes on speed only on hosts with
+  `"av1": "faster"` in host.json (default `"fallback"`: AV1 only where HEVC does not work
+  end-to-end, as before step 4.2), to be enabled per host after its AV1 encoder is measured
+  (Phase 0 latency, VMAF); an encoder that would pad the picture never replaces another
+  family. Clients without timings get the order alone. The host logs the hello's decoders with
+  the session start (`decoders=hevc:hw:2.10ms@1920x1080 …`) and every new choice with its
+  reason (`msg="codec choice" encoder=… reason="auto, hardware encode and decode: first
+  choice"`).
+- *4:4:4* stays off: the host encodes 4:2:0 only (NVENC HEVC is pinned to the Main profile and
+  H.264 to High, AMF encodes 4:2:0 only, QSV gets NV12) and the client asks only for Main
+  profile support. Chrome's hardware decode of HEVC Range Extensions 4:4:4 is reported for
+  NVIDIA (Chrome 137+, driver 572.16+) and Intel GPUs, not for AMD, so a 4:4:4 stream would
+  split clients by GPU; sharper text on an AMD host is for AV1's screen-content tools (Phase 5),
+  see `docs/VENDOR_NOTES.md` 4.2.
+
+An encoder that would pad the session's picture size gives way to HEVC, else H.264, with a
+notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when the client asks
+for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded picture is
+streamed anyway (a host-forced encoder, nothing else decodes, or a size only the capture
+knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom` and the
+client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle; WebGPU:
+scaled texture coordinates).
 
 ## The browser pipeline
 
@@ -346,7 +379,13 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   and the family decodes in software when its software decoder passes (back to hardware, with a
   key frame request but no back-off, if the software decoder then falls behind). The overlay
   shows the results and the stream's live output lag (chunks submitted after a frame before it
-  came out, the smallest per 0.5 s).
+  came out, the smallest per 0.5 s). Then each family is timed (step 4.2) on an 8-frame
+  1920×1080 clip of FFmpeg's moving test pattern (`decoder-timing-clips.js`, same generator)
+  with the decoder the stream would use, one family after another so no two compete for the
+  GPU's decode engine or the CPU; the 640×360 clip cannot do this (it mostly measures the fixed
+  cost of a call: there a software decoder beats a hardware decoder's round trip). The hello
+  carries the times (codec negotiation, above); the overlay's self-test line shows them
+  ("timed 1080p: 2.1 ms/frame").
 - If the decoder falls behind (more than max(4, fps/10) frames in the decoder or waiting in front
   of it for 500 ms), it is reset and resynchronised from a fresh key frame, and the host is asked
   to back off. Latency can't grow without bound.

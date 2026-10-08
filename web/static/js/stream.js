@@ -402,6 +402,7 @@ function onWorker(m) {
     case 'stageDump': S.stageDump = m.recs; break;
     case 'dropTest': S.dropTest = m.result; break;
     case 'decoderTest': S.decoderTest = m.tests; break;
+    case 'hello': S.helloDecoders = m.decoders; break;
     case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
@@ -1054,7 +1055,7 @@ function buildDrawer() {
   $('drawer').replaceChildren(
     el('h3', {}, 'Stream settings', el('button', { class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Video'),
-      field('Codec', select('codec', codecOpts, applyLive), 'HEVC/AV1 give more quality per bit; H.264 decodes fastest everywhere.'),
+      field('Codec', select('codec', codecOpts, applyLive), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
       field('Bitrate', el('div', { class: 'range-row' }, bitrate, out), 'LAN: 50–150 Mbps. Internet: match your upload speed.'),
       field('Frame rate', select('fps', fpsOpts, applyLive)),
       field('Resolution', select('resolution', [['native', 'Native (host display)'], ['client', 'Match this screen'], ['2160', '3840×2160'], ['1440', '2560×1440'], ['1080', '1920×1080'], ['900', '1600×900'], ['720', '1280×720']], applyLive), 'Downscaling happens on the GPU (Windows Graphics Capture).'),

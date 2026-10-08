@@ -11,10 +11,24 @@
 // back is reported to the host as no hardware decoder (the host prefers a
 // family the browser decodes in hardware), and the stream decodes in software
 // when that family's software decoder passes.
+//
+// Then (step 4.2) every family is timed on a 1920x1080 clip
+// (decoder-timing-clips.js) with the decoder the stream would use: the
+// median time from decode() to the output of its P frames, fed one at a time
+// like the stream's. The hello carries the times (decoders[].timing) and the
+// host picks the codec family by them. The 640x360 clip above cannot do this:
+// it mostly measures the fixed cost of a decode call, where a software
+// decoder beats a hardware decoder's round trip to the GPU process.
 
 import { CLIPS } from './decoder-selftest-clips.js';
 
 export { CLIPS };
+
+// The timing clips (226 kB) load when the self-test starts; a failed load is
+// tried again by the next one.
+let timingClips = null;
+const loadTimingClips = () => (timingClips ??= import('./decoder-timing-clips.js').then((m) => m.TIMING_CLIPS)
+  .catch((e) => { timingClips = null; throw e; }));
 
 // The first output may wait for the decoder to start (a hardware decoder's
 // set-up); a decoder that only answers later is reported as a slow start,
@@ -25,6 +39,12 @@ export { CLIPS };
 // holds frames back outputs nothing more (only that counts as holding).
 export const FIRST_OUTPUT_MS = 1000;
 export const NEXT_OUTPUT_MS = 100; // a 640x360 frame
+// Timing: each 1920x1080 frame may take this long before the next goes in
+// (one at a time, as on the stream; a decoder slower than that is timed on
+// overlapping frames, which only makes it look slower). At least
+// MIN_TIMED frames must come out for a time.
+export const TIMING_NEXT_OUTPUT_MS = 250;
+export const MIN_TIMED = 4;
 const FRAME_US = 16667;
 
 function b64(s) {
@@ -35,8 +55,8 @@ function b64(s) {
 }
 
 /**
- * Decodes the clip of a family with the first supported of `accels`
- * (hardwareAcceleration values). Result:
+ * Decodes the clip of a family (opts.clip, else its hygiene clip) with the
+ * first supported of `accels` (hardwareAcceleration values). Result:
  *   supported   false: none of accels is supported (nothing else is set)
  *   accel       the hardwareAcceleration decoded with
  *   firstAfter  chunks submitted when the first output arrived (1: at once; null: no output)
@@ -47,11 +67,12 @@ function b64(s) {
  *   error       the decoder's error message, or null
  *   firstMs     configure -> first output
  *   decodeMs    mean submit -> output of the later frames
+ *   decodeP50   median of the same, over `timed` frames
  * Decoder and Chunk replace VideoDecoder and EncodedVideoChunk (tests).
  */
 export async function selfTestDecoder(family, accels, opts = {}) {
   const { Decoder = globalThis.VideoDecoder, Chunk = globalThis.EncodedVideoChunk, firstOutputMs = FIRST_OUTPUT_MS, nextOutputMs = NEXT_OUTPUT_MS } = opts;
-  const clip = CLIPS[family];
+  const clip = opts.clip || CLIPS[family];
   if (!clip || !Decoder) return { family, supported: false };
   let config = null;
   for (const hardwareAcceleration of accels) {
@@ -63,12 +84,11 @@ export async function selfTestDecoder(family, accels, opts = {}) {
   const data = clip.frames.map(b64);
   const r = {
     family, supported: true, accel: config.hardwareAcceleration, codec: clip.codec, frames: data.length,
-    sent: 0, outputs: 0, firstAfter: null, held: 0, ok: false, error: null, firstMs: null, decodeMs: null,
+    sent: 0, outputs: 0, firstAfter: null, held: 0, ok: false, error: null, firstMs: null, decodeMs: null, decodeP50: null, timed: 0,
   };
   const now = () => performance.now();
   const sentAt = [];
-  let decodeSum = 0;
-  let decodeN = 0;
+  const times = [];
   let wake = null;
   const t0 = now();
   const dec = new Decoder({
@@ -77,7 +97,7 @@ export async function selfTestDecoder(family, accels, opts = {}) {
       f.close();
       const t = now();
       if (!r.outputs) { r.firstAfter = sentAt.length; r.firstMs = t - t0; }
-      else if (sentAt[i] !== undefined) { decodeSum += t - sentAt[i]; decodeN++; }
+      else if (sentAt[i] !== undefined) times.push(t - sentAt[i]);
       r.outputs++;
       wake?.();
     },
@@ -115,7 +135,13 @@ export async function selfTestDecoder(family, accels, opts = {}) {
   }
   r.sent = sentAt.length;
   r.held = r.sent - r.outputs;
-  r.decodeMs = decodeN ? +(decodeSum / decodeN).toFixed(2) : null;
+  r.timed = times.length;
+  if (times.length) {
+    r.decodeMs = +(times.reduce((a, b) => a + b, 0) / times.length).toFixed(2);
+    const sorted = [...times].sort((a, b) => a - b);
+    const m = sorted.length >> 1;
+    r.decodeP50 = +(sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2).toFixed(2);
+  }
   r.firstMs = r.firstMs === null ? null : +r.firstMs.toFixed(1);
   r.ok = !r.error && r.firstAfter === 1 && r.held === 0;
   return r;
@@ -123,6 +149,30 @@ export async function selfTestDecoder(family, accels, opts = {}) {
 
 /** The decoder demonstrably holds frames back (not merely slow to start, nor failing). */
 export const holdsFrames = (r) => !!r?.supported && !r.error && r.outputs > 0 && r.held > 0;
+
+/**
+ * Times a family's decoder (step 4.2): its 1920x1080 timing clip decoded
+ * with `accel`, one frame at a time. Returns the hello's timing
+ * { ms, w, h, n, accel } (ms: median decode() -> output of the n P frames
+ * that came out), or null when the decoder failed or too few frames came out.
+ */
+export async function timeDecoder(family, accel, opts = {}) {
+  const clips = opts.timingClips || (await loadTimingClips());
+  const clip = clips?.[family];
+  if (!clip) return null;
+  const r = await selfTestDecoder(family, [accel], { ...opts, clip, nextOutputMs: opts.timingNextOutputMs ?? TIMING_NEXT_OUTPUT_MS });
+  if (!r.supported || r.error || r.timed < MIN_TIMED) return null;
+  return { ms: r.decodeP50, w: clip.width, h: clip.height, n: r.timed, accel: r.accel };
+}
+
+// The result the stream's decoder of a family corresponds to, or null when
+// it would decode with a hardware decoder that holds frames back (its time
+// per frame is then the hold, not decoding work).
+function streamResult(t) {
+  if (t.software) return t.sw;
+  const r = t.hw || t.sw;
+  return r?.supported && !r.error && r.outputs > 0 && !holdsFrames(r) ? r : null;
+}
 
 /**
  * Tests the families the browser decodes (decoders: [{ family, hw }], hw =
@@ -134,12 +184,17 @@ export const holdsFrames = (r) => !!r?.supported && !r.error && r.outputs > 0 &&
  *   software  decode this family in software: its hardware decoder held
  *             frames back and the software decoder passed
  *   reportHW  the hello's hw flag: a hardware decoder that does not hold frames back
+ *   timing    the hello's timing (timeDecoder) with the decoder the stream would use, or null
  *   text      one line for the overlay and the log
- * The families run in parallel: a decoder that holds frames back costs about
- * 2 x FIRST_OUTPUT_MS + 3 x NEXT_OUTPUT_MS, the others a few frame decodes.
+ * The families' hygiene tests run in parallel: a decoder that holds frames back
+ * costs about 2 x FIRST_OUTPUT_MS + 3 x NEXT_OUTPUT_MS, the others a few frame
+ * decodes. The timing runs follow one family at a time, so no two decoders
+ * compete for the GPU's decode engine or the CPU while timed (eight frames
+ * each); the hygiene tests just warmed every decoder up.
  */
 export async function runSelfTests(decoders, preferHW, opts = {}) {
-  return Promise.all(decoders.map(async (d) => {
+  if (!opts.timingClips) loadTimingClips().catch(() => null); // fetch while the hygiene tests run
+  const tests = await Promise.all(decoders.map(async (d) => {
     const t = { family: d.family };
     if (preferHW && d.hw) {
       t.hw = await selfTestDecoder(d.family, ['prefer-hardware'], opts);
@@ -149,9 +204,22 @@ export async function runSelfTests(decoders, preferHW, opts = {}) {
     }
     t.software = holdsFrames(t.hw) && !!t.sw?.ok;
     t.reportHW = !!d.hw && !holdsFrames(t.hw);
-    t.text = describe(t);
     return t;
   }));
+  for (const t of tests) {
+    const r = streamResult(t);
+    t.timing = r ? await timeDecoder(t.family, r.accel, opts).catch(() => null) : null;
+    t.text = describe(t);
+  }
+  return tests;
+}
+
+/** The hello's decoder entry of a family: the probe's, with the self-test's hw flag and timing. */
+export function helloDecoder(d, t) {
+  if (!t) return d;
+  const out = { ...d, hw: t.reportHW };
+  if (t.timing) out.timing = t.timing;
+  return out;
 }
 
 const NAMES = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
@@ -171,5 +239,6 @@ function describe(t) {
   const parts = [];
   if (t.hw) parts.push(`${ACCEL[t.hw.accel] || 'HW'} ${verdict(t.hw)}`);
   if (t.sw) parts.push(`${t.sw.supported ? ACCEL[t.sw.accel] : 'SW'} ${verdict(t.sw)}`);
-  return `${name} ${parts.join(', ')}${t.software ? ' → decoding in software' : ''}`;
+  const timing = t.timing ? ` · timed ${t.timing.h}p: ${t.timing.ms} ms/frame` : '';
+  return `${name} ${parts.join(', ')}${t.software ? ' → decoding in software' : ''}${timing}`;
 }

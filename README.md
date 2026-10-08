@@ -235,8 +235,13 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 | **Q** | Disconnect |
 
 **Settings** (applied live unless noted):
-- **Codec**: Auto picks HEVC → AV1 → H.264, preferring hardware encode on the PC *and*
-  hardware decode in your browser.
+- **Codec**: Auto prefers hardware encode on the PC *and* hardware decode in your browser, and
+  there HEVC (then AV1, then H.264), on AMD and NVIDIA PCs alike. While connecting, the browser
+  times each codec's decoder on a short 1080p clip (overlay: "Decoder self-test … timed 1080p");
+  a codec your browser decodes clearly faster replaces HEVC (H.264 only when it saves a lot, as
+  it needs more bitrate for the same picture; AV1 only on PCs with `"av1": "faster"`). AV1 is
+  available only where the PC's GPU encodes it (AMD RDNA3 and newer, NVIDIA RTX 40 and newer);
+  RDNA3 uses it only at sizes in 64×16 steps (e.g. not 1920×1080).
 - **Bitrate**: 50–150 Mbps on a LAN. Over the internet, stay below your upload speed.
 - **Frame rate** (up to 240) and **resolution** (native, or downscaled on the GPU).
 - **Encoder preset**: lowest latency / balanced / best quality.
@@ -307,6 +312,7 @@ The new password (at least 10 characters) is read from stdin.
 |---|---|---|
 | `capture` | `auto` | `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion; never chosen by `auto`. The agent uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6) |
 | `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` |
+| `av1` | `fallback` | When the automatic codec choice uses AV1 (on a GPU that encodes it): `fallback` only where HEVC does not work end-to-end (a browser without HEVC; then before H.264); `faster` also instead of HEVC for a browser that decodes AV1 clearly faster (at least 10 % and 0.5 ms per frame). Switch to `faster` after measuring this PC's AV1 encoder (latency overlay, image quality). The host log's `codec choice` line says what was chosen and why |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |

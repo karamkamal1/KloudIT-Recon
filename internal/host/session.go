@@ -49,9 +49,10 @@ type Session struct {
 	ctrl   transport.BidiStream
 
 	hello       proto.Hello
-	prefsMu     sync.Mutex // guards prefs, monitor, alignNotice and amfFallback
+	prefsMu     sync.Mutex // guards prefs, monitor, codecWhy, alignNotice and amfFallback
 	prefs       proto.Prefs
 	monitor     platform.Monitor
+	codecWhy    string // last codec choice and its reason, logged once
 	alignNotice string // last coded-size alignment notice, sent once
 	amfFallback string // why the last generation did not use capture "amf", logged once
 	amfFailed   atomic.Bool
@@ -180,7 +181,8 @@ func (s *Session) run() error {
 			s.onAuth()
 		}
 	}
-	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80))
+	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80),
+		"decoders", decoderSummary(s.hello.Decoders))
 
 	// One active session per host: a new connection takes over.
 	s.a.setActive(s)
@@ -331,20 +333,21 @@ func (s *Session) currentPrefs() proto.Prefs {
 }
 
 // chooseEncoder negotiates the codec between the browser's decoders and the
-// host's encoders for a w x h picture (0, 0: size unknown). An encoder that
-// would pad that size (Caps.Pads; AV1 on RDNA3 at 1920x1080) gives way to
-// HEVC, else H.264, also when the client asks for its codec; notice tells
-// the user why ("" when nothing changed). An encoder forced in the host
-// config is kept: its padding is announced for the client to crop.
-func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, notice string, err error) {
-	e, err = s.negotiateEncoder(prefs)
+// host's encoders for a w x h picture (0, 0: size unknown); why says how
+// (negotiateEncoder). An encoder that would pad that size (Caps.Pads; AV1 on
+// RDNA3 at 1920x1080) gives way to HEVC, else H.264, also when the client
+// asks for its codec; notice tells the user why ("" when nothing changed). An
+// encoder forced in the host config is kept: its padding is announced for the
+// client to crop.
+func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, why, notice string, err error) {
+	e, why, err = s.negotiateEncoder(prefs, w, h)
 	caps := s.a.caps
 	if err != nil || !caps.Pads(e.Name, w, h) {
-		return e, "", err
+		return e, why, "", err
 	}
 	if e.Name == s.a.cfg.Encoder {
 		s.log.Debug("forced encoder pads this size, the client crops", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h))
-		return e, "", nil
+		return e, why, "", nil
 	}
 	// Hardware encoders first, HEVC before H.264.
 	for _, hwOnly := range []bool{true, false} {
@@ -353,13 +356,13 @@ func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInf
 				a := caps.Alignment(e.Name)
 				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
 					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
-				return alt, fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
+				return alt, why + "; " + e.Name + " pads this size", fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
 					familyNames[e.Family], a.W, a.H, familyNames[alt.Family]), nil
 			}
 		}
 	}
 	// Nothing else works end-to-end: keep it, VideoConfig announces the crop.
-	return e, "", nil
+	return e, why, "", nil
 }
 
 // familyNames are the codec families as users know them.
@@ -397,8 +400,11 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 }
 
 // negotiateEncoder picks the encoder by configuration, preference and the
-// browser's decoders.
-func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error) {
+// browser's decoders, for a w x h picture (0, 0: unknown); why says how, for
+// the log. Automatically: the first tier of autoTiers with a family both ends
+// can use, the family in it by chooseFamily (codec.go: HEVC by default, a
+// family the client decodes clearly faster instead).
+func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, why string, err error) {
 	caps := s.a.caps
 	client := s.clientDecoders()
 	usable := s.usableEncoder
@@ -406,37 +412,35 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs) (media.EncoderInfo, error)
 		for _, e := range caps.Encoders {
 			if e.Name == s.a.cfg.Encoder {
 				if _, ok := client[e.Family]; ok && usable(e) {
-					return e, nil
+					return e, "forced in the host config", nil
 				}
 			}
 		}
 	}
-	pick := func(fam string, hwOnly bool) (media.EncoderInfo, bool) { return s.pickEncoder(fam, hwOnly, nil) }
 	if prefs.Codec != "" && prefs.Codec != "auto" {
-		if e, ok := pick(prefs.Codec, false); ok {
-			return e, nil
+		if e, ok := s.pickEncoder(prefs.Codec, false, nil); ok {
+			return e, "the client's codec setting", nil
 		}
 		s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
 	}
-	// Hardware encode + hardware decode first: HEVC, then AV1, then H.264.
-	for _, fam := range []string{"hevc", "av1", "h264"} {
-		if d, ok := client[fam]; ok && d.HW {
-			if e, ok := pick(fam, true); ok {
-				return e, nil
+	policy := s.a.cfg.av1()
+	for _, tier := range autoTiers {
+		var cands []codecCandidate
+		for _, fam := range tier.order {
+			d, ok := client[fam]
+			if !ok || tier.hwDec && !d.HW {
+				continue
+			}
+			if e, ok := s.pickEncoder(fam, tier.hwEnc, nil); ok {
+				cands = append(cands, codecCandidate{enc: e, dec: d, pads: caps.Pads(e.Name, w, h)})
 			}
 		}
-	}
-	for _, fam := range []string{"h264", "hevc", "av1"} {
-		if e, ok := pick(fam, true); ok {
-			return e, nil
+		if len(cands) > 0 {
+			c, why := chooseFamily(cands, policy, w, h)
+			return c.enc, "auto, " + tier.name + ": " + why, nil
 		}
 	}
-	for _, fam := range []string{"h264", "av1", "hevc"} {
-		if e, ok := pick(fam, false); ok {
-			return e, nil
-		}
-	}
-	return media.EncoderInfo{}, errors.New("no codec is supported by both this browser and the host")
+	return media.EncoderInfo{}, "", errors.New("no codec is supported by both this browser and the host")
 }
 
 // sessionParams is the encoder-independent part of buildParams for prefs on
@@ -524,7 +528,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	// Capture timestamps only reach clients that parse the frame extension.
 	p, backend := s.a.sessionParams(prefs, mon, s.hello.V >= proto.HelloVersionFrameExt)
 	outW, outH := p.OutputSize()
-	enc, notice, err := s.chooseEncoder(prefs, outW, outH)
+	enc, why, notice, err := s.chooseEncoder(prefs, outW, outH)
 	if err != nil {
 		return media.Params{}, err
 	}
@@ -537,9 +541,16 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	}
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()
+	choice := enc.Name + " " + why
+	newChoice := choice != s.codecWhy
+	s.codecWhy = choice
 	repeat := notice == s.alignNotice
 	s.alignNotice = notice
 	s.prefsMu.Unlock()
+	if newChoice {
+		s.log.Info("codec choice", "encoder", enc.Name, "family", enc.Family, "reason", why,
+			"size", fmt.Sprintf("%dx%d", outW, outH), "av1", s.a.cfg.av1(), "decoders", decoderSummary(s.hello.Decoders))
+	}
 	if notice != "" && !repeat {
 		s.log.Info("coded-size alignment", "notice", notice, "size", fmt.Sprintf("%dx%d", outW, outH), "encoder", enc.Name)
 		s.notice("info", notice)

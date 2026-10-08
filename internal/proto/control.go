@@ -28,6 +28,24 @@ type DecoderInfo struct {
 	// self-test (step 4.1) report false when the hardware decoder holds
 	// frames back, so that a family decoded in hardware without delay wins.
 	HW bool `json:"hw"`
+	// Timing is the client's timed decode of a short sample of this family
+	// (step 4.2), with the decoder its stream would use. Nil from clients
+	// before it, and when the timed decode failed. The host picks the codec
+	// family by it (see host.chooseFamily).
+	Timing *DecodeTiming `json:"timing,omitempty"`
+}
+
+// DecodeTiming is a timed decode: a W x H key frame and N P frames (decode
+// order = display order) fed one at a time, each after the previous one's
+// output, as frames arrive on a stream.
+type DecodeTiming struct {
+	// Ms is the median time from decode() to the frame's output over the N P
+	// frames: the decoder's latency per frame, not its throughput.
+	Ms    float64 `json:"ms"`
+	W     int     `json:"w"`
+	H     int     `json:"h"`
+	N     int     `json:"n"`
+	Accel string  `json:"accel"` // the WebCodecs hardwareAcceleration it decoded with
 }
 
 type AudioCaps struct {

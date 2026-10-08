@@ -14,7 +14,9 @@
 // client crops it. Decoder hygiene (step 4.1): every scenario checks the
 // decode queue bound, that flush() is never called and that no VideoFrame is
 // left open; the startup decoder self-test is checked on the real decoders
-// and, with a wrapper that holds frames back, on its logic. Presentation
+// and, with a wrapper that holds frames back, on its logic. Codec selection
+// (step 4.2): the hello carries each family's decode time on the 1080p
+// timing clip, which the host logs with its codec choice. Presentation
 // (step 4.3): the transport scenarios draw with the 2D canvas, then the same
 // checks (frames drawn, crop, frame barcode) run with WebGL2 and, in a headed
 // browser on Xvfb, WebGPU; every renderer scenario checks the canvas is sized
@@ -518,6 +520,33 @@ async function checkSelfTest(cfg) {
   const overlay = await page.textContent('#stats').catch(() => '');
   check('overlay shows the decoder self-test, queue and VideoFrame rows', overlay.includes('Decoder self-test') && overlay.includes('Decoder queue') && overlay.includes('VideoFrames open'));
   results.push({ selfTest: tests });
+  await checkHelloTiming(tests, overlay);
+}
+
+// Codec selection (step 4.2): every family whose decoder passed is timed on
+// the 1920x1080 clip with the decoder the stream uses; the hello the worker
+// sent carries those times, and the host received them: its "session started"
+// line lists each family's time, and its "codec choice" line names the
+// encoder this stream runs and why.
+async function checkHelloTiming(tests, overlay) {
+  const hello = await page.evaluate(() => window.__recon.helloDecoders);
+  const res = (t) => (t.software ? t.sw : t.hw || t.sw);
+  const timedOK = (tm, t) => !!tm && tm.ms > 0 && tm.w === 1920 && tm.h === 1080 && tm.n >= 4 && tm.accel === res(t)?.accel;
+  check('decoder timing: every family that passed is timed on the 1920x1080 clip with the decoder the stream uses', tests?.length >= 1 &&
+    tests.every((t) => !res(t)?.ok || timedOK(t.timing, t)) && overlay.includes('timed 1080p'),
+  (tests || []).map((t) => `${t.family}: ${t.timing ? `${t.timing.ms} ms/frame (${t.timing.accel}, ${t.timing.n} frames)` : 'not timed'}`).join('; '));
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  check('the hello carries the decode times', !!hello?.length && tests.every((t) => same(hello.find((d) => d.family === t.family)?.timing ?? null, t.timing ?? null)) &&
+    hello.some((d) => d.timing), JSON.stringify(hello));
+  const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const started = (hostProc.log.match(/msg="session started"[^\n]*/g) || []).pop() || '';
+  const choice = (hostProc.log.match(/msg="codec choice"[^\n]*/g) || []).pop() || '';
+  const cfg = await page.evaluate(() => window.__recon.videoCfg);
+  const inLog = (d) => started.includes(`${d.family}:${d.hw ? 'hw' : 'sw'}:${d.timing ? `${d.timing.ms.toFixed(2)}ms@${d.timing.w}x${d.timing.h}` : '-'}`);
+  check('host logs the hello\'s decode times and its codec choice with the reason', !!hello?.length && hello.every(inLog) &&
+    choice.includes(`encoder=${cfg?.encoder} `) && /reason="auto, [^"]+"/.test(choice),
+  `${started.replace(/^.*?decoders=/, 'decoders=')}; ${choice.replace(/^.*?encoder=/, 'encoder=').slice(0, 220)}`);
+  results.push({ helloDecoders: hello, hostCodecChoice: choice });
 }
 
 // The self-test's logic on a decoder that holds frames back: a wrapper around
@@ -569,7 +598,32 @@ async function checkSelfTestLogic() {
         burst = Math.max(burst, d.decodeQueueSize);
       });
       d.close();
-      return { fam, good, slow, hold1, hold2, choice, burst };
+      // Timing (step 4.2), on a fake decoder that outputs each frame after a
+      // fixed delay per codec (no real decoding: every family): the median
+      // decode() -> output, one family at a time.
+      const runs = [];
+      const delays = { avc1: 24, hev1: 12, av01: 40 };
+      const pure = class {
+        static async isConfigSupported(c) { return { supported: true, config: c }; }
+        constructor({ output }) { this.output = output; this.closed = false; }
+        configure(c) {
+          this.delay = delays[c.codec.slice(0, 4)];
+          this.run = { codec: c.codec, w: c.codedWidth, start: performance.now(), end: null };
+          runs.push(this.run);
+        }
+        decode(chunk) {
+          const timestamp = chunk.timestamp;
+          setTimeout(() => { if (!this.closed) this.output({ timestamp, close() {} }); }, this.delay);
+        }
+        close() { this.closed = true; this.run.end = performance.now(); }
+      };
+      const one = await T.timeDecoder('av1', 'prefer-hardware', { Decoder: pure });
+      runs.length = 0;
+      const all = await T.runSelfTests(['h264', 'hevc', 'av1'].map((family) => ({ family, hw: true })), true, { Decoder: pure });
+      const timed = runs.filter((r) => r.w === 1920).sort((a, b) => a.start - b.start);
+      const overlap = timed.some((r, i) => i && r.start < timed[i - 1].end);
+      const hello = all.map((t) => T.helloDecoder({ family: t.family, hw: true }, t));
+      return { fam, good, slow, hold1, hold2, choice, burst, timing: { one, all: all.map((t) => ({ family: t.family, timing: t.timing, text: t.text })), timedRuns: timed.length, overlap, hello } };
     });
     if (res.error) { check('decoder self-test logic', false, res.error); return; }
     const { good, slow, hold1, hold2, choice } = res;
@@ -582,6 +636,13 @@ async function checkSelfTestLogic() {
     check('decoder self-test decision: a hardware decoder that holds frames back is reported as no hardware decoder; the family decodes in software',
       choice.software === true && choice.reportHW === false && choice.hw?.held === 1 && choice.sw?.ok === true, choice.text);
     console.log(`- the clip's 10 chunks at once into a bare decoder (${res.fam}) reach decodeQueueSize ${res.burst}`);
+    const tm = res.timing;
+    const near = (x, ms) => !!x && x.ms >= ms && x.ms < ms + 15 && x.w === 1920 && x.h === 1080 && x.n === 7;
+    const by = (f) => tm.all.find((t) => t.family === f)?.timing;
+    check('decoder timing logic: the median decode() -> output of the 1920x1080 clip, families timed one at a time, times in the hello',
+      near(tm.one, 40) && tm.one.accel === 'prefer-hardware' && near(by('h264'), 24) && near(by('hevc'), 12) && near(by('av1'), 40) &&
+        tm.timedRuns === 3 && !tm.overlap && tm.hello.every((d) => d.hw === true && d.timing?.ms === by(d.family)?.ms),
+      `fake decoder 40 ms: ${tm.one?.ms} ms/frame over ${tm.one?.n}; ${tm.all.map((t) => t.text).join('; ')}; ${tm.timedRuns} timing runs, overlapping: ${tm.overlap}`);
     results.push({ selfTestLogic: res });
   } finally {
     await ctx2.close();

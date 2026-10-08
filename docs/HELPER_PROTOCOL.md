@@ -187,6 +187,10 @@ ignored by recon-host.
   (e.g. AV1 before the GeForce RTX 40 series). An NVIDIA driver too old for the helper's
   NVENC API shows as `unavailable.nvenc` "the NVIDIA driver supports NVENC API 12.2, the
   helper needs 13.0: update the NVIDIA driver to 570.0 or newer".
+  For the automatic codec choice (step 4.2, `internal/host/codec.go`, docs/ARCHITECTURE.md
+  "Codec negotiation") this is the host side on the helper path, as the probe's test encodes
+  are on the FFmpeg path: a codec in `codecs` is available, one only in `unavailable` is not
+  (no GPU-name rules), and `alignW`/`alignH` decide whether it pads a session's picture size.
 
 `started` reports what the encoder actually does (the mock always produces 320x180):
 

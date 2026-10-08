@@ -11,7 +11,7 @@
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
-import { runSelfTests } from './decoder-selftest.js';
+import { runSelfTests, helloDecoder } from './decoder-selftest.js';
 import { createRenderer, LABELS, PATHS, PICK, pickPath, withTimeout } from './renderers.js';
 import { Pacer } from './pacing.js';
 
@@ -1555,7 +1555,9 @@ async function probeDecoders() {
 // (main thread: decoderTest) and the log; families whose hardware decoder
 // holds frames back go to the host as without a hardware decoder (it prefers
 // a family the browser decodes in hardware) and decode in software when that
-// passed. Returns the hello's decoders.
+// passed. Each family's decode time on the 1080p timing clip goes to the host
+// too (timing), which picks the codec family by it (step 4.2). Returns the
+// hello's decoders.
 async function selfTestDecoders(decoders) {
   let tests = [];
   try {
@@ -1569,7 +1571,7 @@ async function selfTestDecoders(decoders) {
     post('log', { text: `decoder self-test: ${t.text}` });
   }
   post('decoderTest', { tests });
-  return decoders.map((d) => ({ ...d, hw: tests.find((t) => t.family === d.family)?.reportHW ?? d.hw }));
+  return decoders.map((d) => helloDecoder(d, tests.find((t) => t.family === d.family)));
 }
 
 async function start(msg) {
@@ -1592,10 +1594,12 @@ async function start(msg) {
   post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name });
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
+  const helloDecoders = await tested;
   transport.sendControl({
     t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
-    client: msg.client, decoders: await tested, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
+    client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
   });
+  post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
   const pingTimer = setInterval(sendPing, 1000);
   const watchdogTimer = setInterval(videoWatchdog, 250);
