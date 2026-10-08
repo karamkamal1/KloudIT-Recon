@@ -3842,7 +3842,9 @@ Verified in the sandbox:
   `recovering from a loss ... wait_from=72`). `TestFrameSenderLadder/recovery_frame_lost` (the
   encoder's answer to the reopened wait goes out with the frames after it) failed before the fix:
   `recover [1/2 1/5]`, and with that check removed the answer and every later frame stayed unsent
-  (5 of 7 streams); `TestSendStateWait` checks `recoverFrom`.
+  (5 of 7 streams); `TestSendStateWait` checks `recoverFrom`; `TestSessionRefRecovery/v3_client`
+  (the client reports the helper's recovery frame lost) now expects `recover` from frame 4, the
+  wait's first loss, with the acknowledged LTR 2, where it expected frame 6 (the lost answer).
 - Not run: the 0.4 `wifi` profile (no `sch_netem` in the sandbox kernel: `tc qdisc add ... netem`
   answers "Specified qdisc kind is unknown"); T3 and T4 are hardware checks below.
 

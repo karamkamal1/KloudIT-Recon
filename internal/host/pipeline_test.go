@@ -673,12 +673,18 @@ func TestSessionRefRecovery(t *testing.T) {
 			t.Fatalf("recovery frame header %+v ext %v", h, ext)
 		}
 		waitLog(t, r.logs, `msg="loss recovered" gen=1 from_seq=3 by="recovery frame" at=1/5`)
+		s.send.take(fr) // as frameSender does (this rig takes the frames itself): the recovery frame ends the wait
 
-		// A loss only the client saw: {"t":"lost"}.
+		// A loss only the client saw: {"t":"lost"}. Seq 5 is the recovery
+		// frame that answered the loss at seq 3: its loss reopens the wait
+		// from seq 3 (the client waits from there again), so the helper is
+		// asked to recover from frame 4 (seq 3) again, with the acknowledged
+		// LTR; a recovery from frame 6 alone would not end the wait.
 		send(t, r, proto.ClientMsg{T: proto.MsgLost, Gen: 1, FromSeq: 5})
-		if m := expectFakeMsg(t, f, "recover"); m["lostFromFrameId"] != float64(6) || m["ackedLtrFrameId"] != float64(2) {
+		if m := expectFakeMsg(t, f, "recover"); m["lostFromFrameId"] != float64(4) || m["ackedLtrFrameId"] != float64(2) {
 			t.Fatalf("recover after the client's report %v", m)
 		}
+		waitLog(t, r.logs, `msg="recovering from a loss" gen=1 from_seq=5 why=client wait_from=3`)
 		// Another generation's report: nothing to do.
 		send(t, r, proto.ClientMsg{T: proto.MsgLost, Gen: 9, FromSeq: 5})
 		none(t, f, "recover")
