@@ -7,12 +7,13 @@
 //     -> frame pacing (pacing.js): draw on decode (Lowest latency) or at the
 //        next display refresh (Smooth)
 //     -> desynchronized 2D canvas, WebGL2 texture upload or WebGPU external
-//        texture (renderers.js), on a canvas sized to device pixels
+//        texture (renderers.js), on a canvas sized to device pixels; WebGPU
+//        upscales a picture shown larger than it streams with FSR 1 (fsr1.js)
 //   Opus datagrams -> AudioDecoder -> lock-free SharedArrayBuffer ring -> AudioWorklet
 
 import * as P from './protocol.js';
 import { runSelfTests, helloDecoder } from './decoder-selftest.js';
-import { createRenderer, LABELS, PATHS, PICK, pickPath, withTimeout } from './renderers.js';
+import { createRenderer, LABELS, PATHS, PICK, pickPath, Samples, withTimeout } from './renderers.js';
 import { Pacer } from './pacing.js';
 
 const td = new TextDecoder();
@@ -351,21 +352,30 @@ const pres = {
 
 const FAIL_STREAK = 30;
 
+// Client-side upscaling (Phase 5, fsr1.js; prefs.upscale, sharpness,
+// fsrDenoise, applied live): every renderer gets the setting, only WebGPU
+// runs FSR (EASU + RCAS) and reports why not when it does not. The draw stage
+// of the frames drawn with and without FSR this session (the CPU-side cost of
+// the extra passes, where the device has no timestamp-query).
+const upscalePrefs = () => ({ mode: prefs.upscale, sharpness: prefs.sharpness, denoise: prefs.fsrDenoise, input: prefs.fsrInput });
+const drawUp = { fsr: new Samples(300), plain: new Samples(300) };
+
 async function setupRenderers(msg) {
   pres.mode = msg.present?.mode || 'setting';
   if (msg.box?.w > 0 && msg.box?.h > 0) pres.box = [msg.box.w, msg.box.h];
   if (msg.client?.hz > 0) pres.refreshMs = 1000 / msg.client.hz;
   const log = (text) => post('log', { text });
+  const opts = { log, upscale: upscalePrefs() };
   for (const [slot, c] of Object.entries(msg.canvases || {})) {
     let r = null;
     try {
-      r = await createRenderer(slot, c, { log });
+      r = await createRenderer(slot, c, opts);
     } catch (e) {
       pres.errors[slot] = e.message;
       log(`${LABELS[slot] || slot} renderer unavailable (${e.message})`);
       if (pres.mode !== 'bakeoff' && slot !== 'canvas2d') {
         log('using the low-latency 2D canvas instead');
-        r = await createRenderer('canvas2d', c, { log }).catch(() => null); // the canvas may be claimed already
+        r = await createRenderer('canvas2d', c, opts).catch(() => null); // the canvas may be claimed already
       }
     }
     if (!r) {
@@ -395,7 +405,17 @@ function rendererInfo() {
   return {
     name: r.name, slot: r.slot, mode: pres.mode, desynchronized: r.desynchronized, gpu: r.gpu, canvas: r.canvasSize(),
     errors: pres.errors, drawErrors: pres.drawErrors, bake: bakeState(),
+    upscale: { ...r.upscaleInfo(), cpu: { fsr: drawUp.fsr.summary(), plain: drawUp.plain.summary() } },
   };
+}
+
+function applyUpscale() {
+  for (const r of pres.list) r.setUpscale(upscalePrefs());
+  try {
+    renderer?.redraw(); // a still picture shows the change at once (WebGL2 / WebGPU)
+  } catch (e) {
+    renderError(e);
+  }
 }
 
 // The next renderer takes over before a draw; it is announced after it.
@@ -1044,11 +1064,13 @@ function recordStages(m, decoded, start, drawn, pace) {
   s[ST.draw] = drawn - start;
   const fromCapture = s[0] !== null;
   const pacing = pace?.via === 'hop' ? 'latency' : 'smooth';
+  const up = renderer.upscaled; // FSR drew it: its passes are in the draw stage
+  (up ? drawUp.fsr : drawUp.plain).push(s[ST.draw]);
   const rec = {
-    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name, pacing,
+    t: drawn, s, e2e: drawn - (fromCapture ? hostToLocal(capUs) : sendL), e2eSend: drawn - sendL, fromCapture, path: renderer.name, pacing, up,
     raw: {
       captureUs: capUs, encodeDoneUs: doneUs, sendUs: m.sendUs, offset: clock.offset, first: m.first, last: m.recv, submit: m.t, output: decoded,
-      drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null, refresh: pace?.refresh ?? null,
+      drawStart: start, drawn, pacing, via: pace?.via, tick: pace?.tick ?? null, refresh: pace?.refresh ?? null, upscaled: up,
     },
   };
   lat.recs.push(rec);
@@ -1127,9 +1149,14 @@ function reportStages(sum) {
   rows.push({ name: 'e2e', from: sum.from, ...sum.e2e });
   // The presentation path that drew the window's frames (draw and display
   // depend on it); "bakeoff" for a window with several (the bake-off). The
-  // frame pacing mode (hold and display depend on it).
+  // frame pacing mode (hold and display depend on it). Whether FSR upscaled
+  // the frames (fsr, off, or mixed; the draw and display rows depend on it).
   const paths = new Set(lat.recs.map((r) => r.path));
-  transport.sendControl({ t: 'stages', stages: rows, renderer: paths.size === 1 ? [...paths][0] : 'bakeoff', pacing: pacingOf(lat.recs) });
+  const ups = new Set(lat.recs.map((r) => (r.up ? 'fsr' : 'off')));
+  transport.sendControl({
+    t: 'stages', stages: rows, renderer: paths.size === 1 ? [...paths][0] : 'bakeoff', pacing: pacingOf(lat.recs),
+    upscale: ups.size > 1 ? 'mixed' : [...ups][0],
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,6 +1659,7 @@ self.onmessage = (ev) => {
       prefs = { ...prefs, ...m.prefs };
       updateProbeMode();
       pacer.setMode(prefs.pacing); // live
+      if (['upscale', 'sharpness', 'fsrDenoise', 'fsrInput'].some((k) => k in m.prefs)) applyUpscale(); // live
       break;
     case 'tick': pacer.tick(m.t - performance.timeOrigin, 'main'); break; // the main thread's animation frame (absolute ms)
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;

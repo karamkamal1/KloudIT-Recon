@@ -29,7 +29,10 @@
 // back live, checking one draw per display refresh, the hold stage and the
 // stage bookkeeping, and the 2D one Smooth's fallbacks (the main thread's
 // ticks, the watchdog timer); the bake-off runs in Smooth; the pacer's rule
-// is checked on a fake clock.
+// is checked on a fake clock. Client-side upscaling (Phase 5): the WebGPU
+// renderer's FSR 1 passes against a CPU reference written from ffx_fsr1.h
+// (unit), and a scenario streaming the 960x540 picture onto a 1920x1080
+// canvas with upscaling Auto (FSR 1 draws), then Off, live.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -145,9 +148,11 @@ async function checkStages(name, st) {
 // 90 % of the sampled frames must show a valid barcode equal to the frame's seq
 // (the picture drawn is the frame its header describes), and the capture->drawn
 // histogram must have data.
-async function checkProbe(name, method = null) {
-  // A loaded machine can stall decoding for a while: give it up to 10 s more for 10 samples.
-  await until(() => page.evaluate(() => window.__recon.probe?.sampled >= 10), 10000, '10 probe samples').catch(() => {});
+async function checkProbe(name, method = null, rate = 30) {
+  // A loaded machine can stall decoding for a while: give it up to 10 s more
+  // for 10 samples (1 in 30 frames, fewer when readbacks are still in flight:
+  // longer for a stream below 60 fps).
+  await until(() => page.evaluate(() => window.__recon.probe?.sampled >= 10), 10000 * Math.max(1, 60 / rate), '10 probe samples').catch(() => {});
   const pr = await page.evaluate(() => window.__recon.probe);
   const matched = pr ? pr.valid - pr.mismatched : 0;
   const share = pr?.sampled ? matched / pr.sampled : 0;
@@ -448,6 +453,67 @@ async function checkBakeoff() {
   } finally {
     page = mainPage;
   }
+}
+
+// Client-side upscaling in the stream (Phase 5): the WebGPU renderer shows the
+// test stream at half the canvas size each way (FSR_STREAM: 480x270 on the
+// headed page's 960x540 canvas) with upscaling Auto (2x, above 1.05x): FSR 1
+// draws, as the stats and the overlay say (input -> output in device pixels,
+// sharpness), and the scenario's checks before this one ran with it (steady
+// real-time playback, stage bookkeeping, crop, the frame barcode, which is
+// read from the frame's own texture, not from the upscaled canvas). The
+// host logs the stage window with upscale=fsr. Then the drawer's Upscaling
+// "Off", applied live: the plain bilinear path draws again at the stream's
+// rate, and the choice is saved with the settings. The draw stage with and
+// without FSR and the passes' GPU time (timestamp-query) go to the results.
+async function checkUpscaleStream(sc, rate) {
+  const name = sc.name;
+  const st = await page.evaluate(() => window.__recon.lastStats);
+  const u = st?.renderer?.upscale;
+  const canvas = st?.renderer?.canvas;
+  const size = sc.size.join('x');
+  const overlay = await page.textContent('#stats').catch(() => '');
+  const want = `FSR 1 · ${sc.size.join('×')} → ${canvas?.join('×')} (2×) · sharpness 0.2`;
+  check(`${name}: upscaling Auto draws with FSR 1, ${size} -> the canvas (device pixels, 2x), sharpness 0.2, shown in the overlay`,
+    !!u && u.mode === 'auto' && u.active && u.in?.join('x') === size && canvas?.[0] === 2 * sc.size[0] && canvas?.[1] === 2 * sc.size[1] &&
+      u.out?.join('x') === canvas.join('x') && u.sharpness === 0.2 && overlay.includes(want),
+    `${JSON.stringify({ mode: u?.mode, active: u?.active, in: u?.in, out: u?.out, scale: u?.scale, sharpness: u?.sharpness, input: u?.input, why: u?.why })}; ` +
+      `canvas ${canvas?.join('x')}; overlay ${overlay.includes(want) ? `shows "${want}"` : 'lacks it'}`);
+  const hostProc = procs.find((p) => p.spawnargs.includes('run'));
+  const line = await until(() => (hostProc.log.match(/msg="latency stages[^\n]* renderer=webgpu [^\n]*upscale=fsr[^\n]*/) || [])[0], 12000, 'stage line with upscale=fsr').catch(() => '');
+  check(`${name}: the host logs the client's stage window with upscale=fsr`, !!line, line.replace(/^.*?msg=/, '').slice(0, 220));
+  // Off, from the drawer: applies at once.
+  await page.evaluate(() => {
+    const sel = [...document.querySelectorAll('#drawer label')].find((l) => l.textContent === 'Upscaling')?.parentElement.querySelector('select');
+    sel.value = 'off';
+    sel.dispatchEvent(new Event('change'));
+  });
+  const switched = await until(() => page.evaluate(() => {
+    const u2 = window.__recon.lastStats?.renderer?.upscale;
+    return u2 && u2.mode === 'off' && !u2.active ? true : null;
+  }), 5000, 'upscaling off').catch(() => false);
+  await sleep(2000);
+  const fps = [];
+  for (let i = 0; i < 4; i++) {
+    await sleep(500);
+    fps.push(+(await page.evaluate(() => window.__recon.lastStats?.fps ?? 0)).toFixed(1));
+  }
+  const st2 = await page.evaluate(() => window.__recon.lastStats);
+  const u2 = st2?.renderer?.upscale;
+  const overlay2 = await page.textContent('#stats').catch(() => '');
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('recon.prefs.v1') || '{}').upscale);
+  const avg = fps.slice(-3).reduce((a, x) => a + x, 0) / 3;
+  const want2 = `Off: bilinear · ${sc.size.join('×')} → ${canvas?.join('×')}`;
+  check(`${name}: upscaling Off, applied live: the plain bilinear path draws again at the stream's rate, saved with the settings`,
+    switched && u2?.mode === 'off' && !u2.active && u2.why === 'off' && overlay2.includes(want2) && avg >= (rate * 5) / 6 && saved === 'off',
+    `${JSON.stringify({ mode: u2?.mode, active: u2?.active, why: u2?.why })}; overlay ${overlay2.includes(want2) ? `shows "${want2}"` : 'lacks it'}; ` +
+      `${fps.join(' / ')} fps of ${rate}; saved upscale ${saved}`);
+  const ms = (x) => (x ? `mean ${x.mean}, p50 ${x.p50}, p95 ${x.p95} ms (n ${x.n})` : '—');
+  const g = u2?.gpu;
+  const c = u2?.cpu;
+  console.log(`  ${name}: draw stage (CPU) with FSR ${ms(c?.fsr)}; plain ${ms(c?.plain)}. GPU (${g?.method || 'no timestamp-query'}, SwiftShader: ` +
+    `not a GPU's cost) FSR ${ms(g?.fsr)}${g?.copy ? `, of which the copy ${ms(g.copy)}` : ''}; plain ${ms(g?.plain)}`);
+  results.push({ upscale: name, fsr: { fps: st?.fps, stages: st?.stages, info: u }, off: { fps, info: u2 }, drawStage: { fsr: c?.fsr, plain: c?.plain }, gpu: g });
 }
 
 // A headed Chromium on its own Xvfb display (WebGPU works there, not in
@@ -827,6 +893,454 @@ return { out, keep };
     await ctx2.close();
     if (b !== browser) await b.close();
   }
+}
+
+// Client-side upscaling at unit level (Phase 5, web/static/js/fsr1.js): the
+// WebGPU renderer's FSR 1 passes (EASU, then RCAS onto the canvas) against
+// fsrReference below, a CPU port of the same math written from ffx_fsr1.h
+// itself (its gather4 layout, constants and approximations), not from the
+// client's WGSL. The picture (fsrPattern, 64x40): an anti-aliased diagonal
+// edge between dark blue and orange, a 1-px white line on dark grey, a smooth
+// grey ramp. It is drawn at 2x and 1.5x with the external-texture and the
+// copy input, sharpness 0 to 1 stops, denoise, and from a frame padded with 8
+// white rows that the video config crops; the plain path at 1x must return
+// the source exactly (the reference's input). Tolerance: 1 level for EASU
+// alone (RCAS at 20 stops is the identity), 5 levels after RCAS, which
+// amplifies a 1-level rounding difference of the 8-bit intermediate up to
+// 1 / (1 + 4 * lobe), about 2.9x at 0.2 stops. Then against the bilinear
+// path: the edge's 10-90 % rise is narrower and its steepest step higher,
+// flat areas (3 input pixels from anything else) keep their value within a
+// level (no ringing: RCAS's limiter and EASU's min/max clamp), the ramp stays
+// a ramp. Then the streaming geometry the sandbox cannot run in real time
+// (960x540 into 1920x1080, Auto) at 600 sampled pixels. And the plan: FSR
+// never draws a picture shown at its size or smaller, Auto only above 1.05x.
+// n output pixels spread over a w x h picture (a fixed sequence).
+function fsrSamples(w, h, n) {
+  let s = 12345;
+  const rnd = () => { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+  return Array.from({ length: n }, () => [Math.floor(rnd() * w), Math.floor(rnd() * h)]);
+}
+
+function fsrPattern(w, h, pad = 0) {
+  const px = new Uint8ClampedArray(w * (h + pad) * 4).fill(255);
+  const set = (x, y, c) => { const o = (y * w + x) * 4; px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; };
+  const blue = [20, 30, 90];
+  const orange = [230, 140, 40];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (x < 32) {
+        // Coverage of the pixel by the half-plane right of x = 8 + y / 2.
+        const c = Math.min(1, Math.max(0, ((x + 0.5) - (8 + 0.5 * (y + 0.5))) / Math.hypot(1, 0.5) + 0.5));
+        set(x, y, blue.map((v, i) => Math.round(v + (orange[i] - v) * c)));
+      } else if (y < 20) set(x, y, x === 47 && y >= 2 && y < 18 ? [235, 235, 235] : [30, 30, 30]);
+      else set(x, y, Array(3).fill(Math.round(20 + (215 * (x - 32)) / 31)));
+    }
+  }
+  return px;
+}
+
+// FSR 1 on the CPU: EASU then RCAS, ported from ffx_fsr1.h (FsrEasuCon,
+// FsrEasuF, FsrRcasCon, FsrRcasF, the 32-bit versions) and ffx_a.h's
+// approximations (GPUOpen-Effects/FidelityFX-FSR, see third_party/README.md):
+//
+// Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+// src: RGB in [0, 1], w*h*3; returns { at(x, y) }:
+// the output pixel's RGB in [0, 1] before the canvas's 8-bit store (EASU is
+// evaluated where RCAS needs it and stored as 8-bit, like the client's
+// rgba8unorm intermediate). Edges: the gathers clamp to the image (a
+// clamp-to-edge sampler), RCAS's loads to the EASU output.
+function fsrReference(src, w, h, ow, oh, stops, denoise = false) {
+  const f = new Float32Array(1);
+  const u = new Uint32Array(f.buffer);
+  const AU1_AF1 = (a) => { f[0] = a; return u[0]; };
+  const AF1_AU1 = (a) => { u[0] = a >>> 0; return f[0]; };
+  const APrxLoRcpF1 = (a) => AF1_AU1(0x7ef07ebb - AU1_AF1(a));
+  const APrxMedRcpF1 = (a) => { const b = AF1_AU1(0x7ef19fff - AU1_AF1(a)); return b * (-b * a + 2.0); };
+  const APrxLoRsqF1 = (a) => AF1_AU1(0x5f347d74 - (AU1_AF1(a) >>> 1));
+  const ARcpF1 = (a) => 1.0 / a;
+  const ASatF1 = (a) => Math.min(1.0, Math.max(0.0, a));
+  // GPU min/max (HLSL on D3D, GLSL on Vulkan): a NaN operand yields the other one.
+  const max = (a, b) => (Number.isNaN(a) ? b : Number.isNaN(b) ? a : Math.max(a, b));
+  const min = (a, b) => (Number.isNaN(a) ? b : Number.isNaN(b) ? a : Math.min(a, b));
+  // FsrEasuCon(viewport w x h, input size w x h, output ow x oh).
+  const con0 = [w * ARcpF1(ow), h * ARcpF1(oh), 0.5 * w * ARcpF1(ow) - 0.5, 0.5 * h * ARcpF1(oh) - 0.5];
+  const con1 = [ARcpF1(w), ARcpF1(h), 1.0 * ARcpF1(w), -1.0 * ARcpF1(h)];
+  const con2 = [-1.0 * ARcpF1(w), 2.0 * ARcpF1(h), 1.0 * ARcpF1(w), 2.0 * ARcpF1(h)];
+  const con3 = [0.0 * ARcpF1(w), 4.0 * ARcpF1(h), 0, 0];
+  const texel = (x, y, ch) => src[(Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))) * 3 + ch];
+  // textureGather of channel ch at normalised p: the bilinear footprint,
+  // x = (i0, j1), y = (i1, j1), z = (i1, j0), w = (i0, j0).
+  const gather = (p, ch) => {
+    const i0 = Math.floor(p[0] * w - 0.5);
+    const j0 = Math.floor(p[1] * h - 0.5);
+    return [texel(i0, j0 + 1, ch), texel(i0 + 1, j0 + 1, ch), texel(i0 + 1, j0, ch), texel(i0, j0, ch)];
+  };
+  const L4 = (R, G, B) => [0, 1, 2, 3].map((k) => B[k] * 0.5 + (R[k] * 0.5 + G[k]));
+  const FsrEasuTapF = (acc, off, dir, len, lob, clp, c) => {
+    const v = [off[0] * dir[0] + off[1] * dir[1], off[0] * -dir[1] + off[1] * dir[0]];
+    v[0] *= len[0];
+    v[1] *= len[1];
+    const d2 = min(v[0] * v[0] + v[1] * v[1], clp);
+    let wB = (2.0 / 5.0) * d2 + -1.0;
+    let wA = lob * d2 + -1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = (25.0 / 16.0) * wB + -(25.0 / 16.0 - 1.0);
+    const wt = wB * wA;
+    for (let k = 0; k < 3; k++) acc.c[k] += c[k] * wt;
+    acc.w += wt;
+  };
+  const FsrEasuSetF = (st, pp, biS, biT, biU, biV, lA, lB, lC, lD, lE) => {
+    let wt = 0.0;
+    if (biS) wt = (1.0 - pp[0]) * (1.0 - pp[1]);
+    if (biT) wt = pp[0] * (1.0 - pp[1]);
+    if (biU) wt = (1.0 - pp[0]) * pp[1];
+    if (biV) wt = pp[0] * pp[1];
+    const dc = lD - lC;
+    const cb = lC - lB;
+    let lenX = APrxLoRcpF1(max(Math.abs(dc), Math.abs(cb)));
+    const dirX = lD - lB;
+    st.dir[0] += dirX * wt;
+    lenX = ASatF1(Math.abs(dirX) * lenX);
+    st.len += lenX * lenX * wt;
+    const ec = lE - lC;
+    const ca = lC - lA;
+    let lenY = APrxLoRcpF1(max(Math.abs(ec), Math.abs(ca)));
+    const dirY = lE - lA;
+    st.dir[1] += dirY * wt;
+    lenY = ASatF1(Math.abs(dirY) * lenY);
+    st.len += lenY * lenY * wt;
+  };
+  const FsrEasuF = (ipx, ipy) => {
+    const pp = [ipx * con0[0] + con0[2], ipy * con0[1] + con0[3]];
+    const fp = [Math.floor(pp[0]), Math.floor(pp[1])];
+    pp[0] -= fp[0];
+    pp[1] -= fp[1];
+    const p0 = [fp[0] * con1[0] + con1[2], fp[1] * con1[1] + con1[3]];
+    const p1 = [p0[0] + con2[0], p0[1] + con2[1]];
+    const p2 = [p0[0] + con2[2], p0[1] + con2[3]];
+    const p3 = [p0[0] + con3[0], p0[1] + con3[1]];
+    const [bczzR, bczzG, bczzB] = [0, 1, 2].map((ch) => gather(p0, ch));
+    const [ijfeR, ijfeG, ijfeB] = [0, 1, 2].map((ch) => gather(p1, ch));
+    const [klhgR, klhgG, klhgB] = [0, 1, 2].map((ch) => gather(p2, ch));
+    const [zzonR, zzonG, zzonB] = [0, 1, 2].map((ch) => gather(p3, ch));
+    const [bL, cL] = L4(bczzR, bczzG, bczzB);
+    const [iL, jL, fL, eL] = L4(ijfeR, ijfeG, ijfeB);
+    const [kL, lL, hL, gL] = L4(klhgR, klhgG, klhgB);
+    const [, , oL, nL] = L4(zzonR, zzonG, zzonB);
+    const st = { dir: [0, 0], len: 0 };
+    FsrEasuSetF(st, pp, true, false, false, false, bL, eL, fL, gL, jL);
+    FsrEasuSetF(st, pp, false, true, false, false, cL, fL, gL, hL, kL);
+    FsrEasuSetF(st, pp, false, false, true, false, fL, iL, jL, kL, nL);
+    FsrEasuSetF(st, pp, false, false, false, true, gL, jL, kL, lL, oL);
+    const dir = st.dir;
+    let len = st.len;
+    let dirR = dir[0] * dir[0] + dir[1] * dir[1];
+    const zro = dirR < 1.0 / 32768.0;
+    dirR = zro ? 1.0 : APrxLoRsqF1(dirR);
+    dir[0] = zro ? 1.0 : dir[0];
+    dir[0] *= dirR;
+    dir[1] *= dirR;
+    len = len * 0.5;
+    len *= len;
+    const stretch = (dir[0] * dir[0] + dir[1] * dir[1]) * APrxLoRcpF1(max(Math.abs(dir[0]), Math.abs(dir[1])));
+    const len2 = [1.0 + (stretch - 1.0) * len, 1.0 + -0.5 * len];
+    const lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    const clp = APrxLoRcpF1(lob);
+    const q = (R, G, B, k) => [R[k], G[k], B[k]];
+    const fC = q(ijfeR, ijfeG, ijfeB, 2);
+    const gC = q(klhgR, klhgG, klhgB, 3);
+    const jC = q(ijfeR, ijfeG, ijfeB, 1);
+    const kC = q(klhgR, klhgG, klhgB, 0);
+    const min4 = [0, 1, 2].map((ch) => min(min(min(fC[ch], gC[ch]), jC[ch]), kC[ch]));
+    const max4 = [0, 1, 2].map((ch) => max(max(max(fC[ch], gC[ch]), jC[ch]), kC[ch]));
+    const acc = { c: [0, 0, 0], w: 0 };
+    const off = (x, y) => [x - pp[0], y - pp[1]];
+    FsrEasuTapF(acc, off(0.0, -1.0), dir, len2, lob, clp, q(bczzR, bczzG, bczzB, 0)); // b
+    FsrEasuTapF(acc, off(1.0, -1.0), dir, len2, lob, clp, q(bczzR, bczzG, bczzB, 1)); // c
+    FsrEasuTapF(acc, off(-1.0, 1.0), dir, len2, lob, clp, q(ijfeR, ijfeG, ijfeB, 0)); // i
+    FsrEasuTapF(acc, off(0.0, 1.0), dir, len2, lob, clp, jC); // j
+    FsrEasuTapF(acc, off(0.0, 0.0), dir, len2, lob, clp, fC); // f
+    FsrEasuTapF(acc, off(-1.0, 0.0), dir, len2, lob, clp, q(ijfeR, ijfeG, ijfeB, 3)); // e
+    FsrEasuTapF(acc, off(1.0, 1.0), dir, len2, lob, clp, kC); // k
+    FsrEasuTapF(acc, off(2.0, 1.0), dir, len2, lob, clp, q(klhgR, klhgG, klhgB, 1)); // l
+    FsrEasuTapF(acc, off(2.0, 0.0), dir, len2, lob, clp, q(klhgR, klhgG, klhgB, 2)); // h
+    FsrEasuTapF(acc, off(1.0, 0.0), dir, len2, lob, clp, gC); // g
+    FsrEasuTapF(acc, off(1.0, 2.0), dir, len2, lob, clp, q(zzonR, zzonG, zzonB, 2)); // o
+    FsrEasuTapF(acc, off(0.0, 2.0), dir, len2, lob, clp, q(zzonR, zzonG, zzonB, 3)); // n
+    return [0, 1, 2].map((ch) => min(max4[ch], max(min4[ch], acc.c[ch] * ARcpF1(acc.w))));
+  };
+  // EASU on demand (memoised), stored as 8-bit like the rgba8unorm intermediate.
+  const easu = new Float64Array(ow * oh * 3).fill(NaN);
+  const load = (x, y) => {
+    const cx = Math.min(ow - 1, Math.max(0, x));
+    const cy = Math.min(oh - 1, Math.max(0, y));
+    const o = (cy * ow + cx) * 3;
+    if (Number.isNaN(easu[o])) {
+      const p = FsrEasuF(cx, cy);
+      for (let ch = 0; ch < 3; ch++) easu[o + ch] = Math.round(ASatF1(p[ch]) * 255) / 255;
+    }
+    return [easu[o], easu[o + 1], easu[o + 2]];
+  };
+  // FsrRcasCon, FsrRcasF.
+  const sharp = Math.pow(2, -stops);
+  const FSR_RCAS_LIMIT = 0.25 - 1.0 / 16.0;
+  const max3 = (a, b, c) => max(max(a, b), c);
+  const min3 = (a, b, c) => min(min(a, b), c);
+  const L = (c) => c[2] * 0.5 + (c[0] * 0.5 + c[1]);
+  const at = (x, y) => {
+    const b = load(x, y - 1);
+    const d = load(x - 1, y);
+    const e = load(x, y);
+    const fv = load(x + 1, y);
+    const hv = load(x, y + 1);
+    const [bL, dL, eL, fL, hL] = [b, d, e, fv, hv].map(L);
+    let nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+    nz = ASatF1(Math.abs(nz) * APrxMedRcpF1(max3(max3(bL, dL, eL), fL, hL) - min3(min3(bL, dL, eL), fL, hL)));
+    nz = -0.5 * nz + 1.0;
+    const lobes = [0, 1, 2].map((ch) => {
+      const mn4 = min(min3(b[ch], d[ch], fv[ch]), hv[ch]);
+      const mx4 = max(max3(b[ch], d[ch], fv[ch]), hv[ch]);
+      const hitMin = min(mn4, e[ch]) * ARcpF1(4.0 * mx4);
+      const hitMax = (1.0 - max(mx4, e[ch])) * ARcpF1(4.0 * mn4 + -4.0);
+      return max(-hitMin, hitMax);
+    });
+    let lobe = max(-FSR_RCAS_LIMIT, min(max3(lobes[0], lobes[1], lobes[2]), 0.0)) * sharp;
+    if (denoise) lobe *= nz;
+    const rcpL = APrxMedRcpF1(4.0 * lobe + 1.0);
+    return [0, 1, 2].map((ch) => (lobe * b[ch] + lobe * d[ch] + lobe * hv[ch] + lobe * fv[ch] + e[ch]) * rcpL);
+  };
+  return { at };
+}
+
+// Sharpness and flatness of an upscaled fsrPattern (RGBA px, w x h, from W x H):
+// the diagonal edge's mean 10-90 % rise along rows (input pixels) and steepest
+// step (share of the edge's contrast per output pixel), the output pixels in
+// flat areas (the same source colour 3 input pixels all round) and the most
+// any of them is off, and the ramp's rows (monotonic; compared with bilinear).
+function fsrMetrics(px, w, h, src, W, H) {
+  const s = w / W;
+  const at = (x, y, c) => px[(y * w + x) * 4 + c];
+  const widths = [];
+  const steps = [];
+  for (let yi = 8; yi < 32; yi += 2) {
+    const y = Math.floor((yi + 0.5) * s);
+    const row = [];
+    for (let x = 0; x < Math.floor(30 * s); x++) row.push((at(x, y, 0) - 20) / 210); // R: blue 20 -> orange 230
+    const cross = (t) => { for (let x = 1; x < row.length; x++) if (row[x - 1] < t && row[x] >= t) return x - 1 + (t - row[x - 1]) / (row[x] - row[x - 1]); return NaN; };
+    widths.push((cross(0.9) - cross(0.1)) / s);
+    steps.push(Math.max(...row.slice(1).map((v, x) => v - row[x])));
+  }
+  const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  let flat = 0;
+  let flatMax = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const xi = (x + 0.5) / s - 0.5;
+      const yi = (y + 0.5) / s - 0.5;
+      let ref = null;
+      let same = true;
+      for (let dy = -3; dy <= 3 && same; dy++) {
+        for (let dx = -3; dx <= 3 && same; dx++) {
+          const o = (Math.min(H - 1, Math.max(0, Math.round(yi + dy))) * W + Math.min(W - 1, Math.max(0, Math.round(xi + dx)))) * 4;
+          if (!ref) ref = [src[o], src[o + 1], src[o + 2]];
+          else if (src[o] !== ref[0] || src[o + 1] !== ref[1] || src[o + 2] !== ref[2]) same = false;
+        }
+      }
+      if (!same) continue;
+      flat++;
+      flatMax = Math.max(flatMax, ...[0, 1, 2].map((k) => Math.abs(at(x, y, k) - ref[k])));
+    }
+  }
+  const ramp = [];
+  for (let yi = 24; yi < 36; yi += 3) {
+    const y = Math.floor((yi + 0.5) * s);
+    ramp.push(Array.from({ length: Math.floor(60.5 * s) - Math.ceil(35.5 * s) }, (_, i) => at(Math.ceil(35.5 * s) + i, y, 0)));
+  }
+  return { width: +mean(widths).toFixed(3), step: +mean(steps).toFixed(3), flat, flatMax, ramp };
+}
+
+async function checkUpscaleUnit(haveX) {
+  if (!haveX) {
+    console.log('- FSR 1 shader (unit): skipped, WebGPU needs a headed browser (Xvfb) here');
+    return;
+  }
+  const W = 64;
+  const H = 40;
+  const PAD = 8;
+  const plain = fsrPattern(W, H);
+  const cases = [
+    { name: '1x plain', box: [64, 40], up: { mode: 'off' } },
+    { name: '2x', box: [128, 80], up: { mode: 'fsr', sharpness: 0.2, input: 'external' } },
+    { name: '2x copy', box: [128, 80], up: { mode: 'fsr', sharpness: 0.2, input: 'copy' } },
+    { name: '1.5x', box: [96, 60], up: { mode: 'fsr', sharpness: 0.2, input: 'external' } },
+    { name: '1.5x copy 1 stop denoise', box: [96, 60], up: { mode: 'fsr', sharpness: 1, denoise: true, input: 'copy' } },
+    { name: '1.5x EASU alone', box: [96, 60], up: { mode: 'fsr', input: 'external' }, stops: 20 },
+    { name: '1.5x EASU alone copy', box: [96, 60], up: { mode: 'fsr', input: 'copy' }, stops: 20 },
+    { name: '2x cropped frame 0 stops', box: [128, 80], up: { mode: 'fsr', sharpness: 0 }, pad: true },
+    { name: '2x bilinear', box: [128, 80], up: { mode: 'off' } },
+    { name: '1.5x bilinear', box: [96, 60], up: { mode: 'off' } },
+    // The plan: [mode, box] -> upscaled?
+    { name: 'fsr at 1x', box: [64, 40], up: { mode: 'fsr' }, plan: false },
+    { name: 'fsr shown smaller', box: [48, 30], up: { mode: 'fsr' }, plan: false },
+    { name: 'auto at 1.03x', box: [66, 41], up: { mode: 'auto' }, plan: false },
+    { name: 'auto at 1.09x', box: [70, 44], up: { mode: 'auto' }, plan: true },
+    { name: 'fsr at 1.03x', box: [66, 41], up: { mode: 'fsr' }, plan: true },
+    // The streaming geometry the sandbox cannot run in real time: a 960x540
+    // frame (the pattern tiled) into a 1920x1080 canvas, Auto, at sampled pixels.
+    { name: '960x540 -> 1920x1080 auto', box: [1920, 1080], up: { mode: 'auto' }, big: [960, 540], sample: fsrSamples(1920, 1080, 600) },
+  ];
+  const disp = await startXvfb();
+  const b = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: disp }, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
+  const ctx2 = await b.newContext({ ignoreHTTPSErrors: true });
+  let res;
+  try {
+    const p = await ctx2.newPage();
+    await p.goto(`${base}/login`);
+    // Evaluated through the DevTools protocol (the page's CSP does not apply);
+    // the modules come from the gateway like in the app.
+    res = await p.evaluate(async ({ W, H, PAD, px, cases }) => {
+      const P = await import('/js/protocol.js');
+      const R = await import('/js/renderers.js');
+      const frameOf = (pad, big) => {
+        const c = new OffscreenCanvas(W, H + pad);
+        c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(pad ? px.padded : px.plain), W, H + pad), 0, 0);
+        if (!big) return new VideoFrame(c, { timestamp: 0 });
+        const t = new OffscreenCanvas(big[0], big[1]); // the pattern tiled
+        const g = t.getContext('2d');
+        for (let y = 0; y < big[1]; y += H) for (let x = 0; x < big[0]; x += W) g.drawImage(c, x, y);
+        return new VideoFrame(t, { timestamp: 0 });
+      };
+      const out = [];
+      for (const k of cases) {
+        const canvas = new OffscreenCanvas(1, 1);
+        try {
+          const r = await R.createRenderer('webgpu', canvas, { upscale: k.up });
+          const ready = await r.fsrReady;
+          if (k.stops !== undefined) r.up = { ...r.up, sharpness: k.stops }; // past the settings' range: RCAS ~ identity
+          r.resize(k.box[0], k.box[1]);
+          const frame = frameOf(k.pad ? PAD : 0, k.big);
+          const cfg = k.pad ? { width: W, height: H, codedWidth: W, codedHeight: H + PAD, cropBottom: PAD } : null;
+          r.draw(frame, null, P.visibleArea(cfg, frame.visibleRect.width, frame.visibleRect.height, frame.displayWidth, frame.displayHeight));
+          await r.device.queue.onSubmittedWorkDone();
+          const bmp = canvas.transferToImageBitmap();
+          const g = new OffscreenCanvas(bmp.width, bmp.height).getContext('2d');
+          g.drawImage(bmp, 0, 0);
+          const data = k.plan === undefined ? g.getImageData(0, 0, bmp.width, bmp.height).data : null;
+          out.push({ name: k.name, w: bmp.width, h: bmp.height, px: data && !k.sample ? Array.from(data) : null,
+            sampled: data && k.sample ? k.sample.map(([x, y]) => Array.from(data.subarray((y * bmp.width + x) * 4, (y * bmp.width + x) * 4 + 3))) : null,
+            ready, error: r.fsrError, upscaled: r.upscaled, info: r.upscaleInfo() });
+          r.prev?.close();
+          r.prev = null;
+          r.destroy();
+        } catch (e) {
+          out.push({ name: k.name, error: e.message });
+        }
+      }
+      return out;
+    }, { W, H, PAD, px: { plain: Array.from(plain), padded: Array.from(fsrPattern(W, H, PAD)) }, cases });
+  } finally {
+    await ctx2.close();
+    await b.close();
+  }
+  const by = (name) => res.find((x) => x.name === name);
+  const src = new Float64Array(W * H * 3);
+  for (let i = 0; i < W * H; i++) for (let c = 0; c < 3; c++) src[i * 3 + c] = plain[i * 4 + c] / 255;
+  const one = by('1x plain');
+  let srcDiff = Infinity;
+  if (one?.px) {
+    srcDiff = 0;
+    for (let i = 0; i < W * H; i++) for (let c = 0; c < 3; c++) srcDiff = Math.max(srcDiff, Math.abs(one.px[i * 4 + c] - plain[i * 4 + c]));
+  }
+  // Against the reference: max and mean difference in 8-bit levels, and the worst pixel.
+  const compare = (k) => {
+    const r = by(k.name);
+    if (!r?.px) return { name: k.name, error: r?.error || 'no result', max: Infinity };
+    const ref = fsrReference(src, W, H, r.w, r.h, k.stops ?? k.up.sharpness ?? 0.2, !!k.up.denoise);
+    let max = 0;
+    let sum = 0;
+    let worst = '';
+    for (let i = 0; i < r.w * r.h; i++) {
+      const v = ref.at(i % r.w, Math.floor(i / r.w));
+      for (let c = 0; c < 3; c++) {
+        const want = Math.round(Math.min(1, Math.max(0, v[c])) * 255);
+        const d = Math.abs(r.px[i * 4 + c] - want);
+        sum += d;
+        if (d > max) { max = d; worst = `(${i % r.w},${Math.floor(i / r.w)}) ${'rgb'[c]} ${r.px[i * 4 + c]} vs ${want}`; }
+      }
+    }
+    return { name: k.name, w: r.w, h: r.h, max, mean: sum / (r.w * r.h * 3), worst, upscaled: r.upscaled, ready: r.ready };
+  };
+  const txt = (x) => (x.error ? `${x.name}: ${x.error}` : `${x.name} ${x.w}x${x.h}: max ${x.max}, mean ${x.mean.toFixed(3)}${x.max ? ` (worst ${x.worst})` : ''}`);
+  const easu = cases.filter((k) => k.stops !== undefined).map(compare);
+  check('FSR 1 shader (unit): EASU alone matches the CPU reference of ffx_fsr1.h within 1 level (1.5x, external and copy input)',
+    srcDiff === 0 && easu.every((x) => x.upscaled && x.max <= 1), `1x plain path vs source: max ${srcDiff}; ${easu.map(txt).join('; ')}`);
+  const full = cases.filter((k) => k.up.mode === 'fsr' && k.stops === undefined && k.plan === undefined && !k.pad).map(compare);
+  check('FSR 1 shader (unit): EASU + RCAS match the CPU reference at 2x and 1.5x (external and copy input, 0.2 and 1 stop, denoise) within 5 levels',
+    srcDiff === 0 && full.every((x) => x.upscaled && x.max <= 5 && x.mean <= 0.25), full.map(txt).join('; '));
+  const pad = compare(cases.find((k) => k.pad));
+  const padRes = by(pad.name);
+  const white = padRes?.px ? Array.from({ length: padRes.w }, (_, x) => (padRes.h - 1) * padRes.w + x).filter((i) => padRes.px[i * 4] > 248 && padRes.px[i * 4 + 1] > 248 && padRes.px[i * 4 + 2] > 248).length : -1;
+  check('FSR 1 shader (unit): a frame with 8 white padding rows the video config crops upscales the visible 64x40 only (taps clamped to the crop)',
+    pad.upscaled && pad.max <= 5 && white === 0, `${txt(pad)}; white pixels in the bottom row: ${white}`);
+  const m = {};
+  for (const n of ['2x', '2x bilinear', '1.5x', '1.5x bilinear']) m[n] = by(n)?.px ? fsrMetrics(by(n).px, by(n).w, by(n).h, plain, W, H) : null;
+  const sharper = (a, bl) => !!m[a] && !!m[bl] && m[a].width < m[bl].width && m[a].step > m[bl].step;
+  check('FSR 1 shader (unit): the diagonal edge comes out sharper than bilinear (narrower 10-90 % rise, steeper step) at 2x and 1.5x',
+    sharper('2x', '2x bilinear') && sharper('1.5x', '1.5x bilinear'),
+    ['2x', '1.5x'].map((s) => `${s}: rise ${m[s]?.width} vs ${m[`${s} bilinear`]?.width} input px, step ${m[s]?.step} vs ${m[`${s} bilinear`]?.step}`).join('; '));
+  // The ramp: EASU's Lanczos-like kernel leans towards the texels and RCAS
+  // sharpens that into small steps (the reference does the same), so it is
+  // held to a ramp's shape: within half an input step (4 of 7 levels) of
+  // bilinear, no reversal over 1 level.
+  const ramp = (a, bl) => {
+    let off = 0;
+    let back = 0;
+    m[a].ramp.forEach((row, i) => row.forEach((v, x) => { off = Math.max(off, Math.abs(v - m[bl].ramp[i][x])); if (x) back = Math.max(back, row[x - 1] - v); }));
+    return { off, back, ok: off <= 4 && back <= 1 };
+  };
+  check('FSR 1 shader (unit): flat areas stay flat (within 1 level 3 input px from anything else: no ringing), the ramp stays a ramp (within 4 levels of bilinear, no reversal over 1 level)',
+    ['2x', '1.5x'].every((s) => m[s] && m[`${s} bilinear`] && m[s].flat > 1000 && m[s].flatMax <= 1 && ramp(s, `${s} bilinear`).ok),
+    ['2x', '1.5x'].map((s) => (m[s] && m[`${s} bilinear`] ? `${s}: ${m[s].flat} flat px, off by at most ${m[s].flatMax}; ramp at most ${ramp(s, `${s} bilinear`).off} ` +
+      `from bilinear, reversals at most ${ramp(s, `${s} bilinear`).back}` : `${s}: no result`)).join('; '));
+  // The streaming geometry at sampled pixels.
+  const bk = cases.find((k) => k.big);
+  const big = by(bk.name);
+  let bigMax = Infinity;
+  if (big?.sampled) {
+    const [bw, bh] = bk.big;
+    const bsrc = new Float64Array(bw * bh * 3);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) for (let c = 0; c < 3; c++) bsrc[(y * bw + x) * 3 + c] = plain[((y % H) * W + (x % W)) * 4 + c] / 255;
+    const ref = fsrReference(bsrc, bw, bh, big.w, big.h, 0.2);
+    bigMax = Math.max(...bk.sample.map(([x, y], i) => Math.max(...ref.at(x, y).map((v, c) => Math.abs(big.sampled[i][c] - Math.round(Math.min(1, Math.max(0, v)) * 255))))));
+  }
+  check('FSR 1 shader (unit): Auto upscales a 960x540 frame into a 1920x1080 canvas with FSR 1, matching the CPU reference within 5 levels at 600 sampled pixels',
+    !!big && !big.error && big.upscaled && big.info.in?.join('x') === '960x540' && big.info.out?.join('x') === '1920x1080' && bigMax <= 5,
+    big?.error || `${big.upscaled ? 'FSR' : `bilinear (${big.info.why})`} ${big.info.in?.join('x')} -> ${big.info.out?.join('x')}, ${big.info.input} input; max difference ${bigMax} levels`);
+  const plans = cases.filter((k) => k.plan !== undefined).map((k) => ({ k, r: by(k.name) }));
+  check('FSR 1 (unit): never upscales a picture shown at its size or smaller; Auto only above 1.05x, FSR above 1x; the renderer reports why',
+    plans.every(({ k, r }) => r && !r.error && r.upscaled === k.plan && r.info.active === k.plan && (k.plan || !!r.info.why)),
+    plans.map(({ k, r }) => `${k.name}: ${r?.error || `${r.upscaled ? 'FSR' : `bilinear (${r.info.why})`}, ${r.info.in?.join('x')} -> ${r.info.out?.join('x')}`}`).join('; '));
+  results.push({ upscaleUnit: { srcDiff, easu, full, pad, bigMax, metrics: Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v && { width: v.width, step: v.step, flat: v.flat, flatMax: v.flatMax }])) } });
 }
 
 // Auto's pick at unit level (step 4.3, renderers.js pickPath) on made-up
@@ -1488,6 +2002,9 @@ let page = await ctx.newPage();
 // reason.
 const HEADED_VIEWPORT = { width: 768, height: 432 };
 const HEADED_DPR = 1.25;
+// The upscaling scenario's stream: half the headed canvas each way, at a
+// frame rate SwiftShader keeps up with while it runs FSR's passes.
+const FSR_STREAM = { w: 480, h: 270, fps: 15 };
 // Saved settings as the client writes them (rendererV: written since step
 // 4.3; without it a saved "canvas2d", the earlier default, reads as "auto").
 // The 2D canvas unless a scenario picks another renderer.
@@ -1549,6 +2066,14 @@ try {
     // checkRendererCrop). Without Xvfb WebGL2 runs headless.
     { name: 'WebGL2 renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgl2', fps: 30 }, expect: ['webtransport', 'direct'], probe: 'webgl2 readback', headed: 'prefer', pacing: true },
     { name: 'WebGPU renderer', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu', fps: 30 }, expect: ['webtransport', 'direct'], probe: 'webgpu readback', headed: true, pacing: true },
+    // Client-side upscaling (Phase 5, checkUpscaleStream): upscaling Auto,
+    // the stream at half the size of the headed canvas (FSR_STREAM, asked
+    // for live once connected), so FSR 1 draws it at 2x; then Off, live.
+    // SwiftShader cannot run FSR on the 960x540 stream into a 1920x1080
+    // canvas in real time (about 0.45 s of emulated GPU per frame here, see
+    // docs/VENDOR_NOTES.md, Phase 5): that geometry is checked frame by frame
+    // in checkUpscaleUnit, this one at the same factor in real time.
+    { name: 'WebGPU upscaling (FSR)', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu', fps: FSR_STREAM.fps, upscale: 'auto' }, expect: ['webtransport', 'direct'], probe: 'webgpu readback', headed: true, size: [FSR_STREAM.w, FSR_STREAM.h], upscale: true },
   ];
   if (process.env.E2E_ROTATE) scenarios.push(scenarios.shift());
 
@@ -1596,6 +2121,13 @@ try {
     const conn = await page.evaluate(() => window.__recon.conn);
     check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1] && conn.renderer === sc.prefs.renderer,
       `${conn.transport}/${conn.path}, renderer ${conn.renderer}, first frame after ${firstFrameMs} ms`);
+    if (sc.size) {
+      // The stream's size, asked for live (Settings has no such resolution): a new encoder generation.
+      const prefs = { codec: 'auto', bitrate: 30000, fps: sc.prefs.fps, width: sc.size[0], height: sc.size[1], monitor: 0, audio: true, audioCodec: 'opus', cursor: 'local', quality: 'balanced', adaptive: true };
+      await page.evaluate((m) => window.__recon.worker.postMessage({ type: 'ctl', m }), { t: 'settings', prefs });
+      const sized = await until(() => page.evaluate((w) => window.__recon.video.w === w, sc.size[0]), 15000, `the stream at ${sc.size.join('x')}`).catch(() => false);
+      check(`${sc.name}: the stream restarts at ${sc.size.join('x')} (live settings change)`, sized, JSON.stringify(await page.evaluate(() => window.__recon.video)));
+    }
     const calls = await watchDecoder();
 
     // Wait for steady state (software decoders need a moment to warm up on
@@ -1624,8 +2156,10 @@ try {
     await checkPresentation(sc.name, sc.prefs.renderer);
     await checkHygiene(sc.name, calls, st);
     if (sc === scenarios[0]) await checkSelfTest(cfg);
-    const pr = await checkProbe(sc.name, sc.probe);
-    if (sc.name === 'WebTransport direct' || sc.probe) await checkFullscreen(sc.name);
+    const pr = await checkProbe(sc.name, sc.probe, rate);
+    // (Fullscreen is the WebGPU scenario's; the upscaling one has no more to show there.)
+    if (sc.name === 'WebTransport direct' || (sc.probe && !sc.upscale)) await checkFullscreen(sc.name);
+    if (sc.upscale) await checkUpscaleStream(sc, rate).catch((e) => check(`${sc.name}: upscaling`, false, e.message));
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
 
@@ -1724,6 +2258,7 @@ try {
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
   await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
+  await checkUpscaleUnit(xvfbOk).catch((e) => check('FSR 1 shader (unit)', false, e.message));
   await checkPickRule().catch((e) => check("Auto's pick (unit)", false, e.message));
   await checkPacerRule().catch((e) => check('frame pacing (unit)', false, e.message));
   await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));

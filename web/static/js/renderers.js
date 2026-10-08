@@ -6,7 +6,9 @@
 //   webgl2    WebGL2 context with desynchronized: true: texImage2D(frame)
 //             into a texture, one triangle
 //   webgpu    importExternalTexture(frame) (zero copy), one triangle; WebGPU
-//             canvases have no low-latency (desynchronized) mode
+//             canvases have no low-latency (desynchronized) mode. A picture
+//             shown larger than it streams can be upscaled with FSR 1 (EASU +
+//             RCAS, fsr1.js; Phase 5) instead of the bilinear sampler
 //
 // Every renderer draws the part of the frame the video config calls visible
 // (P.visibleArea, step 1.7) scaled to fit and centred ("letterbox") into a
@@ -22,12 +24,16 @@
 // or device is gone), canvasSize(), draw(frame, req, vis), resize(w, h),
 // redraw() (after a resize, where the last picture is still at hand), idle()
 // (another renderer takes over), destroy(), loseContext() (test hook: as if
-// the GPU context were lost). draw() fills req (a latency probe sample,
+// the GPU context were lost), setUpscale({ mode, sharpness, denoise, input })
+// and upscaleInfo() (client-side upscaling, fsr1.js: only the WebGPU path
+// runs FSR; the others scale bilinearly and say so), upscaled (whether FSR
+// drew the last picture). draw() fills req (a latency probe sample,
 // stream-worker.js) with either a clone of the frame (req.clone) or a
 // promise of the barcode cells' mean luma read back from the GPU (req.luma);
 // it throws when nothing could be drawn (the frame is closed then).
 
 import * as P from './protocol.js';
+import { upscaleSettings, upscalePlan, upscaleWhy, easuConstants, rcasConstants, easuWGSL, RCAS_WGSL, COPY_WGSL } from './fsr1.js';
 
 export const PATHS = ['canvas2d', 'webgl2', 'webgpu'];
 export const LABELS = { canvas2d: '2D canvas', webgl2: 'WebGL2', webgpu: 'WebGPU' };
@@ -111,14 +117,54 @@ const attr = (ctx, key) => {
 
 const sameRect = (a, b) => !!a && !!b && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
 
+/** The last n values (a ring): mean, p50, p95 (ms). */
+export class Samples {
+  constructor(n) {
+    this.v = new Float64Array(n);
+    this.n = 0;
+    this.i = 0;
+  }
+  push(x) {
+    this.v[this.i] = x;
+    this.i = (this.i + 1) % this.v.length;
+    this.n = Math.min(this.n + 1, this.v.length);
+  }
+  summary() {
+    if (!this.n) return null;
+    const a = this.v.slice(0, this.n).sort();
+    const q = (p) => +a[Math.min(a.length - 1, Math.floor(p * a.length))].toFixed(3);
+    return { mean: +(a.reduce((s, x) => s + x, 0) / a.length).toFixed(3), p50: q(0.5), p95: q(0.95), n: a.length };
+  }
+}
+
 class Renderer {
   constructor(c) {
     this.c = c;
     this.box = null; // [w, h]: device pixels of the canvas box (main thread), null: the video's size
     this.rect = null; // where the picture went last
+    this.inW = 0; // the picture's size in its pixels (the visible area, rounded)
+    this.inH = 0;
     this.desynchronized = null;
     this.gpu = '';
     this.lost = false;
+    this.up = upscaleSettings(); // client-side upscaling setting (fsr1.js)
+    this.upscaled = false; // FSR drew the last picture
+  }
+  setUpscale(o) {
+    this.up = upscaleSettings(o);
+  }
+  // Upscaling state for the overlay: the setting, the last picture's size in
+  // and out (device pixels), the scale factor and, when FSR did not draw it,
+  // why (the bilinear path drew it). This path has no FSR.
+  upscaleInfo() {
+    const r = this.rect;
+    if (!r || !this.inW) return { ...this.up, active: false, why: 'no picture yet' };
+    const plan = upscalePlan(this.up.mode, this.inW, this.inH, r.w, r.h);
+    return { ...this.up, active: this.upscaled, in: [this.inW, this.inH], out: [r.w, r.h], scale: +plan.scale.toFixed(3),
+      why: this.upscaled ? '' : plan.active ? this.noFsr() : plan.why };
+  }
+  noFsr() {
+    return 'FSR needs the WebGPU renderer';
   }
   resize(w, h) {
     this.box = w > 0 && h > 0 ? [Math.round(w), Math.round(h)] : null;
@@ -140,6 +186,8 @@ class Renderer {
     const r = letterbox(W, H, vis.w, vis.h);
     const moved = !sameRect(r, this.rect);
     this.rect = r;
+    this.inW = Math.max(1, Math.round(vis.w));
+    this.inH = Math.max(1, Math.round(vis.h));
     return { r, resized, moved };
   }
   redraw() {}
@@ -554,7 +602,9 @@ export class WebGPURenderer extends Renderer {
     if (!self.navigator.gpu) throw new Error('WebGPU unavailable');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('no WebGPU adapter');
-    const device = await adapter.requestDevice();
+    // timestamp-query, where the adapter has it: the GPU cost of the draw
+    // passes (FSR upscaling vs the plain path) for the overlay.
+    const device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] });
     const formatProbe = navigator.gpu.getPreferredCanvasFormat();
     {
       const m = device.createShaderModule({ code: WGSL });
@@ -577,11 +627,16 @@ export class WebGPURenderer extends Renderer {
     const r = new WebGPURenderer(c);
     const info = adapter.info || {};
     Object.assign(r, {
-      device, ctx, pipeline, sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }), prev: null, last: null,
+      device, ctx, format, pipeline, sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }), prev: null, last: null,
       name: 'webgpu', gpu: [info.vendor, info.architecture, info.description].filter(Boolean).join(' '),
     });
     r.crop = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     r.cropKey = '';
+    r.plainPass = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }], timestampWrites: undefined };
+    r.plainBG = { layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: r.sampler }, { binding: 1, resource: null }, { binding: 2, resource: { buffer: r.crop } }] };
+    r.log = log;
+    r.initTimestamps();
+    r.initFsr();
     // A lost device draws nothing and reports no error: draw() throws then.
     device.lost.then((info) => {
       r.lost = true;
@@ -621,33 +676,266 @@ export class WebGPURenderer extends Renderer {
     this.last = vis;
   }
 
-  // Draws frame letterboxed (and the probe cells when req asks for them);
-  // returns the probe's readback buffer, if any.
+  // Draws frame letterboxed (and the probe cells when req asks for them):
+  // upscaled with FSR (EASU + RCAS) when the setting and the scale call for
+  // it and its pipelines are ready, else the bilinear sampler; returns the
+  // probe's readback buffer, if any. Every pass is encoded and submitted
+  // here, so the draw stage (stream-worker.js) covers them.
   present(frame, vis, req) {
     const { r } = this.fit(vis);
+    const fsr = !upscaleWhy(this.up.mode, Math.min(r.w / this.inW, r.h / this.inH)) && this.fsrPipelines(this.up.input);
+    const ext = this.device.importExternalTexture({ source: frame });
+    const enc = this.device.createCommandEncoder();
+    // A timestamp readback buffer when this draw is timed: FSR's, and the
+    // plain path's for comparison once FSR has drawn (else nothing is timed).
+    const stamp = fsr || this.gpuFsr.n ? this.stampSlot() : null;
+    if (fsr) this.fsrPasses(enc, ext, r, stamp);
+    else this.plainDraw(enc, ext, frame, vis, r, stamp);
+    if (stamp) {
+      enc.resolveQuerySet(this.ts.set, 0, 3, this.ts.resolve, 0);
+      enc.copyBufferToBuffer(this.ts.resolve, 0, stamp, 0, 24);
+    }
+    const buf = req ? this.probePass(enc, ext, frame, req) : null;
+    this.device.queue.submit([enc.finish()]);
+    if (stamp) this.stampRead(stamp, fsr ? (this.up.input === 'copy' ? 'copy' : 'fsr') : 'plain');
+    this.upscaled = fsr;
+    return buf;
+  }
+
+  // The plain path: one triangle sampling the external texture bilinearly.
+  plainDraw(enc, ext, frame, vis, r, stamp) {
     const key = `${vis.fx},${vis.fy},${frame.displayWidth},${frame.displayHeight}`;
     if (this.cropKey !== key) {
       // Texture coordinates span the visible part only (VideoConfig crop).
       this.cropKey = key;
       this.device.queue.writeBuffer(this.crop, 0, new Float32Array([vis.fx, vis.fy, vis.fx - 0.5 / frame.displayWidth, vis.fy - 0.5 / frame.displayHeight]));
     }
-    const ext = this.device.importExternalTexture({ source: frame });
-    const bg = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: this.crop } }],
-    });
-    const enc = this.device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-    });
+    this.plainBG.entries[1].resource = ext;
+    const bg = this.device.createBindGroup(this.plainBG);
+    this.plainBG.entries[1].resource = null;
+    this.plainPass.colorAttachments[0].view = this.ctx.getCurrentTexture().createView();
+    this.plainPass.timestampWrites = stamp ? this.ts.both : undefined;
+    const pass = enc.beginRenderPass(this.plainPass);
     pass.setViewport(r.x, r.y, r.w, r.h, 0, 1);
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
     pass.draw(3);
     pass.end();
-    const buf = req ? this.probePass(enc, ext, frame, req) : null;
-    this.device.queue.submit([enc.finish()]);
-    return buf;
+    this.plainPass.colorAttachments[0].view = null;
+  }
+
+  // ---- FSR 1 upscaling (fsr1.js) -------------------------------------------
+  // Created once: the uniform buffers and the pass and bind group descriptors
+  // with the renderer; the pipelines when FSR is first needed (a renderer
+  // that never shows a picture enlarged compiles nothing), only those of the
+  // input in use (FSR_PIPES), asynchronously while the bilinear path keeps
+  // drawing; the intermediate texture (EASU output, the output size) and the
+  // copy (the input size) on size changes. Per frame only what WebGPU
+  // requires: the bind group of the external texture (it expires with the
+  // frame), the command encoder and the canvas texture's view; the uniforms
+  // are written when they change.
+  initFsr() {
+    const d = this.device;
+    const uniform = () => d.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const pass = () => ({ colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }], timestampWrites: undefined });
+    const easuU = uniform();
+    const rcasU = uniform();
+    this.fsr = {
+      pipes: {}, pending: {}, easuU, rcasU,
+      easuData: new Float32Array(8), easuLast: new Float32Array(8).fill(NaN), rcasData: new Float32Array(8), rcasLast: new Float32Array(8).fill(NaN),
+      inter: null, copyTex: null, rcasBG: null, easuTexBG: null,
+      easuExtBG: { layout: null, entries: [{ binding: 0, resource: null }, { binding: 1, resource: { buffer: easuU } }] },
+      copyBG: { layout: null, entries: [{ binding: 0, resource: null }] },
+      easuPass: pass(), copyPass: pass(), rcasPass: pass(),
+    };
+    this.fsrError = '';
+  }
+
+  // Whether the pipelines of an input variant are ready; starts compiling
+  // the missing ones (each once; none after a compile error).
+  fsrPipelines(input) {
+    const F = this.fsr;
+    let ready = true;
+    for (const name of WebGPURenderer.FSR_PIPES[input]) {
+      if (F.pipes[name]) continue;
+      ready = false;
+      if (!F.pending[name] && !this.fsrError) F.pending[name] = this.compileFsr(name);
+    }
+    return ready;
+  }
+
+  async compileFsr(name) {
+    const [code, format] = {
+      easuExt: [easuWGSL(true), 'rgba8unorm'], easuTex: [easuWGSL(false), 'rgba8unorm'], copy: [COPY_WGSL, 'rgba8unorm'], rcas: [RCAS_WGSL, this.format],
+    }[name];
+    const module = this.device.createShaderModule({ code });
+    try {
+      const p = await this.device.createRenderPipelineAsync({
+        layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      this.fsr.pipes[name] = p;
+      if (name === 'easuExt') this.fsr.easuExtBG.layout = p.getBindGroupLayout(0);
+      if (name === 'copy') this.fsr.copyBG.layout = p.getBindGroupLayout(0);
+      return true;
+    } catch (e) {
+      const info = await module.getCompilationInfo?.().catch(() => null);
+      const m = info?.messages?.find((x) => x.type === 'error');
+      const msg = m ? `${m.message} (line ${m.lineNum})` : e.message;
+      if (!this.fsrError && !this.destroyed) this.log(`FSR upscaling unavailable (${name}: ${msg}); the WebGPU renderer scales bilinearly`);
+      this.fsrError ||= `${name}: ${msg}`;
+      return false;
+    }
+  }
+
+  // Resolves to whether FSR can draw with the input set now, compiling what
+  // it needs (tests; drawing never waits for it).
+  get fsrReady() {
+    const input = this.up.input;
+    this.fsrPipelines(input);
+    return Promise.all(WebGPURenderer.FSR_PIPES[input].map((n) => this.fsr.pending[n] || Promise.resolve(!!this.fsr.pipes[n]))).then((ok) => ok.every(Boolean));
+  }
+
+  // The intermediate texture at the output size (EASU -> RCAS) and, for
+  // input "copy", the viewport's copy: (re)created when the size changes.
+  fsrTargets(w, h, copy) {
+    const F = this.fsr;
+    const d = this.device;
+    const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+    if (!F.inter || F.inter.width !== w || F.inter.height !== h) {
+      F.inter?.destroy(); // freed once the submitted passes that use it are done
+      F.inter = d.createTexture({ size: [w, h], format: 'rgba8unorm', usage });
+      const view = F.inter.createView();
+      F.easuPass.colorAttachments[0].view = view;
+      F.rcasBG = d.createBindGroup({ layout: F.pipes.rcas.getBindGroupLayout(0), entries: [{ binding: 0, resource: view }, { binding: 1, resource: { buffer: F.rcasU } }] });
+    }
+    if (copy && (!F.copyTex || F.copyTex.width !== this.inW || F.copyTex.height !== this.inH)) {
+      F.copyTex?.destroy();
+      F.copyTex = d.createTexture({ size: [this.inW, this.inH], format: 'rgba8unorm', usage });
+      const view = F.copyTex.createView();
+      F.copyPass.colorAttachments[0].view = view;
+      F.easuTexBG = d.createBindGroup({ layout: F.pipes.easuTex.getBindGroupLayout(0), entries: [{ binding: 0, resource: view }, { binding: 1, resource: { buffer: F.easuU } }] });
+    }
+  }
+
+  // Writes a uniform buffer only when its values changed (no per-frame upload).
+  static writeChanged(device, buf, data, last) {
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] !== last[i]) {
+        device.queue.writeBuffer(buf, 0, data);
+        last.set(data);
+        return;
+      }
+    }
+  }
+
+  // EASU (frame -> intermediate at the output size), RCAS (intermediate ->
+  // the canvas at the letterboxed rectangle), with the copy first for input
+  // "copy". Timed (stamp) from the first pass's start to RCAS's end.
+  fsrPasses(enc, ext, r, stamp) {
+    const F = this.fsr;
+    const d = this.device;
+    const copy = this.up.input === 'copy';
+    this.fsrTargets(r.w, r.h, copy);
+    WebGPURenderer.writeChanged(d, F.easuU, easuConstants(F.easuData, this.inW, this.inH, r.w, r.h), F.easuLast);
+    WebGPURenderer.writeChanged(d, F.rcasU, rcasConstants(F.rcasData, r.x, r.y, r.w, r.h, this.up.sharpness, this.up.denoise), F.rcasLast);
+    let easuBG = F.easuTexBG;
+    if (copy) {
+      F.copyBG.entries[0].resource = ext;
+      const bg = d.createBindGroup(F.copyBG);
+      F.copyBG.entries[0].resource = null;
+      F.copyPass.timestampWrites = stamp ? this.ts.copy : undefined;
+      const p = enc.beginRenderPass(F.copyPass);
+      p.setPipeline(F.pipes.copy);
+      p.setBindGroup(0, bg);
+      p.draw(3);
+      p.end();
+    } else {
+      F.easuExtBG.entries[0].resource = ext;
+      easuBG = d.createBindGroup(F.easuExtBG);
+      F.easuExtBG.entries[0].resource = null;
+    }
+    F.easuPass.timestampWrites = stamp && !copy ? this.ts.begin : undefined;
+    const e = enc.beginRenderPass(F.easuPass);
+    e.setPipeline(copy ? F.pipes.easuTex : F.pipes.easuExt);
+    e.setBindGroup(0, easuBG);
+    e.draw(3);
+    e.end();
+    F.rcasPass.colorAttachments[0].view = this.ctx.getCurrentTexture().createView();
+    F.rcasPass.timestampWrites = stamp ? this.ts.end : undefined;
+    const p = enc.beginRenderPass(F.rcasPass);
+    p.setViewport(r.x, r.y, r.w, r.h, 0, 1);
+    p.setPipeline(F.pipes.rcas);
+    p.setBindGroup(0, F.rcasBG);
+    p.draw(3);
+    p.end();
+    F.rcasPass.colorAttachments[0].view = null;
+  }
+
+  // GPU time of the draw passes (timestamp-query, where the device has it):
+  // at most every STAMP_MS, two readbacks in flight, once FSR has drawn; the
+  // samples go to the FSR or the plain ring (input "copy": also the copy pass
+  // alone, the cost the copy adds). Timestamps: 0 the first pass starts, 1 the last pass
+  // (RCAS or the plain pass) ends, 2 the copy pass ends. Browsers may
+  // quantize them (Chrome: 100 µs without its WebGPU developer features):
+  // the mean over many samples is what the overlay shows.
+  initTimestamps() {
+    this.gpuFsr = new Samples(100);
+    this.gpuCopy = new Samples(100);
+    this.gpuPlain = new Samples(100);
+    this.ts = null;
+    if (!this.device.features?.has('timestamp-query')) return;
+    try {
+      const d = this.device;
+      const querySet = d.createQuerySet({ type: 'timestamp', count: 3 });
+      this.ts = {
+        set: querySet, last: -Infinity,
+        resolve: d.createBuffer({ size: 24, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+        free: [0, 1].map(() => d.createBuffer({ size: 24, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })),
+        both: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+        begin: { querySet, beginningOfPassWriteIndex: 0 },
+        copy: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 2 },
+        end: { querySet, endOfPassWriteIndex: 1 },
+      };
+    } catch {
+      this.ts = null;
+    }
+  }
+
+  stampSlot() {
+    const T = this.ts;
+    if (!T || !T.free.length) return null;
+    const t = performance.now();
+    if (t - T.last < WebGPURenderer.STAMP_MS) return null;
+    T.last = t;
+    return T.free.pop();
+  }
+
+  // kind: plain, fsr, or copy (FSR with input "copy").
+  async stampRead(buf, kind) {
+    try {
+      await buf.mapAsync(GPUMapMode.READ);
+      const v = new BigUint64Array(buf.getMappedRange(), 0, 3);
+      const ns = Number(v[1] - v[0]);
+      if (ns > 0 && ns < 1e9) (kind === 'plain' ? this.gpuPlain : this.gpuFsr).push(ns / 1e6);
+      const copyNs = Number(v[2] - v[0]);
+      if (kind === 'copy' && copyNs >= 0 && copyNs <= ns) this.gpuCopy.push(copyNs / 1e6);
+    } catch {
+      // device lost or destroyed: no sample
+    } finally {
+      if (buf.mapState === 'mapped') buf.unmap();
+      this.ts.free.push(buf);
+    }
+  }
+
+  noFsr() {
+    return this.fsrError ? `FSR unavailable (${this.fsrError})` : 'FSR shaders still compiling';
+  }
+
+  upscaleInfo() {
+    const info = super.upscaleInfo();
+    info.gpu = this.ts ? { method: 'timestamp-query', fsr: this.gpuFsr.summary(), copy: this.gpuCopy.summary(), plain: this.gpuPlain.summary() } : null;
+    return info;
   }
 
   redraw() {
@@ -698,6 +986,7 @@ export class WebGPURenderer extends Renderer {
   destroy() {
     const f = this.prev;
     this.prev = null;
+    this.destroyed = true;
     this.device.queue.onSubmittedWorkDone().catch(() => {}).finally(() => {
       f?.close();
       this.device.destroy();
@@ -709,11 +998,18 @@ export class WebGPURenderer extends Renderer {
   }
 }
 
-/** Creates the renderer for a path on canvas c (throws if the path does not work here). */
-export async function createRenderer(path, c, opts) {
+WebGPURenderer.STAMP_MS = 100;
+// The FSR pipelines each input variant (fsr1.js FSR.input) draws with.
+WebGPURenderer.FSR_PIPES = { copy: ['copy', 'easuTex', 'rcas'], external: ['easuExt', 'rcas'] };
+
+/** Creates the renderer for a path on canvas c (throws if the path does not work here); opts: { log, upscale }. */
+export async function createRenderer(path, c, opts = {}) {
+  let r;
   switch (path) {
-    case 'webgl2': return WebGL2Renderer.create(c, opts);
-    case 'webgpu': return WebGPURenderer.create(c, opts);
-    default: return Canvas2DRenderer.create(c, opts);
+    case 'webgl2': r = await WebGL2Renderer.create(c, opts); break;
+    case 'webgpu': r = await WebGPURenderer.create(c, opts); break;
+    default: r = await Canvas2DRenderer.create(c, opts);
   }
+  r.setUpscale(opts.upscale);
+  return r;
 }

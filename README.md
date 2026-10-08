@@ -48,6 +48,11 @@ Techniques used (most of them are new to browser-based game streaming):
   unless another path is clearly better; the latency rig decides). The canvas is sized to device
   pixels with nothing on top of it, so the compositor never scales or covers it. The main thread
   can't stall a frame. A startup self-test catches decoders that hold frames back and avoids them.
+- **Client-side upscaling with FSR 1.** A stream shown larger than it is sent (1080p or 1440p
+  on a 4K screen, or a lower resolution picked to save bandwidth) is upscaled on your GPU by
+  AMD FidelityFX Super Resolution 1.0 (edge-adaptive upsampling, then contrast-adaptive
+  sharpening), ported to WebGPU shaders, instead of a blurry bilinear stretch: three short
+  GPU passes per frame, timed in the overlay.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
@@ -257,6 +262,14 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   path that stops drawing is dropped for the 2D canvas. Pick a renderer to override Auto, for
   example after measuring click-to-photon with the latency rig
   ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
+- **Upscaling** (Pipeline, applies at once): *Auto* (default) upscales with FSR 1 when the
+  picture is shown more than 5 % larger than it streams and the renderer is WebGPU, bilinearly
+  otherwise; *Off* always scales bilinearly; *FSR 1* whenever the picture is enlarged at all.
+  *FSR sharpness* runs from 0 (sharpest) to 2 stops (default 0.2); *sharpen noise less* turns on
+  RCAS's denoise. A picture shown at its size or smaller is never upscaled. FSR needs the WebGPU
+  renderer: with the 2D canvas or WebGL2 the setting says so and the picture is scaled
+  bilinearly. The overlay shows *Upscaling* (input → output size, sharpness) and the passes' GPU
+  time.
 - **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
   decodes. *Smooth* draws at most one new frame per display refresh, in the refresh's animation
   frame callback, for an even cadence; it costs up to one refresh of latency (the overlay's
@@ -386,7 +399,7 @@ Repository layout:
 | `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters (`transport/cc`: media congestion controller), NUT demuxer, codec strings |
 | `third_party/quic-go` | quic-go with a pluggable congestion-control hook (`go.mod` replace; see `third_party/README.md`) |
 | `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |
-| `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline) |
+| `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline; `js/fsr1.js`: FSR 1 ported to WGSL, MIT, see `third_party/README.md`) |
 | `native/recon-encoder`, `internal/host/encoder` | Native capture/encode helper (C++, in progress) and its Go client; see `docs/HELPER_PROTOCOL.md` |
 | `deploy/` | Proxmox, Linux, Docker and Windows installers |
 | `test/e2e`, `internal/e2e` | Browser end-to-end test; Go integration test (gateway + agent) |

@@ -6,6 +6,7 @@ import * as P from './protocol.js';
 import { codeToScancode } from './keymap.js';
 import { PATHS, LABELS } from './renderers.js';
 import { PACING, PACING_LABELS } from './pacing.js';
+import { FSR, UPSCALE, UPSCALE_LABELS, upscaleSettings } from './fsr1.js';
 
 const $ = (id) => document.getElementById(id);
 const hostId = new URLSearchParams(location.search).get('host');
@@ -27,6 +28,7 @@ const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
   audio: true, audioCodec: 'opus', volume: 100, jitterMs: 30,
   renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto',
+  upscale: 'auto', sharpness: FSR.sharpness, fsrDenoise: false,
   mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
 const PREF_KEY = 'recon.prefs.v1';
@@ -40,6 +42,8 @@ try {
 } catch {}
 if (prefs.renderer !== 'auto' && !PATHS.includes(prefs.renderer)) prefs.renderer = 'auto';
 if (!PACING.includes(prefs.pacing)) prefs.pacing = 'latency';
+if (!UPSCALE.includes(prefs.upscale)) prefs.upscale = 'auto';
+prefs.sharpness = upscaleSettings({ sharpness: prefs.sharpness }).sharpness;
 const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} };
 
 const RESOLUTIONS = {
@@ -237,6 +241,8 @@ function onRenderer(info) {
   S.renderer = info;
   if (S.conn) S.conn.renderer = info.name;
   showCanvas(info.slot);
+  const hint = $('upscale-hint');
+  if (hint) hint.textContent = upscaleHint();
   // The stored winner no longer works here: measure again next time.
   if (info.mode === 'auto' && info.name !== info.slot) storePresent(null);
 }
@@ -318,7 +324,10 @@ async function connect() {
   if (port) transfer.push(port);
   w.postMessage({
     type: 'start', canvases, present: { mode: S.present.mode }, box: S.box || stageBoxNow(), endpoints: ep,
-    prefs: { decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing },
+    prefs: {
+      decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
+      ...upscalePrefs(), fsrInput: prefs.fsrInput, // fsrInput: diagnostics only (localStorage), see fsr1.js FSR.input
+    },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
     audioSab: sab, audioPort: port,
@@ -823,6 +832,7 @@ function onStats(st) {
     row('Loss recovery', v.recovery === 'skip' ? 'skip frame (intra refresh)' : 'key frame'),
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
     ...presentRows(st, row),
+    ...upscaleRows(st.renderer, row),
     pacingRow(st.pacing, row),
     row('Audio', S.audioCfg?.enabled ? `${S.audioCfg.codec} · buf ${fmt(st.audioMs, 0)} · lost ${st.audioLost}` : 'off'),
     ...decoderRows(st, row),
@@ -869,6 +879,33 @@ function presentRows(st, row) {
       rows.push(row(`  ${p === res.winner ? '★ ' : ''}${LABELS[p]}`, v, p === res.winner ? 'good' : x.out ? 'warn' : ''));
     }
     if (res.why) rows.push(row('  pick', res.why));
+  }
+  return rows;
+}
+
+// Client-side upscaling (Phase 5, fsr1.js), with the WebGPU renderer (other
+// paths: only when FSR 1 was chosen, as a warning; the setting's hint says
+// FSR needs WebGPU): FSR 1 drawing (input -> output in device pixels, scale,
+// sharpness) or why the bilinear path draws, and once FSR has drawn the GPU
+// cost of the draw passes: by timestamp-query (FSR's passes, the copy among
+// them, and the plain pass where it drew this session), else the draw stage
+// with and without FSR (CPU side: encoding and submitting the passes).
+function upscaleRows(r, row) {
+  const u = r?.upscale;
+  if (!u || (r.name !== 'webgpu' && u.mode !== 'fsr')) return [];
+  const size = (a) => (a ? `${a[0]}×${a[1]}` : '—');
+  const ms = (x, k = 'mean') => (x ? `${x[k].toFixed(2)} ms` : '—');
+  const head = u.active
+    ? `FSR 1 · ${size(u.in)} → ${size(u.out)} (${u.scale}×) · sharpness ${u.sharpness}${u.denoise ? ' · denoise' : ''}`
+    : `bilinear${u.in ? ` · ${size(u.in)} → ${size(u.out)}` : ''}${u.why && u.why !== 'off' ? ` · ${u.why}` : ''}`;
+  const rows = [row('Upscaling', `${UPSCALE_LABELS[u.mode] || u.mode}: ${head}`, u.mode === 'fsr' && !u.active && u.why !== 'not enlarged' ? 'warn' : '')];
+  const g = u.gpu;
+  if (g?.fsr) {
+    rows.push(row('  GPU (timestamp-query, mean)', `FSR ${ms(g.fsr)}${g.copy ? ` (copy ${ms(g.copy)})` : ''} · plain ${ms(g.plain)} (n ${g.fsr.n})`));
+  } else if (!g && u.cpu?.fsr) {
+    const d = u.cpu.plain ? u.cpu.fsr.p50 - u.cpu.plain.p50 : null;
+    const diff = d === null ? '' : ` · ${d >= 0 ? '+' : ''}${d.toFixed(2)} ms`;
+    rows.push(row('  draw stage (CPU, p50)', `FSR ${ms(u.cpu.fsr, 'p50')} · plain ${ms(u.cpu.plain, 'p50')}${diff}`));
   }
   return rows;
 }
@@ -1029,6 +1066,17 @@ const applyLive = () => {
 const needsReconnect = () => toast('Applies on the next connection — click Reconnect.', 'info', 3500);
 // Frame pacing (step 4.4) applies live in the worker (the host is not involved).
 const applyPacing = () => post({ type: 'prefs', prefs: { pacing: prefs.pacing } });
+// So does upscaling (Phase 5).
+const upscalePrefs = () => ({ upscale: prefs.upscale, sharpness: prefs.sharpness, fsrDenoise: !!prefs.fsrDenoise });
+const applyUpscale = () => post({ type: 'prefs', prefs: upscalePrefs() });
+
+function upscaleHint() {
+  const r = S.renderer?.name;
+  const how = 'Applies at once. Auto: FSR 1 (AMD FidelityFX Super Resolution: edge-adaptive upsampling, then sharpening) when the picture is ' +
+    `shown more than ${Math.round((FSR.autoMin - 1) * 100)} % larger than it streams (e.g. 1080p on a 4K screen), bilinear otherwise; ` +
+    'never when it is shown at its size or smaller. The overlay shows the sizes and the GPU cost.';
+  return r && r !== 'webgpu' ? `FSR needs the WebGPU renderer: this connection draws with ${LABELS[r] || r} and scales bilinearly. ${how}` : how;
+}
 
 function buildDrawer() {
   const w = S.welcome || {};
@@ -1053,6 +1101,10 @@ function buildDrawer() {
   const jout = el('output', {}, `${prefs.jitterMs} ms`);
   jitter.addEventListener('input', () => { jout.textContent = `${jitter.value} ms`; });
   jitter.addEventListener('change', () => { prefs.jitterMs = +jitter.value; savePrefs(); audio.node?.port.postMessage({ targetMs: prefs.jitterMs }); });
+  const sharp = el('input', { type: 'range', min: '0', max: String(FSR.maxSharpness), step: '0.1', value: String(prefs.sharpness) });
+  const sout = el('output', {}, `${prefs.sharpness} stops`);
+  sharp.addEventListener('input', () => { sout.textContent = `${sharp.value} stops`; });
+  sharp.addEventListener('change', () => { prefs.sharpness = +sharp.value; savePrefs(); applyUpscale(); });
 
   $('drawer').replaceChildren(
     el('h3', {}, 'Stream settings', el('button', { class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
@@ -1087,6 +1139,11 @@ function buildDrawer() {
       el('button', { class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),
       field('Frame pacing', select('pacing', [['latency', 'Lowest latency (draw on decode)'], ['smooth', 'Smooth (one frame per display refresh)']], applyPacing),
         'Applies at once. Smooth holds each frame for the next display refresh: an even cadence for up to one refresh more latency (overlay: hold).'),
+      el('div', {}, el('label', {}, 'Upscaling'),
+        select('upscale', [['auto', 'Auto (FSR 1 when shown larger, WebGPU)'], ['off', 'Off (bilinear)'], ['fsr', 'FSR 1 (WebGPU)']], applyUpscale),
+        el('div', { class: 'hint', id: 'upscale-hint' }, upscaleHint())),
+      field('FSR sharpness', el('div', { class: 'range-row' }, sharp, sout), '0 = sharpest; each stop halves the sharpening (RCAS).'),
+      check('fsrDenoise', 'FSR: sharpen noise less (RCAS denoise)', applyUpscale),
       field('Decoder', select('decoder', [['hardware', 'Prefer hardware'], ['software', 'Prefer software']], needsReconnect)),
     ),
     el('div', { class: 'actions' },
