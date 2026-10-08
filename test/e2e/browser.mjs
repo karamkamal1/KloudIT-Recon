@@ -1511,10 +1511,15 @@ async function pacingWindow(ms) {
     self.__refresh = { on: true, ts };
     const loop = (t) => { ts.push(t); if (self.__refresh.ts === ts && self.__refresh.on) raf.call(self, loop); };
     raf.call(self, loop);
+    self.__refresh.decodes0 = self.__decoderCalls?.decodes ?? null; // watchDecoder's count of decode() calls
     return performance.now();
   });
   await sleep(ms);
-  const [t1, rts] = await w.evaluate(() => { self.__refresh.on = false; return [performance.now(), self.__refresh.ts]; });
+  const [t1, rts, decoded] = await w.evaluate(() => {
+    self.__refresh.on = false;
+    const d0 = self.__refresh.decodes0;
+    return [performance.now(), self.__refresh.ts, d0 === null || !self.__decoderCalls ? null : self.__decoderCalls.decodes - d0];
+  });
   const rgaps = rts.slice(1).map((v, i) => v - rts[i]);
   const tickHz = (1000 * rts.length) / (t1 - t0);
   const vsync = rgaps.length ? Math.min(...rgaps) : null;
@@ -1551,7 +1556,7 @@ async function pacingWindow(ms) {
   }
   const probe = { sampled: (s1.probe?.sampled ?? 0) - (s0.probe?.sampled ?? 0), matched: (s1.probe?.valid ?? 0) - (s1.probe?.mismatched ?? 0) - (s0.probe?.valid ?? 0) + (s0.probe?.mismatched ?? 0) };
   return {
-    recs, d, st: s1.st, refresh, tickHz, vsync, fps: (1000 * recs.length) / (t1 - t0), minGap: gaps.length ? Math.min(...gaps) : null,
+    recs, d, st: s1.st, refresh, tickHz, vsync, fps: (1000 * recs.length) / (t1 - t0), decoded, minGap: gaps.length ? Math.min(...gaps) : null,
     hold: { p50: hold(0.5), p95: hold(0.95), p99: hold(0.99) }, waitMax: wait.length ? +Math.max(...wait).toFixed(2) : null, lateRecs, missed, marks,
     sumDiff: recs.length ? sumDiff / recs.length : Infinity, probe, via: [...new Set(recs.map((r) => r.via))], modes: [...new Set(recs.map((r) => r.pacing))],
   };
@@ -1560,11 +1565,12 @@ async function pacingWindow(ms) {
 async function checkPacing(name, rate, fallbacks) {
   await page.evaluate(() => { window.__recon.worker.__pacingTag = 1; window.__recon.conn.__pacingTag = 1; });
   const sameSession = () => page.evaluate(() => window.__recon.worker?.__pacingTag === 1 && window.__recon.conn?.__pacingTag === 1 && window.__recon.streaming);
-  const row = (x) => `${x.recs.length} frames drawn (${x.fps.toFixed(1)} fps of ${rate}; the worker's display refresh meanwhile ${x.tickHz.toFixed(1)} Hz, vsync ` +
+  const row = (x) => `${x.recs.length} frames drawn (${x.fps.toFixed(1)} fps of ${rate}${x.decoded === null ? '' : `; ${x.decoded} chunks decoded meanwhile`}; ` +
+    `the worker's display refresh meanwhile ${x.tickHz.toFixed(1)} Hz, vsync ` +
     `${x.vsync?.toFixed(2)} ms) via ${x.via.join('/') || '—'}; counters +hop ${x.d.hop} +raf ${x.d.raf} +main ${x.d.main} ` +
-    `+timer ${x.d.timer}, stale +${x.d.stale}, late +${x.d.late}; refresh starts at least ${x.minGap?.toFixed(2)} ms apart (pacer's refresh ${x.refresh} ms), ` +
+    `+timer ${x.d.timer}, stale +${x.d.stale}, late +${x.d.late}; refresh starts at least ${x.minGap?.toFixed(2) ?? 'n/a (no draw from a refresh tick)'} ms apart (pacer's refresh ${x.refresh} ms), ` +
     `${x.missed} drawn after a later refresh than the first after their output; ` +
-    `hold p50/p95/p99 ${x.hold.p50}/${x.hold.p95}/${x.hold.p99} ms, refresh start - output at most ${x.waitMax} ms (${x.lateRecs} over 1.25 refresh); ` +
+    `hold p50/p95/p99 ${x.hold.p50}/${x.hold.p95}/${x.hold.p99} ms, refresh start - output at most ${x.waitMax ?? 'n/a'} ms (${x.lateRecs} over 1.25 refresh); ` +
     `marks ${x.marks}, stages vs end-to-end ${x.sumDiff.toFixed(3)} ms; ` +
     `barcode ${x.probe.matched}/${x.probe.sampled} = seq`;
   // Smooth from refresh ticks of `via`, or from the watchdog's timer where the
@@ -1623,9 +1629,16 @@ async function checkPacing(name, rate, fallbacks) {
 
   await setPacing('latency');
   const lt = await pacingWindow(2500);
+  // Every frame the decoder got in the window drawn (at most a tenth
+  // superseded in a burst, and 3 in flight at its edges): relative to what
+  // reached the decoder, so a machine that streams below the frame rate (a
+  // 2-vCPU runner encoding and decoding in software) does not fail it, while
+  // frames held back or dropped by the pacer do. Without the decoder count
+  // (not instrumented), three quarters of the stream's rate.
+  const drawnAll = lt.decoded !== null ? lt.recs.length >= 0.9 * lt.decoded - 3 : lt.fps >= 0.75 * rate;
   check(`${name}: frame pacing back to Lowest latency, applied live: drawn on decode again (one task, hold p50 < 2 ms)`,
     (await sameSession()) && lt.st?.pacing?.mode === 'latency' && lt.recs.length >= rate && lt.via.length === 1 && lt.via[0] === 'hop' && lt.modes[0] === 'latency' &&
-      lt.d.raf === 0 && lt.d.main === 0 && lt.d.timer === 0 && lt.d.hop >= lt.recs.length && lt.hold.p50 < 2 && lt.marks && lt.sumDiff <= 2 && lt.fps >= 0.75 * rate, row(lt));
+      lt.d.raf === 0 && lt.d.main === 0 && lt.d.timer === 0 && lt.d.hop >= lt.recs.length && lt.hold.p50 < 2 && lt.marks && lt.sumDiff <= 2 && drawnAll, row(lt));
   results.push({ pacing: name, mode: 'latency', ...lt, recs: lt.recs.length });
 }
 
@@ -2419,9 +2432,19 @@ try {
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
 
-    // Input: keyboard + mouse (desktop mode = absolute) + wheel.
-    await page.mouse.move(640, 360);
-    await page.mouse.move(700, 400, { steps: 5 });
+    // Input: keyboard + mouse (desktop mode = absolute) + wheel, in the middle
+    // of the stage. Toasts (e.g. the rate controller's congestion notice) sit
+    // at the bottom right with pointer events, and in the headed browser's
+    // 768x432 viewport (HEADED_VIEWPORT) the old fixed points (640, 360) ->
+    // (700, 400) fell on them: the host then got no mouse events.
+    const vp = page.viewportSize() || { width: 1280, height: 720 };
+    const [ix0, iy0, ix1, iy1] = [vp.width * 0.5, vp.height * 0.5, vp.width * 0.55, vp.height * 0.55].map(Math.round);
+    const under = await page.evaluate(([x, y]) => {
+      const e = document.elementFromPoint(x, y);
+      return e ? `${e.tagName.toLowerCase()}${e.id ? `#${e.id}` : ''}${e.parentElement?.id ? ` in #${e.parentElement.id}` : ''}` : 'nothing';
+    }, [ix1, iy1]);
+    await page.mouse.move(ix0, iy0);
+    await page.mouse.move(ix1, iy1, { steps: 5 });
     await page.mouse.down();
     await page.mouse.up();
     await page.mouse.wheel(0, 300);
@@ -2441,10 +2464,10 @@ try {
       const ok = lines.some((e) => e.ev === 'abs') && lines.some((e) => e.ev === 'button' && e.down) &&
         lines.some((e) => e.ev === 'wheel') && keys.some((e) => e.sc === 0x11 && e.down) && keys.some((e) => e.sc === 0x48 && e.ext);
       return ok ? lines : null;
-    }, 5000, 'input events on host').catch((e) => { check(`${sc.name}: input`, false, e.message); return null; }) : null;
+    }, 5000, 'input events on host').catch((e) => { check(`${sc.name}: input`, false, `${e.message} (pointer over ${under})`); return null; }) : null;
     if (events) {
       const abs = events.filter((e) => e.ev === 'abs').pop();
-      check(`${sc.name}: keyboard + mouse reach the host`, true, `${events.length} events; last abs (${abs.x}, ${abs.y}); W=0x11, ArrowUp=E0 48`);
+      check(`${sc.name}: keyboard + mouse reach the host`, true, `${events.length} events; last abs (${abs.x}, ${abs.y}); W=0x11, ArrowUp=E0 48; pointer over ${under}`);
     }
     if (sc.name === 'WebTransport direct') {
       // Export latency data from the overlay: a JSON download with the histogram.
