@@ -131,7 +131,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
    itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
    review: deploy and install", the UDP relay naming an IP mismatch, and "Final review:
-   security", `-trust-proxy` behind a reverse proxy or tunnel.
+   security", `-trust-proxy` behind a reverse proxy or tunnel. "Final review: browser client":
+   the direct path and the UDP relay over IPv6 (the page's CSP).
 12. **Security**: "Final review: security": UDP relay ports released when a session ends, the
    login page's redirect, and FFmpeg and its libraries only from places administrators control
    (a `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored).
@@ -10748,6 +10749,43 @@ latency probe's hint now belongs to its checkbox); the section titles use `--mut
   (Win+Ctrl+Enter): open the drawer (Ctrl+Alt+Shift+O) and Tab through it: entering a section
   reads its name ("Video, group"), the codec selects read "Video codec, combo box" and "Audio
   codec, combo box", and Bitrate is followed by its hint ("LAN: 50–150 Mbps…").
+
+### The direct path and the UDP relay over IPv6 (the page's CSP)
+
+Problem: the page's CSP lists each PC's direct endpoint and the UDP relay ports as host-sources
+built with `net.JoinHostPort`, so an IPv6 address became `https://[2001:db8::5]:48100`. CSP's
+host-source grammar has no IPv6 literals: Chrome drops such a source ("The source list for the
+Content Security Policy directive 'connect-src' contains an invalid source … It will be
+ignored.") and refuses the WebTransport ("violates the document's Content Security Policy").
+When the agent's tunnel reaches the gateway over IPv6 (a pairing code made while the gateway was
+browsed at an IPv6 address, a gateway name with only an AAAA record), every stream silently took
+a relay while the dashboard showed the direct path; a page opened at an IPv6 address lost the
+UDP relay and fell back to the splice.
+
+Fix: an IPv6 host is written as the wildcard host on its port, `https://*:48100` (any host,
+that port only), for the direct endpoints and for the relay ports of a page opened at an IPv6
+address; with more than 32 relay ports such a page gets `https://*:*` (for a name the gateway
+already allowed any port on it). IPv4 addresses and names stay exact, and duplicate sources are
+listed once. The direct URL handed to the browser is unchanged.
+
+- Verified here: `go test ./internal/gateway/ -run TestCSPConnectSources` (pages at
+  `[fd00::1]:8443`, `gw.lan:8443` and `192.0.2.1`, PCs with an IPv6 tunnel address, an advertised
+  IPv6 address, an IPv4 address and a name: every connect-src source matches CSP's host-source
+  grammar, the expected sources; 40 relay ports at an IPv6 address give `https://*:*`). Against
+  the old code it fails with the bracketed sources. In the sandbox's Playwright Chromium (a page
+  with that CSP, `new WebTransport(...)`, nothing listening): `https://[::1]:48100` is reported
+  invalid and the connection refused by the CSP; with `https://*:48100` the CSP lets
+  `https://[::1]:48100/wt` and `https://127.0.0.1:48100/wt` through (the handshake then fails, as
+  nothing listens) and still refuses `https://[::1]:48101/wt`. The browser E2E scenarios
+  "WebTransport direct" and "WebTransport relay" (IPv4 here: their sources are unchanged) and
+  "strict CSP served" pass with the rebuilt gateway.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the target setup with IPv6 between PC and
+  gateway: pair the PC with a code made while the dashboard was opened at the gateway's IPv6
+  address (`https://[fd..]:8443`), or give the gateway a name with only an AAAA record; stream
+  from a Chrome client on the LAN: the overlay's Transport row reads `webtransport · direct`, and
+  the DevTools console has no "invalid source" or "violates the document's Content Security
+  Policy" line. Then open the dashboard at the gateway's IPv6 address with Network path *Relay
+  via gateway*: Transport reads `webtransport · relay` (the UDP relay), not `relay-splice`.
 
 ## Final review: host agent, second round
 
