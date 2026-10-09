@@ -510,15 +510,26 @@ func (s *Session) writeCtrl(b []byte) error {
 // reconnect. A takeover (close) that cut the write short ends the session
 // itself, with its own code.
 func (s *Session) ctrlFailed(err error) {
+	s.end("control stream write failed", "err", err)
+}
+
+// end ends the session from inside: it is cancelled and the connection
+// closed with CodeProtocol and why. Cancelling alone would leave run() in
+// controlLoop's read (the client does not close on a notice), so the session
+// would hold its capture, audio, virtual display and the agent's active slot
+// until the client went away. The client reconnects (no bye) and shows why.
+// Not after a takeover's or revocation's close (its own bye and code) or a
+// session already ending.
+func (s *Session) end(why string, attrs ...any) {
 	s.ctrlDL.Lock()
 	closing := s.closing
 	s.ctrlDL.Unlock()
 	if closing || s.ctx.Err() != nil {
 		return
 	}
-	s.log.Warn("control stream write failed, ending the session", "err", err)
+	s.log.Warn(why+", ending the session", attrs...)
 	s.cancel()
-	go s.c.Close(transport.CodeProtocol, "control stream write failed")
+	go s.c.Close(transport.CodeProtocol, why)
 }
 
 func (s *Session) notice(level, msg string) {
@@ -1366,7 +1377,7 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	}
 	if s.failures > 6 {
 		s.notice("error", "Video encoder keeps failing: "+err.Error())
-		s.cancel()
+		s.end("video encoder keeps failing", "failures", s.failures)
 		return
 	}
 	s.notice("warn", "Video encoder restarted ("+trunc(err.Error(), 160)+")")

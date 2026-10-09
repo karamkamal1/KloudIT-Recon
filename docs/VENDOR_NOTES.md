@@ -768,7 +768,9 @@ Failures of the capture source (ddagrab or gfxcapture losing the desktop to a UA
 lock screen or a display mode change: FFmpeg then only reports `Could not open encoder before
 EOF` for the encoder) and failures after going live count against no encoder: the restarts keep
 the same encoder and usage until the outage ends. As before 1.1, the 7th failure in a row ends
-the session ("Video encoder keeps failing"), so an outage longer than about 7 s still does.
+the session ("Video encoder keeps failing"), so an outage longer than about 7 s still does (since
+"Final review: host agent, second round" the host closes the connection then, and the browser
+reconnects by itself).
 
 The probe now also reads the named values of each encoder option from
 `ffmpeg -h encoder=<name>`. An option is passed only where the encoder has it and, if it has
@@ -949,7 +951,8 @@ Ctrl+Alt+Shift+S):
   still shows `Encoder hevc_amf` after the outage. Repeat with `"encoder": "h264_amf"`: the
   `starting encoder` lines after the outage must not be followed by a `-usage lowlatency`
   (`"logLevel": "debug"`, `ffmpeg args`). An outage longer than about 7 s ends the session after
-  7 failures (unchanged; reconnect).
+  7 failures (unchanged; the browser reconnects by itself, see "Final review: host agent, second
+  round").
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (step 1.1 acceptance) capture→packet about one frame
   interval lower at 60 fps (A1); AV1 at 2560×1440 streams (A3); no periodic IDR spikes in
   10 minutes (A4); no encoder-skipped frames under capdrop (A5); the checks above.
@@ -10659,3 +10662,34 @@ stream frame before the switch counts for the next frame only.
   overlay's frame rate stays at the session's.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same, on an NVENC host whose caps
   report temporal layers.
+
+### The 7th encoder failure in a row ends the session
+
+Problem: on the FFmpeg path the 7th encoder failure in a row (a capture outage longer than about
+7 s: the lock screen, a UAC prompt on the secure desktop) sent the error notice and only
+cancelled the session. Nothing closed the connection, and the client does not close on a notice,
+so `run()` stayed in the control loop's read and its cleanup never ran: a frozen picture with
+audio still playing, no reconnect, the virtual display kept, and the gateway showing the PC as
+streaming until the user reloaded the page. 1.1 documented that this failure ends the session.
+
+Fix: the session ends from inside as a failed control write already did (`Session.end`, shared
+with `ctrlFailed`): cancelled, logged (`video encoder keeps failing, ending the session`), and
+the connection closed with `CodeProtocol` and the reason `video encoder keeps failing`. The
+browser shows the reason and reconnects by itself (up to 6 attempts with growing delays; a new
+session counts its failures from 0), so the stream comes back once the outage ends; a takeover
+or revocation closing the session meanwhile keeps its own bye and code.
+
+- Verified here: `internal/host` `TestEncoderFailureLimitEndsSession`: a control loop on the
+  control stream of a client that sends nothing, then the 6th failure (the session goes on) and
+  the 7th: the error notice goes out, the connection is closed once with `CodeProtocol` and the
+  control loop returns. Before the fix it still ran 3 s later and the connection was never
+  closed. `TestFailedControlWriteEndsSession` and the takeover tests pass unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific (the FFmpeg path). Test: with
+  `"pipeline": "ffmpeg"`, stream from a browser and lock the PC (Win+L) for 30 s, or open a UAC
+  prompt and leave it for 30 s. host.log shows `encoder failed ... attempt=7` and then `video
+  encoder keeps failing, ending the session`; the browser shows "Connection lost — video encoder
+  keeps failing — retrying …" and reconnects (a new `session started`). After unlocking, a
+  reconnect streams again without reloading the page (or, after 6 failed attempts, the browser
+  shows Disconnected with a Reconnect button); the dashboard no longer shows the PC as streaming
+  while the browser waits.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

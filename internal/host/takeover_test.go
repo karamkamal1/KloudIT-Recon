@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
@@ -354,5 +355,60 @@ func TestFailedControlWriteEndsSession(t *testing.T) {
 				t.Fatalf("control stream holds %q (torn %v)", types, torn)
 			}
 		})
+	}
+}
+
+// quietCtrl is the control stream of a client that sends nothing: reads
+// block until the connection is closed (its context ends), as a WebTransport
+// stream's do.
+type quietCtrl struct {
+	*stallCtrl
+	conn *closeConn
+}
+
+func (c quietCtrl) Read([]byte) (int, error) {
+	<-c.conn.ctx.Done()
+	return 0, errors.New("connection closed")
+}
+
+// The 7th encoder failure in a row ends the session: the error notice goes
+// out, the connection is closed (CodeProtocol: the client reconnects and
+// shows why), and the control loop, and with it run() and its cleanup,
+// returns. Before, the session was only cancelled: the control loop went on
+// reading from a client that never closes on a notice, and the session held
+// its audio, virtual display and active slot with a frozen picture.
+func TestEncoderFailureLimitEndsSession(t *testing.T) {
+	s, c := takeoverSession(&Agent{hostClock: media.NewHostClock(), log: slog.New(slog.NewTextHandler(io.Discard, nil))}, nil)
+	defer s.cancel()
+	ctrl := quietCtrl{stallCtrl: newStallCtrl(false), conn: c}
+	s.ctrl = ctrl
+	done := make(chan error, 1)
+	go func() { done <- s.controlLoop() }()
+	fail := media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Could not open encoder before EOF")}
+	s.failures = 5
+	s.handleEncoderFailure(fail) // the 6th: a restart follows (the session is cancelled before it runs)
+	if s.ctx.Err() != nil {
+		t.Fatal("the 6th failure ended the session")
+	}
+	s.handleEncoderFailure(fail)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		c.mu.Lock()
+		n := c.n
+		c.mu.Unlock()
+		t.Fatalf("3 s after the 7th failure the control loop still runs (connection closed %d times): the session never ends", n)
+	}
+	c.mu.Lock()
+	n, code := c.n, c.code
+	c.mu.Unlock()
+	if s.ctx.Err() == nil || n != 1 || code != transport.CodeProtocol {
+		t.Fatalf("session cancelled %v, connection closed %d times with code %d; want once with CodeProtocol", s.ctx.Err() != nil, n, code)
+	}
+	ctrl.mu.Lock()
+	out := ctrl.buf.String()
+	ctrl.mu.Unlock()
+	if !bytes.Contains([]byte(out), []byte("Video encoder keeps failing")) {
+		t.Fatalf("no error notice: %q", out)
 	}
 }
