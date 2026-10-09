@@ -10152,6 +10152,90 @@ Fix (`internal/tlsutil` `Constraints`, `CreateCA`, `Permits`; `internal/gateway/
   `openssl s_server -cert leaf.crt -key k.pem -accept 9443 -www` on the LAN, with the device
   resolving www.example.com to that machine): Safari refuses it.
 
+### Turning 2FA on needs the password and replaces no 2FA
+
+Problem: `POST /api/me/totp/enable` checked only that the code matched the secret in the same
+request and then stored that secret, with no password and whether or not 2FA was already on.
+Turning 2FA off needs the password. Anyone holding a live session cookie (a browser left signed
+in, a stolen cookie) could silently replace the account's 2FA secret with their own: the owner's
+authenticator stopped working and 2FA logins failed until the offline `user reset-2fa`.
+
+Fix (`internal/gateway/api.go` `handleTOTPEnable`, `web/static/js/app.js`): the request carries the
+account's password, checked as the disable path checks it (403 "password is wrong"); a request
+while 2FA is on is refused with 409 "2FA is already on: turn it off first" (checked again inside
+the store update, so two concurrent requests cannot both store a secret). Replacing 2FA is turning
+it off (password) and on again (password and a code from the new secret). The account dialog's
+2FA setup asks for the password ("Password to confirm", a labelled field). SECURITY.md and
+INSTALL.md (step 4) say so.
+
+- Verified here: `internal/gateway` `TestTOTPEnableNeedsPassword`: without 2FA, enabling without
+  a password (the page's old request), with an empty or a wrong one is refused and leaves 2FA off,
+  with the password it turns 2FA on; with 2FA on, enabling with the right password is refused and
+  the secret is unchanged, and off-then-on with the password stores the new secret. Before the
+  fix the request without a password turned 2FA on (HTTP 200). Browser E2E `E2E_ONLY='dashboard
+  a11y'`: the 2FA setup dialog's "Password to confirm" field is named by its label.
+- Gateway check (not GPU-specific, no AMD or NVIDIA step): signed in without 2FA, open
+  **Account**, **Set up 2FA**, scan, enter the code and a wrong password: "password is wrong",
+  2FA stays off; with the right password: "2FA enabled". From the browser console of the signed-in
+  page, `(await import('/js/api.js')).api('POST', '/api/me/totp/enable', {secret: 'A'.repeat(32),
+  code: '000000', password: '<your password>'})` answers "2FA is already on: turn it off first".
+
+### The offline account recovery signs the account out and ends its streams
+
+Problem: README's account recovery (`recon-gateway user passwd <name>` / `user reset-2fa <name>`,
+run with the gateway stopped) changed only the password hash or the 2FA secret. The account's
+login sessions stayed in state.json, so an attacker's `__Host-recon` cookie (72 h idle, 30 days)
+still worked after `systemctl start`: tickets, keyboard and mouse on the PC, user and host
+management for an admin. A stream on a PC's direct path, which does not need the gateway, ran on
+through the whole procedure: the gateway's `end` went only to hosts streaming for a deleted
+user. SECURITY.md promised that changing a password signs out every other session and ends the
+account's streams on every path.
+
+Fix:
+- `internal/gateway/store.go` `RecoverUser` (used by `cmd/recon-gateway` for `passwd` and
+  `reset-2fa`): in the same save as the new password or the 2FA reset, it deletes every login
+  session of the account and records the time (`User.Recovered`, JSON `recovered`). The CLI
+  prints how many sessions it ended.
+- `internal/gateway/hosts.go` `handleHostControl`: a host whose last connection (`Host.LastSeen`,
+  read before this registration updates it) is older than an account's `Recovered` gets an
+  `end` for that account right after `registered`, before the host is listed online here, so no
+  ticket signed with the new connection's key predates it (`recoveredSince` in revoke.go). The
+  host ends the account's session with a bye ("The password or 2FA of this account was reset on
+  the gateway: sign in again") and refuses sessions authorised before it. A host connected since
+  the recovery (the next registration) and a host never connected get none. When the `end`
+  cannot be sent, the host's last-seen time is put back, so the next registration sends it.
+- README ("Account recovery"), SECURITY.md (sessions, revoking access) and ARCHITECTURE.md
+  ("Revoked users") say what the recovery does and that an agent from before this ignores the
+  `end` (take the PC over or restart `recon-host`).
+
+- Verified here: `cmd/recon-gateway` `TestUserRecoverySignsOut` (`userCmd` with the password on
+  stdin, as the README runs it: after `user passwd` and after `user reset-2fa` the account's
+  sessions are gone from state.json, another account's session stays, the new hash verifies and
+  `recovered` is set; on the old code both sessions stayed); `internal/gateway` `TestRecoverUser`
+  (sessions, other accounts, unknown user, persisted) and `TestRecoveredAccountEndsOnRegistration`
+  (a fake host on QUIC: its first registration after the recovery gets `registered` then `end`
+  for the account with the reason, its next registration and a never-connected host get only
+  `registered`; on the old `hosts.go` no `end` came); `internal/e2e`
+  `TestRecoveredAccountStreamsEnd` (real gateway and agent, FFmpeg test source, under the E2E
+  lock): a user streams on the direct path, the gateway is stopped, the account recovered on its
+  data directory and the gateway started again on the same ports; the stream runs on while the
+  gateway is down and ends when the agent reconnects (21 s after the stop: the agent's 20 s idle
+  timeout, then its first retry) with the bye "... reset on the gateway ...", the old session gets
+  401 for tickets, and the account signs in with the new password and streams again; with the
+  old `hosts.go` the stream still ran 45 s after the restart (3367 frames).
+  `TestRevokedUserStreamsEnd` passes. `go test -race` on `internal/gateway` and
+  `cmd/recon-gateway`.
+- Gateway and host check (not GPU-specific, no AMD or NVIDIA step): sign in as a second user in
+  another browser and stream (overlay Transport: direct). On the gateway: `systemctl stop
+  recon-gateway`, `echo 'a new password 123' | recon-gateway -data /var/lib/kloudit-recon user
+  passwd <user>` (prints `ok: <user> is signed out everywhere (1 login sessions ended) ...`),
+  `systemctl start recon-gateway`. The stream keeps running while the gateway is down, then stops
+  within about a minute of the start with "The password or 2FA of this account was reset on the
+  gateway: sign in again" and does not reconnect; host.log has `session ended: the gateway
+  revoked the user's access`, the gateway's journal `ending a recovered account's sessions on a
+  host not connected since the recovery`. Reloading the other browser's dashboard goes to the
+  login page. Repeat with `user reset-2fa <user>`.
+
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
 Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can

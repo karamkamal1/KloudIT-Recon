@@ -201,12 +201,14 @@ function accountModal() {
         el('button', { class: 'btn-sm', onclick: async () => {
           const r = await api('POST', '/api/me/totp/begin', {});
           const code = el('input', { type: 'text', inputmode: 'numeric', maxlength: '6', placeholder: '123456' });
+          // The gateway asks for the password to turn 2FA on, as to turn it off.
+          const pw = el('input', { type: 'password', autocomplete: 'current-password' });
           totpBox.replaceChildren(
             el('img', { class: 'qr', src: r.qr, alt: 'TOTP QR code' }),
             el('p', { class: 'hint' }, 'Scan with your authenticator, or enter the key manually:'),
-            el('div', { class: 'code-box' }, r.secret), ...field('Code from the app', code),
+            el('div', { class: 'code-box' }, r.secret), ...field('Code from the app', code), ...field('Password to confirm', pw),
             el('div', { class: 'modal-actions' }, el('button', { class: 'btn-primary btn-sm', onclick: async () => {
-              try { await api('POST', '/api/me/totp/enable', { secret: r.secret, code: code.value }); user.totp = true; renderTOTP(); toast('2FA enabled', 'ok'); } catch (e) { toast(e.message, 'error'); }
+              try { await api('POST', '/api/me/totp/enable', { secret: r.secret, code: code.value, password: pw.value }); user.totp = true; renderTOTP(); toast('2FA enabled', 'ok'); } catch (e) { toast(e.message, 'error'); }
             } }, 'Enable')));
         } }, 'Set up 2FA'));
     }

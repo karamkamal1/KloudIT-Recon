@@ -2598,7 +2598,7 @@ async function checkDashboardA11y() {
     await dialog(() => page.click('.host.online .btn-icon'), 'Manage E2E Test PC', ['Name']),
     await dialog(() => page.click('#nav-account'), 'Account · admin', ['Current password', 'New password (10+ characters)']),
     await dialog(async () => { await page.click('#nav-account'); await page.click('.modal button:has-text("Set up 2FA")'); await page.waitForSelector('.modal img.qr'); },
-      'Account · admin', ['Code from the app']),
+      'Account · admin', ['Code from the app', 'Password to confirm']),
   ];
   check('dashboard: each dialog is named by its title, each input by its label',
     res.every((r) => r.ok), res.map((r) => `"${r.name}": dialog ${r.d}, ${r.labels.join(', ')}`).join('; '));

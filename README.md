@@ -413,7 +413,13 @@ recon-gateway -data /var/lib/kloudit-recon user passwd <name>     # or: user res
 systemctl start recon-gateway
 ```
 
-The new password (at least 10 characters) is read from stdin.
+The new password (at least 10 characters) is read from stdin. Both commands sign the account out
+everywhere (every browser's login session ends, also the attacker's when the account was taken
+over), and a stream the account still has on a PC's direct path, which does not need the
+gateway and keeps running while it is stopped, ends when that PC's agent reconnects to the
+started gateway (agents retry at least every 30 s; the client shows "The password or 2FA of this
+account was reset on the gateway"). A host agent from before this ignores that: connect to the
+PC yourself (your session takes it over) or restart `recon-host` on it.
 
 **Host** (`%APPDATA%\KlouditRecon\host.json`):
 

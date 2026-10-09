@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +20,10 @@ type User struct {
 	TOTPLast     uint64    `json:"totpLast,omitempty"`
 	Created      time.Time `json:"created"`
 	LastLogin    time.Time `json:"lastLogin,omitempty"`
+	// Recovered is when the offline CLI last reset the password or the 2FA
+	// (RecoverUser). A host not connected since then is sent an "end" for
+	// the user when it registers (revoke.go).
+	Recovered time.Time `json:"recovered,omitzero"`
 }
 
 // Host is a registered gaming PC.
@@ -212,6 +217,30 @@ func (s *Store) Users() []User {
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
 	return out
+}
+
+// RecoverUser changes an existing user with f (the offline CLI's account
+// recovery: a new password, 2FA reset) and in the same save signs the user
+// out everywhere and records the recovery (User.Recovered). It returns how
+// many login sessions it ended.
+func (s *Store) RecoverUser(name string, f func(u *User)) (int, error) {
+	n := 0
+	err := s.Update(func(st *state) error {
+		u := st.Users[name]
+		if u == nil {
+			return fmt.Errorf("no user %s", name)
+		}
+		f(u)
+		u.Recovered = time.Now().UTC()
+		for k, x := range st.Sessions {
+			if x.Username == name {
+				delete(st.Sessions, k)
+				n++
+			}
+		}
+		return nil
+	})
+	return n, err
 }
 
 // UpdateUser creates or modifies a user (used by the offline CLI).

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -354,13 +355,29 @@ func qrSVG(c *qr.Code) string {
 	return b.String()
 }
 
+// errTOTPOn: 2FA is already on, and turning it on again would replace it.
+var errTOTPOn = errors.New("2FA is already on: turn it off first")
+
+// handleTOTPEnable turns 2FA on. It needs the password, as turning it off
+// does, and never replaces a secret that is on (turn that off first): a
+// session left signed in, or a stolen cookie, must not swap the account's
+// second factor for one the owner's authenticator does not have.
 func (s *Server) handleTOTPEnable(w http.ResponseWriter, r *http.Request, u *User, ls *LoginSession) {
 	var req struct {
-		Secret string `json:"secret"`
-		Code   string `json:"code"`
+		Secret   string `json:"secret"`
+		Code     string `json:"code"`
+		Password string `json:"password"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if u.TOTPSecret != "" {
+		jsonError(w, http.StatusConflict, errTOTPOn.Error())
+		return
+	}
+	if !s.verifyPassword(u.PasswordHash, req.Password) {
+		jsonError(w, http.StatusForbidden, "password is wrong")
 		return
 	}
 	c, ok := auth.VerifyTOTP(req.Secret, strings.TrimSpace(req.Code), time.Now(), 0)
@@ -368,12 +385,21 @@ func (s *Server) handleTOTPEnable(w http.ResponseWriter, r *http.Request, u *Use
 		jsonError(w, http.StatusBadRequest, "code does not match — check your authenticator app's clock")
 		return
 	}
-	_ = s.store.Update(func(st *state) error {
-		if p := st.Users[u.Username]; p != nil {
-			p.TOTPSecret, p.TOTPLast = req.Secret, c
+	err := s.store.Update(func(st *state) error {
+		p := st.Users[u.Username]
+		if p == nil {
+			return nil
 		}
+		if p.TOTPSecret != "" { // turned on meanwhile (another request)
+			return errTOTPOn
+		}
+		p.TOTPSecret, p.TOTPLast = req.Secret, c
 		return nil
 	})
+	if errors.Is(err, errTOTPOn) {
+		jsonError(w, http.StatusConflict, err.Error())
+		return
+	}
 	s.audit.Log("totp_enabled", u.Username, s.clientIP(r), "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

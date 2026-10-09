@@ -16,6 +16,8 @@ import (
 	"github.com/coder/websocket"
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/karamkamal1/kloudit-recon/internal/auth"
+	"github.com/karamkamal1/kloudit-recon/internal/gateway"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
@@ -167,10 +169,17 @@ func (l *liveStream) waitFrames(t *testing.T, n int64) {
 // bye carrying want.
 func (l *liveStream) ended(t *testing.T, want string) {
 	t.Helper()
+	l.endedWithin(t, 5*time.Second, want)
+}
+
+// endedWithin checks that the stream ends within d, with the host's bye
+// carrying want.
+func (l *liveStream) endedWithin(t *testing.T, d time.Duration, want string) {
+	t.Helper()
 	select {
 	case <-l.done:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("the stream still runs 5 s after the revocation (%d frames)", l.frames.Load())
+	case <-time.After(d):
+		t.Fatalf("the stream still runs %s after the revocation (%d frames)", d, l.frames.Load())
 	}
 	if !strings.Contains(l.byeMsg(), want) {
 		t.Errorf("bye %q, want it to say %q", l.byeMsg(), want)
@@ -252,4 +261,52 @@ func TestRevokedUserStreamsEnd(t *testing.T) {
 		again := streamWT(t, owner, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket)
 		again.waitFrames(t, 30)
 	})
+}
+
+// TestRecoveredAccountStreamsEnd (final review): the README's account
+// recovery (`recon-gateway user passwd`, run with the gateway stopped) signs
+// the account out everywhere, and a stream it still has on the direct path,
+// which does not need the gateway and runs on while it is stopped, ends when
+// the agent connects to the restarted gateway.
+func TestRecoveredAccountStreamsEnd(t *testing.T) {
+	e := setup(t)
+	const pw = "guest password 123"
+	if err := e.do("POST", "/api/users", map[string]any{"username": "taken", "password": pw}, nil); err != nil {
+		t.Fatal(err)
+	}
+	g := e.login(t, "taken", pw)
+	tk := g.connectInfo()
+	l := streamWT(t, g, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket)
+	l.waitFrames(t, 30)
+	from := e.logs.Len()
+	e.restartGateway(t, func(dir string) {
+		hash, err := auth.HashPassword("a new password 123")
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := gateway.OpenStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := st.RecoverUser("taken", func(u *gateway.User) { u.PasswordHash = hash }); err != nil || n != 1 {
+			t.Fatalf("recovery: %d sessions signed out, %v; want 1", n, err)
+		}
+	})
+	select {
+	case <-l.done:
+		t.Fatal("the direct-path stream ended with the gateway")
+	default:
+	}
+	// The agent notices the stopped gateway after its idle timeout (20 s).
+	l.endedWithin(t, 45*time.Second, "reset on the gateway")
+	if len(e.logs.lines(from, "ending a recovered account's sessions", "user=taken")) == 0 {
+		t.Error("the gateway did not log the end for the recovered account")
+	}
+	if err := g.do("POST", "/api/hosts/"+e.hostID+"/connect", map[string]string{}, nil); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("the signed-out session still gets tickets: %v", err)
+	}
+	// The owner signs in with the new password and streams again.
+	again := e.login(t, "taken", "a new password 123")
+	tk = again.connectInfo()
+	streamWT(t, again, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket).waitFrames(t, 30)
 }
