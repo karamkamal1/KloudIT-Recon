@@ -88,14 +88,14 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
-   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard, the
-   settings after a failed connection, a saved codec another PC does not offer, long text
-   through "Type text on the host" (100 KB into Notepad on the PC), the paste dialog by keyboard
-   and with Narrator, a WebGL2 context that does not come back (Renderer WebGL2, then
-   `chrome://gpucrash`), the dashboard with Narrator and the keyboard). "Final review: host
-   agent, second round": the local cursor after starting with the cursor in the video,
-   controller input only from the active session (ViGEmBus, two browsers signed in as two
-   users), captureTimestamps "off" on the helper. With
+   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard and its
+   sections, names and hints with Narrator, the settings after a failed connection, a saved
+   codec another PC does not offer, long text through "Type text on the host" (100 KB into
+   Notepad on the PC), the paste dialog by keyboard and with Narrator, a WebGL2 context that
+   does not come back (Renderer WebGL2, then `chrome://gpucrash`), the dashboard with Narrator
+   and the keyboard). "Final review: host agent, second round": the local cursor after starting
+   with the cursor in the video, controller input only from the active session (ViGEmBus, two
+   browsers signed in as two users), captureTimestamps "off" on the helper. With
    `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
@@ -170,7 +170,11 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    line), deleting a user or changing a password ending the account's live streams (on the
    direct path, then from the phone hotspot of stage 11 over a relay, then a password change),
    and the private CA vouches only for the gateway (Windows 11: `certutil -verify` reports the
-   name constraint; then macOS and an iPhone: Safari refuses the other name's leaf).
+   name constraint; then macOS and an iPhone: Safari refuses the other name's leaf). Turning
+   2FA on needs the password and replaces no 2FA (a wrong password, then 2FA already on), and
+   the offline account recovery signs the account out and ends its streams (`user passwd`
+   with the gateway stopped while a second user streams on the direct path, then `user
+   reset-2fa`).
 13. **Uninstall** (last: it removes the agent): "Final review: deploy and install", uninstalling
    restores a virtual display's layout (with the Virtual Display Driver, during a stream and
    within the 10 s linger).

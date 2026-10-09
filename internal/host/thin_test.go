@@ -64,10 +64,24 @@ func TestThinState(t *testing.T) {
 }
 
 // sentFrames parses the frames written to the fake connection: seq and the
-// thinned mask (-1: none) per stream, in order.
+// thinned mask (-1: none) per stream, in order. The callers wait for a
+// frame's stream to open, so it waits (up to 5 s) for every stream to be
+// closed or cancelled: on a busy CPU the sender may still be writing the last
+// one.
 func sentFrames(t *testing.T, c *fakeConn) (seqs []uint32, masks []int64) {
 	t.Helper()
-	for _, st := range c.snapshot() {
+	sts := c.snapshot()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); sts = c.snapshot() {
+		done := true
+		for _, st := range sts {
+			done = done && (st.closed || st.cancelled)
+		}
+		if done {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, st := range sts {
 		h, ext, _, err := proto.ParseFrame(st.data)
 		if err != nil || !st.closed {
 			t.Fatalf("stream: %v closed %v", err, st.closed)
