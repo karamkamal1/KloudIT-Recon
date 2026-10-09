@@ -247,7 +247,8 @@ Other ways to install:
 
 Open `https://<gateway-ip>:8443` (with `https://`). The gateway uses its own private CA: accept
 the warning once, or download **ca.crt** from the dashboard and install it as a trusted root on
-your devices. Enter the setup token (it stays valid until used; it's also in
+your devices (it can vouch only for the gateway's own names and private addresses, not for
+other websites). Enter the setup token (it stays valid until used; it's also in
 `/var/lib/kloudit-recon/setup-token.txt`, e.g. `pct exec 210 -- cat /var/lib/kloudit-recon/setup-token.txt`),
 create your admin account, then enable 2FA under **Account**.
 
@@ -389,7 +390,7 @@ untouched, so you keep WebTransport and the direct path. Other options:
 |---|---|---|
 | `-listen` (`RECON_LISTEN`) | `:8443` | TCP (HTTPS/WSS) **and** UDP (HTTP/3, WebTransport, host tunnels) |
 | `-data` (`RECON_DATA`) | `./data` | State, keys, audit log (`/var/lib/kloudit-recon` when installed) |
-| `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP); the container's IPs and hostname are always included |
+| `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP); the container's IPs and hostname are included too, except a public address the private CA was not made for (name it here: a name the CA does not cover has it made again, and devices need the new `ca.crt`; `docs/SECURITY.md`) |
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
 | `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
 | `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40015,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. The page's CSP lists each port; with more than 32 it allows any port on the gateway's name. `off`: relay only through the QUIC splice on 8443 |

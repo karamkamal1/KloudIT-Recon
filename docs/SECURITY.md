@@ -94,6 +94,19 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   issues its HTTPS certificate covering your hostnames and IPs. Installing `ca.crt` once removes the
   browser warnings. WebTransport uses separate short-lived certificates that are pinned by hash, so
   it works even without installing the CA.
+- **The private CA vouches only for the gateway.** It carries X.509 name constraints: local names
+  (`localhost`, `.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`, Tailscale's
+  `.ts.net`), private, loopback, link-local and Tailscale/CGNAT addresses (RFC 1918,
+  100.64.0.0/10, fc00::/7), and the names and addresses the gateway has when it creates the CA
+  (its host name, `-name` / `RECON_NAMES`, public addresses). A device that installs `ca.crt`
+  does not trust it for other websites, so a leaked `ca.key` cannot impersonate your bank or mail
+  to it. A `-name` added later that the CA does not cover makes the gateway create a new CA
+  (logged as a warning): install the new `ca.crt` in place of the old one. An address the CA does
+  not cover (a new public IPv6 address of the gateway) is left out of the HTTPS certificate:
+  name it with `-name` to reach the gateway by it. A CA made by a gateway from before this has no
+  constraints and can vouch for any website; the gateway warns at every start. To replace it,
+  delete `ca.crt` and `ca.key` in the data directory, restart the gateway, and install the new
+  `ca.crt` in place of the old one on every device.
 - **Host ↔ gateway:** QUIC with TLS 1.3. The host pins the gateway's long-lived tunnel key
   (SPKI SHA-256) from the pairing code, and the gateway verifies the host's 256-bit token, stored
   hashed. Failed host logins are rate-limited and audited. Re-pairing rotates the token and
@@ -208,8 +221,12 @@ the rate limit are logged once per client a minute (`login_ratelimited`).
   for the libraries), in a folder only administrators can change (see above).
 - All authenticated users can reach all hosts. Per-host permissions are not implemented.
 - TOTP secrets are stored in the 0600 state file, not encrypted at rest.
-- The gateway's private CA key lives in its data directory. Protect backups of
-  `/var/lib/kloudit-recon`.
+- The gateway's private CA key lives in its data directory (the gateway signs a new HTTPS
+  certificate with it when its names change). Protect backups of `/var/lib/kloudit-recon`:
+  whoever has `ca.key` can impersonate the gateway's names and private addresses to every device
+  that installed `ca.crt` (with a CA from before name constraints, any website). Install `ca.crt`
+  only on your own devices; otherwise click through the warning, or use a real certificate
+  (`-cert` / `-key`).
 
 ## Reporting
 

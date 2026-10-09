@@ -10077,6 +10077,58 @@ Fix:
   a relay) and with a password change from the user's own other browser (both streams end; the
   changer reconnects).
 
+### The private CA vouches only for the gateway (name constraints)
+
+Problem: the private CA that INSTALL.md and README tell users to install as a trusted root on
+every device had no name constraints, and its key sits on the gateway: whoever got the gateway or
+a backup of its data directory could intercept TLS to any website on every phone or PC that
+installed ca.crt. The docs did not say so.
+
+Fix (`internal/tlsutil` `Constraints`, `CreateCA`, `Permits`; `internal/gateway/server.go`
+`caConstraints`, `loadOrCreateCA`):
+- A new CA carries permitted subtrees: local names (localhost, local, lan, home, home.arpa,
+  internal, localdomain, ts.net), private, loopback, link-local and Tailscale/CGNAT addresses, and
+  the names and addresses the gateway has at creation (host name, `-name`, public interface
+  addresses). The extension is not marked critical (allowed by the CA/Browser Forum for
+  constrained CAs, for verifiers that do not know it); verifiers that know it enforce it.
+- A configured `-name` the CA does not cover makes a new CA (warning in the log; devices need the
+  new ca.crt); a detected address it does not cover (a new public IPv6 address) is left out of
+  the HTTPS certificate (info line). The HTTPS certificate is re-issued when another CA signed it.
+  A leaf's common name is a DNS name where there is one (OpenSSL checks a host-name-like common
+  name against DNS constraints when the certificate has no DNS name).
+- A CA from before this is kept (replacing it would make every device reinstall) with a warning at
+  every start that says how to replace it. SECURITY.md, INSTALL.md (step 5) and README say what
+  the CA can vouch for.
+
+- Verified here:
+  - `internal/tlsutil` `TestCAConstraints` (Go's verifier refuses leaves for
+    www.bankofamerica.com, mail.google.com, other IPs; Permits agrees) and `internal/gateway`
+    `TestPrivateCAConstrained` (the gateway's CA covers its names, private and Tailscale
+    addresses and nothing else; the same names keep the CA; a new `-name` makes a new CA and a
+    certificate that verifies against it; an older unconstrained CA is kept).
+  - OpenSSL 3.0.13 (`openssl verify`, curl): the gateway's web.crt verifies against its ca.crt
+    for localhost, the configured domain and IP, `<host>.local` and the interface address; a
+    leaf for www.bankofamerica.com or 8.8.8.8 from the same CA fails with "permitted subtree
+    violation".
+  - Chromium 141 (Playwright, the CA added to a private NSS database as a trusted root): a
+    constrained CA's leaf for gw.local loads; its leaf for victim.test fails with
+    `net::ERR_CERT_INVALID`; an unconstrained CA's leaf for victim.test loads (the control).
+- Windows 11 (the gaming PC): unverified. Test: install the new ca.crt as in INSTALL.md step 5
+  (Local Machine, Trusted Root Certification Authorities); Edge and Chrome open
+  `https://<gateway-ip>:8443` without a warning. Then, on a Linux machine with the gateway's
+  data directory copy, issue a leaf for another name with the CA (`openssl ecparam -name
+  prime256v1 -genkey -noout -out k.pem`, `openssl req -new -subj /CN=www.example.com -addext
+  subjectAltName=DNS:www.example.com -key k.pem -out r.csr`, `openssl x509 -req -in r.csr -CA
+  ca.crt -CAkey ca.key -copy_extensions copy -days 1 -out leaf.crt`; `openssl verify -CAfile
+  ca.crt leaf.crt` there already says "permitted subtree violation"),
+  copy leaf.crt to the PC and run `certutil -verify -urlfetch leaf.crt`: it must report a name
+  constraint error ("CERT_TRUST_INVALID_NAME_CONSTRAINTS" / "The certificate has an invalid name").
+  This is not GPU-specific (no AMD or NVIDIA step).
+- macOS / iPhone: unverified (no Apple device here). Test: install ca.crt as INSTALL.md step 5
+  says; Safari opens the gateway without a warning; serve the leaf above (for example with
+  `openssl s_server -cert leaf.crt -key k.pem -accept 9443 -www` on the LAN, with the device
+  resolving www.example.com to that machine): Safari refuses it.
+
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
 Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can

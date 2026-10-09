@@ -143,6 +143,9 @@ The setup token stays valid until you create the admin account.
    in → Trusted Root Certification Authorities**, and restart the browser. On macOS, open it in
    Keychain Access and set it to *Always Trust*. On iPhone/iPad, download it in Safari, install
    the profile, and enable it under **Settings → General → About → Certificate Trust Settings**.
+   The certificate can vouch only for this gateway's names and your private addresses, not for
+   other websites (`docs/SECURITY.md`, "The private CA vouches only for the gateway"). Still,
+   install it only on your own devices; keep `/var/lib/kloudit-recon` backups private.
 
 ## 6. Prepare Windows
 

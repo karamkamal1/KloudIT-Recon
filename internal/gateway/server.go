@@ -188,13 +188,24 @@ func (s *Server) setupTLS() error {
 		s.webCert = &c
 		return nil
 	}
-	ca, err := tlsutil.LoadOrCreateCA(dir, "KloudIT Recon Local CA")
+	names := s.certNames()
+	ca, err := s.loadOrCreateCA(names)
 	if err != nil {
 		return fmt.Errorf("CA: %w", err)
 	}
 	s.ca = ca
-	names := s.certNames()
-	c, err := s.loadOrIssueWebCert(names)
+	var webNames, left []string
+	for _, n := range names {
+		if ca.Permits(n) {
+			webNames = append(webNames, n)
+		} else {
+			left = append(left, n)
+		}
+	}
+	if len(left) > 0 {
+		s.log.Info("left out of the HTTPS certificate: addresses the private CA was not made for (name them with -name / RECON_NAMES to have it remade)", "names", left)
+	}
+	c, err := s.loadOrIssueWebCert(webNames)
 	if err != nil {
 		return err
 	}
@@ -207,6 +218,79 @@ func (s *Server) setupTLS() error {
 	}
 	s.wtRot = rot
 	return nil
+}
+
+// caName is the private CA's subject.
+const caName = "KloudIT Recon Local CA"
+
+// The private CA may always vouch for local and private names and addresses:
+// localhost, mDNS (.local) and the usual home-network suffixes, Tailscale's
+// MagicDNS names and addresses (100.64.0.0/10, fd7a:115c:a1e0::/48 in
+// fc00::/7), RFC 1918, loopback and link-local. Besides these, only the names
+// and addresses the gateway has when it creates the CA (caConstraints).
+var (
+	caBaseDomains = []string{"localhost", "local", "lan", "home", "home.arpa", "internal", "localdomain", "ts.net"}
+	caBaseRanges  = func() []*net.IPNet {
+		var out []*net.IPNet
+		for _, c := range []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+			"169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10"} {
+			_, n, _ := net.ParseCIDR(c)
+			out = append(out, n)
+		}
+		return out
+	}()
+)
+
+// caConstraints are the name constraints of a new private CA: the base ones
+// plus each of names they do not cover (the configured names, this machine's
+// name and public addresses). A device that installs ca.crt then trusts it for
+// these alone, so a leaked ca.key cannot vouch for other websites.
+func caConstraints(names []string) *tlsutil.Constraints {
+	c := &tlsutil.Constraints{Domains: slices.Clone(caBaseDomains), Ranges: slices.Clone(caBaseRanges)}
+	for _, n := range names {
+		if tlsutil.Permits(c.Domains, c.Ranges, n) {
+			continue
+		}
+		if ip := net.ParseIP(n); ip != nil {
+			bits := 128
+			if ip4 := ip.To4(); ip4 != nil {
+				ip, bits = ip4, 32
+			}
+			c.Ranges = append(c.Ranges, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+		} else if d := strings.TrimPrefix(strings.ToLower(n), "*."); d != "" {
+			c.Domains = append(c.Domains, d)
+		}
+	}
+	return c
+}
+
+// loadOrCreateCA loads the private CA, or creates it constrained to names
+// (caConstraints). A CA that does not cover a configured name (-name, added
+// since) is made again: devices then need the new ca.crt. A CA from before
+// name constraints is kept, with a warning: replacing it would make every
+// device install a new one.
+func (s *Server) loadOrCreateCA(names []string) (*tlsutil.CA, error) {
+	dir := s.cfg.DataDir
+	ca, err := tlsutil.LoadOrCreateCA(dir, caName, caConstraints(names))
+	if err != nil {
+		return nil, err
+	}
+	if !ca.Constrained() {
+		s.log.Warn("the private CA has no name constraints (an older gateway made it): a device that trusts its ca.crt would trust a certificate for any website made with its ca.key. "+
+			"To replace it, delete ca.crt and ca.key in the data directory, restart the gateway and install the new ca.crt in place of the old one", "dir", dir)
+		return ca, nil
+	}
+	var missing []string
+	for _, n := range s.cfg.Names {
+		if !ca.Permits(n) {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) == 0 {
+		return ca, nil
+	}
+	s.log.Warn("the private CA was not made for these names: made a new one; install the new ca.crt on your devices in place of the old one", "names", missing)
+	return tlsutil.CreateCA(dir, caName, caConstraints(names))
 }
 
 func (s *Server) certNames() []string {
@@ -229,11 +313,12 @@ func (s *Server) certNames() []string {
 }
 
 // loadOrIssueWebCert reuses the HTTPS certificate unless the set of names
-// changed or it is close to expiry (so users only click through once).
+// changed, it is close to expiry or another CA signed it (so users only click
+// through once).
 func (s *Server) loadOrIssueWebCert(names []string) (*tls.Certificate, error) {
 	certPath := filepath.Join(s.cfg.DataDir, "web.crt")
 	keyPath := filepath.Join(s.cfg.DataDir, "web.key")
-	if c, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil && c.Leaf != nil {
+	if c, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil && c.Leaf != nil && c.Leaf.CheckSignatureFrom(s.ca.Cert) == nil {
 		have := append(append([]string{}, c.Leaf.DNSNames...), ipStrings(c.Leaf.IPAddresses)...)
 		covered := true
 		for _, n := range names {

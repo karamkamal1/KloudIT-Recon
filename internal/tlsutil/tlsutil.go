@@ -1,7 +1,8 @@
 // Package tlsutil generates and manages the certificates used by Recon.
 //
 //   - A long-lived private CA (gateway) that signs the HTTPS certificate, so a
-//     user can optionally install one root and get a trusted padlock.
+//     user can optionally install one root and get a trusted padlock. Its
+//     name constraints keep that root from vouching for other websites.
 //   - Short-lived (< 14 day) ECDSA P-256 certificates for WebTransport endpoints,
 //     which browsers accept via `serverCertificateHashes` without any trust
 //     store changes. They rotate automatically and both the current and the
@@ -27,6 +28,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,15 +45,34 @@ type CA struct {
 	DER  []byte
 }
 
-// LoadOrCreateCA loads ca.crt/ca.key from dir or creates them.
-func LoadOrCreateCA(dir, name string) (*CA, error) {
-	certPath := filepath.Join(dir, "ca.crt")
-	keyPath := filepath.Join(dir, "ca.key")
-	if ca, err := loadCA(certPath, keyPath); err == nil {
+// Constraints are the X.509 name constraints of a CA: it can vouch only for
+// DNS names under Domains (each domain and its subdomains) and IP addresses in
+// Ranges. A device that installs the CA as a trusted root then trusts it for
+// those names, not for every website.
+type Constraints struct {
+	Domains []string
+	Ranges  []*net.IPNet
+}
+
+// LoadOrCreateCA loads ca.crt/ca.key from dir, or creates them with the name
+// constraints c (nil: none).
+func LoadOrCreateCA(dir, name string, c *Constraints) (*CA, error) {
+	if ca, err := loadCA(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")); err == nil {
 		return ca, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	return CreateCA(dir, name, c)
+}
+
+// CreateCA creates ca.crt/ca.key in dir, replacing any there, with the name
+// constraints c (nil: none). The constraints extension is not marked
+// critical, as the CA/Browser Forum allows for constrained CAs: verifiers
+// that know it (Windows, macOS and iOS, Chrome, Firefox, Go, OpenSSL) enforce
+// it, and one that does not still accepts the CA.
+func CreateCA(dir, name string, c *Constraints) (*CA, error) {
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -65,6 +86,10 @@ func LoadOrCreateCA(dir, name string) (*CA, error) {
 		BasicConstraintsValid: true,
 		MaxPathLenZero:        true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+	}
+	if c != nil {
+		tmpl.PermittedDNSDomains = c.Domains
+		tmpl.PermittedIPRanges = c.Ranges
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -81,6 +106,49 @@ func LoadOrCreateCA(dir, name string) (*CA, error) {
 		return nil, err
 	}
 	return loadCA(certPath, keyPath)
+}
+
+// Constrained reports whether the CA has name constraints (CAs created
+// before they were added have none and can vouch for any name).
+func (ca *CA) Constrained() bool {
+	return len(ca.Cert.PermittedDNSDomains) > 0 || len(ca.Cert.PermittedIPRanges) > 0
+}
+
+// Permits reports whether the CA's name constraints allow a certificate for
+// name (a DNS name or an IP address).
+func (ca *CA) Permits(name string) bool {
+	return Permits(ca.Cert.PermittedDNSDomains, ca.Cert.PermittedIPRanges, name)
+}
+
+// Permits reports whether name constraints (domains, ranges) allow name. An
+// empty list leaves that kind of name unconstrained (RFC 5280).
+func Permits(domains []string, ranges []*net.IPNet, name string) bool {
+	if ip := net.ParseIP(name); ip != nil {
+		if len(ranges) == 0 {
+			return true
+		}
+		for _, r := range ranges {
+			if r.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(domains) == 0 {
+		return true
+	}
+	n := strings.TrimSuffix(strings.ToLower(name), ".")
+	for _, d := range domains {
+		d = strings.ToLower(d)
+		if strings.HasPrefix(d, ".") {
+			if strings.HasSuffix(n, d) {
+				return true
+			}
+		} else if n == d || strings.HasSuffix(n, "."+d) {
+			return true
+		}
+	}
+	return false
 }
 
 func loadCA(certPath, keyPath string) (*CA, error) {
@@ -119,9 +187,19 @@ func (ca *CA) Issue(names []string, validity time.Duration) (tls.Certificate, er
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	// The common name is a DNS name where there is one: a verifier may check
+	// a common name that looks like a host name against the CA's DNS name
+	// constraints (OpenSSL does when there is no DNS name among the SANs).
+	cn := firstOr(names, "recon")
+	for _, n := range names {
+		if net.ParseIP(n) == nil && n != "" {
+			cn = n
+			break
+		}
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial(),
-		Subject:      pkix.Name{CommonName: firstOr(names, "recon")},
+		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(validity),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
