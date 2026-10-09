@@ -3,6 +3,8 @@
 // input handling) can delay a frame.
 //
 //   WebTransport (per-frame QUIC streams + datagrams) or WebSocket fallback
+//     (over a high round trip WebTransport frames may come as datagram shards
+//     with Reed-Solomon parity instead: fec.js rebuilds them)
 //     -> reorder by sequence -> VideoDecoder (optimizeForLatency, at most 2 queued)
 //     -> frame pacing (pacing.js): draw on decode (Lowest latency) or at the
 //        next display refresh (Smooth)
@@ -15,6 +17,7 @@ import * as P from './protocol.js';
 import { runSelfTests, helloDecoder } from './decoder-selftest.js';
 import { createRenderer, LABELS, PATHS, PICK, pickPath, Samples, withTimeout } from './renderers.js';
 import { Pacer } from './pacing.js';
+import { FecReceiver } from './fec.js';
 
 const td = new TextDecoder();
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -45,6 +48,7 @@ const video = {
   keyRequested: 0,
   waitSince: 0,
   hostDropped: new Set(), // seqs of the current generation the host reported dropped
+  fecLost: new Set(), // seqs of the current generation sent as datagram shards that could not be rebuilt (fec.js)
   // Reference recovery (VideoConfig.recovery "ltr" / "invalidate"): the loss
   // being recovered ({ gen, from, since, discarded }: nothing from seq `from`
   // on is decoded until a frame ends it), when the last recovery frame was
@@ -68,6 +72,7 @@ const stats = {
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
   recovered: 0, recoveredByKey: 0, recoveryDiscarded: 0, recoveryRejected: 0, keyFrames: 0,
   audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, supersededChunks: 0, lagMin: Infinity,
+  stalls: 0,
 };
 
 // Freezes: the picture stood still more than FREEZE_MS longer than the
@@ -86,6 +91,9 @@ const stats = {
 // highest seq the client knows the encoder produced (received, or reported
 // dropped).
 const FREEZE_MS = 100;
+// Stalls: the same measure over STALL_MS (GUIDE 2.5 compares the datagram +
+// FEC mode with frame streams by these).
+const STALL_MS = 50;
 const freeze = { drawn: 0, sentUs: 0, gen: -1, seq: 0, seen: new Map() };
 
 function freezeSeen(gen, seq) {
@@ -127,21 +135,28 @@ function sendRateReport() {
     fb.owd = [];
   }
   if (fb.gen >= 0) flags |= P.RATE_REPORT_FRAME;
+  // The video shards (datagram + FEC mode): the host sizes its parity from
+  // their loss.
+  if (hostFeatures.includes(P.FEATURE_VIDEO_FEC)) flags |= P.RATE_REPORT_SHARDS;
   fb.sent++;
+  const fs = fecRx.stats;
   transport.sendDatagram(P.rateReport({
     flags, gen: Math.max(0, fb.gen), timeMs: now(), lastSeq: fb.lastSeq, frames: fb.frames, bytes: fb.bytes,
     owdP50Us: p50 * 1000, owdMaxUs: max * 1000, lost: fb.lost, audio: fb.audio,
     // The decoder's backlog: chunks in the decoder and waiting in front of it
     // (MAX_DECODE_QUEUE), as checkDecoderBacklog counts it.
     decodeQueue: video.inflight.size + video.queue.length,
+    shards: fs.shards, shardsLost: fs.shardsLost,
   }));
 }
 
 // A complete frame (parsed header h, buf.length bytes, last byte at recv).
-function rateReportFrame(h, bytes, recv) {
+// repaired: a frame sent as shards that needed a NACK (fec.js): its delay is
+// the repair's round trip, not a queue, and is left out of the report's.
+function rateReportFrame(h, bytes, recv, repaired) {
   fb.frames++;
   fb.bytes += bytes;
-  if (clock.offset !== null && fb.owd.length < 1000) fb.owd.push(recv - hostToLocal(sentUs(h)));
+  if (clock.offset !== null && fb.owd.length < 1000 && !repaired) fb.owd.push(recv - hostToLocal(sentUs(h)));
   if (fb.gen < 0 || isNewerGen(h.gen, fb.gen)) {
     fb.gen = h.gen;
     fb.lastSeq = h.seq;
@@ -151,6 +166,14 @@ function rateReportFrame(h, bytes, recv) {
 }
 
 const audio = { cfg: null, decoder: null, ring: null, port: null, lastSeq: -1, nextPts: 0, samples: 0, L: null, R: null };
+// An audio packet further behind the last one than this (packets: 320 ms of
+// 5 ms ones) is not late but of another stream: datagrams and the control
+// stream are read apart, so the old stream's last packets can come after the
+// new stream's config (which restarted the sequence), and taking them as the
+// newest made the new stream's packets "late" until its sequence passed the
+// old one's (silence for as long as the old stream had run, up to minutes).
+// The sequence goes on from such a packet.
+const AUDIO_MAX_LATE = 64;
 
 // ---------------------------------------------------------------------------
 // Clock synchronisation (NTP-style, keep the minimum-RTT sample)
@@ -236,6 +259,53 @@ async function readAll(stream) {
   let o = 0;
   for (const c of chunks) { out.set(c, o); o += c.byteLength; }
   return { buf: out, first };
+}
+
+// "Datagram + FEC" video mode (GUIDE 2.5, fec.js): over a high round trip the
+// host may send a frame as datagram shards with Reed-Solomon parity instead of
+// on its own stream. fecRx rebuilds the frame and hands it on exactly as a
+// frame stream would (onFrameBytes); the shards a frame lacks once its shards
+// stop coming it asks for again (NACK) while there is time, then gives the
+// frame up (onFecLost: a loss, as a gap that outlasted its wait). Clients on
+// WebTransport offer it in their hello (hello.fec); WebSocket has no
+// datagrams.
+const fecRx = new FecReceiver({
+  deliver: (buf, recv, first, repaired) => onFrameBytes(buf, recv, first, repaired),
+  lost: (gen, seq) => onFecLost(gen, seq),
+  nack: (b) => transport?.sendDatagram(b),
+  rtt: () => clock.minRtt || clock.rtt,
+  interval: () => 1000 / (video.cfg?.fps || 60),
+});
+const fecTimer = { id: 0, at: Infinity };
+
+// Runs fecRx's NACKs and give-ups when due.
+function fecSchedule() {
+  const due = fecRx.nextDue();
+  if (due >= fecTimer.at) return;
+  clearTimeout(fecTimer.id);
+  fecTimer.at = due;
+  if (due === Infinity) return;
+  fecTimer.id = setTimeout(() => {
+    fecTimer.at = Infinity;
+    fecRx.tick(now());
+    fecSchedule();
+  }, Math.max(1, due - now()));
+}
+
+function onFecShard(d) {
+  fecRx.shard(d, now());
+  fecSchedule();
+}
+
+// A frame sent as shards that could not be rebuilt in time: lost (not
+// reported by the host), at once instead of after the gap timeout.
+function onFecLost(gen, seq) {
+  const cfg = video.cfg;
+  if (!cfg || gen !== cfg.gen || gen === video.lostGen || seq < video.expectSeq) return;
+  post('log', { text: `frame ${gen}/${seq} lost: its shards could not be rebuilt in time` });
+  video.fecLost.add(seq);
+  if (video.fecLost.size > 256) video.fecLost.delete(video.fecLost.values().next().value);
+  if (video.ready) checkGap();
 }
 
 async function openWebTransport(url, hashes, label, timeoutMs) {
@@ -769,6 +839,7 @@ async function onVideoConfig(cfg) {
   video.waitingKey = true;
   video.reorder.clear();
   video.hostDropped.clear();
+  video.fecLost.clear();
   video.gapSince = 0;
   video.lostGen = -1;
   video.recover = null;
@@ -783,7 +854,7 @@ function drainEarly() {
   for (const f of early) onFrame(f);
 }
 
-function onFrameBytes(buf, recv, first = recv) {
+function onFrameBytes(buf, recv, first = recv, repaired = false) {
   const h = P.parseFrameHeader(buf);
   if (!h) return;
   h.data = buf.subarray(h.headerLen);
@@ -791,8 +862,8 @@ function onFrameBytes(buf, recv, first = recv) {
   h.first = first || recv;
   stats.bytes += buf.length;
   freezeSeen(h.gen, h.seq);
-  rateReportFrame(h, buf.length, recv);
-  checkCongestion(recv - hostToLocal(sentUs(h)));
+  rateReportFrame(h, buf.length, recv, repaired);
+  if (!repaired) checkCongestion(recv - hostToLocal(sentUs(h)));
   onFrame(h);
 }
 
@@ -849,13 +920,16 @@ function checkGap() {
   if (!cfg || cfg.gen === video.lostGen) return;
   if (video.recover && skipToRecovery()) return;
   const reported = video.hostDropped.has(video.expectSeq);
+  // A frame sent as shards that fec.js gave up is lost at once (it waited
+  // for its repairs already).
+  const fecLost = video.fecLost.has(video.expectSeq);
   if (!reported) {
     if (!video.reorder.size) return;
     const timeout = gapTimeout();
     const maxBuffered = Math.max(30, 2 * Math.ceil(((cfg.fps || 60) * timeout) / 1000));
-    if (now() - video.gapSince <= timeout && video.reorder.size <= maxBuffered) return;
+    if (!fecLost && now() - video.gapSince <= timeout && video.reorder.size <= maxBuffered) return;
   }
-  frameLost(reported ? 'dropped by host' : 'frame lost');
+  frameLost(reported ? 'dropped by host' : fecLost ? 'shards lost' : 'frame lost');
 }
 
 // A confirmed loss of the frames from expectSeq on: the run the host
@@ -872,6 +946,7 @@ function frameLost(reason) {
   let to = from;
   while (video.hostDropped.has(to)) video.hostDropped.delete(to++);
   if (to === from) to = Math.min(...video.reorder.keys());
+  for (let s = from; s < to; s++) video.fecLost.delete(s);
   const missing = to - from;
   stats.dropped += missing;
   if (!reported) fb.lost += missing; // lost on the way (the host knows its own drops)
@@ -922,6 +997,7 @@ function skipToRecovery() {
   let late = 0;
   for (let s = video.expectSeq; s < to; s++) {
     const buffered = video.reorder.delete(s);
+    video.fecLost.delete(s);
     if (video.hostDropped.delete(s)) { stats.dropped++; continue; }
     if (!buffered) late++;
     r.discarded++;
@@ -1194,6 +1270,7 @@ function drawFrame(frame, meta, decoded, pace) {
     const sent = sentUs(meta);
     const stall = freezeStall(meta, sent, presented);
     Object.assign(freeze, { drawn: presented, sentUs: sent, gen: meta.gen, seq: meta.seq });
+    if (stall > STALL_MS) stats.stalls++;
     if (stall > FREEZE_MS) {
       stats.freezes++;
       stats.lastFreeze = stall;
@@ -1707,7 +1784,7 @@ function onAudioPacket(d) {
       stats.audioLost += gap;
       fb.lost += gap;
       silence(missing > 0 && missing <= gap * 960 ? missing : gap * samples);
-    } else if (gap >= 0x8000) return; // late/duplicate
+    } else if (gap >= 0x8000 && ((audio.lastSeq - seq) & 0xffff) < AUDIO_MAX_LATE) return; // late/duplicate
     // The pts moved on by more than the lost packets held: the host's audio
     // source paused (WASAPI loopback sends nothing while nothing plays; the
     // host moves the pts on by a pause of 50 ms or more). The jitter buffer
@@ -1775,6 +1852,7 @@ function onDatagram(d) {
       break;
     }
     case P.DG_RUMBLE: post('rumble', { idx: d[1], large: d[2], small: d[3] }); break;
+    case P.DG_VIDEO_SHARD: onFecShard(d); break;
   }
 }
 
@@ -1814,7 +1892,11 @@ function postStats() {
     recoveryRejected: stats.recoveryRejected,
     keyFrames: stats.keyFrames, // key frames fed to the decoder (IDRs)
     freezes: stats.freezes,
+    stalls: stats.stalls, // stand-stills over STALL_MS beyond the source's
     lastFreeze: stats.lastFreeze || null,
+    // Datagram + FEC (fec.js, GUIDE 2.5): frames rebuilt from shards and the
+    // shards' counters, this session (null: the host never sent shards).
+    fec: fecRx.stats.shards || fecRx.stats.repairs ? fecRx.summary() : null,
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
     audioMs,
@@ -1913,6 +1995,8 @@ async function start(msg) {
   transport.sendControl({
     t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
     client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: msg.hostPrefs,
+    // Video frames as datagram shards (GUIDE 2.5): WebTransport only.
+    ...(transport.kind === 'webtransport' && prefs.fec !== 'off' ? { fec: P.HELLO_FEC_VERSION } : {}),
   });
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
@@ -1925,6 +2009,8 @@ async function start(msg) {
   clearInterval(watchdogTimer);
   clearInterval(fb.timer);
   fb.timer = 0;
+  clearTimeout(fecTimer.id);
+  fecTimer.at = Infinity;
   transport = null;
   // A deliberate "bye" (e.g. another device took over) must not trigger an
   // automatic reconnect, or two clients would keep stealing the session.

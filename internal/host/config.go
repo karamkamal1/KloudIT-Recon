@@ -57,6 +57,10 @@ type Config struct {
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
 	Congestion string `json:"congestion,omitempty"` // QUIC congestion control of video connections: media | reno ("" = media)
+	// FEC is the "datagram + FEC" video mode (GUIDE 2.5, fec.go): auto ("",
+	// above 15 ms of round trip, for clients that take shards, on the direct
+	// path and the UDP relay) | on (regardless of the round trip) | off.
+	FEC string `json:"fec,omitempty"`
 
 	DefaultKbps int  `json:"defaultKbps"`
 	MaxKbps     int  `json:"maxKbps"`
@@ -146,6 +150,9 @@ func LoadConfig(path string) (*Config, error) {
 	c.Defaults()
 	if !transport.ValidCongestion(c.Congestion) {
 		return nil, fmt.Errorf("%s: congestion must be %q or %q, not %q", path, transport.CongestionReno, transport.CongestionMedia, c.Congestion)
+	}
+	if !validFEC(c.FEC) {
+		return nil, fmt.Errorf("%s: fec must be %q, %q or %q, not %q", path, FECAuto, FECOn, FECOff, c.FEC)
 	}
 	if !validAV1(c.AV1) {
 		return nil, fmt.Errorf("%s: av1 must be %q or %q, not %q", path, AV1Fallback, AV1Faster, c.AV1)

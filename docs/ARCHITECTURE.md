@@ -40,7 +40,7 @@ Every session, whatever its transport, has four logical channels:
 |---|---|---|---|
 | control | reliable, ordered, JSON | bidi stream opened by client, first byte `C`, u32-LE length-prefixed messages | binary message `0x00` + JSON |
 | input | reliable, ordered, binary | bidi stream, first byte `I` | `0x01` + event |
-| frames | reliable per frame, independent | **one unidirectional stream per frame** | `0x02` + frame |
+| frames | reliable per frame, independent | **one unidirectional stream per frame**; over a round trip above 15 ms datagram shards with Reed-Solomon parity ([below](#datagram--fec-video)) | `0x02` + frame |
 | datagram | unreliable | QUIC DATAGRAM | `0x03` + datagram |
 
 ### Frame stream
@@ -226,19 +226,98 @@ running encoder (never from a vendor). Its rungs, cheapest first:
 not sent while the client waited for a recovery or key frame), `recovered` / `recovered_by_key`
 (rung 2's answers) and `key_frames` (rung 4).
 
+### Datagram + FEC video
+
+On a frame stream a lost packet costs its frame, and every frame decoded after it, a retransmission:
+QUIC detects the loss after about a round trip and resends the packet, so above ~15 ms of round
+trip every loss is a visible stall (at 1 % packet loss and 20 Mbit/s at 60 fps, a third of the
+frames lose a packet). The **datagram + FEC mode** (GUIDE 2.5; `internal/host/fec.go`, codec
+`internal/fec`, format `internal/proto/fec.go`, client `web/static/js/fec.js`) sends a frame
+instead as datagrams with forward error correction:
+
+- **Shards.** The frame's bytes, exactly as a frame stream carries them (header, extension,
+  payload), are cut into n data shards of one size S ≤ 1200 bytes (n = ceil(L / 1200), S =
+  ceil(L / n), the last shard shorter), grouped into ceil(n / 64) blocks of consecutive data
+  shards (block i: shards floor(i·n/nb) … floor((i+1)·n/nb) − 1). Each block is a systematic
+  Reed-Solomon code over GF(2^8) (polynomial 0x11d): `github.com/klauspost/reedsolomon`'s default
+  matrix, a Vandermonde matrix made systematic by the inverse of its top square, whose parity row r
+  does not depend on how many rows the code has. Any K of a block's shards rebuild its K data
+  shards. One shard per datagram:
+
+  ```
+  0x12 | u8 flags (1 parity, 2 repair) | u8 gen | u8 index | u32 seq | u32 frameLen |
+  u16 size | u16 base | u8 k | u8 m | payload (size bytes; the frame's last data shard: what is left)
+  ```
+
+  `base` is the block's first data shard, `index` the shard's place in the block (0..k−1 data,
+  k.. parity row index − k), `m` the parity sent with the frame. With the header and QUIC's and
+  WebTransport's framing a shard fits quic-go's smallest packet (1280 bytes); a path whose
+  datagram limit is smaller shrinks the shards, one without datagrams ends the mode.
+- **Parity** per block, from the shard loss p the client reports (rate report flag 4, below; 1 %
+  until it has counted 500 shards; the last 4 s): the fewest parity shards that leave at most 1 %
+  of such blocks short of K shards (a binomial tail), at least 5 % of K (and one), at most the
+  guide's ramp: 5 % below 0.5 % loss rising to 30 % at 3 % and above. A 35-shard block (20 Mbit/s
+  at 60 fps) gets 2 at 1 % loss (5.7 %), 4 at 3 % (11 %); a frame of one shard a copy.
+- **Repairs.** When a frame's shards stop coming (3 ms after its last block's last parity shard
+  or a shard of a newer frame arrived, or after none of its own for max(20 ms, 2 frame
+  intervals)) the client sends a NACK
+  (`0x42 | u8 gen | u8 count | u8 0 | u32 seq | count × (u16 base | u8 need | u8 0)`: per block
+  how many more shards it needs; no entries: none of the frame's shards came, send all of it),
+  again every max(25 ms, 1.5 × RTT) with one spare per block, and gives the frame up max(120 ms,
+  2.5 × RTT + 30 ms) after the stall: then it is a loss like a gap that outlasted its wait (the
+  loss-recovery ladder answers it; the client tells the host with `lost` under reference
+  recovery). The host answers a NACK with fresh parity rows of the block (rows the frame did not
+  send; any of them helps) from the frames it kept (the last second, 120 at most), the data shards
+  for a whole-frame NACK, at most 32 shards per block and repairs of at most a quarter of the video
+  bitrate per second.
+- **Sending.** frameSender cuts the frame and hands the shards to quic-go in order, each block's
+  data then its parity, at most 3 ms of sending time ahead of the pacer (quic-go sends datagrams
+  from one queue, ahead of stream data: audio, cursor and pong datagrams wait behind every shard
+  queued before them). Rung 1 of the loss-recovery ladder applies between shards (a frame past its
+  deadline while a newer one is ready stops; one the client would discard is not sent on). The
+  media congestion controller's target includes the shards' overhead (parity, headers,
+  repairs), and the acknowledged bytes the rate controller reads as delivered video leave it
+  out. While frames go as shards the rate controller's loss decrease waits for 10 % packet loss
+  instead of 2 % (random loss the parity rebuilds is not congestion; 2 % would take a path that
+  loses 3 % to the bitrate floor, where small frames need relatively more parity; the delay
+  still decreases), and a frame completed only after a NACK gives the client's rate report no
+  one-way delay sample (its delay is the repair's round trip, not a queue). The frame's
+  `send_us` is stamped as it is cut; the client's *network* stage ends at its first shard,
+  *transfer* at the shard that completed it.
+- **When.** Host config `fec` (`auto`, the default): for clients whose hello offers it
+  (`hello.fec` = 1: WebTransport clients; WebSocket has no datagrams) on the paths where the host's
+  QUIC connection ends at the browser (direct and UDP relay; the splice ends at the gateway),
+  while the client's minimum round trip (its pings, decided once five of them carried one: about
+  a second, as a loaded browser's first round trip alone can be far above the path's) is above
+  15 ms, back to streams below 12 ms, and the video bitrate is at most 150 Mbit/s (headless Chromium 141 received 150 Mbit/s of
+  datagrams without loss in `tools/dgbench`; docs/VENDOR_NOTES.md 2.5); `on` regardless of the
+  round trip, `off` never. The welcome lists `video-fec` for such clients. Shard loss above 20 % over
+  2 s sends streams for 30 s. The switch is per frame: the client takes frames from streams and
+  shards alike (the reorder buffer sees frames). The client's setting *Video over datagrams: Off*
+  leaves `fec` out of the hello.
+- **Measured.** host.log logs every switch (`video transport mode=… why=… rtt_ms=…`) and, in
+  `stream stats`, `fec_frames`, `fec_parity_pct` (parity shards per data shard), `fec_overhead_pct`
+  (bytes on the wire beyond the frames': parity, headers, repairs), `fec_loss_pct` (the client's
+  shard loss), `fec_nacks`, `fec_repairs`, `fec_nack_misses`. Once shards come, the overlay's
+  *Transport* row adds "datagrams + FEC" and a *FEC* row under it shows the client's side
+  (frames, parity, loss, frames rebuilt from parity, repaired after a NACK, given up); the
+  *Freezes > 100 ms* row also counts stalls over 50 ms.
+
 ### Datagrams
 
 | Type | Dir | Layout | Notes |
 |---|---|---|---|
 | `0x10` audio | H→C | codec, u16 seq, u32 pts(48 kHz), payload | Opus (CELT LD) 10 ms, 5 ms on a LAN (from the ping's RTT) when the capture delivers at most 5 ms at a time; the packets carry their duration; or PCM s16 5 ms. The pts moves on by a pause of the capture source (50 ms or more) |
 | `0x11` cursor pos | H→C | visible, u32 seq, u16 x, u16 y | normalised to the captured display |
+| `0x12` video shard | H→C | flags, gen, index, u32 seq, u32 frameLen, u16 size, u16 base, k, m, payload | datagram + FEC mode only ([above](#datagram--fec-video)) |
 | `0x20` mouse rel | C→H | u32 seq, i32 **cumulative** x, i32 **cumulative** y | loss only delays motion, never drops it |
 | `0x21` mouse abs | C→H | u32 seq, u16 x, u16 y | latest wins |
 | `0x22` gamepad | C→H | idx, connected, u32 seq, XInput state | full snapshot, re-sent every 100 ms |
 | `0x23` rumble | H→C | idx, u8 large motor, u8 small motor | force feedback from ViGEmBus; a running state re-sent every 100 ms, a stop 3 times |
 | `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, ping: u32 min RTT µs; pong: u64 host µs | NTP-style clock sync, minimum-RTT sample; the ping's min RTT (since step 4.6; 16-byte pings before) picks the Opus frame |
 | `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, the ACKs of reference recovery, and the rate controller's feedback from clients without rate reports |
-| `0x41` rate report | C→H | flags, gen, 0, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
+| `0x41` rate report | C→H | flags, gen, 0, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 [, u32 shards, u32 shardsLost] | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
+| `0x42` FEC NACK | C→H | gen, count, 0, u32 seq, count × (u16 base, u8 need, u8 0) | the shards a frame sent as datagrams still needs ([above](#datagram--fec-video)) |
 
 **Rate report** (`proto.RateReport`, 40 bytes, GUIDE 2.2). Flags: bit 0 the delays are valid
 (clock synced, frames since the previous report), bit 1 `gen`/`lastSeq` name a frame. `time` is
@@ -249,7 +328,10 @@ lost) and `audio` (audio datagrams received) are cumulative since the connection
 wrap, so a lost report loses only its delays: the host takes the difference to the last report it
 got. The delays are those of the frames received since the previous report (last byte received
 minus `encodeDoneUs`, or `send_us` without the extension: the 0x40 ack's measure), p50 and maximum;
-`decodeQueue` is the number of frames handed to the decoder and not yet out of it. Hosts list
+`decodeQueue` is the number of frames handed to the decoder and not yet out of it. Flag bit 2
+(clients of hosts that list `video-fec`): 8 more bytes, the video shards received (first
+transmissions, not repairs) and those of the frames' first transmissions that never arrived,
+counted 2 s after a frame's first shard; the host sizes its parity from them. Hosts list
 `rate-report` in `welcome.features`; clients that see it send the report and stop sending their
 own delay-based `{"t":"congestion"}` (the decoder's `reason:"decoder"` one stays). Older hosts
 never see a 0x41 (the client sends it only on the feature); older clients keep their own delay
@@ -325,7 +407,8 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     of a session's delay samples decides nothing (the base needs them).
   - *Decrease* ×0.85 when the delay stays over the target for 3 reports in a row and is not
     falling (a queue that drains needs no second decrease), or when more than 2 % of the
-    packets of the last second were lost; from the rate the path delivered when that is lower
+    packets of the last second were lost (10 % while video goes as datagram shards with parity,
+    [above](#datagram--fec-video)); from the rate the path delivered when that is lower
     than the target: on the direct path and the UDP relay (the host's QUIC connection ends at the
     browser) the connection's acknowledged bytes of the last 100 ms (less audio and overhead), else the client's receive rate of the last 250 ms or 1 s, divided
     by the encoder's fill (its output as a share of its target over the last second: encoders do
@@ -527,7 +610,8 @@ continues on FFmpeg with a notice. Helpers that fail before going live within 3 
 ## The browser pipeline
 
 ```
-worker:  WebTransport.incomingUnidirectionalStreams ─► readAll ─► reorder ─► VideoDecoder
+worker:  WebTransport.incomingUnidirectionalStreams ─► readAll ─┐
+         datagram shards (datagram + FEC) ─► fec.js rebuild/NACK ─┴► reorder ─► VideoDecoder
                                                                         │ output(frame)
                                                                         ▼
                                         pacing.js: draw on decode (Lowest latency) or at the
@@ -722,7 +806,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   period per packet, and two 5 ms packets sent together save nothing. A switch changes the
   running encoder at its next frame and goes out as an `audio` config with `sameStream: true`
   (any other `audio` config starts a new stream, its sequence from 0: the client then forgets the
-  old sequence, also when the codec stays the same). The client takes each packet's duration
+  old sequence, also when the codec stays the same; a packet more than 64 behind the last one is
+  taken as another stream's, not as late, because the old stream's last datagrams can be read
+  after the new config). The client takes each packet's duration
   from its Opus TOC (loss concealment by pts), so a switch needs no decoder change. The
   AudioWorklet's jitter buffer (Settings → Jitter buffer: Auto, or Fixed with the size slider)
   starts at 20 ms and adapts between 10 and 60 ms: the deepest drop of its fill level below the

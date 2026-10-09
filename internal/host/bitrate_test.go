@@ -319,6 +319,45 @@ func TestRateLoss(t *testing.T) {
 	}
 }
 
+// TestRateLossFEC: while video goes as datagram shards with parity (GUIDE
+// 2.5) random loss the parity rebuilds decreases nothing up to
+// fecLossThreshold (5 % does not; 12 % does); back on streams 5 % does again.
+func TestRateLossFEC(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.r.setFEC(true)
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	report := func(lost, total int64) (rateChange, bool) {
+		h.clock = h.clock.Add(25 * time.Millisecond)
+		return h.r.report(feedback{at: h.clock, frames: 1, bytes: 40000, interval: 25 * time.Millisecond, owdValid: true,
+			qd: 20 * time.Millisecond, owd: 30 * time.Millisecond, lost: lost, total: total})
+	}
+	for i := 0; i < 80; i++ { // 2 s at 5 %
+		if c, ok := report(5, 100); ok {
+			t.Fatalf("5 %% loss decreased with FEC: %+v", c)
+		}
+	}
+	decreased := func(lost int64) bool {
+		for i := 0; i < 80; i++ {
+			if c, ok := report(lost, 100); ok {
+				if c.why != "loss" {
+					t.Fatalf("change %+v, want a loss decrease", c)
+				}
+				h.apply(c)
+				return true
+			}
+		}
+		return false
+	}
+	if !decreased(12) {
+		t.Fatal("12 % loss did not decrease with FEC")
+	}
+	h.r.setFEC(false)
+	h.clock = h.clock.Add(2 * time.Second)
+	if !decreased(5) {
+		t.Fatal("5 % loss did not decrease on streams")
+	}
+}
+
 // TestRateIncrease: after a decrease the target climbs +5 %/s just below the
 // last known-good rate, faster far below it (up to +25 %/s), accelerating
 // above it, and never above the ceiling.

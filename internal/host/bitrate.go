@@ -99,9 +99,14 @@ const (
 	// says nothing about the path.
 	pendingStallGap = 100 * time.Millisecond
 
-	lossWindow     = time.Second
-	lossThreshold  = 0.02
-	lossMinPackets = 100 // fewer packets in the window: no loss decision
+	lossWindow    = time.Second
+	lossThreshold = 0.02
+	// fecLossThreshold replaces lossThreshold while video goes as datagram
+	// shards with parity (fec.go): random loss the parity rebuilds is not
+	// congestion, and 2 % would cut the bitrate to the floor on a path that
+	// loses 3 % (GCC's upper loss threshold; the delay still decreases).
+	fecLossThreshold = 0.10
+	lossMinPackets   = 100 // fewer packets in the window: no loss decision
 	// lossSettle: losses count from this long after a decrease is in the
 	// encoder: those detected before were of packets sent at the old rate.
 	lossSettle = 300 * time.Millisecond
@@ -309,6 +314,7 @@ type rateController struct {
 	loss      []timedCount
 	acked     []timedCount // acknowledged bytes per report (span: host time since the previous)
 	ackDirect bool         // the acknowledgements come from the client (setPath)
+	fec       bool         // video goes as datagram shards with parity (setFEC)
 	nonVideo  int          // kbps of audio and overhead in the acknowledged bytes
 	liveFPS   int          // frame rate of the encoder that streams
 	lastAcked time.Time
@@ -471,6 +477,23 @@ func (r *rateController) setPath(direct bool) {
 	r.mu.Unlock()
 }
 
+// setFEC notes whether video goes as datagram shards with parity (fec.go):
+// the loss decrease then waits for fecLossThreshold.
+func (r *rateController) setFEC(on bool) {
+	r.mu.Lock()
+	r.fec = on
+	r.mu.Unlock()
+}
+
+// lossLimit is the packet loss above which the rate decreases. Called with
+// r.mu held.
+func (r *rateController) lossLimit() float64 {
+	if r.fec {
+		return fecLossThreshold
+	}
+	return lossThreshold
+}
+
 // report takes a receive report and returns the decrease it calls for.
 func (r *rateController) report(fb feedback) (rateChange, bool) {
 	r.mu.Lock()
@@ -500,7 +523,7 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 	switch {
 	case r.over >= overReports && !r.draining():
 		return r.decrease(now, "delay")
-	case r.lossFraction() > lossThreshold:
+	case r.lossFraction() > r.lossLimit():
 		return r.decrease(now, "loss")
 	}
 	return rateChange{}, false

@@ -309,6 +309,17 @@ func (s *sendState) take(f *media.Frame) (uint64, ladderStep) {
 	return s.taken, st
 }
 
+// outgoing asks the ladder about a frame being sent (in: lossOutgoing, the
+// frame, its age and deadline, whether a newer one is ready) with the
+// client's current wait: for frames that go as shards (fec.go), which have
+// no stream for due to find.
+func (s *sendState) outgoing(in ladderIn) ladderStep {
+	s.mu.Lock()
+	in.wait = s.wait
+	s.mu.Unlock()
+	return ladder(in)
+}
+
 // register adds a frame stream being written.
 func (s *sendState) register(of *outFrame) {
 	s.mu.Lock()

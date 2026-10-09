@@ -40,7 +40,14 @@
 // requestFullscreen; a fake gamepad's triggers come back as force feedback
 // (host test hook rumble-echo) and are played with
 // vibrationActuator.playEffect; the client reports unadjustedMovement only
-// when the browser read the option.
+// when the browser read the option. Datagram + FEC (step 2.5): with host
+// config fec "on" and 3 % of the video shards lost (host test hook
+// fec-loss) every frame comes as datagram shards and is rebuilt from parity or
+// repaired after a NACK, with steady playback and the stage and barcode
+// checks; WebSocket sessions never get shards. E2E_FEC_COMPARE=<seconds>
+// adds the comparison with frame streams through a UDP proxy that delays
+// each direction 20 ms (40 ms RTT) and loses 1 % / 3 % of the packets:
+// stalls over 50 ms and the overhead of the shards.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -363,7 +370,9 @@ async function checkAudio(name) {
   // a client without an Opus decoder gets PCM for either setting). The host
   // restarts audio, its sequence from 0; the client takes the new stream at
   // once (it used to drop its packets as late until their sequence passed
-  // the old stream's: as long as audio had run). Audio flows: the ring the
+  // the old stream's: as long as audio had run; the old stream's last
+  // datagrams, read after the new config, did that too in about one restart
+  // in ten here: AUDIO_MAX_LATE). Audio flows: the ring the
   // worker fills holds more than one render quantum (2.7 ms; a starved
   // jitter buffer keeps less) in at least half the samples over the 3 s
   // after each switch.
@@ -2563,6 +2572,193 @@ async function checkBitrateRecovery() {
 }
 
 // ---------------------------------------------------------------------------
+// Datagram + FEC (guide step 2.5). The host's "fec" config "on" sends every
+// frame as datagram shards with Reed-Solomon parity (web/static/js/fec.js
+// rebuilds them), whatever the round trip; the test hook fec-loss=0.03 keeps
+// 3 % of the shards (and repairs) from leaving the host, as a lossy network
+// would. Every frame must arrive as shards and be rebuilt (from parity on
+// arrival, or after a NACK from the host's fresh parity rows), with steady
+// playback, the stage bookkeeping and the frame barcode intact; the host
+// measures the client's shard loss (about 3 %) and logs the overhead. A
+// WebSocket session of the same host never gets shards (no datagrams).
+
+async function withHostConfig(extra, fn) {
+  const cfgPath = join(dir, 'host.json');
+  const orig = readFileSync(cfgPath, 'utf8');
+  writeFileSync(cfgPath, JSON.stringify({ ...JSON.parse(orig), ...extra }));
+  try {
+    return await fn();
+  } finally {
+    writeFileSync(cfgPath, orig);
+  }
+}
+
+// The overlay's per-session FEC counters, before -> after.
+const fecDelta = (a, b) => Object.fromEntries(Object.keys(b || {}).map((k) => [k, (b?.[k] ?? 0) - (a?.[k] ?? 0)]));
+
+// The last "stream stats" line's fields of a host log (key=value).
+function lastStreamStats(log) {
+  const line = (log.match(/msg="stream stats"[^\n]*/g) || []).pop() || '';
+  return Object.fromEntries([...line.matchAll(/ (\w+)=("[^"]*"|\S+)/g)].map((m) => [m[1], m[2].replaceAll('"', '')]));
+}
+
+async function checkFec() {
+  await withHostConfig({ fec: 'on' }, async () => {
+    const host = await restartHost({ RECON_TEST_FAULTS: 'fec-loss=0.03' }, 'host-fec');
+    await startStream({ path: 'auto', transport: 'auto' });
+    const conn = await page.evaluate(() => window.__recon.conn);
+    const calls = await watchDecoder();
+    await sleep(4000); // decoder warm-up
+    const st0 = await page.evaluate(() => window.__recon.lastStats);
+    const fps = [];
+    for (const end = Date.now() + 12000; Date.now() < end;) {
+      await sleep(500);
+      fps.push(+((await page.evaluate(() => window.__recon.lastStats))?.fps ?? 0).toFixed(1));
+    }
+    const st = await page.evaluate(() => window.__recon.lastStats);
+    const d = fecDelta(st0?.fec, st?.fec);
+    const avail = /msg="video transport: datagram \+ FEC available"/.test(host.log);
+    const on = /msg="video transport" .*?mode="datagram \+ FEC" why="on in host.json"/.test(host.log);
+    const tail = fps.slice(-6);
+    const steady = tail.reduce((a, b) => a + b, 0) / tail.length;
+    check('datagram + FEC: every frame arrives as shards and is rebuilt (3 % of the shards lost)',
+      conn.transport === 'webtransport' && conn.path === 'direct' && avail && on && d.frames >= 12 * 45 && d.rebuilt > 0 &&
+        d.lost <= 2 && d.bad === 0 && st.fps >= 45,
+      `${conn.transport}/${conn.path}; in 12 s: ${d.frames} frames from ${d.shards} shards (${d.parity} parity, ${d.repairs} repairs), ` +
+        `${d.rebuilt} rebuilt from parity, ${d.repaired} after a NACK (${d.nacks} NACKs, ${d.wholeNacks} whole), ${d.lost} given up, ` +
+        `${d.unused} unused, ${d.bad} bad; shards lost ${d.shardsLost} (${(100 * d.shardsLost / Math.max(1, d.shards + d.shardsLost)).toFixed(2)} %); ` +
+        `fps ${fps.join(' / ')}; host: available ${avail}, on ${on}`);
+    check('datagram + FEC: steady real-time playback', steady >= 50, `last 3 s: ${tail.join(' / ')} fps; stalls > 50 ms ${(st.stalls ?? 0) - (st0?.stalls ?? 0)}`);
+    await until(() => /fec_frames=[1-9]/.test(host.log), 12000, 'stream stats with fec_frames').catch(() => {});
+    const ss = lastStreamStats(host.log);
+    check('datagram + FEC: the host measures the client\'s shard loss and logs the overhead (stream stats)',
+      +ss.fec_frames > 0 && +ss.fec_loss_pct >= 1.5 && +ss.fec_loss_pct <= 6 && ss.fec_overhead_pct !== undefined,
+      `fec_frames=${ss.fec_frames} fec_parity_pct=${ss.fec_parity_pct} fec_overhead_pct=${ss.fec_overhead_pct} fec_loss_pct=${ss.fec_loss_pct} ` +
+        `fec_nacks=${ss.fec_nacks} fec_repairs=${ss.fec_repairs} kbps_target=${ss.kbps_target} mbps=${ss.mbps}`);
+    await checkStages('datagram + FEC', st);
+    await checkHygiene('datagram + FEC', calls, st);
+    await checkProbe('datagram + FEC');
+    results.push({ fec: { conn, delta: d, fps, streamStats: ss } });
+    await page.evaluate(() => { window.__recon.userClosed = true; });
+
+    // WebSocket: never shards.
+    const log0 = host.log.length;
+    await startStream({ path: 'relay', transport: 'websocket' });
+    await sleep(4000);
+    const ws = await page.evaluate(() => window.__recon.lastStats);
+    const why = (host.log.slice(log0).match(/msg="video transport: frame streams only".*? why="[^"]*"/) || [''])[0];
+    check('datagram + FEC: a WebSocket session gets frame streams only', !ws.fec && ws.fps > 30 && /does not take shards/.test(why),
+      `${ws.fps.toFixed(1)} fps, shards ${ws.fec ? ws.fec.shards : 0}; host: ${why.replace(/^msg=/, '')}`);
+    await page.evaluate(() => { window.__recon.userClosed = true; });
+  });
+  await restartHost({}, 'host');
+}
+
+// A UDP proxy in front of the host's direct port that delays each datagram
+// delayMs and loses a share `loss` of them, each direction (netem's wan
+// profile in user space: the sandbox kernel has no sch_netem). The browser
+// is sent to it by rewriting the direct URL of the connect answer; its port
+// is one of the gateway's relay ports, held, so the page's CSP allows it and
+// the gateway skips it.
+function impairProxy(sock, targetPort) {
+  const up = dgram.createSocket('udp4');
+  up.bind(0, '127.0.0.1');
+  const st = { delayMs: 0, loss: 0, c2h: 0, h2c: 0, lostC2h: 0, lostH2c: 0 };
+  let client = null;
+  sock.on('message', (m, r) => {
+    client = r;
+    st.c2h++;
+    if (Math.random() < st.loss) { st.lostC2h++; return; }
+    setTimeout(() => up.send(m, targetPort, '127.0.0.1'), st.delayMs);
+  });
+  up.on('message', (m) => {
+    st.h2c++;
+    if (!client) return;
+    if (Math.random() < st.loss) { st.lostH2c++; return; }
+    const c = client;
+    setTimeout(() => sock.send(m, c.port, c.address), st.delayMs);
+  });
+  up.unref();
+  return st;
+}
+
+// Datagram + FEC against frame streams (E2E_FEC_COMPARE=<seconds per run>):
+// through impairProxy at 40 ms RTT with 1 % and 3 % loss each way, a direct
+// session per mode (host fec "off": frame streams; "auto": datagram + FEC
+// above 15 ms RTT), measured after a warm-up: the client's stalls over 50 ms
+// (the picture standing still that much longer than the source) and freezes
+// over 100 ms, frames per second, key frame requests, the bitrate, and the
+// host's FEC stream stats (overhead: parity, headers and repairs over the
+// frames' bytes). The checked pairs stream a fixed 20 Mbit/s (adaptive
+// bitrate off: both modes carry the same frames, the rate controller's
+// reactions to the loss do not differ between runs); a pair at 3 % with the
+// rate controller on is recorded too.
+async function compareFec(seconds) {
+  const rows = [];
+  const rewrite = async (route) => {
+    const resp = await route.fetch();
+    const body = await resp.json();
+    if (body.direct?.url) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${fecProxyPort}/wt`);
+    await route.fulfill({ response: resp, json: body });
+  };
+  await ctx.route('**/api/hosts/*/connect', rewrite);
+  try {
+    for (const [loss, adaptive] of [[0.01, false], [0.03, false], [0.03, true]]) {
+      for (const mode of ['off', 'auto']) {
+        await withHostConfig({ fec: mode }, async () => {
+          const host = await restartHost({}, `host-fec-${mode}-${loss}`);
+          Object.assign(fecImpair, { delayMs: 20, loss });
+          await startStream({ path: 'direct', transport: 'auto', bitrate: 20, adaptive });
+          await sleep(8000); // warm-up, and the client's minimum RTT reaches the host
+          const st0 = await page.evaluate(() => window.__recon.lastStats);
+          const log0 = host.log.length;
+          const fps = [];
+          const mbps = [];
+          for (const end = Date.now() + seconds * 1000; Date.now() < end;) {
+            await sleep(1000);
+            const x = await page.evaluate(() => window.__recon.lastStats);
+            fps.push(x?.fps ?? 0);
+            mbps.push(x?.mbps ?? 0);
+          }
+          const st = await page.evaluate(() => window.__recon.lastStats);
+          const hl = host.log.slice(log0);
+          const ss = [...hl.matchAll(/msg="stream stats"[^\n]*/g)].map((m) => lastStreamStats(m[0]));
+          const avg = (v) => v.reduce((a, b) => a + b, 0) / Math.max(1, v.length);
+          const num = (k) => ss.map((x) => +x[k]).filter((v) => Number.isFinite(v));
+          const row = {
+            mode: mode === 'off' ? 'frame streams' : 'datagram + FEC', loss, adaptive, seconds,
+            stalls50: (st.stalls ?? 0) - (st0.stalls ?? 0), freezes100: st.freezes - st0.freezes,
+            fps: +avg(fps).toFixed(1), mbps: +avg(mbps).toFixed(1), keyRequests: st.keyRequests - st0.keyRequests,
+            fec: fecDelta(st0.fec, st.fec), overheadPct: +avg(num('fec_overhead_pct')).toFixed(1), parityPct: +avg(num('fec_parity_pct')).toFixed(1),
+            shardLossPct: +avg(num('fec_loss_pct')).toFixed(2), kbpsTarget: Math.round(avg(num('kbps_target'))), lossPct: +avg(num('loss_pct')).toFixed(2),
+            rttMs: st.minRtt, proxy: { ...fecImpair },
+          };
+          rows.push(row);
+          console.log(`  FEC compare: ${row.mode} at ${loss * 100} % loss, 40 ms RTT, ${adaptive ? 'adaptive bitrate' : 'fixed 20 Mbit/s'}, ${seconds} s: stalls > 50 ms ${row.stalls50}, freezes > 100 ms ${row.freezes100}, ` +
+            `${row.fps} fps, ${row.mbps} Mbit/s (target ${row.kbpsTarget}), key requests ${row.keyRequests}, overhead ${row.overheadPct} % ` +
+            `(parity ${row.parityPct} % of data shards, shard loss ${row.shardLossPct} %), frames rebuilt ${row.fec.rebuilt ?? 0}, repaired ${row.fec.repaired ?? 0}, lost ${row.fec.lost ?? 0}`);
+          await page.evaluate(() => { window.__recon.userClosed = true; });
+          await sleep(500);
+        });
+      }
+    }
+  } finally {
+    Object.assign(fecImpair, { delayMs: 0, loss: 0 });
+    await ctx.unroute('**/api/hosts/*/connect', rewrite);
+    await restartHost({}, 'host');
+  }
+  results.push({ fecCompare: rows });
+  for (const loss of [0.01, 0.03]) {
+    const pair = rows.filter((r) => r.loss === loss && !r.adaptive);
+    const [str, dg] = [pair.find((r) => r.mode === 'frame streams'), pair.find((r) => r.mode !== 'frame streams')];
+    check(`FEC compare at ${loss * 100} % loss, 40 ms RTT, 20 Mbit/s: fewer stalls > 50 ms with datagram + FEC, overhead <= 15 %`,
+      dg.stalls50 < str.stalls50 && dg.overheadPct <= 15 && dg.fec.frames > 0,
+      `stalls > 50 ms: streams ${str.stalls50}, FEC ${dg.stalls50}; freezes > 100 ms ${str.freezes100} / ${dg.freezes100}; fps ${str.fps} / ${dg.fps}; ` +
+        `Mbit/s ${str.mbps} / ${dg.mbps}; FEC overhead ${dg.overheadPct} % (parity ${dg.parityPct} %, shard loss ${dg.shardLossPct} %)`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 const dir = mkdtempSync(join(tmpdir(), 'recon-e2e-'));
 const port = await freePort();
@@ -2579,7 +2775,14 @@ await new Promise((res) => blackhole.bind(0, '127.0.0.1', res));
 const blockedPort = blackhole.address().port;
 blackhole.unref();
 process.on('exit', () => { try { blackhole.close(); } catch {} });
-const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(dir, 'gw'), '-relay-ports', [...relayPorts, blockedPort].join(',')], {}, 'gateway');
+// The FEC comparison's impairment proxy (impairProxy), on a held relay port.
+const fecSock = dgram.createSocket('udp4');
+await new Promise((res) => fecSock.bind(0, '127.0.0.1', res));
+const fecProxyPort = fecSock.address().port;
+fecSock.unref();
+const fecImpair = impairProxy(fecSock, directPort);
+process.on('exit', () => { try { fecSock.close(); } catch {} });
+const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(dir, 'gw'), '-relay-ports', [...relayPorts, blockedPort, fecProxyPort].join(',')], {}, 'gateway');
 await until(() => existsSync(join(dir, 'gw', 'setup-token.txt')), 10000, 'gateway setup token');
 const setupToken = readFileSync(join(dir, 'gw', 'setup-token.txt'), 'utf8').trim();
 
@@ -2890,6 +3093,11 @@ try {
   // 3b. Loss handling with the host's fault-injection hook --------------------
   await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
   await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
+  // 3b'. Datagram + FEC (step 2.5) ------------------------------------------------
+  await checkFec().catch((e) => check('datagram + FEC scenario', false, e.message));
+  if (Number(process.env.E2E_FEC_COMPARE) > 0) {
+    await compareFec(Number(process.env.E2E_FEC_COMPARE)).catch((e) => check('FEC comparison', false, e.message));
+  }
   await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
   await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
 

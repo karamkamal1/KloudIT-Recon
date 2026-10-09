@@ -11,6 +11,10 @@ type Hello struct {
 	Decoders []DecoderInfo `json:"decoders"`
 	Audio    AudioCaps     `json:"audio"`
 	Prefs    Prefs         `json:"prefs"`
+	// FEC is the video shard format the client reassembles (HelloFECVersion;
+	// GUIDE 2.5, proto/fec.go): set by clients on a transport with
+	// datagrams (WebTransport), 0 otherwise and from clients before it.
+	FEC int `json:"fec,omitempty"`
 }
 
 type ClientInfo struct {

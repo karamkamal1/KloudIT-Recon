@@ -49,6 +49,10 @@ import (
 //	                  feedback (left trigger: large motor, right: small), as
 //	                  a game's rumble comes back through ViGEmBus; works
 //	                  without ViGEmBus, so a test sees the DgRumble path
+//	fec-loss=P        in the "datagram + FEC" mode (fec.go) do not send a
+//	                  random share P (0-0.5) of the video shards and repairs,
+//	                  as if the network lost them: the client rebuilds them
+//	                  from parity or NACKs them
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -67,14 +71,15 @@ type testFaults struct {
 	// refRecovery makes the FFmpeg pipeline simulate reference recovery
 	// (NewAgent: media.Caps.UseTestRecovery).
 	refRecovery  bool
-	stillAfter   int  // frames of a generation before its source goes still
-	preStageHold bool // sendWelcome, logStages
-	rumbleEcho   bool // Session.gamepad
+	stillAfter   int     // frames of a generation before its source goes still
+	preStageHold bool    // sendWelcome, logStages
+	rumbleEcho   bool    // Session.gamepad
+	fecLoss      float64 // Session.writeShards, fecRepairs
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold || f.rumbleEcho
+		f.preStageHold || f.rumbleEcho || f.fecLoss > 0
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -151,8 +156,14 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: rumble-echo takes no value", rule)
 			}
 			f.rumbleEcho = true
+		case "fec-loss":
+			p, err := strconv.ParseFloat(val, 64)
+			if err != nil || p <= 0 || p > 0.5 {
+				return f, fmt.Errorf("%s: want fec-loss=P with 0 < P <= 0.5", rule)
+			}
+			f.fecLoss = p
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, fec-loss)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

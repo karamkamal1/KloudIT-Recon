@@ -6350,3 +6350,227 @@ host's only through the codec; each check below names its client):
 - NVIDIA: unverified (no NVIDIA host available). Test: the same click-to-photon comparison on a
   client with a GeForce GPU (labels ending in `-nvidia`), streaming from the RX 7900 XT host or
   an NVIDIA host when there is one.
+
+## 2.5 Datagram + FEC video (optional)
+
+Transport-only (vendor-neutral session and client logic): what needs real hardware is real WAN
+paths, real browsers on real client GPUs, and the encoders' frame sizes under the mode.
+
+What changed (docs/ARCHITECTURE.md "Datagram + FEC video"):
+
+- **Shards with Reed-Solomon parity.** Over a round trip above 15 ms (below 12 ms back to a stream
+  per frame, so a LAN keeps streams) a frame goes out as datagram shards (`0x12`, ≤ 1200-byte
+  payloads, the bytes a frame stream carries), blocks of ≤ 64 data shards, each a systematic
+  Reed-Solomon code over GF(2^8): `github.com/klauspost/reedsolomon` v1.14.2 on the host
+  (`internal/fec`), a compact decoder in JavaScript in the worker (`web/static/js/fec.js`: GF tables,
+  the same Vandermonde-made-systematic parity rows, only the missing shards solved: an e × e
+  system for e missing). Parity per block from the shard loss the client reports (rate report
+  flag 4): the fewest that leave ≤ 1 % of blocks short (binomial), at least 5 % of the data
+  shards, at most the guide's 5 % → 30 % ramp. NACK (`0x42`) for what a frame still lacks once
+  its shards stop coming, answered with fresh parity rows; the frame is given up (a loss, the
+  ladder's) 120 ms / 2.5 × RTT + 30 ms after the stall.
+- **When** (host config `fec`: `auto` default, `on`, `off`): WebTransport clients that offer it
+  (`hello.fec`), on the direct path and the UDP relay (the host's QUIC connection ends at the
+  browser), the client's minimum round trip decided once five of its pings carried one (about a
+  second: in one E2E run a loaded browser's first round trip, 19 ms on loopback, put a LAN session
+  on shards for 66 ms), video ≤ 150 Mbit/s (the benchmark below), datagrams that work (a peer without
+  datagrams ends the mode at the first frame; a smaller datagram limit shrinks the shards).
+  WebSocket and the QUIC splice never use it. The browser's Settings → Pipeline → *Video over
+  datagrams* Off leaves it out of the hello.
+- **Pacing and the rate controller.** The media congestion controller's target includes the
+  shards' overhead; the acknowledged bytes the rate controller reads as delivered video leave it
+  out; the pacer model and rung 1's deadline count the bytes on the wire. The shard writer stays
+  at most 3 ms of sending time ahead of the pacer: quic-go sends every datagram from one 32-deep
+  queue, ahead of stream data, so audio, cursor and pong datagrams would otherwise wait behind up
+  to 32 shards (13 ms at 20 Mbit/s).
+- **Client.** A frame rebuilt from shards is handed on exactly as a frame stream's bytes
+  (reorder buffer, decoder, stages: *network* ends at its first shard, *transfer* at the shard
+  that completed it). Once shards come the overlay's *Transport* row says "datagrams + FEC" and a
+  *FEC* row shows frames, parity, shard loss, rebuilt from parity, repaired after a NACK, given
+  up; *Freezes > 100 ms* also counts stalls over 50 ms (on frame streams the overlay keeps its
+  rows: in a 720 px window a longer one pushed *Export latency data* off the screen).
+- **Tools.** `tools/dgbench` (browser datagram benchmark: a WebTransport server that sends
+  video-like bursts, a page whose worker receives them; `node tools/dgbench/bench.mjs` runs the
+  matrix in headless Chromium); host test hook `RECON_TEST_FAULTS=fec-loss=P`; browser E2E
+  `E2E_FEC_COMPARE=<s>` (comparison through a UDP impairment proxy).
+
+Deviations from the guide's wording, and why:
+
+- *Parity is sized per block, not as one share of the stream.* The guide's 5 % → 30 % is the cap;
+  inside it each block gets the fewest parity shards that leave at most 1 % of such blocks short
+  at the measured loss (binomial tail), at least 5 %. At 3 % loss a 35-shard block (20 Mbit/s at
+  60 fps) needs 4 (11 %), not 30 %; the guide's 30 % flat would break its own "≤ 15 % overhead"
+  acceptance. Small blocks need relatively more (a one-shard frame gets a copy). The rest is
+  NACKed.
+- *A JavaScript decoder, not WASM.* Rebuilding only the missing shards (e × (k − e) × size
+  multiply-adds through a 64 KB product table) costs about 1 ms for the worst case measured (a
+  64-shard block missing 8, node 22, first call included); WASM would add a build step for no
+  measured need.
+- *The rate controller's loss rule in this mode* (a change to step 2.2's controller, only while
+  frames go as shards): it decreases for packet loss above 10 % instead of 2 %. The first
+  comparison run (below) showed why: at 3 % random loss the 2 % rule cut both modes by ×0.85
+  every ~1.15 s, from 30 to 2.7 Mbit/s in 17 s; there a frame is a handful of shards, needs
+  relatively more parity (22 % overhead at 3.6 Mbit/s), and the guide's "parity up to 30 % at
+  3-5 % loss" never applies. Random loss the parity rebuilds is not congestion (GCC's loss-based
+  controller holds between 2 % and 10 %); the delay still decreases, and above 20 % shard loss
+  the mode gives way to streams.
+- *Repaired frames give no delay sample.* A frame completed only after a NACK arrives a repair
+  round trip late; in the first run single such frames made reports with a 130 ms one-way delay
+  (no other frame in the 25 ms report), and the delay rules cut the bitrate to 0.43× and then
+  0.71× within 2 s (urgent FFmpeg restarts), where frame streams at the same loss stayed near
+  30 Mbit/s. The client leaves their delay out of its rate report (frames and bytes still
+  count); frame streams are unchanged.
+- *The comparison's pass mark is taken at a fixed bitrate.* With the rate controller on, frame
+  streams at 3 % loss run at a seventh of the bitrate the shards keep (2.6 vs 18 Mbit/s below),
+  so their stalls are those of another stream; the fixed 20 Mbit/s runs (adaptive off, both
+  modes) are the like-for-like comparison, the adaptive run is recorded beside them.
+- *A fix to step 4.6's audio restart* (web/static/js/stream-worker.js `AUDIO_MAX_LATE`): the 4.6
+  check "a restart with the same codec" failed in three of this step's four full E2E runs. A
+  harness that restarts audio 20 times per build (the check's own steps, alternating codec
+  setting "" and "opus", 3 s each) starved 2 of 20 restarts on the base commit and 3 of 20 with
+  this step: the packets came (about 700 per restart) and were all dropped as late. The cause is
+  4.6's: the worker reads datagrams and the control stream apart, so the old stream's last
+  packets can be handled after the new stream's config (which restarted the sequence from 0),
+  and the newest sequence is then the old stream's: the new stream is "late" until it passes it,
+  as long as the old stream had run (minutes, for a real session). A packet more than 64 behind
+  the last one is now taken as another stream's and the sequence goes on from it (at worst one
+  old 5 ms packet plays). With the fix: 0 of 20 starved, and the check passed in the final full run.
+- *Netem in user space.* The sandbox kernel has no `sch_netem` (docs/VENDOR_NOTES.md 0.4), so the
+  comparison runs through a Node UDP proxy in the browser E2E (20 ms each way, random loss each
+  way), not in a network namespace.
+
+Verified in the sandbox (Linux, 4 CPUs shared with other jobs, no GPU):
+
+- **Benchmark: Chromium's WebTransport datagram receive** (`tools/dgbench`, headless Chromium
+  141.0.7390.37, loopback, 1218-byte datagrams (the shard size: 18-byte header + 1200), one
+  burst per 1/60 s paced by the media congestion controller at 1.2 × the rate, 5 s per run,
+  the receiving worker idle or busy 8 ms of every 16.7 ms, `incomingHighWaterMark` Chromium's
+  default (1) or 1024; load average 5-7 from other jobs):
+
+  | Rate | worker | default (1) | 1024 |
+  |---|---|---|---|
+  | 50 Mbit/s | idle | 0 % lost, one-way p50/p99 5.2/7.0 ms | 0 %, 5.3/8.4 ms |
+  | 50 Mbit/s | busy 8 ms per frame | 0 %, 6.1/18.6 ms | 0 %, 6.0/18.1 ms |
+  | 100 Mbit/s | idle | 0 %, 2.8/5.3 ms | 0 %, 2.9/8.7 ms |
+  | 100 Mbit/s | busy 8 ms | 0 %, 4.1/17.4 ms | 0 %, 4.3/32.2 ms |
+  | 150 Mbit/s | idle | 0 %, 2.2/7.6 ms | 0 %, 2.3/8.8 ms; 2.2/5.4 ms |
+  | 150 Mbit/s | busy 8 ms | 0 %, 3.8/15.4 ms | 0 %, 4.3/44.0 ms |
+  | 150 Mbit/s | busy 14 ms | 0 %, 24.9/37.0 ms | 0 %, 23.2/36.8 ms |
+  | 150 Mbit/s | a 100 ms stall every second | 0 %, p95 51.7 ms | 0 %, p95 52.1 ms |
+  | 150 Mbit/s | a 300 ms stall every second | 0 %, p95 252.6 ms | 0 %, p95 251.8 ms |
+  | 150 Mbit/s | busy 14 ms + 300 ms stall | 0 % (rx 141.2 Mbit/s) | 0 % (rx 141.1 Mbit/s) |
+  | 200 Mbit/s | idle / busy 8 ms | 0 % / 0 % | 0 % / 0 % |
+  | 300 Mbit/s | idle | 0 %, 1.6/9.7 ms; 1.6/8.6 ms | 0 %, 2.0/18.8 ms; 1.5/8.6 ms |
+  | 300 Mbit/s | busy 8 ms | **4.2 %**, 18.2/65.4 ms, 84 % of bursts complete | 0 %, 6.2/28.9 ms |
+  | 300 Mbit/s | busy 14 ms | **1.3 %** | **1.7 %** |
+  | 300 Mbit/s | 100 ms stall every second | **1.6 %** | 0 % |
+  | 300 Mbit/s | 300 ms stall every second | **1.1 %** | 0 % |
+
+  (Three runs of the matrix; two values where a setting ran twice. The receiving worker's one-way
+  delay includes the sender's pacing queue.)
+
+  Chromium takes 50-150 Mbit/s of datagrams with nothing lost in every condition, even with the
+  worker busy 14 of every 16.7 ms or stalled 300 ms every second (it queued ~5.6 MB meanwhile):
+  it reports `incomingHighWaterMark` 1 but does not drop at it. 200 Mbit/s also passed. At 300
+  Mbit/s it lost 1-4 % in about half of the runs with a busy or stalled worker, with either
+  high-water mark (the CPU is shared with other jobs: the loss follows the load, not the
+  setting). Hence the mode's limit of 150 Mbit/s of video (the guide's range; the shards' parity
+  and headers add 5-15 %). The client leaves `incomingHighWaterMark` at the browser's default:
+  the benchmark does not call for raising it in Chromium (a first version set 1024, for no
+  measured gain). `maxDatagramSize` reads 1024 in Chromium 141: that is the browser's own sending
+  limit (NACKs are 8-264 bytes); it receives the host's 1218-byte shards.
+- **Reed-Solomon round trips, Go and JS on the same vectors** (`internal/fec`): `TestRoundTrip`
+  (frames of 1 byte to 200 KB, 1-8 parity shards per block, 20 random erasure patterns of up to M
+  shards per block each, plus M + 2 lost and two repairs, plus a whole frame from resent data
+  shards), `TestParityRowsStable` (parity row r is the same with 2 or 5 rows: repairs send rows
+  the frame did not), `TestJSDecoder` (21 vectors made by klauspost: fec.js computes the same
+  parity bytes, including a repair row, and FecReceiver rebuilds every frame from the datagrams
+  with the same erasures the Go assembler gets), `TestJSReceiver` (fec.js on a simulated clock:
+  the NACK after a newer frame's shard + 3 ms asks for exactly what a block lacks, a retry one
+  more, repairs complete the frame, a frame not repaired is given up once, a frame none of whose
+  shards came is NACKed whole and never reported lost, the shards never received are counted),
+  `TestLayout`/`TestLayoutLarge` (every data shard of any frame up to 32 MiB holds at least a
+  byte; blocks cover ceil(len / size) shards, what the client derives), `TestParity`. Wire
+  formats: `internal/proto` `TestVideoShard` (malformed shards rejected; a zero shard size made the
+  first parser divide by zero), `TestFECNack`, `TestRateReportShards` (protocol.js and fec.js
+  build the same bytes).
+- **Host session over real QUIC** (`internal/host`): `TestSessionFEC` (40 frames up to a 150 KB
+  key frame of three blocks as datagrams through quic-go with 8 % of the shards dropped by the
+  test hook; a Go client rebuilding with `fec.Assembler` and NACKing what is missing gets every
+  frame bit-exact, the bytes a frame stream carries, with repairs; no frame stream),
+  `TestSessionFECNoDatagrams` (a peer without datagrams: the first frame and all after it on
+  streams, the mode ended once), `TestUseFEC` (auto above 15 ms, hysteresis to 12 ms, the 150
+  Mbit/s limit, `on`, `off`, WebSocket clients, the splice), `TestFECLossEstimate` (parity from
+  the reported shard loss across counter wraps; > 20 % loss: streams).
+
+- **Browser E2E, scenario "datagram + FEC"** (`test/e2e/browser.mjs` checkFec; host.json
+  `"fec": "on"` on the loopback direct path, `RECON_TEST_FAULTS=fec-loss=0.03` dropping 3 % of
+  the shards at the host): in 12 s 750 frames from 29577 shards (2892 parity, 5 repair shards),
+  503 rebuilt from parity, 4 completed after a NACK, 0 given up, 0 malformed; client shard loss
+  2.91 %; steady 58-62 fps with 0 stalls > 50 ms; host `stream stats` `fec_parity_pct=8.8
+  fec_overhead_pct=10.6 fec_loss_pct=3.03`; stage sums, decoder hygiene, frame barcode 32/32 =
+  seq; a WebSocket session in the same host keeps frame streams (host.log `video transport: frame
+  streams only ... why="the client does not take shards"`). Every other scenario (loopback, RTT
+  below 15 ms) keeps frame streams under the default `auto`.
+- **Comparison, GUIDE 2.5's acceptance** (`E2E_FEC_COMPARE=30`): the browser reaches the host's
+  direct port through a UDP proxy adding 20 ms each way (40 ms RTT) and random loss each way;
+  AV1 960×540 60 fps (libsvtav1, test source), each run 30 s after a warm-up, Settings → *Video
+  over datagrams* Off (frame streams) against the default Auto (datagram + FEC). Stalls: the
+  picture stood still more than 50 ms longer than the source (the client's freeze measure).
+
+  | Loss, bitrate | stalls > 50 ms: streams / FEC | freezes > 100 ms | fps | FEC overhead (parity, shard loss) | rebuilt / repaired / lost |
+  |---|---|---|---|---|---|
+  | 1 %, fixed 20 Mbit/s | 7 / **4** | 0 / 0 | 54.8 / 58.6 | **7.7 %** (6.0 %, 0.94 %) | 528 / 13 / 0 |
+  | 3 %, fixed 20 Mbit/s | 18 / **7** | 0 / 1 | 55.2 / 59.2 | **12.6 %** (10.8 %, 3.11 %) | 1219 / 8 / 0 |
+  | 3 %, adaptive | 25 / 11 | 1 / 0 | 52.2 / 56.8 | 13.6 % (11.8 %, 2.91 %) | 1105 / 10 / 0 |
+
+  Pass (fewer stalls with FEC at 1 % and 3 %, overhead ≤ 15 %). In the adaptive run frame
+  streams settled at 2.6 Mbit/s, the shards at 18 Mbit/s (rate controller loss rule above). The
+  first version (a frame's NACK only once a newer frame's shard came) lost at 3 %: 12 streams
+  vs 13 FEC stalls, overhead 12.3 %; the client now NACKs 3 ms after a frame's last parity shard,
+  as the code and the table above do. Software encode and decode share 4 CPUs with other jobs
+  here: some stalls in both modes are the machine's, not the network's.
+- **Full browser E2E** (`node test/e2e/browser.mjs`, headless Chromium 141, 4 CPUs shared with
+  other jobs, five full runs of this step): every check of this step passed in every run. The
+  final run (final code): 231 of 234; the three failures were load-bound and pass in other runs
+  of the same code: *WebTransport direct: video decoding* (44.9 of 60 fps), the 3.5 *drop test*
+  (the software AV1 decoder rejected the frames after one skipped frame once of three) and
+  *reference recovery: a loss only the client saw* (0 frames decoded after a recovery frame;
+  the same check fails the same way in the 2.4 branch's runs). The run before it (the same code
+  but the audio fix and the round-trip sample count): 233 of 234, only the 4.6 audio restart
+  (above); the one before: 233 of 234, only the live settings change's single fps sample 1.5 s
+  after a bitrate switch (25.8 fps). The first two runs also failed *Export latency data*: the
+  overlay's two new rows pushed the button below a 720 px window. Fixed (the FEC row only once
+  shards come, stalls inside the *Freezes* row); it passed in every run since.
+- **Go integration test** (`internal/e2e`, under the E2E lock): passes (the Go client sends no
+  `hello.fec`: frame streams).
+
+Hardware and real-network checks:
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (datagram + FEC over a real WAN): stream from the AMD
+  host with the client behind 40 ms of RTT (a remote client, or netem on a Linux router:
+  `./netem.sh apply wan --iface <nic> --port 47998` raised to 1 % and then 3 % loss with
+  `tc qdisc change dev <nic> root netem delay 20ms loss 1%`), HEVC 1920×1080 60 fps at 20 and
+  50 Mbit/s, 10 minutes per setting, once with host.json `"fec": "off"` and once with the
+  default. host.log: `video transport mode="datagram + FEC" why="round trip" rtt_ms=…` and the
+  `stream stats` `fec_*` fields. Record per run the overlay's *Freezes > 100 ms* row (freezes and
+  stalls > 50 ms), capture→drawn p50/p95 and the *FEC* row (rebuilt / repaired / lost), and
+  `fec_overhead_pct`. Pass: fewer stalls > 50 ms with FEC at 1 % and 3 %, `fec_overhead_pct` ≤ 15
+  at 20 Mbit/s and above, no capture→drawn p50 regression on the clean path (with
+  `"fec": "on"`, which also forces shards on a LAN: compare with `off`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (the native helper's frames as shards): the same with
+  `pipeline` `helper` (reference recovery: a frame given up by the client is a `lost` the helper
+  answers with a recovery frame; host.log `recovering from a loss ... why=client`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the two AMD tests with hevc_nvenc (and the
+  helper's NVENC backend).
+- Browsers: unverified. Test: `node tools/dgbench/bench.mjs` measures headless Chromium here;
+  on each client run `go run ./tools/dgbench -listen 0.0.0.0:4433 -name <host IP>` on the host and
+  open `https://<host IP>:4433/` in Chrome, Edge (Windows, AMD and NVIDIA client GPUs), Firefox
+  and Safari 26.4, accept the certificate warning, run 50, 100, 150 Mbit/s with busy 0 and 8:
+  loss 0 % and frames complete 100 % at 150 Mbit/s is what the mode's limit assumes. Firefox
+  and Safari: whether `serverCertificateHashes` and datagrams work at all; a browser that sends
+  no `hello.fec`, or whose datagrams fail, keeps frame streams.
+- PMTU: unverified on real paths. The shards fit quic-go's 1280-byte packets; a VPN or PPPoE path
+  that cannot carry them makes quic-go report a smaller datagram limit (host.log `video
+  transport: smaller shards`) or, at 282 bytes or less, end the mode. Test: stream through a
+  WireGuard tunnel (MTU 1420) and a PPPoE line with FEC on; no stalls after the first seconds.
