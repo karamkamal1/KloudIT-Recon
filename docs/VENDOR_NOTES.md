@@ -8873,13 +8873,15 @@ datagrams, FEC, media congestion controller or RESET_STREAM_AT.
   `QUICConfig` and a client sending 1250-byte packets: `InitialPacketSize` 1280 → "dial failed
   after 8 s", 1232 → handshake in 3 ms and 200 kB in 1.4 ms. `TestSessionFEC` now also checks
   that no session shrinks its shards.
-- Docs: INSTALL.md section 9 (the hotspot test reads the overlay's **Transport**:
+- Docs: INSTALL.md section 9 (the hotspot test reads the overlay's **Transport**: it starts with
   `webtransport · direct`, `websocket` means UDP does not get through), ARCHITECTURE.md (shard
   size; "Packet size" under the direct path).
 - AMD RDNA3 (RX 7900 XT): unverified. Test: the INSTALL.md section 9 setup (Tailscale on the
   Proxmox node as subnet router), the laptop on a phone hotspot with Tailscale on; open
-  `https://192.168.1.50:8443`, stream: the overlay's **Transport** reads `webtransport · direct`
-  within about a second (before the fix: `websocket · relay`, after several seconds); with `"fec": "on"` in host.json
+  `https://192.168.1.50:8443`, stream: the overlay's **Transport** starts with `webtransport ·
+  direct` within about a second (before the fix: `websocket · relay`, after several seconds), and
+  above 15 ms of minimum round trip (a hotspot usually is) reads `webtransport · direct ·
+  datagrams + FEC` after a few seconds (the default `"fec": "auto"`); with `"fec": "on"` in host.json
   host.log shows `video transport mode="datagram + FEC"` and no `smaller shards`. Repeat with
   Tailscale on the PC itself and `directAddr` set to its tailnet (100.x) address.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same as AMD; nothing here depends on
@@ -9081,7 +9083,9 @@ frame streams instead (`"fec": "off"`, or the browser's Video over datagrams set
 
 - Verified here: the browser E2E's datagram + FEC check now requires `fecNow` (the overlay's
   suffix) while every frame comes as shards and its WebSocket check requires it off; `node
-  --check`.
+  --check`. Later in the final review, INSTALL.md section 9's hotspot test (over Tailscale) got
+  the same note: above 15 ms the row reads `webtransport · direct · datagrams + FEC`, which is
+  expected (`fecRTTOn` in `internal/host/fec.go`; `fecInit` allows shards on the direct path).
 - AMD RDNA3 (RX 7900 XT): unverified. Test: 0.4's relay setup, `./netem.sh apply wan --ct 210
   --host CLIENT_IP`: within a few seconds the Transport row reads `webtransport · relay ·
   datagrams + FEC` and host.log `video transport mode="datagram + FEC"`; `./netem.sh clear --ct

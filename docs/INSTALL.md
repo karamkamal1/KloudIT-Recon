@@ -353,8 +353,11 @@ anywhere.
 
 Test it before you leave: disconnect the laptop from your home Wi-Fi, connect it to your phone's
 hotspot instead, and start a stream. In the performance overlay (**Ctrl+Alt+Shift+S**),
-**Transport** should read `webtransport · direct` here too. `websocket` means UDP does not get
-through: the stream works, but with more latency and stalls.
+**Transport** should start with `webtransport · direct` here too. A hotspot's round trip is
+usually above 15 ms, and then the row reads `webtransport · direct · datagrams + FEC`: the video
+travels as datagrams with forward error correction (the default `"fec": "auto"`), which is
+expected. `websocket` means UDP does not get through: the stream works, but with more latency
+and stalls.
 
 **Alternative: port forwarding.** Forward **TCP and UDP 8443** and **UDP 8444–8459** (the relay
 ports, one per relayed session) on your router to `192.168.1.50`, keeping the port numbers.
