@@ -609,7 +609,10 @@ async function connect(ep) {
 // A path Auto picked that then fails FAIL_STREAK draws in a row (a lost
 // context, frames that do not upload) is given up: the main thread forgets
 // it and reconnects with the 2D canvas ('presentFailed'; a canvas keeps its
-// context type). A path picked in the settings stays (errors in the overlay).
+// context type). A path picked in the settings stays (errors in the overlay),
+// except that a lost WebGPU device never comes back (WebGL2 restores its
+// context itself): the main thread reconnects with the same path, which gets
+// a new device, or the 2D canvas when WebGPU no longer works ('presentLost').
 //
 // The main thread shows the active renderer's canvas ('renderer', posted
 // after the renderer's first frame), removes the canvases of paths that are
@@ -629,6 +632,7 @@ const pres = {
   drawErrors: 0,
   lastError: '',
   failStreak: 0, // draws in a row that failed
+  lostSent: false, // 'presentLost' posted (a path picked in the settings lost its WebGPU device)
   refreshMs: 1000 / 60, // the display's refresh interval (main thread's measurement at page load)
 };
 
@@ -891,6 +895,12 @@ function renderError(e) {
 // in a row failed (see Presentation above).
 function drawResult(ok) {
   pres.failStreak = ok ? 0 : pres.failStreak + 1;
+  if (!ok && pres.mode === 'setting' && renderer.name === 'webgpu' && renderer.lost && !renderer.destroyed && !pres.lostSent) {
+    pres.lostSent = true;
+    post('log', { text: `presentation: ${renderer.name} lost its device (${pres.lastError}); reconnecting with it` });
+    post('presentLost', { path: renderer.name, reason: pres.lastError });
+    return;
+  }
   if (pres.failStreak !== FAIL_STREAK || renderer.name === 'canvas2d') return;
   if (pres.mode !== 'auto' && !(pres.mode === 'bakeoff' && pres.bake?.done)) return;
   post('log', { text: `presentation: ${renderer.name} failed ${FAIL_STREAK} draws in a row (${pres.lastError}); reconnecting with the 2D canvas` });

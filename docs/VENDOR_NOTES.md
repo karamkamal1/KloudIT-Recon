@@ -6281,7 +6281,7 @@ What changed (browser client; the host only logs one more field):
   streaming (a lost context, decoder frames that do not upload; WebGL2 now fails every draw
   after its first-frame upload check fails, WebGPU after `device.lost`) is forgotten and the
   client reconnects with the 2D canvas. A path picked in the settings stays (its errors show in
-  the overlay). The overlay lists the per-path rows (★ the pick, why a path is out) and the
+  the overlay; a lost WebGPU device reconnects with it, see Final review: browser client). The overlay lists the per-path rows (★ the pick, why a path is out) and the
   reason for the pick; *Measure renderers again* (settings) clears it. An inconclusive bake-off
   (a still picture: too few frames) stores nothing and runs again next time. The host log
   labels a stage window that mixes paths (the bake-off) `renderer=bakeoff`.
@@ -9664,4 +9664,34 @@ most) before the decoder is configured again.
   back, the overlay's Codec row says `(SW)` and a notice says so; Reconnect goes back to
   hardware `(HW)`. Record the decoder error messages. With Codec HEVC the notice says to pick
   another codec instead.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.
+
+### Renderer WebGPU from the settings after a lost device
+
+Problem: with Settings → Renderer *WebGPU* (needed for HDR10 and FSR 1), a lost WebGPU device
+(a driver reset or TDR, Chrome's GPU process restarting) froze the picture until a manual
+Reconnect: every draw threw "WebGPU device lost", only Auto gave a failing path up, nothing
+created a new device, and the user saw no message (audio and input kept running). WebGL2
+recovers by itself through `webglcontextrestored`; WebGPU has no such event.
+
+Fix: when the active renderer of a path picked in the settings is WebGPU and its device is lost
+(not destroyed by the client itself), the worker posts `presentLost` at the first failed draw
+and the page reconnects with the same setting, with the notice "Renderer: WebGPU lost its GPU
+device (driver reset or GPU process restart); reconnecting.". The new connection creates a new
+adapter and device on a new canvas; if WebGPU no longer starts there (a GPU blocklisted after
+crashes) the worker draws with the 2D canvas as before. After more than 3 such reconnects
+within 60 s the page draws with the 2D canvas (error notice) until it is reloaded or the
+setting changes; the setting itself stays.
+
+- Verified here: browser E2E check "renderer WebGPU from the settings: a lost device reconnects"
+  (headed Chromium on Xvfb, SwiftShader WebGPU; the worker's `loseContext` test hook destroys
+  the device): WebGPU draws again 1.3 s later on a new device in mode `setting`, with the
+  notice. Against the old client: no picture with WebGPU again within 25 s, no notice.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: Chrome on a Windows client with an AMD GPU,
+  Settings → Renderer *WebGPU*, stream, then restart the graphics driver (Win+Ctrl+Shift+B) or
+  open `chrome://gpucrash` in another tab. Within about 2 s the notice appears and the stream
+  draws again, the overlay's Renderer row says WebGPU (setting) with 0 errors; the client log
+  has `WebGPU device lost (…)` and `presentation: webgpu lost its device (…); reconnecting with
+  it`. With HDR10 or FSR on, both come back after the reconnect. Do it four times within a
+  minute: the fourth time the page switches to the 2D canvas with the error notice.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.

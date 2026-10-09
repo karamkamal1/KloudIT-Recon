@@ -86,6 +86,8 @@ const S = {
   renderer: null, // the worker's active renderer (info)
   bakeoff: null, // this session's presentation bake-off result
   present2D: false, // Auto's path failed while drawing: the 2D canvas for this page
+  lost2D: null, // the path picked in the settings that kept losing its GPU device: the 2D canvas for this page
+  presentLost: [], // when that path lost its device (onPresentLost)
   connected: false,
   streaming: false,
   userClosed: false,
@@ -230,7 +232,7 @@ function storePresent(rec) {
 }
 
 function presentPlan() {
-  if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [prefs.renderer] };
+  if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [S.lost2D === prefs.renderer ? 'canvas2d' : prefs.renderer] };
   if (S.present2D) return { mode: 'auto', paths: ['canvas2d'] };
   const s = storedPresent();
   if (s) return { mode: 'auto', paths: [s.winner] };
@@ -286,6 +288,29 @@ function onBakeoff(result) {
     video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
   });
   toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
+}
+
+// A path picked in the settings lost its WebGPU device (a driver reset, the
+// GPU process restarting): reconnect with the same setting, which creates a
+// new device (the worker falls back to the 2D canvas if WebGPU no longer
+// works). More than LOST_RECONNECTS in LOST_WINDOW_MS: the 2D canvas for the
+// rest of this page while that path is the setting (lost2D); the setting
+// stays for the next page.
+const LOST_RECONNECTS = 3;
+const LOST_WINDOW_MS = 60000;
+function onPresentLost(m) {
+  const t = performance.now();
+  S.presentLost = S.presentLost.filter((x) => t - x < LOST_WINDOW_MS).concat(t);
+  const name = LABELS[m.path] || m.path;
+  if (S.presentLost.length > LOST_RECONNECTS) {
+    S.lost2D = m.path;
+    toast(`Renderer: ${name} keeps losing its GPU device; reconnecting with the 2D canvas for now.`, 'error', 8000);
+  } else {
+    toast(`Renderer: ${name} lost its GPU device (driver reset or GPU process restart); reconnecting.`, 'warn', 5000);
+  }
+  teardown();
+  S.attempts = 0;
+  connect();
 }
 
 // Auto's path failed draw after draw (the worker gave up on it): forget it
@@ -438,6 +463,7 @@ function onWorker(m) {
     case 'gone': onCanvasGone(m.slot); break;
     case 'bakeoff': onBakeoff(m.result); break;
     case 'presentFailed': onPresentFailed(m); break;
+    case 'presentLost': onPresentLost(m); break;
     case 'drawn': onDrawnMark(m); break;
     case 'ticks': onTicks(m.on); break;
     case 'stageDump': S.stageDump = m.recs; break;

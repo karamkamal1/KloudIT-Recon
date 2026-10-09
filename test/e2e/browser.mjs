@@ -598,6 +598,54 @@ async function checkBakeoff() {
   }
 }
 
+// Renderer WebGPU picked in the settings, its device lost (final review):
+// the worker's loseContext test hook destroys the device as a driver reset or
+// a GPU process restart would lose it. A lost WebGPU device never comes back,
+// so the client reconnects with the same setting (a new device) and the
+// stream draws with WebGPU again, with a notice; before, every draw failed
+// until a manual reconnect.
+async function checkWebGPULost() {
+  const mainPage = page;
+  const hp = await headedPage().catch(() => null);
+  if (!hp) { console.log('- WebGPU device lost: skipped (needs a headed browser on Xvfb)'); return; }
+  page = hp;
+  try {
+    await page.goto(`${base}/`);
+    await page.evaluate(() => localStorage.removeItem('e2e.hdrDisplay'));
+    await startStream({ path: 'auto', transport: 'auto', renderer: 'webgpu', fps: 30 });
+    const before = await until(() => page.evaluate(() => {
+      const st = window.__recon.lastStats;
+      return st?.renderer?.name === 'webgpu' && st.fps > 5 ? { fps: st.fps, mode: st.renderer.mode } : null;
+    }), 15000, 'WebGPU drawing').catch(() => null);
+    if (!before) { check('WebGPU device lost: the setting\'s WebGPU path draws first', false, 'WebGPU does not draw here'); return; }
+    await page.evaluate(() => {
+      window.__toastLog = [];
+      new MutationObserver(() => {
+        for (const t of document.querySelectorAll('.toast')) if (!window.__toastLog.includes(t.textContent)) window.__toastLog.push(t.textContent);
+      }).observe(document.body, { childList: true, subtree: true });
+      window.__lostWorker = window.__recon.worker;
+      window.__recon.worker.postMessage({ type: 'loseContext' });
+    });
+    const t1 = Date.now();
+    const back = await until(() => page.evaluate(() => {
+      const r = window.__recon;
+      const st = r.lastStats;
+      return r.worker && r.worker !== window.__lostWorker && r.streaming && st?.renderer?.name === 'webgpu' && st.renderer.drawErrors === 0 && st.fps > 5
+        ? { fps: st.fps, mode: st.renderer.mode } : null;
+    }), 25000, 'WebGPU drawing again').catch(() => null);
+    const took = ((Date.now() - t1) / 1000).toFixed(1);
+    const toasts = await page.evaluate(() => window.__toastLog);
+    const notice = toasts.find((t) => /WebGPU lost its GPU device .*reconnecting/.test(t));
+    check('renderer WebGPU from the settings: a lost device reconnects with WebGPU (a new device), with a notice',
+      !!back && back.mode === 'setting' && !!notice,
+      `before: webgpu at ${before.fps.toFixed(1)} fps (mode ${before.mode}); ${back ? `webgpu again after ${took} s at ${back.fps.toFixed(1)} fps (mode ${back.mode})` : 'no picture with WebGPU again'}; ` +
+        `notice: ${notice || toasts.join(' | ') || 'none'}`);
+  } finally {
+    await endStream();
+    page = mainPage;
+  }
+}
+
 // Client-side upscaling in the stream (Phase 5): the WebGPU renderer shows the
 // test stream at half the canvas size each way (FSR_STREAM: 480x270 on the
 // headed page's 960x540 canvas) with upscaling Auto (2x, above 1.05x): FSR 1
@@ -4400,6 +4448,7 @@ try {
 
   // 3a. Renderer "auto": the presentation bake-off -----------------------------
   if (want('bake-off')) await checkBakeoff().catch((e) => check('renderer auto (bake-off) scenario', false, e.message));
+  if (want('webgpu device lost')) await checkWebGPULost().catch((e) => check('WebGPU device lost scenario', false, e.message));
   await closeHeaded();
 
   if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));

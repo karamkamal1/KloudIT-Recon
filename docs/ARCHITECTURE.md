@@ -1014,7 +1014,12 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   `visibility: hidden` otherwise, like the closed settings drawer; no transform, filter or
   opacity on the canvas or its ancestors. Fullscreen is element fullscreen of the player (canvas
   stage and stream UI) with `navigationUI: "hide"`. Input (pointer lock, focus, events) goes to
-  the stage that holds the canvas.
+  the stage that holds the canvas. A path picked in the settings keeps drawing through errors,
+  except that a lost WebGPU device never comes back (WebGL2 restores its context itself): the
+  client then reconnects with the same setting, which creates a new device (the worker falls
+  back to the 2D canvas if WebGPU no longer starts), with a notice; after more than 3 such
+  reconnects within 60 s the page draws with the 2D canvas until it is reloaded or the setting
+  changes.
 - **Auto** tries the paths instead of assuming one: the first connection in a browser without a
   stored result gets a canvas per path (a canvas keeps its context type) and the worker runs a
   bake-off on the live stream after 2 s of warm-up: the paths that work take turns, A B C C B A
