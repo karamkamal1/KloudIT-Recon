@@ -32,8 +32,9 @@ args`, `rate report decision`, `congestion: bitrate kept`), and every change of 
 controller: at the default level `congestion: lowering bitrate` and `bitrate recovery: raising
 bitrate` come at most once per 10 s per direction (a frame-rate step always), with `suppressed=N`
 counting the changes in between, and `changing the bitrate in the encoder` only at debug level
-(final review, "Final review: host agent"). Run every check that counts or times rate changes
-with `"logLevel": "debug"`. Record each result in its check's
+(final review, "Final review: host agent"); on FFmpeg, a rate change's `restarting video`,
+`starting encoder` and `encoder ready` are debug lines too. Run every check that counts or
+times rate changes with `"logLevel": "debug"`. Record each result in its check's
 line (status legend above), with the driver and Chrome versions. NVIDIA runs the same stages
 with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
 
@@ -83,14 +84,16 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
    agent": the direct path's port next to Sunshine or Apollo (Moonlight streams while the agent
-   runs) and a takeover between two clients on Wi-Fi. 3.8 wiring's AMD lines (no regression
+   runs), a takeover between two clients on Wi-Fi, tickets with the PC's clock 5 minutes ahead
+   of the gateway's, and nothing encoding while the tab is hidden. 3.8 wiring's AMD lines (no regression
    with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
    iGPU). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
    Sunshine for the comparison), T2 with the 0.3 rig.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
    `· datagrams + FEC`). From the final review: "Final review: host agent", datagram + FEC with
-   reference recovery (a held shard frame released after a loss); "Final review: deploy and
+   reference recovery (a held shard frame released after a loss) and a failed control write
+   ending the session (the client reconnects); "Final review: deploy and
    install", the Transport row and FEC under `wan`; "Final review: RESET_STREAM_AT boundary
    after the peer's STOP_SENDING" (its `go test` on the PC, where Go is installed).
 6. **Rate control**: 2.1 (media against reno under the four 0.4 profiles, relay and direct; its
@@ -119,6 +122,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
      hardware-accelerated GPU scheduling on and once off (1.3).
 10. **The FFmpeg fallback** (`"pipeline": "ffmpeg"`): the checks marked FFmpeg path only (1.2,
    1.4, the 1.3 soak), 1.6 (AMD Direct Capture through FFmpeg), and one stream per codec.
+   "Final review: host agent": FFmpeg's rate restarts no longer filling host.log (at the
+   default `logLevel`), and its FFmpeg line of nothing encoding while the tab is hidden.
 11. **Remote access** (INSTALL.md section 9): "Final review: QUIC packets on a 1280-MTU path
    (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
    itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
