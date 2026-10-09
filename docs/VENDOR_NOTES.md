@@ -21,11 +21,11 @@ The sections after this one follow the order in which the steps were built, and 
 own checks. Some early checks describe behaviour that later steps replaced: they are marked
 **Superseded** (run the newer check named there) or **FFmpeg path only** (run them with
 `"pipeline": "ffmpeg"`). This plan is the order to run everything on the RX 7900 XT, and on an
-NVIDIA host when there is one: each stage needs the ones before it. The "Final review: ..."
-sections at the end are listed in the stages too. Out of scope on the RX 7900 XT: the
-`Intel (...)` lines of 3.8 and 3.8 wiring, which need an Intel host (their AMD lines are in
-stages 1 and 4). Use the default `host.json`
-unless a stage says otherwise, edit it with the agent stopped or restart the agent afterwards
+NVIDIA host when there is one: each stage needs the ones before it. Every item of the "Final
+review: ..." sections at the end with a check on hardware or a real client is in a stage too.
+Out of scope on the RX 7900 XT: the `Intel (...)` lines of 3.8 and 3.8 wiring, which need an
+Intel host (their AMD lines are in stages 1 and 4). Use the default `host.json` unless a stage
+says otherwise, edit it with the agent stopped or restart the agent afterwards
 (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`), and put
 it back after the stage. `"logLevel": "debug"` adds the debug lines some checks read (`ffmpeg
 args`, `rate report decision`, `congestion: bitrate kept`), and every change of the rate
@@ -67,7 +67,10 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    "Final review: deploy and install" also: the FFmpeg checksum line, a custom
    install folder (`-InstallDir C:\Recon`, then reinstall to Program Files), the logon task's
    agent started again after a crash (`-restart`), and upgrades keeping the direct path's port;
-   3.8's AMD line (with `-InstallLibavcodec`, `--print-caps` still picks `amf`).
+   3.8's AMD line (with `-InstallLibavcodec`, `--print-caps` still picks `amf`). "Final review:
+   host agent, second round": the elevated agent writes nothing in folders the user owns, its
+   steps 1-3 (the ProgramData folder's ACL, the logon task's `-log`, no write from a PowerShell
+   that is not elevated; steps 4 and 5 in stage 8).
 2. **The helper by itself**: `recon-encoder.exe --print-caps --backend=amf` and the self-tests
    (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
    3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
@@ -84,7 +87,13 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
-   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard). With
+   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard, long text
+   through "Type text on the host" (100 KB into Notepad on the PC), the paste dialog by keyboard
+   and with Narrator, a WebGL2 context that does not come back (Renderer WebGL2, then
+   `chrome://gpucrash`), the dashboard with Narrator and the keyboard). "Final review: host
+   agent, second round": the local cursor after starting with the cursor in the video,
+   controller input only from the active session (ViGEmBus, two browsers signed in as two
+   users), captureTimestamps "off" on the helper. With
    `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
@@ -109,12 +118,15 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
 7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
    before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
    re-encode, slice output). "Final review: host agent, third round": a late discardable frame
-   is no loss (under `capdrop`).
+   is no loss (under `capdrop`). "Final review: host agent, second round": thinning after the
+   switch to datagram + FEC (under `wan`).
 8. **Virtual display and HDR**: 3.7 and 3.7 wiring (with the Virtual Display Driver, then
    SudoVDA), and "Final review: deploy and install", what the virtual display does after
    `-InstallVirtualDisplay`; 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode), and
    "Final review: AMD Direct Capture sRGB and 10-bit surfaces", its 10-bit HDR check (the PQ
-   assumption), and "Final review: AMD Direct Capture follows Windows HDR".
+   assumption), and "Final review: AMD Direct Capture follows Windows HDR". "Final review: host
+   agent, second round": the elevated agent writes nothing in folders the user owns, its steps 4
+   and 5 (the restore journal in the ProgramData folder, none read next to host.json).
 9. **Soak (T8) on the default pipeline**:
    - AMD RDNA3 (RX 7900 XT): unverified. Test: default host.json (after stage 3), a GPU-bound
      game at 2560x1440 120 fps, HEVC, 50 Mbit/s, on `lan` (direct path), one stream for 2 hours.
@@ -131,15 +143,26 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    "Final review: host agent": FFmpeg's rate restarts no longer filling host.log (at the
    default `logLevel`), and its FFmpeg line of nothing encoding while the tab is hidden. "Final
    review: host agent, third round": the display staying on with only a controller (then its
-   repeat on the default pipeline).
+   repeat on the default pipeline). "Final review: host agent, second round": the 7th encoder
+   failure in a row ends the session (Win+L for 30 s; the browser reconnects).
 11. **Remote access** (INSTALL.md section 9): "Final review: QUIC packets on a 1280-MTU path
    (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
    itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
    review: deploy and install", the UDP relay naming an IP mismatch, and "Final review:
-   security", `-trust-proxy` behind a reverse proxy or tunnel.
-12. **Security**: "Final review: security": UDP relay ports released when a session ends, the
-   login page's redirect, and FFmpeg and its libraries only from places administrators control
-   (a `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored).
+   security", `-trust-proxy` behind a reverse proxy or tunnel. Port forwarding's `--name`
+   (INSTALL.md step 9) makes the gateway a new private CA: install the new ca.crt on the PC and
+   the clients in place of the old one ("Final review: security", the private CA's step 9
+   check).
+12. **Security**: "Final review: security": UDP relay ports held without a session and a
+   relayed connection ending with its session (Reconnect six times, then a takeover), the login
+   page's redirect, FFmpeg and its libraries only from places administrators control (a
+   `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored), 2FA codes bounded per
+   account (three wrong codes end the login; five lock the account's 2FA), failed logins no
+   longer growing the gateway's memory and disk (20 failed logins, one `login_ratelimited`
+   line), deleting a user or changing a password ending the account's live streams (on the
+   direct path, then from the phone hotspot of stage 11 over a relay, then a password change),
+   and the private CA vouches only for the gateway (Windows 11: `certutil -verify` reports the
+   name constraint; then macOS and an iPhone: Safari refuses the other name's leaf).
 13. **Uninstall** (last: it removes the agent): "Final review: deploy and install", uninstalling
    restores a virtual display's layout (with the Virtual Display Driver, during a stream and
    within the 10 s linger).
@@ -9364,6 +9387,20 @@ where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `rat
   and the plan says the Intel lines of 3.8 and 3.8 wiring are out of scope on the RX 7900 XT
   while their AMD lines are in stages 1 and 4. Verified here: each `## Final review` heading
   with an `AMD RDNA3` line, and each of their `###` items with one, is named in the plan.
+- Third round: the plan still said the "Final review: ..." sections were in the stages, but 16
+  items with a check on hardware or a real client added since were in none: the security
+  pass's relay ports held without a session, the relayed connection ending with its session, 2FA
+  codes bounded per account, failed logins bounded, revoked users' streams ending and the
+  private CA's name constraints (Windows 11, macOS, iPhone); the browser client's long text
+  through "Type text on the host", the paste dialog, the WebGL2 context that does not come back
+  and the dashboard; and all of "Final review: host agent, second round" with a check (thinning
+  after the switch to datagram + FEC, the 7th encoder failure, the elevated agent's folders, the
+  local cursor, controller input, captureTimestamps "off"). Fix: each is in a stage (1, 4, 7, 8,
+  10, 12), stage 11 says that port forwarding's `--name` makes a new CA, and the plan's sentence
+  says which items it covers. Verified here: a script lists each `###` item under a `## Final
+  review` heading (and each such heading without items) that has an `unverified` line or a
+  gateway, browser or client check, and looks up its phrase in the plan: 51 items, 16 missing
+  before, none after.
 
 ## Final review: host agent
 
