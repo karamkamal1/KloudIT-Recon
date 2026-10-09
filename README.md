@@ -91,6 +91,14 @@ Techniques used (most of them are new to browser-based game streaming):
   (120 → 90 → 60) instead. A decoder backlog gets
   dropped and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
   then climbs back only to 85 % of where the decoder fell behind.
+- **Input and audio first.** When the path delivers the video slower than the host paces it
+  (a capacity drop, before the bitrate follows), the host keeps at most one video frame in flight
+  beyond those in transit for the round trip (two on a LAN; measured by QUIC acknowledgements),
+  so audio, cursor and clock-sync datagrams never queue behind a video backlog on the path; a
+  path that carries the video, however long or jittery its round trip, is never held back. The
+  browser sends input ahead of control and telemetry (WebTransport `sendOrder` and send groups
+  where it has them, else telemetry gives way on the shared datagram queue). See "Send
+  priorities" in `docs/ARCHITECTURE.md`.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
   drops, and the client recovers at once: it skips the frame when the encoder heals the picture
@@ -491,9 +499,11 @@ NVENC runs, so the host announces `skip` from its real encoder arguments, `ref-r
 FFmpeg pipeline stand in for the native helper's ACK-based recovery (a key frame every few frames,
 sent as a P-frame, and after a loss the next one flagged as the recovery frame; the host announces
 `invalidate`), `still=after:N` sends only the first N frames of every encoder generation, like
-a desktop that stops changing, and `pre-stage-hold` takes the client's latency reports as a host
-from before step 4.4 did (no `stage-hold` in the welcome, at most nine rows)
-(`internal/host/faults.go`). Never set it on a real host; the agent logs a warning when it is set.
+a desktop that stops changing, `pre-stage-hold` takes the client's latency reports as a host
+from before step 4.4 did (no `stage-hold` in the welcome, at most nine rows), and `no-window`
+sends without the video window of the send priorities (docs/ARCHITECTURE.md "Send
+priorities"), for an A/B measurement (`internal/host/faults.go`). Never set it on a real host
+outside such a measurement; the agent logs a warning when it is set.
 
 Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
 platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·

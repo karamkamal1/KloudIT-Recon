@@ -49,6 +49,9 @@ import (
 //	                  feedback (left trigger: large motor, right: small), as
 //	                  a game's rumble comes back through ViGEmBus; works
 //	                  without ViGEmBus, so a test sees the DgRumble path
+//	no-window         send the frames without the video window (GUIDE 2.7,
+//	                  window.go), as before it: an A/B measurement of the
+//	                  datagrams' delay behind a video backlog
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped. Example:
@@ -70,11 +73,12 @@ type testFaults struct {
 	stillAfter   int  // frames of a generation before its source goes still
 	preStageHold bool // sendWelcome, logStages
 	rumbleEcho   bool // Session.gamepad
+	noWindow     bool
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold || f.rumbleEcho
+		f.preStageHold || f.rumbleEcho || f.noWindow
 }
 
 // at returns what happens to the nth frame (n from 1).
@@ -151,8 +155,13 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: rumble-echo takes no value", rule)
 			}
 			f.rumbleEcho = true
+		case "no-window":
+			if val != "" {
+				return f, fmt.Errorf("%s: no-window takes no value", rule)
+			}
+			f.noWindow = true
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

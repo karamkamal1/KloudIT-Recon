@@ -4,6 +4,8 @@ package cc
 
 import (
 	"math"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -38,6 +40,15 @@ const (
 	// With a window of more packets the oldest lost packets of an outage are
 	// not found, which only makes the brake later.
 	sentRingSize = 4096
+
+	// RecentMinRTT is the smallest RTT sample of the last recentRTTWindow,
+	// kept in rttBuckets parts (so it reaches back 1.5 to 2 s).
+	recentRTTWindow = 2 * time.Second
+	rttBuckets      = 4
+	// DeliveredAt's record of when done grew: ackLogSize entries, those
+	// less than ackLogResolution apart merged (at least 256 ms back).
+	ackLogSize       = 1024
+	ackLogResolution = 250 * time.Microsecond
 )
 
 // Media is a rate-following congestion controller for real-time video. Unlike
@@ -76,6 +87,22 @@ type Media struct {
 	ackedPackets, ackedBytes atomic.Uint64
 	lostPackets, lostBytes   atomic.Uint64
 	ecnMarks, collapses      atomic.Uint64
+
+	// Delivery positions (Delivery): ack-eliciting bytes sent, and of those
+	// the bytes acknowledged or declared lost, cumulative; progress is
+	// signalled whenever done grows.
+	sentPos, donePos atomic.Uint64
+	progress         chan struct{}
+	// ackLog: when done reached which position (DeliveredAt), oldest
+	// overwritten; ackN entries written so far.
+	logMu  sync.Mutex
+	ackLog [ackLogSize]ackPoint
+	ackN   int
+
+	// RecentMinRTT: the minimum RTT sample of each part of the window (run
+	// loop only) and of the whole window (ns; 0: no sample yet).
+	rttMin       [rttBuckets]rttBucket
+	recentMinRTT atomic.Int64
 }
 
 type sentRecord struct {
@@ -83,11 +110,23 @@ type sentRecord struct {
 	t  congestion.Time
 }
 
+type ackPoint struct {
+	done uint64
+	at   congestion.Time
+}
+
+// rttBucket is the smallest RTT sample of the n-th part of
+// recentRTTWindow/rttBuckets since the monotonic clock's start (0: none).
+type rttBucket struct {
+	n   int64
+	min time.Duration
+}
+
 var _ congestion.CongestionControl = (*Media)(nil)
 
 // NewMedia returns a media controller for one path of a connection.
 func NewMedia(rtt congestion.RTTStats, initialMaxDatagramSize congestion.ByteCount) *Media {
-	m := &Media{rtt: rtt, largestAcked: -1}
+	m := &Media{rtt: rtt, largestAcked: -1, progress: make(chan struct{}, 1)}
 	m.targetBitrate.Store(DefaultTargetBitrate)
 	m.frameInterval.Store(int64(DefaultFrameInterval))
 	m.maxDatagramSize.Store(int64(initialMaxDatagramSize))
@@ -149,6 +188,50 @@ func (m *Media) Stats() MediaStats {
 	}
 }
 
+// Delivery returns the connection's delivery positions: sent, the bytes of
+// the ack-eliciting packets sent so far, and done, how many of them have left
+// the network (acknowledged, or declared lost and so queued for a
+// retransmission that counts as sent again). Packets leave in about the order
+// they were sent, so data that was handed to the transport when sent read s
+// has left once done >= s. Both are cumulative over this controller (a path
+// migration starts a new one).
+func (m *Media) Delivery() (sent, done uint64) {
+	done = m.donePos.Load()
+	return m.sentPos.Load(), done
+}
+
+// Progress is signalled (capacity 1, never blocks the connection) whenever
+// done grows: an ACK or a loss.
+func (m *Media) Progress() <-chan struct{} { return m.progress }
+
+// DeliveredAt returns when done (Delivery) first reached pos: the ACK (or
+// loss) that took the byte at sent position pos out of the network, within
+// ackLogResolution. false: done has not reached pos yet, or did so before
+// the record reaches back.
+func (m *Media) DeliveredAt(pos uint64) (time.Time, bool) {
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
+	if m.ackN == 0 || m.ackLog[(m.ackN-1)%ackLogSize].done < pos {
+		return time.Time{}, false
+	}
+	lo := max(0, m.ackN-ackLogSize)
+	i := lo + sort.Search(m.ackN-lo, func(i int) bool { return m.ackLog[(lo+i)%ackLogSize].done >= pos })
+	if i == lo && lo > 0 {
+		return time.Time{}, false // reached before the oldest entry kept
+	}
+	return m.ackLog[i%ackLogSize].at.ToTime(), true
+}
+
+// RecentMinRTT is the smallest round trip a packet of this path took in the
+// last 1.5 to 2 s (its ACK's arrival less its sending; 0: none acknowledged
+// yet). Unlike quic-go's min RTT, which is the connection's lifetime
+// minimum, it follows a path whose round trip grows (a route change, a
+// relay fallback) within that time.
+func (m *Media) RecentMinRTT() time.Duration { return time.Duration(m.recentMinRTT.Load()) }
+
+// PacingRate is the rate the controller paces at, in bit/s.
+func (m *Media) PacingRate() int64 { return int64(m.pacingRate() * 8) }
+
 // pacingRate is in bytes/s.
 func (m *Media) pacingRate() float64 {
 	return float64(m.targetBitrate.Load()) * PacingGain / 8
@@ -209,13 +292,61 @@ func (m *Media) TimeUntilSend(congestion.ByteCount) congestion.Time {
 	return m.lastSent.Add(max(d, minPacingDelay))
 }
 
-func (m *Media) OnPacketSent(sentTime congestion.Time, _ congestion.ByteCount, pn congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
+func (m *Media) OnPacketSent(sentTime congestion.Time, bytesInFlight congestion.ByteCount, pn congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
 	budget := m.budgetAt(sentTime)
 	m.budget = budget - min(bytes, budget)
 	m.lastSent = sentTime
 	if isRetransmittable {
 		m.sent[pn%sentRingSize] = sentRecord{pn: pn, t: sentTime}
+		m.sentPos.Add(uint64(bytes))
 	}
+	// bytesInFlight is quic-go's own count after this packet: it also drops
+	// packets the controller never hears of (lost MTU probes), so done
+	// catches up with them here.
+	if sent := m.sentPos.Load(); sent >= uint64(bytesInFlight) {
+		m.advance(sent-uint64(bytesInFlight), sentTime)
+	}
+}
+
+// advance moves the delivery position forward to done at now (run loop
+// only: the single writer).
+func (m *Media) advance(done uint64, now congestion.Time) {
+	if done = min(done, m.sentPos.Load()); done > m.donePos.Load() {
+		m.donePos.Store(done)
+		m.logMu.Lock()
+		if last := &m.ackLog[(m.ackN+ackLogSize-1)%ackLogSize]; m.ackN > 0 && now.Sub(last.at) < ackLogResolution {
+			last.done = done
+		} else {
+			m.ackLog[m.ackN%ackLogSize] = ackPoint{done, now}
+			m.ackN++
+		}
+		m.logMu.Unlock()
+		select {
+		case m.progress <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// rttSample records a packet's round trip at now for RecentMinRTT (run loop
+// only).
+func (m *Media) rttSample(now congestion.Time, rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	n := int64(now) / int64(recentRTTWindow/rttBuckets)
+	if b := &m.rttMin[n%rttBuckets]; b.n != n || b.min == 0 {
+		*b = rttBucket{n, rtt}
+	} else {
+		b.min = min(b.min, rtt)
+	}
+	var low time.Duration
+	for _, b := range m.rttMin {
+		if b.min > 0 && b.n > n-rttBuckets && (low == 0 || b.min < low) {
+			low = b.min
+		}
+	}
+	m.recentMinRTT.Store(int64(low))
 }
 
 func (m *Media) OnPacketAcked(pn congestion.PacketNumber, ackedBytes, _ congestion.ByteCount, eventTime congestion.Time) {
@@ -225,6 +356,10 @@ func (m *Media) OnPacketAcked(pn congestion.PacketNumber, ackedBytes, _ congesti
 	m.largestAcked = max(m.largestAcked, pn)
 	m.ackedPackets.Add(1)
 	m.ackedBytes.Add(uint64(ackedBytes))
+	if r := m.sent[pn%sentRingSize]; r.pn == pn && !r.t.IsZero() {
+		m.rttSample(eventTime, eventTime.Sub(r.t))
+	}
+	m.advance(m.donePos.Load()+uint64(ackedBytes), eventTime)
 	if b := m.brakeWindow.Load(); b > 0 {
 		b += int64(ackedBytes)
 		if congestion.ByteCount(b) >= m.window() {
@@ -243,6 +378,7 @@ func (m *Media) OnCongestionEvent(pn congestion.PacketNumber, lostBytes, _ conge
 	}
 	m.lostPackets.Add(1)
 	m.lostBytes.Add(uint64(lostBytes))
+	m.advance(m.donePos.Load()+uint64(lostBytes), congestion.Now())
 	if m.persistentCongestion(pn) {
 		m.collapse()
 	}

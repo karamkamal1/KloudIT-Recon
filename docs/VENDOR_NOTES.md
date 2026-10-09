@@ -4017,6 +4017,313 @@ Not verified (needs real networks or Windows):
 - PMTU: unverified on real paths. The forwarder sets DF and drops oversized datagrams like a
   router; on a path with a smaller MTU than the host's probe, quic-go's DPLPMTUD should settle
   below it (watch for stalls after the first seconds on PPPoE / VPN client links).
+
+## 2.7 Send priorities
+
+Vendor-neutral (transport, session and browser client): what needs real hardware is a real
+network's capacity drops and other browsers' WebTransport schedulers. No encoder is involved.
+
+What changed (GUIDE 2.7; docs/ARCHITECTURE.md "Send priorities"):
+
+- **Browser** (`stream-worker.js` `openSendChannels`, `telemetrySender`): input (input stream,
+  mouse and gamepad datagrams) outranks control (control stream), which outranks telemetry (frame
+  acks, rate reports, pings): WebTransport `sendOrder` 1000 / 100 / 10, every stream and datagram
+  writable in one send group (`createSendGroup()`) and input and telemetry on separate datagram
+  writables (`datagrams.createWritable({sendGroup, sendOrder})`), each where the browser has it
+  (feature-detected; a browser that schedules by `sendOrder` hands out a `WebTransportSendStream`
+  with the attribute). Where input and telemetry share one datagram writable, telemetry is dropped
+  instead of queued while that queue does not move (its oldest telemetry write pending for
+  50 ms), so a mouse datagram never waits behind a telemetry backlog. `__recon.lastStats.prio` =
+  `{sendOrder, sendGroup, datagramWritables, telemetrySent, telemetryDropped, telemetryStallMs}`
+  (the longest the shared queue stood still); overlay Transport row `send priority: sendOrder
+  ✓/✗ · send groups ✓/✗ · datagram queues ✓/✗ · telemetry dropped N of M (longest stall … ms)`.
+  WebSocket: one ordered channel, nothing to prioritise (`prio` null).
+- **Host video window** (`internal/host/window.go`, `frameSender`): while the path falls short
+  of the pacing rate, at most one frame in flight beyond those in transit for the round trip
+  (the frames in flight sent within the last 1.25 × the recent min RTT, at most as many as the
+  frame rate sends in that time, rounded up): two on a LAN. *Falls short*: the last 8
+  acknowledged frames took more than 1.5 × as long to be delivered (acknowledgement of a frame's
+  first byte to that of its mark) as the pacer took to send them, with at least 20 ms of pacing
+  among them. A frame is in flight from its write's return until the peer acknowledged
+  everything the connection had sent by then: the media congestion controller's new delivery
+  positions (`cc.Media.Delivery`: ack-eliciting bytes sent; acknowledged or declared lost,
+  resynchronised with quic-go's own bytes in flight at every send, which also covers lost MTU
+  probes the controller never hears of; `Progress()` is signalled on every ACK or loss;
+  `DeliveredAt(pos)`, when that position was reached; `RecentMinRTT()`, the smallest round trip
+  of the last 1.5–2 s, 0 before the first, which the window keeps from before a shortfall while
+  it lasts; `PacingRate()`). frameSender opens the next frame's
+  stream and holds it, nothing written, until the window has room, at most until three quarters
+  of the frame's deadline (2.3's) have passed since the opening (25 ms of hold at 60 fps; at most
+  250 ms); the frame's deadline starts when it is released, and `send_us` is re-stamped then. A
+  frame the client would discard while it is held (the client waits for the answer to a loss) is
+  released at once. `stream stats`: `window_held`, `window_max_ms`; a frame-queue overflow during
+  a hold logs `sender=window window_ms=…`. No change to the quic-go fork.
+- **Host pongs**: the datagram loop (input, acks, rate reports) queues pongs for their own
+  goroutine (4 deep, dropped when full) instead of calling quic-go's `SendDatagram`, which blocks
+  while 32 datagrams wait for the congestion window.
+- Test-only hook `RECON_TEST_FAULTS=no-window`: sends without the window, for A/B measurements.
+
+Deviations from the guide's wording, and why:
+
+1. *"In flight"* is measured by QUIC acknowledgements through the media congestion controller,
+   the default (`congestion` `media`). quic-go reports no per-stream acknowledgements
+   (webtransport-go hides the stream; the 2.1 fork carries only the congestion-control hook) and
+   a stream's context ends at `Close`, not at its acknowledgement; "Write returned" alone is what
+   frameSender already had (one frame in the transport at a time: `Write` returns once all but
+   the last packet's worth is packed and sent), and the queue datagrams waited behind was in the
+   network, bounded only by the congestion window. With `reno` there is no window (as before).
+   On the relay paths the window covers the host → gateway leg (the gateway acknowledges) until
+   2.6 makes them one connection.
+2. *"1–2"*: one beyond the frames in transit, which is two on a LAN. A fixed count ignores the
+   round trip (60 fps over 40 ms keeps 3 frames in transit with no queue at all). Counting the
+   frames actually sent within the round trip (not the frame rate's) keeps that allowance at the
+   path's own rate when a capacity drop spaces them out. Exploratory runs with the same harness
+   (20 Mbit/s into 10 Mbit/s over 10 ms, audio one-way p50 ~105 ms without a window): a strict 1
+   (no round-trip allowance) 8 ms but half the throughput (60 of 124 frames in 4 s: every frame
+   waited a round trip for the one before it); 2 beyond the round trip, held until
+   acknowledged, 44 ms; 2 held at most until 2 ms before the deadline, 73 ms (a hold then ends
+   at the deadline more often than at an acknowledgement); the chosen design 36 ms with holds up
+   to 2 ms before the deadline and 40 ms with holds up to a quarter before it (the final one), with
+   the full throughput.
+3. *Interplay with 2.3*: the window's hold is host queue: the frame's deadline (rung 1) starts
+   when the window releases it (review fix 2 below; the claim made here at first, that holding a
+   frame at most until a quarter of its deadline is left keeps rung 1 from cancelling it, was
+   wrong: the write after the hold needs the pacer's time too), and rung 1 judges the write alone
+   as before 2.7. The hold ends at the latest when three quarters of the deadline have passed
+   since the stream's opening (originally slack for frameSender being scheduled late: with 2 ms
+   the unit test's held frame was cancelled now and then while the whole test suite loaded the
+   machine); it bounds the latency the window adds to a frame. A first version held
+   frames until acknowledged (at most 250 ms) and let rung 1 cancel a held frame at its deadline,
+   nothing of it sent. In the browser E2E (Chromium on a CPU-bound loopback, load 6–10 on 4
+   CPUs) it held 11–24 frames per 10 s for up to 17–144 ms although nothing limited the path
+   (the busy browser acknowledged late), and in the reference-recovery scenario rung 1 cancelled
+   17 frames where the hook delayed 9 (the 8 others held by the window): each a loss and a
+   recovery, which in the software stand-in waits for its next key frame. A late
+   acknowledgement now costs at most three quarters of the deadline's worth of host queue on a
+   frame, and since the review fixes only on a path that falls short of the pacing rate.
+4. *Browser support*: the Chromium in this sandbox (141.0.7390.37) has none of the three: no
+   `createSendGroup`, no `datagrams.createWritable`, streams are plain `WritableStream`s and the
+   options dictionary of `createBidirectionalStream` is not even read (a Proxy saw no property
+   access), so the `{sendOrder}` the client already passed for control and input was a no-op
+   there. In Chromium the client-side priority is therefore telemetry giving way on the shared
+   datagram writable. A first version capped telemetry at 2 pending writes: Chromium resolves
+   datagram writes late enough that it dropped 187 of 659 (28 %) telemetry datagrams on the
+   direct path and 22 of 807 / 24 of 802 on the others, with nothing to wait for; hence the 50 ms
+   stall rule (in the final E2E run 4 of 804, 0 of 801 and 1 of 805, longest stalls 64, 39 and
+   53 ms; at load 7–9 in an earlier run 23 of 771, 81 of 735 and 22 of 798). Firefox has send
+   groups from 155 (bugzilla 2007165); what it and Safari schedule by is a hardware-side check
+   below.
+5. *Added*: the pong goroutine (an input loop that waits to send a pong waits with its input).
+
+Verified in the sandbox:
+
+- verified (sandbox): `internal/host` `TestDatagramLatencyBehindVideo` (the GUIDE's before/after
+  test): a real host session (frameSender, datagram loop answering pings, media congestion
+  controller, 20 Mbit/s at 60 fps from a frame source that keeps the frame queue full) over real
+  quic-go through an in-process bottleneck (5 ms each way, 300 ms drop-tail queue), audio-sized
+  datagrams every 10 ms, client pings every 20 ms, one process clock. 10 Mbit/s (a backlog):
+  audio one-way p50 / p95 105.3 / 107.7 ms without the window, 39.6 / 50.1 ms with it; pong RTT
+  p50 111.5 → 44.5 ms; 95 vs 93 frames received; the window held 91 frames. 50 Mbit/s (no
+  backlog): audio 6.4 vs 6.3 ms, pongs 12.0 vs 12.4 ms, 119 vs 118 frames, 1 held. Asserted:
+  ≤ 60 % of the p50s with a backlog, ≥ 85 % of the frames, and no change (±5 ms, ≥ 95 % of the
+  frames) on the clean path. With the same harness (scratch runs, holds up to 2 ms before the
+  deadline): 40 ms round trip, 10 Mbit/s: audio p50 163 → 63 ms, pongs 184 → 83 ms, 96 vs 93
+  frames; 40 ms, 50 Mbit/s: 21.3 vs 21.2 ms,
+  179 vs 179 frames, 0 held; 2 ms round trip, 10 Mbit/s: 88.5 → 33.1 ms; 2 ms, 50 Mbit/s: 2.1
+  vs 2.2 ms, 179 vs 179 frames (31 frames held, each for about a round trip: back-to-back frames
+  after an encoder burst).
+- verified (sandbox): `TestWindowLimit`, `TestVideoWindow` (a frame just sent is in transit, the
+  next may follow; a frame interval later it is queued and the window is full until it is wholly
+  acknowledged; a longer round trip keeps more in transit; a path migration starts over),
+  `TestFrameSenderWindow` (frameSender with a fake meter, 10 ms min RTT: two frames go out back to
+  back, the third waits with its stream open and nothing written until both are acknowledged, its
+  `send_us` after the release; at 30 fps without acknowledgements it goes out whole 50 ms after
+  its stream opened, before its 67 ms deadline, under `invalidate` with a newer frame queued: no
+  cancellation, no `dropped`, no `Recover`; a held frame the client would discard (a loss
+  before it) is released at once, its stream reset with 0 bytes, `Recover 1/1`; 80 runs in a row
+  and with `-race`), `TestPongDoesNotBlockInput` (the datagram loop reads 20 pings while
+  `SendDatagram` blocks; before the change it stopped at the first), `TestParseTestFaults`
+  (`no-window`); `internal/transport/cc` `TestMediaDelivery` (positions, ACK-only packets,
+  losses, a lost MTU probe caught up at the next send, spurious ACKs, one non-blocking signal per
+  growth); `internal/transport` `TestMediaCongestionControlQUIC` (8 MiB over real quic-go: sent
+  ≥ 8 MiB, done within the last ACK of it).
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, headless Chromium 141, libsvtav1
+  960×540 60 fps, under the shared E2E lock), final code: 87 of 87 checks passed. New checks: per
+  WebTransport scenario the send priorities detected as the browser's API has them (here none)
+  and telemetry dropped only with a stall ≥ 50 ms, at most 15 % (direct 4 of 804, relay 0 of 801,
+  WebGPU 1 of 805); WebSocket without `prio`; the unit-level `openSendChannels` /
+  `telemetrySender` checks with fake WebTransport objects (with the full API: one send group,
+  streams 100 / 1000, datagram writables 1000 / 10, telemetry never dropped; without: one shared
+  writable, telemetry dropped after a 70 ms stall and sent again once it moved, input never
+  dropped). The window held 195 frames over the run (up to 13 ms each), no frame-queue
+  overflow; host queue (encodeDone → send) p50 / p95 0.04–0.05 / 0.47–0.60 ms against 0.04–0.05 /
+  0.41–0.71 ms in a run of the code before 2.7 (HEAD, same machine; that run stopped after the
+  relay scenario when its host went offline on the dashboard, unrelated); `host-faults-ref`: 9 of
+  9 held streams cancelled (none more), 15 recoveries by recovery frame, 0 by key frame. Earlier
+  runs: the first version (deviation 3) 79 of 87 (the reference-recovery checks failed on its
+  extra cancellations, telemetry checks on deviation 4, plus load-related playback checks); the
+  final host code with the 50 ms rule before `telemetryStallMs` and its 15 % check, at load 7–9:
+  80 of 87 (the then 1 % telemetry check three times, playback rate checks twice at 28.6 /
+  46–52 fps, and the reference-recovery drop test: it dropped frame 9/80, which was the recovery
+  frame answering an earlier loss at 68 that the client had already used to end its wait; the
+  host then treated it as a lost answer and reopened its wait from 68, which the stand-in's next
+  recovery frame (`refFloor` 79) does not end, so it discarded frames until the client's watchdog
+  asked for a key frame: an interplay of the drop test with the 2.3 rule for lost answers, not of
+  this step).
+- verified (sandbox): `internal/e2e` (real gateway and host agent, libx264) all streaming tests
+  passed under the shared lock with the final host code (paths, media congestion relay / direct /
+  low bitrate, frame loss, deadline drop, bitrate recovery, stalled acks, rate reports, reno,
+  intra refresh, intra refresh still).
+- verified (sandbox), with a caveat: the 2.2 capdrop harness (`sudo test/netem/capdrop.sh`, 50 →
+  15 → 50 Mbit/s with a 50 ms queue, libx264 1280×720 60 fps, 30 Mbit/s setting; under the
+  shared lock, other agents' jobs running beside it). Final window, two runs: 0 overflows,
+  one-way delay p95 10.1 → 28.3 ms during the dip, back in 4.5 s (pass); and 3 overflows,
+  9.9 → 38.1 ms, back in 13.4 s (fail). With `RECON_TEST_FAULTS=no-window`, two runs: 0
+  overflows, 9.8 → 29.8 ms, 7.0 s; 0 overflows, 11.2 → 36.6 ms, 7.9 s (both pass). The first
+  version: 1 overflow, 10.2 → 52.9 ms, 6.0 s. The window held 66–80 frames per 10 s during the
+  dip (up to 15–25 ms each) and next to none outside it. The failing run's overflows read like
+  the ones 2.2 recorded before this step (`sender=write`, not `window`: 7 frames that came out
+  of FFmpeg within 28–81 ms, the encoder catching up in a burst), and its slow return follows a
+  delay decrease to 0.43 × just as the capacity came back, also seen in 2.2's runs; too few runs
+  to tell whether the window changes the odds (the capdrop queue is 50 ms, so the datagrams'
+  gain is small there; the hardware check below repeats it on a deep buffer).
+
+Review fixes (each with a test that fails without it):
+
+1. *The window holds frames only while the path falls short of the pacing rate, and "in
+   transit" is measured against the recent min RTT* (blocker). "In transit" compared a frame's
+   time in flight with 1.25 × quic-go's min RTT, the connection's lifetime minimum: once the
+   round trip stayed above that (a relay fallback on the same QUIC path, cross traffic,
+   Wi-Fi jitter in both directions) every earlier unacknowledged frame counted as queued, so
+   frames were held on paths with capacity to spare; frameSender, which needs ~83 % of a frame
+   interval to pace an average frame out, fell below the frame rate and the frame queue
+   overflowed. Confirmed with `TestDatagramLatencyBehindVideo`'s new cases against the code
+   before the fix (same binary harness, under the shared lock; 200 Mbit/s path, 20 Mbit/s at
+   60 fps; frame latency = queued at the host → last byte at the client): with 2.5 ms + up to
+   10 ms of jitter each way (first in, first out) and frame sizes ±50 %, frame latency p50 /
+   p95 22.4 / 30.1 ms without the window and 39.8 / 56.9 ms with it (112 frames held), the
+   audio unchanged (10.8 vs 10.9 ms: the window gained nothing there); with the round trip
+   stepping from 4 to 40 ms at 1.5 s, 179 frames received without it and 142 with it, frame
+   latency p95 32.1 vs 259.7 ms (53 held).
+   Fix: (a) the window holds a frame only while the last 8 acknowledged frames took more than
+   1.5 × as long to be delivered (acknowledgement of a frame's first byte to that of its mark)
+   as the pacer took to send them, with at least 20 ms of pacing in them (`videoWindow.shortfall`;
+   the controller's new `DeliveredAt` records when its delivery position grew): only a
+   bottleneck slower than the pacer stretches that, a longer or varying round trip delays both
+   ends alike; (b) "in transit" uses `cc.Media.RecentMinRTT`, the smallest round trip a packet
+   took in the last 1.5–2 s, which follows a longer path; while a shortfall lasts the window
+   keeps the value from before it (lower ones count), since the backlog the window leaves is in
+   every round trip then (without that, audio p50 with the 10 Mbit/s backlog was 69.6 ms
+   against 102.7 ms without the window: the reference crept up once the samples from before the
+   backlog aged out). Considered and not taken: smoothed RTT plus a deviation term (it contains
+   the very queue the window bounds: the allowance would grow with the backlog until the window
+   never holds), a windowed min alone (jitter needs the high end of the round trips, not the low
+   one; it also takes the window's length to follow a step).
+   Not done: bounding the hold by the frame's encode time instead of its stream's opening. With
+   (a) a frame is held only while the path cannot carry the video, and then, without the window,
+   it waits as long in the congestion-window-limited write (frame latency p50 with the
+   10 Mbit/s backlog: 338–340 ms without the window, 284–297 ms with it, in every run before
+   and after the fixes); a bound from the encode time would switch the window off exactly in a
+   sustained backlog, where every frame has waited in the full frame queue longer than any such
+   bound. Tests: `TestWindowShortfall` (two frames delivered at a quarter of the pacing rate are
+   a shortfall; a step of the round trip from 10 to 80 ms or ±8 ms of jitter on either end are
+   not; a drop to 40 % shows within three frames; 8 small frames decide nothing),
+   `TestVideoWindow` (the same frames in flight hold nothing back without the evidence),
+   `TestMediaRecentMinRTT` (follows a step from 4 to 40 ms within 2 s), `TestMediaDeliveredAt`,
+   and `TestDatagramLatencyBehindVideo`'s new "no cost" cases (below).
+2. *A held frame's deadline starts when the window releases it* (major). The deadline counted
+   from the stream's opening, before the hold; a frame held to its bound (3/4 of the deadline)
+   then needed the pacer's time for its write (13.9 ms for an average 20 Mbit/s frame at 60 fps,
+   8.3 ms left), so under reference recovery with a newer frame queued rung 1 cancelled it: a
+   loss, a `Recover` and discarded frames that the window caused (deviation 3's claim was
+   wrong; the unit test's fake stream wrote instantly). Now frameSender starts the deadline (and
+   rung 1's timer) after `admit` (`sendState.start`; while held, `outFrame.held` keeps rung 1
+   off it, a discard still applies). `TestFrameSenderWindow` "a paced write after the hold":
+   60 kB frames whose write takes 20 ms at the pacing rate, the held frame released 50 ms after
+   its stream opened with a newer frame queued: sent whole, no `dropped`, no `Recover` (with the
+   deadline counted from the opening it was cancelled, 0 bytes written).
+3. *`RecentMinRTT` is 0 until a packet was acknowledged* (minor). quic-go's `MinRTT` reports its
+   100 ms initial RTT before the first sample (the comment said 0), which let up to 1 + 8 frames
+   go at 60 fps before the first ACK; the window now reads the controller's own per-packet
+   samples (`TestMediaRecentMinRTT`), so `TestWindowLimit`'s first case (no sample: the next
+   frame waits for the last one) is the state the window really sees.
+
+Noted from the code while fixing this, for 2.2 (not changed or measured here): the media
+congestion controller's own window is pacing × (quic-go's lifetime min RTT + 2 frame intervals),
+so a round trip that grows well past that (a relay fallback from a few ms to 80 ms: 112 kB of
+window at 20 Mbit/s against ~200 kB in flight) would throttle the stream below its bitrate for
+the rest of the connection; `RecentMinRTT` follows such a step within 2 s.
+
+After the fixes (sandbox, under the shared lock): `TestDatagramLatencyBehindVideo` passes. With
+the 10 Mbit/s backlog, audio one-way p50 without → with the window 104.2 → 48.8 ms (in two runs
+of a scratch copy with counters added 102.9 → 47.2 ms and 104.9 → 51.5 ms; the window held 88
+frames, frame latency p50 339 → 292–297 ms, 93 of 95 frames); before the fixes the same
+harness gave 39.5–39.9 ms. The difference is the gate: the frames that go out
+before the evidence is in (the first two or three after the drop) leave one frame more in flight,
+and as nearly every hold then ends at its bound (86–87 of ~90) rather than at an
+acknowledgement, the excess stays for as long as the backlog lasts in this harness (scratch
+variants: the fixed code with the gate forced on, 39.2 ms; with the deadline counted from the
+opening again, 50.1 ms; rung-1 cancellations 0 in all). Paths that carry the video, with the
+window against without: 50 Mbit/s audio p50 5.9 vs 5.9 ms, frame latency p50 16.4 vs 16.4 ms,
+120 vs 119 frames; 200 Mbit/s with jitter ±10 ms and frames ±50 %, frame latency p50 / p95 22.1 /
+29.0 vs 23.4 / 37.1 ms, 179 vs 179 frames; round trip 4 → 40 ms at 1.5 s, 30.7 / 31.8 vs 30.6 /
+32.0 ms, 179 vs 179 frames: 0 frames held in all three (asserted: audio and frame latency p50
+within 5 ms, p95 within 15 ms, at least 95 % of the frames). `go test ./...`, the window and
+ladder tests with `-race` repeatedly (`TestFrameSenderWindow`'s "held until acknowledged" and
+"discarded while held" now run at 10 fps, 150 ms of hold: at load 19 with `-race` the third
+frame went out at its 50 ms bound once in 27 runs before the starved test looked, timing the
+original test had too), `go vet` (Linux, Windows), gofmt clean;
+`internal/e2e` all streaming tests passed; browser E2E 87 of 87 (reference recovery: "cancelled 9
+(of 9 delayed 200 ms)", as before; the window held 5 frames over the whole run, at most 2 ms,
+against 195 frames up to 13 ms in the run of the first version: the busy browser's late
+acknowledgements no longer hold frames; 3 frame-queue overflows, `sender=write`, an encoder burst
+as recorded in 2.2, not the window).
+
+Hardware checks (host.json `"pipeline": "auto"` with recon-encoder.exe next to recon-host.exe;
+overlay Ctrl+Alt+Shift+S; host log `$env:APPDATA\KlouditRecon\host.log`; `__recon.lastStats` in
+the browser console):
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (datagram delay behind a video backlog, A/B): direct
+  path to a Linux client with Chrome (Network path "Direct to PC only"); on the client
+  `sudo ./netem.sh apply capdrop --iface <nic> --port 47998 --rates 50,10,50 --queue-ms 300` (a
+  deep router buffer; docs/NETEM.md); stream hevc_amf_helper at 1920×1080 60 fps, 30 Mbit/s with
+  Settings → Adaptive bitrate off (the rate controller then leaves the backlog in place) and a
+  moving scene; from +20 s to +40 s (the 10 Mbit/s step) note the overlay's `round trip (avg)`
+  (pings are datagrams that queue behind the video) and `__recon.lastStats.rtt` every few
+  seconds, and the host's `stream stats` `window_held` / `window_max_ms`. Then stop recon-host,
+  start it with `$env:RECON_TEST_FAULTS='no-window'; & 'C:\Program Files\KlouditRecon\recon-host.exe' run`
+  and repeat. Pass: the round trip during the step with the window at most 60 % of the one
+  without (sandbox: 45 vs 112 ms on a 10 ms path), `window_held` > 0 during the step only, no more
+  `frame queue overflow` lines than without, and the same received bitrate (overlay Bitrate).
+  Record both round trips, the overflows and `window_max_ms`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (no cost when the path carries the video): the 2.3
+  T3 run (`wifi`, 10 minutes) and a 10-minute `lan` run with the window: `window_held` stays 0 or
+  near it on both (record the largest; review fix 1: jitter alone must not hold frames), freezes
+  and the overlay's capture→drawn p95 as in 2.3, and `telemetry dropped` in the overlay's send
+  priority row ≤ 1 % of the telemetry sent.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (a round trip that grows, review fix 1): stream over
+  Tailscale with the direct path up, then block it (`netsh advfirewall firewall add rule
+  name=recon-derp dir=out action=block protocol=udp remoteport=41641` on the host, delete the
+  rule afterwards) so the session falls back to DERP; for 30 s after the fallback the host's
+  `stream stats` show `window_held` 0 unless the overlay's Bitrate drops (a relay slower than the
+  video), no `frame queue overflow` lines that do not also show without the window
+  (`RECON_TEST_FAULTS=no-window`, same steps), and the overlay's fps stays at the stream's.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (2.2 acceptance with the window): `capdrop` (0.4) on
+  the direct path (netem on the Linux client, `--port 47998`: on the relay paths the window sees
+  only the host → gateway leg) with Adaptive bitrate on: no `frame queue overflow` (lines with
+  `sender=window` say the window held a frame at the time), the one-way delay p95 during the dip
+  under the baseline + 30 ms, the target back within 10 s; compare with the same run under
+  `RECON_TEST_FAULTS=no-window`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the three AMD tests above with
+  hevc_nvenc_helper (and av1_nvenc_helper on RTX 40+), same steps and pass criteria.
+- Browsers (vendor-independent, T10): unverified. Test: stream once each from current Chrome,
+  Edge, Firefox (≥ 155 for send groups) and Safari 26.4 on the direct path and record the
+  overlay's `send priority` row (`sendOrder` / `send groups` / `datagram queues`, and `telemetry
+  dropped N of M` where the datagram queue is shared) and `__recon.lastStats.prio`. Where
+  `sendOrder` shows ✓: saturate the client's upload (`iperf3 -c <server> -t 120` from the client)
+  and compare keyboard/mouse click-to-photon (0.3 rig) with and without the upload; record both
+  medians per browser.
+
 ## 3.7 Virtual display matched to the client
 
 `internal/host/vdisplay` gives a session a virtual monitor through an installed IddCx (indirect

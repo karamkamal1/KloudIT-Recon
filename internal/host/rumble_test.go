@@ -63,8 +63,9 @@ func dgSession(t *testing.T, faults testFaults) (*Session, *dgConn, *fakeCtrl) {
 	s := &Session{
 		a: &Agent{hostClock: media.NewHostClock(), faults: faults, cfg: &Config{Audio: true}}, c: c, ctrl: ctrl, ctx: ctx, cancel: cancel,
 		frameQ: make(chan *media.Frame, 6), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		rttSeen: make(chan struct{}, 1), rumbleGo: make(chan struct{}, 1),
+		rttSeen: make(chan struct{}, 1), rumbleGo: make(chan struct{}, 1), pongs: make(chan []byte, 4),
 	}
+	go s.pongSender() // as Session.run starts it (step 2.7: pongs leave the datagram loop)
 	return s, c, ctrl
 }
 

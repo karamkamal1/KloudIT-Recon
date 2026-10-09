@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"math"
 	"regexp"
 	"runtime"
 	"sort"
@@ -104,6 +105,16 @@ type Session struct {
 	// discarded and has not reported yet.
 	send     sendState
 	discards discardRun
+	// win: the frames in flight (window.go, GUIDE 2.7); windowSince: unix
+	// ns since frameSender holds a frame for it (0: none), for the
+	// overflow log; meter: a test's stand-in for the connection's delivery
+	// meter (nil: transport.MediaControl).
+	win         videoWindow
+	windowSince atomic.Int64
+	meter       func() deliveryMeter
+	// pongs: answers to the client's pings, sent by pongSender so the
+	// datagram loop (input) never waits for the datagram queue.
+	pongs chan []byte
 
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
@@ -177,6 +188,7 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		pipeSwap:    make(chan struct{}, 1),
 		rttSeen:     make(chan struct{}, 1),
 		rumbleGo:    make(chan struct{}, 1),
+		pongs:       make(chan []byte, 4),
 		tried:       map[string]bool{},
 		usage:       map[string]string{},
 		encFails:    map[string]int{},
@@ -293,6 +305,7 @@ func (s *Session) run() error {
 	defer s.stopAudio()
 	go s.audioFrameLoop()
 	go s.rumbleLoop()
+	go s.pongSender()
 	go s.datagrams()
 	go s.cursorLoop()
 	go s.statsLoop()
@@ -973,6 +986,9 @@ func (s *Session) logOverflow(fs []*media.Frame) {
 		stage = "write"
 		if s.sendOpening.Load() {
 			stage = "open stream"
+		} else if w := s.windowSince.Load(); w != 0 {
+			stage = "window" // holding the frame for the frames in flight (GUIDE 2.7)
+			attrs = append(attrs, "window_ms", time.Since(time.Unix(0, w)).Milliseconds())
 		}
 		attrs = append(attrs, "sender_busy_ms", time.Since(time.Unix(0, at)).Milliseconds())
 	}
@@ -1282,15 +1298,18 @@ func (s *Session) checkOut() {
 		if c.step.act == actDiscard {
 			c.of.st.CancelWrite()
 			s.discard(f, c.step)
+			c.of.release()
 			continue
 		}
 		s.stats.cancelled.Add(1)
 		s.log.Info("frame stream cancelled", "gen", f.Gen, "seq", f.Seq, "why", c.step.why,
 			"age_ms", c.age.Milliseconds(), "deadline_ms", c.of.deadline.Milliseconds())
-		// The loss first: the reset frees frameSender, whose next frames
-		// must find the wait for the answer to it.
+		// The loss first: the reset (or the release of a frame the video
+		// window holds) frees frameSender, whose next frames must find the
+		// wait for the answer to it.
 		s.lostFrame(f, "deadline")
 		c.of.st.CancelWrite()
+		c.of.release()
 	}
 }
 
@@ -1683,7 +1702,8 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 // The ladder decides about every frame (ladder.go): a frame the client would
 // discard anyway (it waits for the answer to a loss before it) is not sent,
 // and a frame stream still being written past its deadline while a newer
-// frame is ready is cancelled (checkOut, rung 1).
+// frame is ready is cancelled (checkOut, rung 1). A frame goes out only when
+// the video window has room for it (window.go, GUIDE 2.7).
 func (s *Session) frameSender() {
 	buf := make([]byte, 0, 1<<20)
 	faults := s.a.faults
@@ -1723,16 +1743,18 @@ func (s *Session) frameSender() {
 			buf = ext.Append(buf)
 		}
 		buf = append(buf, f.Data...)
-		of := &outFrame{f: f, st: st, n: num, opened: time.Now(), deadline: s.frameDeadline(len(buf))}
+		of := &outFrame{f: f, st: st, n: num, opened: time.Now(), deadline: s.frameDeadline(len(buf)), gone: make(chan struct{}), held: true}
 		// A frame the ladder may cancel when it is late: look again at
 		// its deadline (a newer frame queued later looks too).
 		in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
 		in.key, in.recovery, in.age, in.deadline, in.newer = f.Key, f.Recovery, of.deadline, of.deadline, true
-		if ladder(in).act == actCancel {
-			of.timer = time.AfterFunc(of.deadline, s.checkOut)
-		}
+		lateCancel := ladder(in).act == actCancel
 		s.send.register(of)
-		if drop, delay := faults.at(n); drop {
+		drop, delay := faults.at(n)
+		if drop || delay > 0 {
+			s.send.start(of, lateCancel, s.checkOut) // the test hooks bypass the window
+		}
+		if drop {
 			// Test hook: the stream fails mid-frame.
 			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
 			_, _ = st.Write(buf[:len(buf)/2])
@@ -1750,6 +1772,19 @@ func (s *Session) frameSender() {
 			time.AfterFunc(delay, func() { s.sendFrame(of, h, late) })
 			continue
 		}
+		// Send priorities (GUIDE 2.7): while the path falls short of the
+		// pacing rate, at most videoInFlight frames in flight beyond those
+		// in transit, so datagrams never queue behind a video backlog in
+		// the network (window.go). The frame waits with its stream open,
+		// at most three quarters of its deadline; a frame the client would
+		// discard meanwhile is released at once.
+		if s.admit(of) > 0 && h.Flags&proto.FrameFlagExt != 0 {
+			h.SendUs = s.a.clock() // handed to the transport now: the wait is host queue
+			h.Marshal(buf)
+		}
+		// Its deadline (rung 1) runs from here: the hold was host queue,
+		// not a write the transport holds back.
+		s.send.start(of, lateCancel, s.checkOut)
 		s.sendFrame(of, h, buf)
 	}
 }
@@ -1777,6 +1812,8 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 		return // cancelled while the test hook held it
 	}
 	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	m := s.deliveryMeter()
+	start := startPos(m) // the video window measures the frame's delivery from here
 	if _, err := st.Write(b); err != nil {
 		if s.send.finish(of, outCancelled) {
 			st.CancelWrite()
@@ -1785,6 +1822,12 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 			}
 		}
 		return
+	}
+	if m2 := s.deliveryMeter(); m2 != nil {
+		if m2 != m {
+			start = math.MaxUint64 // the path changed during the write
+		}
+		s.win.sent(m2, start, time.Now()) // in flight until the peer acknowledged what was sent up to here
 	}
 	if !s.send.finish(of, outDone) {
 		return // cancelled as its write completed: reported lost
@@ -1986,7 +2029,7 @@ func (s *Session) datagrams() {
 		switch d[0] {
 		case proto.DgPing:
 			if p := proto.Pong(d, s.a.clock()); p != nil {
-				_ = s.c.SendDatagram(p)
+				s.sendPong(p)
 			}
 			if rtt := proto.PingMinRTT(d); rtt > 0 && s.clientRTT.Swap(int64(rtt)) != int64(rtt) {
 				s.audioFrameCheck()
@@ -2030,6 +2073,30 @@ func (s *Session) datagrams() {
 					}
 				}
 			}
+		}
+	}
+}
+
+// sendPong queues the answer to a ping for pongSender. quic-go's
+// SendDatagram blocks while its queue holds 32 datagrams (a congestion
+// window full for long enough: an outage, a path slower than the datagrams
+// alone): the datagram loop must not wait there, or input waits with it. A
+// pong that finds the queue full is dropped: the client keeps its best
+// (lowest round-trip) sample, and one that waited would not be that.
+func (s *Session) sendPong(p []byte) {
+	select {
+	case s.pongs <- p:
+	default:
+	}
+}
+
+func (s *Session) pongSender() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case p := <-s.pongs:
+			_ = s.c.SendDatagram(p)
 		}
 	}
 }
@@ -2404,6 +2471,10 @@ func (s *Session) statsLoop() {
 			// waited for a recovery or key frame, key frames asked of the
 			// pipeline (rung 4).
 			"deadline_drops", cancelled, "discarded", discarded, "key_frames", keyframes}
+		// Send priorities (GUIDE 2.7): frames the video window held for the
+		// frames in flight, and the longest hold.
+		held, maxHold := s.win.stats()
+		args = append(args, "window_held", held, "window_max_ms", maxHold.Milliseconds())
 		// The rate controller's view: the one-way delay of the client's
 		// reports (p50/p95 of their p50s, the largest maximum), the
 		// continuous target, the frame rate, the queueing-delay margin and
