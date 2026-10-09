@@ -184,13 +184,36 @@ Anyone with physical access to the PC then gets your desktop. Decide whether tha
    ```
 
 Optional: add `-InstallVirtualDisplay` to also install the Virtual Display Driver (a pinned,
-SHA-256-verified release). It is for streaming a virtual monitor at the browser's resolution
-and frame rate, e.g. 2560x1440 at 120 fps although the PC's monitor is 1080p60 (sessions do
-not use it yet; `recon-host.exe vdisplay`, under Useful commands, tests it). Windows asks once
-whether to install software from "SignPath Foundation": choose **Install**. The installer leaves
-the driver's device disabled, so there is no extra monitor: a session enables it only while it
-streams. It also restricts `C:\VirtualDisplayDriver` to administrators (users can read it).
-Skip it if Apollo is installed (its SudoVDA driver is used instead).
+SHA-256-verified release), for streaming a virtual monitor at the browser's resolution and frame
+rate, e.g. 2560x1440 at 120 fps although the PC's monitor is 1080p60. Windows asks once whether
+to install software from "SignPath Foundation": choose **Install**. The installer leaves the
+driver's device disabled, so there is no extra monitor between streams, and restricts
+`C:\VirtualDisplayDriver` to administrators (users can read it). If Apollo is installed, add the
+flag anyway: it finds Apollo's SudoVDA driver, installs nothing and uses SudoVDA. Without the
+flag (and without the setting below) sessions never use a virtual display.
+
+The flag also sets `"virtualDisplay": "auto"` in `host.json` (unless that key is already set),
+and sessions then use the driver:
+
+- **When.** A session creates a virtual monitor when the PC's monitor cannot show the stream 1:1:
+  another size, or a frame rate above its refresh rate. The size is the stream's **Resolution**
+  setting; with the default *Native* it is the browser's screen in device pixels. So a laptop,
+  tablet or phone whose screen differs from the PC's monitor (a 2880x1800 MacBook and a
+  2560x1440 monitor, say) gets one on every stream, at its own screen size. The stream then
+  captures it with Desktop Duplication (never AMD Direct Capture).
+- **Layout.** The virtual monitor becomes the **primary display** while the stream runs
+  (`"virtualDisplayLayout": "primary"`), so the taskbar, new windows and games move to it.
+  `"extend"` adds it to the right of your monitors instead; `"only"` turns your monitors off
+  during the stream.
+- **Afterwards.** It stays 10 seconds after the stream ends (`"virtualDisplayLinger"`, in
+  seconds), so a reconnect gets it back; then it is removed and Windows' previous display layout
+  comes back.
+- **Turn it off** with `"virtualDisplay": "off"` (sessions stream your monitor), or use `"on"`
+  for a virtual monitor in every stream. Restart the agent after editing `host.json`
+  (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`); the
+  README's `host.json` table has the details.
+
+`recon-host.exe vdisplay` (under Useful commands) tests the driver by itself.
 
 Optional, for Intel graphics: add `-InstallLibavcodec` to also download FFmpeg's LGPL shared
 libraries (BtbN's FFmpeg 8.1 LGPL shared build, about 80 MB, SHA-256 verified) into

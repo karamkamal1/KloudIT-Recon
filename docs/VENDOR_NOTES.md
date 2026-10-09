@@ -4986,7 +4986,8 @@ decoder tests before the hello still finds it.
 Host: Windows 11, a 60 Hz physical monitor (set it to 60 Hz in Settings > Display > Advanced
 display), recon-host with recon-encoder.exe next to it, `"virtualDisplay": "auto"` in host.json
 (`install-host.ps1 -InstallVirtualDisplay` sets it); client: a 2560x1440 120 Hz screen, Chrome,
-stream settings Resolution "Native (host display)" or "Match this screen", Frame rate 120 fps.
+stream settings Resolution "Native (host display, or this screen on a virtual display)" or "Match this screen",
+Frame rate 120 fps.
 Logs: `$env:APPDATA\KlouditRecon\host.log`; overlay Ctrl+Alt+Shift+S.
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (driver installs): once with the Virtual Display
@@ -8849,4 +8850,30 @@ install into a new folder, or Program Files.
   standard user `Set-Content C:\Recon\x.txt x` and replacing `C:\Recon\recon-encoder.exe` are
   denied. The agent then starts and streams as from Program Files. The default install
   (Program Files) is unchanged: no `Restricted` line.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### What the virtual display does after -InstallVirtualDisplay
+
+Problem: INSTALL.md step 7 and `install-host.ps1`'s help still said sessions do not use the
+virtual display yet, but the flag writes `"virtualDisplay": "auto"` and since 3.7 wiring every
+session decides on one before its pipeline: with the client's default resolution "Native" the
+requested size is the browser's screen (vdisplay.RequestedMode, as designed in 3.7), so nearly
+every laptop, tablet or phone whose screen differs from the PC's monitor gets a virtual monitor,
+primary by default, kept 10 s after the stream. The Apollo advice ("skip the flag, SudoVDA is used
+instead") left `virtualDisplay` off, so SudoVDA was never used. Fix (documentation and labels,
+the behaviour is 3.7's design): INSTALL.md step 7 says when a session creates one, the layout and
+linger, and how to turn it off; Apollo users add the flag (it finds SudoVDA and sets the key);
+the installer's help says the same and it prints a line when it sets the key; the README's
+installer bullet and `virtualDisplay` row say the flag sets `auto` and what Native means there;
+the client's Resolution option reads "Native (host display, or this screen on a virtual
+display)", with a hint.
+
+- Verified here: `node --check`, the browser E2E (the settings drawer renders), the pwsh parser
+  check. `TestVirtualDisplayPolicy` ("larger client", "default frame rate") already covers the
+  behaviour described.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `install-host.ps1 -InstallVirtualDisplay` prints
+  `host.json: "virtualDisplay": "auto" ...`; a stream from a client whose screen is not the
+  monitor's size, Resolution Native: host.log `streaming a virtual display reason="client wants
+  WxH, monitor is ..."` and the virtual monitor is the primary display; 10 s after the stream
+  the previous layout is back; with `"virtualDisplay": "off"` and a restart no virtual display.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

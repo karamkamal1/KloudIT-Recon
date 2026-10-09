@@ -251,8 +251,12 @@ The installer:
   set to Public)
 - installs ViGEmBus for controller support (`-InstallViGEm`)
 - optionally installs the Virtual Display Driver (`-InstallVirtualDisplay`: pinned release,
-  SHA-256 verified) for streaming a virtual monitor at the client's resolution and frame rate;
-  its device stays disabled (no extra monitor) until a session enables it
+  SHA-256 verified; with Apollo's SudoVDA already there it installs nothing) and sets
+  `"virtualDisplay": "auto"` in `host.json`: a stream the PC's monitor cannot show 1:1 (another
+  size, which with the default resolution *Native* is the browser's screen, or a higher frame
+  rate) then gets a virtual monitor at the client's resolution and frame rate, the primary
+  display while it runs (see `virtualDisplay` below); the device stays disabled (no extra
+  monitor) between streams
 - optionally downloads FFmpeg's LGPL shared libraries (`-InstallLibavcodec`: BtbN's FFmpeg 8.1
   LGPL shared build, SHA-256 verified) into `ffmpeg-lgpl\` for the native encoder helper's
   Intel Quick Sync backend; the GPL `ffmpeg.exe` stays the FFmpeg command-line path
@@ -288,7 +292,9 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   available only where the PC's GPU encodes it (AMD RDNA3 and newer, NVIDIA RTX 40 and newer);
   RDNA3 uses it only at sizes in 64×16 steps (e.g. not 1920×1080).
 - **Bitrate**: 50–150 Mbps on a LAN. Over the internet, stay below your upload speed.
-- **Frame rate** (up to 240) and **resolution** (native, or downscaled on the GPU).
+- **Frame rate** (up to 240) and **resolution** (*Native*: the PC display's own size, or this
+  screen's where the PC streams a virtual display, `virtualDisplay` below; other sizes are
+  downscaled on the GPU, or get a virtual display of that size).
 - **Encoder preset**: lowest latency / balanced / best quality.
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer: *Auto* (default, adapts within
@@ -404,7 +410,7 @@ The new password (at least 10 characters) is read from stdin.
 | `drawCursor` | false | Bake the cursor into the video instead of rendering it locally |
 | `captureTimestamps` | auto | `off` stops stamping frames with their capture time (FFmpeg `setpts=time(0)*1000000`); the overlay then shows send→draw latency. With `capture` `amf` the FFmpeg chain keeps that wall-clock pts (`vsrc_amf`'s own pts are rounded to 1/fps), and `off` only stops sending capture stamps to the client |
 | `gpuPriority` | `auto` | GPU scheduling priority of the capture/encode process (FFmpeg, or the native helper, which applies the same rules to itself), so it is not queued behind a game that keeps the GPU at ~100 %: `auto` (realtime; high when the encoder or the GPU is NVIDIA and hardware-accelerated GPU scheduling is on or cannot be determined, where realtime can freeze NVENC or hang the driver), `high`, `realtime` or `off`. Realtime needs the elevated agent (the logon task); a refused realtime falls back to high. The host log shows the result: `gpu priority: realtime`, `high` or `failed` |
-| `virtualDisplay` | `off` | Stream a virtual monitor matched to the client (its resolution, and the stream's frame rate as refresh rate, e.g. 2560x1440@120 on a 60 Hz host monitor) through an installed IddCx driver: SudoVDA (comes with Apollo) or the Virtual Display Driver (`install-host.ps1 -InstallVirtualDisplay`). `auto`: when the monitor the session would capture cannot show the client's mode 1:1 (another size, or a frame rate above its refresh rate); `on`: always (without a driver the session streams the monitor and says why); `off`. The session captures that display 1:1 with Desktop Duplication (with Windows Graphics Capture when `capture` is `gfxcapture`; never AMD Direct Capture), maps mouse input to it and lists it alone as its monitor; a change of the stream's size or frame rate replaces it. The previous display layout is restored when the session ends (after `virtualDisplayLinger`), when the agent stops, and after a crash at the agent's next start. Test a driver with `recon-host.exe vdisplay` (see `docs/VENDOR_NOTES.md`, 3.7 and 3.7 wiring) |
+| `virtualDisplay` | `off` (`install-host.ps1 -InstallVirtualDisplay` sets `auto`) | Stream a virtual monitor matched to the client (its resolution, and the stream's frame rate as refresh rate, e.g. 2560x1440@120 on a 60 Hz host monitor) through an installed IddCx driver: SudoVDA (comes with Apollo) or the Virtual Display Driver (`install-host.ps1 -InstallVirtualDisplay`). The client's resolution is the stream's Resolution setting, and for *Native* (the default) the browser's screen in device pixels. `auto`: when the monitor the session would capture cannot show the client's mode 1:1 (another size, or a frame rate above its refresh rate), so with *Native* nearly every client whose screen differs from the monitor gets one; `on`: always (without a driver the session streams the monitor and says why); `off`. The session captures that display 1:1 with Desktop Duplication (with Windows Graphics Capture when `capture` is `gfxcapture`; never AMD Direct Capture), maps mouse input to it and lists it alone as its monitor; a change of the stream's size or frame rate replaces it. The previous display layout is restored when the session ends (after `virtualDisplayLinger`), when the agent stops, and after a crash at the agent's next start. Test a driver with `recon-host.exe vdisplay` (see `docs/VENDOR_NOTES.md`, 3.7 and 3.7 wiring) |
 | `virtualDisplayLayout` | `primary` | Where the virtual monitor goes: `primary` (primary display, so games open on it; the other monitors stay on), `extend` (secondary, right of the others) or `only` (the other monitors are off during the session) |
 | `virtualDisplayLinger` | 10 | Seconds a session's virtual display stays after the session ends, so that a client reconnecting with the same size and frame rate gets it back without the desktop being rearranged twice; `0` restores the displays at once (0-600) |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |

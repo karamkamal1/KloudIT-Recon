@@ -1337,7 +1337,11 @@ function buildDrawer() {
       field('Codec', select('codec', codecOpts, applyLive), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
       field('Bitrate', el('div', { class: 'range-row' }, bitrate, out), 'LAN: 50–150 Mbps. Internet: match your upload speed.'),
       field('Frame rate', select('fps', fpsOpts, applyLive)),
-      field('Resolution', select('resolution', [['native', 'Native (host display)'], ['client', 'Match this screen'], ['2160', '3840×2160'], ['1440', '2560×1440'], ['1080', '1920×1080'], ['900', '1600×900'], ['720', '1280×720']], applyLive), 'Downscaling happens on the GPU (Windows Graphics Capture).'),
+      // "Native" sends no size: the host streams its display at its own size,
+      // or, where it streams a virtual display (host config virtualDisplay),
+      // one at this screen's size (vdisplay.RequestedMode).
+      field('Resolution', select('resolution', [['native', 'Native (host display, or this screen on a virtual display)'], ['client', 'Match this screen'], ['2160', '3840×2160'], ['1440', '2560×1440'], ['1080', '1920×1080'], ['900', '1600×900'], ['720', '1280×720']], applyLive),
+        'Native: the PC display at its own size; where the PC streams a virtual display (host.json "virtualDisplay"), one at this screen\'s size. Other sizes are downscaled on the GPU (Windows Graphics Capture), or get a virtual display of that size.'),
       field('Encoder preset', select('quality', [['speed', 'Lowest latency'], ['balanced', 'Balanced'], ['quality', 'Best quality']], applyLive)),
       monOpts.length > 1 ? field('Display', select('monitor', monOpts, applyLive)) : null,
       check('adaptive', 'Adaptive bitrate on congestion', () => { post({ type: 'prefs', prefs: { adaptive: prefs.adaptive } }); applyLive(); }),

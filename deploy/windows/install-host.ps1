@@ -49,12 +49,17 @@
 .PARAMETER InstallVirtualDisplay
   Install the Virtual Display Driver (github.com/VirtualDrivers/Virtual-Display-Driver
   release 25.7.23, an IddCx driver signed by SignPath Foundation) with nefcon v1.14.0, both
-  pinned by SHA-256, and set "virtualDisplay": "auto" in host.json unless it is set already,
-  for streaming a virtual monitor at the client's resolution and frame rate when the physical
-  monitor cannot show them (docs/VENDOR_NOTES.md, 3.7; sessions do not use it yet, test it
-  with recon-host.exe vdisplay). Windows asks once whether to trust the publisher
-  "SignPath Foundation". Skipped when the Virtual Display Driver or SudoVDA (installed by
-  Apollo) is already present.
+  pinned by SHA-256, and set "virtualDisplay": "auto" in host.json unless it is set already.
+  Sessions then stream a virtual monitor at the client's resolution and frame rate whenever
+  the physical monitor cannot show them 1:1: another size (with the client's default
+  resolution "Native", its screen size) or a frame rate above its refresh rate. During the
+  stream it is the primary display ("virtualDisplayLayout": primary; extend or only), and
+  it stays "virtualDisplayLinger" seconds (10) after the stream before the previous layout
+  is restored. Set "virtualDisplay": "off" in host.json to stream the monitor instead.
+  Test the driver alone with recon-host.exe vdisplay (docs/INSTALL.md, step 7). Windows
+  asks once whether to trust the publisher "SignPath Foundation". When the Virtual Display
+  Driver or SudoVDA (installed by Apollo) is already present nothing is installed, and the
+  setting is made for it.
 .PARAMETER NoStart
   Do not start the agent after installing.
 #>
@@ -385,7 +390,10 @@ $cfg['ffmpeg'] = $ffmpeg
 $cfg['directPort'] = $DirectPort
 if (-not $cfg.Contains('audio')) { $cfg['audio'] = $true }
 if (-not $cfg.Contains('gamepad')) { $cfg['gamepad'] = $true }
-if ($virtualDisplayReady -and -not $cfg.Contains('virtualDisplay')) { $cfg['virtualDisplay'] = 'auto' }
+if ($virtualDisplayReady -and -not $cfg.Contains('virtualDisplay')) {
+    $cfg['virtualDisplay'] = 'auto'
+    Write-Step 'host.json: "virtualDisplay": "auto" (a stream the monitor cannot show 1:1 gets a virtual monitor, the primary display while it runs; "off" turns it off)'
+}
 # UTF-8 without a byte-order mark (Set-Content -Encoding UTF8 adds one in PowerShell 5.1).
 [IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
 # Owner-only access: the file holds the host token.
