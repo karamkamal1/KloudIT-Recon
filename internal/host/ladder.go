@@ -23,10 +23,16 @@ import (
 //     (rung 2) of the live generation. Key frames and recovery frames are
 //     never cancelled (another one would have to take their place); under
 //     "skip" and "keyframe" a late frame goes on (the loss would cost a
-//     smeared picture or a key frame, a late frame only time). Once its write
-//     returned (the transport took the frame) and its stream is closed, a
-//     frame is QUIC's to deliver: lost packets are retransmitted, not
-//     cancelled (docs/VENDOR_NOTES.md 2.3, deviation 7).
+//     smeared picture or a key frame, a late frame only time). A late
+//     discardable frame (temporal SVC's enhancement layer) goes on too: the
+//     client cannot tell its loss from that of a frame others reference (it
+//     skips only the seqs ExtThinned names, and often reads a reset stream's
+//     header: onFrameReset), so it would cost a recovery round where its
+//     time costs little; thinning leaves out the next discardable frames
+//     under the same pressure (thin.go: the deadline and the queue). Once
+//     its write returned (the transport took the frame) and its stream is
+//     closed, a frame is QUIC's to deliver: lost packets are retransmitted,
+//     not cancelled (docs/VENDOR_NOTES.md 2.3, deviation 7).
 //  2. Recover without a key frame (recovery "ltr" / "invalidate": the native
 //     helper's AMF long-term references or NVENC reference invalidation, GUIDE
 //     3.5): the encoder codes its next frame from frames the client holds.
@@ -82,10 +88,12 @@ type ladderIn struct {
 	gen   uint8
 	seq   uint32
 
-	// lossOutgoing: the frame (key frame; recovery frame and its refFloor),
-	// how long its stream has been written (0: not opened yet), its deadline,
+	// lossOutgoing: the frame (key frame; recovery frame and its refFloor;
+	// discardable: no frame references it, media.Frame.Discardable), how
+	// long its stream has been written (0: not opened yet), its deadline,
 	// and whether a newer frame is ready (queued or taken after it).
 	key, recovery bool
+	discardable   bool
 	refFloor      uint32
 	age, deadline time.Duration
 	newer         bool
@@ -161,6 +169,8 @@ func ladder(in ladderIn) ladderStep {
 			return ladderStep{why: "late, of a generation the client has left (it discards its frames anyway)"}
 		case !ref:
 			return ladderStep{why: "late, but its loss would cost a key frame or a damaged picture"}
+		case in.discardable:
+			return ladderStep{why: "late discardable frame: its loss would cost a recovery, thinning leaves out the next ones"}
 		}
 		return ladderStep{rung: 1, act: actCancel, why: "past its deadline"}
 	case lossConfirmed, lossOverflow:
@@ -424,7 +434,8 @@ func (s *sendState) markReliable(of *outFrame, n int) bool {
 
 // slow reports the loss-recovery ladder's deadline pressure, for thinning
 // (thin.go): a frame stream still being written past its deadline (where
-// rung 1 does not cancel it: key frames, recovery "skip" or "keyframe"), or
+// rung 1 does not cancel it: key frames, recovery frames, discardable
+// frames, recovery "skip" or "keyframe"), or
 // the last frame written (on a stream, or as shards: shardsDone) taking that
 // long. A large frame's deadline includes
 // its own sending time (frameDeadline), so a key frame paced out in time is
@@ -474,7 +485,7 @@ func (s *sendState) due(in ladderIn, queued bool, now time.Time) []cancelledFram
 		if of.held {
 			age = 0 // held by the video window: its deadline has not started
 		}
-		in.event, in.gen, in.seq, in.key, in.recovery, in.refFloor = lossOutgoing, f.Gen, f.Seq, f.Key, f.Recovery, f.RefFloor
+		in.event, in.gen, in.seq, in.key, in.recovery, in.discardable, in.refFloor = lossOutgoing, f.Gen, f.Seq, f.Key, f.Recovery, f.Discardable, f.RefFloor
 		in.age, in.deadline, in.newer, in.wait = age, of.deadline, queued || s.taken > of.n, s.wait
 		st := ladder(in)
 		if (st.act == actCancel || st.act == actDiscard) && of.state.CompareAndSwap(outWriting, outCancelled) {

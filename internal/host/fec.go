@@ -426,7 +426,8 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 	for i, d := range dgs {
 		if (i > 0 || held) && i%16 == 0 && s.ctx.Err() == nil {
 			in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
-			in.key, in.recovery, in.refFloor, in.age, in.deadline, in.newer = f.Key, f.Recovery, f.RefFloor, time.Since(of.opened), of.deadline, len(s.frameQ) > 0
+			in.key, in.recovery, in.discardable, in.refFloor = f.Key, f.Recovery, f.Discardable, f.RefFloor
+			in.age, in.deadline, in.newer = time.Since(of.opened), of.deadline, len(s.frameQ) > 0
 			switch st := s.send.outgoing(in); st.act {
 			case actCancel:
 				s.stats.cancelled.Add(1)

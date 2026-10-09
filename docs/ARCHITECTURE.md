@@ -246,7 +246,12 @@ running encoder (never from a vendor). Its rungs, cheapest first:
    loss is cheap: under reference recovery of the live generation. Key frames and recovery frames
    are never cancelled (another one would have to take their place), and under `skip` and
    `keyframe` a late frame goes on (its loss would cost a smeared picture or a key frame, a late
-   frame only time). frameSender checks at each stream's deadline and whenever a frame is queued.
+   frame only time). A late discardable frame (temporal SVC's enhancement layer) goes on too: the
+   client cannot tell its loss from that of a frame others reference (it skips only the seqs the
+   `thinned` mask names, and often reads the header of a reset stream), so cancelling it would
+   cost a recovery round; its lateness is thinning's deadline pressure instead, and the backlog
+   behind it thins the next discardable frames. frameSender checks at each stream's deadline and
+   whenever a frame is queued.
    Rung 1 sees frames whose write the transport holds back (a full congestion window, flow
    control). A frame whose write returned and whose stream is closed is QUIC's to deliver: its
    lost packets are retransmitted, not cancelled. The host has no signal that such a frame has

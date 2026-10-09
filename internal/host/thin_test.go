@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -202,6 +203,69 @@ func TestFrameSenderThinning(t *testing.T) {
 			t.Fatalf("thinned without congestion: sent %v", seqs)
 		}
 	})
+}
+
+// TestLateDiscardableFrame: under reference recovery a discardable frame
+// (temporal SVC's enhancement layer) whose stream stalls past its deadline
+// while newer frames wait is not cancelled: it is sent to the end, nothing is
+// reported dropped, the encoder is not asked to recover and no frame waits
+// for a recovery frame; thinning leaves out the next discardable frame under
+// the backlog the stall left. Before, rung 1 cancelled it as a loss: reported
+// dropped, Recover, and the frames up to the recovery frame discarded.
+func TestLateDiscardableFrame(t *testing.T) {
+	s, c, ctrl := testSession(t, testFaults{})
+	s.a.cfg = &Config{} // svc auto
+	s.hello.V = proto.HelloVersionThinned
+	c.stall = map[int]bool{1: true} // seq 1's stream
+	logs := &lockedLog{}
+	s.log = slog.New(slog.NewTextHandler(logs, nil))
+	p := &ladderPipeline{caps: media.PipelineCaps{Recovery: proto.RecoveryLTR, ForceIDR: true}, events: make(chan media.VideoEvent)}
+	s.video = p
+	s.healConfig(&proto.VideoConfig{Gen: 1, Recovery: proto.RecoveryLTR}, 0)
+	s.setCongestionTarget(media.Params{BitrateKbps: 20000, FPS: 60}) // deadline 33 ms
+	go s.frameSender()
+	queue := func(seq uint32) {
+		s.frameQ <- &media.Frame{Gen: 1, Seq: seq, Key: seq == 0, TemporalLayer: uint8(seq % 2), Discardable: seq%2 == 1,
+			Data: bytes.Repeat([]byte{byte(seq)}, 100)}
+		s.checkOut() // as videoEvents does for every frame it queues
+	}
+	queue(0)
+	queue(1) // stalls
+	for deadline := time.Now().Add(5 * time.Second); len(c.snapshot()) < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("seq 1's stream not opened")
+		}
+	}
+	for seq := uint32(2); seq < 6; seq++ {
+		queue(seq) // newer frames wait
+	}
+	time.Sleep(100 * time.Millisecond) // three times its deadline
+	s.checkOut()
+	if st := c.snapshot()[1]; st.cancelled {
+		t.Fatal("the late discardable frame was cancelled")
+	}
+	c.release(1)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(c.snapshot())+int(s.stats.thinned.Load()) < 6 {
+		if time.Now().After(deadline) {
+			t.Fatalf("frames handled: %d streams, %d thinned", len(c.snapshot()), s.stats.thinned.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	seqs, masks := sentFrames(t, c)
+	if fmt.Sprint(seqs) != "[0 1 2 4 5]" || masks[3] != 1 {
+		t.Fatalf("sent %v (masks %v), want every frame but seq 3, thinned under the backlog (seq 4 names it)", seqs, masks)
+	}
+	if d := ctrl.dropped(t); len(d) != 0 {
+		t.Fatalf("dropped reports %+v", d)
+	}
+	if rec, keys, _ := p.state(); len(rec) != 0 || keys != 0 {
+		t.Fatalf("pipeline: recover %v, key frames %d; want neither", rec, keys)
+	}
+	if n, m := s.stats.cancelled.Load(), s.stats.discarded.Load(); n != 0 || m != 0 {
+		t.Fatalf("%d cancelled, %d discarded", n, m)
+	}
 }
 
 // TestThinPressure: the signals that count as congestion for thinning: the

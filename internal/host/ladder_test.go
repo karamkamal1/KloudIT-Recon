@@ -52,6 +52,10 @@ func TestLadder(t *testing.T) {
 		{"nothing newer", out(proto.RecoveryLTR, func(in *ladderIn) { in.newer = false }), 0, actNone, false, false},
 		{"late key frame", out(proto.RecoveryLTR, func(in *ladderIn) { in.key = true }), 0, actNone, false, false},
 		{"late recovery frame", out(proto.RecoveryLTR, func(in *ladderIn) { in.recovery, in.refFloor = true, 7 }), 0, actNone, false, false},
+		// A discardable frame's loss would cost a recovery round (the
+		// client cannot tell it apart); thinning leaves out the next ones.
+		{"late discardable frame", out(proto.RecoveryLTR, func(in *ladderIn) { in.discardable = true }), 0, actNone, false, false},
+		{"discardable, waiting", out(proto.RecoveryLTR, func(in *ladderIn) { in.discardable, in.wait = true, refWait }), 2, actDiscard, false, false},
 		{"late, keyframe", out(proto.RecoveryKeyframe, nil), 0, actNone, false, false},
 		{"late, skip", out(proto.RecoverySkip, nil), 0, actNone, false, false},
 		{"late, nothing live", out("", func(in *ladderIn) { in.live = 0 }), 0, actNone, false, false},

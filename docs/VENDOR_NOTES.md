@@ -108,7 +108,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    (at the default `logLevel`).
 7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
    before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
-   re-encode, slice output).
+   re-encode, slice output). "Final review: host agent, third round": a late discardable frame
+   is no loss (under `capdrop`).
 8. **Virtual display and HDR**: 3.7 and 3.7 wiring (with the Virtual Display Driver, then
    SudoVDA), and "Final review: deploy and install", what the virtual display does after
    `-InstallVirtualDisplay`; 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode), and
@@ -10985,3 +10986,44 @@ deleted with the stream unless `-keep`.
   `live_bitrate_from="helper default"` (no matching cells) until qualify runs again.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same on an NVENC host whose caps have
   `maxTemporalLayers` >= 2; the cells also keep `--intra-refresh` (NVENC combines it with SVC).
+
+### A late discardable frame is no loss
+
+Problem: under reference recovery (`ltr`, `invalidate`) rung 1 of the loss-recovery ladder
+cancelled a frame stream written past its deadline while a newer frame was ready, and treated it
+as lost, also when the frame was discardable (an enhancement-layer frame of the temporal-SVC
+stream, which no frame references): reported `dropped`, `Pipeline.Recover`, and the frames up to
+the recovery frame discarded while the client froze on its last picture. Thinning the same frame
+before it was sent costs nothing; losing it after its stream opened cost a full recovery round
+(on AMF a recovery frame predicted from an older LTR). About half the rung-1 cancels at the onset
+of congestion are of such frames.
+
+Fix: rung 1 never cancels a discardable frame (as key frames and recovery frames): it goes on to
+the end. The fix the review proposed first, cancelling it and naming it in the next frames'
+`thinned` mask, needs a client change: the browser often reads the header of a reset frame
+stream (VENDOR_NOTES 2.4: 10 of 15 cancelled streams in Chromium without partial delivery) and
+then takes the frame for one the host dropped at once (`onFrameReset`), waits for a recovery
+frame that would never come, and asks for a key frame after a second; the mask in the next frame
+comes too late for it. Letting the frame finish needs no protocol change: its lateness is
+thinning's deadline pressure (`sendState.slow`), and the frames that queued behind it are
+queue pressure, so the next discardable frames are left out before they are sent, at no cost.
+The price is the rest of one small enhancement frame's bytes ahead of the next frame.
+
+- Verified here: `internal/host` `TestLadder` (a late discardable frame: no rung; during a
+  recovery wait it is still discarded) and `TestLateDiscardableFrame` (reference recovery, a
+  thinnable client: the discardable seq 1's stream stalls three times past its 33 ms deadline
+  with four newer frames queued; it is not cancelled and goes out once the write moves, nothing
+  is reported dropped, no Recover, no key frame, nothing discarded, and seq 3, the next
+  discardable frame, is thinned under the backlog and named in seq 4's mask). Before the fix the
+  stream was cancelled at its deadline. `TestFrameSenderLadder`, `TestFrameSenderThinning` and
+  the other thinning tests pass unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified; needs temporal SVC (caps `maxTemporalLayers` >= 2) and
+  `ltr` recovery. Test: with `"logLevel": "debug"`, stream from a browser through `sudo
+  ./netem.sh apply capdrop --iface <nic> --port 48100` (0.4) for 2 minutes. host.log: no `frame
+  stream cancelled` line whose seq is an enhancement-layer frame (with two layers every other seq
+  of a generation counted from its key frame; the `thinning: leaving out discardable frames`
+  lines name `temporal_layer=1`), `thinning` episodes with `why=deadline` or `why=queue` at the
+  onset of congestion, and fewer `recovering from a loss` lines than in the same run before the
+  fix (record both counts); the overlay's Freezes count stays lower too.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same on an NVENC host whose caps report
+  temporal layers (recovery `invalidate`).

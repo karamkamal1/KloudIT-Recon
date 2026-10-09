@@ -2133,7 +2133,7 @@ func (s *Session) frameSender() {
 		// A frame the ladder may cancel when it is late: look again at
 		// its deadline (a newer frame queued later looks too).
 		in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
-		in.key, in.recovery, in.age, in.deadline, in.newer = f.Key, f.Recovery, of.deadline, of.deadline, true
+		in.key, in.recovery, in.discardable, in.age, in.deadline, in.newer = f.Key, f.Recovery, f.Discardable, of.deadline, of.deadline, true
 		lateCancel := ladder(in).act == actCancel
 		if s.partial { // GUIDE 2.4: the prefix a cancel still delivers (writeFrame)
 			of.reliable = s.reliablePrefix(f, len(buf)-len(f.Data))
