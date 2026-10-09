@@ -69,7 +69,23 @@ const video = {
   waitingMax: 0, // most chunks waiting in video.queue at once this session
   selfTest: [], // decoder self-test per family (decoder-selftest.js)
   softwareFor: new Set(), // families decoded in software: their hardware decoder held frames back
+  hwFailed: new Set(), // families decoded in software: their hardware decoder kept failing (HW_FAIL_LIMIT)
+  hwFailNotice: null, // the family whose next configure tells the user about it
+  errors: { n: 0, at: 0 }, // decoder errors in a row without a frame out, the last one's time
 };
+
+// A hardware decoder that keeps failing while the browser still reports it
+// supported (its creation refused, a driver that rejects this stream's
+// bitstream): HW_FAIL_LIMIT errors in a row without a frame out, each within
+// HW_FAIL_WINDOW_MS of the one before, and the family decodes in software for
+// the rest of this connection (the next one tries the hardware decoder again).
+// Each further error in a row waits longer before the decoder is configured
+// again (up to ERROR_BACKOFF_MS), so that a decoder failing at once does not
+// spin.
+const HW_FAIL_LIMIT = 3;
+const HW_FAIL_WINDOW_MS = 10000;
+const ERROR_BACKOFF_MS = 2000;
+const FAMILY_NAMES = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
 
 const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0 };
 
@@ -1010,9 +1026,12 @@ async function configureDecoder(cfg) {
   video.submitted = 0;
   const base = { codec: cfg.codec, optimizeForLatency: true, codedWidth: cfg.codedWidth || cfg.width, codedHeight: cfg.codedHeight || cfg.height };
   if (cfg.hdr && cfg.colorSpace) base.colorSpace = cfg.colorSpace; // HDR10: BT.2020 PQ (the bitstream says so too)
-  const avoidHW = video.softwareFor.has(cfg.family);
+  const failed = video.hwFailed.has(cfg.family);
+  const avoidHW = video.softwareFor.has(cfg.family) || failed;
   const wantHW = prefs.decoder !== 'software' && !avoidHW;
-  if (avoidHW && prefs.decoder !== 'software') post('log', { text: `${cfg.codec}: decoding in software, the hardware decoder held frames back in the self-test` });
+  if (avoidHW && prefs.decoder !== 'software') {
+    post('log', { text: `${cfg.codec}: decoding in software, the hardware decoder ${failed ? 'kept failing' : 'held frames back in the self-test'}` });
+  }
   let config = { ...base, hardwareAcceleration: wantHW ? 'prefer-hardware' : 'prefer-software' };
   let support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
   // Without a decoder of the preferred kind, no-preference gets the other
@@ -1028,6 +1047,13 @@ async function configureDecoder(cfg) {
     post('notice', { level: 'error', msg: `This browser cannot decode ${cfg.codec}. Pick another codec in settings.` });
     return false;
   }
+  if (video.hwFailNotice === cfg.family) {
+    video.hwFailNotice = null;
+    const name = FAMILY_NAMES[cfg.family] || cfg.codec;
+    post('notice', video.hw
+      ? { level: 'error', msg: `The hardware ${name} decoder keeps failing, and this browser has no software ${name} decoder. Pick another codec in settings.` }
+      : { level: 'warn', msg: `The hardware ${name} decoder keeps failing: decoding in software for this connection.` });
+  }
   if (cfg !== video.cfg) return false; // superseded while awaiting
   video.decoder = new VideoDecoder({ output: onDecoded, error: onDecodeError });
   video.decoder.ondequeue = feedDecoder; // room in the decoder (browsers without the event: see feedDecoder)
@@ -1038,6 +1064,17 @@ async function configureDecoder(cfg) {
 
 function onDecodeError(e) {
   post('log', { text: `decoder error: ${e.message}` });
+  const t = now();
+  const errs = video.errors;
+  errs.n = t - errs.at <= HW_FAIL_WINDOW_MS ? errs.n + 1 : 1;
+  errs.at = t;
+  const family = video.cfg?.family;
+  if (video.hw && family && errs.n >= HW_FAIL_LIMIT && !video.hwFailed.has(family)) {
+    video.hwFailed.add(family);
+    video.hwFailNotice = family;
+    errs.n = 0; // the software decoder starts afresh
+    post('log', { text: `the hardware decoder failed ${HW_FAIL_LIMIT} times in a row (${video.cfg.codec}): decoding in software for this connection` });
+  }
   if (dropTest.run && !dropTest.run.error) dropTest.run.error = e.message;
   // Right after a recovery frame: this decoder does not take recovery frames
   // after skipped ones (docs/VENDOR_NOTES.md 3.5); this codec's losses ask
@@ -1050,7 +1087,13 @@ function onDecodeError(e) {
   }
   video.recoveredAt = null;
   requestKeyframe('decoder error');
-  if (video.cfg) configureDecoder(video.cfg).then(() => drainEarly());
+  if (!video.cfg) return;
+  video.ready = false; // frames wait (onFrame) until the decoder is configured again
+  const cfg = video.cfg;
+  const again = () => { if (video.cfg === cfg) configureDecoder(cfg).then(() => drainEarly()); };
+  const wait = Math.min(ERROR_BACKOFF_MS, 250 * Math.max(0, errs.n - 1));
+  if (wait) setTimeout(again, wait);
+  else again();
 }
 
 // Drop the current generation and wait for a fresh key frame. When send is
@@ -1541,6 +1584,7 @@ const pacer = new Pacer({
 
 function onDecoded(frame) {
   trackFrame(frame);
+  video.errors.n = 0; // the decoder works
   const meta = video.inflight.get(frame.timestamp);
   video.inflight.delete(frame.timestamp);
   const dt = dropTest.run;

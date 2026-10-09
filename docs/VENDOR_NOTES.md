@@ -9631,3 +9631,37 @@ its hello.
   resumes; after Alt+Tab, typing in the stream reaches the PC. The client log has no `Could not
   connect — retrying`.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.
+
+### A hardware decoder that keeps failing
+
+Problem: a decoder error asked for a key frame and configured the same `prefer-hardware`
+decoder again, which Chrome treats as hardware only. A hardware decoder that kept failing while
+`isConfigSupported` still reported it supported (its creation refused, a driver that rejects
+this host's bitstream, GPU memory pressure) froze the picture for good while audio played; the
+client looped between error, reconfigure and key-frame request with nothing but log lines. A
+decoder failing at its configure made that loop spin with no delay.
+
+Fix: 3 decoder errors in a row (no frame out in between, each within 10 s of the one before)
+on the hardware decoder, and the family decodes in software for the rest of the connection
+(the next connection tries hardware again): log `the hardware decoder failed 3 times in a row
+(<codec>): decoding in software for this connection` and a notice. Where the browser has no
+software decoder for the family (HEVC in Chrome) the stream stays on the hardware decoder and
+the notice says to pick another codec. Each further error in a row waits 250 ms longer (2 s at
+most) before the decoder is configured again.
+
+- Verified here: browser E2E check "a hardware decoder that keeps failing" (the worker's
+  VideoDecoder replaced from its start by one that reports `prefer-hardware` supported for AV1
+  but fails at the first chunk of every instance configured with it): 3 decoder errors, one
+  fallback, the stream plays at 60 fps with the overlay's hw flag false and the notice "The
+  hardware AV1 decoder keeps failing: decoding in software for this connection.". Against the
+  old worker: 23 decoder errors in 30 s and no picture, no notice.
+- AMD RDNA3 (RX 7900 XT): unverified (a real persistent hardware decoder failure cannot be
+  produced on demand). Test: Chrome on a Windows client with an AMD GPU, Codec H.264 or AV1,
+  stream, then reset the GPU driver (Win+Ctrl+Shift+B) a few times in a row, or start the
+  stream while another program holds the GPU's video memory full. If the decoder keeps
+  failing, the client log shows `decoder error: …` three times, then `the hardware decoder
+  failed 3 times in a row (…): decoding in software for this connection`, the picture comes
+  back, the overlay's Codec row says `(SW)` and a notice says so; Reconnect goes back to
+  hardware `(HW)`. Record the decoder error messages. With Codec HEVC the notice says to pick
+  another codec instead.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.

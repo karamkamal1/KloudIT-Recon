@@ -2397,6 +2397,70 @@ async function checkControlBeforeHello() {
   }
 }
 
+// A hardware decoder that keeps failing (final review): the worker's
+// VideoDecoder replaced, from the worker's start, by one that reports
+// prefer-hardware supported for what this browser decodes, but whose
+// instances configured prefer-hardware fail at their first chunk (a driver
+// that rejects the stream, a decoder that cannot be created), while the
+// browser keeps reporting it supported. After HW_FAIL_LIMIT (3) errors in a
+// row the family decodes in software for the connection, with a notice, and
+// the stream plays; before, the client reconfigured the same hardware
+// decoder after every error and never showed a picture.
+async function checkHardwareDecoderFailure() {
+  const install = (w) => {
+    if (!w.url().endsWith('/js/stream-worker.js')) return;
+    w.evaluate(() => {
+      const Real = VideoDecoder;
+      const hw = (c) => c?.hardwareAcceleration === 'prefer-hardware';
+      class FailingHW extends Real {
+        static async isConfigSupported(c) {
+          if (!hw(c)) return Real.isConfigSupported(c);
+          const r = await Real.isConfigSupported({ ...c, hardwareAcceleration: 'no-preference' });
+          return { supported: r.supported, config: c };
+        }
+        constructor(init) { super(init); this.fail = init.error; }
+        configure(c) { this.hw = hw(c); return super.configure(this.hw ? { ...c, hardwareAcceleration: 'no-preference' } : c); }
+        decode(chunk) {
+          if (!this.hw) return super.decode(chunk);
+          if (!this.failed) {
+            this.failed = true;
+            setTimeout(() => this.fail(new DOMException('fake hardware decoder failure', 'EncodingError')), 0);
+          }
+        }
+      }
+      self.VideoDecoder = FailingHW;
+    }).catch(() => {});
+  };
+  page.on('worker', install);
+  const con0 = consoleLines.length;
+  try {
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, ...PREFS_2D, path: 'direct', transport: 'auto', decoder: 'hardware' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.evaluate(() => {
+      window.__toastLog = [];
+      new MutationObserver(() => {
+        for (const t of document.querySelectorAll('.toast')) if (!window.__toastLog.includes(t.textContent)) window.__toastLog.push(t.textContent);
+      }).observe(document.body, { childList: true, subtree: true });
+    });
+    await page.click('#btn-start');
+    const playing = await until(() => page.evaluate(() => window.__recon.streaming && (window.__recon.lastStats?.fps || 0) > 5), 30000, 'the stream').catch(() => false);
+    await sleep(1000);
+    const lines = consoleLines.slice(con0);
+    const errors = lines.filter((l) => l.includes('decoder error: fake hardware decoder failure')).length;
+    const fellBack = lines.filter((l) => /the hardware decoder failed 3 times in a row \(.*\): decoding in software/.test(l)).length;
+    const st = await page.evaluate(() => ({ hw: window.__recon.lastStats?.hw, fps: window.__recon.lastStats?.fps, toasts: window.__toastLog }));
+    const notice = st.toasts.find((t) => /hardware .* decoder keeps failing: decoding in software/.test(t));
+    check('a hardware decoder that keeps failing: after 3 errors in a row the stream decodes in software (overlay SW), with a notice, and plays',
+      !!playing && errors === 3 && fellBack === 1 && st.hw === false && !!notice,
+      `${errors} decoder errors, ${fellBack} fallback(s); stream ${playing ? `plays at ${st.fps?.toFixed(1)} fps` : 'shows no picture'}, hw ${st.hw}; notice: ${notice || st.toasts.join(' | ') || 'none'}`);
+  } finally {
+    page.off('worker', install);
+    await endStream();
+  }
+}
+
 // Input (step 4.6), on a host with the test hook rumble-echo (it plays a
 // gamepad's triggers back as force feedback, as a game's rumble comes back
 // through ViGEmBus, which this host lacks).
@@ -4353,6 +4417,7 @@ try {
   if (want('input host')) await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
+  if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
