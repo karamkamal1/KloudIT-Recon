@@ -274,8 +274,12 @@ void Pipeline::outputLoop() {
         st.ringDropped = ring_.droppedTotal();
         rep_.stats(st);
         if (wr == WriteResult::TooLarge) {
-            rep_.error(Status::Error("frame_too_large", "frame " + std::to_string(f.info.frameId) + " (" +
-                                                            std::to_string(f.size) + " bytes) does not fit a ring slot"),
+            // Its own error (and ring flag DROPPED_TOO_LARGE on the next
+            // frame), not a full ring: recon-host sizes the slots for the
+            // stream, so this means the encoder exceeded that bound.
+            rep_.error(Status::Error("frame_too_large", std::string("frame ") + std::to_string(f.info.frameId) + (f.key ? " (key, " : " (") +
+                                                            std::to_string(f.size) + " bytes) does not fit a ring slot (" +
+                                                            std::to_string(ring_.payloadCapacity()) + " bytes)"),
                        "");
         }
     }

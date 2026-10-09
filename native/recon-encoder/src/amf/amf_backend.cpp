@@ -414,6 +414,7 @@ public:
     Status setRoi(const std::vector<RoiRect>& rects) override;
     Status ack(uint64_t frameId) override;
     void shutdown() override;
+    void limitFrameSize(size_t bytes) override { maxFrameBytes_ = bytes; }
     // Releases everything of a stream: the destructor, a start after a failed
     // one, and stream.cpp when the start fails after init().
     void release() override;
@@ -465,6 +466,7 @@ private:
     int queryTimeoutMs_ = 0;
     amf_int64 usage_ = 0;
     int svcLayers_ = 1;  // temporal layers the encoder runs
+    size_t maxFrameBytes_ = 0;  // limitFrameSize: the ring slot's payload, 0 = no bound
     int baseRun_ = 0;    // output thread: consecutive non-key layer-0 frames (SVC)
     int64_t freq_ = 1;
 
@@ -695,6 +697,15 @@ void AmfEncoder::applyDynamic(PropSetter& s) {
     s.setInt(P_->targetBitrate, v.target, true);
     s.setInt(P_->vbvSize, v.vbv);
     s.setBool(P_->enforceHrd, false);  // A6: Sunshine warns HRD can cause artifacts
+    // No frame larger than a ring slot (limitFrameSize): one would be
+    // dropped, and a dropped key frame leaves the frames after it, and the
+    // LTR slots it cleared, without a reference. AMF has no key-frame size
+    // scale like NVENC's lowDelayKeyFrameScale and HRD is off, so nothing
+    // else bounds a key frame at a high bitrate. In bits (FFmpeg amfenc's
+    // max_au_size). Not required: recon-host's slot sizing still holds an
+    // uncompressed picture (VERIFY that the encoder keeps to it,
+    // docs/VENDOR_NOTES.md).
+    if (maxFrameBytes_ > 0 && P_->maxFrameSize) s.setInt(P_->maxFrameSize, amf_int64(maxFrameBytes_) * 8);
     s.setBool(P_->fillerData, false);
     s.setBool(P_->skipFrame, false);   // A5: ULL turns rate-control frame skipping on
     // Temporal SVC: "NUM_TEMPORAL_LAYERS is a dynamic property and can be

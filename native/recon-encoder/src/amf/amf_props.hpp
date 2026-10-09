@@ -85,6 +85,7 @@ struct AmfCodecProps {
     const wchar_t* peakBitrate = nullptr;
     const wchar_t* vbvSize = nullptr;
     const wchar_t* enforceHrd = nullptr;
+    const wchar_t* maxFrameSize = nullptr;  // in bits: H.264 / HEVC MAX_AU_SIZE, AV1 MAX_COMPRESSED_FRAME_SIZE
     const wchar_t* fillerData = nullptr;
     const wchar_t* skipFrame = nullptr;
     const wchar_t* intraRefreshPerSlot = nullptr;  // H.264 MBs / HEVC CTBs per slot
@@ -181,6 +182,7 @@ inline const AmfCodecProps& amfH264Props() {
         c.peakBitrate = AMF_VIDEO_ENCODER_PEAK_BITRATE;
         c.vbvSize = AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE;
         c.enforceHrd = AMF_VIDEO_ENCODER_ENFORCE_HRD;
+        c.maxFrameSize = AMF_VIDEO_ENCODER_MAX_AU_SIZE;
         c.fillerData = AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE;
         c.skipFrame = AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE;
         c.intraRefreshPerSlot = AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT;
@@ -275,6 +277,7 @@ inline const AmfCodecProps& amfHevcProps() {
         c.peakBitrate = AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE;
         c.vbvSize = AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE;
         c.enforceHrd = AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD;
+        c.maxFrameSize = AMF_VIDEO_ENCODER_HEVC_MAX_AU_SIZE;
         c.fillerData = AMF_VIDEO_ENCODER_HEVC_FILLER_DATA_ENABLE;
         c.skipFrame = AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_SKIP_FRAME_ENABLE;
         c.intraRefreshPerSlot = AMF_VIDEO_ENCODER_HEVC_INTRA_REFRESH_NUM_CTBS_PER_SLOT;
@@ -376,6 +379,7 @@ inline const AmfCodecProps& amfAv1Props() {
         c.peakBitrate = AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE;
         c.vbvSize = AMF_VIDEO_ENCODER_AV1_VBV_BUFFER_SIZE;
         c.enforceHrd = AMF_VIDEO_ENCODER_AV1_ENFORCE_HRD;
+        c.maxFrameSize = AMF_VIDEO_ENCODER_AV1_MAX_COMPRESSED_FRAME_SIZE;
         c.fillerData = AMF_VIDEO_ENCODER_AV1_FILLER_DATA;
         c.skipFrame = AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_SKIP_FRAME;
         c.intraRefreshMode = AMF_VIDEO_ENCODER_AV1_INTRA_REFRESH_MODE;

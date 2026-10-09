@@ -28,6 +28,7 @@ type ringWriter struct {
 	written        uint64
 	dropped        uint64
 	droppedPending uint32
+	tooLarge       bool // one of the droppedPending frames was larger than a slot
 }
 
 // newFakeRing returns a reader and the Go producer on one in-memory ring, as
@@ -58,9 +59,10 @@ func (w *ringWriter) write(f *Frame) bool { return w.writeMangled(f, nil) }
 // writeMangled is write with a hook that can corrupt the slot before it is published.
 func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	read := atomic.LoadUint64(w.counter(offReadCount))
-	if uint64(len(f.Data)) > w.slotSize-slotHeaderSize || w.written-read == w.slots {
+	if tooLarge := uint64(len(f.Data)) > w.slotSize-slotHeaderSize; tooLarge || w.written-read == w.slots {
 		w.dropped++
 		w.droppedPending++
+		w.tooLarge = w.tooLarge || tooLarge
 		atomic.StoreUint64(w.counter(offDropped), w.dropped)
 		return false
 	}
@@ -82,6 +84,9 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	}
 	if w.droppedPending > 0 {
 		flags |= FlagDroppedBefore
+	}
+	if w.tooLarge {
+		flags |= FlagDroppedTooLarge
 	}
 	if f.Dirty >= 0 {
 		flags |= FlagDirty
@@ -122,7 +127,7 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	}
 	atomic.StoreUint64(w.counter(offWriteCount), w.written+1)
 	w.written++
-	w.droppedPending = 0
+	w.droppedPending, w.tooLarge = 0, false
 	return true
 }
 

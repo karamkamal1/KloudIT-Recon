@@ -218,8 +218,61 @@ func TestRingWrapAndDrop(t *testing.T) {
 	if len(got) != 2 || got[0].FrameID != 12 || got[0].DroppedBefore != 0 || got[1].FrameID != 16 || got[1].DroppedBefore != 3 {
 		t.Fatalf("got %+v %+v", got[0], got[1])
 	}
+	// One of the three was too large for a slot: the flag says so.
+	if got[0].DroppedTooLarge || !got[1].DroppedTooLarge {
+		t.Fatalf("DroppedTooLarge %v %v, want false true", got[0].DroppedTooLarge, got[1].DroppedTooLarge)
+	}
 	if r.Dropped() != 3 {
 		t.Fatalf("dropped counter %d", r.Dropped())
+	}
+	// Drops of a full ring alone leave it unset, and it is cleared with the
+	// next written frame.
+	w.write(next()) // 17
+	w.write(next()) // 18
+	w.write(next()) // 19: ring full
+	r.Next()
+	r.Next()
+	w.write(next()) // 20
+	w.write(next()) // 21
+	f20, _ := r.Next()
+	f21, _ := r.Next()
+	if f20 == nil || f20.DroppedBefore != 1 || f20.DroppedTooLarge || f21 == nil || f21.DroppedBefore != 0 || f21.DroppedTooLarge {
+		t.Fatalf("after a full ring: %+v %+v", f20, f21)
+	}
+}
+
+// Slots hold an uncompressed picture of the largest stream (a key frame of a
+// high-bitrate 4K stream does not fit the default 4 MiB).
+func TestSlotSizeFor(t *testing.T) {
+	sdr4k, hdr4k := SlotSizeFor(3840, 2160, false), SlotSizeFor(3840, 2160, true)
+	for _, c := range []struct {
+		name         string
+		w, h         int
+		tenBit       bool
+		minPayload   int
+		want, atMost int
+	}{
+		{"1080p keeps the default", 1920, 1080, false, 1920 * 1080 * 3 / 2, DefaultSlotSize, DefaultSlotSize},
+		{"1080p HDR10 too", 1920, 1080, true, 1920 * 1080 * 15 / 8, DefaultSlotSize, DefaultSlotSize},
+		{"1440p", 2560, 1440, false, 2560 * 1440 * 3 / 2, 0, 8 << 20},
+		// 10 average frames at 250 Mbit/s and 60 fps (5.2 MB): the default
+		// holds only 8.
+		{"4K", 3840, 2160, false, 3840 * 2160 * 3 / 2, 0, 16 << 20},
+		{"4K HDR10", 3840, 2160, true, 3840 * 2160 * 15 / 8, 0, 20 << 20},
+		{"unknown size: 4K", 0, 0, false, 0, sdr4k, sdr4k},
+		{"8K HDR10", 7680, 4320, true, 7680 * 4320 * 15 / 8, 0, 64 << 20},
+		{"larger pictures are capped", 15360, 8640, false, 0, 64 << 20, 64 << 20},
+	} {
+		got := SlotSizeFor(c.w, c.h, c.tenBit)
+		if got%4096 != 0 || got-slotHeaderSize < c.minPayload || got > c.atMost || (c.want != 0 && got != c.want) {
+			t.Errorf("%s: SlotSizeFor(%d, %d, %v) = %d", c.name, c.w, c.h, c.tenBit, got)
+		}
+		if _, err := RingSize(DefaultSlots, got); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+	if sdr4k-slotHeaderSize < 10*250_000_000/8/60 || hdr4k <= sdr4k {
+		t.Errorf("4K slots %d (HDR10 %d)", sdr4k, hdr4k)
 	}
 }
 

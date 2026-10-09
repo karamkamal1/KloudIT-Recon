@@ -287,6 +287,18 @@ func TestHelperVideoStream(t *testing.T) {
 	if fr := nextEvent(t, v).Frame; fr == nil || fr.Seq != 2 {
 		t.Fatalf("frame after the loss %+v", fr)
 	}
+	// Frame 7 is larger than a ring slot (the fake's 64 KiB): dropped, and
+	// the loss says why (not "helper ring full").
+	if f.Publish(&encoder.Frame{FrameID: 7, LTRSlot: -1, Data: make([]byte, 64<<10), CaptureQPC: qpcAt(clock, 5_100_100)}) {
+		t.Fatal("a frame larger than a slot was published")
+	}
+	f.Publish(&encoder.Frame{FrameID: 8, LTRSlot: -1, Data: h264P, CaptureQPC: qpcAt(clock, 5_116_766)})
+	if lost := nextEvent(t, v).Lost; lost == nil || lost.Gen != 2 || lost.From != 3 || lost.Count != 1 || lost.Why != "frame too large for the helper ring" {
+		t.Fatalf("lost %+v", lost)
+	}
+	if fr := nextEvent(t, v).Frame; fr == nil || fr.Seq != 4 {
+		t.Fatalf("frame after the too large one %+v", fr)
+	}
 
 	// Capture changes reach the session.
 	f.Send(encoder.CaptureChanged{Reason: "resized", Width: 2560, Height: 1440})

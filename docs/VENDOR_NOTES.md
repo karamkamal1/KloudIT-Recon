@@ -89,7 +89,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    runs), a takeover between two clients on Wi-Fi, tickets with the PC's clock 5 minutes ahead
    of the gateway's, and nothing encoding while the tab is hidden. 3.8 wiring's AMD lines (no regression
    with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
-   iGPU). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
+   iGPU). "Final review: native encoder helper, third round": 4K key frames at 250 Mbit/s and
+   the ring's slot size (a 3840x2160 monitor). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
    Sunshine for the comparison), T2 with the 0.3 rig.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
@@ -10848,3 +10849,66 @@ browser at its own defaults (60 fps, 30 Mbit/s), which is what a browser sends.
 - Verified here: documentation only (and a config comment); `internal/host` passes.
 - AMD RDNA3 (RX 7900 XT): nothing to check on hardware (no behaviour change).
 - NVIDIA: nothing to check on hardware (no behaviour change).
+
+## Final review: native encoder helper, third round
+
+### Key frames larger than a ring slot
+
+Problem: every helper ring had 8 slots of 4 MiB (`encoder.DefaultSlotSize`; recon-host never set
+another size), whatever the stream. The host allows 250 Mbit/s (`maxKbps`), where an average
+frame is 0.52 MB at 60 fps and 1.04 MB at 30 fps, so a key frame of more than about 8 (60 fps)
+or 4 (30 fps) average frames did not fit a slot's 4,194,176 bytes: normal for a detailed 4K
+desktop or game picture. AMF has no key-frame size scale like NVENC's
+`lowDelayKeyFrameScale` 3, HRD is off and no maximum frame size was set, so nothing bounded it.
+The helper dropped such a frame (non-fatal `frame_too_large`); the P frames after it referenced
+the lost IDR, and the LTR slots the IDR had cleared were gone too, so the next loss fell back to
+another IDR of about the same size, dropped again: the stream froze or looped through dropped
+IDRs until the bitrate fell. host.log called the gap `helper ring full`, hiding the cause.
+
+Fix:
+- recon-host sizes the ring for the stream (`encoder.SlotSizeFor`, `Agent.helperSlotSize`, at
+  every helper launch): an uncompressed 4:2:0 picture of the largest monitor Windows lists
+  (10-bit when host config `hdr` is `auto`) plus 1/16, rounded up to 4096, at least 4 MiB, at
+  most 64 MiB. 1080p keeps 4 MiB; 1440p 5.9 MB; 4K 13.2 MB (HDR10 16.5 MB): 8 slots commit about
+  106 MB per helper (the spare as much again), resident only where frames were written. The
+  largest monitor, not the session's, because a spare helper is launched before the next
+  stream's monitor is known (a virtual display is listed too).
+- The helper passes a slot's payload capacity to the encoder backend
+  (`Backend::limitFrameSize`); AMF sets it as its maximum frame size, in bits: H.264
+  `MAX_AU_SIZE`, HEVC `HEVC_MAX_AU_SIZE`, AV1 `MAX_COMPRESSED_FRAME_SIZE` (dynamic properties,
+  applied before and after `Init` / `ReInit` with the rate, not required: a driver that refuses
+  it is logged with the other properties not accepted). NVENC and libavcodec ignore it (the
+  slot size covers them).
+- A drop of a too-large frame is reported as such: the ring's new slot flag DROPPED_TOO_LARGE
+  (bit 8, additive) on the next written frame, recon-host's loss reason `frame too large for the
+  helper ring` (not `helper ring full`), and its own warning `encoder helper dropped a frame too
+  large for its frame ring ... slot_size=...`; the helper's error text names the frame, whether
+  it was a key frame, its size and the slot's capacity. The encode test's ring has 24 MiB slots
+  (a 4K HDR10 picture).
+
+- Verified here: `internal/host/encoder` `TestSlotSizeFor` (sizes by resolution and bit depth;
+  a 4K slot holds 10 average frames of 250 Mbit/s at 60 fps, the default only 8) and
+  `TestRingWrapAndDrop` (DROPPED_TOO_LARGE after a too-large drop, not after a full ring; the Go
+  producer mirrors `ring.cpp`); `internal/host/media` `TestHelperVideo` (a frame larger than the
+  fake helper's slot gives the loss reason `frame too large for the helper ring`; before the fix
+  the gap said `encoder error` / `helper ring full`); `internal/host` `TestHelperSlotSize` (the
+  largest monitor, 10-bit with `hdr` `auto`). The helper builds with mingw-w64 without warnings;
+  `make helper-test` under Wine (mock backend) passes. MAX_AU_SIZE itself needs AMF.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (stage 4 of the hardware test plan, a 3840x2160
+  monitor): stream HEVC at 4K, 60 fps, 250 Mbit/s (`maxKbps` default; Bitrate 250 Mbit/s in the
+  settings drawer, adaptive off) from a detailed game or a desktop full of small text, on `lan`.
+  host.log's `encoder helper: recon-encoder ...: backend amf, vendor amd, ring 8 x 13221888
+  bytes` (16527360 with `"hdr": "auto"`); no `amf: ... properties not accepted` naming
+  `MaxAUSize` / `HevcMaxAUSize` / `Av1MaxCompressedFrameSize` (at `"logLevel": "debug"` also no
+  `amf: after Init, not accepted:` naming them). Press Request key frame in the settings drawer
+  20 times, a few seconds apart: no `encoder helper dropped a frame too large` warning, no loss
+  with `why="frame too large for the helper ring"`, and the stream never freezes. Repeat at 30
+  fps and with AV1. Then the bound itself: `recon-encoder.exe --encode-test=k.hevc
+  --capture=dda --codec=hevc --kbps=250000 --fps=30 --frames=300 --at=60:idr --at=120:idr
+  --at=180:idr --frame-log=k.jsonl` and check in `k.jsonl` that no frame has `"bytes"` above
+  25165696 (the encode test's slot payload), and that the key frames' sizes are not visibly
+  clipped compared with the same run before this change (MAX_AU_SIZE must not cost quality
+  below the cap).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same 4K stream on NVENC: the ring
+  line shows the same slot size, no `frame too large` warning after 20 forced key frames
+  (NVENC keeps its 3x key-frame scale; it ignores the frame-size limit).
