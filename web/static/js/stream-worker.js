@@ -634,9 +634,10 @@ async function connect(ep) {
 // context, frames that do not upload) is given up: the main thread forgets
 // it and reconnects with the 2D canvas ('presentFailed'; a canvas keeps its
 // context type). A path picked in the settings stays (errors in the overlay),
-// except that a lost WebGPU device never comes back (WebGL2 restores its
-// context itself): the main thread reconnects with the same path, which gets
-// a new device, or the 2D canvas when WebGPU no longer works ('presentLost').
+// except that a lost WebGPU device never comes back, and a lost WebGL2
+// context the browser has not restored within GL_RESTORE_MS may never be:
+// the main thread reconnects with the same path, which gets a new device or
+// context, or the 2D canvas when that path no longer works ('presentLost').
 //
 // The main thread shows the active renderer's canvas ('renderer', posted
 // after the renderer's first frame), removes the canvases of paths that are
@@ -656,11 +657,16 @@ const pres = {
   drawErrors: 0,
   lastError: '',
   failStreak: 0, // draws in a row that failed
-  lostSent: false, // 'presentLost' posted (a path picked in the settings lost its WebGPU device)
+  lostSent: false, // 'presentLost' posted (a path picked in the settings lost its WebGPU device or WebGL2 context)
+  lostSince: 0, // the first failed draw of a lost WebGL2 context (GL_RESTORE_MS)
   refreshMs: 1000 / 60, // the display's refresh interval (main thread's measurement at page load)
 };
 
 const FAIL_STREAK = 30;
+// Chrome restores a lost WebGL2 context by itself (it tries every second),
+// after a driver reset within a second or two; not when it cannot make a new
+// one (no GPU process can: GPU acceleration disabled after crashes).
+const GL_RESTORE_MS = 3000;
 
 // Client-side upscaling (Phase 5, fsr1.js; prefs.upscale, sharpness,
 // fsrDenoise, applied live): every renderer gets the setting, only WebGPU
@@ -928,9 +934,11 @@ function renderError(e) {
 // in a row failed (see Presentation above).
 function drawResult(ok) {
   pres.failStreak = ok ? 0 : pres.failStreak + 1;
-  if (!ok && pres.mode === 'setting' && renderer.name === 'webgpu' && renderer.lost && !renderer.destroyed && !pres.lostSent) {
+  if (ok) pres.lostSince = 0;
+  if (!ok && pres.mode === 'setting' && renderer.lost && !renderer.destroyed && !pres.lostSent && lostForGood()) {
     pres.lostSent = true;
-    post('log', { text: `presentation: ${renderer.name} lost its device (${pres.lastError}); reconnecting with it` });
+    const what = renderer.name === 'webgl2' ? `context, not restored in ${GL_RESTORE_MS / 1000} s` : 'device';
+    post('log', { text: `presentation: ${renderer.name} lost its ${what} (${pres.lastError}); reconnecting with it` });
     post('presentLost', { path: renderer.name, reason: pres.lastError });
     return;
   }
@@ -938,6 +946,17 @@ function drawResult(ok) {
   if (pres.mode !== 'auto' && !(pres.mode === 'bakeoff' && pres.bake?.done)) return;
   post('log', { text: `presentation: ${renderer.name} failed ${FAIL_STREAK} draws in a row (${pres.lastError}); reconnecting with the 2D canvas` });
   post('presentFailed', { path: renderer.name, reason: pres.lastError });
+}
+
+// The active renderer's lost GPU context does not come back by itself: a
+// WebGPU device never does, a WebGL2 context lost for GL_RESTORE_MS of
+// failed draws may never be.
+function lostForGood() {
+  if (renderer.name === 'webgpu') return true;
+  if (renderer.name !== 'webgl2') return false;
+  const t = now();
+  pres.lostSince ||= t;
+  return t - pres.lostSince >= GL_RESTORE_MS;
 }
 
 function onResize(w, h) {

@@ -10331,3 +10331,34 @@ teardown) hand the check on to the next HDR frame. Test hook only; no user-visib
   A deterministic test is not feasible here (which frame the pacer supersedes depends on
   timing).
 - Not GPU-specific (test hook; no hardware step).
+
+### Renderer WebGL2 from the settings after a context that does not come back
+
+Problem: with Settings → Renderer *WebGL2*, a lost context recovered only through the browser's
+`webglcontextrestored`. Chrome restores a lost context by itself (it retries every second), but
+not when it cannot make a new one (for example GPU acceleration disabled after repeated GPU
+process crashes); then every draw threw "WebGL2 context lost", the picture froze while audio and
+input went on, and only the overlay's error count said so. Only Auto gave a failing path up.
+
+Fix: a WebGL2 context of a path picked in the settings still lost after 3 s of failed draws is
+handled like a lost WebGPU device: the worker logs `presentation: webgl2 lost its context, not
+restored in 3 s (…); reconnecting with it` and the page reconnects with the same setting (a new
+canvas and context; the 2D canvas if WebGL2 no longer starts) with the notice "Renderer: WebGL2
+lost its GPU context (driver reset or GPU process restart); reconnecting.". A context restored
+within the 3 s goes on as before; more than 3 reconnects within 60 s: the 2D canvas, as for
+WebGPU.
+
+- Verified here: browser E2E check "renderer WebGL2 from the settings: a context lost for good
+  … reconnects with WebGL2" (the worker's `loseContext` test hook loses the context through
+  `WEBGL_lose_context`, which is never restored): WebGL2 draws again 4.5 s later on a new context
+  in mode `setting`, with the notice. Against the old client: no picture with WebGL2 again
+  within 25 s, no notice.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: Chrome on a Windows client with an AMD GPU, Settings →
+  Renderer *WebGL2*, stream, then restart the graphics driver (Win+Ctrl+Shift+B): the client log
+  has `WebGL2 context lost` then `WebGL2 context restored` within about 2 s and the picture
+  continues without a reconnect (the usual case). Then open `chrome://gpucrash` in another tab
+  four times in a row (Chrome disables GPU acceleration after repeated crashes): if the context is
+  not restored, within about 3 s the notice appears and the stream draws again (overlay Renderer
+  row WebGL2 or 2D canvas, 0 errors); the client log has `presentation: webgl2 lost its context,
+  not restored in 3 s`. Restart Chrome afterwards.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.

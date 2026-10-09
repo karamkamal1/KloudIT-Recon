@@ -603,21 +603,26 @@ async function checkBakeoff() {
 // a GPU process restart would lose it. A lost WebGPU device never comes back,
 // so the client reconnects with the same setting (a new device) and the
 // stream draws with WebGPU again, with a notice; before, every draw failed
-// until a manual reconnect.
-async function checkWebGPULost() {
+// until a manual reconnect. Renderer WebGL2 the same way, its context lost
+// for good (the hook's WEBGL_lose_context loss is never restored, as when
+// the browser cannot make a new context): after 3 s of failed draws it
+// reconnects with WebGL2; before, it waited for a restore that never came.
+async function checkPickedPathLost(path) {
+  const gpu = path === 'webgpu';
+  const label = gpu ? 'WebGPU' : 'WebGL2';
   const mainPage = page;
   const hp = await headedPage().catch(() => null);
-  if (!hp) { console.log('- WebGPU device lost: skipped (needs a headed browser on Xvfb)'); return; }
-  page = hp;
+  if (!hp && gpu) { console.log('- WebGPU device lost: skipped (needs a headed browser on Xvfb)'); return; }
+  if (hp) page = hp;
   try {
     await page.goto(`${base}/`);
     await page.evaluate(() => localStorage.removeItem('e2e.hdrDisplay'));
-    await startStream({ path: 'auto', transport: 'auto', renderer: 'webgpu', fps: 30 });
-    const before = await until(() => page.evaluate(() => {
+    await startStream({ path: 'auto', transport: 'auto', renderer: path, fps: 30 });
+    const before = await until(() => page.evaluate((want) => {
       const st = window.__recon.lastStats;
-      return st?.renderer?.name === 'webgpu' && st.fps > 5 ? { fps: st.fps, mode: st.renderer.mode } : null;
-    }), 15000, 'WebGPU drawing').catch(() => null);
-    if (!before) { check('WebGPU device lost: the setting\'s WebGPU path draws first', false, 'WebGPU does not draw here'); return; }
+      return st?.renderer?.name === want && st.fps > 5 ? { fps: st.fps, mode: st.renderer.mode } : null;
+    }, path), 15000, `${label} drawing`).catch(() => null);
+    if (!before) { check(`${label} ${gpu ? 'device' : 'context'} lost: the setting's ${label} path draws first`, false, `${label} does not draw here`); return; }
     await page.evaluate(() => {
       window.__toastLog = [];
       new MutationObserver(() => {
@@ -627,19 +632,21 @@ async function checkWebGPULost() {
       window.__recon.worker.postMessage({ type: 'loseContext' });
     });
     const t1 = Date.now();
-    const back = await until(() => page.evaluate(() => {
+    const back = await until(() => page.evaluate((want) => {
       const r = window.__recon;
       const st = r.lastStats;
-      return r.worker && r.worker !== window.__lostWorker && r.streaming && st?.renderer?.name === 'webgpu' && st.renderer.drawErrors === 0 && st.fps > 5
+      return r.worker && r.worker !== window.__lostWorker && r.streaming && st?.renderer?.name === want && st.renderer.drawErrors === 0 && st.fps > 5
         ? { fps: st.fps, mode: st.renderer.mode } : null;
-    }), 25000, 'WebGPU drawing again').catch(() => null);
+    }, path), 25000, `${label} drawing again`).catch(() => null);
     const took = ((Date.now() - t1) / 1000).toFixed(1);
     const toasts = await page.evaluate(() => window.__toastLog);
-    const notice = toasts.find((t) => /WebGPU lost its GPU device .*reconnecting/.test(t));
-    check('renderer WebGPU from the settings: a lost device reconnects with WebGPU (a new device), with a notice',
-      !!back && back.mode === 'setting' && !!notice,
-      `before: webgpu at ${before.fps.toFixed(1)} fps (mode ${before.mode}); ${back ? `webgpu again after ${took} s at ${back.fps.toFixed(1)} fps (mode ${back.mode})` : 'no picture with WebGPU again'}; ` +
-        `notice: ${notice || toasts.join(' | ') || 'none'}`);
+    const notice = toasts.find((t) => new RegExp(`${label} lost its GPU ${gpu ? 'device' : 'context'} .*reconnecting`).test(t));
+    const logLine = gpu ? '' : await page.evaluate(() => window.__recon.logs.filter((l) => /presentation: webgl2 lost its context/.test(l)).pop() || '');
+    check(gpu ? 'renderer WebGPU from the settings: a lost device reconnects with WebGPU (a new device), with a notice'
+      : 'renderer WebGL2 from the settings: a context lost for good (not restored in 3 s) reconnects with WebGL2 (a new context), with a notice',
+    !!back && back.mode === 'setting' && !!notice && (gpu || /not restored in 3 s/.test(logLine)),
+    `before: ${path} at ${before.fps.toFixed(1)} fps (mode ${before.mode}); ${back ? `${path} again after ${took} s at ${back.fps.toFixed(1)} fps (mode ${back.mode})` : `no picture with ${label} again`}; ` +
+        `notice: ${notice || toasts.join(' | ') || 'none'}${gpu ? '' : `; log: ${logLine.replace(/^\S+ /, '') || 'none'}`}`);
   } finally {
     await endStream();
     page = mainPage;
@@ -4668,7 +4675,8 @@ try {
 
   // 3a. Renderer "auto": the presentation bake-off -----------------------------
   if (want('bake-off')) await checkBakeoff().catch((e) => check('renderer auto (bake-off) scenario', false, e.message));
-  if (want('webgpu device lost')) await checkWebGPULost().catch((e) => check('WebGPU device lost scenario', false, e.message));
+  if (want('webgpu device lost')) await checkPickedPathLost('webgpu').catch((e) => check('WebGPU device lost scenario', false, e.message));
+  if (want('webgl2 context lost')) await checkPickedPathLost('webgl2').catch((e) => check('WebGL2 context lost scenario', false, e.message));
   await closeHeaded();
 
   if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));

@@ -292,22 +292,24 @@ function onBakeoff(result) {
 }
 
 // A path picked in the settings lost its WebGPU device (a driver reset, the
-// GPU process restarting): reconnect with the same setting, which creates a
-// new device (the worker falls back to the 2D canvas if WebGPU no longer
-// works). More than LOST_RECONNECTS in LOST_WINDOW_MS: the 2D canvas for the
-// rest of this page while that path is the setting (lost2D); the setting
-// stays for the next page.
+// GPU process restarting) or its WebGL2 context for good (not restored):
+// reconnect with the same setting, which creates a new device or context
+// (the worker falls back to the 2D canvas if that path no longer works).
+// More than LOST_RECONNECTS in LOST_WINDOW_MS: the 2D canvas for the rest of
+// this page while that path is the setting (lost2D); the setting stays for
+// the next page.
 const LOST_RECONNECTS = 3;
 const LOST_WINDOW_MS = 60000;
 function onPresentLost(m) {
   const t = performance.now();
   S.presentLost = S.presentLost.filter((x) => t - x < LOST_WINDOW_MS).concat(t);
   const name = LABELS[m.path] || m.path;
+  const what = m.path === 'webgl2' ? 'GPU context' : 'GPU device';
   if (S.presentLost.length > LOST_RECONNECTS) {
     S.lost2D = m.path;
-    toast(`Renderer: ${name} keeps losing its GPU device; reconnecting with the 2D canvas for now.`, 'error', 8000);
+    toast(`Renderer: ${name} keeps losing its ${what}; reconnecting with the 2D canvas for now.`, 'error', 8000);
   } else {
-    toast(`Renderer: ${name} lost its GPU device (driver reset or GPU process restart); reconnecting.`, 'warn', 5000);
+    toast(`Renderer: ${name} lost its ${what} (driver reset or GPU process restart); reconnecting.`, 'warn', 5000);
   }
   teardown();
   S.attempts = 0;
