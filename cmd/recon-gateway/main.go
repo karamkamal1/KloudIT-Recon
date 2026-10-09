@@ -38,6 +38,19 @@ func env(k, d string) string {
 	return d
 }
 
+// envList returns the comma-separated values of environment variable k (the
+// installed service's /etc/kloudit-recon/gateway.env), for the repeatable
+// flags.
+func envList(k string) []string {
+	var out []string
+	for _, v := range strings.Split(os.Getenv(k), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 func main() {
 	listen := flag.String("listen", env("RECON_LISTEN", ":8443"), "address for HTTPS (TCP) and HTTP/3 + host tunnels (UDP)")
 	data := flag.String("data", env("RECON_DATA", "./data"), "data directory (state, certificates, audit log)")
@@ -50,13 +63,10 @@ func main() {
 	verbose := flag.Bool("v", false, "debug logging")
 	var names, proxies multiFlag
 	flag.Var(&names, "name", "extra DNS name or IP for the generated certificate (repeatable)")
-	flag.Var(&proxies, "trust-proxy", "CIDR of a reverse proxy whose X-Forwarded-For is trusted (repeatable)")
+	flag.Var(&proxies, "trust-proxy", "CIDR of a reverse proxy whose X-Forwarded-For is trusted (repeatable; RECON_TRUST_PROXY, comma-separated)")
 	flag.Parse()
-	for _, n := range strings.Split(os.Getenv("RECON_NAMES"), ",") {
-		if n = strings.TrimSpace(n); n != "" {
-			names = append(names, n)
-		}
-	}
+	names = append(names, envList("RECON_NAMES")...)
+	proxies = append(proxies, envList("RECON_TRUST_PROXY")...)
 
 	level := slog.LevelInfo
 	if *verbose {
