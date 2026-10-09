@@ -301,7 +301,7 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 | **M** | Toggle mouse mode: *Desktop* (absolute pointer, local cursor) ↔ *Game* (pointer lock, raw relative input) |
 | **F** | Fullscreen + Keyboard Lock (Esc / Alt+Tab / Win go to the PC; hold Esc to leave) |
 | **S** | Performance overlay (latency breakdown, fps, bitrate, codec, path) |
-| **O** | Settings drawer (it takes the keyboard focus: Tab moves through it, Esc closes it) |
+| **O** | Settings drawer (it takes the keyboard focus: Tab moves through it, Esc closes it); also on the start screen, which has a Settings button too |
 | **V** | Type text on the PC (paste passwords, chat) |
 | **Q** | Disconnect |
 
@@ -321,7 +321,10 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer: *Auto* (default, adapts within
   10–60 ms) or *Fixed* at the size you set.
-- **Network path, transport, renderer and decoder**: these apply on reconnect. Renderer
+- **Network path, transport, renderer and decoder**: these apply on reconnect. Network path
+  *Direct to PC only* has no fallback: where the PC cannot be reached directly every connection
+  fails, and the start screen then offers **Use Network path Auto** and **Settings**; the
+  drawer's **Reset to defaults** puts every setting back. Renderer
   *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for about 10 s on
   the first connection in a browser and remembers its pick for that browser version: a path
   that fails draws, cannot keep the frame rate or holds the page's frames back is out, a

@@ -81,7 +81,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
-   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard). With
+   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard, the
+   settings after a failed connection). With
    `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
@@ -10628,6 +10629,61 @@ the same host (Connect or Wake, Manage, Add a PC).
   idle, and 18 % with these changes).
 - `go test ./internal/e2e/` (under the lock), `go test -race ./internal/host/ ./internal/proto/
   ./internal/gateway/`, `go vet` for linux and windows: pass.
+
+### Stream settings after a failed connection
+
+Problem: the stream settings drawer got its controls only from a connection that came up (the
+host's welcome), the splash (z-index 40) covered the toolbar's Settings button, the splash had
+only Start/Reconnect and "Back to machines", and the settings hotkey worked only while
+streaming. A saved setting that makes every connection fail therefore locked the browser out
+until its site data was cleared by hand: Network path *Direct to PC only* away from the PC's
+network or with its UDP port blocked ("direct failed: WebTransport direct timed out", six
+retries, then Disconnected with a Reconnect that repeated it), in Safari (no WebTransport) at
+once with "no transport available", and *Direct to PC only* with Transport *WebSocket only*,
+which can never connect.
+
+Fix: the drawer is built at boot from the saved settings and the browser's capabilities (the
+codecs this browser decodes; the PC's codecs, frame rates and displays are added when its
+welcome arrives) and sits above the splash. The splash has a Settings button once the drawer is
+built, and Ctrl+Alt+Shift+O opens the drawer on the splash too; closing it gives the focus back
+to that button. A failed connection under *Direct to PC only* also shows "Use Network path
+Auto" on the splash (saves Auto and connects). The drawer has "Reset to defaults" (every
+setting back to its default and saved; the overlay's visibility stays; what applies live
+applies at once), and its Reconnect reads Connect before the first connection. *Direct to PC
+only* is not offered with Transport *WebSocket only* or in a browser without WebTransport (nor
+WebSocket only with Direct); a saved pair from before reads as Network path Auto. When the
+settings leave nothing to try, the splash says why ("Network path "Direct to PC only" needs
+WebTransport, which this browser does not have: choose Auto (Settings → Pipeline → Network
+path)"; also for no direct path offered by the PC) instead of "no transport available", and a
+reason that the browser or the settings rule out is not retried six times. A newer connect
+(Reconnect, Network path Auto) cancels a pending automatic retry and any earlier connect still
+waiting for its endpoints.
+
+- Verified here: browser E2E scenario "settings after a failed connection" (`E2E_ONLY='settings
+  after a failed connection'`): saved *Direct to PC only* with the connect response's direct URL
+  pointing at a port whose datagrams are dropped: the splash says "WebTransport direct timed
+  out" and shows Settings and Use Network path Auto; the button opens the drawer (25 controls,
+  Network path *Direct to PC only*) above the splash (the element in the drawer's middle is the
+  drawer's) with the focus in it, Escape closes it and the hotkey opens it again; Reset to
+  defaults saves path Auto, bitrate 30, pacing Lowest latency, and the next automatic attempt
+  streams over the UDP relay. Then with no direct path in the connect response: the splash
+  names *Direct to PC only* and "no direct path", and Use Network path Auto saves Auto and
+  streams over the relay. Against the old client (same test, old `web/static` through
+  `RECON_WEB_DIR`): no Settings or Network path Auto button, the drawer empty (0 controls) and
+  closed after the click and the hotkey, the saved settings unchanged, no stream; the second
+  part said "no transport available" and kept retrying. The scenarios that use the drawer or
+  the splash ran with it (`E2E_ONLY='drawer keyboard|udp relay reconnects|udp relay host
+  blocked|takeover|settings after a failed connection'`): all pass. One earlier run of that set
+  had Chromium's renderer crash ("Page crashed") at the first drawer Reconnect of "UDP relay
+  reconnects", failing the scenarios after it; three runs since (that scenario alone, with
+  "udp relay host blocked", the whole set) did not.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client (Chrome) away from the
+  PC's network (a phone hotspot) or with the PC's direct UDP port blocked in Windows Firewall:
+  Settings → Pipeline → Network path *Direct to PC only*, Reconnect. "Could not connect" shows
+  Settings and Use Network path Auto; Settings (and Ctrl+Alt+Shift+O) opens the drawer above
+  the splash; Reset to defaults, close it: the next retry streams over the relay (overlay:
+  Transport … relay). Repeat with *Direct to PC only* and Use Network path Auto on the splash.
+  In Safari: *Direct to PC only* is greyed out in the drawer.
 
 ## Final review: host agent, second round
 

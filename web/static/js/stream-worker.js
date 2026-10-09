@@ -603,6 +603,7 @@ async function connect(ep) {
     attempts.push(['relay-splice', async () => ({ t: await openWebTransport(ep.relay.wt, ep.relay.hashes, 'relay-splice', 6000), ticket: '' })]);
   }
   if (prefs.path !== 'direct') attempts.push(['websocket', async () => ({ t: await openWebSocket(ep.relay.ws), ticket: '' })]);
+  if (!attempts.length) throw noAttempt(ep);
   let lastErr;
   for (const [label, fn] of attempts) {
     try {
@@ -614,6 +615,23 @@ async function connect(ep) {
     }
   }
   throw lastErr || new Error('no transport available');
+}
+
+// Network path "Direct to PC only" (the one setting that can leave nothing
+// to try): why it cannot work, for the splash, which offers Auto and the
+// settings. noRetry: this browser or the settings rule it out, a retry
+// would fail the same way.
+function noAttempt(ep) {
+  const e = new Error('no transport available');
+  if (prefs.path !== 'direct') return e;
+  const fix = 'choose Auto (Settings → Pipeline → Network path)';
+  if (typeof WebTransport === 'undefined' || prefs.transport === 'websocket') {
+    e.message = `Network path "Direct to PC only" needs WebTransport, which ${typeof WebTransport === 'undefined' ? 'this browser does not have' : 'Transport "WebSocket only" rules out'}: ${fix}`;
+    e.noRetry = true;
+  } else if (!ep.direct) {
+    e.message = `Network path "Direct to PC only", but the PC offers no direct path right now: ${fix}`;
+  }
+  return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -2530,7 +2548,7 @@ async function start(msg) {
   try {
     conn = await connect(msg.endpoints);
   } catch (e) {
-    post('closed', { reason: `Could not connect: ${e.message}`, retry: true });
+    post('closed', { reason: `Could not connect: ${e.message}`, retry: !e.noRetry });
     return;
   }
   transport = conn.t;

@@ -2662,6 +2662,103 @@ async function checkPasteDialog() {
   }
 }
 
+// Settings after a failed connection (final review). A saved Network path
+// "Direct to PC only" whose direct path does not answer (the connect
+// response's direct URL names the port whose datagrams a socket swallows, as
+// away from the PC's network or with its UDP port blocked: the CSP allows it,
+// a relay port) fails every attempt. Before, the browser was
+// locked out until its site data was cleared: the drawer got its controls
+// only from a connection that came up, the splash covered the toolbar and
+// offered no way to them, and the hotkey worked only while streaming. Now on
+// the "Could not connect" splash its Settings button opens the drawer above
+// the splash with the focus in it (the hotkey toggles it too), Reset to
+// defaults puts every setting back, saved too, and the next attempt streams
+// over a relay. Then, with no direct path in the connect response at all,
+// the splash names the setting that leaves nothing to try and offers Network
+// path Auto, which is saved and streams.
+async function checkSettingsAfterFailedConnect() {
+  let mode = 'blocked';
+  const rewrite = async (route) => {
+    const r = await route.fetch();
+    const body = await r.json();
+    if (mode === 'none') delete body.direct;
+    else if (body.direct) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+    await route.fulfill({ response: r, json: body });
+  };
+  await ctx.route('**/api/hosts/*/connect', rewrite);
+  const failed = () => page.waitForFunction(() => /Could not connect|Disconnected/.test(document.getElementById('splash-title')?.textContent), null, { timeout: 30000 });
+  const splashState = () => page.evaluate(() => {
+    const shown = (id) => { const e = document.getElementById(id); return !!e && !e.classList.contains('hidden') && e.getClientRects().length > 0; };
+    return { text: `${document.getElementById('splash-title').textContent} / ${document.getElementById('splash-sub').textContent}`, settings: shown('btn-splash-settings'), auto: shown('btn-path-auto') };
+  });
+  // The drawer: open, the element in its middle is its own (above the
+  // splash), the focus in it, its Network path select's value.
+  const drawerState = () => page.evaluate(() => {
+    const d = document.getElementById('drawer');
+    const r = d.getBoundingClientRect();
+    const mid = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    const path = [...d.querySelectorAll('select')].find((s) => [...s.options].some((o) => o.value === 'direct'));
+    return { open: d.classList.contains('open'), onTop: !!mid?.closest('#drawer'), focus: !!document.activeElement?.closest('#drawer'), controls: d.querySelectorAll('select, input').length, path: path?.value ?? null };
+  });
+  const saved = () => page.evaluate(() => JSON.parse(localStorage.getItem('recon.prefs.v1') || '{}'));
+  try {
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { ...PREFS_2D, path: 'direct', transport: 'auto', bitrate: 12, pacing: 'smooth' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.click('#btn-start');
+    await failed();
+    const first = await splashState();
+    await page.click('#btn-splash-settings', { timeout: 3000 }).catch(() => {});
+    await sleep(400); // (the drawer slides in)
+    const opened = await drawerState();
+    await page.keyboard.press('Escape');
+    await sleep(400);
+    const escaped = await drawerState();
+    await page.keyboard.press('Control+Alt+Shift+KeyO');
+    await sleep(400);
+    const hotkey = await drawerState();
+    await page.evaluate(() => [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Reset to defaults'))?.click());
+    const reset = { prefs: await saved(), drawer: await drawerState() };
+    // The 2D canvas for the stream that follows (the default, Auto, would
+    // measure every renderer), chosen in the same drawer.
+    await page.evaluate(() => {
+      const s = [...document.querySelectorAll('#drawer select')].find((x) => [...x.options].some((o) => o.value === 'canvas2d'));
+      if (s) { s.value = 'canvas2d'; s.dispatchEvent(new Event('change')); }
+    });
+    await page.keyboard.press('Escape');
+    const streamed = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 45000 }).then(() => true, () => false);
+    const path1 = await page.evaluate(() => window.__recon.conn?.path);
+    check('settings after a failed connection: the splash offers the settings (button and hotkey), the drawer opens above it with the focus inside, Reset to defaults saves the defaults and the next attempt streams over a relay',
+      /Could not connect|Disconnected/.test(first.text) && first.settings && first.auto && opened.open && opened.onTop && opened.focus && opened.controls >= 15 && opened.path === 'direct' &&
+        !escaped.open && hotkey.open && hotkey.focus && reset.prefs.path === 'auto' && reset.prefs.bitrate === 30 && reset.prefs.pacing === 'latency' && reset.drawer.path === 'auto' &&
+        streamed && path1 !== 'direct',
+      `splash: "${first.text.slice(0, 120)}", Settings ${first.settings ? 'shown' : 'missing'}, Network path Auto ${first.auto ? 'shown' : 'missing'}; drawer from the button: ${JSON.stringify(opened)}; ` +
+        `Escape: ${escaped.open ? 'still open' : 'closed'}; hotkey: ${hotkey.open ? 'open' : 'closed'}, focus ${hotkey.focus ? 'inside' : 'outside'}; after Reset: saved path ${reset.prefs.path}, bitrate ${reset.prefs.bitrate}, pacing ${reset.prefs.pacing}, select ${reset.drawer.path}; ` +
+        `then ${streamed ? `streaming over ${path1}` : 'no stream'}`);
+    await endStream();
+
+    // No direct path at all: the reason names the setting, Network path Auto from the splash.
+    mode = 'none';
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { ...PREFS_2D, path: 'direct', transport: 'auto' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.click('#btn-start');
+    await failed();
+    const second = await splashState();
+    await page.click('#btn-path-auto', { timeout: 3000 }).catch(() => {});
+    const streamed2 = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 30000 }).then(() => true, () => false);
+    const path2 = await page.evaluate(() => window.__recon.conn?.path);
+    const after = await saved();
+    check('settings after a failed connection: with no direct path the splash names Network path "Direct to PC only", and its Use Network path Auto saves Auto and streams',
+      /Direct to PC only/.test(second.text) && /no direct path/.test(second.text) && second.auto && second.settings && streamed2 && path2 !== 'direct' && after.path === 'auto',
+      `splash: "${second.text.slice(0, 160)}", Network path Auto ${second.auto ? 'shown' : 'missing'}; then ${streamed2 ? `streaming over ${path2}` : 'no stream'}, saved path ${after.path}`);
+  } finally {
+    await ctx.unroute('**/api/hosts/*/connect', rewrite);
+    await endStream();
+  }
+}
+
 // A hardware decoder that keeps failing (final review): the worker's
 // VideoDecoder replaced, from the worker's start, by one that reports
 // prefer-hardware supported for what this browser decodes, but whose
@@ -4751,6 +4848,7 @@ try {
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
   if (want('paste dialog')) await checkPasteDialog().catch((e) => check('paste dialog scenario', false, e.message));
+  if (want('settings after a failed connection')) await checkSettingsAfterFailedConnect().catch((e) => check('settings after a failed connection scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

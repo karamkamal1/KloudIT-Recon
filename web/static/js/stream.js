@@ -47,6 +47,9 @@ if (!UPSCALE.includes(prefs.upscale)) prefs.upscale = 'auto';
 prefs.sharpness = upscaleSettings({ sharpness: prefs.sharpness }).sharpness;
 if (!HDR_MODES.includes(prefs.hdr)) prefs.hdr = 'auto';
 prefs.hdrWhite = hdrWhite(prefs.hdrWhite);
+// The direct path is WebTransport only: with Transport "WebSocket only" it
+// left nothing to try (the drawer no longer offers the pair).
+if (prefs.path === 'direct' && prefs.transport === 'websocket') prefs.path = 'auto';
 const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} };
 
 const RESOLUTIONS = {
@@ -92,6 +95,8 @@ const S = {
   streaming: false,
   userClosed: false,
   attempts: 0,
+  retryTimer: 0, // the next automatic attempt (onClosed)
+  connectGen: 0, // connect() calls: an earlier one still waiting for its endpoints gives way
   udpRelayFailedAt: -Infinity, // the UDP relay's ports did not answer: try the splice relay first for a while
   ticketRefusedAt: -Infinity, // the host refused its ticket (direct path, UDP relay): skip those paths for a while
   hdrWithdrawn: {}, // HDR10: codec families whose 10-bit frames this browser could not draw as HDR (this page's connections)
@@ -130,12 +135,15 @@ const sendCtl = (m) => post({ type: 'ctl', m });
 // ---------------------------------------------------------------------------
 // Splash / lifecycle
 
-function splash(title, sub, { button = null, spinner = false } = {}) {
+// pathAuto: offer Network path Auto (a connection under "Direct to PC only"
+// failed). The splash's Settings button is there once the drawer is built.
+function splash(title, sub, { button = null, spinner = false, pathAuto = false } = {}) {
   $('splash').classList.remove('hidden');
   $('splash-title').textContent = title;
   $('splash-sub').textContent = sub;
   $('btn-start').classList.toggle('hidden', !button);
   if (button) $('btn-start').innerHTML = button;
+  $('btn-path-auto').classList.toggle('hidden', !pathAuto);
   $('spinner').classList.toggle('hidden', !spinner);
 }
 
@@ -353,13 +361,17 @@ try {
 
 async function connect() {
   S.userClosed = false;
+  clearTimeout(S.retryTimer);
+  const gen = ++S.connectGen;
   splash('Connecting…', 'Requesting a secure session', { spinner: true });
   let ep;
   try {
     ep = await api('POST', `/api/hosts/${encodeURIComponent(hostId)}/connect`, {});
   } catch (e) {
-    return onClosed(e.message, true);
+    if (gen === S.connectGen) onClosed(e.message, true);
+    return;
   }
+  if (gen !== S.connectGen || S.worker) return; // a newer connect() (Reconnect, Network path Auto) took over
   $('host-name').textContent = ep.host;
   document.title = `${ep.host} · KloudIT Recon`;
   const { sab, port } = await audioChannel().catch(() => ({}));
@@ -408,14 +420,36 @@ function onClosed(reason, retry) {
   const wasStreaming = S.streaming;
   teardown();
   if (S.userClosed) return;
+  // A connection under Network path "Direct to PC only" did not come up
+  // (the direct path is blocked or out of reach): offer Auto on the splash.
+  const pathAuto = !wasStreaming && prefs.path === 'direct';
   if (retry && S.attempts < 6) {
     S.attempts++;
     const delay = Math.min(8000, 800 * S.attempts);
-    splash(wasStreaming ? 'Connection lost' : 'Could not connect', `${reason} — retrying in ${Math.round(delay / 1000)} s…`, { spinner: true });
-    setTimeout(() => { if (!S.userClosed && !S.worker) connect(); }, delay);
+    splash(wasStreaming ? 'Connection lost' : 'Could not connect', `${reason} — retrying in ${Math.round(delay / 1000)} s…`, { spinner: true, pathAuto });
+    clearTimeout(S.retryTimer);
+    S.retryTimer = setTimeout(() => { if (!S.userClosed && !S.worker) connect(); }, delay);
     return;
   }
-  splash('Disconnected', reason, { button: '↻&nbsp; Reconnect' });
+  splash('Disconnected', reason, { button: '↻&nbsp; Reconnect', pathAuto });
+}
+
+// A new connection now, with the settings as they are (the drawer's
+// Reconnect, the splash's Network path Auto): in a click, so audio can start.
+function reconnect() {
+  ensureAudioContext();
+  teardown();
+  S.attempts = 0;
+  connect();
+}
+
+// The splash's "Use Network path Auto".
+function usePathAuto() {
+  prefs.path = 'auto';
+  savePrefs();
+  buildDrawer();
+  toast('Network path: Auto (direct, then relay).', 'info', 3000);
+  reconnect();
 }
 
 function disconnect() {
@@ -454,7 +488,7 @@ function onWorker(m) {
       S.streaming = true;
       S.attempts = 0;
       $('splash').classList.add('hidden');
-      S.surface.focus();
+      if (!$('drawer').classList.contains('open')) S.surface.focus(); // (the settings, opened on the splash, keep it)
       // During the bake-off nothing covers the canvas (the toolbar has a
       // backdrop filter), so every path is measured alike: the start-up
       // toolbar and hint come with its result.
@@ -540,7 +574,16 @@ function uiFocused(e) {
 }
 
 window.addEventListener('keydown', (e) => {
-  if (!S.streaming || uiFocused(e)) return;
+  if (uiFocused(e)) return;
+  if (!S.streaming) {
+    // On the splash (before a stream, after a failed one) the settings
+    // hotkey opens the drawer too: the splash covers the toolbar.
+    if (isHotkey(e) && e.code === 'KeyO' && drawerReady()) {
+      e.preventDefault();
+      toggleDrawer();
+    }
+    return;
+  }
   if (isHotkey(e)) {
     const actions = { KeyM: toggleMouseMode, KeyF: toggleFullscreen, KeyS: toggleStats, KeyO: toggleDrawer, KeyQ: disconnect, KeyV: pasteDialog };
     if (actions[e.code]) {
@@ -1290,17 +1333,24 @@ function pasteDialog() {
 // Settings drawer
 
 // Focus moves into the drawer when it opens (on the stage, Tab and Escape
-// go to the PC) and back to the stage when it closes.
+// go to the PC) and back to the stage when it closes, or to the splash's
+// Settings button while the splash is up. The drawer is built at boot, so
+// the settings are reachable before a connection comes up (and when none
+// does: a saved setting that keeps every connection from working).
 function toggleDrawer() {
   const d = $('drawer');
   d.classList.toggle('open');
   if (d.classList.contains('open')) {
     if (locked()) document.exitPointerLock();
     drawerFocusables()[0]?.focus();
+  } else if (!$('splash').classList.contains('hidden')) {
+    $('btn-splash-settings').focus();
   } else {
     S.surface.focus();
   }
 }
+
+const drawerReady = () => $('drawer').childElementCount > 0;
 
 const drawerFocusables = () => [...$('drawer').querySelectorAll('button, select, input, a[href]')].filter((x) => !x.disabled);
 
@@ -1344,15 +1394,17 @@ function field(label, control, hint) {
   return el('div', {}, l, control, hint instanceof Node ? hint : hint ? el('div', { class: 'hint' }, hint) : null);
 }
 
+// Controls keep their ids (set-<key>) when the drawer is rebuilt (each
+// welcome), so the focus stays on the same control.
 function select(key, options, onChange) {
-  const s = el('select', {});
+  const s = el('select', { id: `set-${key}` });
   for (const [v, l] of options) s.append(el('option', { value: v, selected: String(prefs[key]) === String(v) }, l));
   s.addEventListener('change', () => { prefs[key] = s.value; savePrefs(); onChange?.(); });
   return s;
 }
 
 function check(key, label, onChange) {
-  const c = el('input', { type: 'checkbox', checked: !!prefs[key] });
+  const c = el('input', { type: 'checkbox', id: `set-${key}`, checked: !!prefs[key] });
   c.addEventListener('change', () => { prefs[key] = c.checked; savePrefs(); onChange?.(); });
   return el('label', { class: 'check' }, c, label);
 }
@@ -1386,26 +1438,56 @@ function upscaleHint() {
   return `FSR needs the WebGPU renderer: this connection draws with ${LABELS[r] || r} and scales bilinearly. Choose Renderer WebGPU above and Reconnect${auto}. ${how}`;
 }
 
+// Every setting back to its default, saved too: the way out of saved
+// settings that keep every connection from working (a direct path that
+// cannot be reached) without clearing the site's data. The overlay's
+// visibility (a toolbar toggle) stays. What applies live applies at once;
+// Network path, Transport, Renderer and Decoder on the next connection.
+function resetPrefs() {
+  const keep = { stats: prefs.stats };
+  for (const k of Object.keys(prefs)) delete prefs[k];
+  Object.assign(prefs, DEFAULTS, keep, { rendererV: 2 });
+  savePrefs();
+  buildDrawer();
+  if (audio.gain) audio.gain.gain.value = prefs.volume / 100;
+  audio.node?.port.postMessage({ targetMs: prefs.jitterMs, auto: prefs.jitterMode !== 'fixed' });
+  post({ type: 'prefs', prefs: { adaptive: prefs.adaptive, latencyProbe: prefs.latencyProbe, pacing: prefs.pacing, ...upscalePrefs(), ...hdrPrefs() } });
+  applyLive();
+  if (locked()) document.exitPointerLock();
+  updateToolbarState();
+  applyCursor();
+  toast(`Settings reset to their defaults.${S.worker ? ' Network path, transport, renderer and decoder apply on the next connection.' : ''}`, 'info', 5000);
+}
+
+// The codec families of a welcome's encoder names (h264_amf, libx264,
+// hevc_nvenc, av1_qsv, libsvtav1, ...).
+const encoderFamily = (e) => (e.startsWith('h264') || e === 'libx264' ? 'h264' : e.startsWith('hevc') ? 'hevc' : 'av1');
+
+// Built at boot from the settings and this browser's capabilities (the
+// splash offers it before and after a connection), again on each welcome
+// with the PC's codecs, frame rates and displays.
 function buildDrawer() {
   const w = S.welcome || {};
   const caps = window.__caps || { codecs: {} };
+  const d = $('drawer');
+  const focused = d.contains(document.activeElement) ? document.activeElement.id || '-' : '';
   const codecName = { h264: 'H.264', hevc: 'HEVC / H.265', av1: 'AV1' };
-  const hostFams = new Set((w.encoders || []).map((e) => (e.startsWith('h264') || e === 'libx264' ? 'h264' : e.startsWith('hevc') ? 'hevc' : 'av1')));
+  const hostFams = w.encoders ? new Set(w.encoders.map(encoderFamily)) : null; // null: no welcome yet
   const codecOpts = [['auto', 'Auto (best available)']];
   for (const f of ['h264', 'hevc', 'av1']) {
-    if (hostFams.has(f) && caps.codecs[f]) codecOpts.push([f, `${codecName[f]} ${caps.codecs[f] === 'hw' ? '· HW decode' : '· SW decode'}`]);
+    if ((!hostFams || hostFams.has(f)) && caps.codecs[f]) codecOpts.push([f, `${codecName[f]} ${caps.codecs[f] === 'hw' ? '· HW decode' : '· SW decode'}`]);
   }
   const maxFps = w.maxFps || 240;
   const fpsOpts = [30, 60, 90, 120, 144, 165, 240].filter((f) => f <= maxFps).map((f) => [f, `${f} fps`]);
   const monOpts = (w.monitors || []).map((m) => [m.index, `${m.name || 'Display ' + (m.index + 1)} · ${m.w}×${m.h}${m.hz ? '@' + m.hz + 'Hz' : ''}${m.primary ? ' · primary' : ''}`]);
 
-  const bitrate = el('input', { type: 'range', min: '2', max: String(Math.min(250, Math.round((w.maxKbps || 250000) / 1000))), step: '1', value: String(prefs.bitrate) });
+  const bitrate = el('input', { type: 'range', id: 'set-bitrate', min: '2', max: String(Math.min(250, Math.round((w.maxKbps || 250000) / 1000))), step: '1', value: String(prefs.bitrate) });
   const out = el('output', {}, `${prefs.bitrate} Mbps`);
   bitrate.addEventListener('input', () => { out.textContent = `${bitrate.value} Mbps`; });
   bitrate.addEventListener('change', () => { prefs.bitrate = +bitrate.value; savePrefs(); applyLive(); });
-  const vol = el('input', { type: 'range', min: '0', max: '150', value: String(prefs.volume) });
+  const vol = el('input', { type: 'range', id: 'set-volume', min: '0', max: '150', value: String(prefs.volume) });
   vol.addEventListener('input', () => { prefs.volume = +vol.value; savePrefs(); if (audio.gain) audio.gain.gain.value = prefs.volume / 100; });
-  const jitter = el('input', { type: 'range', min: '10', max: '120', step: '5', value: String(prefs.jitterMs), disabled: prefs.jitterMode !== 'fixed' });
+  const jitter = el('input', { type: 'range', id: 'set-jitterMs', min: '10', max: '120', step: '5', value: String(prefs.jitterMs), disabled: prefs.jitterMode !== 'fixed' });
   const jout = el('output', {}, `${prefs.jitterMs} ms`);
   const applyJitter = () => {
     jitter.disabled = prefs.jitterMode !== 'fixed';
@@ -1413,13 +1495,22 @@ function buildDrawer() {
   };
   jitter.addEventListener('input', () => { jout.textContent = `${jitter.value} ms`; });
   jitter.addEventListener('change', () => { prefs.jitterMs = +jitter.value; savePrefs(); applyJitter(); });
-  const sharp = el('input', { type: 'range', min: '0', max: String(FSR.maxSharpness), step: '0.1', value: String(prefs.sharpness) });
+  const sharp = el('input', { type: 'range', id: 'set-sharpness', min: '0', max: String(FSR.maxSharpness), step: '0.1', value: String(prefs.sharpness) });
   const sout = el('output', {}, `${prefs.sharpness} stops`);
   sharp.addEventListener('input', () => { sout.textContent = `${sharp.value} stops`; });
   sharp.addEventListener('change', () => { prefs.sharpness = +sharp.value; savePrefs(); applyUpscale(); });
+  // The direct path is WebTransport only: not with Transport "WebSocket
+  // only", nor in a browser without WebTransport (Safari).
+  const pathSel = select('path', [['auto', 'Auto (direct, then relay)'], ['direct', 'Direct to PC only'], ['relay', 'Relay via gateway']], () => { syncPath(); needsReconnect(); });
+  const transportSel = select('transport', [['auto', 'WebTransport (QUIC), fall back to WebSocket'], ['websocket', 'WebSocket only']], () => { syncPath(); needsReconnect(); });
+  const syncPath = () => {
+    pathSel.querySelector('option[value="direct"]').disabled = prefs.transport === 'websocket' || !caps.webtransport;
+    transportSel.querySelector('option[value="websocket"]').disabled = prefs.path === 'direct';
+  };
+  syncPath();
 
-  $('drawer').replaceChildren(
-    el('h3', {}, 'Stream settings', el('button', { class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
+  d.replaceChildren(
+    el('h3', {}, 'Stream settings', el('button', { id: 'drawer-close', class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Video'),
       field('Codec', select('codec', codecOpts, applyLive), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
       field('Bitrate', el('div', { class: 'range-row' }, bitrate, out), 'LAN: 50–150 Mbps. Internet: match your upload speed.'),
@@ -1450,13 +1541,14 @@ function buildDrawer() {
       el('div', { class: 'hint' }, 'Open tools/latency-test/index.html full-screen on the host PC: the overlay then shows host screen→drawn latency read from the picture. The test pattern source is probed automatically. Export from the overlay.'),
     ),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Pipeline'),
-      field('Network path', select('path', [['auto', 'Auto (direct, then relay)'], ['direct', 'Direct to PC only'], ['relay', 'Relay via gateway']], needsReconnect)),
-      field('Transport', select('transport', [['auto', 'WebTransport (QUIC), fall back to WebSocket'], ['websocket', 'WebSocket only']], needsReconnect)),
+      field('Network path', pathSel, 'Auto tries the direct path, then the gateway\'s relays. Direct to PC only has no fallback: where the PC ' +
+        'cannot be reached directly (away from its network, a blocked port) every connection fails; it needs WebTransport.'),
+      field('Transport', transportSel),
       field('Video over datagrams', select('fec', [['auto', 'Auto (datagrams + FEC over a high round trip)'], ['off', 'Off (a stream per frame)']], needsReconnect),
         'Over a round trip above 15 ms the host may send each frame as datagrams with Reed-Solomon parity: a lost packet is rebuilt instead of waiting for its retransmission.'),
       field('Renderer', select('renderer', [['auto', 'Auto (measured in this browser)'], ['canvas2d', '2D canvas (desynchronized)'],
         ['webgl2', 'WebGL2 (desynchronized if granted)'], ['webgpu', 'WebGPU (zero-copy)']], needsReconnect), presentHint()),
-      el('button', { class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),
+      el('button', { id: 'drawer-measure', class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),
       field('Frame pacing', select('pacing', [['latency', 'Lowest latency (draw on decode)'], ['smooth', 'Smooth (one frame per display refresh)']], applyPacing),
         'Applies at once. Smooth holds each frame for the next display refresh: an even cadence for up to one refresh more latency (overlay: hold).'),
       field('Upscaling', select('upscale', [['auto', 'Auto (FSR 1 when shown larger, WebGPU)'], ['off', 'Off (bilinear)'], ['fsr', 'FSR 1 (WebGPU)']], applyUpscale),
@@ -1471,10 +1563,12 @@ function buildDrawer() {
       field('Decoder', select('decoder', [['hardware', 'Prefer hardware'], ['software', 'Prefer software']], needsReconnect)),
     ),
     el('div', { class: 'actions' },
-      el('button', { onclick: () => { teardown(); S.attempts = 0; connect(); toggleDrawer(); } }, '↻ Reconnect'),
-      el('button', { onclick: () => sendCtl({ t: 'keyframe' }) }, 'Request key frame'),
-      el('a', { class: 'btn', href: '/' }, 'Machines')),
+      el('button', { id: 'drawer-reconnect', onclick: () => { reconnect(); toggleDrawer(); } }, S.welcome ? '↻ Reconnect' : '▶ Connect'),
+      el('button', { id: 'drawer-keyframe', onclick: () => sendCtl({ t: 'keyframe' }) }, 'Request key frame'),
+      el('button', { id: 'drawer-reset', onclick: resetPrefs }, 'Reset to defaults'),
+      el('a', { id: 'drawer-machines', class: 'btn', href: '/' }, 'Machines')),
   );
+  if (focused) ($(focused) || drawerFocusables()[0])?.focus();
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,11 +1578,14 @@ async function boot() {
   for (const [id, icon] of [['btn-fullscreen', 'fullscreen'], ['btn-stats', 'stats'], ['btn-paste', 'paste'], ['btn-settings', 'settings'], ['btn-disconnect', 'disconnect']]) {
     $(id).innerHTML = ICONS[icon];
   }
+  $('btn-splash-settings').insertAdjacentHTML('afterbegin', ICONS.settings);
   $('btn-mouse').onclick = toggleMouseMode;
   $('btn-fullscreen').onclick = toggleFullscreen;
   $('btn-stats').onclick = toggleStats;
   $('btn-paste').onclick = pasteDialog;
   $('btn-settings').onclick = toggleDrawer;
+  $('btn-splash-settings').onclick = toggleDrawer;
+  $('btn-path-auto').onclick = usePathAuto;
   $('btn-disconnect').onclick = disconnect;
   $('btn-export-latency').onclick = downloadLatency;
   $('stats').classList.toggle('hidden', !prefs.stats);
@@ -1510,6 +1607,8 @@ async function boot() {
     splash('Browser not supported', 'This browser lacks WebCodecs. Use a current Chrome, Edge, Firefox or Safari.', {});
     return;
   }
+  buildDrawer();
+  $('btn-splash-settings').classList.remove('hidden');
   splash('Ready to stream', 'Audio and fullscreen need one click to start.', { button: '▶&nbsp; Start streaming' });
   if (new URLSearchParams(location.search).has('autostart')) start();
 }

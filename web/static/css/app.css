@@ -230,8 +230,9 @@ body.stream { background: #000; overflow: hidden; user-select: none; -webkit-use
 .stats-actions { margin-bottom: 8px; }
 .stats-actions button { font: inherit; padding: 4px 10px; pointer-events: auto; }
 
+/* Above the splash (z-index 40): the settings are reachable from it. */
 .drawer {
-  position: fixed; top: 0; right: 0; bottom: 0; width: min(380px, 100%); z-index: 30; padding: 22px;
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(380px, 100%); z-index: 45; padding: 22px;
   background: rgba(12, 16, 26, 0.96); border-left: 1px solid var(--line-2); backdrop-filter: blur(18px);
   transform: translateX(105%); transition: transform 0.25s ease, visibility 0s 0.25s; overflow-y: auto; user-select: text;
   visibility: hidden;
@@ -256,6 +257,8 @@ body.stream { background: #000; overflow: hidden; user-select: none; -webkit-use
 .splash-card p { color: var(--muted); margin: 0 0 18px; }
 .splash-card .btn-primary { font-size: 16px; padding: 13px 26px; }
 .splash .badges { justify-content: center; margin: 18px 0 4px; }
+.splash-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.splash-actions button svg { width: 16px; height: 16px; }
 .spinner {
   width: 42px; height: 42px; border-radius: 50%; margin: 6px auto 0;
   border: 3px solid rgba(148, 163, 184, 0.2); border-top-color: var(--accent); animation: spin 0.9s linear infinite;
