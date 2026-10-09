@@ -10453,8 +10453,9 @@ back. Each field's label names its control (`for`/`id`; the slider of a range ro
   reached the host, Escape left the drawer open, and all 21 controls were unnamed.
 - Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client: stream, press
   Ctrl+Alt+Shift+O, change Bitrate with Tab and the arrow keys, Escape; then with Narrator
-  (Win+Ctrl+Enter) on, Tab through the drawer: each control is read with its name ("Codec,
-  combo box", "Bitrate, slider").
+  (Win+Ctrl+Enter) on, Tab through the drawer: each control is read with its name ("Video codec,
+  combo box", "Bitrate, slider"; the names and groups of "The settings drawer's sections, names
+  and hints for screen readers" below).
 
 ### Long text through "Type text on the host"
 
@@ -10720,6 +10721,33 @@ for the PCs that have the codec. The page also writes the host's notices to the 
   encoder (an RX 6000 or GTX 10-series GPU): the codec select reads "AV1 · this PC does not
   encode it: Auto is used"; after a Reconnect no "Codec av1 is not available end-to-end"
   warning; picking Auto saves it.
+
+### The settings drawer's sections, names and hints for screen readers
+
+Problem: the drawer's video and audio codec selects had the same accessible name, "Codec", and
+its sections (Video, Input, Audio, Diagnostics, Pipeline) were plain `div`s with a `div` title,
+so a screen reader gave nothing to tell the two apart ("Codec, combo box" twice). The hints
+under the controls (Applies on the next connection, the HDR and FSR requirements, the bitrate
+guidance) were not linked to them, and the section titles (`--dim`, 12 px) had about 3.3:1
+contrast on the drawer, below WCAG AA's 4.5:1.
+
+Fix: the selects are labelled "Video codec" and "Audio codec"; each section is
+`role="group"` named by its title (`aria-labelledby`), which screen readers announce when the
+focus enters it; each hint describes its control (`aria-describedby`, read after the name; the
+latency probe's hint now belongs to its checkbox); the section titles use `--muted` (6.5:1).
+
+- Verified here: browser E2E scenario "drawer keyboard" (`E2E_ONLY='drawer keyboard'`), its
+  checks "every select and slider is named by its label, the video and audio codec apart"
+  (Playwright finds Video codec, Audio codec, Renderer, Upscaling, Decoder and HDR once each by
+  role and name) and "its sections are groups named by their titles, each hint describes its
+  control, the titles at AA contrast" (the five groups by role and name; 14 of 14 hints each
+  describe one control, Bitrate's "LAN: 50–150 Mbps…"; titles 6.5:1 from the computed colours).
+  Against the old client: no combobox named Video codec or Audio codec, no group, 0 of 14 hints
+  linked, 3.3:1.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client with Narrator
+  (Win+Ctrl+Enter): open the drawer (Ctrl+Alt+Shift+O) and Tab through it: entering a section
+  reads its name ("Video, group"), the codec selects read "Video codec, combo box" and "Audio
+  codec, combo box", and Bitrate is followed by its hint ("LAN: 50–150 Mbps…").
 
 ## Final review: host agent, second round
 

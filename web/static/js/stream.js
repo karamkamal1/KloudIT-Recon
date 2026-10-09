@@ -1399,7 +1399,8 @@ function presentHint() {
 }
 
 // A labelled control: the label names it (for assistive technology; the
-// input of a range row), hint is text or an element.
+// input of a range row), hint is text or an element, and describes it
+// (aria-describedby: screen readers read it after the name).
 let fieldIds = 0;
 function field(label, control, hint) {
   const l = el('label', {}, label);
@@ -1408,7 +1409,25 @@ function field(label, control, hint) {
     input.id ||= `setting-${++fieldIds}`;
     l.htmlFor = input.id;
   }
-  return el('div', {}, l, control, hint instanceof Node ? hint : hint ? el('div', { class: 'hint' }, hint) : null);
+  return el('div', {}, l, control, describe(input, hint));
+}
+
+// The hint element for a control (text or an element), linked to it.
+function describe(input, hint) {
+  if (!hint) return null;
+  const h = hint instanceof Node ? hint : el('div', { class: 'hint' }, hint);
+  if (input) {
+    h.id ||= `${input.id}-hint`;
+    input.setAttribute('aria-describedby', h.id);
+  }
+  return h;
+}
+
+// A group of settings (Video, Input, ...): named by its title for screen
+// readers, which announce it when the focus enters it.
+function group(title, ...children) {
+  const id = `drawer-${title.toLowerCase()}`;
+  return el('div', { class: 'group', role: 'group', 'aria-labelledby': id }, el('div', { class: 'gtitle', id }, title), ...children);
 }
 
 // Controls keep their ids (set-<key>) when the drawer is rebuilt (each
@@ -1428,10 +1447,11 @@ function select(key, options, onChange, missing = (v) => `${v} · not available 
   return s;
 }
 
-function check(key, label, onChange) {
+function check(key, label, onChange, hint) {
   const c = el('input', { type: 'checkbox', id: `set-${key}`, checked: !!prefs[key] });
   c.addEventListener('change', () => { prefs[key] = c.checked; savePrefs(); onChange?.(); });
-  return el('label', { class: 'check' }, c, label);
+  const l = el('label', { class: 'check' }, c, label);
+  return hint ? el('div', {}, l, describe(c, hint)) : l;
 }
 
 let applyTimer = 0;
@@ -1536,8 +1556,8 @@ function buildDrawer() {
 
   d.replaceChildren(
     el('h3', {}, 'Stream settings', el('button', { id: 'drawer-close', class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
-    el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Video'),
-      field('Codec', select('codec', codecOpts, applyLive,
+    group('Video',
+      field('Video codec', select('codec', codecOpts, applyLive,
         (v) => `${codecName[v] || v} · ${caps.codecs[v] ? 'this PC does not encode it' : 'this browser does not decode it'}: Auto is used`), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
       field('Bitrate', el('div', { class: 'range-row' }, bitrate, out), 'LAN: 50–150 Mbps. Internet: match your upload speed.'),
       field('Frame rate', select('fps', fpsOpts, applyLive,
@@ -1551,23 +1571,23 @@ function buildDrawer() {
       monOpts.length > 1 ? field('Display', select('monitor', monOpts, applyLive, (v) => `Display ${+v + 1} · not on this PC: the first display is used`)) : null,
       check('adaptive', 'Adaptive bitrate on congestion', () => { post({ type: 'prefs', prefs: { adaptive: prefs.adaptive } }); applyLive(); }),
     ),
-    el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Input'),
+    group('Input',
       field('Mouse', select('mouse', [['desktop', 'Desktop — absolute, local cursor'], ['game', 'Game — raw relative (pointer lock)']], updateToolbarState)),
       field('Cursor', select('cursor', [['local', 'Local (zero latency)'], ['video', 'In the video stream']], () => { applyLive(); applyCursor(); })),
     ),
-    el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Audio'),
+    group('Audio',
       check('audio', 'Stream PC audio', applyLive),
-      field('Codec', select('audioCodec', [['opus', 'Opus (CELT low-delay)'], ['pcm', 'PCM (lossless, ~1.5 Mbps)']], applyLive)),
+      field('Audio codec', select('audioCodec', [['opus', 'Opus (CELT low-delay)'], ['pcm', 'PCM (lossless, ~1.5 Mbps)']], applyLive)),
       field('Volume', vol),
       field('Jitter buffer', select('jitterMode', [['auto', 'Auto (adapts, 10–60 ms)'], ['fixed', 'Fixed']], applyJitter),
         'Auto holds what the network needs: 10–20 ms on a LAN, up to 60 ms on a jittery link.'),
       field('Fixed size', el('div', { class: 'range-row' }, jitter, jout), 'Lower = less delay, higher = fewer glitches on Wi-Fi.'),
     ),
-    el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Diagnostics'),
-      check('latencyProbe', 'Latency probe (host test page)', () => post({ type: 'prefs', prefs: { latencyProbe: prefs.latencyProbe } })),
-      el('div', { class: 'hint' }, 'Open tools/latency-test/index.html full-screen on the host PC: the overlay then shows host screen→drawn latency read from the picture. The test pattern source is probed automatically. Export from the overlay.'),
+    group('Diagnostics',
+      check('latencyProbe', 'Latency probe (host test page)', () => post({ type: 'prefs', prefs: { latencyProbe: prefs.latencyProbe } }),
+        'Open tools/latency-test/index.html full-screen on the host PC: the overlay then shows host screen→drawn latency read from the picture. The test pattern source is probed automatically. Export from the overlay.'),
     ),
-    el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Pipeline'),
+    group('Pipeline',
       field('Network path', pathSel, 'Auto tries the direct path, then the gateway\'s relays. Direct to PC only has no fallback: where the PC ' +
         'cannot be reached directly (away from its network, a blocked port) every connection fails; it needs WebTransport.'),
       field('Transport', transportSel),

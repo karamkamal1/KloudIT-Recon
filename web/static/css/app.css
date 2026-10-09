@@ -240,7 +240,8 @@ body.stream { background: #000; overflow: hidden; user-select: none; -webkit-use
 .drawer.open { transform: translateX(0); visibility: visible; transition: transform 0.25s ease, visibility 0s; }
 .drawer h3 { display: flex; justify-content: space-between; align-items: center; font-size: 18px; }
 .drawer .group { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
-.drawer .group > .gtitle { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin-bottom: 2px; }
+/* --muted: 6.5:1 on the drawer (WCAG AA for 12 px text; --dim was 3.3:1). */
+.drawer .group > .gtitle { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 2px; }
 .range-row { display: flex; align-items: center; gap: 12px; }
 .range-row output { font-family: var(--mono); font-size: 13px; min-width: 76px; text-align: right; color: var(--accent); }
 .drawer .actions { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; }

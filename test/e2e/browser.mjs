@@ -2498,7 +2498,10 @@ async function checkControlBeforeHello() {
 // PC), Tab and Shift+Tab move within it and wrap, Escape closes it and gives
 // the stage focus back; no Tab or Escape reaches the host meanwhile. Every
 // select and slider in it has a name from its label (the accessible name
-// screen readers announce).
+// screen readers announce), the video and audio codec selects distinct ones
+// (both were "Codec"); its sections are groups named by their titles, each
+// hint describes its control (aria-describedby: read after the name), and
+// the section titles have WCAG AA contrast (4.5:1) on the drawer.
 async function checkDrawerKeyboard() {
   await startStream({ path: 'auto', transport: 'auto' });
   try {
@@ -2525,8 +2528,28 @@ async function checkDrawerKeyboard() {
     const names = await page.evaluate(() => [...document.querySelectorAll('#drawer select, #drawer input[type=range]')]
       .map((c) => ({ kind: c.tagName === 'SELECT' ? 'combobox' : 'slider', name: [...(c.labels || [])].map((l) => l.textContent.trim()).join(' ') })));
     const unnamed = names.filter((n) => !n.name);
-    const byRole = await Promise.all(['Codec', 'Renderer', 'Upscaling', 'Decoder', 'HDR'].map((n) => page.getByRole('combobox', { name: n, exact: true }).count()));
+    const comboNames = ['Video codec', 'Audio codec', 'Renderer', 'Upscaling', 'Decoder', 'HDR'];
+    const byRole = await Promise.all(comboNames.map((n) => page.getByRole('combobox', { name: n, exact: true }).count()));
     const sliders = await Promise.all(['Bitrate', 'Volume', 'FSR sharpness'].map((n) => page.getByRole('slider', { name: n, exact: true }).count()));
+    const groupNames = ['Video', 'Input', 'Audio', 'Diagnostics', 'Pipeline'];
+    const groups = await Promise.all(groupNames.map((n) => page.getByRole('group', { name: n, exact: true }).count()));
+    // Each hint and the controls it describes; the section titles' contrast
+    // (the drawer's background over the black stage).
+    const desc = await page.evaluate(() => {
+      const hints = [...document.querySelectorAll('#drawer .hint')];
+      const linked = hints.filter((h) => h.id && document.querySelectorAll(`#drawer [aria-describedby~="${h.id}"]`).length === 1);
+      const rgba = (c) => (c.match(/[\d.]+/g) || []).map(Number);
+      const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+      const lum = ([r, g, b]) => 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+      const [br, bg, bb, ba = 1] = rgba(getComputedStyle(document.getElementById('drawer')).backgroundColor);
+      const back = lum([br * ba, bg * ba, bb * ba]);
+      const ratios = [...document.querySelectorAll('#drawer .gtitle')].map((t) => {
+        const f = lum(rgba(getComputedStyle(t).color));
+        return (Math.max(f, back) + 0.05) / (Math.min(f, back) + 0.05);
+      });
+      const bitrate = [...document.querySelectorAll('#drawer input[type=range]')].find((x) => x.labels?.[0]?.textContent === 'Bitrate');
+      return { hints: hints.length, linked: linked.length, contrast: Math.min(...ratios), bitrate: document.getElementById(bitrate?.getAttribute('aria-describedby') || '-')?.textContent.slice(0, 20) || '' };
+    });
     await page.keyboard.press('Escape');
     const closed = await where();
     await sleep(500);
@@ -2538,10 +2561,14 @@ async function checkDrawerKeyboard() {
       opened.open && opened.inDrawer && tabbed.inDrawer && wrapped.inDrawer && last && !closed.open && closed.id === 'stage' && keys.length === 0,
       `opened: focus on ${opened.tag} "${opened.text}"; after 2 Tabs: ${tabbed.tag} "${tabbed.text}"; Shift+Tab from the first: ${wrapped.tag} "${wrapped.text}" (last: ${last}); ` +
         `Escape: drawer ${closed.open ? 'open' : 'closed'}, focus on #${closed.id || closed.tag}; Tab/Escape presses on the host: ${keys.length}`);
-    check('settings drawer: every select and slider is named by its label',
-      names.length >= 15 && unnamed.length === 0 && byRole[0] === 2 && byRole.slice(1).every((c) => c === 1) && sliders.every((c) => c === 1),
-      `${names.length} controls, ${unnamed.length} unnamed${unnamed.length ? ` (${unnamed.map((n) => n.kind).join(', ')})` : ''}; by role and name: Codec ${byRole[0]} (video, audio), ` +
-        `Renderer ${byRole[1]}, Upscaling ${byRole[2]}, Decoder ${byRole[3]}, HDR ${byRole[4]}, sliders Bitrate/Volume/FSR sharpness ${sliders.join('/')}`);
+    check('settings drawer: every select and slider is named by its label, the video and audio codec apart',
+      names.length >= 15 && unnamed.length === 0 && byRole.every((c) => c === 1) && sliders.every((c) => c === 1),
+      `${names.length} controls, ${unnamed.length} unnamed${unnamed.length ? ` (${unnamed.map((n) => n.kind).join(', ')})` : ''}; by role and name: ` +
+        `${comboNames.map((n, i) => `${n} ${byRole[i]}`).join(', ')}, sliders Bitrate/Volume/FSR sharpness ${sliders.join('/')}`);
+    check('settings drawer: its sections are groups named by their titles, each hint describes its control, the titles at AA contrast',
+      groups.every((c) => c === 1) && desc.hints >= 10 && desc.linked === desc.hints && desc.bitrate.startsWith('LAN') && desc.contrast >= 4.5,
+      `groups by role and name: ${groupNames.map((n, i) => `${n} ${groups[i]}`).join(', ')}; ${desc.linked} of ${desc.hints} hints describe one control (Bitrate: "${desc.bitrate}…"); ` +
+        `section titles ${desc.contrast.toFixed(1)}:1`);
   } finally {
     await endStream();
   }
