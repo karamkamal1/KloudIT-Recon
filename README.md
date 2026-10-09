@@ -265,7 +265,8 @@ powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -PairingCode "recon1
 The installer:
 - downloads FFmpeg (an FFmpeg 8.1+ release build, SHA-256 verified)
 - pairs the agent with your gateway
-- registers a hidden **logon task** with highest privileges, so input reaches elevated games
+- registers a hidden **logon task** with highest privileges, so input reaches elevated games;
+  it starts the agent again when the agent crashes (`host.log`: `agent exited, starting it again`)
 - opens UDP 48100 for the direct path on Private networks only (it warns if your network is
   set to Public)
 - installs ViGEmBus for controller support (`-InstallViGEm`)
@@ -487,7 +488,9 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
 - **The PC stays offline.** Look at `%APPDATA%\KlouditRecon\host.log`. `dial ...: timeout`
   means UDP 8443 from the PC to the gateway is blocked or the pairing code holds an address the PC
   can't reach (create codes while browsing via the gateway's LAN IP). `rejected registration`
-  means the PC was re-paired: paste the new pairing command.
+  means the PC was re-paired: paste the new pairing command. `agent exited, starting it again`
+  means the agent crashed or failed to start and is started again (at most a minute apart); the
+  lines before it say why (`startup failed`, or a `panic:` / `fatal error:` trace to report).
 - **Video is choppy or latency is high, and the overlay shows a CPU encoder (x264/SVT-AV1).**
   No GPU encoder works. Run `probe` (above): the `unusable:` lines give the reason, usually an
   outdated GPU driver. Update it and restart the agent.

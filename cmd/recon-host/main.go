@@ -35,7 +35,8 @@ func usage() {
 
 Usage:
   recon-host [flags] pair <pairing-code>   pair this PC with a gateway
-  recon-host [flags] run                   run the agent (default)
+  recon-host [flags] run                   run the agent (default; with -restart, in a
+                                           child process started again after a crash)
   recon-host [flags] probe                 show ffmpeg, encoders (with their ffmpeg
                                            command lines), the native encoder helper's
                                            encoders, capture backends and monitors
@@ -62,6 +63,7 @@ func main() {
 	cfgPath := flag.String("config", host.DefaultConfigPath(), "config file")
 	logPath := flag.String("log", "", "also write logs to this file")
 	verbose := flag.Bool("v", false, "debug logging")
+	restart := flag.Bool("restart", false, "run: run the agent in a child process and start it again when it crashes or exits with an error (the logon task uses it)")
 	flag.Usage = usage
 	flag.Parse()
 	consoleAttach()
@@ -74,8 +76,14 @@ func main() {
 	if *verbose {
 		level = slog.LevelDebug
 	}
+	supervising := cmd == "run" && *restart && os.Getenv(supervisedEnv) == ""
 	var out io.Writer = os.Stderr
-	if *logPath != "" {
+	switch {
+	case *logPath != "" && supervising:
+		// The agent in the child process keeps the log and rotates it; this
+		// process appends only its own lines and the child's stderr.
+		out = tolerantMulti{appendFile(*logPath), os.Stderr}
+	case *logPath != "":
 		f, err := openLogFile(*logPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "log file:", err)
@@ -83,6 +91,11 @@ func main() {
 		}
 		defer f.Close()
 		out = tolerantMulti{f, os.Stderr}
+		if os.Getenv(supervisedEnv) != "" {
+			out = f // stderr goes to the supervisor, which appends it to the log
+		}
+	}
+	if *logPath != "" {
 		errOut = out // the background build has no console: errors must reach the log
 	}
 	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
@@ -159,6 +172,16 @@ func main() {
 			fatal(err)
 		}
 	case "run":
+		if supervising {
+			exe, err := os.Executable()
+			if err != nil {
+				fatal(err)
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			code := newSupervisor(exe, os.Args[1:], out, log).run(ctx)
+			stop()
+			os.Exit(code)
+		}
 		cfg, err := host.LoadConfig(*cfgPath)
 		if err != nil {
 			fatal(err)

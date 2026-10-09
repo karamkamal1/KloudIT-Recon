@@ -10,7 +10,8 @@
     backend (Intel Quick Sync Video), SHA-256 verified (-InstallLibavcodec)
   - Optionally pairs with your gateway (-PairingCode)
   - Registers a logon task that runs the agent hidden, with highest privileges
-    (needed to send input to elevated games/launchers), restarting on failure
+    (needed to send input to elevated games/launchers); the agent runs in a child process
+    that is started again when it crashes or exits with an error (recon-host -restart)
   - Opens the direct-path UDP port in Windows Firewall (Private/Domain only,
     scoped to the agent executable)
   - Optionally installs the ViGEmBus driver for virtual Xbox controllers
@@ -435,7 +436,10 @@ if ($DirectPort -gt 0) {
 # --- Logon task ----------------------------------------------------------------
 Write-Step "Registering logon task '$TaskName'"
 $user = "$env:USERDOMAIN\$env:USERNAME"
-$action = New-ScheduledTaskAction -Execute $exeW -Argument ("-config `"$cfgPath`" -log `"$logPath`" run")
+# -restart: Task Scheduler's RestartCount covers a task that fails to start, not a program that ran
+# and then exited, so the agent's process starts the agent again (in a child process) after a
+# crash, with the crash's trace in host.log.
+$action = New-ScheduledTaskAction -Execute $exeW -Argument ("-config `"$cfgPath`" -log `"$logPath`" -restart run")
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
@@ -486,6 +490,7 @@ if (-not $NoStart) {
         $log = Read-LogSince $logPath $logStart
         if ($log -match 'connected to gateway') { $state = 'connected'; break }
         if ($log -match 'rejected registration') { $state = 'rejected'; break }
+        if ($log -match 'msg="agent exited, starting it again"') { $state = 'restarting'; break }
         if (-not $paired -and $log -match 'not paired') { $state = 'unpaired'; break }
         $running = [bool](Get-Process -Name 'recon-hostw' -ErrorAction SilentlyContinue)
         if ($running) { $seen = $true }
@@ -498,6 +503,7 @@ if (-not $NoStart) {
         'unpaired'  { Write-Step "Agent is running and waiting to be paired: & '$exe' pair <code>" }
         'rejected'  { Write-Warning "The gateway rejected this PC's pairing code (the PC was re-paired or removed in the dashboard). Use Manage > Re-pair on its card and run the command it shows." }
         'exited'    { Write-Warning "The agent stopped. Last log lines ($logPath):`n$recent" }
+        'restarting' { Write-Warning "The agent stopped and is started again, at most a minute apart. Last log lines ($logPath):`n$recent" }
         default     { Write-Warning "The agent is running but has not reached the gateway yet (is UDP to the gateway's port open?). Last log lines ($logPath):`n$recent" }
     }
 }

@@ -326,8 +326,9 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 func (a *Agent) Run(ctx context.Context) error {
 	defer a.closeVirtualDisplays()
 	if a.pair().Gateway == "" {
-		// Wait instead of exiting: the logon task does not restart an agent that
-		// exits, and `recon-host pair` may run after the agent has started.
+		// Wait instead of exiting: the logon task's agent (recon-host -restart) is
+		// started again only after an error, and `recon-host pair` may run after
+		// the agent has started.
 		a.log.Warn("host is not paired yet: run `recon-host pair <code>`; waiting for the pairing", "config", a.cfg.path)
 		for a.pair().Gateway == "" {
 			select {

@@ -96,6 +96,8 @@ jobs:
           go test -count=1 -v ./internal/host/encoder
           go test -count=1 -v -run 'Helper|GPUPriority|ClockFromQPC' ./internal/host/media
           go test -count=1 -v -run 'Qualify' ./internal/host/qualify
+      - name: Agent supervisor (the logon task's -restart; its job object ends the agent with it)
+        run: go test -count=1 -v -run 'Supervisor' ./cmd/recon-host
       - uses: actions/upload-artifact@v4
         with:
           name: recon-encoder-msvc

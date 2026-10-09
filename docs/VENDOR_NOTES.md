@@ -9088,6 +9088,51 @@ frame streams instead (`"fec": "off"`, or the browser's Video over datagrams set
   210`: within about 30 s (the minimum round trip's window) the suffix goes again.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
 
+### The logon task's agent comes back after a crash
+
+Problem: a panic or a fatal runtime error (concurrent map writes) in any of the agent's
+goroutines ended `recon-hostw.exe`, and nothing started it again: the logon task's RestartCount
+covers a task that fails to start, not a program that ran and then exited with an error code
+(the agent's own comment in `Agent.Run` assumed as much). The PC showed Offline until the next
+sign-in at it. The Go runtime writes a crash's trace to the process's stderr handle, which the
+GUI-subsystem build started by Task Scheduler does not have, so host.log just stopped. Fix:
+`recon-host -restart run` (the task's arguments now) runs the agent in a child process, the same
+program and arguments, and starts it again when it exits with an error: after 1 s, doubling to
+at most a minute, back to 1 s after a child that ran 5 minutes; a clean exit (code 0) ends it.
+The child's stderr goes to host.log (`appendFile`: opened per write, so the child's rotation by
+renaming still works on Windows), followed by `agent exited, starting it again status="exit
+status 2"`. A job object with kill-on-close holds the child, so `Stop-ScheduledTask` (which ends
+only the task's own process) and the installer's `Stop-Process` end both. The installer reports
+`restarting` when the log says so; the header no longer claims "restarting on failure".
+`debug.SetCrashOutput` was not used: its duplicated handle on host.log would make every rotation
+by rename fail on Windows (no FILE_SHARE_DELETE).
+
+- Verified here: `cmd/recon-host` `TestSupervisorRestartsCrashedAgent` (the test binary as the
+  agent panics in a goroutine on its first run: the trace `panic: test crash in a session
+  goroutine` and the restart line land in the log, the second run's clean exit ends the
+  supervisor), `TestSupervisorStopsAgent` (Linux: SIGTERM reaches the agent, which stops
+  cleanly; Windows: killed after the wait) and, Windows only, `TestSupervisorKilledEndsAgent`
+  (killing the supervisor's process ends the agent: the job object; it fails with the job
+  assignment removed). All three pass on Linux (`-race`) and under Wine 9 (`GOOS=windows go test
+  -c`), also built with `-H=windowsgui` like `recon-hostw.exe`; CI runs them on windows-latest.
+  The Linux binary with `-log host.log -restart run`: SIGQUIT to the child put its goroutine dump
+  into host.log, then the restart line and the new child's start; SIGTERM to the supervisor
+  ended both. The Windows `recon-hostw.exe -restart run` under Wine with an unusable `ffmpeg`:
+  `startup failed`, `agent exited, starting it again ... in=1s`, then 2s, 4s, 8s. The pwsh parser
+  check of the installer.
+- AMD RDNA3 (RX 7900 XT): unverified (no Windows here). Test: after the installer, Task
+  Manager's Details tab shows two `recon-hostw.exe`; `Get-CimInstance Win32_Process -Filter
+  "Name='recon-hostw.exe'" | Select-Object ProcessId, ParentProcessId, CommandLine` names the
+  child (its parent is the other one; both command lines end in `-restart run`). During a stream
+  run `Stop-Process -Id <child> -Force`: the browser reconnects within a few seconds, host.log has
+  `agent exited, starting it again status="exit status ..."` (the code Stop-Process left) and the new
+  child's start lines, and the dashboard shows the PC online again. `Stop-ScheduledTask 'KloudIT
+  Recon Host'` leaves no `recon-hostw.exe`, `recon-encoder.exe` or `ffmpeg.exe` of the install
+  folder running; `Start-ScheduledTask` brings both back. After an upgrade from an install
+  before this fix, `(Get-ScheduledTask 'KloudIT Recon Host').Actions.Arguments` ends in
+  `-restart run`.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
 ### README, INSTALL and the hardware test plan
 
 Problem: README's feature list and diagram described only the FFmpeg pipeline (key-frame or

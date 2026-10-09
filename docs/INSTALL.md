@@ -276,7 +276,11 @@ PC's card then shows **Online**.
 | `winget not found` | Update *App Installer* from the Microsoft Store, or install ViGEmBus from <https://github.com/nefarius/ViGEmBus/releases>. |
 
 The agent writes its log to `%APPDATA%\KlouditRecon\host.log`. Past 20 MB it moves it to
-`host.log.old` (replacing the one before) and starts a new one, also while it runs.
+`host.log.old` (replacing the one before) and starts a new one, also while it runs. The logon
+task runs the agent in a child process (`recon-host -restart`, so two `recon-hostw.exe` show in
+Task Manager) and starts it again when it crashes or fails to start, after 1 second, then up to
+a minute apart: `host.log` then says `agent exited, starting it again`, after the crash's trace
+(`panic:` or `fatal error:`). Please report that trace. `Stop-ScheduledTask` stops both.
 
 ## 8. Play
 
