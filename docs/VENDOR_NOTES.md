@@ -10220,3 +10220,56 @@ back. Each field's label names its control (`for`/`id`; the slider of a range ro
   Ctrl+Alt+Shift+O, change Bitrate with Tab and the arrow keys, Escape; then with Narrator
   (Win+Ctrl+Enter) on, Tab through the drawer: each control is read with its name ("Codec,
   combo box", "Bitrate, slider").
+
+### Long text through "Type text on the host"
+
+Problem: the paste dialog (Ctrl+Alt+Shift+V) sent its whole text as one input message. Its
+`maxlength` holds only typing, not the text the "From clipboard" button puts in, and the host
+reads input messages up to 64 KiB: a larger one (a log or source file, about 22 000 CJK
+characters) ended the host's input loop and its input stream. Over WebTransport (direct, UDP
+relay, splice) keys, mouse buttons and the wheel then did nothing for the rest of the session
+while the pointer still moved (motion goes as datagrams), with no message; over the WebSocket
+relay the gateway's next input write failed and the whole session ended. Text between 4 KiB and
+64 KiB arrived, but the host types at most 4096 bytes of one message, cut mid-character.
+
+Fix: the client sends the text in messages of at most 4096 bytes (what the host types of one),
+split between code points (`protocol.js` `textEvents`), so any length arrives whole. The host
+skips an input message above the limit (reads it to its end, logs `input message skipped`)
+instead of ending the stream, so no client can switch off a session's input with one message.
+The dialog keeps its 4000-character limit for typing.
+
+- Verified here: browser E2E check "paste dialog: text above the 64 KiB input message limit
+  arrives whole" (70 004 bytes of 1- to 4-byte UTF-8 sequences set as the clipboard button
+  does: 18 messages, the largest 4096 bytes, no U+FFFD, the text whole in the host's input log,
+  then W reaches the host). Against the old client: nothing typed and W never reached the host.
+  `internal/e2e` (TestStreamingPaths): a 64 KiB + 1 text message before the key press on the
+  direct, UDP relay and splice paths and over the WebSocket relay; the key still arrives.
+  Against the old host the direct path loses the key and the WebSocket relay session ends
+  ("session ended"). `internal/proto` TestFraming covers `ReadMsgSkip`.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows host: open Notepad on the PC,
+  stream, copy about 100 KB of text on the client (a log file), Ctrl+Alt+Shift+V, From
+  clipboard, Send: Notepad receives the whole text (it takes a few seconds), then typing,
+  clicks and the wheel still work in the stream; host.log has no `input message skipped`.
+
+### The paste dialog from the keyboard and for screen readers
+
+Problem: the "Type text on the host" dialog was a plain box: no dialog role or name, its text
+box named only by a placeholder, Escape did nothing (the page's key handler leaves keys inside
+dialogs alone and the dialog had no handler), and focus was not held: Shift+Tab from the text
+box reached the stage, where every key (Tab too) goes to the PC while the dialog still covered
+the stream, so what the user meant to paste (a password) could be typed into the PC.
+
+Fix: the dialog has `role="dialog"`, `aria-modal` and is named by its title; the text box is
+named "Text to type on the host". Escape closes it and gives the stage the focus back (as Send
+and Cancel do now), Tab and Shift+Tab wrap inside it.
+
+- Verified here: browser E2E check "paste dialog: a modal dialog named by its title …" (the
+  hotkey, Shift+Tab from the text box to Send, Tab back to the text box, Escape: closed, focus on
+  the stage, no Tab or Escape press in the host's input log; Playwright finds the dialog and the
+  text box by role and name). Against the old page: no dialog or text box by name, Shift+Tab left
+  the dialog, Escape left it open, 2 Tab/Escape presses reached the host.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client: stream,
+  Ctrl+Alt+Shift+V, Shift+Tab and Tab a few times (the focus stays on the dialog's controls,
+  nothing is typed on the PC), Escape (the dialog closes, typing goes to the PC again); with
+  Narrator on, the dialog is read as "Type text on the host, dialog" and the box as "Text to type
+  on the host".

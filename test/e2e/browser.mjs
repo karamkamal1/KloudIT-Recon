@@ -2540,6 +2540,71 @@ async function checkDrawerKeyboard() {
   }
 }
 
+// The paste dialog ("Type text on the host", final review): a modal dialog
+// named by its title, its text box named; Tab and Shift+Tab stay in it,
+// Escape closes it back to the stage, and no Tab or Escape reaches the PC
+// meanwhile. Text above the host's 64 KiB input message limit (the
+// clipboard's: maxlength does not hold a value set by script) arrives whole,
+// in messages of at most 4096 bytes (what the host types of one) split
+// between code points, and keys still reach the host after it (one message
+// above the limit ended the input stream: no keys or mouse buttons for the
+// rest of the session).
+async function checkPasteDialog() {
+  await startStream({ path: 'auto', transport: 'auto' });
+  try {
+    await page.focus('#stage');
+    if (nativeInputLog) writeFileSync(inputLog, '');
+    const where = () => page.evaluate(() => {
+      const a = document.activeElement;
+      return { inDialog: !!a?.closest('[role=dialog]'), id: a?.id || '', tag: a?.tagName.toLowerCase() || '', text: (a?.textContent || '').trim().slice(0, 20), open: !!document.querySelector('#modal-root .modal-bg') };
+    });
+    await page.keyboard.press('Control+Alt+Shift+KeyV');
+    const opened = await where();
+    const named = await page.getByRole('dialog', { name: 'Type text on the host', exact: true }).count();
+    const box = await page.getByRole('textbox', { name: 'Text to type on the host', exact: true }).count();
+    await page.keyboard.press('Shift+Tab'); // from the text box (the first): to the last button
+    const wrappedBack = await where();
+    await page.keyboard.press('Tab'); // from the last: to the text box
+    const wrapped = await where();
+    await page.keyboard.press('Escape');
+    const closed = await where();
+    await sleep(500);
+    const readLog = () => (nativeInputLog ? readFileSync(inputLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+    const tabEsc = readLog().filter((e) => e.ev === 'key' && e.down && (e.sc === 0x0f || e.sc === 0x01));
+    check('paste dialog: a modal dialog named by its title, the text box named; Tab and Shift+Tab stay inside, Escape closes it back to the stage, no Tab or Escape reaches the PC',
+      opened.open && opened.tag === 'textarea' && named === 1 && box === 1 && wrappedBack.inDialog && wrappedBack.text === 'Send' &&
+        wrapped.tag === 'textarea' && !closed.open && closed.id === 'stage' && tabEsc.length === 0,
+      `opened: focus on ${opened.tag}; dialog by role and name: ${named}, text box: ${box}; Shift+Tab: ${wrappedBack.tag} "${wrappedBack.text}"; Tab: ${wrapped.tag}; ` +
+        `Escape: dialog ${closed.open ? 'open' : 'closed'}, focus on #${closed.id || closed.tag}; Tab/Escape presses on the host: ${tabEsc.length}`);
+
+    // Text of 1- to 4-byte UTF-8 sequences, 70 kB, set as the clipboard button does.
+    await page.evaluate(() => document.querySelectorAll('#modal-root .modal-bg').forEach((x) => x.remove())); // (one Escape left open)
+    if (nativeInputLog) writeFileSync(inputLog, '');
+    const text = 'aé€😀'.repeat(7000) + ' end';
+    await page.keyboard.press('Control+Alt+Shift+KeyV');
+    await page.evaluate((t) => { document.querySelector('#modal-root textarea').value = t; }, text);
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    let typed = 'not checked (no input log)';
+    let pieces = [];
+    let keyAfter = false;
+    if (nativeInputLog) {
+      const texts = () => readLog().filter((e) => e.ev === 'text').map((e) => e.s);
+      await until(() => texts().join('').length >= text.length, 10000, 'the text on the host').catch(() => {});
+      pieces = texts();
+      typed = pieces.join('') === text ? 'whole' : `${pieces.join('').length} of ${text.length} UTF-16 units`;
+      await page.focus('#stage');
+      await page.keyboard.press('KeyW');
+      keyAfter = await until(() => readLog().some((e) => e.ev === 'key' && e.sc === 17), 5000, 'a key after the text').then(() => true, () => false);
+    }
+    const bytes = pieces.map((p) => new TextEncoder().encode(p).length);
+    check('paste dialog: text above the 64 KiB input message limit arrives whole, in messages of at most 4096 bytes split between code points, and keys still reach the host after it',
+      !nativeInputLog || (typed === 'whole' && bytes.every((n) => n <= 4096) && pieces.every((p) => !p.includes('\ufffd')) && keyAfter),
+      `${new TextEncoder().encode(text).length} bytes: ${typed}, in ${pieces.length} messages (largest ${Math.max(0, ...bytes)} bytes); a key after it ${keyAfter ? 'reached' : 'did NOT reach'} the host`);
+  } finally {
+    await endStream();
+  }
+}
+
 // A hardware decoder that keeps failing (final review): the worker's
 // VideoDecoder replaced, from the worker's start, by one that reports
 // prefer-hardware supported for what this browser decodes, but whose
@@ -4606,6 +4671,7 @@ try {
   if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
+  if (want('paste dialog')) await checkPasteDialog().catch((e) => check('paste dialog scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

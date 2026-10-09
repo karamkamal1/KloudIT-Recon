@@ -685,7 +685,10 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 		}()
 	}
 	// Input: a key press and relative mouse motion with one "lost" datagram.
+	// Before them a message above the input limit (an earlier client's long
+	// paste): the host skips it, the key still arrives.
 	time.Sleep(dur / 2)
+	proto.WriteMsg(in, append([]byte{proto.InText}, bytes.Repeat([]byte("x"), proto.MaxInputMsg)...))
 	proto.WriteMsg(in, proto.KeyEvent(0x1e, false, true)) // 'A' down
 	proto.WriteMsg(in, proto.KeyEvent(0x1e, false, false))
 	c.SendDatagram(proto.MouseRelDatagram(1, 5, -3))
@@ -1005,6 +1008,7 @@ func TestStreamingPaths(t *testing.T) {
 			}
 			if r.frames == 60 && !sentInput {
 				sentInput = true
+				send(proto.WSInput, append([]byte{proto.InText}, bytes.Repeat([]byte("x"), proto.MaxInputMsg)...)) // skipped (above the limit)
 				send(proto.WSInput, proto.KeyEvent(0x1e, false, true))
 				send(proto.WSInput, proto.KeyEvent(0x1e, false, false))
 				send(proto.WSDatagram, proto.MouseRelDatagram(1, 12, -10))

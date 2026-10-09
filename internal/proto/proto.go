@@ -143,12 +143,28 @@ func WriteMsg(w io.Writer, p []byte) error {
 
 // ReadMsg reads one length-prefixed message, refusing anything above max bytes.
 func ReadMsg(r io.Reader, max int) ([]byte, error) {
+	return readMsg(r, max, false)
+}
+
+// ReadMsgSkip is ReadMsg for a stream that outlives a message above max
+// bytes: it reads that message to its end, discarding it, and returns an
+// error wrapping ErrTooLarge with r at the next message.
+func ReadMsgSkip(r io.Reader, max int) ([]byte, error) {
+	return readMsg(r, max, true)
+}
+
+func readMsg(r io.Reader, max int, skip bool) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 	n := binary.LittleEndian.Uint32(hdr[:])
 	if int64(n) > int64(max) {
+		if skip {
+			if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
+				return nil, err
+			}
+		}
 		return nil, fmt.Errorf("%w: %d > %d", ErrTooLarge, n, max)
 	}
 	p := make([]byte, n)

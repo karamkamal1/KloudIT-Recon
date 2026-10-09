@@ -447,7 +447,9 @@ before a pause can be lost safely.
 ### Input stream events
 
 `1` key (u16 set-1 scancode, flags down|extended) · `2` mouse button · `3` wheel (WHEEL_DELTA
-units, high resolution) · `4` release-all · `5` UTF-8 text (typed as Unicode keystrokes).
+units, high resolution) · `4` release-all · `5` UTF-8 text (typed as Unicode keystrokes; the
+host types at most 4096 bytes of one, so the browser splits longer text between code points).
+Messages are length-prefixed, at most 64 KiB: the host skips a larger one and reads on.
 
 ### Send priorities
 

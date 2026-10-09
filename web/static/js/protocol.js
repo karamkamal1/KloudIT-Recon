@@ -172,12 +172,25 @@ export function releaseAllEvent() {
   return new Uint8Array([IN_RELEASE_ALL]);
 }
 
-export function textEvent(s) {
+// The host types at most this many UTF-8 bytes of one text message
+// (input.Injector.Text) and reads input messages up to proto.MaxInputMsg
+// (64 KiB; a larger one ended an older host's input stream).
+export const TEXT_MAX_BYTES = 4096;
+
+/** Text to type on the host: one message per TEXT_MAX_BYTES, split between code points. */
+export function textEvents(s) {
   const t = enc.encode(s);
-  const b = new Uint8Array(1 + t.length);
-  b[0] = IN_TEXT;
-  b.set(t, 1);
-  return b;
+  const out = [];
+  for (let i = 0; i < t.length;) {
+    let end = Math.min(t.length, i + TEXT_MAX_BYTES);
+    while (end < t.length && (t[end] & 0xc0) === 0x80) end--; // not inside a UTF-8 sequence
+    const b = new Uint8Array(1 + end - i);
+    b[0] = IN_TEXT;
+    b.set(t.subarray(i, end), 1);
+    out.push(b);
+    i = end;
+  }
+  return out;
 }
 
 export function mouseRel(seq, cx, cy) {

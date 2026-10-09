@@ -2330,7 +2330,13 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 	defer st.CancelRead()
 	inj := s.a.inj
 	for {
-		b, err := proto.ReadMsg(st, proto.MaxInputMsg)
+		// A message above the limit is skipped: ending the stream would end
+		// the session's keyboard and mouse buttons (clients split long text).
+		b, err := proto.ReadMsgSkip(st, proto.MaxInputMsg)
+		if errors.Is(err, proto.ErrTooLarge) {
+			s.log.Warn("input message skipped", "err", err)
+			continue
+		}
 		if err != nil {
 			return
 		}

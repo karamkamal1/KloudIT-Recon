@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,24 @@ func TestFraming(t *testing.T) {
 	WriteMsg(&b, make([]byte, 100))
 	if _, err := ReadMsg(&b, 10); err == nil {
 		t.Fatal("oversized message accepted")
+	}
+
+	// ReadMsgSkip: the stream goes on after an oversized message.
+	b.Reset()
+	WriteMsg(&b, bytes.Repeat([]byte{1}, 70000))
+	WriteMsg(&b, []byte("next"))
+	if _, err := ReadMsgSkip(&b, 64<<10); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("oversized message: %v, want ErrTooLarge", err)
+	}
+	if got, err := ReadMsgSkip(&b, 64<<10); err != nil || string(got) != "next" {
+		t.Fatalf("after the oversized message: %q %v", got, err)
+	}
+	// One cut short ends the stream.
+	b.Reset()
+	WriteMsg(&b, make([]byte, 100))
+	b.Truncate(50)
+	if _, err := ReadMsgSkip(&b, 10); err == nil || errors.Is(err, ErrTooLarge) {
+		t.Fatalf("truncated oversized message: %v, want a read error", err)
 	}
 }
 

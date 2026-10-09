@@ -1251,16 +1251,35 @@ function drawSpark(c) {
 // ---------------------------------------------------------------------------
 // Paste text
 
+// A modal dialog: Escape closes it, back to the stage, and Tab and Shift+Tab
+// stay in it (on the stage they would go to the PC). Text longer than one
+// message goes in several (the clipboard's is not held to maxlength).
 function pasteDialog() {
-  const ta = el('textarea', { placeholder: 'Text to type on the host (passwords, chat, commands)…', maxlength: '4000' });
-  const close = () => bg.remove();
-  const bg = el('div', { class: 'modal-bg', onclick: (e) => { if (e.target === bg) close(); } },
-    el('div', { class: 'card modal' }, el('h3', {}, 'Type text on the host'),
-      el('p', { class: 'hint' }, 'Sent as Unicode keystrokes into the focused window on the PC.'), ta,
-      el('div', { class: 'modal-actions' },
-        el('button', { onclick: async () => { try { ta.value = await navigator.clipboard.readText(); } catch { toast('Clipboard access denied', 'warn'); } } }, 'From clipboard'),
-        el('button', { onclick: close }, 'Cancel'),
-        el('button', { class: 'btn-primary', onclick: () => { if (ta.value) sendIn(P.textEvent(ta.value)); close(); S.surface.focus(); } }, 'Send'))));
+  const ta = el('textarea', { placeholder: 'Text to type on the host (passwords, chat, commands)…', maxlength: '4000', 'aria-label': 'Text to type on the host' });
+  const close = () => { bg.remove(); S.surface.focus(); };
+  const send = () => { for (const b of P.textEvents(ta.value)) sendIn(b); close(); };
+  const box = el('div', { class: 'card modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'paste-title' },
+    el('h3', { id: 'paste-title' }, 'Type text on the host'),
+    el('p', { class: 'hint' }, 'Sent as Unicode keystrokes into the focused window on the PC.'), ta,
+    el('div', { class: 'modal-actions' },
+      el('button', { onclick: async () => { try { ta.value = await navigator.clipboard.readText(); } catch { toast('Clipboard access denied', 'warn'); } } }, 'From clipboard'),
+      el('button', { onclick: close }, 'Cancel'),
+      el('button', { class: 'btn-primary', onclick: send }, 'Send')));
+  const bg = el('div', { class: 'modal-bg', onclick: (e) => { if (e.target === bg) close(); } }, box);
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const f = [...box.querySelectorAll('textarea, button')];
+    const to = e.shiftKey ? (document.activeElement === f[0] ? f[f.length - 1] : null) : (document.activeElement === f[f.length - 1] ? f[0] : null);
+    if (to) {
+      e.preventDefault();
+      to.focus();
+    }
+  });
   $('modal-root').append(bg);
   ta.focus();
 }
