@@ -1084,7 +1084,9 @@ func TestCursorLoopAfterVideoCursor(t *testing.T) {
 	s.a.cfg = &Config{}
 	s.prefs = proto.Prefs{Cursor: "video"}
 	s.monitor = platform.Monitor{W: 1920, H: 1080}
-	go s.cursorLoop()
+	done := make(chan struct{})
+	go func() { s.cursorLoop(); close(done) }()
+	t.Cleanup(func() { s.cancel(); <-done }) // the loop ends before its stand-ins go (cleanups run last first)
 	time.Sleep(60 * time.Millisecond)
 	dc.mu.Lock()
 	n := len(dc.sent)
