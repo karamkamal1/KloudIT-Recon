@@ -21,11 +21,11 @@ The sections after this one follow the order in which the steps were built, and 
 own checks. Some early checks describe behaviour that later steps replaced: they are marked
 **Superseded** (run the newer check named there) or **FFmpeg path only** (run them with
 `"pipeline": "ffmpeg"`). This plan is the order to run everything on the RX 7900 XT, and on an
-NVIDIA host when there is one: each stage needs the ones before it. The "Final review: ..."
-sections at the end are listed in the stages too. Out of scope on the RX 7900 XT: the
-`Intel (...)` lines of 3.8 and 3.8 wiring, which need an Intel host (their AMD lines are in
-stages 1 and 4). Use the default `host.json`
-unless a stage says otherwise, edit it with the agent stopped or restart the agent afterwards
+NVIDIA host when there is one: each stage needs the ones before it. Every item of the "Final
+review: ..." sections at the end with a check on hardware or a real client is in a stage too.
+Out of scope on the RX 7900 XT: the `Intel (...)` lines of 3.8 and 3.8 wiring, which need an
+Intel host (their AMD lines are in stages 1 and 4). Use the default `host.json` unless a stage
+says otherwise, edit it with the agent stopped or restart the agent afterwards
 (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`), and put
 it back after the stage. `"logLevel": "debug"` adds the debug lines some checks read (`ffmpeg
 args`, `rate report decision`, `congestion: bitrate kept`), and every change of the rate
@@ -67,7 +67,10 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    "Final review: deploy and install" also: the FFmpeg checksum line, a custom
    install folder (`-InstallDir C:\Recon`, then reinstall to Program Files), the logon task's
    agent started again after a crash (`-restart`), and upgrades keeping the direct path's port;
-   3.8's AMD line (with `-InstallLibavcodec`, `--print-caps` still picks `amf`).
+   3.8's AMD line (with `-InstallLibavcodec`, `--print-caps` still picks `amf`). "Final review:
+   host agent, second round": the elevated agent writes nothing in folders the user owns, its
+   steps 1-3 (the ProgramData folder's ACL, the logon task's `-log`, no write from a PowerShell
+   that is not elevated; steps 4 and 5 in stage 8).
 2. **The helper by itself**: `recon-encoder.exe --print-caps --backend=amf` and the self-tests
    (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
    3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
@@ -86,7 +89,13 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
    connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard, the
-   settings after a failed connection, a saved codec another PC does not offer). With
+   settings after a failed connection, a saved codec another PC does not offer, long text
+   through "Type text on the host" (100 KB into Notepad on the PC), the paste dialog by keyboard
+   and with Narrator, a WebGL2 context that does not come back (Renderer WebGL2, then
+   `chrome://gpucrash`), the dashboard with Narrator and the keyboard). "Final review: host
+   agent, second round": the local cursor after starting with the cursor in the video,
+   controller input only from the active session (ViGEmBus, two browsers signed in as two
+   users), captureTimestamps "off" on the helper. With
    `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
@@ -95,8 +104,11 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    of the gateway's, and nothing encoding while the tab is hidden. 3.8 wiring's AMD lines (no regression
    with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
    iGPU). "Final review: native encoder helper, third round": 4K key frames at 250 Mbit/s and
-   the ring's slot size (a 3840x2160 monitor). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
-   Sunshine for the comparison), T2 with the 0.3 rig.
+   the ring's slot size (a 3840x2160 monitor). Latency: T1 with 0.2's 10-minute latency test
+   (the same scene through Moonlight and Sunshine for the comparison), T2 with the 0.3 rig.
+   Every rig measurement (0.3, 4.3, 4.4, FSR) runs with `"virtualDisplay": "off"`
+   (LATENCY_RIG.md, rules for a fair comparison): a virtual display would put the stream on a
+   monitor that neither `flash.html` nor the host sensor is on.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
    `· datagrams + FEC`). From the final review: "Final review: host agent", datagram + FEC with
@@ -112,12 +124,15 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
 7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
    before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
    re-encode, slice output). "Final review: host agent, third round": a late discardable frame
-   is no loss (under `capdrop`).
+   is no loss (under `capdrop`). "Final review: host agent, second round": thinning after the
+   switch to datagram + FEC (under `wan`).
 8. **Virtual display and HDR**: 3.7 and 3.7 wiring (with the Virtual Display Driver, then
    SudoVDA), and "Final review: deploy and install", what the virtual display does after
    `-InstallVirtualDisplay`; 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode), and
    "Final review: AMD Direct Capture sRGB and 10-bit surfaces", its 10-bit HDR check (the PQ
-   assumption), and "Final review: AMD Direct Capture follows Windows HDR".
+   assumption), and "Final review: AMD Direct Capture follows Windows HDR". "Final review: host
+   agent, second round": the elevated agent writes nothing in folders the user owns, its steps 4
+   and 5 (the restore journal in the ProgramData folder, none read next to host.json).
 9. **Soak (T8) on the default pipeline**:
    - AMD RDNA3 (RX 7900 XT): unverified. Test: default host.json (after stage 3), a GPU-bound
      game at 2560x1440 120 fps, HEVC, 50 Mbit/s, on `lan` (direct path), one stream for 2 hours.
@@ -135,16 +150,27 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    "Final review: host agent": FFmpeg's rate restarts no longer filling host.log (at the
    default `logLevel`), and its FFmpeg line of nothing encoding while the tab is hidden. "Final
    review: host agent, third round": the display staying on with only a controller (then its
-   repeat on the default pipeline).
+   repeat on the default pipeline). "Final review: host agent, second round": the 7th encoder
+   failure in a row ends the session (Win+L for 30 s; the browser reconnects).
 11. **Remote access** (INSTALL.md section 9): "Final review: QUIC packets on a 1280-MTU path
    (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
    itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
    review: deploy and install", the UDP relay naming an IP mismatch, and "Final review:
    security", `-trust-proxy` behind a reverse proxy or tunnel. "Final review: browser client":
-   the direct path and the UDP relay over IPv6 (the page's CSP).
-12. **Security**: "Final review: security": UDP relay ports released when a session ends, the
-   login page's redirect, and FFmpeg and its libraries only from places administrators control
-   (a `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored).
+   the direct path and the UDP relay over IPv6 (the page's CSP). Port forwarding's `--name`
+   (INSTALL.md step 9) makes the gateway a new private CA: install the new ca.crt on the PC and
+   the clients in place of the old one ("Final review: security", the private CA's step 9
+   check).
+12. **Security**: "Final review: security": UDP relay ports held without a session and a
+   relayed connection ending with its session (Reconnect six times, then a takeover), the login
+   page's redirect, FFmpeg and its libraries only from places administrators control (a
+   `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored), 2FA codes bounded per
+   account (three wrong codes end the login; five lock the account's 2FA), failed logins no
+   longer growing the gateway's memory and disk (20 failed logins, one `login_ratelimited`
+   line), deleting a user or changing a password ending the account's live streams (on the
+   direct path, then from the phone hotspot of stage 11 over a relay, then a password change),
+   and the private CA vouches only for the gateway (Windows 11: `certutil -verify` reports the
+   name constraint; then macOS and an iPhone: Safari refuses the other name's leaf).
 13. **Uninstall** (last: it removes the agent): "Final review: deploy and install", uninstalling
    restores a virtual display's layout (with the Virtual Display Driver, during a stream and
    within the 10 s linger).
@@ -417,7 +443,7 @@ p95, and a native Moonlight + Sunshine baseline on the same hardware.
 Hardware acceptance (none of it could run in the build sandbox: no GPU, no Windows, no
 microcontroller):
 
-- AMD RDNA3 (RX 7900 XT): unverified. Test: build the rig with two sensors (client screen on A0, host monitor on A1) and plug it into a 120 Hz Windows client on wired LAN. Open `tools/latency-rig/flash.html` fullscreen on the host. With identical settings in both (HEVC, 1920×1080, 120 fps, same bitrate, fullscreen; Moonlight V-Sync and frame pacing off), alternate 100-sample blocks of `python3 tools/latency-rig/rig.py measure --port COMx --host-sensor --label moonlight-hevc-1080p120-lan-amd --samples 100` and `... --label recon-hevc-1080p120-lan-chrome-amd ...` (Sunshine stream stopped while Recon runs and vice versa) until each label has ≥ 200 samples. Then run `rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-amd.json` and paste the table here. Pass: exit code 0 (≥ 200 click→client samples each), timeouts 0 or explained, and Recon's click→client median within ~5–10 ms of Moonlight's (acceptance T2). Repeat for the wifi, wan and capdrop profiles once step 0.4 exists.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: build the rig with two sensors (client screen on A0, host monitor on A1) and plug it into a 120 Hz Windows client on wired LAN. Set `"virtualDisplay": "off"` in the agent's host.json and restart the agent (LATENCY_RIG.md, rules for a fair comparison: a virtual display would put Recon's stream on another monitor than the one `flash.html`, the A1 sensor and Sunshine use); where possible run the host monitor at 1920×1080 120 Hz. Open `tools/latency-rig/flash.html` fullscreen on the host. With identical settings in both (HEVC, 1920×1080, 120 fps, same bitrate, fullscreen; Moonlight V-Sync and frame pacing off), alternate 100-sample blocks of `python3 tools/latency-rig/rig.py measure --port COMx --host-sensor --label moonlight-hevc-1080p120-lan-amd --samples 100` and `... --label recon-hevc-1080p120-lan-chrome-amd ...` (Sunshine stream stopped while Recon runs and vice versa) until each label has ≥ 200 samples. Then run `rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-amd.json` and paste the table here. Pass: exit code 0 (≥ 200 click→client samples each), timeouts 0 or explained, and Recon's click→client median within ~5–10 ms of Moonlight's (acceptance T2); host.log has no `streaming a virtual display` line during the Recon blocks. Repeat for the wifi, wan and capdrop profiles once step 0.4 exists.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same procedure on an RTX 20/30/40/50 host (HEVC; also AV1 on RTX 40+), labels ending in `-nvidia`, baseline `moonlight-hevc-1080p120-lan-nvidia`. Same pass criteria.
 - Rig firmware on an ATmega32U4 (Leonardo / Pro Micro): unverified (compiled only). Test: flash it, open a serial monitor at 115200 baud and send `i`: it must print `board=atmega32u4 hid=avr`. Send `mon` while covering/uncovering the sensor: the first `# lvl` value follows the light. From a CR+LF terminal (Arduino Serial Monitor *Both NL & CR*, or `python -m serial.tools.miniterm`), `r 5` must take 5 samples and `mon` must keep printing; neither may stop at once with `# stopped`. On the flash page, `cal` prints black/white with no `# err`, and `c` prints `id,click_us,client_us,` with a plausible client_us − click_us. `i` then prints `us per loop` (expect tens of µs with two sensors). The client must enumerate a HID mouse plus a COM port, and USB Device Tree Viewer must show the HID interrupt IN endpoint with bInterval 1 ms.
 - Rig firmware on an RP2040 (both USB stacks: Pico SDK and Adafruit TinyUSB): unverified (compiled only). Test: the same checks as for the ATmega32U4 (`board=rp2040 hid=pico-sdk` / `hid=adafruit-tinyusb`). USB Device Tree Viewer must show bInterval 1 ms on the HID endpoint for both stacks. The core default is 10 ms, and this sketch overrides it.
@@ -9369,6 +9395,34 @@ where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `rat
   and the plan says the Intel lines of 3.8 and 3.8 wiring are out of scope on the RX 7900 XT
   while their AMD lines are in stages 1 and 4. Verified here: each `## Final review` heading
   with an `AMD RDNA3` line, and each of their `###` items with one, is named in the plan.
+- Third round: the plan still said the "Final review: ..." sections were in the stages, but 16
+  items with a check on hardware or a real client added since were in none: the security
+  pass's relay ports held without a session, the relayed connection ending with its session, 2FA
+  codes bounded per account, failed logins bounded, revoked users' streams ending and the
+  private CA's name constraints (Windows 11, macOS, iPhone); the browser client's long text
+  through "Type text on the host", the paste dialog, the WebGL2 context that does not come back
+  and the dashboard; and all of "Final review: host agent, second round" with a check (thinning
+  after the switch to datagram + FEC, the 7th encoder failure, the elevated agent's folders, the
+  local cursor, controller input, captureTimestamps "off"). Fix: each is in a stage (1, 4, 7, 8,
+  10, 12), stage 11 says that port forwarding's `--name` makes a new CA, and the plan's sentence
+  says which items it covers. Verified here: a script lists each `###` item under a `## Final
+  review` heading (and each such heading without items) that has an `unverified` line or a
+  gateway, browser or client check, and looks up its phrase in the plan: 51 items, 16 missing
+  before, none after.
+- Third round, latency rig and the virtual display: LATENCY_RIG.md and 0.3's T2 check did not
+  mention the virtual display. With `"virtualDisplay": "auto"` (`install-host.ps1
+  -InstallVirtualDisplay`, INSTALL step 7) a Recon stream at another size than the host monitor
+  or above its refresh rate streams a new virtual monitor (the primary one by default), while
+  `flash.html`, the A1 host sensor and Sunshine stay on the physical monitor: `cal` fails or
+  Recon is measured on another capture target than Moonlight. Fix (documentation): a rule in
+  LATENCY_RIG.md's "Rules for a fair comparison" (`"virtualDisplay": "off"`, no `streaming a
+  virtual display` line in host.log during a Recon block, a host monitor running the tested
+  mode where possible), the same in 0.3's AMD check (the NVIDIA line runs "the same procedure")
+  and in plan stage 4 for every rig measurement (0.3, 4.3, 4.4, FSR). Verified here: the
+  `streaming a virtual display` line and the `auto` rule are `decideVirtualDisplay` in
+  `internal/host/virtualdisplay.go` (nothing is logged with `off`, the default when the key is
+  absent); `python3 tools/latency-rig/test/test_rig.py` passes. AMD RDNA3 (RX 7900 XT) and
+  NVIDIA: unverified; the changed instructions are 0.3's checks.
 
 ## Final review: host agent
 
@@ -10151,6 +10205,29 @@ Fix (`internal/tlsutil` `Constraints`, `CreateCA`, `Permits`; `internal/gateway/
   says; Safari opens the gateway without a warning; serve the leaf above (for example with
   `openssl s_server -cert leaf.crt -key k.pem -accept 9443 -www` on the LAN, with the device
   resolving www.example.com to that machine): Safari refuses it.
+- Later in the final review: INSTALL.md step 9 (port forwarding) told users to add their public
+  name with `install-gateway.sh ... --name your.domain` but not that the gateway then makes a new
+  CA (a public name is outside the old CA's constraints), so every device that installed ca.crt
+  in step 5 showed the certificate warning again with nothing in INSTALL saying why (the
+  warning is only in the journal); its Upgrading section did not say that an upgraded gateway
+  keeps its unconstrained CA. Fix (documentation): step 9 says the `--name` makes a new CA and
+  how to replace the old one on Windows, macOS and iPhone/iPad; step 4 recommends passing
+  `--name` to `create-lxc.sh` when the gateway will be reached by a public name; Upgrading has
+  "The private CA" (the start warning, deleting ca.crt and ca.key, restarting, installing the
+  new ca.crt on each device). Verified here: `loadOrCreateCA` makes the CA from `certNames()`,
+  which include `-name` (`RECON_NAMES`), and makes a new one for a configured name the CA does
+  not permit; `create-lxc.sh` passes `--name` to `install-gateway.sh`, which writes
+  `RECON_NAMES`; the CA's files are `ca.crt` and `ca.key` in `/var/lib/kloudit-recon` (the
+  service's `-data`); `TestPrivateCAConstrained` covers the new CA for a new name.
+- INSTALL.md step 9 on the Windows 11 PC and a phone: unverified. Test (not GPU-specific, no AMD
+  or NVIDIA step): with ca.crt from step 5 installed on the PC (Local Machine) and an iPhone, run
+  step 9's `install-gateway.sh ... --name <your domain or public IP>`: the journal has `the
+  private CA was not made for these names: made a new one`, and Edge on the PC and Safari on the
+  iPhone show the certificate warning at `https://192.168.1.50:8443`. Follow step 9's removal
+  and reinstall: no warning on either, at the LAN address and at the public name (from the
+  phone on mobile data with the port forwarded); `certlm.msc` lists one *KloudIT Recon Local
+  CA*. On a gateway upgraded from a build before name constraints (journal: `the private CA has
+  no name constraints`), the Upgrading section's steps end that warning at the next start.
 
 ### Turning 2FA on needs the password and replaces no 2FA
 

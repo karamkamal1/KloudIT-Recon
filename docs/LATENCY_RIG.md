@@ -207,6 +207,17 @@ Rules for a fair comparison:
   codec and bitrate, and client display mode (fullscreen). Keep the same host monitor refresh
   and the same Windows settings (HAGS, Game Mode, power plan). Turn VRR off on the client for
   the baseline; measure VRR as its own configuration.
+- **Recon streams the host monitor, not a virtual display.** With `"virtualDisplay": "auto"`
+  (what `install-host.ps1 -InstallVirtualDisplay` writes, INSTALL.md step 7) a Recon stream at
+  another size than the host monitor, or at a frame rate above its refresh rate, streams a new
+  virtual monitor (by default the primary display). `flash.html` and the host sensor stay on
+  the physical monitor, Sunshine streams the physical monitor, and `cal` then fails (`no
+  black/white difference`) or Recon is measured on another capture target than Moonlight. Set
+  `"virtualDisplay": "off"` in the agent's `host.json` (or leave the key out) and restart the
+  agent before measuring; host.log must have no `streaming a virtual display` line for a Recon
+  block. Where you can, use a host monitor that runs the tested mode natively (1920×1080 at
+  120 Hz for the example labels); otherwise both streamers capture the same monitor at its own
+  size and refresh rate.
 - **One streamer at a time.** Sunshine and Recon can both be installed, but only one may be
   streaming. Both capture and encode, and a second one running skews the first.
 - **One label per configuration**, changing one variable at a time, for example
