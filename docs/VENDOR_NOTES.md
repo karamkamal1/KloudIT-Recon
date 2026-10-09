@@ -34,6 +34,22 @@ with `"logLevel": "debug"`. Record each result in its check's
 line (status legend above), with the driver and Chrome versions. NVIDIA runs the same stages
 with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
 
+**The agent by hand, for a test hook.** Checks that set `RECON_TEST_FAULTS` (a test hook the
+agent reads from its environment) need the agent started from a PowerShell window, since a
+`$env:` variable never reaches the logon task; and an agent started by hand writes host.log only
+with `-log` (before `run`). In an administrator PowerShell (the task's agent runs elevated too):
+
+```powershell
+Stop-ScheduledTask 'KloudIT Recon Host'
+$env:RECON_TEST_FAULTS = 'drop=every:300'   # the value the check names
+& "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:APPDATA\KlouditRecon\host.log" run
+```
+
+The window shows the log as well. Run the test, stop the agent with Ctrl+C, close the window
+(the variable goes with it) and `Start-ScheduledTask 'KloudIT Recon Host'`. A check that sums
+host.log lines over a run (T5) gives each run its own file instead: `-log
+"$env:USERPROFILE\Desktop\t5-faults.log"`, and searches that file.
+
 0. **Host setup** (GUIDE 12; INSTALL.md step 8, "On the PC, for the best results"): current
    Adrenalin; Instant Replay, Record & Stream, Radeon Chill and Radeon Boost off; Windows power
    mode Best performance; games in borderless fullscreen; the PC wired. The gateway as INSTALL.md
@@ -1061,7 +1077,8 @@ Hardware checks:
   NVIDIA client GPU (RTX 20/30/40/50; AV1 decode needs RTX 30+), 10 drop tests per codec, same
   records. After 1.2 also with the NVENC host announcing `skip` (`encoder ready ...
   recovery=skip` in host.log): start the agent for this test only with
-  `$env:RECON_TEST_FAULTS="drop=every:600"` (one drop every 10 s at 60 fps) and check that each
+  `$env:RECON_TEST_FAULTS="drop=every:600"` (one drop every 10 s at 60 fps; "The agent by hand"
+  in the hardware test plan) and check that each
   drop shows "skipping 1 lost frame(s)" in `__recon.logs`, no key-frame request, and the picture
   heals within two refresh periods (2 × `-g` frames, at most 2 s; a drop early in a refresh wave
   takes longest), never later; for av1_nvenc record any `decoder error` (the AV1 entropy state
@@ -1262,9 +1279,10 @@ Hardware checks:
   generation starts with an IDR and its parameter sets). `__recon.logs` has no `decoder error`.
 - NVIDIA: unverified (no NVIDIA host available). Test: (guide acceptance: a dropped frame heals
   without an IDR, and the VERIFY: Chrome's decoder accepts P-frames after a skipped frame)
-  `Stop-ScheduledTask 'KloudIT Recon Host'`, then in a PowerShell window
-  `$env:RECON_TEST_FAULTS='drop=every:600'; & 'C:\Program Files\KlouditRecon\recon-host.exe' run`
-  (the 1.4 test hook: one frame dropped and reported every 10 s at 60 fps). Stream hevc_nvenc at
+  `Stop-ScheduledTask 'KloudIT Recon Host'`, then in an administrator PowerShell window
+  `$env:RECON_TEST_FAULTS='drop=every:600'; & 'C:\Program Files\KlouditRecon\recon-host.exe' -log
+  "$env:APPDATA\KlouditRecon\host.log" run` ("The agent by hand" in the hardware test plan; the
+  1.4 test hook: one frame dropped and reported every 10 s at 60 fps). Stream hevc_nvenc at
   1920×1080 60 fps from a scene with constant motion (a game, or a video playing full screen) for
   2 minutes, recording the client screen with a 240 fps phone camera or OBS. In DevTools on the
   stream page run `__recon.logs.filter((l) => /skipping|decoder error|requesting key frame/.test(l))`:
@@ -3443,8 +3461,9 @@ stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` an
   matrix, AMD host × NVIDIA client GPU): the same 10 drop tests per codec from a client with an
   NVIDIA GPU (RTX 20 or later; AV1 decode needs RTX 30+) against the AMD host. Same records.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (host-side losses on the helper): start the agent
-  for this test only with `$env:RECON_TEST_FAULTS="drop=every:300"` (one dropped frame every 5 s
-  at 60 fps, as a failed frame stream) and stream HEVC for 2 minutes with constant motion.
+  for this test only with `$env:RECON_TEST_FAULTS="drop=every:300"` and `-log` ("The agent by
+  hand" in the hardware test plan; one dropped frame every 5 s at 60 fps, as a failed frame
+  stream) and stream HEVC for 2 minutes with constant motion.
   host.log: every `frames dropped ... why="test fault"` is followed by `recovering from a loss
   ... why="test fault"` and `loss recovered ... by="recovery frame" wait_ms=<one or two frame
   intervals>`, no `forcing a key frame`, no `restarting video`; the client: no `requesting key
@@ -3457,8 +3476,12 @@ stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` an
   constant motion (a game or a video). Because frames travel on reliable streams, `wifi`'s 1 %
   packet loss mostly delays frames; run it once plainly and once with
   `$env:RECON_TEST_FAULTS="drop=every:300"` on the host (about 120 losses in 10 minutes on top of
-  real ones). For each run sum the `stream stats` lines' `recovered=` (R) and `recovered_by_key=`
-  (K) over the run: `Select-String host.log -Pattern 'msg="stream stats"'`; T5 = R / (R + K). Pass:
+  real ones). Start the agent by hand for both runs ("The agent by hand" in the hardware test
+  plan), each with its own log file: `-log "$env:USERPROFILE\Desktop\t5-plain.log"` (no
+  `RECON_TEST_FAULTS`) and `-log "$env:USERPROFILE\Desktop\t5-faults.log"`. For each run sum the
+  `stream stats` lines' `recovered=` (R) and `recovered_by_key=` (K) in its file:
+  `Select-String "$env:USERPROFILE\Desktop\t5-faults.log" -Pattern 'msg="stream stats"'`; T5 =
+  R / (R + K). Pass:
   T5 >= 0.9 in both runs. Also record the client's `__recon.lastStats` `recovered`,
   `recoveredByKey`, `recoveryDiscarded`, `keyRequests` and the key-request reasons in `__recon.logs`
   (there should be no `no recovery frame`), the freezes > 100 ms (`Freezes` row; GUIDE T3: < 1 per
@@ -4485,7 +4508,8 @@ the browser console):
   moving scene; from +20 s to +40 s (the 10 Mbit/s step) note the overlay's `round trip (avg)`
   (pings are datagrams that queue behind the video) and `__recon.lastStats.rtt` every few
   seconds, and the host's `stream stats` `window_held` / `window_max_ms`. Then stop recon-host,
-  start it with `$env:RECON_TEST_FAULTS='no-window'; & 'C:\Program Files\KlouditRecon\recon-host.exe' run`
+  start it with `$env:RECON_TEST_FAULTS='no-window'; & 'C:\Program Files\KlouditRecon\recon-host.exe'
+  -log "$env:APPDATA\KlouditRecon\host.log" run` ("The agent by hand" in the hardware test plan)
   and repeat. Pass: the round trip during the step with the window at most 60 % of the one
   without (sandbox: 45 vs 112 ms on a 10 ms path), `window_held` > 0 during the step only, no more
   `frame queue overflow` lines than without, and the same received bitrate (overlay Bitrate).
@@ -6032,7 +6056,8 @@ Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (losses: an IDR in the
   running encoder, no restart): start the agent for this test only with
   `Stop-ScheduledTask 'KloudIT Recon Host'; $env:RECON_TEST_FAULTS="drop=every:300"; &
-  "$env:ProgramFiles\KlouditRecon\recon-host.exe"` (one dropped frame every 5 s at 60 fps) and
+  "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:APPDATA\KlouditRecon\host.log" run`
+  ("The agent by hand" in the hardware test plan; one dropped frame every 5 s at 60 fps) and
   stream HEVC with constant motion for 2 minutes: every `frames dropped why="test fault"` is
   followed by `forcing a key frame reason="frame lost"`, no `recovering from a loss`, no
   `restarting video`, no `encoder helper failed`; the client's `__recon.lastStats.keyFrames` grows by one per
@@ -9217,6 +9242,26 @@ among the FFmpeg-only cases.
   `recon-host probe` lists `unavailable: amd-direct: ...`, and a stream logs `video pipeline
   pipeline=ffmpeg config=auto reason="the helper cannot capture with amd-direct (...)"` and
   streams through FFmpeg with ddagrab (the encoder is not AMF). Put `capture` back.
+
+### Test-hook runs write host.log
+
+Problem: the checks that inject losses with `RECON_TEST_FAULTS` (3.5 and its T5 acceptance run in
+plan stage 5, 1.2, 1.4, 2.7, 3.8 wiring) told the tester to start the agent with
+`$env:RECON_TEST_FAULTS=...` and then judged the run from host.log. A `$env:` variable never
+reaches the logon task, so the agent has to be started by hand, and `recon-host.exe run` started
+by hand logs only to its console: `-log` is the only way to a log file (`cmd/recon-host`), and no
+recipe passed it. The T5 sums of `recovered=` / `recovered_by_key=` over host.log then counted an
+earlier run, or nothing. Fix: "The agent by hand, for a test hook" in the hardware test plan (stop
+the task; an administrator PowerShell; `$env:RECON_TEST_FAULTS`; `recon-host.exe -log
+"$env:APPDATA\KlouditRecon\host.log" run`; Ctrl+C and `Start-ScheduledTask` afterwards), and
+every such check refers to it or carries `-log`; T5 gives each of its two runs its own log file
+and sums that.
+
+- Verified here: `-log` must come before the subcommand (Go's flag package stops at `run`); the
+  Linux build with `-log host.log run` appends to host.log and prints to the console, as the
+  recipe says.
+- AMD RDNA3 (RX 7900 XT): unverified; these are the instructions for the 3.5 and T5 checks.
+- NVIDIA: unverified (no NVIDIA host available); likewise for 1.2 and 1.4.
 
 ### README, INSTALL and the hardware test plan
 
