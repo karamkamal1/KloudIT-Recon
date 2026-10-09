@@ -290,3 +290,69 @@ func TestTakeoverLiveControlPath(t *testing.T) {
 		})
 	}
 }
+
+// tearCtrl's write number tearAt (from 1) keeps keep/2 of its bytes and
+// fails, as a quic-go write that reaches its deadline on a stalled path
+// after it queued half of its message (keep 1) or none of it (keep 0); the
+// stream stays open, as webtransport-go leaves it after a timeout.
+type tearCtrl struct {
+	*stallCtrl
+	tearAt, keep, n int
+}
+
+func (c *tearCtrl) Write(p []byte) (int, error) {
+	c.n++
+	if c.n != c.tearAt {
+		return c.stallCtrl.Write(p)
+	}
+	k := len(p) * c.keep / 2
+	c.mu.Lock()
+	c.buf.Write(p[:k])
+	c.mu.Unlock()
+	return k, os.ErrDeadlineExceeded
+}
+
+// A control write that fails ends the session: after a partial write the
+// client cannot parse the stream, after a lost one it misses the message (a
+// VideoConfig), and on a connection that stays up it would never notice.
+// Before, the session went on writing after the torn message, and the
+// client's control channel died without a reconnect.
+func TestFailedControlWriteEndsSession(t *testing.T) {
+	for _, keep := range []int{1, 0} {
+		t.Run(map[int]string{1: "torn", 0: "lost"}[keep], func(t *testing.T) {
+			ctrl := &tearCtrl{stallCtrl: newStallCtrl(false), tearAt: 2, keep: keep}
+			s, c := takeoverSession(&Agent{log: slog.New(slog.NewTextHandler(io.Discard, nil))}, ctrl)
+			defer s.cancel()
+			if err := s.sendJSON(proto.Notice{T: "notice", Msg: "first"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.sendJSON(proto.Notice{T: "notice", Msg: string(bytes.Repeat([]byte("x"), 3000))}); err == nil {
+				t.Fatal("the failed write reported success")
+			}
+			for i := 0; i < 3; i++ {
+				if err := s.sendJSON(proto.Notice{T: "notice", Msg: "after"}); !errors.Is(err, errClosed) {
+					t.Fatalf("control write %d after the failed one: %v, want errClosed", i, err)
+				}
+			}
+			if s.ctx.Err() == nil {
+				t.Fatal("session not cancelled")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				c.mu.Lock()
+				n, code := c.n, c.code
+				c.mu.Unlock()
+				if n == 1 && code == transport.CodeProtocol {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("connection closed %d times, code %d; want once with CodeProtocol", n, code)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if types, torn := ctrl.messages(t); len(types) != 1 || torn != (keep == 1) {
+				t.Fatalf("control stream holds %q (torn %v)", types, torn)
+			}
+		})
+	}
+}

@@ -1,6 +1,8 @@
 package host
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -65,6 +67,11 @@ import (
 //	refuse-tickets    refuse every ticket (direct path, UDP relay) as a host
 //	                  whose clock runs ahead of the gateway's did: the client
 //	                  goes on to the splice relay
+//	torn-control      the host's first session sends its first clock message
+//	                  torn (the first half of it), as a control write that
+//	                  failed part-way, and goes on, as hosts did before the
+//	                  final review: the client cannot parse its control
+//	                  stream after it and reconnects
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped, and a frame due for either is never
@@ -92,11 +99,12 @@ type testFaults struct {
 	// thinEvery, thinFor: simulated congestion (thinPressure).
 	thinEvery, thinFor int
 	refuseTickets      bool // Agent.verifyTicket
+	tornControl        bool // Session.wallClockLoop
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0 || f.refuseTickets
+		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0 || f.refuseTickets || f.tornControl
 }
 
 // thinAt reports whether the nth frame (n from 1) is taken under the
@@ -205,12 +213,32 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: refuse-tickets takes no value", rule)
 			}
 			f.refuseTickets = true
+		case "torn-control":
+			if val != "" {
+				return f, fmt.Errorf("%s: torn-control takes no value", rule)
+			}
+			f.tornControl = true
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window, thin, fec-loss, refuse-tickets)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window, thin, fec-loss, refuse-tickets, torn-control)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {
 		return f, errors.New("ref-recovery excludes intra-refresh and recovery=")
 	}
 	return f, nil
+}
+
+// tearControl writes v's message torn, its first half, as a control write
+// that failed part-way, and returns as if it had gone out (test fault
+// torn-control).
+func (s *Session) tearControl(v any) {
+	b, _ := json.Marshal(v)
+	var out bytes.Buffer
+	_ = proto.WriteMsg(&out, b)
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	if s.ctrl != nil && !s.ctrlTorn {
+		_, _ = s.ctrl.Write(out.Bytes()[:out.Len()/2])
+		s.log.Warn("TEST fault torn-control: a control message went out torn")
+	}
 }

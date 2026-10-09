@@ -9597,6 +9597,59 @@ Fix:
   4. Turn "Set time automatically" back on.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
 
+### A failed control write ends the session
+
+Problem: a control write that reaches its 5 s deadline after quic-go has sent part of it leaves
+part of the message on the stream: quic-go keeps what it queued, drops the rest, and
+webtransport-go leaves the stream open after a timeout. `writeCtrl` recorded this (`ctrlTorn`),
+but only the takeover's `close()` looked at it. `sendJSON` went on writing after the torn
+message, and the client's parser read the next bytes as part of it. stream-worker.js swallowed
+the parse error (`ctlLoop.catch(() => {})`), so the control loop stopped for good while the
+connection and the video went on: the next generation's video config never arrived (a frozen
+picture after any restart), and notices, rate updates, cursor shapes and the takeover's bye were
+lost until the page was reloaded. The verifiers tore a write with the real quic-go fork: a
+message over about 1.45 KB (in practice a cursor shape's PNG) written during a stall of 5-20 s
+that the connection survives, with heavy but not total loss. A message the deadline drops whole
+(0 bytes) keeps the framing, but is lost: a lost video config freezes the picture the same way.
+
+Fix:
+- Host (`Session.sendJSON`, `ctrlFailed`): any failed control write ends the session. It is
+  logged (`control stream write failed, ending the session`), the session is cancelled and the
+  connection closed with `CodeProtocol`; later control writes return at once. The client
+  reconnects (it retries a connection that ends without a bye). A takeover that cut the write
+  short still ends the session itself, with its bye rules and `CodeReplaced`.
+- Client (`stream-worker.js`): a control stream that does not parse (a bad length or JSON)
+  closes the connection (code 2, `control stream broken`), and the session reconnects. This also
+  covers hosts from before this fix. An exception in the handler of one message is logged and
+  the loop goes on. A control stream the host resets (it does when it closes the connection)
+  only ends the loop, so the host's close code and reason reach the client: in a first version
+  that closed on any read error, the client's own close overtook the host's ticket refusal
+  (code 4) in the E2E.
+
+- Verified here:
+  - `internal/host` `TestFailedControlWriteEndsSession`, a control stream whose second write
+    keeps half of its message (torn) or none of it (lost) and fails: the next writes return
+    `errClosed`, the session is cancelled and the connection closed once with `CodeProtocol`, and
+    nothing follows the torn bytes. Before the fix the next writes returned nil and were appended
+    after the torn message. `TestTakeoverDeadControlPath` and `TestTakeoverLiveControlPath` pass
+    unchanged (a takeover still closes with `CodeReplaced`).
+  - Browser E2E, new scenario "torn control" (host test hook `torn-control`: the first session's
+    first clock message goes out torn, 5 s in, and the host goes on, as before the fix): when
+    the next control message arrives the client logs `control stream: Bad control character in
+    string literal in JSON ...; closing the connection`, reconnects, and streams again (two
+    `session started` in host.log). The previous client swallowed that error and went on
+    without control messages.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. A torn write needs a stall of 5-20 s
+  with heavy loss while a large cursor shape is being sent, which is hard to stage on purpose.
+  Test: stream over Wi-Fi with the overlay open and `"logLevel": "debug"`. On the client, run
+  `sudo ./netem.sh apply wan --iface <nic> --port 48100` and add 90 % loss for 8 s
+  (`sudo tc qdisc change dev <nic> root netem loss 90%`, then back) while moving the pointer over
+  links, text and window edges (new cursor shapes). Whenever host.log has `control stream write
+  failed, ending the session`, the browser shows "Connection lost — retrying" and streams again
+  within a few seconds, with no frozen picture afterwards. Settings changes (bitrate) after the
+  run still apply (a new `Video` row in the overlay).
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
 ## Final review: security
 
 Findings of the final review's security pass. Each item: the problem, the fix, what was verified

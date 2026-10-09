@@ -43,7 +43,8 @@ type Agent struct {
 	hostClock   *media.Clock
 	inj         *input.Injector
 	audioSource media.AudioSource
-	faults      testFaults // TestFaultsEnv: tests only
+	faults      testFaults  // TestFaultsEnv: tests only
+	tornDone    atomic.Bool // the torn-control fault fired (once per process)
 
 	// launchHelper starts the native encoder helper for a session with an
 	// encoder backend ("" = auto: the helper's own order); nil when the host

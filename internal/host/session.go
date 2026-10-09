@@ -464,7 +464,7 @@ func (s *Session) sendJSON(v any) error {
 	}
 	s.ctrlMu.Lock()
 	defer s.ctrlMu.Unlock()
-	if s.ctrl == nil {
+	if s.ctrl == nil || s.ctrlTorn {
 		return errClosed
 	}
 	s.ctrlDL.Lock()
@@ -475,7 +475,11 @@ func (s *Session) sendJSON(v any) error {
 	s.ctrlDue = time.Now().Add(5 * time.Second)
 	_ = s.ctrl.SetWriteDeadline(s.ctrlDue)
 	s.ctrlDL.Unlock()
-	return s.writeCtrl(b)
+	if err := s.writeCtrl(b); err != nil {
+		s.ctrlFailed(err)
+		return err
+	}
+	return nil
 }
 
 // writeCtrl writes one control message; ctrlMu is held.
@@ -485,6 +489,27 @@ func (s *Session) writeCtrl(b []byte) error {
 		s.ctrlTorn = true
 	}
 	return err
+}
+
+// ctrlFailed ends the session after a control write failed (ctrlMu is
+// held). A write that reaches its deadline on a stalled path may have sent
+// part of its message (quic-go keeps what it queued, and the stream stays
+// open): the client cannot parse anything after it. Or it sent none, and the
+// client misses the message (a VideoConfig: the picture freezes). Either way
+// the control channel is lost while the connection, and the video, may go
+// on, and the client would not notice: closing the connection makes it
+// reconnect. A takeover (close) that cut the write short ends the session
+// itself, with its own code.
+func (s *Session) ctrlFailed(err error) {
+	s.ctrlDL.Lock()
+	closing := s.closing
+	s.ctrlDL.Unlock()
+	if closing || s.ctx.Err() != nil {
+		return
+	}
+	s.log.Warn("control stream write failed, ending the session", "err", err)
+	s.cancel()
+	go s.c.Close(transport.CodeProtocol, "control stream write failed")
 }
 
 func (s *Session) notice(level, msg string) {
@@ -536,7 +561,12 @@ func (s *Session) wallClockLoop() {
 			return
 		case <-t.C:
 		}
-		if err := s.sendJSON(proto.Clock{T: "clock", WallOffsetUs: media.WallOffset(s.a.clock)}); errors.Is(err, errClosed) {
+		m := proto.Clock{T: "clock", WallOffsetUs: media.WallOffset(s.a.clock)}
+		if s.a.faults.tornControl && s.a.tornDone.CompareAndSwap(false, true) {
+			s.tearControl(m)
+			continue
+		}
+		if err := s.sendJSON(m); errors.Is(err, errClosed) {
 			return
 		}
 	}

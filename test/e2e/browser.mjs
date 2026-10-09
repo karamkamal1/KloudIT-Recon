@@ -2410,6 +2410,28 @@ async function checkTicketRefused() {
   await endStream();
 }
 
+// Torn control stream (final review): the host writes a control message in
+// part (test hook torn-control: its first clock message, 5 s in) and goes
+// on, as hosts did before the final review after a control write that hit
+// its deadline part-way. The client cannot parse its control stream after
+// it (the next message, the clock 5 s later, shows it): it closes the
+// connection and reconnects. Before, it went on without control messages,
+// and the next video config never arrived (a frozen picture).
+async function checkTornControl() {
+  const host = await restartHost({ RECON_TEST_FAULTS: 'torn-control' }, 'host-torn-control');
+  const con0 = consoleLines.length;
+  await startStream({ path: 'direct', transport: 'auto' });
+  const sessions = () => (host.log.match(/msg="session started"/g) || []).length;
+  const torn = await until(() => /TEST fault torn-control/.test(host.log), 15000, 'the torn control message').then(() => true, () => false);
+  await until(() => sessions() >= 2, 20000, 'a new session').catch(() => {});
+  const streaming = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 30000 }).then(() => true, () => false);
+  const line = consoleLines.slice(con0).find((l) => l.includes('control stream:')) || '';
+  check('torn control stream: the client closes the connection and reconnects, and streams again',
+    torn && sessions() === 2 && streaming && /control stream: .*closing the connection/.test(line),
+    `torn ${torn}; ${sessions()} session(s) in the host log; streaming ${streaming}; client: ${line.replace(/^.*?control stream/, 'control stream').slice(0, 140) || 'no note'}`);
+  await endStream();
+}
+
 // Control and input before the hello (final review): the page may send
 // control messages and input as soon as the transport is up, while the
 // worker's hello still waits for the decoder self-test, and the host takes
@@ -4540,6 +4562,7 @@ try {
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
+  if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
 

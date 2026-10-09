@@ -452,13 +452,31 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
     sendDatagram: telemetrySender(dgTelemetry, prio, () => closed), // acks, rate reports, pings
     close: () => { closed = true; try { wt.close({ closeCode: 0, reason: 'bye' }); } catch {} },
     async run(h) {
-      const ctlParser = new MsgParser((m) => h.control(JSON.parse(td.decode(m))));
+      // A control message that does not parse (a torn stream: a host that
+      // went on writing after a write that failed part-way) leaves nothing
+      // to read on: the connection is closed, so the session reconnects
+      // instead of going on without control messages (no more video
+      // configs: a frozen picture). A handler's error is only that
+      // message's; a stream the host reset (it closes the connection) ends
+      // the loop quietly.
+      const ctlParser = new MsgParser((m) => {
+        const c = JSON.parse(td.decode(m));
+        try { h.control(c); } catch (e) { post('log', { text: `control message ${c?.t}: ${e.message}` }); }
+      });
       const ctlLoop = (async () => {
         const r = ctrl.readable.getReader();
         for (;;) {
           const { value, done } = await r.read();
           if (done) break;
-          ctlParser.push(value);
+          try {
+            ctlParser.push(value);
+          } catch (e) {
+            if (!closed) {
+              post('log', { text: `control stream: ${e.message}; closing the connection` });
+              try { wt.close({ closeCode: P.CLOSE_PROTOCOL, reason: 'control stream broken' }); } catch {}
+            }
+            break;
+          }
         }
       })();
       const dgLoop = (async () => {

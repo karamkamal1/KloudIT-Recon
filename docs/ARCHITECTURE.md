@@ -58,6 +58,13 @@ the old control stream. When the old client's path died, the write in progress g
 writes queued behind it are dropped, and a bye that cannot be sent whole is left out, so the new
 session's welcome waits about a second at most.
 
+**A failed control write ends the session.** A control write that reaches its 5 s deadline on a
+stalled path may leave part of its message on the stream (quic-go keeps what it queued, and the
+stream stays open), or lose the message (a video config: the picture would freeze). The host
+then closes the connection (`CodeProtocol`), and the client reconnects. The client also closes
+the connection itself (code 2) when its control stream does not parse, as it would after a host
+from before that kept writing behind a torn message.
+
 ### Frame stream
 
 ```
