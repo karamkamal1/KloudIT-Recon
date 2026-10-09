@@ -7,6 +7,7 @@
 #                   [--storage local-lvm] [--bridge vmbr0] [--hostname recon]
 #                   [--memory 512] [--cores 1] [--disk 4] [--port 8443]
 #                   [--name recon.example.com] [--public-addr 192.168.1.50:8443]
+#                   [--trust-proxy 192.168.1.60]   (a reverse proxy or tunnel in front of HTTPS)
 #   ./create-lxc.sh --upgrade 210      # push this folder's binary into container 210
 #
 # A static --ip is recommended: paired PCs remember the gateway's address.
@@ -28,9 +29,9 @@ while [[ $# -gt 0 ]]; do
     --memory) MEMORY="$2"; shift 2 ;;
     --cores) CORES="$2"; shift 2 ;;
     --disk) DISK="$2"; shift 2 ;;
-    --port|--name|--public-addr) EXTRA+=("$1" "$2"); shift 2 ;;
+    --port|--name|--public-addr|--trust-proxy) EXTRA+=("$1" "$2"); shift 2 ;;
     --upgrade) UPGRADE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) die "unknown argument $1 (see --help)" ;;
   esac
 done

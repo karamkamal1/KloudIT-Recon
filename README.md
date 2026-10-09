@@ -367,7 +367,12 @@ untouched, so you keep WebTransport and the direct path. Other options:
   a real certificate (`-cert`/`-key`).
 - **HTTP-only reverse proxies / tunnels** (e.g. Cloudflare Tunnel) carry only TCP. Recon
   detects this and falls back to WebSocket automatically. Pass the proxy's address with
-  `-trust-proxy` so rate limiting sees real client IPs.
+  `-trust-proxy` so rate limiting sees real client IPs: on the LXC install
+  `RECON_TRUST_PROXY=127.0.0.1` in `/etc/kloudit-recon/gateway.env` for a `cloudflared` running
+  next to the gateway (or `install-gateway.sh --trust-proxy 127.0.0.1`), in Docker the same
+  variable under `environment:`. Without it every login arrives from the proxy's address: all
+  clients share one rate limit, and anyone can lock an account out for everyone by failing its
+  password.
 - **A reverse proxy for HTTPS only** (Nginx Proxy Manager, Caddy, Traefik on TCP 443/8443) with
   UDP forwarded to the gateway: pass the proxy's address with `-trust-proxy` (on the LXC install
   `RECON_TRUST_PROXY=<proxy IP>/32` in `/etc/kloudit-recon/gateway.env`), or the UDP relay
@@ -386,7 +391,7 @@ untouched, so you keep WebTransport and the direct path. Other options:
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
 | `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
 | `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40015,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. The page's CSP lists each port; with more than 32 it allows any port on the gateway's name. `off`: relay only through the QUIC splice on 8443 |
-| `-trust-proxy` (`RECON_TRUST_PROXY`, comma-separated) | none | CIDR of a reverse proxy whose `X-Forwarded-For` is trusted: rate limiting, the audit log and the UDP relay (which accepts a browser only from the IP of its HTTPS request) then see the client's own IP. Needed for the relay whenever a proxy carries the HTTPS while UDP reaches the gateway directly |
+| `-trust-proxy` (`RECON_TRUST_PROXY`, comma-separated) | none | Address or CIDR of a reverse proxy whose `X-Forwarded-For` is trusted (an entry that is neither stops the gateway): rate limiting, the audit log and the UDP relay (which accepts a browser only from the IP of its HTTPS request) then see the client's own IP. Needed for the relay whenever a proxy carries the HTTPS while UDP reaches the gateway directly |
 
 On a Linux/LXC install the settings live in `/etc/kloudit-recon/gateway.env` (one
 `RECON_...=value` per line; `systemctl restart recon-gateway` after editing). Re-running the

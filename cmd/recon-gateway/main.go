@@ -63,7 +63,7 @@ func main() {
 	verbose := flag.Bool("v", false, "debug logging")
 	var names, proxies multiFlag
 	flag.Var(&names, "name", "extra DNS name or IP for the generated certificate (repeatable)")
-	flag.Var(&proxies, "trust-proxy", "CIDR of a reverse proxy whose X-Forwarded-For is trusted (repeatable; RECON_TRUST_PROXY, comma-separated)")
+	flag.Var(&proxies, "trust-proxy", "address or CIDR of a reverse proxy whose X-Forwarded-For is trusted (repeatable; RECON_TRUST_PROXY, comma-separated)")
 	flag.Parse()
 	names = append(names, envList("RECON_NAMES")...)
 	proxies = append(proxies, envList("RECON_TRUST_PROXY")...)

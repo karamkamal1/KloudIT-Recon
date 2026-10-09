@@ -30,6 +30,11 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   LAN can't claim a fresh gateway.
 - **Brute force:** per-IP token bucket (10/min) plus exponential lockout per user+IP after 5
   failures (1 min, doubling up to 1 h). Keying on user+IP stops attackers from locking you out.
+  Behind a reverse proxy or tunnel (Cloudflare Tunnel, Nginx) that holds only while the gateway
+  trusts the proxy's `X-Forwarded-For` (`-trust-proxy` / `RECON_TRUST_PROXY`): otherwise every
+  request comes from the proxy's IP, all clients share one bucket and one lockout per user. An
+  entry the gateway cannot read as an address or CIDR stops it at startup instead of being
+  dropped.
   Every attempt is audited.
 - **Sessions:** 256-bit random tokens stored only as SHA-256 hashes. The cookie is
   `__Host-recon` (`Secure; HttpOnly; SameSite=Strict; Path=/`). Sessions expire after 72 h idle

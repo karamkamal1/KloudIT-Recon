@@ -15,6 +15,7 @@ services:
       # RECON_NAMES: "recon.lan,192.168.1.20"     # extra certificate names
       # RECON_PUBLIC_ADDR: "192.168.1.20:8443"    # what host agents dial
       # RECON_RELAY_PORTS: "8444-8459"            # UDP relay, one port per relayed session ("off": splice on 8443 only)
+      # RECON_TRUST_PROXY: "127.0.0.1"            # reverse proxy / tunnel in front of HTTPS (its X-Forwarded-For is trusted)
     read_only: true
     security_opt:
       - no-new-privileges:true

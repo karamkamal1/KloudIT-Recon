@@ -3,6 +3,7 @@
 #
 #   sudo ./install-gateway.sh [--binary ./recon-gateway] [--port 8443]
 #                             [--name recon.lan --name 203.0.113.7] [--public-addr 192.168.1.50:8443]
+#                             [--trust-proxy 127.0.0.1]   (a reverse proxy or tunnel; repeatable)
 #
 # Without --binary it uses ./recon-gateway next to this script, or builds from
 # the repository this script lives in (installing a Go toolchain if needed).
@@ -13,6 +14,7 @@ set -euo pipefail
 BINARY=""
 PORT=""
 NAMES=()
+PROXIES=()
 PUBLIC_ADDR=""
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -23,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; shift 2 ;;
     --name) NAMES+=("$2"); shift 2 ;;
     --public-addr) PUBLIC_ADDR="$2"; shift 2 ;;
+    --trust-proxy) PROXIES+=("$2"); shift 2 ;;
     -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) die "unknown argument $1" ;;
   esac
@@ -69,6 +72,7 @@ set_kv() { { grep -v "^$1=" "$envf" || true; echo "$1=$2"; } > "$envf.new" && mv
 if [[ -n "$PORT" ]] || ! grep -q '^RECON_LISTEN=' "$envf"; then set_kv RECON_LISTEN ":${PORT:-8443}"; fi
 if [[ ${#NAMES[@]} -gt 0 ]]; then set_kv RECON_NAMES "$(IFS=,; echo "${NAMES[*]}")"; fi
 if [[ -n "$PUBLIC_ADDR" ]]; then set_kv RECON_PUBLIC_ADDR "$PUBLIC_ADDR"; fi
+if [[ ${#PROXIES[@]} -gt 0 ]]; then set_kv RECON_TRUST_PROXY "$(IFS=,; echo "${PROXIES[*]}")"; fi
 chmod 0644 "$envf"
 PORT=$(sed -n 's/^RECON_LISTEN=.*://p' "$envf" | tail -1)
 echo "==> settings ($envf):"

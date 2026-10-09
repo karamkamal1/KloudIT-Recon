@@ -137,10 +137,8 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	if len(ports) > 0 {
 		s.relay = newUDPRelay(log, nil, ports)
 	}
-	for _, c := range cfg.TrustProxy {
-		if _, n, err := net.ParseCIDR(c); err == nil {
-			s.proxies = append(s.proxies, n)
-		}
+	if s.proxies, err = parseTrustProxy(cfg.TrustProxy); err != nil {
+		return nil, err
 	}
 	if err := s.setupTLS(); err != nil {
 		return nil, err
@@ -439,6 +437,31 @@ func (s *Server) sameOrigin(r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(o, "https://"+r.Host)
+}
+
+// parseTrustProxy parses -trust-proxy values: CIDRs, or a proxy's own
+// address (as /32 or /128). An entry it cannot read stops the gateway: one
+// silently dropped would key rate limits and lockouts on the proxy's address,
+// shared by every client behind it.
+func parseTrustProxy(list []string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, c := range list {
+		c = strings.TrimSpace(c)
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+			continue
+		}
+		ip := net.ParseIP(c)
+		if ip == nil {
+			return nil, fmt.Errorf("trust-proxy %q: want a proxy's address or a CIDR like 10.0.0.0/8", c)
+		}
+		bits := 128
+		if ip4 := ip.To4(); ip4 != nil {
+			ip, bits = ip4, 32
+		}
+		out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return out, nil
 }
 
 // clientIP returns the caller's IP, honouring X-Forwarded-For only from trusted proxies.
