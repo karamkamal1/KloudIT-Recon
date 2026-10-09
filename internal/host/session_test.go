@@ -454,7 +454,8 @@ func TestQueueOverflowEscalates(t *testing.T) {
 			hello: proto.Hello{Decoders: []proto.DecoderInfo{{Family: enc.Family}}},
 			tried: map[string]bool{}, usage: map[string]string{},
 			ctx: ctx, cancel: cancel, ctrl: &fakeCtrl{}, frameQ: make(chan *media.Frame, 6),
-			log: slog.New(slog.NewTextHandler(logs, nil)),
+			// Debug: restarts for the rate controller log there (startVideoLog).
+			log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		}
 		s.video = media.NewVideo(&c, s.log, s.a.clock)
 		t.Cleanup(func() { cancel(); s.video.Stop() })

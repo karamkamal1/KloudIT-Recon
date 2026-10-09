@@ -62,3 +62,57 @@ func TestRateChangeLogVolume(t *testing.T) {
 		t.Fatalf("the first cut after raises: level %v, %d suppressed; want logged (its own direction)", lvl, n)
 	}
 }
+
+// On a pipeline that cannot change its bitrate live (FFmpeg) each change of
+// the rate controller is a new generation. Its "restarting video", and the
+// generation's "starting encoder" and "encoder ready" (media.Params.Quiet),
+// are debug lines: they used to add three lines at the default level per
+// change, about one change a second where the path carries less than the
+// setting. A restart for another reason (settings, key frame, failure) is
+// still logged.
+func TestRateRestartLogVolume(t *testing.T) {
+	logs := &lockedLog{}
+	s, p, _ := fakePipelineSession(t, slog.New(slog.NewTextHandler(logs, nil)), media.PipelineCaps{}) // the default level
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	kbps := 4000
+	for i := 0; i < 30; i++ {
+		to := kbps * 105 / 100
+		down := i%10 == 9
+		if down {
+			to = kbps * 85 / 100
+		}
+		s.applyRate(rateChange{fromKbps: kbps, toKbps: to, fromFPS: 30, toFPS: 30, down: down, why: "delay"}, 0)
+		kbps = to
+	}
+	p.mu.Lock()
+	params := append([]media.Params(nil), p.params...)
+	p.mu.Unlock()
+	if len(params) != 31 || params[0].Quiet {
+		t.Fatalf("%d generations (first quiet %v), want the session's and one per change", len(params), len(params) > 0 && params[0].Quiet)
+	}
+	for i, pr := range params[1:] {
+		if !pr.Quiet {
+			t.Fatalf("rate change %d: its generation is not quiet", i)
+		}
+	}
+	if l := logs.lines(`msg="restarting video"`); len(l) != 0 {
+		t.Fatalf("30 rate changes logged %d restarts at the default level, want none: %q", len(l), l)
+	}
+	if n := len(logs.lines("bitrate recovery: raising bitrate")) + len(logs.lines("congestion: lowering bitrate")); n != 2 {
+		t.Fatalf("%d rate change lines at the default level, want 2 (rateLog)", n)
+	}
+	if err := s.startVideo(true, "keyframe request"); err != nil {
+		t.Fatal(err)
+	}
+	if l := logs.lines(`msg="restarting video"`); len(l) != 1 || !strings.Contains(l[0], `reason="keyframe request"`) {
+		t.Fatalf("a key-frame restart logged %q, want its line", l)
+	}
+	p.mu.Lock()
+	quiet := p.params[len(p.params)-1].Quiet
+	p.mu.Unlock()
+	if quiet {
+		t.Fatal("a key-frame restart's generation is quiet")
+	}
+}

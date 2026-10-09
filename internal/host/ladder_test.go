@@ -272,15 +272,17 @@ type ladderPipeline struct {
 	recovers  []string // "gen/seq"
 	keyframes int
 	starts    []bool // urgent
+	params    []media.Params
 	events    chan media.VideoEvent
 	starting  bool // Hurry finds a generation starting (it takes over)
 	hurries   int
 }
 
-func (p *ladderPipeline) Start(_ media.Params, urgent bool) error {
+func (p *ladderPipeline) Start(params media.Params, urgent bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.starts = append(p.starts, urgent)
+	p.params = append(p.params, params)
 	return nil
 }
 func (p *ladderPipeline) Events() <-chan media.VideoEvent { return p.events }

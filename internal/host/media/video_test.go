@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -231,6 +232,10 @@ func TestCaptureClockFollowsWallClock(t *testing.T) {
 	}
 }
 
+// TestVideoGenerations: an overlapped restart, a new generation from a key
+// frame at the frame rate. The restart is a quiet one (Params.Quiet: the
+// session's rate controller changed the bitrate): its start and ready lines
+// are debug lines, the first generation's are logged at the default level.
 func TestVideoGenerations(t *testing.T) {
 	caps := probeOrSkip(t)
 	enc, ok := caps.Best("h264")
@@ -239,7 +244,8 @@ func TestVideoGenerations(t *testing.T) {
 	}
 	start := time.Now()
 	clock := func() uint64 { return uint64(time.Since(start).Microseconds()) }
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var logs lockedLines
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	v := NewVideo(caps, log, clock)
 	defer v.Stop()
 	p := Params{Source: Source{Backend: "test", NativeW: 640, NativeH: 360}, Encoder: enc, FPS: 60, BitrateKbps: 4000}
@@ -274,6 +280,7 @@ func TestVideoGenerations(t *testing.T) {
 				if !restarted && frames[f.Gen] == 60 {
 					restarted = true
 					p.BitrateKbps = 2000
+					p.Quiet = true
 					if err := v.Start(p, false); err != nil {
 						t.Fatal(err)
 					}
@@ -283,6 +290,11 @@ func TestVideoGenerations(t *testing.T) {
 					t.Logf("gens=%v frames=%v rate=%.1f fps", gens, frames, rate)
 					if rate < 40 || rate > 75 {
 						t.Fatalf("frame rate %.1f not near 60", rate)
+					}
+					for _, msg := range []string{`msg="starting encoder"`, `msg="encoder ready"`} {
+						if l := logs.lines(msg); len(l) != 1 || !strings.Contains(l[0], fmt.Sprintf("gen=%d ", gens[0])) {
+							t.Fatalf("%s at the default level: %q, want the first generation's only", msg, l)
+						}
 					}
 					return
 				}
@@ -641,4 +653,29 @@ func TestVideoDiscardable(t *testing.T) {
 			t.Logf("%s: %d of %d frames discardable", c.name, disc, n)
 		})
 	}
+}
+
+// lockedLines is a log destination for the encoder goroutines' lines.
+type lockedLines struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLines) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	os.Stderr.Write(b)
+	return l.buf.Write(b)
+}
+
+func (l *lockedLines) lines(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, line := range strings.Split(l.buf.String(), "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return out
 }

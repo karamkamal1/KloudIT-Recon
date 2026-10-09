@@ -976,6 +976,17 @@ func (a *Agent) backendFor(prefs proto.Prefs) string {
 // a settings change or a rate change in between would otherwise run an
 // encoder for frames videoEvents drops.
 func (s *Session) startVideo(urgent bool, reason string) error {
+	return s.startVideoLog(urgent, reason, false)
+}
+
+// startVideoLog is startVideo; quiet: a restart that puts a change of the
+// rate controller into effect (setRate on a pipeline that cannot change its
+// bitrate live: FFmpeg), whose "restarting video" and the generation's
+// "starting encoder" and "encoder ready" are debug lines (media.Params.Quiet).
+// Where the path carries less than the setting the controller changes the
+// rate about once a second; applyRate logs the changes (rateLog), "stream
+// stats" the target every 10 s.
+func (s *Session) startVideoLog(urgent bool, reason string, quiet bool) error {
 	if s.paused.Load() {
 		s.log.Debug("client hidden: video starts on resume", "reason", reason)
 		return nil
@@ -987,8 +998,13 @@ func (s *Session) startVideo(urgent bool, reason string) error {
 	}
 	s.rate.setAdaptive(p.Adaptive)
 	p.BitrateKbps, p.FPS = s.rate.target(p.BitrateKbps, p.FPS)
+	p.Quiet = quiet
 	if reason != "" {
-		s.log.Info("restarting video", "reason", reason, "urgent", urgent)
+		lvl := slog.LevelInfo
+		if quiet {
+			lvl = slog.LevelDebug
+		}
+		s.log.Log(context.Background(), lvl, "restarting video", "reason", reason, "urgent", urgent)
 	}
 	// An overlapped start leaves the active generation streaming at its
 	// bitrate until the new one is live (its VideoConfig sets the target
@@ -1927,7 +1943,7 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 		s.kicked()
 	}
 	if !c.LiveBitrate {
-		return s.startVideo(urgent, reason)
+		return s.startVideoLog(urgent, reason, true)
 	}
 	newFPS := 0
 	if cur, ok := v.Current(); ok && fps > 0 && fps != cur.FPS {

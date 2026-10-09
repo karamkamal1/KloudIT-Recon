@@ -1,6 +1,7 @@
 package media
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -279,6 +280,7 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 			sp.LTRSlots, sp.ZeroCopy, sp.RC, sp.LiveBitrate = cur.sp.LTRSlots, cur.sp.ZeroCopy, cur.sp.RC, cur.sp.LiveBitrate // as withCaps made them
 			sp.IntraRefreshFrames, sp.SVCLayers = cur.sp.IntraRefreshFrames, cur.sp.SVCLayers
 			sp.EncoderInstance, sp.ReencodeOversized, sp.SliceOutput = cur.sp.EncoderInstance, cur.sp.ReencodeOversized, cur.sp.SliceOutput
+			p.Quiet = cur.params.Quiet // its start lines are logged, or due, as it started
 			cur.params, cur.sp = p, sp
 			if urgent && cur == v.pending && v.active != nil {
 				v.kill(v.active) // the starting stream takes over at its first key frame
@@ -689,7 +691,7 @@ func (v *HelperVideo) run(pr *helperProc) {
 		// and how it runs (low_power: VDENC; zero_copy false: frames read back).
 		attrs = append(attrs, "encoder", st.Encoder, "usage", st.Usage, "preset", st.Preset)
 	}
-	v.log.Info("encoder helper started", attrs...)
+	v.log.Log(context.Background(), pr.params.infoLevel(), "encoder helper started", attrs...)
 	if later.Kbps != sp.Kbps || later.FPS != sp.FPS || later.VBVFrames != sp.VBVFrames {
 		vbv := later.VBVFrames
 		if vbv <= 0 && sp.VBVFrames > 0 {
@@ -828,10 +830,11 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 		cfg := v.config(pr)
 		if first {
 			startup := time.Since(pr.since).Round(time.Millisecond)
-			v.log.Info("encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height),
+			lvl := pr.params.infoLevel()
+			v.log.Log(context.Background(), lvl, "encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height),
 				"pipeline", PipelineHelper, "startup", startup, "restart", pr.restart)
 			if cfg.CropRight > 0 || cfg.CropBottom > 0 {
-				v.log.Info("coded picture is padded, client crops", "gen", pr.gen,
+				v.log.Log(context.Background(), lvl, "coded picture is padded, client crops", "gen", pr.gen,
 					"coded", fmt.Sprintf("%dx%d", cfg.CodedWidth, cfg.CodedHeight), "crop_right", cfg.CropRight, "crop_bottom", cfg.CropBottom)
 			}
 		} else {
@@ -1063,6 +1066,7 @@ func (v *HelperVideo) failed(pr *helperProc, err error) {
 		next = &helperProc{params: pr.params, since: now, restart: true}
 		next.params.BitrateKbps = pr.sp.Kbps
 		next.params.FPS = pr.sp.FPS
+		next.params.Quiet = false // a failure's restart is logged
 		next.sp, serr = v.startParams(next.params)
 		v.pending = next
 	}

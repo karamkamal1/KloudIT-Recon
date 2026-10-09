@@ -747,6 +747,18 @@ type Params struct {
 	// it has at the full bitrate and the first frame with motion is not
 	// starved. FFmpeg ignores it.
 	VBVFrames float64
+	// Quiet: the generation puts a change of the session's rate controller
+	// into effect (a pipeline that cannot change its bitrate live); its
+	// start and ready lines are debug lines (logLevel), not one per change.
+	Quiet bool
+}
+
+// infoLevel is the level of p's generation's start and ready lines.
+func (p Params) infoLevel() slog.Level {
+	if p.Quiet {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
 }
 
 // OutputSize returns the size of the picture BuildArgs hands the encoder

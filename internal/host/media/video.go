@@ -299,7 +299,7 @@ func (v *Video) Start(p Params, urgent bool) error {
 	}
 	pr := &encProc{gen: v.gen, params: p, args: args, cmd: cmd, cancel: cancel, stderr: &stderrRing{log: v.log}, started: time.Now(), errDone: make(chan struct{})}
 	if v.log != nil {
-		v.log.Info("starting encoder", "gen", pr.gen, "encoder", p.Encoder.Name, "capture", p.Source.Backend,
+		v.log.Log(context.Background(), p.infoLevel(), "starting encoder", "gen", pr.gen, "encoder", p.Encoder.Name, "capture", p.Source.Backend,
 			"fps", p.FPS, "kbps", p.BitrateKbps, "size", fmt.Sprintf("%dx%d", p.Width, p.Height), "adaptive", p.Adaptive, "hdr", p.HDR)
 		v.log.Debug("ffmpeg args", "args", args)
 	}
@@ -529,10 +529,11 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 			md := HDRTestMetadata
 			HDRConfig(cfg, pr.params.HDR && codec.TenBit(params.Codec), &md, hdrNote)
 			if v.log != nil {
-				v.log.Info("encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height),
+				lvl := pr.params.infoLevel()
+				v.log.Log(context.Background(), lvl, "encoder ready", "gen", pr.gen, "codec", cfg.Codec, "size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height),
 					"startup", time.Since(pr.started).Round(time.Millisecond), "recovery", cfg.Recovery, "hdr", cfg.HDR)
 				if cfg.CropRight > 0 || cfg.CropBottom > 0 {
-					v.log.Info("coded picture is padded, client crops", "gen", pr.gen,
+					v.log.Log(context.Background(), lvl, "coded picture is padded, client crops", "gen", pr.gen,
 						"coded", fmt.Sprintf("%dx%d", cfg.CodedWidth, cfg.CodedHeight), "crop_right", cfg.CropRight, "crop_bottom", cfg.CropBottom)
 				}
 			}

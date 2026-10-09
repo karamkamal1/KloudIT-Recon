@@ -9473,7 +9473,8 @@ been reported once.
 
 Problem: every change of the rate controller made two lines at the default level:
 `congestion: lowering bitrate` (Warn) or `bitrate recovery: raising bitrate` (Info), then
-setRate's `changing the bitrate in the encoder`. FFmpeg also adds its restart lines. Where the
+setRate's `changing the bitrate in the encoder`. FFmpeg also adds its restart lines (see "FFmpeg's
+rate restarts no longer fill host.log" below). Where the
 path carries less than the user's setting (30-50 Mbit/s set on 20 Mbit/s Wi-Fi), the controller
 moves continuously: 2 % steps up a few hundred ms apart, then a cut. In the reviewer's
 simulation (`runSim`, 120 s, 20 Mbit/s link, 50 Mbit/s setting) that was 2.64 changes a second on
@@ -9689,6 +9690,70 @@ Fix (`internal/host/session.go`):
 - NVIDIA: unverified (no NVIDIA host available). Test: the same.
 - FFmpeg path (`"pipeline": "ffmpeg"`): the same test; while hidden no `starting encoder` line
   and no ffmpeg.exe in Task Manager.
+
+### FFmpeg's rate restarts no longer fill host.log
+
+Problem: the fix above ("Rate changes no longer fill host.log") limited applyRate's lines, but on
+a pipeline that cannot change its bitrate live (FFmpeg: no helper, `"pipeline": "ffmpeg"`, after
+a helper fallback; or a helper whose live bitrate change is not qualified) every change of the
+rate controller is a new encoder generation, and each wrote three lines at the default level:
+`restarting video`, `starting encoder` and `encoder ready`. The restart policy changes the rate
+about 0.9 times a second where the path carries less than the setting (the reviewer's `runSim`:
+50 Mbit/s set on 10-30 Mbit/s links), about 2.6 lines a second, 1.5-2 MB of host.log an hour.
+With the 20 MB rotation that pushed the session-start lines out within about half a day.
+
+Fix: a restart that puts a rate change into effect (`setRate` on such a pipeline,
+`startVideoLog(..., quiet)`) logs `restarting video` at debug level, and its generation
+(`media.Params.Quiet`) logs `starting encoder`, `encoder ready` and `coded picture is padded` at
+debug level too (on the helper: `encoder helper started` and `encoder ready`). applyRate's line
+(once per 10 s per direction, with `suppressed=N`) and `stream stats` still show the changes and
+the target. Restarts for anything else (settings, key frames, losses, failures, resume, a
+failed live bitrate change, a helper that failed and is replaced) keep their lines at the
+default level. At `"logLevel": "debug"` every line is there as before. The static desktop's
+cap (activity.go) still logs its start and its end at the default level (two lines per idle
+period, only on a live-bitrate helper), left as they are.
+
+- Verified here:
+  - `internal/host` `TestRateRestartLogVolume` (a stand-in pipeline without live bitrate, the
+    default level): 30 rate changes start 30 quiet generations and log no `restarting video`
+    line and 2 rate lines; a key-frame restart afterwards is logged and not quiet.
+  - `internal/host/media` `TestVideoGenerations` (real FFmpeg, libx264): a quiet overlapped
+    restart; at the default level only the first generation has `starting encoder` and
+    `encoder ready` (with the level ignored, both generations do).
+  - `TestQueueOverflowEscalates` now logs at debug level: its urgent congestion restart is a
+    rate restart.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test, with `"pipeline": "ffmpeg"` in
+  host.json and the default log level:
+  1. Stream at a 50 Mbit/s setting over a path that carries about 20 (Wi-Fi, or
+     `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates 20,20,20`).
+  2. After 10 minutes, `(Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern
+     'restarting video|starting encoder|encoder ready').Count` is a handful (the session's start
+     and any non-rate restarts), not hundreds; `lowering bitrate|raising bitrate` gives about
+     two lines per 10 s.
+  3. The overlay's target and `Video` rows still move.
+  4. With `"logLevel": "debug"` each change has its `restarting video reason=congestion` or
+     `reason="bitrate recovery"` line again.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### Runs of the whole suite with these four changes
+
+- Go: `gofmt`, `go vet` (Linux and Windows), `go test` of every package, `go test -race` of
+  `internal/host`, `internal/host/media`, `internal/gateway` and `internal/proto`; the new tests
+  ran 30-200 times under `-race`. Each of the four commits builds and vets on its own and
+  passes its new tests. `internal/gateway` `TestUDPRelayLatencyAndThroughput` (UDP relay 37.4
+  vs direct 46.1 Mbit/s) failed once on CPU load and passed when rerun. The Go integration test
+  (`internal/e2e`, under the E2E lock) passed with the final code.
+- No native code changed (no helper build or Wine run needed).
+- Browser E2E (under the E2E lock): a run of only the scenarios this round adds or depends on
+  ("ticket refused", "torn control", "takeover") passed all 12 of its checks. Two full
+  runs with the final code: 293 of 296 and 291 of 296 checks passed. Every failed check passed
+  in the other run, and each failure was a frame-rate or timing check with the CPUs 16-26 %
+  idle: the datagram + FEC scenario's frame rate (two checks), the "clean link (lan)" key-frame
+  check (one request after the WebGPU scenario's decoder waited for 7 s while the host made a
+  generation for each request; that session was not paused and had no failed control write),
+  the splice relay's
+  telemetry drops (known borderline, above) and frame rates of the splice and WebSocket relays.
+  No run logged `control stream write failed`.
 
 ## Final review: security
 
