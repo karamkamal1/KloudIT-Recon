@@ -10787,6 +10787,16 @@ listed once. The direct URL handed to the browser is unchanged.
   Policy" line. Then open the dashboard at the gateway's IPv6 address with Network path *Relay
   via gateway*: Transport reads `webtransport · relay` (the UDP relay), not `relay-splice`.
 
+### Runs with these four changes (settings after a failed connection to the CSP over IPv6)
+
+- The runs above predate them. Browser E2E filtered to the scenarios they touch, under the
+  shared lock, with the rebuilt gateway and agent (`E2E_ONLY='^WebTransport direct$|^WebTransport
+  relay$|settings after a failed connection|settings not offered here|drawer keyboard'`): 70
+  checks passed, 0 failed; also "udp relay reconnects", "udp relay host blocked" and "takeover"
+  (see the first item). The whole suite is left to the end of the final review.
+- `go test -race ./internal/gateway/`, `go vet ./...` for linux and windows, `gofmt -l`, `node
+  --check` on the changed scripts: pass.
+
 ## Final review: host agent, second round
 
 Findings of the second final review about the PC agent. Each item: the problem, the fix, what was
