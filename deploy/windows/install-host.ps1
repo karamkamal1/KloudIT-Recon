@@ -36,8 +36,10 @@
   as Program Files.
 .PARAMETER DirectPort
   UDP port for direct LAN connections from the browser (0 disables the direct path). The
-  default, 48100, stays clear of Sunshine's and Apollo's ports (47984-48010). Earlier versions
-  used 47998; running this installer again moves host.json and the firewall rule to 48100.
+  default, 48100, stays clear of Sunshine's and Apollo's ports (47984-48010). Without
+  -DirectPort, running this installer again keeps the port host.json has (one set earlier with
+  -DirectPort or by hand, also 0), except 47998, which earlier versions used: that moves to
+  48100 (add -DirectPort 47998 to keep it). The firewall rule follows.
 .PARAMETER UpdateFFmpeg
   Download FFmpeg again even if it is already installed (with -InstallLibavcodec: its libraries too).
 .PARAMETER InstallLibavcodec
@@ -122,6 +124,18 @@ function Expand-BtbNBuild([string]$zipName, [string]$expected, [string]$tmp) {
     $inner = Get-ChildItem -Path $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'bin') } | Select-Object -First 1
     if (-not $inner) { throw "Unexpected archive layout in $zipName." }
     $inner.FullName
+}
+
+# The direct path's port for host.json: -DirectPort when it is given ($given), else the port
+# host.json has (a port chosen earlier, or 0 for relay only), except earlier versions' default
+# 47998 (Sunshine's and Apollo's video port), a missing or unusable value: those get $port.
+function Resolve-DirectPort($cfg, [bool]$given, [int]$port) {
+    if ($given -or -not $cfg.Contains('directPort')) { return $port }
+    $stored = 0
+    if (-not [int]::TryParse("$($cfg['directPort'])", [ref]$stored) -or $stored -lt 0 -or $stored -gt 65535 -or $stored -eq 47998) {
+        return $port
+    }
+    $stored
 }
 
 # Reads what the agent appended to its log since offset $from (the agent keeps
@@ -398,6 +412,11 @@ if (Test-Path $cfgPath) {
     foreach ($p in $existing.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
 }
 $cfg['ffmpeg'] = $ffmpeg
+$DirectPort = Resolve-DirectPort $cfg $PSBoundParameters.ContainsKey('DirectPort') $DirectPort
+if (-not $PSBoundParameters.ContainsKey('DirectPort') -and $cfg.Contains('directPort') -and "$($cfg['directPort'])" -eq "$DirectPort") {
+    if ($DirectPort -gt 0) { Write-Step "Keeping the direct path's port $DirectPort from host.json (-DirectPort changes it)" }
+    else { Write-Step 'Keeping the direct path off (host.json: "directPort": 0; -DirectPort <port> turns it on)' }
+}
 $cfg['directPort'] = $DirectPort
 if (-not $cfg.Contains('audio')) { $cfg['audio'] = $true }
 if (-not $cfg.Contains('gamepad')) { $cfg['gamepad'] = $true }

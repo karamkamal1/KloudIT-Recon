@@ -515,7 +515,7 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   bind its UDP port`, something else listens on that port (Sunshine or Apollo set to it, for
   example): the agent retries every 30 seconds and offers the direct path once it has the port.
   To move it, run the installer again with `-DirectPort <port>` (it changes `host.json` and the
-  firewall rule).
+  firewall rule; later runs without `-DirectPort`, such as upgrades, keep that port).
 - **Black screen in a game.** Use *borderless/windowed fullscreen*. Some old exclusive-fullscreen
   titles can't be duplicated.
 - **The lock screen and UAC prompts aren't visible.** The agent runs in your desktop session and

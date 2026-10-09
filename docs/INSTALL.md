@@ -405,7 +405,9 @@ pick up the old files.
 3. **PC agent**: in an administrator PowerShell, from the new `host-windows-amd64` folder, run
    the installer command **without** `-PairingCode`:
    `powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -InstallViGEm`. The pairing is
-   kept. Add `-UpdateFFmpeg` to also fetch a newer FFmpeg.
+   kept, and so is the direct path's port in `host.json` (`directPort`, also 0 for relay only;
+   the installer prints `Keeping the direct path's port ...`): pass `-DirectPort <port>` only to
+   change it. Add `-UpdateFFmpeg` to also fetch a newer FFmpeg.
 
 **Upgrading from a version without the native encoder helper** (before `recon-encoder.exe` was
 in the bundle). Check these once:
@@ -422,9 +424,10 @@ in the bundle). Check these once:
   graphics driver updates.
 - **Direct path port.** The direct path moved from UDP 47998 to **UDP 48100**: 47998 is the
   video port of Sunshine and Apollo, and a Moonlight session on the same PC could not start
-  while the agent held it. The installer (step 3 above) changes `directPort` in `host.json` and
-  the firewall rule; add `-DirectPort 47998` to keep the old port. A firewall or router rule of
-  your own for 47998 needs the new port.
+  while the agent held it. The installer (step 3 above) changes `directPort` 47998 in
+  `host.json` and the firewall rule to 48100 (a port you chose yourself, or 0, it keeps); add
+  `-DirectPort 47998` to keep the old port. A firewall or router rule of your own for 47998
+  needs the new port.
 - **Congestion control.** `"congestion"` now defaults to `media` (the PC paces its video at the
   session's bitrate and leaves backing off to its rate controller). Nothing to do; `"reno"` in
   `host.json` brings back the old behaviour if a network misbehaves with it.

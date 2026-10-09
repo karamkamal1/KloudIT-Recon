@@ -9133,6 +9133,37 @@ by rename fail on Windows (no FILE_SHARE_DELETE).
   `-restart run`.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
 
+### Upgrades keep the direct path's port
+
+Problem: `install-host.ps1` wrote `directPort` from `-DirectPort` (default 48100) on every run and
+re-created the firewall rule for it. INSTALL's upgrade command has no `-DirectPort`, so an
+upgrade moved a port chosen with `-DirectPort <port>` (README's remedy for a port conflict with
+Sunshine, Apollo or a VPN) back to 48100, and turned a relay-only PC (`directPort` 0, as NETEM.md
+and 0.4 tell testers to set) back to the direct path with UDP 48100 opened on Private/Domain
+networks. The docs mentioned the overwrite only for the 47998 → 48100 move. Fix:
+`Resolve-DirectPort`: `-DirectPort` when given; else the value `host.json` has, except the old
+default 47998 (still moved to 48100, `-DirectPort 47998` keeps it) and a missing, non-numeric or
+out-of-range value (the default); the firewall rule follows the result, and the installer prints
+`Keeping the direct path's port N from host.json` (or that the direct path stays off). The
+`-DirectPort` help, INSTALL's upgrade step and 47998 note, and README's Troubleshooting say so.
+
+- Verified here: the pwsh parser check; `Resolve-DirectPort`, taken from the script's AST, under
+  pwsh 7 on Linux with host.json read as the installer reads it: fresh install 48100; stored
+  48100, 50000 and 0 kept; stored 47998 → 48100; `-DirectPort 47998`, `48100` and `0` win over
+  the stored value; `"abc"`, 70000 and -1 → 48100. The script before the fix has no such function
+  and wrote 48100 over 50000 and 0. The installer's top-level lines (the `[ValidateRange]`
+  parameter reassigned, the messages, the value the firewall rule uses) in a copy of them with a
+  `host.json` of 50000, 0, 47998, none, and `-DirectPort 47998`.
+- AMD RDNA3 (RX 7900 XT): unverified (no Windows here). Test: run `install-host.ps1 -DirectPort
+  50000 -NoStart`, then the upgrade command `install-host.ps1 -InstallViGEm -NoStart`: it prints
+  `Keeping the direct path's port 50000 from host.json`, `host.json` still has `"directPort":
+  50000` and `Get-NetFirewallRule -DisplayName 'KloudIT Recon host (direct path)' |
+  Get-NetFirewallPortFilter` shows LocalPort 50000. Set `"directPort": 0` in `host.json`, run the
+  upgrade command again: `Keeping the direct path off`, no such firewall rule, and after
+  `Start-ScheduledTask` host.log has no `direct WebTransport endpoint listening`. Put `48100` back
+  with `-DirectPort 48100`.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
 ### README, INSTALL and the hardware test plan
 
 Problem: README's feature list and diagram described only the FFmpeg pipeline (key-frame or
@@ -9171,7 +9202,8 @@ LATENCY_RIG.md runs exactly that). When Sunshine held the port first, the agent 
 warning, kept advertising the direct path to the gateway, and every browser waited 2.5 s for it
 before using a relay; it also logged `direct WebTransport endpoint listening` before binding.
 Fix: the default is UDP 48100, outside 47984-48010 (`DefaultDirectPort`; the installer's
-`-DirectPort` default and firewall rule follow, and running it again moves an existing install).
+`-DirectPort` default and firewall rule follow, and running it again moves an install still on
+47998; since "Final review: deploy and install", it keeps any other port).
 The agent binds the port itself before serving, advertises the direct path to the gateway only
 while it holds the port, logs `listening` after the bind, and on a failed bind logs `direct
 endpoint unavailable: cannot bind its UDP port` once and retries every 30 s; each change is sent
