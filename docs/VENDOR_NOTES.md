@@ -9296,6 +9296,31 @@ where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `rat
   "The HDR pixel check after a superseded frame", which changes only a test hook. Items with
   nothing to check on hardware are left out too: the runs, "Test-hook runs write host.log",
   this item and "defaultKbps and defaultFps".
+- The final step's runs, on 66b70f2 (these documents on top of 36e1998, no code change):
+  - `gofmt -l` (the module and `third_party/quic-go`): nothing. `go vet ./...` for linux and
+    windows: clean.
+  - `go test` of every package but `internal/e2e`: 18 packages ok. `go test ./internal/e2e/...`
+    under the shared lock: ok (204 s). The upstream tests of the patched quic-go packages and
+    the latency rig's Python tests (17): ok.
+  - `make build`, `make helper` (mingw-w64): ok. `xvfb-run -a make helper-test
+    WINE=/usr/lib/wine/wine64 WIN_FFMPEG=<FFmpeg 8.1 win64>` (Wine 9.0): all four test binaries
+    pass, 116 tests passed and 10 skipped. AMF, AMD Direct Capture and WGC need a GPU or the
+    MSVC build, and the libavcodec stream tests need an FFmpeg shared build, which this sandbox
+    no longer has.
+  - Browser E2E under the lock: 306 of 307 checks passed. The one failure is the known
+    borderline telemetry-drop check ("WebTransport relay: send priorities ... telemetry gives
+    way"), with 20 % dropped against 16 % allowed at 25 % CPU idle. A rerun of the relay, loss
+    and thinning sections passed 48 of 48.
+  - The same pinned to two CPUs (`taskset -c 0,1`): 303 of 307 passed. All four failures came
+    with the CPUs 4-6 % idle and key-frame requests for a decoder backlog: the held drop test
+    (a new generation replaced it before the backlog reset), recovery "skip", the loss-recovery
+    ladder and temporal SVC thinning. A pinned rerun of the loss and thinning sections passed
+    those four and failed two other load-bound checks at 5 % idle (the reference-recovery
+    stand-in and the ladder again). So the load decides which checks fail, not a code path.
+  - `flash_smoke.mjs`: ok. The PowerShell parser on `install-host.ps1` and
+    `uninstall-host.ps1`: no errors. `bash -n` and `shellcheck -S error` on the 7 shell
+    scripts: clean. Both workflow files parse as YAML. `node --check` on the 18 client and test
+    scripts: ok.
 
 ## Final review: host agent
 
