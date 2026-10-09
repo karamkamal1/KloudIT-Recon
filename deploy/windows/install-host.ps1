@@ -454,6 +454,13 @@ if ($probe -match 'minimum required Nvidia driver[^|\r\n]*') {
 if ($probe -notmatch '(?m)^encoder:\s+\S+\s+\S+\s+(nvidia|amd|intel)') {
     Write-Warning 'No GPU encoder works, so video will be encoded on the CPU (higher latency). Install or update the graphics driver; the "unusable:" lines above say why each GPU encoder failed.'
 }
+# The native encoder helper is the default video pipeline on AMD and NVIDIA (the "helper:" lines
+# above); without a usable backend sessions stream through FFmpeg's command line instead.
+if ($probe -match '(?m)^helper:\s+(no usable encoder|does not run|not installed)') {
+    Write-Warning ('The native encoder helper (recon-encoder.exe) cannot encode on this PC, so streams use FFmpeg: ' +
+        'a lost frame then costs a key frame and bitrate changes restart the encoder. The "helper:" and "unavailable:" lines above say why; ' +
+        "update the graphics driver (NVIDIA: 570 or newer), then run Stop-ScheduledTask '$TaskName'; Start-ScheduledTask '$TaskName'.")
+}
 
 $paired = [bool](Get-Content -Raw -Encoding UTF8 $cfgPath | ConvertFrom-Json).gateway
 if (-not $NoStart) {

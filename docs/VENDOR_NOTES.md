@@ -8907,3 +8907,36 @@ deletes anything.
   (the linger). Also: `recon-host.exe vdisplay -restore` with the agent stopped after a killed
   stream (`Stop-Process -Name recon-hostw -Force`) does the same.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### The probe and the installer report the native encoder helper
+
+Problem: the default video pipeline on AMD and NVIDIA is the native helper, but `recon-host
+probe` (the installer's "Detected capabilities") only tested FFmpeg's encoders: an RX 7900 XT
+host whose helper or AMF could not start installed "successfully", and its first stream silently
+used FFmpeg. INSTALL.md said nothing about the helper, how to see which pipeline streams, or how
+to fall back. Fix: `probe` runs the installed helper's `--print-caps` as a session's first launch
+does (its own choice of backend, `helperFFmpegDir`) and prints `helper:` with the backend, codecs
+(each with recovery, live bitrate mode, size limits) and GPU, then `unavailable:` per backend;
+`no usable encoder`, `does not run`, `not installed` or `not used` otherwise. The installer warns
+when the helper cannot encode. INSTALL.md: the success sample, a troubleshooting row, "Which
+encoder streams" (the overlay's Encoder row, the `video pipeline` line, `"pipeline": "ffmpeg"`
+as the fallback), the probe row of Useful commands; README's probe paragraph.
+
+- Verified here: `internal/host` `TestProbeHelper` (a fake helper: the AMD line, codecs in the
+  sessions' order, unavailable reasons, the arguments `--print-caps --log-level=error
+  --backend=auto --ffmpeg-dir=...`; no usable encoder; libavcodec off; a failing and a missing
+  helper; `pipeline` ffmpeg). The Windows `recon-host.exe probe` under Wine (shared prefix, FFmpeg
+  8.1 Windows build) with the mingw `recon-encoder.exe` next to it: `helper:     no usable
+  encoder: sessions stream with FFmpeg` and the helper's own reasons (`unavailable: amf: AMF
+  runtime (amfrt64.dll) not found in System32 ...`, `nvenc: ...`, `lavc: ...`, `wgc: this build
+  has no C++/WinRT headers ...`); without the helper `helper:     not installed (... File not
+  found.): sessions stream with FFmpeg`. The installer's warning pattern matches that probe
+  output under pwsh and stays quiet for a usable helper and for `pipeline` ffmpeg.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: run the installer (or `recon-host.exe probe`):
+  `helper:     amf    hevc,av1,h264  AMD Radeon RX 7900 XT (recon-encoder.exe ...)`, lines
+  `hevc  recovery=ltr live-bitrate=...`, `unavailable: nvenc: ...` and no warning. For the other
+  path, copy the install folder elsewhere without `recon-encoder.exe` and run that copy's
+  `recon-host.exe probe`: `helper:     not installed (...): sessions stream with FFmpeg`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same: `helper:     nvenc ...` with
+  driver 570 or newer; with an older driver `no usable encoder` and `unavailable: nvenc: the
+  driver supports NVENC API 12.x ...`, and the installer warns.

@@ -240,11 +240,22 @@ The installer:
 **Success** looks like this:
 
 ```
-encoder:    hevc_nvenc   hevc  nvidia        <- a GPU encoder (nvidia / amd / intel)
+encoder:    hevc_amf     hevc  amd           <- a GPU encoder in FFmpeg (amd / nvidia / intel)
+helper:     amf    hevc,av1,h264  AMD Radeon RX 7900 XT (recon-encoder.exe ...)
+                                             <- the native encoder helper (amf / nvenc / lavc)
 monitor 0:  ...
 gamepads:   ViGEmBus available
 ==> Agent is running and connected to the gateway.
 ```
+
+Streams on AMD and NVIDIA graphics come from the **native encoder helper** `recon-encoder.exe`
+(the `helper:` line; NVIDIA shows `nvenc`): it changes the bitrate inside the running encoder
+and answers a lost frame with a recovery frame instead of a key frame. FFmpeg (the `encoder:`
+lines) is the fallback: for what the helper cannot do (the cursor drawn into the video, for
+example), and for a PC where the helper has no usable encoder. Once the agent runs, run
+`recon-host.exe qualify` once (see Useful commands; about 70 minutes on AMD, 25 on NVIDIA, with
+no stream running), and again after each graphics driver update: it measures which kinds of
+bitrate change this GPU's encoder makes without a glitch, and streams use the results.
 
 The dashboard dialog shows **"<name> is connected ✓"** and closes itself a second later. The
 PC's card then shows **Online**.
@@ -252,6 +263,7 @@ PC's card then shows **Online**.
 | If you see… | Do this |
 |---|---|
 | `NVENC needs a newer NVIDIA driver` / `No GPU encoder works` | Update the graphics driver, then `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`. The `unusable:` lines say why each GPU encoder failed. |
+| `The native encoder helper (recon-encoder.exe) cannot encode on this PC` (`helper: no usable encoder`, `does not run` or `not installed`) | Streams still work, through FFmpeg, but a lost frame costs a key frame and bitrate changes restart the encoder. The `unavailable:` lines under `helper:` say why for each backend (`amf`, `nvenc`, `lavc`). Usually: update the graphics driver (NVIDIA needs 570 or newer), then restart the agent as above. `not installed`: the bundle had no `recon-encoder.exe` (a self-built one without mingw-w64); use the CI bundle. |
 | `Network '…' is set to Public` | Run the `Set-NetConnectionProfile` command it prints (see step 6). |
 | `has not reached the gateway yet` | Check `Test-NetConnection 192.168.1.50 -Port 8443` (TCP). The agent itself needs **UDP** 8443, which third-party firewalls or VPN clients can block. Also check that the pairing code was created while browsing via `https://192.168.1.50:8443`. |
 | `The gateway rejected this PC's pairing code` | The code was replaced (Re-pair) or the PC was removed. Use **Manage → Re-pair** on its card and run the command shown. |
@@ -277,6 +289,18 @@ On any device on your home network (laptop, another PC, tablet), open
   `webtransport · direct` at home.
 - **Ctrl+Alt+Shift+O**: settings (bitrate, frame rate, codec, resolution, audio).
 - Controllers: press a button after the stream starts. A "Controller connected" message appears.
+
+**Which encoder streams.** The overlay's **Encoder** row names it: `hevc_amf_helper` (or
+`hevc_nvenc_helper`, `av1_amf_helper`, ...) is the native encoder helper, a plain name such as
+`hevc_amf` is FFmpeg. `host.log` says the same for every stream, with the reason:
+`video pipeline pipeline=helper backend=amf ...`, or `pipeline=ffmpeg ... reason=...` (and
+`skipped=` for each helper backend it passed over). Three helper failures within a minute move
+the stream to FFmpeg by themselves (`was=helper`). If a stream on the helper misbehaves in a way
+that does not trip that (a corrupt or frozen picture, repeated decoder errors in the overlay),
+set `"pipeline": "ffmpeg"` in `%APPDATA%\KlouditRecon\host.json` and restart the agent
+(`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`): streams
+then use FFmpeg only. Please report what happened, with `host.log`. Delete the line again to go
+back.
 
 ## 9. Playing away from home
 
@@ -381,7 +405,7 @@ pick up the old files.
 | Proxmox node | `pct exec 210 -- journalctl -u recon-gateway -n 50 --no-pager` | Gateway log |
 | Proxmox node | `pct enter 210` | Shell inside the container (it has no root password) |
 | PC | `Get-Content "$env:APPDATA\KlouditRecon\host.log" -Tail 30` | Agent log |
-| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), monitors, controllers |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), the native encoder helper's backend and codecs (`helper:`), monitors, controllers |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 70 min on AMD, 25 on NVIDIA; `-quality balanced` a third of that; no stream running); sessions use the results (`live-bitrate.json`) |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" vdisplay -mode 2560x1440@120 -hold 30s` | Create a virtual display for 30 s and restore the displays (stop the agent first) |

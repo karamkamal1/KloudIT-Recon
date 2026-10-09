@@ -432,6 +432,12 @@ only delivers a frame when the screen or the mouse pointer changes, so keep some
 (move the mouse, play a video) until the `frame=` counter reaches 600. Flags go before the
 command: `recon-host.exe -v probe`.
 
+`probe` also asks the native encoder helper, which streams by default on AMD and NVIDIA: its
+`helper:` line names the backend it picks (`amf`, `nvenc`, `lavc`), its codecs and GPU, then one
+line per codec (recovery, live bitrate changes, size limits) and `unavailable:` lines with why
+the other backends (and capture methods) cannot be used. `helper: no usable encoder`,
+`does not run` or `not installed` means sessions stream with FFmpeg; the installer warns then.
+
 Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` once per GPU (and again after a
 driver update), with no stream running, to measure how the native helper's encoder changes its
 bitrate while it runs: for every codec, encoder preset (speed, balanced, quality), rate-control

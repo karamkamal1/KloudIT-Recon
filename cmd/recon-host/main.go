@@ -3,7 +3,8 @@
 //
 //	recon-host pair <code>   store the pairing code shown by the gateway
 //	recon-host run           connect to the gateway and serve streams
-//	recon-host probe         show ffmpeg, its encoders and their command lines
+//	recon-host probe         show ffmpeg, its encoders and their command lines, and
+//	                         the native encoder helper's encoders
 //	recon-host qualify       measure the native helper's live bitrate changes (GUIDE 3.6)
 //	recon-host vdisplay      create a virtual display for a while (hardware test),
 //	                         or (-restore) undo a stopped agent's (uninstall)
@@ -36,7 +37,8 @@ Usage:
   recon-host [flags] pair <pairing-code>   pair this PC with a gateway
   recon-host [flags] run                   run the agent (default)
   recon-host [flags] probe                 show ffmpeg, encoders (with their ffmpeg
-                                           command lines), capture backends and monitors
+                                           command lines), the native encoder helper's
+                                           encoders, capture backends and monitors
   recon-host [flags] qualify [qualify flags]
                                            measure how the native encoder helper's encoder
                                            changes its bitrate while it runs (codec x rate
@@ -130,6 +132,7 @@ func main() {
 		if err != nil {
 			fmt.Println("error:", err)
 		}
+		host.ProbeHelper(context.Background(), cfg, os.Stdout)
 		mons, _ := platform.Monitors()
 		for _, m := range mons {
 			fmt.Printf("monitor %d:  %s %dx%d@%dHz at (%d,%d) primary=%v dxgi=%d\n", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.DXGIOutput)
