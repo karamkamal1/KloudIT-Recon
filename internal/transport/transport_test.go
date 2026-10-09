@@ -20,6 +20,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/internal/transport/cc"
 )
@@ -237,13 +238,16 @@ func TestMediaCongestionControlWebTransport(t *testing.T) {
 }
 
 // lossyProxy relays UDP between one client and a server with a fixed one-way
-// delay, dropping a fraction of the datagrams in each direction.
+// delay, dropping a fraction of the datagrams in each direction, and those
+// larger than maxSize (if set: the path's MTU).
 type lossyProxy struct {
-	pc     *net.UDPConn // client side
-	up     *net.UDPConn // connected to the server
-	client atomic.Pointer[net.UDPAddr]
-	delay  time.Duration
-	loss   float64
+	pc        *net.UDPConn // client side
+	up        *net.UDPConn // connected to the server
+	client    atomic.Pointer[net.UDPAddr]
+	delay     time.Duration
+	loss      float64
+	maxSize   int
+	oversized atomic.Int64 // datagrams dropped for maxSize
 }
 
 type delayed struct {
@@ -252,6 +256,18 @@ type delayed struct {
 }
 
 func newLossyProxy(t *testing.T, server net.Addr, delay time.Duration, loss float64) *lossyProxy {
+	t.Helper()
+	return newProxy(t, server, &lossyProxy{delay: delay, loss: loss})
+}
+
+// newMTUProxy relays UDP without delay or loss over a path that carries
+// datagrams of at most maxSize bytes.
+func newMTUProxy(t *testing.T, server net.Addr, maxSize int) *lossyProxy {
+	t.Helper()
+	return newProxy(t, server, &lossyProxy{maxSize: maxSize})
+}
+
+func newProxy(t *testing.T, server net.Addr, p *lossyProxy) *lossyProxy {
 	t.Helper()
 	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -265,7 +281,7 @@ func newLossyProxy(t *testing.T, server net.Addr, delay time.Duration, loss floa
 		_ = c.SetReadBuffer(8 << 20)
 		_ = c.SetWriteBuffer(8 << 20)
 	}
-	p := &lossyProxy{pc: pc, up: up, delay: delay, loss: loss}
+	p.pc, p.up = pc, up
 	toServer := p.line(func(b []byte) { up.Write(b) })
 	toClient := p.line(func(b []byte) {
 		if a := p.client.Load(); a != nil {
@@ -308,6 +324,10 @@ func (p *lossyProxy) pump(seed uint64, read func([]byte) (int, error), out chan<
 			return
 		}
 		if rng.Float64() < p.loss {
+			continue
+		}
+		if p.maxSize > 0 && n > p.maxSize {
+			p.oversized.Add(1)
 			continue
 		}
 		select {
@@ -405,6 +425,66 @@ func TestMediaThroughputUnderLoss(t *testing.T) {
 	if s.LostPackets == 0 {
 		t.Error("the proxy dropped nothing: the comparison is meaningless")
 	}
+}
+
+// A hop with a 1280-byte IP MTU, such as a Tailscale tunnel (INSTALL.md
+// section 9), carries UDP payloads of at most 1252 bytes (IPv4) and drops
+// larger packets (DF is set). With quic-go's default packet size (1280 bytes
+// of payload, the smallest it ever sends) the server's handshake packets never
+// arrive; QUICConfig's must complete the handshake, carry a stream and a
+// full-size FEC shard datagram (proto.MaxShardPayload with its header and
+// WebTransport's prefix). The client sends 1250-byte packets, like Chrome.
+func TestSmallMTUPath(t *testing.T) {
+	serverTLS, clientTLS := testTLS(t, testALPN)
+	ln, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	proxy := newMTUProxy(t, ln.Addr(), 1280-20-8)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	const size = 200_000
+	shard := make([]byte, proto.VideoShardHeaderLen+proto.MaxShardPayload+8)
+	errc := make(chan error, 1)
+	go func() {
+		qc, err := ln.Accept(ctx)
+		if err != nil {
+			errc <- err
+			return
+		}
+		c := FromQUIC(qc)
+		if err := sendAll(ctx, c, size); err != nil {
+			errc <- err
+			return
+		}
+		errc <- c.SendDatagram(shard)
+	}()
+
+	conf := QUICConfig()
+	conf.InitialPacketSize = 1250
+	conf.HandshakeIdleTimeout = 4 * time.Second
+	t0 := time.Now()
+	qc, err := quic.DialAddr(ctx, proxy.Addr().String(), clientTLS, conf)
+	if err != nil {
+		t.Fatalf("handshake over a 1280-MTU path: %v after %s (%d packets too large for the path)",
+			err, time.Since(t0).Round(time.Millisecond), proxy.oversized.Load())
+	}
+	defer qc.CloseWithError(0, "")
+	c := FromQUIC(qc)
+	if n, err := receiveAll(ctx, c); n != size || err != nil {
+		t.Fatalf("stream: %d bytes, %v", n, err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer dcancel()
+	if d, err := c.ReceiveDatagram(dctx); err != nil || len(d) != len(shard) {
+		t.Fatalf("shard datagram: %d bytes, %v (%d packets too large for the path)", len(d), err, proxy.oversized.Load())
+	}
+	t.Logf("handshake and %d bytes in %s; %d packets too large for the path dropped",
+		size, time.Since(t0).Round(time.Millisecond), proxy.oversized.Load())
 }
 
 // cancelAfterHeader is the sender of the partial-delivery tests: on a new

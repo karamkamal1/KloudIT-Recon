@@ -453,7 +453,8 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 			if errors.As(err, &tooLarge) && tooLarge.MaxDatagramPayloadSize > 256+proto.VideoShardHeaderLen+8 {
 				// A peer that takes smaller datagrams (its
 				// max_datagram_frame_size; quic-go's own packet size
-				// estimate starts at 1280 bytes and only grows): smaller
+				// estimate starts at transport.InitialPacketSize, which
+				// proto.MaxShardPayload fits, and only grows): smaller
 				// shards from the next frame on (WebTransport adds up to 8
 				// bytes).
 				s.fec.mu.Lock()

@@ -340,11 +340,20 @@ func QUICConnFromContext(ctx context.Context) *quic.Conn {
 	return c
 }
 
+// InitialPacketSize is the UDP payload of the first packets of every QUIC
+// connection (quic.Config.InitialPacketSize): the most a 1280-byte IPv6 packet
+// carries, so they cross a 1280-MTU hop, such as a Tailscale tunnel. quic-go
+// never sends a packet smaller than this (path MTU discovery only grows it,
+// where the path allows), and its default, 1280 bytes of payload (1308 bytes
+// of IPv4, DF set), is dropped there: the handshake never completes.
+const InitialPacketSize = 1232
+
 // QUICConfig returns tuned settings for media connections: large flow-control
-// windows (an IDR frame at high bitrate can be several MB), datagrams and
-// keep-alives.
+// windows (an IDR frame at high bitrate can be several MB), datagrams,
+// keep-alives and packets that fit a 1280-MTU path (InitialPacketSize).
 func QUICConfig(opts ...QUICOption) *quic.Config {
 	c := &quic.Config{
+		InitialPacketSize:                InitialPacketSize,
 		MaxIdleTimeout:                   20 * time.Second,
 		KeepAlivePeriod:                  5 * time.Second,
 		InitialStreamReceiveWindow:       4 << 20,

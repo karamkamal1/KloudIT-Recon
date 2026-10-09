@@ -30,10 +30,13 @@ const FeatureVideoFEC = "video-fec"
 // Shard layout limits.
 const (
 	VideoShardHeaderLen = 18
-	// MaxShardPayload is the largest shard (GUIDE 2.5: <= 1200 bytes): with
-	// the header and QUIC's and WebTransport's framing it fits the smallest
-	// QUIC packet quic-go sends (1280 bytes).
-	MaxShardPayload = 1200
+	// MaxShardPayload is the largest shard (GUIDE 2.5: <= 1200 bytes): a
+	// shard datagram fits the smallest QUIC packet the endpoints send
+	// (transport.InitialPacketSize, 1232 bytes: a 1280-MTU path) with any
+	// connection ID: the packet's header and AEAD tag (at most 41 bytes),
+	// the DATAGRAM frame's type and length (3), WebTransport's session
+	// prefix (at most 8) and the shard header.
+	MaxShardPayload = 1232 - 41 - 3 - 8 - VideoShardHeaderLen // 1162
 	// MaxBlockData is the most data shards in one Reed-Solomon block: blocks
 	// stay small enough for the client to rebuild in a fraction of a
 	// millisecond, and data + parity within GF(2^8)'s 256 shards.

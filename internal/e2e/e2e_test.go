@@ -503,14 +503,27 @@ type wtOpts struct {
 	// onFrame (if set) is called for every complete frame with its one-way
 	// delay as measured for the reports (0 before the clock sync).
 	onFrame func(gen uint8, owd time.Duration, bytes int)
+	// packetSize (if set): the client's QUIC packet size instead of
+	// QUICConfig's (Chrome sends 1250 bytes).
+	packetSize uint16
+	// origin (if set): the page origin the client sends instead of the
+	// gateway's.
+	origin string
 }
 
 func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs,
 	opts wtOpts) result {
 	t.Helper()
-	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: transport.QUICConfig()}
+	conf := transport.QUICConfig()
+	if opts.packetSize > 0 {
+		conf.InitialPacketSize = opts.packetSize
+	}
+	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: conf}
 	hdr := http.Header{}
 	hdr.Set("Origin", e.base)
+	if opts.origin != "" {
+		hdr.Set("Origin", opts.origin)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), dur+15*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -937,6 +950,23 @@ func TestStreamingPaths(t *testing.T) {
 // one upstream socket per sender (like a NAT), and returns its address.
 func udpForward(t *testing.T, listenIP, target string) string {
 	t.Helper()
+	return udpForwardMTU(t, listenIP, target, 0, nil)
+}
+
+// udpForwardMTU is udpForward over a path that carries UDP payloads of at
+// most maxSize bytes (if set) both ways: it drops larger datagrams (counted
+// in dropped, if set), as a hop with a small MTU does with DF set.
+func udpForwardMTU(t *testing.T, listenIP, target string, maxSize int, dropped *atomic.Int64) string {
+	t.Helper()
+	fits := func(n int) bool {
+		if maxSize > 0 && n > maxSize {
+			if dropped != nil {
+				dropped.Add(1)
+			}
+			return false
+		}
+		return true
+	}
 	ln, err := net.ListenPacket("udp", net.JoinHostPort(listenIP, "0"))
 	if err != nil {
 		t.Skipf("no %s here: %v", listenIP, err)
@@ -977,14 +1007,16 @@ func udpForward(t *testing.T, listenIP, target string) string {
 						if errors.Is(err, net.ErrClosed) {
 							return
 						}
-						if err == nil {
+						if err == nil && fits(n) {
 							ln.WriteTo(b[:n], from)
 						}
 					}
 				}()
 			}
 			mu.Unlock()
-			up.Write(buf[:n])
+			if fits(n) {
+				up.Write(buf[:n])
+			}
 		}
 	}()
 	return ln.LocalAddr().String()
@@ -1020,6 +1052,54 @@ func TestUDPRelayHostCannotBind(t *testing.T) {
 	r := runWT(t, e, tk.Relay.WT, tk.Relay.Hashes, "", 1, 2*time.Second)
 	if !r.welcome || r.frames < 60 || r.keyframes < 1 {
 		t.Fatalf("splice relay: %+v", r)
+	}
+}
+
+// A hop with a 1280-byte IP MTU between the browser and the PC or the gateway
+// (INSTALL.md section 9: Tailscale, with a subnet router or the PC's tailnet
+// address as directAddr) drops UDP payloads above 1252 bytes (IPv4, DF set).
+// Every QUIC path still connects and streams across it: direct, the UDP relay
+// and the splice. The client sends Chrome's 1250-byte packets.
+func TestStreamingPathsSmallMTU(t *testing.T) {
+	e := setup(t)
+	const mtuPayload = 1280 - 20 - 8
+	for _, path := range []string{"direct", "relay", "relay-splice"} {
+		t.Run(path, func(t *testing.T) {
+			tk := e.connectInfo()
+			rawURL, hashes, ticket := tk.Relay.WT, tk.Relay.Hashes, ""
+			switch path {
+			case "direct":
+				rawURL, hashes, ticket = tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket
+			case "relay":
+				a, err := e.allocRelay(tk.Relay.UDP)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rawURL, hashes, ticket = a.URL, a.Hashes, a.Ticket
+			}
+			u, err := url.Parse(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var dropped atomic.Int64
+			u.Host = udpForwardMTU(t, "127.0.0.1", u.Host, mtuPayload, &dropped)
+			opts := wtOpts{packetSize: 1250}
+			if path == "relay-splice" {
+				// The page came from the gateway at the forwarder's
+				// address: the splice checks the origin against it.
+				opts.origin = "https://" + u.Host
+			}
+			from := e.logs.Len()
+			r := runWTOpts(t, e, u.String(), hashes, ticket, 2, 2*time.Second, defaultPrefs, opts)
+			t.Logf("%s over a 1280-MTU hop: welcome %v, %d frames (%d key), %d audio packets; %d datagrams too large for it (path MTU probes)",
+				path, r.welcome, r.frames, r.keyframes, r.audio, dropped.Load())
+			if !r.welcome || r.frames < 60 || r.keyframes < 1 || r.audio < 60 {
+				t.Fatalf("welcome %v, %d frames (%d key), %d audio packets", r.welcome, r.frames, r.keyframes, r.audio)
+			}
+			if path != "relay-splice" && len(e.logs.lines(from, `msg="session started"`, "path="+path+" ")) == 0 {
+				t.Fatalf("the session did not run over the %s path", path)
+			}
+		})
 	}
 }
 

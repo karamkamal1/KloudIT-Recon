@@ -258,7 +258,7 @@ On any device on your home network (laptop, another PC, tablet), open
 ## 9. Playing away from home
 
 The recommended setup is **Tailscale**: free, nothing exposed to the internet, and UDP keeps
-working.
+working (Recon's QUIC packets fit Tailscale's 1280-byte MTU).
 
 On the **Proxmox node** shell:
 
@@ -285,7 +285,9 @@ On the **laptop**, install Tailscale and sign in with the same account. Linux al
 anywhere.
 
 Test it before you leave: disconnect the laptop from your home Wi-Fi, connect it to your phone's
-hotspot instead, and start a stream.
+hotspot instead, and start a stream. In the performance overlay (**Ctrl+Alt+Shift+S**),
+**Transport** should read `webtransport · direct` here too. `websocket` means UDP does not get
+through: the stream works, but with more latency and stalls.
 
 **Alternative: port forwarding.** Forward **TCP and UDP 8443** and **UDP 8444–8459** (the relay
 ports, one per relayed session) on your router to `192.168.1.50`, keeping the port numbers.

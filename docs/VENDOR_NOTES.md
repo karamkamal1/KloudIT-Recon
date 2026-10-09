@@ -8325,8 +8325,8 @@ paths, real browsers on real client GPUs, and the encoders' frame sizes under th
 What changed (docs/ARCHITECTURE.md "Datagram + FEC video"):
 
 - **Shards with Reed-Solomon parity.** Over a round trip above 15 ms (below 12 ms back to a stream
-  per frame, so a LAN keeps streams) a frame goes out as datagram shards (`0x12`, ≤ 1200-byte
-  payloads, the bytes a frame stream carries), blocks of ≤ 64 data shards, each a systematic
+  per frame, so a LAN keeps streams) a frame goes out as datagram shards (`0x12`, ≤ 1162-byte
+  payloads since the final review, 1200 before; the bytes a frame stream carries), blocks of ≤ 64 data shards, each a systematic
   Reed-Solomon code over GF(2^8): `github.com/klauspost/reedsolomon` v1.14.2 on the host
   (`internal/fec`), a compact decoder in JavaScript in the worker (`web/static/js/fec.js`: GF tables,
   the same Vandermonde-made-systematic parity rows, only the missing shards solved: an e × e
@@ -8649,15 +8649,17 @@ Hardware and real-network checks:
   loss 0 % and frames complete 100 % at 150 Mbit/s is what the mode's limit assumes. Firefox
   and Safari: whether `serverCertificateHashes` and datagrams work at all; a browser that sends
   no `hello.fec`, or whose datagrams fail, keeps frame streams.
-- PMTU: unverified on real paths. The shards (≤ 1218 bytes plus QUIC's and WebTransport's
-  framing) fit quic-go's 1280-byte packets, the same size as the connection's other full packets:
-  quic-go's packet-size estimate starts at 1280 bytes (InitialPacketSize) and only grows with MTU
-  discovery, so a path that cannot carry 1280-byte UDP payloads breaks the QUIC connection itself,
-  not only the shards. Only the peer's `max_datagram_frame_size` makes quic-go refuse a shard
-  (`DatagramTooLargeError`): a smaller one shrinks the shards (host.log `video transport: smaller
-  shards`), one of 282 bytes or less ends the mode. Test: stream through a WireGuard tunnel (MTU
-  1420) and a PPPoE line (1492) with `"fec": "on"`; the session connects, host.log shows no
-  `smaller shards` or `datagrams failed`, and no stalls after the first seconds.
+- PMTU: unverified on real paths. The shards (≤ 1180 bytes with their header, plus the DATAGRAM
+  frame and WebTransport's prefix; final review: was ≤ 1218 for 1280-byte packets) fit the
+  1232-byte packets every endpoint starts with (`transport.InitialPacketSize`, final review
+  below), the size of the connection's other full packets: quic-go's packet-size estimate starts
+  there and only grows with MTU discovery, so a path that cannot carry 1232-byte UDP payloads
+  breaks the QUIC connection itself, not only the shards. Only the peer's
+  `max_datagram_frame_size` makes quic-go refuse a shard (`DatagramTooLargeError`): a smaller one
+  shrinks the shards (host.log `video transport: smaller shards`), one of 282 bytes or less ends
+  the mode. Test: stream through a Tailscale tunnel (MTU 1280), a WireGuard tunnel (MTU 1420) and
+  a PPPoE line (1492) with `"fec": "on"`; the session connects, host.log shows no `smaller shards`
+  or `datagrams failed`, and no stalls after the first seconds.
 
 ### Merged with 2.4, 2.7, Phase 5 wiring and HDR (integ)
 
@@ -8704,3 +8706,54 @@ docs/ARCHITECTURE.md "Datagram + FEC video", Sending):
   scenarios (loss ladder, partial delivery, window) to shards; `checkFec` turns it on, ends its
   streams like the other scenarios, and judges its frame rates against what reached the decoder
   where the CPUs had nothing to spare.
+
+## Final review: QUIC packets on a 1280-MTU path (Tailscale)
+
+Finding: every QUIC endpoint used quic-go's default `InitialPacketSize`, 1280 bytes of UDP payload
+(1308 bytes of IPv4), the smallest packet quic-go ever sends, with DF set (Windows
+`IP_DONTFRAGMENT`, Linux `IP_PMTUDISC_PROBE`, which also ignores ICMP "fragmentation needed").
+Tailscale's tunnel MTU is 1280 (its `safeTUNMTU`), and INSTALL.md section 9 recommends exactly
+that layout: the server's handshake packets were dropped at the subnet router (or refused with
+`EMSGSIZE` on a PC whose own tailnet adapter carries the stream), so direct (2.5 s), the UDP relay
+(3 s) and the splice (6 s) all timed out and the browser ended on WebSocket over TCP: no
+datagrams, FEC, media congestion controller or RESET_STREAM_AT.
+
+- Fix: `transport.QUICConfig` sets `InitialPacketSize` to 1232 (`transport.InitialPacketSize`:
+  the payload of a 1280-byte IPv6 packet, so IPv4 and IPv6 tunnels both fit) for every endpoint:
+  the host's direct and UDP-relay servers, its control and data tunnels, the gateway's HTTP/3 and
+  splice listeners. Path MTU discovery is unchanged and still grows the packets on paths that
+  allow it (up to 1452 bytes). `proto.MaxShardPayload` is now 1162 (was 1200): with the shard
+  header, the DATAGRAM frame, WebTransport's prefix (≤ 8) and the largest short header and AEAD
+  tag (41) a shard fits a 1232-byte packet whatever the connection IDs, and is within quic-go's
+  datagram size check (its estimate is 1232 − 37 = 1195 bytes); with 1200-byte shards the first
+  shard of every session failed with `DatagramTooLargeError` and that frame was lost to the
+  shrink path (`TestSessionFEC` then rebuilt 39 of 40 frames).
+- Verified here: (1) `internal/transport` `TestSmallMTUPath`: a proxy that drops UDP payloads
+  above 1252 bytes, a client sending Chrome's 1250-byte packets; with the old default the
+  handshake times out (7 server packets dropped), with `QUICConfig` the handshake and a 200 kB
+  stream take ~6 ms, and a full-size shard datagram arrives (with 1200-byte shards
+  `SendDatagram` fails). (2) `internal/e2e` `TestStreamingPathsSmallMTU`: the real gateway and
+  host agent, the client through the same kind of forwarder on the direct path, the UDP relay
+  and the splice; with the old default all three fail with "handshake did not complete in
+  time" after 10 s, now all three stream (117 frames, 199 audio packets in 2 s each).
+  (3) `test/netem/mtu1280.sh` (root): `TestStreamingPaths` and `TestStreamingPathsSmallMTU` in a
+  network namespace whose loopback has MTU 1280, so the kernel itself refuses larger packets:
+  every path passes; with the old default the host agent never even reaches the gateway ("host
+  never came online"). (4) Three namespaces, server (MTU 1500) → router → client, the router's
+  link to the client MTU 1280 like a Tailscale subnet router, a raw QUIC server with
+  `QUICConfig` and a client sending 1250-byte packets: `InitialPacketSize` 1280 → "dial failed
+  after 8 s", 1232 → handshake in 3 ms and 200 kB in 1.4 ms. `TestSessionFEC` now also checks
+  that no session shrinks its shards.
+- Docs: INSTALL.md section 9 (the hotspot test reads the overlay's **Transport**:
+  `webtransport · direct`, `websocket` means UDP does not get through), ARCHITECTURE.md (shard
+  size; "Packet size" under the direct path).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: the INSTALL.md section 9 setup (Tailscale on the
+  Proxmox node as subnet router), the laptop on a phone hotspot with Tailscale on; open
+  `https://192.168.1.50:8443`, stream: the overlay's **Transport** reads `webtransport · direct`
+  within about a second (before the fix: `websocket · relay`, after several seconds); with `"fec": "on"` in host.json
+  host.log shows `video transport mode="datagram + FEC"` and no `smaller shards`. Repeat with
+  Tailscale on the PC itself and `directAddr` set to its tailnet (100.x) address.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same as AMD; nothing here depends on
+  the GPU.
+- Browsers: unverified. Test: the AMD test from Chrome and Edge. Chrome's own QUIC packets (1250
+  bytes) fit the tunnel already; the fix is on the host's and the gateway's side.

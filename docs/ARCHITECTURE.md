@@ -282,7 +282,7 @@ frames lose a packet). The **datagram + FEC mode** (GUIDE 2.5; `internal/host/fe
 instead as datagrams with forward error correction:
 
 - **Shards.** The frame's bytes, exactly as a frame stream carries them (header, extension,
-  payload), are cut into n data shards of one size S ≤ 1200 bytes (n = ceil(L / 1200), S =
+  payload), are cut into n data shards of one size S ≤ 1162 bytes (n = ceil(L / 1162), S =
   ceil(L / n), the last shard shorter), grouped into ceil(n / 64) blocks of consecutive data
   shards (block i: shards floor(i·n/nb) … floor((i+1)·n/nb) − 1). Each block is a systematic
   Reed-Solomon code over GF(2^8) (polynomial 0x11d): `github.com/klauspost/reedsolomon`'s default
@@ -296,12 +296,13 @@ instead as datagrams with forward error correction:
   ```
 
   `base` is the block's first data shard, `index` the shard's place in the block (0..k−1 data,
-  k.. parity row index − k), `m` the parity sent with the frame. With the header and QUIC's and
-  WebTransport's framing a shard fits quic-go's smallest packet (1280 bytes): shards are the size
-  of the connection's other full packets, so a path that carries QUIC carries them (quic-go's
-  packet-size estimate starts at 1280 bytes and only grows). Only the peer's
-  `max_datagram_frame_size` limits them: a smaller one shrinks the shards, one without datagrams
-  ends the mode.
+  k.. parity row index − k), `m` the parity sent with the frame. With the header, the DATAGRAM
+  frame and WebTransport's session prefix a shard fits the smallest QUIC packet the endpoints send
+  (1232 bytes, `transport.InitialPacketSize`, below) whatever the connection IDs: shards are no
+  larger than the connection's other full packets, so a path that carries QUIC carries them, a
+  1280-MTU tunnel included (quic-go's packet-size estimate starts at that size and only grows).
+  Only the peer's `max_datagram_frame_size` limits them: a smaller one shrinks the shards, one
+  without datagrams ends the mode.
 - **Parity** per block, from the shard loss p the client reports (rate report flag 4, below: the
   client accounts each frame's first transmission, its shards received and those that never
   came, max(100 ms, 2 × RTT) after it is through, so the estimate is that recent from the first
@@ -1170,6 +1171,16 @@ If the direct connection doesn't succeed within 2.5 s, the client falls back to 
 its own single-use ticket. The direct path is always tried first: on a LAN, or over Tailscale /
 WireGuard (subnet routing to the PC's address, or `directAddr` set to the PC's tailnet address),
 the browser reaches the PC without the gateway in the media path. The relay is the last resort.
+
+Packet size: every QUIC endpoint (`transport.QUICConfig`: the host's direct and UDP-relay servers,
+its tunnels, the gateway's HTTP/3 and splice listeners) starts at 1232-byte UDP payloads
+(`InitialPacketSize`), the most a 1280-byte IPv6 packet carries. quic-go never sends a smaller
+packet, sets DF and ignores ICMP "fragmentation needed", so its default (1280 bytes of payload,
+1308 bytes of IPv4) could not cross a 1280-MTU hop such as Tailscale's tunnel: the handshake timed
+out on every QUIC path and the browser ended on WebSocket. Path MTU discovery still grows the
+packets where the path allows (up to 1452 bytes). `TestStreamingPathsSmallMTU` (a forwarder that
+drops larger datagrams) and `test/netem/mtu1280.sh` (a namespace whose interface has MTU 1280)
+check every path.
 
 ## Relay
 

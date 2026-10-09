@@ -36,7 +36,7 @@ func TestLayout(t *testing.T) {
 		{76801, 1182, 2, []int{32, 33}},
 		{300000, 1200, 4, []int{62, 63, 62, 63}},
 	} {
-		size, blocks := Layout(c.len, proto.MaxShardPayload)
+		size, blocks := Layout(c.len, 1200)
 		var ks []int
 		next := 0
 		for _, b := range blocks {
@@ -235,7 +235,7 @@ func TestRoundTrip(t *testing.T) {
 // rows the code has (repairs send rows the frame did not).
 func TestParityRowsStable(t *testing.T) {
 	var e Encoder
-	frame := frameBytes(30*1200, 3)
+	frame := frameBytes(30*proto.MaxShardPayload, 3)
 	f, shards := cut(t, &e, frame, 2)
 	rep, err := e.Repair(f, 0, 3)
 	if err != nil {

@@ -374,6 +374,11 @@ func TestSessionFEC(t *testing.T) {
 	if s.stats.frames.Load() != n {
 		t.Errorf("%d frames counted sent", s.stats.frames.Load())
 	}
+	// Full-size shards fit the connection's first packets
+	// (transport.InitialPacketSize): no frame was lost to shrinking them.
+	if l := log.lines("smaller shards"); len(l) > 0 {
+		t.Errorf("shards too large for the connection: %s", l[0])
+	}
 }
 
 func frameBytesFor(n, seed int) []byte {
