@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -206,5 +208,110 @@ func TestRateKey(t *testing.T) {
 		if want := map[bool]int{true: http.StatusTooManyRequests, false: http.StatusUnauthorized}[i == 6]; st != want {
 			t.Fatalf("request %d from one /64: HTTP %d %v, want %d", i, st, out, want)
 		}
+	}
+}
+
+// TestFailedLoginsBounded: what unauthenticated logins leave behind is
+// bounded. A failed login keeps a lockout key with at most 64 bytes of the
+// name (the body may carry 64 KiB), and logins refused by the rate limit
+// write one audit entry per client a minute, not one each.
+func TestFailedLoginsBounded(t *testing.T) {
+	s, _ := newLoginServer(t, false)
+	if st, _ := publicPost(s, "/api/login", "198.51.100.7:5000", map[string]string{"username": strings.Repeat("a", 60000), "password": "x"}); st != http.StatusUnauthorized {
+		t.Fatalf("long name: HTTP %d", st)
+	}
+	s.lockouts.mu.Lock()
+	for k := range s.lockouts.fails {
+		if len(k) > 64+1+len("198.51.100.7") {
+			t.Errorf("lockout key of %d bytes", len(k))
+		}
+	}
+	s.lockouts.mu.Unlock()
+
+	codes := map[int]int{}
+	for range 60 {
+		st, _ := publicPost(s, "/api/login/totp", "203.0.113.5:5000", map[string]string{"pending": "x", "code": "000000"})
+		codes[st]++
+	}
+	for range 60 {
+		st, _ := publicPost(s, "/api/login", "203.0.113.5:5000", map[string]string{"username": "owner", "password": "x"})
+		codes[st]++
+	}
+	if codes[http.StatusTooManyRequests] < 100 {
+		t.Fatalf("120 logins from one address: %v, want most refused", codes)
+	}
+	n := 0
+	for _, e := range s.audit.Recent(500) {
+		if e.Event == "login_ratelimited" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d login_ratelimited audit entries for one client within a minute, want 1", n)
+	}
+}
+
+// TestLockoutBounded: keys that are not locked are forgotten a day after
+// their last failure, and the map holds at most max keys (forgetting the
+// unlocked ones first, then not recording new ones).
+func TestLockoutBounded(t *testing.T) {
+	l := newLockout()
+	l.max = 4
+	for range 5 {
+		l.Fail("locked")
+	}
+	l.Fail("stale")
+	l.Fail("fresh")
+	l.fails["stale"].last = time.Now().Add(-lockoutForget - time.Minute)
+	l.swept = time.Time{} // due
+	l.Fail("new")
+	if _, ok := l.fails["stale"]; ok {
+		t.Error("a key with no failure for a day was kept")
+	}
+	if _, ok := l.fails["fresh"]; !ok {
+		t.Error("a recent key was forgotten")
+	}
+	l.Fail("fourth")
+	if len(l.fails) != 4 {
+		t.Fatalf("%d keys, want 4", len(l.fails))
+	}
+	// Full: the keys that are not locked go, the locked one stays.
+	l.Fail("fifth")
+	if locked, _ := l.Locked("locked"); !locked || len(l.fails) != 2 {
+		t.Fatalf("after the map filled: locked %v, keys %v", locked, len(l.fails))
+	}
+	// Full of locked keys: a new key is not recorded.
+	for _, k := range []string{"fifth", "a", "b"} {
+		for range 5 {
+			l.Fail(k)
+		}
+	}
+	if d := l.Fail("c"); d != 0 || len(l.fails) != 4 {
+		t.Fatalf("a new key in a full map of locked keys: locked %v, %d keys", d, len(l.fails))
+	}
+}
+
+// TestAuditRotates: audit.log moves to audit.log.1 and starts again past
+// auditMaxSize while the gateway runs, not only at its start.
+func TestAuditRotates(t *testing.T) {
+	defer func(v int64) { auditMaxSize = v }(auditMaxSize)
+	auditMaxSize = 4 << 10
+	dir := t.TempDir()
+	a, err := OpenAudit(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 500 {
+		a.Log("login_failed", fmt.Sprintf("user%d", i), "203.0.113.5", "")
+	}
+	for _, name := range []string{"audit.log", "audit.log.1"} {
+		fi, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || fi.Size() > auditMaxSize || fi.Size() == 0 {
+			t.Fatalf("%s: %v, err %v (limit %d)", name, fi.Size(), err, auditMaxSize)
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "audit.log"))
+	if !strings.Contains(string(b), `"user499"`) {
+		t.Error("the latest entry is not in audit.log")
 	}
 }

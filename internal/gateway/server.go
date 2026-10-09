@@ -76,6 +76,7 @@ type Server struct {
 
 	loginIP   *limiter
 	apiIP     *limiter
+	limitLog  *limiter   // login_ratelimited audit entries per client
 	lockouts  *lockout   // per user and client (rateKey)
 	totpLocks *lockout   // per user, from every address: wrong 2FA codes
 	totpMu    sync.Mutex // one 2FA code check at a time (checkTOTP)
@@ -129,6 +130,7 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 		pending:   map[string]*pendingLogin{},
 		loginIP:   newLimiter(10, 5),
 		apiIP:     newLimiter(600, 120),
+		limitLog:  newLimiter(1, 1),
 		lockouts:  newLockout(),
 		totpLocks: newLockout(),
 		hashSem:   make(chan struct{}, 2),

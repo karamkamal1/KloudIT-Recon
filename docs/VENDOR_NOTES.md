@@ -10003,6 +10003,35 @@ Fix (`internal/gateway/api.go` `checkTOTP`, `ratelimit.go` `rateKey`):
   for this account, try again in 1m0s", and the audit log has `totp_locked`. After a minute the
   right code signs in.
 
+### Failed logins no longer grow the gateway's memory and disk without bound
+
+Problem: every failed login added a lockout entry keyed on the raw username (up to the 64 KiB body)
+plus the client, and only a successful login removed one; every login refused by the rate limit
+wrote an audit line at no Argon2 cost, and audit.log rotated only at startup. One unauthenticated
+client could push the default LXC (512 MB RAM, 4 GB disk) to an out-of-memory restart, which
+drops every relayed stream, in hours from one IPv4 address and minutes with address rotation; a
+full disk stops state.json writes.
+
+Fix (`internal/gateway/ratelimit.go`, `api.go`, `audit.go`):
+- The lockout key holds at most 64 bytes of the name (the longest valid username). Unknown names
+  still get lockouts, so a lockout does not reveal which names exist.
+- Lockout keys that are not locked are forgotten 24 h after their last failure (long past the
+  1 h longest lock, so waiting out a lock does not reset the back-off), and at most 10,000 keys
+  are kept: a new key in a full map first forgets every key that is not locked, and is not
+  recorded if the map is still full of locked keys (the per-client rate limit still applies).
+- `login_ratelimited` is audited at most once per client (IPv4 address or IPv6 /64) a minute.
+- audit.log moves to audit.log.1 past 20 MB while the gateway runs too.
+
+- Verified here: `internal/gateway` `TestFailedLoginsBounded` (a 60,000-byte name leaves a short
+  key; 120 logins from one address in a second leave one `login_ratelimited` entry) fails on the
+  old code (60,013-byte key, 60 entries); `TestLockoutBounded` (forgetting, the cap, locked keys
+  kept); `TestAuditRotates`. `go test -race`.
+- Gateway check (not GPU-specific, no AMD or NVIDIA step): none needed beyond the unit tests; on
+  a running gateway, `curl -k -X POST -H 'X-Recon-CSRF: public' -H 'Origin: https://<name>:8443'
+  -H 'Content-Type: application/json' -d '{"username":"x","password":"y"}'
+  https://<name>:8443/api/login` 20 times in a row: the audit log has one `login_ratelimited`
+  line, not 15.
+
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
 Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can

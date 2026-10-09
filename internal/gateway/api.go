@@ -85,7 +85,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !auth.EqualHash(strings.TrimSpace(req.SetupToken), s.setupTok) {
-		s.audit.Log("setup_failed", req.Username, ip, "bad setup token")
+		s.audit.Log("setup_failed", trunc(req.Username, 64), ip, "bad setup token")
 		jsonError(w, http.StatusForbidden, "invalid setup token (see the gateway log or setup-token.txt in its data directory)")
 		return
 	}
@@ -122,7 +122,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := s.clientIP(r)
 	if !s.loginIP.Allow(rateKey(ip)) {
-		s.audit.Log("login_ratelimited", "", ip, "")
+		if s.limitLog.Allow(rateKey(ip)) { // costs nothing to send: one entry per client a minute
+			s.audit.Log("login_ratelimited", "", ip, "")
+		}
 		jsonError(w, http.StatusTooManyRequests, "too many attempts, wait a minute")
 		return
 	}
@@ -134,7 +136,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	lockKey := req.Username + "|" + rateKey(ip) // per user+client, so a remote attacker cannot lock the owner out
+	// Per user+client, so a remote attacker cannot lock the owner out. The
+	// name is cut to the longest a user can have (usernameRe): the body may
+	// carry 64 KiB of it, and every failed login keeps its key for a while.
+	lockKey := trunc(req.Username, 64) + "|" + rateKey(ip)
 	if locked, d := s.lockouts.Locked(lockKey); locked {
 		jsonError(w, http.StatusTooManyRequests, fmt.Sprintf("account temporarily locked, try again in %s", d.Round(time.Second)))
 		return

@@ -36,7 +36,9 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **Brute force:** per-client token bucket (10/min) plus exponential lockout per user+client
   after 5 failures (1 min, doubling up to 1 h). A client is an IPv4 address or an IPv6 /64 (one
   subscriber's block: a home or a VPS has more addresses than anyone could try from). Keying on
-  user+client stops attackers from locking you out.
+  user+client stops attackers from locking you out. What failed logins leave behind is bounded:
+  a lockout key holds at most 64 bytes of the name, keys that are not locked are forgotten a day
+  after their last failure, and at most 10,000 are kept (past that, the ones not locked go first).
   Behind a reverse proxy or tunnel (Cloudflare Tunnel, Nginx) that holds only while the gateway
   trusts the proxy's `X-Forwarded-For` (`-trust-proxy` / `RECON_TRUST_PROXY`): otherwise every
   request comes from the proxy's IP, all clients share one bucket and one lockout per user. An
@@ -172,7 +174,9 @@ capabilities dropped.
 
 `audit.log` (JSON lines, 0600) records setup, logins and failures, 2FA changes, password changes,
 host add/remove/re-pair/online/auth failures, Wake-on-LAN, and stream start/end with duration.
-Admins can view it in the UI.
+Admins can view it in the UI. Past 20 MB it moves to `audit.log.1` (replacing the one before) and
+starts again, also while the gateway runs, so it takes at most 40 MB of disk; logins refused by
+the rate limit are logged once per client a minute (`login_ratelimited`).
 
 ## Known limitations
 

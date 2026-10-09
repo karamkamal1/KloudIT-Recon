@@ -75,17 +75,28 @@ func (l *limiter) Allow(key string) bool {
 }
 
 // lockout tracks consecutive failures per account with exponential back-off.
+// Its keys come from unauthenticated requests, so the map is bounded: a key
+// that is not locked and has seen no failure for lockoutForget is forgotten,
+// and at most max keys are kept.
 type lockout struct {
 	mu    sync.Mutex
 	fails map[string]*failState
+	max   int
+	swept time.Time
 }
 
 type failState struct {
 	count int
 	until time.Time
+	last  time.Time // the latest failure
 }
 
-func newLockout() *lockout { return &lockout{fails: map[string]*failState{}} }
+// lockoutForget is how long a key that is not locked keeps its failure count
+// after its latest failure (well past the 1 h longest lock, so waiting out a
+// lock does not reset the back-off).
+const lockoutForget = 24 * time.Hour
+
+func newLockout() *lockout { return &lockout{fails: map[string]*failState{}, max: 10000} }
 
 // Locked reports whether key is currently locked and for how long.
 func (l *lockout) Locked(key string) (bool, time.Duration) {
@@ -101,23 +112,47 @@ func (l *lockout) Locked(key string) (bool, time.Duration) {
 	return false, 0
 }
 
+// sweep forgets the keys that are not locked and have had no failure for
+// lockoutForget, or, with all, every key that is not locked.
+func (l *lockout) sweep(now time.Time, all bool) {
+	for k, f := range l.fails {
+		if now.After(f.until) && (all || now.Sub(f.last) > lockoutForget) {
+			delete(l.fails, k)
+		}
+	}
+	l.swept = now
+}
+
 // Fail records a failure; after 5 failures the account locks for 1 minute,
 // doubling up to 1 hour. It returns how long the key is now locked (0: not).
+// A new key that finds the map full of locked keys is not recorded: the
+// per-client rate limit still applies to it.
 func (l *lockout) Fail(key string) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := time.Now()
+	if now.Sub(l.swept) > 10*time.Minute {
+		l.sweep(now, false)
+	}
 	f := l.fails[key]
 	if f == nil {
+		if len(l.fails) >= l.max {
+			l.sweep(now, true)
+			if len(l.fails) >= l.max {
+				return 0
+			}
+		}
 		f = &failState{}
 		l.fails[key] = f
 	}
 	f.count++
+	f.last = now
 	if f.count >= 5 {
 		d := time.Minute << uint(min(f.count-5, 6))
 		if d > time.Hour {
 			d = time.Hour
 		}
-		f.until = time.Now().Add(d)
+		f.until = now.Add(d)
 		return d
 	}
 	return 0
