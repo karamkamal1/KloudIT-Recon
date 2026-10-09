@@ -85,7 +85,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
-   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard). With
+   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard, the
+   settings after a failed connection, a saved codec another PC does not offer). With
    `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
@@ -139,7 +140,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
    itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
    review: deploy and install", the UDP relay naming an IP mismatch, and "Final review:
-   security", `-trust-proxy` behind a reverse proxy or tunnel.
+   security", `-trust-proxy` behind a reverse proxy or tunnel. "Final review: browser client":
+   the direct path and the UDP relay over IPv6 (the page's CSP).
 12. **Security**: "Final review: security": UDP relay ports released when a session ends, the
    login page's redirect, and FFmpeg and its libraries only from places administrators control
    (a `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored).
@@ -10466,8 +10468,9 @@ back. Each field's label names its control (`for`/`id`; the slider of a range ro
   reached the host, Escape left the drawer open, and all 21 controls were unnamed.
 - Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client: stream, press
   Ctrl+Alt+Shift+O, change Bitrate with Tab and the arrow keys, Escape; then with Narrator
-  (Win+Ctrl+Enter) on, Tab through the drawer: each control is read with its name ("Codec,
-  combo box", "Bitrate, slider").
+  (Win+Ctrl+Enter) on, Tab through the drawer: each control is read with its name ("Video codec,
+  combo box", "Bitrate, slider"; the names and groups of "The settings drawer's sections, names
+  and hints for screen readers" below).
 
 ### Long text through "Type text on the host"
 
@@ -10642,6 +10645,171 @@ the same host (Connect or Wake, Manage, Add a PC).
   idle, and 18 % with these changes).
 - `go test ./internal/e2e/` (under the lock), `go test -race ./internal/host/ ./internal/proto/
   ./internal/gateway/`, `go vet` for linux and windows: pass.
+
+### Stream settings after a failed connection
+
+Problem: the stream settings drawer got its controls only from a connection that came up (the
+host's welcome), the splash (z-index 40) covered the toolbar's Settings button, the splash had
+only Start/Reconnect and "Back to machines", and the settings hotkey worked only while
+streaming. A saved setting that makes every connection fail therefore locked the browser out
+until its site data was cleared by hand: Network path *Direct to PC only* away from the PC's
+network or with its UDP port blocked ("direct failed: WebTransport direct timed out", six
+retries, then Disconnected with a Reconnect that repeated it), in Safari (no WebTransport) at
+once with "no transport available", and *Direct to PC only* with Transport *WebSocket only*,
+which can never connect.
+
+Fix: the drawer is built at boot from the saved settings and the browser's capabilities (the
+codecs this browser decodes; the PC's codecs, frame rates and displays are added when its
+welcome arrives) and sits above the splash. The splash has a Settings button once the drawer is
+built, and Ctrl+Alt+Shift+O opens the drawer on the splash too; closing it gives the focus back
+to that button. A failed connection under *Direct to PC only* also shows "Use Network path
+Auto" on the splash (saves Auto and connects). The drawer has "Reset to defaults" (every
+setting back to its default and saved; the overlay's visibility stays; what applies live
+applies at once), and its Reconnect reads Connect before the first connection. *Direct to PC
+only* is not offered with Transport *WebSocket only* or in a browser without WebTransport (nor
+WebSocket only with Direct); a saved pair from before reads as Network path Auto. When the
+settings leave nothing to try, the splash says why ("Network path "Direct to PC only" needs
+WebTransport, which this browser does not have: choose Auto (Settings → Pipeline → Network
+path)"; also for no direct path offered by the PC) instead of "no transport available", and a
+reason that the browser or the settings rule out is not retried six times. A newer connect
+(Reconnect, Network path Auto) cancels a pending automatic retry and any earlier connect still
+waiting for its endpoints.
+
+- Verified here: browser E2E scenario "settings after a failed connection" (`E2E_ONLY='settings
+  after a failed connection'`): saved *Direct to PC only* with the connect response's direct URL
+  pointing at a port whose datagrams are dropped: the splash says "WebTransport direct timed
+  out" and shows Settings and Use Network path Auto; the button opens the drawer (25 controls,
+  Network path *Direct to PC only*) above the splash (the element in the drawer's middle is the
+  drawer's) with the focus in it, Escape closes it and the hotkey opens it again; Reset to
+  defaults saves path Auto, bitrate 30, pacing Lowest latency, and the next automatic attempt
+  streams over the UDP relay. Then with no direct path in the connect response: the splash
+  names *Direct to PC only* and "no direct path", and Use Network path Auto saves Auto and
+  streams over the relay. Against the old client (same test, old `web/static` through
+  `RECON_WEB_DIR`): no Settings or Network path Auto button, the drawer empty (0 controls) and
+  closed after the click and the hotkey, the saved settings unchanged, no stream; the second
+  part said "no transport available" and kept retrying. The scenarios that use the drawer or
+  the splash ran with it (`E2E_ONLY='drawer keyboard|udp relay reconnects|udp relay host
+  blocked|takeover|settings after a failed connection'`): all pass. One earlier run of that set
+  had Chromium's renderer crash ("Page crashed") at the first drawer Reconnect of "UDP relay
+  reconnects", failing the scenarios after it; three runs since (that scenario alone, with
+  "udp relay host blocked", the whole set) did not.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client (Chrome) away from the
+  PC's network (a phone hotspot) or with the PC's direct UDP port blocked in Windows Firewall:
+  Settings → Pipeline → Network path *Direct to PC only*, Reconnect. "Could not connect" shows
+  Settings and Use Network path Auto; Settings (and Ctrl+Alt+Shift+O) opens the drawer above
+  the splash; Reset to defaults, close it: the next retry streams over the relay (overlay:
+  Transport … relay). Repeat with *Direct to PC only* and Use Network path Auto on the splash.
+  In Safari: *Direct to PC only* is greyed out in the drawer.
+
+### Saved settings this PC or browser does not offer
+
+Problem: saved settings are per browser, not per PC, but when a saved value was not among a
+drawer select's options (a codec the PC does not encode or the browser does not decode, a frame
+rate above the PC's `maxFps`, a display index the PC does not have) the select showed its first
+option while the saved value kept going to the host. The user saw "Auto (best available)" or
+"30 fps" and got something else; for the codec the host warned "Codec hevc is not available
+end-to-end; choosing automatically." at every session start, and picking the Auto the select
+already showed did nothing (a select fires no change for the value it shows), so the warning
+could only be cleared by picking another codec and then Auto again.
+
+Fix: a saved value the options do not hold is shown as the selected option, disabled (it cannot
+be picked again), and labelled with what is used instead: "HEVC / H.265 · this browser does not
+decode it: Auto is used" (or "this PC does not encode it"), "120 fps · this PC streams at most
+60 fps", "Display 3 · not on this PC: the first display is used". Picking any other option saves
+it. The host is asked for Auto instead of a codec family this browser cannot decode, or that the
+PC's welcome of an earlier connection of the page lists no encoder for (the host would choose
+automatically anyway): the warning comes at most once per page. The saved setting itself stays,
+for the PCs that have the codec. The page also writes the host's notices to the console log
+(`[recon] notice: …`), as a toast goes in seconds.
+
+- Verified here: browser E2E scenario "settings not offered here" (`E2E_ONLY='settings not
+  offered here'`; the host restarted with `"maxFps": 60`, saved HEVC and 120 fps; the test host
+  has no HEVC encoder): headless Chromium decodes no HEVC, so the codec select reads "HEVC / H.265
+  · this browser does not decode it: Auto is used" (disabled), Frame rate "120 fps · this PC
+  streams at most 60 fps", and no warning comes. With the page's capabilities saying HEVC decodes
+  (in software): "… this PC does not encode it: Auto is used", one warning in the first session
+  (the welcome not yet known), none in the page's next session (the drawer's Reconnect); picking
+  Auto and 60 fps saves them. Against the old client: the selects read "Auto (best available)"
+  and "30 fps", and the warning came in every session (1, 1, 1).
+- Not GPU-specific (no AMD or NVIDIA step). Test on any client: Settings → Codec *AV1* while
+  streaming from the RX 7900 XT PC, then connect from the same browser to a PC without an AV1
+  encoder (an RX 6000 or GTX 10-series GPU): the codec select reads "AV1 · this PC does not
+  encode it: Auto is used"; after a Reconnect no "Codec av1 is not available end-to-end"
+  warning; picking Auto saves it.
+
+### The settings drawer's sections, names and hints for screen readers
+
+Problem: the drawer's video and audio codec selects had the same accessible name, "Codec", and
+its sections (Video, Input, Audio, Diagnostics, Pipeline) were plain `div`s with a `div` title,
+so a screen reader gave nothing to tell the two apart ("Codec, combo box" twice). The hints
+under the controls (Applies on the next connection, the HDR and FSR requirements, the bitrate
+guidance) were not linked to them, and the section titles (`--dim`, 12 px) had about 3.3:1
+contrast on the drawer, below WCAG AA's 4.5:1.
+
+Fix: the selects are labelled "Video codec" and "Audio codec"; each section is
+`role="group"` named by its title (`aria-labelledby`), which screen readers announce when the
+focus enters it; each hint describes its control (`aria-describedby`, read after the name; the
+latency probe's hint now belongs to its checkbox); the section titles use `--muted` (6.5:1).
+
+- Verified here: browser E2E scenario "drawer keyboard" (`E2E_ONLY='drawer keyboard'`), its
+  checks "every select and slider is named by its label, the video and audio codec apart"
+  (Playwright finds Video codec, Audio codec, Renderer, Upscaling, Decoder and HDR once each by
+  role and name) and "its sections are groups named by their titles, each hint describes its
+  control, the titles at AA contrast" (the five groups by role and name; 14 of 14 hints each
+  describe one control, Bitrate's "LAN: 50–150 Mbps…"; titles 6.5:1 from the computed colours).
+  Against the old client: no combobox named Video codec or Audio codec, no group, 0 of 14 hints
+  linked, 3.3:1.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client with Narrator
+  (Win+Ctrl+Enter): open the drawer (Ctrl+Alt+Shift+O) and Tab through it: entering a section
+  reads its name ("Video, group"), the codec selects read "Video codec, combo box" and "Audio
+  codec, combo box", and Bitrate is followed by its hint ("LAN: 50–150 Mbps…").
+
+### The direct path and the UDP relay over IPv6 (the page's CSP)
+
+Problem: the page's CSP lists each PC's direct endpoint and the UDP relay ports as host-sources
+built with `net.JoinHostPort`, so an IPv6 address became `https://[2001:db8::5]:48100`. CSP's
+host-source grammar has no IPv6 literals: Chrome drops such a source ("The source list for the
+Content Security Policy directive 'connect-src' contains an invalid source … It will be
+ignored.") and refuses the WebTransport ("violates the document's Content Security Policy").
+When the agent's tunnel reaches the gateway over IPv6 (a pairing code made while the gateway was
+browsed at an IPv6 address, a gateway name with only an AAAA record), every stream silently took
+a relay while the dashboard showed the direct path; a page opened at an IPv6 address lost the
+UDP relay and fell back to the splice.
+
+Fix: an IPv6 host is written as the wildcard host on its port, `https://*:48100` (any host,
+that port only), for the direct endpoints and for the relay ports of a page opened at an IPv6
+address; with more than 32 relay ports such a page gets `https://*:*` (for a name the gateway
+already allowed any port on it). IPv4 addresses and names stay exact, and duplicate sources are
+listed once. The direct URL handed to the browser is unchanged.
+
+- Verified here: `go test ./internal/gateway/ -run TestCSPConnectSources` (pages at
+  `[fd00::1]:8443`, `gw.lan:8443` and `192.0.2.1`, PCs with an IPv6 tunnel address, an advertised
+  IPv6 address, an IPv4 address and a name: every connect-src source matches CSP's host-source
+  grammar, the expected sources; 40 relay ports at an IPv6 address give `https://*:*`). Against
+  the old code it fails with the bracketed sources. In the sandbox's Playwright Chromium (a page
+  with that CSP, `new WebTransport(...)`, nothing listening): `https://[::1]:48100` is reported
+  invalid and the connection refused by the CSP; with `https://*:48100` the CSP lets
+  `https://[::1]:48100/wt` and `https://127.0.0.1:48100/wt` through (the handshake then fails, as
+  nothing listens) and still refuses `https://[::1]:48101/wt`. The browser E2E scenarios
+  "WebTransport direct" and "WebTransport relay" (IPv4 here: their sources are unchanged) and
+  "strict CSP served" pass with the rebuilt gateway.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the target setup with IPv6 between PC and
+  gateway: pair the PC with a code made while the dashboard was opened at the gateway's IPv6
+  address (`https://[fd..]:8443`), or give the gateway a name with only an AAAA record; stream
+  from a Chrome client on the LAN: the overlay's Transport row reads `webtransport · direct`, and
+  the DevTools console has no "invalid source" or "violates the document's Content Security
+  Policy" line. Then open the dashboard at the gateway's IPv6 address with Network path *Relay
+  via gateway*: Transport reads `webtransport · relay` (the UDP relay), not `relay-splice`.
+
+### Runs with these four changes (settings after a failed connection to the CSP over IPv6)
+
+- The runs above predate them. Browser E2E filtered to the scenarios they touch, under the
+  shared lock, with the rebuilt gateway and agent (`E2E_ONLY='^WebTransport direct$|^WebTransport
+  relay$|settings after a failed connection|settings not offered here|drawer keyboard'`): 70
+  checks passed, 0 failed; also "udp relay reconnects", "udp relay host blocked" and "takeover"
+  (see the first item). The whole suite is left to the end of the final review.
+- `go test -race ./internal/gateway/`, `go vet ./...` for linux and windows, `gofmt -l`, `node
+  --check` on the changed scripts: pass.
 
 ## Final review: host agent, second round
 

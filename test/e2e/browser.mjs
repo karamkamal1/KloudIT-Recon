@@ -2498,7 +2498,10 @@ async function checkControlBeforeHello() {
 // PC), Tab and Shift+Tab move within it and wrap, Escape closes it and gives
 // the stage focus back; no Tab or Escape reaches the host meanwhile. Every
 // select and slider in it has a name from its label (the accessible name
-// screen readers announce).
+// screen readers announce), the video and audio codec selects distinct ones
+// (both were "Codec"); its sections are groups named by their titles, each
+// hint describes its control (aria-describedby: read after the name), and
+// the section titles have WCAG AA contrast (4.5:1) on the drawer.
 async function checkDrawerKeyboard() {
   await startStream({ path: 'auto', transport: 'auto' });
   try {
@@ -2525,8 +2528,28 @@ async function checkDrawerKeyboard() {
     const names = await page.evaluate(() => [...document.querySelectorAll('#drawer select, #drawer input[type=range]')]
       .map((c) => ({ kind: c.tagName === 'SELECT' ? 'combobox' : 'slider', name: [...(c.labels || [])].map((l) => l.textContent.trim()).join(' ') })));
     const unnamed = names.filter((n) => !n.name);
-    const byRole = await Promise.all(['Codec', 'Renderer', 'Upscaling', 'Decoder', 'HDR'].map((n) => page.getByRole('combobox', { name: n, exact: true }).count()));
+    const comboNames = ['Video codec', 'Audio codec', 'Renderer', 'Upscaling', 'Decoder', 'HDR'];
+    const byRole = await Promise.all(comboNames.map((n) => page.getByRole('combobox', { name: n, exact: true }).count()));
     const sliders = await Promise.all(['Bitrate', 'Volume', 'FSR sharpness'].map((n) => page.getByRole('slider', { name: n, exact: true }).count()));
+    const groupNames = ['Video', 'Input', 'Audio', 'Diagnostics', 'Pipeline'];
+    const groups = await Promise.all(groupNames.map((n) => page.getByRole('group', { name: n, exact: true }).count()));
+    // Each hint and the controls it describes; the section titles' contrast
+    // (the drawer's background over the black stage).
+    const desc = await page.evaluate(() => {
+      const hints = [...document.querySelectorAll('#drawer .hint')];
+      const linked = hints.filter((h) => h.id && document.querySelectorAll(`#drawer [aria-describedby~="${h.id}"]`).length === 1);
+      const rgba = (c) => (c.match(/[\d.]+/g) || []).map(Number);
+      const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+      const lum = ([r, g, b]) => 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+      const [br, bg, bb, ba = 1] = rgba(getComputedStyle(document.getElementById('drawer')).backgroundColor);
+      const back = lum([br * ba, bg * ba, bb * ba]);
+      const ratios = [...document.querySelectorAll('#drawer .gtitle')].map((t) => {
+        const f = lum(rgba(getComputedStyle(t).color));
+        return (Math.max(f, back) + 0.05) / (Math.min(f, back) + 0.05);
+      });
+      const bitrate = [...document.querySelectorAll('#drawer input[type=range]')].find((x) => x.labels?.[0]?.textContent === 'Bitrate');
+      return { hints: hints.length, linked: linked.length, contrast: Math.min(...ratios), bitrate: document.getElementById(bitrate?.getAttribute('aria-describedby') || '-')?.textContent.slice(0, 20) || '' };
+    });
     await page.keyboard.press('Escape');
     const closed = await where();
     await sleep(500);
@@ -2538,10 +2561,14 @@ async function checkDrawerKeyboard() {
       opened.open && opened.inDrawer && tabbed.inDrawer && wrapped.inDrawer && last && !closed.open && closed.id === 'stage' && keys.length === 0,
       `opened: focus on ${opened.tag} "${opened.text}"; after 2 Tabs: ${tabbed.tag} "${tabbed.text}"; Shift+Tab from the first: ${wrapped.tag} "${wrapped.text}" (last: ${last}); ` +
         `Escape: drawer ${closed.open ? 'open' : 'closed'}, focus on #${closed.id || closed.tag}; Tab/Escape presses on the host: ${keys.length}`);
-    check('settings drawer: every select and slider is named by its label',
-      names.length >= 15 && unnamed.length === 0 && byRole[0] === 2 && byRole.slice(1).every((c) => c === 1) && sliders.every((c) => c === 1),
-      `${names.length} controls, ${unnamed.length} unnamed${unnamed.length ? ` (${unnamed.map((n) => n.kind).join(', ')})` : ''}; by role and name: Codec ${byRole[0]} (video, audio), ` +
-        `Renderer ${byRole[1]}, Upscaling ${byRole[2]}, Decoder ${byRole[3]}, HDR ${byRole[4]}, sliders Bitrate/Volume/FSR sharpness ${sliders.join('/')}`);
+    check('settings drawer: every select and slider is named by its label, the video and audio codec apart',
+      names.length >= 15 && unnamed.length === 0 && byRole.every((c) => c === 1) && sliders.every((c) => c === 1),
+      `${names.length} controls, ${unnamed.length} unnamed${unnamed.length ? ` (${unnamed.map((n) => n.kind).join(', ')})` : ''}; by role and name: ` +
+        `${comboNames.map((n, i) => `${n} ${byRole[i]}`).join(', ')}, sliders Bitrate/Volume/FSR sharpness ${sliders.join('/')}`);
+    check('settings drawer: its sections are groups named by their titles, each hint describes its control, the titles at AA contrast',
+      groups.every((c) => c === 1) && desc.hints >= 10 && desc.linked === desc.hints && desc.bitrate.startsWith('LAN') && desc.contrast >= 4.5,
+      `groups by role and name: ${groupNames.map((n, i) => `${n} ${groups[i]}`).join(', ')}; ${desc.linked} of ${desc.hints} hints describe one control (Bitrate: "${desc.bitrate}…"); ` +
+        `section titles ${desc.contrast.toFixed(1)}:1`);
   } finally {
     await endStream();
   }
@@ -2659,6 +2686,180 @@ async function checkPasteDialog() {
       `${new TextEncoder().encode(text).length} bytes: ${typed}, in ${pieces.length} messages (largest ${Math.max(0, ...bytes)} bytes); a key after it ${keyAfter ? 'reached' : 'did NOT reach'} the host`);
   } finally {
     await endStream();
+  }
+}
+
+// Settings after a failed connection (final review). A saved Network path
+// "Direct to PC only" whose direct path does not answer (the connect
+// response's direct URL names the port whose datagrams a socket swallows, as
+// away from the PC's network or with its UDP port blocked: the CSP allows it,
+// a relay port) fails every attempt. Before, the browser was
+// locked out until its site data was cleared: the drawer got its controls
+// only from a connection that came up, the splash covered the toolbar and
+// offered no way to them, and the hotkey worked only while streaming. Now on
+// the "Could not connect" splash its Settings button opens the drawer above
+// the splash with the focus in it (the hotkey toggles it too), Reset to
+// defaults puts every setting back, saved too, and the next attempt streams
+// over a relay. Then, with no direct path in the connect response at all,
+// the splash names the setting that leaves nothing to try and offers Network
+// path Auto, which is saved and streams.
+async function checkSettingsAfterFailedConnect() {
+  let mode = 'blocked';
+  const rewrite = async (route) => {
+    const r = await route.fetch();
+    const body = await r.json();
+    if (mode === 'none') delete body.direct;
+    else if (body.direct) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+    await route.fulfill({ response: r, json: body });
+  };
+  await ctx.route('**/api/hosts/*/connect', rewrite);
+  const failed = () => page.waitForFunction(() => /Could not connect|Disconnected/.test(document.getElementById('splash-title')?.textContent), null, { timeout: 30000 });
+  const splashState = () => page.evaluate(() => {
+    const shown = (id) => { const e = document.getElementById(id); return !!e && !e.classList.contains('hidden') && e.getClientRects().length > 0; };
+    return { text: `${document.getElementById('splash-title').textContent} / ${document.getElementById('splash-sub').textContent}`, settings: shown('btn-splash-settings'), auto: shown('btn-path-auto') };
+  });
+  // The drawer: open, the element in its middle is its own (above the
+  // splash), the focus in it, its Network path select's value.
+  const drawerState = () => page.evaluate(() => {
+    const d = document.getElementById('drawer');
+    const r = d.getBoundingClientRect();
+    const mid = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    const path = [...d.querySelectorAll('select')].find((s) => [...s.options].some((o) => o.value === 'direct'));
+    return { open: d.classList.contains('open'), onTop: !!mid?.closest('#drawer'), focus: !!document.activeElement?.closest('#drawer'), controls: d.querySelectorAll('select, input').length, path: path?.value ?? null };
+  });
+  const saved = () => page.evaluate(() => JSON.parse(localStorage.getItem('recon.prefs.v1') || '{}'));
+  try {
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { ...PREFS_2D, path: 'direct', transport: 'auto', bitrate: 12, pacing: 'smooth' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.click('#btn-start');
+    await failed();
+    const first = await splashState();
+    await page.click('#btn-splash-settings', { timeout: 3000 }).catch(() => {});
+    await sleep(400); // (the drawer slides in)
+    const opened = await drawerState();
+    await page.keyboard.press('Escape');
+    await sleep(400);
+    const escaped = await drawerState();
+    await page.keyboard.press('Control+Alt+Shift+KeyO');
+    await sleep(400);
+    const hotkey = await drawerState();
+    await page.evaluate(() => [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Reset to defaults'))?.click());
+    const reset = { prefs: await saved(), drawer: await drawerState() };
+    // The 2D canvas for the stream that follows (the default, Auto, would
+    // measure every renderer), chosen in the same drawer.
+    await page.evaluate(() => {
+      const s = [...document.querySelectorAll('#drawer select')].find((x) => [...x.options].some((o) => o.value === 'canvas2d'));
+      if (s) { s.value = 'canvas2d'; s.dispatchEvent(new Event('change')); }
+    });
+    await page.keyboard.press('Escape');
+    const streamed = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 45000 }).then(() => true, () => false);
+    const path1 = await page.evaluate(() => window.__recon.conn?.path);
+    check('settings after a failed connection: the splash offers the settings (button and hotkey), the drawer opens above it with the focus inside, Reset to defaults saves the defaults and the next attempt streams over a relay',
+      /Could not connect|Disconnected/.test(first.text) && first.settings && first.auto && opened.open && opened.onTop && opened.focus && opened.controls >= 15 && opened.path === 'direct' &&
+        !escaped.open && hotkey.open && hotkey.focus && reset.prefs.path === 'auto' && reset.prefs.bitrate === 30 && reset.prefs.pacing === 'latency' && reset.drawer.path === 'auto' &&
+        streamed && path1 !== 'direct',
+      `splash: "${first.text.slice(0, 120)}", Settings ${first.settings ? 'shown' : 'missing'}, Network path Auto ${first.auto ? 'shown' : 'missing'}; drawer from the button: ${JSON.stringify(opened)}; ` +
+        `Escape: ${escaped.open ? 'still open' : 'closed'}; hotkey: ${hotkey.open ? 'open' : 'closed'}, focus ${hotkey.focus ? 'inside' : 'outside'}; after Reset: saved path ${reset.prefs.path}, bitrate ${reset.prefs.bitrate}, pacing ${reset.prefs.pacing}, select ${reset.drawer.path}; ` +
+        `then ${streamed ? `streaming over ${path1}` : 'no stream'}`);
+    await endStream();
+
+    // No direct path at all: the reason names the setting, Network path Auto from the splash.
+    mode = 'none';
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { ...PREFS_2D, path: 'direct', transport: 'auto' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.click('#btn-start');
+    await failed();
+    const second = await splashState();
+    await page.click('#btn-path-auto', { timeout: 3000 }).catch(() => {});
+    const streamed2 = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 30000 }).then(() => true, () => false);
+    const path2 = await page.evaluate(() => window.__recon.conn?.path);
+    const after = await saved();
+    check('settings after a failed connection: with no direct path the splash names Network path "Direct to PC only", and its Use Network path Auto saves Auto and streams',
+      /Direct to PC only/.test(second.text) && /no direct path/.test(second.text) && second.auto && second.settings && streamed2 && path2 !== 'direct' && after.path === 'auto',
+      `splash: "${second.text.slice(0, 160)}", Network path Auto ${second.auto ? 'shown' : 'missing'}; then ${streamed2 ? `streaming over ${path2}` : 'no stream'}, saved path ${after.path}`);
+  } finally {
+    await ctx.unroute('**/api/hosts/*/connect', rewrite);
+    await endStream();
+  }
+}
+
+// A saved setting this PC or browser does not offer (final review). Saved
+// settings are per browser, not per PC: here HEVC (the test host has no
+// HEVC encoder) and 120 fps on a host whose maxFps is 60. The drawer's
+// select showed its first option (Auto, 30 fps) while the saved value went
+// on to the host, so the host's "Codec hevc is not available end-to-end"
+// warning came at every session start, and picking the Auto it showed fired
+// no change. Now each select shows the saved value, disabled, labelled with
+// what is used instead, and the host is asked for Auto where this browser
+// decodes no HEVC (headless Chromium here: no warning at all) or the PC's
+// welcome of an earlier connection of the page lists no HEVC encoder (the
+// page then plays a browser that decodes HEVC: one warning, none in the
+// next session); picking Auto and 60 fps saves them.
+async function checkUnavailableSettings() {
+  await withHostConfig({ maxFps: 60 }, () => restartHost({}, 'host-maxfps-60'));
+  // The warnings of a session: in the console (this client logs notices) or
+  // on the screen (a toast lasts 6 s; an older client logs none).
+  const notices = async (from) => Math.max(consoleLines.slice(from).filter((l) => l.includes('not available end-to-end')).length,
+    await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].filter((t) => t.textContent.includes('not available end-to-end')).length));
+  // The video codec and frame rate selects (by their labels), tagged for selectOption.
+  const shown = () => page.evaluate(() => {
+    const sel = (re, tag) => {
+      const s = [...document.querySelectorAll('#drawer label')].find((l) => re.test(l.textContent.trim()))?.parentElement.querySelector('select');
+      if (!s) return null;
+      s.dataset.e2e = tag;
+      const o = s.options[s.selectedIndex];
+      return { value: s.value, text: o?.textContent || '', disabled: !!o?.disabled };
+    };
+    return { codec: sel(/^(video )?codec$/i, 'codec'), fps: sel(/^frame rate$/i, 'fps') };
+  });
+  // A stream with the saved HEVC and 120 fps; fakeHevc: the page's
+  // capabilities say this browser decodes HEVC (in software).
+  const stream = async (fakeHevc) => {
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, ...PREFS_2D, path: 'auto', transport: 'auto', codec: 'hevc', fps: 120 });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    const real = await page.evaluate((fake) => { const v = window.__caps.codecs.hevc; if (fake) window.__caps.codecs.hevc ||= 'sw'; return v || null; }, fakeHevc);
+    const con = consoleLines.length;
+    await page.click('#btn-start');
+    await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    await sleep(1500); // (the session's first notices)
+    return { real, warnings: await notices(con), shown: await shown() };
+  };
+  try {
+    const a = await stream(false);
+    await endStream();
+    const b = await stream(true);
+    await sleep(6000); // (the first session's toasts go)
+    // A second session in this page (the drawer's Reconnect, which opens the drawer).
+    const con1 = consoleLines.length;
+    await page.evaluate(() => {
+      window.__recon.conn = null;
+      [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Reconnect')).click();
+    });
+    await page.waitForFunction(() => window.__recon.streaming && window.__recon.conn, null, { timeout: 30000 });
+    await sleep(1500);
+    const n2 = await notices(con1);
+    await shown(); // (tags the rebuilt drawer's selects)
+    if (!(await page.evaluate(() => document.getElementById('drawer').classList.contains('open')))) await page.keyboard.press('Control+Alt+Shift+KeyO');
+    await page.selectOption('[data-e2e=codec]', 'auto', { timeout: 5000 }).catch(() => {});
+    await page.selectOption('[data-e2e=fps]', '60', { timeout: 5000 }).catch(() => {});
+    const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('recon.prefs.v1') || '{}'));
+    const sel = (x) => `"${x?.text}" (${x?.value}${x?.disabled ? ', disabled' : ''})`;
+    check('a saved setting this PC or browser does not offer: the select shows it, labelled with what is used instead; the host is asked for Auto once the codec is known missing (no warning); Auto and 60 fps can be picked',
+      (a.real || (a.warnings === 0 && a.shown.codec?.value === 'hevc' && a.shown.codec.disabled && /browser does not decode it: Auto is used/.test(a.shown.codec.text))) &&
+        a.shown.fps?.value === '120' && a.shown.fps.disabled && /at most 60 fps/.test(a.shown.fps.text) &&
+        b.shown.codec?.value === 'hevc' && b.shown.codec.disabled && /PC does not encode it: Auto is used/.test(b.shown.codec.text) && b.warnings === 1 && n2 === 0 &&
+        saved.codec === 'auto' && +saved.fps === 60,
+      `this browser decodes HEVC: ${a.real || 'no'}; codec select ${sel(a.shown.codec)}, frame rate ${sel(a.shown.fps)}, ${a.warnings} "not available end-to-end" warning(s); ` +
+        `as a browser that decodes HEVC: codec select ${sel(b.shown.codec)}, ${b.warnings} warning(s), in the page's next session ${n2}; ` +
+        `after picking Auto and 60 fps: saved codec ${saved.codec}, fps ${saved.fps}`);
+  } finally {
+    await endStream();
+    await restartHost({}, 'host');
   }
 }
 
@@ -4751,6 +4952,8 @@ try {
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
   if (want('paste dialog')) await checkPasteDialog().catch((e) => check('paste dialog scenario', false, e.message));
+  if (want('settings after a failed connection')) await checkSettingsAfterFailedConnect().catch((e) => check('settings after a failed connection scenario', false, e.message));
+  if (want('settings not offered here')) await checkUnavailableSettings().catch((e) => check('settings not offered here scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

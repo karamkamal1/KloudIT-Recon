@@ -96,20 +96,27 @@ func (s *Server) secure(next http.Handler) http.Handler {
 // relay ports (under the name the page was loaded from).
 func (s *Server) csp(r *http.Request) string {
 	connect := []string{"'self'"}
+	seen := map[string]bool{}
+	add := func(src string) {
+		if !seen[src] {
+			seen[src] = true
+			connect = append(connect, src)
+		}
+	}
 	s.hosts.mu.Lock()
 	for _, hc := range s.hosts.hosts {
-		if u := hc.directURL(); u != "" {
-			connect = append(connect, strings.TrimSuffix(u, "/wt"))
+		if addr, port := hc.directEndpoint(); addr != "" {
+			add(cspSource(addr, strconv.Itoa(port)))
 		}
 	}
 	s.hosts.mu.Unlock()
 	if s.relay != nil {
 		host := requestHostname(r)
 		if len(s.relay.ports) > 32 {
-			connect = append(connect, "https://"+net.JoinHostPort(host, "*"))
+			add(cspSource(host, "*"))
 		} else {
 			for _, p := range s.relay.ports {
-				connect = append(connect, "https://"+net.JoinHostPort(host, strconv.Itoa(p)))
+				add(cspSource(host, strconv.Itoa(p)))
 			}
 		}
 	}
@@ -118,18 +125,42 @@ func (s *Server) csp(r *http.Request) string {
 		"frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 }
 
-func (hc *hostConn) directURL() string {
+// cspSource is the connect-src source for https://host:port (port "*": any
+// port). CSP's host-source grammar has no IPv6 literals: browsers drop
+// "https://[::1]:48100" as invalid and refuse the connection (the direct
+// path of an agent whose tunnel reaches the gateway over IPv6, the relay
+// ports of a page opened at an IPv6 address). An IPv6 host gets the wildcard
+// host instead: any host on that port (with port "*", any https endpoint).
+func cspSource(host, port string) string {
+	host = strings.Trim(host, "[]")
+	if strings.Contains(host, ":") {
+		host = "*"
+	}
+	return "https://" + net.JoinHostPort(host, port)
+}
+
+// directEndpoint is the address and port of the host's direct path ("" when
+// it offers none): the address it advertises, else its tunnel's peer address.
+func (hc *hostConn) directEndpoint() (string, int) {
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
 	d := hc.info.Direct
 	if d == nil || d.Port == 0 || len(d.Hashes) == 0 {
-		return ""
+		return "", 0
 	}
 	addr := d.Addr
 	if addr == "" {
 		addr = hc.remoteIP
 	}
-	return "https://" + net.JoinHostPort(addr, strconv.Itoa(d.Port)) + "/wt"
+	return addr, d.Port
+}
+
+func (hc *hostConn) directURL() string {
+	addr, port := hc.directEndpoint()
+	if addr == "" {
+		return ""
+	}
+	return "https://" + net.JoinHostPort(addr, strconv.Itoa(port)) + "/wt"
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

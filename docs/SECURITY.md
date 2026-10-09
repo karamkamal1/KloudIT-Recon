@@ -79,7 +79,9 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **Headers:** a strict CSP (`script-src 'self'`, no inline script or style,
   `frame-ancestors 'none'`, `connect-src` limited to self, the hosts' known direct endpoints and
   the UDP relay ports on the name the page was loaded from; with more than 32 relay ports, any
-  port on that name), COOP/COEP (cross-origin isolation), CORP, `nosniff`,
+  port on that name. CSP cannot name an IPv6 address: a direct endpoint at one, and the relay
+  ports of a page opened at one, are allowed as any host on that port, or any https endpoint
+  with more than 32 relay ports), COOP/COEP (cross-origin isolation), CORP, `nosniff`,
   `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, Permissions-Policy, and HSTS when a
   real certificate is configured.
 - **Input limits:** JSON bodies are capped at 64 KiB with unknown fields rejected; control

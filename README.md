@@ -301,7 +301,7 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 | **M** | Toggle mouse mode: *Desktop* (absolute pointer, local cursor) ↔ *Game* (pointer lock, raw relative input) |
 | **F** | Fullscreen + Keyboard Lock (Esc / Alt+Tab / Win go to the PC; hold Esc to leave) |
 | **S** | Performance overlay (latency breakdown, fps, bitrate, codec, path) |
-| **O** | Settings drawer (it takes the keyboard focus: Tab moves through it, Esc closes it) |
+| **O** | Settings drawer (it takes the keyboard focus: Tab moves through it, Esc closes it); also on the start screen, which has a Settings button too |
 | **V** | Type text on the PC (paste passwords, chat) |
 | **Q** | Disconnect |
 
@@ -321,7 +321,10 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer: *Auto* (default, adapts within
   10–60 ms) or *Fixed* at the size you set.
-- **Network path, transport, renderer and decoder**: these apply on reconnect. Renderer
+- **Network path, transport, renderer and decoder**: these apply on reconnect. Network path
+  *Direct to PC only* has no fallback: where the PC cannot be reached directly every connection
+  fails, and the start screen then offers **Use Network path Auto** and **Settings**; the
+  drawer's **Reset to defaults** puts every setting back. Renderer
   *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for about 10 s on
   the first connection in a browser and remembers its pick for that browser version: a path
   that fails draws, cannot keep the frame rate or holds the page's frames back is out, a
@@ -395,7 +398,7 @@ untouched, so you keep WebTransport and the direct path. Other options:
 | `-name` (`RECON_NAMES`, comma-separated) | auto | Extra certificate names (domain, public IP); the container's IPs and hostname are included too, except a public address the private CA was not made for (name it here: a name the CA does not cover has it made again, and devices need the new `ca.crt`; `docs/SECURITY.md`) |
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
 | `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
-| `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40015,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. The page's CSP lists each port; with more than 32 it allows any port on the gateway's name. `off`: relay only through the QUIC splice on 8443 |
+| `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40015,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. The page's CSP lists each port; with more than 32 it allows any port on the gateway's name (on a page opened at an IPv6 address, which CSP cannot name: each port on any host, or any https endpoint with more than 32). `off`: relay only through the QUIC splice on 8443 |
 | `-trust-proxy` (`RECON_TRUST_PROXY`, comma-separated) | none | Address or CIDR of a reverse proxy whose `X-Forwarded-For` is trusted (an entry that is neither stops the gateway): rate limiting, the audit log and the UDP relay (which accepts a browser only from the IP of its HTTPS request) then see the client's own IP. Needed for the relay whenever a proxy carries the HTTPS while UDP reaches the gateway directly |
 
 On a Linux/LXC install the settings live in `/etc/kloudit-recon/gateway.env` (one
