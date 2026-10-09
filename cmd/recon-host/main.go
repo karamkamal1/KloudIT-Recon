@@ -76,10 +76,7 @@ func main() {
 	}
 	var out io.Writer = os.Stderr
 	if *logPath != "" {
-		if fi, err := os.Stat(*logPath); err == nil && fi.Size() > 20<<20 {
-			_ = os.Rename(*logPath, *logPath+".old")
-		}
-		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		f, err := openLogFile(*logPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "log file:", err)
 			os.Exit(1)

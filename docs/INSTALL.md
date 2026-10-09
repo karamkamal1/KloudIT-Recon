@@ -274,7 +274,8 @@ PC's card then shows **Online**.
 | `recon-host.exe not found next to this script` | The folder is incomplete. Extract the host zip again (step 1). |
 | `winget not found` | Update *App Installer* from the Microsoft Store, or install ViGEmBus from <https://github.com/nefarius/ViGEmBus/releases>. |
 
-The agent writes its log to `%APPDATA%\KlouditRecon\host.log`.
+The agent writes its log to `%APPDATA%\KlouditRecon\host.log`. Past 20 MB it moves it to
+`host.log.old` (replacing the one before) and starts a new one, also while it runs.
 
 ## 8. Play
 

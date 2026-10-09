@@ -667,9 +667,12 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     frames, encoder failures, resume) until the controller raises it or the video settings
     change. "Adaptive bitrate" off in the client: the delay and losses decide nothing.
   - Each `video` config carries the target (`bitrate`) and the setting (`maxBitrate`); the stats
-    overlay shows "target … of … Mbps (backed off)". host.log has every decision
+    overlay shows "target … of … Mbps (backed off)". host.log has the decisions
     (`congestion: lowering bitrate from=… to=… why=delay|loss|client|overflow|decoder`,
-    `bitrate recovery: raising bitrate`) and, every 10 s in `stream stats`, the reports' one-way
+    `bitrate recovery: raising bitrate`; at the default level at most one per 10 s in each
+    direction and every frame-rate step, with `suppressed=N` for the changes in between, which
+    are debug lines, as is `changing the bitrate in the encoder`: where the path carries less
+    than the setting the controller moves every few hundred milliseconds) and, every 10 s in `stream stats`, the reports' one-way
     delay (`report_owd_p50_ms`, `_p95_ms`, `_max_ms`), the continuous target (`kbps_est`), the
     frame rate (`fps_target`), the margin (`queue_margin_ms`) and the loss (`loss_pct`). The
     controller's tests include a millisecond simulation of the whole path (encoder, frame

@@ -25,7 +25,12 @@ NVIDIA host when there is one: each stage needs the ones before it. Use the defa
 unless a stage says otherwise, edit it with the agent stopped or restart the agent afterwards
 (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`), and put
 it back after the stage. `"logLevel": "debug"` adds the debug lines some checks read (`ffmpeg
-args`, `rate report decision`, `congestion: bitrate kept`). Record each result in its check's
+args`, `rate report decision`, `congestion: bitrate kept`), and every change of the rate
+controller: at the default level `congestion: lowering bitrate` and `bitrate recovery: raising
+bitrate` come at most once per 10 s per direction (a frame-rate step always), with `suppressed=N`
+counting the changes in between, and `changing the bitrate in the encoder` only at debug level
+(final review, "Final review: host agent"). Run every check that counts or times rate changes
+with `"logLevel": "debug"`. Record each result in its check's
 line (status legend above), with the driver and Chrome versions. NVIDIA runs the same stages
 with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
 
@@ -1487,7 +1492,8 @@ Hardware checks:
   `./netem.sh status --ct 210` (copy the two step lines with their times: the `15` step and the
   `50` step when capacity returns, T50) and then `./netem.sh clear --ct 210`. In DevTools on the
   stream page run `__recon.logs.filter((l) => /freeze:|congestion/.test(l))`. On the PC run
-  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering bitrate|bitrate recovery|restarting video|starting encoder|stream stats|frames dropped' | Select-Object -Last 120`.
+  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering bitrate|bitrate recovery|restarting video|starting encoder|stream stats|frames dropped' | Select-Object -Last 120`
+  (with `"logLevel": "debug"`: every rate change).
   Pass: (1) at T50 + 60 s the target is at least 17000 kbit/s: the last `bitrate recovery:
   raising bitrate ... to=` (or `stream stats ... kbps_target=`) at or before that time, also the
   overlay's `target` row; (2) every raise is `to` ≤ 1.15 × `from`, at least 10 s after the
@@ -3487,7 +3493,8 @@ What changed:
   encodeDone → written time the host's pacer explains; `rateFeedback` turns reports (or acks)
   into differences, the delay less that share, and the media congestion controller's lost /
   acknowledged packets and bytes. host.log: every change (`congestion: lowering bitrate ...
-  why=delay|loss|client|overflow|decoder urgent=...`, `bitrate recovery: raising bitrate`), at
+  why=delay|loss|client|overflow|decoder urgent=...`, `bitrate recovery: raising bitrate`; since
+  the final review, at the default level at most one per 10 s per direction), at
   debug level the report each delay or loss decision was made on (`rate report decision qd_ms=
   owd_ms= pending_ms= interval_ms= deferred=`), and in `stream stats` `report_owd_p50_ms`,
   `_p95_ms`, `_max_ms`, `kbps_est`, `fps_target`, `queue_margin_ms`, `loss_pct`.
@@ -3740,7 +3747,7 @@ Hardware checks:
   Bitrate 30 Mbps, constant motion. On the Proxmox node run
   `./netem.sh apply capdrop --ct 210 --host CLIENT_IP`, wait 70 s, `./netem.sh status --ct 210`
   (note T15 and T50, the times of the 15 and 50 Mbit/s steps), `./netem.sh clear --ct 210`. On the
-  PC: `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|frame queue overflow|stream stats' | Select-Object -Last 80`.
+  PC (with `"logLevel": "debug"`, which logs every rate change): `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|frame queue overflow|stream stats' | Select-Object -Last 80`.
   Pass: no `frames dropped why="queue overflow"` (if there is one, record the `frame queue
   overflow` line before it: an `encode_done_span_ms` far under 100 for its 7 frames at 60 fps
   means the encoder delivered them in a burst); `report_owd_p95_ms` of the `stream stats` lines
@@ -3754,12 +3761,13 @@ Hardware checks:
   target back in 5–9 s, as in the namespace run with libx264).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (wifi / wan, no false back-off): same stream at
   20 Mbps, `./netem.sh apply wifi --ct 210 --host CLIENT_IP` for 10 minutes, then `wan`. Pass:
-  at most one `congestion: lowering bitrate` per minute (`why=delay` or `why=loss`), `kbps_target`
+  at most one `congestion: lowering bitrate` per minute (`why=delay` or `why=loss`; with
+  `"logLevel": "debug"`, which logs every change), `kbps_target`
   in `stream stats` at 20000 most of the time; record `queue_margin_ms` (the jitter-widened
   margin), `loss_pct` and `report_owd_p95_ms`.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (frame-rate ladder, helper `setRate fps`): HEVC
   2560×1440 120 fps at 10 Mbps, `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates
-  50,2,50`. Pass on the helper (AMF's `liveFps` seamless, the fine ladder of Phase 5 wiring A):
+  50,2,50`, `"logLevel": "debug"`. Pass on the helper (AMF's `liveFps` seamless, the fine ladder of Phase 5 wiring A):
   `congestion: lowering bitrate from=2000 to=2000 ... fps=100`, then 90, 75, 60 at least 2 s
   apart, the client's overlay frame rate follows (`rate` messages), and after the step the frame
   rate goes back up a step per 2 s (75, 90, 100, 120) with the bitrate. With `"pipeline":
@@ -6028,7 +6036,7 @@ Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe
   next key frame's arrival (client `__recon.logs`).
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (rate changes): with the
   capdrop profile (`./netem.sh apply capdrop --ct <gateway CTID> --host <client IP>`, 0.4) for 5
-  minutes, host.log: `changing the bitrate in the encoder` lines (no `restarting video`), each
+  minutes, host.log with `"logLevel": "debug"`: `changing the bitrate in the encoder` lines (no `restarting video`), each
   followed by a key frame on the client (flush), increases at least 2 s apart; the overlay's
   bitrate follows the steps. Then run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify
   -quality speed` (Intel: 2-3 codecs x cbr x seamless / flush, about 6 minutes; record the
@@ -8018,7 +8026,7 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (FPS before resolution, no IDR): 120 fps stream at
   `bitrate` 2500 (the floor 2000 is then close), Network path "Relay via gateway", `./netem.sh apply
   capdrop --ct 210 --host CLIENT_IP --rates 50,1,50` on the Proxmox node (netem.sh takes whole
-  Mbit/s: the low step at 1 Mbit/s, below the floor): host.log `congestion: lowering bitrate ...
+  Mbit/s: the low step at 1 Mbit/s, below the floor): host.log (`"logLevel": "debug"`) `congestion: lowering bitrate ...
   fps=100`, then 90, 75, 60 at least 2 s apart (the default `fpsFloor`, 60), `changing the bitrate
   in the encoder ... fps=N`; the helper's log has no `the frame-rate change at frame N made a key
   frame`; the overlay's key-frame count does not rise and the frame rate follows; once capacity
@@ -9231,3 +9239,50 @@ been reported once.
   `"fec": "off"` on the same link: a recovery frame does not wait behind a held, discarded
   frame.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with NVENC `invalidate` recovery.
+
+### Rate changes no longer fill host.log
+
+Problem: every change of the rate controller made two lines at the default level:
+`congestion: lowering bitrate` (Warn) or `bitrate recovery: raising bitrate` (Info), then
+setRate's `changing the bitrate in the encoder`. FFmpeg also adds its restart lines. Where the
+path carries less than the user's setting (30-50 Mbit/s set on 20 Mbit/s Wi-Fi), the controller
+moves continuously: 2 % steps up a few hundred ms apart, then a cut. In the reviewer's
+simulation (`runSim`, 120 s, 20 Mbit/s link, 50 Mbit/s setting) that was 2.64 changes a second on
+the qualified seamless helper, about 3 MB of host.log per streaming hour. host.log was rotated
+only when the agent started, and the logon task's agent runs for days.
+
+Fix:
+- `applyRate` logs a change at its level (Warn for a cut, Info for a raise) at most once per
+  10 s in each direction, and a frame-rate step always (`rateLog`). The changes in between are
+  debug lines, and the next logged line counts them (`suppressed=N`).
+- `changing the bitrate in the encoder` is a debug line; applyRate's line says the same.
+- `stream stats` still has the target every 10 s (`kbps_target`, `kbps_est`, `fps_target`).
+- `recon-host -log` rotates host.log at 20 MB while it runs, not only at the start: it moves to
+  `host.log.old`, replacing the previous one.
+- At debug level (`"logLevel": "debug"`) every change is logged as before. The hardware checks
+  that count or time rate changes now say to use it (see "Hardware test plan").
+
+- Verified here:
+  - `internal/host` `TestRateChangeLogVolume`: 30 changes within a second, 27 raises and 3 cuts.
+    At the default level the old code logged 27 raises, 3 cuts and 30 encoder lines; the new code
+    logs 1, 1 and 0. A frame-rate step is logged with `suppressed=2`. On the controller's clock,
+    30 s of raises 300 ms apart log 3 lines (0, 10.2 s, 20.4 s) counting 33 each.
+  - `cmd/recon-host` `TestLogFileRotates`: limit 1000 bytes. A file over the limit is rotated at
+    start. While writing, both files stay under the limit and hold whole records in order.
+    This test also passes as a Windows binary under Wine, where a rename replaces an existing
+    `.old`.
+  - The browser E2E and the Go integration tests run their hosts at debug level and see every
+    change as before.
+- AMD RDNA3 (RX 7900 XT): unverified. Test, after `recon-host qualify` (seamless policy):
+  1. Stream at a 50 Mbit/s setting over a path that carries about 20: Wi-Fi, or
+     `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates 20,20,20`.
+  2. After 10 minutes, `(Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern
+     'lowering bitrate|raising bitrate|changing the bitrate').Count` is at most about 120 (two
+     per 10 s; it was over 3000). The lines carry `suppressed=`, and no `changing the bitrate in
+     the encoder` line appears.
+  3. The stats overlay's target still moves.
+  4. With `"logLevel": "debug"` every change is there again.
+  5. Rotation: with the agent running, the file moves to `host.log.old` once it passes 20 MB.
+     For a quick check, append 20 MB to host.log with the agent stopped, then start the agent: it
+     is rotated at once.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

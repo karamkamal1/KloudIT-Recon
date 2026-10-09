@@ -110,6 +110,7 @@ type Session struct {
 	track    sendTrack      // frames sent, for the rate controller's feedback (ratefeedback.go)
 	fb       rateFeedback   // the client's receive reports (or acks), turned into feedback
 	noticeAt atomic.Int64   // unix ns of the last congestion notice to the user (rate limited)
+	rateLog  rateLog        // how applyRate logs the controller's changes
 
 	// sendSince: unix ns when frameSender took the frame it sends (0: it
 	// waits for one); sendOpening: it still waits for the frame's stream.
@@ -1615,20 +1616,62 @@ func (s *Session) overflowCut(recovered bool) bool {
 	return true
 }
 
+// rateLogEvery: at the default log level a change of the rate controller is
+// logged at most once per rateLogEvery in each direction, and a frame-rate
+// step always. Where the path carries less than the setting the controller
+// moves every few hundred milliseconds (2 % steps up, a cut, up again); the
+// changes in between are debug lines, and the next logged one counts them
+// (suppressed). "stream stats" has the target every 10 s.
+const rateLogEvery = 10 * time.Second
+
+// rateLog decides the level of applyRate's lines.
+type rateLog struct {
+	mu   sync.Mutex
+	last [2]time.Time // the last change logged at the default level: [0] up, [1] down
+	n    [2]int       // changes logged at debug level since
+}
+
+// level returns the level for a change (normal: its level when it is
+// logged) and how many changes in its direction were debug lines before it.
+func (l *rateLog) level(c rateChange, now time.Time, normal slog.Level) (slog.Level, int) {
+	d := 0
+	if c.down {
+		d = 1
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if c.toFPS == c.fromFPS && !l.last[d].IsZero() && now.Sub(l.last[d]) < rateLogEvery {
+		l.n[d]++
+		return slog.LevelDebug, 0
+	}
+	n := l.n[d]
+	l.last[d], l.n[d] = now, 0
+	return normal, n
+}
+
 // applyRate puts a change of the rate controller into effect (setRate) and
-// logs it; decreases also tell the user, at most once per 30 s.
+// logs it (rateLog); decreases also tell the user, at most once per 30 s.
 func (s *Session) applyRate(c rateChange, delayMs int) {
 	_, ceiling := s.rate.kbps()
 	reason := "bitrate recovery"
 	if c.down {
 		reason = "congestion"
-		s.log.Warn("congestion: lowering bitrate", "from", c.fromKbps, "to", c.toKbps, "why", c.why, "fps", c.toFPS,
-			"delayMs", delayMs, "urgent", c.urgent)
+		attrs := []any{"from", c.fromKbps, "to", c.toKbps, "why", c.why, "fps", c.toFPS, "delayMs", delayMs, "urgent", c.urgent}
+		lvl, n := s.rateLog.level(c, time.Now(), slog.LevelWarn)
+		if n > 0 {
+			attrs = append(attrs, "suppressed", n)
+		}
+		s.log.Log(context.Background(), lvl, "congestion: lowering bitrate", attrs...)
 		if now, last := time.Now().UnixNano(), s.noticeAt.Load(); now-last >= int64(30*time.Second) && s.noticeAt.CompareAndSwap(last, now) {
 			s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(c.toKbps)/1000))
 		}
 	} else {
-		s.log.Info("bitrate recovery: raising bitrate", "from", c.fromKbps, "to", c.toKbps, "fps", c.toFPS, "max", ceiling)
+		attrs := []any{"from", c.fromKbps, "to", c.toKbps, "fps", c.toFPS, "max", ceiling}
+		lvl, n := s.rateLog.level(c, time.Now(), slog.LevelInfo)
+		if n > 0 {
+			attrs = append(attrs, "suppressed", n)
+		}
+		s.log.Log(context.Background(), lvl, "bitrate recovery: raising bitrate", attrs...)
 	}
 	if err := s.setRate(c.toKbps, c.toFPS, c.urgent, reason); err != nil {
 		s.log.Warn("bitrate change failed", "reason", reason, "err", err)
@@ -1844,7 +1887,7 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	if enc < kbps {
 		attrs = append(attrs, "target", kbps, "static_desktop", true)
 	}
-	s.log.Info("changing the bitrate in the encoder", attrs...)
+	s.log.Debug("changing the bitrate in the encoder", attrs...) // applyRate logged the change
 	err := v.SetRate(enc, newFPS, vbv)
 	if err == nil {
 		s.static.applied(now, enc, kbps)
