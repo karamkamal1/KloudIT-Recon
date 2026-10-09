@@ -27,18 +27,25 @@ Techniques used (most of them are new to browser-based game streaming):
 - **One QUIC stream per video frame (WebTransport).** A lost packet only delays its own
   frame, never the frames behind it, unlike TCP/WebSocket or a single ordered stream.
   This is the design behind the IETF *Media over QUIC* work.
-- **Zero-delay framing out of FFmpeg.** Raw H.264 has no frame boundaries, and the MP4/MKV
-  muxers hold each frame until the next one exists (one full frame of added latency, measured
-  during development). Recon reads FFmpeg's **NUT** container, which writes each packet with its exact
-  size the moment it is encoded. The demuxer is verified byte-for-byte against `ffprobe` and
-  proven not to read past a packet.
-- **Zero-copy GPU capture → hardware encode.** DXGI Desktop Duplication (`ddagrab`) or
-  Windows.Graphics.Capture (`gfxcapture`, which supports GPU downscaling and per-window
-  capture) feeds D3D11 textures straight into NVENC / AMF / QSV. They are tuned for ultra-low
-  latency: CBR with a 1–3-frame VBV, no B-frames, no lookahead, zero-latency mode, and each
-  packet read out as soon as its frame is encoded.
-- **Overlapped encoder restarts.** Changing bitrate, resolution, codec or display starts a new
-  encoder *while the old one keeps streaming*, then switches on the new key frame. You get no freeze.
+- **Zero-delay framing out of FFmpeg** (the FFmpeg path). Raw H.264 has no frame boundaries,
+  and the MP4/MKV muxers hold each frame until the next one exists (one full frame of added
+  latency, measured during development). Recon reads FFmpeg's **NUT** container, which writes
+  each packet with its exact size the moment it is encoded. The demuxer is verified
+  byte-for-byte against `ffprobe` and proven not to read past a packet.
+- **Zero-copy GPU capture → hardware encode.** On AMD and NVIDIA the PC streams by default
+  through its own native encoder helper, `recon-encoder.exe` (C++): DXGI Desktop Duplication
+  (AMD Direct Capture or Windows.Graphics.Capture on request) hands D3D11 textures to AMF or
+  NVENC in the same process, and each encoded frame reaches the agent through shared memory.
+  FFmpeg is the fallback (and Intel's path without the helper's Quick Sync libraries):
+  `ddagrab` or `gfxcapture` (GPU downscaling, per-window capture) feeds NVENC / AMF / QSV.
+  Both are tuned for ultra-low latency: CBR (or AMF's latency-constrained VBR) with a 1–3-frame
+  VBV, no B-frames, no lookahead, zero-latency mode, and each packet read out as soon as its
+  frame is encoded.
+- **Encoder changes without a freeze.** On the native helper a bitrate or frame-rate change
+  happens inside the running encoder, without a key frame where the GPU's encoder allows it
+  (`recon-host qualify` measures that). Changing resolution, codec or display (and any change on
+  the FFmpeg path) starts a new encoder *while the old one keeps streaming*, then switches on
+  the new key frame. You get no freeze.
 - **The entire media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`
   (`optimizeForLatency`, at most 2 chunks queued, never flushed) → an **OffscreenCanvas** that
   draws each frame the instant it decodes and closes it at once. Three presentation paths: a
@@ -98,7 +105,8 @@ Techniques used (most of them are new to browser-based game streaming):
   your setting once the delay is down (+5 %/s near the last good rate, up to +25 %/s far below
   it), in the encoder at once on the native helper, with overlapped restarts on FFmpeg (an
   immediate one after a capacity drop). At the 2 Mbit/s floor it lowers the frame rate
-  (120 → 90 → 60) instead. A decoder backlog gets
+  instead: on the native helper in place, 120 → 100 → 90 → 75 → 60 two seconds apart (`fpsFloor`
+  below), on FFmpeg 120 → 90 → 60. A decoder backlog gets
   dropped and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
   then climbs back only to 85 % of where the decoder fell behind.
 - **Input and audio first.** When the path delivers the video slower than the host paces it
@@ -111,8 +119,12 @@ Techniques used (most of them are new to browser-based game streaming):
   priorities" in `docs/ARCHITECTURE.md`.
 - **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
   waits for the late frame instead of asking for a key frame. The host reports every frame it
-  drops, and the client recovers at once: it skips the frame when the encoder heals the picture
-  with intra refresh (NVENC H.264 and HEVC), otherwise it asks for a key frame.
+  drops, and the client recovers at once. On the native helper the PC answers a lost frame with
+  a recovery frame that refers only to frames the browser has acknowledged (AMF long-term
+  references, NVENC reference invalidation): the next frame is whole again, without a key frame
+  (see "The loss-recovery ladder" in `docs/ARCHITECTURE.md`). On FFmpeg the client skips the
+  frame when the encoder heals the picture with intra refresh (NVENC H.264 and HEVC), otherwise
+  it asks for a key frame.
 - **Virtual Xbox controllers** through the ViGEmBus driver's IOCTL interface (no
   ViGEmClient.dll), fed by the browser Gamepad API at 250 Hz, with **rumble**: a game's force
   feedback comes back to your controller through the Gamepad API's `vibrationActuator`.
@@ -168,7 +180,8 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
         ▼                               │
  ┌──────────────────────────────────────┴───────────────────────────┐
  │ recon-host  (Windows 11 gaming PC)                               │
- │ ffmpeg: ddagrab/gfxcapture ─(D3D11)─► NVENC/AMF/QSV ─► NUT ─► Go │
+ │ recon-encoder.exe: DDA ─(D3D11)─► AMF/NVENC ─► shared mem ─► Go  │
+ │ or ffmpeg: ddagrab/gfxcapture ─► NVENC/AMF/QSV ─► NUT ─► Go      │
  │ WASAPI loopback ─► Opus (pure Go) ─► datagrams                   │
  │ SendInput (scancodes, raw rel/abs mouse) · cursor shapes · ViGEm │
  └──────────────────────────────────────────────────────────────────┘
@@ -197,7 +210,13 @@ contains:
 - `SHA256SUMS`
 
 To build them yourself (needs Go 1.26+, `zip`; mingw-w64 and cmake for the optional
-`recon-encoder.exe` helper): `make release`. The output goes to `dist/`.
+`recon-encoder.exe` helper): `make release`. The output goes to `dist/`. The CI bundles differ
+in one way: their `recon-encoder.exe` is the MSVC build (`make release
+HELPER_EXE=path/to/recon-encoder.exe`, built with the MSVC steps in `docs/HELPER_PROTOCOL.md`),
+while a plain `make release` packages the mingw-w64 build, which has no Windows.Graphics.Capture
+(mingw-w64 lacks C++/WinRT). With it, window capture and `"capture": "gfxcapture"` sessions
+stream with FFmpeg instead of the helper (host.log: `video pipeline pipeline=ffmpeg
+reason="the helper cannot capture with wgc (this build has no C++/WinRT headers ...)"`).
 
 ### 1. Gateway on Proxmox (LXC)
 
@@ -415,6 +434,7 @@ The new password (at least 10 characters) is read from stdin.
 | `virtualDisplayLinger` | 10 | Seconds a session's virtual display stays after the session ends, so that a client reconnecting with the same size and frame rate gets it back without the desktop being rearranged twice; `0` restores the displays at once (0-600) |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture) |
+| `logLevel` | `info` | `debug` adds detail to host.log: the FFmpeg command line of every encoder generation (`ffmpeg args`), the rate controller's decisions (`rate report decision`, `congestion: bitrate kept`), static-desktop and region-of-interest updates, relay and direct-path connections. The installed agent (the logon task) has no other switch for it; `recon-host -v` does the same for a command run by hand. Several hardware checks in `docs/VENDOR_NOTES.md` read these lines |
 
 Edit `host.json` with Notepad, then restart the agent: `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`.
 

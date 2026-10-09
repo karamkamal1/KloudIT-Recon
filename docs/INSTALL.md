@@ -44,7 +44,8 @@ The examples use these values. Replace them with your own:
    # Optional: check the files (every line should say OK)
    Get-Content .\SHA256SUMS | ForEach-Object { $h,$n = $_ -split '\s+',2; if (Test-Path $n) { if ((Get-FileHash $n -Algorithm SHA256).Hash -eq $h) { "OK   $n" } else { "BAD  $n" } } }
    Expand-Archive .\kloudit-recon-*-host-windows-amd64.zip -DestinationPath . -Force
-   dir .\host-windows-amd64     # install-host.ps1, recon-host.exe, recon-hostw.exe, uninstall-host.ps1
+   dir .\host-windows-amd64     # install-host.ps1, recon-host.exe, recon-hostw.exe, recon-encoder.exe,
+                                 # uninstall-host.ps1, latency-test\
    ```
 
    **Do not** extract the `gateway-linux-amd64.tar.gz` on Windows. It goes to Proxmox as-is.
@@ -386,6 +387,23 @@ pick up the old files.
    the installer command **without** `-PairingCode`:
    `powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -InstallViGEm`. The pairing is
    kept. Add `-UpdateFFmpeg` to also fetch a newer FFmpeg.
+
+**Upgrading from a version without the native encoder helper** (before `recon-encoder.exe` was
+in the bundle). Check these once:
+
+- **Relay ports.** With port forwarding (step 9), also forward **UDP 8444–8459** to the gateway.
+  Without them streams from outside keep working through the gateway's QUIC splice on 8443, but
+  with two congestion controllers in series; the overlay's Transport row then reads
+  `relay-splice` instead of `relay` (README, Troubleshooting).
+- **The helper is the default.** Streams on AMD and NVIDIA now use `recon-encoder.exe`: the
+  installer's `helper:` line and `video pipeline pipeline=helper` in `host.log` confirm it
+  (step 8, "Which encoder streams"). `"pipeline": "ffmpeg"` in `host.json` goes back to FFmpeg
+  only.
+- **Run `recon-host.exe qualify`** once with no stream running (Useful commands), and again after
+  graphics driver updates.
+- **Congestion control.** `"congestion"` now defaults to `media` (the PC paces its video at the
+  session's bitrate and leaves backing off to its rate controller). Nothing to do; `"reno"` in
+  `host.json` brings back the old behaviour if a network misbehaves with it.
 
 ## Uninstalling
 
