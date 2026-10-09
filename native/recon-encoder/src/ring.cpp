@@ -104,6 +104,7 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (f.info.seqStart && f.key) flags |= kFlagSeqStart;
     if (f.info.dirty >= 0) flags |= kFlagDirty;
     if (f.discardable) flags |= kFlagDiscardable;
+    if (f.reencoded) flags |= kFlagReencoded;
     store<uint64_t>(s + kSlotSeq, written_);
     store<uint64_t>(s + kSlotFrameId, f.info.frameId);
     store<uint32_t>(s + kSlotFlags, flags);
@@ -122,6 +123,13 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     store<uint32_t>(s + kSlotWidth, f.width);
     store<uint32_t>(s + kSlotHeight, f.height);
     if (f.info.dirty >= 0) store<uint32_t>(s + kSlotDirtyPpm, dirtyPpm(f.info.dirty));
+    // Sub-frame output (stats slices / firstSliceQpc), also here so that it
+    // survives stats recon-host drops (and arrives with the frame: the stats
+    // message follows the ring write).
+    if (f.slices > 0 && f.firstSliceQpc) {
+        store<uint32_t>(s + kSlotSlices, static_cast<uint32_t>(f.slices));
+        store<int64_t>(s + kSlotFirstSliceQpc, f.firstSliceQpc);
+    }
     if (f.size) std::memcpy(s + kSlotHeaderSize, f.data, f.size);
 
     // Publish: everything above happens-before recon-host's acquire load of writeCount.

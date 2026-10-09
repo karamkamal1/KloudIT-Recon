@@ -738,6 +738,15 @@ type Params struct {
 	// is not HDR, for clients that asked (VideoConfig.HDRNote).
 	HDR     bool
 	HDRNote string
+	// SVCLayers asks the native helper for temporal layers (Phase 5 SVC: 2,
+	// where its caps allow; 0 or 1: none). FFmpeg ignores it.
+	SVCLayers int
+	// VBVFrames is the encoder's VBV buffer in frame intervals (native
+	// helper; 0: its default, one frame). The session raises it while it
+	// holds the bitrate down on a static desktop, so the VBV keeps the size
+	// it has at the full bitrate and the first frame with motion is not
+	// starved. FFmpeg ignores it.
+	VBVFrames float64
 }
 
 // OutputSize returns the size of the picture BuildArgs hands the encoder

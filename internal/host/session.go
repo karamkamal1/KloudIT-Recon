@@ -124,6 +124,12 @@ type Session struct {
 	// pongs: answers to the client's pings, sent by pongSender so the
 	// datagram loop (input) never waits for the datagram queue.
 	pongs chan []byte
+	// thinning: discardable frames left out under congestion (thin.go);
+	// static: the encoder's bitrate on a static desktop (activity.go).
+	thinning thinState
+	static   staticCap
+	// roi: the encoder's regions of interest from the pointer input (roi.go).
+	roi roiFocus
 
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
@@ -187,6 +193,11 @@ type sessionStats struct {
 	// a loss before them, key frames asked of the pipeline (rung 4: IDRs in
 	// the encoder, or new generations).
 	cancelled, discarded, keyframes atomic.Int64
+	// thinned: discardable frames left out under congestion (thin.go).
+	thinned atomic.Int64
+	// reencoded: frames the encoder encoded a second time because they were
+	// oversized (host config reencodeOversized).
+	reencoded atomic.Int64
 }
 
 var errClosed = errors.New("session closed")
@@ -222,6 +233,9 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		s.partial = transport.PartialDelivery(c)
 		s.resetStreamAt = map[bool]string{true: "yes", false: "no"}[s.partial]
 	}
+	s.rate.setFPSFloor(a.cfg.FPSFloor)
+	s.static.on, s.static.kbps = a.cfg.staticBitrate(), a.cfg.StaticKbps
+	s.roi.mode = a.cfg.roi()
 	return s
 }
 
@@ -332,6 +346,7 @@ func (s *Session) run() error {
 	go s.pongSender()
 	go s.datagrams()
 	go s.cursorLoop()
+	go s.roiLoop()
 	go s.statsLoop()
 	go s.rateLoop()
 	return s.controlLoop()
@@ -714,6 +729,12 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
 	s.triedMu.Unlock()
+	if s.thinOK() {
+		// Temporal SVC (Phase 5): two layers where the native helper's
+		// encoder has them (HelperVideo.withCaps decides and logs), so
+		// frameSender can thin the enhancement layer under congestion.
+		p.SVCLayers = 2
+	}
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()
 	choice := enc.Name + " " + why
@@ -933,9 +954,12 @@ func (s *Session) videoEvents() {
 			s.captureChanged(ev.Capture)
 		case ev.Rate != nil:
 			// The live generation's encoder changed its bitrate or frame
-			// rate in place: the client's config of it is updated.
-			s.rate.live(ev.Rate.Kbps, ev.Rate.FPS)
-			_, ceiling := s.rate.kbps()
+			// rate in place: the client's config of it is updated. The
+			// rate controller hears its own target while a static desktop
+			// caps the encoder (activity.go controllerKbps).
+			target, ceiling := s.rate.kbps()
+			pc := s.vid().Capabilities()
+			s.rate.live(s.static.rate(s.static.clock(), ev.Rate.Kbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), ev.Rate.FPS)
 			s.sendJSON(proto.Rate{T: "rate", Gen: ev.Rate.Gen, BitrateKbps: ev.Rate.Kbps, FPS: ev.Rate.FPS, MaxBitrateKbps: ceiling})
 		case ev.Config != nil:
 			s.encoderLive()
@@ -950,8 +974,10 @@ func (s *Session) videoEvents() {
 			if r := s.a.faults.recovery; r != "" {
 				c.Recovery = r
 			}
-			_, c.MaxBitrateKbps = s.rate.kbps()
-			s.rate.live(c.BitrateKbps, c.FPS)
+			target, ceiling := s.rate.kbps()
+			c.MaxBitrateKbps = ceiling
+			pc := s.vid().Capabilities()
+			s.rate.live(s.static.generation(s.static.clock(), c.BitrateKbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), c.FPS)
 			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
 			s.sendJSON(&c)
@@ -963,7 +989,11 @@ func (s *Session) videoEvents() {
 				continue // test hook: a still desktop, the source sends nothing
 			}
 			s.healFrame(ev.Frame)
+			if ev.Frame.Reencoded {
+				s.stats.reencoded.Add(1)
+			}
 			s.rate.output(len(ev.Frame.Data))
+			s.staticFrame(ev.Frame)
 			select {
 			case s.frameQ <- ev.Frame:
 				// A newer frame is ready: a frame stream past its deadline
@@ -1727,8 +1757,21 @@ func (s *Session) setRate(kbps, fps int, urgent bool, reason string) error {
 	if cur, ok := v.Current(); ok && fps > 0 && fps != cur.FPS {
 		newFPS = fps
 	}
-	s.log.Info("changing the bitrate in the encoder", "reason", reason, "kbps", kbps, "fps", newFPS, "urgent", urgent)
-	if err := v.SetRate(kbps, newFPS); err != nil {
+	// A static desktop keeps the encoder below the target (activity.go).
+	now := s.static.clock()
+	s.static.mu.Lock()
+	enc, vbv := s.static.want(now, kbps, !c.LiveBitrateFlush)
+	attrs := []any{"reason", reason, "kbps", enc, "fps", newFPS, "urgent", urgent}
+	if enc < kbps {
+		attrs = append(attrs, "target", kbps, "static_desktop", true)
+	}
+	s.log.Info("changing the bitrate in the encoder", attrs...)
+	err := v.SetRate(enc, newFPS, vbv)
+	if err == nil {
+		s.static.applied(now, enc, kbps)
+	}
+	s.static.mu.Unlock()
+	if err != nil {
 		s.log.Warn("bitrate change in the encoder failed, restarting", "err", err)
 		s.kicked()
 		return s.startVideo(urgent, reason)
@@ -1766,6 +1809,12 @@ func (s *Session) frameSender() {
 			s.discard(f, step)
 			continue
 		}
+		// A frame the test hook drops or delays is never thinned: the
+		// faults stay as configured, whatever the load.
+		drop, delay := faults.at(n)
+		if !drop && delay == 0 && s.thin(f, num) {
+			continue // left out under congestion: no loss (thin.go)
+		}
 		s.reportDiscards(0) // a frame goes out again: the run before it is complete
 		s.sendOpening.Store(true)
 		s.sendSince.Store(time.Now().UnixNano())
@@ -1782,7 +1831,7 @@ func (s *Session) frameSender() {
 			s.lostFrame(f, "stream failed")
 			continue
 		}
-		h, ext := videoHeader(f, s.hello.V, s.a.clock())
+		h, ext := videoHeader(f, s.hello.V, s.a.clock(), s.thinning.mask(f.Gen, f.Seq))
 		buf = buf[:proto.FrameHeaderLen]
 		h.Marshal(buf)
 		if h.Flags&proto.FrameFlagExt != 0 {
@@ -1799,7 +1848,6 @@ func (s *Session) frameSender() {
 			of.reliable = s.reliablePrefix(f, len(buf)-len(f.Data))
 		}
 		s.send.register(of)
-		drop, delay := faults.at(n)
 		if drop || delay > 0 {
 			s.send.start(of, lateCancel, s.checkOut) // the test hooks bypass the window
 		}
@@ -1933,8 +1981,10 @@ func (s *Session) writeFrame(of *outFrame, b []byte) error {
 }
 
 // videoHeader builds a video frame's header, plus the extension for clients
-// that parse it. now is the host clock as the frame goes to the transport.
-func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, proto.FrameExt) {
+// that parse it. now is the host clock as the frame goes to the transport;
+// thinned is the frame's ExtThinned mask (thinState.mask; sent to clients
+// that read it only).
+func videoHeader(f *media.Frame, helloV int, now uint64, thinned uint32) (proto.FrameHeader, proto.FrameExt) {
 	h := proto.FrameHeader{Type: proto.FrameTypeVideo, Gen: f.Gen, Seq: f.Seq, PtsUs: uint64(f.PtsUs)}
 	if f.Key {
 		h.Flags |= proto.FrameFlagKey
@@ -1971,6 +2021,9 @@ func videoHeader(f *media.Frame, helloV int, now uint64) (proto.FrameHeader, pro
 	}
 	if f.TemporalLayer != 0 {
 		ext.Set(proto.ExtTemporalLayer, uint64(f.TemporalLayer))
+	}
+	if thinned != 0 && helloV >= proto.HelloVersionThinned {
+		ext.Set(proto.ExtThinned, uint64(thinned))
 	}
 	return h, ext
 }
@@ -2127,12 +2180,14 @@ func (s *Session) datagrams() {
 			}
 		case proto.DgMouseRel:
 			if m, ok := proto.ParseMouseRel(d); ok && s.a.isActive(s) {
+				s.roi.pointerRel(time.Now()) // pointer lock: a game's crosshair (roi.go)
 				if dx, dy := s.rel.Update(m.Seq, m.CumX, m.CumY); dx != 0 || dy != 0 {
 					_ = s.a.inj.MoveRel(dx, dy)
 				}
 			}
 		case proto.DgMouseAbs:
 			if m, ok := proto.ParseMouseAbs(d); ok && s.absGate.Accept(m.Seq) && s.a.isActive(s) {
+				s.roi.pointerAbs(m.X, m.Y, time.Now())
 				_ = s.a.inj.MoveAbs(m.X, m.Y)
 			}
 		case proto.DgGamepad:
@@ -2363,8 +2418,10 @@ func (s *Session) controlLoop() error {
 			s.requestKeyframe("keyframe request")
 		case proto.MsgLost:
 			// A loss only the client saw (a gap that outlasted its wait),
-			// under reference recovery: it waits for the recovery frame.
-			s.loss(lossConfirmed, m.Gen, m.FromSeq, "client")
+			// under reference recovery: it waits for the recovery frame. A
+			// frame left out on purpose is none (thin.go): the loss starts
+			// at the next frame sent.
+			s.loss(lossConfirmed, m.Gen, s.thinning.firstSent(m.Gen, m.FromSeq), "client")
 		case "stages":
 			s.logStages(m.Stages, m.Renderer, m.Pacing, m.Upscale)
 		case "congestion":
@@ -2411,14 +2468,23 @@ type hostStage struct {
 	seq            uint32
 	at             uint64  // host clock when sent, then when acknowledged
 	capture, queue float64 // ms; capture < 0: no capture stamp
+	// Sub-frame output (native helper sliceOutput, Phase 5 wiring B): encoder
+	// submit -> first slice ready, and first slice -> whole frame (what
+	// sending slices as they come could gain); ms, < 0: not measured.
+	firstSlice, sliceRest float64
 }
 
 const stageWindowUs = 10_000_000
 
 func (h *hostStages) sentFrame(f *media.Frame, sentUs uint64) {
-	r := hostStage{gen: f.Gen, seq: f.Seq, at: sentUs, capture: -1, queue: float64(sentUs-f.EncodeDoneUs) / 1000}
+	r := hostStage{gen: f.Gen, seq: f.Seq, at: sentUs, capture: -1, queue: float64(sentUs-f.EncodeDoneUs) / 1000,
+		firstSlice: -1, sliceRest: -1}
 	if f.CaptureUs != 0 {
 		r.capture = float64(f.EncodeDoneUs-f.CaptureUs) / 1000
+	}
+	if f.FirstSliceUs != 0 && f.SubmitUs != 0 && f.SubmitUs <= f.FirstSliceUs && f.FirstSliceUs <= f.EncodeDoneUs {
+		r.firstSlice = float64(f.FirstSliceUs-f.SubmitUs) / 1000
+		r.sliceRest = float64(f.EncodeDoneUs-f.FirstSliceUs) / 1000
 	}
 	h.mu.Lock()
 	h.sent[f.Seq%uint32(len(h.sent))] = r
@@ -2443,11 +2509,15 @@ func (h *hostStages) acked(gen uint8, seq uint32, now uint64) {
 	h.recs = h.recs[i:]
 }
 
-// summary returns "p50/p95/p99 n=N" (as the client reports them) of the host's
-// capture->encoded and queue times over the 10 s before now; "" if none.
-func (h *hostStages) summary(now uint64) (capture, queue string) {
+// stageSummary is the host's own stage rows, "p50/p95/p99 n=N" (as the
+// client reports them) over the 10 s before now; "" where nothing was
+// measured: capture->encoded, encoded->sent (queue), and with sub-frame
+// output encoder submit->first slice and first slice->whole frame.
+type stageSummary struct{ capture, queue, firstSlice, sliceRest string }
+
+func (h *hostStages) summary(now uint64) stageSummary {
 	h.mu.Lock()
-	var c, q []float64
+	var c, q, fs, sr []float64
 	for _, r := range h.recs {
 		if now-r.at > stageWindowUs {
 			continue
@@ -2455,10 +2525,13 @@ func (h *hostStages) summary(now uint64) (capture, queue string) {
 		if r.capture >= 0 {
 			c = append(c, r.capture)
 		}
+		if r.firstSlice >= 0 {
+			fs, sr = append(fs, r.firstSlice), append(sr, r.sliceRest)
+		}
 		q = append(q, r.queue)
 	}
 	h.mu.Unlock()
-	return pctString(c), pctString(q)
+	return stageSummary{capture: pctString(c), queue: pctString(q), firstSlice: pctString(fs), sliceRest: pctString(sr)}
 }
 
 // pctString formats percentiles with the client's definition (sorted[floor(p*n)]).
@@ -2497,8 +2570,9 @@ var upscaleModes = map[string]bool{"fsr": true, "off": true, "mixed": true}
 
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
-// the host's own measurement of its stages (host_capture, host_queue), with
-// the client's presentation path (renderer), frame pacing mode (pacing) and
+// the host's own measurement of its stages (host_capture, host_queue; with
+// sub-frame output host_encode_first_slice and host_encode_rest), with the
+// client's presentation path (renderer), frame pacing mode (pacing) and
 // upscaling (upscale) when it names them.
 func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale string) {
 	names := stageNames
@@ -2529,11 +2603,17 @@ func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale st
 		}
 		args = append(args, r.Name, fmt.Sprintf("%.1f/%.1f/%.1f n=%d", r.P50, r.P95, r.P99, r.N))
 	}
-	if c, q := s.hostStages.summary(s.a.clock()); q != "" {
-		if c != "" {
-			args = append(args, "host_capture", c)
+	if h := s.hostStages.summary(s.a.clock()); h.queue != "" {
+		if h.capture != "" {
+			args = append(args, "host_capture", h.capture)
 		}
-		args = append(args, "host_queue", q)
+		args = append(args, "host_queue", h.queue)
+		if h.firstSlice != "" {
+			// Sub-frame output (sliceOutput, experimental): the frames still
+			// go out whole; host_encode_rest is what sending each slice as
+			// it comes could take off the client's encode row.
+			args = append(args, "host_encode_first_slice", h.firstSlice, "host_encode_rest", h.sliceRest)
+		}
 	}
 	s.log.Info("latency stages p50/p95/p99 ms, last 10 s (client; host_*: measured by the host)", args...)
 }
@@ -2555,6 +2635,8 @@ func (s *Session) statsLoop() {
 		dropped := s.stats.dropped.Swap(0)
 		recovered, byKey := s.stats.recovered.Swap(0), s.stats.recoveredByKey.Swap(0)
 		cancelled, discarded, keyframes := s.stats.cancelled.Swap(0), s.stats.discarded.Swap(0), s.stats.keyframes.Swap(0)
+		thinned := s.stats.thinned.Swap(0)
+		reencoded := s.stats.reencoded.Swap(0)
 		avg := int64(0)
 		if acks > 0 {
 			avg = owdSum / acks
@@ -2568,7 +2650,14 @@ func (s *Session) statsLoop() {
 			// past their deadline (rung 1), frames not sent while the client
 			// waited for a recovery or key frame, key frames asked of the
 			// pipeline (rung 4).
-			"deadline_drops", cancelled, "discarded", discarded, "key_frames", keyframes}
+			"deadline_drops", cancelled, "discarded", discarded, "key_frames", keyframes,
+			// Phase 5: discardable frames left out under congestion
+			// (thin.go), and the encoder's bitrate held down on a static
+			// desktop (activity.go).
+			"thinned", thinned, "static_desktop", s.static.isCapped(),
+			// Phase 5 wiring B: oversized frames encoded again at a
+			// higher QP (host config reencodeOversized).
+			"reencoded", reencoded}
 		// Send priorities (GUIDE 2.7): frames the video window held for the
 		// frames in flight, and the longest hold.
 		held, maxHold := s.win.stats()

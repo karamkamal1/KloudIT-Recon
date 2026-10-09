@@ -156,6 +156,10 @@ func (s *Session) openPipeline() (notice string) {
 		LiveBitrate: func(c encoder.Caps, sp encoder.StartParams, adaptive bool) (string, string, bool) {
 			return lb.Choose(c, sp, adaptive)
 		},
+		// Phase 5 encoder options (HelperVideo.withCaps decides from the
+		// caps and logs each decision once).
+		EncoderInstance: string(s.a.cfg.EncoderInstance), ReencodeOversized: s.a.cfg.ReencodeOversized,
+		SliceOutput: s.a.cfg.SliceOutput,
 	})
 	attrs := []any{"pipeline", media.PipelineHelper, "config", mode, "backend", c.Backend, "vendor", c.Vendor,
 		"adapter", c.AdapterName, "encoders", encoderNames(s.helperEncs), "capture", strings.Join(c.Capture, ","),

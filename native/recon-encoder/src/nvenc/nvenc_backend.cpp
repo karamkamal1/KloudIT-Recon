@@ -232,6 +232,12 @@ CodecDetails readDetails(const NV_ENCODE_API_FUNCTION_LIST& nv, void* enc, Codec
     cc.liveBitrate = d.dynBitrate ? "seamless" : "restart";
     if (d.dynBitrate) cc.assumed.push_back("liveBitrate");
     cc.maxTemporalLayers = cap(NV_ENC_CAPS_SUPPORT_TEMPORAL_SVC) ? std::max(1, cap(NV_ENC_CAPS_NUM_MAX_TEMPORAL_LAYERS)) : 1;
+    // Intra refresh together with temporal layers (configure() sets both):
+    // nvEncodeAPI.h names no conflict between enableIntraRefresh and
+    // enableTemporalSVC and there is no cap bit for the pair, so assumed
+    // (VERIFY: docs/VENDOR_NOTES.md "Phase 5 wiring A").
+    cc.intraRefreshSvc = cc.intraRefresh && cc.maxTemporalLayers > 1;
+    if (cc.intraRefreshSvc) cc.assumed.push_back("intraRefreshSvc");
     // ROI by QP delta map (NV_ENC_QP_MAP_DELTA: every codec, alongside AQ; no
     // cap bit exists for it). The emphasis level map proper is H.264 only and
     // needs AQ off ("This feature is not supported when AQ (Spatial/Temporal)

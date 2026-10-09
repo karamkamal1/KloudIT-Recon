@@ -108,6 +108,16 @@ func TestActivityMeter(t *testing.T) {
 	if _, ok := lin.Activity(t0); ok || lin.SuggestKbps(t0, 20000, 0) != 20000 {
 		t.Fatal("unknown share not reported as unknown")
 	}
+	// AddShare: the share alone, as recon-host's frames carry it.
+	var sh ActivityMeter
+	sh.AddShare(t0, 0.001)
+	if !sh.Static(t0) || sh.SuggestKbps(t0, 20000, 2000) != 5000 {
+		t.Fatal("AddShare: static share not static")
+	}
+	sh.AddShare(t0.Add(10*time.Millisecond), -1)
+	if _, ok := sh.Activity(t0.Add(10 * time.Millisecond)); ok {
+		t.Fatal("AddShare: negative share not unknown")
+	}
 }
 
 func TestDroppable(t *testing.T) {
@@ -159,7 +169,7 @@ func TestEncoderInstanceFor(t *testing.T) {
 		want   int // -1 = nil
 		err    bool
 	}{
-		{"", amf, -1, false}, {"default", amf, -1, false},
+		{"", amf, -1, false}, {"default", amf, -1, false}, {"auto", amf, -1, false}, {"auto", nvenc, -1, false},
 		{"dedicated", amf, 1, false}, {"dedicated", nvenc, -1, false}, {"dedicated", one, -1, false},
 		{"0", amf, 0, false}, {" 1 ", amf, 1, false}, {"2", amf, -1, true}, {"-1", amf, -1, true},
 		{"1", nvenc, -1, true}, {"0", nvenc, -1, true}, {"fast", amf, -1, true}, {"0", one, 0, false},

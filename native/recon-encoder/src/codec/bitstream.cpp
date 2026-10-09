@@ -141,6 +141,8 @@ public:
         return k & 1 ? int32_t((k + 1) / 2) : -int32_t(k / 2);
     }
     bool ok() const { return !bad_; }
+    size_t pos() const { return pos_; }
+    const std::vector<uint8_t>& rbsp() const { return rbsp_; }
 
 private:
     uint32_t bit() {
@@ -157,16 +159,30 @@ private:
     bool bad_ = false;
 };
 
-// seq_parameter_set_data() up to max_num_ref_frames (H.264 7.3.2.1.1).
-bool parseH264Sps(BitReader& b, SpsInfo& out) {
+// The fields of an H.264 SPS a slice header depends on (7.3.3).
+struct H264SeqFields {
+    uint32_t id = 0;
+    bool separateColourPlane = false;
+    uint32_t frameNumBits = 0;  // log2_max_frame_num_minus4 + 4
+    uint32_t pocType = 0;
+    uint32_t pocLsbBits = 0;  // log2_max_pic_order_cnt_lsb_minus4 + 4 (type 0)
+    bool deltaPocAlwaysZero = false;
+    bool frameMbsOnly = false;
+};
+
+// seq_parameter_set_data() up to max_num_ref_frames (H.264 7.3.2.1.1); with
+// seq, also on to frame_mbs_only_flag, keeping what slice headers need.
+bool parseH264Sps(BitReader& b, SpsInfo& out, H264SeqFields* seq = nullptr) {
+    H264SeqFields scratch;
+    H264SeqFields& f = seq ? *seq : scratch;
     const uint32_t profile = b.u(8);
     b.skip(8);  // constraint_set0..5_flag, reserved_zero_2bits
     out.levelIdc = int(b.u(8));
-    b.ue();  // seq_parameter_set_id
+    f.id = b.ue();  // seq_parameter_set_id
     static const uint32_t kChromaProfiles[] = {100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135};
     if (std::find(std::begin(kChromaProfiles), std::end(kChromaProfiles), profile) != std::end(kChromaProfiles)) {
         const uint32_t chroma = b.ue();  // chroma_format_idc
-        if (chroma == 3) b.skip(1);      // separate_colour_plane_flag
+        if (chroma == 3) f.separateColourPlane = b.u(1) != 0;  // separate_colour_plane_flag
         b.ue();                          // bit_depth_luma_minus8
         b.ue();                          // bit_depth_chroma_minus8
         b.skip(1);                       // qpprime_y_zero_transform_bypass_flag
@@ -184,12 +200,13 @@ bool parseH264Sps(BitReader& b, SpsInfo& out) {
             }
         }
     }
-    b.ue();  // log2_max_frame_num_minus4
+    f.frameNumBits = b.ue() + 4;  // log2_max_frame_num_minus4
     const uint32_t poc = b.ue();  // pic_order_cnt_type
+    f.pocType = poc;
     if (poc == 0) {
-        b.ue();  // log2_max_pic_order_cnt_lsb_minus4
+        f.pocLsbBits = b.ue() + 4;  // log2_max_pic_order_cnt_lsb_minus4
     } else if (poc == 1) {
-        b.skip(1);  // delta_pic_order_always_zero_flag
+        f.deltaPocAlwaysZero = b.u(1) != 0;  // delta_pic_order_always_zero_flag
         b.se();     // offset_for_non_ref_pic
         b.se();     // offset_for_top_to_bottom_field
         const uint32_t n = b.ue();  // num_ref_frames_in_pic_order_cnt_cycle
@@ -198,7 +215,98 @@ bool parseH264Sps(BitReader& b, SpsInfo& out) {
     }
     const uint32_t refs = b.ue();  // max_num_ref_frames
     out.refFrames = int(refs);
-    return b.ok() && poc <= 2 && refs <= 16;
+    if (seq) {
+        b.skip(1);  // gaps_in_frame_num_value_allowed_flag
+        b.ue();     // pic_width_in_mbs_minus1
+        b.ue();     // pic_height_in_map_units_minus1
+        f.frameMbsOnly = b.u(1) != 0;
+    }
+    return b.ok() && poc <= 2 && refs <= 16 && f.frameNumBits <= 16 && f.pocLsbBits <= 16;
+}
+
+// The fields of an H.264 PPS a slice header depends on (7.3.2.2).
+struct H264PicFields {
+    uint32_t id = 0, spsId = 0;
+    bool cabac = false, bottomFieldPicOrder = false, weightedPred = false, redundantPicCnt = false;
+    uint32_t sliceGroups = 0;
+};
+
+bool parseH264Pps(BitReader& b, H264PicFields& p) {
+    p.id = b.ue();
+    p.spsId = b.ue();
+    p.cabac = b.u(1) != 0;                // entropy_coding_mode_flag
+    p.bottomFieldPicOrder = b.u(1) != 0;  // bottom_field_pic_order_in_frame_present_flag
+    p.sliceGroups = b.ue();               // num_slice_groups_minus1
+    if (p.sliceGroups > 0) return false;  // slice group maps: not parsed
+    b.ue();                               // num_ref_idx_l0_default_active_minus1
+    b.ue();                               // num_ref_idx_l1_default_active_minus1
+    p.weightedPred = b.u(1) != 0;         // weighted_pred_flag
+    b.skip(2);                            // weighted_bipred_idc
+    b.se();                               // pic_init_qp_minus26
+    b.se();                               // pic_init_qs_minus26
+    b.se();                               // chroma_qp_index_offset
+    b.skip(1);                            // deblocking_filter_control_present_flag
+    b.skip(1);                            // constrained_intra_pred_flag
+    p.redundantPicCnt = b.u(1) != 0;      // redundant_pic_cnt_present_flag
+    return b.ok();
+}
+
+// A slice NAL unit (header byte first) of a non-IDR picture as a
+// non-reference one: nal_ref_idc 0 and dec_ref_pic_marking() (one 0 bit:
+// adaptive_ref_pic_marking_mode_flag) left out, the rest of the RBSP shifted
+// up by that bit, the trailing bits redone and emulation prevention applied
+// again. Empty for a slice header this does not handle (see
+// h264AsNonReference).
+std::vector<uint8_t> h264SliceAsNonReference(const uint8_t* nal, size_t n, const H264SeqFields& sps, const H264PicFields& pps) {
+    if (n < 2 || (nal[0] & 0x1f) != 1) return {};
+    BitReader b(nal, n);
+    b.skip(8);  // NAL header
+    b.ue();     // first_mb_in_slice
+    const uint32_t type = b.ue() % 5;  // slice_type: 0 P, 2 I (1 B, 3 SP, 4 SI: not handled)
+    if (type != 0 && type != 2) return {};
+    if (b.ue() != pps.id) return {};  // pic_parameter_set_id
+    if (sps.separateColourPlane) b.skip(2);  // colour_plane_id
+    b.skip(int(sps.frameNumBits));           // frame_num
+    if (!sps.frameMbsOnly) return {};        // field_pic_flag: not handled
+    if (sps.pocType != 2) return {};         // the copy would share the original's picture order count
+    if (pps.redundantPicCnt) b.ue();         // redundant_pic_cnt
+    if (type == 0) {
+        if (b.u(1)) b.ue();  // num_ref_idx_active_override_flag, num_ref_idx_l0_active_minus1
+        if (b.u(1)) {        // ref_pic_list_modification_flag_l0
+            for (uint32_t idc = b.ue(); idc != 3 && b.ok(); idc = b.ue()) {
+                if (idc > 5) return {};
+                b.ue();  // abs_diff_pic_num_minus1 / long_term_pic_num / abs_diff_view_idx_minus1
+            }
+        }
+        if (pps.weightedPred) return {};  // pred_weight_table(): not handled
+    }
+    const size_t marking = b.pos();
+    if (b.u(1) != 0 || !b.ok()) return {};  // adaptive_ref_pic_marking_mode_flag: MMCOs not handled
+    // The RBSP's bits without the marking bit, up to and with the stop bit.
+    const std::vector<uint8_t>& in = b.rbsp();
+    const size_t bits = in.size() * 8;
+    auto bitAt = [&](size_t i) { return (in[i / 8] >> (7 - i % 8)) & 1; };
+    size_t last = bits;
+    while (last > 0 && !bitAt(last - 1)) --last;  // one past rbsp_stop_one_bit
+    if (last <= marking + 1) return {};
+    std::vector<uint8_t> rbsp((last - 1 + 7) / 8, 0);
+    for (size_t i = 0, o = 0; i < last; ++i) {
+        if (i == marking) continue;
+        if (bitAt(i)) rbsp[o / 8] |= uint8_t(0x80 >> (o % 8));
+        ++o;
+    }
+    rbsp[0] &= 0x9f;  // nal_ref_idc 0
+    std::vector<uint8_t> out{rbsp[0]};
+    int zeros = 0;
+    for (size_t i = 1; i < rbsp.size(); ++i) {
+        if (zeros >= 2 && rbsp[i] <= 3) {
+            out.push_back(3);  // emulation_prevention_three_byte
+            zeros = 0;
+        }
+        out.push_back(rbsp[i]);
+        zeros = rbsp[i] == 0 ? zeros + 1 : 0;
+    }
+    return out;  // its last byte holds the stop bit: never 00
 }
 
 // seq_parameter_set_rbsp() up to sps_max_dec_pic_buffering_minus1 (HEVC
@@ -255,6 +363,40 @@ std::vector<Unit> units(Codec c, const uint8_t* p, size_t n, bool& ok) {
 }
 
 }  // namespace
+
+std::vector<uint8_t> h264AsNonReference(const uint8_t* au, size_t n, const uint8_t* paramSets, size_t paramSize) {
+    H264SeqFields sps;
+    H264PicFields pps;
+    bool haveSps = false, havePps = false;
+    for (const Unit& u : annexBUnits(paramSets, paramSize)) {
+        const int t = paramSets[u.header] & 0x1f;
+        if (t != 7 && t != 8) continue;
+        BitReader b(paramSets + u.header + 1, u.end - u.header - 1);
+        SpsInfo info;
+        if (t == 7 && !haveSps) haveSps = parseH264Sps(b, info, &sps);
+        if (t == 8 && !havePps) havePps = parseH264Pps(b, pps);
+    }
+    if (!haveSps || !havePps || pps.spsId != sps.id || pps.cabac) return {};
+    std::vector<uint8_t> out;
+    bool slices = false;
+    for (const Unit& u : annexBUnits(au, n)) {
+        const int t = au[u.header] & 0x1f;
+        out.insert(out.end(), au + u.start, au + u.header);  // its start code
+        if (t == 5 || (t >= 2 && t <= 4)) return {};          // an IDR, data partitions
+        if (t != 1) {
+            out.insert(out.end(), au + u.header, au + u.end);
+            continue;
+        }
+        // Trailing zero bytes before the next start code belong to it.
+        size_t end = u.end;
+        while (end > u.header + 1 && au[end - 1] == 0) --end;
+        const std::vector<uint8_t> slice = h264SliceAsNonReference(au + u.header, end - u.header, sps, pps);
+        if (slice.empty()) return {};
+        out.insert(out.end(), slice.begin(), slice.end());
+        slices = true;
+    }
+    return slices ? out : std::vector<uint8_t>{};
+}
 
 bool parseCodec(const std::string& name, Codec& out) {
     if (name == "h264") out = Codec::H264;

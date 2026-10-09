@@ -47,6 +47,10 @@ const video = {
   keyRequested: 0,
   waitSince: 0,
   hostDropped: new Set(), // seqs of the current generation the host reported dropped
+  // seqs of the current generation the host left out on purpose (the frame
+  // extension's "thinned" mask: temporal SVC thinning under congestion);
+  // not losses: skipped at once (skipThinned). The last THIN_KEEP are kept.
+  thinned: new Set(),
   // Reference recovery (VideoConfig.recovery "ltr" / "invalidate"): the loss
   // being recovered ({ gen, from, since, discarded }: nothing from seq `from`
   // on is decoded until a frame ends it), when the last recovery frame was
@@ -67,7 +71,7 @@ const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, 
 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
-  dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
+  dropped: 0, skipped: 0, hostDropped: 0, thinned: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
   recovered: 0, recoveredByKey: 0, recoveryDiscarded: 0, recoveryRejected: 0, keyFrames: 0, streamResets: 0,
   audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, supersededChunks: 0, lagMin: Infinity,
 };
@@ -96,11 +100,13 @@ function freezeSeen(gen, seq) {
 }
 
 // The picture's stand-still before this drawn frame beyond what the source
-// explains (ms), or 0 for the first frame.
+// explains (ms), or 0 for the first frame. Frames the host left out on purpose
+// in between (thinned) count as consecutive: the source's time between the
+// two drawn frames is allowed.
 function freezeStall(meta, sent, presented) {
   if (!freeze.drawn) return 0;
   const hostMs = (sent - freeze.sentUs) / 1000;
-  const next = meta.gen === freeze.gen && meta.seq === freeze.seq + 1;
+  const next = meta.gen === freeze.gen && (meta.seq === freeze.seq + 1 || onlyThinnedBetween(freeze.seq, meta.seq));
   const missed = !next && (meta.gen === freeze.gen || (freeze.seen.get(freeze.gen) ?? -1) > freeze.seq);
   return presented - freeze.drawn - (missed ? Math.min(hostMs, 1000 / (video.cfg?.fps || 60)) : hostMs);
 }
@@ -1010,6 +1016,7 @@ async function onVideoConfig(cfg) {
   video.waitingKey = true;
   video.reorder.clear();
   video.hostDropped.clear();
+  video.thinned.clear();
   video.gapSince = 0;
   video.lostGen = -1;
   video.recover = null;
@@ -1051,6 +1058,8 @@ function onFrame(f) {
     return;
   }
   if (f.gen !== cfg.gen || f.gen === video.lostGen) return; // superseded generation
+  if (f.ext?.thinned) noteThinned(f);
+  skipThinned();
   if (f.seq < video.expectSeq) return; // duplicate, or late after its loss was handled
   if (f.seq > video.expectSeq) {
     video.reorder.set(f.seq, f);
@@ -1063,10 +1072,10 @@ function onFrame(f) {
   decodeInOrder();
 }
 
-// Decode the buffered frames that are next in sequence, then see whether the
-// next one is missing.
+// Decode the buffered frames that are next in sequence (past the frames the
+// host left out on purpose), then see whether the next one is missing.
 function decodeInOrder() {
-  while (video.reorder.has(video.expectSeq)) {
+  for (skipThinned(); video.reorder.has(video.expectSeq); skipThinned()) {
     const n = video.reorder.get(video.expectSeq);
     video.reorder.delete(video.expectSeq);
     decodeFrame(n);
@@ -1074,6 +1083,38 @@ function decodeInOrder() {
   }
   video.gapSince = video.reorder.size ? now() : 0;
   checkGap();
+}
+
+// Temporal SVC thinning (Phase 5): under congestion the host leaves out
+// frames no other frame references, and every frame it sends after one
+// carries the "thinned" mask of those among the 32 before it. Their seqs are
+// no gap: nothing waits for them, nothing is reported lost or recovered, the
+// next frame decodes as it is (it references none of them).
+const THIN_KEEP = 64;
+
+function noteThinned(f) {
+  for (const s of P.thinnedSeqs(f)) {
+    if (s < video.expectSeq || video.thinned.has(s)) continue;
+    video.thinned.add(s);
+    stats.thinned++;
+  }
+  for (const s of video.thinned) if (s + THIN_KEEP < f.seq) video.thinned.delete(s);
+}
+
+// Moves the next expected seq past frames the host left out on purpose.
+function skipThinned() {
+  while (video.thinned.has(video.expectSeq)) {
+    video.hostDropped.delete(video.expectSeq);
+    video.expectSeq++;
+  }
+}
+
+// Whether every seq strictly between a and b (same generation) was left out
+// on purpose.
+function onlyThinnedBetween(a, b) {
+  if (b <= a + 1 || b - a > 33) return false;
+  for (let s = a + 1; s < b; s++) if (!video.thinned.has(s)) return false;
+  return true;
 }
 
 // Frames travel on reliable streams: a gap in the sequence is a late frame
@@ -1089,6 +1130,7 @@ const gapTimeout = () => Math.max(250, 4 * clock.rtt);
 function checkGap() {
   const cfg = video.cfg;
   if (!cfg || cfg.gen === video.lostGen) return;
+  if (video.thinned.has(video.expectSeq)) { decodeInOrder(); return; } // left out on purpose: no gap
   if (video.recover && skipToRecovery()) return;
   const reported = video.hostDropped.has(video.expectSeq);
   if (!reported) {
@@ -1114,7 +1156,8 @@ function frameLost(reason) {
   let to = from;
   while (video.hostDropped.has(to)) video.hostDropped.delete(to++);
   if (to === from) to = Math.min(...video.reorder.keys());
-  const missing = to - from;
+  let missing = to - from;
+  for (let s = from; s < to; s++) if (video.thinned.has(s)) missing--; // left out on purpose: no loss
   stats.dropped += missing;
   if (!reported) fb.lost += missing; // lost on the way (the host knows its own drops)
   const mode = P.recoveryOf(video.cfg);
@@ -1164,6 +1207,7 @@ function skipToRecovery() {
   let late = 0;
   for (let s = video.expectSeq; s < to; s++) {
     const buffered = video.reorder.delete(s);
+    if (video.thinned.has(s)) continue; // left out on purpose: neither late nor discarded
     if (video.hostDropped.delete(s)) { stats.dropped++; continue; }
     if (!buffered) late++;
     r.discarded++;
@@ -2100,6 +2144,7 @@ function postStats() {
     skipped: stats.skipped,
     hostDropped: stats.hostDropped,
     streamResets: stats.streamResets, // reset frame streams whose header arrived (onFrameReset)
+    thinned: stats.thinned, // frames the host left out on purpose (temporal SVC thinning), not losses
     keyRequests: stats.keyRequests,
     recovered: stats.recovered,
     recoveredByKey: stats.recoveredByKey,

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
@@ -76,6 +77,55 @@ type Config struct {
 	// default) never, HDRAuto to clients that can present HDR, with an
 	// encoder that can make it (hdr.go).
 	HDR string `json:"hdr,omitempty"`
+
+	// SVC is temporal SVC (Phase 5): "auto" ("" = auto) starts native-helper
+	// streams with two temporal layers where the encoder has them (to
+	// clients that can be thinned), and leaves out the frames no other frame
+	// references (the enhancement layer; on the FFmpeg path non-reference
+	// frames) under congestion: the frame rate halves for a moment, no
+	// corruption, no key frame; "off": neither.
+	SVC string `json:"svc,omitempty"`
+	// StaticBitrate "auto" ("" = auto) lowers the encoder's bitrate while the
+	// desktop is static (the native helper's dirty rects; a seamless live
+	// bitrate only) to StaticKbps and raises it again with the first frame
+	// that changes: to the full bitrate from 5 % of the picture changed,
+	// linearly between 0.2 % and 5 %; "off": never.
+	StaticBitrate string `json:"staticBitrate,omitempty"`
+	// StaticKbps is a static desktop's bitrate (0 = a quarter of the rate
+	// controller's target, at least 2000 kbit/s; never above the target).
+	StaticKbps int `json:"staticKbps,omitempty"`
+	// FPSFloor is the lowest frame rate the rate controller lowers to at its
+	// bitrate floor before anything else (0 = 60, GUIDE 2.2). Where the
+	// encoder changes its frame rate in place (the native helper) in fine
+	// steps down to it, 2 s apart; elsewhere (FFmpeg, flushing encoders,
+	// older helpers) the rungs 120 / 90 / 60 at or above it, nothing below
+	// 60.
+	FPSFloor int `json:"fpsFloor,omitempty"`
+	// ROI is the encoder's region of interest around where the player looks
+	// (Phase 5 "sharper crosshair / cursor"; native helper encoders with a
+	// region of interest map: AMF, NVENC): "auto" ("" = auto) the pointer
+	// while the client sends absolute pointer positions; while it sends
+	// relative motion (pointer lock) the host's pointer where that shows (a
+	// game's menu, a strategy game), else the picture's centre (a game's
+	// crosshair); nothing before either; "cursor" always the pointer (where
+	// it was last seen); "center" always the centre; "off" none.
+	ROI string `json:"roi,omitempty"`
+	// EncoderInstance picks the native helper's hardware encode engine
+	// (Phase 5 "dedicated encode engine"; AMF INSTANCE_INDEX, where the GPU
+	// has several and the backend lets a stream choose): "auto" ("" = auto)
+	// the backend's default (engine 0), "dedicated" engine 1 where there is
+	// one, or an engine number (0, 1, ...; also as a JSON number).
+	EncoderInstance engineChoice `json:"encoderInstance,omitempty"`
+	// ReencodeOversized (experimental, 0 = off) has the native helper encode
+	// a non-key frame larger than this many average frames (bitrate / fps)
+	// a second time at a higher QP before it goes out (1.5..100; NVENC,
+	// where the GPU can encode without advancing its state).
+	ReencodeOversized float64 `json:"reencodeOversized,omitempty"`
+	// SliceOutput (experimental, 0 = off) has the native helper's encoder
+	// hand out each frame in this many slices / tiles (1..64; AMF where the
+	// caps allow it). Frames still go out whole: the host's latency stages
+	// measure when the first slice was ready (host_encode_first_slice).
+	SliceOutput int `json:"sliceOutput,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -191,6 +241,32 @@ func LoadConfig(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("%s: helperLibavcodec must be %q or %q, not %q", path, libavcodecAuto, libavcodecOff, c.HelperLibavcodec)
 	}
+	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}} {
+		if v.val != "" && v.val != settingAuto && v.val != settingOff {
+			return nil, fmt.Errorf("%s: %s must be %q or %q, not %q", path, v.key, settingAuto, settingOff, v.val)
+		}
+	}
+	if c.StaticKbps < 0 {
+		return nil, fmt.Errorf("%s: staticKbps must not be negative, not %d", path, c.StaticKbps)
+	}
+	switch c.ROI {
+	case "", settingAuto, settingOff, roiCursor, roiCenter:
+	default:
+		return nil, fmt.Errorf("%s: roi must be %q, %q, %q or %q, not %q", path, settingAuto, roiCursor, roiCenter, settingOff, c.ROI)
+	}
+	if _, err := encoder.EncoderInstanceFor(string(c.EncoderInstance), encoder.CodecCaps{InstanceSelect: true, HWInstances: 16}); err != nil {
+		return nil, fmt.Errorf("%s: encoderInstance must be %q, %q or an engine number 0..15, not %q", path, settingAuto, "dedicated",
+			string(c.EncoderInstance))
+	}
+	if r := c.ReencodeOversized; r != 0 && (r < 1.5 || r > 100) {
+		return nil, fmt.Errorf("%s: reencodeOversized must be 0 (off) or 1.5..100 average frames, not %g", path, r)
+	}
+	if c.SliceOutput < 0 || c.SliceOutput > 64 {
+		return nil, fmt.Errorf("%s: sliceOutput must be 0 (off) or 1..64, not %d", path, c.SliceOutput)
+	}
+	if c.FPSFloor != 0 && (c.FPSFloor < 10 || c.FPSFloor > 240) {
+		return nil, fmt.Errorf("%s: fpsFloor must be 0 (default) or 10..240, not %d", path, c.FPSFloor)
+	}
 	if !vdisplay.ValidPolicy(c.VirtualDisplay) {
 		return nil, fmt.Errorf("%s: virtualDisplay must be %q, %q or %q, not %q", path,
 			vdisplay.PolicyOff, vdisplay.PolicyAuto, vdisplay.PolicyOn, c.VirtualDisplay)
@@ -262,6 +338,54 @@ func (c *Config) LibavcodecDir() string {
 	}
 	return c.helperFFmpegDir(dir)
 }
+
+// Values of the auto | off settings (svc, staticBitrate).
+const (
+	settingAuto = "auto"
+	settingOff  = "off"
+)
+
+// Values of host config "roi" besides auto and off.
+const (
+	roiCursor = "cursor"
+	roiCenter = "center"
+)
+
+// roi returns the region of interest mode: auto, cursor, center or off.
+func (c *Config) roi() string {
+	if c.ROI == "" {
+		return settingAuto
+	}
+	return c.ROI
+}
+
+// engineChoice is host config "encoderInstance": "auto", "dedicated" or an
+// engine number, written as a JSON string or number (null: unset, auto).
+type engineChoice string
+
+func (e *engineChoice) UnmarshalJSON(b []byte) error {
+	if string(bytes.TrimSpace(b)) == "null" {
+		return nil // unset (auto), as encoding/json does with null for other types
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err == nil {
+		*e = engineChoice(strconv.Itoa(n))
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("encoderInstance: want \"auto\", \"dedicated\" or an engine number, not %s", b)
+	}
+	*e = engineChoice(s)
+	return nil
+}
+
+// svc reports whether temporal SVC thinning is on (Phase 5): "svc" auto.
+func (c *Config) svc() bool { return c.SVC != settingOff }
+
+// staticBitrate reports whether a static desktop lowers the bitrate:
+// "staticBitrate" auto.
+func (c *Config) staticBitrate() bool { return c.StaticBitrate != settingOff }
 
 // av1 returns the AV1 policy of the automatic codec choice.
 func (c *Config) av1() string {

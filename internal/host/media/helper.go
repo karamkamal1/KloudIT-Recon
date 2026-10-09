@@ -3,6 +3,7 @@ package media
 import (
 	"errors"
 	"fmt"
+	"image"
 	"log/slog"
 	"slices"
 	"sync"
@@ -67,6 +68,15 @@ type HelperVideo struct {
 	// A zero-copy AMD Direct Capture source that changed (capture_failed) is
 	// restarted as is once; the second time the new helper converts frames.
 	zeroCopyFails int
+	// focus: where the viewer looks (SetFocus), sent to every started helper
+	// whose encoder has a region of interest map.
+	focus Focus
+	// plainStart: a helper refused a start with the Phase 5 encoder options
+	// (engine, re-encode, slice output): later starts go without them.
+	plainStart bool
+	// decided: the last logged decision per Phase 5 encoder option (logged
+	// once per change, not per helper start).
+	decided map[string]string
 }
 
 // HelperOptions configures HelperVideo.
@@ -104,6 +114,19 @@ type HelperOptions struct {
 	// is the start so far (codec, quality, ltrSlots); adaptive: the
 	// session's rate controller changes the bitrate. Optional.
 	LiveBitrate func(c encoder.Caps, sp encoder.StartParams, adaptive bool) (rc, mode string, ok bool)
+	// Phase 5 encoder options (host config; zero values: the backend's
+	// defaults, off), applied where the started helper's caps allow them
+	// (withCaps, which logs each decision once): EncoderInstance is the
+	// hardware engine choice for encoder.EncoderInstanceFor ("auto" = "" =
+	// the default engine, "dedicated", or an engine number);
+	// ReencodeOversized re-encodes non-key frames larger than that many
+	// average frames at a higher QP (caps reencode: NVENC); SliceOutput has
+	// the encoder hand out that many slices / tiles per frame (caps
+	// sliceOutput: AMF; the frames still go out whole, Frame.FirstSliceUs
+	// says when the first part was ready).
+	EncoderInstance   string
+	ReencodeOversized float64
+	SliceOutput       int
 }
 
 // ErrHelperGaveUp is returned by Start after the pipeline gave up.
@@ -150,6 +173,11 @@ type helperProc struct {
 	recovering  bool
 	recoverFrom uint32
 	recoverAt   time.Time
+	// roi: the regions of interest its helper has (SetFocus; nil: none);
+	// roiRefused: its helper answered a setRoi with an error, so it gets no
+	// more. Guarded by HelperVideo.mu.
+	roi        []encoder.ROIRect
+	roiRefused bool
 }
 
 // NewHelperVideo creates the pipeline; nothing runs until Start.
@@ -235,11 +263,22 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 		if cur.sp.FPS != sp.FPS {
 			fps = sp.FPS
 		}
-		rate := cur.sp.Kbps != sp.Kbps || fps > 0
-		if !rate || v.liveBitrate(cur) {
+		vbv := 0.0
+		if cur.sp.VBVFrames != sp.VBVFrames {
+			vbv = sp.VBVFrames
+			if vbv <= 0 {
+				vbv = 1 // back to the helper's default
+			}
+		}
+		rate := cur.sp.Kbps != sp.Kbps || fps > 0 || vbv > 0
+		if !rate || v.liveBitrate(cur) && (fps == 0 || v.liveFPS(cur)) {
 			h, starting := cur.h, cur.started.Codec == ""
+			// A frame-rate change alone goes out as one (Phase 5 setRate
+			// with fps only), to helpers that know it.
+			fpsOnly := fps > 0 && vbv == 0 && cur.sp.Kbps == sp.Kbps && cur.started.LiveFPS != ""
 			sp.LTRSlots, sp.ZeroCopy, sp.RC, sp.LiveBitrate = cur.sp.LTRSlots, cur.sp.ZeroCopy, cur.sp.RC, cur.sp.LiveBitrate // as withCaps made them
-			sp.IntraRefreshFrames = cur.sp.IntraRefreshFrames
+			sp.IntraRefreshFrames, sp.SVCLayers = cur.sp.IntraRefreshFrames, cur.sp.SVCLayers
+			sp.EncoderInstance, sp.ReencodeOversized, sp.SliceOutput = cur.sp.EncoderInstance, cur.sp.ReencodeOversized, cur.sp.SliceOutput
 			cur.params, cur.sp = p, sp
 			if urgent && cur == v.pending && v.active != nil {
 				v.kill(v.active) // the starting stream takes over at its first key frame
@@ -250,7 +289,13 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 				return nil // run starts it with sp, or sets the rate right after its start
 			}
 			if rate {
-				if err := h.SetRate(sp.Kbps, 0, fps); err != nil {
+				var err error
+				if fpsOnly {
+					err = h.SetFPS(fps)
+				} else {
+					err = h.SetRate(sp.Kbps, vbv, fps)
+				}
+				if err != nil {
 					return err
 				}
 				v.mu.Lock()
@@ -279,14 +324,17 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 }
 
 // sameHelperStream reports whether two starts describe the same stream apart
-// from bitrate and frame rate (which SetRate changes) and what withCaps adds
-// (the rate-control mode follows from Params.Adaptive, which the caller
-// compares).
+// from bitrate, frame rate and VBV size (which SetRate changes) and what
+// withCaps adds or takes away (the Phase 5 encoder options come from the
+// pipeline's options, constant for a session; the rate-control mode follows from
+// Params.Adaptive, which the caller compares; the temporal layers from the
+// session's settings, constant for a session).
 func sameHelperStream(a, b encoder.StartParams) bool {
 	bc := a.Barcode == nil && b.Barcode == nil || a.Barcode != nil && b.Barcode != nil && *a.Barcode == *b.Barcode
 	for _, sp := range []*encoder.StartParams{&a, &b} {
-		sp.Kbps, sp.FPS, sp.LTRSlots, sp.ZeroCopy, sp.Barcode, sp.EncoderInstance = 0, 0, 0, nil, nil, nil
-		sp.RC, sp.LiveBitrate, sp.IntraRefreshFrames = "", "", 0
+		sp.Kbps, sp.FPS, sp.VBVFrames, sp.LTRSlots, sp.ZeroCopy, sp.Barcode, sp.EncoderInstance = 0, 0, 0, 0, nil, nil, nil
+		sp.RC, sp.LiveBitrate, sp.IntraRefreshFrames, sp.SVCLayers = "", "", 0, 0
+		sp.ReencodeOversized, sp.SliceOutput = 0, 0
 	}
 	return bc && a == b
 }
@@ -319,6 +367,19 @@ func (v *HelperVideo) liveMode(pr *helperProc) string {
 	return lb
 }
 
+// liveFPS reports whether the proc's encoder changes its frame rate in place
+// (as its started liveFps says; helpers before Phase 5 apply a frame rate
+// sent with the bitrate as they apply the bitrate). Called with v.mu held.
+func (v *HelperVideo) liveFPS(pr *helperProc) bool {
+	switch pr.started.LiveFPS {
+	case "seamless", "flush":
+		return true
+	case "":
+		return true // as liveBitrate, which the caller checks too
+	}
+	return false // restart: a new helper
+}
+
 // startParams turns a generation's parameters into the helper's start
 // message: capture method and monitor from the source, rate control CBR when
 // the rate controller may change the bitrate (else the encoder's low-latency
@@ -335,6 +396,10 @@ func (v *HelperVideo) startParams(p Params) (encoder.StartParams, error) {
 		RC:          "vbr",
 		Quality:     p.Quality,
 		GPUPriority: p.GPUPriority,
+		VBVFrames:   p.VBVFrames,
+	}
+	if p.SVCLayers > 1 {
+		sp.SVCLayers = p.SVCLayers
 	}
 	if p.Adaptive {
 		sp.RC = "cbr"
@@ -388,15 +453,33 @@ type liveChoice struct {
 // held.
 func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encoder.Caps) (encoder.StartParams, liveChoice) {
 	sp.LTRSlots = caps.LTRSlots(sp.Codec)
+	// Temporal SVC (Phase 5) where the session asks for it and the encoder
+	// has the layers; only from a Phase 5 helper (its caps have liveFps):
+	// older ones may mark LTR frames in the enhancement layer, which the
+	// session leaves out under congestion.
+	if sp.SVCLayers > 1 {
+		cc := caps.Codecs[sp.Codec]
+		why := ""
+		switch {
+		case cc.MaxTemporalLayers < sp.SVCLayers:
+			why = fmt.Sprintf("the %s encoder has %d temporal layers", sp.Codec, cc.MaxTemporalLayers)
+		case cc.LiveFPS == "":
+			why = "a helper before Phase 5 (LTR marks may fall on enhancement-layer frames)"
+		}
+		if why != "" {
+			v.log.Info("temporal SVC not used", "codec", sp.Codec, "reason", why)
+			sp.SVCLayers = 0
+		}
+	}
 	// The loss-recovery ladder's safety net (GUIDE 2.3, rung 3): intra
 	// refresh, over half a second of frames as on the FFmpeg path, where
-	// the encoder has it and it does not conflict: not with LTR slots or
-	// SVC (AMF); so NVENC (beside reference invalidation) and AMF H.264
-	// without LTR. A picture a recovery leaves damaged heals by itself;
-	// losses are still answered by recovery frames or IDRs.
-	if sp.SVCLayers <= 1 {
-		sp.IntraRefreshFrames = caps.IntraRefreshFrames(sp.Codec, sp.FPS)
-	}
+	// the encoder has it and it does not conflict: not with LTR slots, nor
+	// with SVC where the caps say so (intraRefreshSvc false: AMF); so NVENC
+	// (beside reference invalidation, with or without SVC) and AMF H.264
+	// without LTR or SVC. A picture a recovery leaves damaged heals by
+	// itself; losses are still answered by recovery frames or IDRs.
+	sp.IntraRefreshFrames = caps.IntraRefreshFrames(sp.Codec, sp.FPS, sp.SVCLayers)
+	v.encoderOptions(&sp, caps.Codecs[sp.Codec])
 	if v.zeroCopyFails >= 2 {
 		off := false
 		sp.ZeroCopy = &off
@@ -417,6 +500,79 @@ func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encod
 		}
 	}
 	return sp, lc
+}
+
+// encoderOptions adds the Phase 5 encoder options of HelperOptions to a
+// start where the codec's caps allow them, and logs each decision once (per
+// change: withCaps runs for every helper start). Nothing where a helper
+// refused a start with them (plainStart). Called with v.mu held.
+func (v *HelperVideo) encoderOptions(sp *encoder.StartParams, cc encoder.CodecCaps) {
+	if v.plainStart {
+		return
+	}
+	// Dedicated encode engine (GUIDE 9 order 4): "auto" keeps the default
+	// engine (GUIDE 3.3: engine 0 unless Adrenalin's recording uses it, a
+	// VERIFY item); "dedicated" or a number pick one where the backend lets
+	// the start choose (AMF INSTANCE_INDEX; not NVENC, which spreads frames
+	// over its engines itself, nor the libavcodec backend) and the GPU has it.
+	choice := v.opt.EncoderInstance
+	if choice == "" {
+		choice = "auto"
+	}
+	inst, err := encoder.EncoderInstanceFor(choice, cc)
+	engines := max(1, cc.HWInstances)
+	switch {
+	case err != nil:
+		v.decide("engine", "encoder engine: the backend's default", "codec", sp.Codec, "config", choice, "engines", engines,
+			"reason", err.Error())
+	case inst != nil:
+		v.decide("engine", "encoder engine", "codec", sp.Codec, "config", choice, "engine", *inst, "engines", engines)
+	case !cc.InstanceSelect:
+		v.decide("engine", "encoder engine: the backend's default", "codec", sp.Codec, "config", choice, "engines", engines,
+			"reason", "the encoder does not let a stream pick its engine (caps instanceSelect false)")
+	case engines < 2:
+		v.decide("engine", "encoder engine: the backend's default", "codec", sp.Codec, "config", choice, "engines", engines,
+			"reason", "the GPU has one engine for this codec")
+	default:
+		v.decide("engine", "encoder engine: the backend's default (engine 0)", "codec", sp.Codec, "config", choice, "engines", engines,
+			"reason", `host config "encoderInstance" "dedicated" or a number picks another (e.g. away from a recording)`)
+	}
+	sp.EncoderInstance = inst
+	// Re-encoding oversized frames (GUIDE 9 order 4, experimental): only
+	// where the encoder can encode a frame without advancing its state.
+	if f := v.opt.ReencodeOversized; f > 0 {
+		if cc.Reencode {
+			sp.ReencodeOversized = f
+			v.decide("reencode", "re-encoding oversized frames", "codec", sp.Codec, "average_frames", f)
+		} else {
+			v.decide("reencode", "re-encoding oversized frames not used", "codec", sp.Codec,
+				"reason", "the encoder cannot encode a frame without advancing its state (caps reencode false)")
+		}
+	}
+	// Sub-frame slice / tile output (GUIDE 9 order 5, experimental): the
+	// frames still go out whole; Frame.FirstSliceUs measures the gain.
+	if n := v.opt.SliceOutput; n > 0 {
+		if cc.SliceOutput {
+			sp.SliceOutput = n
+			v.decide("slices", "sub-frame output (frames still sent whole)", "codec", sp.Codec, "slices", n)
+		} else {
+			v.decide("slices", "sub-frame output not used", "codec", sp.Codec,
+				"reason", "the encoder has no slice / tile output (caps sliceOutput false)")
+		}
+	}
+}
+
+// decide logs a decision once per change of its text. Called with v.mu held.
+func (v *HelperVideo) decide(key, msg string, args ...any) {
+	text := msg + fmt.Sprint(args...)
+	if v.decided[key] == text {
+		return
+	}
+	if v.decided == nil {
+		v.decided = map[string]string{}
+	}
+	v.decided[key] = text
+	v.log.Info(msg, args...)
 }
 
 // kill stops a proc's helper (asynchronously: Close waits for it to exit).
@@ -515,21 +671,31 @@ func (v *HelperVideo) run(pr *helperProc) {
 	v.mu.Lock()
 	pr.started = st
 	later := pr.sp // a SetRate while the start was on its way
+	// The viewer's focus, as far as the session set it.
+	if err := v.applyFocus(pr); err != nil {
+		v.log.Warn("encoder helper: setting the regions of interest failed", "err", err)
+	}
 	v.mu.Unlock()
 	attrs := []any{"backend", st.Backend, "capture", st.Capture, "codec", st.Codec,
 		"size", fmt.Sprintf("%dx%d", st.Width, st.Height), "fps", st.FPS, "kbps", st.Kbps, "adapter", st.AdapterName,
 		"vendor", st.Vendor, "gpu_priority", st.GPUPriority, "live_bitrate", st.LiveBitrate, "rate_control", st.RateControl,
 		"live_bitrate_from", liveSource(pr), "recovery", pr.recovery(), "ltr_slots", st.LTRSlots, "intra_refresh", st.IntraRefreshFrames,
 		"zero_copy", st.ZeroCopy, "barcode", st.Barcode, "cursor_in_video", st.CursorInVideo,
-		"hdr", st.HDR, "bit_depth", st.BitDepth, "color_space", st.ColorSpace}
+		"hdr", st.HDR, "bit_depth", st.BitDepth, "color_space", st.ColorSpace,
+		"svc_layers", max(1, st.SVCLayers), "live_fps", st.LiveFPS, "encoder_instance", st.EncoderInstance, "hw_instances", st.HWInstances,
+		"roi", pr.codecCaps.ROI, "reencode_oversized", st.ReencodeOversized, "slice_output", st.SliceOutput}
 	if st.Encoder != "" {
 		// The libavcodec backend (GUIDE 3.8): FFmpeg's encoder (hevc_qsv, ...)
 		// and how it runs (low_power: VDENC; zero_copy false: frames read back).
 		attrs = append(attrs, "encoder", st.Encoder, "usage", st.Usage, "preset", st.Preset)
 	}
 	v.log.Info("encoder helper started", attrs...)
-	if later.Kbps != sp.Kbps || later.FPS != sp.FPS {
-		_ = h.SetRate(later.Kbps, 0, later.FPS)
+	if later.Kbps != sp.Kbps || later.FPS != sp.FPS || later.VBVFrames != sp.VBVFrames {
+		vbv := later.VBVFrames
+		if vbv <= 0 && sp.VBVFrames > 0 {
+			vbv = 1 // back to the helper's default
+		}
+		_ = h.SetRate(later.Kbps, vbv, later.FPS)
 	}
 	v.read(pr)
 }
@@ -591,6 +757,18 @@ func (v *HelperVideo) read(pr *helperProc) {
 			if errors.As(err, &he) && he.Fatal {
 				v.failed(pr, err)
 				return
+			}
+			if he != nil && he.Re == "setRoi" {
+				// The encoder does not take the map: stop sending it to
+				// this helper (one warning, not one per pointer move).
+				v.mu.Lock()
+				first := !pr.roiRefused
+				pr.roiRefused = true
+				v.mu.Unlock()
+				if first {
+					v.log.Warn("encoder helper refused the regions of interest: none sent to it again", "err", err)
+				}
+				continue
 			}
 			v.log.Warn("encoder helper error", "err", err)
 		}
@@ -728,6 +906,23 @@ func (v *HelperVideo) convert(pr *helperProc, f *encoder.Frame, data []byte, cap
 	}
 	pr.acks.add(f.FrameID, ltr, f.Key)
 	fr.TemporalLayer = uint8(min(f.TemporalLayer, 255))
+	// Only frames the client cannot miss stay: a recovery frame whose
+	// refFloor was not usable is no recovery frame for the client either.
+	fr.Discardable = f.Droppable() && !fr.Recovery
+	if f.Dirty >= 0 {
+		fr.Dirty, fr.HasDirty = min(f.Dirty, 1), true
+		if f.Repeat {
+			fr.Dirty = 0
+		}
+	}
+	// Sub-frame output: when the first slice was ready (between submit and
+	// the whole frame, else not reported).
+	if f.Slices > 0 && f.FirstSliceQPC != 0 {
+		if us := host(f.FirstSliceQPC); us != 0 && us <= fr.EncodeDoneUs && (fr.SubmitUs == 0 || us >= fr.SubmitUs) {
+			fr.FirstSliceUs = us
+		}
+	}
+	fr.Reencoded = f.Reencoded
 	return fr
 }
 
@@ -838,6 +1033,16 @@ func (v *HelperVideo) failed(pr *helperProc, err error) {
 	v.streak++
 	if isHE && he.Code == "capture_failed" && pr.started.ZeroCopy {
 		v.zeroCopyFails++
+	}
+	if isHE && he.Re == "start" && !v.plainStart && (pr.sp.EncoderInstance != nil || pr.sp.ReencodeOversized > 0 || pr.sp.SliceOutput > 0) {
+		// The Phase 5 encoder options are opt-in experiments or tuning: a
+		// start that failed with them is retried without them, for the rest
+		// of the session (also when something else made it fail: the
+		// stream matters more than the options).
+		v.plainStart = true
+		v.log.Warn("the encoder helper refused a start with the Phase 5 encoder options: later starts go without them",
+			"err", err, "encoder_instance", pr.sp.EncoderInstance != nil, "reencode_oversized", pr.sp.ReencodeOversized,
+			"slice_output", pr.sp.SliceOutput)
 	}
 	giveUp := len(v.failures) >= v.opt.GiveUp
 	failedParams := pr.params
@@ -995,10 +1200,78 @@ func (v *HelperVideo) Capabilities() PipelineCaps {
 	c.LiveBitrate = v.liveBitrate(pr)
 	c.LiveBitrateFlush = c.LiveBitrate && v.liveMode(pr) == "flush"
 	c.LiveBitrateMeasured = pr.liveMeasured
+	c.LiveFPS = c.LiveBitrate && pr.started.LiveFPS == "seamless"
+	c.SVCLayers = pr.started.SVCLayers
 	c.CursorInVideo = pr.started.CursorInVideo
 	c.IntraRefresh = pr.started.IntraRefreshFrames > 0
 	c.Recovery = pr.recovery()
+	c.ROI = hasROI(pr.codecCaps) && !pr.roiRefused
 	return c
+}
+
+// hasROI reports whether an encoder has a region of interest map (caps roi:
+// AMF importance, NVENC emphasis = its QP delta map).
+func hasROI(cc encoder.CodecCaps) bool { return cc.ROI != "" && cc.ROI != "none" }
+
+// SetFocus sets where the viewer looks: the regions of interest of the
+// running helper (and of one that is starting) and of every helper started
+// later (encoder.FocusROI with the stream's capture and encoded sizes), sent
+// only where they changed. ErrNoROI where the live encoder has no map.
+func (v *HelperVideo) SetFocus(f Focus) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.focus = f
+	var errs []error
+	for _, pr := range []*helperProc{v.active, v.pending} {
+		if err := v.applyFocus(pr); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if pr := v.active; pr != nil && pr.started.Codec != "" && (!hasROI(pr.codecCaps) || pr.roiRefused) {
+		errs = append(errs, ErrNoROI)
+	}
+	return errors.Join(errs...)
+}
+
+// applyFocus sends the focus's regions to a started proc's helper where its
+// encoder has a map and they differ from what it has. Called with v.mu held
+// (setRoi is only queued).
+func (v *HelperVideo) applyFocus(pr *helperProc) error {
+	if pr == nil || pr.killed || pr.h == nil || pr.started.Codec == "" || !hasROI(pr.codecCaps) || pr.roiRefused {
+		return nil
+	}
+	rects := focusRects(pr.started, v.focus)
+	if slices.Equal(rects, pr.roi) {
+		return nil
+	}
+	if err := pr.h.SetROI(rects); err != nil {
+		return err // not queued: the next SetFocus tries again
+	}
+	pr.roi = rects
+	return nil
+}
+
+// focusRects turns a focus into the regions of interest of a stream
+// (encoder.FocusROI): the pointer's position across the picture mapped to the
+// captured source as displayed (the client's absolute positions are relative
+// to the picture it shows), the regions scaled to the encoded size.
+func focusRects(st encoder.Started, f Focus) []encoder.ROIRect {
+	if !f.Pointer && !f.Center {
+		return nil
+	}
+	srcW, srcH := st.CaptureWidth, st.CaptureHeight
+	if srcW <= 0 || srcH <= 0 {
+		srcW, srcH = st.Width, st.Height
+	}
+	var cursor *image.Point
+	if f.Pointer {
+		cursor = &image.Point{X: int(f.X) * max(0, srcW-1) / 65535, Y: int(f.Y) * max(0, srcH-1) / 65535}
+	}
+	opt := encoder.FocusOptions{Background: f.Background}
+	if !f.Center {
+		opt.CenterSize = -1
+	}
+	return encoder.FocusROI(srcW, srcH, st.Width, st.Height, cursor, opt)
 }
 
 // recovery is how a started proc's stream recovers a lost frame: from an
@@ -1032,10 +1305,12 @@ func (v *HelperVideo) ForceKeyframe() error {
 	return pr.h.ForceIDR()
 }
 
-// SetRate changes the bitrate (and frame rate, fps > 0) of the stream: in the
-// running encoder with live bitrate (seamless, or flush: an encoder flush
-// with an IDR), else with a new helper (overlapped).
-func (v *HelperVideo) SetRate(kbps, fps int) error {
+// SetRate changes the bitrate (and frame rate, fps > 0; and the VBV size,
+// vbvFrames > 0 or 0 for the helper's default) of the stream: in the running
+// encoder with live bitrate (seamless, or flush: an encoder flush with an
+// IDR; a frame-rate change also needs the helper's liveFps), else with a new
+// helper (overlapped).
+func (v *HelperVideo) SetRate(kbps, fps int, vbvFrames float64) error {
 	p, ok := v.Current()
 	if !ok {
 		return errors.New("video: no encoder helper streams")
@@ -1044,6 +1319,7 @@ func (v *HelperVideo) SetRate(kbps, fps int) error {
 	if fps > 0 {
 		p.FPS = fps
 	}
+	p.VBVFrames = vbvFrames
 	return v.Start(p, false)
 }
 

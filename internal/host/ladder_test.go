@@ -301,7 +301,7 @@ func (p *ladderPipeline) ForceKeyframe() error {
 	p.keyframes++
 	return nil
 }
-func (p *ladderPipeline) SetRate(int, int) error { return nil }
+func (p *ladderPipeline) SetRate(int, int, float64) error { return nil }
 func (p *ladderPipeline) Recover(gen uint8, seq uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -312,6 +312,7 @@ func (p *ladderPipeline) Recover(gen uint8, seq uint32) error {
 	return nil
 }
 func (p *ladderPipeline) Ack(uint8, uint32)                {}
+func (p *ladderPipeline) SetFocus(media.Focus) error       { return media.ErrNoROI }
 func (p *ladderPipeline) Capabilities() media.PipelineCaps { return p.caps }
 func (p *ladderPipeline) state() ([]string, int, []bool) {
 	p.mu.Lock()

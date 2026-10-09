@@ -666,6 +666,39 @@ void testLayers() {
     expect(li.temporalId == -1, name, "av1 without an extension");
     std::printf("  %-44s ok\n", name);
 
+    // The mock backend's SVC enhancement layer: each canned P frame recoded
+    // as a non-reference picture (h264AsNonReference). Whether it decodes
+    // to the original's picture is checked with FFmpeg (VENDOR_NOTES Phase
+    // 5 wiring A); here: every P frame converts, nal_ref_idc 0, the marking
+    // bit gone (a hand-made slice), refusals.
+    name = "non-reference copies of the mock clip";
+    {
+        const std::vector<uint8_t> clipIdr = au(0);
+        size_t n = 0;
+        for (size_t i = 1; i < ReplayEncoder::kClipFrames; ++i, ++n) {
+            const std::vector<uint8_t> p = au(i);
+            const std::vector<uint8_t> c = h264AsNonReference(p.data(), p.size(), clipIdr.data(), clipIdr.size());
+            if (c.empty()) {
+                expect(false, name, "frame " + std::to_string(i) + " not converted");
+                break;
+            }
+            const LayerInfo lo = layerInfo(Codec::H264, p.data(), p.size(), 1), lc = layerInfo(Codec::H264, c.data(), c.size(), 1);
+            expect(lo.reference == 1 && lc.reference == 0, name, "nal_ref_idc of frame " + std::to_string(i));
+            expect(c.size() + 2 >= p.size() && c.size() <= p.size() + 1, name, "size of frame " + std::to_string(i));
+        }
+        // first_mb 0, P (5), PPS 0, frame_num 1 (4 bits), no override, no
+        // list modification, adaptive_ref_pic_marking_mode_flag 0, stop bit.
+        const std::vector<uint8_t> slice = bytes({0, 0, 0, 1, 0x41, 0x9a, 0x22});
+        const std::vector<uint8_t> want = bytes({0, 0, 0, 1, 0x01, 0x9a, 0x24});
+        expect(h264AsNonReference(slice.data(), slice.size(), clipIdr.data(), clipIdr.size()) == want, name, "hand-made slice");
+        const std::vector<uint8_t> mmco = bytes({0, 0, 0, 1, 0x41, 0x9a, 0x26});  // adaptive_ref_pic_marking_mode_flag 1
+        expect(h264AsNonReference(mmco.data(), mmco.size(), clipIdr.data(), clipIdr.size()).empty(), name, "converted a slice with MMCOs");
+        expect(h264AsNonReference(clipIdr.data(), clipIdr.size(), clipIdr.data(), clipIdr.size()).empty(), name, "converted an IDR");
+        const std::vector<uint8_t> p1 = au(1);
+        expect(h264AsNonReference(p1.data(), p1.size(), p1.data(), p1.size()).empty(), name, "converted without SPS / PPS");
+        std::printf("  %-44s ok (%zu P frames)\n", name, n);
+    }
+
     name = "sub-frame output: slices put together";
     {
         SliceAssembler a;

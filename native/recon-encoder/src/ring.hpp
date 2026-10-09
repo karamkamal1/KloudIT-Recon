@@ -60,6 +60,8 @@ constexpr size_t kSlotDroppedBefore = 84;  // u32 frames dropped right before th
 constexpr size_t kSlotWidth = 88;          // u32
 constexpr size_t kSlotHeight = 92;         // u32
 constexpr size_t kSlotDirtyPpm = 96;       // u32 dirty share in parts per million (valid with kFlagDirty; Phase 5)
+constexpr size_t kSlotSlices = 100;        // u32 parts of sub-frame output (start sliceOutput), 0 = whole (Phase 5 wiring B)
+constexpr size_t kSlotFirstSliceQpc = 104; // i64 when the first part was ready (valid with kSlotSlices > 0)
 
 constexpr uint32_t kFlagKey = 1u << 0;
 constexpr uint32_t kFlagRecovery = 1u << 1;
@@ -69,6 +71,7 @@ constexpr uint32_t kFlagSeqStart = 1u << 4;  // key frame starting a sequence (s
 // Phase 5 (additive: older helpers leave them 0).
 constexpr uint32_t kFlagDirty = 1u << 5;        // kSlotDirtyPpm is valid (the capture reports dirty regions)
 constexpr uint32_t kFlagDiscardable = 1u << 6;  // no later frame references this one (top SVC layer / non-reference)
+constexpr uint32_t kFlagReencoded = 1u << 7;    // encoded a second time at a higher QP (start reencodeOversized; Phase 5 wiring B)
 }  // namespace ring
 
 enum class WriteResult { Written, Full, TooLarge, Corrupt };

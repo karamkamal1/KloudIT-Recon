@@ -184,6 +184,10 @@ struct CodecCaps {
     std::string recovery = "none";  // "ltr" | "invalidate" | "none"
     int maxLtr = 0;                 // LTR slots start's ltrSlots may ask for (0: no LTR recovery)
     bool intraRefresh = false;
+    // start may combine intraRefreshFrames with svcLayers > 1 (NVENC: no
+    // documented conflict, assumed; AMF cannot: MAX_LTR_FRAMES remarks).
+    // false: a stream with temporal layers starts without intra refresh.
+    bool intraRefreshSvc = false;
     std::string liveBitrate = "restart";  // "seamless" | "flush" | "restart"
     int maxTemporalLayers = 1;
     std::string roi = "none";  // "importance" | "emphasis" | "none"

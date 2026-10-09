@@ -3078,6 +3078,7 @@ async function lossRun(name, faults, seconds, prefs = {}) {
       rejected: delta('recoveryRejected'), keyFrames: delta('keyFrames'), freezes: delta('freezes'),
       // Frame streams the host reset whose header arrived (GUIDE 2.4).
       streamResets: delta('streamResets'),
+      thinned: delta('thinned'), thinnedTotal: st?.thinned ?? 0,
     },
     // Whether the browser negotiated RESET_STREAM_AT (the host's session line).
     resetStreamAt: ((host.log.match(/msg="session started"[^\n]*/g) || []).pop()?.match(/ reset_stream_at=(\S+)/) || [])[1] ?? null,
@@ -3322,6 +3323,71 @@ async function checkLossHandling() {
   delete k.hostLog;
   delete s.hostLog;
   results.push({ loss: 'faults', keyframe: k, skip: s, ref: r, refDropTests: rts });
+  await endStream();
+}
+
+// ---------------------------------------------------------------------------
+// Temporal SVC thinning (Phase 5 wiring A). Under congestion the host leaves
+// out frames no other frame references, before they are sent; the frames
+// after them carry the frame extension's "thinned" mask (clients with hello
+// v >= 4), and the client skips those seqs: no loss, no "lost" report, no
+// recovery, no key-frame request, the frame rate drops for the moment. What
+// is real here: the frames left out are the software AV1 encoder's own
+// non-reference frames (SVT-AV1's low-delay structure codes every second
+// frame with refresh_frame_flags 0; the host reads that from the bitstream,
+// internal/codec Discardable, as the native helper reports its SVC
+// enhancement layer), the leaving out, the masks and the client's handling.
+// What is simulated: the congestion. The host's test-only hook
+// thin=every:120:for:40 puts the last 40 frames of every 120 under pressure
+// (as the rate controller's delay signal, a building frame queue or a frame
+// stream past its deadline would), 0.67 s episodes, short of the second after
+// which lasting thinning would cut the bitrate. The recovery mode is
+// "keyframe" (FFmpeg path), so any frame taken for lost would show as a key
+// request; the frame barcodes check that the frames after a left-out one
+// decode to the right pictures. Adaptive bitrate is off and the bitrate 8
+// Mbit/s, so this CPU-only machine's own delay does not restart the encoder
+// in the window (an overlapped restart can overflow the frame queue: frames
+// the host drops and reports, which are no thinning); the real signals still
+// thin. Frames the host did drop for a reason of its own (logged "frames
+// dropped") are told to the client as before and are the only losses allowed.
+
+async function checkThinning() {
+  const t = await lossRun('host-thin', 'thin=every:120:for:40', 15, { adaptive: false, bitrate: 8 });
+  const hl = t.hostLog;
+  const ended = [...hl.matchAll(/msg="thinning ended".*? frames=(\d+)/g)].map((m) => +m[1]);
+  const hostThinned = ended.reduce((a, b) => a + b, 0);
+  // Episodes by what started them: one the machine's own delay started before the hook's pressure
+  // window goes on through it under that name.
+  const why = {};
+  for (const m of hl.matchAll(/msg="thinning: leaving out discardable frames under congestion".*? why=("[^"]*"|\S+)/g)) {
+    const k = m[1].replace(/"/g, '');
+    why[k] = (why[k] || 0) + 1;
+  }
+  const episodes = Object.values(why).reduce((a, b) => a + b, 0);
+  // Where the CPUs had nothing to spare (2-vCPU runners), the stream plays below 30 fps without any thinning.
+  const starved = t.idle != null && t.idle < STARVED_IDLE;
+  // The host's own drops (queue overflow, awaiting a key frame): logged with their reason, never a thinned frame.
+  const hostDrops = [...hl.matchAll(/msg="frames dropped".*? count=(\d+)/g)].reduce((a, m) => a + +m[1], 0);
+  // Key requests: none for a loss; a software decoder that falls behind (decoder backlog) is this machine's, and a
+  // frame the host dropped of its own is answered by a key frame in recovery "keyframe". Counted while decoding
+  // (instrumentWorker): a frame taken for lost asks then; the watchdog's re-asks while a key frame is awaited
+  // already (after a decoder backlog flush on a starved machine) are not another loss.
+  const lossKeys = Object.entries(t.keyWhileDecoding)
+    .filter(([k]) => k !== 'decoder backlog' && !(hostDrops > 0 && k === 'dropped by host')).reduce((a, [, v]) => a + v, 0);
+  check('temporal SVC thinning: the host leaves out the encoder\'s non-reference frames under (simulated) congestion; the client skips them: no loss, no recovery, no key-frame request',
+    t.cfg?.recovery === 'keyframe' && episodes >= 5 && (why['test fault'] || 0) >= 3 && ended.length >= 4 && hostThinned >= 40 &&
+      // The window's first episode may have begun before it, the last may not have ended (20 frames each at most).
+      Math.abs(t.client.thinned - hostThinned) <= 20 && t.client.lost <= hostDrops && t.client.hostDropped <= hostDrops &&
+      lossKeys === 0 && t.client.recovered === 0 && t.client.recoveredByKey === 0 &&
+      t.decoderErrors === 0 && t.dropped === 0 && (t.fps >= 30 || (starved && t.fps >= 10)),
+    `${t.cfg?.encoder} (recovery ${t.cfg?.recovery}, ${t.cfg?.bitrate} kbps): ${episodes} thinning episodes in the window, ${ended.length} ended with ${hostThinned} frames left out ` +
+      `(${ended.join(', ')}; started by ${counts(why)}); client: ${t.client.thinned} frames skipped as thinned (${t.client.thinnedTotal} this stream), lost ${t.client.lost}, ` +
+      `host-dropped ${t.client.hostDropped} (host logged ${hostDrops} drops of its own), key requests ${t.client.keyRequests} (${counts(t.keyRequestReasons)}), ` +
+      `recovered ${t.client.recovered}/${t.client.recoveredByKey}, decoder errors ${t.decoderErrors}, freezes ${t.client.freezes}; ${t.fps.toFixed(1)} fps mean over ${t.seconds} s; ` +
+      `${idleNote(t.idle)}`);
+  await checkProbe('temporal SVC thinning');
+  delete t.hostLog;
+  results.push({ thinning: t });
   await endStream();
 }
 
@@ -3662,7 +3728,7 @@ try {
     for (let i = 0; i < 16; i++) {
       await sleep(500);
       const x = await page.evaluate(() => window.__recon.lastStats);
-      if (x) timeline.push({ t: Date.now() - settleStart, fps: +x.fps.toFixed(1), decode: x.decode && +x.decode.toFixed(1), total: x.total && +x.total.toFixed(1), q: x.queue, mbps: +x.mbps.toFixed(1), keyReq: x.keyRequests });
+      if (x) timeline.push({ t: Date.now() - settleStart, fps: +x.fps.toFixed(1), decode: x.decode && +x.decode.toFixed(1), total: x.total && +x.total.toFixed(1), q: x.queue, mbps: +x.mbps.toFixed(1), keyReq: x.keyRequests, thinned: x.thinned ?? 0 });
       if (i === 12) tail0 = { d: await decAt(), c: cpuTimes(), s: x?.superseded ?? null }; // the last 1.5 s start here
     }
     const sup1 = await page.evaluate(() => window.__recon.lastStats?.superseded ?? null).catch(() => null);
@@ -3676,19 +3742,28 @@ try {
     results.push({ timeline: sc.name, points: timeline });
     // Steady state = the last 1.5 s of the 8 s window all at real-time rate.
     const tail = timeline.slice(-3);
-    const avg = tail.reduce((a, p) => a + p.fps, 0) / Math.max(1, tail.length);
+    // Frames the host left out on purpose (temporal SVC thinning: its answer to
+    // a delay, a frame queue or a slow stream, which this CPU-only machine's own
+    // load produces too) are no failure to play in real time: their rate over
+    // the window counts with the frames drawn.
+    const before = timeline[timeline.length - 4]; // the sample before the window
+    const thinRate = before && tail.length === 3 ? ((tail[2].thinned - before.thinned) * 1000) / Math.max(1, tail[2].t - before.t) : 0;
+    const thinNote = thinRate > 0 ? ` + ${thinRate.toFixed(1)} thinned/s` : '';
+    const drawn = tail.reduce((a, p) => a + p.fps, 0) / Math.max(1, tail.length);
+    const avg = drawn + thinRate;
     const rate = sc.prefs.fps || 60; // the stream's frame rate
     // (per-0.5 s samples jitter when frames bunch at a boundary). Where the
     // CPUs had nothing to spare, three quarters of what reached the decoder
-    // (starvedRate: frames drawn or superseded; outputs come in bursts).
-    const sr = starvedRate(avg, rate, 0.75, tw);
+    // (starvedRate: frames drawn or superseded; outputs come in bursts;
+    // thinned frames never reach it).
+    const sr = starvedRate(drawn, rate, 0.75, tw);
     const steady = tail.length === 3 && (avg >= (rate * 5) / 6 || sr.ok);
     const st = await page.evaluate(() => window.__recon.lastStats);
-    check(`${sc.name}: steady real-time playback`, steady, `last 1.5 s: ${tail.map((p) => p.fps).join(' / ')} fps; key requests ${st?.keyRequests}${sr.note}`);
+    check(`${sc.name}: steady real-time playback`, steady, `last 1.5 s: ${tail.map((p) => p.fps).join(' / ')} fps${thinNote}; key requests ${st?.keyRequests}${sr.note}`);
     const cfg = await page.evaluate(() => window.__recon.videoCfg);
-    const dr = starvedRate(avg, rate, 0.75, tw); // the window's drawn rate (st.fps is its last 0.5 s)
-    check(`${sc.name}: video decoding`, st && (st.fps > rate * 0.75 || dr.ok),
-      `${st?.fps.toFixed(1)} fps of ${rate}, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}${dr.note}`);
+    const dr = starvedRate(drawn, rate, 0.75, tw); // the window's drawn rate (st.fps is its last 0.5 s)
+    check(`${sc.name}: video decoding`, st && (st.fps + thinRate > rate * 0.75 || dr.ok),
+      `${st?.fps.toFixed(1)} fps${thinNote} of ${rate}, ${st?.mbps.toFixed(2)} Mbps, codec ${cfg?.codec} via ${cfg?.encoder}${dr.note}`);
     check(`${sc.name}: latency measured`, st && st.synced && st.total !== null,
       `stream ${st?.total?.toFixed(1)} ms (network ${st?.owd?.toFixed(2)} ms, decode ${st?.decode?.toFixed(2)} ms, RTT ${st?.rtt?.toFixed(2)} ms)`);
     // GUIDE 2.2: the welcome asks for rate reports; the worker sends one
@@ -3835,6 +3910,7 @@ try {
 
   // 3b. Loss handling with the host's fault-injection hook --------------------
   if (want('loss handling')) await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
+  if (want('thinning')) await checkThinning().catch((e) => check('temporal SVC thinning scenario', false, e.message));
   if (want('bitrate recovery')) await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
   if (want('pre stage hold host')) await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
   if (want('input host')) await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));

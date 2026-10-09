@@ -34,12 +34,14 @@ export const FRAME_FLAG_EXT = 0x80; // TLV extension block after the header
 // Frame header extension tags. Timestamps are host-clock µs (same clock as sendUs).
 export const EXT_TAGS = {
   1: 'presentUs', 2: 'captureUs', 3: 'encodeSubmitUs', 4: 'encodeDoneUs',
-  5: 'refFloor', 6: 'ltrSlot', 7: 'temporalLayer',
+  5: 'refFloor', 6: 'ltrSlot', 7: 'temporalLayer', 8: 'thinned',
 };
 
 // Hello version: 2 asks the host for extended frame headers, 3 says the client
-// handles reference recovery (VideoConfig.recovery "ltr" / "invalidate").
-export const HELLO_VERSION = 3;
+// handles reference recovery (VideoConfig.recovery "ltr" / "invalidate"), 4
+// that it reads the "thinned" tag (the host may then leave out discardable
+// frames under congestion: temporal SVC thinning).
+export const HELLO_VERSION = 4;
 export const FEATURE_FRAME_EXT = 'frame-ext';
 // Hosts with the delay-based rate controller (GUIDE 2.2) list this feature:
 // the client sends a rate report (DG_RATE_REPORT) every 20-50 ms and no
@@ -102,6 +104,20 @@ export const isRefRecovery = (mode) => mode === RECOVERY_LTR || mode === RECOVER
  * the lost frame.
  */
 export const endsRecovery = (h, lostFrom) => h.key || (h.ext?.refFloor !== undefined && h.ext.refFloor < lostFrom);
+
+/**
+ * The seqs of the frames the host left out on purpose (temporal SVC
+ * thinning: frames no other frame references) among the 32 before a frame
+ * (parsed header): its "thinned" mask, bit i = seq - 1 - i. Not losses: skip
+ * them without waiting or recovering. Oldest first.
+ */
+export function thinnedSeqs(h) {
+  const m = h.ext?.thinned;
+  const out = [];
+  if (!m) return out;
+  for (let i = 31; i >= 0; i--) if ((m >>> i) & 1 && h.seq - 1 - i >= 0) out.push(h.seq - 1 - i);
+  return out;
+}
 
 const enc = new TextEncoder();
 

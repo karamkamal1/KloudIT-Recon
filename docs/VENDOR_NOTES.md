@@ -5432,7 +5432,9 @@ EncodePicture thread), H.264 7.4.1 / H.7.3.1.1 (`nal_ref_idc`, prefix NAL unit),
 
 ### Session integration (for the session rewrite)
 
-`internal/host/session.go` is unchanged; the Go API is in `internal/host/encoder`:
+Temporal SVC, the dirty share and FPS before resolution are wired since "Phase 5 wiring A"
+(below); ROI, the dedicated engine, re-encode and slice output since "Phase 5 wiring B" (below).
+The Go API is in `internal/host/encoder`:
 
 - Temporal SVC: start with `SVCLayers: 2` where `CodecCaps.MaxTemporalLayers >= 2` (on AMF
   not together with `IntraRefreshFrames`; `LTRSlots` 2 still works). Under congestion (queue
@@ -7629,3 +7631,611 @@ Added when this step was merged with 3.7 wiring (sessions on a virtual display).
   reason="Windows HDR turned on"`, the overlay shows HDR10. Then change the stream's resolution
   (a new display) and reconnect after the linger: record whether HDR10 stays on without turning
   it on again.
+
+## Phase 5 wiring A Rate and frame control (temporal SVC thinning, FPS before resolution, static desktop)
+
+The session now uses three of the Phase 5 helper features (docs/ARCHITECTURE.md "Thinned frames"
+and "Rate control"; decisions from the pipeline's capabilities, never from a vendor; every new
+behaviour has a host config switch with a safe default):
+
+- **Temporal SVC thinning** (`internal/host/thin.go`, host config `svc` `auto` | `off`, default
+  auto). Helper streams of clients with `hello.v >= 4` start with `svcLayers` 2 where the codec's
+  caps have `maxTemporalLayers >= 2` and the helper is a Phase 5 one (caps `liveFps` present: its
+  LTR marks fall on base-layer frames only, so AMF's LTR recovery keeps working; NVENC's
+  invalidation needs nothing); otherwise none, logged once per helper start (`temporal SVC not
+  used` with the reason; `encoder helper started ... svc_layers=`). Under congestion (two rate
+  reports in a row over the delay target or a frame far over it that does not arrive, two
+  frames waiting behind the one being sent, a frame stream past its deadline) frameSender leaves
+  out `media.Frame.Discardable` frames (the helper's `Frame.Droppable`; on the FFmpeg path the
+  bitstream's non-reference frames, `codec.Params.Discardable`: AV1 `refresh_frame_flags` 0,
+  H.264 `nal_ref_idc` 0; never a key or recovery frame). No `dropped` report, no `Recover`, no
+  ladder rung; every frame sent after one carries the new frame extension tag 8 `thinned` (u32
+  mask of the 32 seqs before it), and the client (`stream-worker.js` `skipThinned`) skips those
+  seqs at once: no gap wait, no loss count, no `lost` report, no recovery wait, no key-frame
+  request; its freeze accounting treats the frames around a thinned one as consecutive. A
+  client `lost` from a thinned seq is moved to the next frame sent. Hello version 4 (protocol.js
+  `HELLO_VERSION`, Go `proto.HelloVersionThinned`): older clients are never thinned and get no
+  tag (the extension parsers skip unknown tags anyway). The rate controller holds its increases
+  while frames are being thinned (until 250 ms after the last; a hold of a second after each
+  episode can keep the bitrate down where a loaded client's own delay starts short episodes every
+  few seconds, as on the E2E machine) and decreases (`why=thinning`) when thinning lasts 1 s:
+  thinning answers spikes, the bitrate a lasting shortage. Episodes are logged at start
+  (`thinning: leaving out discardable frames under congestion` with the reason) and end
+  (`thinning ended frames=N`), the count every 10 s (`stream stats thinned=`), and the client
+  overlay's "Frames dropped" row adds "thinned N" (in that row: the overlay does not scroll, and
+  in a 720 px high window a row of its own pushed "Export latency data" off the screen, which the
+  browser E2E caught).
+  The Phase 5 helper notes above suggested leaving droppable frames out before they get a
+  sequence number, so that the client needs no change. Not done: a frame's seq is assigned by
+  the pipeline when it reads the frame, and the loss-recovery bookkeeping keys on it
+  (`refFloor`, the helper's ack ring, the client's `lost` and `dropped` reports, the 2.3
+  ladder), so thinned frames keep their seqs and the client learns of them from the mask. Clients
+  that cannot read the mask (`hello.v < 4`) are never thinned.
+- **FPS before resolution** (`internal/host/bitrate.go`, host config `fpsFloor`, default 0 =
+  60, GUIDE 2.2's floor): the 2.2 frame-rate ladder at the bitrate floor is one ladder with two
+  step tables by the pipeline's capabilities: FFmpeg, flushing encoders and pre-Phase-5 helpers
+  keep 120 / 90 / 60 (a rung down with each decrease at the floor, back up 5 s apart; a change
+  there costs a restart or a key frame); a helper whose started `liveFps` is `seamless`
+  (`PipelineCaps.LiveFPS`) steps through `encoder.LowerFPS` / `RaiseFPS` (`FPSSteps` down to
+  `fpsFloor`: 120 / 100 / 90 / 75 / 60 by default, on through 50 / 45 / 30 with a lower
+  `fpsFloor`), 2 s apart down as well as up, each sent as a frame-rate change alone
+  (`HelperVideo` -> `Helper.SetFPS`: `setRate` with `fps` only; to a pre-Phase-5 helper with
+  the bitrate, which it requires). A helper whose `liveFps` is `restart` gets a new
+  helper for a frame-rate change.
+- **Static desktop bitrate** (`internal/host/activity.go`, host config `staticBitrate` `auto` |
+  `off` and `staticKbps`, defaults auto and 0 = a quarter of the target, at least 2000 kbit/s):
+  `media.Frame.Dirty` (the ring's `dirtyPpm`, which carries `Stats.Dirty`) feeds an
+  `encoder.ActivityMeter` (new `AddShare`); a static picture for 1 s lowers what the encoder is
+  told (never what the rate controller decides: min of both) at most once a second, with the VBV
+  kept at one full-target frame (`vbvFrames` target / cap; `Pipeline.SetRate` and
+  `media.Params` gained a VBV size, the helper's `setRate` `vbvFrames`); a frame that changes
+  raises the encoder's bitrate and the media congestion controller's pacing at once, before that
+  frame is queued: the full target from 5 % of the picture changed, linearly between 0.2 % and
+  5 % (`ActivityMeter.SuggestKbps`: about 37 % of the target at 1 %, typing or a small window
+  update). The rate controller is told the encoder runs at its target while capped
+  (`staticCap.controllerKbps`: it measures in units of its target). Only on seamless live
+  bitrate (`LiveBitrate` without flush); the FFmpeg path reports no dirty share.
+
+The mock backend gained two temporal layers (the task assumed it had them: it had not; Phase 5
+had given it no SVC). With `svcLayers` 2 each canned P frame is preceded by a non-reference
+copy of itself (`h264AsNonReference` in `src/codec/bitstream.cpp`: `nal_ref_idc` 0 and the one
+`dec_ref_pic_marking()` bit left out, the rest of the RBSP shifted, trailing bits and emulation
+prevention redone; refused for IDRs, CABAC, field coding, slice groups, weighted prediction,
+B/SP/SI slices, POC types 0/1 and MMCOs). It decodes to the same picture as the frame after it
+and no frame references it. Its caps now say `maxTemporalLayers` 2.
+
+### Verified in the sandbox
+
+- verified (sandbox): unit tests, `go test ./...` (the e2e package under the shared lock):
+  `internal/codec` `TestDiscardableSVT` (SVT-AV1 1.7 with the FFmpeg path's arguments,
+  `pred-struct=1:lookahead=0:scd=0:rc=2`: 24 of 48 frames discardable; the stream without them
+  decodes with dav1d to bit-identical pictures for every frame kept, frame MD5s),
+  `TestDiscardableAV1Headers` (crafted frame headers through every branch before
+  `refresh_frame_flags`: decoder model with buffer removal times per operating point, frame ids,
+  order hint, screen content tools chosen per frame, error resilient, intra-only, switch, hidden
+  and show-existing frames, truncation), `TestDiscardableH264` (x264 zero-latency: none);
+  `internal/host/media` `TestVideoDiscardable` (the FFmpeg path marks 20 of 41 libsvtav1 frames,
+  0 of libx264's), `TestHelperVideoPhase5` (SVC asked for only of a Phase 5 helper with layers;
+  `Discardable` only for the helper's droppable frames, never key / recovery; the dirty share and
+  repeats; `SetFPS` without kbps vs `setRate` kbps + fps for an older helper; VBV 4 and back to
+  1; a `liveFps` `restart` helper replaced for a frame-rate change), `TestHelperStartParams`
+  (SVC vs intra refresh); `internal/host` `TestThinState`, `TestFrameSenderThinning` (only
+  discardable frames under pressure, never a recovery frame, masks exact, no `dropped`; v3
+  clients and `svc` off never), `TestThinPressure` (each signal; a stream within its deadline is
+  no pressure), `TestSessionThinning` (fake helper: start `svcLayers` 2 and no intra refresh,
+  enhancement frames left out only under congestion, no `recover` / `forceIdr` / `dropped`, a
+  client `lost` from thinned seq 13 recovered from frame 15; v3 client, `svc` off and a
+  pre-Phase-5 helper start no SVC), `TestSessionLiveFPS` (fine steps and `SetFPS` for a Phase 5
+  helper, rungs and kbps + fps for an older one), `TestRateFPSLadderLive` (since the review fixes:
+  120 -> 100 -> 90 -> 75 -> 60 at the default floor, 60 -> 50 -> 45 -> 30 with `fpsFloor` 30, 45
+  stops there; at least 2 s apart down and back up; the 2.2 `TestRateFPSLadder` unchanged),
+  `TestRateThinning` (no increase while thinning and 250 ms after, a `thinning` decrease after
+  1 s of it, one report over the target is no congestion, a decrease does not end it),
+  `TestStaticCap` (cut after 1 s static to 5000 of 20000 with VBV 4, full target at once on 30 %
+  change, re-cut 1 s after the motion left the window, linear partial activity, `staticKbps`,
+  the VBV bound 30, nothing for an unknown share / not live / off / a target under the floor, a
+  generation restarted capped, a bitrate the pipeline announces as changed in place (anyone's
+  change) taken as the encoder's and cut again 1 s later), `TestSessionStaticDesktop` (fake
+  helper and clock: `setRate` 5000 / VBV 4 after 1.5 s of a caret, the congestion target
+  follows, the rate controller keeps 20000; its own change to 16000 stays capped at 4000; a
+  40 % change restores 16000 / VBV 1 before the frame is sent), `TestVideoHeader` (tag 8 only
+  to v4 clients, only when non-zero), `TestConfigPhase5Rate`; `internal/proto` `TestThinnedJS`
+  (protocol.js reads the masks Go writes, the hello version), `TestLossRecoveryJS` (hello
+  version 4).
+- verified (sandbox): `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64
+  WIN_FFMPEG=<FFmpeg 8.1 win64 ffmpeg.exe>` (Wine 9.0, mingw build): `--self-test-encoder`
+  "non-reference copies of the mock clip" (all 59 P frames convert, `nal_ref_idc` 0, a hand-made
+  slice loses exactly its marking bit, MMCOs / IDR / no parameter sets refused);
+  `TestHelperIntegrationSVC` (mock, `svcLayers` 2: started 2, key frame then copy (layer 1,
+  discardable, `Droppable`) / P (layer 0) pairs through the ring flags and the stats, a forced
+  IDR restarts the pattern; the Windows FFmpeg decodes the 50 frames clean and the 25 base-layer
+  frames alone to the same pictures); `TestHelperIntegrationPhase5` (mock caps now
+  `maxTemporalLayers` 2; three layers refused); the new `TestSessionHelperMockPhase5` (host
+  package under Wine, a v4 session on the real helper's mock backend and synthetic GPU source:
+  `svcLayers` 2 and `liveFps` seamless; with the hook `thin=every:40:for:20` 35 of 150 frames
+  thinned, every thinned seq announced in the masks of the frames after it and never sent, every
+  seq sent or announced, no `dropped`; the source's 0.6 s pauses (idle repeats, dirty 0; the
+  activity window shortened to 300 ms for them) cut the bitrate to the 2000 kbps floor and its
+  next present restores it; a frame-rate change to 20 fps stays in the running encoder, no new
+  generation); every earlier helper test unchanged.
+- verified (sandbox): the mock's SVC stream with Linux FFmpeg 6.1:
+  `recon-encoder.exe --encode-test=svc.h264 --backend=mock --codec=h264 --capture=synthetic
+  --svc=2 --frames=240` ("temporal layers: 121 / 119 frames in layer 0 / 1, 119 discardable");
+  `ffmpeg -v error` prints nothing for `svc.h264` and `svc.base.h264`; every copy decodes to the
+  same frame MD5 as the base frame after it, and the base-only file's 121 frames equal the
+  whole stream's base frames.
+- verified (sandbox): browser E2E (`test/e2e/browser.mjs`, headless Chromium, libsvtav1
+  software AV1 encode and decode, recovery "keyframe"), new scenario "temporal SVC thinning":
+  the hook `thin=every:120:for:40` (simulated congestion: the last 40 of every 120 frames under
+  pressure; adaptive bitrate off and 8 Mbit/s, so that this machine's own delay does not restart
+  the encoder in the window), 15 s: 5 to 8 episodes started by the hook, 164 to 201 frames left
+  out by the host (libsvtav1's frames with `refresh_frame_flags` 0), 149 to 183 skipped by the
+  client as thinned (the window's edges), lost 0, host-dropped 0, key requests 0, recoveries 0,
+  decoder errors 0, freezes 0, 41 to 49 fps mean of 60; frame barcodes 26 to 32 of 26 to 32 =
+  seq (the frames after a left-out one decode to the right pictures). Passed in all 5 runs since
+  the scenario took adaptive bitrate off. The real signals thin in the other scenarios too on
+  this loaded 4-core machine (host.log: episodes `why=delay` / `queue` / `deadline`, 2 to 10 % of
+  the frames per 10 s under load), so the steady-playback and video-decoding checks count the
+  thinned frames' rate with the frames drawn (a frame the host leaves out on purpose is no
+  failure to play in real time; their detail shows "+ N thinned/s"). Whole runs: 186 of 187
+  before the overlay change (the one failure: "Export latency data", above); with the final
+  code 183 of 187: the failures were the
+  WebGPU renderer's input and barcode checks, the renderer bake-off and reference recovery (13
+  of 16 losses answered by a recovery frame, 14 needed), checks that fail now and then in the
+  other branches' runs on this machine as well and that involve no thinning. Runs while other
+  work loaded the machine (load 8 to 11 on 4 cores) failed frame-rate checks (20 to 49 fps
+  drawn, 0.6 to 5.7 thinned per second) and passed the thinning scenario. Its episode count
+  now counts every episode in the window (one the machine's delay started goes on through the
+  hook's window under that name) with at least 3 started by the hook; checked by replaying the
+  last run's host log.
+  `go test ./internal/e2e/...` (under the lock): ok; one earlier run under heavy load failed
+  `TestStreamingRateReports` (a second delay cut, no climb back in time; its client is hello v3
+  on libx264, nothing is thinned there; the same failure is in another branch's log).
+- Not run here: anything on AMF / NVENC hardware (SVC layer patterns, `FRAMERATE` /
+  reconfigure without IDR, the VBV change in a running encoder, DDA / AMD Direct Capture dirty
+  rects in a session), Chrome's hardware decoders on a thinned stream, real congestion (the
+  sandbox's 0.4 profiles need root netns; the E2E simulates the congestion with the hook).
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (SVC in a session): host.json default (`svc` auto),
+  `pipeline` auto, a current Chrome; connect and play a game. host.log `encoder helper started
+  ... svc_layers=2 live_fps=seamless` (else the `temporal SVC not used` reason). Apply
+  `make netem PROFILE=capdrop` (docs/NETEM.md) for a minute: host.log has `thinning: leaving
+  out discardable frames under congestion why=delay|queue|deadline` episodes and `thinning
+  ended frames=N`, `stream stats thinned=` > 0; the overlay's "Frames dropped" row shows
+  "thinned N" rising, its dropped count and "key req" not rising for them, no "Loss recovery"
+  activity, no visible corruption; the frame rate dips to about half during an episode. Repeat
+  for HEVC, AV1 and H.264 (client codec setting). If `thinned=0` throughout although episodes
+  are logged: AMF writes the enhancement layer as reference pictures (`TRAIL_R`, `nal_ref_idc`
+  != 0, AV1 refresh flags) and nothing is discardable: run the Phase 5 "SVC stream" check above
+  and record the NAL types.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD SVC session check with NVENC
+  (host.log `svc_layers=2` where `NV_ENC_CAPS_SUPPORT_TEMPORAL_SVC`); intra refresh stays on
+  beside SVC (caps `intraRefreshSvc` true, `assumed`; the started line `intra_refresh=N` with N
+  half the frame rate and `svc_layers=2`; VERIFY that `NvEncInitializeEncoder` takes
+  `enableIntraRefresh` with `enableTemporalSVC`: a failed start there names the parameter in the
+  helper's log, and then `intraRefreshSvc` must become false in `nvenc_backend.cpp`); a loss is
+  still answered by invalidation (`loss recovered ... by="recovery frame"`), and a picture a
+  recovery left damaged heals within half a second (the intra refresh wave, visible with the
+  `delay=every:N` hook or a capdrop loss).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (Chrome hardware decoders on a thinned stream,
+  VERIFY): in the SVC session above with capdrop, the client console must show no `decoder
+  error` after an episode; record per codec (HEVC, AV1, H.264) and the client GPU (AMD and
+  NVIDIA clients). A decoder error right after an episode means that decoder does not take a
+  frame whose predecessor in decode order was left out: then set `svc` `off` on that host and
+  report it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (FPS before resolution, no IDR): 120 fps stream at
+  `bitrate` 2500 (the floor 2000 is then close), `make netem PROFILE=capdrop` with the low
+  step at 1.5 Mbit/s: host.log `congestion: lowering bitrate ... fps=100`, then 90, 75, 60 at
+  least 2 s apart (the default `fpsFloor`, 60), `changing the bitrate in the encoder ... fps=N`;
+  the helper's log has no `the frame-rate change at frame N made a key frame`; the overlay's
+  key-frame count does not rise and the frame rate follows; once capacity returns the frame rate
+  climbs back 2 s per step. With `fpsFloor` 30 it goes on to 50, 45, 30, also 2 s apart. Per
+  codec.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with NVENC (reconfigure with
+  `frameRateNum`, `forceIDR` 0): no key frame at any step.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (static desktop bitrate): 30000 kbit/s setting,
+  `capture` dda, an idle desktop with Notepad's caret blinking: within about 2 s host.log
+  `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`, the overlay's
+  Mbps drops (bytes on the wire) and the helper's stats report kbps 7500 (debug log); then drag
+  a window: `desktop changes: full bitrate back kbps=30000` on the first changed frame; take a
+  screenshot of the first frame after the drag starts (the overlay's frame barcode probe or a
+  screen capture) and compare its sharpness with the steady state: no visible blur (the VBV kept
+  at one full-rate frame). Also check AMF accepts `vbvFrames` 4 in a running encoder without a
+  key frame (no key frame in the overlay at the cut or the restore) and record the driver.
+  Repeat with `capture` amf (AMD Direct Capture dirty rects) and with a full-screen game
+  (expect no cut).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same static-desktop check with NVENC
+  (`vbvBufferSize` via `NvEncReconfigureEncoder`, no key frame).
+
+### Review fixes
+
+Five review findings, all confirmed and fixed:
+
+- **Static cap vs the rate controller's units** (major). With the cap on, the helper's
+  `VideoEvent.Rate` carried the capped kbps into `rateController.live`, so `output()`'s
+  per-frame target, `fill()`, the delivered rates and `queueCapacity()` were relative to the
+  cap while `est` / `applied` stayed relative to the full target. Reproduced in
+  `TestStaticCapRateController` (the 2.2 harness with a static picture of 500 kbit/s and the cap
+  wired as the session wires it): uncapped a 300 ms delay spike took 20000 to 10837 and back to
+  20000 within 10 s; capped it took it to 3921 (4014 ten seconds later; the queue's growth read
+  against the 5000 cap); a loss burst or a second of thinning: 17000 and back uncapped, 8500 and
+  stuck capped. Fix: `staticCap.rate` / `generation` return the bitrate the controller hears
+  (`controllerKbps`: its target while the cap holds the encoder below it, else the encoder's),
+  and `videoEvents` passes that to `rate.live`; the client's `rate` message still carries the
+  encoder's rate. Now identical with and without the cap, and the cap follows the recovered
+  target. `TestSessionStaticDesktop` also checks the controller hears 20000 after the announced
+  5000 cut (it heard 5000 before the fix).
+- **Fine frame-rate steps down had no hold.** At the floor every decrease (one per 150 ms
+  policy hold) took a step, so a 120 fps stream reached 30 fps in under a second although the
+  comment, ARCHITECTURE.md and the hardware check above said 2 s apart. `fpsDown` now waits
+  `fpsHoldLive` (2 s) after the last frame-rate change on the fine ladder (the coarse rungs keep
+  their 2.2 behaviour: a rung per decrease, back up 5 s apart; the docs now say so), and the
+  default `fpsFloor` is 60 (GUIDE 2.2's 120 -> 90 -> 60) instead of 30; lower floors stay
+  available by config. `TestRateFPSLadderLive` drives a queue that keeps growing for 9 s and
+  checks every step is at least 2 s from the previous one (it fails without the hold).
+- **Intra refresh with SVC from capabilities.** `withCaps` dropped intra refresh whenever the
+  stream had temporal layers, which with `svc` auto took GUIDE 2.3 rung 3 away from NVENC
+  without a capability reason (only AMF refuses the pair). New caps field `intraRefreshSvc`
+  (helper `CodecCaps`, Go `CodecCaps.IntraRefreshSVC`, additive: older helpers omit it = false,
+  the old behaviour): NVENC sets it where it has intra refresh and more than one temporal layer
+  (marked `assumed`, NVIDIA check above), AMF, lavc and the mock leave it false.
+  `Caps.IntraRefreshFrames(codec, fps, svcLayers)` keeps intra refresh beside SVC only with it.
+  Tests: `TestHelperStartParams` (SVC with and without `intraRefreshSvc`),
+  `TestSessionThinning` "intra refresh beside SVC" (start `svcLayers` 2 and
+  `intraRefreshFrames` 30), `TestDecodeCaps`, the NVENC self-test's caps check (the double
+  already starts intra refresh with two layers).
+- **Thinning swallowed test faults.** `frameSender` thinned before `faults.at(n)`, so the
+  `drop=every:N` / `delay=every:N` frame of the 2.3 / 3.5 loss scenarios was skipped when it was
+  thinned (the review's E2E log: 67 to 110 thinned frames per 10 s in those sessions). A frame
+  the hook drops or delays is now never thinned. `TestFrameSenderThinning` "test faults" (an
+  enhancement frame under pressure due for a drop and one due for a delay: both go through the
+  hook, the third is thinned; it fails with the old order).
+- **README wording.** The `staticBitrate` row (and config.go, activity.go, ARCHITECTURE.md,
+  the paragraph above) said the full bitrate comes back with the first changed frame; it comes
+  back fully only from 5 % changed, linearly between 0.2 % and 5 % (intended: a caret or typing
+  needs a fraction of the target). Reworded.
+
+Checks after the fixes: gofmt, `go vet` (Linux and `GOOS=windows`), `go test ./...` (the e2e
+package under the shared lock: ok); `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64
+WIN_FFMPEG=<FFmpeg 8.1 win64>`: all four test binaries pass, `--self-test-nvenc` on the double
+with the new `intraRefreshSvc` check, `TestSessionHelperMockPhase5`, `TestHelperIntegrationSVC`
+/ `Phase5`; browser E2E (under the lock, machine shared with other agents' runs): run 1 186 of
+187 (the known "WebSocket relay: steady real-time playback" dip, 43 fps for one 0.5 s window),
+the loss scenarios with every hook fault applied (6 dropped by the hook, 9 of 9 delayed frames
+cancelled at their deadline, recovery frames for all 15), the thinning scenario 9 episodes /
+161 frames; run 2 at load average 7.4 on 4 cores: 185 of 187, "frame pacing Smooth" (Chromium's
+own refresh fell to 34 Hz) and "bitrate recovery" (eight delay cuts on the FFmpeg path from the
+machine's load), both passed in run 1 and neither runs code these fixes change (the static cap
+and the fine frame-rate steps act only on a seamless live-bitrate helper, the fault order only on
+the hook's frames); run 3 at load 6.7 to 10: 182 of 187, four frame-rate checks (splice relay,
+WebSocket relay, WebGL2: 20 to 37 fps) and recovery "skip" (a decoder error after a skipped
+reference frame, then one of the hook's drops landed in the key-frame wait that followed and
+counted as a key request for a drop; run 2 had three such decoder errors and passed). Every
+check passed in at least one of the three runs. The hook's 6 drops now happen in every run (before,
+thinning under load could take one of them), as in the scenarios before Phase 5.
+
+### Integration notes (merging)
+
+- Protocol: frame extension tag 8 and hello version 4 are new here; another branch that also
+  bumps the hello version must take the next number and keep `v >= 4` meaning "reads tag 8".
+- `media.Pipeline.SetRate(kbps, fps, vbvFrames)` (was `(kbps, fps)`), new `media.Params`
+  fields `SVCLayers` / `VBVFrames`, `media.Frame` fields `Discardable` / `Dirty` / `HasDirty`,
+  `PipelineCaps` `LiveFPS` / `SVCLayers`; `videoHeader` takes the thinned mask.
+- The mock backend's caps changed (`maxTemporalLayers` 2): tests that start it with
+  `svcLayers` 2 now succeed. Review fixes: caps field `intraRefreshSvc` (all backends),
+  `encoder.Caps.IntraRefreshFrames` takes the stream's `svcLayers` (0 for none), host config
+  `fpsFloor` 0 now means 60. `make helper-test` also runs `host.test.exe -test.run
+  SessionHelperMock` under Wine.
+- `test/e2e/browser.mjs`: the steady-playback and video-decoding checks add the thinned
+  frames' rate (`lastStats.thinned`) to the frames drawn; a branch that edits those checks keeps
+  that. New `checkThinning` after `checkLossHandling`; `lossRun` reports `client.thinned`.
+- Thinning is on by default (`svc` auto) for every v4 client, also on the FFmpeg path with
+  libsvtav1: scenarios elsewhere that count frames per second on a loaded machine see the
+  thinned frames as fewer frames drawn (they are in `lastStats.thinned` and the host's `stream
+  stats thinned=`); host config `svc` `off` turns it off.
+- Merged on integ after 2.3's review fixes, 2.4, 2.7, 3.7 / 3.8 wiring and 3.9/4.5 HDR. In
+  frameSender a frame goes through the ladder's take (a frame the client would discard is
+  discarded, 2.3), the test hooks' choice, thinning, and only then, if it goes out, the report
+  of a finished discard run, its stream, its reliable prefix (2.4) and the video window (2.7). A
+  thinned frame opens no stream, so it never enters the window, never gets a reliable boundary
+  and never counts toward rung 1's deadlines (`sendState.slow` looks at frames written since
+  the window released them); recovery and key frames are never thinned, so a recovery wait
+  always ends with a frame that is sent. A path that falls short of the pacing rate makes the
+  window hold frames and the frame queue build behind them, which is thinning's `queue`
+  pressure: the enhancement layer goes first, then the bitrate.
+- The 2-vCPU browser E2E harness: the steady-playback and video-decoding checks add the thinned
+  rate to the frames drawn, while their CPU-starvation alternative compares the frames drawn
+  alone with what reached the decoder (thinned frames never do); `checkThinning` ends its
+  stream like the other scenarios, counts key requests made while decoding (a watchdog re-ask
+  while a key frame is awaited already is no loss) and, where the CPUs had nothing to spare,
+  accepts 10 fps instead of 30.
+- HDR10 and temporal SVC are both decided from the caps and go in the same `start` (`hdr`,
+  `svcLayers` 2); nothing here refuses the pair, but no HDR10 stream with two temporal layers
+  has run on hardware. Hardware check (AMD RDNA3, NVIDIA): unverified. Test: an HDR10 session
+  (docs 3.9/4.5) with `svc` auto: host.log `encoder helper started ... svc_layers=2 ... hdr=true`;
+  under congestion (`make netem PROFILE=capdrop`) `thinning: leaving out ...` episodes, and the
+  HDR picture stays correct through them (no corruption after an episode). The libavcodec backend
+  (3.8) has one temporal layer (`temporal SVC not used`), so its streams are never thinned.
+- Merge fixes for signature changes on the other side: `qualify_test.go` (3.8 wiring) calls
+  `IntraRefreshFrames(codec, fps, 0)`; `helper_windows_test.go` calls `SetRate(kbps, fps, 0)`;
+  the Phase 5 Windows session tests' mock launcher takes 3.8 wiring's backend argument.
+
+## Phase 5 wiring B Encoder options (cursor / crosshair ROI, dedicated engine, re-encode, slice output)
+
+The session now uses the remaining Phase 5 helper features (docs/ARCHITECTURE.md "Regions of
+interest and the encoder options"; decided from the started helper's caps, never from a vendor;
+each with a host config switch and a safe default; every decision logged once per change):
+
+- **Cursor / crosshair ROI** (`internal/host/roi.go`, host config `roi` `auto` | `cursor` |
+  `center` | `off`, default auto). The input path is the host's knowledge of where the player
+  looks: the client's absolute pointer positions (`DgMouseAbs`, 0..65535 across the picture the
+  client shows) put a square around the pointer (`encoder.FocusROI`: an eighth of the capture
+  height, weight 6, the rest of the picture untouched: a desktop has text everywhere); under its
+  relative motion (`DgMouseRel`: pointer lock, game mouse mode) the host's own pointer decides
+  (review fix): where it shows on the captured monitor (`platform.GetCursor` polled each tick,
+  normalised as `cursorLoop` sends it; a game's menu or inventory, a strategy or point-and-click
+  game: the client draws it there) the pointer square follows it, where it is hidden one around
+  the picture's centre (a sixth, weight 8) with the rest at weight -2 (a game's crosshair).
+  `auto` follows the latest kind of input and sets nothing before the first one; `cursor` /
+  `center` force one kind (`cursor`: where the pointer was last seen).
+  `roiLoop` polls every 100 ms and hands `HelperVideo.SetFocus` a new focus only for another kind
+  or a pointer that moved by more than 1/32 of the picture (60 x 34 px at 1080p, a quarter of the
+  square): at most 10 `setRoi` per second, none for motion inside the square.
+  `HelperVideo` maps the position to the stream (capture size as displayed from `started`,
+  scaled to the encoded size), sends `setRoi` only when the rects change, gives every helper it
+  starts the current focus right after `started` (restarts, new streams, the spare), and stops
+  sending to a helper that answers `setRoi` with an `error` (`PipelineCaps.ROI` false, one
+  warning). Only where the codec's caps `roi` is not `none` (AMF `importance`, NVENC `emphasis`,
+  the mock `importance`; lavc none); the FFmpeg path never (`SetFocus`: `ErrNoROI`, the loop
+  ends). host.log: `regions of interest roi=auto used=true` (or `not used` with the reason),
+  `regions of interest: focus focus="around the pointer"` / `"around the centre (pointer lock: a
+  crosshair)"` when the kind changes, `encoder helper started ... roi=importance`.
+- **Dedicated encode engine** (host config `encoderInstance` `auto` | `dedicated` | an engine
+  number, JSON string or number; default auto): `encoder.EncoderInstanceFor` (now also takes
+  `auto`, the same as `default`) with the codec's caps `hwInstances` / `instanceSelect` turns it
+  into `start.encoderInstance`: `auto` leaves it unset (the backend's default, engine 0: GUIDE
+  3.3 says engine 1 only if Adrenalin's recording uses 0, a VERIFY item below); `dedicated` engine
+  1 where the start may pick one and the GPU has two or more (AMF `INSTANCE_INDEX`); a number
+  that engine. Where it cannot be honoured (caps `instanceSelect` false: NVENC spreads frames
+  over its engines itself, the libavcodec backend cannot pick one; one engine; a number beyond
+  the count) the default stays, with the reason: `encoder engine` /
+  `encoder engine: the backend's default ... reason=...`; the started line has
+  `encoder_instance=N hw_instances=M` (AMF reads the engine back).
+- **Re-encode oversized frames** (host config `reencodeOversized`, 0 = off (default), 1.5..100
+  average frames): `start.reencodeOversized` only where the codec's caps `reencode` (NVENC
+  `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`); else `re-encoding oversized frames not used`. The
+  helper flags each frame it encoded twice in the ring (new slot flag REENCODED, bit 7), counted
+  in `stream stats ... reencoded=N` every 10 s.
+- **Sub-frame slice / tile output** (host config `sliceOutput`, 0 = off (default), 1..64,
+  experimental): `start.sliceOutput` only where the codec's caps `sliceOutput` (AMF where
+  `*_CAP_SUPPORT_SLICE_OUTPUT` / `AV1_CAP_SUPPORT_TILE_OUTPUT`); else `sub-frame output not
+  used`. **Frames still go out whole**: the helper assembles the parts. When the first part was
+  ready (`Stats.FirstSliceQPC`) now also travels in the ring slot (`slices` at offset 100,
+  `firstSliceQpc` at 104, formerly reserved: the stats message comes after the ring write and is
+  dropped when nobody reads it; additive, older helpers write 0 = whole frame) and becomes
+  `media.Frame.FirstSliceUs` (only between the encoder submit and the whole frame); the host's
+  stage summary (`latency stages ... host_*` every 10 s, frames the client acknowledged) gains
+  `host_encode_first_slice` (encoder submit -> first slice) and `host_encode_rest` (first slice
+  -> whole frame: what a transport that sends slices as they come could take off the client's
+  `encode` row).
+- A helper that refuses a start made with `encoderInstance`, `reencodeOversized` or
+  `sliceOutput` is replaced by one started without them for the rest of the session (warning
+  `the encoder helper refused a start with the Phase 5 encoder options`), so an opt-in
+  experiment the driver does not take costs one restart, not the helper pipeline. None of the
+  options makes a bitrate or frame-rate change start a new helper (`sameHelperStream`).
+
+Deviations from the task, and why:
+- The pointer position comes from the input path and, under pointer lock, the host's OS pointer
+  (polled in `roiTick` every 100 ms, like `cursorLoop` does for the client, review fix): the
+  helper reports no cursor position of its own (DDA's pointer position is not read; the pointer
+  is drawn by the client). In desktop mouse mode the client's absolute positions are used, so a
+  pointer that a program moves by itself (warps) there is followed only through the next client
+  input. A game that hides the OS pointer and draws its own software pointer in a menu gets the
+  centre square (nothing tells where its pointer is).
+- NVENC's ROI is the helper's QP delta map beside spatial AQ (`NV_ENC_QP_MAP_DELTA`, caps `roi`
+  `emphasis`), not GUIDE 2's emphasis map with AQ off: nvEncodeAPI.h documents the emphasis
+  level map for H.264 only and refuses it with AQ (checked in `nvenc_backend.cpp`; not changed
+  here). The session treats any `roi` other than `none` alike.
+- `encoderInstance` values: the task's `auto` | `0` | `1` plus `dedicated` (the name
+  `EncoderInstanceFor` already had). `auto` is the default engine, not "engine 1 where there are
+  two": which engine Adrenalin's recording uses is unverified (hardware check below).
+- The "encode first slice" measurement is in the host's stage summary (host.log), not a new row
+  of the client's overlay (the client gets no first-slice stamp: the frame header is unchanged).
+- The mock backend now reports `roi` `importance` (it logs every `setRoi`, the canned pictures
+  do not change) and emulates sub-frame output (N parts, the first one ready when the frame was
+  queued), so the plumbing is tested end to end under Wine; it still refuses re-encoding.
+
+### Verified in the sandbox
+
+- verified (sandbox): unit tests (`go test ./...` except the e2e package, which ran under the
+  shared lock): `internal/host` `TestROIFocus` (each mode x pointer input: nothing before input in
+  auto, the pointer square for absolute positions, the centre for relative motion, back to the
+  pointer; `cursor` keeps the square under pointer lock, `center` from the start, `off` nothing;
+  moves within `roiMove` send nothing, one just beyond does, at most every 100 ms; clearing; 1000
+  pointer events in a second reach the pipeline 9 to 10 times; since the review fixes: pointer
+  lock with the host's pointer showing follows it, the centre once it hides, the pointer again in
+  a menu, the client's position back in desktop mode, a shown host pointer ignored outside pointer
+  lock, `cursor` follows a shown host pointer and keeps it once hidden; the burst on roiLoop's
+  ticks with 4 ms of jitter takes every tick (it fails with the old strict interval: the tick 96
+  ms after a late one waited a tick), polls between ticks none), `TestSessionROI` (fake helper
+  with caps `roi`: no `setRoi` before input, the pointer at the bottom-right corner mapped and
+  clipped, an 89-event burst within the interval sends nothing, pointer lock sends the centre
+  square with the background; decision and kinds logged once), `TestROITickPipelines` (FFmpeg: the
+  loop ends, logged once; a helper without a map: logged once, the loop goes on; nothing before
+  the stream starts; `off` returns at once), `TestSessionEncoderOptions` (the start of a session
+  per config x caps: defaults send nothing; an AMF-like encoder gets engine 1 and 4 slices, no
+  re-encode; an NVENC-like one re-encode 3, no engine, no slices; engine `0`; the engine decision
+  logged once; a REENCODED frame counted), `TestHostStages` (first-slice rows from consistent
+  stamps only, none for whole frames), `TestConfigPhase5Options` (defaults, every accepted value
+  incl. a numeric `encoderInstance`, save and load, 11 refused values); `internal/host/media`
+  `TestHelperEncoderOptions` (13 cases of config x caps for engine, re-encode and slices, each
+  decision logged exactly once over two starts, no new helper for a bitrate change),
+  `TestHelperVideoFocus` (setRoi mapped from a 1920x1080 capture to a 1280x720 stream, the corner
+  clipped, the same rects not resent, the centre with its background, cleared, re-sent to the
+  restarted helper right after its start; an encoder without a map gets nothing (`ErrNoROI`); a
+  `setRoi` error stops it, logged once), `TestHelperVideoSliceStamps` (first slice in host time,
+  not when after the frame or before its submit; the re-encode mark), `TestHelperVideoPlainStart`
+  (a start refused with slices and engine is retried without both); `internal/host/encoder`
+  `TestRingSlicesAndReencoded` (offsets 100 / 104 and bit 7; an older helper's slot reads as a
+  whole frame, an implausible count is ignored), `TestEncoderInstanceFor` (`auto`).
+- verified (sandbox): `make helper` (mingw-w64, no warnings) and `clang++
+  --target=x86_64-w64-mingw32 -std=c++20 -fsyntax-only -Wall -Wextra -Wpedantic -Wshadow
+  -Wconversion` of the changed helper sources (`ring.cpp`, `mock/replay_encoder.cpp`): clean.
+- verified (sandbox): `xvfb-run -a make helper-test WINE=/usr/lib/wine/wine64 WIN_FFMPEG=<FFmpeg 8.1
+  win64>` (Wine 9.0): every test passes, among them the new
+  `TestHelperIntegrationSlicesAndROI` (the real helper's mock: started `sliceOutput` 2, 30
+  frames through the ring with 2 slices and `submitQpc <= firstSliceQpc <= outputQpc`, the stats
+  likewise, `setRoi` logged with the `FocusROI` rect and cleared) and
+  `TestSessionHelperMockPhase5B` (a session on the real helper's mock with `encoderInstance`
+  `dedicated` and `sliceOutput` 2: started `encoder_instance=1 hw_instances=2 roi=importance ...
+  slice_output=2`, the engine decision logged once; the frames acknowledged give
+  `host_encode_first_slice` 0.0/0.0/0.0 and `host_encode_rest` 0.4/1.5/3.9 ms over 30 frames (the
+  mock's first part is its queueing); the pointer in the middle of the 640x360 synthetic source
+  gives the mock `setRoi 1 rect(s): 148,78 23x23 weight 6`, a second position 10 ms later
+  nothing, pointer lock `setRoi 2 rect(s): 0,0 320x180 weight -2; 145,75 30x30 weight 8`), and the
+  updated `TestHelperIntegrationPhase5` (mock caps `roi` / `sliceOutput`).
+- verified (sandbox): `go test ./internal/e2e/...` under the shared lock: ok. Browser E2E
+  (`test/e2e/browser.mjs`, FFmpeg path with libsvtav1, under the lock, the machine shared with
+  other agents' runs at load average 4 to 7 on 4 cores), three runs, each 184 of 187: run 1 failed
+  "WebTransport relay: steady real-time playback" (31.8 fps in one window) and the splice relay's
+  steady playback and video decoding (30 to 37 fps); run 2 "frame pacing Smooth" (Chromium's own
+  refresh at 37 Hz), "late frames (200 ms) cause no key-frame request" (3 watchdog requests from
+  a stalled client) and "reference recovery (software stand-in)" (16 of 19 losses answered by a
+  recovery frame, 17 needed: under load more frame streams pass their deadline back to back and
+  share one recovery frame); run 3 the WebSocket relay's steady playback and video decoding (23
+  to 28 fps) and reference recovery again (13 of 19). Every check passed in at least one run; all
+  of them are frame-rate or load cascades on the FFmpeg path, which this step does not change
+  beyond one log line per session (`regions of interest not used ... reason="the FFmpeg pipeline
+  has no region of interest map"`, 21 for 21 sessions in each run's host.log; `roiLoop` ends
+  there) and the `reencoded=0` field of `stream stats`; the same checks fail now and then in the
+  other branches' runs (Phase 5 wiring A above: reference recovery 13 of 16, frame pacing Smooth).
+- Not run here: AMF / NVENC hardware (ROI maps, `INSTANCE_INDEX`, re-encode, slice output),
+  Chrome on a helper stream (the browser E2E runs the FFmpeg path, where none of this applies:
+  `SetFocus` is refused, the options are not used).
+
+### Hardware checks
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (ROI_DATA, sharper crosshair at 10 Mbit/s, screenshot
+  comparison): host.json `"roi":"auto"` (default), `pipeline` auto; client: HEVC, 1920x1080 at
+  60 fps, bitrate 10 Mbit/s, adaptive bitrate off, mouse mode Game (pointer lock). In a game with
+  a fixed centre crosshair and a busy scene (foliage, smoke; stand still facing the same spot)
+  host.log must have `encoder helper started ... roi=importance`, `regions of interest roi=auto
+  used=true`, `regions of interest: focus focus="around the centre (pointer lock: a crosshair)"`
+  and no `refused the regions of interest` nor helper `per-frame property not accepted ... ROI`.
+  Take a client screenshot of the full-screen stream (Win+Shift+S on the client, or the browser
+  devtools `Capture screenshot` with the overlay hidden), then set `"roi":"off"`, restart the host
+  agent, reconnect, same spot, same screenshot. Crop both to the 180x180 px around the centre
+  (`ffmpeg -i shot.png -vf crop=180:180:870:450 c.png`) and to a 180x180 corner: the ROI shot must
+  be visibly sharper at the crosshair (edges, fine texture) and may be softer in the corner.
+  Repeat with the client's Desktop mouse mode over small text (e.g. a browser page, scrolling
+  slowly at 3 Mbit/s): `focus="around the pointer"`, the text under the pointer crisper than
+  with `roi` `off`. Repeat in Game mouse mode in a game that shows the Windows pointer under
+  pointer lock (a strategy game, or a game's options menu; the client draws the host's pointer):
+  `focus="around the pointer"` while it shows, the square (screenshot crop around the pointer)
+  following it as it moves, the corners not softer than with `roi` `off`; back in the game view
+  with the pointer hidden `focus="around the centre (pointer lock: a crosshair)"` (if a game
+  keeps the Windows pointer visible but transparent, the square stays where it was: record the
+  game). Repeat for AV1 (AMF AV1 has no ROI cap, `roi` assumed: confirm the started
+  line says `roi=importance` and the picture changes; if AMF ignores it, record it) and H.264.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (INSTANCE_INDEX with Adrenalin recording on): turn
+  on Adrenalin Instant Replay (Record & Stream, HEVC, 4K60 or the highest it offers) and keep it
+  recording. host.json `"encoderInstance":"dedicated"`: host.log `encoder engine codec=hevc
+  config=dedicated engine=1 engines=2` and `encoder helper started ... encoder_instance=1
+  hw_instances=2`; Task Manager > Performance > GPU 0: the "Video Encode 0" and "Video Encode 1"
+  graphs show one load each (record which engine Instant Replay uses). Play 2 minutes of a
+  high-motion game at 120 fps / 40 Mbit/s and note the client's `encode` row p50/p95 from the
+  `latency stages` lines; repeat with `"encoderInstance":0` and with `1` explicitly. If Instant
+  Replay runs on engine 1, `dedicated` collides with it: record that, and `0` is the choice on
+  AMD (then make `auto`/`dedicated` follow the measurement in `internal/host/encoder/adapt.go`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (slice / tile output, first-slice latency): host.json
+  `"sliceOutput":4`; per codec (HEVC, AV1, H.264): host.log `sub-frame output (frames still sent
+  whole) codec=hevc slices=4` (or `not used` with the caps reason: record the codec) and
+  `encoder helper started ... slice_output=4` (AMF may take another count: the helper logs
+  `asked for 4 slices per frame, the encoder reads N`); after a minute of a game at 1440p120
+  the `latency stages` lines have `host_encode_first_slice` and `host_encode_rest`: record their
+  p50/p95 (`host_encode_rest` p50 = the latency a sub-frame transport could save) next to the
+  client's `encode` row with `sliceOutput` 0 and 4 (the cost of slice mode itself); the client
+  console has no decoder errors, the picture has no slice seams; compare quality at the same
+  bitrate (VMAF with `recon-encoder.exe --encode-test ... --slices=4`, Phase 5 helper notes).
+- AMD RDNA3 (RX 7900 XT): unverified (not applicable: AMF cannot encode without advancing its
+  state). Test: `"reencodeOversized":3` gives host.log `re-encoding oversized frames not used
+  codec=hevc reason="the encoder cannot encode a frame without advancing its state (caps reencode
+  false)"` and a normal session.
+- NVIDIA: unverified (no NVIDIA host available). Test (emphasis = QP delta map): the AMD ROI test
+  with NVENC (started line `roi=emphasis`; spatial AQ stays on): the crosshair crop sharper with
+  `roi` `auto` than `off` at 10 Mbit/s; no `refused the regions of interest`. Also confirm the
+  QP delta map is honoured beside AQ on the driver (if the crops look identical, record the
+  driver version: then NVENC needs AQ off with the map, a helper change).
+- NVIDIA: unverified (no NVIDIA host available). Test (re-encode with a scene cut at low
+  bitrate): host.json `"reencodeOversized":3`; client HEVC 1920x1080 60 fps, 5 Mbit/s, adaptive
+  bitrate off. host.log `re-encoding oversized frames codec=hevc average_frames=3` and the
+  started line `reencode_oversized=3` (else `not used`: the GPU lacks
+  `NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`, record the GPU). Alt-tab every 2 s for a minute between
+  two very different full-screen photos (or play a scene-cut test video full screen): `stream
+  stats ... reencoded=N` with N close to the number of cuts per 10 s (about 5); the overlay's
+  frames-dropped and key-request counts do not rise at the cuts and no `frame queue overflow` /
+  deadline drop is logged for them; repeat with `reencodeOversized` 0 and record the difference
+  (overflows / deadline drops, the frame after a cut arriving late); no artifacts after a
+  re-encoded frame; record the client's `encode` p95 with and without (each frame is encoded
+  inline then).
+- NVIDIA: unverified (no NVIDIA host available). Test (options NVENC cannot take):
+  `"encoderInstance":"dedicated"` gives `encoder engine: the backend's default ... reason="the
+  encoder does not let a stream pick its engine (caps instanceSelect false)"` (no
+  `encoderInstance` in the start); `"sliceOutput":4` gives `sub-frame output not used`.
+
+### Review fixes
+
+Four review findings, all confirmed and fixed:
+
+- **Pointer lock with the host's pointer showing** (`roi` auto). Relative motion always moved the
+  focus to the centre square with the rest at weight -2, even where the game shows the Windows
+  pointer under pointer lock (menus, inventories, strategy and point-and-click games in game mouse
+  mode), which the client draws where the host has it (`stream.js` `onCursorPos`): the area the
+  player looks at got fewer bits than with `roi` `off`. `roiTick` now polls the host's pointer
+  (`pollHostCursor`: `platform.GetCursor`, visible and on the captured monitor, normalised as
+  `cursorLoop` sends it; nothing with capture `test` or off Windows) and `roiFocus.hostCursor`
+  makes it the pointer the player follows while relative motion is the latest input; `auto` uses
+  the centre square only while it is hidden; `cursor` follows it too (and keeps its last place
+  once hidden). Polled in `roiTick` rather than taken from `cursorLoop`, which does not run when
+  the video carries the pointer (`drawCursor`, client cursor `video`; a helper whose caps
+  `cursorInVideo` can then stream). `TestROIFocus` gains the cases above.
+- **Rate limit vs ticker jitter.** `roiFocus.next` compared two `time.Now()` readings of
+  consecutive 100 ms ticks with a strict `< roiInterval`, so a tick a little late followed by one
+  on time skipped the second (reproduced here with a standalone 100 ms ticker: 23 of 49 gaps below
+  100 ms with `time.Now()`, 22 with the tick's own time, so passing that instead would not do):
+  the square lagged the pointer by up to 200 ms. The gap allowed is now `roiMinGap` (roiInterval
+  less a tenth); the rate stays one per tick. The burst test runs on jittered ticks.
+- **`"encoderInstance": null`** read as engine `"0"` (encoding/json calls `UnmarshalJSON` with
+  null, and decoding null into an int leaves 0 without an error; reproduced standalone). Null is
+  now unset (auto); `TestConfigPhase5Options` has the case.
+- **Engine decision wording.** With caps `instanceSelect` false the log said "the encoder spreads
+  its work over its engines itself", true for NVENC only (the libavcodec backend, which backend
+  `auto` includes, and an AMF runtime without `INSTANCE_INDEX` have it false too). Now "the encoder
+  does not let a stream pick its engine (caps instanceSelect false)"; the NVIDIA check above
+  quotes it.
+- verified (sandbox, review fixes): gofmt, `go vet` (Linux and Windows), `go test ./...` (the
+  e2e package under the shared lock: ok), `xvfb-run -a make helper-test` under Wine 9.0 (all
+  pass, among them `TestSessionHelperMockPhase5B` and `TestHelperIntegrationSlicesAndROI`).
+  Browser E2E under the lock: a first run at load average 7 to 8 had 181 of 187 (steady playback
+  and video decoding at 38 to 46 fps, frame pacing Smooth with timer draws, the skip-recovery
+  scenario with congestion restarts: frame-rate and load cascades on the FFmpeg path, which these
+  fixes do not touch), the re-run 187 of 187.
+
+### Integration notes (merging)
+
+- `media.Pipeline` gained `SetFocus(media.Focus) error` (implemented by `Video`: `ErrNoROI`,
+  `HelperVideo`, the tests' `ladderPipeline`); `PipelineCaps.ROI`; `media.Frame` fields
+  `FirstSliceUs` / `Reencoded`; `media.HelperOptions` fields `EncoderInstance` /
+  `ReencodeOversized` / `SliceOutput`. Another branch with a pipeline type must add `SetFocus`.
+- Ring slot: `slices` (offset 100, u32), `firstSliceQpc` (104, i64) and flag REENCODED (bit 7) are
+  taken; the next additions start at offset 112 / bit 8 (native `ring.hpp`, Go `ring.go`, the Go
+  fake's writer and HELPER_PROTOCOL together). `encoder.Frame` fields `Reencoded`, `Slices`,
+  `FirstSliceQPC`.
+- `hostStages.summary` returns a `stageSummary` struct (was two strings).
+- The mock's caps changed (`roi` `importance`, `sliceOutput` true): a test that expects
+  `sliceOutput` `unsupported` from the mock must use another option.
+- Host config keys `roi`, `encoderInstance` (custom JSON type `engineChoice`: string or number),
+  `reencodeOversized`, `sliceOutput`. `encoder.EncoderInstanceFor` accepts `auto`.
+- `make helper-test` runs the new `TestSessionHelperMockPhase5B` with `-test.run SessionHelperMock`.

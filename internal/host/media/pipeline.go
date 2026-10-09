@@ -37,10 +37,12 @@ type Pipeline interface {
 	// which starts a new generation (same parameters, a new VideoConfig);
 	// otherwise a new generation starts urgently with the current parameters.
 	ForceKeyframe() error
-	// SetRate changes the bitrate (and the frame rate, fps > 0): with
-	// Capabilities().LiveBitrate in the running encoder, otherwise as an
-	// overlapped restart with the current parameters.
-	SetRate(kbps, fps int) error
+	// SetRate changes the bitrate (and the frame rate, fps > 0; and the VBV
+	// size in frame intervals, vbvFrames > 0, else the encoder's default):
+	// with Capabilities().LiveBitrate in the running encoder (a frame-rate
+	// change alone with Capabilities().LiveFPS), otherwise as an overlapped
+	// restart with the current parameters.
+	SetRate(kbps, fps int, vbvFrames float64) error
 	// Recover reports that the frames of generation gen from seq lostFrom on
 	// were lost: with Capabilities().Recovery "ltr" or "invalidate" the
 	// encoder codes the next frame from frames the client still has (ltr: an
@@ -52,6 +54,11 @@ type Pipeline interface {
 	// Ack reports that the client decoded frame seq of generation gen (frame
 	// ack datagram); pipelines with long-term references use it.
 	Ack(gen uint8, seq uint32)
+	// SetFocus tells the encoder where the viewer looks (Phase 5 regions of
+	// interest): with Capabilities().ROI the running encoder spends more bits
+	// there, from its next frame, and so does every encoder the pipeline
+	// starts later; otherwise ErrNoROI. Callers rate-limit it.
+	SetFocus(f Focus) error
 	// Capabilities describes the generation that streams (or starts).
 	Capabilities() PipelineCaps
 }
@@ -74,12 +81,23 @@ type PipelineCaps struct {
 	// (recon-host qualify, GUIDE 3.6) rather than assumed from the encoder's
 	// defaults.
 	LiveBitrateMeasured bool
+	// LiveFPS: SetRate changes the frame rate in the running encoder without
+	// a key frame (the native helper's started liveFps "seamless"), so the
+	// rate controller may step it finely (Phase 5 "FPS before resolution").
+	LiveFPS bool
+	// SVCLayers: the temporal layers the stream runs (native helper svcLayers;
+	// 0 or 1: none). Its enhancement-layer frames are Frame.Discardable.
+	SVCLayers int
 	// ForceIDR: ForceKeyframe forces an IDR in the running encoder.
 	ForceIDR bool
 	// IntraRefresh: the encoder runs periodic intra refresh.
 	IntraRefresh bool
 	// CursorInVideo: the frames contain the mouse pointer.
 	CursorInVideo bool
+	// ROI: SetFocus works (the native helper's encoder has a region of
+	// interest map: caps roi importance (AMF) or emphasis (NVENC QP delta
+	// map)).
+	ROI bool
 }
 
 // Pipeline names (PipelineCaps.Name, host config "pipeline").
@@ -96,6 +114,24 @@ const (
 	RecoveryKeyframe   = "keyframe"
 	RecoveryNone       = "none"
 )
+
+// ErrNoROI: the pipeline's encoder has no regions of interest (SetFocus).
+var ErrNoROI = errors.New("video: the encoder has no region of interest map")
+
+// Focus is where the viewer looks, for the encoder's regions of interest
+// (Phase 5 "sharper crosshair / cursor", Pipeline.SetFocus): a square around
+// the pointer (Pointer, at X, Y: 0..65535 across the picture, as the client
+// sends absolute pointer positions) and / or one around the picture's centre,
+// where games draw their crosshair (Center); Background is the weight of the
+// rest of the picture (encoder.FocusOptions.Background: 0 leaves it alone, a
+// negative one lets the encoder take bits from it). The zero Focus clears the
+// regions.
+type Focus struct {
+	Pointer    bool
+	X, Y       uint16
+	Center     bool
+	Background int
+}
 
 // ErrNoRecovery: the pipeline cannot recover a lost frame without a key
 // frame (Recover); use ForceKeyframe.

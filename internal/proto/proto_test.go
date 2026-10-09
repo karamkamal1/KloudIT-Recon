@@ -287,11 +287,77 @@ console.log(JSON.stringify({
 	if fmt.Sprint(got.Ref) != "[true true false false]" {
 		t.Errorf("isRefRecovery (ltr, invalidate, skip, unknown): %v", got.Ref)
 	}
-	if want := []string{RecoveryLTR, RecoveryInvalidate, MsgLost, fmt.Sprint(HelloVersionRecovery), "3", "77"}; fmt.Sprint(got.RefConsts) != fmt.Sprint(want) {
+	// The client's hello version is the newest one it speaks (thinning).
+	if want := []string{RecoveryLTR, RecoveryInvalidate, MsgLost, fmt.Sprint(HelloVersionThinned), "3", "77"}; fmt.Sprint(got.RefConsts) != fmt.Sprint(want) {
 		t.Errorf("constants and lost message %v, want %v", got.RefConsts, want)
 	}
 	if want := "[key:true/true p:false/false plain:false/false recovery:true/false]"; fmt.Sprint(got.Ends) != want {
 		t.Errorf("endsRecovery: %v, want %s", got.Ends, want)
+	}
+}
+
+// TestThinnedJS: the frame extension's thinned mask (Phase 5 temporal SVC
+// thinning) as Go writes it, read by protocol.js: the seqs the host left out
+// among the 32 before the frame, oldest first; none without the tag (needs
+// node).
+func TestThinnedJS(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	frame := func(seq uint32, mask uint64, set bool) string {
+		h := FrameHeader{Type: FrameTypeVideo, Gen: 5, Seq: seq, Flags: FrameFlagExt}
+		var ext FrameExt
+		ext.Set(ExtEncodeDoneUs, 1)
+		ext.Set(ExtTemporalLayer, 0)
+		if set {
+			ext.Set(ExtThinned, mask)
+		}
+		b := make([]byte, FrameHeaderLen)
+		h.Marshal(b)
+		b = ext.Append(b)
+		return hex.EncodeToString(append(b, 0, 0, 0, 1))
+	}
+	vec := map[string]string{
+		"one":    frame(41, 1, true),          // 40
+		"svc":    frame(100, 0b1010101, true), // 99, 97, 95, 93
+		"edge":   frame(40, 1<<31|1, true),    // 39 and 8
+		"start":  frame(3, 1<<5|1<<1, true),   // 1 (seq 3-1-5 < 0 dropped)
+		"high32": frame(64, 0xffffffff, true), // 32..63
+		"none":   frame(10, 0, false),
+	}
+	in, _ := json.Marshal(vec)
+	script := `
+const P = await import(process.argv[1]);
+const vec = JSON.parse(process.argv[2]);
+const out = {};
+for (const [name, hex] of Object.entries(vec)) {
+  const h = P.parseFrameHeader(Uint8Array.from(hex.match(/../g).map((x) => parseInt(x, 16))));
+  out[name] = P.thinnedSeqs(h).join(',');
+}
+out.version = P.HELLO_VERSION;
+out.tag = Object.entries(P.EXT_TAGS).find(([, v]) => v === 'thinned')?.[0];
+console.log(JSON.stringify(out));`
+	b, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js), string(in)).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("%v: %s", err, b)
+	}
+	var all []string
+	for s := 32; s <= 63; s++ {
+		all = append(all, fmt.Sprint(s))
+	}
+	want := map[string]any{"one": "40", "svc": "93,95,97,99", "edge": "8,39", "start": "1", "high32": strings.Join(all, ","), "none": "",
+		"version": float64(HelloVersionThinned), "tag": fmt.Sprint(ExtThinned)}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: %v, want %v", k, got[k], v)
+		}
 	}
 }
 

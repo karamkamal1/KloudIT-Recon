@@ -183,6 +183,10 @@ type CodecCaps struct {
 	LiveFPS        string `json:"liveFps"`
 	InstanceSelect bool   `json:"instanceSelect"`
 	Reencode       bool   `json:"reencode"`
+	// IntraRefreshSVC: Start may combine IntraRefreshFrames with SVCLayers >
+	// 1 (NVENC, assumed; AMF cannot). Older helpers omit it: false, a stream
+	// with temporal layers starts without intra refresh.
+	IntraRefreshSVC bool `json:"intraRefreshSvc"`
 	// Assumed names the fields above that are documented or default values,
 	// not detected on this GPU (e.g. AMF AV1 "roi"; "liveBitrate", which
 	// recon-host qualify measures: internal/host/qualify); omitted when
@@ -215,15 +219,17 @@ func (c *Caps) LTRSlots(codec string) int {
 }
 
 // IntraRefreshFrames returns the intra refresh cycle a stream of codec at fps
-// starts with (StartParams.IntraRefreshFrames): half a second of frames (as
-// media.IntraRefreshPeriod) where the encoder has intra refresh and the
-// stream uses no LTR slots (LTRSlots: AMF cannot combine them; nor SVC, which
-// streams with svcLayers > 1 must leave out too), else 0. It is the
+// with svcLayers temporal layers starts with (StartParams.IntraRefreshFrames):
+// half a second of frames (as media.IntraRefreshPeriod) where the encoder has
+// intra refresh, the stream uses no LTR slots (LTRSlots: AMF cannot combine
+// them) and, with more than one temporal layer, the encoder can combine the
+// two (IntraRefreshSVC: AMF cannot, NVENC can), else 0. It is the
 // loss-recovery ladder's safety net (GUIDE 2.3): losses are still answered by
 // recovery frames or IDRs. Sessions and the live-bitrate qualification both
 // start their streams this way.
-func (c *Caps) IntraRefreshFrames(codec string, fps int) int {
-	if cc, ok := c.Codecs[codec]; !ok || !cc.IntraRefresh || c.LTRSlots(codec) > 0 {
+func (c *Caps) IntraRefreshFrames(codec string, fps, svcLayers int) int {
+	cc, ok := c.Codecs[codec]
+	if !ok || !cc.IntraRefresh || c.LTRSlots(codec) > 0 || svcLayers > 1 && !cc.IntraRefreshSVC {
 		return 0
 	}
 	return max(2, (fps+1)/2)

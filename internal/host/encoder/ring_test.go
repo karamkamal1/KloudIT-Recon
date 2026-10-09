@@ -140,6 +140,38 @@ func TestRingDirtyAndDiscardable(t *testing.T) {
 	}
 }
 
+// TestRingSlicesAndReencoded: the Phase 5 wiring B slot fields (the parts of
+// sub-frame output and when the first one was ready, at offsets 100 / 104,
+// and the REENCODED flag, bit 7); an older helper's slot (zeros there) reads
+// as a whole frame, an implausible part count is ignored.
+func TestRingSlicesAndReencoded(t *testing.T) {
+	r, w := newTestRing(t, 4, 64<<10)
+	w.write(&Frame{FrameID: 1, Key: true, Dirty: -1, Slices: 4, SubmitQPC: 100, FirstSliceQPC: 130, OutputQPC: 160, Data: []byte{1}})
+	w.write(&Frame{FrameID: 2, Dirty: -1, Reencoded: true, Data: []byte{2}})
+	w.write(&Frame{FrameID: 3, Dirty: -1, Slices: 2, FirstSliceQPC: 7, Data: []byte{3}})
+	for _, want := range []struct {
+		slices    int
+		first     int64
+		reencoded bool
+	}{{4, 130, false}, {0, 0, true}, {2, 7, false}} {
+		f, err := r.Next()
+		if err != nil || f.Slices != want.slices || f.FirstSliceQPC != want.first || f.Reencoded != want.reencoded {
+			t.Fatalf("frame %+v %v, want slices %d first %d reencoded %v", f, err, want.slices, want.first, want.reencoded)
+		}
+	}
+	le := binary.LittleEndian
+	w.write(&Frame{FrameID: 4, Dirty: -1, Slices: 3, FirstSliceQPC: 9, Data: []byte{4}})
+	le.PutUint32(w.slot(3)[slotSlices:], 0) // an older helper's slot: reserved bytes 0
+	le.PutUint64(w.slot(3)[slotFirstSliceQPC:], 0)
+	w.write(&Frame{FrameID: 5, Dirty: -1, Slices: 3, FirstSliceQPC: 9, Data: []byte{5}})
+	le.PutUint32(w.slot(4)[slotSlices:], 1<<20)
+	for _, id := range []uint64{4, 5} {
+		if f, err := r.Next(); err != nil || f.FrameID != id || f.Slices != 0 || f.FirstSliceQPC != 0 || f.Reencoded {
+			t.Fatalf("frame %d: %+v %v, want a whole frame", id, f, err)
+		}
+	}
+}
+
 func TestRingCopiesData(t *testing.T) {
 	r, w := newTestRing(t, 2, 64<<10)
 	w.write(&Frame{FrameID: 1, Data: []byte{1, 2, 3}})

@@ -87,8 +87,20 @@ const (
 	ExtRefFloor       byte = 5 // u32 newest earlier frame a recovery frame (or a later one) may reference (recovery frames)
 	ExtLTRSlot        byte = 6 // u8 long-term reference slot this frame is marked into
 	ExtTemporalLayer  byte = 7 // u8 temporal layer id
-	extMaxTag              = 7
+	// ExtThinned (clients with hello v >= HelloVersionThinned only): u32 bit
+	// mask of the frames of this generation the host left out on purpose
+	// among the 32 before this one (bit i: seq - 1 - i), discardable frames
+	// (temporal SVC enhancement layer, non-reference frames) it thinned
+	// under congestion. They are not losses: no other frame references
+	// them; the client skips their seqs without waiting or recovering.
+	ExtThinned byte = 8
+	extMaxTag       = 8
 )
+
+// HelloVersionThinned is the first hello version whose clients read
+// ExtThinned: only to them does the host leave out discardable frames
+// (Phase 5 temporal SVC thinning); older clients get every frame.
+const HelloVersionThinned = 4
 
 // HelloVersionFrameExt is the first hello version whose clients parse
 // FrameFlagExt; older clients get the plain 24-byte header.
@@ -186,7 +198,7 @@ type FrameExt struct {
 	vals [extMaxTag + 1]uint64
 }
 
-var extSize = [extMaxTag + 1]uint8{0, 8, 8, 8, 8, 4, 1, 1}
+var extSize = [extMaxTag + 1]uint8{0, 8, 8, 8, 8, 4, 1, 1, 4}
 
 var ErrBadFrameExt = errors.New("proto: malformed frame header extension")
 

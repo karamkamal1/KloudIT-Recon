@@ -46,13 +46,16 @@ func RaiseFPS(fps, ceiling int) int {
 // StartParams.EncoderInstance (GUIDE 5 "dedicated encode engine": AMF
 // INSTANCE_INDEX away from the engine Adrenalin's recording uses, VERIFY):
 //
-//	"" | "default"  nil: the backend's default (engine 0)
-//	"dedicated"     engine 1 where the codec has more than one engine and the
-//	                backend lets start pick it (CodecCaps.InstanceSelect), else nil
-//	"0", "1", ...   that engine; an error where it cannot be picked
+//	"" | "default" | "auto"  nil: the backend's default (engine 0; host config
+//	                         "encoderInstance" auto until the hardware check of
+//	                         docs/VENDOR_NOTES.md says which engine Adrenalin uses)
+//	"dedicated"              engine 1 where the codec has more than one engine and
+//	                         the backend lets start pick it (CodecCaps.InstanceSelect),
+//	                         else nil
+//	"0", "1", ...            that engine; an error where it cannot be picked
 func EncoderInstanceFor(choice string, cc CodecCaps) (*int, error) {
 	switch c := strings.TrimSpace(choice); c {
-	case "", "default":
+	case "", "default", "auto":
 		return nil, nil
 	case "dedicated":
 		if !cc.InstanceSelect || cc.HWInstances < 2 {
@@ -63,7 +66,7 @@ func EncoderInstanceFor(choice string, cc CodecCaps) (*int, error) {
 	default:
 		n, err := strconv.Atoi(c)
 		if err != nil {
-			return nil, fmt.Errorf("encoder instance %q: want default, dedicated or an engine number", choice)
+			return nil, fmt.Errorf("encoder instance %q: want auto, dedicated or an engine number", choice)
 		}
 		if !cc.InstanceSelect {
 			return nil, fmt.Errorf("encoder instance %d: this encoder picks its engines itself", n)

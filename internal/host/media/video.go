@@ -38,7 +38,28 @@ type Frame struct {
 	MarkedLTR     bool
 	LTRSlot       uint8
 	TemporalLayer uint8
-	Data          []byte
+	// Discardable: no later frame references this one and it is neither a
+	// key frame nor a recovery frame, so the session may leave it out under
+	// congestion without breaking the decoding of any other frame (Phase 5
+	// temporal SVC thinning): the native helper's Frame.Droppable (the
+	// enhancement layer of an SVC stream), on the FFmpeg path a
+	// non-reference frame read from the bitstream (codec.Params.Discardable).
+	Discardable bool
+	// Dirty is the share of the picture the capture reported as changed
+	// since the previous frame (0..1, 0 for an idle repeat), valid with
+	// HasDirty: the native helper's dirty rects (DDA, AMD Direct Capture;
+	// the synthetic GPU source). FFmpeg reports none.
+	Dirty    float64
+	HasDirty bool
+	// FirstSliceUs: host clock when the encoder had the frame's first slice
+	// / tile ready (native helper sub-frame output, StartParams.SliceOutput;
+	// 0 = it came out whole). The frame still goes out whole: EncodeDoneUs -
+	// FirstSliceUs is what sending it slice by slice could gain.
+	FirstSliceUs uint64
+	// Reencoded: the encoder encoded this frame a second time at a higher QP
+	// because the first encode was oversized (StartParams.ReencodeOversized).
+	Reencoded bool
+	Data      []byte
 }
 
 // maxCaptureToEncoded bounds plausible capture->encoded times; anything else
@@ -199,8 +220,9 @@ func (v *Video) ForceKeyframe() error {
 }
 
 // SetRate starts an overlapped generation at the new bitrate (and frame rate):
-// the FFmpeg command line sets them only at start.
-func (v *Video) SetRate(kbps, fps int) error {
+// the FFmpeg command line sets them only at start (and has no VBV setting of
+// its own: vbvFrames is ignored).
+func (v *Video) SetRate(kbps, fps int, vbvFrames float64) error {
 	p, ok := v.Current()
 	if !ok {
 		return errors.New("video: nothing to restart")
@@ -236,6 +258,9 @@ func (v *Video) Recover(gen uint8, lostFrom uint32) error {
 
 // Ack: unused (no long-term references).
 func (v *Video) Ack(gen uint8, seq uint32) {}
+
+// SetFocus: the FFmpeg command line has no regions of interest.
+func (v *Video) SetFocus(Focus) error { return ErrNoROI }
 
 // Start launches a new encoder generation. If urgent is true the current
 // generation is stopped immediately (its frames are useless to the client, e.g.
@@ -441,7 +466,8 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 		if seq == 0 {
 			pts0 = pts
 		}
-		f := &Frame{Gen: pr.gen, Seq: seq, Key: pkt.Key, PtsUs: pts - pts0, EncodeDoneUs: done, Data: data}
+		f := &Frame{Gen: pr.gen, Seq: seq, Key: pkt.Key, PtsUs: pts - pts0, EncodeDoneUs: done, Data: data,
+			Discardable: params.Discardable(data, pkt.Key)}
 		if pr.params.CaptureClock {
 			if seq == 0 || done-wallOffAt >= wallOffsetEvery {
 				wallOff, wallOffAt = WallOffset(v.clock), done

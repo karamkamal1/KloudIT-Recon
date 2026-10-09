@@ -64,6 +64,12 @@ func (m *ActivityMeter) AddStats(at time.Time, s Stats) {
 	m.add(at, d)
 }
 
+// AddShare records a frame by its share alone (0..1, as Frame.Dirty and
+// Stats.Dirty; an idle repeat is 0), or an unknown share (negative): for
+// callers that carry the share in frames of their own (recon-host's session,
+// media.Frame.Dirty).
+func (m *ActivityMeter) AddShare(at time.Time, dirty float64) { m.add(at, dirty) }
+
 func (m *ActivityMeter) add(at time.Time, dirty float64) {
 	if dirty < 0 {
 		dirty = -1

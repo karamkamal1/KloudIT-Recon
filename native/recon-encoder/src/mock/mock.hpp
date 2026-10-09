@@ -40,7 +40,10 @@ private:
 
 // ReplayEncoder outputs the canned clip: frame 0 is an IDR, 1..59 are P frames,
 // and it loops back to the IDR. forceIdr (and recover, which has no LTR to use)
-// jumps back to frame 0. setRate is accepted (recon-host sees it in the stats)
+// jumps back to frame 0. With start's svcLayers 2 every canned P frame is
+// preceded by a non-reference copy of itself (h264AsNonReference: layer 1,
+// discardable; it decodes to the same picture), so the stream has a
+// two-layer temporal structure: key 0, then copy / P pairs. setRate is accepted (recon-host sees it in the stats)
 // but cannot change the canned pictures; with MockOptions::followRate it pads
 // every frame with H.264 filler data to the target bitrate (key frames to three
 // times a P frame), applied from the next submitted frame (rateLag frames
@@ -52,6 +55,13 @@ private:
 // HDR10 stream although the canned one is 8-bit H.264), so capture and the
 // colour conversion run for real on a host without an encoder backend; the
 // converted frames are ignored.
+// Phase 5 session wiring (part B) plumbing: setRoi is accepted (caps roi
+// "importance") and logged, one line per call, as "mock: setRoi N rect(s):
+// x,y wxh weight w ..." (the canned pictures do not change); start's
+// sliceOutput N is taken (caps sliceOutput true) and every frame reports N
+// parts, the first one ready when the frame went into its queue (submit) and
+// the frame when receive() hands it out, so the ring's slice fields and
+// recon-host's stage summary can be tested without AMF.
 // It enforces the init() / release() contract: an init() after a start that
 // failed after init() succeeded fails unless release() was called in between.
 class ReplayEncoder : public Backend {
@@ -84,6 +94,8 @@ private:
     MockOptions opt_;
     std::vector<std::pair<size_t, size_t>> aus_;  // offset, size into the clip
     std::string clipError_;
+    std::vector<std::vector<uint8_t>> nonRef_;  // non-reference copies of the P frames (SVC), [0] unused
+    std::string svcError_;                      // why there are none
 
     std::mutex mu_;
     std::condition_variable cv_;
@@ -99,6 +111,9 @@ private:
     bool flush_ = false, ratePending_ = false;
     RateParams pendingRate_;
     uint32_t gen_ = 0;
+    bool svc_ = false;       // svcLayers 2
+    int slices_ = 0;         // start sliceOutput (emulated)
+    bool copyNext_ = false;  // the next frame is the copy of the next canned P frame
 };
 
 }  // namespace recon

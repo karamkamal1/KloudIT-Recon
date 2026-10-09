@@ -56,7 +56,9 @@ const (
 	slotDroppedBefore = 84
 	slotWidth         = 88
 	slotHeight        = 92
-	slotDirtyPPM      = 96 // u32, valid with FlagDirty (Phase 5)
+	slotDirtyPPM      = 96  // u32, valid with FlagDirty (Phase 5)
+	slotSlices        = 100 // u32 parts of sub-frame output, 0 = whole (Phase 5 wiring B)
+	slotFirstSliceQPC = 104 // i64, valid with slotSlices > 0
 
 	FlagKey           = 1 << 0
 	FlagRecovery      = 1 << 1
@@ -66,7 +68,12 @@ const (
 	// Phase 5 (additive: older helpers leave them unset).
 	FlagDirty       = 1 << 5 // the slot's dirty share is valid
 	FlagDiscardable = 1 << 6 // no later frame references this one
+	FlagReencoded   = 1 << 7 // encoded a second time at a higher QP (start reencodeOversized)
 )
+
+// maxSlicesPerFrame bounds a slot's slice count (start sliceOutput is 0..64;
+// the encoder may take another count): a larger one is ignored.
+const maxSlicesPerFrame = 1024
 
 // ErrRingCorrupt means the shared memory holds something the helper cannot
 // have written correctly; the helper must be restarted.
@@ -92,8 +99,17 @@ type Frame struct {
 	// Dirty is the share of the picture the capture reported as changed since
 	// the previous frame (0..1, from the dirty rects; 0 for an idle repeat),
 	// -1 = unknown (no dirty rects from this capture method, older helpers).
-	Dirty         float64
-	RefLTRMask    uint32
+	Dirty      float64
+	RefLTRMask uint32
+	// Reencoded: the frame was encoded a second time at a higher QP because
+	// the first encode was oversized (StartParams.ReencodeOversized).
+	// Slices / FirstSliceQPC: with StartParams.SliceOutput the parts the
+	// frame came out of the encoder in and when the first one was ready
+	// (Stats.FirstSliceQPC, carried in the ring so it survives dropped stats);
+	// 0 = the frame came out whole (or an older helper).
+	Reencoded     bool
+	Slices        int
+	FirstSliceQPC int64
 	Width, Height uint32
 	// QPC ticks (Ring.QPCFrequency per second); PresentQPC is 0 when unknown.
 	PresentQPC, CaptureQPC, SubmitQPC, OutputQPC int64
@@ -228,6 +244,10 @@ func (r *Ring) Next() (*Frame, error) {
 	}
 	if flags&FlagDirty != 0 {
 		f.Dirty = min(1, float64(le.Uint32(s[slotDirtyPPM:]))/1e6)
+	}
+	f.Reencoded = flags&FlagReencoded != 0
+	if n := le.Uint32(s[slotSlices:]); n > 0 && n <= maxSlicesPerFrame {
+		f.Slices, f.FirstSliceQPC = int(n), int64(le.Uint64(s[slotFirstSliceQPC:]))
 	}
 	r.read++
 	atomic.StoreUint64(r.counter(offReadCount), r.read)
