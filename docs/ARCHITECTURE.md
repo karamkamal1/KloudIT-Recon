@@ -148,7 +148,8 @@ does so before the frame is sent: the frame rate drops for the moment (halves wi
 nothing is corrupted, no key frame is needed and the encoder does not change. Congestion is any of:
 the rate controller's last two reports over its delay target (or a frame far over it that does not
 arrive), two or more frames waiting in the frame queue behind the one being sent, a frame stream
-still being written past its deadline (or the last one written that slowly). A thinned frame gets
+still being written past its deadline (or the last frame written that slowly, on a stream or as
+datagram shards). A thinned frame gets
 no `dropped` report, no recovery and no acknowledgement; every frame sent after it carries the
 `thinned` mask, so the client skips its seq at once, neither waiting for it nor taking it for a
 loss (frame-to-frame freeze accounting treats the frames around it as consecutive). A loss the

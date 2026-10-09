@@ -483,6 +483,10 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 		}
 		sent += len(d)
 	}
+	// Thinning's deadline pressure (sendState.slow): the hand-over of the
+	// shards (the writer's pacing waits, quic-go's full datagram queue)
+	// against the frame's deadline.
+	s.send.shardsDone(of)
 	if m2 := s.deliveryMeter(); m2 != nil {
 		// In flight until the peer acknowledged its shards (GUIDE 2.7):
 		// SendDatagram queues them, so the frame ends at least its bytes

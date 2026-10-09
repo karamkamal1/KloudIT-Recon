@@ -392,6 +392,17 @@ func (s *sendState) finish(of *outFrame, state int32) bool {
 	return true
 }
 
+// shardsDone records a frame whose shards all went out (writeShards) as the
+// last frame written, as finish does for a frame stream: the deadline
+// pressure (slow) follows the frames sent now, whichever way they go, so a
+// late frame stream before the switch to shards does not stay pressure for
+// as long as the datagram mode lasts.
+func (s *sendState) shardsDone(of *outFrame) {
+	s.mu.Lock()
+	s.lastSlow = time.Since(of.opened) > of.deadline
+	s.mu.Unlock()
+}
+
 // markReliable marks the n bytes written to a frame stream so far reliable
 // (GUIDE 2.4, Session.writeFrame) unless the ladder cancelled it first;
 // false then. Every CancelWrite of a frame stream follows its leaving
@@ -414,7 +425,8 @@ func (s *sendState) markReliable(of *outFrame, n int) bool {
 // slow reports the loss-recovery ladder's deadline pressure, for thinning
 // (thin.go): a frame stream still being written past its deadline (where
 // rung 1 does not cancel it: key frames, recovery "skip" or "keyframe"), or
-// the last one written taking that long. A large frame's deadline includes
+// the last frame written (on a stream, or as shards: shardsDone) taking that
+// long. A large frame's deadline includes
 // its own sending time (frameDeadline), so a key frame paced out in time is
 // no pressure.
 func (s *sendState) slow(now time.Time) bool {

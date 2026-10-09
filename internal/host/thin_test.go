@@ -251,3 +251,43 @@ func TestThinPressure(t *testing.T) {
 		t.Fatalf("after a quick write: %q", why)
 	}
 }
+
+// TestThinShardsAfterSlowStream: the deadline pressure follows the frames
+// sent. A frame stream written past its deadline just before the session
+// switches to datagram + FEC is pressure for the next frame only: the
+// frames sent as shards after it, all in time, leave nothing to thin.
+func TestThinShardsAfterSlowStream(t *testing.T) {
+	s, c, _ := testSession(t, testFaults{})
+	c.stall = map[int]bool{0: true}
+	s.c = &dgConn{Conn: c}
+	s.a.cfg = &Config{} // fec and svc auto
+	s.hello = proto.Hello{V: proto.HelloVersionThinned, FEC: proto.HelloFECVersion}
+	s.meta = SessionMeta{Path: "direct"}
+	s.fecNacks = make(chan proto.FECNack, 64)
+	s.fecInit()
+	s.setCongestionTarget(media.Params{BitrateKbps: 20000, FPS: 60})
+	go s.frameSender()
+	// Frame 0 on a stream (no round trip measured yet), written past its
+	// deadline.
+	s.frameQ <- &media.Frame{Gen: 1, Seq: 0, Key: true, Data: bytes.Repeat([]byte{1}, 5000)}
+	time.Sleep(100 * time.Millisecond)
+	c.release(0)
+	waitCond(t, "frame 0 written", func() bool { st := c.snapshot(); return len(st) == 1 && st[0].closed })
+	if !s.send.slow(time.Now()) {
+		t.Fatal("the slow frame stream is no deadline pressure")
+	}
+	// A 40 ms round trip: datagram + FEC. Frame 1 goes as shards; every
+	// frame after it is discardable, sent with no congestion at all.
+	s.clientRTT.Store(int64(40 * time.Millisecond))
+	s.fec.rttReports.Store(fecRTTReports)
+	for seq := uint32(1); seq <= 20; seq++ {
+		s.frameQ <- &media.Frame{Gen: 1, Seq: seq, Discardable: seq%2 == 0, TemporalLayer: uint8(1 - seq%2), Data: bytes.Repeat([]byte{2}, 3000)}
+		waitCond(t, fmt.Sprintf("frame %d sent or thinned", seq), func() bool {
+			return s.fec.frames.Load()+s.stats.thinned.Load() == int64(seq)
+		})
+	}
+	if n := s.stats.thinned.Load(); n != 0 || !s.fecActive() || s.fec.frames.Load() != 20 {
+		t.Fatalf("thinned %d of 10 discardable frames with no congestion (datagram + FEC %v, %d frames as shards)",
+			n, s.fecActive(), s.fec.frames.Load())
+	}
+}

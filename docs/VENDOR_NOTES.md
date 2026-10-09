@@ -10621,3 +10621,41 @@ the same host (Connect or Wake, Manage, Add a PC).
   idle, and 18 % with these changes).
 - `go test ./internal/e2e/` (under the lock), `go test -race ./internal/host/ ./internal/proto/
   ./internal/gateway/`, `go vet` for linux and windows: pass.
+
+## Final review: host agent, second round
+
+Findings of the second final review about the PC agent. Each item: the problem, the fix, what was
+verified here, the check on hardware.
+
+### Thinning after the switch to datagram + FEC
+
+Problem: thinning's deadline pressure (`sendState.slow`) includes "the last frame written past
+its deadline", a flag only a finished frame stream set. Frames sent as datagram shards never
+touched it. When the last frame stream before the switch to datagram + FEC was late (a key frame
+in slow start on a 40 ms path, or the stream frames of the 30 s "too much shard loss" pause), the
+flag stayed set for as long as the datagram mode lasted: every discardable frame was thinned with
+nothing congested (half the frame rate), and the rate controller, which holds its increases
+while frames are thinned and decreases when thinning lasts, walked the bitrate down to its floor
+(`why=thinning` about once a second) and never came back.
+
+Fix: `writeShards` records a frame whose shards all went out as the last frame written
+(`sendState.shardsDone`): late when handing its shards over (the writer's pacing waits, quic-go's
+full datagram queue) took longer than its deadline, measured from after the video window's hold
+as on a frame stream. So the pressure follows the frames sent, on streams or as shards; a late
+stream frame before the switch counts for the next frame only.
+
+- Verified here: `internal/host` `TestThinShardsAfterSlowStream`: a key frame on a stream stalled
+  for 100 ms (past its deadline), then a 40 ms round trip switches to datagram + FEC and 20 frames
+  follow, every other one discardable, with no queue and no delay reports. Before the fix all 10
+  discardable frames were thinned; with it none are. `TestThinPressure`, `TestFECStreamsSwitch`
+  and the rest of the package pass.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific, needs temporal SVC (caps
+  `maxTemporalLayers` >= 2). Test: with `"logLevel": "debug"`, stream from a browser over a path
+  with a 40 ms round trip (`sudo ./netem.sh apply wan --iface <nic> --port 48100`) and a desktop
+  with motion. After host.log logs `video transport` with `mode="datagram + FEC"`, there must be
+  no lasting thinning episode with `why=deadline` (`thinning: leaving out discardable frames
+  under congestion`, then `thinning ended` with a large `frames`) and no run of `congestion:
+  lowering bitrate` with `why=thinning` while the overlay shows no loss and a steady delay; the
+  overlay's frame rate stays at the session's.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same, on an NVENC host whose caps
+  report temporal layers.

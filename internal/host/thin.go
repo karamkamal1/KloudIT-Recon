@@ -18,9 +18,9 @@ import (
 // back with the next frame sent once the pressure is gone. Pressure is any
 // of: the rate controller's last report over its delay target (overTarget),
 // the frame queue building (thinQueued frames wait behind the one taken),
-// the loss-recovery ladder's deadline pressure (a frame stream written past
-// its deadline: sendState.slow), or the test hook's simulated congestion
-// (thin=every:N:for:M).
+// the loss-recovery ladder's deadline pressure (a frame written past its
+// deadline, on a stream or as shards: sendState.slow), or the test hook's
+// simulated congestion (thin=every:N:for:M).
 //
 // A thinned frame is no loss: it gets no "dropped" report, no Recover and no
 // ladder rung, and the client acknowledges nothing for it. Every frame sent
