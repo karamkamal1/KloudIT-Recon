@@ -9650,6 +9650,46 @@ Fix:
   run still apply (a new `Video` row in the overlay).
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
 
+### Nothing starts an encoder while the client is hidden
+
+Problem: while the tab was hidden (paused), a key-frame request, a loss report, a decoder flush
+or a settings change still started a new encoder generation: `requestKeyframe`, `keyframe`,
+`setRate` and `startVideo` did not check the pause, unlike the other restart paths (healDue, the
+capture resize, the HDR restart, helperFallback, the virtual display's loss). `videoEvents`
+dropped the new generation's frames but sent its video config, so the hidden client waited for a
+key frame that never came, and its watchdog asked again every second. On FFmpeg that started an
+ffmpeg process (capture and encoder) about once a second while the tab stayed hidden; on the
+helper it relaunched the helper, then forced an IDR every second. The trigger: a loss, a recovery
+wait or a decoder error pending as the tab is hidden.
+
+Fix (`internal/host/session.go`):
+- `startVideo` starts nothing while paused; `resume` starts the next generation, with the
+  settings and the rate controller's target of that moment. So a settings or rate change made
+  while hidden takes effect on resume.
+- The control loop ignores `keyframe`, `lost` and a decoder flush's key-frame request while
+  paused (resume's generation starts with a key frame).
+- `videoEvents` does not send the config of a generation that went live while paused (one that
+  was starting as the pause came).
+
+- Verified here: `internal/host` `TestPausedClientStartsNoEncoder` (a stand-in pipeline that
+  records starts): after `pause`, two `keyframe` requests, a `lost`, a decoder flush and a
+  bitrate change start no generation (3 starts before the fix), configs of generations that go
+  live meanwhile are not sent, `resume` starts one with the new bitrate, and a key-frame request
+  after it starts one again.
+- AMD RDNA3 (RX 7900 XT): unverified. Test, with `"logLevel": "debug"` and the helper:
+  1. Stream, open DevTools on the stream page and run
+     `__recon.worker.postMessage({ type: 'ctl', m: { t: 'keyframe' } })` right before switching
+     to another tab (or minimise the window), so a request is pending as the pause arrives.
+  2. Stay away 30 s. host.log has `client hidden: pausing video`, then no `encoder helper
+     started`, `forcing a key frame` or `restarting video` line until the tab is shown again
+     (`client hidden: video starts on resume` debug lines are fine). Task Manager > Performance
+     > GPU: the Video Encode graph stays at 0 % while hidden.
+  3. Show the tab: one `restarting video reason=resume`, and the picture is back within a
+     second.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same.
+- FFmpeg path (`"pipeline": "ffmpeg"`): the same test; while hidden no `starting encoder` line
+  and no ffmpeg.exe in Task Manager.
+
 ## Final review: security
 
 Findings of the final review's security pass. Each item: the problem, the fix, what was verified

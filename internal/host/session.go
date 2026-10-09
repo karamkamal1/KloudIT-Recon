@@ -970,7 +970,16 @@ func (a *Agent) backendFor(prefs proto.Prefs) string {
 // congestion back-off stays in effect for every restart until the controller
 // raises the bitrate again or a video settings change resets it, so a
 // key-frame restart after a loss does not go back to the full bitrate.
+//
+// While the client is hidden (paused) nothing starts: resume starts the next
+// generation with the settings and rate of that moment. A key-frame request,
+// a settings change or a rate change in between would otherwise run an
+// encoder for frames videoEvents drops.
 func (s *Session) startVideo(urgent bool, reason string) error {
+	if s.paused.Load() {
+		s.log.Debug("client hidden: video starts on resume", "reason", reason)
+		return nil
+	}
 	prefs := s.currentPrefs()
 	p, err := s.buildParams(prefs)
 	if err != nil {
@@ -1090,6 +1099,12 @@ func (s *Session) videoEvents() {
 			s.rate.live(s.static.generation(s.static.clock(), c.BitrateKbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), c.FPS)
 			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
+			if s.paused.Load() {
+				// Its frames are dropped: a hidden client would wait for
+				// its key frame and ask again and again. Resume starts a
+				// generation with a config of its own.
+				continue
+			}
 			s.sendJSON(&c)
 		case ev.Frame != nil:
 			if s.paused.Load() {
@@ -2589,13 +2604,20 @@ func (s *Session) controlLoop() error {
 				s.startAudio()
 			}
 		case "keyframe":
-			s.requestKeyframe("keyframe request")
+			// While the client is hidden nothing streams, and resume starts
+			// a generation with a key frame: its watchdog's requests and
+			// losses are moot.
+			if !s.paused.Load() {
+				s.requestKeyframe("keyframe request")
+			}
 		case proto.MsgLost:
 			// A loss only the client saw (a gap that outlasted its wait),
 			// under reference recovery: it waits for the recovery frame. A
 			// frame left out on purpose is none (thin.go): the loss starts
 			// at the next frame sent.
-			s.loss(lossConfirmed, m.Gen, s.thinning.firstSent(m.Gen, m.FromSeq), "client")
+			if !s.paused.Load() {
+				s.loss(lossConfirmed, m.Gen, s.thinning.firstSent(m.Gen, m.FromSeq), "client")
+			}
 		case "stages":
 			s.logStages(m.Stages, m.Renderer, m.Pacing, m.Upscale)
 		case "congestion":
@@ -2604,7 +2626,7 @@ func (s *Session) controlLoop() error {
 			// it waits for a key frame, also when the bitrate stays.
 			if m.Reason != proto.CongestionDecoder {
 				s.congestion(m.DelayMs, signalDelay)
-			} else if !s.congestion(m.DelayMs, signalDecoder) {
+			} else if !s.congestion(m.DelayMs, signalDecoder) && !s.paused.Load() {
 				s.requestKeyframe("keyframe request")
 			}
 		case "pause":

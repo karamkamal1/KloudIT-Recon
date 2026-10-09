@@ -65,6 +65,11 @@ then closes the connection (`CodeProtocol`), and the client reconnects. The clie
 the connection itself (code 2) when its control stream does not parse, as it would after a host
 from before that kept writing behind a torn message.
 
+**Pause.** While the tab is hidden the client sends `pause` (and `resume` when it is shown
+again). The host stops the encoder, and nothing starts one until `resume`: key-frame requests
+and losses are ignored, and a settings or rate change takes effect with the generation `resume`
+starts. A config of a generation that went live meanwhile is not sent.
+
 ### Frame stream
 
 ```
