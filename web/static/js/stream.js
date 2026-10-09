@@ -358,6 +358,7 @@ async function connect() {
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
     audioSab: sab, audioPort: port,
   }, transfer);
+  if (document.hidden) sendCtl({ t: 'pause' }); // a reconnect while the tab is hidden
 }
 
 function teardown() {
@@ -545,8 +546,9 @@ function releaseAll() {
 }
 
 window.addEventListener('blur', releaseAll);
+// The worker holds pause and resume until its hello is out.
 document.addEventListener('visibilitychange', () => {
-  if (!S.connected) return;
+  if (!S.worker) return;
   if (document.hidden) {
     releaseAll();
     sendCtl({ t: 'pause' }); // stop encoding while nobody is watching

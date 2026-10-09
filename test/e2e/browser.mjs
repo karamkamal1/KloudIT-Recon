@@ -2343,6 +2343,60 @@ async function checkTakeover() {
   await endStream();
 }
 
+// Control and input before the hello (final review): the page may send
+// control messages and input as soon as the transport is up, while the
+// worker's hello still waits for the decoder self-test, and the host takes
+// the first control message as the hello ("bad hello" otherwise) and ends a
+// session's input stream on input before the session is active. With the
+// timing clips held up (the hello waits up to the timing budget for them),
+// the tab is hidden and the window loses focus (key releases) right after
+// the transport is up: the session starts without a retry, the pause reaches
+// the host after the hello, showing the tab resumes the stream, and keys
+// reach the host.
+async function checkControlBeforeHello() {
+  const host = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const log0 = host.log.length;
+  const hold = async (route) => { await sleep(2500); await route.continue().catch(() => {}); };
+  await ctx.route('**/js/decoder-timing-clips.js', hold);
+  try {
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, ...PREFS_2D, path: 'direct', transport: 'auto' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await page.click('#btn-start');
+    await page.waitForFunction(() => window.__recon?.connected, null, { timeout: 15000, polling: 10 });
+    const early = await page.evaluate(() => {
+      const before = !window.__recon.helloDecoders;
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new Event('blur'));
+      return before;
+    });
+    const paused = await until(() => /client hidden: pausing video/.test(host.log.slice(log0)), 10000, 'the pause').catch(() => false);
+    await page.evaluate(() => { delete document.hidden; document.dispatchEvent(new Event('visibilitychange')); });
+    const playing = await until(() => page.evaluate(() => window.__recon.streaming && (window.__recon.lastStats?.fps || 0) > 5), 20000, 'the stream').catch(() => false);
+    let keys = 'not checked (no input log)';
+    if (nativeInputLog && playing) {
+      writeFileSync(inputLog, '');
+      await page.focus('#stage').catch(() => {});
+      await page.keyboard.press('KeyW');
+      keys = await until(() => readFileSync(inputLog, 'utf8').includes('"sc":17'), 5000, 'the key on the host').then(() => 'W reached the host').catch(() => 'no key on the host');
+    }
+    const log = host.log.slice(log0);
+    const st = await page.evaluate(() => ({ attempts: window.__recon.attempts, hello: !!window.__recon.helloDecoders }));
+    const sessions = (log.match(/msg="session started"/g) || []).length;
+    const pausedAfterHello = paused && log.indexOf('msg="session started"') >= 0 && log.indexOf('msg="session started"') < log.indexOf('client hidden: pausing video');
+    check('control and input before the hello: hidden and blurred while the self-test runs, the session starts once (no "bad hello"), pauses after the hello, resumes, keys reach the host',
+      early && !/bad hello/.test(log) && st.attempts === 0 && sessions === 1 && pausedAfterHello && !!playing && (!nativeInputLog || keys === 'W reached the host'),
+      `sent before the hello: ${early}; host: ${sessions} session(s), ${/bad hello/.test(log) ? '"bad hello"' : 'no "bad hello"'}, ` +
+        `${pausedAfterHello ? 'paused after the hello' : paused ? 'paused, not after the hello' : 'no pause'}; client retries ${st.attempts}; ` +
+        `streaming after the resume: ${!!playing}; ${keys}`);
+  } finally {
+    await ctx.unroute('**/js/decoder-timing-clips.js', hold);
+    await endStream();
+  }
+}
+
 // Input (step 4.6), on a host with the test hook rumble-echo (it plays a
 // gamepad's triggers back as force feedback, as a game's rumble comes back
 // through ViGEmBus, which this host lacks).
@@ -4298,6 +4352,7 @@ try {
   if (want('pre stage hold host')) await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
   if (want('input host')) await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
+  if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

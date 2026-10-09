@@ -9599,3 +9599,35 @@ unchanged.
   Back to Prefer hardware: `hevc:hw:` and HEVC first as before.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client and an RTX
   host: `h264_nvenc` under Prefer software, the HEVC lines as above.
+
+### Control messages and input before the hello
+
+Problem: the page marks the session connected as soon as the transport is up, but the worker
+sends its hello only after the decoder self-test (on a real Windows client with hardware
+decoders and the 1.5 s timing budget, up to about 2 s later). Hiding the tab in that window
+sent `{t:"pause"}` at once, ahead of the hello; the host takes the first control message as the
+hello, so the session ended with `bad hello` and the client retried (and the retry streamed for
+the hidden tab). Alt-tabbing in the same window (a window blur) sent key releases on the input
+stream; the host ends a session's input stream on input that arrives before the session is the
+active one, so that whole session then had no keyboard or mouse, silently.
+
+Fix: the worker holds the page's control messages until its hello is out (the last of each
+kind, pause and resume being one kind; a held settings message gets the HDR prefs current when
+it goes out) and sends input only after the `welcome` (input before it, only key releases, is
+dropped); a `bye` before the hello is left out. The page passes pause and resume to the worker
+from the start of a connection, and a connection started while the tab is hidden pauses after
+its hello.
+
+- Verified here: browser E2E check "control and input before the hello" (the timing clips held
+  up 2.5 s so the hello waits for the timing budget; the tab hidden and the window blurred right
+  after the transport is up, before the hello): one session, no `bad hello`, `client hidden:
+  pausing video` after `session started`, the stream resumes when the tab shows again, and W
+  reaches the host's input log. Against the old client it fails with `bad hello`; with the
+  control fix alone (input not held) it fails with no key on the host.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: Chrome on a Windows client with an AMD GPU (the
+  hardware decoders make the self-test take longest), Start, then at once switch to another tab
+  for 5 s and back, and once more with Alt+Tab instead. host.log has one `session started` per
+  Start and no `bad hello`; after the tab switch `client hidden: pausing video` then the stream
+  resumes; after Alt+Tab, typing in the stream reaches the PC. The client log has no `Could not
+  connect — retrying`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.

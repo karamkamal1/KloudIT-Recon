@@ -2170,6 +2170,7 @@ function onAudioPacket(d) {
 function onControl(m) {
   switch (m.t) {
     case 'welcome':
+      pageCtl.input = true;
       hostFeatures = m.features || [];
       probe.features = hostFeatures;
       fb.on = hostFeatures.includes(P.FEATURE_RATE_REPORT);
@@ -2342,6 +2343,37 @@ async function selfTestDecoders(decoders) {
   return decoders.map((d) => helloDecoder(d, tests.find((t) => t.family === d.family)));
 }
 
+// Control messages from the page (pause and resume when the tab is hidden,
+// live settings, key frame requests) wait for the hello: the host takes the
+// first control message as the hello and ends the session on anything else
+// ("bad hello"), and the page may send them as soon as the transport is up,
+// while the hello still waits for the decoder self-test. Held: the last of
+// each kind (pause and resume are one kind), sent in that order after it.
+// Input waits for the welcome, which comes once the session is the host's
+// active one: the host ends a session's input stream on input that arrives
+// before (a window blur's key releases while the self-test runs), which left
+// the whole session without input. Before the first frame the page sends no
+// other input, so it is dropped, not held.
+const pageCtl = { open: false, held: [], input: false };
+const ctlKind = (c) => (c?.t === 'resume' ? 'pause' : c?.t);
+
+function pageControl(c) {
+  if (!pageCtl.open) {
+    pageCtl.held = pageCtl.held.filter((h) => ctlKind(h) !== ctlKind(c));
+    pageCtl.held.push(c);
+    return;
+  }
+  if (c?.t === 'pause' || c?.t === 'resume') freeze.drawn = 0; // not a freeze
+  if (c?.t === 'settings' && c.prefs) c = { ...c, prefs: { ...c.prefs, hdr: hdrPrefs() } }; // what this client can present now
+  transport?.sendControl(c);
+}
+
+// The hello is out: the page's held control messages follow it.
+function openPageControl() {
+  pageCtl.open = true;
+  for (const c of pageCtl.held.splice(0)) pageControl(c);
+}
+
 async function start(msg) {
   prefs = msg.prefs || {};
   pacer.setMode(prefs.pacing);
@@ -2383,6 +2415,7 @@ async function start(msg) {
     ...(transport.kind === 'webtransport' && prefs.fec !== 'off' ? { fec: P.HELLO_FEC_VERSION } : {}),
   });
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
+  openPageControl();
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
   const pingTimer = setInterval(sendPing, 1000);
   const watchdogTimer = setInterval(videoWatchdog, 250);
@@ -2405,13 +2438,9 @@ self.onmessage = (ev) => {
   const m = ev.data;
   switch (m.type) {
     case 'start': start(m).catch((e) => post('closed', { reason: e.message, retry: true })); break;
-    case 'in': transport?.sendInput(m.b); break;
-    case 'dg': transport?.sendInputDatagram(m.b); break;
-    case 'ctl':
-      if (m.m?.t === 'pause' || m.m?.t === 'resume') freeze.drawn = 0; // not a freeze
-      if (m.m?.t === 'settings' && m.m.prefs) m.m.prefs = { ...m.m.prefs, hdr: hdrPrefs() }; // what this client can present now
-      transport?.sendControl(m.m);
-      break;
+    case 'in': if (pageCtl.input) transport?.sendInput(m.b); break;
+    case 'dg': if (pageCtl.input) transport?.sendInputDatagram(m.b); break;
+    case 'ctl': pageControl(m.m); break;
     case 'prefs':
       prefs = { ...prefs, ...m.prefs };
       updateProbeMode();
@@ -2436,7 +2465,10 @@ self.onmessage = (ev) => {
     case 'loseContext': renderer?.loseContext(); break; // test hook: the active path's GPU context is lost
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
-      if (transport) { transport.sendControl({ t: 'bye' }); setTimeout(() => transport?.close(), 50); }
+      if (transport) {
+        if (pageCtl.open) transport.sendControl({ t: 'bye' }); // (not in place of the hello)
+        setTimeout(() => transport?.close(), 50);
+      }
       break;
   }
 };

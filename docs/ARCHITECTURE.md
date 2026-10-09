@@ -43,6 +43,12 @@ Every session, whatever its transport, has four logical channels:
 | frames | reliable per frame, independent | **one unidirectional stream per frame**; over a round trip above 15 ms datagram shards with Reed-Solomon parity ([below](#datagram--fec-video)) | `0x02` + frame |
 | datagram | unreliable | QUIC DATAGRAM | `0x03` + datagram |
 
+The first control message is the client's `hello`; the host ends the session on anything else
+("bad hello"). Input counts only once the session is the host's active one (the hello checked):
+the host ends the session's input stream on input before that. The browser client therefore
+holds the page's control messages (pause and resume, live settings) until its hello is out, the
+last of each kind, and sends input only after the `welcome`, which comes after that point.
+
 **One session per host.** A new connection takes the host over. The replaced session sends its
 client a `bye` on the control stream, and the client ends the session on it and does not
 reconnect (otherwise two devices would keep taking the session from each other). The host closes
