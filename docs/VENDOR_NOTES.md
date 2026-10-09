@@ -9190,6 +9190,34 @@ checksums.sha256`) say the same, and this file's 1.6 note says "picks" instead o
   `ffmpeg-n8.1-latest-win64-gpl-8.1.zip matches the SHA-256 in the release's checksums.sha256`.
 - NVIDIA: unverified (no NVIDIA host available); the same.
 
+### README's `capture` row on the native helper
+
+Problem: README's host.json `capture` row described only FFmpeg: `auto` as "gfxcapture when
+scaling", `amf` as FFmpeg 8.1's `vsrc_amf` with a ddagrab fallback, and pointed to 1.6 (the FFmpeg
+path). On the default pipeline the helper captures `auto` with DDA and scales itself
+(`Session.helperSource`), `amf` selects the helper's own AMFDisplayCapture (`amd-direct`,
+`startParams`), and a helper without `amd-direct` does not fall back to DDA: `helperBlocker`
+returns `the helper cannot capture with amd-direct (...)` and the whole session streams with
+FFmpeg; a failing amd-direct start counts toward the helper's three failures in 60 s
+(`HelperVideo`), after which the session moves to FFmpeg for good. Fix (documentation; the
+behaviour stays): the row says what each value does on the helper and on FFmpeg, how a helper
+without `amd-direct` ends up on FFmpeg (the probe's `unavailable: amd-direct` line and the
+`video pipeline` reason), and points to 3.2 and "Final review: AMD Direct Capture sRGB and 10-bit
+surfaces" for the helper; the `pipeline` row lists `capture` `amf` without AMD Direct Capture
+among the FFmpeg-only cases.
+
+- Verified here: against the code (`helperSource`, `helperBlocker`, `startParams` in
+  `internal/host/media/helper.go`); `TestHelperBlocker` "AMD Direct Capture missing" already
+  covers the move to FFmpeg.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `"capture": "amf"` in host.json, restart the agent,
+  stream: host.log `video pipeline pipeline=helper backend=amf ... capture=...amd-direct...` and
+  `encoder helper started` with `capture=amd-direct`; the 3.2
+  amd-direct checks then apply. Put `capture` back.
+- NVIDIA: unverified (no NVIDIA host available). Test: `"capture": "amf"` on the NVIDIA host:
+  `recon-host probe` lists `unavailable: amd-direct: ...`, and a stream logs `video pipeline
+  pipeline=ffmpeg config=auto reason="the helper cannot capture with amd-direct (...)"` and
+  streams through FFmpeg with ddagrab (the encoder is not AMF). Put `capture` back.
+
 ### README, INSTALL and the hardware test plan
 
 Problem: README's feature list and diagram described only the FFmpeg pipeline (key-frame or
