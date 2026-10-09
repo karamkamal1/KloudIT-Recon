@@ -10136,6 +10136,34 @@ Fix (`internal/tlsutil` `Constraints`, `CreateCA`, `Permits`; `internal/gateway/
   `openssl s_server -cert leaf.crt -key k.pem -accept 9443 -www` on the LAN, with the device
   resolving www.example.com to that machine): Safari refuses it.
 
+### Turning 2FA on needs the password and replaces no 2FA
+
+Problem: `POST /api/me/totp/enable` checked only that the code matched the secret in the same
+request and then stored that secret, with no password and whether or not 2FA was already on.
+Turning 2FA off needs the password. Anyone holding a live session cookie (a browser left signed
+in, a stolen cookie) could silently replace the account's 2FA secret with their own: the owner's
+authenticator stopped working and 2FA logins failed until the offline `user reset-2fa`.
+
+Fix (`internal/gateway/api.go` `handleTOTPEnable`, `web/static/js/app.js`): the request carries the
+account's password, checked as the disable path checks it (403 "password is wrong"); a request
+while 2FA is on is refused with 409 "2FA is already on: turn it off first" (checked again inside
+the store update, so two concurrent requests cannot both store a secret). Replacing 2FA is turning
+it off (password) and on again (password and a code from the new secret). The account dialog's
+2FA setup asks for the password ("Password to confirm", a labelled field). SECURITY.md and
+INSTALL.md (step 4) say so.
+
+- Verified here: `internal/gateway` `TestTOTPEnableNeedsPassword`: without 2FA, enabling without
+  a password (the page's old request), with an empty or a wrong one is refused and leaves 2FA off,
+  with the password it turns 2FA on; with 2FA on, enabling with the right password is refused and
+  the secret is unchanged, and off-then-on with the password stores the new secret. Before the
+  fix the request without a password turned 2FA on (HTTP 200). Browser E2E `E2E_ONLY='dashboard
+  a11y'`: the 2FA setup dialog's "Password to confirm" field is named by its label.
+- Gateway check (not GPU-specific, no AMD or NVIDIA step): signed in without 2FA, open
+  **Account**, **Set up 2FA**, scan, enter the code and a wrong password: "password is wrong",
+  2FA stays off; with the right password: "2FA enabled". From the browser console of the signed-in
+  page, `(await import('/js/api.js')).api('POST', '/api/me/totp/enable', {secret: 'A'.repeat(32),
+  code: '000000', password: '<your password>'})` answers "2FA is already on: turn it off first".
+
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
 Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can

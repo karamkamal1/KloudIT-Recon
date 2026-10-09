@@ -29,7 +29,9 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   usernames burn the same time. At most 2 hashes run at once, so a burst of logins can't exhaust
   the RAM of a small LXC.
 - **2FA:** TOTP (RFC 6238, tested against the RFC vectors), ±30 s skew, replay protection (a code
-  can't be used twice).
+  can't be used twice). Turning 2FA on, like turning it off, needs the account's password, and 2FA
+  that is on is never replaced (turn it off first): a browser left signed in, or a stolen session
+  cookie, cannot swap your second factor for one your authenticator does not have.
 - **First run:** the admin account can only be created with a random **setup token** that is
   printed in the log and stored in a 0600 file, which is deleted after use. Someone else on your
   LAN can't claim a fresh gateway.

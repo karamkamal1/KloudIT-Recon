@@ -137,7 +137,8 @@ The setup token stays valid until you create the admin account.
    (Edge: **Continue to 192.168.1.50 (unsafe)**).
 3. Enter the setup token and an admin username (pre-filled with `admin`). Type a password of at
    least 10 characters twice, then click **Create account**. You're signed in straight away.
-4. Click **Account** and turn on **two-factor authentication** with an authenticator app.
+4. Click **Account** and turn on **two-factor authentication** with an authenticator app (scan
+   the code, then enter the app's code and your password).
 5. Optional: to get rid of the warning, click **download ca.crt** on the dashboard. On Windows,
    double-click it, then choose **Install Certificate → Local Machine → Place all certificates
    in → Trusted Root Certification Authorities**, and restart the browser. On macOS, open it in
