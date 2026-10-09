@@ -3889,6 +3889,25 @@ try {
   const isolated = await page.evaluate(() => self.crossOriginIsolated);
   check('page is cross-origin isolated (SharedArrayBuffer audio ring)', isolated === true);
 
+  // The login page's ?next= (signed in: it redirects at once) stays on the
+  // gateway: the URL parser reads a backslash as '/' and drops tabs, so
+  // '/\evil.example' and '/<TAB>/evil.example' name another host.
+  if (want('login redirect')) {
+    const offsite = [];
+    const evil = (u) => u.hostname === 'evil.example';
+    await page.route(evil, (r) => { offsite.push(r.request().url()); return r.abort(); });
+    for (const [q, dest] of [['/%5Cevil.example', '/'], ['/%09/evil.example%2Fx', '/'], ['//evil.example', '/'], ['/%3Fe2e%3D1%23top', '/?e2e=1#top']]) {
+      offsite.length = 0;
+      // 'commit': the redirect can come before the login page's load event.
+      const at = await page.goto(`${base}/login?next=${q}`, { waitUntil: 'commit' })
+        .then(() => until(async () => offsite[0] || (page.url().startsWith(`${base}/login`) ? null : page.url()), 15000, `the redirect for next=${q}`))
+        .catch((e) => offsite[0] || e.message);
+      check(`login ?next=${q} stays on the gateway`, at === `${base}${dest}` && !offsite.length, `went to ${at}`);
+    }
+    await page.unroute(evil);
+    await page.goto(`${base}/`);
+  }
+
   // 2. Add a host and pair the agent ------------------------------------------
   await page.click('#add-host');
   await page.fill('.modal input', 'E2E Test PC');

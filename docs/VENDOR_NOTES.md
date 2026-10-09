@@ -9354,3 +9354,24 @@ Fix:
   session ended` for its port until the tab is closed (then within about 2 s). Reload the
   stream page three times, a few seconds apart: each connects as `webtransport · relay`.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### The login page's redirect stays on the gateway
+
+Problem: after signing in (and at once when already signed in) the login page went to its
+`?next=` value when it started with `/` and not `//`. The browser's URL parser reads a backslash
+as `/` and drops tabs and newlines, so `/login?next=/%5Cevil.example` and
+`?next=/%09/evil.example` sent a user who signed in on the real gateway, with password and TOTP,
+to another site (an open redirect, the start of a "session expired, sign in again" phish).
+
+Fix (`web/static/js/login.js`): a value with a backslash or a control character gives `/`; the
+rest is resolved against the page's origin and kept (path, query, fragment) only when it stays
+on that origin. The app's own `next` values (`api.js`: path and query of the page that needed a
+sign-in) are unchanged.
+
+- Verified here: browser E2E section "login redirect" (headless Chromium, signed in):
+  `?next=/%5Cevil.example` and `?next=/%09/evil.example%2Fx` went to `https://evil.example/` and
+  `https://evil.example/x` with the previous login.js (2 of 4 checks failed) and now stay on
+  `/`; `//evil.example` stays on `/` and `/%3Fe2e%3D1%23top` reaches `/?e2e=1#top` with both.
+- Not GPU-specific: no AMD or NVIDIA check. Browser check: sign in, then open
+  `https://<gateway>/login?next=/%5Cexample.com` in Chrome, Edge, Firefox and Safari: each lands
+  on the gateway's dashboard, not example.com.

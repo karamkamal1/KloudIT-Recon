@@ -1,9 +1,19 @@
 import { api, setCSRF } from './api.js';
 
 const $ = (id) => document.getElementById(id);
+// Where to go after signing in: a page of this gateway, else '/'. The value
+// is resolved as location.replace resolves it (the URL parser reads a backslash
+// as '/' and drops tabs and newlines, so '/\evil.example' names another host)
+// and kept only when it stays on this origin.
 const next = () => {
   const n = new URLSearchParams(location.search).get('next');
-  return n && n.startsWith('/') && !n.startsWith('//') ? n : '/';
+  if (!n || !n.startsWith('/') || /[\\\x00-\x1f\x7f]/.test(n)) return '/';
+  try {
+    const u = new URL(n, location.origin);
+    return u.origin === location.origin ? u.pathname + u.search + u.hash : '/';
+  } catch {
+    return '/';
+  }
 };
 let pending = '';
 
