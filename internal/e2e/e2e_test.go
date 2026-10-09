@@ -70,6 +70,10 @@ type env struct {
 	hostID  string
 	logPath string
 	logs    *logBuffer // gateway and host log, Debug included
+	// restartGateway stops the gateway, runs offline on its data directory
+	// (as the offline CLI would, with the gateway stopped) and starts it
+	// again on the same ports. The host agent keeps running.
+	restartGateway func(t *testing.T, offline func(dataDir string))
 }
 
 // logBuffer collects log lines for assertions.
@@ -176,22 +180,50 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 	})
 	web := fstest.MapFS{"index.html": {Data: []byte("<!doctype html>")}}
 	relayPorts := fmt.Sprintf("%d,%d,%d", freePort(t), freePort(t), freePort(t))
-	gw, err := gateway.New(gateway.Config{Listen: fmt.Sprintf("127.0.0.1:%d", port), DataDir: filepath.Join(dir, "gw"), RelayPorts: relayPorts, Web: web}, log.With("c", "gateway"))
+	gwCfg := gateway.Config{Listen: fmt.Sprintf("127.0.0.1:%d", port), DataDir: filepath.Join(dir, "gw"), RelayPorts: relayPorts, Web: web}
+	gwLog := log.With("c", "gateway")
+	gw, err := gateway.New(gwCfg, gwLog)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() {
-		if err := gw.Run(ctx); err != nil {
-			t.Errorf("gateway: %v", err)
-		}
-	}()
+	runGateway := func(gw *gateway.Server) (stop func()) {
+		gctx, gcancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := gw.Run(gctx); err != nil {
+				t.Errorf("gateway: %v", err)
+			}
+		}()
+		return func() { gcancel(); <-done }
+	}
+	stopGateway := runGateway(gw)
 	jar, _ := cookiejar.New(nil)
 	e := &env{t: t, logs: logs, base: fmt.Sprintf("https://127.0.0.1:%d", port), client: &http.Client{
 		Jar: jar, Timeout: 10 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}}
+	e.restartGateway = func(t *testing.T, offline func(dataDir string)) {
+		t.Helper()
+		from := logs.Len()
+		stopGateway()
+		// The stopped gateway's host connection ends with it and saves the
+		// host's last-seen time lazily (within 5 s): let that write land
+		// before offline changes the state (a stopped process writes nothing).
+		deadline := time.Now().Add(10 * time.Second)
+		for len(logs.lines(from, "host offline")) == 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		time.Sleep(6 * time.Second)
+		offline(gwCfg.DataDir)
+		gw, err := gateway.New(gwCfg, gwLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stopGateway = runGateway(gw)
+	}
 	// Wait for the listener.
 	for i := 0; i < 50; i++ {
 		if err := e.do("GET", "/api/state", nil, nil); err == nil {

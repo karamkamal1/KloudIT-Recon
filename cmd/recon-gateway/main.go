@@ -117,6 +117,9 @@ func readPassword() string {
 }
 
 // userCmd manages accounts offline (stop the gateway first: it keeps state in memory).
+// passwd and reset-2fa are the account recovery: they also sign the account
+// out everywhere, and the gateway ends a session a PC still runs for it when
+// that PC's agent next connects (Store.RecoverUser).
 func userCmd(dataDir string, args []string) {
 	if len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: recon-gateway user add|passwd|reset-2fa <name> [-admin]")
@@ -128,6 +131,13 @@ func userCmd(dataDir string, args []string) {
 		os.Exit(1)
 	}
 	name := args[1]
+	recovered := func(n int, err error) {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("ok: %s is signed out everywhere (%d login sessions ended); a PC still streaming for the account ends that stream when its agent next connects to the gateway\n", name, n)
+	}
 	switch args[0] {
 	case "add", "passwd":
 		pw := readPassword()
@@ -140,20 +150,19 @@ func userCmd(dataDir string, args []string) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		if args[0] == "passwd" {
+			recovered(store.RecoverUser(name, func(u *gateway.User) { u.PasswordHash = hash }))
+			return
+		}
 		admin := len(args) > 2 && args[2] == "-admin"
 		first := store.UserCount() == 0 // before UpdateUser, which holds the store lock
 		err = store.UpdateUser(name, func(u *gateway.User, exists bool) error {
-			if args[0] == "add" && exists {
+			if exists {
 				return fmt.Errorf("user %s exists", name)
 			}
-			if args[0] == "passwd" && !exists {
-				return fmt.Errorf("no user %s", name)
-			}
 			u.PasswordHash = hash
-			if args[0] == "add" {
-				u.Admin = admin || first
-				u.Created = time.Now().UTC()
-			}
+			u.Admin = admin || first
+			u.Created = time.Now().UTC()
 			return nil
 		})
 		if err != nil {
@@ -162,18 +171,7 @@ func userCmd(dataDir string, args []string) {
 		}
 		fmt.Println("ok")
 	case "reset-2fa":
-		err := store.UpdateUser(name, func(u *gateway.User, exists bool) error {
-			if !exists {
-				return fmt.Errorf("no user %s", name)
-			}
-			u.TOTPSecret, u.TOTPLast = "", 0
-			return nil
-		})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		fmt.Println("ok")
+		recovered(store.RecoverUser(name, func(u *gateway.User) { u.TOTPSecret, u.TOTPLast = "", 0 }))
 	default:
 		fmt.Fprintln(os.Stderr, "unknown user command")
 		os.Exit(2)

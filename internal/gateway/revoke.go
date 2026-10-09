@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,6 +21,13 @@ import (
 // session with a bye and refuses those tickets and any session the gateway
 // authorised before the end. A host that is offline at the time and comes
 // back streaming for a deleted user gets the end then (handleHostControl).
+//
+// The offline account recovery (recon-gateway user passwd / reset-2fa, run
+// with the gateway stopped) signs the user out everywhere and records when
+// (User.Recovered); a stream on the direct path does not need the gateway
+// and may still run. A host that has not been connected since the recovery
+// is sent an end for the user when it registers, before anything can
+// authorise a new session on it.
 
 // userStreams tracks the streams users have open through the gateway.
 type userStreams struct {
@@ -33,6 +41,10 @@ var errRevoked = errors.New("the user's access was revoked")
 
 // userRemoved is what a deleted user's clients show.
 const userRemoved = "Your account was removed from this gateway"
+
+// accountRecovered is what the clients of an account recovered with the
+// offline CLI show.
+const accountRecovered = "The password or 2FA of this account was reset on the gateway: sign in again"
 
 // revokeKeep is how long a revocation refuses streams authorised before it: a
 // ticket lives 60 s, and opening the host's side of a stream takes 10 s at
@@ -166,4 +178,20 @@ func (s *Server) revokeStreams(user, reason string) {
 			end()
 		}
 	})
+}
+
+// recoveredSince returns the users the offline CLI recovered after prev, when
+// a host was last connected (sorted); none for a host never connected.
+func recoveredSince(st *state, prev time.Time) []string {
+	if prev.IsZero() {
+		return nil
+	}
+	var out []string
+	for name, u := range st.Users {
+		if u.Recovered.After(prev) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

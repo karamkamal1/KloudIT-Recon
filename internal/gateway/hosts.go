@@ -110,8 +110,12 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 		conn.CloseWithError(1, "")
 		return
 	}
+	var recovered []string
+	var prevSeen time.Time
 	_ = s.store.Update(func(st *state) error {
 		if p := st.Hosts[h.ID]; p != nil {
+			prevSeen = p.LastSeen
+			recovered = recoveredSince(st, p.LastSeen)
 			p.LastSeen = time.Now().UTC()
 			p.LastIP = ip
 			if len(reg.MACs) > 0 {
@@ -121,6 +125,24 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 		}
 		return nil
 	})
+	// Accounts recovered with the offline CLI since this host was last
+	// connected: a session it runs for one of them was authorised before the
+	// recovery (revoke.go). The end goes out before the host is online here,
+	// so no ticket of this connection's key is older than it.
+	for _, user := range recovered {
+		s.log.Info("ending a recovered account's sessions on a host not connected since the recovery", "host", h.Name, "user", user)
+		if err := hc.endUser(user, accountRecovered); err != nil {
+			// Not delivered: the next registration sends it again.
+			_ = s.store.Update(func(st *state) error {
+				if p := st.Hosts[h.ID]; p != nil {
+					p.LastSeen = prevSeen
+				}
+				return nil
+			})
+			conn.CloseWithError(1, "")
+			return
+		}
+	}
 	s.hosts.mu.Lock()
 	old := s.hosts.hosts[h.ID]
 	s.hosts.hosts[h.ID] = hc
