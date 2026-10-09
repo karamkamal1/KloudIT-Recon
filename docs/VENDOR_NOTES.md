@@ -9205,7 +9205,10 @@ and frame-rate ladder; a `logLevel` row; the self-built bundle's difference. INS
 checklist, bundle listing, the host setup list of GUIDE 12. Here: "Hardware test plan" at the
 top, superseded and FFmpeg-only markers on 3.1, 1.2, 1.4, 1.5 and the 1.3 soak, the 2.2
 frame-rate check corrected to the helper's fine ladder, the netem commands and `capture` value
-fixed.
+fixed. Later in the final review, HELPER_PROTOCOL's "Live-bitrate qualification" got the same
+correction: it still gave the helper's frame-rate ladder as 120 → 90 → 60, which applies only
+where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `ratePolicy` in
+`internal/host/bitrate.go`).
 
 - Verified here: the corrected commands parse (`netem.sh apply capdrop --ct 210 --host
   192.0.2.1 --rates 50,1,50 --dry-run` prints its tc commands); the fine ladder and its 2 s hold

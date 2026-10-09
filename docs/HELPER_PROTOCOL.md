@@ -1626,7 +1626,10 @@ the cells, `qualify.Results.Choose`). Version 1 files (no `quality` / `ltrSlots`
   2.2, docs/ARCHITECTURE.md "Rate control") changes a qualified `seamless` encoder every 250 ms,
   an unqualified one every second, a `flush` one (a key frame per change) every 2 s upwards
   and 250 ms after the last change downwards; at its floor it also lowers `fps` (`setRate` with
-  `fps`: 120 → 90 → 60). host.log: `live-bitrate qualification ... choice="hevc speed: adaptive
+  `fps` alone): where `started.liveFps` is `seamless` and the bitrate changes seamlessly, through
+  the fine steps of `encoder.FPSSteps` (120 → 100 → 90 → 75 → 60; below 60 only with host config
+  `fpsFloor`), 2 s apart ("FPS before resolution" above); otherwise through the rungs 120 → 90
+  → 60 (README, `fpsFloor`). host.log: `live-bitrate qualification ... choice="hevc speed: adaptive
   cbr/seamless, fixed vbr/seamless; ..."` when a session opens the helper,
   `live_bitrate_from=qualification` on `encoder helper started`.
 
