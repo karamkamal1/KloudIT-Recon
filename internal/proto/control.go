@@ -35,7 +35,8 @@ type DecoderInfo struct {
 	Family string `json:"family"` // h264 | hevc | av1
 	// HW: a hardware decoder is available. Clients with the decoder
 	// self-test (step 4.1) report false when the hardware decoder holds
-	// frames back, so that a family decoded in hardware without delay wins.
+	// frames back, so that a family decoded in hardware without delay wins,
+	// and for every family while their decoder setting is Prefer software.
 	HW bool `json:"hw"`
 	// Timing is the client's timed decode of a short sample of this family
 	// (step 4.2), with the decoder its stream would use. Nil from clients

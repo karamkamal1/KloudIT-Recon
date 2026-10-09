@@ -705,10 +705,14 @@ chooses automatically:
   64×16-aligned (the probed alignment, above).
 - *Client side*: the hello's `decoders`, per family `hw` (`VideoDecoder.isConfigSupported`
   with `prefer-hardware`, and the startup self-test, below, did not catch the hardware decoder
-  holding frames back) and `timing`: the family's decode time on a 1920×1080 sample, timed
-  with the decoder the stream would use (`{"ms":2.1,"w":1920,"h":1080,"n":7,"accel":
-  "prefer-hardware"}`; `ms` is the median from `decode()` to the output over its P frames, fed
-  one at a time like the stream's; absent from clients before it or when the decode failed).
+  holding frames back; false for every family while the Decoder setting is Prefer software, so
+  the host picks for a client that decodes in software) and `timing`: the family's decode time
+  on a 1920×1080 sample, timed with the decoder the stream would use (`{"ms":2.1,"w":1920,
+  "h":1080,"n":7,"accel":"prefer-hardware"}`; `ms` is the median from `decode()` to the output
+  over its P frames, fed one at a time like the stream's; absent from clients before it, when
+  the decode failed, and under Prefer software for a family without a software decoder, such
+  as HEVC in Chrome, which then decodes in hardware: its time would win the choice for the
+  decoder the setting avoids).
 - *The rule*: the first tier with a family both ends can use: (1) hardware encode and hardware
   decode, in the order HEVC → AV1 → H.264; (2) hardware encode, software decode: H.264 → HEVC →
   AV1; (3) software encode: H.264 → AV1 → HEVC, always the first (the order is the host's CPU

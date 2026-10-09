@@ -280,8 +280,16 @@ function streamResult(t) {
  *             when the hardware decoder held frames back
  *   software  decode this family in software: its hardware decoder held
  *             frames back and the software decoder passed
- *   reportHW  the hello's hw flag: a hardware decoder that does not hold frames back
- *   timing    the hello's timing (timeDecoders) with the decoder the stream would use, or null
+ *   noSoftware  !preferHW, and the family has no software decoder (Chrome:
+ *             HEVC decodes only in hardware): the stream decodes it with the
+ *             browser's other decoder (no-preference)
+ *   reportHW  the hello's hw flag: a hardware decoder that does not hold
+ *             frames back, which the stream uses (never with !preferHW: the
+ *             host then picks for a client that decodes in software)
+ *   timing    the hello's timing (timeDecoders) with the decoder the stream
+ *             would use, or null (also for noSoftware: a hardware decoder's
+ *             time would win the host's choice for a family the user's
+ *             setting avoids)
  *   text      one line for the overlay and the log
  * The families' hygiene tests run in parallel: a decoder that holds frames back
  * costs about 2 x FIRST_OUTPUT_MS + 3 x NEXT_OUTPUT_MS, the others a few frame
@@ -300,10 +308,11 @@ export async function runSelfTests(decoders, preferHW, opts = {}) {
       t.sw = await selfTestDecoder(d.family, preferHW ? ['no-preference'] : ['prefer-software', 'no-preference'], opts);
     }
     t.software = holdsFrames(t.hw) && !!t.sw?.ok;
-    t.reportHW = !!d.hw && !holdsFrames(t.hw);
+    t.noSoftware = !preferHW && !!t.sw?.supported && t.sw.accel !== 'prefer-software';
+    t.reportHW = preferHW && !!d.hw && !holdsFrames(t.hw);
     return t;
   }));
-  const entries = tests.map((t) => ({ family: t.family, accel: streamResult(t)?.accel })).filter((e) => e.accel);
+  const entries = tests.filter((t) => !t.noSoftware).map((t) => ({ family: t.family, accel: streamResult(t)?.accel })).filter((e) => e.accel);
   const timings = await timeDecoders(entries, opts).catch(() => ({}));
   for (const t of tests) {
     t.timing = timings[t.family] ?? null;
@@ -338,5 +347,6 @@ function describe(t) {
   if (t.hw) parts.push(`${ACCEL[t.hw.accel] || 'HW'} ${verdict(t.hw)}`);
   if (t.sw) parts.push(`${t.sw.supported ? ACCEL[t.sw.accel] : 'SW'} ${verdict(t.sw)}`);
   const timing = t.timing ? ` · timed ${t.timing.h}p: ${t.timing.ms} ms/frame` : '';
-  return `${name} ${parts.join(', ')}${t.software ? ' → decoding in software' : ''}${timing}`;
+  const how = t.software ? ' → decoding in software' : t.noSoftware ? ' → no software decoder (not timed)' : '';
+  return `${name} ${parts.join(', ')}${how}${timing}`;
 }

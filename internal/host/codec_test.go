@@ -112,6 +112,10 @@ func TestCodecSelection(t *testing.T) {
 	swAV1 := []proto.DecoderInfo{timed("h264", true, 1.5), timed("hevc", true, 2.0), timed("av1", false, 0.9)}
 	old := []proto.DecoderInfo{{Family: "h264", HW: true}, {Family: "hevc", HW: true}, {Family: "av1", HW: true}}
 	onlySWAV1 := []proto.DecoderInfo{timed("av1", false, 5)} // this sandbox's Chromium
+	// Chrome with the decoder setting Prefer software: nothing reported as
+	// hardware-decoded, HEVC (no software decoder, so decoded in hardware
+	// anyway) untimed, the others timed in software.
+	preferSW := []proto.DecoderInfo{timed("h264", false, 3.5), {Family: "hevc"}, timed("av1", false, 2.5)}
 
 	for _, c := range []struct {
 		name     string
@@ -141,6 +145,9 @@ func TestCodecSelection(t *testing.T) {
 		{"client asks for H.264", rtx40, AV1Faster, 1920, 1080, fastAV1, proto.Prefs{Codec: "h264"}, "", "h264_nvenc"},
 		{"host forces h264_amf", rdna3, AV1Faster, 2560, 1440, fastAV1, proto.Prefs{}, "h264_amf", "h264_amf"},
 		{"software decode of AV1 only", rtx40, "", 1920, 1080, onlySWAV1, proto.Prefs{}, "", "av1_nvenc"},
+		{"Prefer software (Chrome), RDNA3 host: H.264", rdna3, "", 2560, 1440, preferSW, proto.Prefs{}, "", "h264_amf"},
+		{"Prefer software (Chrome), RTX 40 host: H.264", rtx40, "", 1920, 1080, preferSW, proto.Prefs{}, "", "h264_nvenc"},
+		{"Prefer software, client asks for HEVC", rtx40, "", 1920, 1080, preferSW, proto.Prefs{Codec: "hevc"}, "", "hevc_nvenc"},
 		{"software decode of AV1 only, software host", &media.Caps{Encoders: sw}, "", 960, 540, onlySWAV1, proto.Prefs{}, "", "libsvtav1"},
 	} {
 		t.Run(c.name, func(t *testing.T) {

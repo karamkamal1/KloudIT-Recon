@@ -9555,3 +9555,47 @@ Verified here (Linux, mingw-w64 build, Wine 9 with Xvfb / Mesa llvmpipe, mode pl
   cases. AMD Direct Capture is AMD only, and DDA hands out only B8G8R8A8_UNORM or FP16: the
   `conversion source: DXGI format 87 (8-bit)` (FP16 with HDR: `10 (FP16 scRGB)`) line of a
   `--capture=dda` encode test is all that changes there.
+
+## Final review: browser client
+
+Findings of the final review about the browser client (web/static/js). Each item: the problem,
+the fix, what was verified here, the check on hardware.
+
+### Decoder setting Prefer software
+
+Problem: with Settings → Decoder *Prefer software* the hello still said `hw: true` for every
+family the browser has a hardware decoder for (the self-test then runs only the software test,
+and the hello's `hw` came from the `prefer-hardware` probe alone). The host therefore stayed in
+its "hardware encode and decode" tier, HEVC first. Chrome has no software HEVC decoder, so the
+stream decoded HEVC on the GPU anyway (the `prefer-software` config is unsupported and the
+client falls back to `no-preference`), the setting changed nothing under Codec Auto, and the
+overlay labelled that hardware decoder `(SW)`.
+
+Fix: under Prefer software the hello reports `hw: false` for every family, so the host picks for
+a client that decodes in software ("hardware encode, software decode": H.264 first; AV1 or HEVC
+replace it only when timed clearly faster in software). A family without a software decoder
+(its self-test fell back to `no-preference`: HEVC in Chrome) stays in the hello, so an explicit
+codec choice still gets it, but goes untimed, so its hardware decode time cannot win the
+automatic choice; the self-test line says `no software decoder (not timed)`. The decoder's
+`(HW)`/`(SW)` label (overlay Codec row, logs) is the kind the stream actually got: when the
+preferred kind is unsupported, `no-preference` gets the other kind, and the worker logs
+`<codec>: no software decoder, decoding in hardware`. The default (Prefer hardware) is
+unchanged.
+
+- Verified here: browser E2E check "decoder setting Prefer software" (self-test with a fake
+  decoder that has hardware decoders for all three families and no software HEVC: every hello
+  entry `hw: false`, HEVC untimed, H.264 and AV1 timed with `prefer-software`); the same logic
+  in node fails against the old decoder-selftest.js (all `hw: true`, HEVC timed with
+  `no-preference`) and passes now. `internal/host` `TestCodecSelection` cases "Prefer software
+  (Chrome)": such a hello gets `h264_amf` on an RDNA3 host and `h264_nvenc` on an RTX 40 host,
+  and an explicit HEVC setting still gets `hevc_nvenc`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: Chrome on a Windows client with an AMD GPU, Codec
+  Auto, Settings → Decoder *Prefer software*, Reconnect. host.log `session started` shows
+  `decoders="h264:sw:… hevc:sw:- av1:sw:…"` and `codec choice` `reason="auto, hardware encode,
+  software decode: first choice"` with `h264_amf` (or AV1/HEVC "decodes clearly faster"); the
+  overlay's Codec row says H.264 `(SW)`; the client log has `decoder self-test: HEVC any ✓ … →
+  no software decoder (not timed)`. Then Codec HEVC + Prefer software: the stream is HEVC, the
+  client log has `hev1…: no software decoder, decoding in hardware` and the overlay says `(HW)`.
+  Back to Prefer hardware: `hevc:hw:` and HEVC first as before.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client and an RTX
+  host: `h264_nvenc` under Prefer software, the HEVC lines as above.

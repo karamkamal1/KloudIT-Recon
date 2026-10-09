@@ -887,6 +887,15 @@ async function checkSelfTestLogic() {
       t0 = performance.now();
       const noClips = await T.timeDecoders([{ family: 'av1', accel: 'prefer-hardware' }], { Decoder: even, timingClips: new Promise(() => {}), timingBudgetMs: 300 });
       const noClipsMs = Math.round(performance.now() - t0);
+      // Decoder setting Prefer software on a client with hardware decoders
+      // for every family and no software HEVC decoder (Chrome): no family
+      // goes to the host as hardware-decoded, HEVC (decoded in hardware
+      // anyway) goes untimed, the others are timed in software.
+      const noSwHevc = class extends even {
+        static async isConfigSupported(c) { return { supported: !(c.hardwareAcceleration === 'prefer-software' && c.codec.startsWith('hev1')), config: c }; }
+      };
+      const sw = await T.runSelfTests(fams.map((family) => ({ family, hw: true })), false, { Decoder: noSwHevc });
+      const swHello = sw.map((t) => T.helloDecoder({ family: t.family, hw: true }, t));
       return {
         fam, good, slow, hold1, hold2, choice, burst,
         timing: {
@@ -894,6 +903,7 @@ async function checkSelfTestLogic() {
           slowAV1, slowAV1Ms, allSlow: allSlow.map((t) => ({ family: t.family, ok: (t.hw || t.sw)?.ok, timing: t.timing })), allSlowMs, noClips, noClipsMs,
           budget: T.TIMING_BUDGET_MS,
         },
+        preferSoftware: { hello: swHello, text: sw.map((t) => t.text) },
       };
     });
     if (res.error) { check('decoder self-test logic', false, res.error); return; }
@@ -920,6 +930,12 @@ async function checkSelfTestLogic() {
       slowOK && allSlowOK && Object.keys(tm.noClips).length === 0 && tm.noClipsMs >= 290 && tm.noClipsMs < 600,
       `AV1 at 200 ms/frame: ${JSON.stringify(tm.slowAV1)} in ${tm.slowAV1Ms} ms; every family 400 ms/frame (50 ms on the hygiene clip): whole self-test ${tm.allSlowMs} ms, ` +
         `timed ${tm.allSlow.filter((t) => t.timing).length}/3; no clips: ${JSON.stringify(tm.noClips)} after ${tm.noClipsMs} ms`);
+    const ps = res.preferSoftware;
+    const psBy = (f) => ps.hello.find((d) => d.family === f);
+    check('decoder setting Prefer software: no family goes to the host as hardware-decoded; one without a software decoder (HEVC in Chrome) goes untimed, the others timed in software',
+      ps.hello.length === 3 && ps.hello.every((d) => d.hw === false) && !psBy('hevc').timing &&
+        ['h264', 'av1'].every((f) => psBy(f).timing?.accel === 'prefer-software'),
+      `${JSON.stringify(ps.hello)}; ${ps.text.join('; ')}`);
     results.push({ selfTestLogic: res });
   } finally {
     await ctx2.close();

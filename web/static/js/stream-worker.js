@@ -1015,8 +1015,12 @@ async function configureDecoder(cfg) {
   if (avoidHW && prefs.decoder !== 'software') post('log', { text: `${cfg.codec}: decoding in software, the hardware decoder held frames back in the self-test` });
   let config = { ...base, hardwareAcceleration: wantHW ? 'prefer-hardware' : 'prefer-software' };
   let support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
-  video.hw = wantHW && support.supported;
+  // Without a decoder of the preferred kind, no-preference gets the other
+  // kind (Chrome has no software HEVC decoder: Prefer software decodes HEVC
+  // in hardware).
+  video.hw = support.supported ? wantHW : !wantHW;
   if (!support.supported) {
+    if (!wantHW) post('log', { text: `${cfg.codec}: no software decoder, decoding in hardware` });
     config = { ...base, hardwareAcceleration: 'no-preference' };
     support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
   }
