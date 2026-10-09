@@ -2843,10 +2843,14 @@ async function instrumentWorker(w) {
   if (!w.url().endsWith('/js/stream-worker.js')) return;
   await w.evaluate(() => {
     if (self.__e2eKey) return;
-    const st = { waitSince: null, fed: null, lag: [], due: performance.now() + 50 };
+    // blockedMs: how long the worker's event loop held its 50 ms ticker more
+    // than 50 ms late, in all (since: when this began), for the send
+    // priority check: a datagram write's resolution waits as long.
+    const st = { waitSince: null, fed: null, lag: [], due: performance.now() + 50, since: performance.now(), blockedMs: 0 };
     self.__e2eKey = st;
     const tick = () => {
       const t = performance.now();
+      if (t - st.due > 50) st.blockedMs += t - st.due;
       st.lag.push([t, t - st.due]);
       while (st.lag.length && st.lag[0][0] < t - 2000) st.lag.shift();
       st.due = t + 50;
@@ -4065,13 +4069,22 @@ try {
       // then. Still required: drops only with a stall, and telemetry flowing.
       const scIdle = idleShare(scC0, cpuTimes());
       const prioStarved = scIdle != null && scIdle < STARVED_IDLE;
+      // A write's resolution waits while the worker's event loop is busy:
+      // the queue then seems to stand still and telemetry due meanwhile is
+      // dropped (instrumentWorker: the share of the stream's time the
+      // worker held its ticker more than 50 ms late). Allowed on top of the
+      // 15 %: that share of the telemetry.
+      const wb = await streamWorker()?.evaluate(() => { const k = self.__e2eKey; return k ? { blocked: k.blockedMs, secs: (performance.now() - k.since) / 1000 } : null; }).catch(() => null);
+      const blockedShare = wb && wb.secs > 0 ? Math.min(1, wb.blocked / 1000 / wb.secs) : 0;
       check(`${sc.name}: send priorities feature-detected; telemetry gives way to input only while the datagram queue stalls`,
         !!p && p.sendOrder === api.sendOrder && p.sendGroup === api.sendGroup && p.datagramWritables === api.datagramWritables &&
-          total > 100 && (p.telemetryDropped <= total * 0.15 || (prioStarved && p.telemetrySent > 100)) &&
+          total > 100 && (p.telemetryDropped <= total * (0.15 + blockedShare) || (prioStarved && p.telemetrySent > 100)) &&
           (p.telemetryDropped === 0 || p.telemetryStallMs > 50),
         p ? `sendOrder ${p.sendOrder}, send groups ${p.sendGroup}, datagram queues ${p.datagramWritables} (browser API: ${JSON.stringify(api)}); ` +
-          `telemetry ${p.telemetrySent} sent, ${p.telemetryDropped} dropped, longest stall ${p.telemetryStallMs} ms; ${idleNote(scIdle)} during the stream` +
-          `${prioStarved && p.telemetryDropped > total * 0.15 ? ' (more than 15 % dropped: judged on the stalls)' : ''}` : 'no prio in the stats');
+          `telemetry ${p.telemetrySent} sent, ${p.telemetryDropped} dropped, longest stall ${p.telemetryStallMs} ms; ` +
+          `worker event loop more than 50 ms late for ${wb ? `${(wb.blocked / 1000).toFixed(1)} s of ${wb.secs.toFixed(0)} s (${(100 * blockedShare).toFixed(0)} %)` : '? (not instrumented)'}; ` +
+          `${idleNote(scIdle)} during the stream` +
+          `${prioStarved && p.telemetryDropped > total * (0.15 + blockedShare) ? ' (judged on the stalls)' : ''}` : 'no prio in the stats');
     } else {
       check(`${sc.name}: no send priorities over WebSocket`, st && st.prio === null);
     }
