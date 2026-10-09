@@ -3554,10 +3554,12 @@ async function checkFec() {
     const on = /msg="video transport" .*?mode="datagram \+ FEC" why="on in host.json"/.test(host.log);
     const tail = fps.slice(-6);
     const steady = tail.reduce((a, b) => a + b, 0) / tail.length;
+    // fecNow: the overlay's Transport row says "datagrams + FEC" while the
+    // video comes as shards (a WebSocket session's below never does).
     check('datagram + FEC: every frame arrives as shards and is rebuilt (3 % of the shards lost)',
-      conn.transport === 'webtransport' && conn.path === 'direct' && avail && on && d.rebuilt > 0 &&
+      conn.transport === 'webtransport' && conn.path === 'direct' && avail && on && d.rebuilt > 0 && st.fecNow === true &&
         d.lost <= 2 && d.bad === 0 && ((d.frames >= 12 * 45 && st.fps >= 45) || (sr.ok && d.frames >= 12 * 15)),
-      `${conn.transport}/${conn.path}; in 12 s: ${d.frames} frames from ${d.shards} shards (${d.parity} parity, ${d.repairs} repairs), ` +
+      `${conn.transport}/${conn.path}${st.fecNow ? ' (overlay: datagrams + FEC)' : ' (overlay: no datagrams + FEC)'}; in 12 s: ${d.frames} frames from ${d.shards} shards (${d.parity} parity, ${d.repairs} repairs), ` +
         `${d.rebuilt} rebuilt from parity, ${d.repaired} after a NACK (${d.nacks} NACKs, ${d.wholeNacks} whole), ${d.lost} given up, ` +
         `${d.unused} unused, ${d.bad} bad; shards lost ${d.shardsLost} (${(100 * d.shardsLost / Math.max(1, d.counted + d.shardsLost)).toFixed(2)} %); ` +
         `fps ${fps.join(' / ')}; host: available ${avail}, on ${on}${sr.note}`);
@@ -3585,7 +3587,7 @@ async function checkFec() {
     const wsIdle = idleShare(wc0, cpuTimes());
     const why = (host.log.slice(log0).match(/msg="video transport: frame streams only".*? why="[^"]*"/) || [''])[0];
     check('datagram + FEC: a WebSocket session gets frame streams only',
-      !ws.fec && (ws.fps > 30 || (wsIdle != null && wsIdle < STARVED_IDLE && ws.fps > 10)) && /does not take shards/.test(why),
+      !ws.fec && !ws.fecNow && (ws.fps > 30 || (wsIdle != null && wsIdle < STARVED_IDLE && ws.fps > 10)) && /does not take shards/.test(why),
       `${ws.fps.toFixed(1)} fps, shards ${ws.fec ? ws.fec.shards : 0}; host: ${why.replace(/^msg=/, '')}; ${idleNote(wsIdle)}`);
     await endStream();
   });

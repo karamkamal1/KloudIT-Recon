@@ -302,6 +302,12 @@ const fecRx = new FecReceiver({
   interval: () => 1000 / (video.cfg?.fps || 60),
 });
 const fecTimer = { id: 0, at: Infinity };
+// Whether the video comes as shards now (the overlay's Transport row): the
+// host switches between shards and frame streams with the round trip, and
+// fecRx's counters cover the whole session. on: frames were rebuilt from
+// shards in the last stats period, or none were drawn then and they were
+// before; frames: fecRx's frame count at that period's end.
+const fecMode = { frames: 0, on: false };
 
 // Runs fecRx's NACKs, give-ups and loss accounting when due.
 function fecSchedule() {
@@ -2214,6 +2220,9 @@ function postStats() {
   }
   const stages = stageSummary();
   reportStages(stages);
+  const fecFrames = fecRx.stats.frames - fecMode.frames;
+  fecMode.frames = fecRx.stats.frames;
+  if (fecFrames > 0 || stats.frames > 0) fecMode.on = fecFrames > 0;
   post('stats', {
     stages,
     probe: probeSummary(false),
@@ -2244,6 +2253,7 @@ function postStats() {
     // Datagram + FEC (fec.js, GUIDE 2.5): frames rebuilt from shards and the
     // shards' counters, this session (null: the host never sent shards).
     fec: fecRx.stats.shards || fecRx.stats.repairs ? fecRx.summary() : null,
+    fecNow: fecMode.on, // the video comes as shards now (fecMode)
     audioPackets: stats.audioPackets,
     audioLost: stats.audioLost,
     audioMs,

@@ -340,8 +340,13 @@ Relay path: the gateway is container 210 on the Proxmox node and the browser cli
 Network path to "Relay via gateway", then Reconnect (or set `directPort` to 0 in the PC's
 `host.json`). The default, "Auto", connects straight to the PC on UDP 47998 whenever it can, which
 is the usual case on a LAN. The video then never crosses the gateway's veth, and every profile
-looks unimpaired. Before measuring, check that the stats overlay's Transport row ends in
-`· relay`. Then run as root on the node, from the gateway release folder:
+looks unimpaired. Before measuring, check that the stats overlay's Transport row starts with
+`webtransport · relay` (not `relay-splice`). Under `wan` (40 ms round trip) it then ends in
+`· datagrams + FEC`: with the PC's default `"fec": "auto"` the video goes as datagram shards with
+forward error correction above a 15 ms minimum round trip (NETEM.md, "FEC under a long round
+trip"). Report the Transport row with each profile; a step that compares per-frame streams sets
+`"fec": "off"` in host.json for all four. Then run as root on the node, from the gateway release
+folder:
 
 ```bash
 ./netem.sh clear --ct 210                                 # lan
@@ -354,7 +359,8 @@ looks unimpaired. Before measuring, check that the stats overlay's Transport row
 
 `--host CLIENT_IP` impairs only the gateway ↔ browser leg. Without it the video crosses the
 impaired veth twice, once on each relay leg. For the direct path (UDP 47998), set Network path to
-"Direct to PC only" and check that the Transport row ends in `· direct`. The Proxmox node is not in
+"Direct to PC only" and check that the Transport row starts with `webtransport · direct` (under
+`wan` followed by `· datagrams + FEC`, as on the relay). The Proxmox node is not in
 this path. Run `./netem.sh apply <profile> --iface <nic> --port 47998` on a Linux client, or use
 the clumsy settings from NETEM.md on the PC or a Windows client.
 
@@ -365,14 +371,16 @@ found in the recording. NVIDIA results stay "unverified" until an NVIDIA host is
 ### Hardware and environment checks
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test: stream the relay path with the client on wired LAN
-  (Network path "Relay via gateway"; the overlay's Transport row must end in `· relay`). Run each
+  (Network path "Relay via gateway"; the overlay's Transport row must start with
+  `webtransport · relay`, and under `wan` it ends in `· datagrams + FEC`). Run each
   of `clear`, `apply wifi`, `apply wan` and `apply capdrop` with `--ct <gateway CTID> --host
   <client IP>` on the Proxmox node. Record the overlay's capture→drawn p50/p95, freezes over
   100 ms and decoder recoveries for 10 minutes per profile (capdrop: for the 60 s run, plus the
   time until the bitrate is back). Expect `status` to show the profile and the client's packets in
   the netem counters (`tc -s qdisc show dev nm-veth<CTID>i0`).
 - NVIDIA: unverified (no NVIDIA host available). Test: force the relay path as for AMD (Transport
-  row `· relay`), run the same four profiles and record the same metrics.
+  row `webtransport · relay`, plus `· datagrams + FEC` under `wan`), run the same four profiles
+  and record the same metrics.
 - Proxmox VE node: unverified (no Proxmox in the sandbox). Test: on the node, run
   `./netem.sh apply wifi --ct 210 --host <client IP>`. Check that `ip -br link` shows
   `nm-veth210i0` and that `pct exec 210 -- ethtool -k eth0` shows the segmentation offloads off.
@@ -3333,19 +3341,19 @@ stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` an
   intervals>`, no `forcing a key frame`, no `restarting video`; the client: no `requesting key
   frame`, `__recon.lastStats.recovered` equals the number of drops, `keyFrames` stays at 1 per
   generation. Repeat for AV1 and H.264.
-- AMD RDNA3 (RX 7900 XT): unverified. Test (T5 acceptance, wifi: >= 90 % of losses recovered
-  without an IDR): force the relay path (Network path "Relay via gateway", Transport row
-  `· relay`), `./netem.sh apply wifi --ct <gateway CTID> --host <client IP>` on the Proxmox node
-  (0.4), hevc_amf_helper at 1920×1080 60 fps 20 Mbit/s, 10 minutes of constant motion (a game or
-  a video). Because frames travel on reliable streams, `wifi`'s 1 % packet loss mostly delays
-  frames; run it once plainly and once with `$env:RECON_TEST_FAULTS="drop=every:300"` on the host
-  (about 120 losses in 10 minutes on top of real ones). For each run sum the `stream stats`
-  lines' `recovered=` (R) and `recovered_by_key=` (K) over the run:
-  `Select-String host.log -Pattern 'msg="stream stats"'`; T5 = R / (R + K). Pass: T5 >= 0.9 in
-  both runs. Also record the client's `__recon.lastStats` `recovered`, `recoveredByKey`,
-  `recoveryDiscarded`, `keyRequests` and the key-request reasons in `__recon.logs` (there should
-  be no `no recovery frame`), the freezes > 100 ms (`Freezes` row; GUIDE T3: < 1 per 10 min),
-  and the median `wait_ms` of the `loss recovered` lines. Repeat with AV1 and H.264.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (T5 acceptance, wifi: >= 90 % of losses recovered without
+  an IDR): force the relay path (Network path "Relay via gateway", Transport row `webtransport ·
+  relay` without `· datagrams + FEC`), `./netem.sh apply wifi --ct <gateway CTID> --host <client
+  IP>` on the Proxmox node (0.4), hevc_amf_helper at 1920×1080 60 fps 20 Mbit/s, 10 minutes of
+  constant motion (a game or a video). Because frames travel on reliable streams, `wifi`'s 1 %
+  packet loss mostly delays frames; run it once plainly and once with
+  `$env:RECON_TEST_FAULTS="drop=every:300"` on the host (about 120 losses in 10 minutes on top of
+  real ones). For each run sum the `stream stats` lines' `recovered=` (R) and `recovered_by_key=`
+  (K) over the run: `Select-String host.log -Pattern 'msg="stream stats"'`; T5 = R / (R + K). Pass:
+  T5 >= 0.9 in both runs. Also record the client's `__recon.lastStats` `recovered`,
+  `recoveredByKey`, `recoveryDiscarded`, `keyRequests` and the key-request reasons in `__recon.logs`
+  (there should be no `no recovery frame`), the freezes > 100 ms (`Freezes` row; GUIDE T3: < 1 per
+  10 min), and the median `wait_ms` of the `loss recovered` lines. Repeat with AV1 and H.264.
 - NVIDIA: unverified (no NVIDIA host available). Test (VERIFY matrix, NVIDIA host ×
   AMD/NVIDIA client GPU, reference invalidation): on an RTX host (`backend=nvenc`, overlay "Loss
   recovery: recovery frame (reference invalidation)"), the same 10 drop tests per codec (HEVC,
@@ -3854,21 +3862,20 @@ unless a test says otherwise; overlay Ctrl+Alt+Shift+S; host log
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (T3, wifi: freezes > 100 ms < 1 per 10 min): stream
   hevc_amf_helper at 1920×1080 60 fps, 20 Mbps, adaptive bitrate on, over the relay path (Network
-  path "Relay via gateway", Transport row `· relay`) with `./netem.sh apply wifi --ct 210 --host
-  CLIENT_IP` (0.4), 10 minutes of constant motion (a game or a video); note `__recon.lastStats.freezes`
-  (overlay `Freezes > 100 ms`) at the start and the end. Pass: the difference is 0. Record from
-  host.log the sums over the run of the `stream stats` fields `deadline_drops`, `discarded`,
-  `dropped`, `recovered`, `recovered_by_key` and `key_frames`
+  path "Relay via gateway", Transport row `webtransport · relay`) with `./netem.sh apply wifi --ct
+  210 --host CLIENT_IP` (0.4), 10 minutes of constant motion (a game or a video); note
+  `__recon.lastStats.freezes` (overlay `Freezes > 100 ms`) at the start and the end. Pass: the
+  difference is 0. Record from host.log the sums over the run of the `stream stats` fields
+  `deadline_drops`, `discarded`, `dropped`, `recovered`, `recovered_by_key` and `key_frames`
   (`Select-String host.log -Pattern 'msg="stream stats"'`), the `frame stream cancelled` lines
-  (`age_ms` ≥ `deadline_ms`, each followed by `recovering from a loss ... why=deadline` and
-  `loss recovered ... by="recovery frame"`; only frames whose write stood still past the
-  deadline, deviation (7): wifi's losses (1 %, bursts of 2) are repaired by QUIC retransmission
-  within a few ms and its 0–15 ms slots stay inside the congestion window, so few or none are
-  expected), and any `restarting video` or `forcing a key frame` (there should be none after the
-  session start). A freeze > 100 ms with no `frame stream cancelled` or `frames dropped` line at
-  its time is a closed frame that waited for retransmissions (deviation (7)): record how many
-  there were. Repeat with AV1 at 2560×1440 and H.264, and once on `lan` (expect
-  `deadline_drops=0`, no freezes).
+  (`age_ms` ≥ `deadline_ms`, each followed by `recovering from a loss ... why=deadline` and `loss
+  recovered ... by="recovery frame"`; only frames whose write stood still past the deadline,
+  deviation (7): wifi's losses (1 %, bursts of 2) are repaired by QUIC retransmission within a few
+  ms and its 0–15 ms slots stay inside the congestion window, so few or none are expected), and any
+  `restarting video` or `forcing a key frame` (there should be none after the session start). A
+  freeze > 100 ms with no `frame stream cancelled` or `frames dropped` line at its time is a closed
+  frame that waited for retransmissions (deviation (7)): record how many there were. Repeat with AV1
+  at 2560×1440 and H.264, and once on `lan` (expect `deadline_drops=0`, no freezes).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (T4, zero encoder restarts with the helper): the same
   stream for 30 minutes under each of `lan`, `wifi`, `wan` and `capdrop` (0.4), after
   `recon-host qualify` (3.6) so that bitrate changes stay in the encoder. Pass: one
@@ -8940,3 +8947,22 @@ as the fallback), the probe row of Useful commands; README's probe paragraph.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same: `helper:     nvenc ...` with
   driver 570 or newer; with an older driver `no usable encoder` and `unavailable: nvenc: the
   driver supports NVENC API 12.x ...`, and the installer warns.
+
+### The Transport row and FEC under `wan`
+
+Problem: NETEM.md and 0.4 told testers to check that the overlay's Transport row ends in
+`· relay`; under `wan` (+40 ms) the default `"fec": "auto"` sends the video as datagram shards and
+the row ends in `· datagrams + FEC`, and the suffix stayed for the rest of the stream once any
+shard had arrived (the counters are per session). Fix: the row's suffix follows the frames of the
+last stats period (`fecNow`); NETEM.md and 0.4 say the row starts with `webtransport · relay`
+(`relay-splice` also contains `· relay`), that `wan` measures the FEC mode, and how to measure
+frame streams instead (`"fec": "off"`, or the browser's Video over datagrams setting).
+
+- Verified here: the browser E2E's datagram + FEC check now requires `fecNow` (the overlay's
+  suffix) while every frame comes as shards and its WebSocket check requires it off; `node
+  --check`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: 0.4's relay setup, `./netem.sh apply wan --ct 210
+  --host CLIENT_IP`: within a few seconds the Transport row reads `webtransport · relay ·
+  datagrams + FEC` and host.log `video transport mode="datagram + FEC"`; `./netem.sh clear --ct
+  210`: within about 30 s (the minimum round trip's window) the suffix goes again.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

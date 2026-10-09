@@ -940,7 +940,7 @@ function onStats(st) {
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Loss recovery', recoveryText(v.recovery, st)),
-    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fec ? ' · datagrams + FEC' : ''}` : '—'),
+    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fecNow ? ' · datagrams + FEC' : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
     st.fec ? fecRow(st.fec, row) : null,
     ...presentRows(st, row),

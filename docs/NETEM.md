@@ -79,10 +79,21 @@ on the gateway's veth then never touches the video, and the results look unimpai
 browser, set Stream settings > Pipeline > Network path to "Relay via gateway" (relay tests) or
 "Direct to PC only" (direct tests), then click Reconnect. For relay tests you can instead set
 `directPort` to 0 in the PC's `host.json`. Before measuring, open the stats overlay and check that
-its Transport row ends in `· relay` (UDP relay: one QUIC connection from the PC to the browser,
-forwarded by the gateway on one of its relay ports, 8444–8459 by default), `· relay-splice` (the
-fallback when the relay ports are blocked: QUIC terminated on the gateway's port 8443) or
-`· direct`.
+its Transport row starts with `webtransport · relay` (UDP relay: one QUIC connection from the PC to
+the browser, forwarded by the gateway on one of its relay ports, 8444–8459 by default),
+`webtransport · relay-splice` (the fallback when the relay ports are blocked: QUIC terminated on
+the gateway's port 8443) or `webtransport · direct`.
+
+**FEC under a long round trip.** With the PC's default `"fec": "auto"`, a session on the direct
+path or the UDP relay sends its video as datagram shards with forward error correction instead of
+a QUIC stream per frame while the browser's minimum round trip is above 15 ms (back to streams
+below 12 ms). `wan` (+40 ms) always crosses that line; the other profiles usually stay below it.
+The Transport row then ends in `· datagrams + FEC` (e.g. `webtransport · relay · datagrams + FEC`),
+and drops that suffix again when the video is back on streams. A `wan` result is therefore a
+result of the FEC mode, the product's default; that is what to report, unless the step compares
+per-frame streams: then set `"fec": "off"` in the PC's `host.json` (and restart the agent) or the
+browser's Stream settings > Pipeline > Video over datagrams to "Off" (and reconnect) for every
+profile, and say so in the result. Give the Transport row with each profile's result.
 
 ### On the Proxmox node (relay path)
 
