@@ -526,13 +526,72 @@ func TestUDPRelayLifetimes(t *testing.T) {
 	}
 }
 
-func TestUDPRelayLimits(t *testing.T) {
-	r := newTestRelay(t, relayMaxPending+2)
-	for i := 0; i < relayMaxPending; i++ {
-		allocate(t, r, "alice")
+// TestUDPRelayHostSilence: a locked allocation lives on what the host sends.
+// Datagrams from the browser's address alone (an Initial-shaped packet locked
+// it, the host has no connection for it) do not keep the port.
+func TestUDPRelayHostSilence(t *testing.T) {
+	r := newTestRelay(t, 1)
+	r.idle = 500 * time.Millisecond
+	a := allocate(t, r, "u")
+	udp := func() *net.UDPConn {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
 	}
-	if _, err := r.allocate(allocRequest{user: "alice"}); !errors.Is(err, errRelayPending) {
-		t.Fatalf("pending allocations per user not limited: %v", err)
+	host, browser := udp(), udp()
+	buf := make([]byte, 2048)
+	for bound := false; !bound; {
+		host.WriteTo(proto.RelayBindPacket(a.token), a.addr())
+		host.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := host.ReadFrom(buf)
+		bound = err == nil && proto.IsRelayBound(buf[:n])
+		if time.Since(a.created) > 2*time.Second {
+			t.Fatal("no bind")
+		}
+	}
+	initial := make([]byte, 1200)
+	initial[0] = 0xc3
+	copy(initial[1:], []byte{0, 0, 0, 1})
+	browser.WriteTo(initial, a.addr())
+	host.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := host.ReadFrom(buf); err != nil || !a.locked.Load() {
+		t.Fatalf("the Initial was not forwarded (%v) or did not lock the allocation", err)
+	}
+	// keep sends from the browser (and from the host while hostToo) every
+	// 50 ms for d and reports whether the allocation ended meanwhile.
+	keep := func(d time.Duration, hostToo bool) bool {
+		for end := time.Now().Add(d); time.Now().Before(end); {
+			browser.WriteTo([]byte("browser"), a.addr())
+			if hostToo {
+				host.WriteTo([]byte("host"), a.addr())
+			}
+			select {
+			case <-a.done:
+				return true
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		return false
+	}
+	if keep(2*time.Second, true) {
+		t.Fatal("ended while the host was sending")
+	}
+	if !keep(3*time.Second, false) {
+		t.Fatal("the browser's datagrams alone kept the allocation")
+	}
+}
+
+func TestUDPRelayLimits(t *testing.T) {
+	r := newTestRelay(t, relayMaxPerUser+2)
+	for i := 0; i < relayMaxPerUser; i++ {
+		a := allocate(t, r, "alice")
+		a.locked.Store(i%2 == 0) // in use or not, each counts
+	}
+	if _, err := r.allocate(allocRequest{user: "alice"}); !errors.Is(err, errRelayPerUser) {
+		t.Fatalf("allocations per user not limited: %v", err)
 	}
 	allocate(t, r, "bob")
 	allocate(t, r, "bob")

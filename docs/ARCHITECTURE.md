@@ -1241,12 +1241,15 @@ browser ──QUIC (host cert, pinned)──► gateway :8444 ──same datagra
    (`IP_PKTINFO`), and DF is set, so the path MTU both ends discover is the real one.
 6. The host's QUIC server accepts one connection per announced allocation (from the gateway's
    allocation address only) and the session's hello must carry the host ticket bound to that
-   allocation; `path=relay` in the host log. When the connection has ended, the host sends
-   `release` (`u8 0x03 | "RLY" | token`) and the gateway frees the port.
+   allocation; `path=relay` in the host log. When the connection has ended (also one that never
+   reached the QUIC accept queue: a failed handshake, an Initial it could not decrypt), the host
+   sends `release` (`u8 0x03 | "RLY" | token`) and the gateway frees the port. A connection that
+   asks for no WebTransport session within 10 s is closed.
 
 Lifetimes: the host must bind within 2 s, the browser must arrive within 20 s, and an
-allocation with no datagram either way for 30 s ends (QUIC itself idles out after 20 s and sends
-keep-alives every 5 s). A user may hold at most 4 allocations the browser has not reached yet.
+allocation on which the host has sent the browser nothing for 30 s ends (QUIC itself idles out
+after 20 s and the host sends keep-alives every 5 s; the browser's datagrams alone do not keep a
+port). A user may hold at most 4 allocations, in use or not.
 Forwarding is rate limited per direction (browser → host 32 Mbit/s, which carries ACKs, input
 and pings; host → browser 1 Gbit/s). A browser that changes its address (network switch)
 loses the connection and reconnects; the gateway does not follow migrations. If the relay port

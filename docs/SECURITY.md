@@ -97,9 +97,13 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
     address to 3 × what it received (RFC 9000 anti-amplification). Forwarding is rate limited
     (browser → host 32 Mbit/s, host → browser 1 Gbit/s).
   - **Lifetimes and quotas:** the host must bind within 2 s, the browser must arrive within
-    20 s, and an allocation ends after 30 s without a datagram or when the host releases it. A
-    user may hold at most 4 allocations the browser has not reached yet; the port range caps
-    the total. Starts and ends are audited (`stream_start` / `stream_end` "via udp relay").
+    20 s, and an allocation ends when the host releases it or after 30 s in which the host sent
+    the browser nothing (its keep-alives come every 5 s): the browser's datagrams alone do not
+    keep a port. The host releases an allocation when its connection on it ends, also one that
+    never completed the handshake (an Initial it could not decrypt, a failed handshake), and
+    closes a connection that asks for no WebTransport session within 10 s. A user may hold at
+    most 4 allocations, in use or not; the port range caps the total. Starts and ends are
+    audited (`stream_start` / `stream_end` "via udp relay").
   - The `bind`/`release` token travels in clear on the gateway ↔ host path. Someone who can read
     that path could replay it from their own address only before the real `bind` arrives (the
     first valid one wins) or release the allocation (ending the session); they could already

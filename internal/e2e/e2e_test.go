@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 
@@ -783,6 +784,71 @@ func TestStreamingPaths(t *testing.T) {
 		if r := runWT(t, e, tk.Direct.URL, tk.Direct.Hashes, a.Ticket, 1, time.Second); r.welcome || r.frames > 0 {
 			t.Fatalf("relay ticket accepted on the direct path: %+v", r)
 		}
+	})
+
+	// Allocations a browser holds without a session end with the host's
+	// connection. A QUIC Initial the host cannot decrypt, from the browser's
+	// address, locks the allocation and starts a host connection that never
+	// reaches Accept (the relay socket admits it before decryption); a
+	// handshake that asks for no WebTransport session reaches Accept and stays
+	// up on keep-alives. Datagrams keep coming from that address (the gateway
+	// alone would end the allocation only after 30 s without host traffic).
+	relayHeld := func(t *testing.T, hold func(dst *net.UDPAddr, c *net.UDPConn)) {
+		from := e.logs.Len()
+		a, err := e.allocRelay(e.connectInfo().Relay.UDP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, err := url.Parse(a.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dst, err := net.ResolveUDPAddr("udp", u.Host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		hold(dst, c)
+		for end := time.Now().Add(20 * time.Second); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
+			if len(e.logs.lines(from, `msg="udp relay: session ended"`, "port="+u.Port()+" ")) > 0 {
+				return
+			}
+			c.WriteTo([]byte("still here"), dst)
+		}
+		if len(e.logs.lines(from, `msg="udp relay: session started"`, "port="+u.Port()+" ")) == 0 {
+			t.Fatal("the browser did not lock the allocation")
+		}
+		t.Fatal("the allocation outlived the host's connection by more than 20 s")
+	}
+	t.Run("udp-relay-junk-initial-released", func(t *testing.T) {
+		relayHeld(t, func(dst *net.UDPAddr, c *net.UDPConn) {
+			// A long-header v1 Initial quic-go parses (8-byte connection IDs, no
+			// token, a length that matches) with a made-up payload, 1200 bytes.
+			initial := make([]byte, 1200)
+			n := copy(initial, []byte{0xc3, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0})
+			binary.BigEndian.PutUint16(initial[n:], 0x4000|uint16(len(initial)-n-2))
+			for i := n + 2; i < len(initial); i++ {
+				initial[i] = byte(i*131 + 7)
+			}
+			c.WriteTo(initial, dst)
+		})
+	})
+	t.Run("udp-relay-no-session-released", func(t *testing.T) {
+		relayHeld(t, func(dst *net.UDPAddr, c *net.UDPConn) {
+			tr := &quic.Transport{Conn: c}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := tr.Dial(ctx, dst, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{http3.NextProtoH3}},
+				&quic.Config{KeepAlivePeriod: time.Second, MaxIdleTimeout: time.Minute})
+			if err != nil {
+				t.Fatal("QUIC handshake through the relay:", err)
+			}
+			t.Cleanup(func() { conn.CloseWithError(0, ""); tr.Close() })
+		})
 	})
 
 	t.Run("webtransport-relay-splice", func(t *testing.T) {

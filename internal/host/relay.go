@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -33,13 +34,16 @@ import (
 // Only allocations the gateway announced are accepted: the quic.Transport
 // refuses connections from any other address, one connection per allocation,
 // and the session's hello must carry a gateway-signed ticket bound to the
-// allocation (verifyTicket).
+// allocation (verifyTicket). The end of that connection, whether it opened a
+// session or not, releases the gateway's port (the gateway ends an allocation
+// also when the host has sent nothing on it for 30 s).
 
 const (
 	relayBindTimeout  = 2 * time.Second // the gateway's wait for the bind
 	relayBindResend   = 200 * time.Millisecond
 	relayUnusedTTL    = 30 * time.Second // the gateway gives the browser 20 s after the bind
 	relayReleaseDelay = 2 * time.Second  // after the connection ended: about 3 PTO of draining
+	relaySessionWait  = 10 * time.Second // from the first Initial to the WebTransport request
 )
 
 type relayServer struct {
@@ -60,6 +64,8 @@ type relayAlloc struct {
 	bound chan struct{} // closed when the gateway confirmed the bind
 	once  sync.Once
 	used  bool // a connection arrived (guarded by relayServer.mu)
+
+	session atomic.Bool // the connection asked for a WebTransport session
 }
 
 func (al *relayAlloc) isBound() bool {
@@ -125,6 +131,7 @@ func (a *Agent) relayServer(ctx context.Context) (*relayServer, error) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		al.session.Store(true)
 		select {
 		case sem <- struct{}{}:
 		default:
@@ -164,14 +171,11 @@ func (rs *relayServer) accept(ctx context.Context, ln *quic.EarlyListener) {
 			return
 		}
 		if al, _ := c.Context().Value(relayAllocKey{}).(*relayAlloc); al != nil {
-			context.AfterFunc(c.Context(), func() {
-				rs.remove(al)
-				// Release the gateway's port once the closing connection had time to
-				// deliver its CONNECTION_CLOSE (twice: a lost release only costs the
-				// gateway's idle timeout).
-				release, dst := proto.RelayReleasePacket(al.token), net.UDPAddrFromAddrPort(al.addr)
-				for _, d := range []time.Duration{relayReleaseDelay, relayReleaseDelay + 100*time.Millisecond} {
-					time.AfterFunc(d, func() { _, _ = rs.tr.WriteTo(release, dst) })
+			// A connection that asks for no session would hold the gateway's port
+			// for as long as its peer answers the keep-alives.
+			time.AfterFunc(relaySessionWait, func() {
+				if !al.session.Load() {
+					_ = c.CloseWithError(0, "no WebTransport session")
 				}
 			})
 		}
@@ -201,7 +205,24 @@ func (rs *relayServer) connContext(ctx context.Context, ci *quic.ClientInfo) (co
 		return nil, errNotAllocated
 	}
 	al.once.Do(func() { close(al.bound) })
+	// quic-go cancels ctx when the connection ends, also one that never
+	// reaches Accept: a handshake that fails, or an Initial it cannot decrypt
+	// (this runs before decryption, so junk from the browser's address marks
+	// the allocation used).
+	context.AfterFunc(ctx, func() { rs.release(al) })
 	return context.WithValue(ctx, relayAllocKey{}, al), nil
+}
+
+// release forgets an allocation whose connection ended and releases the
+// gateway's port once the closing connection had time to deliver its
+// CONNECTION_CLOSE (twice: a lost release only costs the gateway's idle
+// timeout).
+func (rs *relayServer) release(al *relayAlloc) {
+	rs.remove(al)
+	release, dst := proto.RelayReleasePacket(al.token), net.UDPAddrFromAddrPort(al.addr)
+	for _, d := range []time.Duration{relayReleaseDelay, relayReleaseDelay + 100*time.Millisecond} {
+		time.AfterFunc(d, func() { _, _ = rs.tr.WriteTo(release, dst) })
+	}
 }
 
 // readControl receives the gateway's bind confirmations.

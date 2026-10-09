@@ -35,12 +35,18 @@ import (
 // client, so it needs no inbound port; the browser is locked in by its first
 // QUIC Initial from the IP address that requested the allocation. From then on
 // datagrams are forwarded between exactly these two addresses, unmodified.
+//
+// An allocation ends when the host releases it (its connection on the
+// allocation ended, accepted or not) or when the host has sent the browser
+// nothing for relayIdle: the browser's datagrams alone do not keep a port, so
+// a client cannot hold one the host has no connection on by sending to it.
+// Each user holds at most relayMaxPerUser allocations, in use or not.
 
 const (
 	relayBindWait   = 2 * time.Second  // host bind after the allocation (usually one round trip)
 	relayLockWait   = 20 * time.Second // browser's first Initial after the bind
-	relayIdle       = 30 * time.Second // no datagram either way (QUIC idles out after 20 s)
-	relayMaxPending = 4                // allocations per user the browser has not reached yet
+	relayIdle       = 30 * time.Second // nothing from the host (QUIC idles out after 20 s; the host's keep-alives come every 5 s)
+	relayMaxPerUser = 4                // allocations per user, in use or not: a session holds one, a reconnect briefly two
 
 	// Forwarding limits. Browser -> host carries ACKs, input and pings (well under
 	// 1 Mbit/s); host -> browser the video (the host caps it at maxKbps).
@@ -108,7 +114,7 @@ func newUDPRelay(log *slog.Logger, ip net.IP, ports []int) *udpRelay {
 
 var (
 	errRelayFull    = errors.New("all relay ports are in use")
-	errRelayPending = errors.New("too many relay allocations waiting for this user")
+	errRelayPerUser = errors.New("too many relay allocations for this user")
 )
 
 // allocRequest describes who an allocation is for.
@@ -157,14 +163,14 @@ func (r *udpRelay) allocate(req allocRequest) (*allocation, error) {
 	if r.closed {
 		return nil, errRelayFull
 	}
-	pending := 0
+	held := 0
 	for _, a := range r.allocs {
-		if a.req.user == req.user && !a.locked.Load() {
-			pending++
+		if a.req.user == req.user {
+			held++
 		}
 	}
-	if pending >= relayMaxPending {
-		return nil, errRelayPending
+	if held >= relayMaxPerUser {
+		return nil, errRelayPerUser
 	}
 	// Rotate through the range, so a port just released (and the packets still
 	// in flight to it) is the last to be reused.
@@ -232,7 +238,11 @@ func (a *allocation) serve() {
 	// arrives): a reverse proxy in front of HTTPS without -trust-proxy, or a
 	// browser whose UDP leaves by another address (IPv6 vs IPv4, CGNAT).
 	var refused netip.AddrPort
+	// last: the last datagram forwarded either way (the session's end in its
+	// stats); heard: the last one the host sent the browser, which alone keeps
+	// a locked allocation (relayIdle).
 	last := time.Now()
+	heard := last
 	up := tokenBucket{rate: relayUpRate, burst: relayUpBurst, tokens: relayUpBurst, ts: last}
 	down := tokenBucket{rate: relayDownRate, burst: relayDownBurst, tokens: relayDownBurst, ts: last}
 	defer func() {
@@ -291,7 +301,8 @@ func (a *allocation) serve() {
 						"port", a.port, "host", a.req.hostID, "user", a.req.user, "dropped", a.stats.Dropped.Load())
 				}
 				return
-			case browser.addr.IsValid() && now.Sub(last) > r.idle:
+			case browser.addr.IsValid() && now.Sub(heard) > r.idle:
+				r.log.Debug("udp relay: nothing from the host", "port", a.port, "host", a.req.hostID, "for", now.Sub(heard).Round(time.Second))
 				return
 			}
 			deadline = now.Add(time.Second)
@@ -318,7 +329,7 @@ func (a *allocation) serve() {
 				a.stats.Dropped.Add(1)
 				continue
 			}
-			last = now
+			last, heard = now, now
 			if send(pkt, browser) {
 				a.stats.ToBrowser.Add(int64(n))
 				a.stats.PktToBrowser.Add(1)
@@ -363,7 +374,7 @@ func (a *allocation) serve() {
 				continue
 			}
 			browser = peer{addr: from, local: local, oob: a.pc.sourceOOB(local)}
-			last = now
+			last, heard = now, now
 			a.stats.Started = now
 			a.locked.Store(true)
 			r.log.Info("udp relay: session started", "port", a.port, "host", a.req.hostID, "user", a.req.user, "browser", from)

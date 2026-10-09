@@ -4047,7 +4047,8 @@ Verified in the sandbox (Linux, no GPU, loopback; IPv4 only, the sandbox has no 
   QUIC client on 127.0.0.2 (another IP than the requester's) cannot lock the allocation; a
   short-header packet does not lock it; after the lock a stranger's datagrams (even a valid
   bind) are dropped and it gets no answer. Lifetimes (unbound, bound but never reached, idle
-  after the client vanished) end the allocation; 4 pending allocations per user; ports in use
+  after the client vanished) end the allocation; 4 pending allocations per user (4 in all since
+  "Final review: security"); ports in use
   by other programs are skipped; the rate limiter. `go test -race` clean.
 - Source address on a socket bound to all addresses (the default `-listen :8443`): the browser
   (127.0.0.1) sends to the gateway's other address (192.0.2.2), whose answers the routing table
@@ -9308,3 +9309,48 @@ Fix:
   change at all, so it never ran the changed code. With the tree before these changes (the
   direct-path commit) two runs passed with 99 and 27 drops. This is the borderline that
   6ca6e5a already widened for the direct path.
+
+## Final review: security
+
+Findings of the final review's security pass. Each item: the problem, the fix, what was verified
+here, the check on hardware.
+
+### UDP relay ports held without a session
+
+Problem: a locked relay allocation (2.6) lived on datagrams in either direction, and the host
+released it only for connections its QUIC listener accepted. quic-go calls the relay socket's
+`ConnContext` (which marks the allocation used) for an Initial before decrypting it, so one
+Initial-shaped packet from the browser's address marked the allocation used, started a
+connection that never reached the accept queue, and no release followed; a datagram every
+< 30 s from that address then kept the port. A QUIC handshake that asked for no WebTransport
+session stayed up on the host's keep-alives. Only allocations the browser had not reached yet
+counted towards the per-user limit, so a signed-in user with a script could take every relay
+port (16 by default) and keep it: everyone else's sessions fell back to the QUIC splice (two
+congestion controllers in series, 2.6).
+
+Fix:
+- Host (`internal/host/relay.go`): the release is registered in `ConnContext` on the context
+  quic-go cancels when the connection ends, accepted or not; a relay connection that asks for no
+  WebTransport session within 10 s is closed (and so released).
+- Gateway (`internal/gateway/udprelay.go`): a locked allocation ends after 30 s in which the host
+  sent the browser nothing (a live session always has the host's 5 s keep-alives); the browser's
+  datagrams no longer keep it. A user holds at most 4 allocations, in use or not
+  (`too many relay allocations for this user`, 503: the client uses the splice as before).
+
+- Verified here:
+  - `internal/gateway` `TestUDPRelayHostSilence` (the browser keeps sending after the lock, the
+    host is silent: the allocation ends; while the host sends it does not) and
+    `TestUDPRelayLimits` (locked allocations count) fail on the old code and pass.
+  - `internal/e2e` (real gateway and agent): `udp-relay-junk-initial-released` locks an
+    allocation with a parseable v1 Initial the host cannot decrypt and keeps sending from that
+    address: the allocation ended after 7 s (handshake idle timeout + the 2 s release delay);
+    with the old host code it was still there after 20 s. `udp-relay-no-session-released`
+    completes a QUIC handshake through the relay (ALPN h3) and opens no session: ended after
+    12 s; with the old host code still there after 20 s. The relay session subtests and the
+    browser E2E relay scenarios stream as before.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with the gateway and agent from this build, stream
+  over "Relay via gateway" (Transport row `webtransport · relay`) for 10 minutes, the last 5 on a
+  still desktop with no input: the session does not end, and the gateway log has no `udp relay:
+  session ended` for its port until the tab is closed (then within about 2 s). Reload the
+  stream page three times, a few seconds apart: each connects as `webtransport · relay`.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
