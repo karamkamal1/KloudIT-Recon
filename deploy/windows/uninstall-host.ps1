@@ -4,7 +4,8 @@
   stream left (the agent is stopped without its cleanup) is removed and the display layout
   restored first.
 .PARAMETER KeepConfig
-  Keep %APPDATA%\KlouditRecon (pairing and settings).
+  Keep %APPDATA%\KlouditRecon (pairing and settings) and the agent's log in
+  %ProgramData%\KlouditRecon\<user>.
 .PARAMETER RemoveVirtualDisplay
   Also remove the Virtual Display Driver (its device and driver package), as installed by
   install-host.ps1 -InstallVirtualDisplay. SudoVDA (Apollo's driver) is left alone.
@@ -30,8 +31,9 @@ Get-Process -Name 'ffmpeg', 'recon-encoder' -ErrorAction SilentlyContinue | Wher
 Start-Sleep -Milliseconds 800
 # Killed like this, the agent could not remove a virtual display of a session (or one kept
 # for a reconnect) and put the display layout back (with "virtualDisplayLayout": "only" the
-# monitors stay off): do it now from its restore journal, next to the config, before the
-# program and the journal are deleted.
+# monitors stay off): do it now from its restore journal, in the agent's folder
+# (ProgramData\KlouditRecon\<user>, which recon-host finds itself), before the program and the
+# journal are deleted.
 $exe = Join-Path $InstallDir 'recon-host.exe'
 $cfgPath = Join-Path (Join-Path $env:APPDATA 'KlouditRecon') 'host.json'
 if ((Test-Path $exe) -and (Test-Path $cfgPath)) {
@@ -58,5 +60,11 @@ if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
 if (-not $KeepConfig) {
     $cfgDir = Join-Path $env:APPDATA 'KlouditRecon'
     if (Test-Path $cfgDir) { Remove-Item -Recurse -Force $cfgDir }
+    $stateRoot = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'KlouditRecon'
+    $stateDir = Join-Path $stateRoot (($identity.Name -split '\\')[-1])
+    if (Test-Path -LiteralPath $stateDir) { Remove-Item -LiteralPath $stateDir -Recurse -Force }
+    if ((Test-Path -LiteralPath $stateRoot) -and -not (Get-ChildItem -LiteralPath $stateRoot -Force)) {
+        Remove-Item -LiteralPath $stateRoot -Force
+    }
 }
 Write-Host 'KloudIT Recon host agent removed.' -ForegroundColor Green

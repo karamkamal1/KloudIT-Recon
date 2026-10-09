@@ -77,6 +77,16 @@ func main() {
 		level = slog.LevelDebug
 	}
 	supervising := cmd == "run" && *restart && os.Getenv(supervisedEnv) == ""
+	// An elevated agent (the logon task's) writes, rotates and appends to its
+	// log only in a folder that only administrators can change (host.
+	// CheckAgentDir): host.json's folder belongs to the user.
+	var logRefused error
+	if *logPath != "" {
+		if logRefused = host.CheckAgentDir(filepath.Dir(*logPath)); logRefused != nil {
+			fmt.Fprintf(os.Stderr, "log file %s not used: %v\n", *logPath, logRefused)
+			*logPath = ""
+		}
+	}
 	var out io.Writer = os.Stderr
 	switch {
 	case *logPath != "" && supervising:
@@ -99,6 +109,9 @@ func main() {
 		errOut = out // the background build has no console: errors must reach the log
 	}
 	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
+	if logRefused != nil {
+		log.Warn("log file not used", "err", logRefused)
+	}
 
 	switch cmd {
 	case "version":
@@ -265,14 +278,24 @@ func vdisplayTest(cfg *host.Config, args []string, log *slog.Logger) error {
 				m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.HMonitor, m.DXGIOutput, m.Rotated)
 		}
 	}
-	opts := vdisplay.Options{Policy: vdisplay.PolicyOn, Layout: *layout, MonitorID: cfg.HostID + "/vdisplay-test",
-		StateDir: filepath.Join(os.TempDir(), "kloudit-recon-vdisplay-test"), Log: log}
+	opts := vdisplay.Options{Policy: vdisplay.PolicyOn, Layout: *layout, MonitorID: cfg.HostID + "/vdisplay-test", Log: log}
 	if a, err := platform.PrimaryAdapter(); err == nil {
 		opts.RenderAdapter = a.LUID
 		fmt.Printf("render adapter: %s (DXGI adapter 0, luid %#x)\n", a.Name, a.LUID)
 	}
-	if err := os.MkdirAll(opts.StateDir, 0o700); err != nil {
-		return err
+	// The test's journal: in the agent's folder (an elevated run's is one
+	// only administrators can change), apart from the agent's own journal.
+	dir, err := host.AgentFilesDir(cfg)
+	if err == nil && dir == "" {
+		dir = os.TempDir()
+	}
+	if err != nil {
+		fmt.Println("no restore journal for this test (the displays are not put back after a crash):", err)
+	} else {
+		opts.StateDir = filepath.Join(dir, "vdisplay-test")
+		if err := os.MkdirAll(opts.StateDir, 0o700); err != nil {
+			return err
+		}
 	}
 	m := vdisplay.New(opts)
 	if err := m.Recover(); err != nil {

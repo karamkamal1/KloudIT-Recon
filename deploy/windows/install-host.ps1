@@ -13,7 +13,9 @@
   - Optionally pairs with your gateway (-PairingCode)
   - Registers a logon task that runs the agent hidden, with highest privileges
     (needed to send input to elevated games/launchers); the agent runs in a child process
-    that is started again when it crashes or exits with an error (recon-host -restart)
+    that is started again when it crashes or exits with an error (recon-host -restart). Its
+    log goes to %ProgramData%\KlouditRecon\<user>, a folder only administrators can change
+    (you can read it): the elevated agent writes nothing in folders you own
   - Opens the direct-path UDP port in Windows Firewall (Private/Domain only,
     scoped to the agent executable)
   - Optionally installs the ViGEmBus driver for virtual Xbox controllers
@@ -191,6 +193,26 @@ function Protect-AdminFolder([string]$dir, [switch]$Recurse) {
         if ($f.PSIsContainer) { $tree = @('/T') }
         icacls $f.FullName /setowner '*S-1-5-32-544' @tree | Out-Null
         if ($LASTEXITCODE -eq 0) { icacls $f.FullName /reset @tree | Out-Null }
+        if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $($f.FullName) (icacls exit code $LASTEXITCODE)." }
+    }
+}
+# Creates $dir if needed and gives it to administrators for the files the elevated agent writes:
+# owner Administrators and exactly these entries (no inherited ones, none an earlier owner
+# added): Administrators and SYSTEM full control, and the icacls grant $reader. The files in it
+# get the same. A folder that is or holds a link (reparse point) is refused.
+function Protect-AgentFolder([string]$dir, [string]$reader) {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    Assert-NoLinks $dir
+    icacls $dir /setowner '*S-1-5-32-544' | Out-Null
+    if ($LASTEXITCODE -eq 0) { icacls $dir /reset | Out-Null }
+    if ($LASTEXITCODE -eq 0) {
+        icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' $reader | Out-Null
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $dir (icacls exit code $LASTEXITCODE)." }
+    Assert-NoLinks $dir # again, now that only administrators can add entries
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Force -File)) {
+        icacls $f.FullName /setowner '*S-1-5-32-544' | Out-Null
+        if ($LASTEXITCODE -eq 0) { icacls $f.FullName /reset | Out-Null }
         if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $($f.FullName) (icacls exit code $LASTEXITCODE)." }
     }
 }
@@ -408,8 +430,18 @@ if ($InstallVirtualDisplay) {
 # --- Configuration (per user: the agent runs in your interactive session) ----
 $cfgDir = Join-Path $env:APPDATA 'KlouditRecon'
 $cfgPath = Join-Path $cfgDir 'host.json'
-$logPath = Join-Path $cfgDir 'host.log'
 New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+# The files the agent writes (host.log and its rotation, the virtual display's restore journal)
+# go to ProgramData\KlouditRecon\<user>, which only administrators can change (you can read it),
+# not next to host.json: the logon task runs the agent elevated, and any program you run could
+# turn files in your own folder into links that make it create, replace or delete files
+# elsewhere. The agent finds the folder the same way (the known folder, your account name) and
+# keeps its journal there only when this ACL holds. Both from the system, not the environment.
+$stateRoot = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'KlouditRecon'
+$stateDir = Join-Path $stateRoot (($identity.Name -split '\\')[-1])
+Protect-AgentFolder $stateRoot '*S-1-5-32-545:(OI)(CI)RX'
+Protect-AgentFolder $stateDir "*$($identity.User.Value):(OI)(CI)RX"
+$logPath = Join-Path $stateDir 'host.log'
 $cfg = [ordered]@{}
 if (Test-Path $cfgPath) {
     $existing = Get-Content -Raw -Encoding UTF8 $cfgPath | ConvertFrom-Json

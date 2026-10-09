@@ -39,3 +39,7 @@ func Elevated() bool { return false }
 
 // AdminOnly is unsupported outside Windows.
 func AdminOnly(string) error { return ErrUnsupported }
+
+// AgentStateDir is unsupported outside Windows (the agent is never elevated
+// there).
+func AgentStateDir() (string, error) { return "", ErrUnsupported }

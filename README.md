@@ -487,7 +487,7 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
 
 ## Troubleshooting
 
-- **The PC stays offline.** Look at `%APPDATA%\KlouditRecon\host.log`. `dial ...: timeout`
+- **The PC stays offline.** Look at `%ProgramData%\KlouditRecon\<your user name>\host.log`. `dial ...: timeout`
   means UDP 8443 from the PC to the gateway is blocked or the pairing code holds an address the PC
   can't reach (create codes while browsing via the gateway's LAN IP). `rejected registration`
   means the PC was re-paired: paste the new pairing command. `agent exited, starting it again`
@@ -527,7 +527,8 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   `recon-host.exe probe`.
 - **Choppy audio on Wi-Fi.** The *Auto* jitter buffer grows after each glitch (overlay: Audio
   row, underruns); if it still crackles, set it to *Fixed* at 40–60 ms.
-- **Logs**: the PC writes `%APPDATA%\KlouditRecon\host.log`. On the gateway, run
+- **Logs**: the PC writes `%ProgramData%\KlouditRecon\<your user name>\host.log` (a folder only
+  administrators can change; you can read it). On the gateway, run
   `journalctl -u recon-gateway -f` (from the Proxmox node: `pct exec 210 -- journalctl -u recon-gateway -n 50`). The browser's overlay (**Ctrl+Alt+Shift+S**) shows the
   active path, codec and latency breakdown.
 

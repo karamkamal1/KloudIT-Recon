@@ -41,18 +41,20 @@ with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
 **The agent by hand, for a test hook.** Checks that set `RECON_TEST_FAULTS` (a test hook the
 agent reads from its environment) need the agent started from a PowerShell window, since a
 `$env:` variable never reaches the logon task; and an agent started by hand writes host.log only
-with `-log` (before `run`). In an administrator PowerShell (the task's agent runs elevated too):
+with `-log` (before `run`). In an administrator PowerShell (the task's agent runs elevated too;
+an elevated agent writes its log only in a folder only administrators can change, such as the
+one install-host.ps1 made for its log, and otherwise says `log file ... not used`):
 
 ```powershell
 Stop-ScheduledTask 'KloudIT Recon Host'
 $env:RECON_TEST_FAULTS = 'drop=every:300'   # the value the check names
-& "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:APPDATA\KlouditRecon\host.log" run
+& "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" run
 ```
 
 The window shows the log as well. Run the test, stop the agent with Ctrl+C, close the window
 (the variable goes with it) and `Start-ScheduledTask 'KloudIT Recon Host'`. A check that sums
 host.log lines over a run (T5) gives each run its own file instead: `-log
-"$env:USERPROFILE\Desktop\t5-faults.log"`, and searches that file.
+"$env:ProgramData\KlouditRecon\$env:USERNAME\t5-faults.log"`, and searches that file.
 
 0. **Host setup** (GUIDE 12; INSTALL.md step 8, "On the PC, for the best results"): current
    Adrenalin; Instant Replay, Record & Stream, Radeon Chill and Radeon Boost off; Windows power
@@ -1136,8 +1138,8 @@ Hardware checks:
   no impairment (`./netem.sh clear --ct <gateway CTID>` on the Proxmox node), hevc_amf at 1920×1080
   60 fps, a game or video with constant motion, 30 minutes without touching the settings. Then in
   PowerShell on the host:
-  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="restarting video"' | Select-Object -Last 50`
-  and `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'msg="frames dropped"'`. Pass
+  `Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern 'msg="restarting video"' | Select-Object -Last 50`
+  and `Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern 'msg="frames dropped"'`. Pass
   (guide: zero restarts in 30 min): no `restarting video` line in the 30 minutes other than
   `reason=settings` (none if the settings were not touched; `reason=resume` only right after the
   stream tab was hidden and shown again), and no `frames dropped` line; the overlay's "Frames
@@ -1321,7 +1323,7 @@ Hardware checks:
   below is that same `ffmpeg.exe`.)
 - NVIDIA: unverified (no NVIDIA host available). Test: (first frame, parameter sets, restarts)
   stream with Codec HEVC, then H.264, at 1920×1080 60 fps: the picture appears within about a
-  second, host.log (`$env:APPDATA\KlouditRecon\host.log`) has `encoder ready ... recovery=skip`
+  second, host.log (`$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`) has `encoder ready ... recovery=skip`
   and no `without a key frame`, the stats overlay (Ctrl+Alt+Shift+S) shows "Loss recovery: skip
   frame (intra refresh)" and `(HW)` on the Codec row. Change the bitrate in Stream settings twice:
   each change gives a new `encoder ready ... recovery=skip` line and the picture continues (the new
@@ -1330,7 +1332,7 @@ Hardware checks:
   without an IDR, and the VERIFY: Chrome's decoder accepts P-frames after a skipped frame)
   `Stop-ScheduledTask 'KloudIT Recon Host'`, then in an administrator PowerShell window
   `$env:RECON_TEST_FAULTS='drop=every:600'; & 'C:\Program Files\KlouditRecon\recon-host.exe' -log
-  "$env:APPDATA\KlouditRecon\host.log" run` ("The agent by hand" in the hardware test plan; the
+  "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" run` ("The agent by hand" in the hardware test plan; the
   1.4 test hook: one frame dropped and reported every 10 s at 60 fps). Stream hevc_nvenc at
   1920×1080 60 fps from a scene with constant motion (a game, or a video playing full screen) for
   2 minutes, recording the client screen with a 240 fps phone camera or OBS. In DevTools on the
@@ -1560,7 +1562,7 @@ Hardware checks:
   `./netem.sh status --ct 210` (copy the two step lines with their times: the `15` step and the
   `50` step when capacity returns, T50) and then `./netem.sh clear --ct 210`. In DevTools on the
   stream page run `__recon.logs.filter((l) => /freeze:|congestion/.test(l))`. On the PC run
-  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering bitrate|bitrate recovery|restarting video|starting encoder|stream stats|frames dropped' | Select-Object -Last 120`
+  `Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern 'congestion: lowering bitrate|bitrate recovery|restarting video|starting encoder|stream stats|frames dropped' | Select-Object -Last 120`
   (with `"logLevel": "debug"`: every rate change).
   Pass: (1) at T50 + 60 s the target is at least 17000 kbit/s: the last `bitrate recovery:
   raising bitrate ... to=` (or `stream stats ... kbps_target=`) at or before that time, also the
@@ -3486,7 +3488,7 @@ Verified in the sandbox:
   acceptance therefore is a hardware check below.
 
 Hardware checks (host.json `"pipeline": "auto"`, recon-encoder.exe next to recon-host.exe; the
-stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` and the browser's
+stats overlay is Ctrl+Alt+Shift+S; logs: `$env:ProgramData\KlouditRecon\$env:USERNAME\host.log` and the browser's
 `__recon.logs`). On the helper the drop test now runs reference recovery; the 1.4 decoder check
 (plain skipping) needs `"pipeline": "ffmpeg"`.
 
@@ -3528,10 +3530,10 @@ stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` an
   packet loss mostly delays frames; run it once plainly and once with
   `$env:RECON_TEST_FAULTS="drop=every:300"` on the host (about 120 losses in 10 minutes on top of
   real ones). Start the agent by hand for both runs ("The agent by hand" in the hardware test
-  plan), each with its own log file: `-log "$env:USERPROFILE\Desktop\t5-plain.log"` (no
-  `RECON_TEST_FAULTS`) and `-log "$env:USERPROFILE\Desktop\t5-faults.log"`. For each run sum the
+  plan), each with its own log file: `-log "$env:ProgramData\KlouditRecon\$env:USERNAME\t5-plain.log"` (no
+  `RECON_TEST_FAULTS`) and `-log "$env:ProgramData\KlouditRecon\$env:USERNAME\t5-faults.log"`. For each run sum the
   `stream stats` lines' `recovered=` (R) and `recovered_by_key=` (K) in its file:
-  `Select-String "$env:USERPROFILE\Desktop\t5-faults.log" -Pattern 'msg="stream stats"'`; T5 =
+  `Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\t5-faults.log" -Pattern 'msg="stream stats"'`; T5 =
   R / (R + K). Pass:
   T5 >= 0.9 in both runs. Also record the client's `__recon.lastStats` `recovered`,
   `recoveredByKey`, `recoveryDiscarded`, `keyRequests` and the key-request reasons in `__recon.logs`
@@ -3825,7 +3827,7 @@ Hardware checks:
   Bitrate 30 Mbps, constant motion. On the Proxmox node run
   `./netem.sh apply capdrop --ct 210 --host CLIENT_IP`, wait 70 s, `./netem.sh status --ct 210`
   (note T15 and T50, the times of the 15 and 50 Mbit/s steps), `./netem.sh clear --ct 210`. On the
-  PC (with `"logLevel": "debug"`, which logs every rate change): `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|frame queue overflow|stream stats' | Select-Object -Last 80`.
+  PC (with `"logLevel": "debug"`, which logs every rate change): `Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern 'congestion: lowering|bitrate recovery: raising|changing the bitrate in the encoder|frames dropped|frame queue overflow|stream stats' | Select-Object -Last 80`.
   Pass: no `frames dropped why="queue overflow"` (if there is one, record the `frame queue
   overflow` line before it: an `encode_done_span_ms` far under 100 for its 7 frames at 60 fps
   means the encoder delivered them in a burst); `report_owd_p95_ms` of the `stream stats` lines
@@ -4047,7 +4049,7 @@ Verified in the sandbox:
 
 Hardware checks (host.json `"pipeline": "auto"` with recon-encoder.exe next to recon-host.exe
 unless a test says otherwise; overlay Ctrl+Alt+Shift+S; host log
-`$env:APPDATA\KlouditRecon\host.log`; the client's `__recon.lastStats` and `__recon.logs`):
+`$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`; the client's `__recon.lastStats` and `__recon.logs`):
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (T3, wifi: freezes > 100 ms < 1 per 10 min): stream
   hevc_amf_helper at 1920×1080 60 fps, 20 Mbps, adaptive bitrate on, over the relay path (Network
@@ -4548,7 +4550,7 @@ either way and no frame held. `internal/e2e` passed under the shared lock; gofmt
 (Linux, Windows) clean.
 
 Hardware checks (host.json `"pipeline": "auto"` with recon-encoder.exe next to recon-host.exe;
-overlay Ctrl+Alt+Shift+S; host log `$env:APPDATA\KlouditRecon\host.log`; `__recon.lastStats` in
+overlay Ctrl+Alt+Shift+S; host log `$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`; `__recon.lastStats` in
 the browser console):
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (datagram delay behind a video backlog, A/B): direct
@@ -4560,7 +4562,7 @@ the browser console):
   (pings are datagrams that queue behind the video) and `__recon.lastStats.rtt` every few
   seconds, and the host's `stream stats` `window_held` / `window_max_ms`. Then stop recon-host,
   start it with `$env:RECON_TEST_FAULTS='no-window'; & 'C:\Program Files\KlouditRecon\recon-host.exe'
-  -log "$env:APPDATA\KlouditRecon\host.log" run` ("The agent by hand" in the hardware test plan)
+  -log "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" run` ("The agent by hand" in the hardware test plan)
   and repeat. Pass: the round trip during the step with the window at most 60 % of the one
   without (sandbox: 45 vs 112 ms on a 10 ms path), `window_held` > 0 during the step only, no more
   `frame queue overflow` lines than without, and the same received bitrate (overlay Bitrate).
@@ -5009,7 +5011,8 @@ pinned by tests.
   run with `-hold 600s`, end recon-host.exe in Task Manager: SudoVDA removes the monitor within 3
   s and Windows restores the layout by itself; VDD keeps its monitor (the device the run enabled
   stays enabled); then `recon-host.exe vdisplay -hold 1s` prints "restoring the displays after
-  an unfinished virtual display session" (journal in %TEMP%\kloudit-recon-vdisplay-test),
+  an unfinished virtual display session" (journal in the `vdisplay-test` folder of the agent's
+  folder: `%ProgramData%\KlouditRecon\<user>` in an administrator PowerShell),
   disables the VDD device again and leaves the original layout.
   With `-layout only` and VDD, also reboot during the hold: the physical monitor must light up
   at the sign-in screen (nothing saved to the display database).
@@ -5037,7 +5040,8 @@ What changed (session side of 3.7; `internal/host/virtualdisplay.go`, docs/ARCHI
 
 - Agent start (`NewAgent` -> `setupVirtualDisplays`): `vdisplay.New` with the host config's
   policy, layout and linger, the restore journal next to host.json (the folder is created when the
-  policy is not `off`), the host id as the monitor identity, DXGI adapter 0's LUID as render
+  policy is not `off`; an elevated agent's is `%ProgramData%\KlouditRecon\<user>`, since "Final
+  review: host agent, second round"), the host id as the monitor identity, DXGI adapter 0's LUID as render
   adapter; `Recover()` once before any session, whatever the policy (a crashed agent's display is
   put back even after the policy was turned off); one `virtual display policy=... layout=...
   linger=... driver=...` line when the policy is not `off`. `Run` removes a display (a session's,
@@ -5186,7 +5190,7 @@ display), recon-host with recon-encoder.exe next to it, `"virtualDisplay": "auto
 (`install-host.ps1 -InstallVirtualDisplay` sets it); client: a 2560x1440 120 Hz screen, Chrome,
 stream settings Resolution "Native (host display, or this screen on a virtual display)" or "Match this screen",
 Frame rate 120 fps.
-Logs: `$env:APPDATA\KlouditRecon\host.log`; overlay Ctrl+Alt+Shift+S.
+Logs: `$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`; overlay Ctrl+Alt+Shift+S.
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (driver installs): once with the Virtual Display
   Driver (`.\install-host.ps1 -InstallVirtualDisplay`, as in 3.7's install check) and once with
@@ -6076,12 +6080,12 @@ What changed (session side of 3.8; the helper's backend is unchanged):
 On an Intel host (12th gen Core or newer with Iris Xe / UHD 7xx, or an Arc card; Arc and Core
 Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe next to it,
 `install-host.ps1 -InstallLibavcodec` done, host.json `"pipeline": "auto"`; logs in
-`$env:APPDATA\KlouditRecon\host.log`, the stats overlay Ctrl+Alt+Shift+S, the browser's
+`$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`, the stats overlay Ctrl+Alt+Shift+S, the browser's
 `__recon.logs`:
 
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (start-up): restart the
   agent (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`);
-  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'native encoder helper installed' |
+  `Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern 'native encoder helper installed' |
   Select-Object -Last 1` shows `libavcodec="libraries in C:\Program Files\KlouditRecon\ffmpeg-lgpl"`.
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (selection): open a stream
   from Chrome; `Select-String host.log -Pattern 'msg="video pipeline"' | Select-Object -Last 1`
@@ -6107,7 +6111,7 @@ Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe
 - Intel (Iris Xe / Arc): unverified (no Intel host available). Test (losses: an IDR in the
   running encoder, no restart): start the agent for this test only with
   `Stop-ScheduledTask 'KloudIT Recon Host'; $env:RECON_TEST_FAULTS="drop=every:300"; &
-  "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:APPDATA\KlouditRecon\host.log" run`
+  "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" run`
   ("The agent by hand" in the hardware test plan; one dropped frame every 5 s at 60 fps) and
   stream HEVC with constant motion for 2 minutes: every `frames dropped why="test fault"` is
   followed by `forcing a key frame reason="frame lost"`, no `recovering from a loss`, no
@@ -9304,7 +9308,7 @@ by hand logs only to its console: `-log` is the only way to a log file (`cmd/rec
 recipe passed it. The T5 sums of `recovered=` / `recovered_by_key=` over host.log then counted an
 earlier run, or nothing. Fix: "The agent by hand, for a test hook" in the hardware test plan (stop
 the task; an administrator PowerShell; `$env:RECON_TEST_FAULTS`; `recon-host.exe -log
-"$env:APPDATA\KlouditRecon\host.log" run`; Ctrl+C and `Start-ScheduledTask` afterwards), and
+"$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" run`; Ctrl+C and `Start-ScheduledTask` afterwards), and
 every such check refers to it or carries `-log`; T5 gives each of its two runs its own log file
 and sums that.
 
@@ -9520,7 +9524,7 @@ Fix:
 - AMD RDNA3 (RX 7900 XT): unverified. Test, after `recon-host qualify` (seamless policy):
   1. Stream at a 50 Mbit/s setting over a path that carries about 20: Wi-Fi, or
      `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates 20,20,20`.
-  2. After 10 minutes, `(Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern
+  2. After 10 minutes, `(Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern
      'lowering bitrate|raising bitrate|changing the bitrate').Count` is at most about 120 (two
      per 10 s; it was over 3000). The lines carry `suppressed=`, and no `changing the bitrate in
      the encoder` line appears.
@@ -9740,7 +9744,7 @@ period, only on a live-bitrate helper), left as they are.
   host.json and the default log level:
   1. Stream at a 50 Mbit/s setting over a path that carries about 20 (Wi-Fi, or
      `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates 20,20,20`).
-  2. After 10 minutes, `(Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern
+  2. After 10 minutes, `(Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern
      'restarting video|starting encoder|encoder ready').Count` is a handful (the session's start
      and any non-rate restarts), not hundreds; `lowering bitrate|raising bitrate` gives about
      two lines per 10 s.
@@ -10692,4 +10696,65 @@ or revocation closing the session meanwhile keeps its own bye and code.
   reconnect streams again without reloading the page (or, after 6 failed attempts, the browser
   shows Disconnected with a Reconnect button); the dashboard no longer shows the PC as streaming
   while the browser waits.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### The elevated agent writes nothing in folders the user owns
+
+Problem: the logon task runs the agent elevated, but it wrote, rotated (rename to
+`host.log.old`) and appended to `host.log` in `%APPDATA%\KlouditRecon`, and wrote, renamed into
+place, read, applied and deleted the virtual display's restore journal there, a folder the user
+has full control of. Any program the user runs could, while the agent is stopped (a logon race,
+a restart), turn the folder into a junction to `\RPC Control` with object manager symbolic links
+for those names, and the elevated agent would then create, append to, replace or delete files of
+its choosing: the weakness class SECURITY.md already defends for FFmpeg and the helper's
+libraries. The supervisor's own appends to the log had the same problem.
+
+Fix:
+- install-host.ps1 creates `%ProgramData%\KlouditRecon\<user>` (the ProgramData known folder and
+  the account name of the installer's token) with an explicit ACL owned by Administrators:
+  Administrators and SYSTEM full control, the user read (`icacls /reset` first, so no entry an
+  earlier owner added survives; a link is refused), its parent the same with Users read, and the
+  logon task's `-log` points there. uninstall-host.ps1 removes it unless `-KeepConfig`.
+- The agent (`host.CheckAgentDir`): an elevated agent writes its log, also from the supervisor,
+  only when the log's folder passes `platform.AdminOnly` (the check FFmpeg's folder passes);
+  otherwise it prints `log file ... not used: ...` and logs to its console only. The restore
+  journal (`host.AgentFilesDir`, `platform.AgentStateDir`) is in `%ProgramData%\KlouditRecon\<user>`
+  (from the known folder and the process token, not from environment variables) when that folder
+  passes the same check; otherwise there is no journal (`virtual display: no restore journal`
+  while virtual displays are on), and no journal is read, applied or deleted anywhere else, also
+  by `recon-host vdisplay -restore`. `recon-host vdisplay` keeps its test journal in a
+  `vdisplay-test` folder inside the agent's folder. An agent that is not elevated keeps the
+  journal next to host.json, as before.
+- Not changed: host.json and live-bitrate.json are still read from `%APPDATA%\KlouditRecon`, and
+  `recon-host pair` and `recon-host qualify`, which you start yourself, still write there
+  (SECURITY.md says so).
+
+- Verified here: `internal/host` `TestAgentFilesDir` (with the elevation and ACL checks faked: an
+  elevated agent accepts only the admin-only folder, one that is not elevated anywhere) and
+  `TestElevatedRestoreJournal`: an elevated agent with a journal next to host.json neither
+  replays nor deletes it (the startup's recovery and `RestoreVirtualDisplays`) and writes its own
+  in its folder; one in its folder is replayed; without its folder it has none (one warning,
+  the folder not created) and refuses a folder users may change. Before the fix the journal
+  next to host.json was replayed and deleted. Under Wine (whose processes are elevated):
+  `platform.AgentStateDir` returns `C:\ProgramData\KlouditRecon\root` (a throwaway test), and
+  `recon-host.exe -log C:\users\root\AppData\Roaming\KlouditRecon\host.log version` prints
+  `log file ... not used: ...` and logs to the console only. `pwsh` parses both scripts. Not run
+  here: the installer and the ACLs themselves (no Windows).
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test, in an administrator PowerShell
+  after running install-host.ps1 again:
+  1. `icacls "$env:ProgramData\KlouditRecon\$env:USERNAME"` lists only `BUILTIN\Administrators:(OI)(CI)(F)`,
+     `NT AUTHORITY\SYSTEM:(OI)(CI)(F)` and your account with `(OI)(CI)(RX)`, and
+     `(Get-Acl "$env:ProgramData\KlouditRecon\$env:USERNAME").Owner` is `BUILTIN\Administrators`.
+  2. `(Get-ScheduledTask 'KloudIT Recon Host').Actions.Arguments` has `-log
+     "C:\ProgramData\KlouditRecon\<you>\host.log"`; after `Start-ScheduledTask`, that file grows
+     (`connected to gateway`) and nothing new is written to `%APPDATA%\KlouditRecon\host.log`.
+  3. From a PowerShell that is not elevated: `Add-Content
+     "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" x` fails with access denied, and
+     `Get-Content ... -Tail 5` works.
+  4. With `"virtualDisplay": "auto"`: stream at a size the monitor cannot show, end the agent
+     during the stream (`Stop-Process -Name recon-hostw -Force`): `vdisplay-restore.json` is in
+     the ProgramData folder, not next to host.json; `Start-ScheduledTask` restores the layout and
+     deletes it (`restoring the displays after an unfinished virtual display session`).
+  5. Put a file `vdisplay-restore.json` next to host.json (copy the one from step 4 before it is
+     replayed) and restart the agent: it stays there untouched and host.log says nothing about it.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

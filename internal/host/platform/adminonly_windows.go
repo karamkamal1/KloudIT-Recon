@@ -16,6 +16,28 @@ func Elevated() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
 }
 
+// AgentStateDir is the folder an elevated agent writes its own files in
+// besides its log (the virtual display's restore journal):
+// <ProgramData>\KlouditRecon\<user name>, which install-host.ps1 creates for
+// administrators (the user may read it). Both parts come from the system (the
+// known folder, the process token), not from the environment, which the user
+// can change.
+func AgentStateDir() (string, error) {
+	pd, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
+	if err != nil {
+		return "", err
+	}
+	tu, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return "", err
+	}
+	account, _, _, err := tu.User.Sid.LookupAccount("")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(pd, "KlouditRecon", account), nil
+}
+
 // AdminOnly returns an error unless only administrators and the system can
 // change path, a file or folder on a local drive, and what runs from it: path
 // and the folder it is in pass CheckPrivateSD (a folder also with the files

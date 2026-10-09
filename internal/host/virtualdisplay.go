@@ -39,20 +39,27 @@ var newVirtualDisplays = vdisplay.New
 
 // virtualDisplayOptions are the vdisplay.Options of the agent: the host
 // config's, the GPU that renders the virtual display (DXGI adapter 0, where
-// ddagrab captures and the encoders run) and the log. The restore journal's
-// directory is created when the policy may use it.
+// ddagrab captures and the encoders run) and the log. The restore journal is
+// in the agent's own folder (AgentFilesDir: an elevated agent's is one only
+// administrators can change, else the config's), created when the policy may
+// use it.
 func (a *Agent) virtualDisplayOptions() vdisplay.Options {
 	o := a.cfg.virtualDisplayOptions()
 	o.Log = a.log
 	if ad, err := platform.PrimaryAdapter(); err == nil {
 		o.RenderAdapter = ad.LUID
 	}
-	if o.Policy != vdisplay.PolicyOff && o.StateDir != "" {
-		if err := os.MkdirAll(o.StateDir, 0o700); err != nil {
-			a.log.Warn("virtual display: no restore journal (the displays are not put back after a crash)", "dir", o.StateDir, "err", err)
-			o.StateDir = ""
-		}
+	dir, err := AgentFilesDir(a.cfg)
+	if err == nil && dir != "" && o.Policy != vdisplay.PolicyOff && !runsElevated() {
+		err = os.MkdirAll(dir, 0o700)
 	}
+	if err != nil {
+		if o.Policy != vdisplay.PolicyOff {
+			a.log.Warn("virtual display: no restore journal (the displays are not put back after a crash)", "dir", dir, "err", err)
+		}
+		dir = ""
+	}
+	o.StateDir = dir
 	return o
 }
 
@@ -75,12 +82,24 @@ func (a *Agent) setupVirtualDisplays(m *vdisplay.Manager) {
 // RestoreVirtualDisplays puts back the displays a virtual display of an agent
 // with cfg left changed when the agent was stopped without its cleanup (a
 // crash, or a kill: Stop-ScheduledTask and Stop-Process end the windowless
-// agent at once), as the agent's next start would: its restore journal next to
-// the config (vdisplay.Manager.Recover). It reports whether there was one.
-// For "recon-host vdisplay -restore", which uninstall-host.ps1 runs before it
-// deletes the agent and the journal. Stop the agent first.
+// agent at once), as the agent's next start would: its restore journal in the
+// agent's folder (AgentFilesDir; vdisplay.Manager.Recover). It reports whether
+// there was one. For "recon-host vdisplay -restore", which uninstall-host.ps1
+// runs elevated before it deletes the agent and the journal. Stop the agent
+// first. An elevated run without its admin-only folder has nothing to restore
+// (the agent kept no journal) or refuses one it cannot trust.
 func RestoreVirtualDisplays(cfg *Config, log *slog.Logger) (bool, error) {
 	o := cfg.virtualDisplayOptions()
+	dir, err := AgentFilesDir(cfg)
+	if err != nil {
+		if sd, serr := elevatedStateDir(); serr == nil {
+			if _, serr := os.Stat(sd); errors.Is(serr, os.ErrNotExist) {
+				return false, nil
+			}
+		}
+		return false, err
+	}
+	o.StateDir = dir
 	if o.StateDir == "" {
 		return false, nil
 	}

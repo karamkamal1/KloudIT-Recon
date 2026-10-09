@@ -185,6 +185,23 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   entries, and no part is a link. A configured path that fails is ignored for the default
   (`host config "ffmpeg" ignored` in host.log); without an elevated token (a standard user's
   agent) nothing is checked, since nothing is gained.
+- For the same reason the elevated agent writes no file in a folder the user can change: there,
+  any program the user runs could turn the folder or its files into links (a junction to
+  `\RPC Control` and object manager symbolic links) that make the elevated agent create, append
+  to, replace or delete files anywhere. Its log (`host.log`, its rotation to `host.log.old`, and
+  the supervisor's appends) and the virtual display's restore journal (`vdisplay-restore.json`,
+  written, renamed into place, read and deleted at every start) live in
+  `%ProgramData%\KlouditRecon\<user>`, which install-host.ps1 creates with an explicit ACL owned
+  by Administrators (Administrators and SYSTEM full control, the user read; the parent folder the
+  same with Users read). The agent writes there only while the check above passes for that
+  folder; otherwise it writes no log file (`log file ... not used` on its console) and keeps no
+  restore journal (`virtual display: no restore journal` in host.log), and it neither reads nor
+  deletes a journal from anywhere else. It finds that folder from the system (the ProgramData
+  known folder and the account of its token), not from environment variables, which the user
+  sets. From `%APPDATA%\KlouditRecon` it only reads `host.json` and `live-bitrate.json`. Two
+  commands you start yourself still write there: `recon-host pair` (host.json; the installer
+  runs it elevated once with `-PairingCode`) and `recon-host qualify` (`live-bitrate.json`, and
+  its working files in `%TEMP%`); run them from a PowerShell that is not elevated where you can.
 
 ## Gateway hardening (systemd)
 

@@ -964,8 +964,9 @@ the Virtual Display Driver; `internal/host/vdisplay`, session side in
   restarted on the physical monitor (notice), without creating another. A generation being built
   when the display is no longer listed (an FFmpeg restart) removes it first, then captures the
   monitor where the restore put it. Agent shutdown (`Run` returning) removes it; after a crash or
-  power loss the next agent start replays the restore journal (`vdisplay-restore.json` next to
-  host.json) before any session. One virtual display exists at a time: a new session that takes over a running
+  power loss the next agent start replays the restore journal (`vdisplay-restore.json` in the
+  agent's folder: for the elevated logon task's agent `%ProgramData%\KlouditRecon\<user>`, which
+  only administrators can change, else next to host.json) before any session. One virtual display exists at a time: a new session that takes over a running
   one reuses or replaces it, and the replaced session's end leaves it alone.
 - **Not used** for the test pattern, x11grab and window captures. Decisions are logged once per
   session or change (`virtual display not used reason=...`, `streaming a virtual display ...`,

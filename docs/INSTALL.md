@@ -279,12 +279,16 @@ PC's card then shows **Online**.
 | `recon-host.exe not found next to this script` | The folder is incomplete. Extract the host zip again (step 1). |
 | `winget not found` | Update *App Installer* from the Microsoft Store, or install ViGEmBus from <https://github.com/nefarius/ViGEmBus/releases>. |
 
-The agent writes its log to `%APPDATA%\KlouditRecon\host.log`. Past 20 MB it moves it to
-`host.log.old` (replacing the one before) and starts a new one, also while it runs. The logon
-task runs the agent in a child process (`recon-host -restart`, so two `recon-hostw.exe` show in
-Task Manager) and starts it again when it crashes or fails to start, after 1 second, then up to
-a minute apart: `host.log` then says `agent exited, starting it again`, after the crash's trace
-(`panic:` or `fatal error:`). Please report that trace. `Stop-ScheduledTask` stops both.
+The agent writes its log to `%ProgramData%\KlouditRecon\<your user name>\host.log`, a folder
+the installer gives to administrators, with read access for you: the logon task runs the agent
+elevated, and it writes nothing in folders you own (docs/SECURITY.md, Host-side safety; earlier
+versions wrote `%APPDATA%\KlouditRecon\host.log`, which stays until you delete it). Past 20 MB
+it moves it to `host.log.old` (replacing the one before) and starts a new one, also while it
+runs. The logon task runs the agent in a child process (`recon-host -restart`, so two
+`recon-hostw.exe` show in Task Manager) and starts it again when it crashes or fails to start,
+after 1 second, then up to a minute apart: `host.log` then says `agent exited, starting it
+again`, after the crash's trace (`panic:` or `fatal error:`). Please report that trace.
+`Stop-ScheduledTask` stops both.
 
 ## 8. Play
 
@@ -456,7 +460,7 @@ in the bundle). Check these once:
 | Proxmox node | `pct exec 210 -- systemctl status recon-gateway` | Is the gateway running? |
 | Proxmox node | `pct exec 210 -- journalctl -u recon-gateway -n 50 --no-pager` | Gateway log |
 | Proxmox node | `pct enter 210` | Shell inside the container (it has no root password) |
-| PC | `Get-Content "$env:APPDATA\KlouditRecon\host.log" -Tail 30` | Agent log |
+| PC | `Get-Content "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Tail 30` | Agent log |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), the native encoder helper's backend and codecs (`helper:`), monitors, controllers |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 70 min on AMD, 25 on NVIDIA; `-quality balanced` a third of that; no stream running); sessions use the results (`live-bitrate.json`) |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
