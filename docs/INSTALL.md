@@ -303,6 +303,16 @@ set `"pipeline": "ffmpeg"` in `%APPDATA%\KlouditRecon\host.json` and restart the
 then use FFmpeg only. Please report what happened, with `host.log`. Delete the line again to go
 back.
 
+**On the PC, for the best results** (GUIDE section 12):
+
+- **AMD**: a current Adrenalin driver. In AMD Software turn off **Instant Replay** and
+  **Record & Stream** (they also use the GPU's video encoder), **Radeon Chill** and **Radeon
+  Boost** (they lower the frame rate or the resolution under you) while you stream.
+- **NVIDIA**: a current driver (570 or newer); turn off **Instant Replay** in the NVIDIA App.
+- **Both**: Windows **Settings → System → Power & battery → Power mode: Best performance**;
+  play games in **borderless** (windowed) fullscreen; leave some video memory free (the encoder
+  needs it); connect the PC by cable.
+
 ## 9. Playing away from home
 
 The recommended setup is **Tailscale**: free, nothing exposed to the internet, and UDP keeps

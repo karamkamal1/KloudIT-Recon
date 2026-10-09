@@ -15,6 +15,82 @@ Status legend:
 - **unverified**: not yet run on that hardware; the line gives the test to run.
 - **failed**: run on the named hardware and did not pass; the line says what happened.
 
+## Hardware test plan (start here)
+
+The sections after this one follow the order in which the steps were built, and each lists its
+own checks. Some early checks describe behaviour that later steps replaced: they are marked
+**Superseded** (run the newer check named there) or **FFmpeg path only** (run them with
+`"pipeline": "ffmpeg"`). This plan is the order to run everything on the RX 7900 XT, and on an
+NVIDIA host when there is one: each stage needs the ones before it. Use the default `host.json`
+unless a stage says otherwise, edit it with the agent stopped or restart the agent afterwards
+(`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`), and put
+it back after the stage. `"logLevel": "debug"` adds the debug lines some checks read (`ffmpeg
+args`, `rate report decision`, `congestion: bitrate kept`). Record each result in its check's
+line (status legend above), with the driver and Chrome versions. NVIDIA runs the same stages
+with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
+
+0. **Host setup** (GUIDE 12; INSTALL.md step 8, "On the PC, for the best results"): current
+   Adrenalin; Instant Replay, Record & Stream, Radeon Chill and Radeon Boost off; Windows power
+   mode Best performance; games in borderless fullscreen; the PC wired. The gateway as INSTALL.md
+   steps 2-5 build it (container 210), `netem.sh` on the Proxmox node (0.4), a client with a
+   120 Hz screen and current Chrome (also Edge, Firefox and Safari for T10).
+1. **Install and probe** (INSTALL.md steps 6-7): the installer's `Detected capabilities` show
+   `encoder:    hevc_amf ...` (1.1) and `helper:     amf    hevc,av1,h264 ...` with no
+   warning ("Final review: deploy and install", helper probe). Checks: 1.1 (probe), 1.8.
+2. **The helper by itself**: `recon-encoder.exe --print-caps --backend=amf` and the self-tests
+   (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
+   3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
+   (not its first two `--print-caps` checks: superseded).
+3. **Qualify** (T7): `recon-host.exe qualify` with no stream running, about 70 minutes (3.6).
+   Streams use its `live-bitrate.json`, so run it before stages 5-7, and again after a driver
+   update.
+4. **Basic streams on the helper**: HEVC, then AV1 (2560x1440; at 1920x1080 RDNA3 needs 64x16
+   alignment: 1.7, T9), then H.264, from a game: the overlay's Encoder row reads
+   `hevc_amf_helper` and host.log `video pipeline pipeline=helper backend=amf`. Checks: 3.1b,
+   3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
+   4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
+   upscaling). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
+   Sunshine for the comparison), T2 with the 0.3 rig.
+5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
+   (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
+   `· datagrams + FEC`).
+6. **Rate control**: 2.1, 2.2 (T6 under `capdrop`; its frame-rate ladder check), 2.6 (the UDP
+   relay), 2.7 (send priorities), with `"logLevel": "debug"`. 1.5's checks are superseded by
+   2.2.
+7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
+   before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
+   re-encode, slice output).
+8. **Virtual display and HDR**: 3.7 and 3.7 wiring (with the Virtual Display Driver, then
+   SudoVDA); 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode).
+9. **Soak (T8) on the default pipeline**:
+   - AMD RDNA3 (RX 7900 XT): unverified. Test: default host.json (after stage 3), a GPU-bound
+     game at 2560x1440 120 fps, HEVC, 50 Mbit/s, on `lan` (direct path), one stream for 2 hours.
+     Pass: no driver timeout (Event Viewer > Windows Logs > System: no Display event 4101, no
+     WHEA errors); host.log has no `encoder helper failed`, `encoder helper error` or
+     `video pipeline pipeline=ffmpeg ... was=helper` line, and its `stream stats` fps stays
+     steady to the end; the overlay's Freezes count does not grow steadily; the working set of
+     `Get-Process recon-encoder,recon-host | Select-Object Name,WS` at 2 hours is within about
+     10 % of its value at 10 minutes. Record the Adrenalin version.
+   - NVIDIA: unverified (no NVIDIA host available). Test: the same with HEVC on NVENC, once with
+     hardware-accelerated GPU scheduling on and once off (1.3).
+10. **The FFmpeg fallback** (`"pipeline": "ffmpeg"`): the checks marked FFmpeg path only (1.2,
+   1.4, the 1.3 soak), 1.6 (AMD Direct Capture through FFmpeg), and one stream per codec.
+
+Acceptance matrix (GUIDE 13), per vendor, on the default pipeline unless noted:
+
+| Test | What | Where |
+|---|---|---|
+| T1 | capture→drawn p50/p95 on `lan`, against Moonlight | 0.2 (10-minute latency test), stage 4 |
+| T2 | click-to-photon median at 120 Hz on `lan` | 0.3 (the rig) |
+| T3 | freezes over 100 ms per 10 min on `wifi` < 1 | 2.3 |
+| T4 | encoder restarts per 30 min = 0 | 2.3 |
+| T5 | losses recovered without a key frame on `wifi` ≥ 90 % | 3.5 |
+| T6 | bitrate back after the `capdrop` dip within 10 s, no queue overflow | 2.2 |
+| T7 | live bitrate qualification per codec and rate-control mode | 3.6 (`recon-host qualify`) |
+| T8 | 2-hour GPU-bound soak: no hang, no memory growth | stage 9 above (the helper); 1.3 (FFmpeg) |
+| T9 | AV1 at 1080p on RDNA3: HEVC instead, or no padding | 1.7 |
+| T10 | browser matrix Chrome / Edge / Firefox / Safari 26.4 | 2.7, 4.3, 4.4 |
+
 ## 0.1 Per-stage timestamps
 
 Verified in the sandbox:
@@ -485,6 +561,11 @@ Verified in the sandbox (Linux, no GPU, no Windows):
   (`TestHelperRejectsOversizedRequests`).
 
 Hardware / real Windows checks:
+- **Superseded (3.3, 3.4):** the two `--print-caps` checks right below were written before the
+  encoder backends existed; a correct build now reports `"backend":"amf"` (`"nvenc"`) with its
+  codecs instead of `"none"` and "not implemented yet". Run 3.3's (AMD) and 3.4's (NVIDIA)
+  `--print-caps` checks instead, or `recon-host.exe probe` (its `helper:` lines, "Final review:
+  deploy and install"). The integration-test checks after them still apply.
 - AMD RDNA3 (RX 7900 XT): unverified. Test: copy dist/windows/recon-encoder.exe to the
   host and run `recon-encoder.exe --print-caps`; expect `"vendor":"amd"`, a non-empty
   `adapterLuid`/`adapterName` for the Radeon, `"backend":"none"` (no encoder yet), and
@@ -952,6 +1033,10 @@ Verified in the sandbox:
 
 Hardware checks:
 
+- **FFmpeg path only:** these checks need `"pipeline": "ffmpeg"` in host.json (restart the
+  agent; remove it afterwards). With the default `auto` the native helper streams, and it
+  answers drops with reference recovery (3.5, 2.3), not with plain skipping or a key frame.
+
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (VERIFY, Chrome hardware decoder accepts a P-frame
   after a skipped frame, client GPU = the RX 7900 XT, or any RDNA3 client) on the client open
   `chrome://gpu` and note the Video Acceleration decode rows for H.264, HEVC and AV1. Stream from
@@ -1145,6 +1230,14 @@ Verified in the sandbox:
   expected for AV1 above.
 
 Hardware checks:
+
+- **FFmpeg path only:** the stream checks below (`encoder ready ... recovery=skip`, the overlay's
+  "Loss recovery: skip frame (intra refresh)") are for FFmpeg's `hevc_nvenc` / `h264_nvenc` and
+  need `"pipeline": "ffmpeg"` in host.json (restart the agent; remove it afterwards). With the
+  default `auto` and recon-encoder.exe installed, NVIDIA sessions stream on the helper's NVENC:
+  recovery `invalidate` (reference invalidation, 3.4 and 3.5), no `recovery=` field in its
+  `encoder ready` line, and a correct build fails these checks there. The probe check (first
+  item) applies to both.
 
 - NVIDIA: unverified (no NVIDIA host available). Test: (probe) on an NVIDIA host (RTX 20/30/40/50)
   run `& 'C:\Program Files\KlouditRecon\recon-host.exe' probe`. Expect
@@ -1374,6 +1467,12 @@ Verified in the sandbox:
 
 Hardware checks:
 
+- **Superseded by 2.2:** the checks of this section test the interim controller of 1.5 (raises of
+  at most 1.15× at least 10 s apart, each a `restarting video reason="bitrate recovery"`, the
+  15000 → 17250 → 19837 → 20000 and 20 → 15 → 11.25 sequences). Step 2.2 replaced it (continuous
+  raises of 5-25 %/s, changes in the running encoder on the helper): a correct build fails
+  these criteria, on either pipeline. Run 2.2's capdrop acceptance (T6) and switch checks
+  instead; they record the same measurements. Kept for the record of what 1.5 measured.
 - AMD RDNA3 (RX 7900 XT): unverified. Test: (acceptance, capdrop: bitrate back within 15 % of
   the setting 60 s after capacity returns, no freeze over 100 ms at the switches) Gateway in
   container 210 on the Proxmox node, client `CLIENT_IP` on wired LAN. In the browser set Stream
@@ -1571,31 +1670,31 @@ Hardware checks:
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (applied class): agent started by the logon task
   (elevated), default config: at startup the host log has `gpu adapter 0 adapter=amd name="AMD
-  Radeon RX 7900 XT" hags=<on|off> hags_from=kernel`, with hags matching Settings → System →
-  Display → Graphics → Change default graphics settings → Hardware-accelerated GPU scheduling
-  (record it; `hags_from=registry` means the kernel query failed: record its `err=`); when a stream
-  starts, `gpu priority: realtime vendor=amd adapter=amd hags=<on|off> mode=auto` and the
-  PowerShell readback shows class 5 for ffmpeg; with
-  `"gpuPriority": "high"` → `high` and class 4; with `"off"` → `gpu priority: off` and class 2
-  (restart the agent after each edit of `host.json`). Then stop the task and run
-  `recon-host.exe run` from a non-elevated PowerShell: record the startup line
+  Radeon RX 7900 XT" hags=<on|off> hags_from=kernel`, with hags matching Settings → System → Display
+  → Graphics → Change default graphics settings → Hardware-accelerated GPU scheduling (record it;
+  `hags_from=registry` means the kernel query failed: record its `err=`); when a stream starts, `gpu
+  priority: realtime vendor=amd adapter=amd hags=<on|off> mode=auto` and the PowerShell readback
+  shows class 5 for ffmpeg; with `"gpuPriority": "high"` → `high` and class 4; with `"off"` → `gpu
+  priority: off` and class 2 (restart the agent after each edit of `host.json`). Then stop the task
+  and run `recon-host.exe run` from a non-elevated PowerShell: record the startup line
   "SeIncreaseBasePriorityPrivilege not enabled …" and what `gpu priority:` and the readback show
   (expected `high … realtime_refused=…` and class 4 if the kernel requires the privilege for
-  REALTIME). Test (A/B under GPU load): `"encoder": "hevc_amf"`, `"capture": "ddagrab"`,
-  2560×1440, 60 fps, 30 Mbit/s, Chrome on a wired LAN client, overlay open, the GPU-bound load
-  running. Four 5-minute runs in the order off, auto, off, auto (`"gpuPriority"`; restart the agent
-  between runs, keep the load running): for each record the snippet's output, the overlay's
-  capture→encoded p50/p95/p99, the host log's `stream stats` fps over the run and the game's fps
-  (in-game counter or PresentMon). Pass: with auto, capture→encoded p95 and both interval jitter
-  p95 values are lower than with off in both pairs, and the stream fps is closer to 60; record the
-  game's fps cost. Repeat one off/auto pair with `av1_amf` (2560×1440) and with `h264_amf`.
-  Test (soak): `"gpuPriority": "auto"` (REALTIME), `hevc_amf`, 2560×1440 at 60 fps, the
-  GPU-bound load looping, one stream for 2 hours. Pass: no driver timeout (Event Viewer →
-  Windows Logs → System: no Display event 4101 "amdkmdag stopped responding", no WHEA errors), no
-  `encoder … exited` in the host log, `stream stats` fps steady to the end, the overlay's Frames
-  dropped not growing steadily, and the working set of ffmpeg.exe and recon-host.exe
-  (`Get-Process ffmpeg,recon-host | Select-Object Name,WS`) at 2 hours within about 10 % of the
-  value at 10 minutes. Record the Adrenalin version.
+  REALTIME). Test (A/B under GPU load): `"encoder": "hevc_amf"`, `"capture": "ddagrab"`, 2560×1440,
+  60 fps, 30 Mbit/s, Chrome on a wired LAN client, overlay open, the GPU-bound load running. Four
+  5-minute runs in the order off, auto, off, auto (`"gpuPriority"`; restart the agent between runs,
+  keep the load running): for each record the snippet's output, the overlay's capture→encoded
+  p50/p95/p99, the host log's `stream stats` fps over the run and the game's fps (in-game counter or
+  PresentMon). Pass: with auto, capture→encoded p95 and both interval jitter p95 values are lower
+  than with off in both pairs, and the stream fps is closer to 60; record the game's fps cost.
+  Repeat one off/auto pair with `av1_amf` (2560×1440) and with `h264_amf`. Test (soak, FFmpeg path:
+  `"pipeline": "ffmpeg"`; the helper's soak, the default pipeline, is stage 9 of the test plan at
+  the top): `"gpuPriority": "auto"` (REALTIME), `hevc_amf`, 2560×1440 at 60 fps, the GPU-bound load
+  looping, one stream for 2 hours. Pass: no driver timeout (Event Viewer → Windows Logs → System: no
+  Display event 4101 "amdkmdag stopped responding", no WHEA errors), no `encoder … exited` in the
+  host log, `stream stats` fps steady to the end, the overlay's Frames dropped not growing steadily,
+  and the working set of ffmpeg.exe and recon-host.exe (`Get-Process ffmpeg,recon-host |
+  Select-Object Name,WS`) at 2 hours within about 10 % of the value at 10 minutes. Record the
+  Adrenalin version.
 - NVIDIA: unverified (no NVIDIA host available). Test: the AMD tests with `hevc_nvenc` (A/B pair
   also with `h264_nvenc`, and `av1_nvenc` on RTX 40 and newer), once with HAGS on and once with it
   off (Settings → System → Display → Graphics → Change default graphics settings →
@@ -3660,9 +3759,13 @@ Hardware checks:
   margin), `loss_pct` and `report_owd_p95_ms`.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (frame-rate ladder, helper `setRate fps`): HEVC
   2560×1440 120 fps at 10 Mbps, `./netem.sh apply capdrop --ct 210 --host CLIENT_IP --rates
-  50,2,50`. Pass: `congestion: lowering bitrate from=2000 to=2000 ... fps=90`, then `fps=60`, the
-  client's overlay frame rate follows (`rate` messages), and after the step the frame rate goes
-  back up (90, then 120, 5 s apart) with the bitrate.
+  50,2,50`. Pass on the helper (AMF's `liveFps` seamless, the fine ladder of Phase 5 wiring A):
+  `congestion: lowering bitrate from=2000 to=2000 ... fps=100`, then 90, 75, 60 at least 2 s
+  apart, the client's overlay frame rate follows (`rate` messages), and after the step the frame
+  rate goes back up a step per 2 s (75, 90, 100, 120) with the bitrate. With `"pipeline":
+  "ffmpeg"` (or a helper whose `liveFps` is not seamless) the coarse rungs instead: `fps=90`, then
+  `fps=60`, back up 90 then 120, 5 s apart. (Corrected in the final review: this check first
+  gave the coarse rungs for the helper.)
 - AMD RDNA3 (RX 7900 XT): unverified. Test (media vs reno, latency cost of pacing): on `lan`,
   10 minutes each with `"congestion": "media"` (the default) and `"congestion": "reno"` in
   host.json; compare the overlay's capture→drawn p50/p95 and the `queue` stage (key frames are
@@ -7119,7 +7222,8 @@ source):
   (the path is the same: ViGEmBus, XInput, the browser; the GPU plays no part).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (Opus frames and jitter buffer on real links): with the
   host wired, stream from a Windows client on wired LAN, then on Wi-Fi, then through the netem
-  `wan` profile (`make netem PROFILE=wan`, docs/NETEM.md), 2 minutes each with music playing on
+  `wan` profile (`./netem.sh apply wan --ct 210 --host CLIENT_IP` on the Proxmox node with Network
+  path "Relay via gateway", 0.4), 2 minutes each with music playing on
   the host. Expected: host.log `audio capture packet ms=10 frames=480 source=wasapi-loopback`
   at each audio start (the WASAPI packet size: frames per GetBuffer, one engine period; record
   it), and therefore no `audio frame size ... ms=5` line on any link (5 ms frames only with
@@ -7885,8 +7989,9 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (SVC in a session): host.json default (`svc` auto),
   `pipeline` auto, a current Chrome; connect and play a game. host.log `encoder helper started
-  ... svc_layers=2 live_fps=seamless` (else the `temporal SVC not used` reason). Apply
-  `make netem PROFILE=capdrop` (docs/NETEM.md) for a minute: host.log has `thinning: leaving
+  ... svc_layers=2 live_fps=seamless` (else the `temporal SVC not used` reason). With Network
+  path "Relay via gateway", apply `./netem.sh apply capdrop --ct 210 --host CLIENT_IP` on the
+  Proxmox node (0.4) and `./netem.sh clear --ct 210` after a minute: host.log has `thinning: leaving
   out discardable frames under congestion why=delay|queue|deadline` episodes and `thinning
   ended frames=N`, `stream stats thinned=` > 0; the overlay's "Frames dropped" row shows
   "thinned N" rising, its dropped count and "key req" not rising for them, no "Loss recovery"
@@ -7911,17 +8016,19 @@ and no frame references it. Its caps now say `maxTemporalLayers` 2.
   frame whose predecessor in decode order was left out: then set `svc` `off` on that host and
   report it.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (FPS before resolution, no IDR): 120 fps stream at
-  `bitrate` 2500 (the floor 2000 is then close), `make netem PROFILE=capdrop` with the low
-  step at 1.5 Mbit/s: host.log `congestion: lowering bitrate ... fps=100`, then 90, 75, 60 at
-  least 2 s apart (the default `fpsFloor`, 60), `changing the bitrate in the encoder ... fps=N`;
-  the helper's log has no `the frame-rate change at frame N made a key frame`; the overlay's
-  key-frame count does not rise and the frame rate follows; once capacity returns the frame rate
-  climbs back 2 s per step. With `fpsFloor` 30 it goes on to 50, 45, 30, also 2 s apart. Per
-  codec.
+  `bitrate` 2500 (the floor 2000 is then close), Network path "Relay via gateway", `./netem.sh apply
+  capdrop --ct 210 --host CLIENT_IP --rates 50,1,50` on the Proxmox node (netem.sh takes whole
+  Mbit/s: the low step at 1 Mbit/s, below the floor): host.log `congestion: lowering bitrate ...
+  fps=100`, then 90, 75, 60 at least 2 s apart (the default `fpsFloor`, 60), `changing the bitrate
+  in the encoder ... fps=N`; the helper's log has no `the frame-rate change at frame N made a key
+  frame`; the overlay's key-frame count does not rise and the frame rate follows; once capacity
+  returns the frame rate climbs back 2 s per step. With `fpsFloor` 30 it goes on to 50, 45, 30, also
+  2 s apart. Per codec.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with NVENC (reconfigure with
   `frameRateNum`, `forceIDR` 0): no key frame at any step.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (static desktop bitrate): 30000 kbit/s setting,
-  `capture` dda, an idle desktop with Notepad's caret blinking: within about 2 s host.log
+  `"capture": "ddagrab"` (the helper's DDA; the default `auto` does the same), an idle desktop
+  with Notepad's caret blinking: within about 2 s host.log
   `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`, the overlay's
   Mbps drops (bytes on the wire) and the helper's stats report kbps 7500 (debug log); then drag
   a window: `desktop changes: full bitrate back kbps=30000` on the first changed frame; take a
@@ -8037,12 +8144,13 @@ thinning under load could take one of them), as in the scenarios before Phase 5.
   while a key frame is awaited already is no loss) and, where the CPUs had nothing to spare,
   accepts 10 fps instead of 30.
 - HDR10 and temporal SVC are both decided from the caps and go in the same `start` (`hdr`,
-  `svcLayers` 2); nothing here refuses the pair, but no HDR10 stream with two temporal layers
-  has run on hardware. Hardware check (AMD RDNA3, NVIDIA): unverified. Test: an HDR10 session
-  (docs 3.9/4.5) with `svc` auto: host.log `encoder helper started ... svc_layers=2 ... hdr=true`;
-  under congestion (`make netem PROFILE=capdrop`) `thinning: leaving out ...` episodes, and the
-  HDR picture stays correct through them (no corruption after an episode). The libavcodec backend
-  (3.8) has one temporal layer (`temporal SVC not used`), so its streams are never thinned.
+  `svcLayers` 2); nothing here refuses the pair, but no HDR10 stream with two temporal layers has
+  run on hardware. Hardware check (AMD RDNA3, NVIDIA): unverified. Test: an HDR10 session (docs
+  3.9/4.5) with `svc` auto: host.log `encoder helper started ... svc_layers=2 ... hdr=true`; under
+  congestion (`./netem.sh apply capdrop --ct 210 --host CLIENT_IP`, 0.4) `thinning: leaving out ...`
+  episodes, and the HDR picture stays correct through them (no corruption after an episode). The
+  libavcodec backend (3.8) has one temporal layer (`temporal SVC not used`), so its streams are
+  never thinned.
 - Merge fixes for signature changes on the other side: `qualify_test.go` (3.8 wiring) calls
   `IntraRefreshFrames(codec, fps, 0)`; `helper_windows_test.go` calls `SetRate(kbps, fps, 0)`;
   the Phase 5 Windows session tests' mock launcher takes 3.8 wiring's backend argument.
@@ -8966,3 +9074,27 @@ frame streams instead (`"fec": "off"`, or the browser's Video over datagrams set
   datagrams + FEC` and host.log `video transport mode="datagram + FEC"`; `./netem.sh clear --ct
   210`: within about 30 s (the minimum round trip's window) the suffix goes again.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### README, INSTALL and the hardware test plan
+
+Problem: README's feature list and diagram described only the FFmpeg pipeline (key-frame or
+skip recovery, encoder restarts for bitrate changes, 120 → 90 → 60), its host.json table had no
+`logLevel`, and `make release` was presented as equal to the CI bundles although it packages the
+mingw helper without Windows.Graphics.Capture; INSTALL.md's Upgrading section had none of the
+user-visible changes (relay ports, the helper, `qualify`), and its bundle listing missed
+`recon-encoder.exe`. This file had no ordered test plan: early checks that later steps replaced
+read like current ones, some commands failed as written (`make netem PROFILE=...` without a
+device, `--rates` with 1.5, `capture` `dda`), and T1, T7 and T8 were never named. Fix: the README
+overview names the helper first and FFmpeg as the fallback, with the right recovery, rate change
+and frame-rate ladder; a `logLevel` row; the self-built bundle's difference. INSTALL.md: upgrade
+checklist, bundle listing, the host setup list of GUIDE 12. Here: "Hardware test plan" at the
+top, superseded and FFmpeg-only markers on 3.1, 1.2, 1.4, 1.5 and the 1.3 soak, the 2.2
+frame-rate check corrected to the helper's fine ladder, the netem commands and `capture` value
+fixed.
+
+- Verified here: the corrected commands parse (`netem.sh apply capdrop --ct 210 --host
+  192.0.2.1 --rates 50,1,50 --dry-run` prints its tc commands); the fine ladder and its 2 s hold
+  are `encoder.FPSSteps` and `fpsHoldLive` in `internal/host/bitrate.go`; the README diagram's
+  box lines are the same width.
+- AMD RDNA3 (RX 7900 XT): unverified; this is the plan for running the checks.
+- NVIDIA: unverified (no NVIDIA host available); likewise.
