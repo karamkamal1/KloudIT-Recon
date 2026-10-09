@@ -17,9 +17,9 @@ import (
 
 // TestROIFocus: what each host config "roi" mode asks for from the pointer
 // input (absolute positions: the pointer; relative motion, pointer lock: the
-// centre), and when it goes to the pipeline: at once the first time, then
-// only for another kind of focus or a pointer that moved by more than
-// roiMove, at most every roiInterval.
+// host's pointer while it shows, else the centre), and when it goes to the
+// pipeline: at once the first time, then only for another kind of focus or a
+// pointer that moved by more than roiMove, at most every roiInterval.
 func TestROIFocus(t *testing.T) {
 	t0 := time.Unix(1_000_000, 0)
 	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
@@ -29,6 +29,8 @@ func TestROIFocus(t *testing.T) {
 		ms       int
 		abs, rel bool   // input at ms before the tick
 		x, y     uint16 // abs position
+		shown    bool   // the host's pointer shows at hx, hy (polled each tick)
+		hx, hy   uint16
 		want     *media.Focus
 	}
 	none := media.Focus{}
@@ -47,13 +49,24 @@ func TestROIFocus(t *testing.T) {
 			{ms: 900, rel: true, want: nil},                                                                    // still the centre
 			{ms: 1000, abs: true, x: 0, y: 0, want: ptr(pointer(0, 0))},                                        // back to the desktop
 		}},
+		{"auto", []step{ // pointer lock with the host's pointer showing (a menu, a strategy game)
+			{ms: 0, rel: true, shown: true, hx: 1000, hy: 60000, want: ptr(pointer(1000, 60000))},
+			{ms: 100, rel: true, shown: true, hx: 1000 + roiMove, hy: 60000, want: nil}, // within the square
+			{ms: 200, rel: true, shown: true, hx: 30000, hy: 60000, want: ptr(pointer(30000, 60000))},
+			{ms: 300, rel: true, want: ptr(center)},                                                       // the game hides it: a crosshair
+			{ms: 400, rel: true, shown: true, hx: 30000, hy: 60000, want: ptr(pointer(30000, 60000))},     // a menu again
+			{ms: 500, abs: true, x: 5, y: 5, shown: true, hx: 30000, hy: 60000, want: ptr(pointer(5, 5))}, // desktop mode: the client's position
+			{ms: 600, shown: true, hx: 60000, hy: 60000, want: nil},                                       // the host's pointer counts under pointer lock only
+		}},
 		{"", []step{ // "" is auto
 			{ms: 0, rel: true, want: ptr(center)},
 		}},
 		{"cursor", []step{
 			{ms: 0, rel: true, want: nil}, // no pointer position yet
 			{ms: 10, abs: true, x: 100, y: 200, want: ptr(pointer(100, 200))},
-			{ms: 500, rel: true, want: nil}, // relative motion: the pointer square stays
+			{ms: 500, rel: true, want: nil},                                                       // relative motion: the pointer square stays
+			{ms: 600, rel: true, shown: true, hx: 40000, hy: 200, want: ptr(pointer(40000, 200))}, // the host's pointer shows
+			{ms: 700, rel: true, want: nil},                                                       // hidden again: it stays
 		}},
 		{"center", []step{
 			{ms: 0, want: ptr(center)},
@@ -72,6 +85,7 @@ func TestROIFocus(t *testing.T) {
 			case s.rel:
 				r.pointerRel(at(s.ms))
 			}
+			r.hostCursor(s.shown, s.hx, s.hy) // as roiTick polls it
 			f, ok := r.next(at(s.ms))
 			if ok != (s.want != nil) || ok && f != *s.want {
 				t.Fatalf("mode %q step %d (%d ms): %+v %v, want %+v", c.mode, i, s.ms, f, ok, s.want)
@@ -90,19 +104,34 @@ func TestROIFocus(t *testing.T) {
 		t.Fatalf("off after the centre: %+v %v, want the regions cleared", f, ok)
 	}
 	// A burst of pointer events (1000 per second, each far from the last)
-	// polled every 10 ms reaches the pipeline at most every roiInterval.
+	// reaches the pipeline once per roiLoop tick, every roiInterval: ticks
+	// that jitter (one 4 ms late, the next on time, the time.Now() roiLoop
+	// reads) take every change, and polls between ticks (every 10 ms, up to
+	// 80 ms after one) none.
 	r = &roiFocus{mode: settingAuto}
-	sent := 0
+	sent, ticks := 0, 0
 	for ms := 0; ms < 1000; ms++ {
 		r.pointerAbs(uint16(ms*7919%65536), 100, at(ms)) // jumps across the picture
-		if ms%10 == 0 {
-			if _, ok := r.next(at(ms)); ok {
-				sent++
+		tick := ms%100 == 4*((ms/100)%2)                 // 0, 104, 200, 304, ...
+		if !tick && (ms%10 != 0 || ms%100 < 10 || ms%100 > 80) {
+			continue
+		}
+		_, ok := r.next(at(ms))
+		switch {
+		case tick:
+			ticks++
+			if !ok {
+				t.Fatalf("tick at %d ms: the moved pointer waits a tick", ms)
 			}
+		case ok:
+			t.Fatalf("poll at %d ms between ticks: focus handed over", ms)
+		}
+		if ok {
+			sent++
 		}
 	}
-	if sent < 9 || sent > 10 {
-		t.Fatalf("%d focus changes in a second of pointer events, want at most %d", sent, time.Second/roiInterval)
+	if sent < 9 || sent > 10 || ticks != 10 {
+		t.Fatalf("%d focus changes in a second of pointer events (%d ticks), want at most %d", sent, ticks, time.Second/roiInterval)
 	}
 }
 

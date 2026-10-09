@@ -562,21 +562,24 @@ apply.
 `HelperVideo.SetFocus` / `encoderOptions`). Where the helper's encoder has a region of interest
 map (caps `roi` `importance`: AMF `ROI_DATA`, 64x64 blocks, H.264 16x16; `emphasis`: NVENC's QP
 delta map beside spatial AQ, since NVENC's emphasis map proper is H.264-only and needs AQ off;
-`PipelineCaps.ROI`), the session tells it where the player looks, from the input path (the
-helper's captures report no pointer position): the client's absolute pointer positions (desktop
-mouse mode, normalised across the picture the client shows, which is the captured picture) put a
-square around the pointer (`encoder.FocusROI`, an eighth of the source height, weight 6; the
-rest untouched), its relative motion (game mouse mode, pointer lock, where a game hides the
-pointer and draws its crosshair at the centre) a square around the centre (a sixth, weight 8)
-with the rest at weight -2. Host config `roi`: `auto` (default; nothing before the first pointer
-input), `cursor`, `center`, `off`. `roiLoop` polls every 100 ms and hands the focus over only
-when its kind changed or the pointer moved by more than 1/32 of the picture, so the encoder
-builds at most ten maps a second however fast the pointer events come; `HelperVideo` maps it to
-each stream (the capture's size as displayed, scaled to the encoded size), sends `setRoi` only
-when the regions change, gives every helper it starts the current focus right after `started`,
-and stops sending to a helper that answers `setRoi` with an error (then `ROI` is false). Logged:
-`regions of interest` (used, or why not) once per change, `regions of interest: focus` when the
-kind changes. The encoder options come from host config and the caps of the codec each helper
+`PipelineCaps.ROI`), the session tells it where the player looks, from the input path and the
+host's own pointer (the helper's captures report no pointer position): the client's absolute
+pointer positions (desktop mouse mode, normalised across the picture the client shows, which is
+the captured picture) put a square around the pointer (`encoder.FocusROI`, an eighth of the
+source height, weight 6; the rest untouched); under its relative motion (game mouse mode,
+pointer lock) the host's pointer, polled each tick like `cursorLoop` does, decides: where it
+shows on the captured monitor (a game's menu or inventory, a strategy game; the client draws it
+there) the square follows it, where it is hidden (a game that draws its crosshair at the
+centre) a square around the centre (a sixth, weight 8) with the rest at weight -2. Host config
+`roi`: `auto` (default; nothing before the first pointer input), `cursor`, `center`, `off`.
+`roiLoop` polls every 100 ms and hands the focus over only when its kind changed or the pointer
+moved by more than 1/32 of the picture, so the encoder builds at most ten maps a second however
+fast the pointer events come (`roiMinGap`, 90 ms, allows for the ticker's jitter);
+`HelperVideo` maps it to each stream (the capture's size as displayed, scaled to the encoded
+size), sends `setRoi` only when the regions change, gives every helper it starts the current
+focus right after `started`, and stops sending to a helper that answers `setRoi` with an error
+(then `ROI` is false). Logged: `regions of interest` (used, or why not) once per change,
+`regions of interest: focus` when the kind changes. The encoder options come from host config and the caps of the codec each helper
 starts, decided in `withCaps` and logged once per change: `encoderInstance` (`auto`: the
 encoder's default engine; `dedicated`: engine 1 where `instanceSelect` and `hwInstances` > 1,
 i.e. AMF `INSTANCE_INDEX`, e.g. away from Adrenalin's recording; a number), `reencodeOversized`

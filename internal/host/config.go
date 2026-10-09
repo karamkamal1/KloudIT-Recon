@@ -82,10 +82,11 @@ type Config struct {
 	// ROI is the encoder's region of interest around where the player looks
 	// (Phase 5 "sharper crosshair / cursor"; native helper encoders with a
 	// region of interest map: AMF, NVENC): "auto" ("" = auto) the pointer
-	// while the client sends absolute pointer positions, the picture's
-	// centre (a game's crosshair) while it sends relative motion (pointer
-	// lock), nothing before either; "cursor" always the pointer; "center"
-	// always the centre; "off" none.
+	// while the client sends absolute pointer positions; while it sends
+	// relative motion (pointer lock) the host's pointer where that shows (a
+	// game's menu, a strategy game), else the picture's centre (a game's
+	// crosshair); nothing before either; "cursor" always the pointer (where
+	// it was last seen); "center" always the centre; "off" none.
 	ROI string `json:"roi,omitempty"`
 	// EncoderInstance picks the native helper's hardware encode engine
 	// (Phase 5 "dedicated encode engine"; AMF INSTANCE_INDEX, where the GPU
@@ -292,10 +293,13 @@ func (c *Config) roi() string {
 }
 
 // engineChoice is host config "encoderInstance": "auto", "dedicated" or an
-// engine number, written as a JSON string or number.
+// engine number, written as a JSON string or number (null: unset, auto).
 type engineChoice string
 
 func (e *engineChoice) UnmarshalJSON(b []byte) error {
+	if string(bytes.TrimSpace(b)) == "null" {
+		return nil // unset (auto), as encoding/json does with null for other types
+	}
 	var n int
 	if err := json.Unmarshal(b, &n); err == nil {
 		*e = engineChoice(strconv.Itoa(n))

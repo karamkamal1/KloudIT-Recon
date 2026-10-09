@@ -506,8 +506,8 @@ func (v *HelperVideo) encoderOptions(sp *encoder.StartParams, cc encoder.CodecCa
 	// Dedicated encode engine (GUIDE 9 order 4): "auto" keeps the default
 	// engine (GUIDE 3.3: engine 0 unless Adrenalin's recording uses it, a
 	// VERIFY item); "dedicated" or a number pick one where the backend lets
-	// the start choose (AMF INSTANCE_INDEX; NVENC spreads frames over its
-	// engines itself) and the GPU has it.
+	// the start choose (AMF INSTANCE_INDEX; not NVENC, which spreads frames
+	// over its engines itself, nor the libavcodec backend) and the GPU has it.
 	choice := v.opt.EncoderInstance
 	if choice == "" {
 		choice = "auto"
@@ -522,7 +522,7 @@ func (v *HelperVideo) encoderOptions(sp *encoder.StartParams, cc encoder.CodecCa
 		v.decide("engine", "encoder engine", "codec", sp.Codec, "config", choice, "engine", *inst, "engines", engines)
 	case !cc.InstanceSelect:
 		v.decide("engine", "encoder engine: the backend's default", "codec", sp.Codec, "config", choice, "engines", engines,
-			"reason", "the encoder spreads its work over its engines itself")
+			"reason", "the encoder does not let a stream pick its engine (caps instanceSelect false)")
 	case engines < 2:
 		v.decide("engine", "encoder engine: the backend's default", "codec", sp.Codec, "config", choice, "engines", engines,
 			"reason", "the GPU has one engine for this codec")

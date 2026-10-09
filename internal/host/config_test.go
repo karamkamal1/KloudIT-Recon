@@ -224,6 +224,7 @@ func TestConfigPhase5Options(t *testing.T) {
 		{`{"roi":"center","encoderInstance":1}`, "center", "1", 0, 0},
 		{`{"roi":"auto","encoderInstance":"auto","reencodeOversized":2.5,"sliceOutput":4}`, "auto", "auto", 2.5, 4},
 		{`{"encoderInstance":"0","reencodeOversized":100,"sliceOutput":64}`, "auto", "0", 100, 64},
+		{`{"encoderInstance":null}`, "auto", "", 0, 0}, // null: unset (auto), not engine 0
 	} {
 		c, err := load(ok.json)
 		if err != nil || c.roi() != ok.roi || string(c.EncoderInstance) != ok.instance || c.ReencodeOversized != ok.reencode || c.SliceOutput != ok.slices {

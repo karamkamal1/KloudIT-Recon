@@ -70,7 +70,7 @@ func TestHelperEncoderOptions(t *testing.T) {
 		{"default", HelperOptions{}, amfLike, -1, 0, 0, `msg="encoder engine: the backend's default (engine 0)" codec=h264 config=auto engines=2`},
 		{"auto", HelperOptions{EncoderInstance: "auto"}, amfLike, -1, 0, 0, `config=auto engines=2`},
 		{"dedicated, two engines", HelperOptions{EncoderInstance: "dedicated"}, amfLike, 1, 0, 0, `msg="encoder engine" codec=h264 config=dedicated engine=1`},
-		{"dedicated, engines picked by the encoder", HelperOptions{EncoderInstance: "dedicated"}, nvencLike, -1, 0, 0, `spreads its work over its engines`},
+		{"dedicated, engines picked by the encoder", HelperOptions{EncoderInstance: "dedicated"}, nvencLike, -1, 0, 0, `does not let a stream pick its engine (caps instanceSelect false)`},
 		{"dedicated, one engine", HelperOptions{EncoderInstance: "dedicated"}, single, -1, 0, 0, `the GPU has one engine`},
 		{"engine 1", HelperOptions{EncoderInstance: "1"}, amfLike, 1, 0, 0, `engine=1 engines=2`},
 		{"engine 0", HelperOptions{EncoderInstance: "0"}, amfLike, 0, 0, 0, `engine=0 engines=2`},

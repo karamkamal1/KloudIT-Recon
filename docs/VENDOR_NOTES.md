@@ -6090,10 +6090,14 @@ each with a host config switch and a safe default; every decision logged once pe
   `center` | `off`, default auto). The input path is the host's knowledge of where the player
   looks: the client's absolute pointer positions (`DgMouseAbs`, 0..65535 across the picture the
   client shows) put a square around the pointer (`encoder.FocusROI`: an eighth of the capture
-  height, weight 6, the rest of the picture untouched: a desktop has text everywhere); its
-  relative motion (`DgMouseRel`: pointer lock, game mouse mode) puts one around the picture's
-  centre (a sixth, weight 8) with the rest at weight -2 (a game's crosshair). `auto` follows the
-  latest kind of input and sets nothing before the first one; `cursor` / `center` force one kind.
+  height, weight 6, the rest of the picture untouched: a desktop has text everywhere); under its
+  relative motion (`DgMouseRel`: pointer lock, game mouse mode) the host's own pointer decides
+  (review fix): where it shows on the captured monitor (`platform.GetCursor` polled each tick,
+  normalised as `cursorLoop` sends it; a game's menu or inventory, a strategy or point-and-click
+  game: the client draws it there) the pointer square follows it, where it is hidden one around
+  the picture's centre (a sixth, weight 8) with the rest at weight -2 (a game's crosshair).
+  `auto` follows the latest kind of input and sets nothing before the first one; `cursor` /
+  `center` force one kind (`cursor`: where the pointer was last seen).
   `roiLoop` polls every 100 ms and hands `HelperVideo.SetFocus` a new focus only for another kind
   or a pointer that moved by more than 1/32 of the picture (60 x 34 px at 1080p, a quarter of the
   square): at most 10 `setRoi` per second, none for motion inside the square.
@@ -6112,8 +6116,9 @@ each with a host config switch and a safe default; every decision logged once pe
   into `start.encoderInstance`: `auto` leaves it unset (the backend's default, engine 0: GUIDE
   3.3 says engine 1 only if Adrenalin's recording uses 0, a VERIFY item below); `dedicated` engine
   1 where the start may pick one and the GPU has two or more (AMF `INSTANCE_INDEX`); a number
-  that engine. Where it cannot be honoured (NVENC spreads frames over its engines itself, one
-  engine, a number beyond the count) the default stays, with the reason: `encoder engine` /
+  that engine. Where it cannot be honoured (caps `instanceSelect` false: NVENC spreads frames
+  over its engines itself, the libavcodec backend cannot pick one; one engine; a number beyond
+  the count) the default stays, with the reason: `encoder engine` /
   `encoder engine: the backend's default ... reason=...`; the started line has
   `encoder_instance=N hw_instances=M` (AMF reads the engine back).
 - **Re-encode oversized frames** (host config `reencodeOversized`, 0 = off (default), 1.5..100
@@ -6140,10 +6145,13 @@ each with a host config switch and a safe default; every decision logged once pe
   options makes a bitrate or frame-rate change start a new helper (`sameHelperStream`).
 
 Deviations from the task, and why:
-- The pointer position comes from the input path only: the helper reports no cursor position of
-  its own (DDA's pointer position is not read; the pointer is drawn by the client). The host's
-  OS cursor poll (`cursorLoop`, client-side cursor only) is not used either, so a pointer that a
-  game moves by itself (warps) is followed only through the next client input.
+- The pointer position comes from the input path and, under pointer lock, the host's OS pointer
+  (polled in `roiTick` every 100 ms, like `cursorLoop` does for the client, review fix): the
+  helper reports no cursor position of its own (DDA's pointer position is not read; the pointer
+  is drawn by the client). In desktop mouse mode the client's absolute positions are used, so a
+  pointer that a program moves by itself (warps) there is followed only through the next client
+  input. A game that hides the OS pointer and draws its own software pointer in a menu gets the
+  centre square (nothing tells where its pointer is).
 - NVENC's ROI is the helper's QP delta map beside spatial AQ (`NV_ENC_QP_MAP_DELTA`, caps `roi`
   `emphasis`), not GUIDE 2's emphasis map with AQ off: nvEncodeAPI.h documents the emphasis
   level map for H.264 only and refuses it with AQ (checked in `nvenc_backend.cpp`; not changed
@@ -6164,17 +6172,22 @@ Deviations from the task, and why:
   auto, the pointer square for absolute positions, the centre for relative motion, back to the
   pointer; `cursor` keeps the square under pointer lock, `center` from the start, `off` nothing;
   moves within `roiMove` send nothing, one just beyond does, at most every 100 ms; clearing; 1000
-  pointer events in a second reach the pipeline 9 to 10 times), `TestSessionROI` (fake helper with
-  caps `roi`: no `setRoi` before input, the pointer at the bottom-right corner mapped and clipped,
-  an 89-event burst within the interval sends nothing, pointer lock sends the centre square with
-  the background; decision and kinds logged once), `TestROITickPipelines` (FFmpeg: the loop ends,
-  logged once; a helper without a map: logged once, the loop goes on; nothing before the stream
-  starts; `off` returns at once), `TestSessionEncoderOptions` (the start of a session per config x
-  caps: defaults send nothing; an AMF-like encoder gets engine 1 and 4 slices, no re-encode; an
-  NVENC-like one re-encode 3, no engine, no slices; engine `0`; the engine decision logged once;
-  a REENCODED frame counted), `TestHostStages` (first-slice rows from consistent stamps only,
-  none for whole frames), `TestConfigPhase5Options` (defaults, every accepted value incl. a
-  numeric `encoderInstance`, save and load, 11 refused values); `internal/host/media`
+  pointer events in a second reach the pipeline 9 to 10 times; since the review fixes: pointer
+  lock with the host's pointer showing follows it, the centre once it hides, the pointer again in
+  a menu, the client's position back in desktop mode, a shown host pointer ignored outside pointer
+  lock, `cursor` follows a shown host pointer and keeps it once hidden; the burst on roiLoop's
+  ticks with 4 ms of jitter takes every tick (it fails with the old strict interval: the tick 96
+  ms after a late one waited a tick), polls between ticks none), `TestSessionROI` (fake helper
+  with caps `roi`: no `setRoi` before input, the pointer at the bottom-right corner mapped and
+  clipped, an 89-event burst within the interval sends nothing, pointer lock sends the centre
+  square with the background; decision and kinds logged once), `TestROITickPipelines` (FFmpeg: the
+  loop ends, logged once; a helper without a map: logged once, the loop goes on; nothing before
+  the stream starts; `off` returns at once), `TestSessionEncoderOptions` (the start of a session
+  per config x caps: defaults send nothing; an AMF-like encoder gets engine 1 and 4 slices, no
+  re-encode; an NVENC-like one re-encode 3, no engine, no slices; engine `0`; the engine decision
+  logged once; a REENCODED frame counted), `TestHostStages` (first-slice rows from consistent
+  stamps only, none for whole frames), `TestConfigPhase5Options` (defaults, every accepted value
+  incl. a numeric `encoderInstance`, save and load, 11 refused values); `internal/host/media`
   `TestHelperEncoderOptions` (13 cases of config x caps for engine, re-encode and slices, each
   decision logged exactly once over two starts, no new helper for a bitrate change),
   `TestHelperVideoFocus` (setRoi mapped from a 1920x1080 capture to a 1280x720 stream, the corner
@@ -6236,7 +6249,13 @@ Deviations from the task, and why:
   be visibly sharper at the crosshair (edges, fine texture) and may be softer in the corner.
   Repeat with the client's Desktop mouse mode over small text (e.g. a browser page, scrolling
   slowly at 3 Mbit/s): `focus="around the pointer"`, the text under the pointer crisper than
-  with `roi` `off`. Repeat for AV1 (AMF AV1 has no ROI cap, `roi` assumed: confirm the started
+  with `roi` `off`. Repeat in Game mouse mode in a game that shows the Windows pointer under
+  pointer lock (a strategy game, or a game's options menu; the client draws the host's pointer):
+  `focus="around the pointer"` while it shows, the square (screenshot crop around the pointer)
+  following it as it moves, the corners not softer than with `roi` `off`; back in the game view
+  with the pointer hidden `focus="around the centre (pointer lock: a crosshair)"` (if a game
+  keeps the Windows pointer visible but transparent, the square stays where it was: record the
+  game). Repeat for AV1 (AMF AV1 has no ROI cap, `roi` assumed: confirm the started
   line says `roi=importance` and the picture changes; if AMF ignores it, record it) and H.264.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (INSTANCE_INDEX with Adrenalin recording on): turn
   on Adrenalin Instant Replay (Record & Stream, HEVC, 4K60 or the highest it offers) and keep it
@@ -6281,8 +6300,46 @@ Deviations from the task, and why:
   inline then).
 - NVIDIA: unverified (no NVIDIA host available). Test (options NVENC cannot take):
   `"encoderInstance":"dedicated"` gives `encoder engine: the backend's default ... reason="the
-  encoder spreads its work over its engines itself"` (no `encoderInstance` in the start);
-  `"sliceOutput":4` gives `sub-frame output not used`.
+  encoder does not let a stream pick its engine (caps instanceSelect false)"` (no
+  `encoderInstance` in the start); `"sliceOutput":4` gives `sub-frame output not used`.
+
+### Review fixes
+
+Four review findings, all confirmed and fixed:
+
+- **Pointer lock with the host's pointer showing** (`roi` auto). Relative motion always moved the
+  focus to the centre square with the rest at weight -2, even where the game shows the Windows
+  pointer under pointer lock (menus, inventories, strategy and point-and-click games in game mouse
+  mode), which the client draws where the host has it (`stream.js` `onCursorPos`): the area the
+  player looks at got fewer bits than with `roi` `off`. `roiTick` now polls the host's pointer
+  (`pollHostCursor`: `platform.GetCursor`, visible and on the captured monitor, normalised as
+  `cursorLoop` sends it; nothing with capture `test` or off Windows) and `roiFocus.hostCursor`
+  makes it the pointer the player follows while relative motion is the latest input; `auto` uses
+  the centre square only while it is hidden; `cursor` follows it too (and keeps its last place
+  once hidden). Polled in `roiTick` rather than taken from `cursorLoop`, which does not run when
+  the video carries the pointer (`drawCursor`, client cursor `video`; a helper whose caps
+  `cursorInVideo` can then stream). `TestROIFocus` gains the cases above.
+- **Rate limit vs ticker jitter.** `roiFocus.next` compared two `time.Now()` readings of
+  consecutive 100 ms ticks with a strict `< roiInterval`, so a tick a little late followed by one
+  on time skipped the second (reproduced here with a standalone 100 ms ticker: 23 of 49 gaps below
+  100 ms with `time.Now()`, 22 with the tick's own time, so passing that instead would not do):
+  the square lagged the pointer by up to 200 ms. The gap allowed is now `roiMinGap` (roiInterval
+  less a tenth); the rate stays one per tick. The burst test runs on jittered ticks.
+- **`"encoderInstance": null`** read as engine `"0"` (encoding/json calls `UnmarshalJSON` with
+  null, and decoding null into an int leaves 0 without an error; reproduced standalone). Null is
+  now unset (auto); `TestConfigPhase5Options` has the case.
+- **Engine decision wording.** With caps `instanceSelect` false the log said "the encoder spreads
+  its work over its engines itself", true for NVENC only (the libavcodec backend, which backend
+  `auto` includes, and an AMF runtime without `INSTANCE_INDEX` have it false too). Now "the encoder
+  does not let a stream pick its engine (caps instanceSelect false)"; the NVIDIA check above
+  quotes it.
+- verified (sandbox, review fixes): gofmt, `go vet` (Linux and Windows), `go test ./...` (the
+  e2e package under the shared lock: ok), `xvfb-run -a make helper-test` under Wine 9.0 (all
+  pass, among them `TestSessionHelperMockPhase5B` and `TestHelperIntegrationSlicesAndROI`).
+  Browser E2E under the lock: a first run at load average 7 to 8 had 181 of 187 (steady playback
+  and video decoding at 38 to 46 fps, frame pacing Smooth with timer draws, the skip-recovery
+  scenario with congestion restarts: frame-rate and load cascades on the FFmpeg path, which these
+  fixes do not touch), the re-run 187 of 187.
 
 ### Integration notes (merging)
 

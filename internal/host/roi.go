@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 )
 
 // Regions of interest where the player looks (GUIDE 9 order 3, Phase 5
@@ -18,26 +19,35 @@ import (
 // knows where the player looks from the input path: the client's absolute
 // pointer positions (desktop mouse mode: normalised across the picture it
 // shows, which is the captured picture) put a square around the pointer; its
-// relative motion (game mouse mode, pointer lock: the game hides the pointer
-// and draws a crosshair at the centre) puts one around the picture's centre
-// and takes some bits from the rest. The helper's captures report no pointer
-// position of their own (DDA's pointer shape and position are not used, the
-// pointer is drawn by the client), so the input path is the only source.
+// relative motion (game mouse mode, pointer lock) one around the host's own
+// pointer while that shows on the picture (a game's menu or inventory, a
+// strategy or point-and-click game: the client draws the host's pointer there,
+// stream.js onCursorPos), else (the game hides the pointer and draws a
+// crosshair at the centre) one around the picture's centre, taking some bits
+// from the rest. The helper's captures report no pointer position of their own
+// (DDA's pointer shape and position are not used, the pointer is drawn by the
+// client), so the host's pointer is polled here (pollHostCursor, as
+// cursorLoop does for the client).
 //
 // Host config "roi": "auto" (default) follows the input as above, nothing
-// before the first pointer input; "cursor" only the pointer square, "center"
-// only the centre square, "off" nothing. HelperVideo.SetFocus maps the focus
-// to the stream (encoder.FocusROI with its capture and encoded sizes) and
-// re-applies it to every helper it starts; only pipelines whose encoder has a
-// map (PipelineCaps.ROI) get it. The map changes at most every roiInterval and
-// only when the pointer moved by more than roiMove across the picture or the
-// kind of focus changed, so pointer events (up to 1000 per second) never
-// reach the encoder one by one.
+// before the first pointer input; "cursor" only the pointer square (where the
+// pointer was last seen), "center" only the centre square, "off" nothing.
+// HelperVideo.SetFocus maps the focus to the stream (encoder.FocusROI with
+// its capture and encoded sizes) and re-applies it to every helper it starts;
+// only pipelines whose encoder has a map (PipelineCaps.ROI) get it. The map
+// changes at most every roiInterval and only when the pointer moved by more
+// than roiMove across the picture or the kind of focus changed, so pointer
+// events (up to 1000 per second) never reach the encoder one by one.
 
 const (
 	// roiInterval: the focus goes to the pipeline at most this often (each
 	// change makes the encoder build a new map; AMF allocates a surface).
 	roiInterval = 100 * time.Millisecond
+	// roiMinGap is the shortest gap roiFocus.next allows between two foci:
+	// roiInterval less a tenth for the ticker's jitter (a tick a little late
+	// and the next one on time are less than roiInterval apart, and a moving
+	// pointer must not wait a second tick).
+	roiMinGap = roiInterval - roiInterval/10
 	// roiMove: the pointer square moves only when the pointer moved by more
 	// than this across the picture (1/32 of its width or height, 60 x 34 px
 	// at 1920x1080: a quarter of the square), so motion inside the square
@@ -54,21 +64,25 @@ const (
 type roiFocus struct {
 	mode string // host config "roi": auto ("" too) | cursor | center | off
 
-	mu       sync.Mutex
-	absSeen  bool
-	x, y     uint16    // the last absolute pointer position, 0..65535 across the picture
-	abs, rel time.Time // when the last absolute position / relative motion arrived
-	sent     media.Focus
-	sentAt   time.Time
-	have     bool   // the pipeline has been handed sent (it keeps it for the helpers it starts)
-	logged   string // the last logged decision
-	kind     string // the last logged kind of focus (roiTick only)
+	mu sync.Mutex
+	// x, y: where the pointer the player follows was last seen, 0..65535
+	// across the picture (seen: at all): the client's absolute position, or
+	// the host's pointer while it shows under pointer lock.
+	seen      bool
+	x, y      uint16
+	abs, rel  time.Time // when the last absolute position / relative motion arrived
+	hostShown bool      // the host's pointer shows on the picture (the last poll)
+	sent      media.Focus
+	sentAt    time.Time
+	have      bool   // the pipeline has been handed sent (it keeps it for the helpers it starts)
+	logged    string // the last logged decision
+	kind      string // the last logged kind of focus (roiTick only)
 }
 
 // pointerAbs records an absolute pointer position (datagram DgMouseAbs).
 func (r *roiFocus) pointerAbs(x, y uint16, now time.Time) {
 	r.mu.Lock()
-	r.x, r.y, r.abs, r.absSeen = x, y, now, true
+	r.x, r.y, r.abs, r.seen = x, y, now, true
 	r.mu.Unlock()
 }
 
@@ -79,22 +93,39 @@ func (r *roiFocus) pointerRel(now time.Time) {
 	r.mu.Unlock()
 }
 
+// hostCursor records the host's own pointer (pollHostCursor, every roiTick):
+// whether it shows on the picture and where, 0..65535 across it. Under
+// pointer lock a pointer that shows (a game's menu or inventory, a strategy
+// game) is the one the player follows: the client draws it there.
+func (r *roiFocus) hostCursor(shown bool, x, y uint16) {
+	r.mu.Lock()
+	r.hostShown = shown
+	if shown && r.locked() {
+		r.x, r.y, r.seen = x, y, true
+	}
+	r.mu.Unlock()
+}
+
+// locked reports whether relative motion is the latest pointer input
+// (pointer lock). Called with r.mu held.
+func (r *roiFocus) locked() bool { return !r.rel.IsZero() && r.rel.After(r.abs) }
+
 // want is the focus the mode and the input ask for. Called with r.mu held.
 func (r *roiFocus) want() media.Focus {
 	pointer := media.Focus{Pointer: true, X: r.x, Y: r.y}
 	center := media.Focus{Center: true, Background: roiCenterBackground}
 	switch r.mode {
 	case roiCursor:
-		if r.absSeen {
+		if r.seen {
 			return pointer
 		}
 	case roiCenter:
 		return center
 	case settingAuto, "":
 		switch {
-		case !r.rel.IsZero() && r.rel.After(r.abs):
-			return center // pointer lock: a game's crosshair
-		case r.absSeen:
+		case r.locked() && !r.hostShown:
+			return center // pointer lock, the pointer hidden: a game's crosshair
+		case r.seen:
 			return pointer
 		}
 	}
@@ -103,7 +134,7 @@ func (r *roiFocus) want() media.Focus {
 
 // next returns the focus to hand the pipeline at now and whether to: one of
 // another kind than the last one handed over, or whose pointer moved by more
-// than roiMove, at most every roiInterval.
+// than roiMove, at most every roiInterval (roiMinGap: one per roiLoop tick).
 func (r *roiFocus) next(now time.Time) (media.Focus, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -113,7 +144,7 @@ func (r *roiFocus) next(now time.Time) (media.Focus, bool) {
 		return f, false
 	case r.have && !r.moved(f):
 		return f, false
-	case r.have && now.Sub(r.sentAt) < roiInterval:
+	case r.have && now.Sub(r.sentAt) < roiMinGap:
 		return f, false
 	}
 	r.sent, r.sentAt, r.have = f, now, true
@@ -204,6 +235,7 @@ func (s *Session) roiTick(now time.Time) bool {
 		return true
 	}
 	s.roi.decision(s.log, true, "")
+	s.roi.hostCursor(s.pollHostCursor())
 	f, ok := s.roi.next(now)
 	if !ok {
 		return true
@@ -216,4 +248,23 @@ func (s *Session) roiTick(now time.Time) bool {
 		s.log.Debug("regions of interest", "err", err)
 	}
 	return true
+}
+
+// pollHostCursor reports whether the host's pointer shows on the captured
+// monitor and where, normalised across it as cursorLoop sends it to the
+// client. Nothing where the picture has no host pointer (capture "test", not
+// Windows) or the poll fails.
+func (s *Session) pollHostCursor() (shown bool, x, y uint16) {
+	if !s.a.cursorSupported() {
+		return false, 0, 0
+	}
+	cs, err := platform.GetCursor()
+	s.prefsMu.Lock()
+	m := s.monitor
+	s.prefsMu.Unlock()
+	if err != nil || !cs.Visible || m.W <= 1 || m.H <= 1 ||
+		cs.X < m.X || cs.X >= m.X+m.W || cs.Y < m.Y || cs.Y >= m.Y+m.H {
+		return false, 0, 0
+	}
+	return true, clampU16((cs.X - m.X) * 65535 / (m.W - 1)), clampU16((cs.Y - m.Y) * 65535 / (m.H - 1))
 }
