@@ -10809,3 +10809,24 @@ moment the close starts.
   user or change its password in the dashboard: A's controller, mouse and keyboard stop at once,
   before A shows the session ended.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### captureTimestamps "off" on the native helper
+
+Problem: host config `"captureTimestamps": "off"` was read only for FFmpeg's capture-clock
+filter. The native helper, the default pipeline on AMD and NVIDIA, always stamps its frames with
+their capture and present times, and the session sent them whatever the setting, so `off` (for
+example to rule out a bad capture clock in the latency readout) changed nothing there although
+README promised a send→draw readout.
+
+Fix: with `off` the session drops a frame's capture and present stamps before it is sent, on any
+pipeline (`videoEvents`); the host's own stage statistics then have no capture stage either, as
+on the FFmpeg path. README, ARCHITECTURE and the config comment say so.
+
+- Verified here: `internal/host` `TestCaptureTimestampsOff`: a frame with capture and present
+  stamps (as the helper's) keeps both in its frame extension by default and has neither with
+  `off`; before the fix both were sent with `off`.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test: on the helper (host.log `video
+  pipeline pipeline=helper`), set `"captureTimestamps": "off"`, restart the agent and stream: the
+  overlay's latency line shows send→draw (no capture or present stage); remove the setting and
+  restart: capture→draw comes back.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

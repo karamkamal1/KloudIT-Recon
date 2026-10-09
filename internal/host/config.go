@@ -35,7 +35,9 @@ type Config struct {
 	// CaptureTimestamps "off" stops stamping frames with their capture time
 	// (FFmpeg setpts=time(0)*1000000 + a µs encoder time base); default auto = on.
 	// Capture "amf" keeps that wall-clock pts in the FFmpeg chain (vsrc_amf's
-	// own pts are rounded to 1/fps); there "off" only stops sending the stamps.
+	// own pts are rounded to 1/fps); there "off" only stops sending the stamps,
+	// as on the native helper, which always measures its capture and present
+	// times (videoEvents drops them).
 	CaptureTimestamps string `json:"captureTimestamps,omitempty"`
 	// GPUPriority is the GPU scheduling priority of the encoder process
 	// (Windows): auto | high | realtime | off ("" = auto).

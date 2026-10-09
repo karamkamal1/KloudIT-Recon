@@ -132,3 +132,31 @@ func fakePipelineSession(t *testing.T, log *slog.Logger, caps media.PipelineCaps
 	}
 	return s, p, ctrl
 }
+
+// TestCaptureTimestampsOff: host config captureTimestamps "off" sends no
+// capture stamps on any pipeline. The FFmpeg path then makes none; the native
+// helper's frames carry their own (capture and present), which the session
+// drops before they are sent. Before, "off" did nothing on the helper.
+func TestCaptureTimestampsOff(t *testing.T) {
+	for _, off := range []bool{false, true} {
+		s, p, _ := fakePipelineSession(t, slog.New(slog.NewTextHandler(io.Discard, nil)), media.PipelineCaps{})
+		if off {
+			s.a.cfg.CaptureTimestamps = "off"
+		}
+		go s.videoEvents()
+		p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: 0, Key: true, PresentUs: 800, CaptureUs: 900, EncodeDoneUs: 1000,
+			Data: []byte{1}}}
+		var f *media.Frame
+		select {
+		case f = <-s.frameQ:
+		case <-time.After(2 * time.Second):
+			t.Fatal("no frame queued")
+		}
+		h, ext := videoHeader(f, s.hello.V, 1100, 0)
+		_, capture := ext.Get(proto.ExtCaptureUs)
+		_, present := ext.Get(proto.ExtPresentUs)
+		if h.Flags&proto.FrameFlagExt == 0 || capture == off || present == off {
+			t.Fatalf("captureTimestamps off %v: capture stamp sent %v, present stamp sent %v", off, capture, present)
+		}
+	}
+}

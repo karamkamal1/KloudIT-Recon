@@ -129,7 +129,8 @@ carry no capture time. The host measures wall clock minus host clock at the firs
 generation and again every second (on Windows the host clock is QPC while W32Time slews and steps
 the wall clock, and a generation can last a whole session), and converts each pts into
 `captureUs`; a stamp that is not 0–2 s before `encodeDoneUs` is dropped. Only clients with
-`v >= 2` get it; `"captureTimestamps": "off"` in `host.json` disables it.
+`v >= 2` get it; `"captureTimestamps": "off"` in `host.json` disables it, and also keeps the
+native helper's capture and present times (measured on QPC) out of the frames.
 
 The client keeps a short **reorder buffer**: per-frame streams can finish out of order after a
 retransmission. Frames travel on reliable streams, so a gap in the sequence is a late frame, not a
