@@ -1,10 +1,12 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -402,5 +404,180 @@ func TestMediaThroughputUnderLoss(t *testing.T) {
 	}
 	if s.LostPackets == 0 {
 		t.Error("the proxy dropped nothing: the comparison is meaningless")
+	}
+}
+
+// cancelAfterHeader is the sender of the partial-delivery tests: on a new
+// stream it writes hdr, marks it reliable when boundary is set, then a
+// payload larger than the peer's stream receive window (the write stands
+// still on flow control), cancels the stream and, on a second stream,
+// writes "marker". The peer reads the marker first: on this in-order
+// loopback path the reset arrived before it.
+func cancelAfterHeader(ctx context.Context, c Conn, hdr []byte, boundary bool) error {
+	st, err := c.OpenUniStreamSync(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := st.Write(hdr); err != nil {
+		return err
+	}
+	if boundary {
+		st.SetReliableBoundary()
+	}
+	_ = st.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := st.Write(make([]byte, 8<<20)); err == nil {
+		return errors.New("the payload went out whole: the stream was not cut short")
+	}
+	st.CancelWrite()
+	m, err := c.OpenUniStreamSync(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := m.Write([]byte("marker")); err != nil {
+		return err
+	}
+	return m.Close()
+}
+
+// readCancelled reads the cancelled stream after the marker stream and
+// returns what it delivered and the error that ended it.
+func readCancelled(ctx context.Context, c Conn) ([]byte, error) {
+	cut, err := c.AcceptUniStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m, err := c.AcceptUniStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if b, err := io.ReadAll(m); err != nil || string(b) != "marker" {
+		return nil, fmt.Errorf("marker stream: %q, %v", b, err)
+	}
+	return io.ReadAll(cut)
+}
+
+// Partial delivery over raw QUIC (GUIDE 2.4), the client with and without
+// the reset_stream_at transport parameter: with it a cancelled stream still
+// delivers exactly the prefix marked reliable, without it nothing (plain
+// RESET_STREAM), and SetReliableBoundary changes nothing. PartialDelivery
+// reports the negotiation on both ends.
+func TestPartialDeliveryQUIC(t *testing.T) {
+	hdr := bytes.Repeat([]byte("frame header "), 3)
+	for _, tc := range []struct {
+		name             string
+		client, boundary bool // the client enables the extension; the sender marks the header
+		want             []byte
+	}{
+		{name: "negotiated", client: true, boundary: true, want: hdr},
+		{name: "negotiated, no boundary", client: true, boundary: false, want: nil},
+		{name: "not negotiated", client: false, boundary: true, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverTLS, clientTLS := testTLS(t, testALPN)
+			ln, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			srv := make(chan error, 1)
+			go func() {
+				qc, err := ln.Accept(ctx)
+				if err != nil {
+					srv <- err
+					return
+				}
+				c := FromQUIC(qc)
+				if PartialDelivery(c) != tc.client {
+					srv <- fmt.Errorf("server: PartialDelivery = %v with a client that enables it: %v", !tc.client, tc.client)
+					return
+				}
+				srv <- cancelAfterHeader(ctx, c, hdr, tc.boundary)
+				<-qc.Context().Done()
+			}()
+			conf := QUICConfig()
+			conf.EnableStreamResetPartialDelivery = tc.client
+			qc, err := quic.DialAddr(ctx, ln.Addr().String(), clientTLS, conf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := FromQUIC(qc)
+			defer client.Close(CodeNone, "done")
+			if PartialDelivery(client) != tc.client {
+				t.Errorf("client: PartialDelivery = %v, want %v", !tc.client, tc.client)
+			}
+			got, err := readCancelled(ctx, client)
+			var se *quic.StreamError
+			if !errors.As(err, &se) || !se.Remote || se.ErrorCode != CodeCancelled {
+				t.Fatalf("cancelled stream ended with %v, want the peer's reset (code %d)", err, CodeCancelled)
+			}
+			if !bytes.Equal(got, tc.want) {
+				t.Fatalf("cancelled stream delivered %d bytes %q, want %q", len(got), got[:min(len(got), 64)], tc.want)
+			}
+			if err := <-srv; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// Partial delivery over WebTransport: webtransport-go always negotiates the
+// extension (it needs it for its own stream header), and the boundary set
+// through the session's streams (wtQUICStream, by reflection) covers the
+// application's header too. A webtransport-go update that moves the QUIC
+// stream fails here instead of turning partial delivery off unnoticed.
+func TestPartialDeliveryWebTransport(t *testing.T) {
+	if wtStreamField == nil {
+		t.Fatal("webtransport.SendStream has no field str implementing SetReliableBoundary: update wtStreamField")
+	}
+	serverTLS, clientTLS := testTLS(t, http3.NextProtoH3)
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	hdr := bytes.Repeat([]byte("frame header "), 3)
+	mux := http.NewServeMux()
+	srv := &webtransport.Server{
+		H3:          &http3.Server{TLSConfig: serverTLS, Handler: mux, QUICConfig: QUICConfig(), ConnContext: WithQUICConn},
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	defer srv.Close()
+	done := make(chan error, 2)
+	mux.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
+		sess, err := srv.Upgrade(w, r)
+		if err != nil {
+			done <- err
+			return
+		}
+		c := FromWebTransportOver(sess, QUICConnFromContext(r.Context()))
+		if !PartialDelivery(c) {
+			done <- errors.New("server: no PartialDelivery between two webtransport-go ends")
+			return
+		}
+		done <- cancelAfterHeader(ctx, c, hdr, true)
+		<-sess.Context().Done()
+	})
+	go srv.Serve(udp)
+
+	d := &webtransport.Transport{TLSClientConfig: clientTLS, QUICConfig: QUICConfig()}
+	_, sess, err := d.Dial(ctx, "https://"+udp.LocalAddr().String()+"/wt", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := FromWebTransport(sess)
+	defer client.Close(CodeNone, "done")
+	got, err := readCancelled(ctx, client)
+	var se *webtransport.StreamError
+	if !errors.As(err, &se) || se.ErrorCode != CodeCancelled {
+		t.Fatalf("cancelled stream ended with %v, want the peer's reset (code %d)", err, CodeCancelled)
+	}
+	if !bytes.Equal(got, hdr) {
+		t.Fatalf("cancelled stream delivered %d bytes %q, want the header %q", len(got), got[:min(len(got), 64)], hdr)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

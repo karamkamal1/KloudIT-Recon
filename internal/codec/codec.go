@@ -685,6 +685,85 @@ func (p *Params) PrepareKeyFrame(data []byte) []byte {
 	return append(out, data...)
 }
 
+// ParamSetsLen returns the length of the leading part of a frame (an
+// Annex-B access unit, an AV1 temporal unit) that ends with its last
+// parameter set before the coded picture: H.264 SPS / PPS / SPS extension /
+// subset SPS, HEVC VPS / SPS / PPS, the AV1 sequence header OBU. Delimiters,
+// SEI and metadata in front of them are included. 0 when no parameter set
+// comes before the first slice / frame data (or the data does not parse).
+// The host marks this prefix of a key frame reliable on its stream (GUIDE
+// 2.4), so it arrives even when the frame is cancelled.
+func ParamSetsLen(family string, data []byte) int {
+	switch family {
+	case H264, HEVC:
+		// The units in order up to the coded picture, which (most of a
+		// key frame) is not scanned: the host computes this before the
+		// frame goes out.
+		end := 0
+		for sc := bytes.Index(data, annexBStart); sc >= 0; {
+			start := sc + 3
+			if start >= len(data) {
+				break
+			}
+			// A unit of zeros alone is empty (as SplitAnnexB: trailing
+			// zeros belong to the next start code).
+			z := start
+			for z < len(data) && data[z] == 0 {
+				z++
+			}
+			if z-start >= 2 && z < len(data) && data[z] == 1 {
+				sc = z - 2
+				continue
+			}
+			var vcl, set bool
+			if family == H264 {
+				t := h264Type(data[start:])
+				vcl = (t >= 1 && t <= 5) || t == 14 || (t >= 19 && t <= 21) // slices, prefix NAL, auxiliary / extension slices
+				set = t == 7 || t == 8 || t == 13 || t == 15
+			} else {
+				t := hevcType(data[start:])
+				vcl = t < 32
+				set = t >= 32 && t <= 34
+			}
+			if vcl {
+				break
+			}
+			e := len(data)
+			if sc = bytes.Index(data[start:], annexBStart); sc >= 0 {
+				sc += start
+				e = sc
+				for e > start && data[e-1] == 0 {
+					e--
+				}
+			}
+			if set {
+				end = e
+			}
+		}
+		return end
+	case AV1:
+		obus, err := SplitOBUs(data)
+		if err != nil {
+			return 0
+		}
+		end, off := 0, 0
+		for _, o := range obus {
+			off += len(o.raw)
+			switch o.typ {
+			case obuSequenceHeader:
+				end = off
+			case 3, 4, 6, 7, 8: // frame header, tile group, frame, redundant frame header, tile list
+				return end
+			}
+		}
+		return end
+	}
+	return 0
+}
+
+// annexBStart is the 3-byte start code in front of every Annex-B NAL unit.
+var annexBStart = []byte{0, 0, 1}
+
 // ---------------------------------------------------------------------------
 
 type bitReader struct {

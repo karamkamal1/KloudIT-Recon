@@ -7,7 +7,9 @@ import (
 	"context"
 	"io"
 	"net"
+	"reflect"
 	"time"
+	"unsafe"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/webtransport-go"
@@ -39,6 +41,10 @@ type SendStream interface {
 	Close() error
 	CancelWrite()
 	SetWriteDeadline(time.Time) error
+	// SetReliableBoundary marks the data written so far as reliable: a
+	// CancelWrite after it still delivers that prefix (RESET_STREAM_AT)
+	// where the connection has PartialDelivery; elsewhere it does nothing.
+	SetReliableBoundary()
 }
 
 type RecvStream interface {
@@ -83,6 +89,7 @@ func (q quicSend) Write(p []byte) (int, error)        { return q.s.Write(p) }
 func (q quicSend) Close() error                       { return q.s.Close() }
 func (q quicSend) CancelWrite()                       { q.s.CancelWrite(CodeCancelled) }
 func (q quicSend) SetWriteDeadline(t time.Time) error { return q.s.SetWriteDeadline(t) }
+func (q quicSend) SetReliableBoundary()               { q.s.SetReliableBoundary() }
 
 type quicRecv struct{ s *quic.ReceiveStream }
 
@@ -165,6 +172,11 @@ func (w wtSend) Write(p []byte) (int, error)        { return w.s.Write(p) }
 func (w wtSend) Close() error                       { return w.s.Close() }
 func (w wtSend) CancelWrite()                       { w.s.CancelWrite(CodeCancelled) }
 func (w wtSend) SetWriteDeadline(t time.Time) error { return w.s.SetWriteDeadline(t) }
+func (w wtSend) SetReliableBoundary() {
+	if q := wtQUICStream(w.s); q != nil {
+		q.SetReliableBoundary()
+	}
+}
 
 type wtRecv struct{ s *webtransport.ReceiveStream }
 
@@ -210,6 +222,65 @@ func (w wtConn) Close(code uint32, msg string) error {
 }
 func (w wtConn) Context() context.Context { return w.s.Context() }
 func (w wtConn) RemoteAddr() net.Addr     { return w.s.RemoteAddr() }
+
+// ---------------------------------------------------------------------------
+// Partial delivery (RESET_STREAM_AT, GUIDE 2.4)
+
+// PartialDelivery reports whether SendStream.SetReliableBoundary takes effect
+// on c's streams: both ends negotiated QUIC stream resets with partial
+// delivery (the reset_stream_at transport parameter,
+// draft-ietf-quic-reliable-stream-reset; QUICConfig enables it here), so a
+// stream cancelled after SetReliableBoundary still delivers what was written
+// before it. Without it CancelWrite is a plain RESET_STREAM and the peer may
+// get nothing of the stream. A WebTransport session also needs the QUIC
+// stream under webtransport-go's streams (wtQUICStream). Test doubles report
+// it with a PartialDelivery() bool method.
+func PartialDelivery(c Conn) bool {
+	var st quic.ConnectionState
+	switch c := c.(type) {
+	case quicConn:
+		st = c.c.ConnectionState()
+	case wtConn:
+		if wtStreamField == nil {
+			return false
+		}
+		st = c.s.SessionState().ConnectionState
+	case interface{ PartialDelivery() bool }:
+		return c.PartialDelivery()
+	default:
+		return false
+	}
+	return st.SupportsStreamResetPartialDelivery.Local && st.SupportsStreamResetPartialDelivery.Remote
+}
+
+type reliableBoundary interface{ SetReliableBoundary() }
+
+// wtStreamField locates the QUIC stream in a webtransport.SendStream: its
+// unexported field str (*quic.SendStream or *quic.Stream). webtransport-go
+// marks only its own stream header reliable and does not export
+// SetReliableBoundary (v0.13.0 and its master as of 2026-09), so the QUIC
+// stream is reached by reflection. nil when a webtransport-go version no
+// longer has the field: WebTransport sessions then have no PartialDelivery
+// (TestPartialDeliveryWebTransport fails on such an update).
+var wtStreamField = func() []int {
+	f, ok := reflect.TypeFor[webtransport.SendStream]().FieldByName("str")
+	if !ok || !f.Type.Implements(reflect.TypeFor[reliableBoundary]()) {
+		return nil
+	}
+	return f.Index
+}()
+
+// wtQUICStream returns the QUIC stream carrying s, or nil.
+func wtQUICStream(s *webtransport.SendStream) reliableBoundary {
+	if wtStreamField == nil || s == nil {
+		return nil
+	}
+	// str is set by the constructor and never changes: reading it races
+	// with nothing.
+	f := reflect.ValueOf(s).Elem().FieldByIndex(wtStreamField)
+	q, _ := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface().(reliableBoundary)
+	return q
+}
 
 // Congestion controllers, selected per listener or dialer with WithCongestion
 // (host config "congestion").

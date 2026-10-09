@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,6 +110,142 @@ func decodeCount(t *testing.T, format string, data []byte) (int, string) {
 	return n, stderr.String()
 }
 
+// checkParamSetsLen: the prefix ParamSetsLen marks in an encoder's key frame
+// holds all its parameter sets and the rest none.
+func checkParamSetsLen(t *testing.T, p *Params, key []byte) {
+	t.Helper()
+	n := ParamSetsLen(p.Family, key)
+	if n <= 0 || n >= len(key) || !p.hasParamSets(key[:n]) || p.hasParamSets(key[n:]) {
+		t.Fatalf("%s key frame of %d bytes: parameter-set prefix %d bytes", p.Family, len(key), n)
+	}
+}
+
+// ParamSetsLen on hand-made frames: delimiters and SEI in front count, the
+// prefix ends with the last parameter set before the coded picture, and a
+// parameter set after it does not extend it.
+func TestParamSetsLen(t *testing.T) {
+	sc := []byte{0, 0, 0, 1}
+	cat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	h264 := cat(sc, []byte{0x09, 0xf0}, sc, []byte{0x06, 5, 1, 0x80}, sc, []byte{0x67, 0x64, 0, 0x1f}, []byte{0, 0, 1}, []byte{0x68, 0xee}, sc, []byte{0x65, 0x88, 0x84}, sc, []byte{0x68, 0xee})
+	hevc := cat(sc, []byte{0x46, 0x01, 0x50}, sc, []byte{0x40, 0x01, 0x0c}, sc, []byte{0x42, 0x01, 0x01}, sc, []byte{0x44, 0x01, 0xc1}, sc, []byte{0x4e, 0x01, 0x05}, sc, []byte{0x26, 0x01, 0xaf})
+	obu := func(typ byte, payload ...byte) []byte {
+		return append([]byte{typ<<3 | 0x02, byte(len(payload))}, payload...)
+	}
+	av1 := cat(obu(obuTemporalDelimiter), obu(obuSequenceHeader, 0, 0, 0), obu(5, 1), obu(6, 0x10, 0x20, 0x30))
+	for _, tc := range []struct {
+		name, family string
+		data         []byte
+		want         int
+	}{
+		{"h264 aud sei sps pps idr", H264, h264, len(h264) - 2*len(sc) - 5},
+		{"h264 p-frame", H264, cat(sc, []byte{0x09, 0x30}, sc, []byte{0x41, 0x9a}), 0},
+		{"hevc aud vps sps pps sei idr", HEVC, hevc, len(hevc) - 2*len(sc) - 6},
+		{"hevc no start code", HEVC, []byte{0x40, 0x01}, 0},
+		{"av1 td seq metadata frame", AV1, av1, 2 + 5},
+		{"av1 frame only", AV1, cat(obu(obuTemporalDelimiter), obu(6, 1)), 0},
+		{"av1 truncated", AV1, []byte{0x0a, 0x05, 0}, 0},
+		{"unknown family", "vp9", h264, 0},
+	} {
+		if got := ParamSetsLen(tc.family, tc.data); got != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// paramSetsLenAll is ParamSetsLen of Annex-B data as a scan of every unit
+// (SplitAnnexB's offsets) would compute it: TestParamSetsLenScan's reference.
+func paramSetsLenAll(family string, data []byte) int {
+	var units [][2]int
+	start := -1
+	for i := 0; i+2 < len(data); {
+		if data[i] != 0 || data[i+1] != 0 || data[i+2] != 1 {
+			i++
+			continue
+		}
+		if start >= 0 {
+			end := i
+			for end > start && data[end-1] == 0 {
+				end--
+			}
+			units = append(units, [2]int{start, end})
+		}
+		i += 3
+		start = i
+	}
+	if start >= 0 && start < len(data) {
+		units = append(units, [2]int{start, len(data)})
+	}
+	end := 0
+	for _, u := range units {
+		n := data[u[0]:u[1]]
+		if len(n) == 0 {
+			continue
+		}
+		var vcl, set bool
+		if family == H264 {
+			t := h264Type(n)
+			vcl, set = (t >= 1 && t <= 5) || t == 14 || (t >= 19 && t <= 21), t == 7 || t == 8 || t == 13 || t == 15
+		} else {
+			t := hevcType(n)
+			vcl, set = t < 32, t >= 32 && t <= 34
+		}
+		if vcl {
+			break
+		}
+		if set {
+			end = u[1]
+		}
+	}
+	return end
+}
+
+// ParamSetsLen of an Annex-B frame stops at the coded picture (most of a
+// key frame, not read): the same answer as a scan of every unit on random
+// mixes of start codes, zeros, parameter sets, slices and other units.
+func TestParamSetsLenScan(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	parts := map[string][][]byte{
+		H264: {{0x09, 0xf0}, {0x06, 5}, {0x67, 0x64}, {0x68, 0xee}, {0x6d}, {0x6f}, {0x65, 0x88}, {0x41, 0x9a}, {0x74}, {0x01}, {0x00, 0x05}},
+		HEVC: {{0x46, 0x01}, {0x40, 0x01}, {0x42, 0x01}, {0x44, 0x01}, {0x4e, 0x01}, {0x26, 0x01}, {0x02, 0x01}, {0x00, 0x01}, {0x48, 0x01}},
+	}
+	for _, family := range []string{H264, HEVC} {
+		for i := 0; i < 20000; i++ {
+			var b []byte
+			for k := r.IntN(10); k >= 0; k-- {
+				switch r.IntN(5) {
+				case 0:
+					b = append(b, 0, 0, 1)
+				case 1:
+					b = append(b, 0, 0, 0, 1)
+				case 2:
+					b = append(b, make([]byte, r.IntN(4))...)
+				case 3:
+					b = append(b, byte(r.IntN(4)), byte(r.IntN(256)))
+				default:
+					ps := parts[family]
+					b = append(b, ps[r.IntN(len(ps))]...)
+				}
+			}
+			if got, want := ParamSetsLen(family, b), paramSetsLenAll(family, b); got != want {
+				t.Fatalf("%s % x: %d, want %d", family, b, got, want)
+			}
+		}
+	}
+}
+
+// A large HEVC key frame (VPS/SPS/PPS, one IDR slice of 1 MiB): the host
+// computes its reliable prefix before the frame goes out (GUIDE 2.4).
+func BenchmarkParamSetsLenHEVC1MB(b *testing.B) {
+	ps := JoinAnnexB([]byte{0x40, 0x01, 0x0c}, []byte{0x42, 0x01, 0x01}, []byte{0x44, 0x01, 0xc1})
+	key := append(ps, JoinAnnexB(append([]byte{0x26, 0x01}, bytes.Repeat([]byte{0xaf, 0x00, 0x13}, 1<<20/3)...))...)
+	b.SetBytes(int64(len(key)))
+	for b.Loop() {
+		if ParamSetsLen(HEVC, key) != len(ps) {
+			b.Fatal("wrong prefix")
+		}
+	}
+}
+
 func TestH264GlobalHeaderKeyframes(t *testing.T) {
 	pkts := encodeNUT(t, "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "40",
 		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "high", "-g", "15")
@@ -144,6 +281,7 @@ func TestH264GlobalHeaderKeyframes(t *testing.T) {
 			if !p.hasParamSets(d) {
 				t.Fatal("key frame still lacks parameter sets")
 			}
+			checkParamSetsLen(t, p, d)
 		}
 		es.Write(d)
 		frames++
@@ -175,6 +313,7 @@ func TestHEVCKeyframes(t *testing.T) {
 		d := pk.Data
 		if pk.Key {
 			d = p.PrepareKeyFrame(d)
+			checkParamSetsLen(t, p, d)
 		}
 		es.Write(d)
 		frames++
@@ -197,6 +336,7 @@ func TestAV1Keyframes(t *testing.T) {
 			if !p.hasParamSets(d) {
 				t.Fatal("AV1 key frame without sequence header")
 			}
+			checkParamSetsLen(t, p, d)
 		}
 	}
 	if !strings.HasPrefix(p.Codec, "av01.0.") || !strings.HasSuffix(p.Codec, "M.08") {

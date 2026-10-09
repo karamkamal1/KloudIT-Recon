@@ -315,8 +315,11 @@ func (s meteredStream) Write(b []byte) (int, error) {
 func TestFrameSenderWindow(t *testing.T) {
 	// fps 30: deadline 67 ms, holds up to 50 ms; 10: 200 ms, up to 150 ms
 	// (room for a loaded machine where only the hold itself is checked).
-	setup := func(t *testing.T, mode string, fps int, paced bool) (*Session, *fakeConn, *fakeCtrl, *fakeMeter, *ladderPipeline) {
+	setup := func(t *testing.T, mode string, fps int, paced bool, partial ...bool) (*Session, *fakeConn, *fakeCtrl, *fakeMeter, *ladderPipeline) {
 		s, c, ctrl := testSession(t, testFaults{})
+		if len(partial) > 0 { // GUIDE 2.4: the client negotiated RESET_STREAM_AT
+			c.partial, s.partial = partial[0], partial[0]
+		}
 		m := newFakeMeter(10 * time.Millisecond)
 		s.c = &meteredConn{c, m, paced}
 		s.meter = func() deliveryMeter { return m }
@@ -473,6 +476,68 @@ func TestFrameSenderWindow(t *testing.T) {
 		}
 		if rec, _, _ := p.state(); len(rec) != 1 || rec[0] != "1/1" {
 			t.Fatalf("recover calls %v, want [1/1]", rec)
+		}
+	})
+
+	// With partial delivery (GUIDE 2.4): a held frame has nothing written,
+	// so nothing is marked reliable before the window releases it; then its
+	// header (stamped with the release) goes first and is marked, the
+	// payload after it. Discarded while held, it is reset with nothing
+	// marked and nothing written: the reset delivers nothing.
+	hdrLen := func(t *testing.T, x streamState) int {
+		t.Helper()
+		_, _, p, err := proto.ParseFrame(x.data)
+		if err != nil {
+			t.Fatalf("frame stream: %v", err)
+		}
+		return len(x.data) - len(p)
+	}
+	t.Run("held, then its header marked reliable (partial delivery)", func(t *testing.T) {
+		s, c, _, m, _ := setup(t, proto.RecoveryKeyframe, 10, false, true)
+		for seq := uint32(0); seq < 3; seq++ {
+			s.frameQ <- frame(seq)
+		}
+		waitStreams(t, c, 2, "two frames go out")
+		time.Sleep(15 * time.Millisecond)
+		held(t, c)
+		if st := c.snapshot(); st[2].boundaries != 0 {
+			t.Fatalf("a held frame marked %d bytes reliable", st[2].boundary)
+		}
+		s.win.mu.Lock()
+		second := s.win.marks[1].pos
+		s.win.mu.Unlock()
+		release := s.a.clock()
+		m.deliver(second)
+		st := waitStreams(t, c, 3, "the third frame after the second was acknowledged")
+		for i, x := range st[:3] {
+			if !x.closed || x.boundaries != 1 || x.boundary != hdrLen(t, x) {
+				t.Fatalf("frame %d: closed %v, boundary at %d in %d calls, want its header (%d) once", i, x.closed, x.boundary, x.boundaries, hdrLen(t, x))
+			}
+		}
+		if h, _, payload, err := proto.ParseFrame(st[2].data); err != nil || h.Seq != 2 || len(payload) != 1000 || h.SendUs < release {
+			t.Fatalf("third frame: %+v %v, %d payload bytes; send time must be the release (>= %d)", h, err, len(payload), release)
+		}
+	})
+
+	t.Run("discarded while held (partial delivery)", func(t *testing.T) {
+		s, c, _, _, _ := setup(t, proto.RecoveryInvalidate, 10, false, true)
+		logs := &lockedLog{}
+		s.log = slog.New(slog.NewTextHandler(logs, nil))
+		for seq := uint32(0); seq < 3; seq++ {
+			s.frameQ <- frame(seq)
+			s.checkOut()
+		}
+		waitStreams(t, c, 2, "two frames go out")
+		time.Sleep(2 * time.Millisecond)
+		held(t, c)
+		s.lostFrame(&media.Frame{Gen: 1, Seq: 1}, "test")
+		s.checkOut()
+		st := waitStreams(t, c, 3, "the held frame discarded")
+		if x := st[2]; !x.cancelled || len(x.data) != 0 || x.boundaries != 0 || x.delivered(true) != nil {
+			t.Fatalf("discarded frame: cancelled %v, %d bytes written, %d boundaries: want a reset that delivers nothing", x.cancelled, len(x.data), x.boundaries)
+		}
+		if l := logs.lines(`msg="frame stream cancelled"`); len(l) != 0 {
+			t.Fatalf("a discarded frame logged as cancelled: %q", l)
 		}
 	})
 }

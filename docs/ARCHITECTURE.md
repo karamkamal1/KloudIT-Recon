@@ -194,6 +194,30 @@ running encoder (never from a vendor). Its rungs, cheapest first:
    path whose round trip is below the deadline a retransmission comes before a recovery frame
    could; a stall long enough to matter fills the congestion window, and then the newer frames'
    writes stand still and are cancelled (docs/VENDOR_NOTES.md 2.3, deviation 7).
+
+   **Partial delivery** (GUIDE 2.4). Where the client's QUIC endpoint negotiated RESET_STREAM_AT
+   (the `reset_stream_at` transport parameter of draft-ietf-quic-reliable-stream-reset;
+   `transport.QUICConfig` enables it on every endpoint here), a cancel delivers the frame's
+   header: frameSender writes the header and extension first and marks them reliable
+   (`SetReliableBoundary`, only while the ladder has not cancelled the stream:
+   `sendState.markReliable`), a key frame together with its parameter sets (VPS / SPS / PPS, the
+   AV1 sequence header: `codec.ParamSetsLen`), then the payload, and the cancel becomes a
+   RESET_STREAM_AT whose reliable size covers that prefix: the client still receives it, the rest
+   of the frame not. quic-go takes the small header write at once, so even a stream whose payload
+   the congestion window holds back has its header on the way. The client takes a reset frame
+   stream whose header arrived for a frame the host dropped, at once (`onFrameReset`, counted as
+   `streamResets` in its stats; the `dropped` message follows, or for a run of discarded frames
+   comes when the run ends). The host decides per session from the negotiation
+   (`transport.PartialDelivery`) and logs it with the session (`session started ...
+   reset_stream_at=yes|no`; `n/a` on the splice, whose peer is the gateway), and each cancel with
+   the bytes it still delivers (`reliable_bytes`, 0 without). A frame the video window holds
+   before its write (GUIDE 2.7) has nothing written: discarded while held, its reset delivers
+   nothing and the client learns of it from the discard report. Without partial delivery
+   everything stays as it was: one write per frame, and a cancel is a plain RESET_STREAM.
+   Chromium (141) does not negotiate it, so browsers get plain resets today
+   (docs/VENDOR_NOTES.md 2.4). webtransport-go marks only its own stream header reliable and
+   does not export `SetReliableBoundary`; `internal/transport` reaches the QUIC stream under a
+   WebTransport stream by reflection, guarded by a test.
 2. **Recover without a key frame** (`ltr` / `invalidate`, above). From the loss until the frame
    that answers it (a recovery frame with `refFloor` < the lost seq, or a key frame) every frame is
    useless to the client, which discards them: the host does not send them (or stops their
@@ -993,7 +1017,9 @@ relayed about 250 µs) and forwards about 1 Gbit/s on one core (the direct path:
 
 The gateway asks the host for a fresh `recon-data/1` connection, authenticated with a session ID
 and nonce. It then splices the two connections **cut-through**: bytes are forwarded as they
-arrive, streams are mapped 1:1, and FIN/reset propagate. A frame is never buffered in full. The
+arrive, streams are mapped 1:1, and FIN/reset propagate (a reset as a plain RESET_STREAM: the
+gateway does not parse frames, so it cannot know a reliable prefix, and the host does not mark
+one on this path). A frame is never buffered in full. The
 host logs these sessions as `path=relay-splice`, the client as `relay-splice` (WebTransport) or
 `relay` (WebSocket). For WebSocket clients, the gateway translates channel messages to and from
 QUIC streams and datagrams.

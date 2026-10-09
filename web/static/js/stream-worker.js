@@ -68,7 +68,7 @@ const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
   dropped: 0, skipped: 0, hostDropped: 0, keyRequests: 0, lastPost: now(), totalMin: Infinity, totalMax: 0,
-  recovered: 0, recoveredByKey: 0, recoveryDiscarded: 0, recoveryRejected: 0, keyFrames: 0,
+  recovered: 0, recoveredByKey: 0, recoveryDiscarded: 0, recoveryRejected: 0, keyFrames: 0, streamResets: 0,
   audioPackets: 0, audioLost: 0, freezes: 0, lastFreeze: 0, superseded: 0, supersededChunks: 0, lagMin: Infinity,
 };
 
@@ -220,24 +220,36 @@ class MsgParser {
   }
 }
 
-/** Read a frame stream; also returns when its first bytes arrived. */
+/**
+ * Read a frame stream; also returns when its first bytes arrived. A stream
+ * the host reset (it cancelled the frame) returns reset: true with what came
+ * of it: where the browser negotiated RESET_STREAM_AT (GUIDE 2.4) at least
+ * the frame's header, else what was read before the reset.
+ */
 async function readAll(stream) {
   const r = stream.getReader();
   const chunks = [];
   let n = 0;
   let first = 0;
+  let reset = false;
   for (;;) {
-    const { value, done } = await r.read();
-    if (done) break;
+    let next;
+    try {
+      next = await r.read();
+    } catch {
+      reset = true;
+      break;
+    }
+    if (next.done) break;
     if (!first) first = now();
-    chunks.push(value);
-    n += value.byteLength;
+    chunks.push(next.value);
+    n += next.value.byteLength;
   }
-  if (chunks.length === 1) return { buf: chunks[0], first };
+  if (chunks.length === 1) return { buf: chunks[0], first, reset };
   const out = new Uint8Array(n);
   let o = 0;
   for (const c of chunks) { out.set(c, o); o += c.byteLength; }
-  return { buf: out, first };
+  return { buf: out, first, reset };
 }
 
 // Send priorities (GUIDE 2.7). The client sends input (the input stream:
@@ -358,7 +370,7 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
         for (;;) {
           const { value, done } = await r.read();
           if (done) break;
-          readAll(value).then(({ buf, first }) => h.frame(buf, now(), first)).catch(() => {});
+          readAll(value).then(({ buf, first, reset }) => (reset ? h.frameReset(buf) : h.frame(buf, now(), first))).catch(() => {});
         }
       })();
       ctlLoop.catch(() => {});
@@ -1187,6 +1199,25 @@ function endRecovery(f) {
   post('log', { text: `recovered from the loss at ${r.gen}/${r.from} with ${how} ${f.gen}/${f.seq} after ${Math.round(t - r.since)} ms, ${r.discarded} frame(s) discarded` });
   const dt = dropTest.run;
   if (dt?.recovery && !dt.recoveredBy) dt.recoveredBy = { seq: f.seq, key: f.key, refFloor: f.ext?.refFloor ?? null, ms: Math.round(t - r.since), discarded: r.discarded };
+}
+
+// A frame stream the host reset (it cancelled the frame: GUIDE 2.3 rung 1,
+// a frame the client would discard, a failed write) whose header arrived:
+// with partial delivery (RESET_STREAM_AT, GUIDE 2.4) the host marks it
+// reliable, without it the header may have been read before the reset. The
+// frame is lost, as if the host had reported it dropped (its "dropped"
+// message comes too, maybe later: a run of discarded frames is reported
+// when it ends).
+function onFrameReset(buf) {
+  if (buf.byteLength < P.FRAME_HEADER_LEN || buf[0] !== P.FRAME_TYPE_VIDEO) return;
+  stats.streamResets++;
+  const gen = buf[2];
+  const seq = new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(4, true);
+  freezeSeen(gen, seq);
+  const cfg = video.cfg;
+  if (!cfg || gen !== cfg.gen || gen === video.lostGen || seq < video.expectSeq) return;
+  video.hostDropped.add(seq);
+  if (video.ready) checkGap(); // else drainEarly() gets to it
 }
 
 // The host discarded frames it will never send: treat them as lost now.
@@ -2068,6 +2099,7 @@ function postStats() {
     dropped: stats.dropped,
     skipped: stats.skipped,
     hostDropped: stats.hostDropped,
+    streamResets: stats.streamResets, // reset frame streams whose header arrived (onFrameReset)
     keyRequests: stats.keyRequests,
     recovered: stats.recovered,
     recoveredByKey: stats.recoveredByKey,
@@ -2196,7 +2228,7 @@ async function start(msg) {
   const pingTimer = setInterval(sendPing, 1000);
   const watchdogTimer = setInterval(videoWatchdog, 250);
   const statsTimer = setInterval(postStats, 500);
-  const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes });
+  const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset });
   clearInterval(pingTimer);
   clearInterval(statsTimer);
   clearInterval(watchdogTimer);
