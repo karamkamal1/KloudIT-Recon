@@ -6,12 +6,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,9 +29,11 @@ import (
 )
 
 // fakeMeter is a deliveryMeter the test moves by hand: send adds to sent,
-// deliver (deliverAt) moves done and records when.
+// deliver (deliverAt) moves done and records when, limited is its
+// WindowLimited (ns).
 type fakeMeter struct {
 	sent, done atomic.Uint64
+	limited    atomic.Int64
 	progress   chan struct{}
 	minRTT     time.Duration
 	pacing     int64 // bit/s
@@ -45,12 +50,13 @@ func newFakeMeter(minRTT time.Duration) *fakeMeter {
 	return &fakeMeter{progress: make(chan struct{}, 1), minRTT: minRTT, pacing: 24_000_000}
 }
 
-func (m *fakeMeter) Delivery() (uint64, uint64)  { return m.sent.Load(), m.done.Load() }
-func (m *fakeMeter) Progress() <-chan struct{}   { return m.progress }
-func (m *fakeMeter) RecentMinRTT() time.Duration { return m.minRTT }
-func (m *fakeMeter) PacingRate() int64           { return m.pacing }
-func (m *fakeMeter) send(n uint64)               { m.sent.Add(n) }
-func (m *fakeMeter) deliver(upTo uint64)         { m.deliverAt(upTo, time.Now()) }
+func (m *fakeMeter) Delivery() (uint64, uint64)   { return m.sent.Load(), m.done.Load() }
+func (m *fakeMeter) Progress() <-chan struct{}    { return m.progress }
+func (m *fakeMeter) RecentMinRTT() time.Duration  { return m.minRTT }
+func (m *fakeMeter) PacingRate() int64            { return m.pacing }
+func (m *fakeMeter) WindowLimited() time.Duration { return time.Duration(m.limited.Load()) }
+func (m *fakeMeter) send(n uint64)                { m.sent.Add(n) }
+func (m *fakeMeter) deliver(upTo uint64)          { m.deliverAt(upTo, time.Now()) }
 
 func (m *fakeMeter) deliverAt(upTo uint64, at time.Time) {
 	m.mu.Lock()
@@ -84,7 +90,7 @@ func shortOf(w *videoWindow, m deliveryMeter) {
 	}
 	w.npaced = 0
 	for range shortfallFrames {
-		w.paced[w.npaced%shortfallFrames] = paceSample{took: 20 * time.Millisecond, paced: 10 * time.Millisecond}
+		w.paced[w.npaced%shortfallFrames] = paceSample{took: 20 * time.Millisecond, paced: 10 * time.Millisecond, sent: 10 * time.Millisecond}
 		w.npaced++
 	}
 }
@@ -125,7 +131,7 @@ func TestVideoWindow(t *testing.T) {
 	}
 	shortOf(&w, m)
 	m.send(50_000)
-	w.sent(m, 0, now) // frame 1: in flight up to 50 000
+	w.sent(m, writeStart{pos: 0, at: now}, now) // frame 1: in flight up to 50 000
 	if !w.room(m, fi, now) {
 		t.Fatal("frame 1 just sent is in transit: the next one may follow it")
 	}
@@ -142,9 +148,9 @@ func TestVideoWindow(t *testing.T) {
 		t.Fatal("frame 1 acknowledged: room")
 	}
 	m.send(50_000)
-	w.sent(m, 50_000, now)
+	w.sent(m, writeStart{pos: 50_000, at: now}, now)
 	m.send(50_000)
-	w.sent(m, 100_000, now) // frames 2 and 3 in flight, both just sent
+	w.sent(m, writeStart{pos: 100_000, at: now}, now) // frames 2 and 3 in flight, both just sent
 	if w.room(m, fi, now) {
 		t.Fatal("two frames in flight on a 1 ms path: full")
 	}
@@ -178,7 +184,7 @@ func TestVideoWindow(t *testing.T) {
 		t.Fatal("a new controller's window is empty")
 	}
 	m2.send(10)
-	w.sent(m2, 0, now)
+	w.sent(m2, writeStart{pos: 0, at: now}, now)
 	w.mu.Lock()
 	marks, npaced := slices.Clone(w.marks), w.npaced
 	w.mu.Unlock()
@@ -195,7 +201,7 @@ func TestVideoWindow(t *testing.T) {
 	}
 }
 
-// TestWindowShortfall: the evidence of a path slower than the pacer. Each
+// TestWindowShortfall: the evidence of a path slower than the sender. Each
 // frame is 30 000 bytes, 10 ms at the fake's 24 Mbit/s pacing; the path
 // takes took from the acknowledgement of its first byte to that of its mark.
 func TestWindowShortfall(t *testing.T) {
@@ -204,17 +210,22 @@ func TestWindowShortfall(t *testing.T) {
 	fi := time.Second / 60
 	now := time.Now()
 	w.room(m, fi, now)
-	// frame sends a frame of n bytes at now whose first byte the peer
+	// write sends a frame of n bytes at now whose write takes wrote, held
+	// of that by the congestion window, and whose first byte the peer
 	// acknowledges rtt later and its mark took after that.
-	frame := func(n uint64, rtt, took time.Duration) {
+	write := func(n uint64, rtt, took, wrote, held time.Duration) {
 		start, _ := m.Delivery()
+		ws := writeStart{pos: start, at: now, limited: m.WindowLimited()}
 		m.send(n)
-		w.sent(m, start, now)
+		m.limited.Add(int64(held))
+		w.sent(m, ws, now.Add(wrote))
 		m.deliverAt(start+1, now.Add(rtt))
 		m.deliverAt(start+n, now.Add(rtt+took))
-		now = now.Add(fi)
+		now = now.Add(max(fi, wrote))
 		w.room(m, fi, now) // observes the acknowledgement
 	}
+	// frame: a write within the pacer's time.
+	frame := func(n uint64, rtt, took time.Duration) { write(n, rtt, took, 0, 0) }
 	short := func() bool {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -255,6 +266,36 @@ func TestWindowShortfall(t *testing.T) {
 	}
 	if !short() {
 		t.Fatal("three frames at 40 % of the pacing rate: a shortfall")
+	}
+	// A sender that is late itself (a busy CPU runs quic-go's send loop
+	// late: each write takes 2.5 times the pacer's time) delivers as late:
+	// no queue builds, nothing to hold datagrams out of.
+	w, m, now = &videoWindow{}, newFakeMeter(10*time.Millisecond), time.Now()
+	w.room(m, fi, now)
+	for i := range 8 {
+		write(30_000, 10*time.Millisecond, 25*time.Millisecond, 25*time.Millisecond, 0)
+		if short() {
+			t.Fatalf("late sender, frame %d: a shortfall", i)
+		}
+	}
+	// A path three times slower than that sender still shows.
+	for range 3 {
+		write(30_000, 10*time.Millisecond, 75*time.Millisecond, 25*time.Millisecond, 0)
+	}
+	if !short() {
+		t.Fatal("three frames delivered three times as slowly as the late sender sent them: a shortfall")
+	}
+	// The time the congestion window held a write back is the path's (the
+	// acknowledgements it waited for), not the sender's: a capacity drop to
+	// 40 % of the pacing rate shows as before when the window held each
+	// write 15 of its 25 ms.
+	w, m, now = &videoWindow{}, newFakeMeter(10*time.Millisecond), time.Now()
+	w.room(m, fi, now)
+	for range 3 {
+		write(30_000, 10*time.Millisecond, 25*time.Millisecond, 25*time.Millisecond, 15*time.Millisecond)
+	}
+	if !short() {
+		t.Fatal("three frames at 40 % of the pacing rate whose writes waited for the window: a shortfall")
 	}
 	// Small frames (a still desktop) decide nothing: their
 	// acknowledgements' timing would.
@@ -403,13 +444,20 @@ func TestFrameSenderWindow(t *testing.T) {
 			s.checkOut()
 		}
 		waitStreams(t, c, 2, "two frames go out")
-		opened := time.Now()
-		time.Sleep(5 * time.Millisecond)
-		held(t, c)
+		// The hold timed as frameSender records it (its start, the stream's
+		// close), not by this goroutine, which a loaded machine wakes late.
+		var since int64
+		for deadline := time.Now().Add(time.Second); since == 0 && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			since = s.windowSince.Load()
+		}
+		held(t, c) // still held: since is the third frame's
+		if since == 0 {
+			t.Fatal("frameSender is not holding the frame for the window")
+		}
 		s.frameQ <- frame(3) // a newer frame is ready
 		s.checkOut()
 		st := waitStreams(t, c, 3, "the held frame at its deadline")
-		if d := time.Since(opened); d < 45*time.Millisecond {
+		if d := st[2].doneAt.Sub(time.Unix(0, since)); d < 45*time.Millisecond {
 			t.Errorf("the held frame went out after %v, before three quarters of its deadline (67 ms)", d)
 		}
 		if !st[2].closed || st[2].cancelled || len(st[2].data) < 1000 {
@@ -741,35 +789,71 @@ func pctl(v []time.Duration, p float64) time.Duration {
 	return s[int(math.Round(float64(len(s)-1)*p))]
 }
 
-// measureDatagramLatency streams c from a host session (frameSender, the
-// datagram loop answering pings, the media congestion controller) whose
-// encoder produces 20 Mbit/s at 60 fps (a 6-deep frame queue that drops what
-// does not fit, as the session's) over real quic-go through a bottleneck
-// (300 ms drop-tail queue). Below 20 Mbit/s the frame queue stays full, a
-// large video backlog. Audio-sized datagrams go out every 10 ms beside the
-// video (as the session's audio does), the client pings every 20 ms. Clock:
-// one process, so the audio's one-way delay and the frames' latency are
-// exact. window false runs the session without its video window (before
-// GUIDE 2.7).
-func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun {
+// latencyPath is a measurement's path: a listener for the host session
+// behind a bottleneck of c's capacity and delay.
+type latencyPath struct {
+	ln        *quic.Listener
+	bn        *bottleneck
+	clientTLS *tls.Config
+}
+
+func newLatencyPath(t *testing.T, c latencyCase) *latencyPath {
 	t.Helper()
 	serverTLS, clientTLS := testTLS(t)
 	ln, err := quic.ListenAddr("127.0.0.1:0", serverTLS, transport.QUICConfig(transport.WithCongestion(transport.CongestionMedia)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { ln.Close() })
+	return &latencyPath{ln: ln, bn: newBottleneck(t, ln.Addr(), c.capacity, c.oneWay, c.jitter, 300*time.Millisecond), clientTLS: clientTLS}
+}
+
+// measureDatagramLatency streams c without and with the video window (before
+// and after GUIDE 2.7) at the same time, over two paths alike, so both see
+// the same load on the machine: measured one after the other, a CPU that
+// other processes (parallel test packages, a 2-vCPU CI runner) take turns on
+// gives one of them seconds the other did not have, tens of ms of frame
+// latency either way.
+func measureDatagramLatency(t *testing.T, c latencyCase) (before, after latencyRun) {
+	t.Helper()
+	paths := [2]*latencyPath{newLatencyPath(t, c), newLatencyPath(t, c)}
+	var runs [2]latencyRun
+	var errs [2]error
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		wg.Go(func() { runs[i], errs[i] = p.stream(i == 1, c) })
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return runs[0], runs[1]
+}
+
+// stream streams c from a host session (frameSender, the datagram loop
+// answering pings, the media congestion controller) whose encoder produces
+// 20 Mbit/s at 60 fps (a 6-deep frame queue that drops what does not fit, as
+// the session's) over real quic-go through p's bottleneck (300 ms drop-tail
+// queue). Below 20 Mbit/s the frame queue stays full, a large video backlog.
+// Audio-sized datagrams go out every 10 ms beside the video (as the
+// session's audio does), the client pings every 20 ms. Clock: one process,
+// so the audio's one-way delay and the frames' latency are exact. window
+// false runs the session without its video window (before GUIDE 2.7). The
+// frame sizes are the same sequence on every run.
+func (p *latencyPath) stream(window bool, c latencyCase) (latencyRun, error) {
+	defer p.ln.Close()
 	const (
 		kbps = 20000
 		fps  = 60
 	)
-	bn := newBottleneck(t, ln.Addr(), c.capacity, c.oneWay, c.jitter, 300*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), c.d+15*time.Second)
 	defer cancel()
 	t0 := time.Now()
 	since := func() time.Duration { return time.Since(t0) }
 	if c.stepAt > 0 {
-		step := time.AfterFunc(c.stepAt, func() { bn.setDelay(c.stepTo) })
+		step := time.AfterFunc(c.stepAt, func() { p.bn.setDelay(c.stepTo) })
 		defer step.Stop()
 	}
 	queued := make([]atomic.Int64, int(c.d/(time.Second/fps))+fps) // by seq: when the frame was queued
@@ -778,7 +862,7 @@ func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun
 	var run latencyRun
 	hostDone := make(chan *Session, 1)
 	go func() {
-		qc, err := ln.Accept(ctx)
+		qc, err := p.ln.Accept(ctx)
 		if err != nil {
 			hostDone <- nil
 			return
@@ -804,6 +888,7 @@ func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun
 		defer audio.Stop()
 		avg := kbps * 1000 / 8 / fps
 		payload := make([]byte, avg+int(float64(avg)*c.sizeVar))
+		sizes := rand.New(rand.NewPCG(1, 2))
 		for seq := uint32(0); ; {
 			select {
 			case <-stop:
@@ -815,7 +900,7 @@ func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun
 			case <-video.C:
 				n := avg
 				if c.sizeVar > 0 {
-					n = int(float64(avg) * (1 + c.sizeVar*(2*rand.Float64()-1)))
+					n = int(float64(avg) * (1 + c.sizeVar*(2*sizes.Float64()-1)))
 				}
 				if int(seq) < len(queued) {
 					queued[seq].Store(int64(since()))
@@ -834,9 +919,11 @@ func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun
 		}
 	}()
 
-	qc, err := quic.DialAddr(ctx, bn.pc.LocalAddr().String(), clientTLS, transport.QUICConfig())
+	qc, err := quic.DialAddr(ctx, p.bn.pc.LocalAddr().String(), p.clientTLS, transport.QUICConfig())
 	if err != nil {
-		t.Fatal(err)
+		cancel()
+		<-hostDone
+		return run, err
 	}
 	defer qc.CloseWithError(0, "")
 	var mu sync.Mutex
@@ -903,7 +990,7 @@ func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun
 	defer mu.Unlock()
 	out := run
 	out.frame = slices.Clone(run.frame)
-	return out
+	return out, nil
 }
 
 // TestDatagramLatencyBehindVideo measures the audio datagrams' one-way delay
@@ -916,15 +1003,22 @@ func measureDatagramLatency(t *testing.T, window bool, c latencyCase) latencyRun
 // On paths that carry the video the window holds nothing back: the same
 // frames, frame latency and datagram delays either way, on a clean
 // 50 Mbit/s path, on a jittery one (Wi-Fi) and on one whose round trip
-// grows tenfold mid-stream (a relay fallback). The video throughput stays
-// the path's.
+// grows tenfold mid-stream (a relay fallback), and at most maxNoCostHeld
+// frames held. The video throughput stays the path's. Each case runs
+// without and with the window at the same time (measureDatagramLatency), so
+// a loaded machine slows both alike.
 func TestDatagramLatencyBehindVideo(t *testing.T) {
 	if testing.Short() {
-		t.Skip("26 s real-time measurement")
+		t.Skip("13 s real-time measurement")
 	}
 	// Segmentation offload would hand the bottleneck 64 kB batches.
 	t.Setenv("QUIC_GO_DISABLE_GSO", "true")
 	const oneWay = 5 * time.Millisecond
+	// maxNoCostHeld: frames the window may hold on a path that carries the
+	// video: one or two on the first samples' evidence (two frames' worth
+	// of acknowledgements, which 10 ms of jitter can stretch past the
+	// ratio), never a run of them.
+	const maxNoCostHeld = 2
 	log := func(name string, r latencyRun) {
 		ms := func(d time.Duration) time.Duration { return d.Round(100 * time.Microsecond) }
 		t.Logf("%s: audio one-way p50 %v p95 %v max %v (%d); pong RTT p50 %v p95 %v (%d); frame latency p50 %v p95 %v; %d frames received, %d held by the window",
@@ -934,50 +1028,88 @@ func TestDatagramLatencyBehindVideo(t *testing.T) {
 			t.Fatalf("%s: too few samples", name)
 		}
 	}
-	backlog := latencyCase{d: 3 * time.Second, capacity: 10e6, oneWay: oneWay}
-	before := measureDatagramLatency(t, false, backlog)
-	log("10 Mbit/s, before (no window)", before)
-	after := measureDatagramLatency(t, true, backlog)
-	log("10 Mbit/s, after (video window)", after)
-	if before.held != 0 || after.held == 0 {
-		t.Errorf("window held %d frames before, %d after", before.held, after.held)
-	}
-	if b, a := pctl(before.audio, .5), pctl(after.audio, .5); a > b*6/10 {
-		t.Errorf("audio one-way p50 %v with the window, %v without: want at most 60 %%", a, b)
-	}
-	if b, a := pctl(before.pong, .5), pctl(after.pong, .5); a > b*6/10 {
-		t.Errorf("pong RTT p50 %v with the window, %v without: want at most 60 %%", a, b)
-	}
-	if after.frames < before.frames*85/100 {
-		t.Errorf("%d frames received with the window, %d without: the window must not cost throughput", after.frames, before.frames)
+	// judge measures c and applies checks to the runs without (b) and with
+	// (a) the window: each failed check names itself and says why. A check
+	// that fails on the first measurement is judged on three, by the
+	// majority (the median measurement): side by side the two sessions see
+	// the same load, but a loaded machine (other test packages, a 2-vCPU
+	// runner) still gives one of them a few ms more for a whole case now and
+	// then (frame latency p50 6-8 ms apart with no frame held in 3 of 15
+	// comparisons, at a load of 12-16 on 4 CPUs plus 5 busy loops on the
+	// test's 2); a window that costs latency costs it in every measurement.
+	judge := func(name string, c latencyCase, checks func(b, a latencyRun) map[string]string) {
+		t.Helper()
+		failed := map[string][]string{}
+		for i := range 3 {
+			b, a := measureDatagramLatency(t, c)
+			log(name+", before (no window)", b)
+			log(name+", after (video window)", a)
+			f := checks(b, a)
+			if i == 0 && len(f) == 0 {
+				return
+			}
+			for _, k := range slices.Sorted(maps.Keys(f)) {
+				failed[k] = append(failed[k], f[k])
+				if i == 0 {
+					t.Logf("%s: %s; measuring twice more", name, f[k])
+				}
+			}
+		}
+		for _, k := range slices.Sorted(maps.Keys(failed)) {
+			if msgs := failed[k]; len(msgs) >= 2 {
+				t.Errorf("%s: %s (in %d of 3 measurements)", name, strings.Join(msgs, "; "), len(msgs))
+			}
+		}
 	}
 
-	// Paths that carry the video: no cost.
-	for _, c := range []struct {
-		name string
-		c    latencyCase
-	}{
-		{"50 Mbit/s", latencyCase{d: 2 * time.Second, capacity: 50e6, oneWay: oneWay}},
-		{"200 Mbit/s, jitter 2.5 ms + up to 10 ms each way, frames ±50 %",
-			latencyCase{d: 3 * time.Second, capacity: 200e6, oneWay: 2500 * time.Microsecond, jitter: 10 * time.Millisecond, sizeVar: .5}},
-		{"200 Mbit/s, round trip 4 ms, 40 ms from 1.5 s",
-			latencyCase{d: 3 * time.Second, capacity: 200e6, oneWay: 2 * time.Millisecond, stepAt: 1500 * time.Millisecond, stepTo: 20 * time.Millisecond}},
-	} {
-		cb := measureDatagramLatency(t, false, c.c)
-		log(c.name+", before (no window)", cb)
-		ca := measureDatagramLatency(t, true, c.c)
-		log(c.name+", after (video window)", ca)
-		if b, a := pctl(cb.audio, .5), pctl(ca.audio, .5); a > b+5*time.Millisecond {
-			t.Errorf("%s: audio one-way p50 %v with the window, %v without", c.name, a, b)
+	judge("10 Mbit/s", latencyCase{d: 3 * time.Second, capacity: 10e6, oneWay: oneWay}, func(b, a latencyRun) map[string]string {
+		f := map[string]string{}
+		if b.held != 0 || a.held == 0 {
+			f["held"] = fmt.Sprintf("window held %d frames before, %d after", b.held, a.held)
 		}
-		if b, a := pctl(cb.frame, .5), pctl(ca.frame, .5); a > b+5*time.Millisecond {
-			t.Errorf("%s: frame latency p50 %v with the window, %v without", c.name, a, b)
+		if bp, ap := pctl(b.audio, .5), pctl(a.audio, .5); ap > bp*6/10 {
+			f["audio"] = fmt.Sprintf("audio one-way p50 %v with the window, %v without: want at most 60 %%", ap, bp)
 		}
-		if b, a := pctl(cb.frame, .95), pctl(ca.frame, .95); a > b+15*time.Millisecond {
-			t.Errorf("%s: frame latency p95 %v with the window, %v without", c.name, a, b)
+		if bp, ap := pctl(b.pong, .5), pctl(a.pong, .5); ap > bp*6/10 {
+			f["pong"] = fmt.Sprintf("pong RTT p50 %v with the window, %v without: want at most 60 %%", ap, bp)
 		}
-		if ca.frames < cb.frames*95/100 {
-			t.Errorf("%s: %d frames received with the window, %d without", c.name, ca.frames, cb.frames)
+		if a.frames < b.frames*85/100 {
+			f["frames"] = fmt.Sprintf("%d frames received with the window, %d without: the window must not cost throughput", a.frames, b.frames)
 		}
+		return f
+	})
+
+	// Paths that carry the video: no cost. A latency with the window may
+	// exceed the one without by the margin, or by 15 % of the one without
+	// where that is more: these paths' own latencies are 6-31 ms, so that
+	// share only counts where load inflated the latency without the window
+	// (2-4 times under -race or with the test's 2 CPUs shared), and there two
+	// sessions side by side still differ by that much (frame latency p50
+	// +6 to +12 ms with no frame held, at 47-80 ms). The frames held stay
+	// at maxNoCostHeld whatever the load.
+	more := func(with, without, margin time.Duration) bool { return with > without+max(margin, without*15/100) }
+	noCost := func(b, a latencyRun) map[string]string {
+		f := map[string]string{}
+		if a.held > maxNoCostHeld {
+			f["held"] = fmt.Sprintf("the window held %d frames", a.held)
+		}
+		if bp, ap := pctl(b.audio, .5), pctl(a.audio, .5); more(ap, bp, 5*time.Millisecond) {
+			f["audio"] = fmt.Sprintf("audio one-way p50 %v with the window, %v without", ap, bp)
+		}
+		if bp, ap := pctl(b.frame, .5), pctl(a.frame, .5); more(ap, bp, 5*time.Millisecond) {
+			f["frame p50"] = fmt.Sprintf("frame latency p50 %v with the window, %v without", ap, bp)
+		}
+		if bp, ap := pctl(b.frame, .95), pctl(a.frame, .95); more(ap, bp, 15*time.Millisecond) {
+			f["frame p95"] = fmt.Sprintf("frame latency p95 %v with the window, %v without", ap, bp)
+		}
+		if a.frames < b.frames*95/100 {
+			f["frames"] = fmt.Sprintf("%d frames received with the window, %d without", a.frames, b.frames)
+		}
+		return f
 	}
+	judge("50 Mbit/s", latencyCase{d: 2 * time.Second, capacity: 50e6, oneWay: oneWay}, noCost)
+	judge("200 Mbit/s, jitter 2.5 ms + up to 10 ms each way, frames ±50 %",
+		latencyCase{d: 3 * time.Second, capacity: 200e6, oneWay: 2500 * time.Microsecond, jitter: 10 * time.Millisecond, sizeVar: .5}, noCost)
+	judge("200 Mbit/s, round trip 4 ms, 40 ms from 1.5 s",
+		latencyCase{d: 3 * time.Second, capacity: 200e6, oneWay: 2 * time.Millisecond, stepAt: 1500 * time.Millisecond, stepTo: 20 * time.Millisecond}, noCost)
 }

@@ -459,16 +459,23 @@ the host's frame queue.
 
 *Falls short*: over the last 8 acknowledged frames, the path took more than 1.5 × as long to
 deliver their bytes (from the acknowledgement of a frame's first byte to that of its mark:
-`cc.Media.DeliveredAt`, a record of when the delivery position grew) as the pacer took to send
-them (bytes / pacing rate), with at least 20 ms of pacing in those samples: a bottleneck under
-2/3 of the pacing rate (0.8 × the target bitrate). A longer or varying round trip delays both
-acknowledgements alike, so a path that carries the video is never held back, whatever its round
-trip does: a relay fallback (TURN/DERP) that multiplies it, Wi-Fi jitter. A capacity drop shows
-within about three frames. *Recent min RTT* (`cc.Media.RecentMinRTT`): the smallest round trip a
-packet took in the last 1.5–2 s (quic-go's own min RTT is the connection's lifetime minimum,
-which a longer path never raises); 0 before the first acknowledgement. While the path falls
-short the window keeps the value from before (a lower one still counts): the backlog it leaves,
-about a frame, is in every round trip then and would otherwise widen "in transit" by itself.
+`cc.Media.DeliveredAt`, a record of when the delivery position grew) as the sender took to send
+them, with at least 20 ms of pacing in those samples: a bottleneck under 2/3 of the pacing rate
+(0.8 × the target bitrate). The sender's time for a frame is the pacer's (bytes / pacing rate),
+or its write's own duration where that was longer, less the time the congestion window held the
+write back (`cc.Media.WindowLimited`: from a packet the window refused to the next it allowed).
+On a host whose CPU is busy (a game) quic-go's send loop runs late: the frame leaves late and
+arrives as late, no queue builds in the network, and a hold would only add the wait for an
+acknowledgement; measured against the pacer alone that read as a shortfall. Waiting for the
+window is the path's doing (a backlog in the network), so it never hides a shortfall. A longer
+or varying round trip delays both acknowledgements alike, so a path that carries the video is
+never held back, whatever its round trip does: a relay fallback (TURN/DERP) that multiplies it,
+Wi-Fi jitter. A capacity drop shows within about three frames. *Recent min RTT*
+(`cc.Media.RecentMinRTT`): the smallest round trip a packet took in the last 1.5–2 s (quic-go's
+own min RTT is the connection's lifetime minimum, which a longer path never raises); 0 before
+the first acknowledgement. While the path falls short the window keeps the value from before (a
+lower one still counts): the backlog it leaves, about a frame, is in every round trip then and
+would otherwise widen "in transit" by itself.
 
 The window never makes a frame late: it holds a frame at most until three quarters of the
 frame's deadline (the loss-recovery ladder's deadline, max(2 frame intervals, 25 ms)) have passed

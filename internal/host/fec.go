@@ -55,7 +55,11 @@ import (
 // after the hold, a frame the client would discard meanwhile is not sent,
 // and writeShards records it in the window after its last shard
 // (sentDatagrams), so the window counts shard frames in flight as it counts
-// streams. The queue a single frame's shards fill while the path falls short
+// streams. For the window's shortfall gate the shards' "write" is their
+// hand-over, from the first shard's SendDatagram to the last one's return
+// (the writer's pacing waits, waits on quic-go's full datagram queue), less
+// the time the congestion window held the sender meanwhile: a send loop
+// late on a busy CPU is the sender's own time, not the path's. The queue a single frame's shards fill while the path falls short
 // stays (at most 32 shards, ~39 KB: about 31 ms at 10 Mbit/s): the writer
 // does not also wait between shards for acknowledgements. Pongs leave from
 // pongSender, never from the datagram loop, and the client sends NACKs on
@@ -406,8 +410,8 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 	last := time.Now()
 	loss := s.a.faults.fecLoss
 	m := s.deliveryMeter()
-	start := startPos(m) // the video window measures the frame's delivery from here
-	sent := 0            // bytes handed to the connection
+	ws := startWrite(m) // the video window measures the frame's delivery (and the hand-over's time) from here
+	sent := 0           // bytes handed to the connection
 	for i, d := range dgs {
 		if (i > 0 || held) && i%16 == 0 && s.ctx.Err() == nil {
 			in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
@@ -470,14 +474,14 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 	if m2 := s.deliveryMeter(); m2 != nil {
 		// In flight until the peer acknowledged its shards (GUIDE 2.7):
 		// SendDatagram queues them, so the frame ends at least its bytes
-		// after start.
+		// after where its first shard started.
 		end := uint64(0)
 		if m2 != m {
-			start = math.MaxUint64 // the path changed during the writes
-		} else if start != math.MaxUint64 {
-			end = start + uint64(sent)
+			ws.pos = math.MaxUint64 // the path changed during the writes
+		} else if ws.pos != math.MaxUint64 {
+			end = ws.pos + uint64(sent)
 		}
-		s.win.sentDatagrams(m2, start, end, time.Now())
+		s.win.sentDatagrams(m2, ws, end, time.Now())
 	}
 	s.fec.keep(fr)
 	fs := &s.fec

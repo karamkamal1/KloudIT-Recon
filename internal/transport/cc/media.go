@@ -103,6 +103,15 @@ type Media struct {
 	// loop only) and of the whole window (ns; 0: no sample yet).
 	rttMin       [rttBuckets]rttBucket
 	recentMinRTT atomic.Int64
+
+	// WindowLimited: the time the window refused the sender before the
+	// current refusal (limitedTotal) and when that began (limitedSince; zero:
+	// the window allows); limited is the run loop's own copy of the state.
+	limMu        sync.Mutex
+	limitedTotal time.Duration
+	limitedSince congestion.Time
+	limited      bool
+	now          func() congestion.Time
 }
 
 type sentRecord struct {
@@ -126,7 +135,7 @@ var _ congestion.CongestionControl = (*Media)(nil)
 
 // NewMedia returns a media controller for one path of a connection.
 func NewMedia(rtt congestion.RTTStats, initialMaxDatagramSize congestion.ByteCount) *Media {
-	m := &Media{rtt: rtt, largestAcked: -1, progress: make(chan struct{}, 1)}
+	m := &Media{rtt: rtt, largestAcked: -1, progress: make(chan struct{}, 1), now: congestion.Now}
 	m.targetBitrate.Store(DefaultTargetBitrate)
 	m.frameInterval.Store(int64(DefaultFrameInterval))
 	m.maxDatagramSize.Store(int64(initialMaxDatagramSize))
@@ -259,7 +268,36 @@ func (m *Media) GetCongestionWindow() congestion.ByteCount {
 }
 
 func (m *Media) CanSend(bytesInFlight congestion.ByteCount) bool {
-	return bytesInFlight < m.GetCongestionWindow()
+	ok := bytesInFlight < m.GetCongestionWindow()
+	if limited := !ok; limited != m.limited {
+		// quic-go asks before each packet it would send (and after each ACK
+		// it processes), so the refusals' span is when the sender waited.
+		m.limited = limited
+		now := m.now()
+		m.limMu.Lock()
+		if limited {
+			m.limitedSince = now
+		} else {
+			m.limitedTotal += now.Sub(m.limitedSince)
+			m.limitedSince = 0
+		}
+		m.limMu.Unlock()
+	}
+	return ok
+}
+
+// WindowLimited is how long in all the congestion window has kept the sender
+// from sending (from a packet it refused to the next one it allowed):
+// time spent waiting for the path's acknowledgements, as opposed to the
+// pacer's or the sender's own (a run loop that runs late on a busy CPU).
+func (m *Media) WindowLimited() time.Duration {
+	m.limMu.Lock()
+	defer m.limMu.Unlock()
+	d := m.limitedTotal
+	if !m.limitedSince.IsZero() {
+		d += m.now().Sub(m.limitedSince)
+	}
+	return d
 }
 
 func (m *Media) maxBurst() congestion.ByteCount {

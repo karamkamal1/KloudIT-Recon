@@ -416,3 +416,33 @@ func TestMediaRecentMinRTT(t *testing.T) {
 		t.Fatalf("RecentMinRTT %v after an ACK-only packet", r)
 	}
 }
+
+// WindowLimited: the time from a packet the congestion window refused to the
+// next one it allowed, cumulative, the current refusal included.
+func TestMediaWindowLimited(t *testing.T) {
+	m, now := newTestMedia(10 * time.Millisecond)
+	m.now = func() congestion.Time { return *now }
+	w := m.GetCongestionWindow()
+	step := func(d time.Duration) { *now = now.Add(d) }
+	check := func(what string, want time.Duration) {
+		t.Helper()
+		if got := m.WindowLimited(); got != want {
+			t.Fatalf("%s: WindowLimited %v, want %v", what, got, want)
+		}
+	}
+	m.CanSend(w - 1)
+	step(5 * time.Millisecond)
+	check("the window allows", 0)
+	m.CanSend(w) // refused
+	step(3 * time.Millisecond)
+	check("refused 3 ms ago", 3*time.Millisecond)
+	m.CanSend(w + mds) // still refused: the same wait
+	step(2 * time.Millisecond)
+	m.CanSend(w - 1) // allowed again
+	step(20 * time.Millisecond)
+	check("allowed after 5 ms", 5*time.Millisecond)
+	m.CanSend(w)
+	step(time.Millisecond)
+	m.CanSend(0)
+	check("a second wait of 1 ms", 6*time.Millisecond)
+}

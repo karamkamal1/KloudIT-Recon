@@ -234,14 +234,66 @@ func TestFECStreamsSwitch(t *testing.T) {
 
 // sentDatagrams: quic-go queues datagrams, so the meter's sent position can
 // be short of a frame's last shard: the mark is at least its shards' end.
+// The write's own time is the shards' hand-over less the time the congestion
+// window held the sender meanwhile.
 func TestWindowSentDatagrams(t *testing.T) {
 	m := newFakeMeter(10 * time.Millisecond)
 	m.send(100)
 	var w videoWindow
-	w.sentDatagrams(m, 100, 600, time.Now()) // nothing packed yet
+	now := time.Now()
+	ws := writeStart{pos: 100, at: now, limited: m.WindowLimited()}
+	m.limited.Add(int64(5 * time.Millisecond))                // the window held the sender for 5 ms of it
+	w.sentDatagrams(m, ws, 600, now.Add(20*time.Millisecond)) // nothing packed yet
+	ws = writeStart{pos: 600, at: now, limited: m.WindowLimited()}
 	m.send(800)
-	w.sentDatagrams(m, 600, 700, time.Now()) // packed (with other datagrams) past its end
+	w.sentDatagrams(m, ws, 700, now.Add(2*time.Millisecond)) // packed (with other datagrams) past its end
 	if len(w.marks) != 2 || w.marks[0].pos != 600 || w.marks[1].pos != 900 {
 		t.Fatalf("marks %+v, want positions 600 and 900", w.marks)
+	}
+	if w.marks[0].own != 15*time.Millisecond || w.marks[1].own != 2*time.Millisecond {
+		t.Fatalf("own times %v and %v, want 15 ms and 2 ms", w.marks[0].own, w.marks[1].own)
+	}
+}
+
+// The shortfall gate on frames sent as shards (GUIDE 2.5 with 2.7's window,
+// as TestWindowShortfall for streams): frames delivered at a quarter of the
+// pacing rate are a shortfall when their shards were handed over within the
+// pacer's time, or when the congestion window held the hand-over; not when
+// the sender itself took that long (a CPU-starved send loop: the shards
+// leave as late as they are handed over, no queue builds).
+func TestWindowShortfallShards(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		wrote, held  time.Duration
+		wantShortage bool
+	}{
+		{"handed over at the pacer's time", 0, 0, true},
+		{"a starved sender's own time", 40 * time.Millisecond, 0, false},
+		{"held by the congestion window", 40 * time.Millisecond, 38 * time.Millisecond, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := &videoWindow{}
+			m := newFakeMeter(10 * time.Millisecond)
+			fi := time.Second / 60
+			now := time.Now()
+			w.room(m, fi, now)
+			for range 3 { // 30 000 bytes: 10 ms at the fake's 24 Mbit/s
+				start, _ := m.Delivery()
+				ws := writeStart{pos: start, at: now, limited: m.WindowLimited()}
+				m.send(30_000)
+				m.limited.Add(int64(c.held))
+				w.sentDatagrams(m, ws, start+30_000, now.Add(c.wrote))
+				m.deliverAt(start+1, now.Add(10*time.Millisecond))
+				m.deliverAt(start+30_000, now.Add(50*time.Millisecond))
+				now = now.Add(max(fi, c.wrote))
+				w.room(m, fi, now)
+			}
+			w.mu.Lock()
+			short := w.shortfall()
+			w.mu.Unlock()
+			if short != c.wantShortage {
+				t.Fatalf("shortfall %v, want %v", short, c.wantShortage)
+			}
+		})
 	}
 }
