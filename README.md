@@ -474,7 +474,8 @@ bitrate while it runs: for every codec, encoder preset (speed, balanced, quality
 mode (AMD: CBR, latency- and peak-constrained VBR; NVIDIA and Intel Quick Sync through the
 libavcodec backend: CBR) and live-bitrate mode
 (`seamless`, `flush`) it encodes a high-motion test source for 60 s, started as sessions start
-it (the preset, AMD's long-term reference slots), while the bitrate steps 50 → 20 → 50 Mbit/s
+it (the preset, AMD's long-term reference slots, two temporal layers where the encoder has them
+unless `svc` is `off`: run it again after changing `svc`), while the bitrate steps 50 → 20 → 50 Mbit/s
 every 2 s, and checks that no key frame appears on a change (`seamless`), the frame sizes reach
 the new target within 3 frames, no frame or frame barcode is missing and the stream decodes
 cleanly (about 70 minutes on AMD, 25 on NVIDIA, with FFmpeg for the decode checks; `-quality

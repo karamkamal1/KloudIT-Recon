@@ -57,7 +57,8 @@ func qualifyCmd(cfg *host.Config, cfgPath string, args []string) int {
 
 Runs one stream per codec x quality preset x rate-control mode x live-bitrate mode through the
 native encoder helper, started as sessions start it (the preset, LTR slots where the codec
-recovers from them), stepping the bitrate between -high and -low every -step for -duration, and
+recovers from them, two temporal layers where the encoder has them unless host config "svc" is
+off), stepping the bitrate between -high and -low every -step for -duration, and
 checks: no IDR on a change (seamless; flush must make one), P-frame sizes at the new target
 within 3 frames, no frame-id or barcode gaps, a stream that decodes cleanly. Sessions then use
 seamless where it passed, else flush (with less frequent changes), else a new encoder per
@@ -77,6 +78,7 @@ change. Stop streaming sessions first.
 	}
 	o.Helper, o.Codecs, o.Qualities, o.RCModes, o.Modes = *helper, split(*codecs), split(*qualities), split(*rcs), split(*modes)
 	o.HelperArgs = strings.Fields(*helperArgs)
+	o.SVCLayers = cfg.SVCLayers() // as sessions ask for them (host config "svc")
 	if _, err := os.Stat(o.Helper); err != nil {
 		fmt.Fprintln(os.Stderr, "error: the native encoder helper:", err)
 		return 1

@@ -20,9 +20,10 @@ import (
 // FileName is the results file, next to the host config (host.json).
 const FileName = "live-bitrate.json"
 
-// ResultsVersion is the results file format (2: cells carry the quality
-// preset and LTR slots they ran with; version 1 measured neither).
-const ResultsVersion = 2
+// ResultsVersion is the results file format (3: cells carry the temporal
+// layers they ran with; 2: the quality preset and LTR slots, which version 1
+// did not measure).
+const ResultsVersion = 3
 
 // PathFor returns the results file for a host config file.
 func PathFor(configPath string) string { return filepath.Join(filepath.Dir(configPath), FileName) }
@@ -159,8 +160,8 @@ func (r *Results) Matches(c encoder.Caps) (bool, string) {
 // stream is what a cell ran besides rc and live-bitrate mode: Choose uses
 // only cells that ran a session's stream exactly so.
 type stream struct {
-	codec, quality string
-	ltrSlots       int
+	codec, quality      string
+	ltrSlots, svcLayers int // svcLayers 1: one layer (0 in a start or cell)
 }
 
 // streamOf returns the stream of a session's start (no quality: the
@@ -170,13 +171,13 @@ func streamOf(sp encoder.StartParams) stream {
 	if q == "" {
 		q = DefaultQuality
 	}
-	return stream{sp.Codec, q, sp.LTRSlots}
+	return stream{sp.Codec, q, sp.LTRSlots, max(sp.SVCLayers, 1)}
 }
 
 func (r *Results) cell(s stream, rc, mode string) *Cell {
 	for i := range r.Cells {
-		if c := &r.Cells[i]; c.Codec == s.codec && c.Quality == s.quality && c.LTRSlots == s.ltrSlots && c.RC == rc &&
-			c.LiveBitrate == mode {
+		if c := &r.Cells[i]; c.Codec == s.codec && c.Quality == s.quality && c.LTRSlots == s.ltrSlots && max(c.SVCLayers, 1) == s.svcLayers &&
+			c.RC == rc && c.LiveBitrate == mode {
 			return c
 		}
 	}
@@ -209,9 +210,10 @@ func (r *Results) pick(s stream, rc string) (string, bool) {
 
 // Choose returns the rate-control mode (start's rc) and live-bitrate mode
 // (seamless | flush | restart) a stream should use on a helper with caps c,
-// from these results; sp is its start (codec, quality preset, LTR slots: only
-// cells that ran exactly that count). ok false where they say nothing about
-// it (other GPU or backend; codec, preset, LTR slots or mode not measured):
+// from these results; sp is its start (codec, quality preset, LTR slots,
+// temporal layers: only cells that ran exactly that count). ok false where
+// they say nothing about it (other GPU or backend; codec, preset, LTR slots,
+// layers or mode not measured):
 // then the helper's defaults apply. adaptive: the session's rate controller
 // changes the bitrate; it runs CBR where CBR changes seamlessly, else the
 // first of PEAK_CONSTRAINED_VBR and LATENCY_CONSTRAINED_VBR that does (GUIDE
@@ -250,7 +252,7 @@ func (r *Results) Choices() map[string]map[string]Choice {
 		if _, done := out[cell.Codec][cell.Quality]; done {
 			continue
 		}
-		sp := encoder.StartParams{Codec: cell.Codec, Quality: cell.Quality, LTRSlots: cell.LTRSlots}
+		sp := encoder.StartParams{Codec: cell.Codec, Quality: cell.Quality, LTRSlots: cell.LTRSlots, SVCLayers: cell.SVCLayers}
 		var ch Choice
 		if rc, mode, ok := rr.Choose(c, sp, true); ok {
 			ch.AdaptiveRC, ch.Adaptive = rc, mode
@@ -313,7 +315,7 @@ func (r *Results) Print(w io.Writer) {
 		r.Backend, r.AdapterName, r.Vendor, r.HelperVersion, r.Source.Capture, r.Source.Width, r.Source.Height, r.Source.FPS,
 		r.Schedule.HighKbps, r.Schedule.LowKbps, r.Schedule.StepMs, r.Schedule.DurationMs)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "codec\tquality\tltr\trc\tliveBitrate\tverdict\tframes\tchanges\tkeys\tmax lag\tsteady %\tbarcode\twhy")
+	fmt.Fprintln(tw, "codec\tquality\tltr\tlayers\trc\tliveBitrate\tverdict\tframes\tchanges\tkeys\tmax lag\tsteady %\tbarcode\twhy")
 	for _, c := range r.Cells {
 		keys := fmt.Sprintf("%d unexpected", len(c.KeyFrames.Unexpected))
 		if c.LiveBitrate == ModeFlush {
@@ -329,7 +331,7 @@ func (r *Results) Print(w io.Writer) {
 			bc = fmt.Sprintf("%d/%d ok", c.Barcode.Checked-c.Barcode.Unreadable-c.Barcode.Wrong, c.Barcode.Checked)
 		}
 		why := strings.Join(c.Failures, "; ")
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", c.Codec, c.Quality, c.LTRSlots, c.RC, c.LiveBitrate,
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", c.Codec, c.Quality, c.LTRSlots, max(c.SVCLayers, 1), c.RC, c.LiveBitrate,
 			strings.ToUpper(c.Verdict), c.Frames, c.RateChanges, keys, lag, steady, bc, why)
 	}
 	tw.Flush()

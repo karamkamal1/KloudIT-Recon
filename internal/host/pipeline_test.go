@@ -324,6 +324,60 @@ func TestSessionLiveBitrateQualified(t *testing.T) {
 	}
 }
 
+// TestSessionLiveBitrateQualifiedSVC: a session that starts its stream with
+// two temporal layers (host config svc auto, a client that can be thinned, an
+// encoder with the layers) uses only cells qualified with two layers, as
+// recon-host qualify now runs them; cells of a one-layer stream say nothing
+// about it (the helper's defaults). Before, the layers were not matched.
+func TestSessionLiveBitrateQualifiedSVC(t *testing.T) {
+	const svcH264 = `"h264":{"maxW":4096,"maxH":2304,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":1,"alignH":1,` +
+		`"maxTemporalLayers":2,"liveFps":"seamless"}`
+	cells := func(layers int) []qualify.Cell {
+		return []qualify.Cell{
+			{Codec: "h264", Quality: "speed", LTRSlots: 2, SVCLayers: layers, RC: "cbr", LiveBitrate: "seamless", Verdict: "fail"},
+			{Codec: "h264", Quality: "speed", LTRSlots: 2, SVCLayers: layers, RC: "cbr", LiveBitrate: "flush", Verdict: "pass"}}
+	}
+	for _, c := range []struct {
+		name     string
+		layers   int // of the cells
+		wantLive any // the start's liveBitrate
+	}{
+		{"measured with two layers", 2, "flush"},
+		{"measured with one layer", 0, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			r := qualify.Results{Version: qualify.ResultsVersion, Backend: "amf", AdapterName: "AMD Radeon RX 7900 XT", Cells: cells(c.layers)}
+			if err := r.Save(qualify.PathFor(filepath.Join(dir, "host.json"))); err != nil {
+				t.Fatal(err)
+			}
+			l := &fakeLauncher{caps: helperCaps(svcH264, `"dda"`, false), started: make(chan *encoder.Fake, 4)}
+			cfg := &Config{Capture: "test", Pipeline: "helper", TestWidth: 320, TestHeight: 180, DefaultFPS: 30, MaxFPS: 60,
+				DefaultKbps: 4000, MaxKbps: 100000, path: filepath.Join(dir, "host.json")}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s := &Session{
+				a:     &Agent{cfg: cfg, caps: &media.Caps{}, inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch},
+				hello: proto.Hello{V: proto.HelloVersionThinned, Decoders: []proto.DecoderInfo{{Family: "h264", HW: true}}},
+				tried: map[string]bool{}, usage: map[string]string{}, encFails: map[string]int{},
+				ctx: ctx, cancel: cancel, ctrl: &fakeCtrl{}, frameQ: make(chan *media.Frame, 64), pipeSwap: make(chan struct{}, 1),
+				log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			if n := s.openPipeline(); n != "" {
+				t.Fatalf("notice %q", n)
+			}
+			defer func() { s.vid().Stop() }()
+			if err := s.startVideo(false, ""); err != nil {
+				t.Fatal(err)
+			}
+			f := <-l.started
+			if m := expectFakeMsg(t, f, "start"); m["svcLayers"] != float64(2) || m["liveBitrate"] != c.wantLive {
+				t.Fatalf("start svcLayers %v liveBitrate %v, want 2 and %v", m["svcLayers"], m["liveBitrate"], c.wantLive)
+			}
+		})
+	}
+}
+
 // TestSessionOnHelper drives a session on the (fake) native helper: the
 // stream starts in the helper with the test pattern's barcode, key frame
 // requests and bitrate changes act in the running encoder (no restart, no

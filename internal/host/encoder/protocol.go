@@ -224,6 +224,27 @@ func (c *Caps) LTRSlots(codec string) int {
 	return 0
 }
 
+// SVCLayers returns the temporal layers a stream of codec that asks for want
+// starts with (StartParams.SVCLayers; Phase 5): want where the encoder has
+// that many (MaxTemporalLayers) and the helper is from Phase 5 (its caps have
+// liveFps: older ones may mark LTR frames in the enhancement layer, which
+// recon-host leaves out under congestion), else 0 (one layer) and why.
+// Sessions and the live-bitrate qualification both start their streams this
+// way.
+func (c *Caps) SVCLayers(codec string, want int) (layers int, why string) {
+	if want <= 1 {
+		return 0, ""
+	}
+	cc := c.Codecs[codec]
+	switch {
+	case cc.MaxTemporalLayers < want:
+		return 0, fmt.Sprintf("the %s encoder has %d temporal layers", codec, cc.MaxTemporalLayers)
+	case cc.LiveFPS == "":
+		return 0, "a helper before Phase 5 (LTR marks may fall on enhancement-layer frames)"
+	}
+	return want, ""
+}
+
 // IntraRefreshFrames returns the intra refresh cycle a stream of codec at fps
 // with svcLayers temporal layers starts with (StartParams.IntraRefreshFrames):
 // half a second of frames (as media.IntraRefreshPeriod) where the encoder has

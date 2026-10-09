@@ -37,6 +37,50 @@ func TestCellArgs(t *testing.T) {
 	}
 }
 
+// TestCellArgsSVC: a cell starts with the temporal layers a session asks for
+// (Options.SVCLayers, host config svc) where the encoder has them and the
+// helper is from Phase 5 (encoder.Caps.SVCLayers, as media.HelperVideo),
+// with the intra refresh that goes with them (none on AMF, which cannot
+// combine the two; NVENC keeps it).
+func TestCellArgsSVC(t *testing.T) {
+	caps := encoder.Caps{Backend: "amf", Codecs: map[string]encoder.CodecCaps{
+		"hevc": {Recovery: "ltr", MaxLTR: 2, MaxTemporalLayers: 4, LiveFPS: "seamless"},
+		"h264": {Recovery: "none", IntraRefresh: true, MaxTemporalLayers: 4, LiveFPS: "seamless"},
+		"av1":  {Recovery: "ltr", MaxLTR: 2, MaxTemporalLayers: 1, LiveFPS: "seamless"},
+	}}
+	nvenc := encoder.Caps{Backend: "nvenc", Codecs: map[string]encoder.CodecCaps{
+		"hevc": {Recovery: "invalidate", IntraRefresh: true, IntraRefreshSVC: true, MaxTemporalLayers: 4, LiveFPS: "seamless"}}}
+	old := encoder.Caps{Backend: "amf", Codecs: map[string]encoder.CodecCaps{"hevc": {Recovery: "ltr", MaxLTR: 2, MaxTemporalLayers: 4}}}
+	o := Options{}
+	o.defaults()
+	cr := cellRun{backend: "amf", capture: "synthetic-gpu", motion: true, frames: 3600, step: 120}
+	for _, c := range []struct {
+		name    string
+		caps    encoder.Caps
+		codec   string
+		want    int // session's layers (Options.SVCLayers)
+		layers  int
+		svc, ir string // in the args ("" = absent)
+	}{
+		{"amf hevc", caps, "hevc", 2, 2, "--svc=2", ""},
+		{"amf hevc, svc off", caps, "hevc", 0, 0, "", ""},
+		{"amf h264: no intra refresh beside SVC", caps, "h264", 2, 2, "--svc=2", ""},
+		{"amf h264, svc off: intra refresh", caps, "h264", 0, 0, "", "--intra-refresh=30"},
+		{"amf av1 without layers", caps, "av1", 2, 0, "", ""},
+		{"nvenc hevc: intra refresh beside SVC", nvenc, "hevc", 2, 2, "--svc=2", "--intra-refresh=30"},
+		{"helper before Phase 5", old, "hevc", 2, 0, "", ""},
+	} {
+		layers, _ := c.caps.SVCLayers(c.codec, c.want)
+		cell := &Cell{Codec: c.codec, Quality: "speed", LTRSlots: c.caps.LTRSlots(c.codec), SVCLayers: layers, RC: "cbr",
+			LiveBitrate: ModeSeamless, IntraRefresh: c.caps.IntraRefreshFrames(c.codec, o.FPS, layers)}
+		args := strings.Join(cellArgs(o, cr, cell, "s", "s.jsonl"), " ")
+		if layers != c.layers || strings.Contains(args, "--svc") != (c.svc != "") || c.svc != "" && !strings.Contains(args, c.svc) ||
+			strings.Contains(args, "--intra-refresh") != (c.ir != "") || c.ir != "" && !strings.Contains(args, c.ir) {
+			t.Errorf("%s: %d layers, args %s", c.name, layers, args)
+		}
+	}
+}
+
 // A start the encoder refuses for its live-bitrate mode is a fail of that
 // mode; other refusals are errors. A helper that leaves no frame log after
 // its stream started crashed or hung in that mode: a fail; before that an

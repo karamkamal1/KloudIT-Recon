@@ -72,9 +72,10 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
    3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
    (not its first two `--print-caps` checks: superseded).
-3. **Qualify** (T7): `recon-host.exe qualify` with no stream running, about 70 minutes (3.6).
-   Streams use its `live-bitrate.json`, so run it before stages 5-7, and again after a driver
-   update.
+3. **Qualify** (T7): `recon-host.exe qualify` with no stream running, about 70 minutes (3.6,
+   and "Final review: host agent, third round": its streams have the session's temporal
+   layers). Streams use its `live-bitrate.json`, so run it before stages 5-7, and again after a
+   driver update or a change of host config `svc`.
 4. **Basic streams on the helper**: HEVC, then AV1 (2560x1440; at 1920x1080 RDNA3 needs 64x16
    alignment: 1.7, T9), then H.264, from a game: the overlay's Encoder row reads
    `hevc_amf_helper` and host.log `video pipeline pipeline=helper backend=amf`. Checks: 3.1b,
@@ -3244,7 +3245,8 @@ live-bitrate mode (`seamless`, `flush`). Every stream starts as a session starts
 this encoder: its preset, and two LTR slots where the codec recovers from LTR frames (AMF:
 `encoder.Caps.LTRSlots`, the rule `media.HelperVideo` uses; the encode test acknowledges the
 marked frames 2 frames later), so AMF runs its LTR setup (MAX_LTR_FRAMES, LTR_MODE KEEP_UNUSED,
-MAX_NUM_REFRAMES, per-frame marks and FORCE_LTR_REFERENCE, the tracker reset after a flush).
+MAX_NUM_REFRAMES, per-frame marks and FORCE_LTR_REFERENCE, the tracker reset after a flush),
+and the session's temporal layers ("Final review: host agent, third round").
 Each run is the helper's encode test on the
 synthetic GPU source in its new high-motion mode (start `motion`: presents without pauses, a
 scrolling pattern under full-frame noise, scaled to 1920x1080) at 60 fps, 50 Mbit/s, stepping to
@@ -10933,3 +10935,53 @@ relaxes it) streams AV1 at any size.
   --backend=amf`'s `alignW`/`alignH` for av1 (and whether `assumed` lists them).
 - NVIDIA: unverified (no NVIDIA host available). Test: on an RTX 40/50 host on the helper,
   Codec AV1 at 1920×1080 streams AV1 (`av1_nvenc_helper`, no toast): NVENC's caps report 1×1.
+
+### The live-bitrate qualification runs the session's temporal layers
+
+Problem: `recon-host qualify` is meant to measure each stream as a session starts that codec,
+but it never passed temporal SVC, while default sessions (host config `svc` auto, a current
+browser) start the helper with two temporal layers wherever the encoder's caps have them
+(`maxTemporalLayers` >= 2 and a Phase 5 helper). Sessions then picked their rate-control and
+live-bitrate modes from verdicts measured on a one-layer stream, and the results matched cells
+on codec, preset and LTR slots only. A `seamless` verdict that does not hold with layers would
+show as glitches or key frames on rate changes, the static-desktop cut and FPS-first steps, with
+nothing in host.log to say so.
+
+Fix: one rule for the layers, `encoder.Caps.SVCLayers` (the requested layers where the encoder
+has them and the helper is from Phase 5), used by sessions (`HelperVideo.withCaps`) and the
+qualification. `recon-host qualify` asks for the layers sessions ask for (`Config.SVCLayers`: 2,
+or none with `svc` off), so each cell starts with `--svc=2` where the codec has them, with the
+intra refresh that goes with them (none on AMF beside SVC, as in a session), and records
+`svcLayers`. `Results.Choose` matches the layers too (a cell without `svcLayers` is a one-layer
+stream), so a two-layer stream uses only two-layer verdicts and a one-layer stream (svc off, a
+client too old to be thinned) only one-layer ones; otherwise the helper's defaults apply. The
+results file is version 3: version 2 files (no layers) are refused with "run recon-host qualify
+again". The size check's follow window spans whole layer periods (4 frames with two layers,
+whose frame sizes alternate) so that a stream at its target on average is not failed for its
+layer pattern. The encode test's second stream without the discardable frames (`*.base.*`) is
+deleted with the stream unless `-keep`.
+
+- Verified here: `internal/host/qualify` `TestCellArgsSVC` (`--svc=2` for AMF HEVC and H.264 with
+  temporal layers, no intra refresh beside them on AMF, intra refresh kept on NVENC with
+  `intraRefreshSvc`, one layer for an encoder without layers, a helper before Phase 5 or `svc`
+  off), `TestChooseSVC` (two-layer cells for a two-layer start, one-layer cells for one layer,
+  nothing for three), `TestJudgeFollowSVC` (alternating 180 % / 20 % frame sizes pass with two
+  layers and fail with one), `TestResultsFile` (version 3); `internal/host`
+  `TestSessionLiveBitrateQualifiedSVC` (a fake AMF helper with two layers, a thinnable client:
+  the start has `svcLayers` 2 and the two-layer cells' `flush`; one-layer cells leave the
+  helper's default). Under Wine (`make helper-test`, the mingw helper): `TestQualifyMockSVC`
+  runs the mock's H.264 with `--svc=2` (seamless and flush pass, the cells record 2 layers, no
+  `.base` stream left), and the existing qualification tests pass unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with the default host.json (`svc` auto), run
+  `recon-host.exe qualify` (stage 3 of the plan; `-quality speed` for a quicker look). The
+  table's `layers` column is 2 for every codec whose caps (`recon-encoder.exe --print-caps
+  --backend=amf`) have `maxTemporalLayers` >= 2, 1 for the others; the cells' logs in the
+  `qualify-*` folder start with `--svc=2` for those; no cell note says `the encoder runs N
+  temporal layers`; the folder has no `*.base.*` files. Record the verdicts per codec, preset and
+  rc next to those of a run with `"svc": "off"` (copy the first `live-bitrate.json` aside
+  before). Then stream with `"logLevel": "debug"`: host.log `encoder helper started ...
+  svc_layers=2 ... live_bitrate_from=qualification`, and the session's live-bitrate mode is the
+  one the two-layer cells chose. With `"svc": "off"` and the two-layer results the start says
+  `live_bitrate_from="helper default"` (no matching cells) until qualify runs again.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same on an NVENC host whose caps have
+  `maxTemporalLayers` >= 2; the cells also keep `--intra-refresh` (NVENC combines it with SVC).

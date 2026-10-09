@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,34 @@ func TestQualifyMock(t *testing.T) {
 	}
 	if ch := r.Choice["h264"]["speed"]; ch.Adaptive != ModeRestart {
 		t.Fatalf("choice %+v", ch)
+	}
+}
+
+// TestQualifyMockSVC: with the session's two temporal layers (host config
+// svc auto) each stream starts with --svc=2 where the encoder has them (the
+// mock's H.264: two), runs them (started.svcLayers 2, no note) and its cell
+// records them; the stream the encode test writes without the discardable
+// frames is deleted with the stream.
+func TestQualifyMockSVC(t *testing.T) {
+	o := Options{Helper: helperExe(t), Backend: "mock", FFmpeg: os.Getenv("RECON_FFMPEG"), Qualities: []string{"speed"}, SVCLayers: 2}
+	r := runMatrix(t, o)
+	if got := verdicts(r); got != "h264 speed cbr seamless pass, h264 speed cbr flush pass" {
+		t.Fatalf("verdicts: %s", got)
+	}
+	for _, c := range r.Cells {
+		if c.SVCLayers != 2 || len(c.Notes) > 0 && strings.Contains(strings.Join(c.Notes, " "), "temporal layers") {
+			t.Fatalf("cell %+v", c)
+		}
+		if b, err := os.ReadFile(c.Log); err != nil || !strings.Contains(string(b), "--svc=2") {
+			t.Fatalf("log %s: %v", c.Log, err)
+		}
+		if base, _ := filepath.Glob(filepath.Join(filepath.Dir(c.Log), "*.base*")); len(base) > 0 {
+			t.Fatalf("streams without the discardable frames kept: %q", base)
+		}
+	}
+	if _, _, ok := r.Choose(encoder.Caps{Backend: r.Backend, AdapterName: r.AdapterName},
+		encoder.StartParams{Codec: "h264", SVCLayers: 2}, true); !ok {
+		t.Fatal("the two-layer cells do not apply to a two-layer stream")
 	}
 }
 

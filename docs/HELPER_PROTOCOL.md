@@ -1549,9 +1549,12 @@ another one; tests: `-lavc-test-encoder libx264`, whose results never apply). Ea
 stream starts as a session starts that codec on this encoder: its `quality`, and `ltrSlots` 2
 where the codec recovers from LTR frames (caps `recovery` `ltr`, `maxLtr` >= 2: AMF), whose
 marked frames the encode test acknowledges `--ack-delay` (2) frames later, so AMF runs with its
-LTR setup (MAX_LTR_FRAMES, LTR_MODE, per-frame marks and FORCE_LTR_REFERENCE), and
-`--intra-refresh` with half a second of frames where the codec has caps `intraRefresh` and runs no
-LTR slots (NVENC; the loss-recovery ladder's safety net, step 2.3; the cell's `intraRefresh`):
+LTR setup (MAX_LTR_FRAMES, LTR_MODE, per-frame marks and FORCE_LTR_REFERENCE), `--svc=2` (the
+cell's `svcLayers`) where the codec's caps have `maxTemporalLayers` >= 2 and `liveFps` (a Phase 5
+helper) and host config `svc` is not `off`, as sessions start it for clients that can be thinned,
+and `--intra-refresh` with half a second of frames where the codec has caps `intraRefresh` and
+runs no LTR slots, nor temporal layers unless its caps have `intraRefreshSvc` (NVENC; the
+loss-recovery ladder's safety net, step 2.3; the cell's `intraRefresh`):
 
 ```
 recon-encoder.exe --encode-test=DIR\hevc-speed-cbr-seamless.hevc --frame-log=DIR\hevc-speed-cbr-seamless.jsonl
@@ -1574,7 +1577,7 @@ passes when all of these hold:
 | frame ids | consecutive from 1: no gap, no `droppedBefore`, nothing dropped by the helper |
 | key frames | `seamless`: none after the first; `flush`: one within 5 frames of every change and none elsewhere |
 | frame types | every frame the decoder sees as intra (key or I) is flagged key by the encoder and the other way round (an unflagged intra frame on a change fails too) |
-| sizes | after each change some window of 3 P frames starting at most 3 P frames after it has a mean within 25 % of the new target's frame size (kbps x 1000 / 8 / fps); the second half of every phase too (key frames and idle repeats left out) |
+| sizes | after each change some window of 3 P frames (with temporal layers whole layer periods: 4 frames with two, whose sizes alternate) starting at most 3 P frames after it has a mean within 25 % of the new target's frame size (kbps x 1000 / 8 / fps); the second half of every phase too (key frames and idle repeats left out) |
 | barcodes | the decoder output every written frame, each barcode shows its frame's sequence number, no unexplained jumps, at most 1 % unreadable |
 | decode | no decoder errors |
 
@@ -1592,12 +1595,12 @@ The results go to `live-bitrate.json` next to `host.json` (test runs: into their
 directory), printed as a table as well:
 
 ```json
-{"version":2,"time":"2026-10-08T12:00:00Z","host":"GAMING-PC","helperVersion":"0.1.0","backend":"amf",
+{"version":3,"time":"2026-10-08T12:00:00Z","host":"GAMING-PC","helperVersion":"0.1.0","backend":"amf",
  "vendor":"amd","adapterName":"AMD Radeon RX 7900 XT","adapterLuid":"00000000:0000c3a1",
  "source":{"capture":"synthetic-gpu","motion":true,"width":1920,"height":1080,"fps":60,"barcode":true},
  "schedule":{"highKbps":50000,"lowKbps":20000,"stepMs":2000,"durationMs":60000,"stepFrames":120,"frames":3600},
  "criteria":{"followFrames":3,"windowFrames":3,"sizeTolerance":0.25,"keyWithinFrames":5,"maxUnreadablePct":1},
- "cells":[{"codec":"hevc","rc":"cbr","liveBitrate":"seamless","quality":"speed","ltrSlots":2,"verdict":"pass","rateControl":"cbr",
+ "cells":[{"codec":"hevc","rc":"cbr","liveBitrate":"seamless","quality":"speed","ltrSlots":2,"svcLayers":2,"verdict":"pass","rateControl":"cbr",
    "startedLiveBitrate":"seamless","width":1920,"height":1080,"fps":60,"frames":3600,"rateChanges":29,
    "keyFrames":{"mismatched":0},
    "follow":{"maxLagFrames":1,"steadyMin":0.93,"steadyMax":1.02,"levels":{"20000":0.99,"50000":0.97},"firstPhase":0.96},
@@ -1611,14 +1614,17 @@ directory), printed as a table as well:
 gives the ratios of measured to target sizes (`levels` per target, `firstPhase` before any
 change), `maxLagFrames` -1 if a change never reached its target. `choice` (per codec and
 quality preset) is what sessions do with it (written for people; recon-host recomputes it from
-the cells, `qualify.Results.Choose`). Version 1 files (no `quality` / `ltrSlots`: measured at
-`speed` without LTR slots) are refused: run the qualification again.
+the cells, `qualify.Results.Choose`). Files of an earlier version are refused (run the
+qualification again): version 1 has no `quality` / `ltrSlots` (measured at `speed` without LTR
+slots), version 2 no `svcLayers` (measured with one temporal layer, while sessions start two).
 
 * The results apply to a helper whose caps have the same `backend` and `adapterName` (not
   the LUID, which changes with every boot); results of the test double never apply.
 * Only cells run as the session's stream starts count: the same codec, `quality` (none = the
-  helper's default `speed`) and `ltrSlots`; a preset that was not qualified gets the helper's
-  defaults.
+  helper's default `speed`), `ltrSlots` and `svcLayers` (absent = one layer); a preset or layer
+  count that was not qualified gets the helper's defaults (e.g. a client too old to be thinned,
+  whose stream has one layer, after a qualification with two; or host config `svc` changed
+  since).
 * Per codec, preset and rate-control mode: `seamless` where that cell passed, else `flush`
   where that one passed, else `restart` where `seamless` failed (every bitrate change starts a
   new helper, as on the FFmpeg path; never the helper's default then, which is `seamless` on

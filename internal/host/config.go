@@ -408,6 +408,17 @@ func (e *engineChoice) UnmarshalJSON(b []byte) error {
 // svc reports whether temporal SVC thinning is on (Phase 5): "svc" auto.
 func (c *Config) svc() bool { return c.SVC != settingOff }
 
+// SVCLayers returns the temporal layers sessions ask the native helper for
+// (to clients that can be thinned; an encoder with fewer starts with one:
+// encoder.Caps.SVCLayers): 2, or 0 with "svc" off. recon-host qualify starts
+// its streams so too.
+func (c *Config) SVCLayers() int {
+	if c.svc() {
+		return 2
+	}
+	return 0
+}
+
 // staticBitrate reports whether a static desktop lowers the bitrate:
 // "staticBitrate" auto.
 func (c *Config) staticBitrate() bool { return c.StaticBitrate != settingOff }

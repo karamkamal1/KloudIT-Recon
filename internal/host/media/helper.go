@@ -456,21 +456,11 @@ type liveChoice struct {
 func (v *HelperVideo) withCaps(sp encoder.StartParams, adaptive bool, caps encoder.Caps) (encoder.StartParams, liveChoice) {
 	sp.LTRSlots = caps.LTRSlots(sp.Codec)
 	// Temporal SVC (Phase 5) where the session asks for it and the encoder
-	// has the layers; only from a Phase 5 helper (its caps have liveFps):
-	// older ones may mark LTR frames in the enhancement layer, which the
-	// session leaves out under congestion.
+	// has the layers; only from a Phase 5 helper (encoder.Caps.SVCLayers).
 	if sp.SVCLayers > 1 {
-		cc := caps.Codecs[sp.Codec]
-		why := ""
-		switch {
-		case cc.MaxTemporalLayers < sp.SVCLayers:
-			why = fmt.Sprintf("the %s encoder has %d temporal layers", sp.Codec, cc.MaxTemporalLayers)
-		case cc.LiveFPS == "":
-			why = "a helper before Phase 5 (LTR marks may fall on enhancement-layer frames)"
-		}
-		if why != "" {
+		var why string
+		if sp.SVCLayers, why = caps.SVCLayers(sp.Codec, sp.SVCLayers); why != "" {
 			v.log.Info("temporal SVC not used", "codec", sp.Codec, "reason", why)
-			sp.SVCLayers = 0
 		}
 	}
 	// The loss-recovery ladder's safety net (GUIDE 2.3, rung 3): intra

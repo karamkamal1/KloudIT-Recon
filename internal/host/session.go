@@ -930,7 +930,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		// Temporal SVC (Phase 5): two layers where the native helper's
 		// encoder has them (HelperVideo.withCaps decides and logs), so
 		// frameSender can thin the enhancement layer under congestion.
-		p.SVCLayers = 2
+		p.SVCLayers = s.a.cfg.SVCLayers()
 	}
 	// Once per change: buildParams runs again for every restart.
 	s.prefsMu.Lock()

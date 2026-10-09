@@ -165,6 +165,29 @@ func TestJudgeFollow(t *testing.T) {
 	}
 }
 
+// TestJudgeFollowSVC: with two temporal layers the frames alternate in size
+// (a base-layer frame, then a smaller enhancement-layer one), so the follow
+// window spans whole layer periods (4 frames): a stream at its target on
+// average passes. With one layer the same sizes never settle within 3 frames.
+func TestJudgeFollowSVC(t *testing.T) {
+	l := run(600, 120, 50000, 20000, 60)
+	for i := 1; i < len(l.Frames); i++ {
+		if i%2 == 1 {
+			l.Frames[i].Bytes = l.Frames[i].Bytes * 9 / 5 // base layer
+		} else {
+			l.Frames[i].Bytes = l.Frames[i].Bytes / 5 // enhancement layer
+		}
+	}
+	c := Cell{Codec: "hevc", RC: "cbr", LiveBitrate: ModeSeamless}
+	Judge(Input{Mode: ModeSeamless, FPS: 60, SVCLayers: 2, PlannedFrames: len(l.Frames), Log: l, Decoded: decoded(l), Barcode: true}, &c)
+	wantVerdict(t, c, VerdictPass, "")
+	if c.Follow.MaxLagFrames != 0 {
+		t.Fatalf("max lag %d, want 0", c.Follow.MaxLagFrames)
+	}
+	c = judge(t, ModeSeamless, l, decoded(l))
+	wantVerdict(t, c, VerdictFail, "never within the phase")
+}
+
 func TestJudgeInconclusive(t *testing.T) {
 	// A source that does not fill 50 Mbit/s before any change: the high
 	// phases stay at 30 Mbit/s, the low ones follow.

@@ -100,6 +100,36 @@ func TestChoose(t *testing.T) {
 	check(t, none, amd, "hevc", true, want{"", "", false})
 }
 
+// TestChooseSVC: cells measured with two temporal layers (recon-host qualify
+// with host config svc auto, an encoder that has them) apply to streams that
+// start with two, cells measured with one to streams with one (svc off, a
+// client that cannot be thinned): a verdict of one does not hold for the
+// other. Before, the layers were not matched (and qualify never ran them).
+func TestChooseSVC(t *testing.T) {
+	amd := encoder.Caps{Backend: "amf", Vendor: "amd", AdapterName: "AMD Radeon RX 7900 XT"}
+	svc := func(c Cell) Cell { c.SVCLayers = 2; return c }
+	r := results(svc(cell("hevc", "cbr", "seamless", "fail")), svc(cell("hevc", "cbr", "flush", "pass")),
+		cell("hevc", "cbr", "seamless", "pass"))
+	for _, c := range []struct {
+		layers   int
+		rc, mode string
+		ok       bool
+	}{
+		{2, "cbr", "flush", true},    // measured with two layers: seamless failed there
+		{0, "cbr", "seamless", true}, // one layer: its own cell
+		{1, "cbr", "seamless", true},
+		{3, "", "", false}, // not measured
+	} {
+		rc, mode, ok := r.Choose(amd, encoder.StartParams{Codec: "hevc", LTRSlots: 2, SVCLayers: c.layers}, true)
+		if rc != c.rc || mode != c.mode || ok != c.ok {
+			t.Errorf("%d layers: %q %q %v, want %q %q %v", c.layers, rc, mode, ok, c.rc, c.mode, c.ok)
+		}
+	}
+	if ch := r.Choice["hevc"]["speed"]; ch.Adaptive != ModeFlush {
+		t.Errorf("choice (the first cell's stream: two layers) %+v", ch)
+	}
+}
+
 func TestResultsFile(t *testing.T) {
 	dir := t.TempDir()
 	if got := PathFor(filepath.Join(dir, "host.json")); got != filepath.Join(dir, "live-bitrate.json") {
@@ -125,7 +155,7 @@ func TestResultsFile(t *testing.T) {
 	if _, err := Load(path); err != nil {
 		t.Fatalf("BOM: %v", err)
 	}
-	_ = os.WriteFile(path, bytes.Replace(b, []byte(`"version": 2`), []byte(`"version": 9`), 1), 0o600)
+	_ = os.WriteFile(path, bytes.Replace(b, []byte(`"version": 3`), []byte(`"version": 9`), 1), 0o600)
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "results version 9") {
 		t.Fatalf("version: %v", err)
 	}
@@ -149,7 +179,7 @@ func TestResultsPrint(t *testing.T) {
 	var b bytes.Buffer
 	r.Print(&b)
 	out := b.String()
-	for _, want := range []string{"hevc   speed     2    vbr  seamless     FAIL", "2 key frames after the first",
+	for _, want := range []string{"hevc   speed     2    1       vbr  seamless     FAIL", "2 key frames after the first",
 		"hevc, quality speed: adaptive bitrate -> rc cbr, live bitrate seamless; fixed bitrate (rc vbr) -> restart",
 		"hevc, quality balanced: adaptive bitrate -> rc cbr, live bitrate restart; fixed bitrate (rc vbr) -> helper default (not measured)",
 		"h264, quality speed: adaptive bitrate -> rc cbr, live bitrate flush; fixed bitrate (rc vbr) -> helper default (not measured)"} {

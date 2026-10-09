@@ -2,7 +2,8 @@
 // helper (GUIDE 3.6, `recon-host qualify`): for every codec x quality preset x
 // rate-control mode x live-bitrate mode (seamless, flush) of the helper's
 // encoder it runs one stream, started as a session starts it (the preset, the
-// LTR slots of encoder.Caps.LTRSlots), on a high-motion source with the
+// LTR slots of encoder.Caps.LTRSlots, the temporal layers of
+// encoder.Caps.SVCLayers for Options.SVCLayers), on a high-motion source with the
 // bitrate stepping between a high and a low target every 2 s for 60 s, and
 // judges whether the encoder follows without an IDR (seamless), within 3
 // frames, with no frame-id or barcode gaps and a stream that decodes cleanly.
@@ -63,6 +64,11 @@ type Options struct {
 	FFmpeg string
 
 	Codecs []string // default: every codec of the helper's caps
+	// SVCLayers: the temporal layers sessions ask for (host config "svc":
+	// 2, or 0 with off: host.Config.SVCLayers); each codec's stream starts
+	// with them where its encoder has them (encoder.Caps.SVCLayers), as a
+	// session's. 0: one layer.
+	SVCLayers int
 	// Qualities: start's quality presets (default Qualities: every preset
 	// a session may ask for; Choose uses only the presets measured).
 	Qualities []string
@@ -283,10 +289,12 @@ func Run(ctx context.Context, o Options) (*Results, error) {
 						return nil, err
 					}
 					// Started as a session starts this codec: its preset, LTR
-					// slots and intra refresh (encoder.Caps.LTRSlots and
-					// IntraRefreshFrames, as media.HelperVideo).
-					c := Cell{Codec: codec, Quality: quality, LTRSlots: caps.LTRSlots(codec), RC: rc, LiveBitrate: mode,
-						IntraRefresh: caps.IntraRefreshFrames(codec, o.FPS, 0)}
+					// slots, temporal layers and intra refresh
+					// (encoder.Caps.LTRSlots, SVCLayers and IntraRefreshFrames,
+					// as media.HelperVideo).
+					svc, _ := caps.SVCLayers(codec, o.SVCLayers)
+					c := Cell{Codec: codec, Quality: quality, LTRSlots: caps.LTRSlots(codec), SVCLayers: svc, RC: rc, LiveBitrate: mode,
+						IntraRefresh: caps.IntraRefreshFrames(codec, o.FPS, svc)}
 					if _, ok := caps.Codecs[codec]; !ok {
 						c.Verdict = VerdictError
 						c.Failures = []string{"the helper's encoder has no " + codec + " (" + caps.Unavailable[caps.Backend+"-"+codec] + ")"}
@@ -327,8 +335,8 @@ type cellRun struct {
 
 // cellArgs returns the encode test's arguments for a cell: its stream
 // started like a session's (codec, quality preset, LTR slots, whose frames the
-// encode test acknowledges after --ack-delay frames), rc and live-bitrate
-// mode, with the rate schedule.
+// encode test acknowledges after --ack-delay frames, temporal layers, intra
+// refresh), rc and live-bitrate mode, with the rate schedule.
 func cellArgs(o Options, cr cellRun, c *Cell, stream, frameLog string) []string {
 	args := append([]string{"--encode-test=" + stream, "--frame-log=" + frameLog}, o.backendArgs(cr.backend)...)
 	args = append(args, "--codec="+c.Codec, "--capture="+cr.capture, "--fps="+fmt.Sprint(o.FPS), "--kbps="+fmt.Sprint(o.HighKbps),
@@ -336,6 +344,9 @@ func cellArgs(o Options, cr cellRun, c *Cell, stream, frameLog string) []string 
 		fmt.Sprintf("--rate-schedule=%d,%d:%d", o.LowKbps, o.HighKbps, cr.step))
 	if c.LTRSlots > 0 {
 		args = append(args, fmt.Sprintf("--ltr-slots=%d", c.LTRSlots))
+	}
+	if c.SVCLayers > 1 {
+		args = append(args, fmt.Sprintf("--svc=%d", c.SVCLayers))
 	}
 	if c.IntraRefresh > 0 {
 		args = append(args, fmt.Sprintf("--intra-refresh=%d", c.IntraRefresh))
@@ -379,7 +390,10 @@ func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
 	_ = os.WriteFile(logPath, append([]byte(o.Helper+" "+strings.Join(args, " ")+"\n\n"), out...), 0o600)
 	defer func() {
 		if !o.Keep {
+			// With temporal layers the encode test also writes the stream
+			// without the discardable frames (<name>.base<ext>).
 			_ = os.Remove(stream)
+			_ = os.Remove(filepath.Join(cr.dir, name+".base"+ext))
 		}
 	}()
 
@@ -403,7 +417,7 @@ func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
 	if st.FPS > 0 {
 		fps = st.FPS
 	}
-	in := Input{Mode: c.LiveBitrate, FPS: fps, PlannedFrames: cr.frames, Log: log, DecodeSkipped: cr.decodeSkip,
+	in := Input{Mode: c.LiveBitrate, FPS: fps, SVCLayers: max(st.SVCLayers, 1), PlannedFrames: cr.frames, Log: log, DecodeSkipped: cr.decodeSkip,
 		Barcode: cr.barcodeSkip == "" && st.Barcode, BarcodeSkipped: cr.barcodeSkip}
 	if in.BarcodeSkipped == "" && !st.Barcode {
 		in.BarcodeSkipped = "the helper drew no barcode (started.barcode false)"
@@ -425,6 +439,9 @@ func runCell(ctx context.Context, o Options, cr cellRun, c *Cell) {
 	}
 	if log.HasStarted && st.LTRSlots != c.LTRSlots {
 		c.Notes = append(c.Notes, fmt.Sprintf("the encoder runs %d LTR slots, not %d", st.LTRSlots, c.LTRSlots))
+	}
+	if log.HasStarted && max(st.SVCLayers, 1) != max(c.SVCLayers, 1) {
+		c.Notes = append(c.Notes, fmt.Sprintf("the encoder runs %d temporal layers, not %d", max(st.SVCLayers, 1), max(c.SVCLayers, 1)))
 	}
 	Judge(in, c)
 	if runErr != nil && c.Verdict == VerdictPass {

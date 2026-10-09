@@ -12,8 +12,9 @@ import (
 const (
 	// FollowFrames: after a rate change the P-frame sizes must be at the new
 	// target within this many frames: some window of WindowFrames P frames
-	// starting at most FollowFrames P frames after the change has a mean size
-	// within SizeTolerance of the target.
+	// (rounded up to whole temporal-layer periods: 4 with two layers, whose
+	// frames alternate in size) starting at most FollowFrames P frames after
+	// the change has a mean size within SizeTolerance of the target.
 	FollowFrames = 3
 	WindowFrames = 3
 	// SizeTolerance is the allowed relative deviation of a mean P-frame size
@@ -124,10 +125,12 @@ type Cell struct {
 	Codec       string `json:"codec"`
 	RC          string `json:"rc"`          // cbr | vbr | vbr_peak (start's rc)
 	LiveBitrate string `json:"liveBitrate"` // seamless | flush
-	// Quality / LTRSlots: the start's quality preset and LTR slots, as a
-	// session starts this codec on this encoder (Choose matches on both).
-	Quality  string `json:"quality"`
-	LTRSlots int    `json:"ltrSlots"`
+	// Quality / LTRSlots / SVCLayers: the start's quality preset, LTR slots
+	// and temporal layers (0: one), as a session starts this codec on this
+	// encoder (Choose matches on all three).
+	Quality   string `json:"quality"`
+	LTRSlots  int    `json:"ltrSlots"`
+	SVCLayers int    `json:"svcLayers,omitempty"`
 	// IntraRefresh: the intra refresh cycle the stream started with, as a
 	// session's (encoder.Caps.IntraRefreshFrames: the loss-recovery ladder's
 	// safety net, GUIDE 2.3); 0 off. Not matched by Choose.
@@ -163,6 +166,7 @@ func (c *Cell) Passed() bool { return c.Verdict == VerdictPass }
 type Input struct {
 	Mode          string // seamless | flush: how the run applied setRate
 	FPS           int    // frames per second the targets are divided by
+	SVCLayers     int    // temporal layers of the stream (0, 1: one)
 	PlannedFrames int
 	Log           *RunLog
 	// Decoded is the decoder's view of the written frames; nil: not
@@ -344,7 +348,7 @@ func Judge(in Input, c *Cell) {
 
 	// Sizes: every phase (the frames between two changes) is judged on its
 	// P frames (no key frames, no idle repeats).
-	sizeFails := followCheck(frames, changes, fps, &c.Follow)
+	sizeFails := followCheck(frames, changes, fps, max(in.SVCLayers, 1), &c.Follow)
 	inconclusive := false
 	if c.Follow.FirstPhase > 0 && c.Follow.FirstPhase < 1-SizeTolerance && len(sizeFails) > 0 {
 		inconclusive = true
@@ -367,10 +371,11 @@ func Judge(in Input, c *Cell) {
 	}
 }
 
-// followCheck measures how P-frame sizes follow the targets and returns the
-// failures.
-func followCheck(frames []Frame, changes []int, fps int, fc *FollowCheck) []string {
+// followCheck measures how P-frame sizes follow the targets of a stream with
+// layers temporal layers and returns the failures.
+func followCheck(frames []Frame, changes []int, fps, layers int, fc *FollowCheck) []string {
 	var fails []string
+	window := (WindowFrames + layers - 1) / layers * layers
 	target := func(kbps int) float64 { return float64(kbps) * 1000 / 8 / float64(fps) }
 	within := func(mean, t float64) bool { return mean >= t*(1-SizeTolerance) && mean <= t*(1+SizeTolerance) }
 	bounds := append([]int{0}, changes...)
@@ -390,13 +395,13 @@ func followCheck(frames []Frame, changes []int, fps int, fc *FollowCheck) []stri
 		// Follow: only phases that start with a change.
 		if p > 0 {
 			lag := -1
-			for k := 0; k+WindowFrames <= len(sizes); k++ {
-				if within(mean(sizes[k:k+WindowFrames]), t) {
+			for k := 0; k+window <= len(sizes); k++ {
+				if within(mean(sizes[k:k+window]), t) {
 					lag = k
 					break
 				}
 			}
-			if len(sizes) < WindowFrames {
+			if len(sizes) < window {
 				lag = 0 // too short to tell (a phase of a key frame and a frame or two)
 			}
 			switch {
