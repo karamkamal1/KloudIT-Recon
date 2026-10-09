@@ -30,6 +30,7 @@ type hostConn struct {
 	info      proto.TunnelMsg
 	streaming bool
 	user      string
+	tickets   []issuedTicket // host tickets signed in the last minute (revoke.go)
 }
 
 func (h *hostConn) send(m proto.TunnelMsg) error {
@@ -177,6 +178,11 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 			hc.mu.Lock()
 			hc.streaming, hc.user = m.Streaming, m.User
 			hc.mu.Unlock()
+			// Streaming for a user who was deleted while this host was offline
+			// (or the gateway was down): end it (revoke.go).
+			if _, ok := s.store.GetUser(m.User); m.Streaming && m.User != "" && !ok {
+				go func() { _ = hc.endUser(m.User, userRemoved) }()
+			}
 		case "direct": // certificate rotation
 			hc.mu.Lock()
 			hc.info.Direct, hc.info.Relay = m.Direct, m.Relay

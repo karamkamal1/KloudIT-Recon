@@ -10032,6 +10032,51 @@ Fix (`internal/gateway/ratelimit.go`, `api.go`, `audit.go`):
   https://<name>:8443/api/login` 20 times in a row: the audit log has one `login_ratelimited`
   line, not 15.
 
+### Deleting a user or changing a password ends the account's live streams
+
+Problem: deleting a user, or changing the password ("signs out every other session"), removed only
+gateway login sessions. A stream already open does not depend on its login session: the splice
+relays were not tracked per user, UDP relay allocations lived on the host's keep-alives, and the
+host never heard from the gateway again (the tunnel had only ping, open and relay; the ticket is
+checked once, in the hello). A compromised account kept keyboard and mouse control until it
+disconnected, however the admin responded.
+
+Fix:
+- Gateway (`internal/gateway/revoke.go`): user delete and password change call `revokeStreams`.
+  It drops the user's unused relay tickets, sends every online host an `end` tunnel message
+  (`proto.TunnelMsg` `Tickets`: the host tickets signed for the user in the last minute, nonce
+  to expiry; `Detail`: the reason the client shows), and a second later closes the user's
+  splice relays (their host data connection) and UDP relay allocations, now registered per user.
+  A relay or allocation whose ticket was issued before a revocation and that registers after it
+  (the ticket was taken just before) is refused. A host that reports streaming for a user who no
+  longer exists (it was offline at the deletion, or the gateway restarted) gets the `end` then;
+  the agent's status after a tunnel reconnect now names the user.
+- Host (`internal/host/agent.go` `endUser`, `setActive`): on `end`, the user's active session gets
+  a bye with the reason (the client does not reconnect), the listed tickets count as used, and a
+  session the gateway authorised before the `end` (its ticket checked, or its splice opened,
+  before it) is refused when it would become active. Older agents ignore `end`: the gateway's
+  relays and allocations still end, a direct-path session does not (SECURITY.md names the
+  takeover and restarting the agent).
+- A password change ends the changer's own streams too: a stream is not tied to the login
+  session that opened it, and the client connects again with a fresh ticket.
+
+- Verified here: `internal/e2e` `TestRevokedUserStreamsEnd` (real gateway and agent, FFmpeg
+  test source; run under the E2E lock): a user deleted while streaming on the direct path, the UDP
+  relay, the WebTransport relay and the WebSocket relay: each stream ends within the test's 5 s
+  bound with the host's bye "Your account was removed ...", and the direct and UDP relay tickets
+  fetched before the deletion open nothing; a password changed from another login session ends
+  the signed-out session's WebSocket-relay stream (bye "... password ... changed"), that session
+  gets no new tickets, and the changer connects again. On the old code every stream ran on (330
+  frames 5 s after the deletion). `internal/host` `TestEndUserRefusesEarlierSessions`,
+  `internal/gateway` `TestUserStreamsRevoke`. `go test -race`.
+- Gateway and host check (not GPU-specific, no AMD or NVIDIA step): add a second user, sign in
+  as that user in another browser and stream on the direct path; as admin, delete that user: the
+  other browser's stream stops within about a second with "Your account was removed from this
+  gateway" and does not reconnect; host.log has `session ended: the gateway revoked the user's
+  access`. Repeat from a phone hotspot (INSTALL's hotspot test: the overlay's Transport row reads
+  a relay) and with a password change from the user's own other browser (both streams end; the
+  changer reconnects).
+
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
 Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can

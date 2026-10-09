@@ -74,6 +74,11 @@ type Agent struct {
 	gwClock   int64
 	gwClockAt time.Time
 	nonces    map[string]int64
+	// ended: per user the gateway revoked ("end"), that end's number in
+	// endGen and its reason. A session the gateway authorised before it (its
+	// SessionMeta.Gen is lower) cannot become active.
+	ended     map[string]userEnd
+	endGen    uint64
 	tunnel    transport.BidiStream // control stream to the gateway
 	tunnelMu  sync.Mutex
 	directRot *tlsutil.Rotating // certificate of the direct path and the UDP relay
@@ -258,8 +263,20 @@ func (a *Agent) gamepads() *platform.Gamepads {
 	return p
 }
 
-func (a *Agent) setActive(s *Session) {
+type userEnd struct {
+	gen    uint64
+	reason string
+}
+
+// setActive makes s the host's one active session, replacing the one before.
+// It refuses (returning the reason) a session the gateway authorised before
+// it revoked the user's access.
+func (a *Agent) setActive(s *Session) (refused string) {
 	a.mu.Lock()
+	if e, ok := a.ended[s.meta.User]; ok && e.gen > s.meta.Gen {
+		a.mu.Unlock()
+		return e.reason
+	}
 	old := a.active
 	a.active = s
 	a.mu.Unlock()
@@ -268,6 +285,50 @@ func (a *Agent) setActive(s *Session) {
 		old.close("Another device connected to this host")
 	}
 	a.sendTunnel(proto.TunnelMsg{T: "status", Streaming: true, User: s.meta.User})
+	return ""
+}
+
+// endUser handles the gateway's "end": it revoked m.User's access (the user
+// was deleted or the password changed). The user's active session ends with
+// a bye (its client does not reconnect), a session of theirs that a ticket or
+// an open from before this authorised is refused when it would become active,
+// and the tickets the gateway lists count as used.
+func (a *Agent) endUser(m proto.TunnelMsg) {
+	if m.User == "" {
+		return
+	}
+	reason := m.Detail
+	if reason == "" {
+		reason = "Your access to this host was revoked"
+	}
+	a.mu.Lock()
+	a.endGen++
+	if a.ended == nil {
+		a.ended = map[string]userEnd{}
+	}
+	a.ended[m.User] = userEnd{gen: a.endGen, reason: reason}
+	for n, exp := range m.Tickets {
+		if exp > a.nonces[n] {
+			a.nonces[n] = exp
+		}
+	}
+	s := a.active
+	if s != nil && s.meta.User != m.User {
+		s = nil
+	}
+	a.mu.Unlock()
+	if s != nil {
+		s.log.Info("session ended: the gateway revoked the user's access", "user", m.User, "reason", reason)
+		go s.close(reason)
+	}
+}
+
+// authGen is the end number a session the gateway authorises now carries
+// (SessionMeta.Gen).
+func (a *Agent) authGen() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.endGen
 }
 
 func (a *Agent) clearActive(s *Session) {
@@ -291,32 +352,33 @@ func (a *Agent) isActive(s *Session) bool {
 // verifyTicket validates a ticket the gateway issued for the direct path or a
 // UDP relay allocation (relay: the allocation the session arrived through, ""
 // on the direct path). The ticket is bound to the browser origin that
-// requested it.
-func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
+// requested it. It returns the ticket's user and the end number the session
+// carries (SessionMeta.Gen), read with the ticket's nonce.
+func (a *Agent) verifyTicket(tok, origin, relay string) (string, uint64, error) {
 	a.mu.Lock()
 	key := a.directKey
 	a.mu.Unlock()
 	if len(key) == 0 {
-		return "", errors.New("not registered with a gateway")
+		return "", 0, errors.New("not registered with a gateway")
 	}
 	var t proto.DirectTicket
 	if err := auth.VerifyTicket(key, tok, &t); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if a.faults.refuseTickets {
-		return "", errors.New("ticket refused (TEST fault refuse-tickets)")
+		return "", 0, errors.New("ticket refused (TEST fault refuse-tickets)")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.ticketNow()
 	if t.HostID != a.pair().HostID || now > t.Exp || t.Nonce == "" {
-		return "", errors.New("ticket expired or for another host")
+		return "", 0, errors.New("ticket expired or for another host")
 	}
 	if !strings.EqualFold(t.Origin, origin) {
-		return "", errors.New("ticket was issued to a different origin")
+		return "", 0, errors.New("ticket was issued to a different origin")
 	}
 	if t.Relay != relay {
-		return "", errors.New("ticket was issued for another path")
+		return "", 0, errors.New("ticket was issued for another path")
 	}
 	for n, exp := range a.nonces {
 		if exp < now {
@@ -324,10 +386,10 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 		}
 	}
 	if _, used := a.nonces[t.Nonce]; used {
-		return "", errors.New("ticket already used")
+		return "", 0, errors.New("ticket already used")
 	}
 	a.nonces[t.Nonce] = t.Exp
-	return t.User, nil
+	return t.User, a.endGen, nil
 }
 
 // ticketSkew is how long past its expiry a ticket is still accepted when the
@@ -564,10 +626,14 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		}
 	}()
 	a.mu.Lock()
-	streaming := a.active != nil
+	streaming, user := a.active != nil, ""
+	if streaming {
+		user = a.active.meta.User
+	}
 	a.mu.Unlock()
 	if streaming {
-		a.sendTunnel(proto.TunnelMsg{T: "status", Streaming: true})
+		// With the user: one the gateway deleted meanwhile is ended (an "end").
+		a.sendTunnel(proto.TunnelMsg{T: "status", Streaming: true, User: user})
 	}
 
 	for {
@@ -588,9 +654,11 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 			a.setGatewayClock(m.Now)
 			a.sendTunnel(proto.TunnelMsg{T: "pong"})
 		case "open":
-			go a.openData(ctx, m)
+			go a.openData(ctx, m, a.authGen())
 		case "relay":
 			go a.openRelay(ctx, m, udpAddrPort(conn.RemoteAddr()).Addr())
+		case "end":
+			a.endUser(m)
 		}
 	}
 }
@@ -606,8 +674,9 @@ func (q *quicStreamAdapter) SetReadDeadline(t time.Time) error  { return q.s.Set
 func (q *quicStreamAdapter) SetWriteDeadline(t time.Time) error { return q.s.SetWriteDeadline(t) }
 
 // openData dials a dedicated QUIC connection for one session the gateway
-// relays by splicing it with the browser's QUIC connection or WebSocket.
-func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
+// relays by splicing it with the browser's QUIC connection or WebSocket. gen:
+// the end number when the gateway's open arrived (SessionMeta.Gen).
+func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg, gen uint64) {
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	p := a.pair()
@@ -632,7 +701,7 @@ func (a *Agent) openData(ctx context.Context, m proto.TunnelMsg) {
 		return
 	}
 	st.Close()
-	a.HandleConn(transport.FromQUIC(conn), SessionMeta{Path: "relay-splice", User: m.User})
+	a.HandleConn(transport.FromQUIC(conn), SessionMeta{Path: "relay-splice", User: m.User, Gen: gen})
 }
 
 // outboundLocalAddr returns the source address the OS routes from to reach

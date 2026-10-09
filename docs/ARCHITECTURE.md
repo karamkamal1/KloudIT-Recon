@@ -58,6 +58,12 @@ the old control stream. When the old client's path died, the write in progress g
 writes queued behind it are dropped, and a bye that cannot be sent whole is left out, so the new
 session's welcome waits about a second at most.
 
+**Revoked users.** Deleting a user or changing a password ends the account's streams: the gateway
+sends each host an `end` tunnel message for the user (with the host tickets it issued them in the
+last minute), the host ends that user's session with a `bye` and refuses those tickets and any
+session authorised before the `end`, and the gateway closes the user's splice relays and UDP
+relay allocations a second later, after the bye has gone through them (`internal/gateway/revoke.go`).
+
 **A failed control write ends the session.** A control write that reaches its 5 s deadline on a
 stalled path may leave part of its message on the stream (quic-go keeps what it queued, and the
 stream stays open), or lose the message (a video config: the picture would freeze). The host

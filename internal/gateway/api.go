@@ -322,6 +322,9 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request, u *User,
 		return nil
 	})
 	s.audit.Log("password_changed", u.Username, s.clientIP(r), "")
+	// Its live streams end too, also this browser's: a stream does not
+	// depend on the login session that opened it.
+	s.revokeStreams(u.Username, "The password of this account was changed: connect again")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -589,7 +592,8 @@ func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *Us
 	newTicket := func() string {
 		t := auth.RandomToken(24)
 		s.ticketMu.Lock()
-		s.tickets[auth.TokenHash(t)] = &relayTicket{user: u.Username, hostID: id, exp: time.Now().Add(60 * time.Second)}
+		now := time.Now()
+		s.tickets[auth.TokenHash(t)] = &relayTicket{user: u.Username, hostID: id, issued: now, exp: now.Add(60 * time.Second)}
 		s.ticketMu.Unlock()
 		return t
 	}
@@ -610,7 +614,7 @@ func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *Us
 	resp["relay"] = relay
 	if u := hc.directURL(); u != "" {
 		origin := "https://" + r.Host
-		tok, err := auth.SignTicket(hc.directKey, proto.DirectTicket{
+		tok, err := hc.signHostTicket(proto.DirectTicket{
 			HostID: id, User: ls.Username, Exp: time.Now().Add(60 * time.Second).Unix(), Nonce: auth.RandomToken(12), Origin: origin,
 		})
 		if err == nil {
@@ -690,7 +694,9 @@ func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request, u *Use
 		jsonError(w, http.StatusBadRequest, "you cannot delete yourself")
 		return
 	}
+	existed := false
 	_ = s.store.Update(func(st *state) error {
+		existed = st.Users[name] != nil
 		delete(st.Users, name)
 		for k, x := range st.Sessions {
 			if x.Username == name {
@@ -699,6 +705,9 @@ func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request, u *Use
 		}
 		return nil
 	})
+	if existed {
+		s.revokeStreams(name, userRemoved)
+	}
 	s.audit.Log("user_removed", u.Username, s.clientIP(r), name)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

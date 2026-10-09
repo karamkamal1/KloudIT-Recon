@@ -45,6 +45,15 @@ type TunnelMsg struct {
 	Streaming bool   `json:"streaming,omitempty"`
 	Detail    string `json:"detail,omitempty"`
 
+	// end (gateway -> host): the gateway revoked User's access (the user was
+	// deleted, or their password changed). The host ends User's sessions,
+	// with Detail as the reason its client shows, refuses a session of
+	// User's that a ticket or open from before this message authorised, and
+	// takes Tickets (nonce -> expiry in Unix seconds, the gateway's clock),
+	// the tickets the gateway issued User that may still be unused, as used.
+	// Older hosts ignore it.
+	Tickets map[string]int64 `json:"tickets,omitempty"`
+
 	Error string `json:"error,omitempty"`
 }
 

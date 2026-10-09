@@ -73,6 +73,7 @@ type Server struct {
 	ticketMu sync.Mutex
 	tickets  map[string]*relayTicket
 	pending  map[string]*pendingLogin
+	streams  userStreams // users' streams through the gateway (revoke.go)
 
 	loginIP   *limiter
 	apiIP     *limiter
@@ -89,6 +90,7 @@ type Server struct {
 type relayTicket struct {
 	user   string
 	hostID string
+	issued time.Time
 	exp    time.Time
 }
 

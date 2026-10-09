@@ -57,6 +57,17 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   `__Host-recon` (`Secure; HttpOnly; SameSite=Strict; Path=/`). Sessions expire after 72 h idle
   and 30 days absolute, are capped at 20 per user, and changing your password signs out every
   other session.
+- **Revoking access ends live streams:** deleting a user, or changing a password (which signs out
+  every other session), also ends that account's streams on every path, yours too (connect again).
+  A stream does not depend on the login session that opened it, so signing out alone would not
+  stop one. The gateway closes the account's relays and UDP relay allocations, and sends every
+  online host an `end` for the account: the host ends its session with a bye (the client does not
+  reconnect), counts the host tickets the account still held as used, and refuses a session the
+  gateway authorised before the `end`. A host that was offline then and comes back streaming for
+  a deleted account is sent the `end` when it reconnects. A host agent from before this ignores
+  `end`, and a session on its direct path goes on until the client leaves: connect to that host
+  yourself (your session takes it over) or restart `recon-host` on the PC. Someone who had
+  keyboard and mouse control may have changed the PC itself: treat it as compromised too.
 
 ## Request integrity
 

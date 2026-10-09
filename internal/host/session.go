@@ -38,6 +38,10 @@ type SessionMeta struct {
 	RequireTicket bool   // direct and relay paths: the client must present a gateway-signed ticket
 	Origin        string // direct and relay paths: Origin header of the WebTransport request
 	Relay         string // relay path: the allocation the connection arrived through
+	// Gen is the agent's end number (Agent.endGen) when the gateway
+	// authorised the session: its open (relay-splice), or when its ticket
+	// was checked. A gateway "end" for the user after that refuses it.
+	Gen uint64
 }
 
 // Session is one streaming client.
@@ -306,7 +310,7 @@ func (s *Session) run() error {
 		return errors.New("bad hello")
 	}
 	if s.meta.RequireTicket {
-		user, err := s.a.verifyTicket(s.hello.Ticket, s.meta.Origin, s.meta.Relay)
+		user, gen, err := s.a.verifyTicket(s.hello.Ticket, s.meta.Origin, s.meta.Relay)
 		if err != nil {
 			// The refusal has to reach the client, which then leaves out the
 			// paths the host authorises: closing the connection resets the
@@ -321,7 +325,7 @@ func (s *Session) run() error {
 			s.c.Close(transport.CodeAuth, "unauthorized")
 			return fmt.Errorf("%s ticket: %w", s.meta.Path, err)
 		}
-		s.meta.User = user
+		s.meta.User, s.meta.Gen = user, gen
 		if s.onAuth != nil {
 			s.onAuth()
 		}
@@ -329,8 +333,13 @@ func (s *Session) run() error {
 	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80),
 		"decoders", decoderSummary(s.hello.Decoders), "reset_stream_at", s.resetStreamAt)
 
-	// One active session per host: a new connection takes over.
-	s.a.setActive(s)
+	// One active session per host: a new connection takes over, unless the
+	// gateway revoked the user's access since it authorised this one.
+	if reason := s.a.setActive(s); reason != "" {
+		s.log.Info("session refused: the gateway revoked the user's access", "user", s.meta.User)
+		s.close(reason)
+		return errClosed
+	}
 	defer s.a.clearActive(s)
 	defer s.a.inj.ReleaseAll()
 	defer s.releasePads()

@@ -332,6 +332,13 @@ func (s *Server) handleUDPRelay(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	remove, ok := s.streams.add(rt.user, rt.issued, a.close)
+	if !ok {
+		a.close()
+		jsonError(w, http.StatusUnauthorized, errRevoked.Error())
+		return
+	}
+	go func() { <-a.done; remove() }()
 	if err := hc.send(proto.TunnelMsg{T: "relay", SID: a.id, Nonce: base64.StdEncoding.EncodeToString(a.token), User: rt.user, Port: a.port}); err != nil {
 		a.close()
 		jsonError(w, http.StatusServiceUnavailable, errHostOffline.Error())
@@ -349,7 +356,7 @@ func (s *Server) handleUDPRelay(w http.ResponseWriter, r *http.Request) {
 		a.close()
 		return
 	}
-	tok, err := auth.SignTicket(hc.directKey, proto.DirectTicket{
+	tok, err := hc.signHostTicket(proto.DirectTicket{
 		HostID: rt.hostID, User: rt.user, Exp: time.Now().Add(60 * time.Second).Unix(), Nonce: auth.RandomToken(12),
 		Origin: "https://" + r.Host, Relay: a.id,
 	})
@@ -380,6 +387,13 @@ func (s *Server) handleWTRelay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	remove, ok := s.streams.add(rt.user, rt.issued, func() { hostConn.CloseWithError(0, errRevoked.Error()) })
+	if !ok {
+		hostConn.CloseWithError(0, errRevoked.Error())
+		http.Error(w, errRevoked.Error(), http.StatusUnauthorized)
+		return
+	}
+	defer remove()
 	sess, err := s.wt.Upgrade(w, r)
 	if err != nil {
 		hostConn.CloseWithError(1, "browser upgrade failed")
@@ -407,6 +421,13 @@ func (s *Server) handleWSRelay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	remove, ok := s.streams.add(rt.user, rt.issued, func() { hostConn.CloseWithError(0, errRevoked.Error()) })
+	if !ok {
+		hostConn.CloseWithError(0, errRevoked.Error())
+		http.Error(w, errRevoked.Error(), http.StatusUnauthorized)
+		return
+	}
+	defer remove()
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
 		hostConn.CloseWithError(1, "")
