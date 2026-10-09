@@ -76,9 +76,10 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
    `· datagrams + FEC`).
-6. **Rate control**: 2.1, 2.2 (T6 under `capdrop`; its frame-rate ladder check), 2.6 (the UDP
-   relay), 2.7 (send priorities), with `"logLevel": "debug"`. 1.5's checks are superseded by
-   2.2.
+6. **Rate control**: 2.1 (media against reno under the four 0.4 profiles, relay and direct; its
+   pacing-cost check is superseded by 2.2), 2.2 (T6 under `capdrop`; its frame-rate ladder
+   check), 2.6 (the UDP relay), 2.7 (send priorities), with `"logLevel": "debug"`. 1.5's checks
+   are superseded by 2.2.
 7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
    before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
    re-encode, slice output).
@@ -666,35 +667,39 @@ Verified in the sandbox (Linux, no GPU, loopback only):
   (the Docker build's first stage) succeeds; it fails without the vendored `go.mod`, hence the
   extra `COPY` in `deploy/docker/Dockerfile`. The image itself was not built.
 
-Not verified (needs real networks):
+Not verified (needs real networks). Rewritten in the final review: these checks predated 2.2
+(the rate controller; `media` the default since, `Config.congestion()`), 2.6 (the UDP relay, one
+end-to-end connection) and 0.4 (the reporting harness), and gave raw `tc` profiles (a `wifi`
+with per-packet jitter that reorders most packets, a one-way 40 ms `wan`, a `tbf` `capdrop`) and
+a relay whose browser leg was a separate reno connection, which no longer apply.
 
-- Real Wi-Fi/WAN behaviour must be measured with the Phase 0.4 netem profiles, not inferred from
-  the loopback proxy above. Test: apply each profile to the link the host's media connection
-  crosses. Direct sessions: the client ↔ host path (clumsy on the Windows host, or netem on a
-  Linux router between them). Relay sessions: the host → gateway link (clumsy on the host for
-  the gateway's UDP port, or netem on an ifb device for the gateway's ingress). On the relay path
-  only the host → gateway data connection uses the setting; the gateway → browser WebTransport
-  leg stays reno until step 2.6 makes the relay one end-to-end connection, so shaping the
-  gateway's interface toward the client would compare reno with reno. Profiles: lan (none), wifi
-  `tc qdisc replace dev <if> root netem delay 5ms 10ms loss 1%`, wan
-  `tc qdisc replace dev <if> root netem delay 40ms loss 0.5%`, capdrop
-  `tc qdisc replace dev <if> root tbf rate 50mbit burst 64kb latency 50ms` then 15mbit then
-  50mbit. For each profile stream 2 minutes with `"congestion": "reno"` and with `"media"` in
-  `host.json` (restart the agent after editing) and record the overlay's one-way delay p50/p95,
-  fps, freezes, the bitrate and the host's `stream stats` log lines.
-- Until step 2.2 adds the application rate controller, media paces at 1.2 × the session's
-  bitrate (encoder + audio + 200 kbit/s) and never backs off on loss by itself; under a real
-  capacity drop (capdrop) only the existing queue-overflow back-off reacts. That is why reno
-  stays the default.
-- Latency cost of pacing: at 1.2 × the bitrate an average frame is spread over about 83 % of a
-  frame interval minus the 10-packet burst (20 Mbit/s at 60 fps: 41.7 kB per frame, about 10 ms
-  after the first 12 kB), while reno on a LAN sends a frame at line rate. Test: Phase 0.1
-  capture→drawn p50/p95 on lan with reno vs media before 2.2 switches the default; 2.2 may need
-  a burst allowance at frame starts or a higher pacing gain.
-- AMD RDNA3 (RX 7900 XT): unverified. Test: on the Windows AMD host set `"congestion": "media"`,
-  restart the agent, check host.log for `direct WebTransport endpoint listening ... congestion=media`,
-  then run the four netem profiles above for direct sessions and, on the host → gateway link
-  as described above, for relay sessions, and compare with reno.
+- Real Wi-Fi/WAN behaviour of media against reno must be measured with the 0.4 profiles and
+  procedure ("How every later step reports the four profiles"), not inferred from the loopback
+  proxy above. Relay sessions: Network path "Relay via gateway", Transport row `webtransport ·
+  relay` (not `relay-splice`), `./netem.sh apply <profile> --ct 210 --host CLIENT_IP` on the
+  Proxmox node: the UDP relay forwards one QUIC connection from the PC to the browser, so the
+  impaired gateway ↔ browser leg is on the media connection's path, and the PC's setting
+  governs the whole path. Only the splice fallback (`relay-splice`) still has a gateway →
+  browser leg of its own, which stays reno: do not compare there. Direct sessions: Network path
+  "Direct to PC only", `./netem.sh apply <profile> --iface <nic> --port 48100` on a Linux client,
+  or the clumsy settings of NETEM.md. Set `"fec": "off"` in host.json for both settings, so
+  `wan` compares frame streams too (0.4).
+- (History: before 2.2, media paced at 1.2 × the session's bitrate and never backed off on loss
+  by itself, so under a capacity drop only the queue-overflow back-off reacted; that is why reno
+  was the default then. 2.2's rate controller made media the default.)
+- Latency cost of pacing (media on `lan` against reno): **Superseded by 2.2** ("media vs reno,
+  latency cost of pacing").
+- AMD RDNA3 (RX 7900 XT): unverified. Test: the default host.json (no `"congestion"`: media) plus
+  `"fec": "off"`; host.log `direct WebTransport endpoint listening ... congestion=media` and
+  `relay socket ready ... congestion=media`. For each of the four 0.4 profiles (`lan`, `wifi`,
+  `wan`, `capdrop`), on the relay path and on the direct path as above, stream 2 minutes (for
+  `capdrop` the 60 s run) with media, then with `"congestion": "reno"` (restart the agent after
+  each edit; the log lines then say `congestion=reno`), HEVC 1920×1080 60 fps 20 Mbps with
+  constant motion. Record per run, as 0.4 asks (`lan / wifi / wan / capdrop`, with the
+  `netem.sh status` line): the overlay's one-way delay p50/p95, fps, freezes, the bitrate and
+  the Transport row, and the host's `stream stats` lines. Expect media at least as good as reno
+  on every profile (under `wifi`'s burst loss reno backs off, media leaves it to the rate
+  controller). Put `"fec"` and `"congestion"` back.
 - NVIDIA: unverified (no NVIDIA host available). Test: same as AMD on an RTX host.
 
 ## 1.1 AMD encoder arguments
