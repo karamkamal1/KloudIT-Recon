@@ -1155,7 +1155,7 @@ func (s *Session) videoEvents() {
 			}
 			s.rate.output(len(ev.Frame.Data))
 			s.staticFrame(ev.Frame)
-			if s.a.cfg.CaptureTimestamps == "off" {
+			if s.a.cfg != nil && s.a.cfg.CaptureTimestamps == "off" {
 				// No capture stamps on any pipeline: FFmpeg then makes
 				// none, the native helper always measures its own.
 				ev.Frame.CaptureUs, ev.Frame.PresentUs = 0, 0
