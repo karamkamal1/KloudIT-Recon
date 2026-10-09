@@ -415,6 +415,72 @@ func TestHelperIntegrationErrors(t *testing.T) {
 	}
 }
 
+// stallCheck starts p on h, launched with --test-stall-at=at, and checks the
+// encoder hang detection (native hang.hpp): every frame before at comes out,
+// then, about 2 s after frame at was submitted, a fatal encode_failed naming
+// it ends the helper (recon-host then restarts it). encoder: how the error
+// names the encoder.
+func stallCheck(t *testing.T, h *Helper, p StartParams, at uint64, encoder string) {
+	t.Helper()
+	if _, err := h.Start(p); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	var last uint64
+	var lastAt time.Time
+	timeout := time.After(15 * time.Second)
+frames:
+	for {
+		select {
+		case f, ok := <-h.Frames():
+			if !ok {
+				break frames
+			}
+			if f.FrameID >= at {
+				t.Fatalf("frame %d came out of an encoder stalled at frame %d", f.FrameID, at)
+			}
+			last, lastAt = f.FrameID, time.Now()
+		case <-timeout:
+			t.Fatalf("the helper did not end within 15 s of a stall at frame %d (last frame %d)", at, last)
+		}
+	}
+	waited := time.Since(lastAt)
+	var he *HelperError
+	want := fmt.Sprintf("%s did not finish frame %d within 2000 ms", encoder, at)
+	if err := h.Err(); !errors.As(err, &he) || he.Code != "encode_failed" || !he.Fatal || he.Text != want {
+		t.Fatalf("Err() = %v, want the fatal encode_failed %q", err, want)
+	}
+	// Frames before the stall all came out; the error about 2 s after the
+	// last one (frame at went in right after it).
+	if last != at-1 || waited < 1500*time.Millisecond || waited > 6*time.Second {
+		t.Fatalf("last frame %d, the error %v after it; want frame %d and about 2 s", last, waited, at-1)
+	}
+	t.Logf("stalled at frame %d: %s %v after the last frame", at, he.Code, waited.Round(time.Millisecond))
+}
+
+// An encoder that stops finishing frames (--test-stall-at): the mock applies
+// the hang rule of the AMF and libavcodec backends.
+func TestHelperIntegrationStall(t *testing.T) {
+	h := launchMock(t, "--test-stall-at=30")
+	stallCheck(t, h, StartParams{Codec: "h264", FPS: 60, Kbps: 4000}, 30, "the mock encoder")
+}
+
+// The AMF backend's hang detection on a real AMD GPU (skipped elsewhere):
+// with --test-stall-at it stops querying output, its input queue fills, and
+// the helper must end with the fatal encode_failed instead of freezing.
+func TestHelperIntegrationAMFStall(t *testing.T) {
+	h, err := Launch(Options{Exe: helperExe(t), Backend: "amf", LogLevel: "debug", Args: []string{"--test-stall-at=60"},
+		Log: slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	defer h.Close()
+	c := h.Caps()
+	if !c.Usable() || !slices.Contains(c.Capture, "dda") {
+		t.Skipf("no AMF backend with dda here: %v", c.Unavailable)
+	}
+	stallCheck(t, h, StartParams{Capture: "dda", Codec: "hevc", Width: 1280, Height: 720, FPS: 60, Kbps: 8000}, 60, "AMF")
+}
+
 func TestHelperIntegrationStuckExit(t *testing.T) {
 	// A capture/encoder call stuck in the driver (the mock never returns from
 	// submitting frame 5) must not keep the helper alive once it should exit:
@@ -523,6 +589,9 @@ func TestHelperIntegrationCommandLine(t *testing.T) {
 	}
 	if err := exec.Command(exe, "--print-caps", "--backend=amf", "--mock-fatal-at=3").Run(); !errors.As(err, &ee) || ee.ExitCode() != 2 {
 		t.Fatalf("mock option without the mock backend: %v", err)
+	}
+	if err := exec.Command(exe, "--print-caps", "--backend=nvenc", "--test-stall-at=3").Run(); !errors.As(err, &ee) || ee.ExitCode() != 2 {
+		t.Fatalf("--test-stall-at with the NVENC backend (its own hang test is the test double's): %v", err)
 	}
 }
 
@@ -1515,6 +1584,19 @@ func TestHelperIntegrationLavc(t *testing.T) {
 		if c.Backend != "lavc" || c.Codecs["h264"].MaxW == 0 {
 			t.Fatalf("FFmpegDir %q in %s: backend %q, unavailable %v", name, base, c.Backend, c.Unavailable)
 		}
+	})
+
+	// A libavcodec call that does not return (--test-stall-at): the hang
+	// detection ends the helper.
+	t.Run("Stall", func(t *testing.T) {
+		h, err := Launch(Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, LogLevel: "debug",
+			Args: []string{"--lavc-test-encoder=libx264", "--test-stall-at=20"},
+			Log:  slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		defer h.Close()
+		stallCheck(t, h, StartParams{Capture: "synthetic", Codec: "h264", Width: 320, Height: 180, FPS: 60, Kbps: 1000}, 20, "libavcodec libx264")
 	})
 
 	t.Run("Flush", func(t *testing.T) {

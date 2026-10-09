@@ -77,6 +77,31 @@ func TestHelperBlocker(t *testing.T) {
 // stretches its source to the size it is given, so a client size of another
 // aspect ratio than the monitor's is fitted to the monitor's (even, never
 // larger than the client asked, never upscaled); a window keeps its own size.
+// The helper's frame ring holds an uncompressed picture of the largest
+// monitor (a spare helper may stream any of them), 10-bit when HDR10 may be
+// asked for: the default 4 MiB slots drop a 4K stream's large key frames.
+func TestHelperSlotSize(t *testing.T) {
+	mons := []platform.Monitor{{W: 1920, H: 1080, Primary: true}, {W: 3840, H: 2160}, {W: 2560, H: 1440}}
+	for _, c := range []struct {
+		name string
+		mons []platform.Monitor
+		hdr  string
+		want int
+	}{
+		{"1080p", mons[:1], "", encoder.DefaultSlotSize},
+		{"the 4K monitor", mons, "", encoder.SlotSizeFor(3840, 2160, false)},
+		{"HDR10 allowed", mons, proto.HDRAuto, encoder.SlotSizeFor(3840, 2160, true)},
+	} {
+		a := &Agent{cfg: &Config{HDR: c.hdr}, listMonitors: func() []platform.Monitor { return c.mons }}
+		if got := a.helperSlotSize(); got != c.want {
+			t.Errorf("%s: slot size %d, want %d", c.name, got, c.want)
+		}
+	}
+	if encoder.SlotSizeFor(3840, 2160, false) <= encoder.DefaultSlotSize {
+		t.Fatal("4K slots are no larger than the default")
+	}
+}
+
 func TestHelperSource(t *testing.T) {
 	for _, c := range []struct {
 		name    string

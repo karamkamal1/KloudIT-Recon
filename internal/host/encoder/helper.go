@@ -186,6 +186,10 @@ func newHelper(opt Options, c conn) (*Helper, error) {
 // Caps returns the capabilities the helper reported at start-up.
 func (h *Helper) Caps() Caps { return h.caps }
 
+// SlotSize returns the size of the helper's ring slots (header included):
+// the largest frame it can deliver is SlotSize minus 128 bytes.
+func (h *Helper) SlotSize() int { return h.c.ring.SlotSize() }
+
 // QPCFrequency converts the QPC timestamps in Frame and Stats to seconds.
 func (h *Helper) QPCFrequency() int64 { return h.caps.QPCFrequency }
 

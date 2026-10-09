@@ -72,6 +72,9 @@ constexpr uint32_t kFlagSeqStart = 1u << 4;  // key frame starting a sequence (s
 constexpr uint32_t kFlagDirty = 1u << 5;        // kSlotDirtyPpm is valid (the capture reports dirty regions)
 constexpr uint32_t kFlagDiscardable = 1u << 6;  // no later frame references this one (top SVC layer / non-reference)
 constexpr uint32_t kFlagReencoded = 1u << 7;    // encoded a second time at a higher QP (start reencodeOversized; Phase 5 wiring B)
+// A frame dropped right before this one was larger than a slot's payload
+// (frame_too_large), not lost to a full ring (additive: older helpers leave it 0).
+constexpr uint32_t kFlagDroppedTooLarge = 1u << 8;
 }  // namespace ring
 
 enum class WriteResult { Written, Full, TooLarge, Corrupt };
@@ -93,6 +96,8 @@ public:
     uint64_t droppedTotal() const { return dropped_; }
     uint32_t slotCount() const { return slotCount_; }
     uint32_t slotSize() const { return slotSize_; }
+    // The largest frame a slot takes (slot size minus the slot header).
+    uint32_t payloadCapacity() const { return slotSize_ > ring::kSlotHeaderSize ? slotSize_ - ring::kSlotHeaderSize : 0; }
 
 private:
     uint8_t* base_ = nullptr;
@@ -103,6 +108,7 @@ private:
     uint64_t written_ = 0;        // local copy of writeCount
     uint64_t dropped_ = 0;        // total dropped
     uint32_t droppedPending_ = 0; // dropped since the last written slot
+    bool tooLargePending_ = false; // one of them was too large for a slot
 };
 
 }  // namespace recon

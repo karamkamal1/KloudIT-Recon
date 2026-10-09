@@ -69,7 +69,43 @@ const (
 	FlagDirty       = 1 << 5 // the slot's dirty share is valid
 	FlagDiscardable = 1 << 6 // no later frame references this one
 	FlagReencoded   = 1 << 7 // encoded a second time at a higher QP (start reencodeOversized)
+	// FlagDroppedTooLarge: a frame dropped right before this one did not
+	// fit a slot (frame_too_large), rather than finding the ring full
+	// (additive: older helpers leave it unset).
+	FlagDroppedTooLarge = 1 << 8
+
+	// maxStreamSlotSize bounds SlotSizeFor: an 8K HDR10 picture's slot (66
+	// MB, eight of them half a gigabyte of committed memory) is the largest.
+	maxStreamSlotSize = 64 << 20
 )
+
+// SlotSizeFor returns the ring slot size (header included) for streams of up
+// to width x height pixels: room for an uncompressed 4:2:0 picture of that
+// size (10 bits a sample when tenBit, an HDR10 stream) and a sixteenth more,
+// rounded up to 4096 bytes, at least DefaultSlotSize, at most 64 MiB. Width
+// or height 0 (not known): sized for 3840x2160.
+//
+// A frame larger than a slot is dropped (helper error frame_too_large). An
+// encoded frame at the bitrates a session allows (host config maxKbps, 250
+// Mbit/s by default) is smaller than the uncompressed picture, but a key
+// frame of a detailed 4K picture can outgrow DefaultSlotSize: 4 MiB is about
+// eight average frames at 250 Mbit/s and 60 fps, four at 30 fps, and AMF has
+// no key-frame size scale like NVENC's. Pictures up to 1920x1080 keep the
+// default (an uncompressed 1080p picture is 3.1 MB). The AMF backend keeps
+// its frames below the slot's payload as well (MAX_AU_SIZE). The mapping is
+// committed memory (4K: 8 slots of 13.2 MB); only the pages frames are
+// written to become resident.
+func SlotSizeFor(width, height int, tenBit bool) int {
+	if width <= 0 || height <= 0 {
+		width, height = 3840, 2160
+	}
+	raw := uint64(width) * uint64(height) * 3 / 2
+	if tenBit {
+		raw = raw * 10 / 8
+	}
+	size := (raw + raw/16 + slotHeaderSize + 4095) &^ 4095
+	return int(min(max(size, DefaultSlotSize), maxStreamSlotSize))
+}
 
 // maxSlicesPerFrame bounds a slot's slice count (start sliceOutput is 0..64;
 // the encoder may take another count): a larger one is ignored.
@@ -96,6 +132,9 @@ type Frame struct {
 	// layer of an SVC stream, a non-reference frame): it can be left out
 	// without breaking the decoding of any other (see Droppable).
 	Discardable bool
+	// DroppedTooLarge: one of the DroppedBefore frames was larger than a
+	// slot (frame_too_large), not lost to a full ring.
+	DroppedTooLarge bool
 	// Dirty is the share of the picture the capture reported as changed since
 	// the previous frame (0..1, from the dirty rects; 0 for an idle repeat),
 	// -1 = unknown (no dirty rects from this capture method, older helpers).
@@ -161,6 +200,9 @@ type Ring struct {
 	slotSize uint64
 	read     uint64 // next write index to consume
 }
+
+// SlotSize returns the ring's slot size (header included).
+func (r *Ring) SlotSize() int { return int(r.slotSize) }
 
 // NewRing wraps a mapping initialised with InitRing(mem, slots, slotSize).
 func NewRing(mem []byte, slots, slotSize int) (*Ring, error) {
@@ -246,6 +288,7 @@ func (r *Ring) Next() (*Frame, error) {
 		f.Dirty = min(1, float64(le.Uint32(s[slotDirtyPPM:]))/1e6)
 	}
 	f.Reencoded = flags&FlagReencoded != 0
+	f.DroppedTooLarge = flags&FlagDroppedTooLarge != 0
 	if n := le.Uint32(s[slotSlices:]); n > 0 && n <= maxSlicesPerFrame {
 		f.Slices, f.FirstSliceQPC = int(n), int64(le.Uint64(s[slotFirstSliceQPC:]))
 	}

@@ -184,6 +184,12 @@ public:
     // src describes the initialized capture (device, size); the backend fills
     // in (what it wants submitted) and out. Called again after a failed start.
     virtual Status init(const StartParams& p, const SourceInfo& src, InputSpec& in, Started& out) = 0;
+    // The largest frame the frame ring takes (a slot's payload: recon-host
+    // sizes the slots for the stream, docs/HELPER_PROTOCOL.md), set before
+    // every init(). A larger frame is dropped (frame_too_large), so a backend
+    // that can bound its frame sizes keeps them below this (AMF MAX_AU_SIZE /
+    // AV1 MAX_COMPRESSED_FRAME_SIZE); the others ignore it.
+    virtual void limitFrameSize(size_t bytes) { (void)bytes; }
     // The start failed after init() succeeded (stream.cpp: the colour
     // conversion could not be set up, say): release everything init() created
     // now, while the capture is still alive. An encoder may live on the

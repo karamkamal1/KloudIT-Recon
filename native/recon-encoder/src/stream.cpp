@@ -24,6 +24,7 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
     if (src.device) st.gpuPriority = applyGpuPriority(p.gpuPriority, src.adapter);
 
     InputSpec in;
+    choice.backend->limitFrameSize(ring.payloadCapacity());
     s = choice.backend->init(p, src, in, st);
     const bool encoderReady = s.ok;
     std::unique_ptr<d3d::Nv12Converter> conv;

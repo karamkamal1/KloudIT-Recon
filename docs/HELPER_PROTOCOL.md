@@ -12,7 +12,8 @@ slot flag SEQ_START (bit 4); step 3.9 added the HDR10 fields and the `captureCha
 `hdr`; Phase 5 added the fields of "Phase 5 features", two slot flags (DIRTY, bit 5, and
 DISCARDABLE, bit 6) and the slot's `dirtyPpm` in formerly reserved bytes; step 3.8 the
 `lavc` backend and `started.encoder`; Phase 5 wiring B the slot flag REENCODED (bit 7) and the
-slot's `slices` / `firstSliceQpc` in formerly reserved bytes).
+slot's `slices` / `firstSliceQpc` in formerly reserved bytes; the final review the slot flag
+DROPPED_TOO_LARGE, bit 8).
 
 ## Lifecycle
 
@@ -70,6 +71,16 @@ gone within 500 ms: a watchdog thread then terminates the process (exit code 4),
 capture or encoder call stuck in the driver cannot keep it, and its GPU encoder session,
 alive. A driver hang therefore costs up to 500 ms before the restart begins.
 
+An encoder that stops finishing frames without failing a call (an encoder or firmware
+stall: `QueryOutput` keeps answering `AMF_REPEAT`, a libavcodec call does not return, NVENC's
+completion event never comes) is a hang too: every backend ends the helper with a fatal
+`encode_failed` ("AMF did not finish frame N within 2000 ms"; `device_lost` if the D3D11
+device was removed) when the oldest frame in the encoder is still not out 2 s after its
+submission (AMF: or after the last `Flush` + `ReInit` of a `flush` rate change), so recon-host
+restarts it. Without that the stream would freeze for good: the capture thread only sees the
+encoder's input queue full (`encoder_busy`, logged once a second), and recon-host does not
+restart a live helper for sending no frames.
+
 Exit codes: `0` clean shutdown, `2` bad arguments or ring attach failure, `3` after a
 fatal error, `4` the threads did not stop within 500 ms of deciding to exit (watchdog).
 
@@ -81,7 +92,7 @@ recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
                   [--ffmpeg-dir=DIR] [--lavc-test-encoder=NAME[,NAME]]
                   [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
                   [--mock-follow-rate] [--mock-rate-lag=N] [--mock-idr-on-rate]
-                  [--dump-nv12=PATH]
+                  [--test-stall-at=N] [--dump-nv12=PATH]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
 recon-encoder.exe --gpu-priority-table              # the GPU priority decision table (see GPU priority)
 recon-encoder.exe --self-test-convert               # GPU colour conversion on WARP (see Self-tests)
@@ -123,6 +134,13 @@ page's.
   `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
   `--mock-follow-rate`, `--mock-rate-lag`, `--mock-idr-on-rate`: frame sizes that follow
   `setRate` (see "Mock backend"), for the live-bitrate qualification's tests.
+* `--test-stall-at=N` (test only, needs `--backend=amf`, `lavc` or `mock`): the encoder stops
+  finishing frames from frame id N on, as a stalled one does (AMF: `QueryOutput` is no longer
+  called for them, so its input queue fills; libavcodec: the encoder thread blocks before
+  encoding frame N, as in a call that does not return; mock: it takes frame N and outputs
+  nothing more, then answers `encoder_busy`), so the hang detection (see "Lifecycle") can be
+  checked: the helper must end with the fatal `encode_failed` about 2 s later. NVENC's is
+  checked against its test double (`--self-test-nvenc=DLL`).
 * `--nvenc-test-dll=DLL`: with `--encode-test` or `--print-caps` only (refused otherwise):
   the NVENC backend uses DLL, the test double `recon-fake-nvenc.dll`, as its runtime. Like
   `--self-test-nvenc=DLL` a test hook; the mode recon-host runs never loads a DLL by path.
@@ -382,7 +400,8 @@ and when the first one did; also in the ring slot, which the frame reaches recon
 the stats message follows the ring write and may be dropped).
 
 `dropped` frames add `"reason"`: `ringFull` (recon-host did not keep up) or `tooLarge`
-(bigger than a slot). `recovery` frames add `"refFloor"`. `kbps`/`vbvFrames`/`fps` are
+(bigger than a slot; also the error `frame_too_large`, and DROPPED_TOO_LARGE on the next
+written slot). `recovery` frames add `"refFloor"`. `kbps`/`vbvFrames`/`fps` are
 the current target as last set (start or `setRate`). Timestamps are QPC ticks
 (`caps.qpcFrequency` per second): `presentQpc` when the content was presented (0 if the
 capture method cannot tell), `captureQpc` when capture returned it, `submitQpc` when it
@@ -428,8 +447,8 @@ other captures false).
 | `no_output` | no | the requested monitor / window does not exist or is not attached to the desktop |
 | `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly; a zero-copy AMD Direct Capture source that changed size, rotation or surface format: recon-host restarts the helper, which then follows the new source, and starts it with `zeroCopy` false if that happens again; no captured frame converted for 2 s and at least 10 frames, e.g. a texture format the colour conversion cannot read, whose non-fatal error (`unsupported`, `init_failed`) is sent once a second until then: recon-host restarts the helper and, after three failures within 60 s, streams with FFmpeg) |
 | `device_lost` | yes | the D3D11 device was removed (driver reset / TDR), noticed by any capture method, the colour conversion or an encoder (NVENC also on `NV_ENC_ERR_DEVICE_NOT_EXIST`); a new helper starts over |
-| `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped) |
-| `encode_failed` | no / yes | an encoder call failed (AMF `SubmitInput`, `QueryOutput`, surface creation; NVENC `NvEncEncodePicture`, `NvEncLockBitstream`, `NvEncReconfigureEncoder` for a `setRate`, which keeps the old rate); fatal after 10 failures in a row, on `AMF_EOF`, when `liveBitrate` `flush` cannot re-initialize the AMF encoder, or when NVENC does not finish a frame within 2 s |
+| `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped; the text names the frame, whether it was a key frame, its size and the slot's payload capacity) |
+| `encode_failed` | no / yes | an encoder call failed (AMF `SubmitInput`, `QueryOutput`, surface creation; NVENC `NvEncEncodePicture`, `NvEncLockBitstream`, `NvEncReconfigureEncoder` for a `setRate`, which keeps the old rate); fatal after 10 failures in a row, on `AMF_EOF`, when `liveBitrate` `flush` cannot re-initialize the AMF encoder, or when the encoder (NVENC, AMF, libavcodec) does not finish a frame within 2 s of its submission (a hung encoder, see "Lifecycle") |
 | `mock_error` / `mock_fatal` | no / yes | injected by `--mock-error-at` / `--mock-fatal-at` |
 | `protocol` | yes | control framing broken (message over 1 MiB) |
 | `ring` | yes | the ring could not be attached, or its counters are inconsistent |
@@ -450,7 +469,7 @@ starting the helper and validates nothing it reads back without bounds checks.
 | 8 | u32 | `version` = 1 | recon-host |
 | 12 | u32 | `headerSize` = 4096 | recon-host |
 | 16 | u32 | `slotCount` (2..1024, default 8) | recon-host |
-| 20 | u32 | `slotSize` (slot header + payload capacity; multiple of 4096, >= 64 KiB; default 4 MiB) | recon-host |
+| 20 | u32 | `slotSize` (slot header + payload capacity; multiple of 4096, >= 64 KiB; default 4 MiB; sessions: see "Slot size" below) | recon-host |
 | 24 | u64 | `totalSize` = `headerSize + slotCount * slotSize` (= `--ring-size`) | recon-host |
 | 32 | u32 | `slotHeaderSize` = 128 | recon-host |
 | 36 | u32 | reserved (0) | |
@@ -473,7 +492,7 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 |---|---|---|
 | 0 | u64 | `seq`: the write index `n` this slot was written at |
 | 8 | u64 | `frameId`: helper frame counter, from 1, +1 per captured frame |
-| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it), bit 5 DIRTY (`dirtyPpm` valid; Phase 5), bit 6 DISCARDABLE (no later frame references this one; Phase 5), bit 7 REENCODED (encoded a second time at a higher QP: start `reencodeOversized`, stats `reencoded`; Phase 5 wiring B) |
+| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it), bit 5 DIRTY (`dirtyPpm` valid; Phase 5), bit 6 DISCARDABLE (no later frame references this one; Phase 5), bit 7 REENCODED (encoded a second time at a higher QP: start `reencodeOversized`, stats `reencoded`; Phase 5 wiring B), bit 8 DROPPED_TOO_LARGE (one of the `droppedBefore` frames was larger than a slot's payload, `frame_too_large`, rather than lost to a full ring; final review) |
 | 20 | u32 | `gen`: encoder generation inside this helper (bumped on an in-helper re-init) |
 | 24 | u32 | `payloadOffset` from the slot start (>= 128) |
 | 28 | u32 | `payloadSize` in bytes |
@@ -501,12 +520,35 @@ r = atomic_load_acquire(readCount)
 if r > written or written - r > slotCount: fatal "ring"
 if payload > slotSize - 128 or written - r == slotCount:
     drop THIS frame (the newest), droppedFrames++, droppedPending++
+    tooLargePending |= payload > slotSize - 128
     send stats {dropped: true}; never wait
 else:
-    fill slot (written % slotCount): header with droppedBefore = droppedPending, payload
+    fill slot (written % slotCount): header with droppedBefore = droppedPending
+        (and DROPPED_TOO_LARGE if tooLargePending), payload
     atomic_store_release(writeCount, written + 1); written++; droppedPending = 0
+    tooLargePending = false
     SetEvent(frameReady)
 ```
+
+### Slot size
+
+A frame larger than a slot's payload (`slotSize - 128`) is dropped, and a dropped key frame
+leaves the frames after it (and the LTR slots it cleared) without a reference until the
+loss is recovered. recon-host therefore sizes a session's slots for the stream, not the
+4 MiB default (`encoder.SlotSizeFor`, recon-host `helperSlotSize`): an uncompressed 4:2:0
+picture of the largest monitor Windows lists (10-bit samples when host config `hdr` is
+`auto`) plus 1/16, rounded up to 4096 bytes, at least 4 MiB, at most 64 MiB. 1080p keeps
+4 MiB; 4K gets 13.2 MB (HDR10 16.5 MB), so 8 slots commit about 106 MB per helper (the spare
+helper as much again), of which only the pages frames are written to become resident. The
+4 MiB default held about eight average frames of a 250 Mbit/s 60 fps stream (four at
+30 fps), less than a detailed 4K key frame at those rates. The helper passes the payload
+capacity to its encoder backend (`Backend::limitFrameSize`): AMF sets it as the maximum
+frame size (H.264 `MAX_AU_SIZE`, HEVC `HEVC_MAX_AU_SIZE`, AV1 `MAX_COMPRESSED_FRAME_SIZE`, in
+bits), since AMF has no key-frame size scale like NVENC's and HRD is off; the other
+backends ignore it. The encode test (`--encode-test`) uses 24 MiB slots (a 4K HDR10
+picture). recon-host logs a dropped too-large frame as such (`encoder helper dropped a frame
+too large for its frame ring`, and the loss as `frame too large for the helper ring`), not
+as a full ring.
 
 ### Consumer (recon-host)
 
@@ -869,7 +911,10 @@ marks a decoder entry point.
 **Output.** One output thread: while no frame is in the encoder it waits for a
 submission instead of calling `QueryOutput` (which answers `AMF_REPEAT` at once on an empty
 queue); with frames in flight `QueryOutput` (blocking up to `QUERY_TIMEOUT`; a call that
-returns sooner is followed by a 1 ms sleep, as without the timeout), then
+returns sooner is followed by a 1 ms sleep, as without the timeout); the oldest frame in
+flight still not out 2 s after its submission (or after the last `Flush` + `ReInit`) while
+`QueryOutput` answers `AMF_REPEAT` is a hung encoder: the fatal `encode_failed` (`device_lost`
+if the device was removed), as NVENC's. Then
 `OUTPUT_DATA_TYPE` (AV1 `OUTPUT_FRAME_TYPE`) gives `key`,
 `OUTPUT_MARKED_LTR_INDEX` the slot's `ltrSlot`, `OUTPUT_REFERENCED_LTR_INDEX_BITFIELD`
 `refLtrMask`, `OUTPUT_TEMPORAL_LAYER` `temporalLayer` (H.264, HEVC; AV1 has no such property:
@@ -1195,6 +1240,9 @@ IDRs and rate changes and calls `avcodec_send_frame` / `avcodec_receive_packet` 
 thread on the codec context; `async_depth` 1 makes each encode synchronous there), and
 queues the packets for `receive()` (output thread). An encode error is a non-fatal
 `encode_failed`, fatal after 10 in a row; a removed D3D11 device is the fatal `device_lost`.
+The oldest frame in the encoder (sent, no packet yet) still not out 2 s after its submission
+(a call into the runtime that does not return, or an encoder that takes frames and gives
+nothing back) is a hung encoder: `receive()` fails with the fatal `encode_failed`.
 
 **Test path** (`--lavc-test-encoder=libx264`): the same backend drives a software encoder
 from an FFmpeg shared build that has one (BtbN's GPL shared build) on system-memory frames:

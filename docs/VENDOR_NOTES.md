@@ -71,7 +71,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
 2. **The helper by itself**: `recon-encoder.exe --print-caps --backend=amf` and the self-tests
    (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
    3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
-   (not its first two `--print-caps` checks: superseded).
+   (not its first two `--print-caps` checks: superseded); "Final review: native encoder helper,
+   third round", the AMF hang check (`TestHelperIntegrationAMFStall`, Go on the PC).
 3. **Qualify** (T7): `recon-host.exe qualify` with no stream running, about 70 minutes (3.6,
    and "Final review: host agent, third round": its streams have the session's temporal
    layers). Streams use its `live-bitrate.json`, so run it before stages 5-7, and again after a
@@ -92,7 +93,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    runs), a takeover between two clients on Wi-Fi, tickets with the PC's clock 5 minutes ahead
    of the gateway's, and nothing encoding while the tab is hidden. 3.8 wiring's AMD lines (no regression
    with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
-   iGPU). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
+   iGPU). "Final review: native encoder helper, third round": 4K key frames at 250 Mbit/s and
+   the ring's slot size (a 3840x2160 monitor). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
    Sunshine for the comparison), T2 with the 0.3 rig.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
@@ -121,9 +123,10 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
      Pass: no driver timeout (Event Viewer > Windows Logs > System: no Display event 4101, no
      WHEA errors); host.log has no `encoder helper failed`, `encoder helper error` or
      `video pipeline pipeline=ffmpeg ... was=helper` line, and its `stream stats` fps stays
-     steady to the end; the overlay's Freezes count does not grow steadily; the working set of
-     `Get-Process recon-encoder,recon-host | Select-Object Name,WS` at 2 hours is within about
-     10 % of its value at 10 minutes. Record the Adrenalin version.
+     steady to the end, and no `did not finish frame` (a false encoder hang, "Final review:
+     native encoder helper, third round"); the overlay's Freezes count does not grow steadily;
+     the working set of `Get-Process recon-encoder,recon-host | Select-Object Name,WS` at 2
+     hours is within about 10 % of its value at 10 minutes. Record the Adrenalin version.
    - NVIDIA: unverified (no NVIDIA host available). Test: the same with HEVC on NVENC, once with
      hardware-accelerated GPU scheduling on and once off (1.3).
 10. **The FFmpeg fallback** (`"pipeline": "ffmpeg"`): the checks marked FFmpeg path only (1.2,
@@ -11040,3 +11043,116 @@ reset stream (6 of 6) without partial delivery, as the ladder change assumes. `m
 helper-test` under Wine passes (with `TestQualifyMockSVC`); `go test` of every package but
 `internal/e2e` passes, and `go test -race ./internal/host/...` passes. The whole suite is the
 final step's.
+
+## Final review: native encoder helper, third round
+
+### Key frames larger than a ring slot
+
+Problem: every helper ring had 8 slots of 4 MiB (`encoder.DefaultSlotSize`; recon-host never set
+another size), whatever the stream. The host allows 250 Mbit/s (`maxKbps`), where an average
+frame is 0.52 MB at 60 fps and 1.04 MB at 30 fps, so a key frame of more than about 8 (60 fps)
+or 4 (30 fps) average frames did not fit a slot's 4,194,176 bytes: normal for a detailed 4K
+desktop or game picture. AMF has no key-frame size scale like NVENC's
+`lowDelayKeyFrameScale` 3, HRD is off and no maximum frame size was set, so nothing bounded it.
+The helper dropped such a frame (non-fatal `frame_too_large`); the P frames after it referenced
+the lost IDR, and the LTR slots the IDR had cleared were gone too, so the next loss fell back to
+another IDR of about the same size, dropped again: the stream froze or looped through dropped
+IDRs until the bitrate fell. host.log called the gap `helper ring full`, hiding the cause.
+
+Fix:
+- recon-host sizes the ring for the stream (`encoder.SlotSizeFor`, `Agent.helperSlotSize`, at
+  every helper launch): an uncompressed 4:2:0 picture of the largest monitor Windows lists
+  (10-bit when host config `hdr` is `auto`) plus 1/16, rounded up to 4096, at least 4 MiB, at
+  most 64 MiB. 1080p keeps 4 MiB; 1440p 5.9 MB; 4K 13.2 MB (HDR10 16.5 MB): 8 slots commit about
+  106 MB per helper (the spare as much again), resident only where frames were written. The
+  largest monitor, not the session's, because a spare helper is launched before the next
+  stream's monitor is known (a virtual display is listed too).
+- The helper passes a slot's payload capacity to the encoder backend
+  (`Backend::limitFrameSize`); AMF sets it as its maximum frame size, in bits: H.264
+  `MAX_AU_SIZE`, HEVC `HEVC_MAX_AU_SIZE`, AV1 `MAX_COMPRESSED_FRAME_SIZE` (dynamic properties,
+  applied before and after `Init` / `ReInit` with the rate, not required: a driver that refuses
+  it is logged with the other properties not accepted). NVENC and libavcodec ignore it (the
+  slot size covers them).
+- A drop of a too-large frame is reported as such: the ring's new slot flag DROPPED_TOO_LARGE
+  (bit 8, additive) on the next written frame, recon-host's loss reason `frame too large for the
+  helper ring` (not `helper ring full`), and its own warning `encoder helper dropped a frame too
+  large for its frame ring ... slot_size=...`; the helper's error text names the frame, whether
+  it was a key frame, its size and the slot's capacity. The encode test's ring has 24 MiB slots
+  (a 4K HDR10 picture).
+
+- Verified here: `internal/host/encoder` `TestSlotSizeFor` (sizes by resolution and bit depth;
+  a 4K slot holds 10 average frames of 250 Mbit/s at 60 fps, the default only 8) and
+  `TestRingWrapAndDrop` (DROPPED_TOO_LARGE after a too-large drop, not after a full ring; the Go
+  producer mirrors `ring.cpp`); `internal/host/media` `TestHelperVideo` (a frame larger than the
+  fake helper's slot gives the loss reason `frame too large for the helper ring`; before the fix
+  the gap said `encoder error` / `helper ring full`); `internal/host` `TestHelperSlotSize` (the
+  largest monitor, 10-bit with `hdr` `auto`). The helper builds with mingw-w64 without warnings;
+  `make helper-test` under Wine (mock backend) passes. MAX_AU_SIZE itself needs AMF.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (stage 4 of the hardware test plan, a 3840x2160
+  monitor): stream HEVC at 4K, 60 fps, 250 Mbit/s (`maxKbps` default; Bitrate 250 Mbit/s in the
+  settings drawer, adaptive off) from a detailed game or a desktop full of small text, on `lan`.
+  host.log's `encoder helper: recon-encoder ...: backend amf, vendor amd, ring 8 x 13221888
+  bytes` (16527360 with `"hdr": "auto"`); no `amf: ... properties not accepted` naming
+  `MaxAUSize` / `HevcMaxAUSize` / `Av1MaxCompressedFrameSize` (at `"logLevel": "debug"` also no
+  `amf: after Init, not accepted:` naming them). Press Request key frame in the settings drawer
+  20 times, a few seconds apart: no `encoder helper dropped a frame too large` warning, no loss
+  with `why="frame too large for the helper ring"`, and the stream never freezes. Repeat at 30
+  fps and with AV1. Then the bound itself: `recon-encoder.exe --encode-test=k.hevc
+  --capture=dda --codec=hevc --kbps=250000 --fps=30 --frames=300 --at=60:idr --at=120:idr
+  --at=180:idr --frame-log=k.jsonl` and check in `k.jsonl` that no frame has `"bytes"` above
+  25165696 (the encode test's slot payload), and that the key frames' sizes are not visibly
+  clipped compared with the same run before this change (MAX_AU_SIZE must not cost quality
+  below the cap).
+- NVIDIA: unverified (no NVIDIA host available). Test: the same 4K stream on NVENC: the ring
+  line shows the same slot size, no `frame too large` warning after 20 forced key frames
+  (NVENC keeps its 3x key-frame scale; it ignores the frame-size limit).
+
+### An encoder that stops finishing frames ends the helper (AMF, libavcodec)
+
+Problem: NVENC treated a frame still unfinished 2 s after its submission as a hung encoder (a
+fatal `encode_failed`, so recon-host restarts the helper); AMF and the libavcodec backend had no
+such check. A VCN that stops producing output without the D3D11 device being removed (an
+encoder or firmware stall, a driver bug in an LTR / SVC combination) left `AmfEncoder::receive`
+polling `QueryOutput` (`AMF_REPEAT`) forever; `SubmitInput` answered `AMF_INPUT_FULL`, the
+non-fatal `encoder_busy`, and the capture thread dropped frames with a warning once a second.
+recon-host has no watchdog for a live helper that sends no frames, and the session's key-frame
+requests go to the helper's `forceIdr`, never to a restart: the stream stayed frozen, the helper
+looked healthy, until the user reconnected. The libavcodec backend's `receive` waited on its
+output queue the same way when an encoder call did not return.
+
+Fix: the same rule as NVENC's in both backends (native `hang.hpp`, 2000 ms): AMF checks, while
+`QueryOutput` answers `AMF_REPEAT`, whether the oldest frame in flight was submitted (or the
+last `Flush` + `ReInit` of a `flush` rate change ended) more than 2 s ago; libavcodec, when its
+output queue is empty, whether the oldest frame sent to the encoder without a packet back is
+older than 2 s (also while the encoder thread is stuck inside `avcodec_send_frame` /
+`avcodec_receive_packet`). Then `device_lost` if the D3D11 device was removed, else the fatal
+`encode_failed` "AMF did not finish frame N within 2000 ms" / "libavcodec hevc_qsv did not
+finish frame N within 2000 ms"; the helper exits and recon-host replaces it (a spare helper
+starts within about 300 ms). A test hook, `--test-stall-at=N` (backends amf, lavc and mock),
+makes the encoder stop finishing frames from frame N on, so the rule can be checked end to end;
+the mock applies the same rule.
+
+- Verified here: `--self-test-encoder` "encoder hang rule" (2 s boundary, the error); under Wine
+  with the mingw build: `internal/host/encoder` `TestHelperIntegrationStall` (mock: frames 1-29,
+  then the fatal `encode_failed` "the mock encoder did not finish frame 30 within 2000 ms" 2.1 s
+  after the last frame, the helper exits) and `TestHelperIntegrationLavc/Stall` (the libavcodec
+  backend with libx264 from BtbN's FFmpeg 8.1 GPL shared build: the encoder thread blocked before
+  frame 20, the fatal error 2.1 s after frame 19; its Flush / Seamless / GPU runs still pass, no
+  false hang), `TestHelperIntegrationCommandLine` (the option is refused with the NVENC backend);
+  `internal/host/media` `TestHelperVideoStallRestart` (the session's pipeline restarts the
+  stalled helper: the stall noticed 2.0 s after the last frame, the new helper's key frame 0.26 s
+  later). Before the fix the AMF and libavcodec backends had no such path (the option did not
+  exist: the tests fail at launch). The AMF path itself compiles here only (no AMF runtime).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (stage 2 of the hardware test plan, Go installed on
+  the PC): `$env:RECON_HELPER_EXE = "$env:ProgramFiles\KlouditRecon\recon-encoder.exe"; go test
+  -count=1 -v -run 'TestHelperIntegrationAMFStall' ./internal/host/encoder` in the source tree:
+  PASS with `stalled at frame 60: encode_failed` about 2 s after the last frame (the helper log
+  shows `encoder is behind: dropping a captured frame (AMF input queue full)` in between). Then,
+  during stage 9's soak, host.log must have no `did not finish frame` line (a false hang would
+  restart the helper: `encoder helper failed` with that text); and a `liveBitrate` `flush` rate
+  change (stage 6 with a qualification that chose flush) must not trigger one either.
+- NVIDIA: unverified (no NVIDIA host available). Test: none new (NVENC's own 2 s check is
+  unchanged and covered by `--self-test-nvenc` against the test double); the soak line above
+  applies.
+- Intel (Quick Sync, libavcodec backend): unverified (no Intel host). Test: during a 30-minute
+  stream on `hevc_qsv` (3.8 wiring) host.log has no `did not finish frame` line.

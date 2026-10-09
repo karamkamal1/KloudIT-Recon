@@ -63,7 +63,8 @@ func (a *Agent) setupHelper() {
 		}
 		a.lavcMissing = encoder.LavcMissing(ffDir)
 		a.launchHelper = func(log *slog.Logger, backend string) (*encoder.Helper, error) {
-			return encoder.Launch(encoder.Options{Exe: exe, Backend: backend, FFmpegDir: ffDir, Log: log, CapsTimeout: 5 * time.Second})
+			return encoder.Launch(encoder.Options{Exe: exe, Backend: backend, FFmpegDir: ffDir, Log: log, CapsTimeout: 5 * time.Second,
+				SlotSize: a.helperSlotSize()})
 		}
 		lavc := "libraries in " + ffDir
 		switch {
@@ -76,6 +77,23 @@ func (a *Agent) setupHelper() {
 		return
 	}
 	a.log.Info("native encoder helper not used", "reason", a.helperMissing, "pipeline", a.cfg.pipeline())
+}
+
+// helperSlotSize is the frame ring slot size of a helper launched now
+// (encoder.SlotSizeFor): for the largest monitor Windows lists, as a helper
+// may stream any of them (a session's virtual display is listed too, and a
+// spare helper is launched before the next stream's monitor is known), with
+// 10-bit samples when the host config allows HDR10. A frame larger than a
+// slot is dropped; the default 4 MiB slots are too small for a key frame of
+// a high-bitrate stream above 1080p.
+func (a *Agent) helperSlotSize() int {
+	w, h := 0, 0
+	for _, m := range a.monitors() {
+		if m.W*m.H > w*h {
+			w, h = m.W, m.H
+		}
+	}
+	return encoder.SlotSizeFor(w, h, a.cfg.hdr() == proto.HDRAuto)
 }
 
 // vid returns the session's video pipeline.

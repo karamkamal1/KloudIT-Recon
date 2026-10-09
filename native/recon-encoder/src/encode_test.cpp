@@ -441,7 +441,11 @@ int runEncodeTest(EncodeTestOptions& o, BackendChoice& choice) {
 
     LocalRing ring;
     RingWriter writer;
-    s = ring.create(8, 4u << 20);
+    // Slots that hold an uncompressed 4K HDR10 picture (3840x2160 4:2:0 at
+    // 10 bits is 15.6 MB), as recon-host sizes them for a 4K stream
+    // (encoder.SlotSizeFor): a key frame of a high-bitrate 4K test must not
+    // be dropped as frame_too_large here when the session would carry it.
+    s = ring.create(8, 24u << 20);
     if (s.ok) s = writer.attach(ring.mapping(), ring.size(), ring.event());
     if (!s.ok) {
         std::printf("encode-test: %s\n", s.text.c_str());

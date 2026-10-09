@@ -55,7 +55,11 @@
 // applies forced IDRs and rate changes, calls avcodec_send_frame and
 // avcodec_receive_packet (the only thread that touches the codec context;
 // async_depth 1 makes the encode synchronous) and queues packets for
-// receive() (output thread).
+// receive() (output thread). A frame the encoder has not finished 2 s after
+// its submission (a call into the runtime that does not return, or an
+// encoder that takes frames and gives nothing back) is a hang: receive()
+// fails with a fatal encode_failed, as NVENC and AMF do (hang.hpp), so
+// recon-host restarts the helper instead of streaming nothing.
 //
 // --lavc-test-encoder=NAME (test only): the same backend drives a software
 // encoder (libx264 from a GPL shared build) on system-memory frames, so the
@@ -85,6 +89,7 @@ extern "C" {
 #include "codec/bitstream.hpp"
 #include "codec/hdr.hpp"
 #include "d3d/device.hpp"
+#include "hang.hpp"
 #include "lavc/lavc_runtime.hpp"
 #include "probes.hpp"
 
@@ -536,6 +541,7 @@ private:
     Status readTexture(ID3D11Texture2D* tex, ComPtr<ID3D11Texture2D>& staging, const PlaneCopy* planes, int count);
     void encodeLoop();
     void encodeOne(Input& in);
+    void noteOldest();
     void deliver(AVPacket* pkt);
     void fail(const std::string& what, int err);
     void push(Output o);
@@ -574,6 +580,10 @@ private:
     std::deque<Input> inputs_;
     std::deque<Output> outputs_;
     bool stopped_ = false;
+    // The oldest frame in the encoder (pending_.front(), noteOldest): its id
+    // and submission time, 0 = none. For the hang check in receive().
+    uint64_t oldestId_ = 0;
+    int64_t oldestQpc_ = 0;
 
     std::mutex ctlMu_;
     bool idrPending_ = false;
@@ -786,6 +796,8 @@ void LavcEncoder::release() {
     }
     outputs_.clear();
     pending_.clear();
+    oldestId_ = 0;
+    oldestQpc_ = 0;
     // The codec context first: it holds the mapped frames, which hold the
     // converter's textures and the frames / device contexts.
     freeContexts();
@@ -988,8 +1000,26 @@ void LavcEncoder::encodeLoop() {
             in = inputs_.front();
             inputs_.pop_front();
         }
+        if (const uint64_t at = testStallAt(); at && in.info.frameId >= at) {
+            // --test-stall-at: as an encoder call that does not return
+            // (until shutdown), with the frame counted as in the encoder.
+            pending_.push_back(Pending{pts_++, in.info, gen_, false});
+            noteOldest();
+            rt_.av_frame_free(&in.frame);
+            logf(LogLevel::Warn, "lavc: stalling at frame %llu (--test-stall-at)", static_cast<unsigned long long>(in.info.frameId));
+            std::unique_lock<std::mutex> lock(mu_);
+            inCv_.wait(lock, [this] { return stopped_; });
+            return;
+        }
         encodeOne(in);
+        noteOldest();  // after the packets it delivered
     }
+}
+
+void LavcEncoder::noteOldest() {
+    std::lock_guard<std::mutex> lock(mu_);
+    oldestId_ = pending_.empty() ? 0 : pending_.front().info.frameId;
+    oldestQpc_ = pending_.empty() ? 0 : pending_.front().info.submitQpc;
 }
 
 void LavcEncoder::encodeOne(Input& in) {
@@ -1030,6 +1060,7 @@ void LavcEncoder::encodeOne(Input& in) {
         f->flags |= AV_FRAME_FLAG_KEY;
     }
     pending_.push_back(Pending{f->pts, in.info, gen_, idr});
+    noteOldest();  // before the calls that could hang
     int ret = rt_.avcodec_send_frame(enc_, f);
     rt_.av_frame_free(&f);
     if (ret < 0) {
@@ -1139,7 +1170,15 @@ Next LavcEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     std::unique_lock<std::mutex> lock(mu_);
     outCv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return stopped_ || !outputs_.empty(); });
     if (stopped_) return Next::Stopped;
-    if (outputs_.empty()) return Next::Timeout;
+    if (outputs_.empty()) {
+        if (!encoderHung(oldestQpc_, qpcNow(), qpcFrequency())) return Next::Timeout;
+        const uint64_t id = oldestId_;
+        lock.unlock();
+        if (!device_ || !d3d::deviceRemoved(device_.Get(), "lavc: waiting for frame " + std::to_string(id), err)) {
+            err = encoderHangError("libavcodec " + det_.encoder, id);
+        }
+        return Next::Error;
+    }
     Output o = std::move(outputs_.front());
     outputs_.pop_front();
     if (!o.err.ok) {

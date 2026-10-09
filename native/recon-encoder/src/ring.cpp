@@ -87,6 +87,7 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (tooLarge || written_ - read == slotCount_) {
         ++dropped_;
         ++droppedPending_;
+        tooLargePending_ = tooLargePending_ || tooLarge;
         counter(base_, kOffDropped).store(dropped_, std::memory_order_relaxed);
         return tooLarge ? WriteResult::TooLarge : WriteResult::Full;
     }
@@ -97,6 +98,7 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (f.key) flags |= kFlagKey;
     if (f.recovery) flags |= kFlagRecovery;
     if (droppedPending_) flags |= kFlagDroppedBefore;
+    if (tooLargePending_) flags |= kFlagDroppedTooLarge;
     if (f.info.repeat) flags |= kFlagRepeat;
     // Every backend makes the frame after forceIdr an IDR; should one not,
     // recon-host must not start a new stream generation on a frame that is
@@ -136,6 +138,7 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     counter(base_, kOffWriteCount).store(written_ + 1, std::memory_order_release);
     ++written_;
     droppedPending_ = 0;
+    tooLargePending_ = false;
     SetEvent(event_);
     return WriteResult::Written;
 }

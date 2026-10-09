@@ -23,6 +23,7 @@
 #include "control.hpp"
 #include "d3d/convert.hpp"
 #include "encode_test.hpp"
+#include "hang.hpp"
 #include "lavc/lavc_runtime.hpp"
 #include "nvenc/nvenc_runtime.hpp"
 #include "pipeline.hpp"
@@ -63,6 +64,8 @@ const char kUsage[] =
     "                       frame sizes follow setRate; liveBitrate flush restarts the clip with an IDR\n"
     "  --mock-rate-lag=N    mock only, with --mock-follow-rate: sizes follow a setRate N frames late\n"
     "  --mock-idr-on-rate   mock only: every setRate also makes an IDR (an encoder that fails the seamless check)\n"
+    "  --test-stall-at=N    test only, needs --backend=amf, lavc or mock: the encoder stops finishing frames from\n"
+    "                       frame N on (a stalled encoder); the helper ends with a fatal encode_failed 2 s later\n"
     "  --nvenc-test-dll=DLL --encode-test and --print-caps only: load DLL (the test double recon-fake-nvenc.dll)\n"
     "                       as the NVENC runtime\n"
     "  --dump-nv12=PATH     write converted frame 30 (raw NV12, P010 in an HDR10 stream; encoded size) to PATH\n"
@@ -114,6 +117,7 @@ struct Args {
     LogLevel logLevel = LogLevel::Info;
     MockOptions mock;
     LavcOptions lavc;
+    uint64_t testStallAt = 0;  // --test-stall-at (hang.hpp)
 };
 
 bool parseNumber(const std::string& s, uint64_t& out) {
@@ -188,6 +192,7 @@ bool parseArgs(const std::vector<std::string>& args, Args& a, std::string& err) 
         else if (key == "--mock-follow-rate") a.mock.followRate = true;
         else if (key == "--mock-rate-lag") ok = parseNumber(val, a.mock.rateLag) && a.mock.rateLag <= 1000;
         else if (key == "--mock-idr-on-rate") a.mock.idrOnRate = true;
+        else if (key == "--test-stall-at") ok = parseNumber(val, a.testStallAt) && a.testStallAt != 0;
         else if (key == "--nvenc-test-dll") ok = !(a.nvencTestDll = val).empty();
         else {
             err = "unknown argument " + arg;
@@ -210,6 +215,10 @@ bool parseArgs(const std::vector<std::string>& args, Args& a, std::string& err) 
     if (!a.nvencTestDll.empty() && a.encodeTest.output.empty() && !a.printCaps) {
         // Never in the mode recon-host runs: a DLL loaded by path is for tests only.
         err = "--nvenc-test-dll needs --encode-test or --print-caps";
+        return false;
+    }
+    if (a.testStallAt && a.backend != "amf" && a.backend != "lavc" && a.backend != "mock") {
+        err = "--test-stall-at needs --backend=amf, lavc or mock";
         return false;
     }
     if (!a.lavc.testEncoders.empty() && a.backend != "lavc") {
@@ -347,6 +356,7 @@ int main(int argc, char** argv) {
         }
     }
     setLavcOptions(a.lavc);
+    setTestStallAt(a.testStallAt);
     BackendChoice choice = chooseBackend(a.backend, a.mock);
     if (!a.encodeTest.output.empty()) return runEncodeTest(a.encodeTest, choice);
     if (a.printCaps) {

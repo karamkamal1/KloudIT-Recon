@@ -13,6 +13,7 @@ src/pipeline.*            capture thread -> NV12 conversion -> encoder; output t
 src/stream.*              starting a stream (capture, priority, encoder, conversion, pipeline)
 src/encode_test.*         --encode-test: one stream to a file without recon-host (hardware checks)
 src/backend.hpp           Backend and Capture interfaces
+src/hang.hpp              the encoder hang rule (a frame not out 2 s after its submission), --test-stall-at
 src/registry.cpp          backend selection, probing for caps
 src/mock/                 synthetic capture + replay encoder (testdata/mock_clip.h264)
 src/amf/                  AMF encoder backend (H.264 / HEVC / AV1; amf_props.hpp: per-codec

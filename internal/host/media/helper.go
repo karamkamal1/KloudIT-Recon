@@ -750,6 +750,14 @@ func (v *HelperVideo) read(pr *helperProc) {
 				v.failed(pr, err)
 				return
 			}
+			if he != nil && he.Code == "frame_too_large" {
+				// Larger than a ring slot (sized for an uncompressed
+				// picture, encoder.SlotSizeFor): dropped, and recovered
+				// from like any lost frame (the next frame says it was too
+				// large, LostFrames.Why).
+				v.log.Warn("encoder helper dropped a frame too large for its frame ring", "err", err, "slot_size", h.SlotSize())
+				continue
+			}
 			if he != nil && he.Re == "setRoi" {
 				// The encoder does not take the map: stop sending it to
 				// this helper (one warning, not one per pointer move).
@@ -780,9 +788,13 @@ func (v *HelperVideo) frame(pr *helperProc, f *encoder.Frame, freq int64) {
 	var evs, after []VideoEvent // before and after the frame
 	if pr.live && f.FrameID > pr.lastID+1 {
 		// The helper lost frames (ring full: this process did not keep up;
-		// or an encoder error): gaps in the frame ids.
+		// a frame larger than a ring slot; or an encoder error): gaps in the
+		// frame ids.
 		why := "encoder error"
-		if f.DroppedBefore > 0 {
+		switch {
+		case f.DroppedTooLarge:
+			why = "frame too large for the helper ring"
+		case f.DroppedBefore > 0:
 			why = "helper ring full"
 		}
 		evs = append(evs, VideoEvent{Lost: &LostFrames{Gen: pr.gen, From: uint32(pr.lastID + 1 - pr.seqBase),
