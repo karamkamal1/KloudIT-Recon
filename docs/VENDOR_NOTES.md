@@ -54,7 +54,8 @@ with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
    `hevc_amf_helper` and host.log `video pipeline pipeline=helper backend=amf`. Checks: 3.1b,
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
-   upscaling). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
+   upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
+   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
    Sunshine for the comparison), T2 with the 0.3 rig.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
