@@ -156,8 +156,10 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 
 ## Host-side safety
 
-- Input is injected only for the single active session. When it ends, or a new session takes
-  over, every held key and button is released, so nothing gets stuck down.
+- Input (keyboard, mouse and controllers) is injected only for the single active session, and
+  not while it is being closed (a takeover, or the user's access revoked: none during the bye).
+  When it ends, or a new session takes over, every held key and button is released, so nothing
+  gets stuck down.
 - FFmpeg runs as a child process with an argument list (no shell). The only free-text option (the
   window-title regex) is checked against a strict allow-list and escaped for the filtergraph,
   which blocks filter injection such as `movie=`.

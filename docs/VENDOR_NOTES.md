@@ -10784,3 +10784,28 @@ session (a shape sent before in the session goes without its image: the client k
   no reconnect; in game mode (Ctrl+Alt+Shift+M) a game's or the desktop's menu pointer is drawn.
   Switch back to "In the video stream": the pointer is in the video only (no second pointer).
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### Controller input only from the active session
+
+Problem: gamepad datagrams reached the shared virtual pads without the check the mouse datagrams
+and the keyboard stream make (the active session only). A session another one took over kept
+feeding the pads until it ended (up to two bye waits, about 1 s, on a stalled path), and a
+session whose user's access the gateway revoked kept all its input, controller, mouse and
+keyboard, during its bye, since it stays the active session until it ends.
+
+Fix: one check for every input path (`Session.inputAllowed`): the session is the active one and
+is not being closed. Gamepad datagrams go through it like the mouse datagrams and the keyboard
+stream; a session being closed (a revocation's or a takeover's bye) gives no input from the
+moment the close starts.
+
+- Verified here: `internal/host` `TestGamepadOnlyFromActiveSession` (the test hook rumble-echo
+  shows what reached the pads): a gamepad datagram is applied for the active session, and not
+  for a session that was taken over or one being closed; before the fix both were applied.
+  `TestSessionRumble`, `TestAgentRumble`, the takeover and revocation tests pass.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test (ViGEmBus installed, two browsers
+  A and B signed in as different users, a controller on A): stream from A and hold a trigger in a
+  game or `joy.cpl`; connect B (takeover): A's controller has no effect any more from the moment B
+  takes over (joy.cpl shows the pad idle or B's input only). Then, streaming from A, delete A's
+  user or change its password in the dashboard: A's controller, mouse and keyboard stop at once,
+  before A shows the session ended.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

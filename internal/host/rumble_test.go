@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"sync"
@@ -183,5 +184,40 @@ func TestAgentRumble(t *testing.T) {
 	a.rumble(1, 5, 6)
 	if got, _ := c.of(proto.DgRumble); len(got) != 1 || !bytes.Equal(got[0], proto.Rumble(1, 5, 6)) {
 		t.Fatalf("active session got %v", got)
+	}
+}
+
+// TestGamepadOnlyFromActiveSession: the shared virtual pads take a client's
+// gamepad datagrams only while its session is the active one and is not being
+// closed, as the keyboard and mouse do: not from a session another one took
+// over, nor from one being closed (the user's access revoked) during its bye.
+// The test hook rumble-echo shows what reached the pads.
+func TestGamepadOnlyFromActiveSession(t *testing.T) {
+	pad := func(seq uint32) []byte {
+		b := make([]byte, 20)
+		b[0], b[1], b[2], b[10] = proto.DgGamepad, 1, 1, 200 // pad 1 connected, LT 200
+		binary.LittleEndian.PutUint32(b[4:], seq)
+		return b
+	}
+	for _, c := range []struct {
+		name            string
+		active, closing bool
+	}{{"active", true, false}, {"taken over", false, false}, {"closing", true, true}} {
+		t.Run(c.name, func(t *testing.T) {
+			s, dc, _ := dgSession(t, testFaults{rumbleEcho: true})
+			s.a.active = &Session{}
+			if c.active {
+				s.a.active = s
+			}
+			s.closing = c.closing
+			go s.rumbleLoop()
+			go s.datagrams()
+			dc.in <- pad(1)
+			time.Sleep(100 * time.Millisecond)
+			got, _ := dc.of(proto.DgRumble)
+			if want := c.active && !c.closing; (len(got) > 0) != want {
+				t.Fatalf("%d rumble datagrams: the pad state was applied %v, want %v", len(got), len(got) > 0, want)
+			}
+		})
 	}
 }

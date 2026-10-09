@@ -2346,6 +2346,19 @@ func (s *Session) applyAudioFrame() {
 // ---------------------------------------------------------------------------
 // Input
 
+// inputAllowed reports whether the session's client may give input now: it is
+// the active session and is not being closed (a takeover moves the active
+// session first; a revocation of the user's access closes it, with a bye,
+// while it is still the active one).
+func (s *Session) inputAllowed() bool {
+	if !s.a.isActive(s) {
+		return false
+	}
+	s.ctrlDL.Lock()
+	defer s.ctrlDL.Unlock()
+	return !s.closing
+}
+
 func (s *Session) inputLoop(st transport.BidiStream) {
 	defer st.CancelRead()
 	inj := s.a.inj
@@ -2360,7 +2373,7 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 		if err != nil {
 			return
 		}
-		if !s.a.isActive(s) {
+		if !s.inputAllowed() {
 			return
 		}
 		ev, err := proto.ParseInput(b)
@@ -2406,19 +2419,21 @@ func (s *Session) datagrams() {
 				}
 			}
 		case proto.DgMouseRel:
-			if m, ok := proto.ParseMouseRel(d); ok && s.a.isActive(s) {
+			if m, ok := proto.ParseMouseRel(d); ok && s.inputAllowed() {
 				s.roi.pointerRel(time.Now()) // pointer lock: a game's crosshair (roi.go)
 				if dx, dy := s.rel.Update(m.Seq, m.CumX, m.CumY); dx != 0 || dy != 0 {
 					_ = s.a.inj.MoveRel(dx, dy)
 				}
 			}
 		case proto.DgMouseAbs:
-			if m, ok := proto.ParseMouseAbs(d); ok && s.absGate.Accept(m.Seq) && s.a.isActive(s) {
+			if m, ok := proto.ParseMouseAbs(d); ok && s.absGate.Accept(m.Seq) && s.inputAllowed() {
 				s.roi.pointerAbs(m.X, m.Y, time.Now())
 				_ = s.a.inj.MoveAbs(m.X, m.Y)
 			}
 		case proto.DgGamepad:
-			if g, ok := proto.ParseGamepad(d); ok && g.Index < 4 && s.padGates[g.Index].Accept(g.Seq) {
+			// The shared virtual pads take only the active session's
+			// client, as the keyboard and mouse do.
+			if g, ok := proto.ParseGamepad(d); ok && g.Index < 4 && s.padGates[g.Index].Accept(g.Seq) && s.inputAllowed() {
 				s.gamepad(g)
 			}
 		case proto.DgRateReport:
