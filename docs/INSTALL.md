@@ -99,7 +99,9 @@ The script:
 
 It picks the `local-lvm` storage automatically, or on ZFS installs the first storage that holds
 containers. Use `--storage` / `--bridge` if yours differ (`pvesm status --content rootdir` lists
-storages).
+storages). If you will reach the gateway by a public name or address (port forwarding, step 9),
+add `--name your.domain` here: a name added later makes the gateway a new certificate
+authority, which every device then has to install again.
 
 **Success** looks like this:
 
@@ -377,6 +379,14 @@ two congestion controllers in series (see `docs/ARCHITECTURE.md`, Relay). Then:
 
 - Add your public name to the certificate:
   `pct exec 210 -- /root/recon/install-gateway.sh --binary /root/recon/recon-gateway --name your.domain`.
+  The gateway's certificate authority can vouch only for the names it had when it was made
+  (step 4), so this makes it create a new one, and every device that installed the old ca.crt
+  (step 5) shows the certificate warning again. On each of them, remove the old *KloudIT
+  Recon Local CA* (Windows: `certlm.msc` → Trusted Root Certification Authorities →
+  Certificates; macOS: Keychain Access; iPhone/iPad: **Settings → General → VPN & Device
+  Management**), then download **ca.crt** from the dashboard again and install it as in step 5.
+  To skip this, pass `--name your.domain` already to `create-lxc.sh` in step 4, before any
+  device trusts the CA.
 - Use 2FA.
 - When away, set **Settings → Network path → Relay via gateway**, so the browser doesn't try the
   PC's LAN address first.
@@ -445,6 +455,15 @@ in the bundle). Check these once:
 - **Congestion control.** `"congestion"` now defaults to `media` (the PC paces its video at the
   session's bitrate and leaves backing off to its rate controller). Nothing to do; `"reno"` in
   `host.json` brings back the old behaviour if a network misbehaves with it.
+- **The private CA.** A new gateway's certificate authority can vouch only for its own names
+  and private addresses. An upgraded gateway keeps its old one, which can vouch for any
+  website: whoever gets the gateway or a backup of `/var/lib/kloudit-recon` could impersonate
+  any site to the devices that installed its ca.crt. The gateway's log says so at every start
+  (`the private CA has no name constraints`). To replace it, on the node:
+  `pct exec 210 -- rm /var/lib/kloudit-recon/ca.crt /var/lib/kloudit-recon/ca.key`, then
+  `pct exec 210 -- systemctl restart recon-gateway`; on each device remove the old *KloudIT
+  Recon Local CA* and install the new ca.crt, as step 9 (port forwarding) describes
+  (`docs/SECURITY.md` has the details).
 
 ## Uninstalling
 

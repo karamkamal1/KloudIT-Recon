@@ -10146,6 +10146,29 @@ Fix (`internal/tlsutil` `Constraints`, `CreateCA`, `Permits`; `internal/gateway/
   says; Safari opens the gateway without a warning; serve the leaf above (for example with
   `openssl s_server -cert leaf.crt -key k.pem -accept 9443 -www` on the LAN, with the device
   resolving www.example.com to that machine): Safari refuses it.
+- Later in the final review: INSTALL.md step 9 (port forwarding) told users to add their public
+  name with `install-gateway.sh ... --name your.domain` but not that the gateway then makes a new
+  CA (a public name is outside the old CA's constraints), so every device that installed ca.crt
+  in step 5 showed the certificate warning again with nothing in INSTALL saying why (the
+  warning is only in the journal); its Upgrading section did not say that an upgraded gateway
+  keeps its unconstrained CA. Fix (documentation): step 9 says the `--name` makes a new CA and
+  how to replace the old one on Windows, macOS and iPhone/iPad; step 4 recommends passing
+  `--name` to `create-lxc.sh` when the gateway will be reached by a public name; Upgrading has
+  "The private CA" (the start warning, deleting ca.crt and ca.key, restarting, installing the
+  new ca.crt on each device). Verified here: `loadOrCreateCA` makes the CA from `certNames()`,
+  which include `-name` (`RECON_NAMES`), and makes a new one for a configured name the CA does
+  not permit; `create-lxc.sh` passes `--name` to `install-gateway.sh`, which writes
+  `RECON_NAMES`; the CA's files are `ca.crt` and `ca.key` in `/var/lib/kloudit-recon` (the
+  service's `-data`); `TestPrivateCAConstrained` covers the new CA for a new name.
+- INSTALL.md step 9 on the Windows 11 PC and a phone: unverified. Test (not GPU-specific, no AMD
+  or NVIDIA step): with ca.crt from step 5 installed on the PC (Local Machine) and an iPhone, run
+  step 9's `install-gateway.sh ... --name <your domain or public IP>`: the journal has `the
+  private CA was not made for these names: made a new one`, and Edge on the PC and Safari on the
+  iPhone show the certificate warning at `https://192.168.1.50:8443`. Follow step 9's removal
+  and reinstall: no warning on either, at the LAN address and at the public name (from the
+  phone on mobile data with the port forwarded); `certlm.msc` lists one *KloudIT Recon Local
+  CA*. On a gateway upgraded from a build before name constraints (journal: `the private CA has
+  no name constraints`), the Upgrading section's steps end that warning at the next start.
 
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
