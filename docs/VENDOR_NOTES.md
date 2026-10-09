@@ -21,7 +21,10 @@ The sections after this one follow the order in which the steps were built, and 
 own checks. Some early checks describe behaviour that later steps replaced: they are marked
 **Superseded** (run the newer check named there) or **FFmpeg path only** (run them with
 `"pipeline": "ffmpeg"`). This plan is the order to run everything on the RX 7900 XT, and on an
-NVIDIA host when there is one: each stage needs the ones before it. Use the default `host.json`
+NVIDIA host when there is one: each stage needs the ones before it. The "Final review: ..."
+sections at the end are listed in the stages too. Out of scope on the RX 7900 XT: the
+`Intel (...)` lines of 3.8 and 3.8 wiring, which need an Intel host (their AMD lines are in
+stages 1 and 4). Use the default `host.json`
 unless a stage says otherwise, edit it with the agent stopped or restart the agent afterwards
 (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`), and put
 it back after the stage. `"logLevel": "debug"` adds the debug lines some checks read (`ffmpeg
@@ -57,7 +60,11 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    120 Hz screen and current Chrome (also Edge, Firefox and Safari for T10).
 1. **Install and probe** (INSTALL.md steps 6-7): the installer's `Detected capabilities` show
    `encoder:    hevc_amf ...` (1.1) and `helper:     amf    hevc,av1,h264 ...` with no
-   warning ("Final review: deploy and install", helper probe). Checks: 1.1 (probe), 1.8.
+   warning ("Final review: deploy and install", helper probe). Checks: 1.1 (probe), 1.8; from
+   "Final review: deploy and install" also: the FFmpeg checksum line, a custom
+   install folder (`-InstallDir C:\Recon`, then reinstall to Program Files), the logon task's
+   agent started again after a crash (`-restart`), and upgrades keeping the direct path's port;
+   3.8's AMD line (with `-InstallLibavcodec`, `--print-caps` still picks `amf`).
 2. **The helper by itself**: `recon-encoder.exe --print-caps --backend=amf` and the self-tests
    (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
    3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
@@ -71,20 +78,34 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
-   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
+   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard). With
+   `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
+   `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
+   8) and "Final review: deploy and install", README's `capture` row. "Final review: host
+   agent": the direct path's port next to Sunshine or Apollo (Moonlight streams while the agent
+   runs) and a takeover between two clients on Wi-Fi. 3.8 wiring's AMD lines (no regression
+   with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
+   iGPU). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
    Sunshine for the comparison), T2 with the 0.3 rig.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
-   `· datagrams + FEC`).
+   `· datagrams + FEC`). From the final review: "Final review: host agent", datagram + FEC with
+   reference recovery (a held shard frame released after a loss); "Final review: deploy and
+   install", the Transport row and FEC under `wan`; "Final review: RESET_STREAM_AT boundary
+   after the peer's STOP_SENDING" (its `go test` on the PC, where Go is installed).
 6. **Rate control**: 2.1 (media against reno under the four 0.4 profiles, relay and direct; its
    pacing-cost check is superseded by 2.2), 2.2 (T6 under `capdrop`; its frame-rate ladder
    check), 2.6 (the UDP relay), 2.7 (send priorities), with `"logLevel": "debug"`. 1.5's checks
-   are superseded by 2.2.
+   are superseded by 2.2. "Final review: host agent", rate changes no longer filling host.log
+   (at the default `logLevel`).
 7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
    before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
    re-encode, slice output).
 8. **Virtual display and HDR**: 3.7 and 3.7 wiring (with the Virtual Display Driver, then
-   SudoVDA); 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode).
+   SudoVDA), and "Final review: deploy and install", what the virtual display does after
+   `-InstallVirtualDisplay`; 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode), and
+   "Final review: AMD Direct Capture sRGB and 10-bit surfaces", its 10-bit HDR check (the PQ
+   assumption).
 9. **Soak (T8) on the default pipeline**:
    - AMD RDNA3 (RX 7900 XT): unverified. Test: default host.json (after stage 3), a GPU-bound
      game at 2560x1440 120 fps, HEVC, 50 Mbit/s, on `lan` (direct path), one stream for 2 hours.
@@ -98,6 +119,17 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
      hardware-accelerated GPU scheduling on and once off (1.3).
 10. **The FFmpeg fallback** (`"pipeline": "ffmpeg"`): the checks marked FFmpeg path only (1.2,
    1.4, the 1.3 soak), 1.6 (AMD Direct Capture through FFmpeg), and one stream per codec.
+11. **Remote access** (INSTALL.md section 9): "Final review: QUIC packets on a 1280-MTU path
+   (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
+   itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
+   review: deploy and install", the UDP relay naming an IP mismatch, and "Final review:
+   security", `-trust-proxy` behind a reverse proxy or tunnel.
+12. **Security**: "Final review: security": UDP relay ports released when a session ends, the
+   login page's redirect, and FFmpeg and its libraries only from places administrators control
+   (a `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored).
+13. **Uninstall** (last: it removes the agent): "Final review: deploy and install", uninstalling
+   restores a virtual display's layout (with the Virtual Display Driver, during a stream and
+   within the 10 s linger).
 
 Acceptance matrix (GUIDE 13), per vendor, on the default pipeline unless noted:
 
@@ -9294,6 +9326,15 @@ where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `rat
   box lines are the same width.
 - AMD RDNA3 (RX 7900 XT): unverified; this is the plan for running the checks.
 - NVIDIA: unverified (no NVIDIA host available); likewise.
+- Later in the final review: the plan named only three of the "Final review" sections, so a
+  tester working through it stage by stage skipped AMD checks of the primary hardware (AMD Direct
+  Capture's sRGB and 10-bit surfaces, the Tailscale setup INSTALL recommends, Sunshine next to
+  the agent, the takeover, FEC with reference recovery, the security checks, the install-folder,
+  virtual-display-flag and uninstall checks). Fix: every final-review section with a hardware
+  check is in a stage (1, 4, 5, 6, 8, and the new 11 remote access, 12 security, 13 uninstall),
+  and the plan says the Intel lines of 3.8 and 3.8 wiring are out of scope on the RX 7900 XT
+  while their AMD lines are in stages 1 and 4. Verified here: each `## Final review` heading
+  with an `AMD RDNA3` line, and each of their `###` items with one, is named in the plan.
 
 ## Final review: host agent
 
