@@ -1110,7 +1110,8 @@ come from the same directory or System32), from `--ffmpeg-dir` or the default di
 layouts compiled in); `avcodec_license()` is logged. FFmpeg's log goes to the helper's log
 (its errors as warnings, warnings as info, the rest at debug). Licensing: install-host.ps1's
 `-InstallLibavcodec` installs BtbN's **LGPL** shared build (`ffmpeg-n8.1-latest-win64-lgpl-
-shared-8.1.zip`, SHA-256 verified like the FFmpeg download) into `ffmpeg-lgpl\`; the GPL
+shared-8.1.zip`, checked like the FFmpeg download against the SHA-256 in the same release's
+`checksums.sha256`) into `ffmpeg-lgpl\`; the GPL
 static `ffmpeg.exe` stays the FFmpeg command-line path, and the helper never loads it.
 
 **Caps.** Adapter 0 if it is Intel, else the Intel adapter with the most video memory (an
@@ -1658,6 +1659,6 @@ tests run everywhere with `go test ./...`. `make helper-test FFMPEG_DIR=<bin dir
 an FFmpeg 8.x shared build with libx264>` (`RECON_FFMPEG_DIR` for `go test`) adds the
 libavcodec backend's stream checks (`TestHelperIntegrationLavc`; without it only its
 "unavailable" case runs; CI's `helper-windows` job downloads BtbN's GPL shared 8.1 build,
-SHA-256 verified, for it). The same through the encode test:
+checked against the release's `checksums.sha256`, for it). The same through the encode test:
 `recon-encoder.exe --encode-test=out.h264 --backend=lavc --lavc-test-encoder=libx264
 --ffmpeg-dir=DIR --codec=h264 --capture=synthetic --at=20:idr --at=40:loss --at=70:rate=2000`.

@@ -1774,7 +1774,8 @@ Verified in the sandbox:
 - verified (sandbox): gfxcapture is new in FFmpeg 8.1 (libavfilter/allfilters.c registers
   `ff_vsrc_gfxcapture` in release/8.1, not in release/8.0). The error for a build without it now
   says "need FFmpeg >= 8.1" (`TestWriteReport`); README and install-host.ps1 already said 8.1.
-- verified (sandbox): install-host.ps1 already pins the oldest ≥ 8.1 release build: its
+- verified (sandbox): install-host.ps1 already picks the oldest ≥ 8.1 release build by name (its
+  hash comes from the same release's `checksums.sha256`, so the build is not pinned): its
   selection code, run in pwsh 7 on BtbN's current `checksums.sha256` (n8.1 and n9.0 listed),
   picks `ffmpeg-n8.1-latest-win64-gpl-8.1.zip`, and that zip matches the listed SHA-256 (the
   Windows build used for all Wine checks). Changed: the fallback to the nightly master build, used
@@ -9167,6 +9168,27 @@ out-of-range value (the default); the firewall rule follows the result, and the 
   `Start-ScheduledTask` host.log has no `direct WebTransport endpoint listening`. Put `48100` back
   with `-DirectPort 48100`.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### What the FFmpeg download's checksum proves
+
+Problem: README, INSTALL, HELPER_PROTOCOL and the installer's help called the FFmpeg download and
+`-InstallLibavcodec`'s LGPL libraries "SHA-256 verified", while the expected hash comes at install
+time from `checksums.sha256` in the same mutable BtbN "latest" release as the zip: the check
+catches a damaged download, not a replaced release, yet the elevated agent runs that
+`ffmpeg.exe` and the helper loads those DLLs. The Virtual Display Driver and nefcon, by contrast,
+are pinned by constants. Fix (documentation; the behaviour stays): pinning needs a fixed build,
+and BtbN rebuilds "latest" (the `n8.1-latest` zips change with each point release), so a
+constant hash would break the installer between Recon releases. The docs now say "checked
+against the SHA-256 the release publishes", SECURITY.md's Known limitations says what that does
+and does not prove and points to `-FFmpegPath` / `helperFFmpegDir` for a vetted build, the
+installer's comment and its step line (`... matches the SHA-256 in the release's
+checksums.sha256`) say the same, and this file's 1.6 note says "picks" instead of "pins".
+
+- Verified here: the pwsh parser check; `grep` finds no "SHA-256 verified" left for the BtbN
+  downloads (the Virtual Display Driver's, which is pinned, keeps it).
+- AMD RDNA3 (RX 7900 XT): unverified; nothing to test on hardware beyond the installer printing
+  `ffmpeg-n8.1-latest-win64-gpl-8.1.zip matches the SHA-256 in the release's checksums.sha256`.
+- NVIDIA: unverified (no NVIDIA host available); the same.
 
 ### README, INSTALL and the hardware test plan
 

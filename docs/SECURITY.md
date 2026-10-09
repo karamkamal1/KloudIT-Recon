@@ -164,6 +164,14 @@ Admins can view it in the UI.
   (`-trust-proxy`). The gateway logs the refused Initial's source and the expected IP once per
   allocation (`udp relay: refused a QUIC Initial from another IP ...`).
 
+- The installer downloads FFmpeg (and, with `-InstallLibavcodec`, its LGPL libraries) from
+  BtbN's "latest" GitHub release and checks it against the SHA-256 in that release's
+  `checksums.sha256`. This catches a damaged download, not a replaced release: whoever can change
+  that release can change both. The elevated agent runs that `ffmpeg.exe` and the helper loads
+  those libraries, so BtbN's release is trusted as much as the agent's own bundle. BtbN rebuilds
+  the release regularly, so no fixed hash can be pinned (the Virtual Display Driver and nefcon
+  are pinned). For a build you vetted yourself, pass `-FFmpegPath` (and set `helperFFmpegDir`
+  for the libraries), in a folder only administrators can change (see above).
 - All authenticated users can reach all hosts. Per-host permissions are not implemented.
 - TOTP secrets are stored in the 0600 state file, not encrypted at rest.
 - The gateway's private CA key lives in its data directory. Protect backups of

@@ -263,7 +263,8 @@ powershell -ExecutionPolicy Bypass -File .\install-host.ps1 -PairingCode "recon1
 ```
 
 The installer:
-- downloads FFmpeg (an FFmpeg 8.1+ release build, SHA-256 verified)
+- downloads FFmpeg (an FFmpeg 8.1+ release build from BtbN's GitHub releases, checked against
+  the SHA-256 that release publishes; `-FFmpegPath` uses an `ffmpeg.exe` you choose instead)
 - pairs the agent with your gateway
 - registers a hidden **logon task** with highest privileges, so input reaches elevated games;
   it starts the agent again when the agent crashes (`host.log`: `agent exited, starting it again`)
@@ -278,7 +279,7 @@ The installer:
   display while it runs (see `virtualDisplay` below); the device stays disabled (no extra
   monitor) between streams
 - optionally downloads FFmpeg's LGPL shared libraries (`-InstallLibavcodec`: BtbN's FFmpeg 8.1
-  LGPL shared build, SHA-256 verified) into `ffmpeg-lgpl\` for the native encoder helper's
+  LGPL shared build, checked like FFmpeg) into `ffmpeg-lgpl\` for the native encoder helper's
   Intel Quick Sync backend; the GPL `ffmpeg.exe` stays the FFmpeg command-line path
 - starts the agent and checks that it reaches the gateway, and warns if no GPU encoder works
 

@@ -5,9 +5,11 @@
 .DESCRIPTION
   - Copies recon-host.exe / recon-hostw.exe to the install directory, plus
     recon-encoder.exe (the native capture/encode helper) when the bundle has it
-  - Downloads FFmpeg (BtbN GPL release build, SHA-256 verified) unless -FFmpegPath is given
+  - Downloads FFmpeg (BtbN GPL release build) unless -FFmpegPath is given, checked against the
+    SHA-256 its GitHub release publishes: that catches a damaged download, not a replaced
+    release, so you trust BtbN's release as you trust the download (-FFmpegPath: a build you chose)
   - Optionally downloads FFmpeg's LGPL shared libraries for the encoder helper's libavcodec
-    backend (Intel Quick Sync Video), SHA-256 verified (-InstallLibavcodec)
+    backend (Intel Quick Sync Video), checked the same way (-InstallLibavcodec)
   - Optionally pairs with your gateway (-PairingCode)
   - Registers a logon task that runs the agent hidden, with highest privileges
     (needed to send input to elevated games/launchers); the agent runs in a child process
@@ -44,7 +46,7 @@
   Download FFmpeg again even if it is already installed (with -InstallLibavcodec: its libraries too).
 .PARAMETER InstallLibavcodec
   Download BtbN's FFmpeg 8.1 LGPL shared build (ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip,
-  SHA-256 verified like the FFmpeg download) and put avcodec-62.dll, avutil-60.dll and
+  its SHA-256 checked like the FFmpeg download) and put avcodec-62.dll, avutil-60.dll and
   swresample-6.dll with its LICENSE.txt into <InstallDir>\ffmpeg-lgpl, where recon-encoder.exe
   loads them for its libavcodec backend: hardware encoding with Intel Quick Sync Video
   (h264_qsv, hevc_qsv, av1_qsv) on GPUs without an AMF or NVENC backend (docs/VENDOR_NOTES.md,
@@ -93,7 +95,9 @@ $RuleName = 'KloudIT Recon host (direct path)'
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
 # BtbN's FFmpeg builds (https://github.com/BtbN/FFmpeg-Builds, release "latest"): file name ->
-# SHA-256 from the release's checksums.sha256.
+# SHA-256 from the release's checksums.sha256. That file comes from the same release as the
+# builds, so the check catches a damaged download, not a replaced release; BtbN rebuilds this
+# release regularly, so there is no fixed hash to pin here (unlike the Virtual Display Driver).
 $BtbNBase = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
 function Get-BtbNChecksums {
     $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$BtbNBase/checksums.sha256").Content
@@ -119,7 +123,7 @@ function Expand-BtbNBuild([string]$zipName, [string]$expected, [string]$tmp) {
     Invoke-WebRequest -UseBasicParsing -Uri "$BtbNBase/$zipName" -OutFile $zip
     $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
     if ($expected -ne $actual) { throw "Checksum mismatch for $zipName (expected $expected, got $actual)." }
-    Write-Step "$zipName checksum verified"
+    Write-Step "$zipName matches the SHA-256 in the release's checksums.sha256"
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     $inner = Get-ChildItem -Path $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'bin') } | Select-Object -First 1
     if (-not $inner) { throw "Unexpected archive layout in $zipName." }

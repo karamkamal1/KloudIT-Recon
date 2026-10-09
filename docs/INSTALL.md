@@ -217,7 +217,8 @@ and sessions then use the driver:
 `recon-host.exe vdisplay` (under Useful commands) tests the driver by itself.
 
 Optional, for Intel graphics: add `-InstallLibavcodec` to also download FFmpeg's LGPL shared
-libraries (BtbN's FFmpeg 8.1 LGPL shared build, about 80 MB, SHA-256 verified) into
+libraries (BtbN's FFmpeg 8.1 LGPL shared build, about 80 MB, checked against the SHA-256 its
+release publishes, like FFmpeg) into
 `C:\Program Files\KlouditRecon\ffmpeg-lgpl`. The native encoder helper uses them to encode
 with Intel Quick Sync Video on GPUs that have no AMD AMF or NVIDIA NVENC encoder (see
 `docs/HELPER_PROTOCOL.md`, "libavcodec encoder backend"); without them the helper reports
