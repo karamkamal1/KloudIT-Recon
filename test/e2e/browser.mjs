@@ -3430,6 +3430,19 @@ async function startStream(prefs) {
   await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
 }
 
+// The worker's drop test (debug toggle, docs/VENDOR_NOTES.md 1.4 and 3.5) until
+// n conclusive results or tries runs; pause ms after each. Every result, in order.
+async function dropTests(n, tries, pause = 0) {
+  const out = [];
+  for (let i = 0; i < tries && out.filter((d) => d && !d.inconclusive).length < n; i++) {
+    await page.evaluate(() => { window.__recon.dropTest = null; window.__recon.worker.postMessage({ type: 'dropTest' }); });
+    out.push(await until(() => page.evaluate(() => window.__recon.dropTest), 8000, 'drop test result').catch(() => null));
+    if (!out[out.length - 1]) break; // no result: no use asking again
+    if (pause) await sleep(pause);
+  }
+  return out;
+}
+
 // Stream over direct WebTransport from a host started with faults; measure
 // `seconds` after a warm-up.
 async function lossRun(name, faults, seconds, prefs = {}) {
@@ -3619,20 +3632,30 @@ async function checkLossHandling() {
   // runs on the clean host: whether a decoder accepts the next P-frame can
   // depend on the frame skipped (AV1 frames inherit entropy-coding state from
   // a reference frame; a non-reference frame can go missing harmlessly).
+  // A run the stream moved on from first (a new generation, a key frame
+  // asked for: restarts under load) is inconclusive and run again.
   await startStream({ path: 'auto', transport: 'auto' });
   await sleep(4000);
-  const dts = [];
-  for (let i = 0; i < 3; i++) {
-    await page.evaluate(() => { window.__recon.dropTest = null; window.__recon.worker.postMessage({ type: 'dropTest' }); });
-    const dt = await until(() => page.evaluate(() => window.__recon.dropTest), 8000, 'drop test result').catch(() => null);
-    dts.push(dt);
-    await sleep(1500); // after a decoder error: the key frame it asked for
-  }
-  const dtRows = dts.map((d) => (d ? `${d.gen}/${d.seq}: ${d.ok ? 'accepted' : 'error'} (${d.decoded} decoded${d.error ? `, ${d.error}` : ''})` : 'no result'));
+  const dts = await dropTests(3, 6, 1500); // after a decoder error: the key frame it asked for
+  const dtRows = dts.map((d) => (d ? `${d.gen}/${d.seq}: ${d.inconclusive ? `inconclusive (${d.superseded})` : d.ok ? 'accepted' : 'error'} (${d.decoded} decoded${d.error ? `, ${d.error}` : ''})` : 'no result'));
   check('drop test (debug toggle) reports whether the decoder accepts the frames after a skipped one',
-    dts.every((d) => d && (d.ok || !!d.error)),
+    dts.every((d) => d && (d.ok || !!d.error || d.inconclusive)) && dts.some((d) => !d.inconclusive),
     `${dts[0]?.codec} (${dts[0]?.hw ? 'hardware' : 'software'} decoder): ${dtRows.join('; ')}`);
-  results.push({ loss: 'dropTest', runs: dts });
+  // A run the stream moves on from before it can tell, made to happen: the
+  // decoder gets no chunks from the test on (no output, no error) until the
+  // client resets it for the backlog and asks for a key frame.
+  const sw = page.workers().find((w) => w.url().endsWith('/js/stream-worker.js'));
+  await sw.evaluate(() => {
+    const p = VideoDecoder.prototype;
+    const { decode, reset } = p;
+    p.decode = function () {};
+    p.reset = function () { p.decode = decode; p.reset = reset; return reset.call(this); };
+  });
+  const held = (await dropTests(1, 1))[0];
+  check('drop test: a run the stream moved on from first (the decoder reset for its backlog, a key frame asked for) is inconclusive, not a rejection',
+    !!held && held.inconclusive && !held.ok && !held.error && /decoder backlog/.test(held.superseded || ''),
+    held ? `${held.gen}/${held.seq}: ok ${held.ok}, inconclusive ${held.inconclusive} (${held.superseded}), ${held.decoded} decoded${held.error ? `, ${held.error}` : ''}` : 'no result');
+  results.push({ loss: 'dropTest', runs: dts, held });
   await endStream();
 
   // Recovery "keyframe" (the software encoders have no intra refresh).
@@ -3766,16 +3789,13 @@ async function checkLossHandling() {
   await checkProbe('reference recovery');
   // The drop test under reference recovery: the client drops a frame itself,
   // reports it ({"t":"lost"}), and the host answers with a recovery frame.
-  const rts = [];
-  for (let i = 0; i < 2; i++) {
-    await page.evaluate(() => { window.__recon.dropTest = null; window.__recon.worker.postMessage({ type: 'dropTest' }); });
-    rts.push(await until(() => page.evaluate(() => window.__recon.dropTest), 8000, 'drop test result').catch(() => null));
-  }
+  const rts = await dropTests(2, 4);
+  const conclusive = rts.filter((d) => d && !d.inconclusive);
   const host = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
   const clientLost = (host.log.match(/msg="recovering from a loss".*? why=client/g) || []).length;
   check('reference recovery: a loss only the client saw (drop test) is reported ("lost") and answered by a recovery frame the decoder accepts',
-    rts.every((d) => d?.ok && d.recovery === 'invalidate' && d.recoveredBy && !d.recoveredBy.key && d.recoveredBy.refFloor < d.seq) && clientLost >= rts.length,
-    `${rts.map((d) => (d ? `${d.gen}/${d.seq}: ${d.recoveredBy ? `${d.recoveredBy.key ? 'key frame' : `recovery frame ${d.recoveredBy.seq} (refFloor ${d.recoveredBy.refFloor})`} after ${d.recoveredBy.ms} ms, ${d.recoveredBy.discarded} discarded` : 'not recovered'}, ${d.decoded} decoded${d.error ? `, ${d.error}` : ''}` : 'no result')).join('; ')}; ` +
+    conclusive.length === 2 && conclusive.every((d) => d.ok && d.recovery === 'invalidate' && d.recoveredBy && !d.recoveredBy.key && d.recoveredBy.refFloor < d.seq) && clientLost >= conclusive.length,
+    `${rts.map((d) => (d ? `${d.gen}/${d.seq}: ${d.inconclusive ? `inconclusive (${d.superseded})` : d.recoveredBy ? `${d.recoveredBy.key ? 'key frame' : `recovery frame ${d.recoveredBy.seq} (refFloor ${d.recoveredBy.refFloor})`} after ${d.recoveredBy.ms} ms, ${d.recoveredBy.discarded} discarded` : 'not recovered'}, ${d.decoded} decoded${d.error ? `, ${d.error}` : ''}` : 'no result')).join('; ')}; ` +
       `host: ${clientLost} client-reported losses recovered`);
   delete r.hostLog;
   delete k.hostLog;

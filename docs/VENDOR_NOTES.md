@@ -1022,7 +1022,10 @@ What changed (B1, B2):
 - Debug toggle for the decoder check below: in the stream page's DevTools console,
   `__recon.worker.postMessage({type:'dropTest'})` drops the next delta frame before the decoder
   (what `skip` does) and after 2 s reports `{ok, decoded, error, codec, hw, gen, seq}` in
-  `__recon.dropTest` and the log (`__recon.logs`, "drop test: …").
+  `__recon.dropTest` and the log (`__recon.logs`, "drop test: …"). A run the stream moved on
+  from before it could tell (a new generation or a key-frame request before any frame after the
+  skipped one was decoded) reports `inconclusive: true` and logs `drop test: inconclusive, …;
+  run it again`; it is no rejection and does not count (Final review: browser client).
 - Test-only hook: `RECON_TEST_FAULTS` (`internal/host/faults.go`, README "Development") makes
   `frameSender` delay or drop selected frames and can force the announced recovery mode.
 
@@ -1109,7 +1112,8 @@ Hardware checks:
   After 10 s open DevTools on the stream page and run
   `for (let i = 0; i < 10; i++) setTimeout(() => __recon.worker.postMessage({type:'dropTest'}), i * 3000)`.
   After 35 s run `__recon.logs.filter((l) => l.includes('drop test'))`. Record per codec how many
-  of the 10 runs say "decoder accepted" and the error text of the others, and whether the
+  of the 10 runs say "decoder accepted" and the error text of the others (a run logged
+  `drop test: inconclusive` does not count: run another one), and whether the
   picture keeps playing (smearing that stays until the next key frame is expected: the AMF
   encoders have no intra refresh). Expect H.264 and HEVC to accept all 10. AV1 may reject some,
   as dav1d did in the sandbox; each rejection must be followed in the log by `requesting key frame
@@ -3410,8 +3414,9 @@ came with 3.3 and 3.4, the session plumbing with 3.1b; this step wires them end 
   `recoveryDiscarded`, `recoveryRejected`, `keyFrames` (IDRs fed to the decoder). The drop test
   (`__recon.worker.postMessage({type:'dropTest'})`) under reference recovery treats the dropped
   frame as a loss the client saw: it sends `lost` and reports `recovery` and `recoveredBy`
-  ({seq, key, refFloor, ms, discarded}). 1.4 (dropped reports, late-frame wait) and 1.2 (skip)
-  are unchanged.
+  ({seq, key, refFloor, ms, discarded}); a new generation before the recovery frame (a key frame
+  of a restart) makes the run inconclusive (`drop test: inconclusive, …`; it does not count).
+  1.4 (dropped reports, late-frame wait) and 1.2 (skip) are unchanged.
 - Test hook `RECON_TEST_FAULTS=ref-recovery` (`media.Caps.UseTestRecovery`): the FFmpeg pipeline
   stands in for an encoder with reference invalidation so the browser path runs without a GPU: a
   key frame every `TestRecoveryGOP` (fps/6) frames, sent as P-frames (no key flag); after a
@@ -3491,7 +3496,8 @@ stats overlay is Ctrl+Alt+Shift+S; logs: `$env:APPDATA\KlouditRecon\host.log` an
   stream page
   `for (let i = 0; i < 10; i++) setTimeout(() => __recon.worker.postMessage({type:'dropTest'}), i * 3000)`,
   after 35 s `__recon.logs.filter((l) => /drop test|recovered from|rejected|decoder error/.test(l))`.
-  Pass per codec: 10 of 10 "decoder accepted ... recovery frame g/s (refFloor r) after N ms"
+  Pass per codec (a run logged `drop test: inconclusive` does not count: run another one):
+  10 of 10 "decoder accepted ... recovery frame g/s (refFloor r) after N ms"
   (N below ~50 ms on a LAN: one round trip plus a frame), no `decoder error`, no `the decoder
   rejected a recovery frame`, host.log has 10 `recovering from a loss ... why=client` each
   followed by `loss recovered ... by="recovery frame"`, and the picture shows no smearing after
@@ -10273,3 +10279,55 @@ and Cancel do now), Tab and Shift+Tab wrap inside it.
   nothing is typed on the PC), Escape (the dialog closes, typing goes to the PC again); with
   Narrator on, the dialog is read as "Type text on the host, dialog" and the box as "Text to type
   on the host".
+
+### Drop tests the stream moved on from
+
+Problem: the debug drop test (`__recon.worker.postMessage({type:'dropTest'})`, the decoder
+checks in 1.4 and 3.5) counted only decoded frames of the generation it skipped a frame in.
+When a new generation started within its 2 s (an overlapped restart, a forced IDR, a bitrate or
+settings change) or the client asked for a key frame (a decoder backlog, a loss) before any frame
+after the skipped one was decoded, nothing of that generation was decoded any more: the run
+reported `decoder did NOT accept … 0 decoded` with no error, a rejection that never happened
+(under reference recovery the same when a key frame of a new generation ended the wait). The
+hardware records in 1.4 and 3.5 could then wrongly mark skip or LTR recovery unsafe on a decoder
+that accepts it, and the E2E check failed under load.
+
+Fix: such a run is `inconclusive: true`, with `superseded` saying why (`generation N replaced
+it`, `a key frame was requested (decoder backlog)`), and logs `drop test: inconclusive, …; run
+it again` instead of "decoder did NOT accept". A run with a frame after the skipped one
+decoded or a decoder error reports as before; under reference recovery "no recovery frame came"
+(the client's own key-frame request after waiting) stays a result. The VERIFY steps in 1.4 and
+3.5 say an inconclusive run does not count.
+
+- Verified here: browser E2E check "drop test: a run the stream moved on from first … is
+  inconclusive" (the worker's decoder gets no chunks from the test on, no output and no error,
+  until the client resets it for the backlog and asks for a key frame): inconclusive, superseded
+  `a key frame was requested (decoder backlog)`. Against the old worker: `ok: false`, no error
+  (the false rejection). The E2E drop test checks (skip and reference recovery) run an
+  inconclusive run again, up to 6 and 4 runs.
+- Not GPU-specific beyond the 1.4 and 3.5 checks themselves (AMD and NVIDIA steps there): when
+  recording them, a run logged `drop test: inconclusive` is repeated, not counted.
+
+### The HDR pixel check after a superseded frame
+
+Problem: the E2E's HDR pixel check (test hook `hdrCheck`) rides on the first HDR frame whose
+plane copy starts after the request, and was answered only if that frame was drawn. When the
+pacer superseded it (decoder outputs in a burst on a loaded machine) or another renderer took
+over, the planes were released and the request was gone: the check timed out ("timeout waiting
+for HDR pixel check", "worst 0.0000" with no rows compared), on loaded CI runners and here when
+pinned to 2 CPUs.
+
+Fix: planes a frame is not drawn with (dropped, released for another renderer, a failed draw,
+teardown) hand the check on to the next HDR frame. Test hook only; no user-visible change.
+
+- Verified here: the WebGPU HDR10 scenario pinned to 2 CPUs (`taskset -c 0,1`, as in the
+  failing run). Old worker: 14 frames superseded, the pixel check got no answer ("worst 0.0000,
+  codes off by at most 0", no rows compared). New worker: 19 superseded, the check answered and
+  compared every patch (codes within 3 of the host's). That pinned run still failed the check on
+  one patch (red, 2.7695 against 2.7847 in extended range, tolerance 0.0076): the CPU reference
+  takes the nearest chroma sample while the GPU interpolates between samples, and the starved
+  encoder's noise (codes off by up to 3) makes neighbours differ; this tolerance question under
+  heavy load is separate and not changed here. Unpinned, the full suite passes the check (below).
+  A deterministic test is not feasible here (which frame the pacer supersedes depends on
+  timing).
+- Not GPU-specific (test hook; no hardware step).

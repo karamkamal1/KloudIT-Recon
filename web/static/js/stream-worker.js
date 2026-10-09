@@ -865,11 +865,20 @@ function hdrPrepare(item) {
   }).finally(() => {
     hdr.copying = false;
     if (f.codedWidth) pacer.offer(item);
-    else item.planes?.release(); // closed meanwhile (teardown)
+    else releasePlanes(item.planes); // closed meanwhile (teardown)
     const n = hdr.next;
     hdr.next = null;
     if (n) hdrPrepare(n);
   });
+}
+
+// Copied planes a frame is not drawn with (dropped, another renderer, a
+// failed draw): free again. The HDR pixel check (test hook) they carry goes
+// to the next HDR frame.
+function releasePlanes(planes) {
+  if (!planes) return;
+  if (planes.capture && !hdr.check) hdr.check = { points: planes.capture.points };
+  planes.release();
 }
 
 // The 10-bit codes [Y, Cb, Cr] at points of a copied frame (nearest chroma sample; test hook).
@@ -1134,6 +1143,8 @@ function onDecodeError(e) {
 // false the caller asks the host for a restart some other way (congestion).
 function requestKeyframe(reason, send = true) {
   const t = now();
+  // ("no recovery frame" is a drop test's answer under reference recovery.)
+  if (reason !== 'no recovery frame') supersedeDropTest(`a key frame was requested (${reason})`);
   video.waitingKey = true;
   video.recover = null; // the key frame ends any recovery
   video.reorder.clear();
@@ -1172,6 +1183,7 @@ function videoWatchdog() {
 }
 
 async function onVideoConfig(cfg) {
+  if (cfg.gen !== dropTest.run?.gen) supersedeDropTest(`generation ${cfg.gen} replaced it`);
   video.waitSince = 0;
   video.cfg = cfg;
   video.expectSeq = 0;
@@ -1514,7 +1526,7 @@ function decodeFrame(f) {
     const ref = P.isRefRecovery(P.recoveryOf(video.cfg)) && !video.refRejected.has(video.cfg.codec);
     dropTest.run = {
       gen: f.gen, seq: f.seq, codec: video.cfg?.codec, encoder: video.cfg?.encoder, hw: video.hw, at: now(), decoded: 0, error: null,
-      recovery: ref ? video.cfg.recovery : null, recoveredBy: null,
+      recovery: ref ? video.cfg.recovery : null, recoveredBy: null, superseded: null,
     };
     post('log', { text: `drop test: skipping frame ${f.gen}/${f.seq} (${video.cfg?.codec}, ${video.hw ? 'hardware' : 'software'} decoder${ref ? `, waiting for a recovery frame (${video.cfg.recovery})` : ''})` });
     setTimeout(finishDropTest, DROP_TEST_MS);
@@ -1590,7 +1602,7 @@ function trackFrame(f) {
 // A decoded frame closed unseen (superseded, or stale in Smooth): its HDR
 // planes are free again, and it counts as decoded.
 function dropFrame(it, why) {
-  it.planes?.release();
+  releasePlanes(it.planes);
   it.frame.close();
   if (why === 'superseded') stats.superseded++;
   if (it.meta) ackFrame(it.meta, it.decoded);
@@ -1675,7 +1687,7 @@ function drawFrame(frame, meta, decoded, pace) {
   // HDR planes copied for this renderer (another one took over: drawn as usual).
   let planes = pace?.planes;
   if (planes && planes.renderer !== renderer) {
-    planes.release();
+    releasePlanes(planes);
     planes = null;
   }
   if (req && planes?.luma) {
@@ -1688,6 +1700,7 @@ function drawFrame(frame, meta, decoded, pace) {
   } catch (e) {
     drew = false;
     frame.close();
+    releasePlanes(planes); // (released already when the renderer got that far)
     renderError(e);
   }
   const presented = now();
@@ -1735,16 +1748,31 @@ function drawFrame(frame, meta, decoded, pace) {
 // damaged until the encoder heals it (intra refresh) or a key frame; under
 // reference recovery the drop is a loss the host is told of ({"t":"lost"}),
 // and recoveredBy names the frame that ended it (key: a key frame instead of
-// a recovery frame).
+// a recovery frame). A run the stream moved on from before it could tell
+// (a new generation: a restart, a forced IDR, a setting; a key frame asked
+// for: a decoder backlog, a loss) is inconclusive (superseded: why), not a
+// rejection: nothing of its generation is decoded any more.
 const DROP_TEST_MS = 2000;
 const dropTest = { armed: false, run: null };
+
+// Before a frame after the skipped one was decoded or the decoder failed.
+function supersedeDropTest(why) {
+  const r = dropTest.run;
+  if (r && !r.decoded && !r.error && !r.superseded) r.superseded = why;
+}
 
 function finishDropTest() {
   const r = dropTest.run;
   if (!r) return;
   dropTest.run = null;
-  const result = { ...r, ms: DROP_TEST_MS, ok: !r.error && r.decoded > 0 && (!r.recovery || !!r.recoveredBy) };
+  const inconclusive = !!r.superseded && !r.decoded && !r.error;
+  const result = { ...r, ms: DROP_TEST_MS, inconclusive, ok: !inconclusive && !r.error && r.decoded > 0 && (!r.recovery || !!r.recoveredBy) };
   delete result.at;
+  if (inconclusive) {
+    post('log', { text: `drop test: inconclusive, ${r.superseded} before a frame after the skipped one (${r.gen}/${r.seq}) was decoded; run it again` });
+    post('dropTest', { result });
+    return;
+  }
   const rb = r.recoveredBy;
   const rec = !r.recovery ? '' : !rb ? '; no recovery frame came'
     : rb.key ? `; a key frame (${r.gen}/${rb.seq}) ended the wait after ${rb.ms} ms, not a recovery frame`
