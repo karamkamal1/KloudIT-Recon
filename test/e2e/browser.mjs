@@ -2445,6 +2445,60 @@ async function checkControlBeforeHello() {
   }
 }
 
+// The settings drawer from the keyboard while streaming (final review): its
+// hotkey opens it with focus inside (on the stage, Tab and Escape go to the
+// PC), Tab and Shift+Tab move within it and wrap, Escape closes it and gives
+// the stage focus back; no Tab or Escape reaches the host meanwhile. Every
+// select and slider in it has a name from its label (the accessible name
+// screen readers announce).
+async function checkDrawerKeyboard() {
+  await startStream({ path: 'auto', transport: 'auto' });
+  try {
+    await page.focus('#stage');
+    if (nativeInputLog) writeFileSync(inputLog, '');
+    const where = () => page.evaluate(() => {
+      const a = document.activeElement;
+      return { inDrawer: !!a?.closest('#drawer'), id: a?.id || '', tag: a?.tagName.toLowerCase() || '', text: (a?.getAttribute('aria-label') || a?.textContent || '').trim().slice(0, 20), open: document.getElementById('drawer').classList.contains('open') };
+    });
+    await page.keyboard.press('Control+Alt+Shift+KeyO');
+    const opened = await where();
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Tab');
+    const tabbed = await where();
+    // From the first control (the close button), Shift+Tab wraps to the last.
+    await page.evaluate(() => document.querySelector('#drawer button')?.focus());
+    await page.keyboard.press('Shift+Tab');
+    const wrapped = await where();
+    const last = await page.evaluate(() => {
+      const f = [...document.querySelectorAll('#drawer button, #drawer select, #drawer input, #drawer a[href]')].filter((x) => !x.disabled);
+      return document.activeElement === f[f.length - 1];
+    });
+    // The names, while the drawer is open (closed, it is hidden from the accessibility tree).
+    const names = await page.evaluate(() => [...document.querySelectorAll('#drawer select, #drawer input[type=range]')]
+      .map((c) => ({ kind: c.tagName === 'SELECT' ? 'combobox' : 'slider', name: [...(c.labels || [])].map((l) => l.textContent.trim()).join(' ') })));
+    const unnamed = names.filter((n) => !n.name);
+    const byRole = await Promise.all(['Codec', 'Renderer', 'Upscaling', 'Decoder', 'HDR'].map((n) => page.getByRole('combobox', { name: n, exact: true }).count()));
+    const sliders = await Promise.all(['Bitrate', 'Volume', 'FSR sharpness'].map((n) => page.getByRole('slider', { name: n, exact: true }).count()));
+    await page.keyboard.press('Escape');
+    const closed = await where();
+    await sleep(500);
+    // Key presses (downs) of Tab or Escape on the host. (The page sends a
+    // key's release also when the host never got it down: Escape's, once
+    // the drawer has closed and the stage has focus again.)
+    const keys = nativeInputLog ? readFileSync(inputLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.ev === 'key' && e.down && (e.sc === 0x0f || e.sc === 0x01)) : [];
+    check('settings drawer from the keyboard: the hotkey moves focus into it, Tab and Shift+Tab stay inside, Escape closes it back to the stage, no Tab or Escape reaches the PC',
+      opened.open && opened.inDrawer && tabbed.inDrawer && wrapped.inDrawer && last && !closed.open && closed.id === 'stage' && keys.length === 0,
+      `opened: focus on ${opened.tag} "${opened.text}"; after 2 Tabs: ${tabbed.tag} "${tabbed.text}"; Shift+Tab from the first: ${wrapped.tag} "${wrapped.text}" (last: ${last}); ` +
+        `Escape: drawer ${closed.open ? 'open' : 'closed'}, focus on #${closed.id || closed.tag}; Tab/Escape presses on the host: ${keys.length}`);
+    check('settings drawer: every select and slider is named by its label',
+      names.length >= 15 && unnamed.length === 0 && byRole[0] === 2 && byRole.slice(1).every((c) => c === 1) && sliders.every((c) => c === 1),
+      `${names.length} controls, ${unnamed.length} unnamed${unnamed.length ? ` (${unnamed.map((n) => n.kind).join(', ')})` : ''}; by role and name: Codec ${byRole[0]} (video, audio), ` +
+        `Renderer ${byRole[1]}, Upscaling ${byRole[2]}, Decoder ${byRole[3]}, HDR ${byRole[4]}, sliders Bitrate/Volume/FSR sharpness ${sliders.join('/')}`);
+  } finally {
+    await endStream();
+  }
+}
+
 // A hardware decoder that keeps failing (final review): the worker's
 // VideoDecoder replaced, from the worker's start, by one that reports
 // prefer-hardware supported for what this browser decodes, but whose
@@ -4467,6 +4521,7 @@ try {
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
+  if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

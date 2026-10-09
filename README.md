@@ -298,7 +298,7 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 | **M** | Toggle mouse mode: *Desktop* (absolute pointer, local cursor) ↔ *Game* (pointer lock, raw relative input) |
 | **F** | Fullscreen + Keyboard Lock (Esc / Alt+Tab / Win go to the PC; hold Esc to leave) |
 | **S** | Performance overlay (latency breakdown, fps, bitrate, codec, path) |
-| **O** | Settings drawer |
+| **O** | Settings drawer (it takes the keyboard focus: Tab moves through it, Esc closes it) |
 | **V** | Type text on the PC (paste passwords, chat) |
 | **Q** | Disconnect |
 

@@ -1265,12 +1265,38 @@ function pasteDialog() {
 // ---------------------------------------------------------------------------
 // Settings drawer
 
+// Focus moves into the drawer when it opens (on the stage, Tab and Escape
+// go to the PC) and back to the stage when it closes.
 function toggleDrawer() {
   const d = $('drawer');
   d.classList.toggle('open');
-  if (d.classList.contains('open') && locked()) document.exitPointerLock();
-  if (!d.classList.contains('open')) S.surface.focus();
+  if (d.classList.contains('open')) {
+    if (locked()) document.exitPointerLock();
+    drawerFocusables()[0]?.focus();
+  } else {
+    S.surface.focus();
+  }
 }
+
+const drawerFocusables = () => [...$('drawer').querySelectorAll('button, select, input, a[href]')].filter((x) => !x.disabled);
+
+// In the open drawer: Escape (or the settings hotkey, which the page's key
+// handler leaves to the drawer while it has focus) closes it, Tab stays in it.
+$('drawer').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' || (isHotkey(e) && e.code === 'KeyO')) {
+    e.preventDefault();
+    toggleDrawer();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const f = drawerFocusables();
+  if (!f.length) return;
+  const to = e.shiftKey ? (document.activeElement === f[0] ? f[f.length - 1] : null) : (document.activeElement === f[f.length - 1] ? f[0] : null);
+  if (to) {
+    e.preventDefault();
+    to.focus();
+  }
+});
 
 function presentHint() {
   const s = storedPresent();
@@ -1281,8 +1307,17 @@ function presentHint() {
   return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}.`;
 }
 
+// A labelled control: the label names it (for assistive technology; the
+// input of a range row), hint is text or an element.
+let fieldIds = 0;
 function field(label, control, hint) {
-  return el('div', {}, el('label', {}, label), control, hint ? el('div', { class: 'hint' }, hint) : null);
+  const l = el('label', {}, label);
+  const input = control.matches('input, select') ? control : control.querySelector('input, select');
+  if (input) {
+    input.id ||= `setting-${++fieldIds}`;
+    l.htmlFor = input.id;
+  }
+  return el('div', {}, l, control, hint instanceof Node ? hint : hint ? el('div', { class: 'hint' }, hint) : null);
 }
 
 function select(key, options, onChange) {
@@ -1400,8 +1435,7 @@ function buildDrawer() {
       el('button', { class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),
       field('Frame pacing', select('pacing', [['latency', 'Lowest latency (draw on decode)'], ['smooth', 'Smooth (one frame per display refresh)']], applyPacing),
         'Applies at once. Smooth holds each frame for the next display refresh: an even cadence for up to one refresh more latency (overlay: hold).'),
-      el('div', {}, el('label', {}, 'Upscaling'),
-        select('upscale', [['auto', 'Auto (FSR 1 when shown larger, WebGPU)'], ['off', 'Off (bilinear)'], ['fsr', 'FSR 1 (WebGPU)']], applyUpscale),
+      field('Upscaling', select('upscale', [['auto', 'Auto (FSR 1 when shown larger, WebGPU)'], ['off', 'Off (bilinear)'], ['fsr', 'FSR 1 (WebGPU)']], applyUpscale),
         el('div', { class: 'hint', id: 'upscale-hint' }, upscaleHint())),
       field('FSR sharpness', el('div', { class: 'range-row' }, sharp, sout), '0 = sharpest; each stop halves the sharpening (RCAS).'),
       check('fsrDenoise', 'FSR: sharpen noise less (RCAS denoise)', applyUpscale),

@@ -9695,3 +9695,28 @@ setting changes; the setting itself stays.
   it`. With HDR10 or FSR on, both come back after the reconnect. Do it four times within a
   minute: the fourth time the page switches to the 2D canvas with the error notice.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.
+
+### The settings drawer from the keyboard and for screen readers
+
+Problem: opening the drawer (Ctrl+Alt+Shift+O or the toolbar button) left the focus on the
+stage, where the page sends every mapped key to the PC and cancels its default: Tab and Escape
+went to the PC, focus could never get into the drawer and Escape did not close it, so keyboard-only
+users could not change a setting while streaming. Its selects and sliders also had no
+accessible name (the label was a sibling without `for`), so screen readers announced them as an
+unnamed combo box or slider.
+
+Fix: the drawer moves the focus to its first control (Close) when it opens; inside it Tab and
+Shift+Tab wrap around, Escape (or the hotkey again) closes it and gives the stage the focus
+back. Each field's label names its control (`for`/`id`; the slider of a range row).
+
+- Verified here: browser E2E checks "settings drawer from the keyboard" (the hotkey, two Tabs,
+  Shift+Tab from Close to the last control, Escape: the focus stays in the drawer, then goes
+  back to the stage; no Tab or Escape press in the host's input log) and "every select and
+  slider is named by its label" (21 controls, all with a label; Playwright finds Codec (2),
+  Renderer, Upscaling, Decoder, HDR as comboboxes and Bitrate, Volume, FSR sharpness as
+  sliders by name). Against the old page: focus stayed on the stage, three Tab/Escape presses
+  reached the host, Escape left the drawer open, and all 21 controls were unnamed.
+- Not GPU-specific (no AMD or NVIDIA step). Test on the Windows client: stream, press
+  Ctrl+Alt+Shift+O, change Bitrate with Tab and the arrow keys, Escape; then with Narrator
+  (Win+Ctrl+Enter) on, Tab through the drawer: each control is read with its name ("Codec,
+  combo box", "Bitrate, slider").
