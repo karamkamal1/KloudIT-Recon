@@ -251,10 +251,16 @@ instead as datagrams with forward error correction:
 
   `base` is the block's first data shard, `index` the shard's place in the block (0..k−1 data,
   k.. parity row index − k), `m` the parity sent with the frame. With the header and QUIC's and
-  WebTransport's framing a shard fits quic-go's smallest packet (1280 bytes); a path whose
-  datagram limit is smaller shrinks the shards, one without datagrams ends the mode.
-- **Parity** per block, from the shard loss p the client reports (rate report flag 4, below; 1 %
-  until it has counted 500 shards; the last 4 s): the fewest parity shards that leave at most 1 %
+  WebTransport's framing a shard fits quic-go's smallest packet (1280 bytes): shards are the size
+  of the connection's other full packets, so a path that carries QUIC carries them (quic-go's
+  packet-size estimate starts at 1280 bytes and only grows). Only the peer's
+  `max_datagram_frame_size` limits them: a smaller one shrinks the shards, one without datagrams
+  ends the mode.
+- **Parity** per block, from the shard loss p the client reports (rate report flag 4, below: the
+  client accounts each frame's first transmission, its shards received and those that never
+  came, max(100 ms, 2 × RTT) after it is through, so the estimate is that recent from the first
+  frame on; the last 4 s; 1 % until 500 shards are accounted, and the previous estimate while
+  frames go as shards again after a pause): the fewest parity shards that leave at most 1 %
   of such blocks short of K shards (a binomial tail), at least 5 % of K (and one), at most the
   guide's ramp: 5 % below 0.5 % loss rising to 30 % at 3 % and above. A 35-shard block (20 Mbit/s
   at 60 fps) gets 2 at 1 % loss (5.7 %), 4 at 3 % (11 %); a frame of one shard a copy.
@@ -269,15 +275,25 @@ instead as datagrams with forward error correction:
   recovery). The host answers a NACK with fresh parity rows of the block (rows the frame did not
   send; any of them helps) from the frames it kept (the last second, 120 at most), the data shards
   for a whole-frame NACK, at most 32 shards per block and repairs of at most a quarter of the video
-  bitrate per second.
+  bitrate per second. A frame completed by the answer to a whole-frame NACK is a repaired frame
+  like the others (no delay sample, below), its first shard the time its gap showed.
 - **Sending.** frameSender cuts the frame and hands the shards to quic-go in order, each block's
   data then its parity, at most 3 ms of sending time ahead of the pacer (quic-go sends datagrams
-  from one queue, ahead of stream data: audio, cursor and pong datagrams wait behind every shard
-  queued before them). Rung 1 of the loss-recovery ladder applies between shards (a frame past its
+  from one FIFO queue, 32 deep, ahead of stream data: audio, cursor and pong datagrams wait behind
+  every shard queued before them). That bound is against the writer's model of the pacer, not
+  against acknowledgements: when the path carries less than the pacing rate (the congestion window
+  full, an outage) shards fill the queue at once, where frame streams fill it only with audio.
+  GUIDE 2.7's send priorities (a separate step, commit 782d52f) bound the video in flight by
+  acknowledgements and send pongs from their own goroutine; merging it, sendFEC must put shard
+  frames through the same video window (`admit()` before the frame is cut, as a hold re-stamps
+  `send_us`, which the data shards carry; `win.sent()` after the last shard; `internal/host/fec.go`
+  lists the steps), and the client already sends NACKs on the transport's input-class datagram
+  writer where it has one (2.7's telemetry writer drops while its queue stands still). Rung 1 of
+  the loss-recovery ladder applies between shards (a frame past its
   deadline while a newer one is ready stops; one the client would discard is not sent on). The
-  media congestion controller's target includes the shards' overhead (parity, headers,
-  repairs), and the acknowledged bytes the rate controller reads as delivered video leave it
-  out. While frames go as shards the rate controller's loss decrease waits for 10 % packet loss
+  media congestion controller's target includes the shards' overhead (parity and headers, from
+  each frame's first transmission; repairs come out of the pacing headroom), and the
+  acknowledged bytes the rate controller reads as delivered video leave it out. While frames go as shards the rate controller's loss decrease waits for 10 % packet loss
   instead of 2 % (random loss the parity rebuilds is not congestion; 2 % would take a path that
   loses 3 % to the bitrate floor, where small frames need relatively more parity; the delay
   still decreases), and a frame completed only after a NACK gives the client's rate report no
@@ -298,7 +314,10 @@ instead as datagrams with forward error correction:
 - **Measured.** host.log logs every switch (`video transport mode=… why=… rtt_ms=…`) and, in
   `stream stats`, `fec_frames`, `fec_parity_pct` (parity shards per data shard), `fec_overhead_pct`
   (bytes on the wire beyond the frames': parity, headers, repairs), `fec_loss_pct` (the client's
-  shard loss), `fec_nacks`, `fec_repairs`, `fec_nack_misses`. Once shards come, the overlay's
+  shard loss), `fec_nacks`, `fec_repairs`, `fec_nack_misses` (NACKs for frames not kept: too old,
+  sent on a stream, stopped by rung 1; or the NACK queue full), `fec_repair_refused` (over the repair
+  budget). The client logs each frame it gives up with what it lacked, its NACKs and the repair
+  shards that came. Once shards come, the overlay's
   *Transport* row adds "datagrams + FEC" and a *FEC* row under it shows the client's side
   (frames, parity, loss, frames rebuilt from parity, repaired after a NACK, given up); the
   *Freezes > 100 ms* row also counts stalls over 50 ms.
@@ -329,9 +348,10 @@ wrap, so a lost report loses only its delays: the host takes the difference to t
 got. The delays are those of the frames received since the previous report (last byte received
 minus `encodeDoneUs`, or `send_us` without the extension: the 0x40 ack's measure), p50 and maximum;
 `decodeQueue` is the number of frames handed to the decoder and not yet out of it. Flag bit 2
-(clients of hosts that list `video-fec`): 8 more bytes, the video shards received (first
-transmissions, not repairs) and those of the frames' first transmissions that never arrived,
-counted 2 s after a frame's first shard; the host sizes its parity from them. Hosts list
+(clients of hosts that list `video-fec`): 8 more bytes, of the frames' first transmissions (data
+and parity, not repairs) the shards received and those that never arrived, both counted when
+the client accounts a frame (max(100 ms, 2 × RTT) after its first transmission is through), so
+they cover the same frames; the host sizes its parity from them. Hosts list
 `rate-report` in `welcome.features`; clients that see it send the report and stop sending their
 own delay-based `{"t":"congestion"}` (the decoder's `reason:"decoder"` one stays). Older hosts
 never see a 0x41 (the client sends it only on the feature); older clients keep their own delay

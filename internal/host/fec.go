@@ -34,10 +34,31 @@ import (
 // streams: a LAN keeps per-frame streams) and the video bitrate is at most
 // fecMaxKbps (what the browser's datagram path sustains: docs/VENDOR_NOTES.md
 // 2.5); "on" regardless of the round trip (tests, measurements), "off" never.
-// A datagram that cannot be sent (the path's datagram limit below the
+// A datagram that cannot be sent (the peer's datagram limit below the
 // smallest shard, datagrams not negotiated) ends the mode for the session:
 // streams again. The switch is per frame and seamless: the client handles
 // both at once (a frame is a frame, however it came).
+//
+// Send priorities (GUIDE 2.7, a separate step not merged here: commit
+// 782d52f): quic-go sends datagrams from one FIFO queue (32 deep, its
+// SendDatagram blocks while full), so audio, cursor and pong datagrams wait
+// behind every shard queued before them. The shard writer keeps at most
+// fecQueueAhead of sending time queued, but against its model of the pacer,
+// not against acknowledgements: when the path carries less than the pacing
+// rate (the congestion window full, an outage) the queue fills with shards
+// at once, where frame streams fill it only with audio (~320 ms). Until 2.7
+// the datagram loop sends pongs inline and then waits on that queue too.
+// Merging 2.7: (1) sendFEC passes the frame through admit() before it is
+// cut (a placeholder outFrame without a stream: f, opened, deadline from the
+// frame's bytes and the overhead ratio; a hold re-stamps h.SendUs, which the
+// data shards carry, so before Cut), and writeShards records
+// win.sent(meter, now) after its last shard, so the window counts shard
+// frames as it counts streams; optionally the writer also waits between
+// shards while the delivery meter shows more than one frame in flight.
+// (2) 2.7's pongSender replaces the inline pong (datagrams()). (3) The
+// client already sends NACKs on the transport's input-class datagram writer
+// where it has one (2.7's sendInputDatagram), not on the telemetry sender
+// that drops while its queue stands still.
 
 const (
 	FECAuto = "auto"
@@ -72,7 +93,11 @@ const (
 	fecMaxRepair = 32
 
 	// Shard loss estimate: the client's counts over fecLossWindow, once they
-	// cover fecLossMinShards shards; fecInitialLoss until then.
+	// cover fecLossMinShards shards; fecInitialLoss until then (and the last
+	// estimate meanwhile when frames go as shards again). The client counts
+	// a frame's first transmission, received and lost alike, max(100 ms, 2 x
+	// RTT) after it (web/static/js/fec.js accountMs), so the estimate is
+	// that recent from the first frame on.
 	fecLossWindow    = 4 * time.Second
 	fecLossMinShards = 500
 	fecInitialLoss   = 0.01
@@ -109,7 +134,7 @@ type fecState struct {
 	on       bool      // frames go as shards now
 	off      string    // why the mode ended for the session ("": it did not)
 	pause    time.Time // streams until then (too much loss)
-	maxShard int       // shard payload limit (proto.MaxShardPayload, or less for a small path MTU)
+	maxShard int       // shard payload limit (proto.MaxShardPayload, or less for a peer's smaller max_datagram_frame_size)
 	ring     []*fecFrame
 	// rttReports: the client's pings that carried its minimum round trip
 	// (the datagram loop counts them).
@@ -127,7 +152,7 @@ type fecState struct {
 	ratio atomic.Int64
 
 	// Counters for stream stats (since the last report).
-	frames, shards, parity, frameBytes, wireBytes, repairShards, nacks, nackMisses atomic.Int64
+	frames, shards, parity, frameBytes, wireBytes, repairShards, nacks, nackMisses, repairRefused atomic.Int64
 }
 
 type fecFrame struct {
@@ -262,10 +287,10 @@ func (s *Session) fecReport(r proto.RateReport, now time.Time) {
 		return
 	}
 	d := lossSample{at: now, shards: r.Shards - fs.lastShards, los: r.ShardsLost - fs.lastLo}
-	fs.lastShards, fs.lastLo = r.Shards, r.ShardsLost
 	if d.shards > 1<<24 || d.los > 1<<24 {
-		return // a reordered report
+		return // a reordered report (the next one's difference covers it)
 	}
+	fs.lastShards, fs.lastLo = r.Shards, r.ShardsLost
 	fs.lossSamples = append(fs.lossSamples, d)
 	var got, lost, got2, lost2 uint64
 	keep := fs.lossSamples[:0]
@@ -310,6 +335,8 @@ func (s *Session) sendFEC(f *media.Frame, n int) bool {
 	s.fec.mu.Lock()
 	maxShard := s.fec.maxShard
 	s.fec.mu.Unlock()
+	// Merging GUIDE 2.7: the video window's admit() goes here (see the top
+	// of this file).
 	fr, dgs, err := s.fec.enc.Cut(buf, f.Gen, f.Seq, maxShard, s.fecParity)
 	if err != nil {
 		s.log.Debug("frame not cut into shards", "gen", f.Gen, "seq", f.Seq, "bytes", len(buf), "err", err)
@@ -393,8 +420,11 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 			}
 			var tooLarge *quic.DatagramTooLargeError
 			if errors.As(err, &tooLarge) && tooLarge.MaxDatagramPayloadSize > 256+proto.VideoShardHeaderLen+8 {
-				// A path that carries smaller datagrams: smaller shards from
-				// the next frame on (WebTransport adds up to 8 bytes).
+				// A peer that takes smaller datagrams (its
+				// max_datagram_frame_size; quic-go's own packet size
+				// estimate starts at 1280 bytes and only grows): smaller
+				// shards from the next frame on (WebTransport adds up to 8
+				// bytes).
 				s.fec.mu.Lock()
 				s.fec.maxShard = int(tooLarge.MaxDatagramPayloadSize) - proto.VideoShardHeaderLen - 8
 				s.fec.mu.Unlock()
@@ -537,8 +567,12 @@ func (s *Session) fecRepairs() {
 		if t := s.ccTarget.Load(); t != nil {
 			kbps = t.videoKbps
 		}
-		if len(dgs) == 0 || !fs.repairBudget(bytes, kbps) {
+		if len(dgs) == 0 {
 			fs.nackMisses.Add(1)
+			continue
+		}
+		if !fs.repairBudget(bytes, kbps) {
+			fs.repairRefused.Add(1)
 			continue
 		}
 		for _, d := range dgs {
@@ -574,5 +608,5 @@ func (s *Session) fecStats() []any {
 	}
 	return []any{"fec_on", on, "fec_frames", frames, "fec_shards", shards, "fec_parity_pct", pct(parity, shards-parity),
 		"fec_overhead_pct", pct(wb-fb, fb), "fec_loss_pct", fmt.Sprintf("%.2f", loss*100), "fec_nacks", fs.nacks.Swap(0),
-		"fec_repairs", fs.repairShards.Swap(0), "fec_nack_misses", fs.nackMisses.Swap(0)}
+		"fec_repairs", fs.repairShards.Swap(0), "fec_nack_misses", fs.nackMisses.Swap(0), "fec_repair_refused", fs.repairRefused.Swap(0)}
 }

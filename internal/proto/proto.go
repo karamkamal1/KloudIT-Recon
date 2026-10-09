@@ -475,10 +475,11 @@ type RateReport struct {
 	Lost               uint32 // frames lost on the way (gap timeout; not those the host reported dropped) + audio packets lost
 	Audio              uint32 // audio packets received
 	DecodeQueue        uint16 // frames handed to the decoder and not yet out of it
-	// Video shards ("datagram + FEC" mode, RateReportShards): those
-	// received, and those of the frames' first transmission (data and
-	// parity, not repairs) that never arrived, counted once a frame is done
-	// with. Cumulative, wrapping.
+	// Video shards ("datagram + FEC" mode, RateReportShards): of the
+	// frames' first transmissions (data and parity, not repairs), those
+	// received and those that never arrived, both counted when the client
+	// accounts a frame (about 100 ms after its first transmission is
+	// through), so they cover the same frames. Cumulative, wrapping.
 	Shards, ShardsLost uint32
 }
 

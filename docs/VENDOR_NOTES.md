@@ -6378,11 +6378,14 @@ What changed (docs/ARCHITECTURE.md "Datagram + FEC video"):
   WebSocket and the QUIC splice never use it. The browser's Settings → Pipeline → *Video over
   datagrams* Off leaves it out of the hello.
 - **Pacing and the rate controller.** The media congestion controller's target includes the
-  shards' overhead; the acknowledged bytes the rate controller reads as delivered video leave it
-  out; the pacer model and rung 1's deadline count the bytes on the wire. The shard writer stays
-  at most 3 ms of sending time ahead of the pacer: quic-go sends every datagram from one 32-deep
-  queue, ahead of stream data, so audio, cursor and pong datagrams would otherwise wait behind up
-  to 32 shards (13 ms at 20 Mbit/s).
+  shards' overhead (parity and headers of each frame's first transmission; repairs are counted
+  in `fec_overhead_pct` but come out of the pacing headroom); the acknowledged bytes the rate
+  controller reads as delivered video leave it out; the pacer model and rung 1's deadline count
+  the bytes on the wire. The shard writer stays at most 3 ms of sending time ahead of the pacer:
+  quic-go sends every datagram from one 32-deep FIFO queue, ahead of stream data, so audio, cursor
+  and pong datagrams would otherwise wait behind up to 32 shards (13 ms at 20 Mbit/s). That bound
+  is against the writer's model of the pacer, not acknowledgements: see "Send priorities (2.7)"
+  below.
 - **Client.** A frame rebuilt from shards is handed on exactly as a frame stream's bytes
   (reorder buffer, decoder, stages: *network* ends at its first shard, *transfer* at the shard
   that completed it). Once shards come the overlay's *Transport* row says "datagrams + FEC" and a
@@ -6512,11 +6515,13 @@ Verified in the sandbox (Linux, 4 CPUs shared with other jobs, no GPU):
   seq; a WebSocket session in the same host keeps frame streams (host.log `video transport: frame
   streams only ... why="the client does not take shards"`). Every other scenario (loopback, RTT
   below 15 ms) keeps frame streams under the default `auto`.
-- **Comparison, GUIDE 2.5's acceptance** (`E2E_FEC_COMPARE=30`): the browser reaches the host's
-  direct port through a UDP proxy adding 20 ms each way (40 ms RTT) and random loss each way;
-  AV1 960×540 60 fps (libsvtav1, test source), each run 30 s after a warm-up, Settings → *Video
-  over datagrams* Off (frame streams) against the default Auto (datagram + FEC). Stalls: the
-  picture stood still more than 50 ms longer than the source (the client's freeze measure).
+- **Comparison, GUIDE 2.5's acceptance, first measurement** (`E2E_FEC_COMPARE=30`, one run per
+  mode; superseded by the repeated runs under "Review fixes" below): the browser reaches the
+  host's direct port through a UDP proxy adding 20 ms each way (40 ms RTT) and random loss each
+  way; AV1 960×540 60 fps (libsvtav1, test source), each run 30 s after a warm-up, host.json
+  `"fec": "off"` (frame streams) against `"fec": "auto"` (datagram + FEC; the client's Settings
+  stay at their default). Stalls: the picture stood still more than 50 ms longer than the source
+  (the client's freeze measure).
 
   | Loss, bitrate | stalls > 50 ms: streams / FEC | freezes > 100 ms | fps | FEC overhead (parity, shard loss) | rebuilt / repaired / lost |
   |---|---|---|---|---|---|
@@ -6524,7 +6529,11 @@ Verified in the sandbox (Linux, 4 CPUs shared with other jobs, no GPU):
   | 3 %, fixed 20 Mbit/s | 18 / **7** | 0 / 1 | 55.2 / 59.2 | **12.6 %** (10.8 %, 3.11 %) | 1219 / 8 / 0 |
   | 3 %, adaptive | 25 / 11 | 1 / 0 | 52.2 / 56.8 | 13.6 % (11.8 %, 2.91 %) | 1105 / 10 / 0 |
 
-  Pass (fewer stalls with FEC at 1 % and 3 %, overhead ≤ 15 %). In the adaptive run frame
+  One run each, so not a pass on its own: a reviewer's independent run of the same code (load
+  average 6-8) failed at 1 %, frame streams 10 stalls against FEC 11, FEC giving up 2 frames
+  (2 key requests); the 1 % margin is within the run-to-run spread, and its "fixed 20 Mbit/s"
+  stream run at 3 % ran at a 17000 kbps target (a frame-queue overflow's cut, which adaptive off
+  still makes). In the adaptive run frame
   streams settled at 2.6 Mbit/s, the shards at 18 Mbit/s (rate controller loss rule above). The
   first version (a frame's NACK only once a newer frame's shard came) lost at 3 %: 12 streams
   vs 13 FEC stalls, overhead 12.3 %; the client now NACKs 3 ms after a frame's last parity shard,
@@ -6544,6 +6553,110 @@ Verified in the sandbox (Linux, 4 CPUs shared with other jobs, no GPU):
   shards come, stalls inside the *Freezes* row); it passed in every run since.
 - **Go integration test** (`internal/e2e`, under the E2E lock): passes (the Go client sends no
   `hello.fec`: frame streams).
+
+Review fixes (after the first commit of this step; each code fix has a test that fails without
+it):
+
+- **The shard-loss estimate ran 2 s behind and read 0 % at the start of every period.** The client
+  counted received shards as they came but lost ones only when it forgot a frame, 2 s after its
+  first shard, so each rate report carried current receipts and the losses of 2 s before; once
+  500 shards were counted (0.25 s at 20 Mbit/s) the host replaced its 1 % starting value with the
+  measured 0 %: at session start, after each 30 s pause and after each switch back to shards, and
+  the > 20 % pause rule reacted 2 s late. Probe (fec.js on a simulated clock, 20 Mbit/s at 60 fps,
+  35 data + 2 parity shards per frame, 3 % random loss): 0 shards lost of 1067 / 2148 / 4298
+  received at 0.5 / 1 / 2 s, 41 of 5377 at 2.5 s. Now the client accounts each frame's first
+  transmission, its shards received and those that never came together, max(100 ms, 2 × RTT)
+  after it is through (its last shard, a newer frame's shard, or its stall), complete or not,
+  and the rate report carries that pair (a shard later than that counts as lost). Same probe:
+  33 lost of 888 accounted at 0.5 s (3.7 %), 66 of 1998 at 1 s (3.3 %). The host keeps 1 % (or
+  its previous estimate, when frames go as shards again) until 500 accounted shards.
+  `TestFECLossFromReceiver` (internal/host) drives the receiver's counters into `fecReport`: the
+  parity of a 35-shard block reaches 4 at 350 ms (1 s required) and stays there, the estimate never
+  below 1 %; with the old receiver the estimate is 0.00 % for the first 1.75 s and the parity never
+  reaches 4 within 3 s (0.89 % at 3 s). `TestJSReceiver` checks the accounted pair 400 ms in.
+- **A reordered rate report counted an interval twice** (`fecReport` stored its counters before
+  rejecting it, so the next report's difference covered an interval already counted): stored only
+  after the check. `TestFECLossEstimate`: 3.23 % for 100 lost in 3100, 4.76 % with the old code.
+- **A frame completed by the resend a whole-frame NACK asked for** was delivered as not repaired,
+  its first time the resend's first shard: its NACK round trip went into the rate report's delay
+  samples and the congestion check (the samples this step leaves out for repaired frames), and
+  `repaired` missed it. The entry that replaces the placeholder now keeps its NACK count and its
+  first time (when the gap showed), and the frame's first transmission counts as lost (before,
+  the resent data shards counted as received). `TestJSReceiver` (repaired, first 16 ms, 4 of 4
+  shards lost; before: not repaired, first 60 ms, 1 lost).
+- *Send priorities (2.7)*, a separate step (commit 782d52f) not in this branch: frameSender sends
+  a frame as shards before the stream path, where 2.7 adds its video window (`admit()`, and
+  `win.sent()` in sendFrame), so after a plain merge shard frames would never be held by it. The
+  shard writer's 3 ms bound is against its model of the pacer, not acknowledgements, and quic-go's
+  datagram queue is FIFO (32 deep, SendDatagram blocks while full): when the path carries less
+  than the pacing rate (the congestion window full, an outage) the queue fills with shards at
+  once, where on frame streams only audio fills it (~320 ms of it), and audio, cursor and pongs
+  wait behind it; without 2.7 the datagram loop sends pongs inline and then waits on that queue
+  too. Merging 2.7 (also in `internal/host/fec.go`'s header and at the call in frameSender):
+  sendFEC puts the frame through `admit()` before cutting it (a placeholder `outFrame` without a
+  stream: f, opened, a deadline from the frame's bytes and the overhead ratio; a hold re-stamps
+  `send_us`, which the data shards carry), writeShards records `win.sent(meter, now)` after the
+  last shard (so the window counts shard frames), optionally the writer waits between shards
+  while the delivery meter shows more than one frame in flight; 2.7's pongSender replaces the
+  inline pong. The client already sends NACKs on the transport's input-class datagram writer
+  where there is one (`sendInputDatagram`, 2.7), not on 2.7's telemetry sender, which drops while
+  its queue stands still for 50 ms; without 2.7 that is the only datagram writer, as before.
+  Documented in docs/ARCHITECTURE.md ("Datagram + FEC video", Sending); not verifiable here
+  before the merge.
+- **Docs.** (a) The congestion target includes parity and headers, not repairs (the ratio is per
+  frame from its first transmission; repairs are in `fec_overhead_pct`): ARCHITECTURE and above
+  corrected. (b) The comparison toggles host.json `fec` off / auto, not the client's Settings:
+  corrected above. (c) The PMTU check was wrong about quic-go: its datagram limit starts at 1280
+  bytes and only grows, so a path that cannot carry the shards cannot carry QUIC; only the peer's
+  `max_datagram_frame_size` shrinks or ends them: rewritten below.
+- **Diagnostics for the comparison.** Stream stats split `fec_repair_refused` (over the repair
+  budget) out of `fec_nack_misses` (NACKs for frames not kept: too old, on a stream, stopped by
+  rung 1; or the NACK queue full); the client logs each frame it gives up with what it lacked,
+  its NACKs and the repair shards that came; `E2E_FEC_COMPARE` saves each run's host log.
+- **Comparison, repeated** (finding: one 30 s run per mode is within the run-to-run spread; a
+  reviewer's run failed at 1 %). `E2E_FEC_COMPARE=45` now runs the checked pairs
+  `E2E_FEC_COMPARE_RUNS` times per mode (default 3), the modes interleaved (off, auto, off, ...)
+  so a change of the machine's load hits both, and checks the medians; each run records its
+  target's range and saves its host log; the adaptive pair runs once. Same setup as above (UDP
+  proxy, 20 ms each way, random loss each way, AV1 960×540 60 fps, host.json `fec` off / auto),
+  45 s per run after an 8 s warm-up, load average 5-11 from other jobs:
+
+  | Loss, bitrate | stalls > 50 ms: streams (median) | FEC (median) | freezes > 100 ms streams / FEC | fps streams / FEC | FEC overhead (parity, shard loss) | FEC repaired / given up |
+  |---|---|---|---|---|---|---|
+  | 1 %, fixed 20 Mbit/s | 11, 10, 12 (**11**) | 9, 11, 3 (**9**) | 0, 0, 2 / 0, 0, 0 | 53.6, 53.8, 53.3 / 59.4, 58.4, 59.2 | **7.5-7.6 %** (5.8-6.0 %, 1.01-1.03 %) | 20, 17, 13 / 0, 0, 0 |
+  | 3 %, fixed 20 Mbit/s | 22, 28, 23 (**23**) | 8, 4, 11 (**8**) | 0, 2, 2 / 1, 0, 2 | 54.8, 54.2, 56.1 / 59.2, 59.7, 58.3 | **13.2-13.4 %** (11.5-11.7 %, 3.03-3.13 %) | 14, 10, 21 / 0, 0, 0 |
+  | 3 %, adaptive (1 run) | 51 at 2.4 Mbit/s (target 2000-5450) | 10 at 17.4 Mbit/s (target 11931-20000) | 2 / 3 | 52.4 / 57.8 | 14.6 % (12.9 %, 2.96 %) | 13 / 0 |
+
+  Pass on the medians at both loss rates, overhead ≤ 15 %. At 3 % the runs do not overlap
+  (streams 22-28, FEC 4-11); at 1 % they do (FEC 3-11, streams 10-12): there the margin is small
+  and a single run can go either way, as the reviewer's did. What FEC's stalls at 1 % are: the
+  parity there is 2 per 35-shard block (5.7 %), sized to leave ~0.6 % of blocks to a NACK
+  (`Residual` 1 %), so 13-20 frames per 45 s wait a NACK round trip (40 ms plus the grace and
+  the repair's sending), each close to the 50 ms mark; the rest are this machine's (software AV1
+  decode shares 4 CPUs with other jobs: the streams' fps of 53-54 against FEC's 58-59 is the
+  retransmissions' share). The fixed-rate stream runs kept their 20 Mbit/s target in the
+  measured window except one 3 % run (19313-20000: a frame-queue overflow in its warm-up cut
+  it to 15000, rate recovery was finishing the climb); frame streams overflowed in 2 of 7 runs,
+  the shards in none. Frames given up: 0 of 108 repaired frames (115 NACKs) over the 7 FEC
+  runs, with 0 shards stopped by rung 1, 0 NACK misses and 0 repairs refused on the host; the
+  reviewer's 2 give-ups of 13 NACKed frames did not recur, so their cause is not established:
+  not the repair budget nor rung 1 in these runs; the remaining candidate is a repair round trip
+  longer than the give-up time (max(120 ms, 2.5 × min RTT + 30 ms) = 130 ms at 40 ms) on a more
+  loaded machine. The client's log line for each give-up (shards short, NACKs, repair shards
+  that came, ms since the stall) and the saved host logs now tell which.
+- **Checks of the review fixes.** go vet (Linux, Windows), `go test` of every package; full
+  browser E2E with the comparison above: 235 of 236, the one failure *WebTransport direct: frame
+  pacing Smooth: requestAnimationFrame restored* (32.5 fps of 60 with the worker's display
+  refresh at 39 Hz: frame streams on loopback, untouched by this step; the same check failed with
+  11-33 fps in five other branches' runs on this machine); every datagram + FEC check passed
+  (scenario: 720 frames from shards in 12 s, 478 rebuilt, 7 after a NACK, 0 given up, shard
+  loss 2.93 %, 0 stalls > 50 ms, `fec_overhead_pct` 13.2). A second full run while another job
+  ran a Windows host test outside the E2E lock (load 9-15) failed 12 fps-bound checks (relay and
+  WebSocket decoding at 25-40 fps, the bitrate recovery cut to the floor, the FEC scenario's
+  steady playback at 31-58 fps); none is a check of this step's logic. Go integration test
+  (`internal/e2e`, under the lock): passed (two runs before under that load failed
+  `TestStreamingFrameLoss` on a 7-frame queue overflow and `TestStreamingBitrateRecovery` on a
+  slow climb, frame streams of a client without `hello.fec`).
 
 Hardware and real-network checks:
 
@@ -6570,7 +6683,12 @@ Hardware and real-network checks:
   loss 0 % and frames complete 100 % at 150 Mbit/s is what the mode's limit assumes. Firefox
   and Safari: whether `serverCertificateHashes` and datagrams work at all; a browser that sends
   no `hello.fec`, or whose datagrams fail, keeps frame streams.
-- PMTU: unverified on real paths. The shards fit quic-go's 1280-byte packets; a VPN or PPPoE path
-  that cannot carry them makes quic-go report a smaller datagram limit (host.log `video
-  transport: smaller shards`) or, at 282 bytes or less, end the mode. Test: stream through a
-  WireGuard tunnel (MTU 1420) and a PPPoE line with FEC on; no stalls after the first seconds.
+- PMTU: unverified on real paths. The shards (≤ 1218 bytes plus QUIC's and WebTransport's
+  framing) fit quic-go's 1280-byte packets, the same size as the connection's other full packets:
+  quic-go's packet-size estimate starts at 1280 bytes (InitialPacketSize) and only grows with MTU
+  discovery, so a path that cannot carry 1280-byte UDP payloads breaks the QUIC connection itself,
+  not only the shards. Only the peer's `max_datagram_frame_size` makes quic-go refuse a shard
+  (`DatagramTooLargeError`): a smaller one shrinks the shards (host.log `video transport: smaller
+  shards`), one of 282 bytes or less ends the mode. Test: stream through a WireGuard tunnel (MTU
+  1420) and a PPPoE line (1492) with `"fec": "on"`; the session connects, host.log shows no
+  `smaller shards` or `datagrams failed`, and no stalls after the first seconds.

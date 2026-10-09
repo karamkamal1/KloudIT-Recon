@@ -942,7 +942,7 @@ function onStats(st) {
 // after a NACK and frames given up. (Frame streams add no row: the overlay
 // has no room to spare in a 720 px window.)
 function fecRow(f, row) {
-  const all = f.shards + f.shardsLost;
+  const all = f.counted + f.shardsLost; // the shards of the frames accounted (fec.js)
   const loss = all ? (100 * f.shardsLost) / all : 0;
   return row('  FEC', `${f.frames} frames · parity ${f.shards ? ((100 * f.parity) / f.shards).toFixed(0) : 0} % of shards · ` +
     `loss ${loss.toFixed(2)} % · rebuilt ${f.rebuilt} · repaired ${f.repaired} (${f.nacks} NACKs) · lost ${f.lost}`, f.lost ? 'warn' : '');

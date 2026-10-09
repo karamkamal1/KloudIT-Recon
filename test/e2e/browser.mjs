@@ -47,7 +47,8 @@
 // checks; WebSocket sessions never get shards. E2E_FEC_COMPARE=<seconds>
 // adds the comparison with frame streams through a UDP proxy that delays
 // each direction 20 ms (40 ms RTT) and loses 1 % / 3 % of the packets:
-// stalls over 50 ms and the overhead of the shards.
+// stalls over 50 ms (the median of E2E_FEC_COMPARE_RUNS runs per mode,
+// default 3) and the overhead of the shards.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -2626,7 +2627,7 @@ async function checkFec() {
         d.lost <= 2 && d.bad === 0 && st.fps >= 45,
       `${conn.transport}/${conn.path}; in 12 s: ${d.frames} frames from ${d.shards} shards (${d.parity} parity, ${d.repairs} repairs), ` +
         `${d.rebuilt} rebuilt from parity, ${d.repaired} after a NACK (${d.nacks} NACKs, ${d.wholeNacks} whole), ${d.lost} given up, ` +
-        `${d.unused} unused, ${d.bad} bad; shards lost ${d.shardsLost} (${(100 * d.shardsLost / Math.max(1, d.shards + d.shardsLost)).toFixed(2)} %); ` +
+        `${d.unused} unused, ${d.bad} bad; shards lost ${d.shardsLost} (${(100 * d.shardsLost / Math.max(1, d.counted + d.shardsLost)).toFixed(2)} %); ` +
         `fps ${fps.join(' / ')}; host: available ${avail}, on ${on}`);
     check('datagram + FEC: steady real-time playback', steady >= 50, `last 3 s: ${tail.join(' / ')} fps; stalls > 50 ms ${(st.stalls ?? 0) - (st0?.stalls ?? 0)}`);
     await until(() => /fec_frames=[1-9]/.test(host.log), 12000, 'stream stats with fec_frames').catch(() => {});
@@ -2691,9 +2692,18 @@ function impairProxy(sock, targetPort) {
 // host's FEC stream stats (overhead: parity, headers and repairs over the
 // frames' bytes). The checked pairs stream a fixed 20 Mbit/s (adaptive
 // bitrate off: both modes carry the same frames, the rate controller's
-// reactions to the loss do not differ between runs); a pair at 3 % with the
-// rate controller on is recorded too.
+// reactions to the loss do not differ between runs; a frame-queue overflow
+// still cuts it, so each run records its target's range) and run
+// E2E_FEC_COMPARE_RUNS times per mode (default 3), the modes interleaved so
+// a change of this shared machine's load hits both; the check compares the
+// medians (one 30 s run's stall count is within the run-to-run spread). A
+// pair at 3 % with the rate controller on runs once. Each run's host log is
+// saved (host-fec-<mode>-<loss>-<run>.log in the results), and a FEC run
+// records why frames were given up: the client's log of each (shards short,
+// NACKs, repairs that came), the host's stopped frames (rung 1), NACKs for
+// frames it did not keep and repairs the budget refused.
 async function compareFec(seconds) {
+  const runs = Math.max(1, Number(process.env.E2E_FEC_COMPARE_RUNS) || 3);
   const rows = [];
   const rewrite = async (route) => {
     const resp = await route.fetch();
@@ -2704,42 +2714,57 @@ async function compareFec(seconds) {
   await ctx.route('**/api/hosts/*/connect', rewrite);
   try {
     for (const [loss, adaptive] of [[0.01, false], [0.03, false], [0.03, true]]) {
-      for (const mode of ['off', 'auto']) {
-        await withHostConfig({ fec: mode }, async () => {
-          const host = await restartHost({}, `host-fec-${mode}-${loss}`);
-          Object.assign(fecImpair, { delayMs: 20, loss });
-          await startStream({ path: 'direct', transport: 'auto', bitrate: 20, adaptive });
-          await sleep(8000); // warm-up, and the client's minimum RTT reaches the host
-          const st0 = await page.evaluate(() => window.__recon.lastStats);
-          const log0 = host.log.length;
-          const fps = [];
-          const mbps = [];
-          for (const end = Date.now() + seconds * 1000; Date.now() < end;) {
-            await sleep(1000);
-            const x = await page.evaluate(() => window.__recon.lastStats);
-            fps.push(x?.fps ?? 0);
-            mbps.push(x?.mbps ?? 0);
-          }
-          const st = await page.evaluate(() => window.__recon.lastStats);
-          const hl = host.log.slice(log0);
-          const ss = [...hl.matchAll(/msg="stream stats"[^\n]*/g)].map((m) => lastStreamStats(m[0]));
-          const avg = (v) => v.reduce((a, b) => a + b, 0) / Math.max(1, v.length);
-          const num = (k) => ss.map((x) => +x[k]).filter((v) => Number.isFinite(v));
-          const row = {
-            mode: mode === 'off' ? 'frame streams' : 'datagram + FEC', loss, adaptive, seconds,
-            stalls50: (st.stalls ?? 0) - (st0.stalls ?? 0), freezes100: st.freezes - st0.freezes,
-            fps: +avg(fps).toFixed(1), mbps: +avg(mbps).toFixed(1), keyRequests: st.keyRequests - st0.keyRequests,
-            fec: fecDelta(st0.fec, st.fec), overheadPct: +avg(num('fec_overhead_pct')).toFixed(1), parityPct: +avg(num('fec_parity_pct')).toFixed(1),
-            shardLossPct: +avg(num('fec_loss_pct')).toFixed(2), kbpsTarget: Math.round(avg(num('kbps_target'))), lossPct: +avg(num('loss_pct')).toFixed(2),
-            rttMs: st.minRtt, proxy: { ...fecImpair },
-          };
-          rows.push(row);
-          console.log(`  FEC compare: ${row.mode} at ${loss * 100} % loss, 40 ms RTT, ${adaptive ? 'adaptive bitrate' : 'fixed 20 Mbit/s'}, ${seconds} s: stalls > 50 ms ${row.stalls50}, freezes > 100 ms ${row.freezes100}, ` +
-            `${row.fps} fps, ${row.mbps} Mbit/s (target ${row.kbpsTarget}), key requests ${row.keyRequests}, overhead ${row.overheadPct} % ` +
-            `(parity ${row.parityPct} % of data shards, shard loss ${row.shardLossPct} %), frames rebuilt ${row.fec.rebuilt ?? 0}, repaired ${row.fec.repaired ?? 0}, lost ${row.fec.lost ?? 0}`);
-          await page.evaluate(() => { window.__recon.userClosed = true; });
-          await sleep(500);
-        });
+      for (let run = 1; run <= (adaptive ? 1 : runs); run++) {
+        for (const mode of ['off', 'auto']) {
+          await withHostConfig({ fec: mode }, async () => {
+            const name = `host-fec-${mode}-${loss * 100}pct${adaptive ? '-adaptive' : ''}-${run}`;
+            const host = await restartHost({}, name);
+            Object.assign(fecImpair, { delayMs: 20, loss });
+            await startStream({ path: 'direct', transport: 'auto', bitrate: 20, adaptive });
+            await sleep(8000); // warm-up, and the client's minimum RTT reaches the host
+            const st0 = await page.evaluate(() => window.__recon.lastStats);
+            const log0 = host.log.length;
+            const con0 = consoleLines.length;
+            const fps = [];
+            const mbps = [];
+            for (const end = Date.now() + seconds * 1000; Date.now() < end;) {
+              await sleep(1000);
+              const x = await page.evaluate(() => window.__recon.lastStats);
+              fps.push(x?.fps ?? 0);
+              mbps.push(x?.mbps ?? 0);
+            }
+            const st = await page.evaluate(() => window.__recon.lastStats);
+            const hl = host.log.slice(log0);
+            writeFileSync(join(outDir, `${name}.log`), host.log);
+            const ss = [...hl.matchAll(/msg="stream stats"[^\n]*/g)].map((m) => lastStreamStats(m[0]));
+            const avg = (v) => v.reduce((a, b) => a + b, 0) / Math.max(1, v.length);
+            const sum = (v) => v.reduce((a, b) => a + b, 0);
+            const num = (k) => ss.map((x) => +x[k]).filter((v) => Number.isFinite(v));
+            const targets = num('kbps_target');
+            const row = {
+              mode: mode === 'off' ? 'frame streams' : 'datagram + FEC', loss, adaptive, seconds, run,
+              stalls50: (st.stalls ?? 0) - (st0.stalls ?? 0), freezes100: st.freezes - st0.freezes,
+              fps: +avg(fps).toFixed(1), mbps: +avg(mbps).toFixed(1), keyRequests: st.keyRequests - st0.keyRequests,
+              fec: fecDelta(st0.fec, st.fec), overheadPct: +avg(num('fec_overhead_pct')).toFixed(1), parityPct: +avg(num('fec_parity_pct')).toFixed(1),
+              shardLossPct: +avg(num('fec_loss_pct')).toFixed(2), kbpsTarget: Math.round(avg(targets)),
+              kbpsTargetMin: targets.length ? Math.min(...targets) : null, kbpsTargetMax: targets.length ? Math.max(...targets) : null,
+              lossPct: +avg(num('loss_pct')).toFixed(2), rttMs: st.minRtt, proxy: { ...fecImpair },
+              deadlineDrops: sum(num('deadline_drops')), shardsStopped: (hl.match(/msg="frame shards stopped"/g) || []).length,
+              nackMisses: sum(num('fec_nack_misses')), repairRefused: sum(num('fec_repair_refused')),
+              givenUp: consoleLines.slice(con0).filter((l) => /lost: its shards could not be rebuilt/.test(l)).map((l) => l.replace(/^.*?frame /, 'frame ')),
+            };
+            rows.push(row);
+            console.log(`  FEC compare: ${row.mode} at ${loss * 100} % loss, 40 ms RTT, ${adaptive ? 'adaptive bitrate' : 'fixed 20 Mbit/s'}, run ${run}, ${seconds} s: ` +
+              `stalls > 50 ms ${row.stalls50}, freezes > 100 ms ${row.freezes100}, ${row.fps} fps, ${row.mbps} Mbit/s ` +
+              `(target ${row.kbpsTarget}, ${row.kbpsTargetMin}-${row.kbpsTargetMax}), key requests ${row.keyRequests}, deadline drops ${row.deadlineDrops}` +
+              (mode === 'off' ? '' : `, overhead ${row.overheadPct} % (parity ${row.parityPct} % of data shards, shard loss ${row.shardLossPct} %), ` +
+                `frames rebuilt ${row.fec.rebuilt ?? 0}, repaired ${row.fec.repaired ?? 0} (${row.fec.nacks ?? 0} NACKs, ${row.fec.wholeNacks ?? 0} whole), ` +
+                `lost ${row.fec.lost ?? 0}; host: shards stopped ${row.shardsStopped}, NACK misses ${row.nackMisses}, repairs refused ${row.repairRefused}` +
+                (row.givenUp.length ? `; given up: ${row.givenUp.join(' | ')}` : '')));
+            await page.evaluate(() => { window.__recon.userClosed = true; });
+            await sleep(500);
+          });
+        }
       }
     }
   } finally {
@@ -2748,13 +2773,18 @@ async function compareFec(seconds) {
     await restartHost({}, 'host');
   }
   results.push({ fecCompare: rows });
+  const median = (v) => { const a = [...v].sort((x, y) => x - y); return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2; };
   for (const loss of [0.01, 0.03]) {
     const pair = rows.filter((r) => r.loss === loss && !r.adaptive);
-    const [str, dg] = [pair.find((r) => r.mode === 'frame streams'), pair.find((r) => r.mode !== 'frame streams')];
-    check(`FEC compare at ${loss * 100} % loss, 40 ms RTT, 20 Mbit/s: fewer stalls > 50 ms with datagram + FEC, overhead <= 15 %`,
-      dg.stalls50 < str.stalls50 && dg.overheadPct <= 15 && dg.fec.frames > 0,
-      `stalls > 50 ms: streams ${str.stalls50}, FEC ${dg.stalls50}; freezes > 100 ms ${str.freezes100} / ${dg.freezes100}; fps ${str.fps} / ${dg.fps}; ` +
-        `Mbit/s ${str.mbps} / ${dg.mbps}; FEC overhead ${dg.overheadPct} % (parity ${dg.parityPct} %, shard loss ${dg.shardLossPct} %)`);
+    const [str, dg] = [pair.filter((r) => r.mode === 'frame streams'), pair.filter((r) => r.mode !== 'frame streams')];
+    const col = (v, k) => v.map((r) => r[k]);
+    check(`FEC compare at ${loss * 100} % loss, 40 ms RTT, 20 Mbit/s: fewer stalls > 50 ms with datagram + FEC (median of ${runs} runs each), overhead <= 15 %`,
+      median(col(dg, 'stalls50')) < median(col(str, 'stalls50')) && Math.max(...col(dg, 'overheadPct')) <= 15 && dg.every((r) => r.fec.frames > 0),
+      `stalls > 50 ms: streams ${col(str, 'stalls50').join('/')} (median ${median(col(str, 'stalls50'))}), FEC ${col(dg, 'stalls50').join('/')} ` +
+        `(median ${median(col(dg, 'stalls50'))}); freezes > 100 ms ${col(str, 'freezes100').join('/')} vs ${col(dg, 'freezes100').join('/')}; ` +
+        `fps ${col(str, 'fps').join('/')} vs ${col(dg, 'fps').join('/')}; streams' target ${str.map((r) => `${r.kbpsTargetMin}-${r.kbpsTargetMax}`).join(', ')} kbps; ` +
+        `FEC overhead ${col(dg, 'overheadPct').join('/')} % (parity ${col(dg, 'parityPct').join('/')} %, shard loss ${col(dg, 'shardLossPct').join('/')} %), ` +
+        `given up ${dg.map((r) => r.fec.lost ?? 0).join('/')}`);
   }
 }
 

@@ -136,7 +136,8 @@ function sendRateReport() {
   }
   if (fb.gen >= 0) flags |= P.RATE_REPORT_FRAME;
   // The video shards (datagram + FEC mode): the host sizes its parity from
-  // their loss.
+  // their loss (the frames fec.js has accounted: received and never received
+  // shards of the same frames).
   if (hostFeatures.includes(P.FEATURE_VIDEO_FEC)) flags |= P.RATE_REPORT_SHARDS;
   fb.sent++;
   const fs = fecRx.stats;
@@ -146,7 +147,7 @@ function sendRateReport() {
     // The decoder's backlog: chunks in the decoder and waiting in front of it
     // (MAX_DECODE_QUEUE), as checkDecoderBacklog counts it.
     decodeQueue: video.inflight.size + video.queue.length,
-    shards: fs.shards, shardsLost: fs.shardsLost,
+    shards: fs.counted, shardsLost: fs.shardsLost,
   }));
 }
 
@@ -271,14 +272,18 @@ async function readAll(stream) {
 // datagrams.
 const fecRx = new FecReceiver({
   deliver: (buf, recv, first, repaired) => onFrameBytes(buf, recv, first, repaired),
-  lost: (gen, seq) => onFecLost(gen, seq),
-  nack: (b) => transport?.sendDatagram(b),
+  lost: (gen, seq, why) => onFecLost(gen, seq, why),
+  // A NACK is due before the frame's give-up time: the transport's input
+  // class where it has one (GUIDE 2.7's send priorities: its telemetry
+  // datagrams are dropped while their queue stands still), else its only
+  // datagram writer.
+  nack: (b) => (transport?.sendInputDatagram ?? transport?.sendDatagram)?.(b),
   rtt: () => clock.minRtt || clock.rtt,
   interval: () => 1000 / (video.cfg?.fps || 60),
 });
 const fecTimer = { id: 0, at: Infinity };
 
-// Runs fecRx's NACKs and give-ups when due.
+// Runs fecRx's NACKs, give-ups and loss accounting when due.
 function fecSchedule() {
   const due = fecRx.nextDue();
   if (due >= fecTimer.at) return;
@@ -299,10 +304,10 @@ function onFecShard(d) {
 
 // A frame sent as shards that could not be rebuilt in time: lost (not
 // reported by the host), at once instead of after the gap timeout.
-function onFecLost(gen, seq) {
+function onFecLost(gen, seq, why) {
   const cfg = video.cfg;
   if (!cfg || gen !== cfg.gen || gen === video.lostGen || seq < video.expectSeq) return;
-  post('log', { text: `frame ${gen}/${seq} lost: its shards could not be rebuilt in time` });
+  post('log', { text: `frame ${gen}/${seq} lost: its shards could not be rebuilt in time (${why})` });
   video.fecLost.add(seq);
   if (video.fecLost.size > 256) video.fecLost.delete(video.fecLost.values().next().value);
   if (video.ready) checkGap();

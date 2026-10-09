@@ -5,9 +5,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -135,8 +140,23 @@ func TestFECLossEstimate(t *testing.T) {
 	if got := s.fecParity(35); got != fec.Parity(35, 0.0291) || got != 4 {
 		t.Errorf("parity at 3 %% loss: %d", got)
 	}
-	// 25 % loss for 2 s: streams.
-	for i := 0; i < 80; i++ {
+	// A reordered report (older counters after newer ones) counts nothing,
+	// and the next one only its own interval: 3000 shards received, 100
+	// lost, each counted once.
+	s.fec.mu.Lock()
+	s.fec.lossSamples = nil
+	s.fec.mu.Unlock()
+	report(shards+2000, lost+100)
+	report(shards+1000, lost) // made before the previous one
+	shards += 3000
+	lost += 100
+	report(shards, lost)
+	if l := s.fec.loss; math.Abs(l-100.0/3100) > 1e-9 {
+		t.Errorf("loss after a reordered report %.4f, want %.4f", l, 100.0/3100)
+	}
+	// 25 % loss for 3 s (the pause rule's 2 s window then holds only it):
+	// streams.
+	for i := 0; i < 120; i++ {
 		shards += 30
 		lost += 10
 		report(shards, lost)
@@ -144,6 +164,81 @@ func TestFECLossEstimate(t *testing.T) {
 	if s.useFEC() {
 		t.Error("shards at 25 % loss")
 	}
+}
+
+// TestFECLossFromReceiver: the client's counters (web/static/js/fec.js
+// FecReceiver on a simulated clock: 20 Mbit/s at 60 fps, 35 data shards per
+// frame with the 2 parity shards of the initial 1 % estimate, 3 % of the
+// shards lost at random, a rate report every 25 ms) give the host its loss
+// estimate within about a second of the first shard: the parity of a
+// 35-shard block reaches 4 by 1 s and stays there, and until enough frames
+// are accounted the estimate is the initial 1 %, never 0 (counting received
+// shards at once and lost ones 2 s later read 0 % for the first 2 s and
+// left the parity at 2 until 3 s). Needs node.
+func TestFECLossFromReceiver(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "fec.js")
+	script := `
+const F = await import(process.argv[1]);
+let seed = 2025;
+const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+const rx = new F.FecReceiver({ deliver: () => {}, lost: () => {}, nack: () => {}, rtt: () => 40, interval: () => 1000 / 60 });
+const frame = new Uint8Array(35 * 1200 - 100);
+const out = [];
+let report = 25;
+for (let i = 0; i < 180; i++) { // 3 s
+  const t0 = (i * 1000) / 60;
+  const dgs = F.cutFrame(frame, 1, i, 1200, () => 2);
+  for (let j = 0; j <= dgs.length; j++) {
+    const t = j < dgs.length ? t0 + j * 0.4 : t0 + 1000 / 60; // paced over the frame interval
+    while (rx.nextDue() <= t) rx.tick(rx.nextDue());
+    while (report <= t) {
+      out.push([report, rx.stats.counted, rx.stats.shardsLost]);
+      report += 25;
+    }
+    if (j < dgs.length && rnd() >= 0.03) rx.shard(dgs[j], t);
+  }
+}
+console.log(JSON.stringify(out));`
+	b, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node: %v %s", err, b)
+	}
+	var reports [][3]float64
+	if err := json.Unmarshal(b, &reports); err != nil || len(reports) < 100 {
+		t.Fatalf("%v: %s", err, b)
+	}
+	s := fecSession(&Config{FEC: FECOn}, proto.Hello{FEC: 1}, "direct", nil)
+	s.fecInit()
+	start := time.Now()
+	first4 := time.Duration(-1)
+	for _, r := range reports {
+		at := time.Duration(r[0] * float64(time.Millisecond))
+		s.fecReport(proto.RateReport{Flags: proto.RateReportShards, Shards: uint32(r[1]), ShardsLost: uint32(r[2])}, start.Add(at))
+		s.fec.mu.Lock()
+		loss := s.fec.loss
+		s.fec.mu.Unlock()
+		p := s.fecParity(35)
+		if p >= 4 && first4 < 0 {
+			first4 = at
+		}
+		switch {
+		case loss < 0.01:
+			t.Errorf("at %v: loss estimate %.2f %% (%v shards counted, %v lost)", at, 100*loss, r[1], r[2])
+		case at >= 1500*time.Millisecond && p < 4:
+			t.Errorf("at %v: parity %d at a loss estimate of %.2f %%", at, p, 100*loss)
+		}
+	}
+	if first4 < 0 || first4 > time.Second {
+		t.Errorf("parity 4 first at %v, want by 1 s", first4)
+	}
+	last := reports[len(reports)-1]
+	t.Logf("parity 4 from %v; after 3 s %v shards counted, %v lost (%.2f %%), estimate %.2f %%", first4, last[1], last[2],
+		100*last[2]/(last[1]+last[2]), 100*s.fec.loss)
 }
 
 // quicPair returns a connected server and client (raw QUIC, the media

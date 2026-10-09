@@ -1667,8 +1667,12 @@ func (s *Session) frameSender() {
 			continue
 		}
 		s.reportDiscards(0) // a frame goes out again: the run before it is complete
+		// Datagram shards (fec.go). They bypass the stream path below, so
+		// GUIDE 2.7's video window (admit, win.sent) must be added to
+		// sendFEC as well when that step is merged (fec.go, "Send
+		// priorities").
 		if s.useFEC() && s.sendFEC(f, n) {
-			continue // sent as datagram shards (fec.go)
+			continue
 		}
 		s.sendOpening.Store(true)
 		s.sendSince.Store(time.Now().UnixNano())

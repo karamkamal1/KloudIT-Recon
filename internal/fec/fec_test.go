@@ -407,8 +407,11 @@ console.log(JSON.stringify(out));`
 // newer frame's shard), again with one spare after the retry time, is completed by fresh
 // parity rows (repairs), or given up (lost) after the give-up time; a frame
 // none of whose shards came (between two that did) is NACKed whole and never
-// reported lost (it may have gone on a stream); the shards that never came
-// are counted once the frame is forgotten.
+// reported lost (it may have gone on a stream); the shards of each frame's
+// first transmission that came and those that never did are counted 100 ms
+// after it (the rate report's pair). A frame NACKed whole and completed by
+// the host's resend is a repaired frame (no delay sample) that arrived from
+// when its gap showed, and all of its first transmission counts as lost.
 func TestJSReceiver(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -457,8 +460,22 @@ rx.shard(F.cutFrame(frame(100, 5), 1, 4, 1200, () => 1)[0], 70); // a newer fram
 log.length = 0;
 run(400);
 out.second = log.slice();
+out.at400 = rx.summary();
 run(3000);
 out.summary = rx.summary();
+// A whole-frame NACK answered by the host's resend (data shards, repair flag).
+const got2 = [];
+const rx2 = new F.FecReceiver({ deliver: (b, t, first, repaired) => got2.push({ len: b.length, t, first, repaired }), lost: () => {}, nack: () => {}, rtt: () => 40, interval: () => 16 });
+const run2 = (t) => { while (rx2.nextDue() <= t) rx2.tick(rx2.nextDue()); };
+F.cutFrame(frame(500, 6), 1, 0, 1200, () => 1).forEach((d) => rx2.shard(d, 0));
+const w1 = frame(3000, 7);
+const d1 = F.cutFrame(w1, 1, 1, 1200, () => 1); // 3 data + 1 parity, all lost
+F.cutFrame(frame(500, 8), 1, 2, 1200, () => 1).forEach((d) => rx2.shard(d, 16)); // frame 1's gap shows at t=16
+run2(20); // its placeholder's whole-frame NACK
+d1.slice(0, 3).forEach((d) => { const s = F.parseShard(d); rx2.shard(F.shardDatagram({ ...s, flags: F.SHARD_REPAIR }, s.data), 60); });
+run2(3000);
+out.resent = got2.find((x) => x.len === 3000) || null;
+out.resentSummary = rx2.summary();
 console.log(JSON.stringify(out));`
 	b, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js)).CombinedOutput()
 	if err != nil {
@@ -467,7 +484,13 @@ console.log(JSON.stringify(out));`
 	var res struct {
 		OpenAfterShards int            `json:"openAfterShards"`
 		Frame0          bool           `json:"frame0"`
+		At400           map[string]int `json:"at400"`
 		Summary         map[string]int `json:"summary"`
+		Resent          *struct {
+			T, First float64
+			Repaired bool
+		} `json:"resent"`
+		ResentSummary map[string]int `json:"resentSummary"`
 	}
 	if err := json.Unmarshal(b, &res); err != nil {
 		t.Fatalf("%v: %s", err, b)
@@ -511,9 +534,21 @@ console.log(JSON.stringify(out));`
 	}
 	s := res.Summary
 	// Shards never received of the first transmissions: frame 0's 3, frame
-	// 3's 2, frame 4's parity.
-	if s["frames"] != 3 || s["lost"] != 1 || s["repaired"] != 1 || s["rebuilt"] != 1 || s["shardsLost"] != 6 || s["open"] != 0 || s["wholeNacks"] < 1 {
+	// 3's 2, frame 4's parity; received: frame 0's 8, frame 2's 2, frame 3's
+	// 2, frame 4's 1. All counted by t=400 (frame 4, the last, complete
+	// without its parity shard and no frame after it: 32 ms quiet + 100 ms).
+	if s["frames"] != 3 || s["lost"] != 1 || s["repaired"] != 1 || s["rebuilt"] != 1 || s["shardsLost"] != 6 || s["counted"] != 13 ||
+		s["open"] != 0 || s["wholeNacks"] < 1 {
 		t.Errorf("summary %v", s)
+	}
+	if a := res.At400; a["shardsLost"] != 6 || a["counted"] != 13 {
+		t.Errorf("at t=400: %d shards counted, %d lost, want 13 and 6", a["counted"], a["shardsLost"])
+	}
+	// The resent frame: repaired (no delay sample), from when its gap showed
+	// (t=16), its first transmission's 4 shards lost.
+	if r, rs := res.Resent, res.ResentSummary; r == nil || !r.Repaired || r.First != 16 || r.T != 60 || rs["repaired"] != 1 ||
+		rs["shardsLost"] != 4 || rs["counted"] != 4 {
+		t.Errorf("resent frame %+v, summary %v", r, rs)
 	}
 }
 

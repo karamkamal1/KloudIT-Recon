@@ -271,11 +271,20 @@ export function shardDatagram(h, payload) {
 // handling takes over, a recovery frame or a key frame). GIVE_UP leaves room
 // for two NACK rounds and stays below the reorder buffer's gap timeout
 // (max(250, 4 x RTT)), which would otherwise decide.
+//
+// The shard loss the host sizes its parity from: a frame's first
+// transmission is accounted (its shards received, and those that never came)
+// accountMs after it is through (sentAt, or its stall), whether or not it
+// completed; both counters cover the same frames, so their ratio is the loss
+// from the first frame on (counting the received shards live and the lost
+// ones only when a frame is forgotten put the loss 2 s behind and read 0 %
+// for the first 2 s). A shard later than that counts as lost.
 const GRACE_MS = 3;
 const quietMs = (interval) => Math.max(20, 2 * interval);
 const retryMs = (rtt) => Math.max(25, 1.5 * rtt);
 const giveUpMs = (rtt) => Math.max(120, 2.5 * rtt + 30);
-const FORGET_MS = 2000; // a frame's bookkeeping (late shards, the loss count) lasts this long
+const accountMs = (rtt) => Math.max(100, 2 * rtt);
+const FORGET_MS = 2000; // a frame's bookkeeping (late shards, duplicates) lasts this long
 const MAX_PLACEHOLDERS = 8; // frames with no shard at all, NACKed whole, per gap
 
 const frameKey = (gen, seq) => gen * 4294967296 + seq;
@@ -283,19 +292,26 @@ const frameKey = (gen, seq) => gen * 4294967296 + seq;
 /**
  * Collects video shards into frames. h: { deliver(buf, recv, first,
  * repaired): a complete frame (its bytes, when its last needed shard arrived,
- * when its first did, whether it needed a NACK), lost(gen, seq): a frame
- * given up, nack(datagram), rtt(): ms,
+ * when its first did, whether it needed a NACK), lost(gen, seq, why): a frame
+ * given up (why: what it lacked, its NACKs and repairs, for the log),
+ * nack(datagram), rtt(): ms,
  * interval(): the frame interval, ms }. Every method takes the time t (ms);
  * the caller runs tick(t) at nextDue() while that is finite.
+ *
+ * stats: shards (first transmissions received, live), counted and
+ * shardsLost (the first-transmission shards of the frames accounted:
+ * received, never received; the rate report's pair), the rest per frame or
+ * datagram.
  */
 export class FecReceiver {
   constructor(h) {
     this.h = h;
     this.frames = new Map(); // frameKey -> entry, oldest first
     this.open = new Set(); // entries neither complete nor given up
+    this.unaccounted = new Set(); // entries (not placeholders) whose first transmission is not yet accounted
     this.top = new Map(); // gen -> newest seq seen
     this.stats = {
-      frames: 0, shards: 0, parity: 0, repairs: 0, shardsLost: 0, rebuilt: 0, repaired: 0, nacks: 0, wholeNacks: 0,
+      frames: 0, shards: 0, parity: 0, repairs: 0, counted: 0, shardsLost: 0, rebuilt: 0, repaired: 0, nacks: 0, wholeNacks: 0,
       lost: 0, unused: 0, bad: 0, bytes: 0, frameBytes: 0,
     };
   }
@@ -312,16 +328,23 @@ export class FecReceiver {
     this.newer(s.gen, s.seq, t);
     const key = frameKey(s.gen, s.seq);
     let e = this.frames.get(key);
-    if (e?.ph) { // a placeholder: the frame's first shard
+    if (e?.ph) { // a placeholder: the frame's first shard (normally the answer to its whole-frame NACK)
+      const ph = e;
       this.frames.delete(key);
-      this.open.delete(e);
-      e = null;
+      this.open.delete(ph);
+      e = this.entry(s, t);
+      // It waited for its NACK: a repaired frame (no delay sample, the
+      // repaired count), arrived from when its gap showed.
+      e.nacks = ph.nacks;
+      e.first = ph.first;
     }
     e ||= this.entry(s, t);
     const b = e.blocks?.find((x) => x.base === s.base);
     if (!b || b.k !== s.k || s.len !== e.len || s.size !== e.size) { st.bad++; return; }
     if (b.seen.has(s.index)) return;
     b.seen.add(s.index);
+    if (s.flags & SHARD_REPAIR) e.repairs++;
+    else b.got++;
     if (b.m < 0) b.m = s.m;
     e.last = t;
     // The frame's last shard of its first transmission (or a repair): every
@@ -345,12 +368,13 @@ export class FecReceiver {
   entry(s, t) {
     const n = Math.ceil(s.len / s.size);
     const e = {
-      gen: s.gen, seq: s.seq, len: s.len, size: s.size, first: t, last: t, sentAt: 0, stallAt: 0, nackAt: 0, nacks: 0,
+      gen: s.gen, seq: s.seq, len: s.len, size: s.size, first: t, last: t, sentAt: 0, stallAt: 0, nackAt: 0, nacks: 0, repairs: 0,
       done: false, lost: false, rebuilt: false, out: new Uint8Array(n * s.size),
-      blocks: blockLayout(n).map(({ base, k }) => ({ base, k, m: -1, seen: new Set(), data: new Uint8Array(k), parity: new Map(), have: 0, done: false })),
+      blocks: blockLayout(n).map(({ base, k }) => ({ base, k, m: -1, seen: new Set(), got: 0, data: new Uint8Array(k), parity: new Map(), have: 0, done: false })),
     };
     this.frames.set(frameKey(s.gen, s.seq), e);
     this.open.add(e);
+    this.unaccounted.add(e);
     return e;
   }
 
@@ -374,7 +398,10 @@ export class FecReceiver {
     this.top.delete(gen);
     this.top.set(gen, seq);
     if (this.top.size > 4) this.top.delete(this.top.keys().next().value);
-    for (const e of this.open) if (e.gen === gen && e.seq < seq && !e.sentAt) e.sentAt = t;
+    // The open frames (an open frame without sentAt has neither stalled nor
+    // been accounted), and the complete ones not yet accounted (their last
+    // parity shards lost).
+    for (const e of this.unaccounted) if (e.gen === gen && e.seq < seq && !e.sentAt) e.sentAt = t;
   }
 
   // Block b has k shards: fill in its missing data shards.
@@ -406,7 +433,7 @@ export class FecReceiver {
     this.h.deliver(out, t, e.first, e.nacks > 0);
   }
 
-  /** Runs the NACKs and give-ups due at t. */
+  /** Runs the NACKs, give-ups and loss accounting due at t. */
   tick(t) {
     const rtt = this.h.rtt() || 50;
     const interval = this.h.interval() || 1000 / 60;
@@ -423,29 +450,40 @@ export class FecReceiver {
         e.lost = true;
         e.out = null;
         this.stats.lost++;
-        this.h.lost(e.gen, e.seq);
+        let short = 0;
+        for (const b of e.blocks) if (!b.done) short += b.k - b.have;
+        this.h.lost(e.gen, e.seq, `${short} shards short after ${e.nacks} NACKs (${e.repairs} repair shards came), ` +
+          `${Math.round(t - e.stallAt)} ms after its shards stopped`);
         continue;
       }
       if (!e.nackAt || t >= e.nackAt + retryMs(rtt)) this.nack(e, t);
     }
-    // Forget frames long done with, counting the shards they never got.
+    for (const e of this.unaccounted) if (t >= this.accountDue(e, rtt, interval)) this.account(e);
+    // Forget frames long done with.
     for (const [key, e] of this.frames) {
       if (t < e.first + FORGET_MS) break;
       if (this.open.has(e)) continue;
       this.frames.delete(key);
-      if (!e.ph) this.account(e);
+      if (this.unaccounted.has(e)) this.account(e);
     }
   }
 
-  // The shards of frame e's first transmission (data and parity sent with
-  // it) that never arrived: a block none of whose shards came counts its
-  // data shards.
+  // When frame e's first transmission is accounted: accountMs after it was
+  // through (its last shard, a newer frame's shard, its stall; a frame with
+  // none of them, complete without its last parity and no frame after it:
+  // once quiet).
+  accountDue(e, rtt, interval) {
+    return (e.sentAt || e.stallAt || e.last + quietMs(interval)) + accountMs(rtt);
+  }
+
+  // Counts the shards of frame e's first transmission (data and parity sent
+  // with it, not repairs) that arrived and those that never did; a block none
+  // of whose shards came (its parity unknown) counts its data shards.
   account(e) {
+    this.unaccounted.delete(e);
     for (const b of e.blocks) {
-      if (b.m < 0) { this.stats.shardsLost += b.k; continue; }
-      let got = 0;
-      for (const i of b.seen) if (i < b.k + b.m) got++;
-      this.stats.shardsLost += b.k + b.m - got;
+      this.stats.counted += b.got;
+      this.stats.shardsLost += Math.max(0, b.k + Math.max(0, b.m) - b.got);
     }
   }
 
@@ -478,6 +516,7 @@ export class FecReceiver {
         due = Math.min(due, e.stallAt + giveUpMs(rtt), e.nackAt + retryMs(rtt));
       }
     }
+    for (const e of this.unaccounted) due = Math.min(due, this.accountDue(e, rtt, interval));
     if (due === Infinity && this.frames.size) due = this.frames.values().next().value.first + FORGET_MS;
     return due;
   }
