@@ -10890,8 +10890,8 @@ is logged once (`cannot keep the display on while streaming`) and the session go
 - AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test: set the power plan's display
   timeout to 1 minute (`powercfg /change monitor-timeout-ac 1`) and `"pipeline": "ffmpeg"` in
   host.json; stream from a browser and, during the stream, `powercfg /requests` (administrator)
-  lists `[PROCESS] ...\recon-host.exe` with `KloudIT Recon is streaming this PC's display` under
-  DISPLAY. Play with only a controller (no mouse or keyboard input on the client) for 3 minutes:
+  lists `[PROCESS] ...\recon-hostw.exe` (the logon task's agent; `recon-host.exe` when started
+  by hand) with `KloudIT Recon is streaming this PC's display` under DISPLAY. Play with only a controller (no mouse or keyboard input on the client) for 3 minutes:
   the display stays on and the stream keeps moving. Hide the tab (another tab in front) for 2
   minutes: `powercfg /requests` no longer lists it and the display may turn off; show the tab and
   move the mouse once: the stream comes back. End the stream: the request is gone. Repeat on the
@@ -11027,3 +11027,16 @@ The price is the rest of one small enhancement frame's bytes ahead of the next f
   fix (record both counts); the overlay's Freezes count stays lower too.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same on an NVENC host whose caps report
   temporal layers (recovery `invalidate`).
+
+### Runs with these changes
+
+Under the shared E2E lock: `go test -run 'TestStreamingDeadlineDrop|TestStreamingFrameLoss'
+./internal/e2e/` passes, and the browser E2E filtered to the scenarios the ladder change touches
+(`E2E_ONLY='loss handling|thinning|fec'`, Chromium 141) passes 33 of 33 checks: the reference
+recovery stand-in cancels its held frame streams at their deadline and recovers every loss with
+a recovery frame (12 of 12, no key frame, no restart); thinning skips the encoder's
+non-reference frames with no loss or key-frame request; the client read the header of every
+reset stream (6 of 6) without partial delivery, as the ladder change assumes. `make
+helper-test` under Wine passes (with `TestQualifyMockSVC`); `go test` of every package but
+`internal/e2e` passes, and `go test -race ./internal/host/...` passes. The whole suite is the
+final step's.
