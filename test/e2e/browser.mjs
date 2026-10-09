@@ -2547,6 +2547,56 @@ async function checkDrawerKeyboard() {
   }
 }
 
+// The dashboard for keyboard and screen-reader users (final review). Its
+// dialogs are named by their titles and their inputs by their labels (a
+// label next to an input names nothing: the account's two password fields
+// had no name at all). The host list, refreshed every 5 s, keeps the focus:
+// rebuilt cards dropped it to the page at every refresh. Here a refresh with
+// a change (the host renamed through the API) rebuilds the card and the
+// focus goes back to the same host's Connect link; one without a change
+// keeps the very element.
+async function checkDashboardA11y() {
+  await page.goto(`${base}/`);
+  await page.waitForSelector('.host.online a.btn-primary');
+  const dialog = async (open, name, labels) => {
+    await open();
+    const d = await page.getByRole('dialog', { name, exact: true }).count();
+    const l = await Promise.all(labels.map((n) => page.getByLabel(n, { exact: true }).count()));
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('#modal-root .modal-bg', { state: 'detached', timeout: 3000 }).catch(() => {});
+    return { name, d, labels: labels.map((n, i) => `${n} ${l[i]}`), ok: d === 1 && l.every((c) => c === 1) };
+  };
+  const res = [
+    await dialog(() => page.click('#add-host'), 'Add a PC', ['Name']),
+    await dialog(() => page.click('.host.online .btn-icon'), 'Manage E2E Test PC', ['Name']),
+    await dialog(() => page.click('#nav-account'), 'Account · admin', ['Current password', 'New password (10+ characters)']),
+    await dialog(async () => { await page.click('#nav-account'); await page.click('.modal button:has-text("Set up 2FA")'); await page.waitForSelector('.modal img.qr'); },
+      'Account · admin', ['Code from the app']),
+  ];
+  check('dashboard: each dialog is named by its title, each input by its label',
+    res.every((r) => r.ok), res.map((r) => `"${r.name}": dialog ${r.d}, ${r.labels.join(', ')}`).join('; '));
+
+  const id = await page.evaluate(() => new URL(document.querySelector('.host.online a.btn-primary').href).searchParams.get('host'));
+  const rename = (name) => page.evaluate(async ([hid, n]) => { const { api } = await import('/js/api.js'); await api('POST', `/api/hosts/${hid}/rename`, { name: n }); }, [id, name]);
+  const where = () => page.evaluate(() => {
+    const a = document.activeElement;
+    return { focus: a?.dataset?.focus || a?.tagName.toLowerCase() || '', marked: !!a?.__e2e, name: document.querySelector('.host.online .host-name')?.textContent };
+  });
+  await page.focus('.host.online a.btn-primary');
+  await page.evaluate(() => { document.activeElement.__e2e = true; });
+  await rename('E2E Test PC renamed');
+  const changed = await until(async () => { const w = await where(); return w.name === 'E2E Test PC renamed' ? w : null; }, 12000, 'the renamed host').catch(() => null);
+  await page.evaluate(() => { document.activeElement.__e2e = true; });
+  await sleep(5600); // a refresh with nothing changed
+  const same = await where();
+  await rename('E2E Test PC');
+  await until(async () => (await where()).name === 'E2E Test PC', 12000, 'the name back').catch(() => {});
+  check('dashboard: the host list refresh keeps the focus (a changed card: the same host\'s Connect link; no change: the same element)',
+    changed?.focus === `${id}:main` && !changed.marked && same.focus === `${id}:main` && same.marked,
+    `after the rename: ${changed ? `focus on ${changed.focus} (${changed.marked ? 'the old element' : 'the new card'})` : 'the card did not change'}; ` +
+      `after a refresh with no change: focus on ${same.focus} (${same.marked ? 'the same element' : 'a new element'})`);
+}
+
 // The paste dialog ("Type text on the host", final review): a modal dialog
 // named by its title, its text box named; Tab and Shift+Tab stay in it,
 // Escape closes it back to the stage, and no Tab or Escape reaches the PC
@@ -4346,6 +4396,7 @@ try {
   await until(async () => (await page.$$('.host.online')).length === 1, 60000, 'host online on dashboard');
   await page.screenshot({ path: join(outDir, 'dashboard.png') });
   check('host shows online on the dashboard', true);
+  if (want('dashboard a11y')) await checkDashboardA11y().catch((e) => check('dashboard accessibility scenario', false, e.message));
 
   // 3. Stream over each path -------------------------------------------------
   const scenarios = [

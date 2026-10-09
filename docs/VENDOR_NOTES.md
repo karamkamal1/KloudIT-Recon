@@ -10362,3 +10362,41 @@ WebGPU.
   row WebGL2 or 2D canvas, 0 errors); the client log has `presentation: webgl2 lost its context,
   not restored in 3 s`. Restart Chrome afterwards.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with a GeForce client.
+
+### The dashboard for screen readers and the keyboard
+
+Problem: the dashboard's dialogs (Add a PC, Manage, Account with 2FA set-up, Users) had no
+accessible name, and their labels sat next to their inputs without naming them: the account's
+two password fields had no name at all (no placeholder either), the PC name fields none or only a
+placeholder, the 2FA code only its placeholder. The host list, refreshed every 5 s (every 3 s for
+a minute after a Wake), was rebuilt each time, so a focused Connect, Wake or Manage control was
+removed and the focus fell to the page: keyboard and screen-reader users lost their place every
+few seconds.
+
+Fix: each dialog is named by its title (`aria-labelledby`), each label names its input
+(`for`/`id`; the Users dialog's inputs and the 2FA password by `aria-label`). The host list is
+replaced only when what it shows changed, and then the focus goes back to the same control of
+the same host (Connect or Wake, Manage, Add a PC).
+
+- Verified here: browser E2E checks "dashboard: each dialog is named by its title, each input by
+  its label" (Playwright finds the dialogs Add a PC, Manage E2E Test PC, Account · admin and the
+  inputs Name, Current password, New password (10+ characters), Code from the app by role and
+  label) and "dashboard: the host list refresh keeps the focus" (the host renamed through the API
+  while its Connect link has focus: the card is rebuilt and the focus is on the new card's Connect
+  link; a refresh with no change keeps the very element). Against the old page: no dialog or
+  input found by name, and the focus on the page's body after the refresh.
+- Not GPU-specific (no AMD or NVIDIA step). Test on any client: with Narrator on, open Account:
+  it is read as "Account · <user>, dialog" and the fields as "Current password" and "New password
+  (10+ characters)"; on the machines page Tab to a PC's Connect link and wait 15 s: the focus
+  stays on it.
+
+### Runs of the whole suite with these changes
+
+- Browser E2E, whole suite under the shared lock: 302 checks passed, 1 failed: "WebTransport
+  relay fallback (splice): send priorities … telemetry gives way to input only while the
+  datagram queue stalls" (16 % of the telemetry datagrams dropped against 15 % allowed, 36 %
+  CPU idle). That check does not touch these changes; with the sandbox loaded by other work it
+  fails the same way on the code before them (the splice scenario alone: 21 % dropped at 18 %
+  idle, and 18 % with these changes).
+- `go test ./internal/e2e/` (under the lock), `go test -race ./internal/host/ ./internal/proto/
+  ./internal/gateway/`, `go vet` for linux and windows: pass.

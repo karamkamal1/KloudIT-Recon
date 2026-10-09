@@ -24,13 +24,23 @@ const encoderLabel = (e) => ({
 // ---------------------------------------------------------------------------
 // Modals
 
+// A label and the input it names (for assistive technology: a label next to
+// its input names nothing).
+let ids = 0;
+function field(label, input) {
+  input.id ||= `field-${++ids}`;
+  return [el('label', { for: input.id }, label), input];
+}
+
+// The dialog is named by its title.
 function modal(title, body, actions = []) {
   const root = $('modal-root');
   const close = () => { bg.remove(); document.removeEventListener('keydown', esc); };
   const esc = (e) => { if (e.key === 'Escape') close(); };
+  const titleId = `modal-title-${++ids}`;
   const bg = el('div', { class: 'modal-bg', onclick: (e) => { if (e.target === bg) close(); } },
-    el('div', { class: 'card modal', role: 'dialog', 'aria-modal': 'true' },
-      el('h3', {}, title), body,
+    el('div', { class: 'card modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId },
+      el('h3', { id: titleId }, title), body,
       el('div', { class: 'modal-actions' }, ...actions.map((a) => el('button', { class: a.primary ? 'btn-primary' : a.danger ? 'btn-danger' : '', onclick: () => a.run(close) }, a.label)),
         el('button', { onclick: close }, actions.length ? 'Cancel' : 'Close'))));
   document.addEventListener('keydown', esc);
@@ -77,17 +87,25 @@ function pairingModal(name, code, id) {
 // ---------------------------------------------------------------------------
 // Hosts
 
+// Every 5 s and after a wake. The cards are replaced only when what they show
+// changed, and then the focus goes back to the same control of the same host
+// (data-focus): a removed element drops the focus to the page, so keyboard
+// and screen-reader users lost their place in the list at every refresh.
 async function loadHosts() {
   const { hosts } = await api('GET', '/api/hosts');
   const box = $('hosts');
-  box.replaceChildren();
-  for (const h of hosts || []) box.append(hostCard(h));
+  const next = el('div', {});
+  for (const h of hosts || []) next.append(hostCard(h));
   if (user.admin) {
-    box.append(el('div', { class: 'card host add-host', role: 'button', tabindex: '0', onclick: addHost, onkeydown: (e) => e.key === 'Enter' && addHost() },
+    next.append(el('div', { class: 'card host add-host', role: 'button', tabindex: '0', 'data-focus': 'add', onclick: addHost, onkeydown: (e) => e.key === 'Enter' && addHost() },
       el('div', {}, '+ Add a PC')));
   } else if (!hosts || !hosts.length) {
-    box.append(el('div', { class: 'card empty' }, 'No machines yet. Ask an administrator to add one.'));
+    next.append(el('div', { class: 'card empty' }, 'No machines yet. Ask an administrator to add one.'));
   }
+  if (next.innerHTML === box.innerHTML) return;
+  const focus = box.contains(document.activeElement) ? document.activeElement.dataset.focus : null;
+  box.replaceChildren(...next.childNodes);
+  if (focus) [...box.querySelectorAll('[data-focus]')].find((x) => x.dataset.focus === focus)?.focus();
 }
 
 function hostCard(h) {
@@ -103,14 +121,14 @@ function hostCard(h) {
 
   const actions = el('div', { class: 'host-actions' });
   if (h.online) {
-    actions.append(el('a', { class: 'btn btn-primary', href: `/stream?host=${encodeURIComponent(h.id)}` }, '▶  Connect'));
+    actions.append(el('a', { class: 'btn btn-primary', href: `/stream?host=${encodeURIComponent(h.id)}`, 'data-focus': `${h.id}:main` }, '▶  Connect'));
   } else if (h.canWake) {
-    actions.append(el('button', { class: 'btn-primary', onclick: () => wake(h) }, '⏻  Wake PC'));
+    actions.append(el('button', { class: 'btn-primary', 'data-focus': `${h.id}:main`, onclick: () => wake(h) }, '⏻  Wake PC'));
   } else {
     actions.append(el('button', { class: 'btn-primary', disabled: true }, 'Offline'));
   }
   if (user.admin) {
-    actions.append(el('button', { class: 'btn-icon', title: 'Manage', 'aria-label': 'Manage', onclick: () => manageHost(h) }, '⋯'));
+    actions.append(el('button', { class: 'btn-icon', title: 'Manage', 'aria-label': 'Manage', 'data-focus': `${h.id}:manage`, onclick: () => manageHost(h) }, '⋯'));
   }
   card.append(
     el('div', { class: 'host-top' }, icon, el('div', {},
@@ -132,7 +150,7 @@ async function wake(h) {
 
 function addHost() {
   const name = el('input', { type: 'text', placeholder: 'Gaming PC', maxlength: '64' });
-  modal('Add a PC', el('div', {}, el('label', {}, 'Name'), name), [{
+  modal('Add a PC', el('div', {}, field('Name', name)), [{
     label: 'Create pairing code', primary: true,
     run: async (close) => {
       try {
@@ -148,7 +166,7 @@ function addHost() {
 function manageHost(h) {
   const name = el('input', { type: 'text', value: h.name, maxlength: '64' });
   modal(`Manage ${h.name}`, el('div', {},
-    el('label', {}, 'Name'), name,
+    field('Name', name),
     el('p', { class: 'hint' }, 'Re-pairing issues a new secret and disconnects the current agent until you run the new pairing command on the PC.')), [
     { label: 'Remove', danger: true, run: async (close) => {
       if (!confirm(`Remove ${h.name}? The agent will be disconnected.`)) return;
@@ -173,7 +191,7 @@ function accountModal() {
   const renderTOTP = () => {
     totpBox.replaceChildren();
     if (user.totp) {
-      const pw = el('input', { type: 'password', placeholder: 'Password to confirm' });
+      const pw = el('input', { type: 'password', placeholder: 'Password to confirm', 'aria-label': 'Password to confirm' });
       totpBox.append(el('p', { class: 'hint' }, '✅ Two-factor authentication is on.'), pw,
         el('div', { class: 'modal-actions' }, el('button', { class: 'btn-danger btn-sm', onclick: async () => {
           try { await api('POST', '/api/me/totp/disable', { password: pw.value }); user.totp = false; renderTOTP(); toast('2FA disabled', 'warn'); } catch (e) { toast(e.message, 'error'); }
@@ -186,7 +204,7 @@ function accountModal() {
           totpBox.replaceChildren(
             el('img', { class: 'qr', src: r.qr, alt: 'TOTP QR code' }),
             el('p', { class: 'hint' }, 'Scan with your authenticator, or enter the key manually:'),
-            el('div', { class: 'code-box' }, r.secret), el('label', {}, 'Code from the app'), code,
+            el('div', { class: 'code-box' }, r.secret), ...field('Code from the app', code),
             el('div', { class: 'modal-actions' }, el('button', { class: 'btn-primary btn-sm', onclick: async () => {
               try { await api('POST', '/api/me/totp/enable', { secret: r.secret, code: code.value }); user.totp = true; renderTOTP(); toast('2FA enabled', 'ok'); } catch (e) { toast(e.message, 'error'); }
             } }, 'Enable')));
@@ -197,7 +215,7 @@ function accountModal() {
   modal(`Account · ${user.username}`, el('div', {},
     el('div', { class: 'gtitle hint' }, 'Two-factor authentication'), totpBox,
     el('hr', { class: 'sep' }),
-    el('label', {}, 'Current password'), cur, el('label', {}, 'New password (10+ characters)'), nw,
+    field('Current password', cur), field('New password (10+ characters)', nw),
     el('div', { class: 'modal-actions' }, el('button', { class: 'btn-sm', onclick: async () => {
       try { await api('POST', '/api/me/password', { current: cur.value, new: nw.value }); cur.value = nw.value = ''; toast('Password changed — other sessions were signed out', 'ok'); } catch (e) { toast(e.message, 'error'); }
     } }, 'Change password'))));
@@ -211,8 +229,8 @@ async function usersModal() {
       if (!confirm(`Delete ${u.username}?`)) return;
       await api('DELETE', `/api/users/${encodeURIComponent(u.username)}`); closeM(); usersModal();
     } }, 'Delete')))));
-  const name = el('input', { type: 'text', placeholder: 'username' });
-  const pw = el('input', { type: 'password', placeholder: 'password (10+ chars)' });
+  const name = el('input', { type: 'text', placeholder: 'username', 'aria-label': 'New user name' });
+  const pw = el('input', { type: 'password', placeholder: 'password (10+ chars)', 'aria-label': 'New user password (10+ characters)' });
   const adm = el('input', { type: 'checkbox' });
   const closeM = modal('Users', el('div', {},
     el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'User'), el('th', {}, 'Role'), el('th', {}, '2FA'), el('th', {}, 'Last login'), el('th', {}))), rows),
