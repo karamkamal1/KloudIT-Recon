@@ -9286,3 +9286,25 @@ Fix:
      For a quick check, append 20 MB to host.log with the agent stopped, then start the agent: it
      is rotated at once.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### Runs of the whole suite with these changes
+
+- Go: `go vet` (Linux and Windows), `go test` of every package; `go test -race` of
+  `internal/host` and `cmd/recon-host`. The Go integration test (`internal/e2e`, under the E2E
+  lock) passed with the final code. An earlier run, with only the direct-path change, failed
+  `TestStreamingFrameLoss` on the known 7-frame queue overflow under load (2.5 above).
+- Browser E2E, final code: 280 of 284 checks passed. An earlier full run, with the takeover
+  change but not the last two, passed 281 of 284. Every failed check was load-bound and passed
+  in the other run or in a rerun of its scenario:
+  - steady playback or decoding frame rates (17-21 % CPU idle);
+  - the loss scenario's two 20 s checks (13.8 fps: only 3 frames delayed);
+  - the 3.5 drop test (0 frames decoded, known above);
+  - "WebTransport relay fallback (splice): send priorities ... telemetry gives way" (more than
+    15 % of telemetry dropped).
+
+  The last one failed in most runs of that afternoon. Six interleaved runs of the splice
+  scenario, without and with the rate-log change, dropped 117, 143 and 42 datagrams without it
+  and 213, 139 and 78 with it. One run on each side failed. The run with 213 drops made no rate
+  change at all, so it never ran the changed code. With the tree before these changes (the
+  direct-path commit) two runs passed with 99 and 27 drops. This is the borderline that
+  6ca6e5a already widened for the direct path.
