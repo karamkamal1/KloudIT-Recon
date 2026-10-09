@@ -4040,6 +4040,17 @@ delivery"):
   cancel (rung 1, a discarded or failed stream) then goes out as RESET_STREAM_AT with that
   reliable size: the client still gets the prefix (quic-go retransmits it if lost), the rest
   never. host.log `frame stream cancelled ... reliable_bytes=N` (0 without partial delivery).
+  The boundary is set under frameSender's send-state lock and only while the stream is still
+  being written (`sendState.markReliable`; review fix): every `CancelWrite` of a frame stream
+  follows its leaving that state under the same lock, so the boundary never follows the reset.
+  quic-go's `SetReliableBoundary` has no check for a reset stream: after `CancelWrite` it would
+  raise the reliable size behind the RESET_STREAM_AT already queued (a lost one is then not sent
+  again and the stream never completes; with nothing marked before, the ACK of its data panics
+  on a negative frame count). A stream the ladder cancels between the header write and the
+  boundary is reset with nothing marked and gets no more writes, and `reliable_bytes` is what
+  the reset delivers. `codec.ParamSetsLen` stops at the first slice / frame OBU (review fix: it
+  scanned every NAL unit of the key frame first, ~0.55-0.75 ms per MiB on the sandbox, 1-2 MB
+  4K IDRs delayed by that; now ~90 ns, `BenchmarkParamSetsLenHEVC1MB`).
   Cost: with two writes the header can leave in a small packet of its own (at most one extra
   packet per frame), and a cancelled stream's header is retransmitted if lost. Not negotiated:
   one write per frame and plain RESET_STREAM, byte for byte as before.
@@ -4095,6 +4106,16 @@ Verified in the sandbox (Linux, no GPU, loopback):
   generation's family. `internal/codec` `TestParamSetsLen` (hand-made H.264 / HEVC / AV1 frames,
   P-frames, garbage) and the prefix check on real libx264, libx265 and libaom key frames: the
   prefix holds all parameter sets, the rest none.
+- Review fixes: `TestFrameSenderPartialCancelBeforeBoundary` cancels a frame (rung 1) on the
+  writing goroutine right after its header write returns, before the boundary: the stream is
+  reset with no boundary and nothing more written, logged `reliable_bytes=0`. Before the fix the
+  fake stream recorded `SetReliableBoundary` after `CancelWrite` (the reviewer's quic-go test:
+  `panic: numOutStandingFrames negative` on raw QUIC, a RESET_STREAM_AT never retransmitted on
+  WebTransport). `TestParamSetsLenScan`: the early-stopping scan gives the full scan's answer
+  on 40000 random mixes of start codes, zeros, parameter sets, slices and other units (H.264 and
+  HEVC); `BenchmarkParamSetsLenHEVC1MB` 745 us/op before, 91 ns/op after. `internal/e2e` passes
+  as before: `TestStreamingDeadlineDrop` 7 of 7 cancelled streams delivered their header,
+  logged `reliable_bytes=46`.
 - `internal/e2e` `TestStreamingDeadlineDrop` (real gateway and host agent, a webtransport-go
   client, which negotiates RESET_STREAM_AT; test hook `delay=every:23:150ms,ref-recovery`): the
   host logs `reset_stream_at=yes` for the direct session, and every frame stream cancelled at its

@@ -271,7 +271,8 @@ type outFrame struct {
 	st transport.SendStream
 	// Partial delivery (GUIDE 2.4, Session.writeFrame): the prefix of the
 	// stream to mark reliable (0: none, the connection has no partial
-	// delivery) and how much of it was written and marked.
+	// delivery) and how much of it was written and marked
+	// (sendState.markReliable: before the stream left outWriting).
 	reliable int
 	relSent  atomic.Int32
 	n        uint64 // its number among the frames taken: a frame taken later is newer
@@ -330,6 +331,25 @@ func (s *sendState) finish(of *outFrame, state int32) bool {
 		return false
 	}
 	s.remove(of)
+	return true
+}
+
+// markReliable marks the n bytes written to a frame stream so far reliable
+// (GUIDE 2.4, Session.writeFrame) unless the ladder cancelled it first;
+// false then. Every CancelWrite of a frame stream follows its leaving
+// outWriting under s.mu, so the boundary never follows the reset: quic-go
+// would keep the RESET_STREAM_AT it queued with the reliable size of the
+// moment (a lost one is not sent again and the stream never completes; with
+// none marked before, the ACK of its data panics). relSent, which the cancel
+// log reads, is what the reset delivers.
+func (s *sendState) markReliable(of *outFrame, n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if of.state.Load() != outWriting {
+		return false
+	}
+	of.st.SetReliableBoundary()
+	of.relSent.Store(int32(n))
 	return true
 }
 

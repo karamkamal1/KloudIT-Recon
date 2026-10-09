@@ -73,13 +73,16 @@ func TestParseTestFaults(t *testing.T) {
 // still: their writes block until CancelWrite or release. partial: the peer
 // negotiated RESET_STREAM_AT (transport.PartialDelivery); a stalled stream
 // then takes the writes before its reliable boundary at once, as quic-go
-// takes a small write whatever holds the rest back.
+// takes a small write whatever holds the rest back. afterWrite: run after
+// the first write to the stream numbered so returns (on the writing
+// goroutine): what another goroutine does before the writer's next call.
 type fakeConn struct {
 	transport.Conn
-	mu      sync.Mutex
-	streams []*fakeStream
-	stall   map[int]bool
-	partial bool
+	mu         sync.Mutex
+	streams    []*fakeStream
+	stall      map[int]bool
+	partial    bool
+	afterWrite map[int]func()
 }
 
 func (c *fakeConn) PartialDelivery() bool { return c.partial }
@@ -87,7 +90,7 @@ func (c *fakeConn) PartialDelivery() bool { return c.partial }
 func (c *fakeConn) OpenUniStreamSync(context.Context) (transport.SendStream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st := &fakeStream{partial: c.partial, streamState: streamState{boundary: -1}}
+	st := &fakeStream{partial: c.partial, afterWrite: c.afterWrite[len(c.streams)], streamState: streamState{boundary: -1}}
 	if c.stall[len(c.streams)] {
 		st.release, st.reset = make(chan struct{}), make(chan struct{})
 	}
@@ -122,6 +125,7 @@ type fakeStream struct {
 	partial        bool
 	release, reset chan struct{} // a stalled stream (fakeConn.stall)
 	resetOnce      sync.Once
+	afterWrite     func() // fakeConn.afterWrite
 }
 
 type streamState struct {
@@ -129,8 +133,9 @@ type streamState struct {
 	closed, cancelled bool
 	doneAt            time.Time // closed or cancelled
 	// boundary: the bytes marked reliable by the last SetReliableBoundary
-	// (-1: never called), in calls.
-	boundary, boundaries int
+	// (-1: never called), in calls; late: calls after CancelWrite (quic-go
+	// then breaks the RESET_STREAM_AT it queued: the host must make none).
+	boundary, boundaries, late int
 }
 
 // delivered is what the peer gets of a finished stream: all of it, or of a
@@ -157,8 +162,13 @@ func (s *fakeStream) Write(b []byte) (int, error) {
 		}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.data = append(s.data, b...)
+	after := s.afterWrite
+	s.afterWrite = nil
+	s.mu.Unlock()
+	if after != nil {
+		after()
+	}
 	return len(b), nil
 }
 func (s *fakeStream) Close() error {
@@ -180,6 +190,9 @@ func (s *fakeStream) SetReliableBoundary() {
 	s.mu.Lock()
 	s.boundary = len(s.data)
 	s.boundaries++
+	if s.cancelled {
+		s.late++
+	}
 	s.mu.Unlock()
 }
 

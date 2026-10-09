@@ -145,6 +145,52 @@ func TestFrameSenderPartialDelivery(t *testing.T) {
 	}
 }
 
+// A frame stream the ladder cancels between the write of its reliable
+// prefix and the boundary (checkOut runs at stream deadlines and on the
+// control and video event goroutines) is reset with nothing marked and
+// nothing more written. A boundary after the reset would break quic-go's
+// bookkeeping of the RESET_STREAM_AT it queued: a lost reset not sent again,
+// a stream that never completes, or (nothing marked before) a panic on the
+// ACK of its data. The cancel log says what the reset delivers: nothing.
+func TestFrameSenderPartialCancelBeforeBoundary(t *testing.T) {
+	s, c, _ := testSession(t, testFaults{})
+	s.hello.V = proto.HelloVersionFrameExt
+	c.partial, s.partial = true, true
+	logs := &lockedLog{}
+	s.log = slog.New(slog.NewTextHandler(logs, nil))
+	s.video = &ladderPipeline{caps: media.PipelineCaps{ForceIDR: true, Recovery: proto.RecoveryInvalidate}, events: make(chan media.VideoEvent)}
+	s.healConfig(&proto.VideoConfig{Gen: 1, Family: codec.HEVC, Recovery: proto.RecoveryInvalidate}, 0)
+	s.setCongestionTarget(media.Params{BitrateKbps: 20000, FPS: 60}) // deadline 33 ms
+	payload := func(seq uint32) []byte { return bytes.Repeat([]byte{byte(seq)}, 100) }
+	c.afterWrite = map[int]func(){1: func() {
+		// Frame 1's header is written, not yet marked: the frame is past
+		// its deadline and a newer one is ready (rung 1).
+		time.Sleep(50 * time.Millisecond)
+		s.frameQ <- &media.Frame{Gen: 1, Seq: 2, Data: payload(2)}
+		s.checkOut()
+	}}
+	go s.frameSender()
+	for seq := uint32(0); seq < 2; seq++ {
+		s.frameQ <- &media.Frame{Gen: 1, Seq: seq, Data: payload(seq)}
+	}
+	st := waitStreams(t, c, 2)
+	if !st[0].closed || st[0].boundaries != 1 {
+		t.Fatalf("frame 0: %+v", st[0])
+	}
+	x := st[1]
+	if !x.cancelled || x.late != 0 || x.boundaries != 0 {
+		t.Fatalf("frame 1 cancelled after its header was written: cancelled %v, %d boundaries, %d after the reset; want a reset and none",
+			x.cancelled, x.boundaries, x.late)
+	}
+	if h, _, p, err := proto.ParseFrame(x.data); err != nil || h.Seq != 1 || len(p) != 0 {
+		t.Errorf("frame 1: %d bytes written (%v, %d payload bytes), want its header alone", len(x.data), err, len(p))
+	}
+	line := logs.lines(`msg="frame stream cancelled" gen=1 seq=1`)
+	if len(line) != 1 || !strings.Contains(line[0], "reliable_bytes=0 ") {
+		t.Errorf("cancel log %q, want reliable_bytes=0", line)
+	}
+}
+
 // reliablePrefix: a P-frame's header alone; a key frame's header and its
 // generation's parameter sets, by the family of the generation it belongs
 // to (the config of a newer generation may come before its frames are sent).

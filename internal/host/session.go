@@ -166,6 +166,9 @@ type sessionStats struct {
 
 var errClosed = errors.New("session closed")
 
+// errFrameCancelled: the ladder cancelled the frame stream being written.
+var errFrameCancelled = errors.New("frame stream cancelled")
+
 func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 	ctx, cancel := context.WithCancel(c.Context())
 	s := &Session{
@@ -1255,7 +1258,8 @@ func (s *Session) checkOut() {
 		}
 		s.stats.cancelled.Add(1)
 		// reliable_bytes: what the reset still delivers (GUIDE 2.4: the
-		// header where the client has partial delivery and it was written).
+		// header where the client has partial delivery and it was marked
+		// before the cancel, sendState.markReliable).
 		s.log.Info("frame stream cancelled", "gen", f.Gen, "seq", f.Seq, "why", c.step.why, "reliable_bytes", c.of.relSent.Load(),
 			"age_ms", c.age.Milliseconds(), "deadline_ms", c.of.deadline.Milliseconds())
 		// The loss first: the reset frees frameSender, whose next frames
@@ -1798,14 +1802,17 @@ func (s *Session) reliablePrefix(f *media.Frame, hdrLen int) int {
 // part of it), to the frame's stream. Under partial delivery (GUIDE 2.4) the
 // reliable prefix goes first, once, and is marked reliable: a CancelWrite
 // after that (rung 1, a failed write) still delivers it, the rest of the
-// frame not. Without it, one write as before.
+// frame not. A stream the ladder cancelled before the mark stays unmarked
+// (sendState.markReliable) and gets no more writes. Without partial
+// delivery, one write as before.
 func (s *Session) writeFrame(of *outFrame, b []byte) error {
 	if n := min(of.reliable, len(b)); n > 0 && of.relSent.Load() == 0 {
 		if _, err := of.st.Write(b[:n]); err != nil {
 			return err
 		}
-		of.st.SetReliableBoundary()
-		of.relSent.Store(int32(n))
+		if !s.send.markReliable(of, n) {
+			return errFrameCancelled
+		}
 	}
 	_, err := of.st.Write(b[of.relSent.Load():])
 	return err

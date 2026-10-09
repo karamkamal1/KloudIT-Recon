@@ -633,27 +633,48 @@ func (p *Params) PrepareKeyFrame(data []byte) []byte {
 func ParamSetsLen(family string, data []byte) int {
 	switch family {
 	case H264, HEVC:
+		// The units in order up to the coded picture, which (most of a
+		// key frame) is not scanned: the host computes this before the
+		// frame goes out.
 		end := 0
-		for _, u := range annexBUnits(data) {
-			n := data[u[0]:u[1]]
-			if len(n) == 0 {
+		for sc := bytes.Index(data, annexBStart); sc >= 0; {
+			start := sc + 3
+			if start >= len(data) {
+				break
+			}
+			// A unit of zeros alone is empty (as SplitAnnexB: trailing
+			// zeros belong to the next start code).
+			z := start
+			for z < len(data) && data[z] == 0 {
+				z++
+			}
+			if z-start >= 2 && z < len(data) && data[z] == 1 {
+				sc = z - 2
 				continue
 			}
 			var vcl, set bool
 			if family == H264 {
-				t := h264Type(n)
+				t := h264Type(data[start:])
 				vcl = (t >= 1 && t <= 5) || t == 14 || (t >= 19 && t <= 21) // slices, prefix NAL, auxiliary / extension slices
 				set = t == 7 || t == 8 || t == 13 || t == 15
 			} else {
-				t := hevcType(n)
+				t := hevcType(data[start:])
 				vcl = t < 32
 				set = t >= 32 && t <= 34
 			}
 			if vcl {
 				break
 			}
+			e := len(data)
+			if sc = bytes.Index(data[start:], annexBStart); sc >= 0 {
+				sc += start
+				e = sc
+				for e > start && data[e-1] == 0 {
+					e--
+				}
+			}
 			if set {
-				end = u[1]
+				end = e
 			}
 		}
 		return end
@@ -677,32 +698,8 @@ func ParamSetsLen(family string, data []byte) int {
 	return 0
 }
 
-// annexBUnits returns the [start, end) offsets of the NAL units in an
-// Annex-B buffer, start codes excluded (as SplitAnnexB: trailing zeros
-// belong to the next start code).
-func annexBUnits(b []byte) [][2]int {
-	var units [][2]int
-	start := -1
-	for i := 0; i+2 < len(b); {
-		if b[i] != 0 || b[i+1] != 0 || b[i+2] != 1 {
-			i++
-			continue
-		}
-		if start >= 0 {
-			end := i
-			for end > start && b[end-1] == 0 {
-				end--
-			}
-			units = append(units, [2]int{start, end})
-		}
-		i += 3
-		start = i
-	}
-	if start >= 0 && start < len(b) {
-		units = append(units, [2]int{start, len(b)})
-	}
-	return units
-}
+// annexBStart is the 3-byte start code in front of every Annex-B NAL unit.
+var annexBStart = []byte{0, 0, 1}
 
 // ---------------------------------------------------------------------------
 

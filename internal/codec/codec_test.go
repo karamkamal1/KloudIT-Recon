@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,6 +148,100 @@ func TestParamSetsLen(t *testing.T) {
 	} {
 		if got := ParamSetsLen(tc.family, tc.data); got != tc.want {
 			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// paramSetsLenAll is ParamSetsLen of Annex-B data as a scan of every unit
+// (SplitAnnexB's offsets) would compute it: TestParamSetsLenScan's reference.
+func paramSetsLenAll(family string, data []byte) int {
+	var units [][2]int
+	start := -1
+	for i := 0; i+2 < len(data); {
+		if data[i] != 0 || data[i+1] != 0 || data[i+2] != 1 {
+			i++
+			continue
+		}
+		if start >= 0 {
+			end := i
+			for end > start && data[end-1] == 0 {
+				end--
+			}
+			units = append(units, [2]int{start, end})
+		}
+		i += 3
+		start = i
+	}
+	if start >= 0 && start < len(data) {
+		units = append(units, [2]int{start, len(data)})
+	}
+	end := 0
+	for _, u := range units {
+		n := data[u[0]:u[1]]
+		if len(n) == 0 {
+			continue
+		}
+		var vcl, set bool
+		if family == H264 {
+			t := h264Type(n)
+			vcl, set = (t >= 1 && t <= 5) || t == 14 || (t >= 19 && t <= 21), t == 7 || t == 8 || t == 13 || t == 15
+		} else {
+			t := hevcType(n)
+			vcl, set = t < 32, t >= 32 && t <= 34
+		}
+		if vcl {
+			break
+		}
+		if set {
+			end = u[1]
+		}
+	}
+	return end
+}
+
+// ParamSetsLen of an Annex-B frame stops at the coded picture (most of a
+// key frame, not read): the same answer as a scan of every unit on random
+// mixes of start codes, zeros, parameter sets, slices and other units.
+func TestParamSetsLenScan(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	parts := map[string][][]byte{
+		H264: {{0x09, 0xf0}, {0x06, 5}, {0x67, 0x64}, {0x68, 0xee}, {0x6d}, {0x6f}, {0x65, 0x88}, {0x41, 0x9a}, {0x74}, {0x01}, {0x00, 0x05}},
+		HEVC: {{0x46, 0x01}, {0x40, 0x01}, {0x42, 0x01}, {0x44, 0x01}, {0x4e, 0x01}, {0x26, 0x01}, {0x02, 0x01}, {0x00, 0x01}, {0x48, 0x01}},
+	}
+	for _, family := range []string{H264, HEVC} {
+		for i := 0; i < 20000; i++ {
+			var b []byte
+			for k := r.IntN(10); k >= 0; k-- {
+				switch r.IntN(5) {
+				case 0:
+					b = append(b, 0, 0, 1)
+				case 1:
+					b = append(b, 0, 0, 0, 1)
+				case 2:
+					b = append(b, make([]byte, r.IntN(4))...)
+				case 3:
+					b = append(b, byte(r.IntN(4)), byte(r.IntN(256)))
+				default:
+					ps := parts[family]
+					b = append(b, ps[r.IntN(len(ps))]...)
+				}
+			}
+			if got, want := ParamSetsLen(family, b), paramSetsLenAll(family, b); got != want {
+				t.Fatalf("%s % x: %d, want %d", family, b, got, want)
+			}
+		}
+	}
+}
+
+// A large HEVC key frame (VPS/SPS/PPS, one IDR slice of 1 MiB): the host
+// computes its reliable prefix before the frame goes out (GUIDE 2.4).
+func BenchmarkParamSetsLenHEVC1MB(b *testing.B) {
+	ps := JoinAnnexB([]byte{0x40, 0x01, 0x0c}, []byte{0x42, 0x01, 0x01}, []byte{0x44, 0x01, 0xc1})
+	key := append(ps, JoinAnnexB(append([]byte{0x26, 0x01}, bytes.Repeat([]byte{0xaf, 0x00, 0x13}, 1<<20/3)...))...)
+	b.SetBytes(int64(len(key)))
+	for b.Loop() {
+		if ParamSetsLen(HEVC, key) != len(ps) {
+			b.Fatal("wrong prefix")
 		}
 	}
 }
