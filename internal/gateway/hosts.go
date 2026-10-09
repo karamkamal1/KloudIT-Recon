@@ -105,7 +105,7 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 	key := make([]byte, 32)
 	_, _ = rand.Read(key)
 	hc := &hostConn{id: h.ID, conn: conn, ctrl: st, directKey: key, remoteIP: ip, connected: time.Now(), info: reg}
-	if err := hc.send(proto.TunnelMsg{T: "registered", DirectKey: base64.StdEncoding.EncodeToString(key)}); err != nil {
+	if err := hc.send(proto.TunnelMsg{T: "registered", DirectKey: base64.StdEncoding.EncodeToString(key), Now: time.Now().UnixMilli()}); err != nil {
 		conn.CloseWithError(1, "")
 		return
 	}
@@ -144,7 +144,8 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 		s.log.Info("host offline", "host", h.Name)
 	}()
 
-	// Keep-alive pings and message loop.
+	// Keep-alive pings and message loop. The pings carry the gateway's clock,
+	// which host tickets' expiry is checked against.
 	go func() {
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()
@@ -153,7 +154,7 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if hc.send(proto.TunnelMsg{T: "ping"}) != nil {
+				if hc.send(proto.TunnelMsg{T: "ping", Now: time.Now().UnixMilli()}) != nil {
 					conn.CloseWithError(1, "")
 					return
 				}

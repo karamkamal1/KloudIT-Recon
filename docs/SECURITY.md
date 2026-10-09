@@ -16,7 +16,12 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   (below).
 - A **host** trusts the gateway whose tunnel certificate matches the SPKI pin in its pairing code,
   plus any browser presenting a valid gateway-signed direct ticket (or relay ticket, bound to the
-  relay allocation the browser arrives through).
+  relay allocation the browser arrives through). A ticket's 60 s run on the gateway's clock: the
+  host checks the expiry against the gateway's time from the tunnel (its `registered` message and
+  pings), advanced on the host's monotonic clock, and keeps used nonces until then. The
+  estimate lags the gateway's clock by the message's transit time, so a ticket lives that much
+  longer at most. With a gateway from before this (no time in the tunnel), the host allows 2
+  minutes past the expiry on its own clock and keeps the nonces as long.
 
 ## Authentication
 

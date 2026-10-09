@@ -1202,11 +1202,19 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
    which verifies the PC's certificate by hash. Its first control message carries the ticket.
 4. The host verifies the HMAC, expiry, host ID and nonce (single use), and checks that the ticket's
    origin equals the WebTransport `Origin` header. Unauthenticated sessions are capped at 8 and
-   time out after 10 s.
+   time out after 10 s. The expiry is the gateway's time, so the host checks it against the
+   gateway's clock: the tunnel's `registered` message and its pings (every 15 s) carry the
+   gateway's time (`now`, Unix ms), which the host advances on its monotonic clock. A PC clock
+   minutes off the gateway's (time sync off or stale) does not refuse every ticket. With a
+   gateway from before that (no `now`), tickets get 2 minutes of slack on the PC's clock.
 
 If the direct connection doesn't succeed within 2.5 s, the client falls back to the UDP relay
 (3 s), then to the QUIC splice relay over WebTransport (6 s), then to WebSocket. Each path uses
-its own single-use ticket. The direct path is always tried first: on a LAN, or over Tailscale /
+its own single-use ticket. When the host refuses the ticket of the direct path or the UDP relay,
+it sends `{"t":"error","msg":"unauthorized"}`, waits up to 0.5 s for the client to end the
+session (so the refusal is not reset in flight) and closes it with code 4 (`CodeAuth`). The
+client's next attempts then leave out both paths for 10 minutes and go on to the splice relay,
+whose ticket the gateway checks. The direct path is always tried first: on a LAN, or over Tailscale /
 WireGuard (subnet routing to the PC's address, or `directAddr` set to the PC's tailnet address),
 the browser reaches the PC without the gateway in the media path. The relay is the last resort.
 

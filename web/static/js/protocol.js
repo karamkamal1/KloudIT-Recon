@@ -4,6 +4,9 @@
 export const KIND_CONTROL = 0x43; // 'C'
 export const KIND_INPUT = 0x49; // 'I'
 
+// WebTransport session close codes (mirror of internal/transport Code*).
+export const CLOSE_AUTH = 4; // the host refused the hello's ticket (direct path, UDP relay)
+
 export const WS_CONTROL = 0;
 export const WS_INPUT = 1;
 export const WS_FRAME = 2;

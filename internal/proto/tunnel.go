@@ -28,6 +28,10 @@ type TunnelMsg struct {
 
 	// registered (gateway -> host)
 	DirectKey string `json:"directKey,omitempty"` // base64, HMAC key for direct-path tickets
+	// registered, ping (gateway -> host): the gateway's clock in Unix
+	// milliseconds. The gateway sets DirectTicket.Exp by its clock, and the
+	// host checks the expiry against it. Absent: an older gateway.
+	Now int64 `json:"now,omitempty"`
 
 	// open (gateway -> host): a relay data connection (QUIC splice)
 	// relay (gateway -> host): a UDP relay allocation; SID is its ID, Nonce

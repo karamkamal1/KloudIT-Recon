@@ -9538,6 +9538,65 @@ Fix:
   direct-path commit) two runs passed with 99 and 27 drops. This is the borderline that
   6ca6e5a already widened for the direct path.
 
+### Tickets expire by the gateway's clock
+
+Problem: the gateway sets a ticket's expiry (60 s) by its clock, and the PC checked it against its
+own clock with no margin. A PC clock 60 s or more ahead of the gateway's refused every direct and
+UDP-relay ticket. The browser took the refusal (`unauthorized`, after the transport was up) for
+a lost connection and retried the same path 6 times, then showed "Disconnected": it never reached
+the splice relay or WebSocket, whose tickets the gateway checks. host.log only said `direct
+ticket: ticket expired or for another host`. The clean trigger is a skew between about a minute
+and an hour (Windows time sync off or stale, a clock set a few minutes fast). Above an hour the
+browser first rejects the host's certificate as not yet valid (it is backdated one hour) and goes
+on to the splice relay.
+
+Fix:
+- Gateway: the tunnel's `registered` message and its pings (every 15 s) carry the gateway's
+  clock, `now` in Unix ms (`proto.TunnelMsg.Now`; older hosts ignore it).
+- Host (`Agent.ticketNow`): the expiry, and how long a used nonce is kept, are checked against
+  the gateway's clock: its last `now` plus the time since on the monotonic clock, so a PC clock
+  stepped meanwhile does not matter either. The estimate only lags the gateway's clock, by the
+  message's transit time. With a gateway from before this (no `now`), a ticket gets 2 minutes of
+  slack on the PC's clock (`ticketSkew`), and nonces are kept as long.
+- The refusal reaches the client: the host writes it (`{"t":"error","msg":"unauthorized"}`) and
+  waits up to 0.5 s (`byeGrace`) for the client to end the session, then closes it with code 4
+  (`CodeAuth`), as for a takeover's bye. Closing at once reset the control stream with the
+  refusal in flight: in the E2E, 4 of 5 refused attempts looked like a lost connection to the
+  client.
+- Client (`stream-worker.js`, `stream.js`): on the refusal (or a close with code 4, from a host
+  from before this fix) it ends the session, and the next attempts leave out the direct path
+  and the UDP relay for 10 minutes (`skipTicketed`), so Auto and "Relay via gateway" go on to
+  the splice relay. "Direct to PC only" keeps trying the direct path (there is nothing else).
+  This also covers a refusal for another reason.
+
+- Verified here:
+  - `internal/host` `TestTicketExpiryUsesGatewayClock`, with the gateway's clock 10 minutes
+    behind the PC's: a fresh ticket is accepted (with the old check it is refused: "ticket
+    expired or for another host"), its replay and a ticket expired by the gateway's clock are
+    refused. With no gateway clock (an older gateway), a ticket from a gateway 90 s behind is
+    accepted and one expired beyond the slack is refused.
+  - Browser E2E, new scenario "ticket refused" (host test hook `refuse-tickets`: every ticket is
+    refused, as a host with its clock ahead did), Network path Auto: the first attempt goes
+    direct and is refused once (host.log: one `direct ticket: ticket refused`), the retry leaves
+    out the direct path and the UDP relay and streams over `relay-splice`, and `__recon.logs`
+    has `the host refused the direct path's ticket`. While the client could not see the refusal
+    (a first version of this change, whose control loop closed the connection itself on the
+    stream reset, overtaking code 4), every attempt went direct, was refused, and no stream
+    started within 30 s, as before the change; with the host closing at once, 4 of 5 refusals
+    did not reach the client.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test:
+  1. On the PC, Settings > Time & language > Date & time: turn "Set time automatically" off and
+     set the clock 5 minutes ahead. Restart the agent (or wait 15 s for the next ping).
+  2. On the LAN, stream with Network path Auto: the overlay's Transport row reads
+     `webtransport · direct`, no "unauthorized" notice, and host.log has no `direct ticket:`
+     line. With "Relay via gateway" (from outside the LAN, if the UDP relay ports are open): the
+     row reads `· relay`.
+  3. Old-host fallback (optional): with the previous agent build and the clock still 5 minutes
+     ahead, Auto shows one "unauthorized" notice, then streams over `relay-splice`, and
+     `__recon.logs` in DevTools has `the host refused the direct path's ticket`.
+  4. Turn "Set time automatically" back on.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
 ## Final review: security
 
 Findings of the final review's security pass. Each item: the problem, the fix, what was verified

@@ -67,6 +67,11 @@ type Agent struct {
 	mu        sync.Mutex
 	active    *Session
 	directKey []byte
+	// gwClock is the gateway's clock (Unix ms) in its last registered or ping
+	// message and gwClockAt when that arrived (time.Since measures from it on
+	// the monotonic clock); 0: the gateway sends none (older gateways).
+	gwClock   int64
+	gwClockAt time.Time
 	nonces    map[string]int64
 	tunnel    transport.BidiStream // control stream to the gateway
 	tunnelMu  sync.Mutex
@@ -297,7 +302,12 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 	if err := auth.VerifyTicket(key, tok, &t); err != nil {
 		return "", err
 	}
-	now := time.Now().Unix()
+	if a.faults.refuseTickets {
+		return "", errors.New("ticket refused (TEST fault refuse-tickets)")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.ticketNow()
 	if t.HostID != a.pair().HostID || now > t.Exp || t.Nonce == "" {
 		return "", errors.New("ticket expired or for another host")
 	}
@@ -307,8 +317,6 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 	if t.Relay != relay {
 		return "", errors.New("ticket was issued for another path")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	for n, exp := range a.nonces {
 		if exp < now {
 			delete(a.nonces, n)
@@ -319,6 +327,31 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 	}
 	a.nonces[t.Nonce] = t.Exp
 	return t.User, nil
+}
+
+// ticketSkew is how long past its expiry a ticket is still accepted when the
+// gateway does not send its clock (older gateways): the gateway sets the
+// expiry by its clock, and this PC's may run ahead of it.
+const ticketSkew = 2 * time.Minute
+
+// ticketNow is the time, in Unix seconds, ticket expiries are checked against
+// (and used nonces kept until): the gateway's clock as of its last message
+// plus the time since, so a PC clock that runs ahead of the gateway's (time
+// sync off or stale) does not reject every ticket. The estimate errs only
+// towards the past, by the message's transit time. a.mu must be held.
+func (a *Agent) ticketNow() int64 {
+	if a.gwClock <= 0 {
+		return time.Now().Add(-ticketSkew).Unix()
+	}
+	return (a.gwClock + time.Since(a.gwClockAt).Milliseconds()) / 1000
+}
+
+// setGatewayClock records the gateway's clock from a registered or ping
+// message (0: the gateway sends none).
+func (a *Agent) setGatewayClock(ms int64) {
+	a.mu.Lock()
+	a.gwClock, a.gwClockAt = ms, time.Now()
+	a.mu.Unlock()
 }
 
 // Run serves until ctx is cancelled. When it returns, a virtual display a
@@ -494,6 +527,7 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 	a.mu.Lock()
 	a.directKey = key
 	a.mu.Unlock()
+	a.setGatewayClock(resp.Now)
 	a.tunnelMu.Lock()
 	a.tunnel = &quicStreamAdapter{st}
 	a.tunnelMu.Unlock()
@@ -550,6 +584,7 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		}
 		switch m.T {
 		case "ping":
+			a.setGatewayClock(m.Now)
 			a.sendTunnel(proto.TunnelMsg{T: "pong"})
 		case "open":
 			go a.openData(ctx, m)

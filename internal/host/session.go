@@ -308,7 +308,16 @@ func (s *Session) run() error {
 	if s.meta.RequireTicket {
 		user, err := s.a.verifyTicket(s.hello.Ticket, s.meta.Origin, s.meta.Relay)
 		if err != nil {
-			s.sendJSON(proto.Notice{T: "error", Level: "error", Msg: "unauthorized"})
+			// The refusal has to reach the client, which then leaves out the
+			// paths the host authorises: closing the connection resets the
+			// control stream with it in flight. The client ends the session
+			// when it reads it (as on a bye); byeGrace at most.
+			if s.sendJSON(proto.Notice{T: "error", Level: "error", Msg: "unauthorized"}) == nil {
+				select {
+				case <-s.c.Context().Done():
+				case <-time.After(byeGrace):
+				}
+			}
 			s.c.Close(transport.CodeAuth, "unauthorized")
 			return fmt.Errorf("%s ticket: %w", s.meta.Path, err)
 		}

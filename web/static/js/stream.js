@@ -93,6 +93,7 @@ const S = {
   userClosed: false,
   attempts: 0,
   udpRelayFailedAt: -Infinity, // the UDP relay's ports did not answer: try the splice relay first for a while
+  ticketRefusedAt: -Infinity, // the host refused its ticket (direct path, UDP relay): skip those paths for a while
   hdrWithdrawn: {}, // HDR10: codec families whose 10-bit frames this browser could not draw as HDR (this page's connections)
   video: { w: 0, h: 0 },
   videoCfg: null,
@@ -376,6 +377,7 @@ async function connect() {
     prefs: {
       decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, fec: prefs.fec, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
       skipUdpRelay: performance.now() - S.udpRelayFailedAt < 10 * 60 * 1000,
+      skipTicketed: performance.now() - S.ticketRefusedAt < 10 * 60 * 1000,
       ...upscalePrefs(), fsrInput: prefs.fsrInput, // fsrInput: diagnostics only (localStorage), see fsr1.js FSR.input
       ...hdrPrefs(), gamutP3: gamutP3(), hdrWithdrawn: S.hdrWithdrawn,
     },
@@ -432,6 +434,7 @@ function onWorker(m) {
       if (S.logs.length > 200) S.logs.shift();
       break;
     case 'udpRelayFailed': S.udpRelayFailedAt = performance.now(); break;
+    case 'ticketRefused': S.ticketRefusedAt = performance.now(); break;
     case 'connected':
       S.conn = m;
       S.connected = true;

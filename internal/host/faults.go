@@ -62,6 +62,9 @@ import (
 //	                  random share P (0-0.5) of the video shards and repairs,
 //	                  as if the network lost them: the client rebuilds them
 //	                  from parity or NACKs them
+//	refuse-tickets    refuse every ticket (direct path, UDP relay) as a host
+//	                  whose clock runs ahead of the gateway's did: the client
+//	                  goes on to the splice relay
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped, and a frame due for either is never
@@ -88,11 +91,12 @@ type testFaults struct {
 	fecLoss      float64 // Session.writeShards, fecRepairs
 	// thinEvery, thinFor: simulated congestion (thinPressure).
 	thinEvery, thinFor int
+	refuseTickets      bool // Agent.verifyTicket
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0
+		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0 || f.refuseTickets
 }
 
 // thinAt reports whether the nth frame (n from 1) is taken under the
@@ -196,8 +200,13 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: want fec-loss=P with 0 < P <= 0.5", rule)
 			}
 			f.fecLoss = p
+		case "refuse-tickets":
+			if val != "" {
+				return f, fmt.Errorf("%s: refuse-tickets takes no value", rule)
+			}
+			f.refuseTickets = true
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window, thin, fec-loss)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window, thin, fec-loss, refuse-tickets)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

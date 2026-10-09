@@ -2391,6 +2391,25 @@ async function checkTakeover() {
   await endStream();
 }
 
+// Ticket refused (final review): the host refuses the hello's ticket (test
+// hook refuse-tickets), as a host whose clock ran a minute or more ahead of
+// the gateway's did before it checked the expiry against the gateway's
+// clock. The client's next attempt leaves out the paths the host authorises
+// (direct, UDP relay) and streams over the splice relay, whose authorisation
+// is the gateway's; before, it retried the direct path until it gave up.
+async function checkTicketRefused() {
+  const host = await restartHost({ RECON_TEST_FAULTS: 'refuse-tickets' }, 'host-refuse-tickets');
+  const con0 = consoleLines.length;
+  await startStream({ path: 'auto', transport: 'auto' });
+  const path = await page.evaluate(() => window.__recon.conn?.path);
+  const refused = (host.log.match(/ticket refused \(TEST fault refuse-tickets\)/g) || []).length;
+  const note = consoleLines.slice(con0).find((l) => l.includes("path's ticket")) || '';
+  check('ticket refused by the host: the next attempt skips the paths the host authorises and streams over the splice relay',
+    path === 'relay-splice' && refused === 1 && /refused the direct path's ticket/.test(note),
+    `streaming over ${path}; ${refused} refusal(s) in the host log; client: ${note.replace(/^.*?the host/, 'the host').slice(0, 140) || 'no note'}`);
+  await endStream();
+}
+
 // Control and input before the hello (final review): the page may send
 // control messages and input as soon as the transport is up, while the
 // worker's hello still waits for the decoder self-test, and the host takes
@@ -4520,6 +4539,7 @@ try {
   if (want('input host')) await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
+  if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
 

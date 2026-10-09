@@ -31,6 +31,7 @@ const now = () => performance.now();
 let transport = null;
 let prefs = {};
 let byeReason = '';
+let authRefused = false; // the host refused the hello's ticket ("unauthorized", or a close with P.CLOSE_AUTH)
 let hostFeatures = []; // welcome.features
 let renderer = null; // the active presentation path (see Presentation)
 
@@ -481,6 +482,7 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
       uniLoop.catch(() => {});
       try {
         const info = await wt.closed;
+        if (info?.closeCode === P.CLOSE_AUTH) authRefused = true;
         return info?.reason || 'connection closed';
       } catch (e) {
         return e?.message || 'connection lost';
@@ -558,10 +560,14 @@ async function allocateRelay(url) {
 async function connect(ep) {
   const attempts = [];
   const wtOK = typeof WebTransport !== 'undefined' && prefs.transport !== 'websocket';
-  if (wtOK && ep.direct && prefs.path !== 'relay') {
+  // skipTicketed: the host refused a ticket a moment ago (its clock or key
+  // disagrees with the gateway's): the paths the host authorises are left
+  // out for a while, so Auto and Relay reach the splice relay, which the
+  // gateway authorises. Direct only has nothing else to try.
+  if (wtOK && ep.direct && prefs.path !== 'relay' && !(prefs.skipTicketed && prefs.path !== 'direct')) {
     attempts.push(['direct', async () => ({ t: await openWebTransport(ep.direct.url, ep.direct.hashes, 'direct', 2500), ticket: ep.direct.ticket })]);
   }
-  if (wtOK && ep.relay.udp && prefs.path !== 'direct' && !prefs.skipUdpRelay) {
+  if (wtOK && ep.relay.udp && prefs.path !== 'direct' && !prefs.skipUdpRelay && !prefs.skipTicketed) {
     attempts.push(['relay', async () => {
       let a;
       try {
@@ -2255,7 +2261,17 @@ function onControl(m) {
       // bye still in flight.
       transport?.close();
       break;
-    case 'error': post('notice', { level: 'error', msg: m.msg }); break;
+    case 'error':
+      post('notice', { level: 'error', msg: m.msg });
+      // The host refused the hello's ticket. Ending the session tells it
+      // the refusal arrived (it waits for that before it closes the
+      // connection with P.CLOSE_AUTH, which would reset the stream with the
+      // refusal in flight).
+      if (m.msg === 'unauthorized') {
+        authRefused = true;
+        transport?.close();
+      }
+      break;
   }
 }
 
@@ -2475,6 +2491,10 @@ async function start(msg) {
   const watchdogTimer = setInterval(videoWatchdog, 250);
   const statsTimer = setInterval(postStats, 500);
   const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset });
+  if (authRefused && conn.ticket) {
+    post('log', { text: `the host refused the ${transport.path} path's ticket: the next attempts skip the paths it authorises for 10 minutes` });
+    post('ticketRefused', { path: transport.path });
+  }
   clearInterval(pingTimer);
   clearInterval(statsTimer);
   clearInterval(watchdogTimer);
@@ -2485,7 +2505,7 @@ async function start(msg) {
   transport = null;
   // A deliberate "bye" (e.g. another device took over) must not trigger an
   // automatic reconnect, or two clients would keep stealing the session.
-  post('closed', { reason: byeReason || reason, retry: !byeReason });
+  post('closed', { reason: byeReason || (authRefused ? 'The PC refused the connection ticket' : reason), retry: !byeReason });
 }
 
 self.onmessage = (ev) => {
