@@ -73,10 +73,11 @@ type Session struct {
 	ctrlTorn bool      // a control write failed, maybe part-way: no framing to append to (ctrlMu)
 
 	hello       proto.Hello
-	prefsMu     sync.Mutex // guards prefs, monitor, codecWhy, alignNotice and amfFallback
+	prefsMu     sync.Mutex // guards prefs, monitor, codecWhy, codecWarned, alignNotice and amfFallback
 	prefs       proto.Prefs
 	monitor     platform.Monitor
 	codecWhy    string // last codec choice and its reason, logged once
+	codecWarned string // the client's codec setting last warned about as unavailable, sent once
 	hdrChoice   string // last HDR10 decision (chooseHDR), logged once
 	alignNotice string // last coded-size alignment notice, sent once
 	amfFallback string // why the last generation did not use capture "amf", logged once
@@ -741,11 +742,12 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 // negotiateEncoder picks the encoder by configuration, preference and the
 // browser's decoders, for a w x h picture (0, 0: unknown); why says how, for
 // the log; notify: tell the user when the codec they asked for is not
-// available. Automatically: the first tier of autoTiers with a family both
-// ends can use, the family in it by chooseFamily (codec.go: HEVC by default, a
-// family the client decodes clearly faster instead), with software encoding
-// the first in its order. The encoders are the session's (encoders: the
-// native helper's first while the session runs on it).
+// available, once until they ask for another (buildParams runs again for
+// every encoder restart). Automatically: the first tier of autoTiers with a
+// family both ends can use, the family in it by chooseFamily (codec.go: HEVC
+// by default, a family the client decodes clearly faster instead), with
+// software encoding the first in its order. The encoders are the session's
+// (encoders: the native helper's first while the session runs on it).
 func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e media.EncoderInfo, why string, err error) {
 	client := s.clientDecoders()
 	usable := s.usableEncoder
@@ -758,11 +760,24 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e 
 			}
 		}
 	}
+	warned := ""
 	if prefs.Codec != "" && prefs.Codec != "auto" {
 		if e, ok := s.pickEncoder(prefs.Codec, false, nil); ok {
+			if notify {
+				s.prefsMu.Lock()
+				s.codecWarned = ""
+				s.prefsMu.Unlock()
+			}
 			return e, "the client's codec setting", nil
 		}
-		if notify {
+		warned = prefs.Codec
+	}
+	if notify {
+		s.prefsMu.Lock()
+		repeat := warned == s.codecWarned
+		s.codecWarned = warned
+		s.prefsMu.Unlock()
+		if warned != "" && !repeat {
 			s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
 		}
 	}
@@ -2155,7 +2170,8 @@ func (s *Session) frameSender() {
 			// Test hook: this frame arrives late, the next ones on time
 			// (its stream's write stands still meanwhile; rung 1 treats
 			// it as a write the transport holds back).
-			s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay)
+			s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay,
+				"key", f.Key, "recovery", f.Recovery, "discardable", f.Discardable)
 			late := append([]byte(nil), buf...)
 			if of.reliable > 0 {
 				// quic-go takes a small write at once, whatever holds

@@ -381,7 +381,8 @@ func (s *Session) sendFEC(f *media.Frame, n int, num uint64) bool {
 		s.lostFrame(f, "test fault") // as if every shard was lost
 		return true
 	} else if delay > 0 {
-		s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay)
+		s.log.Debug("test fault: delaying frame", "gen", f.Gen, "seq", f.Seq, "delay", delay,
+			"key", f.Key, "recovery", f.Recovery, "discardable", f.Discardable)
 		time.AfterFunc(delay, func() {
 			if !s.writeShards(of, h, fr, dgs, wire, len(buf), false) {
 				s.lostFrame(f, "datagrams failed")

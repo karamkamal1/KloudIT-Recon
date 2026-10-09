@@ -3726,6 +3726,10 @@ async function lossRun(name, faults, seconds, prefs = {}) {
   return {
     name, faults, seconds, cfg, idle, fps: fps.reduce((a, b) => a + b, 0) / Math.max(1, fps.length),
     delayed: (hl.match(/msg="test fault: delaying frame"/g) || []).length,
+    // Of those, the frames rung 1 never cancels: key and recovery frames
+    // (another would have to take their place) and discardable frames (no
+    // other frame references them; thinning leaves out the next ones).
+    delayedKept: (hl.match(/msg="test fault: delaying frame".*? (key=true|recovery=true|discardable=true)/g) || []).length,
     dropped: (hl.match(/msg="frames dropped".*? why="test fault"/g) || []).length,
     restarts: restartsByReason(hl),
     keyRequestReasons: keyRequestsByReason(con),
@@ -3987,7 +3991,10 @@ async function checkLossHandling() {
   // the host cancels it (rung 1: "frame stream cancelled") and treats it as
   // lost; the encoder answers with a recovery frame (rung 2), and the host
   // does not send the frames up to it (the client would discard them; they
-  // are reported dropped). Counted: cancelled frames, recoveries, IDRs (the
+  // are reported dropped). Key and recovery frames are never cancelled, nor
+  // is a delayed discardable frame (one no other frame references: here
+  // libsvtav1's non-reference frames): it goes on late, and thinning leaves
+  // out the next ones. Counted: cancelled frames, recoveries, IDRs (the
   // client's key frames, the host's forced ones) and encoder restarts.
   const r = await lossRun('host-faults-ref', `${LOSS_FAULTS},ref-recovery`, 20);
   const refRestarts = (r.restarts['keyframe request (urgent)'] || 0) + (r.restarts['frame lost (urgent)'] || 0);
@@ -4018,9 +4025,10 @@ async function checkLossHandling() {
       `host restarts: ${counts(r.restarts)}; ${r.fps.toFixed(1)} fps mean over ${r.seconds} s; ${idleNote(r.idle)}`);
   const restartsAll = Object.values(r.restarts).reduce((a, b) => a + b, 0);
   check('loss-recovery ladder: frames held past their deadline are cancelled (rung 1) and recovered without a key frame (rung 2): no IDR, no restart for a loss',
-    r.delayed >= 5 && r.cancelled >= r.delayed - 2 && r.recoveredByFrame >= r.cancelled - 1 && r.recoveredByKey === r.keyFrameLosses &&
+    r.delayed >= 5 && r.cancelled >= r.delayed - r.delayedKept - 2 && r.recoveredByFrame >= r.cancelled - 1 && r.recoveredByKey === r.keyFrameLosses &&
       r.forcedKeys === 0 && refRestarts <= refAllow && r.client.keyFrames <= 1 + restartsAll,
-    `${r.delayed} streams held 200 ms, ${r.cancelled} cancelled at their deadline, ${r.dropped} dropped by the hook; ` +
+    `${r.delayed} streams held 200 ms (${r.delayedKept} of key, recovery or discardable frames: not cancelled), ${r.cancelled} cancelled at their deadline, ` +
+      `${r.dropped} dropped by the hook; ` +
       `recoveries: ${r.recoveredByFrame} by recovery frame, ${r.recoveredByKey} by key frame` +
       `${r.keyFrameLosses ? ` (${r.keyFrameLosses} for a lost generation key frame: nothing to recover from)` : ''}; ` +
       `restarts for a key-frame request ${refRestarts} (the client's requests not for a loss: ${refAllow}); IDRs: ${r.client.keyFrames} decoded by the client ` +

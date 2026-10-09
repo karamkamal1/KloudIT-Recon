@@ -10896,6 +10896,14 @@ for the PCs that have the codec. The page also writes the host's notices to the 
   (the welcome not yet known), none in the page's next session (the drawer's Reconnect); picking
   Auto and 60 fps saves them. Against the old client: the selects read "Auto (best available)"
   and "30 fps", and the warning came in every session (1, 1, 1).
+- Merged with the other round-3 branches: the host sent the warning again at every encoder
+  restart (`buildParams` runs for each; on the FFmpeg path every bitrate change restarts the
+  encoder), so a session under congestion showed it once per rate change. The full browser E2E
+  run after the merge failed this scenario that way: the first session's congestion restarts
+  left 4 warning toasts on screen in the page's next session. The host now sends it once per
+  codec setting in a session (`Session.codecWarned`; again after the client asked for a codec
+  that works or for Auto): `internal/host` `TestCodecWarningOnce` (1 warning for the session's
+  start and two restarts; it failed before with one per restart).
 - Not GPU-specific (no AMD or NVIDIA step). Test on any client: Settings → Codec *AV1* while
   streaming from the RX 7900 XT PC, then connect from the same browser to a PC without an AV1
   encoder (an RX 6000 or GTX 10-series GPU): the codec select reads "AV1 · this PC does not
@@ -11353,6 +11361,14 @@ The price is the rest of one small enhancement frame's bytes ahead of the next f
   discardable frame, is thinned under the backlog and named in seq 4's mask). Before the fix the
   stream was cancelled at its deadline. `TestFrameSenderLadder`, `TestFrameSenderThinning` and
   the other thinning tests pass unchanged.
+- Merged with the other round-3 branches: the browser E2E's "loss-recovery ladder" check still
+  wanted all delayed frames but two cancelled. On its FFmpeg test path libsvtav1's low-delay
+  structure codes frames no other frame references (discardable: `refresh_frame_flags` 0), and
+  some of the frames the hook delays (every 97th) are such frames, which now go on late (full run
+  after the merge: 10 delayed, 6 cancelled, check failed). The test hook's `test fault: delaying
+  frame` debug line now carries `key`, `recovery` and `discardable`, and the check leaves out the
+  frames rung 1 never cancels (the next full run: 9 delayed, 2 of them kept, 7 cancelled:
+  passes; the whole browser E2E then passed, 307 checks).
 - AMD RDNA3 (RX 7900 XT): unverified; needs temporal SVC (caps `maxTemporalLayers` >= 2) and
   `ltr` recovery. Test: with `"logLevel": "debug"`, stream from a browser through `sudo
   ./netem.sh apply capdrop --iface <nic> --port 48100` (0.4) for 2 minutes. host.log: no `frame

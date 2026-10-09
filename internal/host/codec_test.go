@@ -208,6 +208,49 @@ func TestCodecSelectionFailover(t *testing.T) {
 	}
 }
 
+// TestCodecWarningOnce: a codec setting no encoder of the host serves is
+// warned about once, not again at each encoder restart (buildParams runs for
+// every one: the FFmpeg path restarts for each bitrate change); again after
+// the client asked for a codec that works and then for the missing one.
+func TestCodecWarningOnce(t *testing.T) {
+	caps := &media.Caps{Encoders: []media.EncoderInfo{
+		{Name: "libx264", Family: "h264", Vendor: "software"},
+		{Name: "libsvtav1", Family: "av1", Vendor: "software"},
+	}}
+	cfg := &Config{Capture: "test", TestWidth: 960, TestHeight: 540}
+	cfg.Defaults()
+	ctrl := &ctrlRecorder{}
+	s := &Session{
+		a:     &Agent{cfg: cfg, caps: caps, inj: input.NewInjector(nil)},
+		hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: []proto.DecoderInfo{timed("h264", true, 1.5), timed("hevc", true, 2), timed("av1", true, 1.9)}},
+		ctrl:  ctrl, tried: map[string]bool{},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	warnings := func() int {
+		n := 0
+		for _, m := range ctrl.notices(t) {
+			if strings.Contains(m, "not available end-to-end") {
+				n++
+			}
+		}
+		return n
+	}
+	for i, c := range []struct {
+		codec string
+		want  int
+	}{
+		{"hevc", 1}, {"hevc", 0}, {"hevc", 0}, // the session's start, then two restarts
+		{"h264", 0}, {"hevc", 1}, {"auto", 0}, {"hevc", 1},
+	} {
+		if _, err := s.buildParams(proto.Prefs{Codec: c.codec}); err != nil {
+			t.Fatal(err)
+		}
+		if n := warnings(); n != c.want {
+			t.Fatalf("step %d (codec %s): %d warnings, want %d", i, c.codec, n, c.want)
+		}
+	}
+}
+
 // TestCodecSelectionSoftwareEncode: software encoding keeps its order
 // (libx264 first, the cheapest to encode) whatever the client decodes faster,
 // on a host without hardware encoders and on one whose hardware encoders all
