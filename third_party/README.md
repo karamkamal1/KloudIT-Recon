@@ -52,6 +52,18 @@ bitrate. The patch adds one hook and changes nothing when it is unused:
 The application side is `internal/transport` (`WithCongestion`, `MediaControl`) and the media
 controller in `internal/transport/cc`.
 
+It also fixes one bug (not in upstream as of v0.63.0 and its `master`; report it upstream):
+
+- `SendStream.SetReliableBoundary` is a no-op once the stream was reset. Upstream raises the
+  reliable size even after the peer's STOP_SENDING, which zeroed it and the count of
+  outstanding frames: the next ACK or loss of a STREAM frame sent before then takes that count
+  below zero (`panic: numOutStandingFrames negative` in the connection's run loop), and the
+  RESET_STREAM's ACK no longer matches, so the stream never completes. The host calls it after
+  each frame stream's reliable prefix (RESET_STREAM_AT, GUIDE 2.4; `sendState.markReliable`),
+  which a client's STOP_SENDING can precede. After a CancelWrite it would likewise move the
+  reliable size past the one the RESET_STREAM_AT announced. Test:
+  `TestSendStreamResetStreamAtSetReliableBoundaryAfterReset` (`send_stream_test.go`).
+
 ### Updating to a new quic-go release
 
 ```bash
@@ -68,7 +80,7 @@ Then run the tests and commit `third_party/`, `go.mod` and `go.sum` together:
 
 ```bash
 go vet ./... && GOOS=windows go vet ./... && go test ./...
-(cd third_party/quic-go && go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/... && go test -run TestConfig .)
+(cd third_party/quic-go && go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/... && go test -run 'TestConfig|TestSendStream' .)
 third_party/update-quic-go.sh --check
 ```
 
@@ -88,7 +100,8 @@ If the patch no longer applies, port it by hand:
 
 Edit the files in `quic-go/`, then run `third_party/update-quic-go.sh --diff` to regenerate
 `quic-go.patch` (the diff against the pristine release) and `--check` to confirm the tree and the
-patch agree. Keep the patch to the hook: it is re-applied on every upstream release.
+patch agree. Keep the patch to the hook and that fix: it is re-applied on every upstream release
+(drop the fix once upstream has one).
 
 ### CI
 

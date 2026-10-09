@@ -1808,6 +1808,91 @@ func testSendStreamResetStreamAtStopSendingAfterCancelation(t *testing.T, loseRe
 	cf3.Handler.OnAcked(cf3.Frame)
 }
 
+func TestSendStreamResetStreamAtSetReliableBoundaryAfterReset(t *testing.T) {
+	t.Run("STOP_SENDING, STREAM frame acknowledged", func(t *testing.T) {
+		testSendStreamResetStreamAtSetReliableBoundaryAfterStopSending(t, false)
+	})
+	t.Run("STOP_SENDING, STREAM frame lost", func(t *testing.T) {
+		testSendStreamResetStreamAtSetReliableBoundaryAfterStopSending(t, true)
+	})
+	t.Run("CancelWrite", testSendStreamResetStreamAtSetReliableBoundaryAfterCancelWrite)
+}
+
+// A STOP_SENDING while a STREAM frame is in flight, then SetReliableBoundary (the
+// application has not seen the reset yet) and CancelWrite (it has): the stream
+// stays reset with a reliable size of 0, the in-flight frame's acknowledgment or
+// loss is ignored (it used to take numOutstandingFrames below 0: a panic), and
+// the acknowledgment of the RESET_STREAM completes the stream.
+func testSendStreamResetStreamAtSetReliableBoundaryAfterStopSending(t *testing.T, loseStreamFrame bool) {
+	mockCtrl := gomock.NewController(t)
+	mockFC := newTestStreamFlowControllerWithSendWindow(42, protocol.MaxByteCount)
+	mockSender := NewMockStreamSender(mockCtrl)
+	str := newSendStream(context.Background(), 1337, mockSender, mockFC, true)
+
+	mockSender.EXPECT().onHasStreamData(protocol.StreamID(1337), str)
+	_, err := str.Write([]byte("foobar"))
+	require.NoError(t, err)
+	f, _, hasMore := str.popStreamFrame(protocol.MaxByteCount, protocol.Version1)
+	require.Equal(t, protocol.ByteCount(6), f.Frame.DataLen())
+	require.False(t, hasMore)
+
+	mockSender.EXPECT().onHasStreamControlFrame(protocol.StreamID(1337), str)
+	str.handleStopSendingFrame(&wire.StopSendingFrame{StreamID: 1337, ErrorCode: 42})
+	str.SetReliableBoundary()
+	str.CancelWrite(1234)
+	require.True(t, mockCtrl.Satisfied())
+
+	if loseStreamFrame {
+		f.Handler.OnLost(f.Frame)
+		_, hasMore = str.popRetransmissionFrame(protocol.MaxByteCount, protocol.Version1)
+		require.False(t, hasMore)
+	} else {
+		f.Handler.OnAcked(f.Frame)
+	}
+	require.True(t, mockCtrl.Satisfied())
+
+	cf, ok, _ := str.getControlFrame(monotime.Now())
+	require.True(t, ok)
+	require.Equal(t, &wire.ResetStreamFrame{StreamID: 1337, FinalSize: 6, ErrorCode: 42, ReliableSize: 0}, cf.Frame)
+	mockSender.EXPECT().onStreamCompleted(protocol.StreamID(1337))
+	cf.Handler.OnAcked(cf.Frame)
+}
+
+// SetReliableBoundary after CancelWrite does not move the reliable size the
+// RESET_STREAM_AT carries.
+func testSendStreamResetStreamAtSetReliableBoundaryAfterCancelWrite(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	mockFC := newTestStreamFlowControllerWithSendWindow(42, protocol.MaxByteCount)
+	mockSender := NewMockStreamSender(mockCtrl)
+	str := newSendStream(context.Background(), 1337, mockSender, mockFC, true)
+
+	mockSender.EXPECT().onHasStreamData(protocol.StreamID(1337), str).Times(2)
+	_, err := str.Write([]byte("foobar"))
+	require.NoError(t, err)
+	str.SetReliableBoundary()
+	_, err = str.Write([]byte("baz"))
+	require.NoError(t, err)
+	f, _, _ := str.popStreamFrame(protocol.MaxByteCount, protocol.Version1)
+	require.Equal(t, protocol.ByteCount(9), f.Frame.DataLen())
+
+	mockSender.EXPECT().onHasStreamControlFrame(protocol.StreamID(1337), str)
+	str.CancelWrite(1234)
+	str.SetReliableBoundary()
+	cf, ok, _ := str.getControlFrame(monotime.Now())
+	require.True(t, ok)
+	require.Equal(t, &wire.ResetStreamFrame{StreamID: 1337, FinalSize: 9, ErrorCode: 1234, ReliableSize: 6}, cf.Frame)
+	require.True(t, mockCtrl.Satisfied())
+
+	// The lost frame is retransmitted up to the reliable size of the reset only.
+	mockSender.EXPECT().onHasStreamRetransmission(protocol.StreamID(1337), str)
+	f.Handler.OnLost(f.Frame)
+	r, _ := str.popRetransmissionFrame(protocol.MaxByteCount, protocol.Version1)
+	require.Equal(t, []byte("foobar"), r.Frame.Data)
+	cf.Handler.OnAcked(cf.Frame)
+	mockSender.EXPECT().onStreamCompleted(protocol.StreamID(1337))
+	r.Handler.OnAcked(r.Frame)
+}
+
 func TestSendStreamResetStreamAtRandomized(t *testing.T) {
 	const streamID protocol.StreamID = 123456
 	const dataLen = 8 << 10

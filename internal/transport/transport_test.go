@@ -602,6 +602,80 @@ func TestPartialDeliveryQUIC(t *testing.T) {
 	}
 }
 
+// The client stops reading a frame stream (STOP_SENDING) while its payload is
+// in flight, and the host marks the header reliable after that (it has not
+// seen the reset yet: Session.writeFrame). The vendored quic-go ignores the
+// mark (third_party/README.md): upstream raised the reliable size of the reset
+// stream, and the ACKs of its in-flight data took the count of outstanding
+// frames below zero, a panic in the connection's run loop that ended the
+// process. The connection must carry on.
+func TestReliableBoundaryAfterStopSending(t *testing.T) {
+	serverTLS, clientTLS := testTLS(t, testALPN)
+	ln, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srv := make(chan error, 1)
+	go func() {
+		qc, err := ln.Accept(ctx)
+		if err != nil {
+			srv <- err
+			return
+		}
+		if !PartialDelivery(FromQUIC(qc)) {
+			srv <- errors.New("RESET_STREAM_AT not negotiated")
+			return
+		}
+		st, err := qc.OpenUniStreamSync(ctx)
+		if err != nil {
+			srv <- err
+			return
+		}
+		if _, err := st.Write(make([]byte, 40)); err != nil {
+			srv <- err
+			return
+		}
+		go st.Write(make([]byte, 4<<20)) // the payload, in flight
+		select {
+		case <-st.Context().Done(): // the client's STOP_SENDING
+		case <-ctx.Done():
+			srv <- ctx.Err()
+			return
+		}
+		quicSend{st}.SetReliableBoundary()
+		// The ACKs of the payload sent before the STOP_SENDING arrive now;
+		// then the connection still carries a stream.
+		time.Sleep(300 * time.Millisecond)
+		srv <- sendAll(ctx, FromQUIC(qc), 1000)
+		<-qc.Context().Done()
+	}()
+	// 10 ms each way: a window of the payload is still in flight when the
+	// STOP_SENDING arrives.
+	proxy := newLossyProxy(t, ln.Addr(), 10*time.Millisecond, 0)
+	qc, err := quic.DialAddr(ctx, proxy.Addr().String(), clientTLS, QUICConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qc.CloseWithError(0, "")
+	st, err := qc.AcceptUniStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(st, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	st.CancelRead(CodeCancelled)
+	if n, err := receiveAll(ctx, FromQUIC(qc)); n != 1000 || err != nil {
+		t.Fatalf("next stream: %d bytes, %v", n, err)
+	}
+	if err := <-srv; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Partial delivery over WebTransport: webtransport-go always negotiates the
 // extension (it needs it for its own stream header), and the boundary set
 // through the session's streams (wtQUICStream, by reflection) covers the

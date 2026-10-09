@@ -382,11 +382,11 @@ func (s *sendState) finish(of *outFrame, state int32) bool {
 // markReliable marks the n bytes written to a frame stream so far reliable
 // (GUIDE 2.4, Session.writeFrame) unless the ladder cancelled it first;
 // false then. Every CancelWrite of a frame stream follows its leaving
-// outWriting under s.mu, so the boundary never follows the reset: quic-go
-// would keep the RESET_STREAM_AT it queued with the reliable size of the
-// moment (a lost one is not sent again and the stream never completes; with
-// none marked before, the ACK of its data panics). relSent, which the cancel
-// log reads, is what the reset delivers.
+// outWriting under s.mu, so the boundary never follows our reset. The
+// client's STOP_SENDING may come first: the vendored quic-go then ignores
+// the boundary (upstream raised the reliable size of the reset stream, and
+// the ACK of its data panicked; third_party/README.md). relSent, which the
+// cancel log reads, is what the reset delivers.
 func (s *sendState) markReliable(of *outFrame, n int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

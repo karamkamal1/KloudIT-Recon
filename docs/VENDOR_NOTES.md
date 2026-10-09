@@ -8757,3 +8757,36 @@ datagrams, FEC, media congestion controller or RESET_STREAM_AT.
   the GPU.
 - Browsers: unverified. Test: the AMD test from Chrome and Edge. Chrome's own QUIC packets (1250
   bytes) fit the tunnel already; the fix is on the host's and the gateway's side.
+
+## Final review: RESET_STREAM_AT boundary after the peer's STOP_SENDING
+
+Finding: `Session.writeFrame` writes a frame stream's reliable prefix, then `markReliable` calls
+`SetReliableBoundary` (GUIDE 2.4). A client's STOP_SENDING that quic-go processed between the two
+(the writer goroutine delayed by about a round trip; the JS client never stops frame streams, but
+a session teardown does) left quic-go v0.63.0 with the stream reset, its reliable size and count
+of outstanding frames zeroed, and then raised the reliable size again: the next ACK or loss of a
+STREAM frame sent before the STOP_SENDING took the count below zero (`panic: numOutStandingFrames
+negative` in the connection's run loop: recon-host exits, the logon task restarts it within a
+minute, the session is lost); without such an ACK the RESET_STREAM's ACK no longer matched and the
+stream never completed. Reachable only with a client that negotiates RESET_STREAM_AT (Chromium 141
+does not, 2.4 above; the Go clients do).
+
+- Fix, in the vendored quic-go (`third_party/quic-go/send_stream.go`, now part of
+  `quic-go.patch`; `third_party/README.md`, `NOTICE` and `update-quic-go.sh`'s NOTICE template
+  say so): `SendStream.SetReliableBoundary` is a no-op once the stream was reset (STOP_SENDING
+  or CancelWrite), so the reset keeps the reliable size it announced. Upstream `master` has the
+  same code as v0.63.0 (checked 2026-10-09): to be reported upstream; drop the hunk once a release
+  fixes it. The quic-go workflow now also runs the fork's `TestSendStream*` tests.
+- Verified here: `TestSendStreamResetStreamAtSetReliableBoundaryAfterReset` (fork, unit: STOP_SENDING
+  with a STREAM frame in flight, then the boundary and CancelWrite; the frame acknowledged or lost;
+  and CancelWrite then the boundary) panics with "numOutStandingFrames negative" without the fix
+  and passes with it; `internal/transport` `TestReliableBoundaryAfterStopSending` (a real
+  connection with RESET_STREAM_AT negotiated, 10 ms each way: the client reads 100 bytes of a
+  4 MiB stream and stops it, the server marks the boundary after the STOP_SENDING, then sends a
+  second stream) panicked in 10 of 10 runs without the fix and passes 10 of 10 with it.
+  `update-quic-go.sh --check`, the fork's ackhandler/congestion tests and `go test .` (only the
+  IPv6 tests fail, as before: no IPv6 here) pass.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test: `go test -run
+  'TestReliableBoundaryAfterStopSending|TestPartialDelivery' ./internal/transport` on the
+  Windows host (with Go installed): both pass.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same.

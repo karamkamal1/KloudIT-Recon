@@ -219,7 +219,8 @@ running encoder (never from a vendor). Its rungs, cheapest first:
    `transport.QUICConfig` enables it on every endpoint here), a cancel delivers the frame's
    header: frameSender writes the header and extension first and marks them reliable
    (`SetReliableBoundary`, only while the ladder has not cancelled the stream:
-   `sendState.markReliable`), a key frame together with its parameter sets (VPS / SPS / PPS, the
+   `sendState.markReliable`; after a client's STOP_SENDING the vendored quic-go ignores it,
+   `third_party/README.md`), a key frame together with its parameter sets (VPS / SPS / PPS, the
    AV1 sequence header: `codec.ParamSetsLen`), then the payload, and the cancel becomes a
    RESET_STREAM_AT whose reliable size covers that prefix: the client still receives it, the rest
    of the frame not. quic-go takes the small header write at once, so even a stream whose payload

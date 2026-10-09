@@ -609,10 +609,15 @@ func (s *SendStream) Close() error {
 // It is valid to call this function multiple times, thereby increasing the reliable size.
 // It only has an effect if the peer enabled support for the RESET_STREAM_AT extension,
 // otherwise, it is a no-op.
+// Once the stream was reset (CancelWrite, or the peer's STOP_SENDING), it is a no-op:
+// the reset fixed the reliable size.
 func (s *SendStream) SetReliableBoundary() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	if s.resetErr != nil {
+		return
+	}
 	if s.nextFrame != nil {
 		s.reliableSize = max(s.reliableSize, s.writeOffset+s.nextFrame.DataLen())
 	} else {

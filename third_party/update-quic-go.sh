@@ -81,7 +81,8 @@ Commit: ${3:-unknown}
 
 Modifications: ../quic-go.patch (a pluggable congestion controller:
 quic.Config.Congestion, (*quic.Conn).CongestionControl and the public package
-github.com/quic-go/quic-go/congestion). Edit the files here, then run
+github.com/quic-go/quic-go/congestion; SendStream.SetReliableBoundary is a
+no-op once the stream was reset). Edit the files here, then run
 ../update-quic-go.sh --diff to refresh the patch; ../update-quic-go.sh <version>
 moves to another upstream release. See ../README.md.
 EOF

@@ -35,7 +35,7 @@ jobs:
         working-directory: third_party/quic-go
         run: |
           go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/...
-          go test -run TestConfig .
+          go test -run 'TestConfig|TestSendStream' .
 
   upstream:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -61,7 +61,7 @@ jobs:
         working-directory: third_party/quic-go
         run: |
           go test ./internal/ackhandler/... ./internal/congestion/... ./congestion/...
-          go test -run TestConfig .
+          go test -run 'TestConfig|TestSendStream' .
       - name: Summary
         if: always()
         run: |
