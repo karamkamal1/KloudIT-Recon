@@ -70,6 +70,12 @@ type StartParams struct {
 	// live-bitrate qualification (step 3.6): presents without pauses, every
 	// image new (a scrolling pattern under full-frame noise).
 	Motion bool `json:"motion,omitempty"`
+	// TestFormat (capture synthetic-gpu only, tests): the texture format the
+	// test source presents in, as AMD Direct Capture can hand them out:
+	// "bgra-srgb" (a fully typed sRGB texture), "rgb10a2" (10-bit; with HDR
+	// BT.2020 PQ), "rgba16" (a format the conversion cannot read); "" = 8-bit
+	// BGRA (FP16 with HDR).
+	TestFormat string `json:"testFormat,omitempty"`
 
 	// Phase 5 experiments (zero = off). ReencodeOversized: a non-key frame
 	// larger than this many average frames (bitrate / fps) is encoded again at

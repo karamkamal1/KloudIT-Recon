@@ -33,7 +33,8 @@ src/capture/              DDA, AMD Direct Capture, WGC (C++/WinRT, MSVC), synthe
                           source; paced_capture + pacer: frame pacing shared by all of them;
                           dirty.hpp: the changed share of an image from its dirty rects
 src/d3d/                  output selection, D3D11 device, output colour (Windows HDR),
-                          BGRA -> NV12 and scRGB -> P010 BT.2020 PQ (HDR10) shaders + barcode,
+                          BGRA (also sRGB-typed) / 10-bit -> NV12 and scRGB / 10-bit PQ ->
+                          P010 BT.2020 PQ (HDR10) shaders + barcode,
                           --self-test-convert; dxgiGate (DDA vs NVENC bitstream locks)
 test/fake_nvenc.*         recon-fake-nvenc.dll: a test double of the NVIDIA NVENC runtime for
                           --self-test-nvenc=DLL (checks the API rules; never shipped)

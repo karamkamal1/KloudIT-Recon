@@ -92,6 +92,7 @@ const char kUsage[] =
     "  --rate-schedule=K1[,K2...]:N  every N frames the next rate of the list (cyclically), set right before the\n"
     "                       frame is submitted (frame 1+k*N is the first at the k-th new rate; step 3.6)\n"
     "  --barcode=X,Y,CELL   draw the frame barcode (GUIDE 0.2)  --motion=0|1  synthetic-gpu: high-motion source\n"
+    "  --test-format=bgra-srgb|rgb10a2|rgba16  synthetic-gpu: present in that texture format (tests)\n"
     "  --frame-log=FILE     JSON lines: started, one line per frame (flags, bytes, target kbps), end counters\n";
 
 struct Args {

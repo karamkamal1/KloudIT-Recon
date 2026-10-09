@@ -9,6 +9,11 @@
 // HDR10 streams (GUIDE 3.9) get P010 instead: the FP16 scRGB desktop of
 // Windows HDR converted to BT.2020 primaries and the SMPTE ST 2084 (PQ)
 // transfer, 10-bit limited range, same siting, scaling and barcode.
+// Sources: 8-bit BGRA / RGBA (UNORM, TYPELESS, or fully typed sRGB: a game's
+// sRGB swap chain, which can only be viewed as sRGB, so the sampler decodes
+// it), FP16 scRGB and 10-bit R10G10B10A2 (sRGB-coded, or BT.2020 PQ while the
+// captured output is in HDR mode: setHdrDisplay), as AMD Direct Capture can
+// hand them out.
 //
 // Output textures come from a small pool. A converted frame stays reserved
 // while any copy of its `hold` exists, so the AMF / NVENC backends keep it
@@ -121,12 +126,20 @@ public:
     // must fit the content.
     Status init(ID3D11Device* device, uint32_t width, uint32_t height, const BarcodeLayout& barcode, Output output,
                 int poolSize = 6, uint32_t contentWidth = 0, uint32_t contentHeight = 0, Format format = Format::Nv12);
-    // Converts src (8-bit BGRA/RGBA, or FP16 scRGB: clipped to SDR for NV12,
-    // PQ for P010; an 8-bit source in P010 is SDR at kSdrWhiteNits) into a
-    // free pool texture, with the barcode of barcodeValue (the frame's
-    // sequence number) when enabled. Error "pool_exhausted" (non-fatal) when
-    // every pool texture is still reserved by the encoder.
+    // Converts src (8-bit BGRA/RGBA or 10-bit RGB, sRGB; FP16 scRGB: clipped
+    // to SDR for NV12, PQ for P010; an sRGB source in P010 is SDR at
+    // kSdrWhiteNits; 10-bit BT.2020 PQ: as it is for P010, for NV12 with
+    // kSdrWhiteNits as white) into a free pool texture, with the barcode of
+    // barcodeValue (the frame's sequence number) when enabled. Error
+    // "pool_exhausted" (non-fatal) when every pool texture is still reserved
+    // by the encoder; "unsupported" for a texture format it cannot read.
     Status convert(ID3D11Texture2D* src, int rotation, uint16_t barcodeValue, ConvertedFrame& out);
+    // Whether the captured output is in Windows HDR mode, which decides what a
+    // 10-bit (R10G10B10A2) source holds: BT.2020 PQ (an HDR10 swap chain the
+    // display scans out) when it is, else sRGB-coded R'G'B' like 8-bit
+    // (VERIFY on hardware, docs/VENDOR_NOTES.md). Set before convert, on its
+    // thread (the pipeline: at the start and on every capture event).
+    void setHdrDisplay(bool hdr) { hdrDisplay_ = hdr; }
     // Copies a converted frame to the CPU as tightly packed NV12 (Y plane, then
     // interleaved CbCr), or P010 (the same with 16-bit little-endian samples).
     // Stalls until the GPU is done: tests and dumps only.
@@ -152,7 +165,9 @@ private:
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<ID3D11ShaderResourceView> srv;
         ComPtr<ID3D11Texture2D> copy;  // when the source cannot be bound as a shader resource
-        bool linear = false;
+        uint32_t kind = 0;             // how the shader reads it (convert.cpp SourceKind)
+        float linearWhite = 0;         // a linear source: cd/m2 of 1.0
+        bool tenBit = false;           // 10-bit RGB: BT.2020 PQ while hdrDisplay_
     };
 
     Status createSlot(Slot& s);
@@ -176,6 +191,8 @@ private:
     BarcodeLayout barcode_;
     Output output_ = Output::Nv12;
     Format format_ = Format::Nv12;
+    bool hdrDisplay_ = false;
+    DXGI_FORMAT loggedFormat_ = DXGI_FORMAT_UNKNOWN;  // the source format last logged
 };
 
 }  // namespace recon::d3d

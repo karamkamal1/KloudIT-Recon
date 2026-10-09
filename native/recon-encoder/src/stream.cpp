@@ -52,6 +52,7 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
             conv = std::make_unique<Converter>();
             s = conv->init(src.device, in.width, in.height, p.barcode, mode, 6, in.contentWidth, in.contentHeight, format);
             if (s.ok) {
+                conv->setHdrDisplay(src.display.hdr);  // later: the capture's events (Pipeline::captureLoop)
                 std::string padded;
                 if (conv->contentWidth() != in.width || conv->contentHeight() != in.height) {
                     padded = " padded to " + std::to_string(in.width) + "x" + std::to_string(in.height);

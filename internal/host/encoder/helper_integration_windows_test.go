@@ -1296,6 +1296,97 @@ func TestHelperIntegrationHDRPipeline(t *testing.T) {
 	}
 }
 
+// The capture texture formats AMD Direct Capture can hand out besides 8-bit
+// UNORM and FP16 (final review), played by the GPU test source (start
+// testFormat): a fully typed sRGB texture (a game's sRGB swap chain) and a
+// 10-bit sRGB-coded one convert into NV12 frames (the barcode of the dumped
+// frame 30 reads 29, the picture keeps its top-to-bottom gradient); a 10-bit
+// one holding BT.2020 PQ (hdr: the output in HDR mode, an HDR10 swap chain)
+// goes into P010 as it is (the 1000 cd/m2 patch, PQ code 769, at Y 722-723);
+// and a format the conversion cannot read ends the helper with the fatal
+// capture_failed within seconds instead of streaming nothing.
+func TestHelperIntegrationCaptureFormats(t *testing.T) {
+	const w, hgt, fps = 320, 180, 30
+	start := func(t *testing.T, h *Helper, p StartParams) Started {
+		t.Helper()
+		p.Capture, p.Codec, p.Width, p.Height, p.FPS, p.Kbps = "synthetic-gpu", "h264", w, hgt, fps, 4000
+		st, err := h.Start(p)
+		var he *HelperError
+		if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+			t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+		}
+		if err != nil {
+			t.Fatalf("start %+v: %v", p, err)
+		}
+		return st
+	}
+	for _, f := range []string{"bgra-srgb", "rgb10a2"} {
+		t.Run(f, func(t *testing.T) {
+			dump := t.TempDir() + `\frame30.nv12`
+			h := launchMock(t, "--dump-nv12="+dump)
+			if st := start(t, h, StartParams{TestFormat: f, Barcode: &Barcode{Cell: proto.BarcodeCell}}); st.HDR || st.BitDepth != 8 {
+				t.Fatalf("started hdr %v, bitDepth %d", st.HDR, st.BitDepth)
+			}
+			for i := 0; i < 32; i++ {
+				nextFrame(t, h)
+			}
+			b, err := os.ReadFile(dump)
+			if err != nil || len(b) != w*hgt*3/2 {
+				t.Fatalf("dump: %d bytes, %v", len(b), err)
+			}
+			if v, ok := proto.BarcodeReadLuma(b[:w*hgt], w, proto.BarcodeCell); !ok || v != 29 {
+				t.Fatalf("barcode of the dumped frame 30 reads %d (valid %v), want 29", v, ok)
+			}
+			// Green rises from 0 at the top to 255 at the bottom (the test
+			// pattern), about 157 luma codes; columns 200-239 keep clear of
+			// the barcode and of most of the moving bar.
+			mean := func(y0 int) float64 {
+				sum := 0
+				for y := y0; y < y0+8; y++ {
+					for x := 200; x < 240; x++ {
+						sum += int(b[y*w+x])
+					}
+				}
+				return float64(sum) / (8 * 40)
+			}
+			if top, bottom := mean(4), mean(hgt-12); bottom-top < 100 {
+				t.Fatalf("mean luma %.1f at the top, %.1f at the bottom: not the test pattern's gradient", top, bottom)
+			}
+		})
+	}
+	t.Run("rgb10a2 PQ", func(t *testing.T) {
+		dump := t.TempDir() + `\frame30.p010`
+		h := launchMock(t, "--dump-nv12="+dump)
+		if st := start(t, h, StartParams{TestFormat: "rgb10a2", HDR: true}); !st.HDR || st.BitDepth != 10 || st.ColorSpace != "bt2020-pq" {
+			t.Fatalf("started hdr %v, bitDepth %d, colorSpace %q", st.HDR, st.BitDepth, st.ColorSpace)
+		}
+		for i := 0; i < 32; i++ {
+			nextFrame(t, h)
+		}
+		b, err := os.ReadFile(dump)
+		if err != nil || len(b) != w*hgt*3 {
+			t.Fatalf("dump: %d bytes (want %d: P010), %v", len(b), w*hgt*3, err)
+		}
+		code := func(i int) int { return (int(b[2*i]) | int(b[2*i+1])<<8) >> 6 }
+		// 64 + 876 x 769 / 1023 = 722.5; read as sRGB it would be far brighter.
+		x, y := 312, 8
+		cb, cr := code(w*hgt+(y/2)*w+x), code(w*hgt+(y/2)*w+x+1)
+		if yy := code(y*w + x); yy < 721 || yy > 724 || cb < 511 || cb > 513 || cr < 511 || cr > 513 {
+			t.Fatalf("1000 cd/m2 PQ patch: YCbCr %d,%d,%d, want 722,512,512", yy, cb, cr)
+		}
+	})
+	t.Run("rgba16", func(t *testing.T) {
+		h := launchMock(t)
+		start(t, h, StartParams{TestFormat: "rgba16"})
+		began := time.Now()
+		he := waitHelperError(t, h, "capture_failed")
+		if !he.Fatal || !strings.Contains(he.Text, "cannot convert capture format") {
+			t.Fatalf("capture_failed %+v: want fatal, naming the conversion failure", he)
+		}
+		t.Logf("fatal after %v: %s", time.Since(began).Round(time.Millisecond), he.Text)
+	})
+}
+
 // The libavcodec backend (native/recon-encoder/src/lavc, step 3.8). Without
 // FFmpeg's DLLs it is unavailable with the reason. With RECON_FFMPEG_DIR set to
 // the bin directory of an FFmpeg 8.x shared build that has libx264 (BtbN's

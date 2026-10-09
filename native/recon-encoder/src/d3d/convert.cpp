@@ -29,6 +29,12 @@ namespace {
 // averaged after PQ, like the SDR path averages gamma-encoded values (Sunshine
 // averages linear light before PQ; the difference shows only at sharp
 // high-contrast colour edges).
+//
+// A 10-bit source holding BT.2020 PQ (an HDR10 swap chain scanned out while
+// the output is in HDR mode) goes into P010 as it is; into NV12 it is turned
+// into absolute light, BT.709 primaries (the inverse of the BT.2087 matrix)
+// and sRGB with the HDR reference white of ITU-R BT.2408 (203 cd/m2, where an
+// sRGB source goes in HDR10) as SDR white, brighter clipped.
 const char kShader[] = R"HLSL(
 Texture2D<float4> src : register(t0);
 SamplerState lin : register(s0);
@@ -43,9 +49,9 @@ cbuffer Params : register(b0) {
     uint4 bcRect;     // barcode x0, y0, x1, y1 (exclusive), output pixels: 8 x 3 cells
     uint4 bcGrid;     // x: cell size in output pixels
     uint4 bcValue;    // x: the 24-bit word (value << 8 | crc), w: enabled
-    uint4 flags;      // x: source is linear (scRGB FP16); y: HDR10 output (BT.2020 PQ)
+    uint4 flags;      // x: the source's values (SourceKind): 0 sRGB-coded, 1 linear light, 2 BT.2020 PQ; y: HDR10 output (BT.2020 PQ)
     float4 levels;    // barcode luma 0 / 1, neutral chroma (code / maximum); w: 1023 = 10-bit codes in UNORM16 (P010), 0 = UNORM8
-    float4 nits;      // HDR10: cd/m2 of 1.0 in a linear (scRGB) source, of white in an sRGB source
+    float4 nits;      // x: cd/m2 of 1.0 in a linear source (scRGB 80; a decoded sRGB texture: SDR white); y: of SDR white
 };
 
 struct VSOut { float4 pos : SV_Position; };
@@ -71,14 +77,31 @@ float3 pq(float3 cdm2) {
     return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
 }
 
+// SMPTE ST 2084 (PQ) EOTF: the signal (0..1) to absolute luminance in cd/m2.
+float3 pqToNits(float3 e) {
+    float3 p = pow(saturate(e), 1.0 / 78.84375);
+    return 10000.0 * pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
+}
+
 float3 fetch(float2 lumaPos) {
     float3 uv1 = float3(lumaPos * lumaSize.zw, 1.0);
     float2 st = float2(dot(xformU.xyz, uv1), dot(xformV.xyz, uv1));
     float3 c = src.SampleLevel(lin, st, 0).rgb;
+    if (flags.x == 2) {
+        // BT.2020 PQ R'G'B'.
+        c = saturate(c);
+        if (flags.y != 0) return c;
+        float3 l = pqToNits(c) / nits.y;
+        float3 narrow = float3(dot(float3(1.6604903, -0.5876391, -0.0728516), l),
+                               dot(float3(-0.1245500, 1.1328999, -0.0083480), l),
+                               dot(float3(-0.0181511, -0.1005787, 1.1187299), l));
+        return linearToSrgb(saturate(narrow));
+    }
     if (flags.y != 0) {
         // HDR10: absolute linear light with BT.709 primaries (scRGB 1.0 =
-        // 80 cd/m2; an sRGB image at SDR reference white), to BT.2020 (ITU-R
-        // BT.2087), then PQ. Colours outside BT.2020 (negative) clip.
+        // 80 cd/m2; an sRGB image, coded or decoded, at SDR reference white),
+        // to BT.2020 (ITU-R BT.2087), then PQ. Colours outside BT.2020
+        // (negative) clip.
         float3 l = flags.x != 0 ? c * nits.x : srgbToLinear(saturate(c)) * nits.y;
         float3 wide = float3(dot(float3(0.6274040, 0.3292820, 0.0433136), l),
                              dot(float3(0.0690970, 0.9195400, 0.0113612), l),
@@ -173,23 +196,47 @@ Status failure(ID3D11Device* device, const char* code, const std::string& text) 
     return Status::Error(code, text);
 }
 
-// SRV format for a source texture format; linear = scRGB.
-bool srvFormat(DXGI_FORMAT f, DXGI_FORMAT& out, bool& linear) {
-    linear = false;
+// What a source's values are (the shader's flags.x).
+enum SourceKind : uint32_t {
+    kSrgbCoded = 0,  // sRGB R'G'B': 8-bit desktops, a 10-bit surface of an SDR output
+    kLinear = 1,     // linear light: scRGB FP16, or an sRGB-typed texture the sampler decodes
+    kPq = 2,         // BT.2020 PQ R'G'B': a 10-bit surface of an output in HDR mode
+};
+
+// The shader resource view of a source texture format and how the shader
+// reads it. A view may have another format than its texture only when the
+// texture is TYPELESS (CreateShaderResourceView: E_INVALIDARG otherwise), so a
+// fully typed sRGB texture (a game's sRGB swap chain) is viewed as sRGB: the
+// sampler decodes it to linear light, SDR white at 1.0, and the shader codes
+// it again (NV12) or places it at kSdrWhiteNits (P010).
+bool srvFormat(DXGI_FORMAT f, DXGI_FORMAT& out, SourceKind& kind, double& linearWhite, bool& tenBit) {
+    kind = kSrgbCoded;
+    linearWhite = 0;
+    tenBit = false;
     switch (f) {
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: out = DXGI_FORMAT_B8G8R8A8_UNORM; return true;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: out = DXGI_FORMAT_B8G8R8A8_UNORM; return true;
     case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: out = DXGI_FORMAT_B8G8R8X8_UNORM; return true;
+    case DXGI_FORMAT_B8G8R8X8_UNORM: out = DXGI_FORMAT_B8G8R8X8_UNORM; return true;
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: out = DXGI_FORMAT_R8G8B8A8_UNORM; return true;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: out = DXGI_FORMAT_R8G8B8A8_UNORM; return true;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        out = f;
+        kind = kLinear;
+        linearWhite = kSdrWhiteNits;
+        return true;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        out = DXGI_FORMAT_R10G10B10A2_UNORM;
+        tenBit = true;  // sRGB-coded, or BT.2020 PQ from an output in HDR mode (setHdrDisplay)
+        return true;
     case DXGI_FORMAT_R16G16B16A16_TYPELESS:
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
         out = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        linear = true;  // scRGB: PQ for HDR10 output, clipped to SDR for NV12
+        kind = kLinear;  // scRGB: PQ for HDR10 output, clipped to SDR for NV12
+        linearWhite = kScrgbWhiteNits;
         return true;
     default: return false;
     }
@@ -455,9 +502,13 @@ Status Nv12Converter::sourceView(ID3D11Texture2D* src, SrvEntry*& out) {
     SrvEntry e;
     e.texture = src;
     DXGI_FORMAT f;
-    if (!srvFormat(td.Format, f, e.linear)) {
+    SourceKind kind;
+    double white;
+    if (!srvFormat(td.Format, f, kind, white, e.tenBit)) {
         return Status::Error("unsupported", "cannot convert capture format " + std::to_string(int(td.Format)));
     }
+    e.kind = kind;
+    e.linearWhite = float(white);
     ID3D11Texture2D* viewed = src;
     if (td.ArraySize != 1) {
         // A texture array (AMF can hand out array slices): only slice 0 is
@@ -465,6 +516,7 @@ Status Nv12Converter::sourceView(ID3D11Texture2D* src, SrvEntry*& out) {
         logf(LogLevel::Warn, "capture texture is an array of %u: converting slice 0", td.ArraySize);
     }
     if (!(td.BindFlags & D3D11_BIND_SHADER_RESOURCE) || td.ArraySize != 1 || td.SampleDesc.Count != 1 || td.MipLevels != 1) {
+        // A copy in the same format, so the view below fits it as well.
         D3D11_TEXTURE2D_DESC cd{};
         cd.Width = td.Width;
         cd.Height = td.Height;
@@ -484,6 +536,16 @@ Status Nv12Converter::sourceView(ID3D11Texture2D* src, SrvEntry*& out) {
     sd.Texture2D.MipLevels = 1;
     const HRESULT hr = device_->CreateShaderResourceView(viewed, &sd, e.srv.ReleaseAndGetAddressOf());
     if (FAILED(hr)) return failure(device_.Get(), "init_failed", "CreateShaderResourceView on the capture texture failed: " + hrText(hr));
+    if (td.Format != loggedFormat_) {
+        // Once per format: which ones AMD Direct Capture hands out is a VERIFY
+        // item (docs/VENDOR_NOTES.md).
+        loggedFormat_ = td.Format;
+        const char* what = e.tenBit ? (hdrDisplay_ ? "10-bit, read as BT.2020 PQ: the output is in HDR mode" : "10-bit, sRGB-coded")
+                           : f == DXGI_FORMAT_R16G16B16A16_FLOAT ? "FP16 scRGB"
+                           : kind == kLinear                     ? "8-bit sRGB-typed, viewed as sRGB"
+                                                                 : "8-bit";
+        logf(LogLevel::Info, "conversion source: DXGI format %d (%s)", int(td.Format), what);
+    }
     srvCache_.insert(srvCache_.begin(), std::move(e));
     if (srvCache_.size() > 8) srvCache_.pop_back();
     out = &srvCache_.front();
@@ -559,7 +621,7 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint16_t barco
         c.bcGrid[0] = uint32_t(barcode_.cell);
         c.bcValue[0] = barcodeWord(barcodeValue), c.bcValue[3] = 1;
     }
-    c.flags[0] = srv->linear ? 1 : 0;
+    c.flags[0] = srv->tenBit && hdrDisplay_ ? kPq : srv->kind;
     c.flags[1] = hdr10 ? 1 : 0;
     // Barcode cells: limited-range black and white, neutral chroma (16 / 235
     // / 128 in 8 bits, 64 / 940 / 512 in 10 bits).
@@ -568,7 +630,7 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint16_t barco
     c.levels[1] = (hdr10 ? 940.0f : 235.0f) / codeMax;
     c.levels[2] = (hdr10 ? 512.0f : 128.0f) / codeMax;
     c.levels[3] = hdr10 ? 1023.0f : 0.0f;
-    c.nits[0] = float(kScrgbWhiteNits);
+    c.nits[0] = srv->linearWhite;
     c.nits[1] = float(kSdrWhiteNits);
     std::memcpy(m.pData, &c, sizeof(c));
     ctx_->Unmap(cb_.Get(), 0);

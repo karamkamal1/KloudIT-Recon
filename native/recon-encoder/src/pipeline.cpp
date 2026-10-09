@@ -8,6 +8,14 @@ namespace recon {
 namespace {
 constexpr int kPollMs = 100;  // how often the threads look at the stop flag when idle
 constexpr uint64_t kDumpFrameId = 30;
+// Captured frames that all failed to convert (a texture format the
+// conversion cannot read): after this many in a row over at least
+// kConvertGiveUpMs the helper ends with the fatal capture_failed, so
+// recon-host restarts it (and gives the session to FFmpeg if that keeps
+// happening) instead of streaming nothing. The idle repeats (idleRepeatMs)
+// keep failing frames coming on a still image too.
+constexpr int kConvertGiveUpFrames = 10;
+constexpr int64_t kConvertGiveUpMs = 2000;
 }
 
 void Pipeline::dump(const d3d::ConvertedFrame& f, uint64_t frameId) {
@@ -71,7 +79,9 @@ void Pipeline::captureLoop() {
     // is submitted (not dropped before the encoder, not refused as busy).
     uint64_t seqBase = 1, idrServed = 0;
     bool firstPending = true;
-    int64_t lastPoolWarn = 0, lastBusyWarn = 0;
+    int64_t lastPoolWarn = 0, lastBusyWarn = 0, lastConvertWarn = 0;
+    int convertFails = 0;  // conversions failed in a row (not counting pool_exhausted)
+    int64_t convertFailSince = 0;
     // The dirty share of captures dropped before the encoder took them: the
     // next encoded frame references an older image, so it carries their
     // changes too (like the pacer's merged deliveries).
@@ -81,7 +91,11 @@ void Pipeline::captureLoop() {
         Status err;
         const Next r = cap_.next(frame, kPollMs, err);
         CaptureEvent ev;
-        while (cap_.takeEvent(ev)) rep_.captureChanged(ev);
+        while (cap_.takeEvent(ev)) {
+            // What a 10-bit capture surface holds follows the output's HDR mode.
+            if (opt_.converter) opt_.converter->setHdrDisplay(ev.hdr);
+            rep_.captureChanged(ev);
+        }
         switch (r) {
         case Next::Timeout:
             continue;
@@ -143,9 +157,25 @@ void Pipeline::captureLoop() {
                     rep_.fatal(cs);
                     return;
                 }
-                rep_.error(cs, "");
+                // The same failure with every frame: reported once a second,
+                // fatal when no frame has converted for kConvertGiveUpMs.
+                const int64_t now = qpcNow();
+                if (convertFails++ == 0) convertFailSince = now;
+                if (convertFails >= kConvertGiveUpFrames && now - convertFailSince >= kConvertGiveUpMs * qpcFrequency() / 1000) {
+                    rep_.fatal(Status::Error("capture_failed",
+                                             "no captured frame could be converted for " +
+                                                 std::to_string((now - convertFailSince) * 1000 / qpcFrequency()) + " ms (" +
+                                                 std::to_string(convertFails) + " in a row): " + cs.code + ": " + cs.text,
+                                             true));
+                    return;
+                }
+                if (convertFails == 1 || now - lastConvertWarn > qpcFrequency()) {
+                    rep_.error(cs, "");
+                    lastConvertWarn = now;
+                }
                 continue;
             }
+            convertFails = 0;
             ef.nv12 = cf.nv12;
             ef.y = cf.nv12 ? nullptr : cf.y;
             ef.uv = cf.nv12 ? nullptr : cf.uv;

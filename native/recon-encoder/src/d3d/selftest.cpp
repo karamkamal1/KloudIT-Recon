@@ -9,7 +9,12 @@
 //   PQ, 10-bit limited range) and an 8-bit sRGB source in an HDR10 stream (at
 //   203 cd/m2), against a double-precision reference of the PQ curve and the
 //   BT.709 -> BT.2020 matrix, plus absolute code values of known luminances
-//   (100 cd/m2 = PQ 0.508 = code 509, 1000 cd/m2 = 723, 10000 cd/m2 = 940).
+//   (100 cd/m2 = PQ 0.508 = code 509, 1000 cd/m2 = 723, 10000 cd/m2 = 940);
+// - the other capture formats AMD Direct Capture can hand out: a fully typed
+//   sRGB texture (B8G8R8A8_UNORM_SRGB: a game's sRGB swap chain, which can
+//   only be viewed as sRGB) and 10-bit R10G10B10A2 (also TYPELESS), sRGB-coded
+//   or, from an output in HDR mode, BT.2020 PQ (into P010 as it is; into NV12
+//   with the HDR reference white as SDR white).
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -34,12 +39,17 @@ struct Rgb {
     double r = 0, g = 0, b = 0;
 };
 
+// What a source's values are: sRGB-coded R'G'B' (UNORM8 / 255, UNORM10 /
+// 1023), scRGB (FP16), an sRGB-typed texture (the sampler decodes it to
+// linear light, SDR white at 1.0), BT.2020 PQ R'G'B' (UNORM10 / 1023).
+enum class Encoding { Srgb, Scrgb, SrgbTyped, Pq };
+
 // A source image: the texture's bytes and the value the shader reads for every
-// texel (UNORM8 / 255, or the FP16 value exactly as stored).
+// texel (UNORM8 / 255, the FP16 value exactly as stored, an sRGB texel decoded).
 struct Image {
     uint32_t w = 0, h = 0;
     DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    bool linear = false;  // scRGB FP16
+    Encoding encoding = Encoding::Srgb;
     std::vector<uint8_t> data;
     uint32_t pitch = 0;
     std::vector<Rgb> texels;
@@ -101,7 +111,7 @@ Image hdrPattern(uint32_t w, uint32_t h, bool random) {
     img.w = w;
     img.h = h;
     img.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    img.linear = true;
+    img.encoding = Encoding::Scrgb;
     img.pitch = w * 8;
     img.data.resize(size_t(w) * h * 8);
     img.texels.resize(size_t(w) * h);
@@ -166,22 +176,114 @@ double pqEncode(double cdm2) {
     return std::pow((c1 + c2 * y) / (1 + c3 * y), m2);
 }
 
+// SMPTE ST 2084 EOTF: the PQ signal 0..1 to absolute luminance in cd/m2.
+double pqDecode(double e) {
+    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32,
+                 c3 = 2392.0 / 4096 * 32;
+    const double p = std::pow(clamp01(e), 1 / m2);
+    return 10000 * std::pow(std::max(p - c1, 0.0) / (c2 - c3 * p), 1 / m1);
+}
+
+// BT.709 -> BT.2020 primaries (ITU-R BT.2087), and its inverse.
+const double k709To2020[3][3] = {{0.6274040, 0.3292820, 0.0433136}, {0.0690970, 0.9195400, 0.0113612}, {0.0163916, 0.0880132, 0.8955950}};
+
+Rgb mul(const double m[3][3], Rgb c) {
+    return {m[0][0] * c.r + m[0][1] * c.g + m[0][2] * c.b, m[1][0] * c.r + m[1][1] * c.g + m[1][2] * c.b,
+            m[2][0] * c.r + m[2][1] * c.g + m[2][2] * c.b};
+}
+
+Rgb from2020To709(Rgb c) {
+    const double(&m)[3][3] = k709To2020;
+    const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                       m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const double inv[3][3] = {{(m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det, (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det,
+                               (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det},
+                              {(m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det, (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det,
+                               (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det},
+                              {(m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det, (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det,
+                               (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det}};
+    return mul(inv, c);
+}
+
 // The non-linear R'G'B' the encoder's Y'CbCr is made of, from one sample.
-Rgb transfer(Rgb c, bool linearSource, bool hdr10) {
+Rgb transfer(Rgb c, Encoding e, bool hdr10) {
+    if (e == Encoding::Pq) {
+        // BT.2020 PQ: HDR10 takes it as it is; SDR gets linear BT.709 with the
+        // HDR reference white (203 cd/m2) as white, brighter clipped, in sRGB.
+        c = {clamp01(c.r), clamp01(c.g), clamp01(c.b)};
+        if (hdr10) return c;
+        const double s = d3d::kSdrWhiteNits;
+        const Rgb l = from2020To709({pqDecode(c.r) / s, pqDecode(c.g) / s, pqDecode(c.b) / s});
+        return {linearToSrgb(clamp01(l.r)), linearToSrgb(clamp01(l.g)), linearToSrgb(clamp01(l.b))};
+    }
+    const bool linearSource = e != Encoding::Srgb;
     if (hdr10) {
         // Linear light in cd/m2 with BT.709 primaries, to BT.2020 (ITU-R
-        // BT.2087 matrix), clipped at 0, PQ.
-        const double scale = linearSource ? d3d::kScrgbWhiteNits : d3d::kSdrWhiteNits;
+        // BT.2087 matrix), clipped at 0, PQ. scRGB 1.0 is 80 cd/m2, SDR white
+        // (an sRGB source, coded or decoded) 203 cd/m2.
+        const double scale = e == Encoding::Scrgb ? d3d::kScrgbWhiteNits : d3d::kSdrWhiteNits;
         Rgb l = linearSource ? c : Rgb{srgbToLinear(clamp01(c.r)), srgbToLinear(clamp01(c.g)), srgbToLinear(clamp01(c.b))};
         l.r *= scale, l.g *= scale, l.b *= scale;
-        const double r = 0.6274040 * l.r + 0.3292820 * l.g + 0.0433136 * l.b;
-        const double g = 0.0690970 * l.r + 0.9195400 * l.g + 0.0113612 * l.b;
-        const double b = 0.0163916 * l.r + 0.0880132 * l.g + 0.8955950 * l.b;
-        return {pqEncode(r > 0 ? r : 0), pqEncode(g > 0 ? g : 0), pqEncode(b > 0 ? b : 0)};
+        const Rgb w = mul(k709To2020, l);
+        return {pqEncode(w.r > 0 ? w.r : 0), pqEncode(w.g > 0 ? w.g : 0), pqEncode(w.b > 0 ? w.b : 0)};
     }
     c = {clamp01(c.r), clamp01(c.g), clamp01(c.b)};
     if (linearSource) c = {linearToSrgb(c.r), linearToSrgb(c.g), linearToSrgb(c.b)};
     return c;
+}
+
+// The colour bars as a fully typed sRGB texture (B8G8R8A8_UNORM_SRGB, the
+// same bytes): the shader reads every texel decoded to linear light.
+Image srgbTyped(const Image& bars) {
+    Image img = bars;
+    img.format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    img.encoding = Encoding::SrgbTyped;
+    for (Rgb& t : img.texels) t = {srgbToLinear(t.r), srgbToLinear(t.g), srgbToLinear(t.b)};
+    return img;
+}
+
+// PQ codes (10-bit full range) of the PQ pattern's grey bars: 0, 1, 10,
+// 100, 203, 1000, 4000 and 10000 cd/m2.
+const int kPqGreyCodes[8] = {0, 153, 307, 520, 594, 769, 923, 1023};
+
+// An R10G10B10A2_UNORM image (R in bits 0-9, G 10-19, B 20-29, A 30-31).
+// sRGB-coded (pq false): the 100 % colour bars at codes 0 / 1023 in the top
+// half. BT.2020 PQ (pq true, a 10-bit surface of an output in HDR mode): the
+// grey bars of kPqGreyCodes in the top quarter, colour bars (primaries and
+// mixes at several levels) in the second. Pseudo-random codes below.
+Image pattern10(uint32_t w, uint32_t h, bool pq) {
+    static const uint8_t bars[8][3] = {{1, 1, 1}, {1, 1, 0}, {0, 1, 1}, {0, 1, 0}, {1, 0, 1}, {1, 0, 0}, {0, 0, 1}, {0, 0, 0}};
+    static const int colours[8][3] = {{520, 0, 0}, {0, 520, 0}, {0, 0, 520}, {769, 594, 153}, {300, 700, 1000},
+                                      {594, 594, 0}, {1023, 0, 1023}, {64, 128, 32}};
+    Image img;
+    img.w = w;
+    img.h = h;
+    img.format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    img.encoding = pq ? Encoding::Pq : Encoding::Srgb;
+    img.pitch = w * 4;
+    img.data.resize(size_t(w) * h * 4);
+    img.texels.resize(size_t(w) * h);
+    uint32_t seed = 777;
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            int v[3];
+            const uint32_t bar = x * 8 / w;
+            if (pq && y < h / 4) {
+                v[0] = v[1] = v[2] = kPqGreyCodes[bar];
+            } else if (pq && y < h / 2) {
+                for (int i = 0; i < 3; ++i) v[i] = colours[bar][i];
+            } else if (y < h / 2) {
+                for (int i = 0; i < 3; ++i) v[i] = bars[bar][i] ? 1023 : 0;
+            } else {
+                seed = seed * 1664525u + 1013904223u;
+                v[0] = int(seed >> 22), v[1] = int((seed >> 12) & 1023), v[2] = int((seed >> 2) & 1023);
+            }
+            const uint32_t word = uint32_t(v[0]) | uint32_t(v[1]) << 10 | uint32_t(v[2]) << 20 | 3u << 30;
+            std::memcpy(&img.data[(size_t(y) * w + x) * 4], &word, 4);
+            img.texels[size_t(y) * w + x] = {v[0] / 1023.0, v[1] / 1023.0, v[2] / 1023.0};
+        }
+    }
+    return img;
 }
 
 // The shader's fetch(): an output luma position mapped through the rotation.
@@ -189,7 +291,7 @@ Rgb fetch(const Image& img, uint32_t outW, uint32_t outH, int rotation, double l
     float xu[3], xv[3];
     d3d::rotationTransform(rotation, xu, xv);
     const double u = lx / outW, v = ly / outH;
-    return transfer(sample(img, xu[0] * u + xu[1] * v + xu[2], xv[0] * u + xv[1] * v + xv[2]), img.linear, hdr10);
+    return transfer(sample(img, xu[0] * u + xu[1] * v + xu[2], xv[0] * u + xv[1] * v + xv[2]), img.encoding, hdr10);
 }
 
 struct Levels {
@@ -242,7 +344,7 @@ std::vector<int> reference(const Image& img, uint32_t w, uint32_t h, uint32_t cw
     return out;
 }
 
-enum class Source { Bars, Hdr, HdrSmooth };
+enum class Source { Bars, Hdr, HdrSmooth, SrgbTyped, Bars10, Pq10 };
 
 struct Case {
     const char* name;
@@ -255,6 +357,7 @@ struct Case {
     uint32_t contentW = 0, contentH = 0;  // picture inside outW x outH, the rest padding (0 = no padding)
     Source source = Source::Bars;
     Format format = Format::Nv12;
+    bool typeless = false;  // the source texture in the TYPELESS format of its family
 };
 
 BarcodeLayout layout(int x, int y, int cell) {
@@ -342,6 +445,11 @@ const int kHdrGreyY[8] = {64, 490, 509, 573, 723, 855, 940, 940};
 // Its first three colour bars (scRGB red, green, blue at 80 cd/m2) as BT.2020
 // PQ Y'CbCr, computed in double precision from BT.2087, ST 2084 and BT.2020.
 const int kHdrColourYuv[3][3] = {{325, 448, 598}, {450, 432, 476}, {226, 650, 535}};
+// The PQ pattern's grey bars (kPqGreyCodes): in P010 64 + 876 x code / 1023;
+// in NV12 with 203 cd/m2 as SDR white (1 cd/m2 = 29, 10 = 70, 100 = 176,
+// from 203 up white).
+const int kPqGreyP010[8] = {64, 195, 327, 509, 573, 722, 854, 940};
+const int kPqGreyNv12[8] = {16, 29, 70, 176, 235, 235, 235, 235};
 
 // Checks the code value at output (x, y) of the top-left content against want (±1).
 void expectAt(Checker& chk, const std::vector<int>& got, uint32_t w, uint32_t h, uint32_t x, uint32_t y, const int want[3],
@@ -362,12 +470,20 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
         chk.fail("init: %s", s.text.c_str());
         return chk.failures();
     }
+    // A 10-bit surface holds BT.2020 PQ when the captured output is in HDR mode.
+    conv.setHdrDisplay(img.encoding == Encoding::Pq);
     D3D11_TEXTURE2D_DESC td{};
     td.Width = img.w;
     td.Height = img.h;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = img.format;
+    if (c.typeless) {
+        td.Format = img.format == DXGI_FORMAT_R10G10B10A2_UNORM   ? DXGI_FORMAT_R10G10B10A2_TYPELESS
+                    : img.format == DXGI_FORMAT_B8G8R8A8_UNORM    ? DXGI_FORMAT_B8G8R8A8_TYPELESS
+                    : img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_FORMAT_R16G16B16A16_TYPELESS
+                                                                   : img.format;
+    }
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = c.noShaderBinding ? D3D11_BIND_RENDER_TARGET : D3D11_BIND_SHADER_RESOURCE;
@@ -425,13 +541,20 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
     // Absolute values in the middle of the bars (unrotated cases).
     const Levels lv = levelsFor(c.format);
     auto barX = [&](int b) { return (uint32_t(b) * 2 + 1) * cw / 16; };
-    if (c.rotation == 0 && c.source == Source::Bars && !p010) {
+    // The 100 % colour bars, whatever the texture format holding them.
+    const bool bars = c.source == Source::Bars || c.source == Source::SrgbTyped || c.source == Source::Bars10;
+    if (c.rotation == 0 && bars && !p010) {
         for (int b = 0; b < 8; ++b) expectAt(chk, got, w, h, barX(b), ch * 3 / 8, kBarYuv[b], "bar", b);
-    } else if (c.rotation == 0 && c.source == Source::Bars) {
+    } else if (c.rotation == 0 && bars) {
         // sRGB in an HDR10 stream: white at 203 cd/m2 (PQ 0.581, code 573), black 64.
         const int white[3] = {573, 512, 512}, black[3] = {64, 512, 512};
         expectAt(chk, got, w, h, barX(0), ch * 3 / 8, white, "sRGB white bar at 203 cd/m2", 0);
         expectAt(chk, got, w, h, barX(7), ch * 3 / 8, black, "sRGB black bar", 7);
+    } else if (c.rotation == 0 && c.source == Source::Pq10) {
+        for (int b = 0; b < 8; ++b) {
+            const int want[3] = {p010 ? kPqGreyP010[b] : kPqGreyNv12[b], lv.mid, lv.mid};
+            expectAt(chk, got, w, h, barX(b), ch / 8, want, "PQ grey bar", b);
+        }
     } else if (c.rotation == 0) {
         for (int b = 0; b < 8; ++b) {
             // NV12 clips scRGB to SDR: 0 is black, 1.0 and above white.
@@ -445,7 +568,7 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
         } else {
             expectAt(chk, got, w, h, barX(0), ch * 3 / 8, kBarYuv[5], "clipped red bar", 0);  // scRGB red = sRGB red
         }
-    } else if (c.rotation == 90 && c.source == Source::Bars) {
+    } else if (c.rotation == 90 && bars) {
         // Displayed = source turned 90 degrees clockwise: the source's top-left
         // (white bar) is at the top right, its top-right (black bar) at the bottom right.
         if (std::abs(got[size_t(4) * w + (w - 4)] - 235) > 1) chk.fail("rotation: top right is not white");
@@ -538,6 +661,7 @@ int runConvertSelfTest(bool hardware) {
                      : "no P010 render targets: HDR10 on separate R16/R16G16 planes (HDR10 mode planar)");
 
     const Image bars = testPattern(256, 128), hdr = hdrPattern(256, 128, true), smooth = hdrPattern(256, 128, false);
+    const Image barsSrgb = srgbTyped(bars), bars10 = pattern10(256, 128, false), pq10 = pattern10(256, 128, true);
     const Case cases[] = {
         {"1:1 + barcode", 256, 128, 0, layout(8, 72, 16), 0xA5C3, 1, false},
         {"2:1 downscale + barcode", 128, 64, 0, layout(4, 36, 8), 0xC0FF, 1, true},
@@ -557,10 +681,31 @@ int runConvertSelfTest(bool hardware) {
         {"HDR10 from an sRGB source", 256, 128, 0, BarcodeLayout{}, 0, 1, false, 0, 0, Source::Bars, Format::P010},
         {"HDR10 scaled into 64x16 padding", 256, 96, 0, layout(8, 64, 2), 0xBEEF, 2, false, 200, 90, Source::HdrSmooth,
          Format::P010},
+        // What AMD Direct Capture can hand out besides 8-bit UNORM and FP16
+        // (final review): a game's sRGB swap chain, fully typed (viewed as
+        // sRGB, the sampler decodes it), also copied first and in HDR10.
+        {"sRGB-typed 1:1 + barcode", 256, 128, 0, layout(8, 72, 16), 0xA5C3, 1, false, 0, 0, Source::SrgbTyped},
+        {"sRGB-typed 2:1 downscale (copy)", 128, 64, 0, BarcodeLayout{}, 0, 1, true, 0, 0, Source::SrgbTyped},
+        // Tolerance 2: PQ magnifies the sampler's sRGB decoding error near
+        // black (Mesa llvmpipe under Wine is a few per cent off there).
+        {"HDR10 from an sRGB-typed source", 256, 128, 0, BarcodeLayout{}, 0, 2, false, 0, 0, Source::SrgbTyped, Format::P010},
+        // 10-bit R10G10B10A2: sRGB-coded from an SDR output.
+        {"10-bit sRGB 1:1 + barcode", 256, 128, 0, layout(8, 72, 16), 0x1234, 1, false, 0, 0, Source::Bars10},
+        {"10-bit TYPELESS 4:3 downscale", 192, 96, 0, BarcodeLayout{}, 0, 2, false, 0, 0, Source::Bars10, Format::Nv12, true},
+        {"HDR10 from a 10-bit sRGB source", 256, 128, 0, BarcodeLayout{}, 0, 1, false, 0, 0, Source::Bars10, Format::P010},
+        // ... and BT.2020 PQ from an output in HDR mode.
+        {"HDR10 from 10-bit PQ + barcode", 256, 128, 0, layout(8, 72, 16), 0xBEEF, 1, false, 0, 0, Source::Pq10, Format::P010},
+        {"HDR10 2:1 from 10-bit PQ (copy)", 128, 64, 0, BarcodeLayout{}, 0, 1, true, 0, 0, Source::Pq10, Format::P010},
+        {"10-bit PQ to SDR", 256, 128, 0, BarcodeLayout{}, 0, 1, false, 0, 0, Source::Pq10},
     };
     int failures = checkBarcodeWords();
     for (const Case& c : cases) {
-        const Image& img = c.source == Source::Hdr ? hdr : c.source == Source::HdrSmooth ? smooth : bars;
+        const Image& img = c.source == Source::Hdr         ? hdr
+                           : c.source == Source::HdrSmooth ? smooth
+                           : c.source == Source::SrgbTyped ? barsSrgb
+                           : c.source == Source::Bars10    ? bars10
+                           : c.source == Source::Pq10      ? pq10
+                                                           : bars;
         const bool rt = c.format == Format::P010 ? p010 : nv12;
         failures += runCase(dev.device.Get(), rt ? Converter::Output::Nv12 : Converter::Output::Planar, img, c);
     }

@@ -136,6 +136,12 @@ struct StartParams {
     // every image new: a fast-scrolling texture under full-frame noise), the
     // live-bitrate qualification's (step 3.6) worst case for rate control.
     bool motion = false;
+    // synthetic-gpu only (tests): the texture format it presents in, as AMD
+    // Direct Capture can hand out: "" (B8G8R8A8_UNORM; FP16 with hdr),
+    // "bgra-srgb" (B8G8R8A8_UNORM_SRGB: a game's sRGB swap chain), "rgb10a2"
+    // (R10G10B10A2_UNORM: sRGB-coded; with hdr BT.2020 PQ, an HDR10 swap
+    // chain), "rgba16" (R16G16B16A16_UNORM, which the conversion cannot read).
+    std::string testFormat;
     // Phase 5 experiments (optional, off by default; caps say where they work).
     // reencodeOversized: a non-key frame larger than this many average frames
     // (bitrate / fps) is encoded once more at a higher QP before it goes out

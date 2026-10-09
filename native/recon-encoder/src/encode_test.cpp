@@ -86,6 +86,7 @@ const OptionField kStartOptions[] = {
     {"--monitor", "monitor", Kind::Int},
     {"--hmonitor", "hmonitor", Kind::Hex},
     {"--motion", "motion", Kind::Bool},
+    {"--test-format", "testFormat", Kind::Str},
 };
 
 // "A,B,..." -> non-negative integers.

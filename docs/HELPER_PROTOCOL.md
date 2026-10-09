@@ -164,7 +164,7 @@ ignored by recon-host.
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr` \| `vbr_peak`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr` (AMF LATENCY_CONSTRAINED_VBR), `vbr_peak` is AMF's PEAK_CONSTRAINED_VBR (NVENC: VBR, as `vbr`); added in step 3.6, older helpers refuse it; recon-host sends what the live-bitrate qualification chose, see "Live-bitrate qualification"), `quality` (`speed` \| `balanced` \| `quality`), `hdr` (HDR10, opt-in: see "HDR10"), `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots`, nor with `svcLayers` > 1 unless the codec's caps have `intraRefreshSvc`; recon-host asks for half a second of frames wherever the codec's caps have `intraRefresh` and the stream uses no LTR slots and no SVC, or SVC with `intraRefreshSvc`, the loss-recovery ladder's safety net, GUIDE 2.3 / docs/ARCHITECTURE.md), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible); `motion` (step 3.6, `synthetic-gpu` only, else `bad_message`: its high-motion mode, see "Capture"; not with `hdr`: `unsupported`); Phase 5 experiments (optional, off by default): `reencodeOversized` (0 = off, else 1.5..100: re-encode a non-key frame larger than that many average frames; caps `reencode`), `sliceOutput` (0 = off, else 1..64 slices / tiles per frame handed out one by one; caps `sliceOutput`, AMF only) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
+| `start` | `capture` (`dda` \| `amd-direct` \| `wgc` \| `synthetic` \| `synthetic-gpu`; empty = backend default, `wgc` when a window is given), `monitor`, `hmonitor`, `adapterLuid`, `window`, `windowTitle`, `codec` (`h264` \| `hevc` \| `av1`), `width`, `height` (0 = capture size), `fps` (1-480), `kbps`, `vbvFrames` (VBV in frame intervals, default 1; GUIDE 3.3 recommends 1.0-1.5), `rc` (`cbr` \| `vbr` \| `vbr_peak`: `cbr` when the rate controller may change the bitrate, the backend picks its low-latency VBR flavour for `vbr` (AMF LATENCY_CONSTRAINED_VBR), `vbr_peak` is AMF's PEAK_CONSTRAINED_VBR (NVENC: VBR, as `vbr`); added in step 3.6, older helpers refuse it; recon-host sends what the live-bitrate qualification chose, see "Live-bitrate qualification"), `quality` (`speed` \| `balanced` \| `quality`), `hdr` (HDR10, opt-in: see "HDR10"), `ltrSlots` (0-8, at most the codec's caps `maxLtr`; 0 = no LTR recovery: a loss then costs what caps `recovery` says, `invalidate` = NVENC reference invalidation, `none` = an IDR; AMF needs 0 or >= 2), `svcLayers` (1-4), `gpuPriority`, `idleRepeatMs`, `barcode`; encoder knobs (step 3.3, all optional): `liveBitrate` (`seamless` \| `flush`, default the codec's caps value), `encoderInstance` (hardware engine, -1 = default 0), `ltrInterval` (frames between LTR marks, 0 = fps/10), `intraRefreshFrames` (intra refresh cycle, 0 = off; not with `ltrSlots`, nor with `svcLayers` > 1 unless the codec's caps have `intraRefreshSvc`; recon-host asks for half a second of frames wherever the codec's caps have `intraRefresh` and the stream uses no LTR slots and no SVC, or SVC with `intraRefreshSvc`, the loss-recovery ladder's safety net, GUIDE 2.3 / docs/ARCHITECTURE.md), `zeroCopy` (default true: AMD Direct Capture surfaces go to the AMF encoder unconverted when possible); `motion` (step 3.6, `synthetic-gpu` only, else `bad_message`: its high-motion mode, see "Capture"; not with `hdr`: `unsupported`); `testFormat` (tests, `synthetic-gpu` only, else `bad_message`: `bgra-srgb` \| `rgb10a2` \| `rgba16`, the texture format it presents in, see "Capture"; not with `motion`, with `hdr` only `rgb10a2`: `unsupported`); Phase 5 experiments (optional, off by default): `reencodeOversized` (0 = off, else 1.5..100: re-encode a non-key frame larger than that many average frames; caps `reencode`), `sliceOutput` (0 = off, else 1..64 slices / tiles per frame handed out one by one; caps `sliceOutput`, AMF only) | Start capture + encode. Once per helper: a second `start` is `already_started`; after a failed `start` another one may follow. See "Capture" for the selection fields and "AMF encoder backend" for the knobs. |
 | `forceIdr` | | Next frame is an IDR / key frame (in the running encoder), and starts a new sequence: its ring slot has SEQ_START and its barcode value is 0 (step 3.1b; recon-host starts a new stream generation there). |
 | `recover` | `lostFromFrameId`, `ackedLtrFrameId` (optional) | Frames from `lostFromFrameId` on were lost. NVENC: every frame from `lostFromFrameId` to the newest one is invalidated and the next frame references an older one (`ackedLtrFrameId` is not used); AMF: the next frame references only the LTR slot holding the newest acknowledged LTR frame before `lostFromFrameId` (`ackedLtrFrameId` names one recon-host saw acknowledged); without a usable reference an IDR. |
 | `ack` | `frameId` | The client decoded this frame (GUIDE 3.5). The AMF backend uses it to know which long-term references the client holds: send it at least for every frame whose ring slot has `ltrSlot >= 0`, as soon as the client's ACK arrives; other ids are ignored. Added in step 3.3 (older helpers answer `bad_message`). |
@@ -424,7 +424,7 @@ reports the state at its start; other captures false).
 | `unsupported` | no | the backend cannot do what was asked (e.g. codec) |
 | `init_failed` | no | capture or encoder initialisation failed (e.g. `DuplicateOutput` refused) |
 | `no_output` | no | the requested monitor / window does not exist or is not attached to the desktop |
-| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly; a zero-copy AMD Direct Capture source that changed size, rotation or surface format: recon-host restarts the helper, which then follows the new source, and starts it with `zeroCopy` false if that happens again) |
+| `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly; a zero-copy AMD Direct Capture source that changed size, rotation or surface format: recon-host restarts the helper, which then follows the new source, and starts it with `zeroCopy` false if that happens again; no captured frame converted for 2 s and at least 10 frames, e.g. a texture format the colour conversion cannot read, whose non-fatal error (`unsupported`, `init_failed`) is sent once a second until then: recon-host restarts the helper and, after three failures within 60 s, streams with FFmpeg) |
 | `device_lost` | yes | the D3D11 device was removed (driver reset / TDR), noticed by any capture method, the colour conversion or an encoder (NVENC also on `NV_ENC_ERR_DEVICE_NOT_EXIST`); a new helper starts over |
 | `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped) |
 | `encode_failed` | no / yes | an encoder call failed (AMF `SubmitInput`, `QueryOutput`, surface creation; NVENC `NvEncEncodePicture`, `NvEncLockBitstream`, `NvEncReconfigureEncoder` for a `setRate`, which keeps the old rate); fatal after 10 failures in a row, on `AMF_EOF`, when `liveBitrate` `flush` cannot re-initialize the AMF encoder, or when NVENC does not finish a frame within 2 s |
@@ -564,7 +564,7 @@ after both threads have been joined.
 | `amd-direct` | AMD Direct Capture (`AMFDisplayCapture`), AMD adapters only, opt-in | the output's adapter, wrapped in an `AMFContext` | `WAIT_FOR_PRESENT`, framerate (0,1), dirty rects, `DUPLICATEOUTPUT`; monitor index = the output's index on its adapter (VERIFY) |
 | `wgc` | Windows.Graphics.Capture: a monitor or a window | the monitor's adapter | MSVC build only (C++/WinRT); cursor off (listed only where Windows allows it), border off where allowed |
 | `synthetic` | timer-driven frame counter, no image | none | mock tests |
-| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s; with `motion` (step 3.6) it presents without pauses and every 640x360 image is new: an 8 px checkerboard with a ramp scrolling 12 px right and 5 px down per present under full-frame noise (+-40 per channel), which no tested bitrate can carry at 1080p, so the encoder's rate control always sets the frame sizes | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path; the live-bitrate qualification's source; with `hdr` it plays an output in HDR mode (FP16 scRGB up to 4000 cd/m2, a 1000 cd/m2 patch in the top-right 32x32 corner, a 1000 cd/m2 panel's metadata; not with `motion`) |
+| `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s; with `motion` (step 3.6) it presents without pauses and every 640x360 image is new: an 8 px checkerboard with a ramp scrolling 12 px right and 5 px down per present under full-frame noise (+-40 per channel), which no tested bitrate can carry at 1080p, so the encoder's rate control always sets the frame sizes | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path; the live-bitrate qualification's source; with `hdr` it plays an output in HDR mode (FP16 scRGB up to 4000 cd/m2, a 1000 cd/m2 patch in the top-right 32x32 corner, a 1000 cd/m2 panel's metadata; not with `motion`); `testFormat` presents the same pictures in the other formats AMD Direct Capture can hand out: `bgra-srgb` (B8G8R8A8_UNORM_SRGB), `rgb10a2` (R10G10B10A2_UNORM, sRGB-coded; with `hdr` BT.2020 PQ, the patch at PQ code 769), `rgba16` (R16G16B16A16_UNORM, which the conversion cannot read) |
 
 Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
 `hmonitor` (the HMONITOR recon-host already has for each monitor; a session's virtual display,
@@ -662,7 +662,18 @@ With `InputSpec::Nv12` every GPU frame goes through one D3D11 pixel-shader pass 
 luma column, between the two luma rows; Sunshine's 6-tap filter), bilinear scaling to the
 encoded size, rotation for rotated displays (the texture-to-display rotation of
 `DXGI_OUTDUPL_DESC::Rotation`), FP16 scRGB sources clipped to SDR (an HDR desktop in an
-SDR stream; HDR10 streams get P010 instead, see "HDR10"). The
+SDR stream; HDR10 streams get P010 instead, see "HDR10"). Sources: 8-bit BGRA / BGRX /
+RGBA (UNORM or TYPELESS, viewed as UNORM; fully typed `*_UNORM_SRGB`, a game's sRGB swap
+chain as AMD Direct Capture can hand it out, viewed as sRGB, since D3D11 lets a view
+differ from its texture's format only for a TYPELESS texture: the sampler decodes it to
+linear light and the shader codes it again, so it filters in linear light), FP16
+(`R16G16B16A16_FLOAT` / `TYPELESS`) and 10-bit `R10G10B10A2_UNORM` / `TYPELESS`, read as
+sRGB-coded like 8-bit, or as BT.2020 PQ (an HDR10 swap chain scanned out) while the
+captured output is in Windows HDR mode (the source's `display` at the start, then every
+`captureChanged`'s `hdr`; VERIFY on hardware, docs/VENDOR_NOTES.md); PQ goes into NV12
+as absolute light in BT.709 with 203 cd/m2 (ITU-R BT.2408 reference white, where an sRGB
+source goes in HDR10) as white, brighter clipped. Any other format is `unsupported` for
+that frame (see `capture_failed`). The
 render target views select the NV12 planes by format (R8 luma, R8G8 chroma). The device is
 shared with the capture and the encoder's threads, so each conversion holds the device's
 critical section (`ID3D10Multithread::Enter`/`Leave`) and sets or clears every pipeline
@@ -711,7 +722,8 @@ Pipeline:
   turned off during the stream (Sunshine's format list has both). An SDR stream asks for
   B8G8R8A8 only, and DXGI converts an HDR desktop to SDR itself.
 - **Conversion** (`InputSpec::P010`, `src/d3d/convert.cpp`): per tap, scRGB x 80 cd/m2 (an
-  8-bit sRGB source: decoded, white at 203 cd/m2, the HDR reference white of ITU-R BT.2408),
+  sRGB source, 8 or 10 bits, coded or sRGB-typed: decoded, white at 203 cd/m2, the HDR
+  reference white of ITU-R BT.2408; a 10-bit BT.2020 PQ source goes in as it is),
   the BT.709 -> BT.2020 matrix of ITU-R BT.2087, negative values clipped, the SMPTE ST 2084
   (PQ) inverse EOTF; then the BT.2020 non-constant-luminance matrix into 10-bit limited
   range (Y 64..940, CbCr 64..960), written to a `DXGI_FORMAT_P010` texture (render target
@@ -831,7 +843,8 @@ no padding) and the encoder accepts the capture format, the capture surfaces the
 go to the encoder (`zeroCopy`, the Streaming SDK's path; DCC-compressed surfaces are
 copied first, since they cannot be encoded as they are). Zero-copy takes 8-bit UNORM
 BGRA / RGBA only: an RGBA_F16 (HDR desktop) or R10G10B10A2 capture format goes through the
-NV12 conversion. Every zero-copy surface is checked again (its AMF format and its D3D11
+NV12 conversion (which also takes sRGB-typed and 10-bit textures, see "Colour
+conversion"). Every zero-copy surface is checked again (its AMF format and its D3D11
 texture format): a source that changes size, rotation or format (the capture
 re-initializes after a mode change or an HDR switch; an sRGB-typed or 10-bit game swap
 chain, which the Streaming SDK also refuses to encode directly) ends the helper with the
@@ -1384,7 +1397,14 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
   1:1, 2:1 downscale from a copied source, a 90 degree rotation, an 8-bit sRGB source at
   203 cd/m2, padding), every P010 sample's low 6 bits zero, absolute codes (0, 80, 100, 203,
   1000, 4000, 10000 cd/m2 = Y 64, 490, 509, 573, 723, 855, 940; scRGB red, green, blue at
-  80 cd/m2 = 325/448/598, 450/432/476, 226/650/535) and the barcode at 64 / 940 / 512.
+  80 cd/m2 = 325/448/598, 450/432/476, 226/650/535) and the barcode at 64 / 940 / 512;
+  the other capture formats AMD Direct Capture can hand out (final review): the colour bars
+  as a fully typed B8G8R8A8_UNORM_SRGB texture (1:1 with barcode, 2:1 from a copy, into
+  P010 at 203 cd/m2: the same absolute values) and as R10G10B10A2 (sRGB-coded: 1:1,
+  TYPELESS 4:3, into P010), and 10-bit BT.2020 PQ of an output in HDR mode (grey bars of
+  0, 1, 10, 100, 203, 1000, 4000, 10000 cd/m2: into P010 as it is, Y 64, 195, 327, 509,
+  573, 722, 854, 940, also 2:1 from a copy; into NV12 with 203 cd/m2 as white, Y 16, 29,
+  70, 176 and 235 from 203 cd/m2 up).
   Scaled HDR cases use a smooth pattern: texture filtering weights have limited precision
   (D3D11: 8 fractional bits), and PQ magnifies a weight error between a near-black and a
   very bright texel into many codes. It prints `mode nv12` when it tested NV12 render
@@ -1398,7 +1418,10 @@ double on WARP); the Go integration tests run them too (`TestHelperIntegrationNv
 one) and drive `synthetic-gpu` through the mock encoder (fps cap, idle repeats, a
 `forceIdr` starting a new sequence, and the barcode of a `--dump-nv12` frame reading as its
 sequence number with `proto.BarcodeReadLuma`; with `hdr`, the P010 dump's barcode, its
-1000 cd/m2 patch at code 723 and `started`'s HDR10 fields).
+1000 cd/m2 patch at code 723 and `started`'s HDR10 fields; `TestHelperIntegrationCaptureFormats`:
+with `testFormat` `bgra-srgb` and `rgb10a2` the NV12 dump's barcode and gradient, with
+`rgb10a2` and `hdr` the P010 dump's 1000 cd/m2 PQ patch at 722-723, and with `rgba16` the
+fatal `capture_failed` about 2 s after the start).
 
 ## Encode test
 
@@ -1412,7 +1435,8 @@ start. Options become `start` fields (validated by the same parser): `--codec`,
 `--capture` (`synthetic-gpu` needs no display), `--width`, `--height`, `--fps`, `--kbps`,
 `--rc`, `--quality`, `--vbv`, `--ltr-slots`, `--ltr-interval`, `--live-bitrate`,
 `--instance`, `--zero-copy=0|1`, `--intra-refresh`, `--hdr=0|1`, `--monitor`, `--hmonitor`,
-`--motion=0|1`, `--barcode=X,Y,CELL`, Phase 5 `--svc=N` (`svcLayers`; also writes FILE
+`--motion=0|1`, `--test-format=bgra-srgb|rgb10a2|rgba16` (`testFormat`), `--barcode=X,Y,CELL`,
+Phase 5 `--svc=N` (`svcLayers`; also writes FILE
 without the discardable frames as `FILE.base` with the extension kept, e.g.
 `out.base.hevc`, which must decode cleanly), `--reencode=F` (`reencodeOversized`),
 `--slices=N` (`sliceOutput`); plus

@@ -106,7 +106,7 @@ Status parseStart(const json& j, StartParams& p) {
         !optField(j, "encoderInstance", p.encoderInstance, err) || !optField(j, "ltrInterval", p.ltrInterval, err) ||
         !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err) ||
         !optField(j, "motion", p.motion, err) || !optField(j, "reencodeOversized", p.reencodeOversized, err) ||
-        !optField(j, "sliceOutput", p.sliceOutput, err)) {
+        !optField(j, "sliceOutput", p.sliceOutput, err) || !optField(j, "testFormat", p.testFormat, err)) {
         return bad(err);
     }
     if (p.codec != "h264" && p.codec != "hevc" && p.codec != "av1") return bad("codec must be h264, hevc or av1");
@@ -133,6 +133,10 @@ Status parseStart(const json& j, StartParams& p) {
         return bad("window capture needs capture \"wgc\"");
     }
     if (p.motion && p.capture != "synthetic-gpu") return bad("motion needs capture \"synthetic-gpu\"");
+    if (!p.testFormat.empty() && p.capture != "synthetic-gpu") return bad("testFormat needs capture \"synthetic-gpu\"");
+    if (!p.testFormat.empty() && p.testFormat != "bgra-srgb" && p.testFormat != "rgb10a2" && p.testFormat != "rgba16") {
+        return bad("testFormat must be bgra-srgb, rgb10a2 or rgba16");
+    }
     return Status::Ok();
 }
 

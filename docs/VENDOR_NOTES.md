@@ -2684,11 +2684,13 @@ Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
   With SDR, start the same run and switch HDR on during it: the helper ends with the fatal
   `capture_failed` "the AMD Direct Capture surfaces are now AMF format ..."; a second run
   (the new format) converts to NV12. Then a fullscreen game with a 10-bit swap chain
-  (R10G10B10A2) and one with an sRGB swap chain (`DXGI_FORMAT_B8G8R8A8_UNORM_SRGB`; most
-  UE4/UE5 titles in exclusive or independent-flip fullscreen): record whether AMD Direct
-  Capture hands out those surfaces (log line with "DXGI format 24" / "91"), and that the
-  helper then ends with that `capture_failed` instead of `encode_failed` or wrong colours;
-  `--zero-copy=0` streams the same game with correct colours.
+  (R10G10B10A2) and one with an sRGB swap chain (`DXGI_FORMAT_B8G8R8A8_UNORM_SRGB`; a
+  blt-model exclusive-fullscreen game, since flip-model swap chains cannot use `*_SRGB`
+  formats): record whether AMD Direct Capture hands out those surfaces (log line with "DXGI
+  format 24" / "91"), and that the helper then ends with that `capture_failed` instead of
+  `encode_failed` or wrong colours; `--zero-copy=0` streams the same game with correct
+  colours (the conversion reads both formats since the final review: "Final review: AMD
+  Direct Capture sRGB and 10-bit surfaces"; before it, it refused them on every frame).
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD Direct Capture is AMD only).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (idle output thread, review fix):
   `HelperIntegrationAMDDirect`-style run through recon-host or `--encode-test
@@ -9459,3 +9461,97 @@ lists the variable; README and SECURITY.md say what goes wrong without it.
   127.0.0.1. Fail the password five times from a phone on mobile data: the phone is locked out,
   a sign-in from another network still works. `RECON_TRUST_PROXY=cloudflared` makes the service
   fail to start, with `trust-proxy "cloudflared"` in the journal.
+
+## Final review: AMD Direct Capture sRGB and 10-bit surfaces
+
+Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can
+hand out (the Streaming SDK checks for both, and the AMF backend already sends them away from
+zero-copy): a fully typed sRGB texture (`DXGI_FORMAT_B8G8R8A8_UNORM_SRGB` = 91, a game's sRGB
+swap chain) and a 10-bit one (`R10G10B10A2_UNORM` = 24, AMF format 13). For `*_SRGB` it asked
+for a `B8G8R8A8_UNORM` view, which D3D11 allows only on a TYPELESS texture
+(`CreateShaderResourceView`: E_INVALIDARG, its copy fallback kept the sRGB format);
+R10G10B10A2 was not in its format table at all ("cannot convert capture format 24"). Both were
+non-fatal per-frame errors: the helper encoded nothing, logged an error per captured frame for
+the rest of the session, and recon-host never restarted it or fell back to DDA. The restart
+with `zeroCopy` false after two zero-copy `capture_failed` led straight into this state.
+
+Fix (`native/recon-encoder/src/d3d/convert.cpp`, `pipeline.cpp`):
+- A fully typed `*_UNORM_SRGB` texture (BGRA, BGRX, RGBA) is viewed with its own sRGB
+  format: the sampler decodes it to linear light (SDR white = 1.0, filtered in linear light),
+  and the shader codes it back to sRGB for NV12 or places it at 203 cd/m2 for P010, exactly
+  where an sRGB-coded source goes. No copy per frame.
+- `R10G10B10A2_UNORM` / `TYPELESS` is read as sRGB-coded like 8-bit while the captured output
+  is in SDR, and as BT.2020 PQ while it is in Windows HDR mode (an HDR10 swap chain scanned
+  out): into P010 as it is, into NV12 as absolute light in BT.709 (the inverse BT.2087
+  matrix) with 203 cd/m2 (ITU-R BT.2408 reference white) as white, brighter clipped. The HDR
+  state comes from the source's `display` at the start and every `captureChanged`'s `hdr`
+  (AMD Direct Capture: as at its start). Which of the two a 10-bit surface holds is an
+  assumption to verify on hardware (below). The stream format is unchanged: AMD Direct
+  Capture still makes HDR10 only from FP16 surfaces at the start.
+- A conversion that keeps failing ends the helper: when no captured frame has converted for
+  2 s and at least 10 frames, the fatal `capture_failed` "no captured frame could be
+  converted for N ms (M in a row): <code>: <text>"; until then the non-fatal error goes out
+  once a second instead of once per frame. recon-host restarts the helper and, after three
+  failures within 60 s, streams with FFmpeg (helper fallback), instead of streaming nothing.
+- The helper logs each new conversion source format once: `conversion source: DXGI format
+  N (8-bit | 8-bit sRGB-typed, viewed as sRGB | 10-bit, sRGB-coded | 10-bit, read as
+  BT.2020 PQ: the output is in HDR mode | FP16 scRGB)`.
+- The GPU test source presents in these formats with start `testFormat` (`bgra-srgb`,
+  `rgb10a2`, with `hdr` as BT.2020 PQ, and `rgba16`, a format the conversion cannot read);
+  encode test `--test-format=`.
+
+Verified here (Linux, mingw-w64 build, Wine 9 with Xvfb / Mesa llvmpipe, mode planar):
+- `--self-test-convert`: nine new cases against the CPU reference (the colour bars as a fully
+  typed sRGB texture: 1:1 with barcode, 2:1 from a copy, into P010; as R10G10B10A2
+  sRGB-coded: 1:1 with barcode, TYPELESS 4:3, into P010; 10-bit BT.2020 PQ: into P010 1:1 with
+  barcode and 2:1 from a copy, and into NV12, with absolute grey codes 64/195/327/509/573/
+  722/854/940 in P010 and 16/29/70/176/235 in NV12). Against the old converter all nine fail
+  (E_INVALIDARG, "cannot convert capture format 24/23"); now all pass with max error 0-1,
+  except the sRGB-typed source into P010 at 2: Mesa's sRGB decoding is a few per cent off near
+  black, which PQ magnifies (that case allows 2).
+- `internal/host/encoder` `TestHelperIntegrationCaptureFormats` (Wine): `bgra-srgb` and
+  `rgb10a2` stream through the mock encoder, the dumped NV12 frame 30's barcode reads 29 and
+  the picture has its gradient; `rgb10a2` with `hdr` streams HDR10 with the 1000 cd/m2 patch
+  (PQ code 769) at Y 722; `rgba16` ends with the fatal `capture_failed` 2.0 s after the start
+  (50 frames, two non-fatal errors before it). Against the old converter and pipeline the
+  first three get no frame and `rgba16` only repeats the non-fatal `unsupported` error.
+- clang `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` on the changed sources: no warnings;
+  `make helper-test` under Wine.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `recon-encoder.exe --self-test-convert=hw`: ends
+  with `ok (mode nv12; HDR10 mode p010)` and the nine new cases at max error 0-1 (2 would
+  mean the GPU's sRGB decoding is as coarse as Mesa's).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (sRGB swap chain): Windows HDR off, a blt-model
+  exclusive-fullscreen D3D11 game with an sRGB swap chain (or any D3D11 sample that creates a
+  `DXGI_FORMAT_B8G8R8A8_UNORM_SRGB` swap chain with `DXGI_SWAP_EFFECT_DISCARD` in
+  fullscreen), then `recon-encoder.exe --encode-test=srgb.hevc --backend=amf
+  --capture=amd-direct --codec=hevc --zero-copy=0 --frames=600 --log-level=debug`: the log
+  has `conversion source: DXGI format 91 (8-bit sRGB-typed, viewed as sRGB)` (record the
+  format if it is another one, e.g. 87: then the capture hands out UNORM copies), no `warn:
+  init_failed: CreateShaderResourceView` lines, `encode-test: ok`; `ffplay srgb.hevc` shows
+  the game with the same brightness and colours as a `--capture=dda` run (not darker, not
+  washed out). Without `--zero-copy=0` the helper ends with the zero-copy `capture_failed`
+  as described in 3.3, and recon-host's third helper (zeroCopy false) streams it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (10-bit, SDR): Windows HDR off, a game with a
+  10-bit swap chain (R10G10B10A2, colour space G22 P709) in independent-flip fullscreen, or
+  AMD Software "10-bpc" colour depth on the desktop if the capture then hands out 10-bit
+  surfaces: the same encode test logs `DXGI format 24 (10-bit, sRGB-coded)` (startup line
+  `surface format 13`) and the stream's colours match a `--capture=dda` run.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (10-bit, HDR; the PQ assumption): Windows HDR
+  on, a game with HDR enabled (an HDR10 swap chain, R10G10B10A2 G2084 P2020) in
+  independent-flip fullscreen: the encode test with `--hdr=1` logs `DXGI format 24 (10-bit,
+  read as BT.2020 PQ: the output is in HDR mode)`; if the stream started from FP16 desktop
+  surfaces it is HDR10 and must look like the game on the host's HDR display (an HDR client,
+  or `ffplay` with tone mapping); if it started from 10-bit surfaces it is SDR (log `the
+  capture surfaces are AMF format 13, not RGBA_F16: SDR`) and must show the game's mid tones
+  at normal brightness with highlights clipped. A very dark picture means AMD Direct Capture
+  hands out sRGB-coded data on an HDR output: record it, the PQ reading must then go.
+  Through recon-host (host capture `amf`): no `encoder helper error` line per frame in
+  host.log; if a format still cannot be converted, host.log shows the helper's
+  `unsupported: cannot convert capture format N` once a second, then `encoder helper failed,
+  restarting it` with "no captured frame could be converted", and after three of them the
+  session streams with FFmpeg: record N.
+- NVIDIA: unverified (no NVIDIA host available). Test: `recon-encoder.exe
+  --self-test-convert=hw` ends with `ok (mode nv12; HDR10 mode p010)` including the new
+  cases. AMD Direct Capture is AMD only, and DDA hands out only B8G8R8A8_UNORM or FP16: the
+  `conversion source: DXGI format 87 (8-bit)` (FP16 with HDR: `10 (FP16 scRGB)`) line of a
+  `--capture=dda` encode test is all that changes there.

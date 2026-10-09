@@ -18,7 +18,17 @@
 // P010 output) and display metadata of a 1000 cd/m2 panel, so the HDR10
 // conversion runs end to end too. The high-motion source has no HDR mode: a
 // start with both motion and hdr is refused.
+//
+// start's testFormat presents the same pictures in the other texture formats
+// AMD Direct Capture can hand out (final review): "bgra-srgb" (a fully typed
+// sRGB texture, the same bytes), "rgb10a2" (10 bits, sRGB-coded; with hdr
+// BT.2020 PQ as an HDR10 swap chain holds it: the HDR picture's layout, the
+// 1000 cd/m2 patch top right at PQ code 769 = P010 Y 722.5) and "rgba16"
+// (R16G16B16A16_UNORM, which the conversion cannot read: the helper must give
+// up with the fatal capture_failed). Not with motion.
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -32,6 +42,12 @@ namespace recon {
 namespace {
 
 using d3d::ComPtr;
+
+// The 10-bit full-range SMPTE ST 2084 (PQ) code of an absolute luminance.
+uint16_t pqCode(double cdm2) {
+    const double y = std::pow(std::clamp(cdm2 / 10000.0, 0.0, 1.0), 0.1593017578125);
+    return uint16_t(std::lround(std::pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375) * 1023));
+}
 
 class GpuTestCapture : public PacedCapture {
 public:
@@ -52,6 +68,8 @@ private:
     void drawPattern();
     void drawMotion();
     void drawHdr();
+    void drawPq();
+    void pack();
 
     d3d::Device dev_;
     ComPtr<ID3D11Texture2D> slots_[2];
@@ -59,7 +77,9 @@ private:
     SourceInfo src_;
     uint32_t bytesPerPixel_ = 4;
     std::vector<uint8_t> pixels_;
-    std::vector<uint16_t> hdrRed_, hdrGreen_;  // HDR: FP16 gradients by column / row
+    std::vector<uint16_t> hdrRed_, hdrGreen_;  // HDR: FP16 gradients by column / row (PQ: 10-bit codes)
+    DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
+    std::vector<uint8_t> packed_;              // testFormat rgb10a2 (SDR) / rgba16: pixels_ in that format
     int64_t start_ = 0, presentPeriod_ = 0, nextPresent_ = 0;
     uint64_t presents_ = 0;
     bool motion_ = false;
@@ -80,6 +100,10 @@ Status GpuTestCapture::init(const StartParams& p) {
     src_.width = 640;
     src_.height = 360;
     if (p.motion && p.hdr) return Status::Error("unsupported", "the high-motion test source (motion) has no HDR mode");
+    if (!p.testFormat.empty() && (p.motion || (p.hdr && p.testFormat != "rgb10a2"))) {
+        return Status::Error("unsupported", "testFormat " + p.testFormat + " is not for the high-motion source" +
+                                                (p.hdr ? ", and only rgb10a2 has an HDR mode" : ""));
+    }
     if (p.hdr) {
         // A 1000 cd/m2 HDR panel with P3-like primaries.
         DisplayColor& d = src_.display;
@@ -91,12 +115,21 @@ Status GpuTestCapture::init(const StartParams& p) {
         src_.hdr = true;
         bytesPerPixel_ = 8;
     }
+    format_ = src_.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (p.testFormat == "bgra-srgb") {
+        format_ = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    } else if (p.testFormat == "rgb10a2") {
+        format_ = DXGI_FORMAT_R10G10B10A2_UNORM;
+        bytesPerPixel_ = 4;  // with hdr: drawPq's words
+    } else if (p.testFormat == "rgba16") {
+        format_ = DXGI_FORMAT_R16G16B16A16_UNORM;  // drawn as 8-bit BGRA, then pack()
+    }
     D3D11_TEXTURE2D_DESC td{};
     td.Width = src_.width;
     td.Height = src_.height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = src_.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = format_;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -105,9 +138,13 @@ Status GpuTestCapture::init(const StartParams& p) {
         if (FAILED(hr)) return Status::Error("init_failed", "creating the test texture failed: " + d3d::hrText(hr));
     }
     pixels_.resize(size_t(td.Width) * td.Height * bytesPerPixel_);
-    if (src_.hdr) {
+    if (format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) {
         for (uint32_t x = 0; x < src_.width; ++x) hdrRed_.push_back(d3d::toHalf(12.5f * float(x) / float(src_.width)));
         for (uint32_t y = 0; y < src_.height; ++y) hdrGreen_.push_back(d3d::toHalf(2.0f * float(y) / float(src_.height)));
+    } else if (src_.hdr) {
+        // PQ (10-bit): the same gradients, 0..1000 and 0..160 cd/m2.
+        for (uint32_t x = 0; x < src_.width; ++x) hdrRed_.push_back(pqCode(1000.0 * x / src_.width));
+        for (uint32_t y = 0; y < src_.height; ++y) hdrGreen_.push_back(pqCode(160.0 * y / src_.height));
     }
     motion_ = p.motion;
     const int64_t freq = qpcFrequency();
@@ -134,10 +171,13 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
         nextPresent_ += presentPeriod_;
         if (qpcNow() - present > presentPeriod_ * 4) nextPresent_ = qpcNow();  // fell behind (debugger): resync
         ++presents_;
-        if (src_.hdr) drawHdr();
+        if (format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) drawHdr();
+        else if (src_.hdr) drawPq();
         else if (motion_) drawMotion();
         else drawPattern();
-        dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, pixels_.data(), src_.width * bytesPerPixel_, 0);
+        pack();
+        const std::vector<uint8_t>& data = packed_.empty() ? pixels_ : packed_;
+        dev_.context->UpdateSubresource(slots_[1 - cur_].Get(), 0, nullptr, data.data(), UINT(data.size() / src_.height), 0);
         a.presentQpc = present;
         a.captureQpc = qpcNow();
         a.dirty = 1;  // the whole test image changes
@@ -195,6 +235,46 @@ void GpuTestCapture::drawHdr() {
                 px[0] = hdrRed_[x], px[1] = hdrGreen_[y], px[2] = blue;
             }
             px[3] = one;
+        }
+    }
+}
+
+// HDR in 10 bits (testFormat rgb10a2 with hdr): drawHdr's picture as BT.2020
+// PQ codes (an HDR10 swap chain): the gradients, a 4000 cd/m2 bar, the
+// 1000 cd/m2 patch top right.
+void GpuTestCapture::drawPq() {
+    const uint32_t w = src_.width, h = src_.height, bar = uint32_t(presents_ * 7 % (w - 64));
+    const uint32_t patch = pqCode(1000), bright = pqCode(4000), blue = pqCode(80.0 * double(presents_ * 3 % 256) / 255.0);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t r = hdrRed_[x], g = hdrGreen_[y], b = blue;
+            if (x >= w - 32 && y < 32) r = g = b = patch;
+            else if (x >= bar && x < bar + 16) r = g = b = bright;
+            const uint32_t word = r | g << 10 | b << 20 | 3u << 30;
+            std::memcpy(&pixels_[(size_t(y) * w + x) * 4], &word, 4);
+        }
+    }
+}
+
+// The 8-bit BGRA picture in testFormat rgb10a2 (SDR: the codes scaled to 10
+// bits) or rgba16; the others upload pixels_ as drawn (bgra-srgb: the same
+// bytes, typed sRGB).
+void GpuTestCapture::pack() {
+    const size_t n = size_t(src_.width) * src_.height;
+    if (format_ == DXGI_FORMAT_R10G10B10A2_UNORM && !src_.hdr) {
+        packed_.resize(n * 4);
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* px = &pixels_[i * 4];  // B, G, R, A
+            auto ten = [](uint8_t v) { return uint32_t(v) * 1023 / 255; };
+            const uint32_t word = ten(px[2]) | ten(px[1]) << 10 | ten(px[0]) << 20 | 3u << 30;
+            std::memcpy(&packed_[i * 4], &word, 4);
+        }
+    } else if (format_ == DXGI_FORMAT_R16G16B16A16_UNORM) {
+        packed_.resize(n * 8);
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* px = &pixels_[i * 4];
+            const uint16_t v[4] = {uint16_t(px[2] * 257), uint16_t(px[1] * 257), uint16_t(px[0] * 257), 65535};
+            std::memcpy(&packed_[i * 8], v, 8);
         }
     }
 }
