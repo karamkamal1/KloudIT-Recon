@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"math"
 	"runtime"
 	"sort"
 	"sync"
@@ -1642,16 +1643,18 @@ func (s *Session) frameSender() {
 			buf = ext.Append(buf)
 		}
 		buf = append(buf, f.Data...)
-		of := &outFrame{f: f, st: st, n: num, opened: time.Now(), deadline: s.frameDeadline(len(buf)), gone: make(chan struct{})}
+		of := &outFrame{f: f, st: st, n: num, opened: time.Now(), deadline: s.frameDeadline(len(buf)), gone: make(chan struct{}), held: true}
 		// A frame the ladder may cancel when it is late: look again at
 		// its deadline (a newer frame queued later looks too).
 		in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
 		in.key, in.recovery, in.age, in.deadline, in.newer = f.Key, f.Recovery, of.deadline, of.deadline, true
-		if ladder(in).act == actCancel {
-			of.timer = time.AfterFunc(of.deadline, s.checkOut)
-		}
+		lateCancel := ladder(in).act == actCancel
 		s.send.register(of)
-		if drop, delay := faults.at(n); drop {
+		drop, delay := faults.at(n)
+		if drop || delay > 0 {
+			s.send.start(of, lateCancel, s.checkOut) // the test hooks bypass the window
+		}
+		if drop {
 			// Test hook: the stream fails mid-frame.
 			_ = st.SetWriteDeadline(time.Now().Add(time.Second))
 			_, _ = st.Write(buf[:len(buf)/2])
@@ -1669,15 +1672,19 @@ func (s *Session) frameSender() {
 			time.AfterFunc(delay, func() { s.sendFrame(of, h, late) })
 			continue
 		}
-		// Send priorities (GUIDE 2.7): at most videoInFlight frames in
-		// flight beyond those in transit, so datagrams never queue behind
-		// a video backlog in the network (window.go). The frame waits with
-		// its stream open, at most until a quarter of its deadline is left;
-		// a frame the client would discard meanwhile is released at once.
+		// Send priorities (GUIDE 2.7): while the path falls short of the
+		// pacing rate, at most videoInFlight frames in flight beyond those
+		// in transit, so datagrams never queue behind a video backlog in
+		// the network (window.go). The frame waits with its stream open,
+		// at most three quarters of its deadline; a frame the client would
+		// discard meanwhile is released at once.
 		if s.admit(of) > 0 && h.Flags&proto.FrameFlagExt != 0 {
 			h.SendUs = s.a.clock() // handed to the transport now: the wait is host queue
 			h.Marshal(buf)
 		}
+		// Its deadline (rung 1) runs from here: the hold was host queue,
+		// not a write the transport holds back.
+		s.send.start(of, lateCancel, s.checkOut)
 		s.sendFrame(of, h, buf)
 	}
 }
@@ -1705,6 +1712,8 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 		return // cancelled while the test hook held it
 	}
 	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	m := s.deliveryMeter()
+	start := startPos(m) // the video window measures the frame's delivery from here
 	if _, err := st.Write(b); err != nil {
 		if s.send.finish(of, outCancelled) {
 			st.CancelWrite()
@@ -1714,8 +1723,11 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 		}
 		return
 	}
-	if m := s.deliveryMeter(); m != nil {
-		s.win.sent(m, time.Now()) // in flight until the peer acknowledged what was sent up to here
+	if m2 := s.deliveryMeter(); m2 != nil {
+		if m2 != m {
+			start = math.MaxUint64 // the path changed during the write
+		}
+		s.win.sent(m2, start, time.Now()) // in flight until the peer acknowledged what was sent up to here
 	}
 	if !s.send.finish(of, outDone) {
 		return // cancelled as its write completed: reported lost

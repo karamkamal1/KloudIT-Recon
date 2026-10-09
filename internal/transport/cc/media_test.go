@@ -320,7 +320,99 @@ func TestMediaDelivery(t *testing.T) {
 	m.OnPacketAcked(5, mds, inFlight, *now)
 	m.OnPacketAcked(3, mds, inFlight, *now)
 	check("spurious acknowledgements", 5*mds, 5*mds)
-	if m.MinRTT() != 10*time.Millisecond {
-		t.Fatalf("MinRTT %v", m.MinRTT())
+	if p := m.PacingRate(); p != int64(DefaultTargetBitrate*PacingGain) {
+		t.Fatalf("PacingRate %d", p)
+	}
+}
+
+// DeliveredAt: when done reached a position, from the record of its growth
+// (merged within ackLogResolution, as far back as ackLogSize entries).
+func TestMediaDeliveredAt(t *testing.T) {
+	m, now := newTestMedia(10 * time.Millisecond)
+	t0 := *now
+	if _, ok := m.DeliveredAt(1); ok {
+		t.Fatal("nothing delivered yet")
+	}
+	inFlight := congestion.ByteCount(0)
+	for pn := congestion.PacketNumber(0); pn < 4; pn++ {
+		inFlight += mds
+		m.OnPacketSent(*now, inFlight, pn, mds, true)
+	}
+	at := func(pos uint64) time.Duration {
+		t.Helper()
+		ts, ok := m.DeliveredAt(pos)
+		if !ok {
+			t.Fatalf("DeliveredAt(%d): unknown", pos)
+		}
+		return ts.Sub(t0.ToTime())
+	}
+	*now = now.Add(10 * time.Millisecond)
+	m.OnPacketAcked(0, mds, inFlight, *now)
+	*now = now.Add(100 * time.Microsecond) // merged with the entry before
+	m.OnPacketAcked(1, mds, inFlight, *now)
+	*now = now.Add(5 * time.Millisecond)
+	m.OnPacketAcked(2, mds, inFlight, *now)
+	if d := at(1); d != 10*time.Millisecond {
+		t.Errorf("first byte delivered at +%v, want +10ms", d)
+	}
+	if d := at(2 * mds); d != 10*time.Millisecond {
+		t.Errorf("second packet delivered at +%v, want +10ms (merged)", d)
+	}
+	if d := at(2*mds + 1); d != 15100*time.Microsecond {
+		t.Errorf("third packet delivered at +%v, want +15.1ms", d)
+	}
+	if _, ok := m.DeliveredAt(3*mds + 1); ok {
+		t.Error("the fourth packet is not delivered yet")
+	}
+	// The record reaches back ackLogSize entries.
+	for pn := congestion.PacketNumber(4); pn < 4+ackLogSize; pn++ {
+		inFlight += mds
+		m.OnPacketSent(*now, inFlight, pn, mds, true)
+		*now = now.Add(time.Millisecond)
+		m.OnPacketAcked(pn, mds, inFlight, *now)
+	}
+	if _, ok := m.DeliveredAt(1); ok {
+		t.Error("a position older than the record must be unknown")
+	}
+	if _, ok := m.DeliveredAt(uint64(3+ackLogSize) * mds); !ok { // packet 3 is still in flight
+		t.Error("the last position delivered is unknown")
+	}
+}
+
+// RecentMinRTT: 0 before any packet is acknowledged (quic-go's min RTT is
+// its 100 ms initial RTT then), the smallest round trip of the last 1.5 to
+// 2 s after, following a round trip that grows (unlike the lifetime min).
+func TestMediaRecentMinRTT(t *testing.T) {
+	m, now := newTestMedia(4 * time.Millisecond)
+	if r := m.RecentMinRTT(); r != 0 {
+		t.Fatalf("RecentMinRTT before any sample %v, want 0", r)
+	}
+	pn := congestion.PacketNumber(0)
+	sample := func(rtt time.Duration) {
+		m.OnPacketSent(*now, mds, pn, mds, true)
+		*now = now.Add(rtt)
+		m.OnPacketAcked(pn, mds, mds, *now)
+		pn++
+	}
+	sample(10 * time.Millisecond)
+	sample(4 * time.Millisecond)
+	sample(9 * time.Millisecond)
+	if r := m.RecentMinRTT(); r != 4*time.Millisecond {
+		t.Fatalf("RecentMinRTT %v, want 4ms", r)
+	}
+	// The round trip grows to 40 ms: within 2 s the 4 ms sample is gone.
+	for range 60 {
+		sample(40 * time.Millisecond)
+	}
+	if r := m.RecentMinRTT(); r != 40*time.Millisecond {
+		t.Fatalf("RecentMinRTT 2.4 s after the step %v, want 40ms", r)
+	}
+	// An ACK-only packet's acknowledgement (never sent as ack-eliciting)
+	// gives no sample.
+	m.OnPacketSent(*now, mds, pn, mds, false)
+	*now = now.Add(time.Millisecond)
+	m.OnPacketAcked(pn, mds, mds, *now)
+	if r := m.RecentMinRTT(); r != 40*time.Millisecond {
+		t.Fatalf("RecentMinRTT %v after an ACK-only packet", r)
 	}
 }

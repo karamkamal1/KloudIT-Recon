@@ -269,11 +269,15 @@ type takenFrame struct {
 type outFrame struct {
 	f        *media.Frame
 	st       transport.SendStream
-	n        uint64 // its number among the frames taken: a frame taken later is newer
-	opened   time.Time
+	n        uint64        // its number among the frames taken: a frame taken later is newer
+	opened   time.Time     // the stream's opening; from start on, when the frame went to the transport
 	deadline time.Duration // from opened (frameDeadline)
 	timer    *time.Timer   // runs checkOut at the deadline; nil: the ladder never cancels it for lateness
 	state    atomic.Int32  // outWriting, then outDone or outCancelled
+	// held: the video window holds the frame before its write (window.go):
+	// its deadline has not started, rung 1 leaves it alone (only a discard
+	// applies). start ends it and sets opened.
+	held bool
 	// gone is closed once checkOut has dealt with the frame's cancellation
 	// (its loss or discard recorded): the video window stops holding it
 	// (Session.admit). nil: nothing waits for it.
@@ -327,6 +331,19 @@ func (s *sendState) register(of *outFrame) {
 	s.mu.Unlock()
 }
 
+// start begins a registered frame stream's deadline now: the frame goes to
+// the transport (a frame the video window held waited before it), and with
+// timer the ladder looks at it again when the deadline has passed (checkOut:
+// check).
+func (s *sendState) start(of *outFrame, timer bool, check func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	of.held, of.opened = false, time.Now()
+	if timer && of.state.Load() == outWriting {
+		of.timer = time.AfterFunc(of.deadline, check)
+	}
+}
+
 // finish ends a frame stream's write as done or failed (outCancelled); false
 // if the ladder cancelled it first.
 func (s *sendState) finish(of *outFrame, state int32) bool {
@@ -367,6 +384,9 @@ func (s *sendState) due(in ladderIn, queued bool, now time.Time) []cancelledFram
 		of := s.out[i]
 		f := of.f
 		age := now.Sub(of.opened)
+		if of.held {
+			age = 0 // held by the video window: its deadline has not started
+		}
 		in.event, in.gen, in.seq, in.key, in.recovery, in.refFloor = lossOutgoing, f.Gen, f.Seq, f.Key, f.Recovery, f.RefFloor
 		in.age, in.deadline, in.newer, in.wait = age, of.deadline, queued || s.taken > of.n, s.wait
 		st := ladder(in)
