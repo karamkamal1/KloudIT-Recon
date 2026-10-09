@@ -102,7 +102,10 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    of the gateway's, and nothing encoding while the tab is hidden. 3.8 wiring's AMD lines (no regression
    with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
    iGPU). Latency: T1 with 0.2's 10-minute latency test (the same scene through Moonlight and
-   Sunshine for the comparison), T2 with the 0.3 rig.
+   Sunshine for the comparison), T2 with the 0.3 rig. Every rig measurement (0.3, 4.3, 4.4,
+   FSR) runs with `"virtualDisplay": "off"` (LATENCY_RIG.md, rules for a fair comparison): a
+   virtual display would put the stream on a monitor that neither `flash.html` nor the host
+   sensor is on.
 5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
    (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
    `· datagrams + FEC`). From the final review: "Final review: host agent", datagram + FEC with
@@ -435,7 +438,7 @@ p95, and a native Moonlight + Sunshine baseline on the same hardware.
 Hardware acceptance (none of it could run in the build sandbox: no GPU, no Windows, no
 microcontroller):
 
-- AMD RDNA3 (RX 7900 XT): unverified. Test: build the rig with two sensors (client screen on A0, host monitor on A1) and plug it into a 120 Hz Windows client on wired LAN. Open `tools/latency-rig/flash.html` fullscreen on the host. With identical settings in both (HEVC, 1920×1080, 120 fps, same bitrate, fullscreen; Moonlight V-Sync and frame pacing off), alternate 100-sample blocks of `python3 tools/latency-rig/rig.py measure --port COMx --host-sensor --label moonlight-hevc-1080p120-lan-amd --samples 100` and `... --label recon-hevc-1080p120-lan-chrome-amd ...` (Sunshine stream stopped while Recon runs and vice versa) until each label has ≥ 200 samples. Then run `rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-amd.json` and paste the table here. Pass: exit code 0 (≥ 200 click→client samples each), timeouts 0 or explained, and Recon's click→client median within ~5–10 ms of Moonlight's (acceptance T2). Repeat for the wifi, wan and capdrop profiles once step 0.4 exists.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: build the rig with two sensors (client screen on A0, host monitor on A1) and plug it into a 120 Hz Windows client on wired LAN. Set `"virtualDisplay": "off"` in the agent's host.json and restart the agent (LATENCY_RIG.md, rules for a fair comparison: a virtual display would put Recon's stream on another monitor than the one `flash.html`, the A1 sensor and Sunshine use); where possible run the host monitor at 1920×1080 120 Hz. Open `tools/latency-rig/flash.html` fullscreen on the host. With identical settings in both (HEVC, 1920×1080, 120 fps, same bitrate, fullscreen; Moonlight V-Sync and frame pacing off), alternate 100-sample blocks of `python3 tools/latency-rig/rig.py measure --port COMx --host-sensor --label moonlight-hevc-1080p120-lan-amd --samples 100` and `... --label recon-hevc-1080p120-lan-chrome-amd ...` (Sunshine stream stopped while Recon runs and vice versa) until each label has ≥ 200 samples. Then run `rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-amd.json` and paste the table here. Pass: exit code 0 (≥ 200 click→client samples each), timeouts 0 or explained, and Recon's click→client median within ~5–10 ms of Moonlight's (acceptance T2); host.log has no `streaming a virtual display` line during the Recon blocks. Repeat for the wifi, wan and capdrop profiles once step 0.4 exists.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same procedure on an RTX 20/30/40/50 host (HEVC; also AV1 on RTX 40+), labels ending in `-nvidia`, baseline `moonlight-hevc-1080p120-lan-nvidia`. Same pass criteria.
 - Rig firmware on an ATmega32U4 (Leonardo / Pro Micro): unverified (compiled only). Test: flash it, open a serial monitor at 115200 baud and send `i`: it must print `board=atmega32u4 hid=avr`. Send `mon` while covering/uncovering the sensor: the first `# lvl` value follows the light. From a CR+LF terminal (Arduino Serial Monitor *Both NL & CR*, or `python -m serial.tools.miniterm`), `r 5` must take 5 samples and `mon` must keep printing; neither may stop at once with `# stopped`. On the flash page, `cal` prints black/white with no `# err`, and `c` prints `id,click_us,client_us,` with a plausible client_us − click_us. `i` then prints `us per loop` (expect tens of µs with two sensors). The client must enumerate a HID mouse plus a COM port, and USB Device Tree Viewer must show the HID interrupt IN endpoint with bInterval 1 ms.
 - Rig firmware on an RP2040 (both USB stacks: Pico SDK and Adafruit TinyUSB): unverified (compiled only). Test: the same checks as for the ATmega32U4 (`board=rp2040 hid=pico-sdk` / `hid=adafruit-tinyusb`). USB Device Tree Viewer must show bInterval 1 ms on the HID endpoint for both stacks. The core default is 10 ms, and this sketch overrides it.
@@ -9401,6 +9404,20 @@ where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `rat
   review` heading (and each such heading without items) that has an `unverified` line or a
   gateway, browser or client check, and looks up its phrase in the plan: 51 items, 16 missing
   before, none after.
+- Third round, latency rig and the virtual display: LATENCY_RIG.md and 0.3's T2 check did not
+  mention the virtual display. With `"virtualDisplay": "auto"` (`install-host.ps1
+  -InstallVirtualDisplay`, INSTALL step 7) a Recon stream at another size than the host monitor
+  or above its refresh rate streams a new virtual monitor (the primary one by default), while
+  `flash.html`, the A1 host sensor and Sunshine stay on the physical monitor: `cal` fails or
+  Recon is measured on another capture target than Moonlight. Fix (documentation): a rule in
+  LATENCY_RIG.md's "Rules for a fair comparison" (`"virtualDisplay": "off"`, no `streaming a
+  virtual display` line in host.log during a Recon block, a host monitor running the tested
+  mode where possible), the same in 0.3's AMD check (the NVIDIA line runs "the same procedure")
+  and in plan stage 4 for every rig measurement (0.3, 4.3, 4.4, FSR). Verified here: the
+  `streaming a virtual display` line and the `auto` rule are `decideVirtualDisplay` in
+  `internal/host/virtualdisplay.go` (nothing is logged with `off`, the default when the key is
+  absent); `python3 tools/latency-rig/test/test_rig.py` passes. AMD RDNA3 (RX 7900 XT) and
+  NVIDIA: unverified; the changed instructions are 0.3's checks.
 
 ## Final review: host agent
 
