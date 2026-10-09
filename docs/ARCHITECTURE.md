@@ -481,6 +481,45 @@ Direct Capture or DDA it lacks, `capture` `x11grab` / `test`, or an FFmpeg encod
 host.json. Otherwise FFmpeg. A later settings change that needs FFmpeg moves the session to
 FFmpeg for good, with the generation numbers continuing.
 
+The rungs, in order (GUIDE 3.8; `chooseHelper` in `internal/host/pipeline.go`):
+
+1. The helper with the GPU vendor's own encoder backend (AMF, NVENC): reference recovery, live
+   bitrate.
+2. The helper's libavcodec backend (Intel Quick Sync Video through FFmpeg 8.x's shared
+   libraries in host config `helperFFmpegDir`, by default `ffmpeg-lgpl\` next to
+   `recon-host.exe`; `helperLibavcodec` `off` skips it): its caps say recovery `none` (every
+   loss costs a key frame, forced in the running encoder: no restart), live bitrate `flush` (a
+   key frame per change, so the rate controller changes it seconds apart) unless a qualification
+   measured `seamless`, no LTR, SVC, ROI or intra refresh. The session reads all of this from
+   the caps, as for any backend.
+3. FFmpeg's command line.
+
+The first launch lets the helper pick its backend (`auto`: the primary display adapter's
+vendor first; libavcodec last, or first on an Intel primary adapter, whose outputs AMF and NVENC
+cannot encode). Two exceptions: a helper encoder forced in host.json (`encoder`
+`<codec>_<backend>_helper`) launches its backend first, and with `helperLibavcodec` `off` the
+vendor backends are launched by name (`auto` would choose, and probe the Quick Sync encoders of,
+the libavcodec backend on an Intel adapter 0). The helper captures on the output's own GPU and
+every backend encodes on that capture's device, taking any GPU of its own vendor (`caps.vendor`;
+the helper checks the same at start): a monitor whose output (`caps.outputs`, by HMONITOR) is on
+another vendor's GPU, a hybrid laptop's external port on the discrete GPU for instance, rules
+that backend out. A second GPU of the same vendor (a Ryzen iGPU next to a Radeon, two GeForce
+cards) stays on the same backend: `caps.adapterLuid` is only the GPU its probe read the caps on,
+so a codec of the caps that the other GPU lacks (AV1, say) makes the helper refuse the start, and
+HelperVideo's failure fallback applies. A negotiated codec that is not one of the backend's
+codecs rules it out too. Then the next backend in the order that no launch reported unavailable
+is launched by name (`--backend=...`), until one fits or none is left. A helper that does not
+start with its own choice is launched with the vendor backends by name (not libavcodec: its
+probe may be what failed); a second failed start ends the selection. The codec is negotiated
+at the stream's real size (as `buildParams` does), so the decode-time choice (step 4.2) cannot
+differ. The chosen backend is pinned for the session: its restarts and the spare helper launch
+with it. host.log has one `video pipeline` line per session with the choice, the reason and why
+each rung before it was skipped (`skipped="amf: AMF runtime ... not found; nvenc: ...; lavc: its
+FFmpeg libraries are not installed: ..."`, `auto: it did not start: ...` first when the helper's
+own choice did not start), `host config encoder not used` when the chosen helper has not got
+a forced helper encoder, and at start `native encoder helper installed ... libavcodec=libraries
+in ...` (or why not).
+
 **Generations on the helper.** The helper numbers frames itself (frame ids; a gap is a lost
 frame). A generation starts at a key frame flagged SEQ_START (the stream's first frame, and the IDR
 that answers `forceIdr`), and `seq` is the frame id minus that frame's. A forced key frame
@@ -523,6 +562,53 @@ new one starts with an IDR as a new generation; further replacements before one 
 300 ms more each (at most 1.5 s). Three failures within 60 s end the helper pipeline: the session
 continues on FFmpeg with a notice. Helpers that fail before going live within 3 s of a
 `device_lost` (a driver reset) do not count.
+
+### Virtual displays (GUIDE 3.7)
+
+With host config `virtualDisplay` `on`, or `auto` when the monitor the session would capture
+cannot show the client's mode 1:1 (another size, or a frame rate above its refresh rate), a
+session streams a monitor created for its client through an installed IddCx driver (SudoVDA or
+the Virtual Display Driver; `internal/host/vdisplay`, session side in
+`internal/host/virtualdisplay.go`):
+
+- **Mode.** The size the client streams at (prefs `width`/`height`), else its screen in device
+  pixels (hello `client.w`/`h`), rounded down to even; the stream's frame rate (prefs `fps`, else
+  `defaultFps`, at most `maxFps`) as refresh rate. The client's hello already carries all of it;
+  its measured refresh rate (`client.hz`) is not used: the monitor refreshes as fast as the
+  stream runs.
+- **When.** The session creates it as it starts, after taking over from an older session and
+  before its pipeline (the helper's caps then list the display's output) and welcome (which lists
+  the display alone, `virtual: true`: the session captures nothing else, and the client offers no
+  display choice for one monitor). A settings change of the size or frame rate replaces it: the
+  video is suspended, `Create` removes the old display and adds one at the new mode, and the next
+  generation starts at once. A session without one decides again on such a change. A switch to a
+  window capture (prefs `window`) removes it at once; a monitor capture afterwards decides again.
+- **Capture.** Exactly that display, 1:1 (the prefs size equals the display's, so nothing scales):
+  FFmpeg's `ddagrab` with its DXGI output index (`gfxcapture` of its HMONITOR when it is not an
+  output of DXGI adapter 0, the render adapter the agent gives the driver, or when the host
+  config asks for `gfxcapture`), the helper's `dda` by HMONITOR (`wgc` of that HMONITOR when the
+  host config asks for `gfxcapture`). Never AMD Direct Capture (the GPU's display engine never
+  scans out an IddCx monitor): capture `amf` falls back to DDA for it.
+  The fps cap is the display's refresh rate, so 120 fps on a 60 Hz host monitor works. Absolute
+  mouse input and the client-side cursor map to the display's desktop rectangle (looked up in
+  the monitor list for every generation).
+- **Restore.** When the session ends the display is released: after `virtualDisplayLinger`
+  (10 s) it is removed and the topology from before it restored, unless a reconnecting client
+  took it over (same mode: the same display, nothing rearranged; another mode: replaced). A
+  display whose driver stops answering (SudoVDA's watchdog removes it), or that Windows no longer
+  lists (checked every second, gone after two misses in a row: the Virtual Display Driver has no
+  keepalive, and the helper's `dda` only reports a vanished output `lost` and retries), is left at
+  once: the video is suspended, the display removed, the topology restored and the stream
+  restarted on the physical monitor (notice), without creating another. A generation being built
+  when the display is no longer listed (an FFmpeg restart) removes it first, then captures the
+  monitor where the restore put it. Agent shutdown (`Run` returning) removes it; after a crash or
+  power loss the next agent start replays the restore journal (`vdisplay-restore.json` next to
+  host.json) before any session. One virtual display exists at a time: a new session that takes over a running
+  one reuses or replaces it, and the replaced session's end leaves it alone.
+- **Not used** for the test pattern, x11grab and window captures. Decisions are logged once per
+  session or change (`virtual display not used reason=...`, `streaming a virtual display ...`,
+  `virtual display changed ...`); a failure is also a notice ("Virtual display unavailable: ...;
+  streaming the monitor.").
 
 ## The browser pipeline
 

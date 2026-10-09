@@ -921,7 +921,7 @@ func TestAMFCaptureBackend(t *testing.T) {
 	s := newSession("amf")
 	dda := media.Params{Source: media.Source{Backend: "ddagrab", Output: 2, NativeW: 2560, NativeH: 1440}, Encoder: hevc}
 	p := dda
-	s.useAMFCapture(&p, mon)
+	s.useAMFCapture(&p, mon, false)
 	if p.Source != (media.Source{Backend: "amf", Output: 2, NativeW: 2560, NativeH: 1440}) || fallbacks() != 0 {
 		t.Fatalf("source %+v, log %s", p.Source, logs.String())
 	}
@@ -932,7 +932,7 @@ func TestAMFCaptureBackend(t *testing.T) {
 	}{{true, 1}, {true, 1}, {false, 1}, {true, 2}} {
 		p = dda
 		p.DrawCursor = c.cursor
-		s.useAMFCapture(&p, mon)
+		s.useAMFCapture(&p, mon, false)
 		if wantAMF := !c.cursor; (p.Source.Backend == "amf") != wantAMF || fallbacks() != c.logs {
 			t.Fatalf("step %d: source %s, %d fallback lines", i, p.Source.Backend, fallbacks())
 		}
@@ -956,13 +956,13 @@ func TestAMFCaptureBackend(t *testing.T) {
 	s.noteCaptureFailure(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Failed to initialize capture component: 3"),
 		Failed: &media.Params{Source: media.Source{Backend: "ddagrab"}}})
 	p = dda
-	if s.useAMFCapture(&p, mon); p.Source.Backend != "amf" {
+	if s.useAMFCapture(&p, mon, false); p.Source.Backend != "amf" {
 		t.Fatal("a ddagrab failure turned AMD Direct Capture off")
 	}
 	s.noteCaptureFailure(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: Failed to initialize capture component: 3"),
 		Failed: &media.Params{Source: media.Source{Backend: "amf"}}})
 	p = dda
-	if s.useAMFCapture(&p, mon); p.Source.Backend != "ddagrab" || !strings.Contains(logs.String(), "AMD Direct Capture failed") ||
+	if s.useAMFCapture(&p, mon, false); p.Source.Backend != "ddagrab" || !strings.Contains(logs.String(), "AMD Direct Capture failed") ||
 		!strings.Contains(logs.String(), "failed earlier in this session") {
 		t.Fatalf("after a failure: %s, log %s", p.Source.Backend, logs.String())
 	}

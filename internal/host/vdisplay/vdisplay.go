@@ -446,12 +446,22 @@ func (d *Display) Info() Info { return d.mon.info }
 // removes the monitor): the session should capture something else.
 func (d *Display) Lost() <-chan struct{} { return d.mon.lost }
 
-// Close releases the display: after Options.Linger (at once without) the
-// monitor is removed and the previous topology restored, unless a new
-// session has taken it over by then.
+// Close releases the display: after Options.Linger (at once without, and
+// for a display that is lost) the monitor is removed and the previous
+// topology restored, unless a new session has taken it over by then.
 func (d *Display) Close() error {
 	var err error
-	d.once.Do(func() { err = d.m.release(d) })
+	d.once.Do(func() { err = d.m.release(d, false) })
+	return err
+}
+
+// Remove releases the display like Close, but removes it and restores the
+// topology at once, without the linger: the caller cannot use it (it is
+// gone, or cannot be captured), so a reconnecting client should not get it
+// back either.
+func (d *Display) Remove() error {
+	var err error
+	d.once.Do(func() { err = d.m.release(d, true) })
 	return err
 }
 
@@ -506,7 +516,7 @@ func (m *Manager) Close() {
 	}
 }
 
-func (m *Manager) release(d *Display) error {
+func (m *Manager) release(d *Display, now bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	mon := m.cur
@@ -514,7 +524,12 @@ func (m *Manager) release(d *Display) error {
 		return nil // already replaced or removed
 	}
 	mon.owner = nil
-	if m.opts.Linger > 0 {
+	select {
+	case <-mon.lost:
+		now = true // gone: nothing to keep for a reconnect
+	default:
+	}
+	if m.opts.Linger > 0 && !now {
 		mon.linger = time.AfterFunc(m.opts.Linger, func() {
 			m.mu.Lock()
 			defer m.mu.Unlock()

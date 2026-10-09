@@ -111,6 +111,10 @@ type MonitorInfo struct {
 	Y       int    `json:"y"`
 	Primary bool   `json:"primary"`
 	Hz      int    `json:"hz,omitempty"`
+	// Virtual: the session streams a virtual display the host created for
+	// this client (GUIDE 3.7); the welcome then lists it alone. Hosts before
+	// it never set it.
+	Virtual bool `json:"virtual,omitempty"`
 }
 
 // VideoConfig announces a (new) encoder generation. The client must (re)configure

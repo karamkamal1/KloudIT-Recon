@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,5 +166,50 @@ func TestConfigVirtualDisplay(t *testing.T) {
 	}
 	if _, err := load(`{"virtualDisplayLayout":"mirror"}`); err == nil || !strings.Contains(err.Error(), "virtualDisplayLayout") {
 		t.Fatalf("unknown virtualDisplayLayout: %v", err)
+	}
+	// virtualDisplayLinger: seconds, 10 by default, 0 = restore at once.
+	if o := c.virtualDisplayOptions(); o.Linger != 10*time.Second {
+		t.Fatalf("default linger %v", o.Linger)
+	}
+	for in, want := range map[string]time.Duration{"0": 0, "30": 30 * time.Second, "600": 10 * time.Minute} {
+		if c, err := load(`{"virtualDisplayLinger":` + in + `}`); err != nil || c.virtualDisplayOptions().Linger != want {
+			t.Fatalf("linger %s: %v", in, err)
+		}
+	}
+	for _, in := range []string{"-1", "601"} {
+		if _, err := load(`{"virtualDisplayLinger":` + in + `}`); err == nil || !strings.Contains(err.Error(), "virtualDisplayLinger") {
+			t.Fatalf("linger %s accepted: %v", in, err)
+		}
+	}
+}
+
+// TestConfigLibavcodec: host config helperLibavcodec (auto | off) and
+// helperFFmpegDir (default ffmpeg-lgpl next to recon-host.exe; relative to
+// that directory).
+func TestConfigLibavcodec(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	install := filepath.Join(dir, "KlouditRecon")
+	c, err := load(`{}`)
+	if err != nil || !c.libavcodecOn() || c.helperFFmpegDir(install) != filepath.Join(install, "ffmpeg-lgpl") {
+		t.Fatalf("defaults: %v on %v dir %q", err, c.libavcodecOn(), c.helperFFmpegDir(install))
+	}
+	if c, err = load(`{"helperLibavcodec":"off","helperFFmpegDir":"libs/ffmpeg"}`); err != nil || c.libavcodecOn() ||
+		c.helperFFmpegDir(install) != filepath.Join(install, "libs", "ffmpeg") {
+		t.Fatalf("off, relative dir: %v on %v dir %q", err, c.libavcodecOn(), c.helperFFmpegDir(install))
+	}
+	abs := filepath.Join(dir, "ffmpeg-8.1")
+	if c, err = load(`{"helperLibavcodec":"auto","helperFFmpegDir":` + strconv.Quote(abs) + `}`); err != nil || !c.libavcodecOn() ||
+		c.helperFFmpegDir(install) != abs {
+		t.Fatalf("auto, absolute dir: %v dir %q", err, c.helperFFmpegDir(install))
+	}
+	if _, err := load(`{"helperLibavcodec":"on"}`); err == nil || !strings.Contains(err.Error(), "helperLibavcodec") {
+		t.Fatalf("bad value: %v", err)
 	}
 }

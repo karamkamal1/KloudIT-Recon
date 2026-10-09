@@ -26,6 +26,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
+	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -44,11 +45,20 @@ type Agent struct {
 	audioSource media.AudioSource
 	faults      testFaults // TestFaultsEnv: tests only
 
-	// launchHelper starts the native encoder helper for a session; nil when
-	// the host has none (helperMissing says why: not Windows, host config
-	// "pipeline" "ffmpeg", or recon-encoder.exe missing).
-	launchHelper  func(log *slog.Logger) (*encoder.Helper, error)
+	// launchHelper starts the native encoder helper for a session with an
+	// encoder backend ("" = auto: the helper's own order); nil when the host
+	// has none (helperMissing says why: not Windows, host config "pipeline"
+	// "ffmpeg", or recon-encoder.exe missing). lavcMissing says why the
+	// helper's libavcodec backend cannot find FFmpeg's libraries ("" when
+	// they are installed).
+	launchHelper  func(log *slog.Logger, backend string) (*encoder.Helper, error)
 	helperMissing string
+	lavcMissing   string
+	// listMonitors replaces the system's monitors in monitors() (tests).
+	listMonitors func() []platform.Monitor
+	// vd creates sessions' virtual displays (GUIDE 3.7, virtualdisplay.go);
+	// nil: none (tests).
+	vd *vdisplay.Manager
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -164,6 +174,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 	}
 	a.setupHelper()
+	a.setupVirtualDisplays(newVirtualDisplays(a.virtualDisplayOptions()))
 	if v := os.Getenv(TestFaultsEnv); v != "" {
 		if a.faults, err = parseTestFaults(v); err != nil {
 			return nil, fmt.Errorf("%s: %w", TestFaultsEnv, err)
@@ -183,6 +194,9 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 func (a *Agent) clock() uint64 { return a.hostClock.Now() }
 
 func (a *Agent) monitors() []platform.Monitor {
+	if a.listMonitors != nil {
+		return a.listMonitors()
+	}
 	mons, err := platform.Monitors()
 	if err != nil || len(mons) == 0 {
 		return []platform.Monitor{{W: a.cfg.TestWidth, H: a.cfg.TestHeight, Primary: true, Name: "Display", DXGIOutput: -1}}
@@ -301,8 +315,10 @@ func (a *Agent) verifyTicket(tok, origin, relay string) (string, error) {
 	return t.User, nil
 }
 
-// Run serves until ctx is cancelled.
+// Run serves until ctx is cancelled. When it returns, a virtual display a
+// session created is removed and the displays restored.
 func (a *Agent) Run(ctx context.Context) error {
+	defer a.closeVirtualDisplays()
 	if a.pair().Gateway == "" {
 		// Wait instead of exiting: the logon task does not restart an agent that
 		// exits, and `recon-host pair` may run after the agent has started.

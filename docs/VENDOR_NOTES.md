@@ -4025,9 +4025,9 @@ display) driver: a monitor at the client's resolution and the stream's frame rat
 only display, never rotated, captured with Desktop Duplication, and the previous display
 topology restored when the session ends. Host config `virtualDisplay` (`off` default, `auto`,
 `on`) and `virtualDisplayLayout` (`primary` default, `extend`, `only`); installer switch
-`-InstallVirtualDisplay`; test command `recon-host vdisplay`. The package is self-contained:
-the session (`internal/host/session.go`, being rewritten in another track) does not call it
-yet; "Session integration" below is the contract for that.
+`-InstallVirtualDisplay`; test command `recon-host vdisplay`. Sessions use it since "3.7 wiring"
+(next section); "Session integration" below was the contract for that, and the wiring section
+lists where it differs.
 
 ### Driver research
 
@@ -4157,7 +4157,7 @@ pinned by tests.
    device the session enabled is disabled again, before the restore. `Recover` at agent start
    replays the journal after a crash.
 
-### Session integration (for the session rewrite)
+### Session integration (for the session rewrite; done in 3.7 wiring)
 
 - Agent start: `vd := vdisplay.New(cfg.virtualDisplayOptions())` plus `RenderAdapter` =
   `platform.PrimaryAdapter().LUID`, `Linger` = 5 s, `Log`; `vd.Recover()` once before serving
@@ -4183,9 +4183,9 @@ pinned by tests.
 ### Verified in the sandbox
 
 - verified (sandbox): manager logic against a simulated CCD and driver
-  (`internal/host/vdisplay/fake_test.go`; Linux and Windows/Wine): primary (physical monitor
-  moved to (-1920, 0), layout saved for SudoVDA, journal while it exists, exact restore without
-  saving, journal removed), extend, only (physical off, never saved, back on after), a monitor
+  (`internal/host/vdisplay/fake.go`, `fake_test.go` before 3.7 wiring; Linux and Windows/Wine):
+  primary (physical monitor moved to (-1920, 0), layout saved for SudoVDA, journal while it
+  exists, exact restore without saving, journal removed), extend, only (physical off, never saved, back on after), a monitor
   arriving rotated 90 degrees (identity, 2560x1440 not swapped), a 1080x2400 portrait client, a
   monitor arriving off (switched on), a duplicated monitor (own source), a driver LUID that
   differs from CCD's (found as the new target id), a refresh rate Windows will not set
@@ -4296,6 +4296,263 @@ pinned by tests.
   for the helper command; also the render adapter on a hybrid laptop (Intel iGPU + NVIDIA):
   the capture line's `output_idx` must be on DXGI adapter 0 and `recon-encoder` must report the
   NVIDIA adapter in `started`.
+
+## 3.7 wiring Sessions on a virtual display
+
+What changed (session side of 3.7; `internal/host/virtualdisplay.go`, docs/ARCHITECTURE.md
+"Virtual displays"):
+
+- Agent start (`NewAgent` -> `setupVirtualDisplays`): `vdisplay.New` with the host config's
+  policy, layout and linger, the restore journal next to host.json (the folder is created when the
+  policy is not `off`), the host id as the monitor identity, DXGI adapter 0's LUID as render
+  adapter; `Recover()` once before any session, whatever the policy (a crashed agent's display is
+  put back even after the policy was turned off); one `virtual display policy=... layout=...
+  linger=... driver=...` line when the policy is not `off`. `Run` removes a display (a session's,
+  or one lingering for a reconnect) when it returns (agent shutdown).
+- Session start (`run`): after taking over from an older session, before the pipeline and the
+  welcome, `openVirtualDisplay`: `RequestedMode(hello.client, prefs, defaultFps, maxFps)` completed
+  from the monitor prefs name, `Manager.Decide` with that monitor (which may be the agent's own
+  display left by the previous session: then reused or replaced), `Create`. Not for capture
+  `test` / `x11grab` or a window capture. A failure is logged and a notice ("Virtual display
+  unavailable: ...; streaming the monitor."); the session streams the monitor. Also refused
+  right after creation when FFmpeg could not capture the display (not an output of DXGI adapter 0,
+  no `gfxcapture`) and no native helper is installed: removed at once (`Display.Remove`).
+- Capture: every generation looks the display up in the monitor list (`captureMonitor`; rectangle,
+  Hz, HMONITOR, DXGI output) and captures it whole: FFmpeg `ddagrab` `output_idx` = its DXGI
+  output (`gfxcapture` of its HMONITOR when it has none on adapter 0, or with host config capture
+  `gfxcapture`; never `gfxcapture` scaling: the prefs size equals the display's), the helper
+  `capture: "dda"` with `hmonitor` (also with host config capture `amf`: `Session.capture`;
+  `capture: "wgc"` with that `hmonitor` when host config capture is `gfxcapture`). FFmpeg
+  with capture `amf`: `useAMFCapture` logs `AMD Direct Capture (capture "amf") not used, capturing
+  with ddagrab reason="monitor \\.\DISPLAYn is a virtual display, which AMD Direct Capture cannot
+  capture"`. The fps cap is the display's refresh rate. Absolute mouse input
+  (`Injector.SetTarget`) and the cursor position datagrams use the display's desktop rectangle.
+  On FFmpeg (after the helper gave up) without `gfxcapture`, a display without a DXGI output index
+  is left (removed at once, notice) instead of capturing another output.
+- Welcome: lists the virtual display alone (`MonitorInfo.virtual`, new optional field; old
+  clients ignore it): the session captures nothing else, and the client then shows no display
+  choice.
+- Settings: a change of `width`, `height`, `fps` or `monitor` calls `updateVirtualDisplay`: with a
+  display and another requested mode the video is suspended, `Create` replaces the display (old
+  one removed, topology restored, new one added) and the next generation starts urgently on it
+  (`virtual display changed mode=... was=...`); without one the policy decides again (e.g. a
+  client that asks for 120 fps on a 60 Hz monitor). A change of `window` calls it too: a window
+  capture (protocol clients; the bundled web client never sends `window`) suspends the video,
+  removes the display at once (`leaving the virtual display reason="the client captures a
+  window"`) and restarts urgently on the window (FFmpeg `gfxcapture` as without a display, the
+  helper `wgc`); clearing `window` decides again. Otherwise a session keeps its display until it
+  ends.
+- Lost: `Display.Lost()` (SudoVDA's driver stopped answering; its watchdog removes the monitor) or
+  the display missing from the monitor list twice in a row (`watchVirtualDisplay` checks every
+  second: the VDD has no keepalive, Windows can remove or deactivate a SudoVDA monitor whose
+  driver still answers, and the helper's `dda` does not end a generation whose output vanished,
+  it reports `captureChanged` `lost` once and retries): the video is suspended, the display
+  removed at once (the package no longer lingers a lost display), the user told ("The virtual
+  display is gone (...); streaming the monitor."), the stream restarted urgently on the physical
+  monitor, and no other display created in that session. A generation being built when the
+  display is no longer listed (an FFmpeg restart after ddagrab failed; `captureMonitor`) removes
+  it and restores the topology before looking up the monitor it captures instead (no suspend: the
+  generation being built is the restart).
+- End: `closeVirtualDisplay` after the video stopped: the display stays `virtualDisplayLinger`
+  seconds (host config, default 10, 0-600; 0 = restore at once) for a reconnect with the same mode
+  (`virtual display reused`), then it is removed and the topology restored. A newer session that
+  takes over a running one reuses or replaces the display; the older session's end then leaves it
+  alone.
+- Client hello: nothing added. Clients already send their screen in device pixels (`client.w`,
+  `client.h`, `screen.width/height * devicePixelRatio`), the measured refresh rate (`client.hz`,
+  not used: the display refreshes at the stream's rate) and the stream's size (`prefs.width/height`,
+  0 for "Native", the screen for "Match this screen") and frame rate (`prefs.fps`). A device that
+  rotates mid-session keeps the display of its connection (a reconnect picks up the new
+  orientation).
+- `internal/host/vdisplay`: the test double moved from `fake_test.go` to `fake.go` with an
+  exported `Sim` (a simulated PC for the session tests: physical monitors, a SudoVDA- or VDD-like
+  driver, `Monitors()` as `platform.Monitors` lists them, `Lose`, `RemoveDriver`, `FailPlug`,
+  `OffAdapter0`, `Counts`), as `internal/host/encoder/fake.go` does for the helper; `Display.Remove`
+  (release without the linger); a lost display is removed at once on release.
+
+Differences from the 3.7 contract ("Session integration" above): the display is created as the
+session starts, before the pipeline and the welcome, not in `buildParams` (the helper's caps must
+list its output, and the welcome can list it), and on settings changes of size, frame rate or
+monitor; the welcome lists it alone instead of a selected monitor in the `video` config; the
+linger is 10 s by default (configurable) rather than 5 s, so that a page reload with the 4.1 / 4.2
+decoder tests before the hello still finds it.
+
+### Verified in the sandbox
+
+- verified (sandbox): session-level tests against `vdisplay.Sim` (`go test ./internal/host -run
+  VirtualDisplay`, Linux, `-race -count=3`; and as a Windows binary under Wine 9.0 + Xvfb,
+  `GOOS=windows go test -c ./internal/host`, `-test.run VirtualDisplay|AMFCapture|HelperSource|
+  HelperBlocker|PipelineSelection|PipelineMonitorSwitch|OpenPipeline`, all pass):
+  `TestVirtualDisplayCapture` (a 2560x1440@120 client on a 1920x1080@60 monitor, `auto`, layouts
+  primary and extend: display 2560x1440@120 at (0,0) with the monitor at (-1920,0), resp. at
+  (1920,0); `streaming a virtual display reason="client wants 2560x1440, monitor is 1920x1080"`;
+  welcome lists it alone with `virtual`; capture `auto`: `ddagrab` with its DXGI output, native
+  size, 120 fps, also when the client names its size (no `gfxcapture`); absolute input mapped to
+  its rectangle, cursor monitor = it; session end restores the monitor at (0,0), journal removed,
+  1 plug / 1 unplug), `TestVirtualDisplayAMDDirectCapture` (capture `amf`: ddagrab, the reason
+  logged once), `TestVirtualDisplayOffAdapter0` (no DXGI output: `gfxcapture` of its HMONITOR at
+  its size; without `gfxcapture` and no helper: refused with a notice and removed at once),
+  `TestVirtualDisplayPolicy` (14 cases: matching monitor -> none, `reason="the monitor matches the
+  client"` logged once; 120 fps on 60 Hz -> 1920x1080@120; larger client; client size setting
+  1280x720; default frame rate; a second 2560x1440@144 monitor chosen in prefs -> none; no driver
+  -> none; `on` without driver and a failing plug -> the notice; `on`; `off` and default -> no log
+  line at all; capture `test` and a window -> none), `TestVirtualDisplayResolutionChange` (through
+  `controlLoop`: a bitrate change keeps the display and starts overlapped; 1920x1080, then 60 fps,
+  then back to the client's screen each replace it (suspend, urgent start on the new display,
+  plugs 2-4, 3 unplugs); a session without one gets one when it asks for 120 fps),
+  `TestVirtualDisplayLost` (SudoVDA keepalive fails and the monitor departs: notice, suspend,
+  urgent restart on the physical monitor, restored at once despite a 1 h linger, input mapped to
+  the monitor, a later 2560x1440@144 request creates none and logs why; VDD-like display that
+  disappears from the list: the next generation captures the monitor, restored before it returns
+  and input mapped to the monitor at (0,0), notice "Windows no longer lists it"; VDD-like display
+  that disappears under a running generation that only reports `captureChanged` `lost` (the
+  helper's `dda`), through `videoEvents`: notice, suspend, urgent restart on the 1920x1080@60
+  monitor within the 2 s check, restored), `TestVirtualDisplayWindow` (through `controlLoop`: a
+  switch to `window` "Notepad" on a virtual display suspends, removes it at once despite a 1 h
+  linger and starts urgently with FFmpeg `gfxcapture` of the window; `captureBackend` gives
+  `gfxcapture` for a window also while the display exists; clearing `window` creates it again and
+  captures it with `ddagrab`), `TestVirtualDisplayReconnect` (reconnect within the 1 s linger -> same
+  display, `reason="the monitor is the previous session's virtual display"`, 1 plug; a takeover at
+  1920x1080@144 replaces it; the replaced session's end leaves it; removed 1 s after the last
+  session), `TestVirtualDisplayAgent` (a crashed agent's display and journal (layout `only`, the
+  physical monitor off): `NewAgent` restores it before any session (`restoring the displays after
+  an unfinished virtual display session`, 1 driver recover, journal gone), options policy / layout
+  / journal dir / 10 s linger, one start line; `Run` returning removes a lingering display; also
+  passes under Wine with the Windows FFmpeg 8.1 build on `WINEPATH`), `TestVirtualDisplaySessionRun`
+  (a whole session through `Agent.HandleConn` over a pipe: the helper is launched after the
+  display exists (its caps list the display's output), the welcome lists it alone, the helper's
+  `start` has `capture: "dda"`, the display's `hmonitor`, 120 fps, with host config capture `amf`;
+  the client's `bye` restores the displays; a session whose video cannot start (no codec in
+  common) restores them too). `TestConfigVirtualDisplay`: `virtualDisplayLinger` default 10 s, 0,
+  30, 600 accepted, -1 and 601 refused. `internal/host/vdisplay`: `TestLostDisplayNotKept` and
+  `Display.Remove` in `TestLingerReuse` (Linux, `-race`, and the Windows build under Wine).
+- verified (sandbox): mutation checks (`go test -overlay`), each fails a test above: no
+  `closeVirtualDisplay` at session end, no `Recover` at agent start, no close in `Run`,
+  `buildParams` capturing the prefs monitor, `captureBackend` ignoring the display (`gfxcapture`
+  scaling / no output), the helper source following host config `amf`, no suspend before a
+  re-create, AMD Direct Capture not turned down, the welcome listing all monitors, settings not
+  updating the display, no reaction to a lost display, and the display created after the
+  pipeline. Review fixes: no monitor-list check in `watchVirtualDisplay`, the removal in
+  `captureMonitor` asynchronous again, `captureBackend` ignoring `window`, the display kept for a
+  window capture, `controlLoop` not passing a `window` change on.
+- verified (sandbox): `go vet ./...`, `GOOS=windows go vet ./...`, `go test ./...` (the e2e package
+  under the shared lock: ok). Browser E2E (Linux: capture `test`, policy `off`, so the stream path
+  is the one before this step): first run 176 passed / 9 failed, all real-time checks (`steady
+  real-time playback` at 43-58 fps of 60, `video decoding` 44 fps, frame pacing fps, the skip and
+  reference recovery scenarios' fps, freezes in the bitrate recovery) at a load of 6-8 on the 4
+  cores; the re-run 184 / 1 (the loss-recovery ladder scenario saw one key frame after an urgent
+  queue-overflow restart); the base commit (`git archive` of 4ad4d24, same lock and load) 181 / 4
+  (relay and WebSocket fps, a skip-recovery decoder error): the same kind of failures, from load.
+- Not verifiable here: everything on a real IddCx driver (no Windows, no GPU); the Wine runs use
+  the simulated display configuration.
+
+### Hardware checks
+
+Host: Windows 11, a 60 Hz physical monitor (set it to 60 Hz in Settings > Display > Advanced
+display), recon-host with recon-encoder.exe next to it, `"virtualDisplay": "auto"` in host.json
+(`install-host.ps1 -InstallVirtualDisplay` sets it); client: a 2560x1440 120 Hz screen, Chrome,
+stream settings Resolution "Native (host display)" or "Match this screen", Frame rate 120 fps.
+Logs: `$env:APPDATA\KlouditRecon\host.log`; overlay Ctrl+Alt+Shift+S.
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (driver installs): once with the Virtual Display
+  Driver (`.\install-host.ps1 -InstallVirtualDisplay`, as in 3.7's install check) and once with
+  SudoVDA (install Apollo, which ships it; uninstall the VDD with `uninstall-host.ps1
+  -RemoveVirtualDisplay` first). After restarting the agent (`Stop-ScheduledTask 'KloudIT Recon
+  Host'; Start-ScheduledTask 'KloudIT Recon Host'`) host.log has one line `msg="virtual display"
+  policy=auto layout=primary linger=10s driver="vdd device ROOT\DISPLAY\000N disabled ..."` resp.
+  `driver="sudovda protocol 0.2.x, watchdog 3 s"`. Run each test below with both drivers.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (2560x1440@120 on a 60 Hz host monitor): connect;
+  host.log: `streaming a virtual display reason="client wants 2560x1440, monitor is 1920x1080"`
+  (or `client wants 120 fps, monitor refreshes at 60 Hz` with a 2560x1440 monitor)
+  `mode=2560x1440@120 ... refresh=120.000 ... dxgi_output=N hmonitor=0x...` (record N: VERIFY that
+  it is >= 0, i.e. the IddCx output is enumerated on DXGI adapter 0, the render adapter), then
+  `video pipeline pipeline=helper backend=amf` without an adapter `skipped` reason (record
+  `recon-encoder.exe --print-caps` `outputs`: the virtual display's adapter and vendor) and
+  `encoder helper started ... capture=dda`. Settings > Display shows it primary, 2560x1440,
+  120 Hz, the physical monitor left of it; the client's settings drawer shows no Display choice.
+  Open `tools/latency-test/index.html` full screen on the host (it opens on the primary, virtual,
+  display; its status line shows its frame rate): the overlay shows 2560x1440 and about 120 fps,
+  host.log `stream stats fps=` about 120 every 10 s. Repeat with `"pipeline": "ffmpeg"`:
+  `msg="starting encoder" ... capture=ddagrab fps=120` (with `"logLevel": "debug"` the `ffmpeg
+  args` line has `ddagrab=output_idx=N:framerate=120`), the same fps.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (pixel-exact): set the virtual display's scale to 100 %
+  (Settings > Display while streaming), make a 1-pixel checkerboard: `ffmpeg -f lavfi -i
+  "nullsrc=s=2560x1440,geq=lum='255*mod(X+Y,2)':cb=128:cr=128" -frames:v 1 -y C:\checker.png`, open
+  it in Chrome on the virtual display, F11 (full screen, 100 % zoom). On the host: `ffmpeg -f lavfi
+  -i "ddagrab=output_idx=N:framerate=1,hwdownload,format=bgra" -frames:v 1 -y C:\cap.png` and
+  `ffmpeg -i C:\cap.png -i C:\checker.png -lavfi "[0]format=gray[a];[1]format=gray[b];[a][b]psnr"
+  -f null -`: `average:inf` (identical: captured 1:1, nothing scaled). On the client (full screen,
+  2560x1440 device pixels): the checkerboard shows as an even fine grey texture without moire or
+  beat stripes, and the overlay's video size is 2560x1440 with no crop. Repeat with layout
+  `extend` and `only`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (input mapping): with layout `primary`, then `extend`
+  (window moved onto the virtual display with Win+Shift+Arrow), mouse mode "Desktop": click the
+  Start button, a window's close button and a 1-pixel line in Paint at the client's four corners:
+  each lands where the client shows the pointer (no offset by the physical monitor's 1920 px, no
+  scaling); with `extend` the pointer cannot leave the virtual display through the client.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (settings change): switch the client's Resolution to
+  1920x1080: host.log `virtual display changed mode=1920x1080@120 was=2560x1440@120`, one short
+  freeze (< 3 s with SudoVDA, < 6 s with VDD), then 1920x1080; Settings > Display shows the
+  virtual display at 1920x1080. Frame rate 60: `mode=1920x1080@60`. Back to Native / 120:
+  2560x1440@120. A bitrate change logs no `virtual display changed`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (end, reconnect, several clients): close the tab:
+  10 s later `virtual display removed, displays restored` and Settings > Display back to the
+  physical monitor alone at its old place, windows back on it. Reload the client page during a
+  stream: `virtual display reused` and no `removed` in between (the desktop is not rearranged).
+  Connect from a second browser (another device) while the first streams: the first gets "Another
+  device connected to this host"; with the same screen and fps the display is reused, with another
+  (e.g. a 1920x1080 laptop) it is replaced (`virtual display created ... 1920x1080`), and the first
+  session's end does not remove it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (agent killed, kill -9 equivalent): during a stream run
+  `taskkill /F /IM recon-host.exe` in an elevated PowerShell. SudoVDA: the virtual display
+  disappears within 3 s (watchdog) and Windows puts the physical monitor back; VDD: it stays (the
+  device the session enabled stays enabled). `%APPDATA%\KlouditRecon\vdisplay-restore.json` exists.
+  `Start-ScheduledTask 'KloudIT Recon Host'`: host.log `restoring the displays after an unfinished
+  virtual display session driver=... mode=2560x1440@120` before any session, the journal is gone,
+  Settings > Display shows the arrangement from before the stream (VDD device disabled again in
+  Device Manager). Also with layout `only` (the physical monitor dark during the stream, lit again
+  after the restart) and an agent stopped with `Stop-ScheduledTask` (the same, it is a kill).
+  Then a normal agent stop (Ctrl+C on `recon-host.exe run` in a console) during a stream: the
+  display is removed and the layout restored before the process exits.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (driver stops, SudoVDA): during a stream disable
+  Apollo's driver in Device Manager (the device with hardware id `root\sudomaker\sudovda`): the
+  client gets "The virtual display is gone (...); streaming the monitor.", the stream continues
+  on the physical monitor within ~5 s, host.log `virtual display lost, streaming the monitor`;
+  changing the resolution afterwards creates no new display (`virtual display not used
+  reason="the session's virtual display was lost (...)"`). Re-enable the driver.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (display vanishes without a keepalive failure, helper
+  pipeline): with the VDD, during a stream disable the virtual display in Device Manager (Display
+  adapters > the Virtual Display Driver device > Disable device) or in Settings > Display (the
+  virtual display > Disconnect this display); with SudoVDA, Settings > Display > Disconnect this
+  display (the driver keeps answering). Within ~2 s the client gets "The virtual display is gone
+  (Windows no longer lists it); streaming the monitor." and the stream continues on the physical
+  monitor (host.log `capture changed reason=lost`, then `virtual display lost, streaming the
+  monitor reason="Windows no longer lists it"` and `restarting video reason="virtual display
+  lost" urgent=true`); the picture does not stay frozen. Repeat with `"pipeline": "ffmpeg"` (FFmpeg
+  exits, the restart captures the monitor: the same notice).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (AMD Direct Capture refused): `"capture": "amf"`,
+  `"pipeline": "ffmpeg"`: `AMD Direct Capture (capture "amf") not used, capturing with ddagrab
+  reason="monitor \\.\DISPLAYn is a virtual display, which AMD Direct Capture cannot capture"`
+  and the stream works; with `"pipeline": "helper"` the helper's start has `capture=dda`.
+  Independently confirm the reason: `recon-encoder.exe --encode-test=x.hevc --backend=amf
+  --capture=amd-direct --hmonitor=<the display's> --frames=60` fails (3.7's check).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HDR on the virtual display): with each driver,
+  during `recon-host.exe vdisplay -mode 2560x1440@120 -hold 120s` (agent stopped): Settings >
+  Display > the virtual display > Use HDR on (record whether the driver offers it);
+  `recon-encoder.exe --encode-test=hdr.hevc --backend=amf --codec=hevc --capture=dda
+  --hmonitor=<the display's> --hdr=1 --fps=120 --kbps=50000 --frames=600`: `started` with `hdr`
+  true and 2560x1440, and `ffprobe -v error -show_streams hdr.hevc` reports
+  `pix_fmt=yuv420p10le color_transfer=smpte2084 color_primaries=bt2020`. Sessions do not stream HDR
+  yet (3.9 is opt-in in the helper; the session part follows), so this records whether the
+  virtual display can be the HDR source.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (auto, matching client): a 1920x1080 60 Hz client on a
+  1920x1080 60 Hz host: `virtual display not used reason="the monitor matches the client"` once per
+  session, the physical monitor is streamed as before.
+- NVIDIA: unverified (no NVIDIA host available). Test: all of the above with `backend=nvenc`
+  (`video pipeline pipeline=helper backend=nvenc`; skip the AMD Direct Capture test), and on a
+  hybrid laptop (Intel iGPU + NVIDIA dGPU): the display's `dxgi_output` and the adapter of its
+  output in `--print-caps` `outputs` (if it is on the Intel adapter the session uses `lavc` or
+  FFmpeg: record `video pipeline ... skipped=...`).
 
 ## 3.9 HDR10 in the helper
 
@@ -4938,14 +5195,13 @@ Ultra for AV1), after `install-host.ps1 -InstallLibavcodec` and a current Intel 
 
 ### Session integration (for the session rewrite)
 
-The pipeline selection of step 3.1b is not in this worktree's base, so `internal/host/session.go`
-is unchanged; the Go API is `internal/host/encoder`:
+Done in "3.8 wiring" below (these were the notes for it). The Go API is `internal/host/encoder`:
 
 - No session change is needed for the backend to be used: `Launch` with `Backend` "auto" picks
   `lavc` on an Intel primary adapter when the libraries are installed (default directory next
   to the helper); `Caps.Usable()` then holds and the 3.1b selection (helper when the caps
-  handshake succeeds, else FFmpeg) applies unchanged. `Options.FFmpegDir` only for a host.json
-  override (e.g. `"helperFFmpegDir"`); leave it empty normally.
+  handshake succeeds, else FFmpeg) applies unchanged. `Options.FFmpegDir`: recon-host passes
+  host.json `"helperFFmpegDir"` (default `ffmpeg-lgpl` next to it; 3.8 wiring).
 - Behaviour from caps, not vendor names: `CodecCaps.Recovery` "none" -> a confirmed loss is
   `ForceIDR` (or `Recover`, which does the same); `LiveBitrate` / `Started.LiveBitrate` "flush"
   -> rate changes cost an IDR: change less often (as 3.6's flush handling); `ROI` "none" -> no
@@ -4954,6 +5210,221 @@ is unchanged; the Go API is `internal/host/encoder`:
   zero copy reads frames back: a few ms more latency).
 - The FFmpeg command-line path (GPL `ffmpeg.exe`, hevc_qsv through `hwmap`) stays the fallback
   when the helper is not usable.
+
+## 3.8 wiring Sessions on the libavcodec backend
+
+What changed (session side of 3.8; the helper's backend is unchanged):
+
+- Pipeline selection (`internal/host/pipeline.go`: `openPipeline`, `chooseHelper`, `helperFits`,
+  `adapterBlocker`; docs/ARCHITECTURE.md "Two pipelines") tries, in order: the helper with a
+  vendor backend (AMF, NVENC), the helper's libavcodec backend, FFmpeg's command line. The first
+  launch is the helper's `auto` (vendor of adapter 0 first, `lavc` last, or first on an Intel
+  adapter 0), except that a helper encoder forced in host.json (`<codec>_<backend>_helper`)
+  launches its backend first and `helperLibavcodec` `off` launches `amf` / `nvenc` by name (never
+  `auto`, which on an Intel adapter 0 would choose `lavc` and open its Quick Sync encoders). When
+  the backend cannot serve the session for a reason of its own (not usable; the captured
+  monitor's output in `caps.outputs` is on another vendor's GPU than `caps.vendor`; the
+  negotiated codec is not one of its codecs) recon-host launches the next backend of that order
+  no launch reported unavailable, with `--backend=...`. A second GPU of the backend's own vendor
+  is not ruled out: the helper encodes on the capture's device and checks only the vendor
+  (`caps.adapterLuid` is just the GPU its probe read the caps on; a codec that GPU has and the
+  other lacks makes the helper refuse the start, and HelperVideo's failure fallback applies, as
+  before this step). When `auto` does not start, `amf` and `nvenc` are launched by name (not
+  `lavc`: its probe may be what failed); a second failed start ends the selection. The chosen
+  backend is pinned for the session (restarts, spare). host.log: one `video pipeline` line with
+  `backend=` and `skipped="auto: ...; amf: ...; nvenc: ...; lavc: ..."` (why each earlier rung
+  was not used); `native encoder helper: trying another backend backend=... instead_of=...
+  reason=...` per relaunch; `host config encoder not used encoder=... reason=...` when the chosen
+  helper has not got a forced helper encoder (the codec is then chosen automatically); at agent
+  start `native encoder helper installed ... libavcodec="libraries in
+  <dir>"` or `"not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec
+  installs FFmpeg's LGPL libraries there)"` or `off (host config "helperLibavcodec")`.
+- Host config: `helperFFmpegDir` (default `<install>\ffmpeg-lgpl`, relative paths from the
+  install directory; recon-host passes it as `--ffmpeg-dir` to every helper and to `recon-host
+  qualify`), `helperLibavcodec` `auto` (default) | `off`.
+- The codec is negotiated at the stream's real size in `openPipeline` too (as `buildParams`),
+  so the 4.2 decode-time choice cannot move the session to FFmpeg right after it opened the
+  helper (merge note (d)).
+- Behaviour from the caps, unchanged code paths checked for this combination (recovery `none`,
+  `forceIdr` true, `liveBitrate` / `liveFps` `flush` assumed, `maxLtr` 0, no intra refresh, SVC
+  or ROI): `start` carries no `ltrSlots` / `intraRefreshFrames` / `svcLayers`; the client is told
+  recovery `keyframe` (also clients with hello v3); a loss goes to the ladder's rung 4 with
+  `ForceIDR`: an IDR in the running encoder, never `recover`, never a restart; the rate controller
+  runs its `flush` policy (a key frame per change; increases at most every 2 s); a qualification
+  of the backend (`backend` `lavc`, cbr cells only) makes it `seamless` (250 ms) or `restart` (a
+  new helper per change, same backend); fixed-bitrate sessions (rc `vbr`, not qualified on this
+  backend) keep the helper's default (`flush`).
+- `encoder helper started` logs `recovery=` and, for the libavcodec backend, `encoder=`
+  (`hevc_qsv`, ...), `usage=` (`low_power` or `default`) and `preset=`, next to `zero_copy=`.
+- `recon-host qualify`: `-backend lavc`, `-ffmpeg-dir` (default: host config), tests
+  `-lavc-test-encoder`; the results file gains `testEncoder` (results of the test encoders never
+  apply to sessions). The results file holds one backend: the one sessions use (`-backend auto`).
+
+### Verified in the sandbox
+
+- verified (sandbox): selection order with fake helpers and caps (`go test ./internal/host -run
+  'PipelineSelection|PipelineMonitorSwitch|AdapterBlocker|SessionOnLavcHelper|OpenPipeline'`):
+  AMF chosen with nothing skipped; NVENC with `skipped="amf: ..."`; `lavc` when no vendor
+  backend is usable (`skipped` lists AMF's and NVENC's reasons); helper present but libavcodec
+  libraries missing -> FFmpeg, `reason="it has no usable encoder"`, `skipped=... lavc: its FFmpeg
+  libraries are not installed: <dir> has no avcodec-62.dll (install-host.ps1 -InstallLibavcodec
+  installs ...)`; `helperLibavcodec` `off` with NVENC usable -> launches `amf`, `nvenc` (never
+  `auto`); `off` with nothing else -> launches `amf` only, FFmpeg, `reason="its amf backend is not
+  usable (...)"`, `skipped=... lavc: off (...)`; a codec only the libavcodec backend has (AV1
+  client, AMF without AV1) -> relaunch with `lavc`; a codec no backend has -> FFmpeg with every
+  backend's reason; `auto` not starting -> `amf`, `nvenc` by name (`skipped="auto: it did not
+  start: ...; amf: ..."`), never `lavc` (`lavc: not launched: ...`), and a second failed start
+  ends it (launches `""`, `amf`); a forced `h264_lavc_helper` on an AMD host with an Intel iGPU
+  -> launches `lavc` only; a forced `hevc_nvenc_helper` without NVENC -> `nvenc`, then `amf`,
+  `host config encoder not used`; a forced lavc encoder with `off` -> `amf`, the same log line.
+  Monitors from a test seam (`Agent.listMonitors`) with capture `ddagrab`: a hybrid laptop
+  (outputs on an Intel and an NVIDIA adapter) streams its panel on `lavc` (one launch) and an
+  external monitor on the dGPU on `nvenc` (launches `""`, `nvenc`, `skipped=... lavc: its lavc
+  encoder runs on intel GPUs (...), the monitor (\\.\DISPLAY2) is on NVIDIA ...`); a monitor on
+  a second AMD GPU (Ryzen iGPU next to a Radeon) stays on `amf` with one launch; a running session
+  switching to the other vendor's monitor leaves the helper for FFmpeg in `buildParams` (`video
+  pipeline pipeline=ffmpeg was=helper reason="its lavc encoder runs on ..."`), to the same
+  vendor's second GPU it stays. `adapterBlocker` alone: DDA, AMD Direct Capture and WGC monitor
+  captures are checked; window and test captures and monitors the caps do not list are not.
+  Mutation checks (`go test -overlay`): removing the adapter check from `helperFits` or from
+  `buildParams`, comparing LUIDs instead of vendors, ignoring the forced backend, launching
+  `auto` with `off`, or dropping the `host config encoder not used` line each fails a test.
+  The same tests pass as a Windows binary under Wine 9.0 (`GOOS=windows go test -c
+  ./internal/host`, run with `-test.run 'PipelineSelection|PipelineMonitorSwitch|AdapterBlocker|
+  OpenPipeline|SessionOnLavcHelper'`: client-side cursor, so `drawCursor` false) and with
+  `-race -count=3`. After these review fixes `xvfb-run -a make helper-test` still passes (the
+  `lavc` Wine tests skipped: only the static GPL FFmpeg build was in the sandbox then; the fixes
+  do not touch the helper, its Go client or the qualification).
+- verified (sandbox): a session on a fake helper with the libavcodec backend's real caps
+  (`TestSessionOnLavcHelper`): start without LTR / intra refresh / SVC, rc `cbr`; VideoConfig
+  `encoder` `h264_lavc_helper`, `recovery` `keyframe` for a hello-v3 client; capabilities
+  ForceIDR, LiveBitrate + Flush, rate policy `flush`; helper-dropped frames and a client `lost`
+  -> `forceIdr`, no `recover`, no restart; a congestion cut -> `setRate`, the flush key frame
+  inside the generation, `{"t":"rate"}` to the client, a key-frame request right after it
+  covered; the spare helper launched with `lavc`; a qualification with seamless passed ->
+  `liveBitrate` `seamless`, policy `seamless`, `live_bitrate_from=qualification`; one where both
+  failed -> no live bitrate, policy `restart`, the cut starts a new `lavc` helper. Race detector
+  clean (`-race -count=3`).
+- verified (sandbox, Wine 9.0 + Xvfb, mingw build, BtbN `ffmpeg-n8.1-latest-win64-gpl-shared-8.1`
+  as of 2026-10-08, SHA-256 `4468dc0e...26644`): `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64 FFMPEG_DIR=<its bin>` (WINEPREFIX=the shared prefix,
+  WINEDEBUG=-all): all pass, among them `TestHelperVideoLavc` (HelperVideo, the session's
+  pipeline, on the real helper `--backend=lavc --lavc-test-encoder=libx264` with the synthetic GPU
+  source): config gen 1 `h264_lavc_helper` `recovery` `keyframe`; capabilities as above
+  (`flush`: Flush set; `seamless` via a qualification: not set, measured); 10 frames, key only
+  first; `Recover` -> `ErrNoRecovery`; `ForceKeyframe` -> gen 2 key frame from the running
+  helper 27-32 ms after the request; `SetRate(1000)` -> RateChange(gen 2, 1000) then, `flush`, a
+  key frame within 3 frames in gen 2, `seamless` none in 20 frames; one helper launched in all;
+  the session's byte stream decodes cleanly with the build's `ffmpeg.exe`. And
+  `TestQualifyLavcTestEncoder` (`recon-host qualify`'s runs with `Backend lavc`, `FFmpegDir`,
+  `LavcTestEncoder libx264`, 320x180@60, 4000 <-> 1500 kbps every 500 ms for 3 s): two cells (h264
+  speed cbr seamless / flush: cbr only, no LTR slots, no intra refresh), 180 frames, 5 changes,
+  0 unexpected key frames, flush: 0 changes without a key frame, 180/180 barcodes, clean decode;
+  libx264 ultrafast follows the sizes 5-10 frames late (seamless FAIL, flush INCONCLUSIVE: a
+  property of that software encoder, not judged by the test); results marked `testEncoder`, never
+  chosen. `TestQualifyMock`, `TestQualifyNvencTestDouble` and every encoder / media helper test
+  still pass.
+- verified (sandbox): `go vet ./...`, `GOOS=windows go vet ./...`, `go test ./...` (the e2e
+  package under the shared lock). The browser E2E (Linux: FFmpeg pipeline, which this step does
+  not change there) passed 177 checks and failed 8 real-time / fps checks (`steady real-time
+  playback`, `video decoding` at 35-44 fps of 60, ...) while other jobs kept the 4-core sandbox at
+  a load of 6-8; the base commit, built from `git archive` and run right after under the same lock
+  and load, gave the same 177 / 8 with the same kind of failures.
+- Not run here: anything on Quick Sync Video (no Intel GPU; under Wine adapter 0 reports NVIDIA,
+  so `auto` never picks `lavc` and the adapter check sees no real second GPU).
+
+### Hardware checks
+
+On an Intel host (12th gen Core or newer with Iris Xe / UHD 7xx, or an Arc card; Arc and Core
+Ultra for AV1), current Intel graphics driver, recon-host with recon-encoder.exe next to it,
+`install-host.ps1 -InstallLibavcodec` done, host.json `"pipeline": "auto"`; logs in
+`$env:APPDATA\KlouditRecon\host.log`, the stats overlay Ctrl+Alt+Shift+S, the browser's
+`__recon.logs`:
+
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (start-up): restart the
+  agent (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`);
+  `Select-String "$env:APPDATA\KlouditRecon\host.log" -Pattern 'native encoder helper installed' |
+  Select-Object -Last 1` shows `libavcodec="libraries in C:\Program Files\KlouditRecon\ffmpeg-lgpl"`.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (selection): open a stream
+  from Chrome; `Select-String host.log -Pattern 'msg="video pipeline"' | Select-Object -Last 1`
+  shows `pipeline=helper ... backend=lavc vendor=intel adapter="Intel(R) ..."
+  encoders=hevc_lavc_helper,...,h264_lavc_helper skipped="amf: ...; nvenc: ..."`, and
+  `msg="encoder helper started" backend=lavc ... encoder=hevc_qsv usage=low_power ... zero_copy=true
+  live_bitrate=flush ... recovery=keyframe ltr_slots=0 intra_refresh=0` (record `usage`,
+  `zero_copy`; `zero_copy=false` costs a few ms: record the overlay's encode p50 / p95). The
+  overlay shows Encoder `hevc_lavc_helper` and "Loss recovery: key frame".
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (libraries missing): rename
+  `C:\Program Files\KlouditRecon\ffmpeg-lgpl` to `ffmpeg-lgpl.off`, restart the agent: the start
+  line says `libavcodec="not installed: ...ffmpeg-lgpl has no avcodec-62.dll (install-host.ps1
+  -InstallLibavcodec ...)"`; a stream logs `video pipeline pipeline=ffmpeg ... reason="it has no
+  usable encoder" skipped="amf: ...; nvenc: ...; lavc: its FFmpeg libraries are not installed:
+  ..."` and streams with FFmpeg's `hevc_qsv` (`msg="starting encoder"`). Rename it back.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (`helperLibavcodec` off):
+  add `"helperLibavcodec": "off"` to host.json, restart: `libavcodec="off (host config
+  \"helperLibavcodec\")"`; a stream logs `pipeline=ffmpeg reason="its amf backend is not usable
+  (...)" skipped="nvenc: ...; lavc: off (host config \"helperLibavcodec\")"`, the helper's start
+  banner says `backend=amf` (requested by name) and no `lavc:` / `h264_qsv` line appears in
+  host.log (no Quick Sync encoder opened). On a hybrid laptop the stream runs on `backend=nvenc`
+  after the `amf` launch. Remove it again.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (losses: an IDR in the
+  running encoder, no restart): start the agent for this test only with
+  `Stop-ScheduledTask 'KloudIT Recon Host'; $env:RECON_TEST_FAULTS="drop=every:300"; &
+  "$env:ProgramFiles\KlouditRecon\recon-host.exe"` (one dropped frame every 5 s at 60 fps) and
+  stream HEVC with constant motion for 2 minutes: every `frames dropped why="test fault"` is
+  followed by `forcing a key frame reason="frame lost"`, no `recovering from a loss`, no
+  `restarting video`, no `encoder helper failed`; the client's `__recon.lastStats.keyFrames` grows by one per
+  drop; the picture recovers within ~2 frame intervals (overlay Freezes row: none > 100 ms).
+  Repeat with H.264 and (Arc / Core Ultra) AV1. Record the time from `frames dropped` to the
+  next key frame's arrival (client `__recon.logs`).
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (rate changes): with the
+  capdrop profile (`./netem.sh apply capdrop --ct <gateway CTID> --host <client IP>`, 0.4) for 5
+  minutes, host.log: `changing the bitrate in the encoder` lines (no `restarting video`), each
+  followed by a key frame on the client (flush), increases at least 2 s apart; the overlay's
+  bitrate follows the steps. Then run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify
+  -quality speed` (Intel: 2-3 codecs x cbr x seamless / flush, about 6 minutes; record the
+  table), restart the stream: `live-bitrate qualification ... choice="hevc speed: adaptive
+  cbr/<mode>, ..."` and `encoder helper started ... live_bitrate=<mode>
+  live_bitrate_from=qualification`; with `seamless` the capdrop run shows no key frames at the
+  changes and changes 250 ms apart. Record per codec whether the QSV runtime resets without a new
+  sequence (seamless pass) as in 3.8's `--live-bitrate=seamless` check.
+- Intel (Iris Xe / Arc): unverified (no Intel host available). Test (hybrid laptop, Intel iGPU
+  + NVIDIA dGPU, both backends usable): stream the internal panel: `backend=lavc` (adapter 0 is
+  the iGPU; `skipped` has no nvenc entry, or `nvenc: usable, not tried (the helper chose lavc
+  for Intel...)`). Then choose an external monitor wired to the dGPU in the client's monitor
+  setting: `native encoder helper: trying another backend backend=nvenc instead_of=lavc
+  reason="its lavc encoder runs on intel GPUs (Intel(R) ...), the monitor (\\.\DISPLAYn) is on
+  NVIDIA ..."`
+  and `video pipeline pipeline=helper backend=nvenc` (for an already running session: `video
+  pipeline pipeline=ffmpeg was=helper reason="its lavc encoder runs on ..."`, the session moves to
+  FFmpeg). Record which outputs DXGI lists on which adapter (`recon-encoder.exe --print-caps`
+  `outputs`).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (no regression; with an Intel iGPU enabled and
+  `-InstallLibavcodec` done, and without): a stream logs `video pipeline pipeline=helper ...
+  backend=amf` without `skipped`, `msg="encoder helper started"` without `encoder=` /
+  `usage=`; the time from `session started` to `encoder ready` is the same as before (no
+  relaunch: one `encoder helper:` start banner per session plus the spare). A monitor on the
+  iGPU's outputs (if any) logs `trying another backend backend=lavc` and streams on Quick Sync.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD test with `backend=nvenc`
+  (`skipped="amf: AMF runtime ... not found ..."` is expected there).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (second AMD GPU, review fix): on a Ryzen with its
+  iGPU enabled and a monitor wired to the motherboard (or an APU laptop with a Radeon dGPU),
+  choose that monitor in the client's monitor setting: `video pipeline pipeline=helper
+  backend=amf` with no `trying another backend` line (one launch), `encoder helper started`
+  without an error, and the picture is that monitor's. Record the `adapter=` of the caps (the
+  probed dGPU) and whether a codec of the caps that the iGPU lacks (AV1 on a pre-RDNA3 iGPU) makes
+  the start fail (`encoder helper failed ... the capture runs on ...` or `unsupported`) and the
+  session fall back as HelperVideo's failure path does. Same test on NVIDIA with two GeForce
+  cards (NVIDIA: unverified, no NVIDIA host available) and on an Intel iGPU next to an Arc card
+  (Intel: unverified, no Intel host available).
+- AMD RDNA3 (RX 7900 XT): unverified. Test (forced helper encoder, review fix): on a host with
+  an Intel iGPU and `-InstallLibavcodec`, set host.json `"encoder": "h264_lavc_helper"` and
+  restart: a stream logs one launch, `video pipeline pipeline=helper backend=lavc
+  encoders=...h264_lavc_helper skipped="amf: usable, not tried (host.json forces
+  h264_lavc_helper); ..."` and `codec choice encoder=h264_lavc_helper reason="forced in the host
+  config"`. Then `"encoder": "hevc_nvenc_helper"` (no NVIDIA GPU): `trying another backend
+  backend=amf instead_of=nvenc`, `host config encoder not used encoder=hevc_nvenc_helper`, the
+  stream on `amf`. Remove the setting again.
+
 ## 4.1 Decoder hygiene
 
 What changed (browser client only; no protocol change: the hello's per-family `hw` flag is now

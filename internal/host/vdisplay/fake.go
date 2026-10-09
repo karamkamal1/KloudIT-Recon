@@ -4,12 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 )
+
+// Test double of Windows' display configuration and an IddCx driver (tests
+// only, here and, through Sim, in the packages that use a Manager): the
+// manager's logic runs against it on any OS.
 
 // fakeSys simulates Windows' display configuration closely enough for the
 // manager: connected monitors (targets) with their supported refresh rates,
@@ -23,6 +28,7 @@ type fakeSys struct {
 	fail      map[uint32]int // Apply flags -> how many more calls with them fail
 	instances map[LUID]string
 	database  map[Target]fakeState // what SDC_USE_DATABASE_CURRENT restores
+	dxgiOff   map[LUID]bool        // adapters whose outputs are not on DXGI adapter 0 (DXGIOutput -1)
 	events    []string             // "apply" and "depart <target>", in order
 }
 
@@ -288,8 +294,12 @@ func (s *fakeSys) Monitor(name string) (platform.Monitor, bool) {
 	defer s.mu.Unlock()
 	for i, t := range s.targets {
 		if t.connected && t.active && t.name == name {
+			out := i
+			if s.dxgiOff[t.t.Adapter] {
+				out = -1
+			}
 			return platform.Monitor{Index: i, Name: name, X: t.x, Y: t.y, W: t.w, H: t.h, Primary: t.x == 0 && t.y == 0,
-				Hz: int(t.hz + 0.5), HMonitor: uint64(0x10000 + i), DXGIOutput: i}, true
+				Hz: int(t.hz + 0.5), HMonitor: uint64(0x10000 + i), DXGIOutput: out}, true
 		}
 	}
 	return platform.Monitor{}, false
@@ -425,3 +435,108 @@ func (d *fakeDriver) count() (plugs, unplugs, recovers int) {
 	defer d.mu.Unlock()
 	return d.plugs, d.unplugs, d.recovers
 }
+
+// Sim is a simulated PC for tests of code that uses a Manager (the sessions in
+// internal/host): physical monitors, the display configuration Windows keeps
+// for them (CCD, GDI), and a virtual display driver, all the test double
+// above. Configure it before handing its Manager out: the setters are not
+// synchronised with a running Manager, except Lose.
+type Sim struct {
+	sys *fakeSys
+	drv *fakeDriver
+}
+
+// simLUID is the adapter the simulated driver's monitors appear on.
+var simLUID = LUID{Low: 0x5eda, High: 1}
+
+// NewSim returns a PC without monitors and with driver (DriverSudoVDA: a
+// monitor added and removed on demand, pinged every 5 ms; DriverVDD: the
+// device enabled for a session, no keepalive).
+func NewSim(driver string) *Sim {
+	sys := newFakeSys()
+	drv := &fakeDriver{sys: sys, name: DriverSudoVDA, adapter: simLUID, every: 5 * time.Millisecond}
+	if driver == DriverVDD {
+		drv.name, drv.vddLike, drv.every = DriverVDD, true, 0
+	}
+	return &Sim{sys: sys, drv: drv}
+}
+
+// AddMonitor connects an active physical monitor of w x h at (x, y) on the
+// desktop, refreshing at hz.
+func (s *Sim) AddMonitor(w, h, x, y, hz int) {
+	s.sys.mu.Lock()
+	id := uint32(len(s.sys.targets) + 1)
+	s.sys.mu.Unlock()
+	s.sys.addPhysical(id, w, h, x, y, float64(hz))
+}
+
+// Manager returns a Manager on this PC, as New does on Windows, with
+// timeouts and polling for tests (the simulated displays change at once).
+func (s *Sim) Manager(opts Options) *Manager {
+	m := newManager(opts, s.sys, []driver{s.drv})
+	m.poll, m.activateAt, m.appearWait, m.departWait, m.monitorWait = time.Millisecond, 20*time.Millisecond, time.Second, time.Second, time.Second
+	return m
+}
+
+// Monitors lists the active displays as platform.Monitors does: primary
+// first, then left to right, Index in that order; HMonitor and DXGIOutput are
+// fixed per display.
+func (s *Sim) Monitors() []platform.Monitor {
+	s.sys.mu.Lock()
+	var names []string
+	for _, t := range s.sys.targets {
+		if t.connected && t.active && t.cloneOf == nil {
+			names = append(names, t.name)
+		}
+	}
+	s.sys.mu.Unlock()
+	var mons []platform.Monitor
+	for _, n := range names {
+		if m, ok := s.sys.Monitor(n); ok {
+			mons = append(mons, m)
+		}
+	}
+	sort.SliceStable(mons, func(i, j int) bool {
+		if mons[i].Primary != mons[j].Primary {
+			return mons[i].Primary
+		}
+		return mons[i].X < mons[j].X
+	})
+	for i := range mons {
+		mons[i].Index = i
+	}
+	return mons
+}
+
+// RemoveDriver makes Detect report that no driver is installed.
+func (s *Sim) RemoveDriver() { s.drv.detectErr = ErrNoDriver }
+
+// FailPlug makes the driver fail to add a monitor with err.
+func (s *Sim) FailPlug(err error) { s.drv.plugErr = err }
+
+// OffAdapter0 puts the driver's monitors on another DXGI adapter than 0 (the
+// render adapter was not applied): their DXGIOutput is -1.
+func (s *Sim) OffAdapter0() {
+	s.sys.mu.Lock()
+	defer s.sys.mu.Unlock()
+	if s.sys.dxgiOff == nil {
+		s.sys.dxgiOff = map[LUID]bool{}
+	}
+	s.sys.dxgiOff[simLUID] = true
+}
+
+// Lose makes the driver stop answering and remove its monitor, as SudoVDA's
+// watchdog does when the agent stops pinging (Windows then rearranges the
+// remaining displays from its database). With DriverVDD nothing reports the
+// loss (no keepalive).
+func (s *Sim) Lose() {
+	s.drv.pingErr.Store(true)
+	s.drv.mu.Lock()
+	t := s.drv.target
+	s.drv.mu.Unlock()
+	s.sys.unplug(t)
+}
+
+// Counts returns how many monitors the driver plugged, unplugged and removed
+// after a crash (Recover).
+func (s *Sim) Counts() (plugs, unplugs, recovers int) { return s.drv.count() }

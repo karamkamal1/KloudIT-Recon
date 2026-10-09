@@ -148,3 +148,52 @@ func TestQualifyNvencTestDouble(t *testing.T) {
 		t.Fatal("test double results chosen")
 	}
 }
+
+// TestQualifyLavcTestEncoder: recon-host qualify on the libavcodec backend
+// (GUIDE 3.8) through its test-only software path (--lavc-test-encoder=libx264
+// from the FFmpeg 8.x shared build in RECON_FFMPEG_DIR): every codec of its
+// caps, in CBR only, started as a session starts it (no LTR slots, no intra
+// refresh), seamless and flush; the flush runs make a key frame at every
+// change, the seamless ones none. The results never apply to sessions.
+func TestQualifyLavcTestEncoder(t *testing.T) {
+	dir := os.Getenv("RECON_FFMPEG_DIR")
+	if dir == "" {
+		t.Skip("set RECON_FFMPEG_DIR to the bin directory of an FFmpeg 8.x shared build with libx264")
+	}
+	ff := os.Getenv("RECON_FFMPEG")
+	if ff == "" {
+		if _, err := os.Stat(dir + `\ffmpeg.exe`); err == nil {
+			ff = dir + `\ffmpeg.exe`
+		}
+	}
+	r := runMatrix(t, Options{Helper: helperExe(t), Backend: "lavc", FFmpegDir: dir, LavcTestEncoder: "libx264", FFmpeg: ff,
+		Qualities: []string{"speed"}, Width: 320, Height: 180, FPS: 60, HighKbps: 4000, LowKbps: 1500, Step: 500 * time.Millisecond,
+		Duration: 3 * time.Second})
+	if c := r.Cells[0]; c.Verdict == VerdictError && strings.Contains(strings.Join(c.Failures, " "), "D3D11") {
+		t.Skipf("no D3D11 device (Wine needs an X display): %s", c.Failures[0])
+	}
+	if r.Backend != "lavc" || r.TestEncoder != "libx264" || r.TestDouble || r.Source.Capture != "synthetic-gpu" {
+		t.Fatalf("results %+v", r)
+	}
+	if got := verdicts(r); !strings.HasPrefix(got, "h264 speed cbr seamless ") || !strings.Contains(got, ", h264 speed cbr flush ") ||
+		strings.Count(got, ",") != 1 {
+		t.Fatalf("cells: %s", got)
+	}
+	for _, c := range r.Cells {
+		if c.Verdict == VerdictError || c.Frames != 180 || c.RateChanges != 5 || c.RateControl == "" || c.StartedLiveBitrate != c.LiveBitrate ||
+			c.LTRSlots != 0 || c.IntraRefresh != 0 || len(c.KeyFrames.Unexpected) != 0 || c.FrameIDs.Gaps != 0 {
+			t.Fatalf("cell %+v", c)
+		}
+		if c.LiveBitrate == ModeFlush && len(c.KeyFrames.MissingAfterChange) != 0 {
+			t.Fatalf("flush without a key frame at every change: %+v", c.KeyFrames)
+		}
+		if ff != "" && (c.Decode == nil || c.Decode.Errors != 0 || c.KeyFrames.Mismatched != 0) {
+			t.Fatalf("decode %+v keys %+v", c.Decode, c.KeyFrames)
+		}
+		t.Logf("%s %s: %s (follow %+v)", c.Codec, c.LiveBitrate, c.Verdict, c.Follow)
+	}
+	// Software encoders: never chosen for a session.
+	if _, _, ok := r.Choose(encoder.Caps{Backend: r.Backend, AdapterName: r.AdapterName}, encoder.StartParams{Codec: "h264", Quality: "speed"}, true); ok {
+		t.Fatal("test encoder results chosen")
+	}
+}

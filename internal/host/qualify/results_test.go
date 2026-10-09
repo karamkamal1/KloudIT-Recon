@@ -166,3 +166,58 @@ func TestResultsPrint(t *testing.T) {
 		t.Errorf("choice lines %q", got)
 	}
 }
+
+// TestChooseLavc: the libavcodec backend (GUIDE 3.8) is qualified in CBR
+// only (Quick Sync's low-delay VBR capped at the target), with no LTR slots
+// (caps recovery none): adaptive streams take its CBR result, fixed-bitrate
+// ones (rc vbr, not measured) keep the helper's default (flush); results of
+// its test encoders (software) never apply.
+func TestChooseLavc(t *testing.T) {
+	intel := encoder.Caps{Backend: "lavc", Vendor: "intel", AdapterName: "Intel(R) Arc(TM) A770 Graphics"}
+	lavc := func(cells ...Cell) *Results {
+		r := &Results{Version: ResultsVersion, Backend: "lavc", Vendor: "intel", AdapterName: intel.AdapterName, Cells: cells}
+		r.fillChoice()
+		return r
+	}
+	cell := func(codec, mode, verdict string) Cell {
+		return Cell{Codec: codec, Quality: "speed", RC: "cbr", LiveBitrate: mode, Verdict: verdict}
+	}
+	if got := DefaultRCModes("lavc"); len(got) != 1 || got[0] != "cbr" {
+		t.Fatalf("rc modes %q", got)
+	}
+	sp := encoder.StartParams{Codec: "hevc"} // as a session starts it on this backend: no LTR slots
+	r := lavc(cell("hevc", "seamless", "pass"), cell("hevc", "flush", "pass"), cell("av1", "seamless", "fail"), cell("av1", "flush", "pass"),
+		cell("h264", "seamless", "fail"), cell("h264", "flush", "fail"))
+	for _, c := range []struct {
+		codec    string
+		adaptive bool
+		rc, mode string
+		ok       bool
+	}{
+		{"hevc", true, "cbr", "seamless", true},
+		{"hevc", false, "", "", false}, // rc vbr not measured: the helper's default
+		{"av1", true, "cbr", "flush", true},
+		{"h264", true, "cbr", "restart", true},
+	} {
+		sp.Codec = c.codec
+		if rc, mode, ok := r.Choose(intel, sp, c.adaptive); rc != c.rc || mode != c.mode || ok != c.ok {
+			t.Errorf("%s adaptive %v: %q %q %v, want %q %q %v", c.codec, c.adaptive, rc, mode, ok, c.rc, c.mode, c.ok)
+		}
+	}
+	if got := strings.Join(r.ChoiceLines(), "; "); got != "hevc speed: adaptive cbr/seamless, fixed vbr/-; av1 speed: adaptive cbr/flush, fixed vbr/-; "+
+		"h264 speed: adaptive cbr/restart, fixed vbr/-" {
+		t.Errorf("choice lines %q", got)
+	}
+	// Measured with LTR slots (another encoder's way of starting): not this stream.
+	if _, _, ok := r.Choose(intel, encoder.StartParams{Codec: "hevc", LTRSlots: 2}, true); ok {
+		t.Error("cells without LTR slots chosen for a stream with them")
+	}
+	te := lavc(cell("h264", "seamless", "pass"))
+	te.TestEncoder = "libx264"
+	if ok, why := te.Matches(encoder.Caps{Backend: "lavc", AdapterName: te.AdapterName}); ok || !strings.Contains(why, "libx264") {
+		t.Errorf("test encoder results match: %v %q", ok, why)
+	}
+	if ch := te.Choice["h264"]["speed"]; ch.Adaptive != ModeSeamless {
+		t.Errorf("test encoder choice (for the record) %+v", ch)
+	}
+}

@@ -198,6 +198,13 @@ libraries (BtbN's FFmpeg 8.1 LGPL shared build, about 80 MB, SHA-256 verified) i
 with Intel Quick Sync Video on GPUs that have no AMD AMF or NVIDIA NVENC encoder (see
 `docs/HELPER_PROTOCOL.md`, "libavcodec encoder backend"); without them the helper reports
 that backend unavailable. The FFmpeg command-line path keeps using the GPL `ffmpeg.exe`.
+Sessions use the backend by themselves where the GPU has no AMF or NVENC encoder (after them,
+before FFmpeg's command line); `host.log` says so at start (`native encoder helper installed
+... libavcodec=libraries in C:\Program Files\KlouditRecon\ffmpeg-lgpl`) and per session
+(`video pipeline pipeline=helper backend=lavc ...`). Libraries kept elsewhere: set
+`"helperFFmpegDir"` in `host.json`; `"helperLibavcodec": "off"` keeps sessions on FFmpeg's
+command line instead. Run `recon-host.exe qualify` once afterwards (see the README) so
+bitrate changes need no key frame where Quick Sync allows it.
 
 The installer:
 

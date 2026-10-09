@@ -283,3 +283,183 @@ func TestHelperVideoSpareRestart(t *testing.T) {
 	t.Logf("restart with a spare helper: first frame of the new helper %v after the failure was seen (%d launches)",
 		time.Since(failedAt).Round(time.Millisecond), n)
 }
+
+// TestHelperVideoLavc drives HelperVideo, the session's pipeline on the
+// helper, with the real helper's libavcodec backend (GUIDE 3.8) on its
+// test-only software path (--lavc-test-encoder=libx264 from the FFmpeg 8.x
+// shared build in RECON_FFMPEG_DIR, as the encoder package's
+// TestHelperIntegrationLavc) and the synthetic GPU source (Wine needs an X
+// display for D3D11). What the session does comes from the backend's caps:
+// a start without LTR slots or intra refresh; recovery "keyframe", so a loss
+// is not recovered from references (Recover: ErrNoRecovery) but answered with
+// an IDR in the running encoder (a new generation, no new helper); a rate
+// change in the running encoder, flush (the caps' default: a key frame in the
+// stream) or seamless (as a qualification may choose: no key frame). The
+// whole stream decodes cleanly.
+func TestHelperVideoLavc(t *testing.T) {
+	exe := helperExe(t)
+	dir := os.Getenv("RECON_FFMPEG_DIR")
+	if dir == "" {
+		t.Skip("set RECON_FFMPEG_DIR to the bin directory of an FFmpeg 8.x shared build with libx264")
+	}
+	for _, mode := range []string{"flush", "seamless"} {
+		t.Run(mode, func(t *testing.T) {
+			log := slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			var mu sync.Mutex
+			launches := 0
+			launch := func() (*encoder.Helper, error) {
+				mu.Lock()
+				launches++
+				mu.Unlock()
+				return encoder.Launch(encoder.Options{Exe: exe, Backend: "lavc", FFmpegDir: dir, Args: []string{"--lavc-test-encoder=libx264"}, Log: log})
+			}
+			opt := HelperOptions{Launch: launch, Log: log, Clock: NewHostClock()}
+			if mode == "seamless" {
+				// As a qualification that passed seamless (CBR) makes it.
+				opt.LiveBitrate = func(c encoder.Caps, sp encoder.StartParams, adaptive bool) (string, string, bool) {
+					return "cbr", "seamless", c.Backend == "lavc" && sp.Codec == "h264" && sp.LTRSlots == 0 && adaptive
+				}
+			}
+			v := NewHelperVideo(opt)
+			defer v.Stop()
+			p := Params{Source: Source{Backend: "test", NativeW: 320, NativeH: 180},
+				Encoder: EncoderInfo{Name: "h264_lavc_helper", Family: "h264", Vendor: "intel", HW: true, Helper: true},
+				FPS:     30, BitrateKbps: 2000, Adaptive: true, Barcode: true, GPUPriority: GPUPriorityAuto}
+			if err := v.Start(p, false); err != nil {
+				t.Fatal(err)
+			}
+			var stream bytes.Buffer
+			next := func() VideoEvent {
+				t.Helper()
+				select {
+				case ev := <-v.Events():
+					if ev.Frame != nil {
+						stream.Write(ev.Frame.Data)
+					}
+					return ev
+				case <-time.After(20 * time.Second):
+					t.Fatal("no video event")
+				}
+				return VideoEvent{}
+			}
+			ev := next()
+			if ev.Err != nil {
+				var he *encoder.HelperError
+				if errors.As(ev.Err, &he) && he.Code == "init_failed" {
+					t.Skipf("no D3D11 device for the synthetic GPU source (Wine needs an X display): %v", ev.Err)
+				}
+				t.Fatalf("start: %v", ev.Err)
+			}
+			if c := ev.Config; c == nil || c.Gen != 1 || c.Family != "h264" || !strings.HasPrefix(c.Codec, "avc1.") || c.Width != 320 ||
+				c.Encoder != "h264_lavc_helper" || c.Recovery != RecoveryKeyframe || c.BitrateKbps != 2000 {
+				t.Fatalf("config %+v", ev.Config)
+			}
+			c := v.Capabilities()
+			if !c.ForceIDR || !c.LiveBitrate || c.LiveBitrateFlush != (mode == "flush") || c.LiveBitrateMeasured != (mode == "seamless") ||
+				c.IntraRefresh || c.Recovery != RecoveryKeyframe {
+				t.Fatalf("capabilities %+v", c)
+			}
+			frame := func() *Frame {
+				t.Helper()
+				for {
+					ev := next()
+					if ev.Frame != nil {
+						return ev.Frame
+					}
+					if ev.Err != nil || ev.Lost != nil || ev.Config != nil {
+						t.Fatalf("event %+v", ev)
+					}
+				}
+			}
+			for seq := uint32(0); seq < 10; seq++ {
+				if f := frame(); f.Gen != 1 || f.Seq != seq || f.Key != (seq == 0) {
+					t.Fatalf("frame %+v", f)
+				}
+			}
+
+			// A loss: no reference recovery on this backend; the session
+			// answers with a key frame forced in the running encoder.
+			if err := v.Recover(1, 9); !errors.Is(err, ErrNoRecovery) {
+				t.Fatalf("Recover: %v", err)
+			}
+			t0 := time.Now()
+			if err := v.ForceKeyframe(); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				ev := next()
+				if ev.Config != nil {
+					if ev.Config.Gen != 2 || ev.Config.Recovery != RecoveryKeyframe {
+						t.Fatalf("config after the forced key frame %+v", ev.Config)
+					}
+					break
+				}
+				if ev.Err != nil || ev.Lost != nil {
+					t.Fatalf("event %+v", ev)
+				}
+			}
+			if f := frame(); f.Gen != 2 || f.Seq != 0 || !f.Key {
+				t.Fatalf("forced key frame %+v", f)
+			}
+			t.Logf("forced key frame %v after the request", time.Since(t0).Round(time.Millisecond))
+
+			// A rate change in the running encoder: announced before the
+			// next frame; flush makes that frame (or one right after) a key
+			// frame of the same generation, seamless none.
+			if err := v.SetRate(1000, 0); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				ev := next()
+				if ev.Rate != nil {
+					if ev.Rate.Gen != 2 || ev.Rate.Kbps != 1000 {
+						t.Fatalf("rate change %+v", ev.Rate)
+					}
+					break
+				}
+				if ev.Err != nil || ev.Lost != nil || ev.Config != nil {
+					t.Fatalf("event %+v", ev)
+				}
+			}
+			keyAt := -1
+			for i := 0; i < 20; i++ {
+				f := frame()
+				if f.Gen != 2 {
+					t.Fatalf("frame after the rate change %+v", f)
+				}
+				if f.Key && keyAt < 0 {
+					keyAt = i
+				}
+			}
+			if (mode == "flush") != (keyAt >= 0 && keyAt < 3) || mode == "seamless" && keyAt >= 0 {
+				t.Fatalf("%s: key frame %d frames after the rate change (-1: none)", mode, keyAt)
+			}
+			if p, _ := v.Current(); p.BitrateKbps != 1000 {
+				t.Fatalf("after SetRate: %d kbps", p.BitrateKbps)
+			}
+			mu.Lock()
+			n := launches
+			mu.Unlock()
+			if n != 1 {
+				t.Fatalf("%d helpers launched, want 1 (key frames and rate changes in the running encoder)", n)
+			}
+
+			// What the session sent decodes cleanly.
+			ff := dir + `\ffmpeg.exe`
+			if _, err := os.Stat(ff); err != nil {
+				t.Logf("no %s: stream not decoded", ff)
+				return
+			}
+			file := t.TempDir() + `\stream.h264`
+			if err := os.WriteFile(file, stream.Bytes(), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(ff, "-v", "error", "-i", file, "-f", "null", "-")
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil || stderr.Len() > 0 {
+				t.Fatalf("decoding the stream: %v %s", err, stderr.Bytes())
+			}
+		})
+	}
+}

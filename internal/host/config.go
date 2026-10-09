@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -41,6 +43,16 @@ type Config struct {
 	// recon-host.exe, Windows) when it starts, can encode the negotiated codec
 	// and the session needs nothing only FFmpeg offers; else FFmpeg.
 	Pipeline string `json:"pipeline,omitempty"`
+	// HelperFFmpegDir is where the helper's libavcodec backend (Intel Quick
+	// Sync Video, GUIDE 3.8) loads FFmpeg 8.x's shared libraries from ("" =
+	// ffmpeg-lgpl next to recon-host.exe, where install-host.ps1
+	// -InstallLibavcodec puts them; a relative path is taken from
+	// recon-host.exe's directory).
+	HelperFFmpegDir string `json:"helperFFmpegDir,omitempty"`
+	// HelperLibavcodec: whether sessions may stream with the helper's
+	// libavcodec backend where it has no AMF or NVENC encoder for them: auto
+	// | off ("" = auto; off: the FFmpeg command line instead).
+	HelperLibavcodec string `json:"helperLibavcodec,omitempty"`
 	// VirtualDisplay gives a session a virtual monitor matched to the client
 	// (resolution and frame rate) through an installed IddCx driver
 	// (internal/host/vdisplay): off | auto | on ("" = off).
@@ -48,6 +60,12 @@ type Config struct {
 	// VirtualDisplayLayout places the virtual monitor: primary | extend | only
 	// ("" = primary).
 	VirtualDisplayLayout string `json:"virtualDisplayLayout,omitempty"`
+	// VirtualDisplayLinger is how many seconds a session's virtual display
+	// stays after the session ends, so that a client reconnecting with the
+	// same mode gets it back without the desktop being rearranged twice
+	// (unset = defaultVirtualDisplayLinger; 0 = the displays are restored at
+	// once; at most 600).
+	VirtualDisplayLinger *int `json:"virtualDisplayLinger,omitempty"`
 	// AV1 is when the automatic codec choice uses AV1 (step 4.2): AV1Fallback
 	// ("" = default) only where HEVC does not work end-to-end, AV1Faster also
 	// instead of HEVC for clients that decode AV1 clearly faster (enable it
@@ -160,6 +178,11 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: pipeline must be %q, %q or %q, not %q", path, pipelineAuto, media.PipelineHelper,
 			media.PipelineFFmpeg, c.Pipeline)
 	}
+	switch c.HelperLibavcodec {
+	case "", libavcodecAuto, libavcodecOff:
+	default:
+		return nil, fmt.Errorf("%s: helperLibavcodec must be %q or %q, not %q", path, libavcodecAuto, libavcodecOff, c.HelperLibavcodec)
+	}
 	if !vdisplay.ValidPolicy(c.VirtualDisplay) {
 		return nil, fmt.Errorf("%s: virtualDisplay must be %q, %q or %q, not %q", path,
 			vdisplay.PolicyOff, vdisplay.PolicyAuto, vdisplay.PolicyOn, c.VirtualDisplay)
@@ -167,6 +190,9 @@ func LoadConfig(path string) (*Config, error) {
 	if !vdisplay.ValidLayout(c.VirtualDisplayLayout) {
 		return nil, fmt.Errorf("%s: virtualDisplayLayout must be %q, %q or %q, not %q", path,
 			vdisplay.LayoutPrimary, vdisplay.LayoutExtend, vdisplay.LayoutOnly, c.VirtualDisplayLayout)
+	}
+	if l := c.VirtualDisplayLinger; l != nil && (*l < 0 || *l > 600) {
+		return nil, fmt.Errorf("%s: virtualDisplayLinger must be 0-600 seconds, not %d", path, *l)
 	}
 	c.path = path
 	return c, nil
@@ -195,6 +221,40 @@ func (c *Config) pipeline() string {
 	return c.Pipeline
 }
 
+// Host config "helperLibavcodec" values.
+const (
+	libavcodecAuto = "auto"
+	libavcodecOff  = "off"
+)
+
+// libavcodecOn reports whether sessions may use the helper's libavcodec
+// backend (host config "helperLibavcodec", default auto).
+func (c *Config) libavcodecOn() bool { return c.HelperLibavcodec != libavcodecOff }
+
+// helperFFmpegDir returns the directory the helper's libavcodec backend loads
+// FFmpeg's shared libraries from, for an agent installed in installDir:
+// helperFFmpegDir, relative to installDir, by default ffmpeg-lgpl there.
+func (c *Config) helperFFmpegDir(installDir string) string {
+	d := c.HelperFFmpegDir
+	if d == "" {
+		d = encoder.LavcDirName
+	}
+	if !filepath.IsAbs(d) {
+		d = filepath.Join(installDir, d)
+	}
+	return filepath.Clean(d)
+}
+
+// LibavcodecDir is the directory of the helper's libavcodec libraries for
+// this executable (recon-host qualify runs the helper with it, as sessions do).
+func (c *Config) LibavcodecDir() string {
+	dir := "."
+	if exe, err := os.Executable(); err == nil {
+		dir = filepath.Dir(exe)
+	}
+	return c.helperFFmpegDir(dir)
+}
+
 // av1 returns the AV1 policy of the automatic codec choice.
 func (c *Config) av1() string {
 	if c.AV1 == "" {
@@ -211,11 +271,21 @@ func (c *Config) gpuPriority() string {
 	return c.GPUPriority
 }
 
-// virtualDisplayOptions are the vdisplay.Options of this config: policy and
-// layout, the restore journal next to the config file, and the host id as the
-// virtual monitor's identity. The caller adds RenderAdapter, Linger and Log.
+// defaultVirtualDisplayLinger is how long a session's virtual display stays
+// for a reconnecting client by default: a page reload, or a client that
+// retries after a lost connection (its first retries come within 5 s).
+const defaultVirtualDisplayLinger = 10 * time.Second
+
+// virtualDisplayOptions are the vdisplay.Options of this config: policy,
+// layout and linger, the restore journal next to the config file, and the
+// host id as the virtual monitor's identity. The caller adds RenderAdapter and
+// Log.
 func (c *Config) virtualDisplayOptions() vdisplay.Options {
-	o := vdisplay.Options{Policy: c.VirtualDisplay, Layout: c.VirtualDisplayLayout, MonitorID: c.HostID}
+	o := vdisplay.Options{Policy: c.VirtualDisplay, Layout: c.VirtualDisplayLayout, MonitorID: c.HostID,
+		Linger: defaultVirtualDisplayLinger}
+	if l := c.VirtualDisplayLinger; l != nil {
+		o.Linger = time.Duration(*l) * time.Second
+	}
 	if o.Policy == "" {
 		o.Policy = vdisplay.PolicyOff
 	}

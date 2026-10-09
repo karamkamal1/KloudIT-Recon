@@ -560,7 +560,9 @@ after both threads have been joined.
 | `synthetic-gpu` | test source: a simulated game presenting into a D3D11 texture at 2x fps (at most 240 Hz) for 1 s, then nothing for 0.6 s; with `motion` (step 3.6) it presents without pauses and every 640x360 image is new: an 8 px checkerboard with a ramp scrolling 12 px right and 5 px down per present under full-frame noise (+-40 per channel), which no tested bitrate can carry at 1080p, so the encoder's rate control always sets the frame sizes | default adapter, else WARP | not listed in caps; CI / Wine tests of the whole GPU path; the live-bitrate qualification's source; with `hdr` it plays an output in HDR mode (FP16 scRGB up to 4000 cd/m2, a 1000 cd/m2 patch in the top-right 32x32 corner, a 1000 cd/m2 panel's metadata; not with `motion`) |
 
 Monitor selection (`dda`, `amd-direct`, `wgc` without a window), first match wins:
-`hmonitor` (the HMONITOR recon-host already has for each monitor); `adapterLuid` (as in
+`hmonitor` (the HMONITOR recon-host already has for each monitor; a session's virtual display,
+GUIDE 3.7, is captured with `dda` by it, or `wgc` when recon-host's host config `capture` is
+`gfxcapture`, never `amd-direct`); `adapterLuid` (as in
 caps, `"%08x:%08x"` HighPart:LowPart) + `monitor` = output index on that adapter;
 `monitor` alone = output index on DXGI adapter 0 (what ddagrab's `output_idx` means).
 The output must be attached to the desktop, else `no_output`. The D3D11 device is created
@@ -1161,6 +1163,24 @@ device has no NV12 render targets, Wine), the synthetic capture's test pattern o
 `preset` `ultrafast`, `tune` `zerolatency`, `forced-idr` 1, `scenecut` 0. It never runs in
 production (the installed LGPL build has no libx264).
 
+**Sessions** (step 3.8 wiring; docs/ARCHITECTURE.md "Two pipelines"). recon-host launches every
+helper with `--ffmpeg-dir` = host config `helperFFmpegDir` (default `ffmpeg-lgpl\` next to
+recon-host.exe, which is where the helper looks by default too; a relative value is taken from
+that directory) and checks at start that `avcodec-62.dll` and `avutil-60.dll` are there. A session
+takes this backend when the helper's `auto` choice falls to it (no AMF / NVENC encoder, or an
+Intel primary adapter) or when the vendor backend cannot serve it (a monitor on another vendor's
+GPU, a codec it lacks: then recon-host relaunches the helper with `--backend=lavc`), or first
+when host.json forces one of its encoders (`h264_lavc_helper`, ...); the backend is then pinned
+for the session's restarts and spare. With `helperLibavcodec` `off` recon-host never launches
+`auto` (it would choose this backend on an Intel adapter 0) but `--backend=amf` / `nvenc`, so no
+Quick Sync encoder is opened; the light probe for `unavailable` still loads the libraries when
+they are installed.
+From the caps: `recover` is never sent (recovery `none`: the session forces an IDR, the client
+is told recovery `keyframe`), `start` carries no `ltrSlots` / `intraRefreshFrames` / `svcLayers`,
+and `liveBitrate` `flush` (a key frame per `setRate`; the rate controller's flush policy) unless
+`recon-host qualify` measured `seamless`. The `encoder helper started` log line carries
+`encoder`, `usage`, `preset` and `zero_copy`.
+
 ## Phase 5 features
 
 GUIDE 9's differentiators, helper and Go client side (`internal/host/encoder`); the session
@@ -1447,7 +1467,10 @@ changes its bitrate while it runs and records it for sessions. It reads the help
 (`--print-caps`) and runs one encode test per codec of the caps x quality preset (`speed`,
 `balanced`, `quality`: every preset a session may ask for; `-quality` narrows it) x
 rate-control mode (AMF: `cbr`, `vbr` = LATENCY_CONSTRAINED_VBR, `vbr_peak` =
-PEAK_CONSTRAINED_VBR; NVENC and others: `cbr`) x live-bitrate mode (`seamless`, `flush`). Each
+PEAK_CONSTRAINED_VBR; NVENC, libavcodec and others: `cbr`) x live-bitrate mode (`seamless`,
+`flush`). The helper runs as sessions run it (`--backend=auto`, `--ffmpeg-dir` = host config
+`helperFFmpegDir`; `-backend lavc` measures the libavcodec backend on a host where `auto` picks
+another one; tests: `-lavc-test-encoder libx264`, whose results never apply). Each
 stream starts as a session starts that codec on this encoder: its `quality`, and `ltrSlots` 2
 where the codec recovers from LTR frames (caps `recovery` `ltr`, `maxLtr` >= 2: AMF), whose
 marked frames the encode test acknowledges `--ack-delay` (2) frames later, so AMF runs with its

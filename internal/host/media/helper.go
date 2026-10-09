@@ -509,11 +509,17 @@ func (v *HelperVideo) run(pr *helperProc) {
 	pr.started = st
 	later := pr.sp // a SetRate while the start was on its way
 	v.mu.Unlock()
-	v.log.Info("encoder helper started", "backend", st.Backend, "capture", st.Capture, "codec", st.Codec,
+	attrs := []any{"backend", st.Backend, "capture", st.Capture, "codec", st.Codec,
 		"size", fmt.Sprintf("%dx%d", st.Width, st.Height), "fps", st.FPS, "kbps", st.Kbps, "adapter", st.AdapterName,
 		"vendor", st.Vendor, "gpu_priority", st.GPUPriority, "live_bitrate", st.LiveBitrate, "rate_control", st.RateControl,
-		"live_bitrate_from", liveSource(pr), "ltr_slots", st.LTRSlots, "intra_refresh", st.IntraRefreshFrames, "zero_copy", st.ZeroCopy,
-		"barcode", st.Barcode, "cursor_in_video", st.CursorInVideo)
+		"live_bitrate_from", liveSource(pr), "recovery", pr.recovery(), "ltr_slots", st.LTRSlots, "intra_refresh", st.IntraRefreshFrames,
+		"zero_copy", st.ZeroCopy, "barcode", st.Barcode, "cursor_in_video", st.CursorInVideo}
+	if st.Encoder != "" {
+		// The libavcodec backend (GUIDE 3.8): FFmpeg's encoder (hevc_qsv, ...)
+		// and how it runs (low_power: VDENC; zero_copy false: frames read back).
+		attrs = append(attrs, "encoder", st.Encoder, "usage", st.Usage, "preset", st.Preset)
+	}
+	v.log.Info("encoder helper started", attrs...)
 	if later.Kbps != sp.Kbps || later.FPS != sp.FPS {
 		_ = h.SetRate(later.Kbps, 0, later.FPS)
 	}
