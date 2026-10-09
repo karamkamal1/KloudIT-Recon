@@ -791,9 +791,10 @@ func TestStreamingPaths(t *testing.T) {
 	// address, locks the allocation and starts a host connection that never
 	// reaches Accept (the relay socket admits it before decryption); a
 	// handshake that asks for no WebTransport session reaches Accept and stays
-	// up on keep-alives. Datagrams keep coming from that address (the gateway
-	// alone would end the allocation only after 30 s without host traffic).
-	relayHeld := func(t *testing.T, hold func(dst *net.UDPAddr, c *net.UDPConn)) {
+	// up on keep-alives, as does one whose session ended. Datagrams keep coming
+	// from that address (the gateway alone would end the allocation only after
+	// 30 s without host traffic).
+	relayHeld := func(t *testing.T, within time.Duration, hold func(a udpRelay, dst *net.UDPAddr, c *net.UDPConn)) {
 		from := e.logs.Len()
 		a, err := e.allocRelay(e.connectInfo().Relay.UDP)
 		if err != nil {
@@ -812,8 +813,8 @@ func TestStreamingPaths(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		hold(dst, c)
-		for end := time.Now().Add(20 * time.Second); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
+		hold(a, dst, c)
+		for end := time.Now().Add(within); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
 			if len(e.logs.lines(from, `msg="udp relay: session ended"`, "port="+u.Port()+" ")) > 0 {
 				return
 			}
@@ -822,10 +823,10 @@ func TestStreamingPaths(t *testing.T) {
 		if len(e.logs.lines(from, `msg="udp relay: session started"`, "port="+u.Port()+" ")) == 0 {
 			t.Fatal("the browser did not lock the allocation")
 		}
-		t.Fatal("the allocation outlived the host's connection by more than 20 s")
+		t.Fatalf("the allocation was still held after %v", within)
 	}
 	t.Run("udp-relay-junk-initial-released", func(t *testing.T) {
-		relayHeld(t, func(dst *net.UDPAddr, c *net.UDPConn) {
+		relayHeld(t, 20*time.Second, func(_ udpRelay, dst *net.UDPAddr, c *net.UDPConn) {
 			// A long-header v1 Initial quic-go parses (8-byte connection IDs, no
 			// token, a length that matches) with a made-up payload, 1200 bytes.
 			initial := make([]byte, 1200)
@@ -838,7 +839,7 @@ func TestStreamingPaths(t *testing.T) {
 		})
 	})
 	t.Run("udp-relay-no-session-released", func(t *testing.T) {
-		relayHeld(t, func(dst *net.UDPAddr, c *net.UDPConn) {
+		relayHeld(t, 20*time.Second, func(_ udpRelay, dst *net.UDPAddr, c *net.UDPConn) {
 			tr := &quic.Transport{Conn: c}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -848,6 +849,56 @@ func TestStreamingPaths(t *testing.T) {
 				t.Fatal("QUIC handshake through the relay:", err)
 			}
 			t.Cleanup(func() { conn.CloseWithError(0, ""); tr.Close() })
+		})
+	})
+	// A session the host ends (here: a hello without a valid ticket) on a
+	// connection the client keeps up, as a browser does: one allocation
+	// carries one session, so the connection ends with it.
+	t.Run("udp-relay-ended-session-released", func(t *testing.T) {
+		relayHeld(t, 8*time.Second, func(a udpRelay, dst *net.UDPAddr, c *net.UDPConn) {
+			tr := &quic.Transport{Conn: c}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			conf := transport.QUICConfig()
+			conf.KeepAlivePeriod, conf.MaxIdleTimeout = time.Second, time.Minute
+			conn, err := tr.Dial(ctx, dst, pinHashes(a.Hashes), conf)
+			if err != nil {
+				t.Fatal("QUIC handshake through the relay:", err)
+			}
+			t.Cleanup(func() { conn.CloseWithError(0, ""); tr.Close() })
+			// Unlike webtransport.Transport.Dial, a ClientConn leaves the
+			// connection up when the session ends.
+			cc, err := (&webtransport.Transport{}).NewClientConn(conn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hdr := http.Header{}
+			hdr.Set("Origin", e.base)
+			_, sess, err := cc.Dial(ctx, a.URL, hdr)
+			if err != nil {
+				t.Fatal("WebTransport session through the relay:", err)
+			}
+			// One session per allocation: a second request is refused and
+			// leaves the first alone.
+			if resp, _, err := cc.Dial(ctx, a.URL, hdr); err == nil || resp == nil || resp.StatusCode != http.StatusConflict {
+				t.Fatalf("second session on the allocation: %v (%v)", err, resp)
+			}
+			ctrl, err := sess.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctrl.Write([]byte{proto.StreamKindControl})
+			proto.WriteMsg(ctrl, hello("not a ticket", 2, defaultPrefs))
+			select {
+			case <-sess.Context().Done():
+			case <-ctx.Done():
+				t.Fatal("the host did not end a session without a ticket")
+			}
+			// The session's close reached the client before its connection's.
+			var se *webtransport.SessionError
+			if _, err := sess.AcceptStream(ctx); !errors.As(err, &se) || se.ErrorCode != transport.CodeAuth {
+				t.Fatalf("session ended with %v, want the host's close with code %d", err, transport.CodeAuth)
+			}
 		})
 	})
 

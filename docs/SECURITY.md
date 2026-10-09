@@ -106,9 +106,13 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
     the browser nothing (its keep-alives come every 5 s): the browser's datagrams alone do not
     keep a port. The host releases an allocation when its connection on it ends, also one that
     never completed the handshake (an Initial it could not decrypt, a failed handshake), and
-    closes a connection that asks for no WebTransport session within 10 s. A user may hold at
-    most 4 allocations, in use or not; the port range caps the total. Starts and ends are
-    audited (`stream_start` / `stream_end` "via udp relay").
+    closes a connection that asks for no WebTransport session within 10 s. A connection carries
+    one session (a second request is refused), and the host closes it 1 s after that session
+    ended, however it ended (a refused ticket, an error, the end of the stream): a browser keeps
+    its connection up after the session, and its answers to the host's keep-alives would hold
+    the port and one of the user's allocations. A user may hold at most 4 allocations, in use or
+    not; the port range caps the total. Starts and ends are audited (`stream_start` /
+    `stream_end` "via udp relay").
   - The `bind`/`release` token travels in clear on the gateway ↔ host path. Someone who can read
     that path could replay it from their own address only before the real `bind` arrives (the
     first valid one wins) or release the allocation (ending the session); they could already

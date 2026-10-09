@@ -1285,7 +1285,10 @@ browser ──QUIC (host cert, pinned)──► gateway :8444 ──same datagra
    allocation; `path=relay` in the host log. When the connection has ended (also one that never
    reached the QUIC accept queue: a failed handshake, an Initial it could not decrypt), the host
    sends `release` (`u8 0x03 | "RLY" | token`) and the gateway frees the port. A connection that
-   asks for no WebTransport session within 10 s is closed.
+   asks for no WebTransport session within 10 s is closed. A connection carries one session (a
+   second request gets 409), and the host closes it 1 s after that session ended (time for the
+   session's close code to reach the browser), since a browser keeps the connection up on
+   keep-alives after its session ended.
 
 Lifetimes: the host must bind within 2 s, the browser must arrive within 20 s, and an
 allocation on which the host has sent the browser nothing for 30 s ends (QUIC itself idles out

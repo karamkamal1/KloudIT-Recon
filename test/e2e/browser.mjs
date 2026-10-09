@@ -3489,6 +3489,46 @@ async function checkUdpRelayHostBlocked() {
   }
 }
 
+// UDP relay reconnects (final review): every connect over the UDP relay takes
+// an allocation (a port: 3 usable ones here; a user holds 4 at most), and
+// Chromium keeps a QUIC connection up after its WebTransport session ended
+// (until its idle timeout, about 20 s), so an allocation lasted that long
+// after its session unless the host closed the connection. The host closes it
+// 1 s after the session and releases the port 2 s later: six connects in a
+// row through the drawer's Reconnect, 3 s of streaming each, all stay on the
+// UDP relay and each ended session's port is released.
+async function checkUdpRelayReconnects() {
+  const gw0 = gw.log.length;
+  const con0 = consoleLines.length;
+  try {
+    await startStream({ path: 'relay', transport: 'auto' });
+    const paths = [await page.evaluate(() => window.__recon.conn?.path)];
+    for (let i = 0; i < 5; i++) {
+      await sleep(3000);
+      await page.evaluate(() => {
+        window.__recon.conn = null;
+        [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Reconnect')).click();
+      });
+      await page.waitForFunction(() => window.__recon.streaming && window.__recon.conn, null, { timeout: 30000 });
+      paths.push(await page.evaluate(() => window.__recon.conn.path));
+    }
+    await sleep(4000); // the last ended session's release: 1 s + the host's 2 s delay
+    // The gateway's starts and ends of these sessions (an earlier session's
+    // end may fall in this window too: ports are reused).
+    const open = new Set();
+    let started = 0, ended = 0;
+    for (const [, what, port] of gw.log.slice(gw0).matchAll(/msg="udp relay: session (started|ended)" port=(\d+)/g)) {
+      if (what === 'started') { started++; open.add(port); } else if (open.delete(port)) ended++;
+    }
+    const why = (consoleLines.slice(con0).find((l) => l.includes('relay failed:')) || '').replace(/^.*?relay failed/, 'relay failed');
+    check('UDP relay reconnects: six connects in a row stay on the UDP relay, each ended session releases its port',
+      paths.every((p) => p === 'relay') && started === 6 && ended === 5 && !why,
+      `paths ${paths.join(', ')}; gateway: ${started} relay sessions started, ${ended} of them ended; ${why.slice(0, 160) || 'no relay failure'}`);
+  } finally {
+    await endStream();
+  }
+}
+
 async function checkLossHandling() {
   // The scenarios so far ran on a clean loopback link ("lan"): no gap may
   // have been taken for a loss. Restarts for other reasons (settings changes,
@@ -4547,6 +4587,7 @@ try {
   await closeHeaded();
 
   if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
+  if (want('udp relay reconnects')) await checkUdpRelayReconnects().catch((e) => check('UDP relay reconnects scenario', false, e.message));
 
   // 3b. Loss handling with the host's fault-injection hook --------------------
   if (want('loss handling')) await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));

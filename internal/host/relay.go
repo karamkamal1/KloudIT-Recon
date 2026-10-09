@@ -34,9 +34,10 @@ import (
 // Only allocations the gateway announced are accepted: the quic.Transport
 // refuses connections from any other address, one connection per allocation,
 // and the session's hello must carry a gateway-signed ticket bound to the
-// allocation (verifyTicket). The end of that connection, whether it opened a
-// session or not, releases the gateway's port (the gateway ends an allocation
-// also when the host has sent nothing on it for 30 s).
+// allocation (verifyTicket). The connection carries one session and ends with
+// it (relayCloseGrace), and its end, whether it opened a session or not,
+// releases the gateway's port (the gateway ends an allocation also when the
+// host has sent nothing on it for 30 s).
 
 const (
 	relayBindTimeout  = 2 * time.Second // the gateway's wait for the bind
@@ -44,6 +45,7 @@ const (
 	relayUnusedTTL    = 30 * time.Second // the gateway gives the browser 20 s after the bind
 	relayReleaseDelay = 2 * time.Second  // after the connection ended: about 3 PTO of draining
 	relaySessionWait  = 10 * time.Second // from the first Initial to the WebTransport request
+	relayCloseGrace   = time.Second      // from the end of the session to the connection's: its close reaches the browser
 )
 
 type relayServer struct {
@@ -65,7 +67,7 @@ type relayAlloc struct {
 	once  sync.Once
 	used  bool // a connection arrived (guarded by relayServer.mu)
 
-	session atomic.Bool // the connection asked for a WebTransport session
+	session atomic.Bool // the connection asked for a WebTransport session (one per connection)
 }
 
 func (al *relayAlloc) isBound() bool {
@@ -131,7 +133,16 @@ func (a *Agent) relayServer(ctx context.Context) (*relayServer, error) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		al.session.Store(true)
+		// One session per allocation (its ticket is single use), and the
+		// connection ends with it, which releases the gateway's port: a browser
+		// keeps the connection up after its session ended, and the keep-alives
+		// would hold the port and one of the user's allocations for as long
+		// as it answers them.
+		if al.session.Swap(true) {
+			http.Error(w, "one session per allocation", http.StatusConflict)
+			return
+		}
+		defer closeRelayConn(transport.QUICConnFromContext(r.Context()))
 		select {
 		case sem <- struct{}{}:
 		default:
@@ -185,6 +196,17 @@ func (rs *relayServer) accept(ctx context.Context, ln *quic.EarlyListener) {
 			}
 		}()
 	}
+}
+
+// closeRelayConn closes a relayed connection whose session ended, once the
+// session's close (its code tells the browser why) had time to arrive.
+func closeRelayConn(c *quic.Conn) {
+	if c == nil {
+		return
+	}
+	time.AfterFunc(relayCloseGrace, func() {
+		_ = c.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "session ended")
+	})
 }
 
 // connContext admits one connection per allocation and refuses every other
