@@ -58,9 +58,13 @@ Techniques used (most of them are new to browser-based game streaming):
 - **HDR10, end to end (experimental, opt-in).** With `"hdr": "auto"` on the PC, Windows HDR on
   and a browser on an HDR display (Renderer *WebGPU*), the native encoder streams 10-bit
   BT.2020 PQ HEVC / AV1 with HDR metadata, and the browser shows it with real highlights on an
-  extended-range WebGPU canvas, from the decoded 10-bit planes (not Chrome's SDR conversion).
-  Anything less (an SDR display, another renderer, no 10-bit decoder, H.264) streams SDR as
-  before; the overlay says why.
+  extended-range WebGPU canvas, from a copy of the decoded 10-bit planes (not Chrome's SDR
+  conversion). That needs a decoder whose 10-bit frames WebCodecs can copy: today's Chrome
+  gives none for its hardware decoders (they output P010, `VideoFrame.format` null), so where
+  the stream decodes in hardware the browser withdraws HDR at the first frame and the stream
+  returns to SDR; a software decoder (dav1d for AV1) works. Anything less (an SDR display,
+  another renderer, no usable 10-bit decoder, H.264, window capture) streams SDR as before;
+  the overlay says why.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's

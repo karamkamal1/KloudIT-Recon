@@ -33,12 +33,13 @@
 // it throws when nothing could be drawn (the frame is closed then).
 //
 // HDR10 (step 4.5, hdr.js): only the WebGPU renderer draws HDR streams
-// (hdrDraws(frame, cfg)): prepare(frame, inspect) copies the decoded planes
-// into textures (resolving to the planes, which draw(frame, req, vis, planes)
-// takes), setHdr({ want, why, white, space, peak }) says whether the canvas
-// shows extended range or tone-maps, hdrInfo() describes it for the overlay.
-// The other renderers never get an HDR stream (the client does not offer HDR
-// with them).
+// (hdrBlocked(format, visibleRect): null, or why a frame cannot take the HDR
+// path): prepare(frame, inspect) copies the decoded planes into textures
+// (resolving to the planes, which draw(frame, req, vis, planes) takes),
+// setHdr({ want, why, white, space, peak }) says whether the canvas shows
+// extended range or tone-maps, hdrInfo() describes it for the overlay. The
+// other renderers never get an HDR stream (the client does not offer HDR
+// with them, and withdraws the offer when one takes over).
 
 import * as P from './protocol.js';
 import { upscaleSettings, upscalePlan, upscaleWhy, easuConstants, rcasConstants, easuWGSL, RCAS_WGSL, COPY_WGSL } from './fsr1.js';
@@ -205,8 +206,8 @@ class Renderer {
   loseContext() {}
   // HDR10 (hdr.js): only the WebGPU renderer draws it.
   setHdr() {}
-  hdrDraws() {
-    return false;
+  hdrBlocked() {
+    return { scope: 'renderer', why: `HDR needs the WebGPU renderer (${this.name} draws now)` };
   }
   hdrInfo() {
     return { path: null, why: 'HDR needs the WebGPU renderer' };
@@ -1016,6 +1017,9 @@ export class WebGPURenderer extends Renderer {
       canvasKey: 'sdr', readback: false, pipes: null, pending: null, error: '', failed: {},
       convU: u(16), convData: new Float32Array(4), convLast: new Float32Array(4).fill(NaN),
       outU: u(64), outData: new Float32Array(16), outLast: new Float32Array(16).fill(NaN),
+      outIn: { space: null, white: 0, tone: false, peak: 0 }, // what outData was computed from
+      layout: { fmt: undefined, w: 0, h: 0, L: null }, // the last planeLayout (hdrLayout)
+      copyOpts: { rect: { x: 0, y: 0, width: 0, height: 0 } }, // copyTo's options (the visible rect), reused
       sets: [], inter: null, outBG: null, staging: null, convPass: pass(), outPass: pass(),
       copy: new Samples(100), bytes: 0, frame: null, last: null, drawn: 0,
     };
@@ -1029,12 +1033,30 @@ export class WebGPURenderer extends Renderer {
     for (const k of ['want', 'why', 'white', 'space', 'peak']) if (o[k] !== undefined) H[k] = o[k];
   }
 
-  // Whether a frame of the video config cfg goes through the HDR path: an
-  // HDR10 generation whose decoder output format has a plane path here (else
-  // importExternalTexture draws it: Chrome's SDR conversion).
-  hdrDraws(frame, cfg) {
-    const vr = frame.visibleRect;
-    return !!cfg?.hdr && !this.lost && !this.hdr.error && !this.hdr.failed[frame.format] && !!vr && !!planeLayout(frame.format, vr.width, vr.height);
+  // Why a decoded frame of an HDR10 generation (its format, visible rect)
+  // cannot go through the HDR path, or null when it can: { scope, why } with
+  // scope 'lost' (the device: another renderer takes over; or a closed
+  // frame), 'renderer' (the HDR shaders failed) or 'format' (no plane path:
+  // format null, which Chrome's hardware decoders give for 10-bit frames, or a
+  // format whose copy failed). Such frames draw through importExternalTexture
+  // (Chrome's SDR conversion) until the worker's withdrawn offer brings an
+  // SDR generation.
+  hdrBlocked(fmt, vr) {
+    const H = this.hdr;
+    if (this.lost) return { scope: 'lost', why: 'WebGPU device lost' };
+    if (!vr) return { scope: 'lost', why: 'the frame is closed' };
+    if (H.error) return { scope: 'renderer', why: H.error };
+    if (H.failed[fmt]) return { scope: 'format', why: H.failed[fmt] };
+    if (this.hdrLayout(fmt, vr.width, vr.height)) return null;
+    return { scope: 'format', why: fmt ? `no HDR plane path for ${fmt} frames`
+      : "VideoFrame.format null (a hardware decoder's P010 frames, which WebCodecs cannot copy)" };
+  }
+
+  // planeLayout(fmt, w, h), kept for the next frames of the same format and size.
+  hdrLayout(fmt, w, h) {
+    const c = this.hdr.layout;
+    if (c.fmt !== fmt || c.w !== w || c.h !== h) this.hdr.layout = { fmt, w, h, L: planeLayout(fmt, w, h) };
+    return this.hdr.layout.L;
   }
 
   async hdrPipes() {
@@ -1073,20 +1095,36 @@ export class WebGPURenderer extends Renderer {
     await this.hdrPipes();
     if (H.error) throw new Error(H.error);
     const vr = frame.visibleRect;
-    const L = planeLayout(frame.format, vr.width, vr.height);
-    if (!L) throw new Error(`no HDR plane path for ${frame.format || 'opaque'} frames`);
-    const rect = { x: vr.x, y: vr.y, width: vr.width, height: vr.height };
+    const fmt = frame.format;
+    const L = this.hdrLayout(fmt, vr.width, vr.height);
+    if (!L) throw new Error(`no HDR plane path for ${fmt || 'opaque'} frames`);
+    const opts = H.copyOpts;
+    const { rect } = opts;
+    rect.x = vr.x;
+    rect.y = vr.y;
+    rect.width = vr.width;
+    rect.height = vr.height;
     const t0 = performance.now();
-    const size = frame.allocationSize({ rect });
+    const size = frame.allocationSize(opts);
     if (!H.staging || H.staging.byteLength < size) H.staging = new Uint8Array(size);
-    const layout = await frame.copyTo(H.staging, { rect });
+    const layout = await frame.copyTo(H.staging, opts);
     if (this.lost || this.destroyed) throw new Error('WebGPU device lost');
     const set = this.hdrSet(L);
-    L.planes.forEach((p, i) => this.device.queue.writeTexture({ texture: set.tex[i] }, H.staging,
-      { offset: layout[i].offset, bytesPerRow: layout[i].stride, rowsPerImage: p.h }, [p.w, p.h]));
+    for (let i = 0; i < L.planes.length; i++) {
+      const src = set.src[i];
+      src.offset = layout[i].offset;
+      src.bytesPerRow = layout[i].stride;
+      this.device.queue.writeTexture(set.dst[i], H.staging, src, set.size[i]);
+    }
     H.copy.push(performance.now() - t0);
     H.bytes = size;
-    H.frame = { format: frame.format, colorSpace: frame.colorSpace?.toJSON?.() || null, w: vr.width, h: vr.height, bits: L.bits };
+    // The overlay's "decoded" row: new only when the format, size or colour space changes.
+    const F = H.frame;
+    const cs = frame.colorSpace;
+    if (!F || F.format !== fmt || F.w !== vr.width || F.h !== vr.height || F.colorSpace?.primaries !== cs?.primaries ||
+      F.colorSpace?.transfer !== cs?.transfer || F.colorSpace?.matrix !== cs?.matrix || F.colorSpace?.fullRange !== cs?.fullRange) {
+      H.frame = { format: fmt, colorSpace: cs?.toJSON?.() || null, w: vr.width, h: vr.height, bits: L.bits };
+    }
     let released = false;
     const planes = { set, layout: L, renderer: this, release: () => { if (!released) { released = true; set.busy = false; } } };
     try {
@@ -1110,7 +1148,11 @@ export class WebGPURenderer extends Renderer {
       const v = tex.map((t) => t.createView());
       const bg = d.createBindGroup({ layout: H.pipes.conv.getBindGroupLayout(0),
         entries: [{ binding: 0, resource: v[0] }, { binding: 1, resource: v[1] }, { binding: 2, resource: v[2] || v[1] }, { binding: 3, resource: { buffer: H.convU } }] });
-      s = { key: L.key, tex, bg, busy: false };
+      // writeTexture's arguments per plane (prepare sets the offset and stride of each copy).
+      const dst = tex.map((texture) => ({ texture }));
+      const src = L.planes.map((p) => ({ offset: 0, bytesPerRow: 0, rowsPerImage: p.h }));
+      const size = L.planes.map((p) => [p.w, p.h]);
+      s = { key: L.key, tex, bg, dst, src, size, busy: false };
       H.sets.push(s);
     }
     s.busy = true;
@@ -1167,8 +1209,16 @@ export class WebGPURenderer extends Renderer {
 
   hdrOutput(enc, r, tone) {
     const H = this.hdr;
-    outputUniforms(H.outData, { space: tone ? 'srgb' : H.space, white: H.white, tone, peak: H.peak });
-    WebGPURenderer.writeChanged(this.device, H.outU, H.outData, H.outLast);
+    const k = H.outIn;
+    const space = tone ? 'srgb' : H.space;
+    if (k.space !== space || k.white !== H.white || k.tone !== tone || k.peak !== H.peak) {
+      k.space = space;
+      k.white = H.white;
+      k.tone = tone;
+      k.peak = H.peak;
+      outputUniforms(H.outData, k);
+      WebGPURenderer.writeChanged(this.device, H.outU, H.outData, H.outLast);
+    }
     const tex = this.ctx.getCurrentTexture();
     H.outPass.colorAttachments[0].view = tex.createView();
     const p = enc.beginRenderPass(H.outPass);

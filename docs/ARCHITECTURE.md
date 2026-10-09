@@ -649,7 +649,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
 - **HDR10** (step 4.5, `hdr.js`; see [HDR10](#hdr10) below): frames of an HDR10 generation are
   copied plane by plane (`VideoFrame.copyTo`) between the decoder's output and the frame pacer
   and drawn by the WebGPU renderer through two passes onto an extended-range canvas, or
-  tone-mapped to SDR; the copy counts in the *draw* stage.
+  tone-mapped to SDR; the copy counts in the *draw* stage. Frames that cannot be copied
+  (`format` null: Chrome's hardware decoders' 10-bit P010 output) withdraw the client's HDR
+  offer, and the host moves to SDR.
 - Decoder hygiene: `prefer-hardware` + `optimizeForLatency`; `flush()` is never called while
   streaming (it waits for every output and makes the next chunk a key frame; recovery resets and
   reconfigures instead). At most 2 chunks wait inside the decoder (`decodeQueueSize`); later ones
@@ -878,26 +880,34 @@ thread), whether the renderer that draws is WebGPU and a canvas configured `rgba
 `toneMapping: {mode: "extended"}` reports both back through `getConfiguration()` (Chrome 131+;
 feature-detected, never assumed; not during Auto's bake-off), and which families have a 10-bit
 decoder (`VideoDecoder.isConfigSupported` of `hev1.2.4.L153.B0` / `av01.0.13M.10`,
-prefer-hardware first; the timed decode of 4.2 stays 8-bit). Hosts that allow HDR list `hdr10`
+prefer-hardware first; the timed decode of 4.2 stays 8-bit; a family whose frames turned out
+not to be drawable as HDR is withdrawn, see *Presentation*). Hosts that allow HDR list `hdr10`
 in `welcome.features`. A generation is HDR10 when all of these hold (`decideHDR`), checked in
-this order, the first failure being the reason:
+this order, the first failure being the reason (what stays the same for the session before
+the client's setting and display, so that a stream that cannot be HDR keeps its reason when
+those change):
 
 1. host config `hdr` is `auto` (default `off`);
-2. the client offered HDR, with mode `auto`, an HDR display, an extended-range canvas;
-3. the codec is HEVC or AV1 (the negotiated codec is not changed for HDR: an H.264 stream
-   stays SDR) and the client has a 10-bit decoder for it;
-4. the pipeline can make it (`hdrPipeline`): the native helper with a codec whose caps have
-   `hdr10` (it then streams HDR10 when the captured output is in Windows HDR mode, else SDR
-   with the reason), or on the FFmpeg path the test pattern with libsvtav1 (below). FFmpeg's
-   Windows captures stay SDR: FFmpeg 8.1's ddagrab has HDR content only as FP16 scRGB (its
-   10-bit X2BGR10 output is DWM's SDR conversion, tagged sRGB), NVENC takes no FP16 input,
-   `scale_d3d11` converts to P010 without colour spaces (no PQ), and `amfenc` passes neither an
-   RGBAF16 surface's input transfer nor HDR metadata (ddagrab attaches none). HDR on Windows
-   is the native helper's (step 3.9).
+2. the codec is HEVC or AV1 (the negotiated codec is not changed for HDR: an H.264 stream
+   stays SDR);
+3. the pipeline can make it (`hdrPipeline`): the native helper with a codec whose caps have
+   `hdr10` and a capture with an HDR path (DDA or AMD Direct Capture; its WGC capture, used for
+   a window or host capture `gfxcapture`, has none), which then streams HDR10 when the
+   captured output is in Windows HDR mode, else SDR with the reason; or on the FFmpeg path the
+   test pattern with libsvtav1 (below). FFmpeg's Windows captures stay SDR: FFmpeg 8.1's
+   ddagrab has HDR content only as FP16 scRGB (its 10-bit X2BGR10 output is DWM's SDR
+   conversion, tagged sRGB), NVENC takes no FP16 input, `scale_d3d11` converts to P010 without
+   colour spaces (no PQ), and `amfenc` passes neither an RGBAF16 surface's input transfer nor
+   HDR metadata (ddagrab attaches none). HDR on Windows is the native helper's (step 3.9);
+4. the client offered HDR (`HDRPrefs.CanPresent`): an extended-range canvas, a 10-bit decoder
+   for the family, mode `auto`, an HDR display.
 
 The decision goes into the generation's `media.Params` (`HDR`, `HDRNote`), the host log has
-`hdr choice` (hdr, encoder, reason, the client's prefs) once per change, and a settings message
-whose HDR prefs differ (the setting, the display) restarts the video like any video setting.
+`hdr choice` (hdr, encoder, reason, the client's prefs) once per change. A settings message
+whose HDR prefs alone differ (the setting, the display, a withdrawn decoder) restarts the video
+only when it changes the current generation's decision or its reason (`hdrRestart`), and keeps
+the congestion back-off; a window moving between an HDR and an SDR monitor under a stream that
+stays SDR anyway restarts nothing.
 
 **Video config.** An HDR10 generation's `video` message adds `hdr: true`, `bitDepth: 10`,
 `colorSpace` in WebCodecs `VideoColorSpaceInit` terms (`{"primaries":"bt2020","transfer":"pq",
@@ -907,7 +917,9 @@ the stream); the codec string names the 10-bit profile (from the bitstream: `hev
 `av01.0.xxM.10`). For clients that offered HDR, a generation that is not HDR carries
 `hdrNote`, why not. Every other generation is byte-identical to before. On the helper the fields
 come from its `started` (`hdr`, `bitDepth`, `colorSpace` `bt2020-pq`, `hdrMetadata`); an HDR10
-start on an SDR output starts SDR with `hdrNote` "the host display is not in Windows HDR mode".
+start that the helper starts SDR gets an `hdrNote` by its capture: "the host display is not in
+Windows HDR mode" for DDA, either that or no FP16 frames for AMD Direct Capture (the helper's
+log says which).
 **Windows HDR toggled** during a stream (the helper's `captureChanged` `hdr`): a stream that was
 asked for HDR no longer matches the output, so the session restarts it (a new helper, a new
 generation and video config in the output's new mode); an SDR stream that was not asked for HDR
@@ -932,10 +944,17 @@ are SDR. Chrome's `importExternalTexture` tone-maps a PQ frame into SDR (measure
 within [0, 1]; docs/VENDOR_NOTES.md 3.9/4.5), so the HDR path copies the decoded planes
 instead: `VideoFrame.copyTo` of the visible rectangle into a reused staging buffer,
 `writeTexture` into `r16uint` (`r8uint` for 8-bit) textures of a reusable set per plane layout
-(I420P10 / P12, I422 / I444 P10 / P12, P010, I420, NV12: whatever the decoder outputs; an
-opaque or unknown format falls back to `importExternalTexture`, said in the overlay), one copy
+(I420P10 / P12, I422 / I444 P10 / P12, I420, NV12: the formats WebCodecs can copy), one copy
 at a time between the decoder's output and the frame pacer (a newer frame replaces one waiting
-for it). Two passes in the draw call: *convert* (planes → an
+for it). WebCodecs has no P010: Chrome's hardware decoders (D3D11, VideoToolbox, VA-API)
+output 10-bit video as P010, and such frames have `format` null and cannot be copied
+(Chromium's `CopyToFormat`), so with today's Chrome only a software decoder's frames (dav1d:
+`I420P10`) take this path. The first frame of an HDR10 generation that cannot (format null,
+a failed copy, failed HDR shaders, another renderer) withdraws the client's offer: the
+family's 10-bit decoder (kept withdrawn for the page's later connections) or the canvas; the
+page sends a settings message, the host moves to SDR (`hdrNote` "the browser has no 10-bit …
+decoder", the overlay adds the client's reason), and until then Chrome's SDR conversion draws
+the frames (`importExternalTexture`). Two passes in the draw call: *convert* (planes → an
 `rgba16float` intermediate of the visible size: BT.2020 NCL limited-range Y'CbCr → R'G'B',
 still PQ-encoded; 4:2:0 chroma bilinear, sited as `chroma_sample_loc_type` 0) and *output*
 (sampled bilinearly onto the canvas at the letterboxed rectangle: the PQ EOTF → cd/m2, BT.2020

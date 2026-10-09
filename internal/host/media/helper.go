@@ -753,10 +753,7 @@ func (v *HelperVideo) config(pr *helperProc) *proto.VideoConfig {
 	c.SetCrop(st.Width, st.Height, max(st.CodedWidth, pr.codec.CodedWidth), max(st.CodedHeight, pr.codec.CodedHeight))
 	note := pr.params.HDRNote
 	if pr.sp.HDR && !hdr {
-		note = "the host display is not in Windows HDR mode"
-		if st.HDR {
-			note = fmt.Sprintf("the helper started a stream it did not describe as HDR10 (%d-bit %s)", st.BitDepth, st.ColorSpace)
-		}
+		note = helperSDRNote(st)
 	}
 	var md *proto.HDRMetadata
 	if m := st.HDRMetadata; m != nil {
@@ -765,6 +762,30 @@ func (v *HelperVideo) config(pr *helperProc) *proto.VideoConfig {
 	}
 	HDRConfig(c, hdr, md, note)
 	return c
+}
+
+// HelperWGCNoHDR is why a helper stream captured with Windows Graphics
+// Capture (a window, or host capture "gfxcapture") is SDR: the helper's WGC
+// capture has no HDR path (docs/HELPER_PROTOCOL.md "HDR10").
+const HelperWGCNoHDR = "window capture (Windows Graphics Capture) has no HDR path in the native encoder helper"
+
+// helperSDRNote is why a stream the helper was asked to make HDR10 started
+// SDR (st: its started), by the capture it used: DDA and the GPU test source
+// make HDR10 whenever the output is in Windows HDR mode, AMD Direct Capture
+// only when its surfaces are FP16 (the helper logs which), WGC never.
+func helperSDRNote(st encoder.Started) string {
+	if st.HDR {
+		return fmt.Sprintf("the helper started a stream it did not describe as HDR10 (%d-bit %s)", st.BitDepth, st.ColorSpace)
+	}
+	switch st.Capture {
+	case "", "dda", "synthetic-gpu":
+		return "the host display is not in Windows HDR mode"
+	case "amd-direct":
+		return "the host display is not in Windows HDR mode, or AMD Direct Capture gave no FP16 frames (the helper's log says which)"
+	case "wgc":
+		return HelperWGCNoHDR
+	}
+	return fmt.Sprintf("the helper's %s capture has no HDR path", st.Capture)
 }
 
 // defaultCodecString is a WebCodecs codec string per family for a stream

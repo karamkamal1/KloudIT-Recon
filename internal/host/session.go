@@ -2048,17 +2048,24 @@ func (s *Session) controlLoop() error {
 			videoChanged := old.Codec != m.Prefs.Codec || old.BitrateKbps != m.Prefs.BitrateKbps || old.FPS != m.Prefs.FPS ||
 				old.Width != m.Prefs.Width || old.Height != m.Prefs.Height || old.Monitor != m.Prefs.Monitor ||
 				old.Window != m.Prefs.Window || old.Quality != m.Prefs.Quality || old.Cursor != m.Prefs.Cursor ||
-				old.AdaptiveBitrate() != m.Prefs.AdaptiveBitrate() || !proto.SameHDR(old.HDR, m.Prefs.HDR)
-			if videoChanged {
+				old.AdaptiveBitrate() != m.Prefs.AdaptiveBitrate()
+			// HDR prefs alone (the display, the setting) restart the video
+			// only when they change the current generation's HDR decision.
+			hdrChanged := !videoChanged && !proto.SameHDR(old.HDR, m.Prefs.HDR) && s.hdrRestart(*m.Prefs)
+			if videoChanged || hdrChanged {
 				s.triedMu.Lock()
 				s.tried = map[string]bool{}
 				s.usage = map[string]string{}
 				clear(s.encFails)
 				s.triedMu.Unlock()
 				// An explicit video choice resets the congestion back-off;
-				// an audio-only change keeps it.
-				s.rate.reset()
-				if err := s.startVideo(false, "settings"); err != nil {
+				// an audio-only or HDR-only change keeps it.
+				reason := "HDR settings"
+				if videoChanged {
+					s.rate.reset()
+					reason = "settings"
+				}
+				if err := s.startVideo(false, reason); err != nil {
 					s.notice("error", "Could not apply settings: "+err.Error())
 				}
 			}

@@ -40,7 +40,10 @@
 // Both passes run in the draw call; the copy runs between the decoder's
 // output and the frame pacer (stream-worker.js), its time counted in the draw
 // stage. FSR upscaling is off for HDR frames (the bilinear output pass draws;
-// renderers.js says why).
+// renderers.js says why). Frames without a plane path (format null: the 10-bit
+// frames of Chrome's hardware decoders, P010, which WebCodecs cannot read
+// back) cannot be shown this way: the worker withdraws its HDR offer for the
+// codec family at the first one, and the host returns to SDR.
 
 export const HDR_MODES = ['auto', 'off'];
 export const HDR_LABELS = { auto: 'Auto', off: 'Off' };
@@ -97,9 +100,15 @@ function rgbToXyz(p) {
   const s = inv3(m).map((row) => row.reduce((acc, v, k) => acc + v * w[k], 0));
   return m.map((row) => row.map((v, k) => v * s[k]));
 }
+const FROM_BT2020 = new Map(); // per colour space: computed once
 /** The 3x3 matrix (rows) from linear BT.2020 to linear RGB of a canvas colour space (srgb, display-p3). */
 export function fromBT2020(space) {
-  return mul3(inv3(rgbToXyz(PRIMARIES[space] || PRIMARIES.srgb)), rgbToXyz(PRIMARIES.bt2020));
+  let m = FROM_BT2020.get(space);
+  if (!m) {
+    m = mul3(inv3(rgbToXyz(PRIMARIES[space] || PRIMARIES.srgb)), rgbToXyz(PRIMARIES.bt2020));
+    FROM_BT2020.set(space, m);
+  }
+  return m;
 }
 
 /** The peak luminance an HDR10 stream's tone mapping starts from: MaxCLL, else the mastering display's peak, else 1000 cd/m2. */
@@ -110,9 +119,11 @@ export function sourcePeak(md) {
 }
 
 // The decoder's output formats the copy handles (VideoFrame.format): plane
-// texture formats, chroma subsampling, whether U and V share a plane (NV12,
-// P010), and the factor from a texel's value to a 10-bit code (8-bit x 4,
-// 12-bit / 4; P010 keeps its 10 bits at the top of 16).
+// texture formats, chroma subsampling, whether U and V share a plane (NV12),
+// and the factor from a texel's value to a 10-bit code (8-bit x 4, 12-bit /
+// 4). WebCodecs has no P010: Chrome's hardware decoders output 10-bit video
+// as P010, and such frames have format null (copyTo cannot read them back),
+// so they have no plane path (stream-worker.js withdraws HDR for them).
 const FORMATS = {
   I420P10: { tex: ['r16uint', 'r16uint', 'r16uint'], sub: [2, 2], scale: 1 },
   I420P12: { tex: ['r16uint', 'r16uint', 'r16uint'], sub: [2, 2], scale: 0.25 },
@@ -120,7 +131,6 @@ const FORMATS = {
   I422P12: { tex: ['r16uint', 'r16uint', 'r16uint'], sub: [2, 1], scale: 0.25 },
   I444P10: { tex: ['r16uint', 'r16uint', 'r16uint'], sub: [1, 1], scale: 1 },
   I444P12: { tex: ['r16uint', 'r16uint', 'r16uint'], sub: [1, 1], scale: 0.25 },
-  P010: { tex: ['r16uint', 'rg16uint'], sub: [2, 2], scale: 1 / 64 },
   I420: { tex: ['r8uint', 'r8uint', 'r8uint'], sub: [2, 2], scale: 4 },
   I422: { tex: ['r8uint', 'r8uint', 'r8uint'], sub: [2, 1], scale: 4 },
   I444: { tex: ['r8uint', 'r8uint', 'r8uint'], sub: [1, 1], scale: 4 },
@@ -245,7 +255,12 @@ fn srgb(c: vec3f) -> vec3f {
  */
 export function outputUniforms(out, { space, white, tone, peak }) {
   const m = fromBT2020(space);
-  for (let r = 0; r < 3; r++) out.set([...m[r], 0], 4 * r);
+  for (let r = 0; r < 3; r++) {
+    out[4 * r] = m[r][0];
+    out[4 * r + 1] = m[r][1];
+    out[4 * r + 2] = m[r][2];
+    out[4 * r + 3] = 0;
+  }
   out[12] = white;
   out[13] = tone ? 1 : 0;
   out[14] = pqOetf(peak);

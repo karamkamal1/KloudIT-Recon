@@ -529,12 +529,20 @@ function applyUpscale() {
 // supersedes one waiting for it; the copy counts in the draw stage) and drawn
 // with extended range, or tone-mapped to SDR while the setting is Off, the
 // display is not HDR or the canvas lacks extended range (until the host's SDR
-// generation comes).
+// generation comes). A frame that cannot take that path (renderer.hdrBlocked:
+// format null, which Chrome's hardware decoders give for 10-bit frames; a
+// failed copy; failed HDR shaders; another renderer) withdraws the offer
+// (hdrWithdraw): the family's decoder, or the canvas, and the page sends the
+// host a settings message, which brings an SDR generation; meanwhile Chrome's
+// SDR conversion (importExternalTexture) draws. Withdrawn families stay
+// withdrawn for the page's later connections (prefs.hdrWithdrawn).
 
 const hdr = {
   mode: 'auto', display: false, white: HDR_WHITE, space: 'srgb',
   canvas: { ok: false, why: 'no renderer yet' }, // the drawing renderer's extended-range check
   decoders: [], // 10-bit decoders: [{ family, hw }]
+  withdrawn: {}, // family -> why its frames cannot be drawn as HDR (hdrWithdraw)
+  opaqueTest: false, // test hook (hdrOpaque): HDR frames count as format null
   hostOffers: false, // welcome feature hdr10 (host config "hdr": "auto")
   copying: false, next: null, // hdrPrepare's copy and the frame waiting for it
   check: null, // test hook (hdrCheck): canvas pixels and decoded codes at points
@@ -544,10 +552,33 @@ const hdr = {
 // Why this client cannot present HDR ('' when it can).
 function hdrWhy() {
   if (!hdr.canvas.ok) return hdr.canvas.why;
-  if (!hdr.decoders.length) return 'no 10-bit decoder (HEVC Main 10 or AV1 10-bit) in this browser';
-  if (!hdr.display) return 'the display is not in HDR mode';
+  if (!hdr.decoders.length) {
+    const w = Object.keys(hdr.withdrawn);
+    return w.length ? `no 10-bit decoder whose frames can be drawn as HDR (${w.map((f) => `${f}: ${hdr.withdrawn[f]}`).join('; ')})`
+      : 'no 10-bit decoder (HEVC Main 10 or AV1 10-bit) in this browser';
+  }
   if (hdr.mode !== 'auto') return 'HDR is Off in the settings';
+  if (!hdr.display) return 'the display is not in HDR mode';
   return '';
+}
+
+// An HDR10 generation's frame cannot take the HDR path (b: renderer.hdrBlocked):
+// the offer is withdrawn (the family's decoder for a format, the canvas for
+// the renderer) and the page tells the host (a settings message: an SDR
+// generation follows). Once per family / renderer.
+function hdrWithdraw(b, family) {
+  if (b.scope === 'lost') return; // the renderer is replaced (its successor's frames decide), or the frame closed
+  if (b.scope === 'renderer') {
+    if (!hdr.canvas.ok) return;
+    hdr.canvas = { ok: false, why: b.why };
+  } else {
+    if (hdr.withdrawn[family]) return;
+    hdr.withdrawn[family] = b.why;
+    hdr.decoders = hdr.decoders.filter((d) => d.family !== family);
+  }
+  post('log', { text: `HDR: withdrawn for ${b.scope === 'renderer' ? 'this renderer' : `${family} streams`} (${b.why}); asking the host for SDR` });
+  post('hdrWithdrawn', { family: b.scope === 'renderer' ? null : family, why: b.why });
+  applyHdr(false);
 }
 
 // The prefs.hdr the host gets (hello and every settings message).
@@ -590,6 +621,7 @@ function hdrPrepare(item) {
   const r = renderer;
   const f = item.frame;
   const fmt = f.format;
+  const family = video.cfg?.family;
   const check = hdr.check;
   hdr.check = null;
   r.prepare(f, (buf, layout, planes) => {
@@ -608,7 +640,10 @@ function hdrPrepare(item) {
   }, (e) => {
     // This format has no working plane path: its frames draw through
     // importExternalTexture (Chrome's SDR conversion) from now on.
-    if (!r.destroyed && !r.lost) r.hdr.failed[fmt] = e.message;
+    if (!r.destroyed && !r.lost) {
+      r.hdr.failed[fmt] = `copying ${fmt} frames failed (${e.message})`;
+      hdrWithdraw({ scope: r.hdr.error ? 'renderer' : 'format', why: r.hdr.error || r.hdr.failed[fmt] }, family);
+    }
     if (!hdr.failedLog.has(fmt)) {
       hdr.failedLog.add(fmt);
       post('log', { text: `HDR: copying ${fmt || 'opaque'} frames failed (${e.message}); drawing them through importExternalTexture` });
@@ -1280,9 +1315,17 @@ function onDecoded(frame) {
   }
   feedDecoder();
   const item = { frame, meta, decoded };
-  // HDR10 on the WebGPU renderer: the planes are copied first (hdrPrepare).
-  if (renderer?.hdrDraws(frame, video.cfg)) hdrPrepare(item);
-  else pacer.offer(item);
+  // HDR10 on the WebGPU renderer: the planes are copied first (hdrPrepare);
+  // a frame that cannot take that path withdraws the HDR offer.
+  if (video.cfg?.hdr && renderer) {
+    const b = renderer.hdrBlocked(hdr.opaqueTest ? null : frame.format, frame.visibleRect);
+    if (!b) {
+      hdrPrepare(item);
+      return;
+    }
+    hdrWithdraw(b, video.cfg.family);
+  }
+  pacer.offer(item);
 }
 
 // Frame acknowledgement (0x40): one-way delay and decode time of a decoded frame.
@@ -1613,7 +1656,6 @@ function probeSample(req, drawn) {
 // bits), or RGB channel offsets.
 function plane0(fmt) {
   if (fmt === 'RGBA' || fmt === 'RGBX') return { px: 4, r: 0, g: 1, b: 2 };
-  if (fmt === 'P010') return { px: 2, shift: 8 }; // 10 bits at the top of 16
   if (fmt === 'BGRA' || fmt === 'BGRX') return { px: 4, r: 2, g: 1, b: 0 };
   if (fmt === 'NV12' || /^I4(20|22|44)A?$/.test(fmt || '')) return { px: 1, shift: 0 };
   const m = /^I4(20|22|44)A?P(10|12)$/.exec(fmt || '');
@@ -1959,7 +2001,7 @@ function postStats() {
     // canvas size (device pixels) and the bake-off's progress or result.
     renderer: renderer ? rendererInfo() : null,
     // HDR10 (4.5): what this client offers the host and why not.
-    hdr: { ...hdrPrefs(), decoderInfo: hdr.decoders, hostOffers: hdr.hostOffers, white: hdr.white, space: hdr.space },
+    hdr: { ...hdrPrefs(), decoderInfo: hdr.decoders, withdrawn: hdr.withdrawn, hostOffers: hdr.hostOffers, white: hdr.white, space: hdr.space },
     // Frame pacing (4.4): the mode, where Smooth's refresh ticks come from,
     // the refresh interval it works with (its ticks' or the page-load
     // measurement), the draws per source and Smooth's stale (dropped) and
@@ -2021,6 +2063,7 @@ async function start(msg) {
   hdr.display = !!prefs.hdrDisplay;
   hdr.white = hdrWhite(prefs.hdrWhite);
   hdr.space = prefs.gamutP3 ? 'display-p3' : 'srgb';
+  hdr.withdrawn = { ...prefs.hdrWithdrawn }; // this page's earlier connections found these families' frames not drawable as HDR
   hdr.canvas = renderer.name !== 'webgpu' ? { ok: false, why: `HDR needs the WebGPU renderer (this connection draws with ${LABELS[renderer.name] || renderer.name})` }
     : pres.mode === 'bakeoff' ? { ok: false, why: 'HDR needs Renderer WebGPU (Auto is measuring the renderers)' } : renderer.hdrCanvasOk;
   const hdrDecs = renderer.name === 'webgpu' ? hdrDecoders() : Promise.resolve([]);
@@ -2039,9 +2082,11 @@ async function start(msg) {
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   const helloDecoders = await tested;
-  hdr.decoders = await hdrDecs;
+  hdr.decoders = (await hdrDecs).filter((d) => !hdr.withdrawn[d.family]);
   applyHdr(false);
-  post('log', { text: `HDR: ${hdrWhy() || 'offered to the host'} (canvas ${hdr.canvas.ok ? 'extended range' : 'SDR'}, 10-bit decoders ${hdr.decoders.map((d) => `${d.family}${d.hw ? ' hw' : ''}`).join(', ') || 'none'})` });
+  const withdrawn = Object.keys(hdr.withdrawn);
+  post('log', { text: `HDR: ${hdrWhy() || 'offered to the host'} (canvas ${hdr.canvas.ok ? 'extended range' : 'SDR'}, 10-bit decoders ${hdr.decoders.map((d) => `${d.family}${d.hw ? ' hw' : ''}`).join(', ') || 'none'}` +
+    `${withdrawn.length ? `; withdrawn: ${withdrawn.join(', ')}` : ''})` });
   transport.sendControl({
     t: 'hello', v: P.HELLO_VERSION, ticket: conn.ticket,
     client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: { ...msg.hostPrefs, hdr: hdrPrefs() },
@@ -2089,6 +2134,7 @@ self.onmessage = (ev) => {
       }
       break;
     case 'hdrCheck': hdr.check = { points: m.points }; break; // test hook: the next HDR frame's canvas pixels and codes
+    case 'hdrOpaque': hdr.opaqueTest = true; break; // test hook: HDR frames count as format null (Chrome's hardware 10-bit frames)
     case 'tick': pacer.tick(m.t - performance.timeOrigin, 'main'); break; // the main thread's animation frame (absolute ms)
     case 'probeDump': post('probeDump', { probe: probeSummary(true), stages: stageSummary() }); break;
     case 'displayed': onDisplayed(m.id, m.t); break;

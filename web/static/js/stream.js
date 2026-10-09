@@ -91,6 +91,7 @@ const S = {
   userClosed: false,
   attempts: 0,
   udpRelayFailedAt: -Infinity, // the UDP relay's ports did not answer: try the splice relay first for a while
+  hdrWithdrawn: {}, // HDR10: codec families whose 10-bit frames this browser could not draw as HDR (this page's connections)
   video: { w: 0, h: 0 },
   videoCfg: null,
   audioCfg: null,
@@ -340,7 +341,7 @@ async function connect() {
       decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
       skipUdpRelay: performance.now() - S.udpRelayFailedAt < 10 * 60 * 1000,
       ...upscalePrefs(), fsrInput: prefs.fsrInput, // fsrInput: diagnostics only (localStorage), see fsr1.js FSR.input
-      ...hdrPrefs(), gamutP3: gamutP3(),
+      ...hdrPrefs(), gamutP3: gamutP3(), hdrWithdrawn: S.hdrWithdrawn,
     },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
@@ -431,6 +432,12 @@ function onWorker(m) {
     case 'decoderTest': S.decoderTest = m.tests; S.decoderTestMs = m.ms; break;
     case 'hello': S.helloDecoders = m.decoders; break;
     case 'hdrCheck': S.hdrCheck = m.result; break;
+    case 'hdrWithdrawn':
+      // HDR10 frames this browser cannot draw as HDR: the host gets the
+      // withdrawn offer (the worker's prefs.hdr) and moves to SDR.
+      if (m.family) S.hdrWithdrawn[m.family] = m.why;
+      applyLive();
+      break;
     case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
@@ -959,12 +966,17 @@ function hdrRows(st, v, row) {
   const r = st.renderer?.hdr;
   if (!h) return [];
   if (!v.hdr) {
-    const why = v.hdrNote || (h.why ? h.why : !h.hostOffers ? 'the host does not offer HDR (host.json "hdr": "auto")' : 'SDR stream');
+    let why = v.hdrNote || (h.why ? h.why : !h.hostOffers ? 'the host does not offer HDR (host.json "hdr": "auto")' : 'SDR stream');
+    // This browser withdrew the family's HDR offer: why its frames cannot be drawn as HDR.
+    const w = h.withdrawn?.[v.family];
+    if (w && !why.includes(w)) why += ` (${v.family}: ${w})`;
     return [row('HDR', `off · ${why}`)];
   }
+  // Why its frames cannot take the HDR path (this browser withdrew HDR: an SDR generation follows).
+  const fail = h.withdrawn?.[v.family] || (r?.failed && Object.values(r.failed)[0]) || r?.error;
   const path = r?.path === 'extended' ? `extended range (rgba16float, ${r.space}, SDR white ${r.white} cd/m²)`
     : r?.path === 'tonemap' ? `tone-mapped to SDR (BT.2390, peak ${r.peak} → ${r.white} cd/m²): ${r.why}`
-      : `drawn through importExternalTexture (Chrome's SDR conversion)${r?.failed && Object.keys(r.failed).length ? `: ${Object.values(r.failed)[0]}` : ''}`;
+      : `drawn through importExternalTexture (Chrome's SDR conversion)${fail ? `: ${fail}` : ''}`;
   const cs = v.colorSpace || {};
   const md = v.hdrMetadata;
   const rows = [

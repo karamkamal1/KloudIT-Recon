@@ -1727,7 +1727,9 @@ async function checkHdrUnit(haveX) {
 // time, stage bookkeeping with the copy in the draw stage, crop, the barcode
 // read from the copied planes). Then HDR Off from the drawer, live: the
 // running HDR stream is tone-mapped at once (pixel check), and the host
-// moves to an SDR generation with the reason.
+// moves to an SDR generation with the reason. Then HDR Auto again with
+// frames that cannot be copied (test hook): the client withdraws its offer
+// and the host returns to SDR.
 const HDR_STREAM = { w: 480, h: 270, fps: 15 };
 // media.HDRTestPatches: x (32 px wide, the top 48 rows), name, 10-bit codes.
 const HDR_PATCHES = [[160, 'black', [64, 512, 512]], [192, '100 cd/m2', [508, 512, 512]], [224, '200 cd/m2', [572, 512, 512]], [256, '1000 cd/m2', [724, 512, 512]],
@@ -1760,7 +1762,7 @@ async function checkHdrStream(sc) {
   const cfg = await page.evaluate(() => window.__recon.videoCfg);
   const st = await page.evaluate(() => window.__recon.lastStats);
   const h = st?.renderer?.hdr;
-  const hostProc = procs.find((p) => p.spawnargs.includes('run'));
+  const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null) || procs.find((p) => p.spawnargs.includes('run'));
   const choice = (hostProc.log.match(/msg="hdr choice"[^\n]* hdr=true [^\n]*/g) || []).pop() || '';
   check(`${name}: the host streams HDR10 to a client that offers it: 10-bit AV1 (libsvtav1), BT.2020 PQ limited range, HDR metadata; its choice logged`,
     !!cfg?.hdr && cfg.bitDepth === 10 && /^av01\.0\.\d\dM\.10$/.test(cfg.codec) && cfg.encoder === 'libsvtav1' && !cfg.hdrNote &&
@@ -1808,6 +1810,36 @@ async function checkHdrStream(sc) {
     !!sdr && /\.08$/.test(sdr.codec) && !sdr.bitDepth && !sdr.colorSpace && sdr.hdrNote === "HDR is off in the client's settings" && st2?.renderer?.hdr?.path === null &&
       st2.renderer.hdr.canvasConfig.startsWith('sdr') && overlay2.includes("off · HDR is off in the client's settings") && st2.fps > HDR_STREAM.fps * 0.6,
     `gen ${gen} -> ${sdr?.gen} codec ${sdr?.codec} hdrNote "${sdr?.hdrNote}"; renderer path ${st2?.renderer?.hdr?.path}, canvas ${st2?.renderer?.hdr?.canvasConfig}; ${st2?.fps?.toFixed(1)} fps`);
+
+  // 10-bit frames without a plane path: Chrome's hardware decoders output
+  // P010, whose VideoFrame.format is null (copyTo cannot read it); the
+  // worker's test hook hdrOpaque plays such a decoder. HDR Auto again (an
+  // HDR-only settings change that changes the decision: a restart) brings an
+  // HDR10 generation, its first frame withdraws the AV1 offer, and the host
+  // returns to SDR (a second restart) with the reason.
+  const log0 = hostProc.log.length;
+  const con1 = consoleLines.length;
+  const gen2 = sdr?.gen ?? gen;
+  await page.evaluate(() => {
+    window.__recon.worker.postMessage({ type: 'hdrOpaque' });
+    const sel = [...document.querySelectorAll('#drawer label')].find((l) => l.textContent === 'HDR')?.parentElement.querySelector('select');
+    sel.value = 'auto';
+    sel.dispatchEvent(new Event('change'));
+  });
+  const back = await until(() => page.evaluate((g) => { const c = window.__recon.videoCfg; return c && c.gen !== g && !c.hdr && /no 10-bit av1 decoder/.test(c.hdrNote || '') ? c : null; }, gen2),
+    20000, 'SDR after the withdrawn offer').catch(() => null);
+  await sleep(1500);
+  const hostLog = hostProc.log.slice(log0);
+  const hdrAgain = /msg="hdr choice"[^\n]* hdr=true /.test(hostLog);
+  const restarts = (hostLog.match(/msg="restarting video"[^\n]* reason="HDR settings"/g) || []).length;
+  const withdrawnLog = consoleLines.slice(con1).find((l) => l.includes('HDR: withdrawn for av1 streams')) || '';
+  const st3 = await page.evaluate(() => window.__recon.lastStats);
+  const overlay3 = await page.textContent('#stats').catch(() => '');
+  check(`${name}: 10-bit frames that cannot be copied (VideoFrame.format null, as from Chrome's hardware decoders; test hook): HDR Auto again streams HDR10, its first frame withdraws the AV1 offer, the host returns to SDR with the reason (two HDR-only restarts), the overlay says why`,
+    hdrAgain && !!back && restarts === 2 && /VideoFrame\.format null/.test(withdrawnLog) && !st3?.hdr?.decoders?.includes('av1') &&
+      /VideoFrame\.format null/.test(st3?.hdr?.withdrawn?.av1 || '') && overlay3.includes('off · the browser has no 10-bit av1 decoder (av1: VideoFrame.format null') && st3.fps > 0,
+    `host: HDR10 again ${hdrAgain}, ${restarts} restarts for HDR settings; gen ${gen2} -> ${back?.gen} hdrNote "${back?.hdrNote}"; client: ${withdrawnLog.replace(/^.*?HDR: /, '').slice(0, 160)}; ` +
+      `offers ${JSON.stringify(st3?.hdr?.decoders)}; overlay ${(overlay3.match(/HDR\s*off · [^\n]*/) || [''])[0].slice(0, 160)}; ${st3?.fps?.toFixed(1)} fps`);
 }
 
 // Auto's pick at unit level (step 4.3, renderers.js pickPath) on made-up

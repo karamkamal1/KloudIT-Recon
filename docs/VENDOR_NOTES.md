@@ -6153,8 +6153,9 @@ Verified in the sandbox:
   only when all say yes, the first reason otherwise, none for old clients),
   `TestHDRPipeline` (helper codecs with and without `hdr10`; FFmpeg test pattern with libsvtav1
   probed / not probed, libaom-av1, ddagrab, gfxcapture), `TestHDRPrefsChange` (a changed setting,
-  display, canvas or decoder list restarts the video), `TestVideoConfigHDR` (an SDR config has
-  none of the new fields; the HDR one's JSON; `CanPresent`).
+  display, canvas or decoder list restarts the video; narrowed by the review fixes below),
+  `TestVideoConfigHDR` (an SDR config has none of the new fields; the HDR one's JSON;
+  `CanPresent`).
 - verified (sandbox): `TestSessionHDRChoice` (buildParams on the FFmpeg test path: HDR10 with
   AV1 for an HDR client; the automatic choice stays H.264 and SDR with the reason; host config
   off; a client before HDR: SDR, no log line), each decision logged once.
@@ -6221,9 +6222,16 @@ HDR display on the host, in Windows HDR mode, and on the client):
   `encoder helper started` line with `hdr=true bit_depth=10 color_space=bt2020-pq`; the overlay
   (Ctrl+Alt+Shift+S): *HDR* `HDR10 · extended range (rgba16float, srgb, SDR white 203 cd/m²)`,
   *colour* `bt2020/pq/bt2020-ncl/limited · 10-bit`, *metadata* with the host display's peak as
-  mastering max and MaxCLL, *decoded* format and colour space (record the format Chrome's
-  hardware HEVC decoder gives: `P010`, `I420P10` or an opaque frame that falls back to
-  `importExternalTexture`, said in the *HDR* row). Look: specular highlights and the
+  mastering max and MaxCLL, *decoded* format and colour space. Expected with today's Chrome
+  (see "Review fixes" below): its hardware HEVC decoder outputs P010, `VideoFrame.format` is
+  null, so the first HDR10 frame withdraws the offer (the browser console: `HDR: withdrawn for
+  hevc streams (VideoFrame.format null …)`), host.log `restarting video reason="HDR settings"`
+  and `hdr choice hdr=false … reason="the browser has no 10-bit hevc decoder"`, the overlay
+  *HDR* `off · the browser has no 10-bit hevc decoder (hevc: VideoFrame.format null …)`, and
+  the stream goes on in SDR with correct colours. Record the format and whether a newer Chrome
+  gives a copyable one (`I420P10`): only then does the extended-range picture below appear.
+  For the picture itself, use codec AV1 with Settings → Decoder *Prefer software* (dav1d gives
+  `I420P10`; record its decode time and CPU load at 1440p / 4K). Look: specular highlights and the
   calibration app's bright patches brighter than the desktop's white, with detail (not clipped
   flat), the desktop and taskbar as bright as the client's SDR content, no washed-out or
   oversaturated colours; compare side by side with the host's own display.
@@ -6232,8 +6240,9 @@ HDR display on the host, in Windows HDR mode, and on the client):
   overlay's *copy (copyTo + upload)* p50 / p95 and MB/frame, and the latency table's *draw* row
   with HDR Auto and HDR Off (SDR: `importExternalTexture`). Pass: copy p95 below 2 ms at 1440p
   (expect 3 bytes per pixel: 11 MB per 1440p frame; a hardware decoder's frame needs a GPU
-  readback in `copyTo`). If it is too slow at 4K, record it: the follow-up is
-  `importExternalTexture` once Chrome keeps HDR there, or a GPU-side plane import.
+  readback in `copyTo`; with today's Chrome only a software decoder's frames are copied, see
+  above). If it is too slow at 4K, record it: the follow-up is `importExternalTexture` once
+  Chrome keeps HDR there, or a GPU-side plane import.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (MaxCLL metadata): with the stream running,
   `recon-encoder.exe --encode-test=hdr.hevc --backend=amf --codec=hevc --capture=dda --hdr=1
   --frames=300` as in 3.9, then `ffprobe -show_frames -read_intervals %+#1 hdr.hevc`: the
@@ -6251,12 +6260,96 @@ HDR display on the host, in Windows HDR mode, and on the client):
 - NVIDIA: unverified (no NVIDIA host available). Test: the end-to-end, copy-cost, MaxCLL and
   toggle checks above with an RTX host (`hevc_nvenc_helper`; AV1 on RTX 40/50 with the codec
   set to AV1) and, as a client, a GeForce PC with an HDR display (Chrome's NVIDIA hardware
-  decoder: record the frame format and the copy cost).
+  decoder: expected `format` null and the offer withdrawn as above; record the frame format,
+  and the copy cost with Decoder *Prefer software* and AV1).
 - Browser matrix: unverified. Record per browser and display: Chrome / Edge 131+ on Windows 11
-  with an HDR display in HDR mode (expected: HDR offered, extended range); the same browser with
-  Windows HDR off (expected: not offered, "the client's display is not in HDR mode"); Chrome on
-  macOS with an XDR / HDR display (MacBook Pro): `dynamic-range: high` and the extended canvas
-  expected, Display P3 (`color-gamut: p3`) as the canvas colour space, HEVC Main 10 via
-  VideoToolbox; Firefox and Safari: expected not offered (no WebGPU extended-range canvas or
+  with an HDR display in HDR mode (expected: HDR offered; with a hardware decoder withdrawn at
+  the first frame, `format` null, and SDR; extended range with AV1 decoded in software); the
+  same browser with Windows HDR off (expected: not offered, "the client's display is not in HDR
+  mode"); Chrome on macOS with an XDR / HDR display (MacBook Pro): `dynamic-range: high` and the
+  extended canvas expected, Display P3 (`color-gamut: p3`) as the canvas colour space, HEVC
+  Main 10 via VideoToolbox (expected `format` null as well: withdrawn, SDR; AV1 in software
+  shows HDR); Firefox and Safari: expected not offered (no WebGPU extended-range canvas or
   no `getConfiguration`), the reason in the overlay. For each: the overlay's *HDR* rows and a
   photo of a 1000 cd/m2 patch next to SDR white.
+
+### Review fixes
+
+- **Hardware decoders' 10-bit frames cannot be copied.** Chromium's WebCodecs
+  (`third_party/blink/renderer/modules/webcodecs/video_frame.cc`, main: `CopyToFormat()`
+  returns nothing for a frame that is not CPU-mappable and not 8-bit, "Readback is not
+  supported for high bit-depth formats", nor for a format outside `IsFormatEnabled`, which has
+  no `PIXEL_FORMAT_P010LE`; `VideoFrame::format()` is null then; `video_pixel_format.idl` has
+  no "P010"; here Chromium 141 rejects `new VideoFrame(…, {format: 'P010'})` as "not a valid
+  enum value"). Chrome's hardware decoders (D3D11, VideoToolbox, VA-API) output 10-bit video as
+  P010, so their frames of an HDR10 stream never took the plane path: they were drawn through
+  `importExternalTexture` (Chrome's SDR conversion, worse than an SDR stream) for the whole
+  generation, and the client kept offering HDR. HEVC decodes only in hardware in Chrome; AV1
+  in hardware on GPUs that have it. Now the first frame of an HDR10 generation that cannot take
+  the plane path (`renderer.hdrBlocked`: format null or without a plane layout, a failed copy;
+  failed HDR shaders or another renderer withdraw the canvas instead) withdraws the client's
+  offer for that codec family (`hdr.withdrawn`, kept by the page for its later connections),
+  the page sends a settings message and the host restarts in SDR (`hdrNote` "the browser has
+  no 10-bit av1 decoder", the overlay adds the client's reason). P010 is gone from the plane
+  layouts and the barcode probe (dead code). Not done: a startup decode of a 10-bit clip per
+  family (the runtime check uses the stream's own decoder, configuration and size, and costs
+  one HDR10 → SDR restart per family and page), and decoding HDR10 AV1 with prefer-software
+  (dav1d: `I420P10`) where the hardware decoder's frames cannot be copied: its CPU cost at
+  1440p / 4K needs measuring on a client first (the hardware test above records it with
+  Decoder *Prefer software*).
+- **HDR-prefs-only settings restart only when the decision changes.** A settings message whose
+  HDR prefs alone changed (the window moved between an HDR and an SDR monitor, Windows HDR or
+  battery saver on the client) restarted every stream, also ones that could never be HDR10 (host
+  config off, H.264, a 2D canvas client), with a new generation and IDR, and reset the
+  congestion back-off and the encoder retry state. Now `hdrRestart` decides the current
+  generation's HDR anew with the new prefs and restarts only when HDR10-or-not or the reason
+  changes, keeping the back-off. For the reason to stay put, `decideHDR` checks what is fixed
+  for the session first (host config, codec, pipeline, the client's canvas and decoder) and
+  then the client's setting and display (`CanPresent` reordered alike).
+- **WGC has no HDR path.** A helper stream captured with Windows Graphics Capture (a window, or
+  host capture `gfxcapture`) was asked for HDR10, started SDR, and was announced as "the host
+  display is not in Windows HDR mode" even with Windows HDR on. `hdrPipeline` now gives the
+  reason ("window capture (Windows Graphics Capture) has no HDR path in the native encoder
+  helper") and does not ask; the note of a helper stream that started SDR follows its capture
+  (DDA and the GPU test source: the display; AMD Direct Capture: the display or no FP16
+  frames, the helper's log says which; WGC: no HDR path).
+- **Per-frame allocations on the HDR draw path.** The output pass's uniforms (the BT.2020 →
+  canvas matrix from two primaries solves, about fifty short-lived arrays) were computed for
+  every frame; the plane layout twice per frame; the overlay's decoded-frame record and the
+  copy's rectangle and `writeTexture` descriptors per frame. Now the matrices are cached per
+  colour space and the uniforms recomputed only when the space, white, tone mapping or peak
+  change; the layout is cached by format and size; the copy options and the per-plane
+  `writeTexture` descriptors are reused (per texture set); the decoded-frame record is new
+  only when its format, size or colour space changes.
+
+Verified in the sandbox (review fixes):
+
+- verified (sandbox): `TestDecideHDR` (the order: the pipeline's reason before the client's,
+  the canvas before the display, the decoder before the setting, the setting before the
+  display), `TestHDRPipeline` (helper DDA and AMD Direct Capture: HDR; helper WGC for a window
+  and for capture `gfxcapture`: the WGC reason), `TestHelperSDRNote` (the note per capture),
+  `TestHDRPrefsChange` (`hdrRestart`: restarts when an HDR10 stream's display leaves HDR mode,
+  its setting goes Off or its family's decoder is withdrawn, and when an SDR stream can be
+  HDR10 now; none for another family's decoder, host config off, H.264, FFmpeg's screen capture,
+  the helper's WGC, a 2D canvas client, a display change under HDR Off, or nothing streaming),
+  `TestSessionHelperHDR` (through the control loop with a fake helper: a decoder list that keeps
+  HEVC restarts nothing; HDR Off: a new helper without `hdr` at the backed-off 7000 kbit/s, not
+  the reset 20000; the display going SDR under HDR Off restarts nothing; Auto again: a new
+  helper with `hdr`, generation 5 HDR10; two `HDR settings` restarts in all).
+- verified (sandbox, browser E2E scenario `WebGPU HDR10`, after HDR Off): HDR Auto again with
+  the worker's test hook `hdrOpaque` (HDR frames count as `format` null, as Chrome's hardware
+  decoders' P010 frames): the host restarts into HDR10 (`hdr choice hdr=true`, `restarting
+  video reason="HDR settings"`), the first frame withdraws AV1 (console `HDR: withdrawn for
+  av1 streams (VideoFrame.format null …)`), 0.5 s later the host restarts into SDR (`hdr
+  choice hdr=false … reason="the browser has no 10-bit av1 decoder"`, the client now offers no
+  decoder), generation 3 → 5, the overlay `off · the browser has no 10-bit av1 decoder (av1:
+  VideoFrame.format null …)`, 16 fps. The rest of the HDR scenario and the HDR unit section
+  unchanged (pixels within 0.0032 extended / 0.46 levels tone-mapped, copy p50 0.25 ms, I420P12
+  / I444P10 / NV12 and chroma siting as before: the cached uniforms and layouts give the same
+  results; `outputUniforms` also compared with the previous version in node for every space,
+  white, peak and tone setting: identical). Full browser E2E 240 of 241: the SDR scenarios'
+  clients send `prefs.hdr` and get no `HDR settings` restart (two in the whole host log, both
+  the scenario's); the one failure was the load-sensitive software reference-recovery count
+  (4 of 18 losses fell to congestion restarts at load average 5-6), whose section passed 19 of
+  19 on its own right after (15 of 15 losses answered by recovery frames, no restarts). Go
+  integration test (`internal/e2e`) passed.

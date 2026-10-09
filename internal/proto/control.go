@@ -104,32 +104,33 @@ const (
 )
 
 // CanPresent reports whether the client asks for and can present an HDR10
-// stream of a codec family, or why not.
+// stream of a codec family, or why not. What the browser can do (the canvas,
+// the family's decoder) is checked before what changes during a session (the
+// setting, the display), so a client that cannot present the family keeps
+// its reason when its display or setting changes.
 func (h *HDRPrefs) CanPresent(family string) (bool, string) {
 	switch {
 	case h == nil:
 		return false, "the client does not support HDR"
-	case h.Mode != HDRAuto:
-		return false, "HDR is off in the client's settings"
-	case !h.Display:
-		return false, "the client's display is not in HDR mode"
 	case !h.Canvas:
 		why := h.Why
 		if why == "" {
 			why = "the client's canvas cannot show extended range"
 		}
 		return false, why
+	case !slices.Contains(h.Decoders, family):
+		return false, fmt.Sprintf("the browser has no 10-bit %s decoder", family)
+	case h.Mode != HDRAuto:
+		return false, "HDR is off in the client's settings"
+	case !h.Display:
+		return false, "the client's display is not in HDR mode"
 	}
-	for _, f := range h.Decoders {
-		if f == family {
-			return true, ""
-		}
-	}
-	return false, fmt.Sprintf("the browser has no 10-bit %s decoder", family)
+	return true, ""
 }
 
 // SameHDR reports whether two HDR preferences ask for the same thing (a
-// settings change that differs here restarts the video).
+// settings change that differs here restarts the video when it changes the
+// HDR decision: Session.hdrRestart).
 func SameHDR(a, b *HDRPrefs) bool {
 	if a == nil || b == nil {
 		return a == b

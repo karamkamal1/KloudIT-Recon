@@ -3,6 +3,8 @@ package host
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -54,8 +56,16 @@ func TestDecideHDR(t *testing.T) {
 		{"H.264", proto.HDRAuto, hdrClient("hevc", "av1", "h264"), "h264", "", false, "H.264 streams are SDR (HDR10 needs HEVC Main 10 or AV1 10-bit)"},
 		{"H.264, config off", proto.HDROff, hdrClient("hevc"), "h264", "", false, `HDR is off in the host config ("hdr")`},
 		{"pipeline cannot", proto.HDRAuto, hdrClient("hevc"), "hevc", helperNoHDR, false, helperNoHDR},
-		{"client reason before the pipeline's", proto.HDRAuto, with(func(h *proto.HDRPrefs) { h.Display = false }), "hevc", helperNoHDR, false,
-			"the client's display is not in HDR mode"},
+		// What stays the same for the session is the reason before what can
+		// change (the client's setting and display): no restart for a note.
+		{"the pipeline's reason before the client's", proto.HDRAuto, with(func(h *proto.HDRPrefs) { h.Display = false }), "hevc", helperNoHDR, false,
+			helperNoHDR},
+		{"the canvas before the display", proto.HDRAuto, with(func(h *proto.HDRPrefs) { h.Canvas, h.Display, h.Why = false, false, "the renderer is the 2D canvas" }),
+			"hevc", "", false, "the renderer is the 2D canvas"},
+		{"the decoder before the setting", proto.HDRAuto, with(func(h *proto.HDRPrefs) { h.Mode, h.Decoders = proto.HDROff, []string{"av1"} }),
+			"hevc", "", false, "the browser has no 10-bit hevc decoder"},
+		{"the setting before the display", proto.HDRAuto, with(func(h *proto.HDRPrefs) { h.Mode, h.Display = proto.HDROff, false }),
+			"hevc", "", false, "HDR is off in the client's settings"},
 	} {
 		got, why := decideHDR(c.config, c.client, c.family, c.pipeline)
 		if got != c.want || why != c.why {
@@ -65,8 +75,9 @@ func TestDecideHDR(t *testing.T) {
 }
 
 // TestHDRPipeline: which pipelines make HDR10: the helper with a codec whose
-// caps have hdr10, FFmpeg only for the test pattern with libsvtav1 that the
-// probe ran.
+// caps have hdr10 and a capture with an HDR path (not WGC: a window or host
+// capture "gfxcapture"), FFmpeg only for the test pattern with libsvtav1 that
+// the probe ran.
 func TestHDRPipeline(t *testing.T) {
 	probed, notProbed := &media.Caps{}, &media.Caps{}
 	probed.SetHDRTest(true)
@@ -82,6 +93,12 @@ func TestHDRPipeline(t *testing.T) {
 		{"helper HEVC hdr10", notProbed, media.Params{Encoder: media.EncoderInfo{Name: "hevc_amf_helper", Family: "hevc", Helper: true}}, true},
 		{"helper AV1 hdr10", notProbed, media.Params{Encoder: media.EncoderInfo{Name: "av1_nvenc_helper", Family: "av1", Helper: true}}, true},
 		{"helper H.264", notProbed, media.Params{Encoder: media.EncoderInfo{Name: "h264_amf_helper", Family: "h264", Helper: true}}, false},
+		{"helper DDA", notProbed, media.Params{Source: media.Source{Backend: "ddagrab"}, Encoder: media.EncoderInfo{Name: "hevc_amf_helper", Family: "hevc", Helper: true}}, true},
+		{"helper AMD Direct Capture", notProbed, media.Params{Source: media.Source{Backend: "amf"}, Encoder: media.EncoderInfo{Name: "hevc_amf_helper", Family: "hevc", Helper: true}}, true},
+		{"helper WGC (a window)", notProbed, media.Params{Source: media.Source{Backend: "gfxcapture", Window: "Game"},
+			Encoder: media.EncoderInfo{Name: "hevc_amf_helper", Family: "hevc", Helper: true}}, false},
+		{"helper WGC (host capture gfxcapture)", notProbed, media.Params{Source: media.Source{Backend: "gfxcapture"},
+			Encoder: media.EncoderInfo{Name: "av1_nvenc_helper", Family: "av1", Helper: true}}, false},
 		{"test pattern, libsvtav1, probed", probed, media.Params{Source: test, Encoder: svt}, true},
 		{"test pattern, libsvtav1, probe failed", notProbed, media.Params{Source: test, Encoder: svt}, false},
 		{"test pattern, libaom-av1", probed, media.Params{Source: test, Encoder: media.EncoderInfo{Name: "libaom-av1", Family: "av1"}}, false},
@@ -89,7 +106,7 @@ func TestHDRPipeline(t *testing.T) {
 		{"gfxcapture hevc_nvenc", probed, media.Params{Source: media.Source{Backend: "gfxcapture"}, Encoder: media.EncoderInfo{Name: "hevc_nvenc", Family: "hevc", HW: true}}, false},
 	} {
 		why := (&Agent{caps: c.caps}).hdrPipeline(c.p, helper)
-		if (why == "") != c.ok {
+		if (why == "") != c.ok || (c.p.Source.Backend == "gfxcapture" && c.p.Encoder.Helper && why != media.HelperWGCNoHDR) {
 			t.Errorf("%s: %q", c.name, why)
 		}
 	}
@@ -152,8 +169,11 @@ func TestSessionHDRChoice(t *testing.T) {
 // HEVC gets a start with hdr; the helper's started HDR fields become the
 // video config's (10-bit codec string, BT.2020 PQ, the display's metadata).
 // Windows HDR turned off during the stream restarts it (a new helper, a new
-// generation) and the new config is SDR with the reason; a settings change
-// to HDR Off restarts it without hdr.
+// generation) and the new config is SDR with the reason. Settings messages
+// that change only the client's HDR prefs (controlLoop) restart the video
+// when they change the HDR decision (HDR Off: a new helper without hdr; Auto
+// again: with hdr), keeping the congestion back-off, and not otherwise (a
+// decoder list that keeps HEVC, the display under HDR Off).
 func TestSessionHelperHDR(t *testing.T) {
 	const fakeHEVC10 = `"hevc":{"maxW":8192,"maxH":4352,"tenBit":true,"hdr10":true,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":1,"alignH":1}`
 	md := &encoder.HDRMetadata{DisplayPrimaries: [3][2]float64{{0.708, 0.292}, {0.17, 0.797}, {0.131, 0.046}}, WhitePoint: [2]float64{0.3127, 0.329},
@@ -183,14 +203,18 @@ func TestSessionHelperHDR(t *testing.T) {
 	cfg.Defaults()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctrl := &fakeCtrl{}
+	in, client := io.Pipe() // the client's control messages
+	defer client.Close()
+	sc := &scriptedCtrl{r: in}
+	ctrl := &sc.fakeCtrl
+	logs := &lockedLog{}
 	prefs := proto.Prefs{HDR: hdrClient("hevc")}
 	s := &Session{
 		a:     &Agent{cfg: cfg, caps: &media.Caps{}, inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch},
 		hello: proto.Hello{V: proto.HelloVersionRecovery, Decoders: []proto.DecoderInfo{{Family: "hevc", HW: true}}, Prefs: prefs},
 		prefs: prefs, tried: map[string]bool{}, usage: map[string]string{}, encFails: map[string]int{},
-		ctx: ctx, cancel: cancel, ctrl: ctrl, frameQ: make(chan *media.Frame, 64), pipeSwap: make(chan struct{}, 1),
-		log: slog.New(slog.NewTextHandler(&lockedLog{}, nil)),
+		ctx: ctx, cancel: cancel, ctrl: sc, frameQ: make(chan *media.Frame, 64), pipeSwap: make(chan struct{}, 1),
+		log: slog.New(slog.NewTextHandler(logs, nil)),
 	}
 	if n := s.openPipeline(); n != "" {
 		t.Fatalf("notice %q", n)
@@ -251,29 +275,65 @@ func TestSessionHelperHDR(t *testing.T) {
 	f3.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
 	waitMsg(t, ctrl, `"t":"video"`, `"gen":3`, `"hdr":true`)
 
-	// The client's setting to Off (a settings message): a new helper without hdr.
-	off := proto.Prefs{HDR: &proto.HDRPrefs{Mode: proto.HDROff, Display: true, Canvas: true, Decoders: []string{"hevc"}}}
-	s.prefsMu.Lock()
-	s.prefs = off
-	s.prefsMu.Unlock()
-	if err := s.startVideo(false, "settings"); err != nil {
-		t.Fatal(err)
+	// Settings messages with HDR prefs only (the client's control stream),
+	// under a congestion back-off to 7000 kbit/s.
+	go func() { _ = s.controlLoop() }()
+	s.rate.mu.Lock()
+	s.rate.est = 7000
+	s.rate.mu.Unlock()
+	settings := func(h *proto.HDRPrefs) {
+		t.Helper()
+		b, _ := json.Marshal(proto.ClientMsg{T: "settings", Prefs: &proto.Prefs{HDR: h}})
+		if err := proto.WriteMsg(client, b); err != nil {
+			t.Fatal(err)
+		}
 	}
+	both := []string{"hevc", "av1"}
+	// A 10-bit AV1 decoder more: the HEVC stream's decision stays (no
+	// restart). The setting to Off: a new helper without hdr, at the
+	// backed-off bitrate. (Had the first restarted, generation 4 would be
+	// that restart's HDR10 one.)
+	settings(&proto.HDRPrefs{Mode: proto.HDRAuto, Display: true, Canvas: true, Decoders: both})
+	settings(&proto.HDRPrefs{Mode: proto.HDROff, Display: true, Canvas: true, Decoders: both})
 	var f4 *encoder.Fake
 	select {
 	case f4 = <-l.started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("no new helper after the HDR setting changed")
 	}
-	if m := expectFakeMsg(t, f4, "start"); m["hdr"] != nil {
-		t.Fatalf("start with HDR off: %v", m)
+	if m := expectFakeMsg(t, f4, "start"); m["hdr"] != nil || m["kbps"] != float64(7000) {
+		t.Fatalf("start with HDR off: %v (want no hdr, the backed-off 7000 kbps)", m)
 	}
 	f4.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
 	waitMsg(t, ctrl, `"t":"video"`, `"gen":4`, `"hdrNote":"HDR is off in the client's settings"`)
+	// Under HDR Off the display going SDR changes nothing (no restart);
+	// Auto on an HDR display again restarts with hdr: generation 5 is HDR10.
+	settings(&proto.HDRPrefs{Mode: proto.HDROff, Display: false, Canvas: true, Decoders: both})
+	settings(&proto.HDRPrefs{Mode: proto.HDRAuto, Display: true, Canvas: true, Decoders: both})
+	var f5 *encoder.Fake
+	select {
+	case f5 = <-l.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no new helper after the HDR setting changed back")
+	}
+	if m := expectFakeMsg(t, f5, "start"); m["hdr"] != true {
+		t.Fatalf("start with HDR Auto: %v", m)
+	}
+	f5.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+	waitMsg(t, ctrl, `"t":"video"`, `"gen":5`, `"hdr":true`)
+	if n := len(logs.lines(`msg="restarting video" reason="HDR settings"`)); n != 2 {
+		t.Fatalf("%d restarts for HDR settings, want 2", n)
+	}
 }
 
-// TestHDRPrefsChange: a settings message whose HDR prefs differ is a video
-// change (the session restarts the video); an equal one is not.
+// TestHDRPrefsChange: a settings message whose HDR prefs differ (SameHDR)
+// restarts the video only when it changes the current generation's HDR
+// decision or its reason (hdrRestart): an HDR10 stream whose client's
+// display left HDR mode, or whose decoder the client withdrew, or an SDR
+// stream that can be HDR10 now. Not an SDR stream that cannot be HDR10
+// anyway (host config off, H.264, FFmpeg's screen capture, the helper's WGC,
+// a 2D canvas client) when the display changes, nor a stream whose family
+// keeps its decoder, nor when nothing streams.
 func TestHDRPrefsChange(t *testing.T) {
 	a, b := hdrClient("hevc"), hdrClient("hevc")
 	if !proto.SameHDR(a, b) || !proto.SameHDR(nil, nil) || proto.SameHDR(a, nil) {
@@ -289,4 +349,71 @@ func TestHDRPrefsChange(t *testing.T) {
 			t.Errorf("%+v counts as unchanged", c)
 		}
 	}
+
+	caps := &media.Caps{}
+	caps.SetHDRTest(true)
+	svt := media.EncoderInfo{Name: "libsvtav1", Family: "av1", Vendor: "software"}
+	x264 := media.EncoderInfo{Name: "libx264", Family: "h264", Vendor: "software"}
+	amf := media.EncoderInfo{Name: "hevc_amf", Family: "hevc", Vendor: "amd", HW: true}
+	helperHEVC := media.EncoderInfo{Name: "hevc_amf_helper", Family: "hevc", Helper: true}
+	test := media.Source{Backend: "test"}
+	with := func(f func(h *proto.HDRPrefs)) *proto.HDRPrefs { h := hdrClient("hevc", "av1"); f(h); return h }
+	sdrDisplay := func(h *proto.HDRPrefs) { h.Display = false }
+	canvas2D := func(h *proto.HDRPrefs) { h.Canvas, h.Why = false, "HDR needs the WebGPU renderer" }
+	for _, c := range []struct {
+		name     string
+		config   string
+		p        media.Params // the current generation (its HDR decision from old)
+		none     bool         // nothing streams
+		old, now *proto.HDRPrefs
+		restart  bool
+	}{
+		{"HDR10 stream, the display leaves HDR mode", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			hdrClient("hevc", "av1"), with(sdrDisplay), true},
+		{"HDR10 stream, the setting Off", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			hdrClient("av1"), with(func(h *proto.HDRPrefs) { h.Mode = proto.HDROff }), true},
+		{"HDR10 stream, its decoder withdrawn", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			hdrClient("hevc", "av1"), hdrClient("hevc"), true},
+		{"HDR10 stream, another family's decoder withdrawn", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			hdrClient("hevc", "av1"), hdrClient("av1"), false},
+		{"SDR stream that can be HDR10: the display enters HDR mode", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			with(sdrDisplay), hdrClient("hevc", "av1"), true},
+		{"host config off, the display changes", proto.HDROff, media.Params{Source: test, Encoder: svt}, false,
+			hdrClient("av1"), with(sdrDisplay), false},
+		{"H.264, the display changes", proto.HDRAuto, media.Params{Source: test, Encoder: x264}, false,
+			hdrClient("hevc", "av1"), with(sdrDisplay), false},
+		{"FFmpeg screen capture, the display changes", proto.HDRAuto, media.Params{Source: media.Source{Backend: "ddagrab"}, Encoder: amf}, false,
+			with(sdrDisplay), hdrClient("hevc", "av1"), false},
+		{"helper WGC, the display changes", proto.HDRAuto, media.Params{Source: media.Source{Backend: "gfxcapture", Window: "Game"}, Encoder: helperHEVC}, false,
+			hdrClient("hevc"), with(sdrDisplay), false},
+		{"2D canvas client, the display changes", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			with(canvas2D), with(func(h *proto.HDRPrefs) { canvas2D(h); sdrDisplay(h) }), false},
+		{"HDR Off, the display changes", proto.HDRAuto, media.Params{Source: test, Encoder: svt}, false,
+			with(func(h *proto.HDRPrefs) { h.Mode = proto.HDROff }), with(func(h *proto.HDRPrefs) { h.Mode = proto.HDROff; sdrDisplay(h) }), false},
+		{"nothing streams", proto.HDRAuto, media.Params{}, true, hdrClient("av1"), with(sdrDisplay), false},
+	} {
+		cfg := &Config{HDR: c.config}
+		cfg.Defaults()
+		s := &Session{a: &Agent{cfg: cfg, caps: caps}, video: currentOnly{p: c.p, ok: !c.none},
+			helperCaps: encoder.Caps{Codecs: map[string]encoder.CodecCaps{"hevc": {HDR10: true}}}}
+		if c.p.Encoder.Helper {
+			s.helperEncs = []media.EncoderInfo{helperHEVC}
+		}
+		_, _, helper := s.onHelper()
+		c.p.HDR, c.p.HDRNote = decideHDR(cfg.hdr(), c.old, c.p.Encoder.Family, s.a.hdrPipeline(c.p, helper))
+		s.video = currentOnly{p: c.p, ok: !c.none}
+		if got := s.hdrRestart(proto.Prefs{HDR: c.now}); got != c.restart {
+			t.Errorf("%s: restart %v, want %v (generation HDR %v %q)", c.name, got, c.restart, c.p.HDR, c.p.HDRNote)
+		}
+	}
 }
+
+// currentOnly is a pipeline whose current generation has the parameters p
+// (ok: one streams); nothing else is called.
+type currentOnly struct {
+	media.Pipeline
+	p  media.Params
+	ok bool
+}
+
+func (c currentOnly) Current() (media.Params, bool) { return c.p, c.ok }

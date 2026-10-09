@@ -689,7 +689,7 @@ SDR (`started.hdr` false, a log line says why; not an error, as in Sunshine):
    colour space `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (caps `outputs[].hdr`).
 2. The capture method delivers HDR frames: `dda` (always), `amd-direct` when its surfaces
    are `AMF_SURFACE_RGBA_F16` (VERIFY, docs/VENDOR_NOTES.md 3.9), `synthetic-gpu` (test).
-   `wgc` has no HDR path yet: SDR.
+   `wgc` has no HDR path yet: SDR (recon-host does not ask for `hdr` with `wgc`).
 
 The codec must have caps `hdr10` (HEVC or AV1 with 10-bit encoding of P010 input), else the
 `start` fails with `unsupported`, whatever the output: recon-host checks caps first.

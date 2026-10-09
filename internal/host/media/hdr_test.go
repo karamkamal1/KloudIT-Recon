@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/codec"
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
@@ -247,4 +248,28 @@ func decode10(t *testing.T, ffmpeg string, frames []*Frame, w, h int) [][]uint16
 		pics = append(pics, p)
 	}
 	return pics
+}
+
+// TestHelperSDRNote: why a helper stream asked for HDR10 started SDR, by the
+// capture the helper used: only DDA's (and the GPU test source's) SDR start
+// means the display is not in Windows HDR mode; WGC has no HDR path, AMD
+// Direct Capture may lack FP16 frames.
+func TestHelperSDRNote(t *testing.T) {
+	for _, c := range []struct {
+		st   encoder.Started
+		want string
+	}{
+		{encoder.Started{Capture: "dda", BitDepth: 8, ColorSpace: "bt709"}, "the host display is not in Windows HDR mode"},
+		{encoder.Started{Capture: "synthetic-gpu", BitDepth: 8, ColorSpace: "bt709"}, "the host display is not in Windows HDR mode"},
+		{encoder.Started{Capture: "amd-direct", BitDepth: 8, ColorSpace: "bt709"},
+			"the host display is not in Windows HDR mode, or AMD Direct Capture gave no FP16 frames (the helper's log says which)"},
+		{encoder.Started{Capture: "wgc", BitDepth: 8, ColorSpace: "bt709"}, HelperWGCNoHDR},
+		{encoder.Started{Capture: "synthetic"}, "the helper's synthetic capture has no HDR path"},
+		{encoder.Started{Capture: "dda", HDR: true, BitDepth: 8, ColorSpace: "bt709"},
+			"the helper started a stream it did not describe as HDR10 (8-bit bt709)"},
+	} {
+		if got := helperSDRNote(c.st); got != c.want {
+			t.Errorf("%s: %q, want %q", c.st.Capture, got, c.want)
+		}
+	}
 }
