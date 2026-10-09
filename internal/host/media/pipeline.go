@@ -136,11 +136,16 @@ type RateChange struct {
 // CaptureChange is a change of the capture source (HelperVideo): Reason
 // "resized" (new size or rotation: the stream keeps its size, scaled, until
 // restarted; the next Start starts a new helper even with the same Params),
-// "lost" (capture is impossible for now, the last image is repeated) or
-// "restored".
+// "lost" (capture is impossible for now, the last image is repeated),
+// "restored" or "hdr" (Windows HDR was turned on or off for the output: HDR
+// says which). Restart: the stream no longer is what it was asked for (an
+// HDR10 stream after an "hdr" change keeps the format it started with), so
+// the session restarts it; the next Start starts a new helper.
 type CaptureChange struct {
 	Reason        string
 	Width, Height int
 	Rotation      int
 	Text          string
+	HDR           bool
+	Restart       bool
 }

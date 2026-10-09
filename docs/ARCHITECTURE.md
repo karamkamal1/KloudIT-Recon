@@ -703,7 +703,8 @@ worker:  WebTransport.incomingUnidirectionalStreams ─► readAll ─► reorde
                                           webgl2    getContext('webgl2', {desynchronized:true}),
                                                     texImage2D(frame) + one triangle (after a self-test)
                                           webgpu    importExternalTexture (zero copy, after a self-test);
-                                                    shown larger: FSR 1, EASU + RCAS (fsr1.js)
+                                                    shown larger: FSR 1, EASU + RCAS (fsr1.js);
+                                                    HDR10: the decoded planes copied, PQ shader (hdr.js)
 main:    pointerrawupdate / keys / gamepads ──postMessage──► worker ──► input stream / datagrams
 audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─► AudioWorklet (adaptive jitter buffer)
 ```
@@ -811,6 +812,12 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   else the draw stage's p50 with and without FSR). The latency
   probe reads the barcode from the frame's own texture, not from the canvas, so upscaling does
   not touch it. The bake-off measures WebGPU with the upscaling setting in effect.
+- **HDR10** (step 4.5, `hdr.js`; see [HDR10](#hdr10) below): frames of an HDR10 generation are
+  copied plane by plane (`VideoFrame.copyTo`) between the decoder's output and the frame pacer
+  and drawn by the WebGPU renderer through two passes onto an extended-range canvas, or
+  tone-mapped to SDR; the copy counts in the *draw* stage. Frames that cannot be copied
+  (`format` null: Chrome's hardware decoders' 10-bit P010 output) withdraw the client's HDR
+  offer, and the host moves to SDR.
 - Decoder hygiene: `prefer-hardware` + `optimizeForLatency`; `flush()` is never called while
   streaming (it waits for every output and makes the next chunk a key frame; recovery resets and
   reconfigures instead). At most 2 chunks wait inside the decoder (`decodeQueueSize`); later ones
@@ -1053,8 +1060,129 @@ WebGL2 renderer does the same from the texture the frame was uploaded to: the ce
 framebuffer, `readPixels` into a pixel buffer, a fence, and `getBufferSubData` once the fence has
 passed (polled on timers). At most two readbacks are in flight.
 
+In an HDR10 stream the barcode has the 10-bit codes 64 / 940 (the native helper's P010 and the
+HDR test pattern alike), which read as 16 / 235 at 8 bits: the reader's thresholds hold. The
+WebGPU renderer's HDR path reads it from the copy of the decoded planes it already made (10-bit
+luma / 4; probe method `copyTo I420P10 (HDR planes)`), at no GPU cost.
+
 The overlay shows sampled / valid / mismatched counts and the histogram's p50/p95/p99
 (1 ms buckets over the whole connection), `window.__recon.probe` holds the same summary, and
 **Export latency data** (overlay) downloads a JSON document with the histogram, every sample
 (time, gen, seq, barcode, latency, page→capture), the stage summary, the video configuration and
 the connection.
+
+## HDR10
+
+GUIDE 3.9 (host) and 4.5 (browser), experimental and opt-in at both ends: nothing changes for a
+host without `"hdr": "auto"` in host.json, a client that does not offer HDR, or an older peer.
+
+**Negotiation** (`internal/host/hdr.go`). The client offers HDR in its hello and every settings
+message (`prefs.hdr`: `{mode, display, canvas, decoders, why}`): its *HDR* setting (`auto` |
+`off`), whether the display is in HDR mode (`matchMedia("(dynamic-range: high)")`, from the main
+thread), whether the renderer that draws is WebGPU and a canvas configured `rgba16float` with
+`toneMapping: {mode: "extended"}` reports both back through `getConfiguration()` (Chrome 131+;
+feature-detected, never assumed; not during Auto's bake-off), and which families have a 10-bit
+decoder (`VideoDecoder.isConfigSupported` of `hev1.2.4.L153.B0` / `av01.0.13M.10`,
+prefer-hardware first; the timed decode of 4.2 stays 8-bit; a family whose frames turned out
+not to be drawable as HDR is withdrawn, see *Presentation*). Hosts that allow HDR list `hdr10`
+in `welcome.features`. A generation is HDR10 when all of these hold (`decideHDR`), checked in
+this order, the first failure being the reason (what stays the same for the session before
+the client's setting and display, so that a stream that cannot be HDR keeps its reason when
+those change):
+
+1. host config `hdr` is `auto` (default `off`);
+2. the codec is HEVC or AV1 (the negotiated codec is not changed for HDR: an H.264 stream
+   stays SDR);
+3. the pipeline can make it (`hdrPipeline`): the native helper with a codec whose caps have
+   `hdr10` and a capture with an HDR path (DDA or AMD Direct Capture; its WGC capture, used for
+   a window or host capture `gfxcapture`, has none), which then streams HDR10 when the
+   captured output is in Windows HDR mode, else SDR with the reason; or on the FFmpeg path the
+   test pattern with libsvtav1 (below). FFmpeg's Windows captures stay SDR: FFmpeg 8.1's
+   ddagrab has HDR content only as FP16 scRGB (its 10-bit X2BGR10 output is DWM's SDR
+   conversion, tagged sRGB), NVENC takes no FP16 input, `scale_d3d11` converts to P010 without
+   colour spaces (no PQ), and `amfenc` passes neither an RGBAF16 surface's input transfer nor
+   HDR metadata (ddagrab attaches none). HDR on Windows is the native helper's (step 3.9);
+4. the client offered HDR (`HDRPrefs.CanPresent`): an extended-range canvas, a 10-bit decoder
+   for the family, mode `auto`, an HDR display.
+
+The decision goes into the generation's `media.Params` (`HDR`, `HDRNote`), the host log has
+`hdr choice` (hdr, encoder, reason, the client's prefs) once per change. A settings message
+whose HDR prefs alone differ (the setting, the display, a withdrawn decoder) restarts the video
+only when it changes the current generation's decision or its reason (`hdrRestart`), and keeps
+the congestion back-off; a window moving between an HDR and an SDR monitor under a stream that
+stays SDR anyway restarts nothing.
+
+**Video config.** An HDR10 generation's `video` message adds `hdr: true`, `bitDepth: 10`,
+`colorSpace` in WebCodecs `VideoColorSpaceInit` terms (`{"primaries":"bt2020","transfer":"pq",
+"matrix":"bt2020-ncl","fullRange":false}`) and `hdrMetadata` (mastering display primaries and
+white point as CIE xy, luminance range, MaxCLL, MaxFALL in cd/m2: what the encoder writes into
+the stream); the codec string names the 10-bit profile (from the bitstream: `hev1.2.4…`,
+`av01.0.xxM.10`). For clients that offered HDR, a generation that is not HDR carries
+`hdrNote`, why not. Every other generation is byte-identical to before. On the helper the fields
+come from its `started` (`hdr`, `bitDepth`, `colorSpace` `bt2020-pq`, `hdrMetadata`); an HDR10
+start that the helper starts SDR gets an `hdrNote` by its capture: "the host display is not in
+Windows HDR mode" for DDA, either that or no FP16 frames for AMD Direct Capture (the helper's
+log says which).
+**Windows HDR toggled** during a stream (the helper's `captureChanged` `hdr`): a stream that was
+asked for HDR no longer matches the output, so the session restarts it (a new helper, a new
+generation and video config in the output's new mode); an SDR stream that was not asked for HDR
+is left alone (DXGI converts).
+**On a virtual display** (GUIDE 3.7) the same rules hold: the helper captures it with `dda`, so
+HDR10 is asked for and the display's own Windows HDR mode decides (toggling it restarts the
+stream as above); a new size or frame rate replaces the display and the next generation asks
+again; an HDR-only settings change restarts the video on the same display. The agent does not
+switch Windows HDR on for the display it creates, which normally comes up SDR, so such a session
+streams SDR ("the host display is not in Windows HDR mode") until HDR is turned on for that
+display in Windows, and the `auto` policy does not weigh HDR when it picks the virtual display
+over an HDR monitor (`docs/VENDOR_NOTES.md`, 3.9/4.5 "HDR on a virtual display").
+
+**HDR test pattern** (FFmpeg, `capture: "test"` with libsvtav1; `media.HDRTestGraph`): testsrc2
+as SDR content at the BT.2408 reference white of 203 cd/m2 (`zscale`: BT.709 → BT.2020
+primaries, SMPTE ST 2084, BT.2020 NCL, limited range, 10 bits), and overlaid on its top 48 rows
+a strip drawn at 8 bits and converted exactly (codes × 4): black, the frame barcode (64 / 940)
+and nine patches of known codes from x 160 (`media.HDRTestPatches`: greys at 0, ~100, ~200,
+1000, ~4000 and 10000 cd/m2, red, green, blue). The encoder gets `-color_primaries bt2020
+-color_trc smpte2084 -colorspace bt2020nc -color_range tv`, SVT-AV1's `mastering-display` /
+`content-light` parameters (metadata OBUs: BT.2020 / D65, 10000 / 0.0001 cd/m2, MaxCLL 10000,
+MaxFALL 203) and preset 10 (at 11 and 12 SVT-AV1 1.7 leaves some changed barcode cells of the
+static strip as they were). The probe runs it once (codes exact, a 10-bit sequence header) and
+offers HDR on the test path only where it passed.
+
+**Presentation** (browser, `hdr.js`, `renderers.js` WebGPU renderer). Only the WebGPU renderer
+draws HDR streams; with the 2D canvas or WebGL2 the client does not offer HDR, so their streams
+are SDR. Chrome's `importExternalTexture` tone-maps a PQ frame into SDR (measured here: grey
+100 / 203 / 1000 / 10000 cd/m2 patches import as 0.51 / 0.58 / 0.75 / 1.0 linear, the greys
+within [0, 1]; docs/VENDOR_NOTES.md 3.9/4.5), so the HDR path copies the decoded planes
+instead: `VideoFrame.copyTo` of the visible rectangle into a reused staging buffer,
+`writeTexture` into `r16uint` (`r8uint` for 8-bit) textures of a reusable set per plane layout
+(I420P10 / P12, I422 / I444 P10 / P12, I420, NV12: the formats WebCodecs can copy), one copy
+at a time between the decoder's output and the frame pacer (a newer frame replaces one waiting
+for it). WebCodecs has no P010: Chrome's hardware decoders (D3D11, VideoToolbox, VA-API)
+output 10-bit video as P010, and such frames have `format` null and cannot be copied
+(Chromium's `CopyToFormat`), so with today's Chrome only a software decoder's frames (dav1d:
+`I420P10`) take this path. The first frame of an HDR10 generation that cannot (format null,
+a failed copy, failed HDR shaders, another renderer) withdraws the client's offer: the
+family's 10-bit decoder (kept withdrawn for the page's later connections) or the canvas; the
+page sends a settings message, the host moves to SDR (`hdrNote` "the browser has no 10-bit …
+decoder", the overlay adds the client's reason), and until then Chrome's SDR conversion draws
+the frames (`importExternalTexture`). Two passes in the draw call: *convert* (planes → an
+`rgba16float` intermediate of the visible size: BT.2020 NCL limited-range Y'CbCr → R'G'B',
+still PQ-encoded; 4:2:0 chroma bilinear, sited as `chroma_sample_loc_type` 0) and *output*
+(sampled bilinearly onto the canvas at the letterboxed rectangle: the PQ EOTF → cd/m2, BT.2020
+→ the canvas's primaries, then either *extended*: cd/m2 / SDR white (Settings → *HDR: SDR
+white*, 203 by default) on an `rgba16float` canvas with `toneMapping: "extended"` in `srgb` or
+`display-p3` (where `color-gamut: p3` matches), values above 1 for highlights and below 0 out of
+gamut, encoded with the sRGB curve extended to all reals (the canvas reads its values that way:
+0.5 shows as 128); or *tonemap*: the ITU-R BT.2390 EETF on max(R, G, B) in PQ space (hue
+preserved) from the stream's peak (MaxCLL, else the mastering peak, else 1000 cd/m2) to the SDR
+white, clipped to 0-1 on the ordinary SDR canvas). Tone mapping is used while the setting is
+*Off* with an HDR stream still running (until the host's SDR generation comes), when the
+display left HDR mode, or without an extended-range canvas. FSR stays off for HDR frames (the
+output pass scales bilinearly, the overlay says why): RCAS's limiter and EASU's clamp assume
+SDR-range input, and an HDR FSR (on the PQ intermediate, or FSR 1's reversible tonemapper
+around it) would add two `rgba16float` passes and needs its own verification. The copy's time
+(copyTo + upload, CPU) counts in the *draw* stage (hold stays the pacing wait; the stages still
+add up) and is shown in the overlay (*copy* p50 / p95, bytes per frame), with *HDR* (HDR10 and
+how it is shown, or off and why), the colour description, the metadata and the decoded frames'
+format and colour space. A test hook (`hdrCheck`) reads canvas pixels and the copied codes back
+for the E2E's pixel check.

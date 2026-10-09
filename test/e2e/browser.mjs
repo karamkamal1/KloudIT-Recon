@@ -40,7 +40,14 @@
 // requestFullscreen; a fake gamepad's triggers come back as force feedback
 // (host test hook rumble-echo) and are played with
 // vibrationActuator.playEffect; the client reports unadjustedMovement only
-// when the browser read the option.
+// when the browser read the option. HDR10 (steps 3.9 / 4.5): the host
+// allows HDR ("hdr": "auto"), every scenario before the HDR one streams SDR
+// to clients whose display is SDR (unchanged); the WebGPU renderer's HDR
+// shader against a CPU reference (unit), and a scenario on a page that plays
+// an HDR display: a 10-bit PQ AV1 stream presented with extended range,
+// checked to the pixel, then HDR Off live (tone-mapped, then an SDR stream).
+// E2E_ONLY=<regex> runs the scenarios and sections whose names match
+// (development).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -104,6 +111,8 @@ function cleanup() { for (const p of procs) { try { p.kill('SIGTERM'); } catch {
 process.on('exit', cleanup);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// E2E_ONLY=<regex>: only the scenarios and sections whose names match (development runs).
+const want = (name) => !process.env.E2E_ONLY || new RegExp(process.env.E2E_ONLY, 'i').test(name);
 async function until(fn, ms, what) {
   const end = Date.now() + ms;
   let last;
@@ -661,6 +670,13 @@ async function headedPage() {
     args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
   });
   const c = await b.newContext({ ignoreHTTPSErrors: true, viewport: HEADED_VIEWPORT, deviceScaleFactor: HEADED_DPR, storageState: await ctx.storageState() });
+  // Test hook for the HDR scenario: with localStorage e2e.hdrDisplay set, the
+  // page sees an HDR display (matchMedia "(dynamic-range: high)"; Xvfb is SDR).
+  await c.addInitScript(() => {
+    if (localStorage.getItem('e2e.hdrDisplay') !== '1') return;
+    const mm = window.matchMedia.bind(window);
+    window.matchMedia = (q) => (/dynamic-range:\s*high/.test(q) ? { matches: true, media: q, onchange: null, addEventListener() {}, removeEventListener() {} } : mm(q));
+  });
   const p = await c.newPage();
   p.on('console', onConsole.bind(p));
   p.on('pageerror', onPageError);
@@ -1578,6 +1594,401 @@ async function checkUpscaleUnit(haveX) {
     plans.every(({ k, r }) => r && !r.error && r.upscaled === k.plan && r.info.active === k.plan && (k.plan || !!r.info.why)),
     plans.map(({ k, r }) => `${k.name}: ${r?.error || `${r.upscaled ? 'FSR' : `bilinear (${r.info.why})`}, ${r.info.in?.join('x')} -> ${r.info.out?.join('x')}`}`).join('; '));
   results.push({ upscaleUnit: { srcDiff, easu, full, pad, geo, bigMax, metrics: Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v && { width: v.width, step: v.step, flat: v.flat, flatMax: v.flatMax }])) } });
+}
+
+// HDR10 at unit level (step 4.5, web/static/js/hdr.js): the WebGPU renderer's
+// HDR path (the decoded planes copied into textures, BT.2020 Y'CbCr -> PQ
+// R'G'B', the PQ EOTF, BT.2020 -> the canvas's primaries, then extended range
+// or BT.2390 tone mapping) against hdrReference, a CPU reference written from
+// the standards (ITU-R BT.2020 / BT.2100, SMPTE ST 2084, BT.2390-10 5.4.1;
+// the primaries matrices derived through XYZ by Gaussian elimination, not
+// hdr.js's code). Read back from the canvas itself through the renderer's
+// test hook (planes.capture: copyTextureToBuffer of the rgba16float or
+// bgra8unorm canvas texture). Code values: black, 1, 100, 203 (reference
+// white), 1000, 4000 and 10000 cd/m2 greys, a code above 940, and the BT.2020
+// primaries at 1000 cd/m2 and red at 10000.
+const HDR_D65 = [0.3127, 0.3290];
+const HDR_PRIM = { bt2020: [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]], srgb: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]], 'display-p3': [[0.68, 0.32], [0.265, 0.69], [0.15, 0.06]] };
+function hdrSolve3(A, b) {
+  const m = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < 3; c++) {
+    let p = c;
+    for (let r = c + 1; r < 3; r++) if (Math.abs(m[r][c]) > Math.abs(m[p][c])) p = r;
+    [m[c], m[p]] = [m[p], m[c]];
+    for (let r = 0; r < 3; r++) {
+      if (r === c) continue;
+      const f = m[r][c] / m[c][c];
+      for (let k = c; k < 4; k++) m[r][k] -= f * m[c][k];
+    }
+  }
+  return m.map((r, i) => r[3] / r[i]);
+}
+function hdrToXYZ(p) {
+  const xyz = ([x, y]) => [x / y, 1, (1 - x - y) / y];
+  const P = [0, 1, 2].map((r) => p.map((c) => xyz(c)[r]));
+  const S = hdrSolve3(P, xyz(HDR_D65));
+  return P.map((r) => r.map((v, k) => v * S[k]));
+}
+const HDR_PQ = { m1: 2610 / 16384, m2: (2523 / 4096) * 128, c1: 3424 / 4096, c2: (2413 / 4096) * 32, c3: (2392 / 4096) * 32 };
+const hdrEotf = (e) => { const { m1, m2, c1, c2, c3 } = HDR_PQ; const p = Math.max(e, 0) ** (1 / m2); return 10000 * (Math.max(p - c1, 0) / (c2 - c3 * p)) ** (1 / m1); };
+const hdrOetf = (l) => { const { m1, m2, c1, c2, c3 } = HDR_PQ; const t = Math.min(Math.max(l / 10000, 0), 1) ** m1; return ((c1 + c2 * t) / (1 + c3 * t)) ** m2; };
+// BT.2390-10 5.4.1 EETF with LB = Lmin = 0 (b = 0): source [0, Lw] into [0, Lmax].
+function hdrEetf(L, Lw, Lmax) {
+  const e1 = Math.min(hdrOetf(L) / hdrOetf(Lw), 1);
+  const maxLum = hdrOetf(Lmax) / hdrOetf(Lw);
+  const ks = 1.5 * maxLum - 0.5;
+  let e2 = e1;
+  if (ks < 1 && e1 >= ks) {
+    const T = (e1 - ks) / (1 - ks);
+    e2 = (2 * T ** 3 - 3 * T ** 2 + 1) * ks + (T ** 3 - 2 * T ** 2 + T) * (1 - ks) + (-2 * T ** 3 + 3 * T ** 2) * maxLum;
+  }
+  return hdrEotf(e2 * hdrOetf(Lw));
+}
+const hdrSrgb = (x) => { const a = Math.abs(x); return Math.sign(x) * (a <= 0.0031308 ? 12.92 * a : 1.055 * a ** (1 / 2.4) - 0.055); };
+// The canvas value for 10-bit codes [Y, Cb, Cr] (fractional: interpolated chroma).
+function hdrReference([Y, Cb, Cr], { mode, white, space, peak }) {
+  const Kr = 0.2627;
+  const Kb = 0.0593;
+  const y = (Y - 64) / 876;
+  const cb = (Cb - 512) / 896;
+  const cr = (Cr - 512) / 896;
+  const R = y + 2 * (1 - Kr) * cr;
+  const B = y + 2 * (1 - Kb) * cb;
+  const G = (y - Kr * R - Kb * B) / (1 - Kr - Kb);
+  let lin = [R, G, B].map((v) => hdrEotf(Math.min(1, Math.max(0, v))));
+  if (mode === 'tonemap') {
+    const m = Math.max(...lin);
+    if (m > 0) { const t = hdrEetf(m, peak, white) / m; lin = lin.map((v) => v * t); }
+  }
+  const to = hdrToXYZ(HDR_PRIM[mode === 'tonemap' ? 'srgb' : space]);
+  const from = hdrToXYZ(HDR_PRIM.bt2020);
+  let out = hdrSolve3(to, from.map((r) => r[0] * lin[0] + r[1] * lin[1] + r[2] * lin[2])).map((v) => v / white);
+  if (mode === 'tonemap') out = out.map((v) => Math.min(1, Math.max(0, v)));
+  return out.map(hdrSrgb);
+}
+// Within half-float precision (extended) or one 8-bit level (tone mapped).
+const hdrClose = (got, want, mode) => got.every((g, k) => Math.abs(g - want[k]) <= (mode === 'tonemap' ? 1.5 / 255 : 0.002 + 0.002 * Math.abs(want[k])));
+// 10-bit Y'CbCr codes of BT.2020 R'G'B' (PQ values).
+const hdrCodes = (r, g, b) => {
+  const y = 0.2627 * r + 0.678 * g + 0.0593 * b;
+  return [64 + 876 * y, 512 + (896 * (b - y)) / 1.8814, 512 + (896 * (r - y)) / 1.4746].map(Math.round);
+};
+
+async function checkHdrUnit(haveX) {
+  if (!haveX) {
+    console.log('- HDR shader (unit): skipped, WebGPU needs a headed browser (Xvfb) here');
+    return;
+  }
+  const P1000 = hdrOetf(1000);
+  const grey = (n) => [Math.round(64 + 876 * hdrOetf(n)), 512, 512];
+  const patches = [
+    ['black', [64, 512, 512]], ['1 cd/m2', grey(1)], ['100 cd/m2', grey(100)], ['203 cd/m2 (reference white)', grey(203)],
+    ['1000 cd/m2', grey(1000)], ['4000 cd/m2', grey(4000)], ['10000 cd/m2', [940, 512, 512]], ['above 940', [1000, 512, 512]],
+    ['BT.2020 red 1000', hdrCodes(P1000, 0, 0)], ['BT.2020 green 1000', hdrCodes(0, P1000, 0)], ['BT.2020 blue 1000', hdrCodes(0, 0, P1000)],
+    ['BT.2020 red 10000', hdrCodes(1, 0, 0)],
+  ];
+  const outputs = [
+    { name: 'extended, sRGB canvas, white 203', o: { want: true, white: 203, space: 'srgb', peak: 1000 } },
+    { name: 'extended, Display P3 canvas, white 100', o: { want: true, white: 100, space: 'display-p3', peak: 1000 } },
+    { name: 'tone mapped, peak 1000', o: { want: false, white: 203, space: 'srgb', peak: 1000 } },
+    { name: 'tone mapped, peak 10000', o: { want: false, white: 203, space: 'srgb', peak: 10000 } },
+  ];
+  const disp = await startXvfb();
+  const b = await chromium.launch({ headless: false, env: { ...process.env, DISPLAY: disp }, args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'] });
+  const ctx2 = await b.newContext({ ignoreHTTPSErrors: true });
+  let res;
+  try {
+    const p = await ctx2.newPage();
+    await p.goto(`${base}/login`);
+    res = await p.evaluate(async ({ patches, outputs }) => {
+      const R = await import('/js/renderers.js');
+      const W = 64;
+      const H = 48;
+      const CS = { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false };
+      // A W x H frame of format fmt: 16x16 patches of codes [Y, Cb, Cr] (10-bit
+      // units), 4 per row; or, with chroma, a frame whose Cr changes with every
+      // chroma sample (the siting and interpolation check).
+      const frameOf = (fmt, cells, chroma) => {
+        const sub = fmt.startsWith('I444') ? 1 : 2;
+        const cw = W / sub;
+        const ch = H / sub;
+        const bits = fmt === 'NV12' ? 8 : fmt.endsWith('P12') ? 12 : 10;
+        const conv = (v) => (bits === 8 ? Math.round(v / 4) : bits === 12 ? v * 4 : v);
+        const Y = new Float64Array(W * H);
+        const U = new Float64Array(cw * ch);
+        const V = new Float64Array(cw * ch);
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) Y[y * W + x] = chroma ? 400 : cells[Math.floor(y / 16) * 4 + Math.floor(x / 16)][0];
+        for (let y = 0; y < ch; y++) {
+          for (let x = 0; x < cw; x++) {
+            const c = chroma ? null : cells[Math.floor((y * sub) / 16) * 4 + Math.floor((x * sub) / 16)];
+            U[y * cw + x] = chroma ? 512 : c[1];
+            V[y * cw + x] = chroma ? 512 + 40 * ((x * 7 + y * 3) % 9) - 160 : c[2];
+          }
+        }
+        const T = bits === 8 ? Uint8Array : Uint16Array;
+        const planes = fmt === 'NV12' ? [Y, (() => { const uv = new Float64Array(cw * ch * 2); for (let i = 0; i < cw * ch; i++) { uv[2 * i] = U[i]; uv[2 * i + 1] = V[i]; } return uv; })()] : [Y, U, V];
+        const arrays = planes.map((pl) => T.from(pl, conv));
+        const size = arrays.reduce((s, a) => s + a.byteLength, 0);
+        const data = new Uint8Array(size);
+        let o = 0;
+        for (const a of arrays) { data.set(new Uint8Array(a.buffer), o); o += a.byteLength; }
+        return { frame: new VideoFrame(data, { format: fmt, codedWidth: W, codedHeight: H, timestamp: 0, colorSpace: CS }), V: Array.from(V), cw, sub };
+      };
+      const out = { outputs: [], formats: [], siting: null };
+      const c = new OffscreenCanvas(W, H);
+      const r = await R.WebGPURenderer.create(c, { log: (t) => console.log(t) });
+      out.canvas = r.hdrCanvasOk;
+      const vis = { w: W, h: H, fx: 1, fy: 1 };
+      const cells = patches.map((x) => x[1]);
+      const centres = cells.map((_, i) => [(i % 4) * 16 + 8, Math.floor(i / 4) * 16 + 8]);
+      const draw = async (f, points, o) => {
+        r.setHdr(o);
+        const planes = await r.prepare(f);
+        return new Promise((resolve) => { planes.capture = { points, resolve }; r.draw(f, null, vis, planes); });
+      };
+      for (const k of outputs) out.outputs.push({ name: k.name, ...(await draw(frameOf('I420P10', cells).frame, centres, k.o)) });
+      for (const fmt of ['I420P12', 'I444P10', 'NV12']) {
+        try {
+          out.formats.push({ fmt, ...(await draw(frameOf(fmt, cells).frame, centres, outputs[0].o)) });
+        } catch (e) {
+          out.formats.push({ fmt, error: e.message });
+        }
+      }
+      // Chroma siting: Cr per chroma sample; luma columns 2i (co-sited) and
+      // 2i + 1 (between two samples), rows 2j and 2j + 1 (a quarter and three
+      // quarters of the way from sample j - 1 / j).
+      const s = frameOf('I420P10', null, true);
+      const pts = [];
+      for (const y of [9, 10, 20, 21]) for (const x of [10, 11, 30, 31]) pts.push([x, y]);
+      out.siting = { pts, V: s.V, cw: s.cw, ...(await draw(s.frame, pts, outputs[0].o)) };
+      // What importExternalTexture makes of the same PQ frame (Chrome's
+      // conversion): the patches read from the external texture into an
+      // rgba16float texture.
+      try {
+        const d = r.device;
+        const f = frameOf('I420P10', cells).frame;
+        const ext = d.importExternalTexture({ source: f });
+        const code = `@group(0) @binding(0) var tex: texture_external;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let i = u32(pos.x);
+  return textureLoad(tex, vec2u((i % 4u) * 16u + 8u, (i / 4u) * 16u + 8u));
+}`;
+        const m = d.createShaderModule({ code });
+        const pl = d.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] } });
+        const t = d.createTexture({ size: [cells.length, 1], format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+        const e = d.createCommandEncoder();
+        const pass = e.beginRenderPass({ colorAttachments: [{ view: t.createView(), loadOp: 'clear', storeOp: 'store' }] });
+        pass.setPipeline(pl);
+        pass.setBindGroup(0, d.createBindGroup({ layout: pl.getBindGroupLayout(0), entries: [{ binding: 0, resource: ext }] }));
+        pass.draw(3);
+        pass.end();
+        const buf = d.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        e.copyTextureToBuffer({ texture: t }, { buffer: buf, bytesPerRow: 256 }, [cells.length, 1]);
+        d.queue.submit([e.finish()]);
+        await buf.mapAsync(GPUMapMode.READ);
+        const h = new Uint16Array(buf.getMappedRange().slice(0, 8 * cells.length));
+        const half = (v) => { const sg = v & 0x8000 ? -1 : 1; const ex = (v >> 10) & 31; const mt = v & 1023; return sg * (ex ? 2 ** (ex - 15) * (1 + mt / 1024) : 2 ** -14 * (mt / 1024)); };
+        out.external = cells.map((_, i) => [0, 1, 2].map((k) => +half(h[i * 4 + k]).toFixed(4)));
+        f.close();
+      } catch (e) {
+        out.external = e.message;
+      }
+      out.info = r.hdrInfo();
+      r.destroy();
+      return out;
+    }, { patches, outputs });
+  } finally {
+    await ctx2.close();
+    await b.close();
+    stopXvfb(disp);
+  }
+  const mode = (o) => (o.want ? 'extended' : 'tonemap');
+  const cmp = (got, k, codes, label) => {
+    const rows = [];
+    let ok = !got.error && got.values?.length === codes.length && got.format === (k.want ? 'rgba16float' : got.format) && got.mode === mode(k);
+    codes.forEach((code, i) => {
+      const want = hdrReference(code, { mode: mode(k), white: k.white, space: k.space, peak: k.peak });
+      const v = got.values?.[i] || [NaN, NaN, NaN];
+      const good = hdrClose(v, want, mode(k));
+      ok &&= good;
+      if (!good || i < 1) rows.push(`${label(i)}: ${v.map((x) => x.toFixed(4)).join(',')} vs ${want.map((x) => x.toFixed(4)).join(',')}`);
+    });
+    const worst = Math.max(...codes.map((code, i) => Math.max(...hdrReference(code, { mode: mode(k), white: k.white, space: k.space, peak: k.peak }).map((w, c) => Math.abs((got.values?.[i]?.[c] ?? NaN) - w)))));
+    return { ok, worst, rows };
+  };
+  const outs = outputs.map((k, i) => ({ k, r: cmp(res.outputs[i], k.o, patches.map((x) => x[1]), (j) => patches[j][0]), got: res.outputs[i] }));
+  check('HDR shader (unit): an rgba16float canvas with toneMapping "extended" is confirmed by getConfiguration() here (Chromium on SwiftShader)', !!res.canvas?.ok, JSON.stringify(res.canvas));
+  check('HDR shader (unit): I420P10 planes -> BT.2020 PQ -> extended range (sRGB and Display P3 canvases, SDR white 203 / 100 cd/m2) match the CPU reference ' +
+    '(black, 1/100/203/1000/4000/10000 cd/m2, a code above 940, BT.2020 primaries), within half-float precision',
+  outs.slice(0, 2).every((x) => x.r.ok),
+  outs.slice(0, 2).map((x) => `${x.k.name} (${x.got.format}): worst ${x.r.worst.toFixed(4)}${x.r.rows.length ? `; ${x.r.rows.join('; ')}` : ''}`).join(' | '));
+  check('HDR shader (unit): tone mapped to SDR (BT.2390 EETF on max(R,G,B), peak 1000 and 10000 cd/m2 to the 203 cd/m2 white, bgra8unorm canvas) matches the CPU reference within 1.5 levels',
+    outs.slice(2).every((x) => x.r.ok),
+    outs.slice(2).map((x) => `${x.k.name} (${x.got.format}): worst ${(x.r.worst * 255).toFixed(2)} levels${x.r.rows.length ? `; ${x.r.rows.join('; ')}` : ''}`).join(' | '));
+  const fmts = res.formats.map((g) => {
+    const codes = patches.map((x) => (g.fmt === 'NV12' ? x[1].map((v) => Math.round(v / 4) * 4) : x[1]));
+    return { fmt: g.fmt, r: g.error ? { ok: false, rows: [g.error] } : cmp(g, outputs[0].o, codes, (j) => patches[j][0]) };
+  });
+  check('HDR shader (unit): the other decoder output formats (I420P12, I444P10, NV12 as 8-bit codes x 4) give the reference too',
+    fmts.every((x) => x.r.ok), fmts.map((x) => `${x.fmt}: ${x.r.ok ? `worst ${x.r.worst.toFixed(4)}` : x.r.rows.join('; ')}`).join(' | '));
+  // Siting: Cr at luma (x, y) interpolates chroma (x / 2, (y - 0.5) / 2).
+  const si = res.siting;
+  const crAt = (x, y) => {
+    const cx = x / 2;
+    const cy = (y - 0.5) / 2;
+    const x0 = Math.floor(cx);
+    const y0 = Math.floor(cy);
+    const fx = cx - x0;
+    const fy = cy - y0;
+    const v = (i, j) => si.V[Math.min(Math.max(j, 0), 23) * si.cw + Math.min(Math.max(i, 0), si.cw - 1)];
+    return (v(x0, y0) * (1 - fx) + v(x0 + 1, y0) * fx) * (1 - fy) + (v(x0, y0 + 1) * (1 - fx) + v(x0 + 1, y0 + 1) * fx) * fy;
+  };
+  const sit = cmp(si, outputs[0].o, si.pts.map(([x, y]) => [400, 512, crAt(x, y)]), (j) => `(${si.pts[j]})`);
+  check('HDR shader (unit): 4:2:0 chroma is interpolated bilinearly and sited as chroma_sample_loc_type 0 (co-sited columns, between rows)',
+    sit.ok, `16 pixels: worst ${sit.worst.toFixed(4)}${sit.rows.length ? `; ${sit.rows.join('; ')}` : ''}`);
+  // A record, not a pass/fail of this code: what Chrome's importExternalTexture
+  // makes of a PQ frame (docs/VENDOR_NOTES.md 3.9/4.5).
+  const ext = Array.isArray(res.external) ? res.external : null;
+  // The greys say what happened to luminance (colours outside sRGB can read
+  // below 0 or above 1 at any brightness: extended sRGB).
+  const greys = patches.map((x, i) => i).filter((i) => !/BT\.2020/.test(patches[i][0]));
+  const sdr = ext ? greys.every((i) => ext[i].every((x) => x <= 1.001)) : null;
+  console.log(`  HDR (unit): importExternalTexture of the I420P10 BT.2020 PQ frame ${ext ? `reads ${patches.map((x, i) => `${x[0]} ${ext[i].join('/')}`).join('; ')}` : `failed: ${res.external}`}` +
+    `${sdr === null ? '' : sdr ? ' -> every grey up to 10000 cd/m2 within [0, 1]: luminance tone-mapped into SDR by Chrome, HDR lost' : ' -> greys above 1: extended range kept'}`);
+  results.push({ hdrUnit: { canvas: res.canvas, outputs: outs.map((x) => ({ name: x.k.name, format: x.got.format, worst: x.r.worst, values: x.got.values })),
+    formats: fmts.map((x) => ({ fmt: x.fmt, ok: x.r.ok, worst: x.r.worst })), siting: { worst: sit.worst }, external: res.external, externalSDR: sdr } });
+}
+
+// HDR10 end to end in the stream (steps 3.9 / 4.5): the headed page plays an
+// HDR display (the test hook e2e.hdrDisplay makes matchMedia("(dynamic-range:
+// high)") match; Xvfb is SDR), Renderer WebGPU, codec AV1, HDR Auto; the
+// host ("hdr": "auto") streams the test pattern as HDR10 (libsvtav1 10-bit,
+// BT.2020 PQ, HDR metadata; media.HDRTestGraph) at HDR_STREAM. Checked: the
+// video config and the host's choice, the decoded frames' format and colour
+// space, extended-range presentation (or the tone-mapped fallback, recorded),
+// the canvas pixels at the test pattern's patches against hdrReference of the
+// codes the frame carried (and those codes against the host's), FSR off with
+// its reason, the overlay; the scenario's common checks ran with it (real
+// time, stage bookkeeping with the copy in the draw stage, crop, the barcode
+// read from the copied planes). Then HDR Off from the drawer, live: the
+// running HDR stream is tone-mapped at once (pixel check), and the host
+// moves to an SDR generation with the reason. Then HDR Auto again with
+// frames that cannot be copied (test hook): the client withdraws its offer
+// and the host returns to SDR.
+const HDR_STREAM = { w: 480, h: 270, fps: 15 };
+// media.HDRTestPatches: x (32 px wide, the top 48 rows), name, 10-bit codes.
+const HDR_PATCHES = [[160, 'black', [64, 512, 512]], [192, '100 cd/m2', [508, 512, 512]], [224, '200 cd/m2', [572, 512, 512]], [256, '1000 cd/m2', [724, 512, 512]],
+  [288, '4000 cd/m2', [856, 512, 512]], [320, '10000 cd/m2', [940, 512, 512]], [352, 'red', [260, 396, 848]], [384, 'green', [452, 288, 228]], [416, 'blue', [140, 848, 456]]];
+
+async function hdrCheckOnce() {
+  await page.evaluate((points) => { window.__recon.hdrCheck = null; window.__recon.worker.postMessage({ type: 'hdrCheck', points }); }, HDR_PATCHES.map(([x]) => [x + 16, 24]));
+  return until(() => page.evaluate(() => window.__recon.hdrCheck), 8000, 'HDR pixel check');
+}
+
+function hdrPixels(res) {
+  const rows = [];
+  let ok = !!res && !res.error && res.values?.length === HDR_PATCHES.length;
+  let worst = 0;
+  let codeOff = 0;
+  HDR_PATCHES.forEach(([, name, want], i) => {
+    const code = res?.codes?.[i];
+    if (!code) { ok = false; return; }
+    codeOff = Math.max(codeOff, ...code.map((v, k) => Math.abs(v - want[k])));
+    const ref = hdrReference(code, { mode: res.mode, white: res.white, space: res.space, peak: res.peak });
+    const v = res.values[i];
+    worst = Math.max(worst, ...v.map((g, k) => Math.abs(g - ref[k])));
+    if (!hdrClose(v, ref, res.mode)) { ok = false; rows.push(`${name} codes ${code.join('/')}: ${v.map((x) => x.toFixed(4)).join(',')} vs ${ref.map((x) => x.toFixed(4)).join(',')}`); }
+  });
+  return { ok: ok && codeOff <= 8, worst, codeOff, rows };
+}
+
+async function checkHdrStream(sc) {
+  const name = sc.name;
+  const cfg = await page.evaluate(() => window.__recon.videoCfg);
+  const st = await page.evaluate(() => window.__recon.lastStats);
+  const h = st?.renderer?.hdr;
+  const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null) || procs.find((p) => p.spawnargs.includes('run'));
+  const choice = (hostProc.log.match(/msg="hdr choice"[^\n]* hdr=true [^\n]*/g) || []).pop() || '';
+  check(`${name}: the host streams HDR10 to a client that offers it: 10-bit AV1 (libsvtav1), BT.2020 PQ limited range, HDR metadata; its choice logged`,
+    !!cfg?.hdr && cfg.bitDepth === 10 && /^av01\.0\.\d\dM\.10$/.test(cfg.codec) && cfg.encoder === 'libsvtav1' && !cfg.hdrNote &&
+      JSON.stringify(cfg.colorSpace) === '{"primaries":"bt2020","transfer":"pq","matrix":"bt2020-ncl","fullRange":false}' &&
+      cfg.hdrMetadata?.maxCll === 10000 && cfg.hdrMetadata.maxLuminance === 10000 && st?.hdr?.display && st.hdr.canvas && st.hdr.decoders.includes('av1') && !!choice,
+    `config hdr ${cfg?.hdr} bitDepth ${cfg?.bitDepth} codec ${cfg?.codec} via ${cfg?.encoder}, ${JSON.stringify(cfg?.colorSpace)}, metadata ${JSON.stringify(cfg?.hdrMetadata)}; ` +
+      `client offers ${JSON.stringify({ mode: st?.hdr?.mode, display: st?.hdr?.display, canvas: st?.hdr?.canvas, decoders: st?.hdr?.decoders })}; host: ${choice.replace(/^.*?msg=/, '').slice(0, 200)}`);
+  const f = h?.frame;
+  check(`${name}: the decoder outputs 10-bit frames with the HDR10 colour space (VideoFrame.format, colorSpace)`,
+    f?.format === 'I420P10' && f.bits === 10 && f.colorSpace?.primaries === 'bt2020' && f.colorSpace.transfer === 'pq' && f.colorSpace.matrix === 'bt2020-ncl' && f.colorSpace.fullRange === false,
+    `format ${f?.format} (${f?.bits}-bit) ${f?.w}x${f?.h}, colorSpace ${JSON.stringify(f?.colorSpace)}`);
+  const overlay = await page.textContent('#stats').catch(() => '');
+  const path = h?.path;
+  check(`${name}: presented with extended range (rgba16float, toneMapping extended; or the tone-mapped fallback with its reason), shown in the overlay with the colour, metadata and copy cost`,
+    (path === 'extended' || (path === 'tonemap' && !!h.why)) && h.canvasConfig?.startsWith(path === 'extended' ? 'extended:srgb' : 'sdr') && overlay.includes('HDR10 · ') &&
+      overlay.includes('bt2020/pq/bt2020-ncl/limited · 10-bit') && overlay.includes('MaxCLL 10000') && overlay.includes('copy (copyTo + upload)') && h.copy?.n > 10,
+    `path ${path}${path === 'tonemap' ? ` (${h.why})` : ''}, canvas ${h?.canvasConfig}, ${h?.drawn} HDR frames drawn; copy p50 ${h?.copy?.p50} p95 ${h?.copy?.p95} ms (n ${h?.copy?.n}), ` +
+      `${(h?.bytes / 1e6).toFixed(2)} MB/frame; overlay ${overlay.includes('HDR10 · ') ? 'shows HDR10' : 'lacks HDR10'}`);
+  const u = st?.renderer?.upscale;
+  check(`${name}: FSR stays off for HDR frames, with the reason (the picture is shown 2x: Auto would upscale an SDR stream)`,
+    !!u && !u.active && /off for HDR streams/.test(u.why || ''), JSON.stringify({ mode: u?.mode, active: u?.active, in: u?.in, out: u?.out, why: u?.why }));
+  const px = hdrPixels(await hdrCheckOnce().catch((e) => ({ error: e.message })));
+  check(`${name}: canvas pixels at the test pattern's patches (greys 0-10000 cd/m2, colours) = the CPU reference of the codes the frame carried; those codes = the host's (within 8)`,
+    px.ok, `worst ${px.worst.toFixed(4)}, codes off by at most ${px.codeOff}${px.rows.length ? `; ${px.rows.join('; ')}` : ''}`);
+  results.push({ hdrStream: name, cfg, hdr: h, pixels: { worst: px.worst, codeOff: px.codeOff } });
+  console.log(`  ${name}: HDR path ${path}; plane copy (copyTo + writeTexture, CPU) p50 ${h?.copy?.p50} ms, p95 ${h?.copy?.p95} ms, ${(h?.bytes / 1e6).toFixed(2)} MB/frame`);
+
+  // HDR Off from the drawer: tone-mapped at once, then an SDR generation.
+  const gen = cfg.gen;
+  await page.evaluate(() => {
+    const sel = [...document.querySelectorAll('#drawer label')].find((l) => l.textContent === 'HDR')?.parentElement.querySelector('select');
+    sel.value = 'off';
+    sel.dispatchEvent(new Event('change'));
+  });
+  const tone = await hdrCheckOnce().catch((e) => ({ error: e.message }));
+  const tpx = hdrPixels(tone);
+  check(`${name}: HDR Off with the HDR stream running: tone-mapped to SDR at once (BT.2390, bgra8unorm canvas), = the CPU reference`,
+    tone?.mode === 'tonemap' && tone.format !== 'rgba16float' && tone.peak === 10000 && tpx.ok,
+    `mode ${tone?.mode} on ${tone?.format}, peak ${tone?.peak}, white ${tone?.white}; worst ${(tpx.worst * 255).toFixed(2)} levels${tpx.rows.length ? `; ${tpx.rows.join('; ')}` : ''}${tone?.error ? `; ${tone.error}` : ''}`);
+  const sdr = await until(() => page.evaluate((g) => { const c = window.__recon.videoCfg; return c && c.gen !== g && !c.hdr ? c : null; }, gen), 10000, 'an SDR generation').catch(() => null);
+  await sleep(1500);
+  const st2 = await page.evaluate(() => window.__recon.lastStats);
+  const overlay2 = await page.textContent('#stats').catch(() => '');
+  check(`${name}: the host then streams SDR (a new generation: 8-bit, no colour fields, hdrNote why), the canvas back to SDR, the overlay says why`,
+    !!sdr && /\.08$/.test(sdr.codec) && !sdr.bitDepth && !sdr.colorSpace && sdr.hdrNote === "HDR is off in the client's settings" && st2?.renderer?.hdr?.path === null &&
+      st2.renderer.hdr.canvasConfig.startsWith('sdr') && overlay2.includes("off · HDR is off in the client's settings") && st2.fps > HDR_STREAM.fps * 0.6,
+    `gen ${gen} -> ${sdr?.gen} codec ${sdr?.codec} hdrNote "${sdr?.hdrNote}"; renderer path ${st2?.renderer?.hdr?.path}, canvas ${st2?.renderer?.hdr?.canvasConfig}; ${st2?.fps?.toFixed(1)} fps`);
+
+  // 10-bit frames without a plane path: Chrome's hardware decoders output
+  // P010, whose VideoFrame.format is null (copyTo cannot read it); the
+  // worker's test hook hdrOpaque plays such a decoder. HDR Auto again (an
+  // HDR-only settings change that changes the decision: a restart) brings an
+  // HDR10 generation, its first frame withdraws the AV1 offer, and the host
+  // returns to SDR (a second restart) with the reason.
+  const log0 = hostProc.log.length;
+  const con1 = consoleLines.length;
+  const gen2 = sdr?.gen ?? gen;
+  await page.evaluate(() => {
+    window.__recon.worker.postMessage({ type: 'hdrOpaque' });
+    const sel = [...document.querySelectorAll('#drawer label')].find((l) => l.textContent === 'HDR')?.parentElement.querySelector('select');
+    sel.value = 'auto';
+    sel.dispatchEvent(new Event('change'));
+  });
+  const back = await until(() => page.evaluate((g) => { const c = window.__recon.videoCfg; return c && c.gen !== g && !c.hdr && /no 10-bit av1 decoder/.test(c.hdrNote || '') ? c : null; }, gen2),
+    20000, 'SDR after the withdrawn offer').catch(() => null);
+  await sleep(1500);
+  const hostLog = hostProc.log.slice(log0);
+  const hdrAgain = /msg="hdr choice"[^\n]* hdr=true /.test(hostLog);
+  const restarts = (hostLog.match(/msg="restarting video"[^\n]* reason="HDR settings"/g) || []).length;
+  const withdrawnLog = consoleLines.slice(con1).find((l) => l.includes('HDR: withdrawn for av1 streams')) || '';
+  const st3 = await page.evaluate(() => window.__recon.lastStats);
+  const overlay3 = await page.textContent('#stats').catch(() => '');
+  check(`${name}: 10-bit frames that cannot be copied (VideoFrame.format null, as from Chrome's hardware decoders; test hook): HDR Auto again streams HDR10, its first frame withdraws the AV1 offer, the host returns to SDR with the reason (two HDR-only restarts), the overlay says why`,
+    hdrAgain && !!back && restarts === 2 && /VideoFrame\.format null/.test(withdrawnLog) && !st3?.hdr?.decoders?.includes('av1') &&
+      /VideoFrame\.format null/.test(st3?.hdr?.withdrawn?.av1 || '') && overlay3.includes('off · the browser has no 10-bit av1 decoder (av1: VideoFrame.format null') && st3.fps > 0,
+    `host: HDR10 again ${hdrAgain}, ${restarts} restarts for HDR settings; gen ${gen2} -> ${back?.gen} hdrNote "${back?.hdrNote}"; client: ${withdrawnLog.replace(/^.*?HDR: /, '').slice(0, 160)}; ` +
+      `offers ${JSON.stringify(st3?.hdr?.decoders)}; overlay ${(overlay3.match(/HDR\s*off · [^\n]*/) || [''])[0].slice(0, 160)}; ${st3?.fps?.toFixed(1)} fps`);
 }
 
 // Auto's pick at unit level (step 4.3, renderers.js pickPath) on made-up
@@ -3081,7 +3492,7 @@ try {
   check('pairing code issued', code.startsWith('recon1:'));
 
   const cfgPath = join(dir, 'host.json');
-  const hostCfg = { capture: 'test', testWidth: 960, testHeight: 540, testPad: TEST_PAD, directPort, directAddr: '127.0.0.1', audio: true, logLevel: 'debug' };
+  const hostCfg = { capture: 'test', testWidth: 960, testHeight: 540, testPad: TEST_PAD, directPort, directAddr: '127.0.0.1', audio: true, logLevel: 'debug', hdr: 'auto' };
   if (process.env.E2E_HOST_FFMPEG) hostCfg.ffmpeg = process.env.E2E_HOST_FFMPEG;
   writeFileSync(cfgPath, JSON.stringify(hostCfg));
   const pair = run('recon-host', ['-config', cfgPath, 'pair', code], {}, 'pair');
@@ -3118,7 +3529,11 @@ try {
     // docs/VENDOR_NOTES.md, Phase 5): that geometry is checked frame by frame
     // in checkUpscaleUnit, this one at the same factor in real time.
     { name: 'WebGPU upscaling (FSR)', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu', fps: FSR_STREAM.fps, upscale: 'auto' }, expect: ['webtransport', 'direct'], probe: 'webgpu readback', headed: true, size: [FSR_STREAM.w, FSR_STREAM.h], upscale: true },
-  ];
+    // HDR10 (checkHdrStream): the headed page plays an HDR display, AV1 (the
+    // test pattern's HDR encoder is libsvtav1), HDR_STREAM asked for live like
+    // the upscaling scenario's size; the barcode is read from the copied planes.
+    { name: 'WebGPU HDR10', prefs: { path: 'auto', transport: 'auto', renderer: 'webgpu', fps: HDR_STREAM.fps, codec: 'av1' }, expect: ['webtransport', 'direct'], probe: 'copyTo I420P10 (HDR planes)', headed: true, size: [HDR_STREAM.w, HDR_STREAM.h], hdr: true },
+  ].filter((sc) => want(sc.name));
   if (process.env.E2E_ROTATE) scenarios.push(scenarios.shift());
 
   // Unmeasured warm-up stream. On CPU-only CI machines the browser's first
@@ -3159,6 +3574,7 @@ try {
     writeFileSync(inputLog, '');
     await page.goto(`${base}/`);
     await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), { ...PREFS_2D, ...sc.prefs });
+    await page.evaluate((on) => (on ? localStorage.setItem('e2e.hdrDisplay', '1') : localStorage.removeItem('e2e.hdrDisplay')), !!sc.hdr);
     // The gateway allocates a relay port and the host binds to it, but the
     // browser is sent to the port whose datagrams are dropped.
     const blockRoute = async (route) => {
@@ -3193,7 +3609,7 @@ try {
     }
     if (sc.size) {
       // The stream's size, asked for live (Settings has no such resolution): a new encoder generation.
-      const prefs = { codec: 'auto', bitrate: 30000, fps: sc.prefs.fps, width: sc.size[0], height: sc.size[1], monitor: 0, audio: true, audioCodec: 'opus', cursor: 'local', quality: 'balanced', adaptive: true };
+      const prefs = { codec: sc.prefs.codec || 'auto', bitrate: 30000, fps: sc.prefs.fps, width: sc.size[0], height: sc.size[1], monitor: 0, audio: true, audioCodec: 'opus', cursor: 'local', quality: 'balanced', adaptive: true };
       await page.evaluate((m) => window.__recon.worker.postMessage({ type: 'ctl', m }), { t: 'settings', prefs });
       const sized = await until(() => page.evaluate((w) => window.__recon.video.w === w, sc.size[0]), 15000, `the stream at ${sc.size.join('x')}`).catch(() => false);
       check(`${sc.name}: the stream restarts at ${sc.size.join('x')} (live settings change)`, sized, JSON.stringify(await page.evaluate(() => window.__recon.video)));
@@ -3268,11 +3684,13 @@ try {
     await checkCrop(sc.name);
     await checkPresentation(sc.name, sc.prefs.renderer);
     await checkHygiene(sc.name, calls, st);
-    if (sc === scenarios[0]) await checkSelfTest(cfg);
+    // (The codec choice's reason is the automatic one's: E2E_ONLY can make a scenario with a codec setting the first.)
+    if (sc === scenarios[0] && !sc.prefs.codec) await checkSelfTest(cfg);
     const pr = await checkProbe(sc.name, sc.probe, rate);
     // (Fullscreen is the WebGPU scenario's; the upscaling one has no more to show there.)
-    if (sc.name === 'WebTransport direct' || (sc.probe && !sc.upscale)) await checkFullscreen(sc.name);
+    if (sc.name === 'WebTransport direct' || (sc.probe && !sc.upscale && !sc.hdr)) await checkFullscreen(sc.name);
     if (sc.upscale) await checkUpscaleStream(sc, rate).catch((e) => check(`${sc.name}: upscaling`, false, e.message));
+    if (sc.hdr) await checkHdrStream(sc).catch((e) => check(`${sc.name}: HDR10`, false, e.message));
     check(`${sc.name}: audio`, st && st.audioPackets > 50, `${st?.audioPackets} packets/0.5 s window cumulative, buffer ${st?.audioMs?.toFixed(0)} ms, lost ${st?.audioLost}`);
     if (sc === scenarios[0]) await checkAudio(sc.name);
     results.push({ scenario: sc.name, stats: st, firstFrameMs, conn, cfg });
@@ -3368,31 +3786,33 @@ try {
     }
     // Frame pacing (step 4.4): Smooth and back, live, on this renderer.
     if (sc.pacing) await checkPacing(sc.name, sc.prefs.fps || 60, sc.pacing === 'fallbacks').catch((e) => check(`${sc.name}: frame pacing`, false, e.message));
+    await page.evaluate(() => localStorage.removeItem('e2e.hdrDisplay')).catch(() => {});
     await endStream();
   }
   page = mainPage;
 
   // 3a. Renderer "auto": the presentation bake-off -----------------------------
-  await checkBakeoff().catch((e) => check('renderer auto (bake-off) scenario', false, e.message));
+  if (want('bake-off')) await checkBakeoff().catch((e) => check('renderer auto (bake-off) scenario', false, e.message));
   await closeHeaded();
 
-  await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
+  if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
 
   // 3b. Loss handling with the host's fault-injection hook --------------------
-  await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
-  await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
-  await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
-  await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
+  if (want('loss handling')) await checkLossHandling().catch((e) => check('loss handling scenario', false, e.message));
+  if (want('bitrate recovery')) await checkBitrateRecovery().catch((e) => check('bitrate recovery scenario', false, e.message));
+  if (want('pre stage hold host')) await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
+  if (want('input host')) await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;
-  await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
-  await checkUpscaleUnit(xvfbOk).catch((e) => check('FSR 1 shader (unit)', false, e.message));
-  await checkPickRule().catch((e) => check("Auto's pick (unit)", false, e.message));
-  await checkPacerRule().catch((e) => check('frame pacing (unit)', false, e.message));
-  await checkJitterRule().catch((e) => check('jitter buffer (unit)', false, e.message));
-  await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
-  await checkSendPriorities().catch((e) => check('send priorities (unit)', false, e.message));
+  if (want('renderer crop unit')) await checkRendererCrop(xvfbOk).catch((e) => check('renderer crop (unit)', false, e.message));
+  if (want('fsr unit')) await checkUpscaleUnit(xvfbOk).catch((e) => check('FSR 1 shader (unit)', false, e.message));
+  if (want('hdr unit')) await checkHdrUnit(xvfbOk).catch((e) => check('HDR shader (unit)', false, e.message));
+  if (want('pick rule unit')) await checkPickRule().catch((e) => check("Auto's pick (unit)", false, e.message));
+  if (want('pacer unit')) await checkPacerRule().catch((e) => check('frame pacing (unit)', false, e.message));
+  if (want('jitter unit')) await checkJitterRule().catch((e) => check('jitter buffer (unit)', false, e.message));
+  if (want('self-test logic unit')) await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
+  if (want('send priorities unit')) await checkSendPriorities().catch((e) => check('send priorities (unit)', false, e.message));
 
   // 3d. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a
@@ -3404,7 +3824,7 @@ try {
   const ffmpegBin = process.env.E2E_HOST_FFMPEG || 'ffmpeg';
   const haveX = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0 &&
     /x11grab/.test(spawnSync(ffmpegBin, ['-hide_banner', '-devices'], { encoding: 'utf8' }).stdout || '');
-  if (process.env.E2E_WALLCLOCK === '0' || hostBin || !haveX) {
+  if (process.env.E2E_WALLCLOCK === '0' || hostBin || !haveX || !want('wallclock')) {
     console.log('- latency probe wallclock scenario skipped (needs Xvfb, an FFmpeg with x11grab and the native host)');
   } else {
     await checkWallclockProbe().catch((e) => check('latency probe (wallclock) scenario', false, e.message));

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -928,4 +929,134 @@ func TestVirtualDisplaySessionRun(t *testing.T) {
 	if p, u, _ := sim.Counts(); p != 2 || u != 2 {
 		t.Fatalf("plugs %d unplugs %d", p, u)
 	}
+}
+
+// TestVirtualDisplayHDR: HDR10 on a virtual display (3.7 wiring with
+// 3.9/4.5). The session asks the helper for HDR10 of the virtual display
+// (DDA by its HMONITOR, start hdr), and the display's own Windows HDR mode
+// decides, as for a physical monitor: the agent does not switch Windows HDR
+// on for it (docs/VENDOR_NOTES.md 3.9/4.5, "HDR on a virtual display"). A
+// virtual display in SDR mode streams SDR with the reason; HDR turned on for
+// it in Windows restarts the stream as HDR10; a new size replaces the display
+// (a monitor of the same identity, whose HDR setting Windows keeps: the fake
+// keeps it for every virtual display) and the next generation asks for HDR10
+// again; an HDR-only settings change (the client's display left HDR mode)
+// restarts the video without touching the virtual display.
+func TestVirtualDisplayHDR(t *testing.T) {
+	sim := vdisplay.NewSim(vdisplay.DriverSudoVDA)
+	sim.AddMonitor(1920, 1080, 0, 0, 60)
+	physical := sim.Monitors()[0].HMonitor
+	r := newVDRig(t, sim, Config{Pipeline: "helper", HDR: proto.HDRAuto, VirtualDisplay: "auto", VirtualDisplayLinger: linger(0)})
+	const hevc10 = `"hevc":{"maxW":8192,"maxH":4352,"tenBit":true,"hdr10":true,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":1,"alignH":1}`
+	var mu sync.Mutex
+	virtualHDR := false // Windows HDR of the virtual display (the physical monitor's is on)
+	type start struct {
+		f *encoder.Fake
+		m map[string]any
+	}
+	starts := make(chan start, 8)
+	r.a.launchHelper = func(_ *slog.Logger, backend string) (*encoder.Helper, error) {
+		var outs []string
+		for _, m := range sim.Monitors() {
+			outs = append(outs, output(m.Name, m.HMonitor, "00000000:0000a1b2", "AMD Radeon RX 7900 XT", "amd"))
+		}
+		caps := onGPUs(capsMsg("amf", "amd", "AMD Radeon RX 7900 XT", hevc10, noNVENC+","+noIntel), strings.Join(outs, ","))
+		h, _, err := encoder.LaunchFake(caps, func(f *encoder.Fake, m map[string]any) {
+			if m["t"] != "start" {
+				return
+			}
+			mu.Lock()
+			on := m["hdr"] == true && (virtualHDR || m["hmonitor"] == float64(physical))
+			mu.Unlock()
+			st := encoder.Started{Backend: "amf", Capture: "dda", Codec: "hevc", Width: 2560, Height: 1440, FPS: 120, Kbps: int(m["kbps"].(float64)),
+				LiveBitrate: "seamless", BitDepth: 8, ColorSpace: "bt709"}
+			if on {
+				st.HDR, st.BitDepth, st.ColorSpace = true, 10, "bt2020-pq"
+			}
+			f.Send(st)
+			starts <- start{f, m}
+		})
+		return h, err
+	}
+	key := []byte{0, 0, 0, 1, 0x26, 0x01, 0xaf} // HEVC IDR slice without parameter sets: the generic codec string
+	next := func(what string) start {
+		t.Helper()
+		select {
+		case s := <-starts:
+			s.f.Publish(&encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: key, CaptureQPC: 1, OutputQPC: 2})
+			return s
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the helper got no start", what)
+			return start{}
+		}
+	}
+	hdr := &proto.HDRPrefs{Mode: proto.HDRAuto, Display: true, Canvas: true, Decoders: []string{"hevc"}}
+	prefs := proto.Prefs{FPS: 120, HDR: hdr}
+	msgs, send, done := runClient(t, r.a, proto.Hello{V: proto.HelloVersionRecovery, Client: proto.ClientInfo{Width: 2560, Height: 1440, DPR: 1, Hz: 120},
+		Decoders: []proto.DecoderInfo{{Family: "hevc", HW: true}}, Prefs: prefs})
+
+	// A new virtual display is SDR: asked for HDR10, streamed SDR with the reason.
+	s := next("first generation")
+	vm := virtualMonitor(t, sim, 1)
+	if s.m["capture"] != "dda" || s.m["hmonitor"] != float64(vm.HMonitor) || s.m["hdr"] != true || s.m["codec"] != "hevc" {
+		t.Fatalf("start %v, want HEVC with hdr, dda of the virtual display %#x", s.m, vm.HMonitor)
+	}
+	waitFor(t, msgs, `"t":"video"`, `"gen":1`, `"hdrNote":"the host display is not in Windows HDR mode"`)
+	if hasMsg(msgs(), `"gen":1`, `"hdr":true`) {
+		t.Fatal("an SDR virtual display's stream announced as HDR10")
+	}
+
+	// HDR turned on for the virtual display in Windows: HDR10.
+	mu.Lock()
+	virtualHDR = true
+	mu.Unlock()
+	s.f.Send(encoder.CaptureChanged{Reason: "hdr", Width: 2560, Height: 1440, HDR: true})
+	s = next("Windows HDR on")
+	if s.m["hmonitor"] != float64(vm.HMonitor) || s.m["hdr"] != true {
+		t.Fatalf("start %v after Windows HDR turned on", s.m)
+	}
+	waitFor(t, msgs, `"t":"video"`, `"gen":2`, `"hdr":true`, `"bitDepth":10`)
+
+	// A new size: a new virtual display, asked for HDR10 again.
+	p2 := prefs
+	p2.Width, p2.Height = 1920, 1080
+	send(proto.ClientMsg{T: "settings", Prefs: &p2})
+	s = next("1080p")
+	vm2 := virtualMonitor(t, sim, 1)
+	if vm2.HMonitor == vm.HMonitor || vm2.W != 1920 || s.m["hmonitor"] != float64(vm2.HMonitor) || s.m["hdr"] != true {
+		t.Fatalf("start %v on %+v, want hdr on the new 1920x1080 virtual display", s.m, vm2)
+	}
+	waitFor(t, msgs, `"t":"video"`, `"gen":3`, `"hdr":true`)
+	if l := r.logs.lines(`msg="virtual display changed"`); len(l) != 1 {
+		t.Fatalf("log %q", l)
+	}
+
+	// The client's display leaves HDR mode: an HDR-only change restarts the
+	// video (SDR, the reason) on the same virtual display.
+	plugs, _, _ := sim.Counts()
+	p3 := p2
+	p3.HDR = &proto.HDRPrefs{Mode: proto.HDRAuto, Display: false, Canvas: true, Decoders: []string{"hevc"}}
+	send(proto.ClientMsg{T: "settings", Prefs: &p3})
+	s = next("client display SDR")
+	if s.m["hmonitor"] != float64(vm2.HMonitor) || s.m["hdr"] != nil {
+		t.Fatalf("start %v, want no hdr on the same virtual display %#x", s.m, vm2.HMonitor)
+	}
+	waitFor(t, msgs, `"t":"video"`, `"gen":4`, `"hdrNote":"the client's display is not in HDR mode"`)
+	if p, _, _ := sim.Counts(); p != plugs {
+		t.Fatalf("an HDR-only change plugged a virtual display (%d plugs, was %d)", p, plugs)
+	}
+	var why []string
+	for _, l := range r.logs.lines(`msg="restarting video"`) {
+		why = append(why, l[strings.Index(l, "reason="):])
+	}
+	if want := []string{`reason="Windows HDR turned on" urgent=false`, "reason=settings urgent=true", `reason="HDR settings" urgent=false`}; !slices.Equal(why, want) {
+		t.Fatalf("restarts %q, want %q", why, want)
+	}
+	send(proto.ClientMsg{T: "bye"})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session did not end")
+	}
+	r.restored(t)
 }

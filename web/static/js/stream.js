@@ -7,6 +7,7 @@ import { codeToScancode } from './keymap.js';
 import { PATHS, LABELS } from './renderers.js';
 import { PACING, PACING_LABELS } from './pacing.js';
 import { FSR, UPSCALE, UPSCALE_LABELS, upscaleSettings } from './fsr1.js';
+import { HDR_MODES, HDR_WHITES, HDR_WHITE, hdrWhite } from './hdr.js';
 
 const $ = (id) => document.getElementById(id);
 const hostId = new URLSearchParams(location.search).get('host');
@@ -28,7 +29,7 @@ const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
   audio: true, audioCodec: 'opus', volume: 100, jitterMode: 'auto', jitterMs: 30,
   renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto',
-  upscale: 'auto', sharpness: FSR.sharpness, fsrDenoise: false,
+  upscale: 'auto', sharpness: FSR.sharpness, fsrDenoise: false, hdr: 'auto', hdrWhite: HDR_WHITE,
   mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
 const PREF_KEY = 'recon.prefs.v1';
@@ -44,6 +45,8 @@ if (prefs.renderer !== 'auto' && !PATHS.includes(prefs.renderer)) prefs.renderer
 if (!PACING.includes(prefs.pacing)) prefs.pacing = 'latency';
 if (!UPSCALE.includes(prefs.upscale)) prefs.upscale = 'auto';
 prefs.sharpness = upscaleSettings({ sharpness: prefs.sharpness }).sharpness;
+if (!HDR_MODES.includes(prefs.hdr)) prefs.hdr = 'auto';
+prefs.hdrWhite = hdrWhite(prefs.hdrWhite);
 const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch {} };
 
 const RESOLUTIONS = {
@@ -60,8 +63,16 @@ function hostPrefs() {
     codec: prefs.codec, bitrate: Math.round(prefs.bitrate * 1000), fps: +prefs.fps, width: w, height: h,
     monitor: +prefs.monitor, audio: !!prefs.audio, audioCodec: prefs.audioCodec, cursor: prefs.cursor, quality: prefs.quality,
     adaptive: prefs.adaptive !== false,
+    // HDR10 (step 4.5): the setting and the display; the worker adds what
+    // its renderer and decoders can do (stream-worker.js hdrPrefs).
+    hdr: { mode: prefs.hdr, display: hdrDisplay() },
   };
 }
+
+// HDR10 (step 4.5): the display is in HDR mode (Windows HDR on, macOS XDR),
+// and covers Display P3 (the extended canvas's colour space then).
+const hdrDisplay = () => matchMedia('(dynamic-range: high)').matches;
+const gamutP3 = () => matchMedia('(color-gamut: p3)').matches;
 
 // ---------------------------------------------------------------------------
 // State
@@ -80,6 +91,7 @@ const S = {
   userClosed: false,
   attempts: 0,
   udpRelayFailedAt: -Infinity, // the UDP relay's ports did not answer: try the splice relay first for a while
+  hdrWithdrawn: {}, // HDR10: codec families whose 10-bit frames this browser could not draw as HDR (this page's connections)
   video: { w: 0, h: 0 },
   videoCfg: null,
   audioCfg: null,
@@ -340,6 +352,7 @@ async function connect() {
       decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
       skipUdpRelay: performance.now() - S.udpRelayFailedAt < 10 * 60 * 1000,
       ...upscalePrefs(), fsrInput: prefs.fsrInput, // fsrInput: diagnostics only (localStorage), see fsr1.js FSR.input
+      ...hdrPrefs(), gamutP3: gamutP3(), hdrWithdrawn: S.hdrWithdrawn,
     },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
@@ -430,6 +443,13 @@ function onWorker(m) {
     case 'dropTest': S.dropTest = m.result; break;
     case 'decoderTest': S.decoderTest = m.tests; S.decoderTestMs = m.ms; break;
     case 'hello': S.helloDecoders = m.decoders; break;
+    case 'hdrCheck': S.hdrCheck = m.result; break;
+    case 'hdrWithdrawn':
+      // HDR10 frames this browser cannot draw as HDR: the host gets the
+      // withdrawn offer (the worker's prefs.hdr) and moves to SDR.
+      if (m.family) S.hdrWithdrawn[m.family] = m.why;
+      applyLive();
+      break;
     case 'probeDump': for (const done of probeDumpWait.splice(0)) done(m); break;
     case 'rumble': rumble(m); break;
     case 'closed': onClosed(m.reason, m.retry); break;
@@ -924,6 +944,7 @@ function onStats(st) {
     st.prio ? row('  send priority', prioText(st.prio)) : null,
     ...presentRows(st, row),
     ...upscaleRows(st.renderer, row),
+    ...hdrRows(st, v, row),
     pacingRow(st.pacing, row),
     inputRow(row),
     audioRow(st, row),
@@ -1045,6 +1066,44 @@ function upscaleRows(r, row) {
     const diff = d === null ? '' : ` · ${d >= 0 ? '+' : ''}${d.toFixed(2)} ms`;
     rows.push(row('  draw stage (CPU, p50)', `FSR ${ms(u.cpu.fsr, 'p50')} · plain ${ms(u.cpu.plain, 'p50')}${diff}`));
   }
+  return rows;
+}
+
+// HDR10 (step 4.5): whether this generation is HDR and how it is shown
+// (extended range, tone-mapped to SDR and why, or Chrome's own conversion when
+// the decoder's frames cannot be copied), else why not (the host's reason in
+// the video config, this client's, or a host that does not offer HDR); the
+// colour description and metadata, the decoded frames' format and colour
+// space, and the plane copy's cost (copyTo + upload, per frame).
+function hdrRows(st, v, row) {
+  const h = st.hdr;
+  const r = st.renderer?.hdr;
+  if (!h) return [];
+  if (!v.hdr) {
+    let why = v.hdrNote || (h.why ? h.why : !h.hostOffers ? 'the host does not offer HDR (host.json "hdr": "auto")' : 'SDR stream');
+    // This browser withdrew the family's HDR offer: why its frames cannot be drawn as HDR.
+    const w = h.withdrawn?.[v.family];
+    if (w && !why.includes(w)) why += ` (${v.family}: ${w})`;
+    return [row('HDR', `off · ${why}`)];
+  }
+  // Why its frames cannot take the HDR path (this browser withdrew HDR: an SDR generation follows).
+  const fail = h.withdrawn?.[v.family] || (r?.failed && Object.values(r.failed)[0]) || r?.error;
+  const path = r?.path === 'extended' ? `extended range (rgba16float, ${r.space}, SDR white ${r.white} cd/m²)`
+    : r?.path === 'tonemap' ? `tone-mapped to SDR (BT.2390, peak ${r.peak} → ${r.white} cd/m²): ${r.why}`
+      : `drawn through importExternalTexture (Chrome's SDR conversion)${fail ? `: ${fail}` : ''}`;
+  const cs = v.colorSpace || {};
+  const md = v.hdrMetadata;
+  const rows = [
+    row('HDR', `HDR10 · ${path}`, r?.path === 'extended' ? 'good' : 'warn'),
+    row('  colour', `${cs.primaries}/${cs.transfer}/${cs.matrix}/${cs.fullRange ? 'full' : 'limited'} · ${v.bitDepth}-bit`),
+  ];
+  if (md) rows.push(row('  metadata', `mastering ${md.maxLuminance}/${md.minLuminance} cd/m² · MaxCLL ${md.maxCll} · MaxFALL ${md.maxFall}`));
+  const f = r?.frame;
+  if (f) {
+    const fc = f.colorSpace ? `${f.colorSpace.primaries}/${f.colorSpace.transfer}/${f.colorSpace.matrix}/${f.colorSpace.fullRange ? 'full' : 'limited'}` : 'no colour space';
+    rows.push(row('  decoded', `${f.format} (${f.bits}-bit) ${f.w}×${f.h} · ${fc}`));
+  }
+  if (r?.copy) rows.push(row('  copy (copyTo + upload)', `p50 ${fmt(r.copy.p50, 2)} · p95 ${fmt(r.copy.p95, 2)} · ${(r.bytes / 1e6).toFixed(2)} MB/frame`));
   return rows;
 }
 
@@ -1207,6 +1266,11 @@ const applyPacing = () => post({ type: 'prefs', prefs: { pacing: prefs.pacing } 
 // So does upscaling (Phase 5).
 const upscalePrefs = () => ({ upscale: prefs.upscale, sharpness: prefs.sharpness, fsrDenoise: !!prefs.fsrDenoise });
 const applyUpscale = () => post({ type: 'prefs', prefs: upscalePrefs() });
+// HDR (step 4.5): the worker tone-maps a running HDR stream at once when HDR
+// is no longer wanted; the host then changes the stream (settings message).
+const hdrPrefs = () => ({ hdr: prefs.hdr, hdrWhite: prefs.hdrWhite, hdrDisplay: hdrDisplay() });
+const applyHdr = (host = true) => { post({ type: 'prefs', prefs: hdrPrefs() }); if (host) applyLive(); };
+matchMedia('(dynamic-range: high)').addEventListener?.('change', () => { if (S.worker) applyHdr(); });
 
 function upscaleHint() {
   const r = S.renderer?.name;
@@ -1292,6 +1356,11 @@ function buildDrawer() {
         el('div', { class: 'hint', id: 'upscale-hint' }, upscaleHint())),
       field('FSR sharpness', el('div', { class: 'range-row' }, sharp, sout), '0 = sharpest; each stop halves the sharpening (RCAS).'),
       check('fsrDenoise', 'FSR: sharpen noise less (RCAS denoise)', applyUpscale),
+      field('HDR', select('hdr', [['auto', 'Auto (HDR10 when everything allows it)'], ['off', 'Off (SDR)']], () => applyHdr()),
+        'Auto: HDR10 when this display is in HDR mode, the renderer is WebGPU (Renderer: WebGPU), the browser decodes 10-bit HEVC or AV1 and ' +
+        'the host allows it (host.json "hdr": "auto"); the overlay says why not. Off: SDR; an HDR stream already running is tone-mapped until it is SDR.'),
+      field('HDR: SDR white', select('hdrWhite', HDR_WHITES.map((w) => [w, `${w} cd/m²${w === HDR_WHITE ? ' (BT.2408)' : ''}`]), () => { prefs.hdrWhite = +prefs.hdrWhite; savePrefs(); applyHdr(false); }),
+        'The brightness of SDR white (the desktop) in an HDR stream: it maps to the display\'s SDR white; highlights go above it.'),
       field('Decoder', select('decoder', [['hardware', 'Prefer hardware'], ['software', 'Prefer software']], needsReconnect)),
     ),
     el('div', { class: 'actions' },

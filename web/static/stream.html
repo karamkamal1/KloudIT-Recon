@@ -38,8 +38,9 @@
   </div>
 
   <div class="stats hidden" id="stats">
-    <div id="stats-body"></div>
+    <!-- The button first: a long overlay can run past the bottom of a small window. -->
     <div class="stats-actions"><button type="button" id="btn-export-latency" title="Download the latency probe histogram, samples and stage statistics as JSON">Export latency data</button></div>
+    <div id="stats-body"></div>
   </div>
 
   <aside class="drawer" id="drawer" aria-label="Settings"></aside>

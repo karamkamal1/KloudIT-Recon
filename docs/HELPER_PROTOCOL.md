@@ -404,7 +404,7 @@ reports the state at its start; other captures false).
 | `resized` | the source has a new size or rotation (mode change, rotated display, resized window) | keeps the encoded size and scales the new source into it; recon-host starts a new helper once the size has been stable for 300 ms |
 | `lost` | capture is not possible right now (`DXGI_ERROR_ACCESS_LOST` during a mode or full-screen switch, secure desktop, output or window gone); `text` says why | repeats the last image every `idleRepeatMs`, retries every 250 ms |
 | `restored` | capture works again | |
-| `hdr` | Windows HDR was turned on or off for the output (DDA; `hdr` says which) | keeps the stream's format: an HDR10 stream shows the SDR desktop at 203 cd/m2, an SDR stream gets DXGI's conversion of the HDR desktop; recon-host restarts the helper if it wants to follow |
+| `hdr` | Windows HDR was turned on or off for the output (DDA; `hdr` says which) | keeps the stream's format: an HDR10 stream shows the SDR desktop at 203 cd/m2, an SDR stream gets DXGI's conversion of the HDR desktop; recon-host restarts a stream it started with `hdr` (a new helper in the output's new mode, step 4.5), and leaves one started without it alone |
 
 `error`: `{"t":"error","code":"unsupported","text":"...","fatal":false,"re":"start"}`.
 `re` names the request that caused it, if any. After a fatal error the helper exits
@@ -691,7 +691,7 @@ SDR (`started.hdr` false, a log line says why; not an error, as in Sunshine):
    colour space `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (caps `outputs[].hdr`).
 2. The capture method delivers HDR frames: `dda` (always), `amd-direct` when its surfaces
    are `AMF_SURFACE_RGBA_F16` (VERIFY, docs/VENDOR_NOTES.md 3.9), `synthetic-gpu` (test).
-   `wgc` has no HDR path yet: SDR.
+   `wgc` has no HDR path yet: SDR (recon-host does not ask for `hdr` with `wgc`).
 
 The codec must have caps `hdr10` (HEVC or AV1 with 10-bit encoding of P010 input), else the
 `start` fails with `unsupported`, whatever the output: recon-host checks caps first.
@@ -736,6 +736,17 @@ Pipeline:
   off gives `captureChanged` `hdr` (false) and the SDR desktop at 203 cd/m2 in the PQ
   stream; turning it on in an SDR stream gives `captureChanged` `hdr` (true) and DXGI's SDR
   conversion. recon-host restarts the helper to switch.
+
+recon-host (step 4.5, `internal/host/hdr.go`, docs/ARCHITECTURE.md "HDR10") sends `start` with
+`hdr` when its config has `"hdr": "auto"`, the browser offered HDR (an HDR display, a WebGPU
+canvas with extended range, a 10-bit decoder of the codec) and the codec's caps have `hdr10`;
+it does not look at `outputs[].hdr` (the helper decides from the output's state at the start,
+so a later `captureChanged` `hdr` can switch the stream to HDR10). `started`'s `hdr`,
+`bitDepth`, `colorSpace` and `hdrMetadata` become the browser's video config (`hdr`,
+`bitDepth` 10, `colorSpace` BT.2020 / PQ / BT.2020 NCL / limited, `hdrMetadata`); a stream
+asked for HDR that started SDR is announced SDR with `hdrNote` "the host display is not in
+Windows HDR mode". A `captureChanged` `hdr` under a stream started with `hdr` whose output no
+longer matches its format restarts it with a new helper (a new generation and video config).
 
 ## AMF encoder backend
 

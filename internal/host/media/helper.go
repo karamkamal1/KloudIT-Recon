@@ -123,6 +123,10 @@ type helperProc struct {
 	// (captureChanged), so it encodes a scaled picture: the next Start needs a
 	// new helper.
 	resized bool
+	// hdrStale: it was asked for HDR10 and Windows HDR was turned on or off
+	// for its output since it started (captureChanged "hdr"): it keeps the
+	// format it started with, so the next Start needs a new helper.
+	hdrStale bool
 	// announce: its bitrate or frame rate changed in place while it was live;
 	// a RateChange goes out before its next frame.
 	announce bool
@@ -226,7 +230,7 @@ func (v *HelperVideo) Start(p Params, urgent bool) error {
 	if cur == nil {
 		cur = v.active
 	}
-	if cur != nil && !cur.resized && cur.params.Adaptive == p.Adaptive && sameHelperStream(cur.sp, sp) {
+	if cur != nil && !cur.resized && !cur.hdrStale && cur.params.Adaptive == p.Adaptive && sameHelperStream(cur.sp, sp) {
 		fps := 0
 		if cur.sp.FPS != sp.FPS {
 			fps = sp.FPS
@@ -363,6 +367,9 @@ func (v *HelperVideo) startParams(p Params) (encoder.StartParams, error) {
 	if p.Barcode {
 		sp.Barcode = &encoder.Barcode{Cell: proto.BarcodeCell}
 	}
+	// HDR10 (the session asks only with a codec whose caps have hdr10): the
+	// helper makes it when the captured output is in Windows HDR mode.
+	sp.HDR = p.HDR
 	return sp, nil
 }
 
@@ -513,7 +520,8 @@ func (v *HelperVideo) run(pr *helperProc) {
 		"size", fmt.Sprintf("%dx%d", st.Width, st.Height), "fps", st.FPS, "kbps", st.Kbps, "adapter", st.AdapterName,
 		"vendor", st.Vendor, "gpu_priority", st.GPUPriority, "live_bitrate", st.LiveBitrate, "rate_control", st.RateControl,
 		"live_bitrate_from", liveSource(pr), "recovery", pr.recovery(), "ltr_slots", st.LTRSlots, "intra_refresh", st.IntraRefreshFrames,
-		"zero_copy", st.ZeroCopy, "barcode", st.Barcode, "cursor_in_video", st.CursorInVideo}
+		"zero_copy", st.ZeroCopy, "barcode", st.Barcode, "cursor_in_video", st.CursorInVideo,
+		"hdr", st.HDR, "bit_depth", st.BitDepth, "color_space", st.ColorSpace}
 	if st.Encoder != "" {
 		// The libavcodec backend (GUIDE 3.8): FFmpeg's encoder (hevc_qsv, ...)
 		// and how it runs (low_power: VDENC; zero_copy false: frames read back).
@@ -557,15 +565,23 @@ func (v *HelperVideo) read(pr *helperProc) {
 		case c := <-h.CaptureChanges():
 			v.mu.Lock()
 			relevant := !pr.killed && (v.active == pr || v.pending == pr)
-			if c.Reason == "resized" {
+			switch c.Reason {
+			case "resized":
 				// Back at the size it started with (or turned by 180°) it
 				// needs no new helper.
 				st := pr.started
 				pr.resized = st.CaptureWidth <= 0 || c.Width != st.CaptureWidth || c.Height != st.CaptureHeight
+			case "hdr":
+				// An HDR10 stream asked for keeps its format: it no longer
+				// matches the output once Windows HDR changed (back as it
+				// started it does again). An SDR stream is unaffected.
+				pr.hdrStale = pr.sp.HDR && c.HDR != pr.started.HDR
 			}
+			restart := pr.hdrStale && c.Reason == "hdr"
 			v.mu.Unlock()
 			if relevant {
-				v.emit(VideoEvent{Capture: &CaptureChange{Reason: c.Reason, Width: c.Width, Height: c.Height, Rotation: c.Rotation, Text: c.Text}})
+				v.emit(VideoEvent{Capture: &CaptureChange{Reason: c.Reason, Width: c.Width, Height: c.Height, Rotation: c.Rotation, Text: c.Text,
+					HDR: c.HDR, Restart: restart}})
 			}
 		case err := <-h.Errors():
 			// A fatal error ends the helper. Its replacement starts at once,
@@ -731,17 +747,61 @@ func (v *HelperVideo) config(pr *helperProc) *proto.VideoConfig {
 	}
 	c := &proto.VideoConfig{T: "video", Gen: pr.gen, Family: pr.codec.Family, Codec: pr.codec.Codec, FPS: fps,
 		BitrateKbps: pr.sp.Kbps, Encoder: pr.params.Encoder.Name, Capture: st.Capture, Recovery: pr.recovery()}
+	// HDR10 as the helper started it (started.hdr: the output was in Windows
+	// HDR mode), the metadata it writes into the stream.
+	hdr := st.HDR && st.BitDepth == 10 && st.ColorSpace == "bt2020-pq"
 	if c.Codec == "" {
 		c.Codec = defaultCodecString[c.Family]
+		if hdr {
+			c.Codec = defaultCodecString10[c.Family]
+		}
 		v.log.Warn("no parameter sets in the encoder helper's key frame, using a generic codec string", "codec", c.Codec)
 	}
 	c.SetCrop(st.Width, st.Height, max(st.CodedWidth, pr.codec.CodedWidth), max(st.CodedHeight, pr.codec.CodedHeight))
+	note := pr.params.HDRNote
+	if pr.sp.HDR && !hdr {
+		note = helperSDRNote(st)
+	}
+	var md *proto.HDRMetadata
+	if m := st.HDRMetadata; m != nil {
+		md = &proto.HDRMetadata{DisplayPrimaries: m.DisplayPrimaries, WhitePoint: m.WhitePoint, MaxLuminance: m.MaxLuminance,
+			MinLuminance: m.MinLuminance, MaxCLL: m.MaxCLL, MaxFALL: m.MaxFALL}
+	}
+	HDRConfig(c, hdr, md, note)
 	return c
+}
+
+// HelperWGCNoHDR is why a helper stream captured with Windows Graphics
+// Capture (a window, or host capture "gfxcapture") is SDR: the helper's WGC
+// capture has no HDR path (docs/HELPER_PROTOCOL.md "HDR10").
+const HelperWGCNoHDR = "window capture (Windows Graphics Capture) has no HDR path in the native encoder helper"
+
+// helperSDRNote is why a stream the helper was asked to make HDR10 started
+// SDR (st: its started), by the capture it used: DDA and the GPU test source
+// make HDR10 whenever the output is in Windows HDR mode, AMD Direct Capture
+// only when its surfaces are FP16 (the helper logs which), WGC never.
+func helperSDRNote(st encoder.Started) string {
+	if st.HDR {
+		return fmt.Sprintf("the helper started a stream it did not describe as HDR10 (%d-bit %s)", st.BitDepth, st.ColorSpace)
+	}
+	switch st.Capture {
+	case "", "dda", "synthetic-gpu":
+		return "the host display is not in Windows HDR mode"
+	case "amd-direct":
+		return "the host display is not in Windows HDR mode, or AMD Direct Capture gave no FP16 frames (the helper's log says which)"
+	case "wgc":
+		return HelperWGCNoHDR
+	}
+	return fmt.Sprintf("the helper's %s capture has no HDR path", st.Capture)
 }
 
 // defaultCodecString is a WebCodecs codec string per family for a stream
 // whose parameter sets could not be read (High / Main profile, level 5.1).
 var defaultCodecString = map[string]string{"h264": "avc1.640033", "hevc": "hvc1.1.6.L153.B0", "av1": "av01.0.13M.08"}
+
+// defaultCodecString10 is defaultCodecString for an HDR10 stream: HEVC Main
+// 10, AV1 Main at 10 bits.
+var defaultCodecString10 = map[string]string{"hevc": "hvc1.2.4.L153.B0", "av1": "av01.0.13M.10"}
 
 // failed handles a proc whose helper exited, failed or refused the start:
 // unless it was stopped on purpose, a new helper takes its place (Restarted):

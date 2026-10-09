@@ -55,6 +55,16 @@ Techniques used (most of them are new to browser-based game streaming):
   GPU passes per frame, timed in the overlay. It needs the WebGPU renderer: choose Renderer
   *WebGPU* in Settings → Pipeline, because Renderer *Auto* keeps the desynchronized 2D canvas
   wherever the browser has one (e.g. Chrome), and the 2D canvas scales bilinearly.
+- **HDR10, end to end (experimental, opt-in).** With `"hdr": "auto"` on the PC, Windows HDR on
+  and a browser on an HDR display (Renderer *WebGPU*), the native encoder streams 10-bit
+  BT.2020 PQ HEVC / AV1 with HDR metadata, and the browser shows it with real highlights on an
+  extended-range WebGPU canvas, from a copy of the decoded 10-bit planes (not Chrome's SDR
+  conversion). That needs a decoder whose 10-bit frames WebCodecs can copy: today's Chrome
+  gives none for its hardware decoders (they output P010, `VideoFrame.format` null), so where
+  the stream decodes in hardware the browser withdraws HDR at the first frame and the stream
+  returns to SDR; a software decoder (dav1d for AV1) works. Anything less (an SDR display,
+  another renderer, no usable 10-bit decoder, H.264, window capture) streams SDR as before;
+  the overlay says why.
 - **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
   the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
   automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
@@ -303,6 +313,14 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   it keeps the 2D canvas where that is desynchronized (e.g. Chrome): choose Renderer *WebGPU*
   for FSR. The overlay shows *Upscaling* (input → output size, sharpness) and the passes' GPU
   time.
+- **HDR** (Pipeline, experimental): *Auto* (default) streams HDR10 when everything allows it:
+  the PC's `"hdr": "auto"`, the PC's display in Windows HDR mode (native encoder helper), this
+  display in HDR mode, Renderer *WebGPU* with an extended-range canvas (Chrome / Edge 131+), a
+  10-bit HEVC or AV1 decoder in the browser, and HEVC or AV1 as the codec. *Off*: SDR; an HDR
+  stream already running is tone-mapped (ITU-R BT.2390) until the PC switches to SDR. *HDR: SDR
+  white* (default 203 cd/m², ITU-R BT.2408) is how bright SDR white (the desktop) is shown;
+  highlights go above it. The overlay's *HDR* rows say whether the stream is HDR and why not,
+  the colour description and metadata, and what copying the decoded frame costs per frame.
 - **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
   decodes. *Smooth* draws at most one new frame per display refresh, in the refresh's animation
   frame callback, for an even cadence; it costs up to one refresh of latency (the overlay's
@@ -364,6 +382,7 @@ The new password (at least 10 characters) is read from stdin.
 | `helperLibavcodec` | `auto` | `auto`: sessions stream with the helper's libavcodec backend (Intel Quick Sync Video: `h264_qsv`, `hevc_qsv`, `av1_qsv` in the running helper) where it has no AMF or NVENC encoder for them; `off`: they use FFmpeg's command line there instead, and recon-host starts the helper with AMF or NVENC by name, so it never chooses the libavcodec backend or opens a Quick Sync encoder (it still loads the libraries, when installed, to report them in its caps). Recovery is a key frame per loss (no reference recovery), bitrate changes make a key frame unless `recon-host qualify` measured them seamless. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.8 wiring |
 | `encoder` | auto | Force an encoder, e.g. `hevc_nvenc`, `av1_nvenc`, `h264_amf` (FFmpeg), or a helper encoder such as `hevc_amf_helper` (`<codec>_<backend>_helper`: that backend is launched first; host.log says `host config encoder not used` when the chosen helper has not got it, and the codec is then chosen automatically) |
 | `av1` | `fallback` | When the automatic codec choice uses AV1 (on a GPU that encodes it): `fallback` only where HEVC does not work end-to-end (a browser without HEVC; then before H.264); `faster` also instead of HEVC for a browser that decodes AV1 clearly faster (at least 10 % and 0.5 ms per frame). Switch to `faster` after measuring this PC's AV1 encoder (latency overlay, image quality). The host log's `codec choice` line says what was chosen and why |
+| `hdr` | `off` | HDR10 streams (experimental): `auto` streams 10-bit BT.2020 PQ HEVC / AV1 with HDR metadata to browsers that can show it (HDR display, Renderer WebGPU with an extended-range canvas, a 10-bit decoder) when the native encoder helper captures a display in Windows HDR mode (turning Windows HDR on or off restarts the stream in the new mode); `off` never. FFmpeg's captures stay SDR (only its test pattern, `capture` `test`, has an HDR10 version, for tests). The host log's `hdr choice` line and the browser's overlay say why a stream is not HDR (`docs/ARCHITECTURE.md`, "HDR10") |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
 | `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
@@ -453,9 +472,10 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   reconnect automatically.
 - The Windows secure desktop (lock screen, UAC) can't be captured (see above).
 - No microphone passthrough or host → browser clipboard sync yet (you can type text into the PC).
-- HDR desktops are streamed as SDR (the capture API converts them). The native encoder
-  helper can already encode HDR10 (10-bit BT.2020 PQ with HDR metadata, HEVC / AV1, opt-in),
-  but the agent does not ask for it yet: browser HDR presentation comes later.
+- HDR is experimental and opt-in (`"hdr": "auto"`): only the native encoder helper streams HDR10,
+  only the WebGPU renderer shows it (Chrome / Edge 131+ on an HDR display), and it is
+  unverified on real HDR hardware (`docs/VENDOR_NOTES.md`, 3.9/4.5). Without it HDR desktops
+  are streamed as SDR (the capture API converts them).
 
 ## Development
 
@@ -469,7 +489,7 @@ Repository layout:
 | `internal/proto`, `internal/transport`, `internal/nut`, `internal/codec` | Wire protocol, QUIC/WebTransport adapters (`transport/cc`: media congestion controller), NUT demuxer, codec strings |
 | `third_party/quic-go` | quic-go with a pluggable congestion-control hook (`go.mod` replace; see `third_party/README.md`) |
 | `internal/auth`, `internal/tlsutil` | Password hashing, TOTP, tickets; CA and certificate handling |
-| `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline; `js/fsr1.js`: FSR 1 ported to WGSL, MIT, see `third_party/README.md`) |
+| `web/static` | Browser client (`js/stream-worker.js` is the decode/render pipeline; `js/fsr1.js`: FSR 1 ported to WGSL, MIT, see `third_party/README.md`; `js/hdr.js`: HDR10 presentation shaders) |
 | `native/recon-encoder`, `internal/host/encoder` | Native capture/encode helper (C++) and its Go client; `internal/host/media/helper.go` is the session's pipeline on it. See `docs/HELPER_PROTOCOL.md` |
 | `deploy/` | Proxmox, Linux, Docker and Windows installers |
 | `test/e2e`, `internal/e2e` | Browser end-to-end test; Go integration test (gateway + agent) |

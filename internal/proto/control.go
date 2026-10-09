@@ -1,5 +1,10 @@
 package proto
 
+import (
+	"fmt"
+	"slices"
+)
+
 // Control channel messages. Every message is a JSON object with a "t" field.
 
 // Hello is the first control message sent by the client.
@@ -67,6 +72,70 @@ type Prefs struct {
 	Cursor      string `json:"cursor,omitempty"`     // local | video
 	Quality     string `json:"quality,omitempty"`    // speed | balanced | quality
 	Adaptive    *bool  `json:"adaptive,omitempty"`   // adaptive bitrate on congestion, default true
+	// HDR is the client's HDR10 presentation (GUIDE 3.9 / 4.5): the user's
+	// setting and what the browser can show. Nil from clients before it: they
+	// never get an HDR stream.
+	HDR *HDRPrefs `json:"hdr,omitempty"`
+}
+
+// HDRPrefs is what a client says about HDR10 (Prefs.HDR). The host streams
+// HDR10 only when Mode is HDRAuto and the client can present it
+// (CanPresent): an HDR display, a WebGPU canvas that confirmed extended range
+// and a 10-bit decoder for the stream's codec family.
+type HDRPrefs struct {
+	Mode string `json:"mode"` // HDROff | HDRAuto: the user's setting
+	// Display: the screen is in HDR mode (matchMedia "(dynamic-range: high)").
+	Display bool `json:"display"`
+	// Canvas: a WebGPU canvas configured rgba16float with toneMapping
+	// "extended" reports it back (getConfiguration, Chrome 131+), on the
+	// renderer that will draw (WebGPU; the 2D canvas and WebGL2 never get HDR).
+	Canvas bool `json:"canvas"`
+	// Decoders: the families with a 10-bit decoder (VideoDecoder
+	// isConfigSupported of HEVC Main10 / AV1 10-bit): hevc, av1.
+	Decoders []string `json:"decoders,omitempty"`
+	// Why the client cannot present HDR ("" when it can), for the host log.
+	Why string `json:"why,omitempty"`
+}
+
+// HDRPrefs.Mode values (the client's "HDR" setting).
+const (
+	HDROff  = "off"
+	HDRAuto = "auto"
+)
+
+// CanPresent reports whether the client asks for and can present an HDR10
+// stream of a codec family, or why not. What the browser can do (the canvas,
+// the family's decoder) is checked before what changes during a session (the
+// setting, the display), so a client that cannot present the family keeps
+// its reason when its display or setting changes.
+func (h *HDRPrefs) CanPresent(family string) (bool, string) {
+	switch {
+	case h == nil:
+		return false, "the client does not support HDR"
+	case !h.Canvas:
+		why := h.Why
+		if why == "" {
+			why = "the client's canvas cannot show extended range"
+		}
+		return false, why
+	case !slices.Contains(h.Decoders, family):
+		return false, fmt.Sprintf("the browser has no 10-bit %s decoder", family)
+	case h.Mode != HDRAuto:
+		return false, "HDR is off in the client's settings"
+	case !h.Display:
+		return false, "the client's display is not in HDR mode"
+	}
+	return true, ""
+}
+
+// SameHDR reports whether two HDR preferences ask for the same thing (a
+// settings change that differs here restarts the video when it changes the
+// HDR decision: Session.hdrRestart).
+func SameHDR(a, b *HDRPrefs) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Mode == b.Mode && a.Display == b.Display && a.Canvas == b.Canvas && slices.Equal(a.Decoders, b.Decoders)
 }
 
 func (p Prefs) AudioEnabled() bool { return p.Audio == nil || *p.Audio }
@@ -156,7 +225,49 @@ type VideoConfig struct {
 	CodedHeight int `json:"codedHeight,omitempty"`
 	CropRight   int `json:"cropRight,omitempty"`
 	CropBottom  int `json:"cropBottom,omitempty"`
+	// HDR10 (GUIDE 3.9 / 4.5, only to clients whose prefs ask for HDR): HDR
+	// is set for a 10-bit BT.2020 PQ generation (BitDepth 10, ColorSpace
+	// HDR10ColorSpace, HDRMetadata the encoder writes into the stream; the
+	// codec string names the 10-bit profile). HDRNote says why this
+	// generation is or is not HDR, for clients that sent Prefs.HDR. Other
+	// generations omit them: 8-bit BT.709 as before.
+	HDR         bool         `json:"hdr,omitempty"`
+	BitDepth    int          `json:"bitDepth,omitempty"`
+	ColorSpace  *ColorSpace  `json:"colorSpace,omitempty"`
+	HDRMetadata *HDRMetadata `json:"hdrMetadata,omitempty"`
+	HDRNote     string       `json:"hdrNote,omitempty"`
 }
+
+// ColorSpace is a stream's colour description in WebCodecs' VideoColorSpaceInit
+// terms (the client configures its decoder and renderer with it).
+type ColorSpace struct {
+	Primaries string `json:"primaries"` // bt709 | bt2020
+	Transfer  string `json:"transfer"`  // bt709 | pq
+	Matrix    string `json:"matrix"`    // bt709 | bt2020-ncl
+	FullRange bool   `json:"fullRange"`
+}
+
+// HDR10ColorSpace: BT.2020 primaries, the SMPTE ST 2084 (PQ) transfer, the
+// BT.2020 non-constant-luminance matrix, limited range.
+var HDR10ColorSpace = ColorSpace{Primaries: "bt2020", Transfer: "pq", Matrix: "bt2020-ncl"}
+
+// HDRMetadata is an HDR10 stream's static metadata (SMPTE ST 2086 mastering
+// display colour volume, CTA-861.3 content light level), as the encoder
+// writes it: primaries red, green, blue and the white point as CIE 1931 xy,
+// luminance in cd/m2, MaxCLL / MaxFALL in cd/m2 (0 = unknown).
+type HDRMetadata struct {
+	DisplayPrimaries [3][2]float64 `json:"displayPrimaries"`
+	WhitePoint       [2]float64    `json:"whitePoint"`
+	MaxLuminance     float64       `json:"maxLuminance"`
+	MinLuminance     float64       `json:"minLuminance"`
+	MaxCLL           int           `json:"maxCll"`
+	MaxFALL          int           `json:"maxFall"`
+}
+
+// FeatureHDR is the Welcome.Features entry of hosts whose configuration
+// allows HDR10 streams (host config "hdr": "auto"); the client shows why it
+// gets none without it.
+const FeatureHDR = "hdr10"
 
 // SetCrop announces the padding of a coded picture of codedW x codedH whose
 // visible part is w x h (no crop fields when it has none).

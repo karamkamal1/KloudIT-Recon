@@ -14,6 +14,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
 
@@ -71,6 +72,10 @@ type Config struct {
 	// instead of HEVC for clients that decode AV1 clearly faster (enable it
 	// after measuring this host's AV1 encoder: Phase 0 latency and VMAF).
 	AV1 string `json:"av1,omitempty"`
+	// HDR allows HDR10 streams (GUIDE 3.9 / 4.5, opt-in): HDROff ("" =
+	// default) never, HDRAuto to clients that can present HDR, with an
+	// encoder that can make it (hdr.go).
+	HDR string `json:"hdr,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -168,6 +173,9 @@ func LoadConfig(path string) (*Config, error) {
 	if !validAV1(c.AV1) {
 		return nil, fmt.Errorf("%s: av1 must be %q or %q, not %q", path, AV1Fallback, AV1Faster, c.AV1)
 	}
+	if c.HDR != "" && c.HDR != proto.HDROff && c.HDR != proto.HDRAuto {
+		return nil, fmt.Errorf("%s: hdr must be %q or %q, not %q", path, proto.HDROff, proto.HDRAuto, c.HDR)
+	}
 	if !media.ValidGPUPriority(c.GPUPriority) {
 		return nil, fmt.Errorf("%s: gpuPriority must be %q, %q, %q or %q, not %q", path,
 			media.GPUPriorityAuto, media.GPUPriorityHigh, media.GPUPriorityRealtime, media.GPUPriorityOff, c.GPUPriority)
@@ -261,6 +269,15 @@ func (c *Config) av1() string {
 		return AV1Fallback
 	}
 	return c.AV1
+}
+
+// hdr returns whether HDR10 streams are allowed: proto.HDRAuto or
+// proto.HDROff.
+func (c *Config) hdr() string {
+	if c.HDR == proto.HDRAuto {
+		return proto.HDRAuto
+	}
+	return proto.HDROff
 }
 
 // gpuPriority returns the encoder's GPU scheduling priority mode.

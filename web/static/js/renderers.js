@@ -31,9 +31,19 @@
 // stream-worker.js) with either a clone of the frame (req.clone) or a
 // promise of the barcode cells' mean luma read back from the GPU (req.luma);
 // it throws when nothing could be drawn (the frame is closed then).
+//
+// HDR10 (step 4.5, hdr.js): only the WebGPU renderer draws HDR streams
+// (hdrBlocked(format, visibleRect): null, or why a frame cannot take the HDR
+// path): prepare(frame, inspect) copies the decoded planes into textures
+// (resolving to the planes, which draw(frame, req, vis, planes) takes),
+// setHdr({ want, why, white, space, peak }) says whether the canvas shows
+// extended range or tone-maps, hdrInfo() describes it for the overlay. The
+// other renderers never get an HDR stream (the client does not offer HDR
+// with them, and withdraws the offer when one takes over).
 
 import * as P from './protocol.js';
 import { upscaleSettings, upscalePlan, upscaleWhy, easuConstants, rcasConstants, easuWGSL, RCAS_WGSL, COPY_WGSL } from './fsr1.js';
+import { HDR_WHITE, CONVERT_WGSL, OUTPUT_WGSL, planeLayout, outputUniforms, halfToFloat } from './hdr.js';
 
 export const PATHS = ['canvas2d', 'webgl2', 'webgpu'];
 export const LABELS = { canvas2d: '2D canvas', webgl2: 'WebGL2', webgpu: 'WebGPU' };
@@ -194,6 +204,14 @@ class Renderer {
   idle() {}
   destroy() {}
   loseContext() {}
+  // HDR10 (hdr.js): only the WebGPU renderer draws it.
+  setHdr() {}
+  hdrBlocked() {
+    return { scope: 'renderer', why: `HDR needs the WebGPU renderer (${this.name} draws now)` };
+  }
+  hdrInfo() {
+    return { path: null, why: 'HDR needs the WebGPU renderer' };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +655,8 @@ export class WebGPURenderer extends Renderer {
     r.log = log;
     r.initTimestamps();
     r.initFsr();
+    r.initHdr();
+    r.hdrCanvasOk = WebGPURenderer.hdrCanvasCheck(device);
     // A lost device draws nothing and reports no error: draw() throws then.
     device.lost.then((info) => {
       r.lost = true;
@@ -662,11 +682,26 @@ export class WebGPURenderer extends Renderer {
     return r;
   }
 
-  draw(frame, req, vis) {
+  draw(frame, req, vis, planes) {
     if (this.lost) {
+      planes?.release();
       frame.close();
       throw new Error('WebGPU device lost');
     }
+    if (planes) {
+      // HDR10: the planes' textures hold the picture, the frame can go
+      // (and the kept one of an earlier SDR draw once the GPU is done).
+      frame.close();
+      this.idle();
+      try {
+        this.drawHdr(vis, planes);
+      } finally {
+        planes.release();
+      }
+      this.last = vis;
+      return;
+    }
+    this.hdr.last = null;
     const buf = this.present(frame, vis, req);
     if (buf) req.luma = this.probeRead(buf);
     else if (req) req.clone = frame.clone();
@@ -682,6 +717,7 @@ export class WebGPURenderer extends Renderer {
   // probe's readback buffer, if any. Every pass is encoded and submitted
   // here, so the draw stage (stream-worker.js) covers them.
   present(frame, vis, req) {
+    this.hdrCanvas('sdr');
     const { r } = this.fit(vis);
     const fsr = !upscaleWhy(this.up.mode, Math.min(r.w / this.inW, r.h / this.inH)) && this.fsrPipelines(this.up.input);
     const ext = this.device.importExternalTexture({ source: frame });
@@ -933,6 +969,7 @@ export class WebGPURenderer extends Renderer {
   }
 
   noFsr() {
+    if (this.hdr.last) return 'FSR is off for HDR streams (the HDR output pass scales bilinearly)';
     return this.fsrError ? `FSR unavailable (${this.fsrError})` : 'FSR shaders still compiling';
   }
 
@@ -943,7 +980,302 @@ export class WebGPURenderer extends Renderer {
   }
 
   redraw() {
-    if (this.prev && this.last) this.present(this.prev, this.last, null);
+    if (this.hdr.last && this.last) this.redrawHdr(this.last);
+    else if (this.prev && this.last) this.present(this.prev, this.last, null);
+  }
+
+  // ---- HDR10 (step 4.5, hdr.js) --------------------------------------------
+  // Whether a WebGPU canvas here keeps extended range: a scratch canvas
+  // configured rgba16float with toneMapping "extended" must report both back
+  // (getConfiguration, Chrome 131+; browsers before toneMapping ignore it).
+  static hdrCanvasCheck(device) {
+    try {
+      const ctx = new OffscreenCanvas(4, 4).getContext('webgpu');
+      ctx.configure({ device, format: 'rgba16float', toneMapping: { mode: 'extended' }, alphaMode: 'opaque' });
+      if (typeof ctx.getConfiguration !== 'function') return { ok: false, why: 'the canvas cannot confirm extended range (getConfiguration: Chrome 131+)' };
+      const c = ctx.getConfiguration();
+      ctx.unconfigure();
+      if (c?.format !== 'rgba16float' || c?.toneMapping?.mode !== 'extended') {
+        return { ok: false, why: `the canvas does not keep extended range (${c?.format}, toneMapping ${c?.toneMapping?.mode || 'standard'})` };
+      }
+      return { ok: true, why: '' };
+    } catch (e) {
+      return { ok: false, why: `the canvas cannot show extended range (${e.message})` };
+    }
+  }
+
+  // Created with the renderer: uniforms and pass descriptors; the pipelines
+  // with the first HDR frame (prepare); texture sets per plane layout (one
+  // per frame between its copy and its draw, at most HDR_SETS), the
+  // intermediate on size changes.
+  initHdr() {
+    const d = this.device;
+    const u = (size) => d.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const pass = () => ({ colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    this.hdr = {
+      want: false, why: 'no HDR stream', white: HDR_WHITE, space: 'srgb', peak: 1000,
+      canvasKey: 'sdr', readback: false, pipes: null, pending: null, error: '', failed: {},
+      convU: u(16), convData: new Float32Array(4), convLast: new Float32Array(4).fill(NaN),
+      outU: u(64), outData: new Float32Array(16), outLast: new Float32Array(16).fill(NaN),
+      outIn: { space: null, white: 0, tone: false, peak: 0 }, // what outData was computed from
+      layout: { fmt: undefined, w: 0, h: 0, L: null }, // the last planeLayout (hdrLayout)
+      copyOpts: { rect: { x: 0, y: 0, width: 0, height: 0 } }, // copyTo's options (the visible rect), reused
+      sets: [], inter: null, outBG: null, staging: null, convPass: pass(), outPass: pass(),
+      copy: new Samples(100), bytes: 0, frame: null, last: null, drawn: 0,
+    };
+  }
+
+  // want: show extended range (else tone-map to SDR), why not; white: SDR
+  // reference white (cd/m2); space: the extended canvas's colour space
+  // (srgb, display-p3); peak: the stream's peak for tone mapping (cd/m2).
+  setHdr(o = {}) {
+    const H = this.hdr;
+    for (const k of ['want', 'why', 'white', 'space', 'peak']) if (o[k] !== undefined) H[k] = o[k];
+  }
+
+  // Why a decoded frame of an HDR10 generation (its format, visible rect)
+  // cannot go through the HDR path, or null when it can: { scope, why } with
+  // scope 'lost' (the device: another renderer takes over; or a closed
+  // frame), 'renderer' (the HDR shaders failed) or 'format' (no plane path:
+  // format null, which Chrome's hardware decoders give for 10-bit frames, or a
+  // format whose copy failed). Such frames draw through importExternalTexture
+  // (Chrome's SDR conversion) until the worker's withdrawn offer brings an
+  // SDR generation.
+  hdrBlocked(fmt, vr) {
+    const H = this.hdr;
+    if (this.lost) return { scope: 'lost', why: 'WebGPU device lost' };
+    if (!vr) return { scope: 'lost', why: 'the frame is closed' };
+    if (H.error) return { scope: 'renderer', why: H.error };
+    if (H.failed[fmt]) return { scope: 'format', why: H.failed[fmt] };
+    if (this.hdrLayout(fmt, vr.width, vr.height)) return null;
+    return { scope: 'format', why: fmt ? `no HDR plane path for ${fmt} frames`
+      : "VideoFrame.format null (a hardware decoder's P010 frames, which WebCodecs cannot copy)" };
+  }
+
+  // planeLayout(fmt, w, h), kept for the next frames of the same format and size.
+  hdrLayout(fmt, w, h) {
+    const c = this.hdr.layout;
+    if (c.fmt !== fmt || c.w !== w || c.h !== h) this.hdr.layout = { fmt, w, h, L: planeLayout(fmt, w, h) };
+    return this.hdr.layout.L;
+  }
+
+  async hdrPipes() {
+    const H = this.hdr;
+    if (H.pipes) return;
+    H.pending ||= (async () => {
+      const d = this.device;
+      const make = async (code, format) => {
+        const module = d.createShaderModule({ code });
+        try {
+          return await d.createRenderPipelineAsync({ layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+            primitive: { topology: 'triangle-list' } });
+        } catch (e) {
+          const info = await module.getCompilationInfo?.().catch(() => null);
+          const m = info?.messages?.find((x) => x.type === 'error');
+          throw new Error(m ? `${m.message} (line ${m.lineNum})` : e.message);
+        }
+      };
+      try {
+        const [conv, ext, tone] = await Promise.all([make(CONVERT_WGSL, 'rgba16float'), make(OUTPUT_WGSL, 'rgba16float'), make(OUTPUT_WGSL, this.format)]);
+        H.pipes = { conv, ext, tone };
+      } catch (e) {
+        H.error = `HDR shaders: ${e.message}`;
+        this.log(`HDR path unavailable (${e.message}); HDR frames draw through importExternalTexture`);
+      }
+    })();
+    await H.pending;
+  }
+
+  // Copies the visible area of a decoded frame into a texture set (planes
+  // as decoded, see hdr.js planeLayout) and resolves to it: { set, layout,
+  // release() }. inspect(buf, layout, planes) sees the copy before the
+  // staging buffer is reused (the latency probe's barcode, test hooks).
+  async prepare(frame, inspect) {
+    const H = this.hdr;
+    await this.hdrPipes();
+    if (H.error) throw new Error(H.error);
+    const vr = frame.visibleRect;
+    const fmt = frame.format;
+    const L = this.hdrLayout(fmt, vr.width, vr.height);
+    if (!L) throw new Error(`no HDR plane path for ${fmt || 'opaque'} frames`);
+    const opts = H.copyOpts;
+    const { rect } = opts;
+    rect.x = vr.x;
+    rect.y = vr.y;
+    rect.width = vr.width;
+    rect.height = vr.height;
+    const t0 = performance.now();
+    const size = frame.allocationSize(opts);
+    if (!H.staging || H.staging.byteLength < size) H.staging = new Uint8Array(size);
+    const layout = await frame.copyTo(H.staging, opts);
+    if (this.lost || this.destroyed) throw new Error('WebGPU device lost');
+    const set = this.hdrSet(L);
+    for (let i = 0; i < L.planes.length; i++) {
+      const src = set.src[i];
+      src.offset = layout[i].offset;
+      src.bytesPerRow = layout[i].stride;
+      this.device.queue.writeTexture(set.dst[i], H.staging, src, set.size[i]);
+    }
+    H.copy.push(performance.now() - t0);
+    H.bytes = size;
+    // The overlay's "decoded" row: new only when the format, size or colour space changes.
+    const F = H.frame;
+    const cs = frame.colorSpace;
+    if (!F || F.format !== fmt || F.w !== vr.width || F.h !== vr.height || F.colorSpace?.primaries !== cs?.primaries ||
+      F.colorSpace?.transfer !== cs?.transfer || F.colorSpace?.matrix !== cs?.matrix || F.colorSpace?.fullRange !== cs?.fullRange) {
+      H.frame = { format: fmt, colorSpace: cs?.toJSON?.() || null, w: vr.width, h: vr.height, bits: L.bits };
+    }
+    let released = false;
+    const planes = { set, layout: L, renderer: this, release: () => { if (!released) { released = true; set.busy = false; } } };
+    try {
+      inspect?.(H.staging, layout, planes);
+    } catch (e) {
+      planes.release();
+      throw e;
+    }
+    return planes;
+  }
+
+  hdrSet(L) {
+    const H = this.hdr;
+    let s = H.sets.find((x) => !x.busy && x.key === L.key);
+    if (!s) {
+      if (H.sets.filter((x) => x.key === L.key).length >= WebGPURenderer.HDR_SETS) throw new Error('no free HDR texture set (a frame kept its planes)');
+      for (const x of H.sets) if (!x.busy && x.key !== L.key) x.tex.forEach((t) => t.destroy()); // another size or format: no longer needed
+      H.sets = H.sets.filter((x) => x.busy || x.key === L.key);
+      const d = this.device;
+      const tex = L.planes.map((p) => d.createTexture({ size: [p.w, p.h], format: p.format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST }));
+      const v = tex.map((t) => t.createView());
+      const bg = d.createBindGroup({ layout: H.pipes.conv.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: v[0] }, { binding: 1, resource: v[1] }, { binding: 2, resource: v[2] || v[1] }, { binding: 3, resource: { buffer: H.convU } }] });
+      // writeTexture's arguments per plane (prepare sets the offset and stride of each copy).
+      const dst = tex.map((texture) => ({ texture }));
+      const src = L.planes.map((p) => ({ offset: 0, bytesPerRow: 0, rowsPerImage: p.h }));
+      const size = L.planes.map((p) => [p.w, p.h]);
+      s = { key: L.key, tex, bg, dst, src, size, busy: false };
+      H.sets.push(s);
+    }
+    s.busy = true;
+    return s;
+  }
+
+  // The canvas configuration: SDR (the preferred format: SDR streams and
+  // tone-mapped HDR) or extended (rgba16float, toneMapping "extended", the
+  // HDR colour space); readback (test hook) adds COPY_SRC.
+  hdrCanvas(mode) {
+    const H = this.hdr;
+    const key = `${mode === 'extended' ? `extended:${H.space}` : 'sdr'}${H.readback ? ':readback' : ''}`;
+    if (key === H.canvasKey) return;
+    H.canvasKey = key;
+    const usage = GPUTextureUsage.RENDER_ATTACHMENT | (H.readback ? GPUTextureUsage.COPY_SRC : 0);
+    if (mode === 'extended') this.ctx.configure({ device: this.device, format: 'rgba16float', colorSpace: H.space, toneMapping: { mode: 'extended' }, alphaMode: 'opaque', usage });
+    else this.ctx.configure({ device: this.device, format: this.format, alphaMode: 'opaque', usage });
+  }
+
+  // An HDR frame: planes -> the intermediate (PQ R'G'B', the visible size),
+  // then the output pass onto the canvas at the letterboxed rectangle.
+  drawHdr(vis, planes) {
+    const H = this.hdr;
+    const d = this.device;
+    const { r } = this.fit(vis);
+    const tone = !H.want;
+    if (planes.capture) H.readback = true;
+    this.hdrCanvas(tone ? 'sdr' : 'extended');
+    if (!H.inter || H.inter.width !== this.inW || H.inter.height !== this.inH) {
+      H.inter?.destroy(); // freed once the submitted passes that use it are done
+      H.inter = d.createTexture({ size: [this.inW, this.inH], format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+      const view = H.inter.createView();
+      H.convPass.colorAttachments[0].view = view;
+      H.outBG = [H.pipes.ext, H.pipes.tone].map((p) => d.createBindGroup({ layout: p.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: this.sampler }, { binding: 1, resource: view }, { binding: 2, resource: { buffer: H.outU } }] }));
+    }
+    const L = planes.layout;
+    H.convData.set([L.sub[0], L.sub[1], L.scale, L.semi ? 1 : 0]);
+    WebGPURenderer.writeChanged(d, H.convU, H.convData, H.convLast);
+    const enc = d.createCommandEncoder();
+    const p = enc.beginRenderPass(H.convPass);
+    p.setPipeline(H.pipes.conv);
+    p.setBindGroup(0, planes.set.bg);
+    p.draw(3);
+    p.end();
+    const tex = this.hdrOutput(enc, r, tone);
+    const cap = planes.capture ? this.hdrCapture(enc, tex, r, planes.capture) : null;
+    d.queue.submit([enc.finish()]);
+    H.last = { tone };
+    H.drawn++;
+    this.upscaled = false;
+    cap?.();
+  }
+
+  hdrOutput(enc, r, tone) {
+    const H = this.hdr;
+    const k = H.outIn;
+    const space = tone ? 'srgb' : H.space;
+    if (k.space !== space || k.white !== H.white || k.tone !== tone || k.peak !== H.peak) {
+      k.space = space;
+      k.white = H.white;
+      k.tone = tone;
+      k.peak = H.peak;
+      outputUniforms(H.outData, k);
+      WebGPURenderer.writeChanged(this.device, H.outU, H.outData, H.outLast);
+    }
+    const tex = this.ctx.getCurrentTexture();
+    H.outPass.colorAttachments[0].view = tex.createView();
+    const p = enc.beginRenderPass(H.outPass);
+    p.setViewport(r.x, r.y, r.w, r.h, 0, 1);
+    p.setPipeline(tone ? H.pipes.tone : H.pipes.ext);
+    p.setBindGroup(0, H.outBG[tone ? 1 : 0]);
+    p.draw(3);
+    p.end();
+    H.outPass.colorAttachments[0].view = null;
+    return tex;
+  }
+
+  // The last HDR picture again (a resize, a changed setting): the output
+  // pass from the intermediate, which still holds it.
+  redrawHdr(vis) {
+    const H = this.hdr;
+    if (!H.inter) return;
+    const { r } = this.fit(vis);
+    const tone = !H.want;
+    this.hdrCanvas(tone ? 'sdr' : 'extended');
+    const enc = this.device.createCommandEncoder();
+    this.hdrOutput(enc, r, tone);
+    this.device.queue.submit([enc.finish()]);
+    H.last = { tone };
+  }
+
+  // Test hook: the canvas pixels at points of the picture (visible-area
+  // pixels: [x, y]) after this draw; c.resolve gets them with the output's
+  // settings. Returns the readback to start after the submit.
+  hdrCapture(enc, tex, r, c) {
+    const H = this.hdr;
+    const n = c.points.length;
+    const buf = this.device.createBuffer({ size: 256 * n, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const at = c.points.map(([x, y]) => [Math.min(r.x + r.w - 1, Math.floor(r.x + ((x + 0.5) * r.w) / this.inW)), Math.min(r.y + r.h - 1, Math.floor(r.y + ((y + 0.5) * r.h) / this.inH))]);
+    at.forEach(([x, y], k) => enc.copyTextureToBuffer({ texture: tex, origin: [x, y] }, { buffer: buf, offset: 256 * k }, [1, 1]));
+    const format = tex.format;
+    const out = { mode: H.want ? 'extended' : 'tonemap', white: H.white, space: H.want ? H.space : 'srgb', peak: H.peak, format, at, rect: r };
+    return () => buf.mapAsync(GPUMapMode.READ).then(() => {
+      const m = buf.getMappedRange();
+      out.values = at.map((_, k) => {
+        if (format === 'rgba16float') return [...new Uint16Array(m, 256 * k, 4)].slice(0, 3).map(halfToFloat);
+        const b = new Uint8Array(m, 256 * k, 4);
+        return (format.startsWith('bgra') ? [b[2], b[1], b[0]] : [b[0], b[1], b[2]]).map((v) => v / 255);
+      });
+      buf.unmap();
+      buf.destroy();
+      c.resolve(out);
+    }, (e) => c.resolve({ ...out, error: e.message }));
+  }
+
+  hdrInfo() {
+    const H = this.hdr;
+    return {
+      canvas: this.hdrCanvasOk, want: H.want, why: H.why, white: H.white, space: H.space, peak: H.peak, error: H.error, failed: H.failed,
+      path: H.last ? (H.last.tone ? 'tonemap' : 'extended') : null, canvasConfig: H.canvasKey, frame: H.frame, drawn: H.drawn,
+      copy: H.copy.summary(), bytes: H.bytes,
+    };
   }
 
   probePass(enc, ext, frame, req) {
@@ -1003,6 +1335,10 @@ export class WebGPURenderer extends Renderer {
 }
 
 WebGPURenderer.STAMP_MS = 100;
+// Texture sets per plane layout: the frame being copied, the one waiting
+// for its draw, and slack (a set is free again once its frame is drawn or
+// dropped).
+WebGPURenderer.HDR_SETS = 4;
 // The FSR pipelines each input variant (fsr1.js FSR.input) draws with.
 WebGPURenderer.FSR_PIPES = { copy: ['copy', 'easuTex', 'rcas'], external: ['easuExt', 'rcas'] };
 
