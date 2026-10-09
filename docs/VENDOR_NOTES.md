@@ -8790,3 +8790,63 @@ does not, 2.4 above; the Go clients do).
   'TestReliableBoundaryAfterStopSending|TestPartialDelivery' ./internal/transport` on the
   Windows host (with Go installed): both pass.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same.
+
+## Final review: deploy and install
+
+Findings of the final review about installing, diagnosing and testing the PC agent and the
+gateway. Each item: the problem, the fix, what was verified here, the check on hardware.
+
+### The UDP relay names an IP mismatch
+
+Problem: a browser whose QUIC Initial reached its relay port from another IP than its HTTPS
+request was refused silently; after 20 s the gateway logged "the browser never arrived (is the
+relay port range open in the firewall?)". Behind a reverse proxy for HTTPS without `-trust-proxy`
+(the expected IP is then the proxy's) every relayed session used the splice, and the log sent
+the admin to the firewall. Fix: the gateway logs the first refused Initial per allocation
+(`udp relay: refused a QUIC Initial from another IP than the browser's HTTPS request ... from=
+expected=`), and an allocation the browser never locked logs `never arrived from its HTTPS
+request's IP` with `refused=` and `dropped=`; README and SECURITY.md say that a proxy in front
+of HTTPS needs `-trust-proxy` for the UDP relay.
+
+- Verified here: `internal/gateway` `TestUDPRelayIPMismatchLogged` (Initials from 127.0.0.2 for an
+  allocation requested from 127.0.0.1: one refusal line, the end line with the refused source and
+  `dropped=3`, no firewall wording; an allocation that saw nothing keeps the firewall wording)
+  fails before the fix and passes after; `go test -race ./internal/gateway`.
+- Gateway (Proxmox LXC): unverified (no Proxmox here). Test: put a reverse proxy (Caddy or Nginx
+  Proxy Manager) in front of the gateway's TCP 8443 and forward UDP 8443-8459 straight to the
+  container; start a stream with Network path "Relay via gateway": the gateway log
+  (`pct exec 210 -- journalctl -u recon-gateway -n 50`) has `udp relay: refused a QUIC Initial
+  from another IP` with the client's address as `from` and the proxy's as `expected`, and the
+  overlay's Transport row reads `webtransport · relay-splice`. Add `-trust-proxy <proxy CIDR>`
+  (`RECON_TRUST_PROXY` in `/etc/kloudit-recon/gateway.env`), restart the gateway and reload the
+  page: the row reads `webtransport · relay`, the log `udp relay: session started`.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific (the test above with this PC as the host).
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### A custom install folder is restricted to administrators
+
+Problem: `install-host.ps1 -InstallDir C:\Recon` created the folder without an ACL, so it
+inherited "Authenticated Users: Modify" from the drive root, while the logon task runs
+`recon-hostw.exe` from it elevated and the agent starts `recon-encoder.exe`, FFmpeg and the
+helper's FFmpeg libraries from it: any local account could replace them and run code as the
+installing administrator. Fix: a folder outside Program Files gets the treatment the Virtual
+Display Driver's folder already had (now `Protect-AdminFolder`, recursive here): owner
+Administrators, inheritance removed, Administrators and SYSTEM full control, Users read and
+execute, everything already in it reset to that; a folder that is or holds a link is refused.
+What another account put into a folder before the install stays (owned by Administrators now):
+install into a new folder, or Program Files.
+
+- Verified here: the parser check of the script with pwsh 7; `Test-InProgramFiles` (Program Files
+  and Program Files (x86), case-insensitive; `C:\Recon`, `D:\Games\Recon` and `C:\Program Files
+  Evil\...` are outside) and `Assert-NoLinks` (a symbolic link two levels down is refused with
+  `-Recurse` only) run under pwsh on Linux with the functions taken from the script. `icacls`
+  itself needs Windows.
+- AMD RDNA3 (RX 7900 XT): unverified (no Windows here). Test: from an elevated PowerShell,
+  `.\install-host.ps1 -InstallDir C:\Recon -NoStart`; it prints `Restricted C:\Recon to
+  administrators`. `icacls C:\Recon` lists only `BUILTIN\Administrators:(OI)(CI)(F)`,
+  `NT AUTHORITY\SYSTEM:(OI)(CI)(F)` and `BUILTIN\Users:(OI)(CI)(RX)` (no Authenticated Users),
+  `icacls C:\Recon\ffmpeg\bin\ffmpeg.exe` only inherited `(I)` entries of those, and as a
+  standard user `Set-Content C:\Recon\x.txt x` and replacing `C:\Recon\recon-encoder.exe` are
+  denied. The agent then starts and streams as from Program Files. The default install
+  (Program Files) is unchanged: no `Restricted` line.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

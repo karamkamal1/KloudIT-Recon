@@ -25,7 +25,10 @@
   Code shown by the gateway's "Add a PC" dialog (starts with recon1:). Can also
   be applied later with recon-host.exe pair <code>; a running agent picks it up.
 .PARAMETER InstallDir
-  Where to install (default: Program Files\KlouditRecon).
+  Where to install (default: Program Files\KlouditRecon). The logon task runs the agent from
+  there elevated, so a folder outside Program Files is restricted to administrators (owner
+  Administrators, users read and run), with everything already in it; a folder that is or
+  holds a link (junction, symbolic link) is refused.
 .PARAMETER FFmpegPath
   Use an existing ffmpeg.exe (FFmpeg 7.1+; 8.1+ recommended, older builds lack gfxcapture).
 .PARAMETER DirectPort
@@ -124,6 +127,54 @@ function Read-LogSince([string]$path, [long]$from) {
     } catch { '' }
 }
 
+# Folders the elevated agent loads programs, libraries or settings from must be writable by
+# administrators only. A folder made under C:\ (or another drive's root) would inherit
+# "Authenticated Users: Modify" from the drive root, so any local account could replace what
+# runs elevated there. Reparse points (junctions, symbolic links) in it would let whoever made
+# them redirect it.
+function Assert-NoLinks([string]$dir, [switch]$Recurse) {
+    $root = Get-Item -LiteralPath $dir -Force
+    if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$($root.FullName) is a link (reparse point); remove it and run the installer again."
+    }
+    foreach ($c in @(Get-ChildItem -LiteralPath $dir -Force)) {
+        if (($c.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$($c.FullName) is a link (reparse point); remove it and run the installer again."
+        }
+        if ($Recurse -and $c.PSIsContainer) { Assert-NoLinks $c.FullName -Recurse }
+    }
+}
+# Creates $dir if needed and gives it to administrators: owner Administrators, no inherited
+# access, Administrators and SYSTEM full control, Users read and execute. What is in it from
+# before (its files; with -Recurse its folders too, all the way down) becomes owned by
+# Administrators with only that access.
+function Protect-AdminFolder([string]$dir, [switch]$Recurse) {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    Assert-NoLinks $dir -Recurse:$Recurse
+    icacls $dir /setowner '*S-1-5-32-544' | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $dir (icacls exit code $LASTEXITCODE)." }
+    Assert-NoLinks $dir -Recurse:$Recurse # again, now that only administrators can add entries
+    $items = if ($Recurse) { @(Get-ChildItem -LiteralPath $dir -Force) } else { @(Get-ChildItem -LiteralPath $dir -Force -File) }
+    foreach ($f in $items) {
+        $tree = @()
+        if ($f.PSIsContainer) { $tree = @('/T') }
+        icacls $f.FullName /setowner '*S-1-5-32-544' @tree | Out-Null
+        if ($LASTEXITCODE -eq 0) { icacls $f.FullName /reset @tree | Out-Null }
+        if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $($f.FullName) (icacls exit code $LASTEXITCODE)." }
+    }
+}
+# Whether $dir is inside Program Files, whose access Windows already limits to administrators.
+function Test-InProgramFiles([string]$dir) {
+    $full = [IO.Path]::GetFullPath($dir).TrimEnd('\') + '\'
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }) {
+        if ($full.StartsWith([IO.Path]::GetFullPath($pf).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    $false
+}
+
 # --- Preconditions -----------------------------------------------------------
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -151,6 +202,13 @@ $old = @(Get-Process -Name 'recon-hostw', 'recon-host' -ErrorAction SilentlyCont
 $old | Stop-Process -Force -ErrorAction SilentlyContinue
 $old | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# The logon task runs the agent from here elevated, and the agent starts recon-encoder.exe,
+# FFmpeg and the helper's FFmpeg libraries from here: outside Program Files, only
+# administrators may change the folder (see Protect-AdminFolder).
+if (-not (Test-InProgramFiles $InstallDir)) {
+    Protect-AdminFolder $InstallDir -Recurse
+    Write-Step "Restricted $InstallDir to administrators (users read and run)"
+}
 # Skip files that are already in place (when re-run from the install directory).
 # recon-encoder.exe is optional: without it the agent uses the FFmpeg path.
 foreach ($f in 'recon-host.exe', 'recon-hostw.exe', 'recon-encoder.exe', 'install-host.ps1', 'uninstall-host.ps1') {
@@ -236,33 +294,11 @@ $nefcon = @{
 }
 # The driver reads its modes from vdd_settings.xml in this folder (VDDPATH), and the elevated agent
 # adds each client's mode to it: only administrators and SYSTEM may change the folder and its
-# files (users, among them the driver's LocalService host, read them). A folder made under C:\
-# would inherit "Authenticated Users: Modify" from the drive root; the agent refuses to edit a
-# folder that non-administrators can change.
+# files (users, among them the driver's LocalService host, read them; Protect-AdminFolder). The
+# agent refuses to edit a folder that non-administrators can change.
 function Get-VddFolder {
     $p = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\MikeTheTech\VirtualDisplayDriver' -Name VDDPATH -ErrorAction SilentlyContinue).VDDPATH
     if ($p) { $p } else { 'C:\VirtualDisplayDriver' }
-}
-function Assert-NoVddLinks([string]$dir) {
-    $links = @(@(Get-Item -LiteralPath $dir -Force) + @(Get-ChildItem -LiteralPath $dir -Force) |
-        Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
-    if ($links) { throw "$($links[0].FullName) is a link (reparse point); remove it and run the installer again." }
-}
-function Protect-VddFolder([string]$dir) {
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-    Assert-NoVddLinks $dir
-    icacls $dir /setowner '*S-1-5-32-544' | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
-    }
-    if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $dir (icacls exit code $LASTEXITCODE)." }
-    Assert-NoVddLinks $dir # again, now that only administrators can add entries
-    # Files from before: owned by Administrators, only the folder's access.
-    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Force -File)) {
-        icacls $f.FullName /setowner '*S-1-5-32-544' | Out-Null
-        if ($LASTEXITCODE -eq 0) { icacls $f.FullName /reset | Out-Null }
-        if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $($f.FullName) (icacls exit code $LASTEXITCODE)." }
-    }
 }
 $virtualDisplayReady = $false
 if ($InstallVirtualDisplay) {
@@ -274,7 +310,7 @@ if ($InstallVirtualDisplay) {
         if ($vddPresent) {
             $vddDir = Get-VddFolder
             if (Test-Path -LiteralPath $vddDir) {
-                Protect-VddFolder $vddDir
+                Protect-AdminFolder $vddDir
                 Write-Step "Restricted $vddDir to administrators (users read)"
             }
             if ($vddPresent[0].Status -eq 'OK') {
@@ -305,7 +341,7 @@ if ($InstallVirtualDisplay) {
             }
             # The driver's settings (modes): the agent adds each client's mode when needed.
             $vddDir = Get-VddFolder
-            Protect-VddFolder $vddDir
+            Protect-AdminFolder $vddDir
             if (-not (Test-Path -LiteralPath (Join-Path $vddDir 'vdd_settings.xml'))) {
                 Copy-Item (Join-Path $tmp 'VirtualDisplayDriver\vdd_settings.xml') $vddDir
             }
