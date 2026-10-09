@@ -58,6 +58,10 @@ import (
 //	                  among them (thin.go) exactly as on a congested path; the
 //	                  frames themselves are the encoder's (SVT-AV1's low-delay
 //	                  non-reference frames on the software path)
+//	fec-loss=P        in the "datagram + FEC" mode (fec.go) do not send a
+//	                  random share P (0-0.5) of the video shards and repairs,
+//	                  as if the network lost them: the client rebuilds them
+//	                  from parity or NACKs them
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped, and a frame due for either is never
@@ -81,13 +85,14 @@ type testFaults struct {
 	preStageHold bool // sendWelcome, logStages
 	rumbleEcho   bool // Session.gamepad
 	noWindow     bool
+	fecLoss      float64 // Session.writeShards, fecRepairs
 	// thinEvery, thinFor: simulated congestion (thinPressure).
 	thinEvery, thinFor int
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0
+		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0
 }
 
 // thinAt reports whether the nth frame (n from 1) is taken under the
@@ -185,8 +190,14 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: want thin=every:N:for:M with 1 <= M < N", rule)
 			}
 			f.thinEvery, f.thinFor = n, m
+		case "fec-loss":
+			p, err := strconv.ParseFloat(val, 64)
+			if err != nil || p <= 0 || p > 0.5 {
+				return f, fmt.Errorf("%s: want fec-loss=P with 0 < P <= 0.5", rule)
+			}
+			f.fecLoss = p
 		default:
-			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window, thin)", rule)
+			return f, fmt.Errorf("%s: unknown rule (delay, drop, recovery, intra-refresh, ref-recovery, still, pre-stage-hold, rumble-echo, no-window, thin, fec-loss)", rule)
 		}
 	}
 	if f.refRecovery && (f.intraRefresh || f.recovery != "") {

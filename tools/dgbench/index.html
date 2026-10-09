@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Datagram bench</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; background: #fff; color: #111; }
+  input { width: 5em; }
+  pre { background: #f3f3f3; padding: 8px; overflow-x: auto; }
+</style>
+<h1>WebTransport datagram bench</h1>
+<p>
+  Mbit/s <input id="mbps" value="100"> fps <input id="fps" value="60"> datagram B <input id="shard" value="1218">
+  seconds <input id="seconds" value="5"> busy ms/frame <input id="busy" value="0"> incomingHighWaterMark <input id="hwm" value="">
+  <button id="go">Run</button>
+</p>
+<pre id="out">-</pre>
+<script type="module">
+  // runBench(params) runs one measurement in a dedicated worker (the stream
+  // client receives in one too) and resolves with the worker's report.
+  window.runBench = async (p) => {
+    const info = await (await fetch('/info')).json();
+    const w = new Worker('/worker.js');
+    try {
+      return await new Promise((res, rej) => {
+        w.onmessage = (ev) => (ev.data.error ? rej(new Error(ev.data.error)) : res(ev.data));
+        w.onerror = (e) => rej(new Error(e.message));
+        w.postMessage({ ...info, ...p });
+      });
+    } finally {
+      w.terminate();
+    }
+  };
+  const v = (id) => document.getElementById(id).value;
+  document.getElementById('go').onclick = async () => {
+    const out = document.getElementById('out');
+    out.textContent = 'running…';
+    try {
+      const r = await window.runBench({ mbps: +v('mbps'), fps: +v('fps'), shard: +v('shard'), seconds: +v('seconds'), busyMs: +v('busy'), hwm: v('hwm') ? +v('hwm') : 0 });
+      out.textContent = JSON.stringify(r, null, 2);
+    } catch (e) {
+      out.textContent = e.message;
+    }
+  };
+</script>

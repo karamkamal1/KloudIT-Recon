@@ -11,6 +11,7 @@ export const WS_DATAGRAM = 3;
 
 export const DG_AUDIO = 0x10;
 export const DG_CURSOR_POS = 0x11;
+export const DG_VIDEO_SHARD = 0x12; // a shard of a video frame, "datagram + FEC" mode (fec.js)
 export const DG_MOUSE_REL = 0x20;
 export const DG_MOUSE_ABS = 0x21;
 export const DG_GAMEPAD = 0x22;
@@ -19,6 +20,7 @@ export const DG_PING = 0x30;
 export const DG_PONG = 0x31;
 export const DG_FRAME_ACK = 0x40;
 export const DG_RATE_REPORT = 0x41;
+export const DG_FEC_NACK = 0x42; // the shards a video frame still needs (fec.js)
 
 export const IN_KEY = 1;
 export const IN_MOUSE_BUTTON = 2;
@@ -49,6 +51,13 @@ export const FEATURE_FRAME_EXT = 'frame-ext';
 export const FEATURE_RATE_REPORT = 'rate-report';
 export const RATE_REPORT_OWD = 1; // owdP50Us / owdMaxUs valid
 export const RATE_REPORT_FRAME = 2; // gen / lastSeq name a received frame
+export const RATE_REPORT_SHARDS = 4; // shards / shardsLost follow (48 bytes)
+// "Datagram + FEC" video mode (GUIDE 2.5, fec.js; mirror of
+// internal/proto/fec.go): clients on WebTransport send hello.fec =
+// HELLO_FEC_VERSION, and a host that may send them video frames as shards
+// (DG_VIDEO_SHARD) lists FEATURE_VIDEO_FEC.
+export const HELLO_FEC_VERSION = 1;
+export const FEATURE_VIDEO_FEC = 'video-fec';
 // The host takes the "hold" row (frame pacing wait) in the client's stage
 // report; without it the client reports hold and draw as one draw row.
 export const FEATURE_STAGE_HOLD = 'stage-hold';
@@ -253,12 +262,15 @@ export function frameAck(gen, seq, owdUs, decodeUs) {
 }
 
 /**
- * The rate report datagram (mirror of proto.RateReport, 40 bytes): the
- * counters (frames, bytes, lost, audio) are cumulative and wrap at 2^32; the
- * one-way delays (µs) are those of the frames since the previous report.
+ * The rate report datagram (mirror of proto.RateReport, 40 bytes; 48 with
+ * RATE_REPORT_SHARDS: the video shards received and lost): the counters
+ * (frames, bytes, lost, audio, shards, shardsLost) are cumulative and wrap at
+ * 2^32; the one-way delays (µs) are those of the frames since the previous
+ * report.
  */
 export function rateReport(r) {
-  const b = new Uint8Array(40);
+  const shards = (r.flags & RATE_REPORT_SHARDS) !== 0;
+  const b = new Uint8Array(shards ? 48 : 40);
   const v = new DataView(b.buffer);
   const u32 = (x) => Math.floor(x) >>> 0;
   const i32 = (x) => Math.max(-2147483648, Math.min(2147483647, Math.round(x)));
@@ -274,6 +286,10 @@ export function rateReport(r) {
   v.setUint32(28, u32(r.lost), true);
   v.setUint32(32, u32(r.audio), true);
   v.setUint16(36, Math.max(0, Math.min(65535, r.decodeQueue | 0)), true);
+  if (shards) {
+    v.setUint32(40, u32((r.shards || 0) % 4294967296), true);
+    v.setUint32(44, u32((r.shardsLost || 0) % 4294967296), true);
+  }
   return b;
 }
 

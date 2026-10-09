@@ -7,7 +7,8 @@
 //	control  reliable, ordered   length-prefixed JSON messages (client-opened bidi stream, kind 'C')
 //	input    reliable, ordered   length-prefixed binary input events (client-opened bidi stream, kind 'I')
 //	frames   reliable per frame  one host-opened unidirectional stream per encoded video frame
-//	datagram unreliable          audio packets, pointer motion, gamepad state, clock pings
+//	datagram unreliable          audio packets, pointer motion, gamepad state, clock pings,
+//	                             and video frames in the "datagram + FEC" mode (VideoShard)
 //
 // Over WebTransport and the gateway<->host QUIC tunnel the channels map 1:1 onto
 // QUIC streams and datagrams. Over the WebSocket fallback every channel becomes a
@@ -50,6 +51,7 @@ const (
 const (
 	DgAudio      byte = 0x10 // host->client: audio packet
 	DgCursorPos  byte = 0x11 // host->client: cursor position/visibility
+	DgVideoShard byte = 0x12 // host->client: a shard of a video frame, "datagram + FEC" mode (VideoShard)
 	DgMouseRel   byte = 0x20 // client->host: cumulative relative motion
 	DgMouseAbs   byte = 0x21 // client->host: absolute position (normalised)
 	DgGamepad    byte = 0x22 // client->host: full gamepad state snapshot
@@ -58,6 +60,7 @@ const (
 	DgPong       byte = 0x31 // host->client
 	DgFrameAck   byte = 0x40 // client->host
 	DgRateReport byte = 0x41 // client->host: receive report for the rate controller (RateReport)
+	DgFECNack    byte = 0x42 // client->host: shards a video frame still needs ("datagram + FEC" mode, FECNack)
 )
 
 // Input stream event types.
@@ -441,13 +444,21 @@ func ParseFrameAck(b []byte) (FrameAck, bool) {
 // reads instead.
 const FeatureRateReport = "rate-report"
 
-// RateReportLen is the size of a RateReport datagram.
-const RateReportLen = 40
+// RateReportLen is the size of a RateReport datagram; RateReportShardsLen
+// with the shard counters (RateReportShards).
+const (
+	RateReportLen       = 40
+	RateReportShardsLen = 48
+)
 
 // RateReport flags.
 const (
 	RateReportOWD   byte = 1 // OWDP50Us / OWDMaxUs are valid: clock synced and frames since the previous report
 	RateReportFrame byte = 2 // Gen / LastSeq name a frame: one was received
+	// RateReportShards: Shards / ShardsLost follow (RateReportShardsLen
+	// bytes; clients that receive video shards, GUIDE 2.5). Hosts before
+	// them read the first 40 bytes.
+	RateReportShards byte = 4
 )
 
 // RateReport is the client's receive report for the host's rate controller
@@ -455,7 +466,7 @@ const (
 //
 //	u8 type 0x41 | u8 flags | u8 gen | u8 0 | u32 timeMs | u32 lastSeq |
 //	u32 frames | u32 bytes | i32 owdP50Us | i32 owdMaxUs | u32 lost |
-//	u32 audio | u16 decodeQueue | u16 0
+//	u32 audio | u16 decodeQueue | u16 0 [| u32 shards | u32 shardsLost]
 //
 // The counters are cumulative since the client connected (they wrap), so a
 // lost report loses nothing but its delay samples: the host takes the
@@ -476,6 +487,12 @@ type RateReport struct {
 	Lost               uint32 // frames lost on the way (gap timeout; not those the host reported dropped) + audio packets lost
 	Audio              uint32 // audio packets received
 	DecodeQueue        uint16 // frames handed to the decoder and not yet out of it
+	// Video shards ("datagram + FEC" mode, RateReportShards): of the
+	// frames' first transmissions (data and parity, not repairs), those
+	// received and those that never arrived, both counted when the client
+	// accounts a frame (about 100 ms after its first transmission is
+	// through), so they cover the same frames. Cumulative, wrapping.
+	Shards, ShardsLost uint32
 }
 
 // ParseRateReport decodes a DgRateReport datagram.
@@ -484,7 +501,7 @@ func ParseRateReport(b []byte) (RateReport, bool) {
 		return RateReport{}, false
 	}
 	le := binary.LittleEndian
-	return RateReport{
+	r := RateReport{
 		Flags: b[1], Gen: b[2],
 		TimeMs:      le.Uint32(b[4:]),
 		LastSeq:     le.Uint32(b[8:]),
@@ -495,13 +512,25 @@ func ParseRateReport(b []byte) (RateReport, bool) {
 		Lost:        le.Uint32(b[28:]),
 		Audio:       le.Uint32(b[32:]),
 		DecodeQueue: le.Uint16(b[36:]),
-	}, true
+	}
+	if r.Flags&RateReportShards != 0 {
+		if len(b) < RateReportShardsLen {
+			r.Flags &^= RateReportShards
+		} else {
+			r.Shards, r.ShardsLost = le.Uint32(b[40:]), le.Uint32(b[44:])
+		}
+	}
+	return r, true
 }
 
 // Marshal encodes the report as a DgRateReport datagram (tests and the Go
 // reference client; web/static/js/protocol.js rateReport mirrors it).
 func (r RateReport) Marshal() []byte {
-	b := make([]byte, RateReportLen)
+	n := RateReportLen
+	if r.Flags&RateReportShards != 0 {
+		n = RateReportShardsLen
+	}
+	b := make([]byte, n)
 	le := binary.LittleEndian
 	b[0], b[1], b[2] = DgRateReport, r.Flags, r.Gen
 	le.PutUint32(b[4:], r.TimeMs)
@@ -513,6 +542,10 @@ func (r RateReport) Marshal() []byte {
 	le.PutUint32(b[28:], r.Lost)
 	le.PutUint32(b[32:], r.Audio)
 	le.PutUint16(b[36:], r.DecodeQueue)
+	if n == RateReportShardsLen {
+		le.PutUint32(b[40:], r.Shards)
+		le.PutUint32(b[44:], r.ShardsLost)
+	}
 	return b
 }
 

@@ -258,6 +258,20 @@ func (w *videoWindow) sent(m deliveryMeter, start uint64, now time.Time) {
 	w.marks = append(w.marks, windowMark{start: start, pos: pos, at: now, pacing: m.PacingRate()})
 }
 
+// sentDatagrams records a frame sent as datagram shards (fec.go) whose last
+// shard was handed to m's path at now, from m's sent position start
+// (math.MaxUint64: unknown), as sent does, its mark at least end (0: none).
+// quic-go queues datagrams (SendDatagram returns before they are packed), so
+// m's sent position can still be short of the frame's last shard; start plus
+// the shards' bytes is a lower bound of its end (packets add their headers).
+func (w *videoWindow) sentDatagrams(m deliveryMeter, start, end uint64, now time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.inFlight(m)
+	pos, _ := m.Delivery()
+	w.marks = append(w.marks, windowMark{start: start, pos: max(pos, end), at: now, pacing: m.PacingRate()})
+}
+
 // startPos is the sent position a frame's write begins at on m's path, for
 // sent (math.MaxUint64 without a meter).
 func startPos(m deliveryMeter) uint64 {

@@ -28,7 +28,7 @@ const ICONS = {
 const DEFAULTS = {
   codec: 'auto', bitrate: 30, fps: 60, resolution: 'native', quality: 'balanced', monitor: 0,
   audio: true, audioCodec: 'opus', volume: 100, jitterMode: 'auto', jitterMs: 30,
-  renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto',
+  renderer: 'auto', pacing: 'latency', decoder: 'hardware', path: 'auto', transport: 'auto', fec: 'auto',
   upscale: 'auto', sharpness: FSR.sharpness, fsrDenoise: false, hdr: 'auto', hdrWhite: HDR_WHITE,
   mouse: 'desktop', cursor: 'local', stats: false, adaptive: true, autoFullscreen: false, latencyProbe: false,
 };
@@ -349,7 +349,7 @@ async function connect() {
   w.postMessage({
     type: 'start', canvases, present: { mode: S.present.mode }, box: S.box || stageBoxNow(), endpoints: ep,
     prefs: {
-      decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
+      decoder: prefs.decoder, path: prefs.path, transport: prefs.transport, fec: prefs.fec, adaptive: prefs.adaptive, latencyProbe: !!prefs.latencyProbe, pacing: prefs.pacing,
       skipUdpRelay: performance.now() - S.udpRelayFailedAt < 10 * 60 * 1000,
       ...upscalePrefs(), fsrInput: prefs.fsrInput, // fsrInput: diagnostics only (localStorage), see fsr1.js FSR.input
       ...hdrPrefs(), gamutP3: gamutP3(), hdrWithdrawn: S.hdrWithdrawn,
@@ -940,8 +940,9 @@ function onStats(st) {
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Loss recovery', recoveryText(v.recovery, st)),
-    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}` : '—'),
+    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fec ? ' · datagrams + FEC' : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
+    st.fec ? fecRow(st.fec, row) : null,
     ...presentRows(st, row),
     ...upscaleRows(st.renderer, row),
     ...hdrRows(st, v, row),
@@ -953,7 +954,7 @@ function onStats(st) {
     // row of its own, so the overlay (which does not scroll) keeps its height.
     row('Frames dropped', `${st.dropped} (host dropped ${st.hostDropped}) · skipped ${st.skipped} · superseded ${st.superseded ?? 0} (+${st.supersededChunks ?? 0} undecoded) · key req ${st.keyRequests}${st.thinned ? ` · thinned ${st.thinned}` : ''}`, st.dropped ? 'warn' : ''),
     st.recovered || st.recoveredByKey ? row('  recovered', `${st.recovered} by recovery frame · ${st.recoveredByKey} by key frame · ${st.recoveryDiscarded} frames waited out`) : null,
-    row('Freezes > 100 ms', st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0', st.freezes ? 'warn' : ''),
+    row('Freezes > 100 ms', `${st.freezes ? `${st.freezes} (last ${fmt(st.lastFreeze, 0)})` : '0'} · stalls > 50 ms ${st.stalls ?? 0}`, st.freezes ? 'warn' : ''),
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
@@ -966,6 +967,18 @@ function prioText(p) {
   const yes = (b) => (b ? '✓' : '✗');
   const shared = p.datagramWritables ? '' : ` · telemetry dropped ${p.telemetryDropped} of ${p.telemetrySent + p.telemetryDropped} (longest stall ${p.telemetryStallMs} ms)`;
   return `sendOrder ${yes(p.sendOrder)} · send groups ${yes(p.sendGroup)} · datagram queues ${yes(p.datagramWritables)}${shared}`;
+}
+
+// Video over datagrams (GUIDE 2.5, fec.js), once the host sent shards: frames
+// that came as datagram shards with Reed-Solomon parity this session, the
+// shards' loss before repair, frames rebuilt from parity, frames completed
+// after a NACK and frames given up. (Frame streams add no row: the overlay
+// has no room to spare in a 720 px window.)
+function fecRow(f, row) {
+  const all = f.counted + f.shardsLost; // the shards of the frames accounted (fec.js)
+  const loss = all ? (100 * f.shardsLost) / all : 0;
+  return row('  FEC', `${f.frames} frames · parity ${f.shards ? ((100 * f.parity) / f.shards).toFixed(0) : 0} % of shards · ` +
+    `loss ${loss.toFixed(2)} % · rebuilt ${f.rebuilt} · repaired ${f.repaired} (${f.nacks} NACKs) · lost ${f.lost}`, f.lost ? 'warn' : '');
 }
 
 // What a lost frame costs in this generation (VideoConfig.recovery): reference
@@ -1348,6 +1361,8 @@ function buildDrawer() {
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Pipeline'),
       field('Network path', select('path', [['auto', 'Auto (direct, then relay)'], ['direct', 'Direct to PC only'], ['relay', 'Relay via gateway']], needsReconnect)),
       field('Transport', select('transport', [['auto', 'WebTransport (QUIC), fall back to WebSocket'], ['websocket', 'WebSocket only']], needsReconnect)),
+      field('Video over datagrams', select('fec', [['auto', 'Auto (datagrams + FEC over a high round trip)'], ['off', 'Off (a stream per frame)']], needsReconnect),
+        'Over a round trip above 15 ms the host may send each frame as datagrams with Reed-Solomon parity: a lost packet is rebuilt instead of waiting for its retransmission.'),
       field('Renderer', select('renderer', [['auto', 'Auto (measured in this browser)'], ['canvas2d', '2D canvas (desynchronized)'],
         ['webgl2', 'WebGL2 (desynchronized if granted)'], ['webgpu', 'WebGPU (zero-copy)']], needsReconnect), presentHint()),
       el('button', { class: 'btn-sm', onclick: () => { storePresent(null); toast('Auto measures the renderers again on the next connection.', 'info', 3500); } }, 'Measure renderers again'),

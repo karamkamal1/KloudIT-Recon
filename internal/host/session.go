@@ -130,6 +130,10 @@ type Session struct {
 	static   staticCap
 	// roi: the encoder's regions of interest from the pointer input (roi.go).
 	roi roiFocus
+	// fec: the "datagram + FEC" video mode (fec.go); fecNacks: the client's
+	// NACKs for fecRepairs.
+	fec      fecState
+	fecNacks chan proto.FECNack
 
 	// rateChanges carries the rate controller's decisions on the client's
 	// reports from the datagram loop to rateLoop, which applies them in
@@ -219,6 +223,7 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		usage:       map[string]string{},
 		encFails:    map[string]int{},
 		rateChanges: make(chan rateChange, 16),
+		fecNacks:    make(chan proto.FECNack, 64),
 	}
 	s.log = a.log.With("session", s.id, "path", meta.Path)
 	// The direct path and the UDP relay end at the client; the splice relay
@@ -314,6 +319,7 @@ func (s *Session) run() error {
 	defer s.releasePads()
 
 	s.prefs = s.hello.Prefs
+	s.fecInit()
 	// A virtual display first: the pipeline captures it (the helper's caps
 	// list its output) and the welcome lists it. Released (removed after the
 	// linger) once the video has stopped.
@@ -335,6 +341,9 @@ func (s *Session) run() error {
 
 	go s.frameSender()
 	go s.videoEvents()
+	if s.fec.avail {
+		go s.fecRepairs()
+	}
 	if err := s.startVideo(false, ""); err != nil {
 		s.notice("error", "Could not start video: "+err.Error())
 		return err
@@ -433,6 +442,9 @@ func (s *Session) sendWelcome() error {
 	}
 	if s.a.cfg.hdr() == proto.HDRAuto {
 		w.Features = append(w.Features, proto.FeatureHDR)
+	}
+	if s.fec.avail {
+		w.Features = append(w.Features, proto.FeatureVideoFEC)
 	}
 	// The test pattern's frames carry their seq as a barcode: FFmpeg's
 	// drawbox chain, or the native helper's conversion shader.
@@ -922,7 +934,8 @@ func (s *Session) applyCongestionTarget() int64 {
 	if m == nil {
 		return 0
 	}
-	kbps := t.videoKbps + s.audioKbps.Load() + ccOverheadKbps
+	// Frames sent as shards (fec.go) carry parity and shard headers too.
+	kbps := t.videoKbps + s.fecOverheadKbps(t.videoKbps) + s.audioKbps.Load() + ccOverheadKbps
 	m.SetTarget(kbps*1000, t.frameInterval)
 	return kbps
 }
@@ -1612,12 +1625,17 @@ func (s *Session) ccCounters() ccCounters {
 		return ccCounters{}
 	}
 	st := m.Stats()
+	nonVideo := s.audioKbps.Load() + ccOverheadKbps
+	if t := s.ccTarget.Load(); t != nil {
+		nonVideo += s.fecOverheadKbps(t.videoKbps) // parity and shard headers (fec.go)
+	}
 	return ccCounters{ok: true, lost: st.LostPackets, total: st.LostPackets + st.AckedPackets, acked: st.AckedBytes,
-		nonVideoKbps: int(s.audioKbps.Load() + ccOverheadKbps)}
+		nonVideoKbps: int(nonVideo)}
 }
 
 // rateReport feeds a client's receive report to the rate controller.
 func (s *Session) rateReport(r proto.RateReport) {
+	s.fecReport(r, time.Now())
 	var comp time.Duration
 	if r.Flags&proto.RateReportFrame != 0 {
 		comp, _ = s.track.cover(r.Gen, r.LastSeq)
@@ -1816,6 +1834,12 @@ func (s *Session) frameSender() {
 			continue // left out under congestion: no loss (thin.go)
 		}
 		s.reportDiscards(0) // a frame goes out again: the run before it is complete
+		// Datagram shards (fec.go). They bypass the stream path below;
+		// sendFEC puts them through the video window (GUIDE 2.7) itself
+		// (fec.go, "Send priorities").
+		if s.useFEC() && s.sendFEC(f, n) {
+			continue
+		}
 		s.sendOpening.Store(true)
 		s.sendSince.Store(time.Now().UnixNano())
 		s.applyCongestionTarget()
@@ -2175,8 +2199,11 @@ func (s *Session) datagrams() {
 			if p := proto.Pong(d, s.a.clock()); p != nil {
 				s.sendPong(p)
 			}
-			if rtt := proto.PingMinRTT(d); rtt > 0 && s.clientRTT.Swap(int64(rtt)) != int64(rtt) {
-				s.audioFrameCheck()
+			if rtt := proto.PingMinRTT(d); rtt > 0 {
+				s.fec.rttReports.Add(1)
+				if s.clientRTT.Swap(int64(rtt)) != int64(rtt) {
+					s.audioFrameCheck()
+				}
 			}
 		case proto.DgMouseRel:
 			if m, ok := proto.ParseMouseRel(d); ok && s.a.isActive(s) {
@@ -2197,6 +2224,10 @@ func (s *Session) datagrams() {
 		case proto.DgRateReport:
 			if r, ok := proto.ParseRateReport(d); ok {
 				s.rateReport(r)
+			}
+		case proto.DgFECNack:
+			if n, ok := proto.ParseFECNack(d); ok && s.fec.avail {
+				s.fecNack(n)
 			}
 		case proto.DgFrameAck:
 			if a, ok := proto.ParseFrameAck(d); ok {
@@ -2671,6 +2702,11 @@ func (s *Session) statsLoop() {
 		}
 		args = append(args, "kbps_est", int(est), "fps_target", fpsTarget, "queue_margin_ms", margin.Milliseconds(),
 			"loss_pct", fmt.Sprintf("%.2f", loss*100))
+		// The "datagram + FEC" mode (fec.go): frames sent as shards, the
+		// parity's share of the data shards, the bytes on the wire beyond the
+		// frames' (parity, headers, repairs), the client's shard loss, NACKs
+		// and the repair shards that answered them.
+		args = append(args, s.fecStats()...)
 		s.log.Info("stream stats", args...)
 	}
 }

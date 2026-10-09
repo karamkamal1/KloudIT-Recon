@@ -137,6 +137,29 @@ func TestConfigPipeline(t *testing.T) {
 	}
 }
 
+func TestConfigFEC(t *testing.T) {
+	dir := t.TempDir()
+	load := func(json string) (*Config, error) {
+		p := filepath.Join(dir, "host.json")
+		if err := os.WriteFile(p, []byte(json), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load(`{}`)
+	if err != nil || c.fec() != FECAuto {
+		t.Fatalf("default: %v %q", err, c.fec())
+	}
+	for _, m := range []string{FECAuto, FECOn, FECOff} {
+		if c, err := load(`{"fec":"` + m + `"}`); err != nil || c.fec() != m {
+			t.Fatalf("%s: %v", m, err)
+		}
+	}
+	if _, err := load(`{"fec":"always"}`); err == nil || !strings.Contains(err.Error(), "fec") {
+		t.Fatalf("unknown fec: %v", err)
+	}
+}
+
 func TestConfigVirtualDisplay(t *testing.T) {
 	dir := t.TempDir()
 	load := func(json string) (*Config, error) {
