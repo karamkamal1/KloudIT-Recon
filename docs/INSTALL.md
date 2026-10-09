@@ -226,7 +226,8 @@ Sessions use the backend by themselves where the GPU has no AMF or NVENC encoder
 before FFmpeg's command line); `host.log` says so at start (`native encoder helper installed
 ... libavcodec=libraries in C:\Program Files\KlouditRecon\ffmpeg-lgpl`) and per session
 (`video pipeline pipeline=helper backend=lavc ...`). Libraries kept elsewhere: set
-`"helperFFmpegDir"` in `host.json`; `"helperLibavcodec": "off"` keeps sessions on FFmpeg's
+`"helperFFmpegDir"` in `host.json` to a folder only administrators can change (the elevated
+agent ignores any other); `"helperLibavcodec": "off"` keeps sessions on FFmpeg's
 command line instead. Run `recon-host.exe qualify` once afterwards (see the README) so
 bitrate changes need no key frame where Quick Sync allows it.
 

@@ -141,7 +141,10 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 		media.LogGPUHost(log)
 	}
-	ff, err := media.FindFFmpeg(cfg.FFmpeg)
+	ff, skipped, err := cfg.FindFFmpeg()
+	if skipped != nil {
+		log.Warn(`host config "ffmpeg" ignored`, "err", skipped)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg not found (install FFmpeg 7.1+ or set \"ffmpeg\" in the config): %w", err)
 	}

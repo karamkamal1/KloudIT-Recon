@@ -329,24 +329,33 @@ func (c *Config) libavcodecOn() bool { return c.HelperLibavcodec != libavcodecOf
 
 // helperFFmpegDir returns the directory the helper's libavcodec backend loads
 // FFmpeg's shared libraries from, for an agent installed in installDir:
-// helperFFmpegDir, relative to installDir, by default ffmpeg-lgpl there.
-func (c *Config) helperFFmpegDir(installDir string) string {
+// helperFFmpegDir, relative to installDir, by default ffmpeg-lgpl there. The
+// helper loads them whatever backend it runs (it reports them in its caps),
+// so an elevated agent replaces a directory checkCodePath refuses with the
+// default (refused says why).
+func (c *Config) helperFFmpegDir(installDir string) (dir string, refused error) {
+	def := filepath.Join(installDir, encoder.LavcDirName)
 	d := c.HelperFFmpegDir
 	if d == "" {
-		d = encoder.LavcDirName
+		return def, nil
 	}
 	if !filepath.IsAbs(d) {
 		d = filepath.Join(installDir, d)
 	}
-	return filepath.Clean(d)
+	d = filepath.Clean(d)
+	if refused = checkCodePath(d, installDir); refused != nil {
+		return def, refused
+	}
+	return d, nil
 }
 
 // LibavcodecDir is the directory of the helper's libavcodec libraries for
-// this executable (recon-host qualify runs the helper with it, as sessions do).
-func (c *Config) LibavcodecDir() string {
-	dir := "."
-	if exe, err := os.Executable(); err == nil {
-		dir = filepath.Dir(exe)
+// this executable (recon-host qualify runs the helper with it, as sessions
+// do), and why a configured one was refused.
+func (c *Config) LibavcodecDir() (string, error) {
+	dir := exeDir()
+	if dir == "" {
+		dir = "."
 	}
 	return c.helperFFmpegDir(dir)
 }

@@ -47,7 +47,11 @@ func ProbeHelper(ctx context.Context, cfg *Config, w io.Writer) bool {
 		return false
 	}
 	dir := filepath.Dir(self)
-	return probeHelper(ctx, cfg, filepath.Join(dir, helperExeName), cfg.helperFFmpegDir(dir), w)
+	ffDir, refused := cfg.helperFFmpegDir(dir)
+	if refused != nil {
+		fmt.Fprintf(w, "helper:     host config \"helperFFmpegDir\" ignored: %v\n", refused)
+	}
+	return probeHelper(ctx, cfg, filepath.Join(dir, helperExeName), ffDir, w)
 }
 
 // probeHelper is ProbeHelper for the helper exe, whose libavcodec backend

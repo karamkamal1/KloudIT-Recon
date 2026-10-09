@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 )
 
 // guidDevClassDisplay is GUID_DEVCLASS_DISPLAY (the Display adapters class
@@ -238,7 +240,7 @@ func vddCheckPrivate(paths ...string) error {
 			var sd *windows.SECURITY_DESCRIPTOR
 			sd, err = windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 			if err == nil {
-				err = checkPrivateSD(sd)
+				err = platform.CheckPrivateSD(sd)
 			}
 		}
 		if err != nil {
@@ -247,79 +249,6 @@ func vddCheckPrivate(paths ...string) error {
 		}
 	}
 	return nil
-}
-
-// fileWriteRights are the rights that let a holder change a file or folder,
-// its contents (a folder's FILE_ADD_FILE/FILE_ADD_SUBDIRECTORY are
-// FILE_WRITE_DATA/FILE_APPEND_DATA) or its ACL.
-const fileWriteRights = windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | fileDeleteChild |
-	windows.FILE_WRITE_ATTRIBUTES | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE | windows.GENERIC_ALL
-
-const fileDeleteChild = 0x40 // FILE_DELETE_CHILD
-
-// trustedInstallerSID is NT SERVICE\TrustedInstaller.
-const trustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
-
-// privilegedSID: Administrators, SYSTEM, TrustedInstaller, or a placeholder
-// for the owner (CREATOR OWNER, OWNER RIGHTS), which must be one of these.
-func privilegedSID(s *windows.SID) bool {
-	return s.IsWellKnown(windows.WinBuiltinAdministratorsSid) || s.IsWellKnown(windows.WinLocalSystemSid) ||
-		s.IsWellKnown(windows.WinCreatorOwnerSid) || s.IsWellKnown(windows.WinCreatorOwnerRightsSid) ||
-		s.String() == trustedInstallerSID
-}
-
-// checkPrivateSD checks a file's or folder's owner and DACL for
-// vddCheckPrivate. Inherit-only ACEs count too: they become the ACL of the
-// files created in a folder.
-func checkPrivateSD(sd *windows.SECURITY_DESCRIPTOR) error {
-	owner, _, err := sd.Owner()
-	if err != nil || owner == nil {
-		return fmt.Errorf("no owner (%v)", err)
-	}
-	if owner.IsWellKnown(windows.WinCreatorOwnerSid) || owner.IsWellKnown(windows.WinCreatorOwnerRightsSid) || !privilegedSID(owner) {
-		return fmt.Errorf("owned by %s", sidName(owner))
-	}
-	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil {
-		return errors.New("no DACL: everyone has full access")
-	}
-	for i := uint16(0); i < dacl.AceCount; i++ {
-		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, uint32(i), &ace); err != nil {
-			return fmt.Errorf("ACE %d: %w", i, err)
-		}
-		switch ace.Header.AceType {
-		case windows.ACCESS_ALLOWED_ACE_TYPE, aceTypeAllowedCallback:
-		case windows.ACCESS_DENIED_ACE_TYPE, aceTypeDeniedObject, aceTypeDeniedCallback, aceTypeDeniedCallbackObject:
-			continue
-		default:
-			return fmt.Errorf("ACE %d has type %d", i, ace.Header.AceType)
-		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-		if uint32(ace.Mask)&fileWriteRights != 0 && !privilegedSID(sid) {
-			return fmt.Errorf("%s may change it (access mask %#x)", sidName(sid), uint32(ace.Mask))
-		}
-	}
-	return nil
-}
-
-// ACE types beyond the two x/sys names (winnt.h).
-const (
-	aceTypeDeniedObject         = 6
-	aceTypeAllowedCallback      = 9 // same layout as ACCESS_ALLOWED_ACE up to SidStart
-	aceTypeDeniedCallback       = 10
-	aceTypeDeniedCallbackObject = 12
-)
-
-// sidName is DOMAIN\name, else the SID string.
-func sidName(s *windows.SID) string {
-	if account, domain, _, err := s.LookupAccount(""); err == nil {
-		if domain != "" {
-			return domain + `\` + account
-		}
-		return account
-	}
-	return s.String()
 }
 
 func (d *vdd) Plug(m Mode, _ monitorID, _ LUID) (plug, error) {

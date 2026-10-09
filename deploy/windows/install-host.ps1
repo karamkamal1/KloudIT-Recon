@@ -30,7 +30,9 @@
   Administrators, users read and run), with everything already in it; a folder that is or
   holds a link (junction, symbolic link) is refused.
 .PARAMETER FFmpegPath
-  Use an existing ffmpeg.exe (FFmpeg 7.1+; 8.1+ recommended, older builds lack gfxcapture).
+  Use an existing ffmpeg.exe (FFmpeg 7.1+; 8.1+ recommended, older builds lack gfxcapture). The
+  agent runs elevated and runs it only from a folder that only administrators can change, such
+  as Program Files.
 .PARAMETER DirectPort
   UDP port for direct LAN connections from the browser (0 disables the direct path). The
   default, 48100, stays clear of Sunshine's and Apollo's ports (47984-48010). Earlier versions
@@ -227,6 +229,12 @@ foreach ($f in 'recon-host.exe', 'recon-hostw.exe', 'recon-encoder.exe', 'instal
 if ($FFmpegPath) {
     if (-not (Test-Path $FFmpegPath)) { throw "FFmpeg not found at $FFmpegPath" }
     $ffmpeg = (Resolve-Path $FFmpegPath).Path
+    # The agent runs elevated, so it runs FFmpeg only from its own folder or a folder only
+    # administrators can change (it checks the owner and ACL), else it ignores this path.
+    $inInstallDir = $ffmpeg.StartsWith([IO.Path]::GetFullPath($InstallDir).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+    if (-not $inInstallDir -and -not (Test-InProgramFiles (Split-Path $ffmpeg))) {
+        Write-Warning "The agent runs FFmpeg only from a folder that only administrators can change (Program Files, or one with such an ACL), and otherwise ignores $ffmpeg (host.log: host config `"ffmpeg`" ignored). Without -FFmpegPath the installer puts FFmpeg into $InstallDir."
+    }
 } else {
     $ffDir = Join-Path $InstallDir 'ffmpeg'
     $ffmpeg = Join-Path $ffDir 'bin\ffmpeg.exe'

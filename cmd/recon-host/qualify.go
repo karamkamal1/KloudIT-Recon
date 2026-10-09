@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host"
-	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/qualify"
 )
 
@@ -45,7 +44,11 @@ func qualifyCmd(cfg *host.Config, cfgPath string, args []string) int {
 	fs.StringVar(&o.WorkDir, "dir", "", "directory for the streams and logs (default qualify-<time> next to the config)")
 	fs.BoolVar(&o.Keep, "keep", false, "keep the encoded streams (about 250 MB per run at the defaults)")
 	ffmpeg := fs.String("ffmpeg", "", "ffmpeg (5.1+) for the decode and barcode checks (default: as the agent finds it)")
-	fs.StringVar(&o.FFmpegDir, "ffmpeg-dir", cfg.LibavcodecDir(), "where the libavcodec backend loads FFmpeg's shared libraries from (host config helperFFmpegDir)")
+	lavcDir, refused := cfg.LibavcodecDir()
+	if refused != nil {
+		fmt.Fprintln(os.Stderr, `warning: host config "helperFFmpegDir" ignored:`, refused)
+	}
+	fs.StringVar(&o.FFmpegDir, "ffmpeg-dir", lavcDir, "where the libavcodec backend loads FFmpeg's shared libraries from (host config helperFFmpegDir)")
 	fs.StringVar(&o.NvencTestDLL, "nvenc-test-dll", "", "tests: run the NVENC backend against this test double (recon-fake-nvenc.dll)")
 	fs.StringVar(&o.LavcTestEncoder, "lavc-test-encoder", "", "tests: run the libavcodec backend (-backend lavc) with these FFmpeg software encoders, e.g. libx264")
 	helperArgs := fs.String("helper-args", "", "tests: extra helper arguments for every run, space separated (e.g. --mock-rate-lag=5)")
@@ -80,7 +83,11 @@ change. Stop streaming sessions first.
 	}
 	o.FFmpeg = *ffmpeg
 	if o.FFmpeg == "" {
-		if ff, err := media.FindFFmpeg(cfg.FFmpeg); err == nil {
+		ff, skipped, err := cfg.FindFFmpeg()
+		if skipped != nil {
+			fmt.Fprintln(os.Stderr, `warning: host config "ffmpeg" ignored:`, skipped)
+		}
+		if err == nil {
 			o.FFmpeg = ff
 		} else {
 			fmt.Fprintln(os.Stderr, "warning: no ffmpeg, the decode and barcode checks are skipped:", err)

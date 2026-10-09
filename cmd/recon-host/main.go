@@ -116,7 +116,10 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		ff, err := media.FindFFmpeg(cfg.FFmpeg)
+		ff, skipped, err := cfg.FindFFmpeg()
+		if skipped != nil {
+			fmt.Printf("warning: host config \"ffmpeg\" ignored: %v\n", skipped)
+		}
 		if err != nil {
 			fatal(fmt.Errorf("ffmpeg not found: %w", err))
 		}

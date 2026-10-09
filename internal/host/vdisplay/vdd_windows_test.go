@@ -11,38 +11,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// TestCheckPrivateSD: the settings folder check accepts the ACL the agent and
-// the installer set and refuses one that lets non-administrators change the
-// folder or the files created in it.
-func TestCheckPrivateSD(t *testing.T) {
-	for _, c := range []struct {
-		sddl string
-		why  string // "" = accepted
-	}{
-		{"O:BA" + vddDirSDDL, ""},
-		{"O:SY" + vddDirSDDL, ""},
-		{"O:BAD:P(D;;FA;;;WD)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)(A;;FA;;;" + trustedInstallerSID + ")", ""},
-		// A folder created under C:\ without an explicit ACL: Authenticated
-		// Users' Modify inherited from the drive root.
-		{"O:BAD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)(A;OICIID;0x1200a9;;;BU)(A;ID;0x1301bf;;;AU)(A;OICIIOID;SDGXGWGR;;;AU)", "may change it"},
-		// Inherit-only: the ACL of the files the agent creates in it.
-		{"O:BAD:P(A;OICI;FA;;;BA)(A;OICIIO;GW;;;BU)", "may change it"},
-		{"O:BAD:P(A;OICI;FA;;;BA)(A;;WD;;;WD)", "may change it"},
-		{"O:BUD:P(A;OICI;FA;;;BA)", "owned by"},
-		{"O:CO" + vddDirSDDL, "owned by"},
-		{"O:BA", "no DACL"},
-	} {
-		sd, err := windows.SecurityDescriptorFromString(c.sddl)
-		if err != nil {
-			t.Fatalf("%s: %v", c.sddl, err)
-		}
-		err = checkPrivateSD(sd)
-		if c.why == "" && err != nil || c.why != "" && (err == nil || !strings.Contains(err.Error(), c.why)) {
-			t.Errorf("%s: %v, want %q", c.sddl, err, c.why)
-		}
-	}
-}
-
 // TestCreatePrivateDir: the folder the agent creates passes its own check
 // (on Windows; under Wine only where the file system keeps security
 // descriptors).

@@ -210,6 +210,7 @@ func TestConfigVirtualDisplay(t *testing.T) {
 // helperFFmpegDir (default ffmpeg-lgpl next to recon-host.exe; relative to
 // that directory).
 func TestConfigLibavcodec(t *testing.T) {
+	notElevated(t) // TestHelperFFmpegDirElevated has the elevated agent
 	dir := t.TempDir()
 	load := func(json string) (*Config, error) {
 		p := filepath.Join(dir, "host.json")
@@ -219,18 +220,25 @@ func TestConfigLibavcodec(t *testing.T) {
 		return LoadConfig(p)
 	}
 	install := filepath.Join(dir, "KlouditRecon")
+	hd := func(c *Config) string {
+		d, err := c.helperFFmpegDir(install)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
 	c, err := load(`{}`)
-	if err != nil || !c.libavcodecOn() || c.helperFFmpegDir(install) != filepath.Join(install, "ffmpeg-lgpl") {
-		t.Fatalf("defaults: %v on %v dir %q", err, c.libavcodecOn(), c.helperFFmpegDir(install))
+	if err != nil || !c.libavcodecOn() || hd(c) != filepath.Join(install, "ffmpeg-lgpl") {
+		t.Fatalf("defaults: %v on %v dir %q", err, c.libavcodecOn(), hd(c))
 	}
 	if c, err = load(`{"helperLibavcodec":"off","helperFFmpegDir":"libs/ffmpeg"}`); err != nil || c.libavcodecOn() ||
-		c.helperFFmpegDir(install) != filepath.Join(install, "libs", "ffmpeg") {
-		t.Fatalf("off, relative dir: %v on %v dir %q", err, c.libavcodecOn(), c.helperFFmpegDir(install))
+		hd(c) != filepath.Join(install, "libs", "ffmpeg") {
+		t.Fatalf("off, relative dir: %v on %v dir %q", err, c.libavcodecOn(), hd(c))
 	}
 	abs := filepath.Join(dir, "ffmpeg-8.1")
 	if c, err = load(`{"helperLibavcodec":"auto","helperFFmpegDir":` + strconv.Quote(abs) + `}`); err != nil || !c.libavcodecOn() ||
-		c.helperFFmpegDir(install) != abs {
-		t.Fatalf("auto, absolute dir: %v dir %q", err, c.helperFFmpegDir(install))
+		hd(c) != abs {
+		t.Fatalf("auto, absolute dir: %v dir %q", err, hd(c))
 	}
 	if _, err := load(`{"helperLibavcodec":"on"}`); err == nil || !strings.Contains(err.Error(), "helperLibavcodec") {
 		t.Fatalf("bad value: %v", err)

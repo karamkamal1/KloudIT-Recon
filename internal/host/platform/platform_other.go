@@ -32,3 +32,10 @@ func (*Gamepads) Close()                {}
 
 // RaisePriority is a no-op outside Windows.
 func RaisePriority() {}
+
+// Elevated is false outside Windows: the agent runs elevated only from the
+// Windows logon task.
+func Elevated() bool { return false }
+
+// AdminOnly is unsupported outside Windows.
+func AdminOnly(string) error { return ErrUnsupported }

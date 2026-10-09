@@ -91,6 +91,8 @@ function freeUdpPort() {
 // Optional: run the host agent through a wrapper, e.g. the Windows build under Wine:
 //   E2E_HOST_BIN=dist/host-windows-amd64/recon-host.exe
 //   E2E_HOST_CMD='["xvfb-run","-a","/usr/lib/wine/wine64"]'  E2E_HOST_FFMPEG=/path/to/ffmpeg.exe
+// Under Wine the agent runs elevated, so it runs only an ffmpeg.exe inside its own folder
+// (dist/host-windows-amd64/ffmpeg/bin/ffmpeg.exe): Wine reports every file as the user's.
 const hostCmd = process.env.E2E_HOST_CMD ? JSON.parse(process.env.E2E_HOST_CMD) : [];
 const hostBin = process.env.E2E_HOST_BIN ? join(root, process.env.E2E_HOST_BIN) : null;
 const nativeInputLog = !hostBin; // the logging input backend only exists on non-Windows hosts

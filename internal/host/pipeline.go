@@ -57,7 +57,10 @@ func (a *Agent) setupHelper() {
 			a.helperMissing = helperExeName + " is not installed next to recon-host: " + err.Error()
 			break
 		}
-		ffDir := a.cfg.helperFFmpegDir(dir)
+		ffDir, refused := a.cfg.helperFFmpegDir(dir)
+		if refused != nil {
+			a.log.Warn(`host config "helperFFmpegDir" ignored`, "err", refused, "using", ffDir)
+		}
 		a.lavcMissing = encoder.LavcMissing(ffDir)
 		a.launchHelper = func(log *slog.Logger, backend string) (*encoder.Helper, error) {
 			return encoder.Launch(encoder.Options{Exe: exe, Backend: backend, FFmpegDir: ffDir, Log: log, CapsTimeout: 5 * time.Second})

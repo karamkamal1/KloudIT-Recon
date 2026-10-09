@@ -9375,3 +9375,62 @@ sign-in) are unchanged.
 - Not GPU-specific: no AMD or NVIDIA check. Browser check: sign in, then open
   `https://<gateway>/login?next=/%5Cexample.com` in Chrome, Edge, Firefox and Safari: each lands
   on the gateway's dashboard, not example.com.
+
+### FFmpeg and its libraries only from places administrators control
+
+Problem: the logon task runs the agent elevated (`RunLevel Highest`), but it reads
+`%APPDATA%\KlouditRecon\host.json`, which the user owns: any program the user runs can change it
+without elevation. `helperFFmpegDir` took any absolute path, and every helper start passes it as
+`--ffmpeg-dir`; the helper loads `avutil-60.dll` and `avcodec-62.dll` from there to report the
+libavcodec backend in its caps, on AMD and NVIDIA hosts too and with `"helperLibavcodec": "off"`.
+`ffmpeg` names the executable the agent runs. Either way a DLL or executable planted by a
+non-elevated program ran with the agent's elevated token on the next stream: a silent,
+persistent UAC bypass. The PATH search for FFmpeg had the same weakness (the user's PATH).
+
+Fix: an elevated agent (`internal/host/codepath.go`) runs FFmpeg and gives the helper a library
+folder only from its install folder (which install-host.ps1 restricts to administrators, as it
+does for `recon-host.exe`) or from a local path `platform.AdminOnly` accepts: the file or folder,
+the folder it is in and, for a folder, the files in it are owned by Administrators, SYSTEM or
+TrustedInstaller with no write, delete or permission rights for anyone else (the check the
+Virtual Display Driver folder already had, moved to `platform`); no folder above gives anyone
+else the right to rename or delete its entries (adding new ones is allowed: C:\ lets users
+create folders); no component is a link; the path exists. A configured `ffmpeg` that fails is
+ignored for the default search (next to recon-host.exe, then PATH, checked the same way), a
+`helperFFmpegDir` for `ffmpeg-lgpl` in the install folder; host.log says `host config "ffmpeg"
+ignored` / `host config "helperFFmpegDir" ignored` with the reason, and `recon-host probe` and
+`qualify` print it. `install-host.ps1 -FFmpegPath` warns when the path is outside the install
+folder and Program Files. Without an elevated token nothing is checked.
+
+Not done: a High mandatory label on the config folder, which the review offered as the
+alternative. It would stop the user from editing `host.json` and running `recon-host qualify`
+(which writes `live-bitrate.json` next to it) without elevation.
+
+- Verified here (no Windows): `internal/host` `TestCheckCodePath`, `TestHelperFFmpegDirElevated`
+  and `TestFindFFmpegElevated` (elevation and the ACL check replaced by test doubles: a configured
+  path outside the admin folder is skipped, PATH entries are checked too, the install folder and
+  relative paths inside it are accepted, `..` out of it is not). `internal/host/platform`
+  `TestCheckPrivateSD` and `TestCheckAncestorSD` (security descriptors from SDDL: the Program
+  Files and drive-root ACLs pass, a folder created under C:\ with inherited Authenticated Users
+  Modify, FILE_DELETE_CHILD or WRITE_DAC for users, or a user owner fail) and `TestAdminOnly`
+  (a file and folder in the user's temp folder, a missing path and a UNC path are refused), run
+  under Wine; `GOOS=windows go vet`. Wine's processes count as elevated, so the Windows
+  `recon-host.exe probe` under Wine runs the real check: with `"ffmpeg"` pointing at the FFmpeg
+  8.1 build in the scratch folder it printed `warning: host config "ffmpeg" ignored: ...
+  owned by VM\root` and stopped (no other FFmpeg next to it or on PATH); with the same
+  ffmpeg.exe copied to `ffmpeg\bin` next to recon-host.exe it probed that one without a
+  warning. `make helper-test` under Wine passes (the session tests on the mock helper use the
+  default library folder).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with the agent installed by install-host.ps1 (default
+  folder) and `-InstallLibavcodec`, from a normal (not elevated) PowerShell: copy
+  `C:\Program Files\KlouditRecon\ffmpeg-lgpl` to `%USERPROFILE%\lavc`, set `"helperFFmpegDir":
+  "C:\\Users\\<you>\\lavc"` in host.json, restart the agent: host.log has `host config
+  "helperFFmpegDir" ignored ... may change it` and `native encoder helper installed ...
+  libavcodec=libraries in C:\Program Files\KlouditRecon\ffmpeg-lgpl`; a stream starts on the AMF
+  helper as before. Then set `"ffmpeg"` to a copy of ffmpeg.exe in `%USERPROFILE%`: `host config
+  "ffmpeg" ignored`, `probing ffmpeg ... ffmpeg=C:\Program Files\KlouditRecon\ffmpeg\bin\ffmpeg.exe`.
+  Then copy FFmpeg to `C:\Program Files\FFmpeg\bin` from an elevated prompt and point `ffmpeg`
+  there: no warning, `probing ffmpeg ... ffmpeg=C:\Program Files\FFmpeg\bin\ffmpeg.exe`. Run
+  `recon-host.exe probe` (elevated and not): the elevated one prints the same warnings, the
+  other none. Put host.json back.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test, with the NVENC
+  helper).

@@ -130,6 +130,16 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   there only when the folder and the files it writes are not links (reparse points), are owned by
   Administrators, SYSTEM or TrustedInstaller, and give no one else write, delete or permission
   rights; otherwise it refuses and names the `icacls` command that fixes the folder.
+- The logon task runs the agent elevated, but `host.json` and the user's PATH belong to the user,
+  and any program the user runs can change them without elevation. The elevated agent therefore
+  runs FFmpeg (`ffmpeg`, else next to it or on PATH) and has the helper load FFmpeg's libraries
+  (`helperFFmpegDir`) only from its install folder (Program Files, or a folder the installer
+  restricts to administrators, as for `recon-host.exe` itself) or from a local folder only
+  administrators can change: the file or folder, the folder it is in and, for a folder, the
+  files in it pass the check above, no folder above lets anyone else rename or delete its
+  entries, and no part is a link. A configured path that fails is ignored for the default
+  (`host config "ffmpeg" ignored` in host.log); without an elevated token (a standard user's
+  agent) nothing is checked, since nothing is gained.
 
 ## Gateway hardening (systemd)
 
