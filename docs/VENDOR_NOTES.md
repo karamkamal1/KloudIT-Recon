@@ -17,182 +17,20 @@ Status legend:
 
 ## Hardware test plan (start here)
 
-The sections after this one follow the order in which the steps were built, and each lists its
-own checks. Some early checks describe behaviour that later steps replaced: they are marked
+The order in which to run these checks on the RX 7900 XT, and then on an NVIDIA host, is
+[HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md) ("the hardware test plan" in the lines below; its
+stages are numbered 1-16). It starts with the FFmpeg pipeline, then the native helper by itself,
+streams on the helper, loss recovery, `recon-host qualify`, latency and the browser matrix,
+relay / WAN and rate control, FEC, the virtual display, HDR, FSR, the Phase 5 features, the soak,
+security and uninstalling, and gives each item's setting or command, what to look at, its pass
+criterion (the acceptance matrix T1-T10 of GUIDE 13 is in it too) and what to send back. It also
+has "The agent by hand, for a test hook", which the checks that set `RECON_TEST_FAULTS` refer to.
+
+The sections below follow the order in which the steps were built, and each lists its own
+checks in full. Some early checks describe behaviour that later steps replaced: they are marked
 **Superseded** (run the newer check named there) or **FFmpeg path only** (run them with
-`"pipeline": "ffmpeg"`). This plan is the order to run everything on the RX 7900 XT, and on an
-NVIDIA host when there is one: each stage needs the ones before it. Every item of the "Final
-review: ..." sections at the end with a check on hardware or a real client is in a stage too.
-Out of scope on the RX 7900 XT: the `Intel (...)` lines of 3.8 and 3.8 wiring, which need an
-Intel host (their AMD lines are in stages 1 and 4). Use the default `host.json` unless a stage
-says otherwise, edit it with the agent stopped or restart the agent afterwards
-(`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`), and put
-it back after the stage. `"logLevel": "debug"` adds the debug lines some checks read (`ffmpeg
-args`, `rate report decision`, `congestion: bitrate kept`), and every change of the rate
-controller: at the default level `congestion: lowering bitrate` and `bitrate recovery: raising
-bitrate` come at most once per 10 s per direction (a frame-rate step always), with `suppressed=N`
-counting the changes in between, and `changing the bitrate in the encoder` only at debug level
-(final review, "Final review: host agent"); on FFmpeg, a rate change's `restarting video`,
-`starting encoder` and `encoder ready` are debug lines too. Run every check that counts or
-times rate changes with `"logLevel": "debug"`. Record each result in its check's
-line (status legend above), with the driver and Chrome versions. NVIDIA runs the same stages
-with the `NVIDIA:` lines and section 3.4 (driver 570 or newer).
-
-**The agent by hand, for a test hook.** Checks that set `RECON_TEST_FAULTS` (a test hook the
-agent reads from its environment) need the agent started from a PowerShell window, since a
-`$env:` variable never reaches the logon task; and an agent started by hand writes host.log only
-with `-log` (before `run`). In an administrator PowerShell (the task's agent runs elevated too;
-an elevated agent writes its log only in a folder only administrators can change, such as the
-one install-host.ps1 made for its log, and otherwise says `log file ... not used`):
-
-```powershell
-Stop-ScheduledTask 'KloudIT Recon Host'
-$env:RECON_TEST_FAULTS = 'drop=every:300'   # the value the check names
-& "$env:ProgramFiles\KlouditRecon\recon-host.exe" -log "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" run
-```
-
-The window shows the log as well. Run the test, stop the agent with Ctrl+C, close the window
-(the variable goes with it) and `Start-ScheduledTask 'KloudIT Recon Host'`. A check that sums
-host.log lines over a run (T5) gives each run its own file instead: `-log
-"$env:ProgramData\KlouditRecon\$env:USERNAME\t5-faults.log"`, and searches that file.
-
-0. **Host setup** (GUIDE 12; INSTALL.md step 8, "On the PC, for the best results"): current
-   Adrenalin; Instant Replay, Record & Stream, Radeon Chill and Radeon Boost off; Windows power
-   mode Best performance; games in borderless fullscreen; the PC wired. The gateway as INSTALL.md
-   steps 2-5 build it (container 210), `netem.sh` on the Proxmox node (0.4), a client with a
-   120 Hz screen and current Chrome (also Edge, Firefox and Safari for T10).
-1. **Install and probe** (INSTALL.md steps 6-7): the installer's `Detected capabilities` show
-   `encoder:    hevc_amf ...` (1.1) and `helper:     amf    hevc,av1,h264 ...` with no
-   warning ("Final review: deploy and install", helper probe). Checks: 1.1 (probe), 1.8; from
-   "Final review: deploy and install" also: the FFmpeg checksum line, a custom
-   install folder (`-InstallDir C:\Recon`, then reinstall to Program Files), the logon task's
-   agent started again after a crash (`-restart`), and upgrades keeping the direct path's port;
-   3.8's AMD line (with `-InstallLibavcodec`, `--print-caps` still picks `amf`). "Final review:
-   host agent, second round": the elevated agent writes nothing in folders the user owns, its
-   steps 1-3 (the ProgramData folder's ACL, the logon task's `-log`, no write from a PowerShell
-   that is not elevated; steps 4 and 5 in stage 8).
-2. **The helper by itself**: `recon-encoder.exe --print-caps --backend=amf` and the self-tests
-   (`--self-test-convert`, `--self-test-pacer`, `--self-test-encoder`, `--gpu-priority-table`):
-   3.2, 3.3 (AMD), 3.4 (NVIDIA, also `--self-test-nvenc`); the native integration tests of 3.1
-   (not its first two `--print-caps` checks: superseded); "Final review: native encoder helper,
-   third round", the AMF hang check (`TestHelperIntegrationAMFStall`, Go on the PC).
-3. **Qualify** (T7): `recon-host.exe qualify` with no stream running, about 70 minutes (3.6,
-   and "Final review: host agent, third round": its streams have the session's temporal
-   layers). Streams use its `live-bitrate.json`, so run it before stages 5-7, and again after a
-   driver update or a change of host config `svc`.
-4. **Basic streams on the helper**: HEVC, then AV1 (2560x1440; at 1920x1080 RDNA3 needs 64x16
-   alignment: 1.7, T9), then H.264, from a game: the overlay's Encoder row reads
-   `hevc_amf_helper` and host.log `video pipeline pipeline=helper backend=amf`. Checks: 3.1b,
-   1.7 (on the helper, then with `"pipeline": "ffmpeg"`), "Final review: host agent, third
-   round" (the AV1 alignment guard on the helper),
-   3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
-   4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
-   upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
-   connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard and its
-   sections, names and hints with Narrator, the settings after a failed connection, a saved
-   codec another PC does not offer, long text through "Type text on the host" (100 KB into
-   Notepad on the PC), the paste dialog by keyboard and with Narrator, a WebGL2 context that
-   does not come back (Renderer WebGL2, then `chrome://gpucrash`), the dashboard with Narrator
-   and the keyboard). "Final review: host agent, second round": the local cursor after starting
-   with the cursor in the video, controller input only from the active session (ViGEmBus, two
-   browsers signed in as two users), captureTimestamps "off" on the helper. With
-   `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
-   `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
-   8) and "Final review: deploy and install", README's `capture` row. "Final review: host
-   agent": the direct path's port next to Sunshine or Apollo (Moonlight streams while the agent
-   runs), a takeover between two clients on Wi-Fi, tickets with the PC's clock 5 minutes ahead
-   of the gateway's, and nothing encoding while the tab is hidden. 3.8 wiring's AMD lines (no regression
-   with `-InstallLibavcodec`; a second AMD GPU and a forced helper encoder where the PC has an
-   iGPU). "Final review: native encoder helper, third round": 4K key frames at 250 Mbit/s and
-   the ring's slot size (a 3840x2160 monitor). Latency: T1 with 0.2's 10-minute latency test
-   (the same scene through Moonlight and Sunshine for the comparison), T2 with the 0.3 rig.
-   Every rig measurement (0.3, 4.3, 4.4, FSR) runs with `"virtualDisplay": "off"`
-   (LATENCY_RIG.md, rules for a fair comparison): a virtual display would put the stream on a
-   monitor that neither `flash.html` nor the host sensor is on.
-5. **Loss recovery** (Network path "Relay via gateway", netem as in 0.4): 3.5 (T5, `wifi`), 2.3
-   (T3, T4), 2.4, 2.5 (datagram + FEC under `wan`; the overlay's Transport row then ends in
-   `· datagrams + FEC`). From the final review: "Final review: host agent", datagram + FEC with
-   reference recovery (a held shard frame released after a loss) and a failed control write
-   ending the session (the client reconnects); "Final review: deploy and
-   install", the Transport row and FEC under `wan`; "Final review: RESET_STREAM_AT boundary
-   after the peer's STOP_SENDING" (its `go test` on the PC, where Go is installed).
-6. **Rate control**: 2.1 (media against reno under the four 0.4 profiles, relay and direct; its
-   pacing-cost check is superseded by 2.2), 2.2 (T6 under `capdrop`; its frame-rate ladder
-   check), 2.6 (the UDP relay), 2.7 (send priorities), with `"logLevel": "debug"`. 1.5's checks
-   are superseded by 2.2. "Final review: host agent", rate changes no longer filling host.log
-   (at the default `logLevel`).
-7. **Phase 5 features**: Phase 5 (helper features), Phase 5 wiring A (temporal SVC thinning, FPS
-   before resolution, static desktop), Phase 5 wiring B (regions of interest, dedicated engine,
-   re-encode, slice output). "Final review: host agent, third round": a late discardable frame
-   is no loss (under `capdrop`). "Final review: host agent, second round": thinning after the
-   switch to datagram + FEC (under `wan`).
-8. **Virtual display and HDR**: 3.7 and 3.7 wiring (with the Virtual Display Driver, then
-   SudoVDA), and "Final review: deploy and install", what the virtual display does after
-   `-InstallVirtualDisplay`; 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode), and
-   "Final review: AMD Direct Capture sRGB and 10-bit surfaces", its 10-bit HDR check (the PQ
-   assumption), and "Final review: AMD Direct Capture follows Windows HDR". "Final review: host
-   agent, second round": the elevated agent writes nothing in folders the user owns, its steps 4
-   and 5 (the restore journal in the ProgramData folder, none read next to host.json).
-9. **Soak (T8) on the default pipeline**:
-   - AMD RDNA3 (RX 7900 XT): unverified. Test: default host.json (after stage 3), a GPU-bound
-     game at 2560x1440 120 fps, HEVC, 50 Mbit/s, on `lan` (direct path), one stream for 2 hours.
-     Pass: no driver timeout (Event Viewer > Windows Logs > System: no Display event 4101, no
-     WHEA errors); host.log has no `encoder helper failed`, `encoder helper error` or
-     `video pipeline pipeline=ffmpeg ... was=helper` line, and its `stream stats` fps stays
-     steady to the end, and no `did not finish frame` (a false encoder hang, "Final review:
-     native encoder helper, third round"); the overlay's Freezes count does not grow steadily;
-     the working set of `Get-Process recon-encoder,recon-host | Select-Object Name,WS` at 2
-     hours is within about 10 % of its value at 10 minutes. Record the Adrenalin version.
-   - NVIDIA: unverified (no NVIDIA host available). Test: the same with HEVC on NVENC, once with
-     hardware-accelerated GPU scheduling on and once off (1.3).
-10. **The FFmpeg fallback** (`"pipeline": "ffmpeg"`): the checks marked FFmpeg path only (1.2,
-   1.4, the 1.3 soak), 1.6 (AMD Direct Capture through FFmpeg), and one stream per codec.
-   "Final review: host agent": FFmpeg's rate restarts no longer filling host.log (at the
-   default `logLevel`), and its FFmpeg line of nothing encoding while the tab is hidden. "Final
-   review: host agent, third round": the display staying on with only a controller (then its
-   repeat on the default pipeline). "Final review: host agent, second round": the 7th encoder
-   failure in a row ends the session (Win+L for 30 s; the browser reconnects).
-11. **Remote access** (INSTALL.md section 9): "Final review: QUIC packets on a 1280-MTU path
-   (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
-   itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
-   review: deploy and install", the UDP relay naming an IP mismatch, and "Final review:
-   security", `-trust-proxy` behind a reverse proxy or tunnel. "Final review: browser client":
-   the direct path and the UDP relay over IPv6 (the page's CSP). Port forwarding's `--name`
-   (INSTALL.md step 9) makes the gateway a new private CA: install the new ca.crt on the PC and
-   the clients in place of the old one ("Final review: security", the private CA's step 9
-   check).
-12. **Security**: "Final review: security": UDP relay ports held without a session and a
-   relayed connection ending with its session (Reconnect six times, then a takeover), the login
-   page's redirect, FFmpeg and its libraries only from places administrators control (a
-   `host.json` `ffmpeg` and `helperFFmpegDir` outside them are ignored), 2FA codes bounded per
-   account (three wrong codes end the login; five lock the account's 2FA), failed logins no
-   longer growing the gateway's memory and disk (20 failed logins, one `login_ratelimited`
-   line), deleting a user or changing a password ending the account's live streams (on the
-   direct path, then from the phone hotspot of stage 11 over a relay, then a password change),
-   and the private CA vouches only for the gateway (Windows 11: `certutil -verify` reports the
-   name constraint; then macOS and an iPhone: Safari refuses the other name's leaf). Turning
-   2FA on needs the password and replaces no 2FA (a wrong password, then 2FA already on), and
-   the offline account recovery signs the account out and ends its streams (`user passwd`
-   with the gateway stopped while a second user streams on the direct path, then `user
-   reset-2fa`).
-13. **Uninstall** (last: it removes the agent): "Final review: deploy and install", uninstalling
-   restores a virtual display's layout (with the Virtual Display Driver, during a stream and
-   within the 10 s linger).
-
-Acceptance matrix (GUIDE 13), per vendor, on the default pipeline unless noted:
-
-| Test | What | Where |
-|---|---|---|
-| T1 | capture→drawn p50/p95 on `lan`, against Moonlight | 0.2 (10-minute latency test), stage 4 |
-| T2 | click-to-photon median at 120 Hz on `lan` | 0.3 (the rig) |
-| T3 | freezes over 100 ms per 10 min on `wifi` < 1 | 2.3 |
-| T4 | encoder restarts per 30 min = 0 | 2.3 |
-| T5 | losses recovered without a key frame on `wifi` ≥ 90 % | 3.5 |
-| T6 | bitrate back after the `capdrop` dip within 10 s, no queue overflow | 2.2 |
-| T7 | live bitrate qualification per codec and rate-control mode | 3.6 (`recon-host qualify`) |
-| T8 | 2-hour GPU-bound soak: no hang, no memory growth | stage 9 above (the helper); 1.3 (FFmpeg) |
-| T9 | AV1 at 1080p on RDNA3: HEVC instead, or no padding | 1.7 |
-| T10 | browser matrix Chrome / Edge / Firefox / Safari 26.4 | 2.7, 4.3, 4.4 |
+`"pipeline": "ffmpeg"`). Record each result in its check's line (status legend above), with the
+driver and Chrome versions.
 
 ## 0.1 Per-stage timestamps
 
@@ -267,9 +105,9 @@ Hardware checks:
   (`encoder=… vendor=amd`, p50/p95/p99 per stage) and the overlay table. Look for: the overlay says
   "End-to-end (capture→draw)", not "Stream latency (send→draw)", and the host log has no
   "implausible capture timestamp" warning (the AMF encoders keep the µs pts); capture→encoded p50
-  is about 1–3 frame intervals (expected about one interval more than necessary until 1.1 sets
-  `-async_depth 1 -flags +low_delay`); the `stream stats` lines show the same fps and Mbit/s as a 60 s run with
-  `"captureTimestamps": "off"`; capture→encoded values are not quantized to 1 ms or 15.6 ms steps
+  is about 1–3 frame intervals (1.1's `-async_depth 1 -flags +low_delay` took about one interval
+  off; 1.1's A1 check measures it); the `stream stats` lines show the same fps and Mbit/s as a
+  60 s run with `"captureTimestamps": "off"`; capture→encoded values are not quantized to 1 ms or 15.6 ms steps
   (in the browser console post `{type:'stageDump'}` to `__recon.worker`, then inspect
   `__recon.stageDump[i].stages[0]`), which would mean the FFmpeg build's `av_gettime()` uses the
   coarse system time. Long run: stream one session for 30+ minutes without changing settings (one
@@ -447,7 +285,7 @@ p95, and a native Moonlight + Sunshine baseline on the same hardware.
 Hardware acceptance (none of it could run in the build sandbox: no GPU, no Windows, no
 microcontroller):
 
-- AMD RDNA3 (RX 7900 XT): unverified. Test: build the rig with two sensors (client screen on A0, host monitor on A1) and plug it into a 120 Hz Windows client on wired LAN. Set `"virtualDisplay": "off"` in the agent's host.json and restart the agent (LATENCY_RIG.md, rules for a fair comparison: a virtual display would put Recon's stream on another monitor than the one `flash.html`, the A1 sensor and Sunshine use); where possible run the host monitor at 1920×1080 120 Hz. Open `tools/latency-rig/flash.html` fullscreen on the host. With identical settings in both (HEVC, 1920×1080, 120 fps, same bitrate, fullscreen; Moonlight V-Sync and frame pacing off), alternate 100-sample blocks of `python3 tools/latency-rig/rig.py measure --port COMx --host-sensor --label moonlight-hevc-1080p120-lan-amd --samples 100` and `... --label recon-hevc-1080p120-lan-chrome-amd ...` (Sunshine stream stopped while Recon runs and vice versa) until each label has ≥ 200 samples. Then run `rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-amd.json` and paste the table here. Pass: exit code 0 (≥ 200 click→client samples each), timeouts 0 or explained, and Recon's click→client median within ~5–10 ms of Moonlight's (acceptance T2); host.log has no `streaming a virtual display` line during the Recon blocks. Repeat for the wifi, wan and capdrop profiles once step 0.4 exists.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: build the rig with two sensors (client screen on A0, host monitor on A1) and plug it into a 120 Hz Windows client on wired LAN. Set `"virtualDisplay": "off"` in the agent's host.json and restart the agent (LATENCY_RIG.md, rules for a fair comparison: a virtual display would put Recon's stream on another monitor than the one `flash.html`, the A1 sensor and Sunshine use); where possible run the host monitor at 1920×1080 120 Hz. Open `tools/latency-rig/flash.html` fullscreen on the host. With identical settings in both (HEVC, 1920×1080, 120 fps, same bitrate, fullscreen; Moonlight V-Sync and frame pacing off), alternate 100-sample blocks of `python3 tools/latency-rig/rig.py measure --port COMx --host-sensor --label moonlight-hevc-1080p120-lan-amd --samples 100` and `... --label recon-hevc-1080p120-lan-chrome-amd ...` (Sunshine stream stopped while Recon runs and vice versa) until each label has ≥ 200 samples. Then run `rig.py analyze results/*.csv --baseline moonlight-hevc-1080p120-lan-amd --strict --json results/summary-amd.json` and paste the table here. Pass: exit code 0 (≥ 200 click→client samples each), timeouts 0 or explained, and Recon's click→client median within ~5–10 ms of Moonlight's (acceptance T2); host.log has no `streaming a virtual display` line during the Recon blocks. Repeat for the wifi, wan and capdrop profiles of step 0.4.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same procedure on an RTX 20/30/40/50 host (HEVC; also AV1 on RTX 40+), labels ending in `-nvidia`, baseline `moonlight-hevc-1080p120-lan-nvidia`. Same pass criteria.
 - Rig firmware on an ATmega32U4 (Leonardo / Pro Micro): unverified (compiled only). Test: flash it, open a serial monitor at 115200 baud and send `i`: it must print `board=atmega32u4 hid=avr`. Send `mon` while covering/uncovering the sensor: the first `# lvl` value follows the light. From a CR+LF terminal (Arduino Serial Monitor *Both NL & CR*, or `python -m serial.tools.miniterm`), `r 5` must take 5 samples and `mon` must keep printing; neither may stop at once with `# stopped`. On the flash page, `cal` prints black/white with no `# err`, and `c` prints `id,click_us,client_us,` with a plausible client_us − click_us. `i` then prints `us per loop` (expect tens of µs with two sensors). The client must enumerate a HID mouse plus a COM port, and USB Device Tree Viewer must show the HID interrupt IN endpoint with bInterval 1 ms.
 - Rig firmware on an RP2040 (both USB stacks: Pico SDK and Adafruit TinyUSB): unverified (compiled only). Test: the same checks as for the ATmega32U4 (`board=rp2040 hid=pico-sdk` / `hid=adafruit-tinyusb`). USB Device Tree Viewer must show bInterval 1 ms on the HID endpoint for both stacks. The core default is 10 ms, and this sketch overrides it.
@@ -689,7 +527,7 @@ Hardware / real Windows checks:
 - NVIDIA: unverified (no NVIDIA host available). Test: the same integration test run on
   an NVIDIA host; all pass, `restart to first frame` < 300 ms.
 - AMD RDNA3 (RX 7900 XT): unverified. Test: with recon-host running a session on the
-  helper (after the session integration step), kill recon-host from Task Manager;
+  helper (the default pipeline since 3.1b), kill recon-host from Task Manager;
   recon-encoder.exe must exit by itself within a second (stdin EOF), and Process
   Explorer must show no named section or event created by either process (the ring and
   event are unnamed and only inherited by the helper). Then start a new session, suspend
@@ -904,9 +742,11 @@ Verified in the sandbox:
   (local FFmpeg) checks them for an encoder FFmpeg does not know (not live), a source that fails
   (not live, not the encoder) and an encoder process killed after its first key frame (live).
 
-Hardware checks (FFmpeg path; use `"capture": "ddagrab"` in `%APPDATA%\KlouditRecon\host.json`
-and restart the agent after each edit; `"logLevel": "debug"` adds the `ffmpeg args` line with the
-exact command line of every generation to `host.log`; to run one by hand, copy the list between
+Hardware checks (FFmpeg path: `"pipeline": "ffmpeg"` in `%APPDATA%\KlouditRecon\host.json`, or
+the FFmpeg `"encoder"` a check names, which also moves the session to FFmpeg; with neither, a
+codec picked in the browser streams on the native helper, `<codec>_amf_helper`. Use
+`"capture": "ddagrab"` and restart the agent after each edit; `"logLevel": "debug"` adds the
+`ffmpeg args` line with the exact command line of every generation to `host.log`; to run one by hand, copy the list between
 `[` and `]` and quote the `-filter_complex` and `-map` values; the stats overlay is
 Ctrl+Alt+Shift+S):
 
@@ -1035,10 +875,13 @@ What changed (B1, B2):
   `nvenc.c` makes the GOP infinite and sets `intraRefreshPeriod = -g`, `intraRefreshCnt = -g - 1`),
   or h264_amf `-intra_refresh_mb N` with ceil(macroblocks per picture / N) ≤ fps (its refresh
   cycles also repeat continuously). Everything else is `keyframe`. No encoder runs with intra
-  refresh yet, so today every encoder announces `keyframe` (`encoder ready ... recovery=keyframe`
-  in the host log, "Loss recovery: key frame" in the stats overlay). Step 1.2 has to set `-g` to
-  the refresh period (at most fps, 1 s) when it turns on `-intra-refresh`; with the session's
-  default `-g` (an hour of frames) the host keeps announcing `keyframe`. On a confirmed loss the
+  refresh yet, so at this step every encoder announced `keyframe` (`encoder ready ... recovery=keyframe`
+  in the host log, "Loss recovery: key frame" in the stats overlay). Since 1.2, h264_nvenc and
+  hevc_nvenc announce `skip` on the FFmpeg path, and the native helper, the default pipeline since
+  3.1b, announces its reference recovery (`ltr` on AMF, `invalidate` on NVENC: 3.5). Step 1.2
+  therefore sets `-g` to the refresh period (at most fps, 1 s) when it turns on
+  `-intra-refresh`; with the session's default `-g` (an hour of frames) the host would keep
+  announcing `keyframe`. On a confirmed loss the
   client skips the lost frames and decodes on (`skip`) or asks for a key frame (`keyframe`: the
   restart path as before, now only for confirmed losses). A loss before the generation's first key
   frame always asks for a key frame, and a decoder error after a skip falls back to reset + key
@@ -1785,6 +1628,13 @@ How to measure (used by the checks below):
 
 Hardware checks:
 
+- **FFmpeg path:** the class readback and the A/B below are for ffmpeg.exe and need
+  `"pipeline": "ffmpeg"` (the A/B's `"encoder": "hevc_amf"` also selects FFmpeg). On the
+  default pipeline the native helper applies the same rules to itself: host.log `encoder helper
+  started ... gpu_priority=realtime`, and the readback snippet with `Get-Process recon-encoder`
+  in place of `Get-Process ffmpeg` (3.2's checks; the helper's soak is stage 14 of the hardware
+  test plan).
+
 - AMD RDNA3 (RX 7900 XT): unverified. Test (applied class): agent started by the logon task
   (elevated), default config: at startup the host log has `gpu adapter 0 adapter=amd name="AMD
   Radeon RX 7900 XT" hags=<on|off> hags_from=kernel`, with hags matching Settings → System → Display
@@ -1804,12 +1654,12 @@ Hardware checks:
   PresentMon). Pass: with auto, capture→encoded p95 and both interval jitter p95 values are lower
   than with off in both pairs, and the stream fps is closer to 60; record the game's fps cost.
   Repeat one off/auto pair with `av1_amf` (2560×1440) and with `h264_amf`. Test (soak, FFmpeg path:
-  `"pipeline": "ffmpeg"`; the helper's soak, the default pipeline, is stage 9 of the test plan at
-  the top): `"gpuPriority": "auto"` (REALTIME), `hevc_amf`, 2560×1440 at 60 fps, the GPU-bound load
+  `"pipeline": "ffmpeg"`; the helper's soak, the default pipeline, is stage 14 of the hardware
+  test plan): `"gpuPriority": "auto"` (REALTIME), `hevc_amf`, 2560×1440 at 60 fps, the GPU-bound load
   looping, one stream for 2 hours. Pass: no driver timeout (Event Viewer → Windows Logs → System: no
   Display event 4101 "amdkmdag stopped responding", no WHEA errors), no `encoder … exited` in the
   host log, `stream stats` fps steady to the end, the overlay's Frames dropped not growing steadily,
-  and the working set of ffmpeg.exe and recon-host.exe (`Get-Process ffmpeg,recon-host |
+  and the working set of ffmpeg.exe and the agent (`Get-Process ffmpeg,recon-hostw |
   Select-Object Name,WS`) at 2 hours within about 10 % of the value at 10 minutes. Record the
   Adrenalin version.
 - NVIDIA: unverified (no NVIDIA host available). Test: the AMD tests with `hevc_nvenc` (A/B pair
@@ -2268,7 +2118,7 @@ called "the AMF test line" below. Keep something moving on that monitor while it
      client FPS = the monitor's refresh rate.
   4. Repeat both backends for 5 minutes each with a GPU-bound game in borderless fullscreen
      (overlay numbers only, no barcode).
-  5. Pass (amf may become the default for AMF encoders in a later step): amf's capture→encoded
+  5. Pass (amf stays opt-in on the FFmpeg path unless it wins here): amf's capture→encoded
      p95 is lower than ddagrab's in every run, and the CPU and frame-rate checks below pass.
      Otherwise amf stays opt-in. Also compare page→capture p95 and host screen→drawn p95. The
      capture stamp is taken after the capture filter for both backends, so capture→encoded does
@@ -2338,7 +2188,10 @@ called "the AMF test line" below. Keep something moving on that monitor while it
   Pass: amf starts and its colours are no worse than ddagrab's, or it fails exactly as above and
   the ddagrab stream follows. If the format is 11 or 13, record it: the agent then needs an HDR
   guard (ddagrab when `DXGI_OUTPUT_DESC1.ColorSpace` is
-  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`) to skip the failed first generation, until 3.9.
+  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`) to skip the failed first generation. (On the
+  native helper, the default pipeline, `"capture": "amf"` uses the helper's own AMD Direct
+  Capture, which handles HDR desktops: 3.9 and "Final review: AMD Direct Capture follows Windows
+  HDR".)
   If the colours are washed out, clipped or tinted, record it: the same guard applies.
 - AMD RDNA3 (RX 7900 XT): unverified (VERIFY rotated monitor; amf blocked until then). The
   agent keeps a rotated monitor on ddagrab because `vsrc_amf` does not rotate (see above). Test:
@@ -2442,7 +2295,9 @@ Verified in the sandbox (Linux, no GPU, no Windows):
   Since the merge 0.2 is on the main branch: its barcode (`internal/proto/barcode.go`) is a
   16-bit value plus its CRC-8 in 8×3 cells, which this layout cannot express (it draws only
   frame-id bits). Before recon-host drives the helper with the client's seq probe, the helper
-  needs that word (or the client a second format); recon-host does not use the helper yet.
+  needs that word (or the client a second format); recon-host did not use the helper yet. (Since
+  3.1b recon-host drives the helper, and the helper draws 0.2's barcode: 3.1b's "barcode and AV1
+  crop on the helper" check.)
 - Review fixes (sandbox): both compilers build every source without warnings, the
   C++/WinRT capture included (GCC link and clang syntax check against the generated
   Windows SDK 10.0.26100 headers; a static_assert confirmed the SDK-projection test for
@@ -2709,8 +2564,8 @@ Hardware checks (on the Windows host, elevated PowerShell, CI-built MSVC
   `codedHeight` 1088, `cropBottom` 8 (1440p: no crop); `ffprobe -show_streams av1.ivf` shows
   1920x1088; `ffplay -vf crop=1920:1080:0:0 av1.ivf` shows a clean picture and without the
   crop the bottom 8 rows repeat the last picture row (no green / garbage band); log: no
-  "properties not accepted" for `Av1AlignmentMode`. Then with the Go client in recon-host
-  (once wired) Chrome must show no padding rows.
+  "properties not accepted" for `Av1AlignmentMode`. Then through recon-host (3.1b's crop check
+  with `"encoder": "av1_amf_helper"`) Chrome must show no padding rows.
 - NVIDIA: unverified (no NVIDIA host available). Test: not applicable (AMD only).
 - AMD RDNA3 (RX 7900 XT): unverified. Test (LTR recovery, GUIDE 3.5 VERIFY): for each
   codec `--ltr-slots=2 --frames=600 --at=200:loss --at=400:loss` (`--ack-delay=2`, and once
@@ -3971,7 +3826,8 @@ What changed (GUIDE 2.3; docs/ARCHITECTURE.md "The loss-recovery ladder"):
   additions. (5) A late frame of a generation the client has left is not cancelled (one frame at
   a switch; it keeps 1.4's rule that only frames the host drops are reported). (6) Rung 1 sees
   what holds up the host's own frame streams: on the direct path the path to the browser; on the
-  relay paths (until 2.6 makes them one connection) the host → gateway leg, and a stall of the
+  QUIC splice relay (the UDP relay of 2.6 is one connection, like the direct path) the host →
+  gateway leg, and a stall of the
   gateway → browser leg only once the gateway's stream receive window is full (the splice stops
   reading), so it acts later there. (7) Rung 1 cancels a frame while its stream's write stands
   still (the transport has not taken the frame: a full congestion window, flow control), not a
@@ -5287,9 +5143,12 @@ Logs: `$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`; overlay Ctrl+Alt+S
   (e.g. a 1920x1080 laptop) it is replaced (`virtual display created ... 1920x1080`), and the first
   session's end does not remove it.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (agent killed, kill -9 equivalent): during a stream run
-  `taskkill /F /IM recon-host.exe` in an elevated PowerShell. SudoVDA: the virtual display
-  disappears within 3 s (watchdog) and Windows puts the physical monitor back; VDD: it stays (the
-  device the session enabled stays enabled). `%APPDATA%\KlouditRecon\vdisplay-restore.json` exists.
+  `taskkill /F /IM recon-hostw.exe` (the logon task's agent and its supervisor) in an elevated
+  PowerShell. SudoVDA: the virtual display disappears within 3 s (watchdog) and Windows puts the
+  physical monitor back; VDD: it stays (the device the session enabled stays enabled).
+  `%ProgramData%\KlouditRecon\<user>\vdisplay-restore.json` exists (the elevated agent's folder:
+  "Final review: host agent, second round", "The elevated agent writes nothing in folders the user
+  owns").
   `Start-ScheduledTask 'KloudIT Recon Host'`: host.log `restoring the displays after an unfinished
   virtual display session driver=... mode=2560x1440@120` before any session, the journal is gone,
   Settings > Display shows the arrangement from before the stream (VDD device disabled again in
@@ -5325,9 +5184,9 @@ Logs: `$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`; overlay Ctrl+Alt+S
   `recon-encoder.exe --encode-test=hdr.hevc --backend=amf --codec=hevc --capture=dda
   --hmonitor=<the display's> --hdr=1 --fps=120 --kbps=50000 --frames=600`: `started` with `hdr`
   true and 2560x1440, and `ffprobe -v error -show_streams hdr.hevc` reports
-  `pix_fmt=yuv420p10le color_transfer=smpte2084 color_primaries=bt2020`. Sessions do not stream HDR
-  yet (3.9 is opt-in in the helper; the session part follows), so this records whether the
-  virtual display can be the HDR source.
+  `pix_fmt=yuv420p10le color_transfer=smpte2084 color_primaries=bt2020`. This records whether the
+  virtual display can be the HDR source; sessions stream HDR since 3.9/4.5 (host config `"hdr":
+  "auto"`; "3.9/4.5 HDR end to end", "HDR on a virtual display").
 - AMD RDNA3 (RX 7900 XT): unverified. Test (auto, matching client): a 1920x1080 60 Hz client on a
   1920x1080 60 Hz host: `virtual display not used reason="the monitor matches the client"` once per
   session, the physical monitor is streamed as before.
@@ -5340,8 +5199,8 @@ Logs: `$env:ProgramData\KlouditRecon\$env:USERNAME\host.log`; overlay Ctrl+Alt+S
 ## 3.9 HDR10 in the helper
 
 recon-encoder.exe can make HDR10 streams (opt-in: `start` with `hdr`; helper side and the Go
-client `internal/host/encoder` only, the session does not ask for it yet and the browser side
-is step 4.5). docs/HELPER_PROTOCOL.md "HDR10" is the reference. In short:
+client `internal/host/encoder` only at this step; sessions ask for it since "3.9/4.5 HDR end to
+end", with host config `"hdr": "auto"`). docs/HELPER_PROTOCOL.md "HDR10" is the reference. In short:
 
 - When the captured output is in Windows HDR mode (`IDXGIOutput6::GetDesc1` colour space
   `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`) and `hdr` was asked for, DDA duplicates with
@@ -6332,7 +6191,7 @@ only, so the E2E streams libsvtav1):
   report) is not reached in the sandbox (no hardware decoder): checked by reading only.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (self-test and output lag on the AMD host's streams):
   stream from the AMD host to Chrome on a Windows client (any GPU) once per codec (drawer:
-  Codec H.264, HEVC, AV1; FFmpeg path and, once Phase 3 is the default, the helper path), with
+  Codec H.264, HEVC, AV1; the helper path, the default, and with `"pipeline": "ffmpeg"`), with
   the overlay open (Ctrl+Alt+Shift+S): "Decoder self-test" shows each family the client decodes
   with "HW ✓" (record the ms/frame), "Decoder output lag" stays at 0 frames during motion, and
   "Decoder queue" max stays at 2 or less. Record any family with "holds N frames back" and any
@@ -9141,8 +9000,9 @@ Problem: `uninstall-host.ps1` ends the agent with `Stop-Process -Force` (the win
 no other way to be told), so its virtual display cleanup never ran, and then it deleted
 `%APPDATA%\KlouditRecon` with the restore journal and the program that replays it: a virtual
 display of a running stream or of the 10 s linger stayed enabled and primary (with layout `only`
-the monitors stayed off). Fix: `recon-host vdisplay -restore` replays the journal next to the
-config, as the agent's start does (`host.RestoreVirtualDisplays`, vdisplay.Manager.Recover,
+the monitors stayed off). Fix: `recon-host vdisplay -restore` replays the agent's restore journal
+(in `%ProgramData%\KlouditRecon\<user>` since "The elevated agent writes nothing in folders the
+user owns"), as the agent's start does (`host.RestoreVirtualDisplays`, vdisplay.Manager.Recover,
 whatever the policy is now), and the uninstaller runs it after stopping the agent and before it
 deletes anything.
 
@@ -9427,6 +9287,15 @@ where `fineFPS` is false (FFmpeg, a `flush` helper, liveFps not `seamless`: `rat
   `internal/host/virtualdisplay.go` (nothing is logged with `off`, the default when the key is
   absent); `python3 tools/latency-rig/test/test_rig.py` passes. AMD RDNA3 (RX 7900 XT) and
   NVIDIA: unverified; the changed instructions are 0.3's checks.
+- Final step: the plan moved out of this file into its own document,
+  [HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md), and was reordered to start with the FFmpeg
+  pipeline (the safest path) before the native helper. Each item there now gives the exact
+  setting or command, what to look at, the pass criterion and what to send back. The stage
+  numbers in the items above are those of the old plan in this file. A script that looks up
+  every `###` item of the `## Final review` sections in the new plan finds all of them, except
+  "The HDR pixel check after a superseded frame", which changes only a test hook. Items with
+  nothing to check on hardware are left out too: the runs, "Test-hook runs write host.log",
+  this item and "defaultKbps and defaultFps".
 
 ## Final review: host agent
 
@@ -9582,7 +9451,8 @@ Fix:
 - `recon-host -log` rotates host.log at 20 MB while it runs, not only at the start: it moves to
   `host.log.old`, replacing the previous one.
 - At debug level (`"logLevel": "debug"`) every change is logged as before. The hardware checks
-  that count or time rate changes now say to use it (see "Hardware test plan").
+  that count or time rate changes now say to use it (see the hardware test plan, "Conventions used
+  below").
 
 - Verified here:
   - `internal/host` `TestRateChangeLogVolume`: 30 changes within a second, 27 raises and 3 cuts.
@@ -11318,7 +11188,7 @@ deleted with the stream unless `-keep`.
   runs the mock's H.264 with `--svc=2` (seamless and flush pass, the cells record 2 layers, no
   `.base` stream left), and the existing qualification tests pass unchanged.
 - AMD RDNA3 (RX 7900 XT): unverified. Test: with the default host.json (`svc` auto), run
-  `recon-host.exe qualify` (stage 3 of the plan; `-quality speed` for a quicker look). The
+  `recon-host.exe qualify` (stage 6 of the hardware test plan; `-quality speed` for a quicker look). The
   table's `layers` column is 2 for every codec whose caps (`recon-encoder.exe --print-caps
   --backend=amf`) have `maxTemporalLayers` >= 2, 1 for the others; the cells' logs in the
   `qualify-*` folder start with `--svc=2` for those; no cell note says `the encoder runs N
@@ -11437,7 +11307,7 @@ Fix:
   the gap said `encoder error` / `helper ring full`); `internal/host` `TestHelperSlotSize` (the
   largest monitor, 10-bit with `hdr` `auto`). The helper builds with mingw-w64 without warnings;
   `make helper-test` under Wine (mock backend) passes. MAX_AU_SIZE itself needs AMF.
-- AMD RDNA3 (RX 7900 XT): unverified. Test (stage 4 of the hardware test plan, a 3840x2160
+- AMD RDNA3 (RX 7900 XT): unverified. Test (item 4.8 of the hardware test plan, a 3840x2160
   monitor): stream HEVC at 4K, 60 fps, 250 Mbit/s (`maxKbps` default; Bitrate 250 Mbit/s in the
   settings drawer, adaptive off) from a detailed game or a desktop full of small text, on `lan`.
   host.log's `encoder helper: recon-encoder ...: backend amf, vendor amd, ring 8 x 13221888
@@ -11492,14 +11362,14 @@ the mock applies the same rule.
   stalled helper: the stall noticed 2.0 s after the last frame, the new helper's key frame 0.26 s
   later). Before the fix the AMF and libavcodec backends had no such path (the option did not
   exist: the tests fail at launch). The AMF path itself compiles here only (no AMF runtime).
-- AMD RDNA3 (RX 7900 XT): unverified. Test (stage 2 of the hardware test plan, Go installed on
+- AMD RDNA3 (RX 7900 XT): unverified. Test (item 3.3 of the hardware test plan, Go installed on
   the PC): `$env:RECON_HELPER_EXE = "$env:ProgramFiles\KlouditRecon\recon-encoder.exe"; go test
   -count=1 -v -run 'TestHelperIntegrationAMFStall' ./internal/host/encoder` in the source tree:
   PASS with `stalled at frame 60: encode_failed` about 2 s after the last frame (the helper log
   shows `encoder is behind: dropping a captured frame (AMF input queue full)` in between). Then,
-  during stage 9's soak, host.log must have no `did not finish frame` line (a false hang would
+  during stage 14's soak, host.log must have no `did not finish frame` line (a false hang would
   restart the helper: `encoder helper failed` with that text); and a `liveBitrate` `flush` rate
-  change (stage 6 with a qualification that chose flush) must not trigger one either.
+  change (stage 8 with a qualification that chose flush) must not trigger one either.
 - NVIDIA: unverified (no NVIDIA host available). Test: none new (NVENC's own 2 s check is
   unchanged and covered by `--self-test-nvenc` against the test double); the soak line above
   applies.

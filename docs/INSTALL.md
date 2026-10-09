@@ -4,6 +4,12 @@ This guide takes you from nothing to playing a game from your PC in a browser, f
 and then away from home. It takes about 30 minutes. Each step says what success looks like and
 what to check if it fails.
 
+After the install, follow [HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md) for the first sessions
+on a new PC (an AMD PC first, then NVIDIA). It gives the order to try things in, from the FFmpeg
+path up to the native encoder helper, recovery, the qualification, the relay, FEC, the virtual
+display, HDR and FSR. Each item says what to look at, what passes and what to send back if it
+fails.
+
 The examples use these values. Replace them with your own:
 
 | Example | Meaning |
@@ -324,7 +330,8 @@ that does not trip that (a corrupt or frozen picture, repeated decoder errors in
 set `"pipeline": "ffmpeg"` in `%APPDATA%\KlouditRecon\host.json` and restart the agent
 (`Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`): streams
 then use FFmpeg only. Please report what happened, with `host.log`. Delete the line again to go
-back.
+back. To check a new PC stage by stage, starting with that FFmpeg-only setting, follow
+[HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md).
 
 **On the PC, for the best results** (GUIDE section 12):
 

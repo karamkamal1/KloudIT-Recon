@@ -22,112 +22,159 @@ hardware decoder and sends input back over QUIC.
 | Video decode | **WebCodecs, hardware**, no media-element buffering | native | native | native | images / canvas |
 | Self-hosted gateway with users, 2FA, audit | **yes** | no | no | no | yes |
 
-Techniques used (most of them are new to browser-based game streaming):
+---
 
-- **One QUIC stream per video frame (WebTransport).** A lost packet only delays its own
-  frame, never the frames behind it, unlike TCP/WebSocket or a single ordered stream.
-  This is the design behind the IETF *Media over QUIC* work.
-- **Zero-delay framing out of FFmpeg** (the FFmpeg path). Raw H.264 has no frame boundaries,
-  and the MP4/MKV muxers hold each frame until the next one exists (one full frame of added
-  latency, measured during development). Recon reads FFmpeg's **NUT** container, which writes
-  each packet with its exact size the moment it is encoded. The demuxer is verified
-  byte-for-byte against `ffprobe` and proven not to read past a packet.
-- **Zero-copy GPU capture → hardware encode.** On AMD and NVIDIA the PC streams by default
-  through its own native encoder helper, `recon-encoder.exe` (C++): DXGI Desktop Duplication
-  (AMD Direct Capture or Windows.Graphics.Capture on request) hands D3D11 textures to AMF or
-  NVENC in the same process, and each encoded frame reaches the agent through shared memory.
-  FFmpeg is the fallback (and Intel's path without the helper's Quick Sync libraries):
-  `ddagrab` or `gfxcapture` (GPU downscaling, per-window capture) feeds NVENC / AMF / QSV.
-  Both are tuned for ultra-low latency: CBR (or AMF's latency-constrained VBR) with a 1–3-frame
-  VBV, no B-frames, no lookahead, zero-latency mode, and each packet read out as soon as its
-  frame is encoded.
-- **Encoder changes without a freeze.** On the native helper a bitrate or frame-rate change
-  happens inside the running encoder, without a key frame where the GPU's encoder allows it
-  (`recon-host qualify` measures that). Changing resolution, codec or display (and any change on
-  the FFmpeg path) starts a new encoder *while the old one keeps streaming*, then switches on
-  the new key frame. You get no freeze.
-- **The entire media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`
-  (`optimizeForLatency`, at most 2 chunks queued, never flushed) → an **OffscreenCanvas** that
-  draws each frame the instant it decodes and closes it at once. Three presentation paths: a
-  **desynchronized** (front-buffer) 2D canvas, **WebGL2** (`texImage2D` of the frame) or
-  **WebGPU `importExternalTexture`** zero-copy rendering; **Auto** tries them on the live stream
-  the first time and keeps a pick for that browser (a heuristic: the desynchronized 2D canvas
-  unless another path is clearly better; the latency rig decides). The canvas is sized to device
-  pixels with nothing on top of it, so the compositor never scales or covers it. The main thread
-  can't stall a frame. A startup self-test catches decoders that hold frames back and avoids them.
-- **Client-side upscaling with FSR 1.** A stream shown larger than it is sent (1080p or 1440p
-  on a 4K screen, or a lower resolution picked to save bandwidth) is upscaled on your GPU by
-  AMD FidelityFX Super Resolution 1.0 (edge-adaptive upsampling, then contrast-adaptive
-  sharpening), ported to WebGPU shaders, instead of a blurry bilinear stretch: three short
-  GPU passes per frame, timed in the overlay. It needs the WebGPU renderer: choose Renderer
-  *WebGPU* in Settings → Pipeline, because Renderer *Auto* keeps the desynchronized 2D canvas
-  wherever the browser has one (e.g. Chrome), and the 2D canvas scales bilinearly.
-- **HDR10, end to end (experimental, opt-in).** With `"hdr": "auto"` on the PC, Windows HDR on
-  and a browser on an HDR display (Renderer *WebGPU*), the native encoder streams 10-bit
-  BT.2020 PQ HEVC / AV1 with HDR metadata, and the browser shows it with real highlights on an
-  extended-range WebGPU canvas, from a copy of the decoded 10-bit planes (not Chrome's SDR
-  conversion). That needs a decoder whose 10-bit frames WebCodecs can copy: today's Chrome
-  gives none for its hardware decoders (they output P010, `VideoFrame.format` null), so where
-  the stream decodes in hardware the browser withdraws HDR at the first frame and the stream
-  returns to SDR; a software decoder (dav1d for AV1) works. Anything less (an SDR display,
-  another renderer, no usable 10-bit decoder, H.264, window capture) streams SDR as before;
-  the overlay says why.
-- **Direct path with certificate-hash pinning.** On your LAN the browser connects **straight to
-  the PC** using WebTransport `serverCertificateHashes` (short-lived ECDSA certs, rotated
-  automatically). Access requires a gateway-signed, single-use ticket that is bound to the page's
-  origin. If the direct path fails, Recon falls back to the gateway relay, which forwards the
-  datagrams of the same end-to-end QUIC connection (one congestion controller, the PC's), then to
-  a QUIC splice on the gateway's main port, then to WebSocket.
-- **Raw input with no lost motion.** `pointerrawupdate` plus Pointer Lock with
-  `unadjustedMovement` gives raw mouse deltas. Mouse motion travels as unreliable datagrams that
-  carry *running totals*, so a lost datagram only delays motion and never drops it. The host
-  injects **scancodes** via SendInput, which works with DirectInput and raw-input games. In
-  fullscreen, Keyboard Lock passes Esc, Alt+Tab and the Win key to the PC (Chrome and Edge; Safari
-  26.4 keeps Esc for the PC through its fullscreen keyboard-lock option).
-- **Zero-latency local cursor.** In desktop mode the host sends its real cursor shapes (arrow,
-  I-beam, resize…) and your browser renders them natively, so the pointer never lags.
-- **Lock-free audio.** System audio is captured with WASAPI loopback and encoded as Opus
-  (CELT low-delay) in pure Go, so the PC needs no extra DLLs: 10 ms frames, 5 ms ones on a LAN
-  (from the measured round-trip time) when the capture delivers audio at least every 5 ms
-  (Windows' default 10 ms audio engine period does not, and smaller frames would then save
-  nothing). It travels as datagrams, through `AudioDecoder`, a **SharedArrayBuffer** ring and an
-  AudioWorklet whose jitter buffer adapts to the network (10–20 ms on a LAN, up to 60 ms on a
-  jittery link; the pauses between sounds do not count) and trims drift.
-- **Live latency readout.** NTP-style clock sync and per-frame host timestamps split every
-  frame's *capture → on-screen* latency into capture/encode, host queue, network, transfer,
-  reorder, decode, draw and display, with p50/p95/p99 per stage. A **latency probe** checks them
-  from the picture: it reads a frame barcode (the test pattern's frame number, or the wall clock
-  drawn by `tools/latency-test/index.html` on the PC) and builds a capture → drawn histogram you
-  can export as JSON.
-- **Self-protecting under load.** A delay-based rate controller on the host (GCC / SCReAM style)
-  reads the browser's receive reports every 25 ms: it lowers the bitrate as soon as a queue
-  builds on the path (or packets get lost), to what the path still delivers, and climbs back to
-  your setting once the delay is down (+5 %/s near the last good rate, up to +25 %/s far below
-  it), in the encoder at once on the native helper, with overlapped restarts on FFmpeg (an
-  immediate one after a capacity drop). At the 2 Mbit/s floor it lowers the frame rate
-  instead: on the native helper in place, 120 → 100 → 90 → 75 → 60 two seconds apart (`fpsFloor`
-  below), on FFmpeg 120 → 90 → 60. A decoder backlog gets
-  dropped and resynced from a fresh key frame, so latency can't grow without bound; the bitrate
-  then climbs back only to 85 % of where the decoder fell behind.
-- **Input and audio first.** When the path delivers the video slower than the host paces it
-  (a capacity drop, before the bitrate follows), the host keeps at most one video frame in flight
-  beyond those in transit for the round trip (two on a LAN; measured by QUIC acknowledgements),
-  so audio, cursor and clock-sync datagrams never queue behind a video backlog on the path; a
-  path that carries the video, however long or jittery its round trip, is never held back. The
-  browser sends input ahead of control and telemetry (WebTransport `sendOrder` and send groups
-  where it has them, else telemetry gives way on the shared datagram queue). See "Send
-  priorities" in `docs/ARCHITECTURE.md`.
-- **No restarts for late frames.** Frames travel on reliable streams, so a gap in the sequence
-  waits for the late frame instead of asking for a key frame. The host reports every frame it
-  drops, and the client recovers at once. On the native helper the PC answers a lost frame with
-  a recovery frame that refers only to frames the browser has acknowledged (AMF long-term
-  references, NVENC reference invalidation): the next frame is whole again, without a key frame
-  (see "The loss-recovery ladder" in `docs/ARCHITECTURE.md`). On FFmpeg the client skips the
-  frame when the encoder heals the picture with intra refresh (NVENC H.264 and HEVC), otherwise
-  it asks for a key frame.
-- **Virtual Xbox controllers** through the ViGEmBus driver's IOCTL interface (no
-  ViGEmClient.dll), fed by the browser Gamepad API at 250 Hz, with **rumble**: a game's force
-  feedback comes back to your controller through the Gamepad API's `vibrationActuator`.
+## Features
+
+**Status.** Everything below is built and tested in CI and in a GPU-less sandbox: unit and
+integration tests, a browser end-to-end test with software encoders, and Wine for the Windows
+code. Nothing GPU-specific has run on a real AMD or NVIDIA GPU yet. The first sessions on real
+hardware follow **[docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md)**, and
+[docs/VENDOR_NOTES.md](docs/VENDOR_NOTES.md) records what has been verified where.
+
+### Video on the PC
+
+- **Native encoder helper.** `recon-encoder.exe` (C++) is the default on AMD and NVIDIA.
+  - DXGI Desktop Duplication hands D3D11 textures to AMF or NVENC in the same process, and each
+    encoded frame reaches the agent through shared memory. AMD Direct Capture and
+    Windows.Graphics.Capture are available on request.
+  - Bitrate and frame-rate changes happen inside the running encoder.
+  - A lost frame is answered with a recovery frame from frames the browser acknowledged (AMF
+    long-term references, NVENC reference invalidation) instead of a key frame.
+  - Intel Quick Sync runs through the helper's libavcodec backend (`-InstallLibavcodec`).
+- **FFmpeg as the fallback.** `ddagrab` or `gfxcapture` feed NVENC, AMF or QSV. The agent reads
+  FFmpeg's NUT container, which hands over each packet the moment it is encoded (MP4/MKV hold
+  each frame until the next one exists).
+- **Tuned for latency.**
+  - CBR, or AMF's latency-constrained VBR.
+  - A 1-3-frame VBV, no B-frames and no lookahead.
+  - GPU scheduling priority, so a game at 100 % GPU does not queue the encoder behind it.
+- **Codec Auto.**
+  - HEVC first, on AMD and NVIDIA alike.
+  - AV1 or H.264 where the browser decodes them clearly faster, from a decoder self-test timed
+    while connecting.
+  - AV1 on RDNA3 only at sizes in 64×16 steps.
+- **`recon-host qualify`** measures, once per GPU and driver, which bitrate changes the encoder
+  makes without a glitch, and sessions use the result.
+- **Changes without a freeze.** A change of resolution, codec or display starts a new encoder
+  while the old one keeps streaming, then switches on the new key frame.
+- **Virtual display (opt-in).** A virtual monitor at the client's resolution and frame rate,
+  through the Virtual Display Driver or Apollo's SudoVDA. The PC's layout comes back after the
+  stream.
+- **HDR10 end to end** (experimental, opt-in). 10-bit BT.2020 PQ HEVC or AV1 with HDR metadata,
+  shown on an extended-range WebGPU canvas.
+- **Under load and on still pictures.**
+  - Temporal SVC thinning: under congestion the frames no other frame references are left out,
+    with no damage and no key frame.
+  - The frame rate goes down before the picture does at the bitrate floor.
+  - The bitrate drops on a static desktop.
+  - Regions of interest spend more bits around the pointer or a game's crosshair.
+  - Experiments, off by default: a dedicated encode engine, re-encoding oversized frames (NVENC)
+    and slice output (AMF).
+
+### Network
+
+- **One QUIC stream per video frame (WebTransport).** A lost packet delays only its own frame.
+  WebSocket is the fallback.
+- **Direct path on the LAN.** WebTransport straight to the PC, with certificate-hash pinning
+  and a single-use, origin-bound gateway ticket. Without it:
+  1. The gateway's **UDP relay**, which forwards the datagrams of the same end-to-end QUIC
+     connection.
+  2. A QUIC splice on the gateway's main port.
+  3. WebSocket.
+- **Rate control.** The host's QUIC congestion control (`media`) paces the video at 1.2 × its
+  bitrate. A delay-based rate controller (GCC / SCReAM style) reads the browser's receive
+  reports every 25 ms:
+  - It lowers the bitrate as soon as a queue builds, and climbs back once the delay is down.
+  - At the 2 Mbit/s floor it lowers the frame rate instead: 120 → 100 → 90 → 75 → 60 on the
+    helper.
+- **Loss-recovery ladder.**
+  1. A frame stream stalled past its deadline is cancelled.
+  2. A recovery frame repairs the picture.
+  3. A key frame is the last rung.
+  4. RESET_STREAM_AT is used where the browser negotiates it.
+- **Send priorities.** Input and audio go first. When the path falls behind, the host keeps at
+  most one video frame in flight beyond those in transit, so audio, cursor and clock datagrams
+  never wait behind a video backlog.
+- **Datagram + FEC video.** On paths with a minimum round trip above 15 ms, frames travel as
+  datagram shards with Reed-Solomon parity and NACKs, instead of one stream per frame.
+
+### Browser client
+
+- **The media pipeline runs in a Worker.** WebTransport → reorder buffer → `VideoDecoder`
+  (`optimizeForLatency`, at most 2 chunks queued) → OffscreenCanvas. A self-test catches
+  decoders that hold frames back, and a hardware decoder that keeps failing falls back to
+  software.
+- **Renderers.** A desynchronized 2D canvas, WebGL2, or WebGPU `importExternalTexture`. *Auto*
+  measures them on the live stream once per browser.
+- **Frame pacing.** *Lowest latency* draws each frame as it decodes. *Smooth* draws one per
+  display refresh.
+- **FSR 1 upscaling** (WebGPU), for a stream shown larger than it is sent.
+- **Live latency readout.** NTP-style clock sync and per-frame host timestamps split *capture →
+  on screen* into its stages (p50/p95/p99). A latency probe reads a frame barcode and exports a
+  capture → drawn histogram.
+
+### Input and audio
+
+- **Raw mouse.** `pointerrawupdate` and Pointer Lock with `unadjustedMovement`. Motion travels as
+  running totals in datagrams, so a lost datagram delays motion but never drops it.
+- **Keyboard.** Scancodes through SendInput. In fullscreen, Keyboard Lock passes Esc, Alt+Tab
+  and Win to the PC.
+- **Cursor.** The PC's real cursor shapes are drawn locally.
+- **Controllers.** Virtual Xbox controllers through ViGEmBus, at 250 Hz, with rumble back to
+  your controller.
+- **Audio.** WASAPI loopback → Opus (CELT low-delay, pure Go). 10 ms frames, 5 ms on a LAN when
+  the capture allows it. A SharedArrayBuffer ring and an AudioWorklet whose jitter buffer adapts
+  between 10 and 60 ms.
+
+### Gateway and security
+
+- **A small gateway on Proxmox** (LXC or Docker). It handles users (Argon2id passwords, TOTP
+  2FA), rate limiting and lockout, an audit log and Wake-on-LAN.
+- **A private CA** that, on a new install, can vouch only for the gateway's own names and
+  private addresses, and rotating WebTransport certificates.
+- **The PC dials out.** Its tunnel pins the gateway's identity, so the PC opens no inbound port
+  except the optional direct path on Private networks.
+- **The elevated agent** runs FFmpeg and its libraries only from folders that only
+  administrators control. See [docs/SECURITY.md](docs/SECURITY.md).
+
+### Defaults
+
+What a fresh install does without any setting. The browser's settings drawer (Ctrl+Alt+Shift+O)
+and the PC's `host.json` (Configuration below) change them.
+
+| | Default |
+|---|---|
+| Video pipeline | the native helper on AMD and NVIDIA, FFmpeg otherwise and as the fallback (`pipeline` `auto`) |
+| Capture | Desktop Duplication (`capture` `auto`) |
+| Codec | Auto: HEVC first (`av1` `fallback`) |
+| Bitrate, frame rate, resolution | 30 Mbit/s, 60 fps, *Native* (caps: `maxKbps` 250000, `maxFps` 240) |
+| Encoder preset, adaptive bitrate | Balanced, on |
+| Congestion control, FEC | `media`, `auto` (datagrams + FEC above 15 ms of minimum round trip) |
+| Thinning, static desktop, regions of interest | `svc`, `staticBitrate` and `roi` all `auto` |
+| Network path | Auto: direct → UDP relay → QUIC splice → WebSocket |
+| Renderer, frame pacing, upscaling | Auto, Lowest latency, Auto (FSR 1 with Renderer WebGPU) |
+| Decoder, audio | Prefer hardware; Opus with the Auto jitter buffer |
+| Mouse, cursor | Desktop mode, local cursor |
+| HDR | off on the PC (`hdr` `off`), Auto in the browser |
+| Virtual display | off (`install-host.ps1 -InstallVirtualDisplay` sets `auto`) |
+| GPU priority | `auto`: realtime, or high on NVIDIA with hardware-accelerated GPU scheduling |
+| Ports | direct path UDP 48100; gateway TCP+UDP 8443, relay UDP 8444-8459 |
+| Experimental, off | AMD Direct Capture (`capture` `amf`), `encoderInstance`, `reencodeOversized`, `sliceOutput` |
+
+### Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Installing, step by step: gateway, PC, first stream, remote access, upgrading, uninstalling |
+| [docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md) | The first sessions on real hardware: an ordered plan (AMD first, then NVIDIA), with the acceptance tests T1-T10 and what to send back |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Protocol, latency design, rate control, loss recovery, send priorities, FEC, HDR10 |
+| [docs/SECURITY.md](docs/SECURITY.md) | Security model and known limitations |
+| [docs/HELPER_PROTOCOL.md](docs/HELPER_PROTOCOL.md) | The native encoder helper: protocol, backends, MSVC build, live-bitrate qualification |
+| [docs/VENDOR_NOTES.md](docs/VENDOR_NOTES.md) | What has been verified where, per GPU vendor, with every hardware check in full |
+| [docs/NETEM.md](docs/NETEM.md) | Network test profiles (lan, wifi, wan, capdrop) |
+| [docs/LATENCY_RIG.md](docs/LATENCY_RIG.md) | The click-to-photon latency rig |
+| [third_party/README.md](third_party/README.md) | Vendored and ported code (quic-go patch, FSR 1) |
 
 ![Streaming with the performance overlay](docs/img/stream.png)
 
@@ -323,39 +370,31 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   10–60 ms) or *Fixed* at the size you set.
 - **Network path, transport, renderer and decoder**: these apply on reconnect. Network path
   *Direct to PC only* has no fallback: where the PC cannot be reached directly every connection
-  fails, and the start screen then offers **Use Network path Auto** and **Settings**; the
-  drawer's **Reset to defaults** puts every setting back. Renderer
-  *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for about 10 s on
-  the first connection in a browser and remembers its pick for that browser version: a path
-  that fails draws, cannot keep the frame rate or holds the page's frames back is out, a
-  desynchronized context comes first, and it leaves the 2D canvas only for a path that draws
-  clearly faster in both rounds (overlay: per-path numbers and why; *Measure renderers again*
-  repeats it). This is a heuristic: the browser cannot measure presentation itself. A picked
-  path that stops drawing is dropped for the 2D canvas. Pick a renderer to override Auto, for
-  example after measuring click-to-photon with the latency rig
+  fails, and the start screen then offers **Use Network path Auto** and **Settings**. The
+  drawer's **Reset to defaults** puts every setting back.
+- **Renderer** *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for
+  about 10 s, on the first connection in a browser, and remembers its pick for that browser
+  version. It leaves the desynchronized 2D canvas only for a path that draws clearly faster.
+  The overlay shows the numbers, and *Measure renderers again* repeats it. This is a heuristic:
+  pick a renderer yourself after measuring with the latency rig
   ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
-- **Upscaling** (Pipeline, applies at once): *Auto* (default) upscales with FSR 1 when the
-  picture is shown more than 5 % larger than it streams and the renderer is WebGPU, bilinearly
-  otherwise; *Off* always scales bilinearly; *FSR 1* whenever the picture is enlarged at all.
-  *FSR sharpness* runs from 0 (sharpest) to 2 stops (default 0.2); *sharpen noise less* turns on
-  RCAS's denoise. A picture shown at its size or smaller is never upscaled. FSR needs the WebGPU
-  renderer: with the 2D canvas or WebGL2 the setting says so and the picture is scaled
-  bilinearly. Renderer *Auto* prefers a desynchronized context, which WebGPU cannot report, so
-  it keeps the 2D canvas where that is desynchronized (e.g. Chrome): choose Renderer *WebGPU*
-  for FSR. The overlay shows *Upscaling* (input → output size, sharpness) and the passes' GPU
-  time.
-- **HDR** (Pipeline, experimental): *Auto* (default) streams HDR10 when everything allows it:
-  the PC's `"hdr": "auto"`, the PC's display in Windows HDR mode (native encoder helper), this
-  display in HDR mode, Renderer *WebGPU* with an extended-range canvas (Chrome / Edge 131+), a
-  10-bit HEVC or AV1 decoder in the browser, and HEVC or AV1 as the codec. *Off*: SDR; an HDR
-  stream already running is tone-mapped (ITU-R BT.2390) until the PC switches to SDR. *HDR: SDR
-  white* (default 203 cd/m², ITU-R BT.2408) is how bright SDR white (the desktop) is shown;
-  highlights go above it. The overlay's *HDR* rows say whether the stream is HDR and why not,
-  the colour description and metadata, and what copying the decoded frame costs per frame.
-- **Frame pacing** (Pipeline): *Lowest latency* (default) draws each frame the moment it
-  decodes. *Smooth* draws at most one new frame per display refresh, in the refresh's animation
-  frame callback, for an even cadence; it costs up to one refresh of latency (the overlay's
-  *hold* row) and drops a frame that missed its refresh when a newer one is already decoding.
+- **Upscaling** (applies at once): *Auto* (default) upscales with FSR 1 when the picture is shown
+  more than 5 % larger than it streams and the renderer is WebGPU; otherwise it scales
+  bilinearly. *FSR 1* upscales whenever the picture is enlarged, and *Off* never does.
+  *FSR sharpness* runs from 0 (sharpest) to 2 stops (default 0.2). Renderer *Auto* keeps
+  Chrome's desynchronized 2D canvas, so **choose Renderer *WebGPU* for FSR**.
+- **HDR** (experimental): *Auto* (default) streams HDR10 when everything allows it:
+  - the PC's `"hdr": "auto"`, with the PC's display in Windows HDR mode;
+  - this display in HDR mode;
+  - Renderer *WebGPU* (Chrome / Edge 131+);
+  - a 10-bit HEVC or AV1 decoder whose frames the browser can copy.
+
+  *Off* streams SDR, and tone-maps (ITU-R BT.2390) an HDR stream already running. *HDR: SDR
+  white* (default 203 cd/m²) sets how bright the desktop is shown. The overlay's *HDR* rows say
+  why a stream is not HDR.
+- **Frame pacing**: *Lowest latency* (default) draws each frame the moment it decodes. *Smooth*
+  draws at most one new frame per display refresh, for an even cadence, at a cost of up to one
+  refresh of latency (the overlay's *hold* row).
 - **Latency probe** (Diagnostics): open `tools/latency-test/index.html` (in the release zip:
   `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
   host screen → drawn latency measured from the picture, and **Export latency data** saves it.
@@ -551,9 +590,14 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
 - The Windows secure desktop (lock screen, UAC) can't be captured (see above).
 - No microphone passthrough or host → browser clipboard sync yet (you can type text into the PC).
 - HDR is experimental and opt-in (`"hdr": "auto"`): only the native encoder helper streams HDR10,
-  only the WebGPU renderer shows it (Chrome / Edge 131+ on an HDR display), and it is
-  unverified on real HDR hardware (`docs/VENDOR_NOTES.md`, 3.9/4.5). Without it HDR desktops
-  are streamed as SDR (the capture API converts them).
+  only the WebGPU renderer shows it (Chrome / Edge 131+ on an HDR display), and today's Chrome
+  copies no 10-bit frame of its hardware decoders, so the browser falls back to SDR there (a
+  software decoder, dav1d for AV1, works). Without it HDR desktops are streamed as SDR (the
+  capture API converts them).
+- Not yet run on real GPUs: the GPU-specific parts (the native helper's AMF and NVENC backends,
+  the capture paths, HDR, the virtual display) are verified with tests, test doubles and Wine
+  only. [docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md) is the plan for the first
+  sessions on an RX 7900 XT and an NVIDIA PC.
 
 ## Development
 
@@ -602,7 +646,3 @@ from before step 4.4 did (no `stage-hold` in the welcome, at most nine rows), an
 sends without the video window of the send priorities (docs/ARCHITECTURE.md "Send
 priorities"), for an A/B measurement (`internal/host/faults.go`). Never set it on a real host
 outside such a measurement; the agent logs a warning when it is set.
-
-Layout: `cmd/` (binaries) · `internal/gateway` · `internal/host` (session, media, input,
-platform) · `internal/nut`, `internal/codec`, `internal/proto`, `internal/transport` ·
-`web/static` (client) · `deploy/` · `test/e2e`.
