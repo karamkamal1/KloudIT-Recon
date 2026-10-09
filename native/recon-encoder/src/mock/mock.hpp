@@ -114,6 +114,10 @@ private:
     bool svc_ = false;       // svcLayers 2
     int slices_ = 0;         // start sliceOutput (emulated)
     bool copyNext_ = false;  // the next frame is the copy of the next canned P frame
+    // --test-stall-at: the frame the encoder stalled on and when it was
+    // submitted (0: not stalled).
+    uint64_t stalledId_ = 0;
+    int64_t stalledQpc_ = 0;
 };
 
 }  // namespace recon

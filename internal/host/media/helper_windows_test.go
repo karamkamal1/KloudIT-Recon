@@ -284,6 +284,69 @@ func TestHelperVideoSpareRestart(t *testing.T) {
 		time.Since(failedAt).Round(time.Millisecond), n)
 }
 
+// TestHelperVideoStallRestart: a helper whose encoder stops finishing frames
+// (--test-stall-at, the mock applying the AMF / libavcodec hang rule) ends
+// with a fatal encode_failed about 2 s later, and the pipeline replaces it:
+// the stream goes on with a new helper's key frame instead of freezing.
+func TestHelperVideoStallRestart(t *testing.T) {
+	exe := helperExe(t)
+	log := slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var mu sync.Mutex
+	launches := 0
+	launch := func() (*encoder.Helper, error) {
+		mu.Lock()
+		launches++
+		var args []string
+		if launches == 1 {
+			args = []string{"--test-stall-at=30"}
+		}
+		mu.Unlock()
+		return encoder.Launch(encoder.Options{Exe: exe, Backend: "mock", Args: args, Log: log})
+	}
+	v := NewHelperVideo(HelperOptions{Launch: launch, Log: log, Clock: NewHostClock(), KeepSpare: true})
+	defer v.Stop()
+	p := Params{Source: Source{Backend: "test", NativeW: 320, NativeH: 180},
+		Encoder: EncoderInfo{Name: "h264_mock_helper", Family: "h264", Vendor: "mock", HW: true, Helper: true},
+		FPS:     30, BitrateKbps: 4000, GPUPriority: GPUPriorityAuto}
+	if err := v.Start(p, false); err != nil {
+		t.Fatal(err)
+	}
+	var lastFrame, failedAt time.Time
+	deadline := time.After(20 * time.Second)
+	for {
+		var ev VideoEvent
+		select {
+		case ev = <-v.Events():
+		case <-deadline:
+			t.Fatal("the stalled helper was not replaced")
+		}
+		if ev.Err != nil {
+			var he *encoder.HelperError
+			if !ev.Restarted || !errors.As(ev.Err, &he) || he.Code != "encode_failed" || !he.Fatal ||
+				!strings.Contains(he.Text, "did not finish frame 30 within 2000 ms") {
+				t.Fatalf("failure event %+v (%v)", ev, ev.Err)
+			}
+			failedAt = time.Now()
+			continue
+		}
+		if ev.Frame == nil {
+			continue
+		}
+		if failedAt.IsZero() {
+			if ev.Frame.Seq >= 29 {
+				t.Fatalf("frame seq %d of an encoder stalled at frame 30", ev.Frame.Seq)
+			}
+			lastFrame = time.Now()
+			continue
+		}
+		if ev.Frame.Key && ev.Frame.Seq == 0 {
+			break
+		}
+	}
+	t.Logf("stall noticed %v after the last frame; the new helper's first frame %v after that",
+		failedAt.Sub(lastFrame).Round(time.Millisecond), time.Since(failedAt).Round(time.Millisecond))
+}
+
 // TestHelperVideoLavc drives HelperVideo, the session's pipeline on the
 // helper, with the real helper's libavcodec backend (GUIDE 3.8) on its
 // test-only software path (--lavc-test-encoder=libx264 from the FFmpeg 8.x

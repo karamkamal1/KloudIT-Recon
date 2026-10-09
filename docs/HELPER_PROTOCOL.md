@@ -71,6 +71,16 @@ gone within 500 ms: a watchdog thread then terminates the process (exit code 4),
 capture or encoder call stuck in the driver cannot keep it, and its GPU encoder session,
 alive. A driver hang therefore costs up to 500 ms before the restart begins.
 
+An encoder that stops finishing frames without failing a call (an encoder or firmware
+stall: `QueryOutput` keeps answering `AMF_REPEAT`, a libavcodec call does not return, NVENC's
+completion event never comes) is a hang too: every backend ends the helper with a fatal
+`encode_failed` ("AMF did not finish frame N within 2000 ms"; `device_lost` if the D3D11
+device was removed) when the oldest frame in the encoder is still not out 2 s after its
+submission (AMF: or after the last `Flush` + `ReInit` of a `flush` rate change), so recon-host
+restarts it. Without that the stream would freeze for good: the capture thread only sees the
+encoder's input queue full (`encoder_busy`, logged once a second), and recon-host does not
+restart a live helper for sending no frames.
+
 Exit codes: `0` clean shutdown, `2` bad arguments or ring attach failure, `3` after a
 fatal error, `4` the threads did not stop within 500 ms of deciding to exit (watchdog).
 
@@ -82,7 +92,7 @@ recon-encoder.exe --ring-handle=0x1a4 --ring-size=33558528 --event-handle=0x1a8
                   [--ffmpeg-dir=DIR] [--lavc-test-encoder=NAME[,NAME]]
                   [--mock-error-at=N] [--mock-fatal-at=N] [--mock-hang-at=N]
                   [--mock-follow-rate] [--mock-rate-lag=N] [--mock-idr-on-rate]
-                  [--dump-nv12=PATH]
+                  [--test-stall-at=N] [--dump-nv12=PATH]
 recon-encoder.exe --print-caps [--backend=...]      # caps JSON on stdout, then exit
 recon-encoder.exe --gpu-priority-table              # the GPU priority decision table (see GPU priority)
 recon-encoder.exe --self-test-convert               # GPU colour conversion on WARP (see Self-tests)
@@ -124,6 +134,13 @@ page's.
   `--mock-hang-at`: submitting that frame never returns (a call stuck in the driver).
   `--mock-follow-rate`, `--mock-rate-lag`, `--mock-idr-on-rate`: frame sizes that follow
   `setRate` (see "Mock backend"), for the live-bitrate qualification's tests.
+* `--test-stall-at=N` (test only, needs `--backend=amf`, `lavc` or `mock`): the encoder stops
+  finishing frames from frame id N on, as a stalled one does (AMF: `QueryOutput` is no longer
+  called for them, so its input queue fills; libavcodec: the encoder thread blocks before
+  encoding frame N, as in a call that does not return; mock: it takes frame N and outputs
+  nothing more, then answers `encoder_busy`), so the hang detection (see "Lifecycle") can be
+  checked: the helper must end with the fatal `encode_failed` about 2 s later. NVENC's is
+  checked against its test double (`--self-test-nvenc=DLL`).
 * `--nvenc-test-dll=DLL`: with `--encode-test` or `--print-caps` only (refused otherwise):
   the NVENC backend uses DLL, the test double `recon-fake-nvenc.dll`, as its runtime. Like
   `--self-test-nvenc=DLL` a test hook; the mode recon-host runs never loads a DLL by path.
@@ -429,7 +446,7 @@ other captures false).
 | `capture_failed` | yes | capture broke beyond recovery (unexpected `AcquireNextFrame` error, out of video memory, AMD Direct Capture `AMF_EOF`, the capture ended unexpectedly; a zero-copy AMD Direct Capture source that changed size, rotation or surface format: recon-host restarts the helper, which then follows the new source, and starts it with `zeroCopy` false if that happens again; no captured frame converted for 2 s and at least 10 frames, e.g. a texture format the colour conversion cannot read, whose non-fatal error (`unsupported`, `init_failed`) is sent once a second until then: recon-host restarts the helper and, after three failures within 60 s, streams with FFmpeg) |
 | `device_lost` | yes | the D3D11 device was removed (driver reset / TDR), noticed by any capture method, the colour conversion or an encoder (NVENC also on `NV_ENC_ERR_DEVICE_NOT_EXIST`); a new helper starts over |
 | `frame_too_large` | no | an encoded frame did not fit a ring slot (dropped; the text names the frame, whether it was a key frame, its size and the slot's payload capacity) |
-| `encode_failed` | no / yes | an encoder call failed (AMF `SubmitInput`, `QueryOutput`, surface creation; NVENC `NvEncEncodePicture`, `NvEncLockBitstream`, `NvEncReconfigureEncoder` for a `setRate`, which keeps the old rate); fatal after 10 failures in a row, on `AMF_EOF`, when `liveBitrate` `flush` cannot re-initialize the AMF encoder, or when NVENC does not finish a frame within 2 s |
+| `encode_failed` | no / yes | an encoder call failed (AMF `SubmitInput`, `QueryOutput`, surface creation; NVENC `NvEncEncodePicture`, `NvEncLockBitstream`, `NvEncReconfigureEncoder` for a `setRate`, which keeps the old rate); fatal after 10 failures in a row, on `AMF_EOF`, when `liveBitrate` `flush` cannot re-initialize the AMF encoder, or when the encoder (NVENC, AMF, libavcodec) does not finish a frame within 2 s of its submission (a hung encoder, see "Lifecycle") |
 | `mock_error` / `mock_fatal` | no / yes | injected by `--mock-error-at` / `--mock-fatal-at` |
 | `protocol` | yes | control framing broken (message over 1 MiB) |
 | `ring` | yes | the ring could not be attached, or its counters are inconsistent |
@@ -891,7 +908,10 @@ marks a decoder entry point.
 **Output.** One output thread: while no frame is in the encoder it waits for a
 submission instead of calling `QueryOutput` (which answers `AMF_REPEAT` at once on an empty
 queue); with frames in flight `QueryOutput` (blocking up to `QUERY_TIMEOUT`; a call that
-returns sooner is followed by a 1 ms sleep, as without the timeout), then
+returns sooner is followed by a 1 ms sleep, as without the timeout); the oldest frame in
+flight still not out 2 s after its submission (or after the last `Flush` + `ReInit`) while
+`QueryOutput` answers `AMF_REPEAT` is a hung encoder: the fatal `encode_failed` (`device_lost`
+if the device was removed), as NVENC's. Then
 `OUTPUT_DATA_TYPE` (AV1 `OUTPUT_FRAME_TYPE`) gives `key`,
 `OUTPUT_MARKED_LTR_INDEX` the slot's `ltrSlot`, `OUTPUT_REFERENCED_LTR_INDEX_BITFIELD`
 `refLtrMask`, `OUTPUT_TEMPORAL_LAYER` `temporalLayer` (H.264, HEVC; AV1 has no such property:
@@ -1217,6 +1237,9 @@ IDRs and rate changes and calls `avcodec_send_frame` / `avcodec_receive_packet` 
 thread on the codec context; `async_depth` 1 makes each encode synchronous there), and
 queues the packets for `receive()` (output thread). An encode error is a non-fatal
 `encode_failed`, fatal after 10 in a row; a removed D3D11 device is the fatal `device_lost`.
+The oldest frame in the encoder (sent, no packet yet) still not out 2 s after its submission
+(a call into the runtime that does not return, or an encoder that takes frames and gives
+nothing back) is a hung encoder: `receive()` fails with the fatal `encode_failed`.
 
 **Test path** (`--lavc-test-encoder=libx264`): the same backend drives a software encoder
 from an FFmpeg shared build that has one (BtbN's GPL shared build) on system-memory frames:

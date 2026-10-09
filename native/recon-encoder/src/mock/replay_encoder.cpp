@@ -4,6 +4,7 @@
 
 #include "codec/bitstream.hpp"
 #include "codec/hdr.hpp"
+#include "hang.hpp"
 #include "mock/mock.hpp"
 
 // Generated from testdata/mock_clip.h264 by cmake/embed.cmake.
@@ -147,6 +148,8 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     pos_ = 0;
     idrPending_ = false;
     stopped_ = false;
+    stalledId_ = 0;
+    stalledQpc_ = 0;
     for (EncodedFrame& f : queue_) releaseOutput(f);
     queue_.clear();
     kbps_ = lagKbps_ = p.kbps;
@@ -189,6 +192,17 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
     }
     if (opt_.fatalAt && info.frameId == opt_.fatalAt) {
         return Status::Error("mock_fatal", "injected fatal error at frame " + std::to_string(info.frameId), true);
+    }
+    if (const uint64_t at = testStallAt(); at && info.frameId >= at) {
+        // --test-stall-at: the encoder takes this frame and finishes none
+        // from here on; its input queue then stays full (encoder_busy), as
+        // a stalled AMF encoder's does. receive() reports the hang.
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stalledId_) return Status::Error("encoder_busy", "the encoder has stalled (--test-stall-at)");
+        stalledId_ = info.frameId;
+        stalledQpc_ = info.submitQpc;
+        logf(LogLevel::Warn, "mock: stalling at frame %llu (--test-stall-at)", static_cast<unsigned long long>(info.frameId));
+        return Status::Ok();
     }
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -254,11 +268,16 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
     return Status::Ok();
 }
 
-Next ReplayEncoder::receive(EncodedFrame& out, int timeoutMs, Status&) {
+Next ReplayEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return !queue_.empty() || stopped_; });
     if (stopped_) return Next::Stopped;
-    if (queue_.empty()) return Next::Timeout;
+    if (queue_.empty()) {
+        // The hang check of the real backends (hang.hpp), for --test-stall-at.
+        if (!encoderHung(stalledQpc_, qpcNow(), qpcFrequency())) return Next::Timeout;
+        err = encoderHangError("the mock encoder", stalledId_);
+        return Next::Error;
+    }
     out = queue_.front();
     queue_.pop_front();
     out.outputQpc = qpcNow();

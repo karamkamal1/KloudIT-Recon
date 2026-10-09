@@ -28,7 +28,9 @@
 // D3D11 device lock (ID3D10Multithread) held: AMF takes it itself
 // (AMFContext::LockDX11), and holding it across a call that waits for AMF's own
 // threads could deadlock. (FFmpeg's amf_submit_frame_locked takes a plain
-// mutex of its own, not the device lock.)
+// mutex of its own, not the device lock.) A frame still not out 2 s after its
+// submission while QueryOutput answers AMF_REPEAT is a hung encoder: a fatal
+// encode_failed, as NVENC's (hang.hpp), so recon-host restarts the helper.
 //
 // Phase 5 (GUIDE 9): temporal SVC (MAX_NUM_TEMPORAL_LAYERS before Init,
 // NUM_TEMPORAL_LAYERS; LTR marks and recovery frames on base-layer frames only,
@@ -74,6 +76,7 @@
 #include "codec/ltr.hpp"
 #include "codec/slices.hpp"
 #include "d3d/device.hpp"
+#include "hang.hpp"
 #include "probes.hpp"
 
 namespace recon {
@@ -446,6 +449,7 @@ private:
     Status roiSurface(const RoiMap& m, amf::AMFSurfacePtr& out);
     Status buildRoi(const std::vector<RoiRect>& rects);
     Status submitFailed(AMF_RESULT r, const char* what);
+    bool hung(Status& err);
     void warnOnce(const std::string& key, const std::string& text);
     amf_pts toPts(int64_t qpc) const { return amf_pts(qpc / freq_ * AMF_SECOND + qpc % freq_ * AMF_SECOND / freq_); }
 
@@ -490,6 +494,9 @@ private:
     std::mutex flightMu_;
     std::condition_variable flightCv_;
     std::deque<InFlight> flight_;
+    // When the last Flush + ReInit ended (guarded by flightMu_): a frame
+    // submitted before it counts toward the hang check from then on.
+    int64_t flushedQpc_ = 0;
 
     std::mutex holdsMu_;
     std::unordered_map<amf::AMFSurface*, Hold> holds_;
@@ -1161,6 +1168,10 @@ Status AmfEncoder::applyRate(const RateParams& r, bool& idr) {
                 applyDynamic(after);
             }
         }
+        // Before QueryOutput can run again: the flush and ReInit time is not
+        // the encoder hanging on the frames in flight (receive, hung()).
+        std::lock_guard<std::mutex> lock(flightMu_);
+        flushedQpc_ = qpcNow();
     }
     if (res != AMF_OK) return Status::Error("encode_failed", amfError("setRate: Flush + ReInit", res), true);
     {
@@ -1383,11 +1394,33 @@ Status AmfEncoder::submit(const EncoderFrame& frame, const SubmitInfo& info) {
     return Status::Ok();
 }
 
+// NVENC's hang check (hang.hpp): the oldest frame in flight is still not
+// out kEncoderHangMs after its submission (or after the last Flush + ReInit)
+// while QueryOutput keeps answering AMF_REPEAT: VCN stopped without the
+// device being removed (an encoder or firmware stall). Fatal encode_failed
+// (device_lost if the device is gone after all), so recon-host restarts the
+// helper; SubmitInput would only keep answering AMF_INPUT_FULL (encoder_busy).
+bool AmfEncoder::hung(Status& err) {
+    uint64_t id = 0;
+    int64_t since = 0;
+    {
+        std::lock_guard<std::mutex> lock(flightMu_);
+        if (flight_.empty()) return false;
+        id = flight_.front().frameId;
+        since = std::max(flight_.front().info.submitQpc, flushedQpc_);
+    }
+    if (!encoderHung(since, qpcNow(), freq_)) return false;
+    if (!d3d::deviceRemoved(device_.Get(), "amf: waiting for frame " + std::to_string(id), err)) err = encoderHangError("AMF", id);
+    return true;
+}
+
 Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
     const int64_t deadline = qpcNow() + int64_t(timeoutMs) * freq_ / 1000;
+    const uint64_t stallAt = testStallAt();
     amf::AMFDataPtr data;
     for (;;) {
         if (stopped_ || !enc_) return Next::Stopped;
+        bool stalled = false;  // --test-stall-at
         {
             // Nothing in the encoder: wait for a submission instead of querying.
             // QueryOutput answers AMF_REPEAT when "the output queue is empty"
@@ -1405,10 +1438,13 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
                 if (stopped_) return Next::Stopped;
                 if (flight_.empty()) return Next::Timeout;
             }
+            stalled = stallAt && flight_.front().frameId >= stallAt;
         }
         AMF_RESULT r;
         const int64_t before = qpcNow();
-        {
+        if (stalled) {
+            r = AMF_REPEAT;  // --test-stall-at: as a VCN that stopped finishing frames
+        } else {
             std::shared_lock<std::shared_mutex> shared(componentMu_);
             r = enc_->QueryOutput(&data);
         }
@@ -1447,6 +1483,7 @@ Next AmfEncoder::receive(EncodedFrame& out, int timeoutMs, Status& err) {
         const int64_t now = qpcNow();
         if (r == AMF_REPEAT || r == AMF_OK || r == AMF_NEED_MORE_INPUT) {
             queryErrors_ = 0;
+            if (hung(err)) return Next::Error;
             if (now >= deadline) return Next::Timeout;
             // A call that waited out QUERY_TIMEOUT (at least half of it) goes
             // again at once; one that came back sooner (no timeout in effect,

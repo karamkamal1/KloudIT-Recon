@@ -11,7 +11,8 @@
 // recoveries on base-layer frames, the layer prediction), temporal ids and the
 // discardable flag from H.264 / HEVC / AV1 units, the sub-frame output
 // assembler, the cursor / crosshair ROI maps of encoder.FocusROI written into
-// a pitched GRAY32 plane, and the NVENC re-encode limits and QP maps.
+// a pitched GRAY32 plane, and the NVENC re-encode limits and QP maps. The
+// encoder hang rule (hang.hpp) that AMF, libavcodec and the mock apply.
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include "codec/ltr.hpp"
 #include "codec/rfi.hpp"
 #include "codec/slices.hpp"
+#include "hang.hpp"
 #include "mock/mock.hpp"
 #include "nvenc/nvenc_policy.hpp"
 #include "selftest.hpp"
@@ -1075,6 +1077,20 @@ void testHdrMetadata() {
     std::printf("  %-44s ok\n", name);
 }
 
+void testHang() {
+    const char* name = "encoder hang rule";
+    const int64_t f = 10'000'000;  // QPC ticks per second
+    const int64_t t0 = 5 * f;
+    expect(!encoderHung(0, t0 + 60 * f, f), name, "no frame in the encoder is a hang");
+    expect(!encoderHung(t0, t0 + kEncoderHangMs * f / 1000, f), name, "exactly 2 s is a hang");
+    expect(encoderHung(t0, t0 + kEncoderHangMs * f / 1000 + 1, f), name, "more than 2 s is no hang");
+    expect(!encoderHung(t0, t0 + f / 2, f), name, "500 ms (a slow frame) is a hang");
+    const Status s = encoderHangError("AMF", 42);
+    expect(!s.ok && s.fatal && s.code == "encode_failed" && s.text == "AMF did not finish frame 42 within 2000 ms", name,
+           "error: " + s.code + " " + s.text);
+    std::printf("  %-44s ok\n", name);
+}
+
 }  // namespace
 
 int runEncoderSelfTest() {
@@ -1087,6 +1103,7 @@ int runEncoderSelfTest() {
     testRoi();
     testNvencPolicy();
     testHdrMetadata();
+    testHang();
     std::printf("self-test-encoder: %s\n", failures ? "FAIL" : "ok");
     return failures ? 1 : 0;
 }
