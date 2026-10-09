@@ -43,3 +43,15 @@ func AdminOnly(string) error { return ErrUnsupported }
 // AgentStateDir is unsupported outside Windows (the agent is never elevated
 // there).
 func AgentStateDir() (string, error) { return "", ErrUnsupported }
+
+// DisplayRequest keeps the display on while set: Windows only.
+type DisplayRequest struct{}
+
+// NewDisplayRequest is unsupported outside Windows.
+func NewDisplayRequest(string) (*DisplayRequest, error) { return nil, ErrUnsupported }
+
+// Set does nothing outside Windows.
+func (*DisplayRequest) Set(bool) error { return nil }
+
+// Close does nothing outside Windows.
+func (*DisplayRequest) Close() {}

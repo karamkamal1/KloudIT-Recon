@@ -24,6 +24,7 @@ import (
 	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
+	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -1104,5 +1105,94 @@ func TestCursorLoopAfterVideoCursor(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("no pointer after switching to the local cursor: %q, %d datagrams", ctrl.messages(t), n)
 		}
+	}
+}
+
+// fakeDisplayRequest records what a session does with its display request.
+type fakeDisplayRequest struct {
+	mu  *sync.Mutex
+	log *[]string
+}
+
+func (f fakeDisplayRequest) Set(on bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	*f.log = append(*f.log, map[bool]string{true: "set", false: "clear"}[on])
+	return nil
+}
+
+func (f fakeDisplayRequest) Close() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	*f.log = append(*f.log, "close")
+}
+
+// fakeDisplayRequests replaces newDisplayRequest for a test and returns
+// what was done with the requests made, in order.
+func fakeDisplayRequests(t *testing.T) (events func() string) {
+	var mu sync.Mutex
+	var log []string
+	nd := newDisplayRequest
+	t.Cleanup(func() { newDisplayRequest = nd })
+	newDisplayRequest = func(string) (displayRequest, error) { return fakeDisplayRequest{&mu, &log}, nil }
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Join(log, ",")
+	}
+}
+
+// TestSessionKeepsDisplayOn: a session keeps the PC's display on from its
+// welcome until it ends, whatever the pipeline (here FFmpeg's, whose video
+// cannot start: the session ends at once and lets the display go). Before,
+// only the native helper's capture did, so on the FFmpeg path the display
+// turned off after the power plan's timeout in a session with only a
+// controller's input.
+func TestSessionKeepsDisplayOn(t *testing.T) {
+	events := fakeDisplayRequests(t)
+	sim := vdisplay.NewSim(vdisplay.DriverSudoVDA)
+	sim.AddMonitor(1920, 1080, 0, 0, 60)
+	r := newVDRig(t, sim, Config{Pipeline: "ffmpeg"})
+	msgs, _, done := runClient(t, r.a, proto.Hello{V: proto.HelloVersionFrameExt, Client: proto.ClientInfo{Width: 1920, Height: 1080}})
+	waitFor(t, msgs, `"t":"notice"`, "Could not start video")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session did not end")
+	}
+	if e := events(); e != "set,clear,close" {
+		t.Fatalf("display request: %v, want set, then clear and close when the session ends", e)
+	}
+}
+
+// TestHiddenClientLetsDisplaySleep: while the client is hidden the session
+// lets the display follow the power plan (as the native helper does, whose
+// capture stops), and keeps it on again from resume.
+func TestHiddenClientLetsDisplaySleep(t *testing.T) {
+	events := fakeDisplayRequests(t)
+	s, _, ctrl := fakePipelineSession(t, slog.New(slog.NewTextHandler(io.Discard, nil)), media.PipelineCaps{})
+	control := func(msgs ...proto.ClientMsg) {
+		t.Helper()
+		var in bytes.Buffer
+		for _, m := range msgs {
+			b, _ := json.Marshal(m)
+			if err := proto.WriteMsg(&in, b); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctrl.r = &in
+		if err := s.controlLoop(); !errors.Is(err, io.EOF) {
+			t.Fatalf("control loop: %v", err)
+		}
+	}
+	release := s.keepDisplayOn()
+	control(proto.ClientMsg{T: "pause"}, proto.ClientMsg{T: "pause"})
+	if e := events(); e != "set,clear" {
+		t.Fatalf("display request after pause: %v, want set, then clear", e)
+	}
+	control(proto.ClientMsg{T: "resume"})
+	release()
+	if e := events(); e != "set,clear,set,clear,close" {
+		t.Fatalf("display request: %v, want set again on resume, then clear and close", e)
 	}
 }

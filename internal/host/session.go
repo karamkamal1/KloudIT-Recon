@@ -116,6 +116,11 @@ type Session struct {
 	noticeAt atomic.Int64   // unix ns of the last congestion notice to the user (rate limited)
 	rateLog  rateLog        // how applyRate logs the controller's changes
 
+	// display keeps the PC's display on while set (keepDisplayOn, nil
+	// without one); displayHeld: it is set (the client watches).
+	display     displayRequest
+	displayHeld bool
+
 	// sendSince: unix ns when frameSender took the frame it sends (0: it
 	// waits for one); sendOpening: it still waits for the frame's stream.
 	// For the overflow log (logOverflow).
@@ -361,6 +366,7 @@ func (s *Session) run() error {
 			s.notice("warn", n)
 		}
 	}
+	defer s.keepDisplayOn()()
 	if s.hello.V >= proto.HelloVersionFrameExt {
 		go s.wallClockLoop()
 	}
@@ -385,6 +391,58 @@ func (s *Session) run() error {
 	go s.statsLoop()
 	go s.rateLoop()
 	return s.controlLoop()
+}
+
+// displayRequest keeps the PC's display on while set (platform.DisplayRequest).
+type displayRequest interface {
+	Set(on bool) error
+	Close()
+}
+
+// newDisplayRequest is platform.NewDisplayRequest (tests replace it).
+var newDisplayRequest = func(reason string) (displayRequest, error) {
+	r, err := platform.NewDisplayRequest(reason)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// keepDisplayOn keeps the PC's display on while the session streams,
+// whatever the pipeline, and returns the release. Windows turns the display
+// off after the power plan's timeout without keyboard or mouse input, and a
+// controller's virtual pad does not count as input: a display that goes to
+// sleep stops presenting, so the stream freezes, and waking it restarts the
+// capture. The native helper's capture also keeps the display on; FFmpeg
+// (ddagrab, gfxcapture) does not. Not while the client is hidden
+// (displayOn): nobody watches then, and the helper's capture stops too.
+func (s *Session) keepDisplayOn() (release func()) {
+	r, err := newDisplayRequest("KloudIT Recon is streaming this PC's display")
+	if err != nil {
+		if !errors.Is(err, platform.ErrUnsupported) {
+			s.log.Warn("cannot keep the display on while streaming: it may turn off without keyboard or mouse input", "err", err)
+		}
+		return func() {}
+	}
+	s.display = r
+	s.displayOn(!s.paused.Load())
+	return func() {
+		s.displayOn(false)
+		r.Close()
+	}
+}
+
+// displayOn sets the session's display request while the client watches
+// and clears it while it is hidden (run's goroutine: its control loop).
+func (s *Session) displayOn(on bool) {
+	if s.display == nil || s.displayHeld == on {
+		return
+	}
+	if err := s.display.Set(on); err != nil {
+		s.log.Warn("cannot keep the display on while streaming: it may turn off without keyboard or mouse input", "on", on, "err", err)
+		return
+	}
+	s.displayHeld = on
 }
 
 func trunc(s string, n int) string {
@@ -2715,9 +2773,11 @@ func (s *Session) controlLoop() error {
 				s.log.Info("client hidden: pausing video")
 				s.vid().Suspend()
 				s.drainQueue()
+				s.displayOn(false)
 			}
 		case "resume":
 			if s.paused.Swap(false) {
+				s.displayOn(true)
 				if err := s.startVideo(true, "resume"); err != nil {
 					s.notice("error", err.Error())
 				}

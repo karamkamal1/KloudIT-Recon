@@ -1,5 +1,6 @@
 // Package platform wraps OS facilities the host needs besides capture/encode:
-// monitor enumeration, DPI awareness, cursor shapes and virtual gamepads.
+// monitor enumeration, DPI awareness, cursor shapes, virtual gamepads and
+// keeping the display on.
 package platform
 
 import "errors"

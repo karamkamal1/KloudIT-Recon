@@ -98,6 +98,8 @@ jobs:
           go test -count=1 -v -run 'Qualify' ./internal/host/qualify
       - name: Agent supervisor (the logon task's -restart; its job object ends the agent with it)
         run: go test -count=1 -v -run 'Supervisor' ./cmd/recon-host
+      - name: Display power request (sessions keep the display on)
+        run: go test -count=1 -v -run 'DisplayRequest' ./internal/host/platform
       - uses: actions/upload-artifact@v4
         with:
           name: recon-encoder-msvc

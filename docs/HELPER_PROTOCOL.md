@@ -600,7 +600,8 @@ holds the device's lock while it waits (Sunshine display_base.cpp), and the enco
 the same device, so the helper waits in slices of at most 2 ms with 0.5 ms pauses outside
 the call: an encoder thread that needs the device waits at most a slice, and a present is
 noticed at most 0.5 ms late. While streaming, the capture thread keeps the display awake
-(`ES_DISPLAY_REQUIRED`).
+(`ES_DISPLAY_REQUIRED`); the agent's session also holds a display power request while its
+client watches, whatever the pipeline (ARCHITECTURE "The PC's display stays on").
 
 All GPU captures: while a capture exists the helper raises the system timer resolution
 to 1 ms (`timeBeginPeriod`; since Windows 10 2004 a process that does not ask gets ~15.6 ms

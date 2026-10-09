@@ -125,7 +125,9 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
 10. **The FFmpeg fallback** (`"pipeline": "ffmpeg"`): the checks marked FFmpeg path only (1.2,
    1.4, the 1.3 soak), 1.6 (AMD Direct Capture through FFmpeg), and one stream per codec.
    "Final review: host agent": FFmpeg's rate restarts no longer filling host.log (at the
-   default `logLevel`), and its FFmpeg line of nothing encoding while the tab is hidden.
+   default `logLevel`), and its FFmpeg line of nothing encoding while the tab is hidden. "Final
+   review: host agent, third round": the display staying on with only a controller (then its
+   repeat on the default pipeline).
 11. **Remote access** (INSTALL.md section 9): "Final review: QUIC packets on a 1280-MTU path
    (Tailscale)" (the laptop on a phone hotspot through Tailscale, then Tailscale on the PC
    itself); with port forwarding and a reverse proxy in front of the gateway's HTTPS, "Final
@@ -10848,3 +10850,41 @@ browser at its own defaults (60 fps, 30 Mbit/s), which is what a browser sends.
 - Verified here: documentation only (and a config comment); `internal/host` passes.
 - AMD RDNA3 (RX 7900 XT): nothing to check on hardware (no behaviour change).
 - NVIDIA: nothing to check on hardware (no behaviour change).
+
+## Final review: host agent, third round
+
+Findings of the third final review about the PC agent. Each item: the problem, the fix, what was
+verified here, the check on hardware.
+
+### The display stays on with only a controller, on every pipeline
+
+Problem: only the native helper kept the PC's display on while streaming (its capture thread's
+`ES_DISPLAY_REQUIRED`). On the FFmpeg path (`"pipeline": "ffmpeg"`, Cursor "In the video stream",
+the fallback after three helper failures, Intel without `-InstallLibavcodec`) nothing did, and
+Windows turned the display off after the power plan's display timeout (10 minutes on Balanced)
+when the only input was a controller: a virtual pad's input does not count as user activity. The
+picture froze or went black until a mouse or keyboard input arrived.
+
+Fix: each session holds a Windows display power request (`PowerCreateRequest` /
+`PowerSetRequest(PowerRequestDisplayRequired)`, reason "KloudIT Recon is streaming this PC's
+display") from its welcome until it ends, whatever the pipeline, and clears it while the client
+is hidden (paused) as the helper's capture, which stops then, does. A request that cannot be made
+is logged once (`cannot keep the display on while streaming`) and the session goes on.
+
+- Verified here: `internal/host` `TestSessionKeepsDisplayOn` (the request faked): a session on
+  the FFmpeg path sets it after the welcome, and clears and closes it when it ends;
+  `TestHiddenClientLetsDisplaySleep`: a pause clears it (once for two pauses), resume sets it
+  again, the end clears and closes it. Before the fix there was no request. `internal/host/platform`
+  `TestDisplayRequest` (REASON_CONTEXT's x64 layout; create, set, clear, close) is in the Windows
+  CI job (`helper-windows`); under Wine 9 `PowerCreateRequest` is a stub that fails, so the test
+  skips there. `GOOS=windows go vet` passes.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test: set the power plan's display
+  timeout to 1 minute (`powercfg /change monitor-timeout-ac 1`) and `"pipeline": "ffmpeg"` in
+  host.json; stream from a browser and, during the stream, `powercfg /requests` (administrator)
+  lists `[PROCESS] ...\recon-host.exe` with `KloudIT Recon is streaming this PC's display` under
+  DISPLAY. Play with only a controller (no mouse or keyboard input on the client) for 3 minutes:
+  the display stays on and the stream keeps moving. Hide the tab (another tab in front) for 2
+  minutes: `powercfg /requests` no longer lists it and the display may turn off; show the tab and
+  move the mouse once: the stream comes back. End the stream: the request is gone. Repeat on the
+  default pipeline (the helper). Put the display timeout back afterwards.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

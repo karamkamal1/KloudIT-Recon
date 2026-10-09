@@ -159,6 +159,9 @@ Set-NetConnectionProfile -InterfaceIndex <number from above> -NetworkCategory Pr
 powercfg /change standby-timeout-ac 0    # don't sleep while plugged in
 ```
 
+The display may keep its timeout: a stream keeps it on while you watch, also when you play with
+only a controller.
+
 If you want to start games while you're away, the PC also has to sign in by itself. The agent
 starts at sign-in and can't see the lock screen. To set that up:
 

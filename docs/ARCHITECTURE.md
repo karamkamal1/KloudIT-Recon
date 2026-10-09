@@ -76,6 +76,13 @@ again). The host stops the encoder, and nothing starts one until `resume`: key-f
 and losses are ignored, and a settings or rate change takes effect with the generation `resume`
 starts. A config of a generation that went live meanwhile is not sent.
 
+**The PC's display stays on** while a client watches, whatever the pipeline: the session holds a
+Windows display power request (`PowerRequestDisplayRequired`, listed by `powercfg /requests`)
+from its welcome until it ends, cleared while the client is hidden (paused). Without it Windows
+turns the display off after the power plan's timeout when the only input is a controller (a
+virtual pad's input does not count), which freezes the picture; the native helper's capture
+thread also holds `ES_DISPLAY_REQUIRED` while it captures, FFmpeg's capture does not.
+
 ### Frame stream
 
 ```

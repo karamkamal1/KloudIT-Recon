@@ -357,7 +357,9 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   `latency-test\index.html`) full-screen on the streamed monitor of the PC; the overlay then shows
   host screen → drawn latency measured from the picture, and **Export latency data** saves it.
 
-The stream pauses automatically when the tab is hidden, which frees your PC's GPU.
+The stream pauses automatically when the tab is hidden, which frees your PC's GPU. While you
+watch, the PC's display stays on (also with only a controller's input); while the tab is hidden
+the power plan's display timeout applies again.
 
 ## Playing away from home
 
