@@ -368,7 +368,9 @@ pick up the old files.
 - **PC**, in an administrator PowerShell:
   `powershell -ExecutionPolicy Bypass -File "$env:ProgramFiles\KlouditRecon\uninstall-host.ps1"`.
   Add `-KeepConfig` to keep the pairing, `-RemoveVirtualDisplay` to also remove the Virtual
-  Display Driver.
+  Display Driver. If a stream's virtual monitor is still there (a stream running, or the
+  10 seconds after it), the script removes it and restores your display layout first
+  (`recon-host.exe vdisplay -restore`).
 - **Gateway**: `pct stop 210 && pct destroy 210` on the Proxmox node.
 
 ## Useful commands
@@ -383,4 +385,5 @@ pick up the old files.
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 70 min on AMD, 25 on NVIDIA; `-quality balanced` a third of that; no stream running); sessions use the results (`live-bitrate.json`) |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" vdisplay -mode 2560x1440@120 -hold 30s` | Create a virtual display for 30 s and restore the displays (stop the agent first) |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" vdisplay -restore` | Remove a virtual display a stopped agent left and restore the display layout (stop the agent first; its next start does the same) |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" pair "recon1:..."` | Re-pair. The running agent picks up the new code within seconds. |

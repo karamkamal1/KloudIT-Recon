@@ -8877,3 +8877,33 @@ display)", with a hint.
   WxH, monitor is ..."` and the virtual monitor is the primary display; 10 s after the stream
   the previous layout is back; with `"virtualDisplay": "off"` and a restart no virtual display.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### Uninstalling restores a virtual display's layout
+
+Problem: `uninstall-host.ps1` ends the agent with `Stop-Process -Force` (the windowless agent has
+no other way to be told), so its virtual display cleanup never ran, and then it deleted
+`%APPDATA%\KlouditRecon` with the restore journal and the program that replays it: a virtual
+display of a running stream or of the 10 s linger stayed enabled and primary (with layout `only`
+the monitors stayed off). Fix: `recon-host vdisplay -restore` replays the journal next to the
+config, as the agent's start does (`host.RestoreVirtualDisplays`, vdisplay.Manager.Recover,
+whatever the policy is now), and the uninstaller runs it after stopping the agent and before it
+deletes anything.
+
+- Verified here: `internal/host` `TestRestoreVirtualDisplays` (vdisplay.Sim: a killed agent's
+  display with layout `only` removed and the 1920x1080 monitor primary again, the journal gone,
+  also with `virtualDisplay` `off` by then; nothing without a journal). The Windows build of
+  `recon-host.exe vdisplay -restore` under Wine (Wine's display configuration): without a
+  journal `virtual display: nothing to restore`, exit 0; with a journal (driver sudovda,
+  2560x1440@120) `restoring the displays after an unfinished virtual display session`, `virtual display:
+  removed, the displays restored`, exit 0, the journal gone; with an unreadable journal the
+  error and exit code 1 (the uninstaller then warns), the journal removed. The pwsh parser
+  check.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with the Virtual Display Driver and
+  `"virtualDisplayLayout": "only"`, start a stream from a client whose screen differs from the
+  monitor (the virtual monitor is the only display), then, from that PC's console or an SSH
+  session, run `uninstall-host.ps1`: it prints `Removed a virtual display a stream had left and
+  restored the display layout.`, the physical monitor is on and primary again and the Virtual
+  Display Driver device is disabled in Device Manager. Repeat within 10 s after ending a stream
+  (the linger). Also: `recon-host.exe vdisplay -restore` with the agent stopped after a killed
+  stream (`Stop-Process -Name recon-hostw -Force`) does the same.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

@@ -928,13 +928,14 @@ type journal struct {
 	Time    time.Time `json:"time"`
 }
 
-const journalName = "vdisplay-restore.json"
+// JournalName is the restore journal's file name in Options.StateDir.
+const JournalName = "vdisplay-restore.json"
 
 func (m *Manager) journalPath() string {
 	if m.opts.StateDir == "" {
 		return ""
 	}
-	return filepath.Join(m.opts.StateDir, journalName)
+	return filepath.Join(m.opts.StateDir, JournalName)
 }
 
 func (m *Manager) writeJournal(mon *monitor, plugged bool) error {

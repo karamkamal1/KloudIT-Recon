@@ -67,7 +67,7 @@ func TestCreatePrimaryAndRestore(t *testing.T) {
 	if !hasFlag(sys.flags(), SDCSaveToDatabase) {
 		t.Fatalf("a SudoVDA session layout is saved to the display database: flags %#x", sys.flags())
 	}
-	if _, err := os.Stat(filepath.Join(dir, journalName)); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, JournalName)); err != nil {
 		t.Fatalf("journal while the display exists: %v", err)
 	}
 	if found, ok := info.Find([]platform.Monitor{{Name: `\\.\DISPLAY1`}, {Name: strings.ToLower(info.Name), W: 1}}); !ok || found.W != 1 {
@@ -82,7 +82,7 @@ func TestCreatePrimaryAndRestore(t *testing.T) {
 	if _, ok := sys.state(drv.target); ok {
 		t.Fatal("the virtual monitor is still connected")
 	}
-	if _, err := os.Stat(filepath.Join(dir, journalName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, JournalName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal after restore: %v", err)
 	}
 	last := sys.flags()[len(sys.flags())-1]
@@ -195,7 +195,7 @@ func TestTargetFoundWhenLUIDDiffers(t *testing.T) {
 		t.Fatalf("target %v", d.Info().Target)
 	}
 	// The journal (Recover) and the departure wait use CCD's target.
-	b, err := os.ReadFile(filepath.Join(dir, journalName))
+	b, err := os.ReadFile(filepath.Join(dir, JournalName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestFailedSetupRollsBack(t *testing.T) {
 	if st, _ := sys.state(phys.t); !st.active || st.x != 0 {
 		t.Fatalf("physical monitor %+v", st)
 	}
-	if _, err := os.Stat(filepath.Join(dir, journalName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, JournalName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal left: %v", err)
 	}
 	if m.cur != nil {
@@ -496,18 +496,18 @@ func TestRecoverAfterCrash(t *testing.T) {
 	if st, _ := sys.state(phys.t); !st.active || st.x != 0 {
 		t.Fatalf("physical monitor %+v", st)
 	}
-	if _, err := os.Stat(filepath.Join(dir, journalName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, JournalName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal: %v", err)
 	}
 	if err := m2.Recover(); err != nil { // nothing to do
 		t.Fatal(err)
 	}
 	// A corrupt journal is reported and removed.
-	os.WriteFile(filepath.Join(dir, journalName), []byte("{"), 0o600)
+	os.WriteFile(filepath.Join(dir, JournalName), []byte("{"), 0o600)
 	if err := m2.Recover(); err == nil {
 		t.Fatal("corrupt journal accepted")
 	}
-	if _, err := os.Stat(filepath.Join(dir, journalName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, JournalName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal: %v", err)
 	}
 }
@@ -539,7 +539,7 @@ func TestPlugFailure(t *testing.T) {
 	if _, err := m.Create(mode1440); err == nil || !strings.Contains(err.Error(), "sudovda: STATUS_TOO_MANY_NODES") {
 		t.Fatalf("err %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, journalName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, JournalName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("journal: %v", err)
 	}
 }

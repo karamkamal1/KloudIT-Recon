@@ -746,6 +746,53 @@ func TestVirtualDisplayAgent(t *testing.T) {
 	r.restored(t)
 }
 
+// TestRestoreVirtualDisplays: "recon-host vdisplay -restore", which
+// uninstall-host.ps1 runs after it killed the agent and before it deletes
+// the agent and its config: the virtual display a killed agent left (here
+// with layout "only": the physical monitor off) is removed and the displays
+// restored from the journal next to the config, whatever the policy says
+// now; without a journal nothing happens.
+func TestRestoreVirtualDisplays(t *testing.T) {
+	sim := vdisplay.NewSim(vdisplay.DriverSudoVDA)
+	sim.AddMonitor(1920, 1080, 0, 0, 60)
+	dir := t.TempDir()
+	cfg := &Config{VirtualDisplay: "auto", VirtualDisplayLayout: "only", HostID: "h1", path: filepath.Join(dir, "host.json")}
+	defer func(f func(vdisplay.Options) *vdisplay.Manager) { newVirtualDisplays = f }(newVirtualDisplays)
+	newVirtualDisplays = sim.Manager
+	logs := &lockedLog{}
+	log := slog.New(slog.NewTextHandler(logs, nil))
+
+	if found, err := RestoreVirtualDisplays(cfg, log); found || err != nil {
+		t.Fatalf("no journal: found %v, err %v", found, err)
+	}
+	if _, _, rec := sim.Counts(); rec != 0 {
+		t.Fatalf("recovers %d without a journal", rec)
+	}
+	// The killed agent's display: neither the session nor the agent removed it.
+	if _, err := sim.Manager(cfg.virtualDisplayOptions()).Create(vdisplay.Mode{Width: 2560, Height: 1440, Hz: 120}); err != nil {
+		t.Fatal(err)
+	}
+	if m := sim.Monitors(); len(m) != 1 || m[0].W != 2560 {
+		t.Fatalf("killed agent's displays %+v", m)
+	}
+	off := *cfg
+	off.VirtualDisplay = "off" // turned off before uninstalling: restored all the same
+	found, err := RestoreVirtualDisplays(&off, log)
+	if !found || err != nil {
+		t.Fatalf("found %v, err %v", found, err)
+	}
+	(&vdRig{sim: sim, dir: dir}).restored(t)
+	if _, _, rec := sim.Counts(); rec != 1 {
+		t.Fatalf("recovers %d", rec)
+	}
+	if l := logs.lines("restoring the displays after an unfinished virtual display session"); len(l) != 1 {
+		t.Fatalf("log %q", l)
+	}
+	if found, err := RestoreVirtualDisplays(cfg, log); found || err != nil {
+		t.Fatalf("again: found %v, err %v", found, err)
+	}
+}
+
 // pipeConn is a transport.Conn whose only stream is the control stream a
 // test client plays over a net.Pipe.
 type pipeConn struct {

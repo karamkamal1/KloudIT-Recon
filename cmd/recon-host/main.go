@@ -5,7 +5,8 @@
 //	recon-host run           connect to the gateway and serve streams
 //	recon-host probe         show ffmpeg, its encoders and their command lines
 //	recon-host qualify       measure the native helper's live bitrate changes (GUIDE 3.6)
-//	recon-host vdisplay      create a virtual display for a while (hardware test)
+//	recon-host vdisplay      create a virtual display for a while (hardware test),
+//	                         or (-restore) undo a stopped agent's (uninstall)
 package main
 
 import (
@@ -45,6 +46,9 @@ Usage:
   recon-host [flags] vdisplay [-mode 2560x1440@120] [-layout primary|extend|only] [-hold 30s]
                                            create a virtual display (SudoVDA or Virtual
                                            Display Driver), list the monitors, restore
+  recon-host [flags] vdisplay -restore     put back the displays a stopped agent's virtual
+                                           display left changed (its restore journal next
+                                           to the config); stop the agent first
   recon-host version
 
 Flags:
@@ -205,7 +209,20 @@ func vdisplayTest(cfg *host.Config, args []string, log *slog.Logger) error {
 	modeArg := fs.String("mode", "2560x1440@120", "virtual monitor WIDTHxHEIGHT@HZ")
 	layout := fs.String("layout", cfg.VirtualDisplayLayout, "primary, extend or only (default: virtualDisplayLayout, else primary)")
 	hold := fs.Duration("hold", 30*time.Second, "how long to keep it (Ctrl+C ends earlier)")
+	restore := fs.Bool("restore", false, "only put back the displays a virtual display of the agent (this config's) left changed "+
+		"when the agent was stopped without its cleanup (uninstall-host.ps1 runs it); stop the agent first")
 	_ = fs.Parse(args)
+	if *restore {
+		platform.EnableDPIAwareness()
+		found, err := host.RestoreVirtualDisplays(cfg, log)
+		switch {
+		case !found:
+			fmt.Println("virtual display: nothing to restore")
+		case err == nil:
+			fmt.Println("virtual display: removed, the displays restored")
+		}
+		return err
+	}
 	mode, err := vdisplay.ParseMode(*modeArg)
 	if err != nil {
 		return err

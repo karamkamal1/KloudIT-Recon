@@ -1,8 +1,11 @@
 package host
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
@@ -67,6 +70,28 @@ func (a *Agent) setupVirtualDisplays(m *vdisplay.Manager) {
 	}
 	o := a.cfg.virtualDisplayOptions()
 	a.log.Info("virtual display", "policy", m.Policy(), "layout", o.Layout, "linger", o.Linger, "driver", m.Detect().String())
+}
+
+// RestoreVirtualDisplays puts back the displays a virtual display of an agent
+// with cfg left changed when the agent was stopped without its cleanup (a
+// crash, or a kill: Stop-ScheduledTask and Stop-Process end the windowless
+// agent at once), as the agent's next start would: its restore journal next to
+// the config (vdisplay.Manager.Recover). It reports whether there was one.
+// For "recon-host vdisplay -restore", which uninstall-host.ps1 runs before it
+// deletes the agent and the journal. Stop the agent first.
+func RestoreVirtualDisplays(cfg *Config, log *slog.Logger) (bool, error) {
+	o := cfg.virtualDisplayOptions()
+	if o.StateDir == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(filepath.Join(o.StateDir, vdisplay.JournalName)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	o.Log = log
+	return true, newVirtualDisplays(o).Recover()
 }
 
 // closeVirtualDisplays removes a virtual display (a session's, or one kept
