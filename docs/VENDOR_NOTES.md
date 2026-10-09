@@ -108,7 +108,7 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    SudoVDA), and "Final review: deploy and install", what the virtual display does after
    `-InstallVirtualDisplay`; 3.9 and 3.9/4.5 (HDR10, a monitor in Windows HDR mode), and
    "Final review: AMD Direct Capture sRGB and 10-bit surfaces", its 10-bit HDR check (the PQ
-   assumption).
+   assumption), and "Final review: AMD Direct Capture follows Windows HDR".
 9. **Soak (T8) on the default pipeline**:
    - AMD RDNA3 (RX 7900 XT): unverified. Test: default host.json (after stage 3), a GPU-bound
      game at 2560x1440 120 fps, HEVC, 50 Mbit/s, on `lan` (direct path), one stream for 2 hours.
@@ -9991,8 +9991,9 @@ Fix (`native/recon-encoder/src/d3d/convert.cpp`, `pipeline.cpp`):
   out): into P010 as it is, into NV12 as absolute light in BT.709 (the inverse BT.2087
   matrix) with 203 cd/m2 (ITU-R BT.2408 reference white) as white, brighter clipped. The HDR
   state comes from the source's `display` at the start and every `captureChanged`'s `hdr`
-  (AMD Direct Capture: as at its start). Which of the two a 10-bit surface holds is an
-  assumption to verify on hardware (below). The stream format is unchanged: AMD Direct
+  (AMD Direct Capture: as at its start; **superseded**: it follows Windows HDR changes since
+  "Final review: AMD Direct Capture follows Windows HDR"). Which of the two a 10-bit surface
+  holds is an assumption to verify on hardware (below). The stream format is unchanged: AMD Direct
   Capture still makes HDR10 only from FP16 surfaces at the start.
 - A conversion that keeps failing ends the helper: when no captured frame has converted for
   2 s and at least 10 frames, the fatal `capture_failed` "no captured frame could be
@@ -10061,6 +10062,65 @@ Verified here (Linux, mingw-w64 build, Wine 9 with Xvfb / Mesa llvmpipe, mode pl
   cases. AMD Direct Capture is AMD only, and DDA hands out only B8G8R8A8_UNORM or FP16: the
   `conversion source: DXGI format 87 (8-bit)` (FP16 with HDR: `10 (FP16 scRGB)`) line of a
   `--capture=dda` encode test is all that changes there.
+
+## Final review: AMD Direct Capture follows Windows HDR
+
+Problem: AMD Direct Capture read the output's Windows HDR state once, at its start. Its `lost`,
+`restored` and `resized` events carried that start value, and it never sent `captureChanged`
+`hdr`. Since "Final review: AMD Direct Capture sRGB and 10-bit surfaces" the colour conversion
+decides from exactly that flag whether a 10-bit (`R10G10B10A2`) surface is BT.2020 PQ or
+sRGB-coded, and only AMD Direct Capture hands out 10-bit surfaces (DDA asks for FP16 / BGRA, WGC
+for BGRA). With host capture `amf` on the conversion path (almost every stream: recon-host asks
+for a scaled size), Windows HDR turned on during a session made an HDR10 game's PQ codes read as
+sRGB (washed out, wrong colours), and turned off made a 10-bit SDR swap chain read as PQ (too
+dark), until the helper restarted; recon-host never restarted an HDR10 stream into the output's
+new mode either (step 4.5 waits for `hdr`).
+
+Fix (`native/recon-encoder/src/capture/amd_direct_capture.cpp`): the capture keeps a DXGI factory
+made before it enumerates the output. Windows makes a factory stale (`IDXGIFactory1::IsCurrent`
+false) when the display configuration changes, Windows HDR on or off included (Microsoft's
+D3D12HDR sample relies on it; DDA checks it the same way). Whenever it is stale, checked on every
+pass of the capture loop, and after every re-initialization of the component, the capture makes
+a new factory, finds the output again by its GDI name on its adapter (an output enumerated from a
+stale factory keeps its old colour), reads `IDXGIOutput6::GetDesc1` and updates the source's
+`display`. A changed HDR mode posts `captureChanged` `hdr` ("Windows HDR turned on|off for the
+output; the stream stays HDR10|SDR", also logged as `amd-direct: ...`), and `lost` / `restored` /
+`resized` carry the current state. The pipeline hands every event's `hdr` to the conversion, and
+recon-host restarts an HDR10 stream as with DDA. An output that cannot be found (in the middle of a
+mode change) keeps the last state and is looked up again every 250 ms. The stream format is
+unchanged (HDR10 only from FP16 surfaces at the start).
+
+Verified here (Linux, mingw-w64 build, Wine 9 with Xvfb / Mesa llvmpipe):
+- `make helper` (mingw-w64 g++ 13, `-Wall -Wextra`) and clang `-Wall -Wextra -Wpedantic -Wshadow
+  -Wconversion` (`--target=x86_64-w64-mingw32`) on the changed source: no warnings.
+- `make helper-test` under Wine (the DDA, synthetic-gpu and mock paths, unchanged): passes.
+- Not tested here: AMD Direct Capture needs the AMD driver's `AMFDisplayCapture` component
+  (amfrt64.dll), which neither Wine nor CI's windows-latest has, and there is no AMF test
+  double, so no test can fail before and pass after this change. It was reviewed against
+  `DdaCapture::reacquire`, which follows Windows HDR the same way.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (HDR toggled, encode test): Windows HDR off,
+  `recon-encoder.exe --encode-test=toggle.hevc --backend=amf --capture=amd-direct --codec=hevc
+  --zero-copy=0 --frames=2400 --log-level=debug`, and during the run press Win+Alt+B, wait 10 s,
+  press it again. The log has `amd-direct: Windows HDR turned on for the output; the stream stays
+  SDR` and then `... turned off ...`, each with a `capture hdr: WxH Windows HDR turned ...` line
+  (if the toggle also fails `QueryOutput`, `capture lost` / `capture restored` lines come with
+  it); no fatal error, `encode-test: ok`. Record whether `capture lost` appeared (that is, whether an HDR
+  toggle fails `QueryOutput`). No `hdr` line at all means the factory did not go stale on the toggle:
+  record it.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (10-bit surfaces after a toggle; the case this fixes):
+  start the encode test above with Windows HDR off, then turn HDR on and start a game with HDR
+  enabled (an HDR10 swap chain, `R10G10B10A2` G2084 P2020) in independent-flip fullscreen: after
+  the `hdr` line, `ffplay toggle.hevc` shows the game's mid tones at normal brightness with
+  highlights clipped, the same as a run started with HDR already on (not washed out). The reverse:
+  start with HDR on, a game with a 10-bit SDR swap chain, turn HDR off: not too dark afterwards.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (through recon-host): host capture `amf`, a session
+  with the client's HDR setting on and Windows HDR on (an HDR10 stream from FP16 surfaces, overlay
+  *HDR* on); press Win+Alt+B: host.log has `capture changed reason=hdr hdr=false`, then
+  `restarting video reason="Windows HDR turned off"`, and the client gets an SDR generation
+  with correct colours; on again: back to HDR10. With an SDR session (HDR setting off) the toggle
+  logs `capture changed reason=hdr` without a restart and the picture stays correct.
+- NVIDIA: unverified (no NVIDIA host available). Not applicable: AMD Direct Capture is AMD only;
+  DDA, which NVIDIA hosts use, already followed Windows HDR (3.9 "HDR toggled during a stream").
 
 ## Final review: browser client
 

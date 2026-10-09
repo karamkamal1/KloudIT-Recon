@@ -27,6 +27,17 @@
 // device was removed (fatal device_lost). AMF_EOF only follows a Drain(),
 // which the helper never calls, so it is a fatal capture_failed.
 //
+// Windows HDR: the component does not say whether the output is in HDR mode,
+// which decides how a 10-bit surface is read (BT.2020 PQ or sRGB-coded,
+// d3d/convert.cpp) and whether an HDR10 stream still matches the output. So
+// the output's colour (IDXGIOutput6::GetDesc1) is read again whenever the
+// display configuration changed, which Windows signals by making the DXGI
+// factory stale (IsCurrent false; turning HDR on or off does, as in
+// Microsoft's D3D12HDR sample), and after every re-initialization. The output
+// is found again by name for it: one enumerated from a stale factory keeps its
+// old colour. A change gives captureChanged "hdr" (the stream keeps its
+// format), as with DDA.
+//
 // Surfaces reach the encoder through the NV12 converter (it samples the
 // surface's D3D11 texture; DCC is resolved by the shader read), or, with the
 // AMF encoder on the same AMFContext (SourceInfo::amfContext), as they are
@@ -36,7 +47,8 @@
 // VERIFY on hardware (docs/VENDOR_NOTES.md): MONITOR_INDEX = the output's
 // index on its adapter (the doc says "determined by EnumAdapters"), AMF
 // rotation values vs DXGI, exclusive full screen, HDR desktops (FP16 surfaces),
-// IddCx virtual displays (probably unsupported: use DDA).
+// HDR turned on or off during a stream, IddCx virtual displays (probably
+// unsupported: use DDA).
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -99,9 +111,14 @@ protected:
 
 private:
     Status initComponent();
+    bool readDisplay();
+    void followHdr(bool wasHdr);
     float dirtyShare(amf::AMFSurface* s, amf_int32 w, amf_int32 h);
 
     d3d::OutputRef output_;
+    ComPtr<IDXGIFactory1> factory_;  // stale once the display configuration changed (top of file)
+    DisplayColor color_;             // the output's colour as last read
+    int64_t nextDisplayRead_ = 0;    // after a failed readDisplay: not before then
     d3d::Device dev_;
     amf::AMFContextPtr ctx_;
     amf::AMFComponentPtr comp_;
@@ -117,6 +134,8 @@ private:
 Status AmdDirectCapture::init(const StartParams& p) {
     const AmfRuntime& rt = amfRuntime();
     if (!rt.factory) return Status::Error("unavailable", rt.error);
+    // Before the output is enumerated: a change after that makes it stale.
+    CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory_.GetAddressOf()));
     Status s = d3d::selectOutput(p, output_);
     if (!s.ok) return s;
     if (output_.adapterInfo.vendor != "amd") {
@@ -136,7 +155,7 @@ Status AmdDirectCapture::init(const StartParams& p) {
     }
     s = initComponent();
     if (!s.ok) return s;
-    const DisplayColor color = d3d::displayColor(output_.output.Get());
+    const DisplayColor color = color_ = d3d::displayColor(output_.output.Get());
     bool hdr = false;
     {
         std::lock_guard<std::mutex> lock(srcMu_);
@@ -191,6 +210,43 @@ Status AmdDirectCapture::initComponent() {
     return Status::Ok();
 }
 
+// Reads the output's colour again (top of file): found again by name, on the
+// adapter our device lives on, after a new DXGI factory is made, which then
+// tells when it changes next. False when the output cannot be found right now
+// (in the middle of a mode change, gone): the last colour stays, and the next
+// try is kRetryMs later.
+bool AmdDirectCapture::readDisplay() {
+    ComPtr<IDXGIFactory1> factory;
+    CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory.GetAddressOf()));
+    d3d::OutputRef ref;
+    if (!factory || !d3d::findOutput(output_.adapterInfo.luidValue, output_.deviceName, ref).ok) {
+        factory_.Reset();
+        nextDisplayRead_ = qpcNow() + int64_t(kRetryMs) * qpcFrequency() / 1000;
+        return false;
+    }
+    factory_ = factory;
+    output_.output = ref.output;
+    output_.desc = ref.desc;
+    color_ = ref.desc.color;
+    std::lock_guard<std::mutex> lock(srcMu_);
+    src_.display = color_;
+    return true;
+}
+
+// captureChanged "hdr" when Windows HDR was turned on or off for the output
+// since wasHdr was read (as DdaCapture::reacquire).
+void AmdDirectCapture::followHdr(bool wasHdr) {
+    if (color_.hdr == wasHdr) return;
+    CaptureEvent ev;
+    ev.reason = "hdr";
+    ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
+    ev.hdr = color_.hdr;
+    ev.text = std::string("Windows HDR turned ") + (color_.hdr ? "on" : "off") + " for the output; the stream stays " +
+              (src_.hdr ? "HDR10" : "SDR");
+    logf(LogLevel::Info, "amd-direct: %s", ev.text.c_str());
+    postEvent(ev);
+}
+
 // The share of the surface its DIRTY_RECTS (an AMFBuffer of AMFRect, the
 // same left / top / right / bottom layout as DirtyRect) cover, each region
 // counted once; -1 when the surface carries none.
@@ -214,6 +270,11 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
     for (;;) {
         if (stopping()) return Next::Stopped;
         int64_t now = qpcNow();
+        if ((!factory_ || !factory_->IsCurrent()) && now >= nextDisplayRead_) {
+            // The display configuration changed (HDR, mode, outputs).
+            const bool wasHdr = color_.hdr;
+            if (readDisplay()) followHdr(wasHdr);
+        }
         if (broken_) {
             // The component failed (mode change, display gone): re-initialize
             // it every kRetryMs; the last image is repeated meanwhile.
@@ -230,11 +291,15 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
                 continue;
             }
             broken_ = false;
+            // The mode change may have turned HDR on or off.
+            const bool wasHdr = color_.hdr;
+            readDisplay();
             CaptureEvent ev;
             ev.reason = "restored";
             ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
-            ev.hdr = src_.display.hdr;  // as at the start (DDA follows HDR switches)
+            ev.hdr = color_.hdr;
             postEvent(ev);
+            followHdr(wasHdr);
         }
         amf::AMFDataPtr data;
         const AMF_RESULT r = comp_->QueryOutput(&data);
@@ -259,7 +324,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "lost";
             ev.width = int(src_.width), ev.height = int(src_.height), ev.rotation = rotation_;
-            ev.hdr = src_.display.hdr;  // as at the start (DDA follows HDR switches)
+            ev.hdr = color_.hdr;
             ev.text = amfError("QueryOutput", r);
             postEvent(ev);
             continue;
@@ -286,7 +351,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             CaptureEvent ev;
             ev.reason = "resized";
             ev.width = int(w), ev.height = int(h), ev.rotation = rotation_;
-            ev.hdr = src_.display.hdr;
+            ev.hdr = color_.hdr;
             ev.text = "was " + std::to_string(lastW_) + "x" + std::to_string(lastH_);
             postEvent(ev);
             std::lock_guard<std::mutex> lock(srcMu_);

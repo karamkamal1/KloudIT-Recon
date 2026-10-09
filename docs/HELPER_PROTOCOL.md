@@ -401,15 +401,15 @@ entry point). `ltrSlot` and `temporalLayer` complete the picture.
 {"t":"captureChanged","reason":"resized","width":1920,"height":1080,"rotation":0,"hdr":false,"text":"was 2560x1440 rotation 0"}
 ```
 
-`hdr` (additive, step 3.9): the output is in Windows HDR mode now (DDA; AMD Direct Capture
-reports the state at its start; other captures false).
+`hdr` (additive, step 3.9): the output is in Windows HDR mode now (DDA, AMD Direct Capture;
+other captures false).
 
 | `reason` | Meaning | Helper meanwhile |
 |---|---|---|
 | `resized` | the source has a new size or rotation (mode change, rotated display, resized window) | keeps the encoded size and scales the new source into it; recon-host starts a new helper once the size has been stable for 300 ms |
 | `lost` | capture is not possible right now (`DXGI_ERROR_ACCESS_LOST` during a mode or full-screen switch, secure desktop, output or window gone); `text` says why | repeats the last image every `idleRepeatMs`, retries every 250 ms |
 | `restored` | capture works again | |
-| `hdr` | Windows HDR was turned on or off for the output (DDA; `hdr` says which) | keeps the stream's format: an HDR10 stream shows the SDR desktop at 203 cd/m2, an SDR stream gets DXGI's conversion of the HDR desktop; recon-host restarts a stream it started with `hdr` (a new helper in the output's new mode, step 4.5), and leaves one started without it alone |
+| `hdr` | Windows HDR was turned on or off for the output (DDA, AMD Direct Capture; `hdr` says which) | keeps the stream's format: an HDR10 stream shows the SDR desktop at 203 cd/m2, an SDR stream gets DXGI's conversion of the HDR desktop; recon-host restarts a stream it started with `hdr` (a new helper in the output's new mode, step 4.5), and leaves one started without it alone |
 
 `error`: `{"t":"error","code":"unsupported","text":"...","fatal":false,"re":"start"}`.
 `re` names the request that caused it, if any. After a fatal error the helper exits
@@ -607,7 +607,11 @@ to 1 ms (`timeBeginPeriod`; since Windows 10 2004 a process that does not ask ge
 ticks, so 1 ms sleeps and short wait timeouts would last that long). AMD Direct Capture
 polls `QueryOutput` with 1 ms high-resolution timer sleeps (`AMF_REPEAT`); a failing
 `QueryOutput` re-initializes the component every 250 ms (`lost` / `restored`) unless the
-device was removed (`device_lost`). WGC's frame handlers run on thread-pool threads and
+device was removed (`device_lost`). The component does not report the output's Windows HDR
+mode, so AMD Direct Capture reads it from DXGI again whenever the display configuration
+changed (its DXGI factory is no longer current, as turning HDR on or off makes it) and after
+every re-initialization, finding the output again by name; a change is `hdr`, as with DDA
+(final review). WGC's frame handlers run on thread-pool threads and
 hold only shared state, never the capture object, so they can safely outlive it. While no
 new image arrives, every capture checks the device for removal (at least every 100 ms),
 since a removed device can also just stop presents.
