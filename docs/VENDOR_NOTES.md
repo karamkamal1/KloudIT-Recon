@@ -78,6 +78,8 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
 4. **Basic streams on the helper**: HEVC, then AV1 (2560x1440; at 1920x1080 RDNA3 needs 64x16
    alignment: 1.7, T9), then H.264, from a game: the overlay's Encoder row reads
    `hevc_amf_helper` and host.log `video pipeline pipeline=helper backend=amf`. Checks: 3.1b,
+   1.7 (on the helper, then with `"pipeline": "ffmpeg"`), "Final review: host agent, third
+   round" (the AV1 alignment guard on the helper),
    3.2 (capture: DDA, then `"capture": "amf"` for AMD Direct Capture), 1.3 (GPU priority), 4.1,
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
@@ -2020,7 +2022,9 @@ Hardware checks:
      this GPU needs 64×16-aligned sizes; using HEVC"; the overlay (Ctrl+Alt+Shift+S) shows
      `Video 1920×1080 HEVC`; host.log has `coded-size alignment notice=…` and `encoder ready …
      codec=hev1…`. One toast per connection (a reconnect shows it again); none on key-frame,
-     pause/resume or congestion restarts at the same size.
+     pause/resume or congestion restarts at the same size. On the default pipeline (the native
+     helper) the same, with `hevc_amf_helper` (from the helper's caps alignment: "Final review:
+     host agent, third round"); run it there and with `"pipeline": "ffmpeg"`.
   3. Desktop at 2560×1440 (or a 1440p monitor), Codec AV1, Resolution Native. Pass: no toast;
      overlay `Video 2560×1440 AV1`; host.log `encoder ready … codec=av01…` with `av1_amf`. The
      picture has no green or grey line at the bottom edge. On a 1440p monitor also pick
@@ -3203,8 +3207,9 @@ recon-host.exe by `install-host.ps1`):
 - AMD RDNA3 (RX 7900 XT): unverified. Test (barcode and AV1 crop on the helper): host.json
   `"capture": "test", "pipeline": "helper"`: the helper streams its synthetic GPU source with
   the frame barcode, the welcome lists `barcode-seq` and the overlay's `Frame barcode (seq)`
-  row shows >= 90 % valid, 0 mismatched; then in Settings choose AV1 at 1920x1080 (or
-  `"encoder": "av1_amf_helper"`): host.log `coded picture is padded, client crops ...
+  row shows >= 90 % valid, 0 mismatched; then set `"encoder": "av1_amf_helper"` and stream at
+  1920x1080 (AV1 chosen in Settings gives way to HEVC with the 1.7 notice there: "Final review:
+  host agent, third round"): host.log `coded picture is padded, client crops ...
   coded=1920x1088 crop_bottom=8`, the overlay's Video row says `(coded 1920×1088, cropped)` and
   no grey rows show at the bottom.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (capture changes): at the default resolution
@@ -6991,6 +6996,7 @@ with libx264 / libsvtav1):
   Edge on a Windows PC with a Radeon GPU, streaming from the AMD host: the overlay's "Decoder
   self-test" lines show each family "HW ✓ … · timed 1080p: N ms/frame" (record N per family and
   the browser, driver and GPU). Then, per codec (Settings → Codec H.264, HEVC, AV1) at 1920x1080
+  (AV1 at 2560x1440: at 1920x1080 RDNA3 streams HEVC instead, 1.7)
   60 fps, 30 Mbit/s, record the overlay's *decode* stage p50/p95 after 30 s: the timed value
   should be within 50 % or 1 ms (whichever is larger) of the live decode p50 (the clip predicts
   the decoder's latency per frame; a large miss means its low-bitrate picture does not
@@ -10888,3 +10894,42 @@ is logged once (`cannot keep the display on while streaming`) and the session go
   move the mouse once: the stream comes back. End the stream: the request is gone. Repeat on the
   default pipeline (the helper). Put the display timeout back afterwards.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### The AV1 alignment guard on the native helper
+
+Problem: the step 1.7 guard (AV1 on RDNA3 at a size that is not 64×16-aligned, such as
+1920×1080, gives way to HEVC with a notice, also when the client asks for AV1) read only the
+FFmpeg probe's alignment. The native helper's encoders (`av1_amf_helper`) had none, although the
+helper's caps report it (`codecs.av1.alignW/alignH`, 64×16 on RDNA3), so on the default pipeline
+of the RX 7900 XT a client choosing Codec AV1 at 1080p, or a host with `"av1": "faster"`, got
+AV1 coded 1920×1088 and cropped by the client: the path whose Chrome hardware-decoder crop (A7
+VERIFY) is still unverified. README, ARCHITECTURE, HELPER_PROTOCOL and 1.7 described the guard
+on every pipeline; 3.1b's check expected the padded stream for the same setting.
+
+Fix: the session takes an encoder's alignment from the native helper's caps for the helper's
+encoders and from the probe for FFmpeg's (`Session.alignment`), in the encoder choice and in the
+automatic codec choice. So AV1 at 1920×1080 on the helper gives way to the helper's HEVC with
+the notice "AV1 on this GPU needs 64×16-aligned sizes; using HEVC", and `"av1": "faster"` never
+picks AV1 at a padded size; the session stays on the helper. An encoder forced in host.json
+(`"encoder": "av1_amf_helper"`) is still kept and padded (the client crops); 3.1b's crop check
+now uses it. A GPU whose caps report no alignment (NVENC, the libavcodec backend, RDNA4 if it
+relaxes it) streams AV1 at any size.
+
+- Verified here: `internal/host` `TestAlignmentGuardHelper` (a fake AMF helper whose AV1 caps
+  say 64×16, through `openPipeline` and `buildParams`): AV1 asked for at 1920×1080 gives
+  `hevc_amf_helper` and the exact notice; at 2560×1440 `av1_amf_helper`; auto with AV1 the only
+  hardware decoder gives `hevc_amf_helper` with the notice; `"av1": "faster"` with a client that
+  decodes AV1 faster picks AV1 at 2560×1440 and HEVC at 1920×1080; caps with 1×1 keep AV1;
+  `av1_amf_helper` forced stays; the session stays on the helper every time. Before the fix
+  three of these cases got `av1_amf_helper`. `TestAlignmentGuard` and `TestCodecSelection`
+  (FFmpeg path) pass unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: on the default pipeline (host.log `video pipeline
+  pipeline=helper backend=amf`), 1.7's step 2 (desktop at 1920×1080, Settings → Codec AV1,
+  Resolution Native): the toast "AV1 on this GPU needs 64×16-aligned sizes; using HEVC", the
+  overlay's Encoder row `hevc_amf_helper` and `Video 1920×1080 HEVC`, host.log `coded-size
+  alignment notice=…` and no `coded picture is padded` line. Then 1.7's step 3 at 2560×1440
+  (AV1, `av1_amf_helper`, no toast), and 3.1b's crop check with `"encoder": "av1_amf_helper"`
+  (padded, `coded=1920x1088 crop_bottom=8`). Record `recon-encoder.exe --print-caps
+  --backend=amf`'s `alignW`/`alignH` for av1 (and whether `assumed` lists them).
+- NVIDIA: unverified (no NVIDIA host available). Test: on an RTX 40/50 host on the helper,
+  Codec AV1 at 1920×1080 streams AV1 (`av1_nvenc_helper`, no toast): NVENC's caps report 1×1.

@@ -297,7 +297,9 @@ Since step 3.3 `started` also says what the encoder does (the mock fills the def
 
 `codedWidth`/`codedHeight`: the frame size in the bitstream. It differs from
 `width`/`height` only where the encoder needs an aligned size: AV1 on RDNA3 is coded in
-multiples of 64x16 (`caps.codecs.av1.alignW/alignH`), so 1920x1080 is coded as 1920x1088;
+multiples of 64x16 (`caps.codecs.av1.alignW/alignH`), so 1920x1080 is coded as 1920x1088
+(recon-host starts AV1 at such a size only when it is forced in host.json or the browser
+decodes nothing else: docs/ARCHITECTURE.md "Codec negotiation");
 the picture is the top-left `width` x `height` and the last `cropRight` columns /
 `cropBottom` rows are padding (the edge pixels repeated) that the client must crop (GUIDE
 1.7, `proto.VideoConfig`). H.264 and HEVC signal their cropping in the SPS, so their coded

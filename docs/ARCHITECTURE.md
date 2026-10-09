@@ -737,7 +737,8 @@ chooses automatically:
   without an AV1 encoder (AMD before RDNA3, NVIDIA before the RTX 40 series) fails `av1_amf`'s
   or `av1_nvenc`'s test encode, so AV1 is simply absent there (the native helper's caps list a
   codec only where the GPU can encode it, too). RDNA3's AV1 encoder pads sizes that are not
-  64×16-aligned (the probed alignment, above).
+  64×16-aligned: the probed alignment (above) on FFmpeg, the caps' `alignW`/`alignH` on the
+  native helper.
 - *Client side*: the hello's `decoders`, per family `hw` (`VideoDecoder.isConfigSupported`
   with `prefer-hardware`, and the startup self-test, below, did not catch the hardware decoder
   holding frames back; false for every family while the Decoder setting is Prefer software, so
@@ -779,7 +780,8 @@ chooses automatically:
 
 An encoder that would pad the session's picture size gives way to HEVC, else H.264, with a
 notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when the client asks
-for AV1; an encoder forced in host.json (`encoder`) is kept. When a padded picture is
+for AV1, on either pipeline (the native helper's AV1 gives way to the helper's HEVC); an
+encoder forced in host.json (`encoder`) is kept. When a padded picture is
 streamed anyway (a host-forced encoder, nothing else decodes, or a size only the capture
 knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom` and the
 client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle; WebGPU:

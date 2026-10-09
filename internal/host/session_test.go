@@ -1108,6 +1108,72 @@ func TestCursorLoopAfterVideoCursor(t *testing.T) {
 	}
 }
 
+// TestAlignmentGuardHelper: the step 1.7 guard on the native helper, whose
+// caps give the coded-size alignment (AMF AV1 on RDNA3: alignW/alignH
+// 64x16). AV1 at 1920x1080 gives way to the helper's HEVC with the notice,
+// also when the client asks for AV1, and the session stays on the helper; at
+// an aligned size, or where the caps report no alignment, AV1 stays; forced
+// in the host config it stays (the client crops). Before, the helper's
+// encoders had no alignment and AV1 was always padded to 1920x1088.
+func TestAlignmentGuardHelper(t *testing.T) {
+	const av1Aligned = `"av1":{"maxW":8192,"maxH":4352,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":64,"alignH":16}`
+	const av1Any = `"av1":{"maxW":8192,"maxH":4352,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":1,"alignH":1}`
+	all := []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc", HW: true}, {Family: "h264", HW: true}}
+	fastAV1 := []proto.DecoderInfo{timed("h264", true, 1.4), timed("hevc", true, 2.0), timed("av1", true, 1.2)}
+	av1 := proto.Prefs{Codec: "av1"}
+	const notice = "AV1 on this GPU needs 64×16-aligned sizes; using HEVC"
+	for _, c := range []struct {
+		name     string
+		av1, enc string // the helper's AV1 caps; the host config's encoder
+		w, h     int
+		decoders []proto.DecoderInfo
+		prefs    proto.Prefs
+		want     string
+		notice   string
+		cfgAV1   string
+	}{
+		{"client asks for AV1 at 1920x1080", av1Aligned, "", 1920, 1080, all, av1, "hevc_amf_helper", notice, ""},
+		{"client asks for AV1 at 2560x1440", av1Aligned, "", 2560, 1440, all, av1, "av1_amf_helper", "", ""},
+		{"auto, AV1 the only hardware decoder", av1Aligned, "", 1920, 1080,
+			[]proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc"}, {Family: "h264"}}, proto.Prefs{}, "hevc_amf_helper", notice, ""},
+		// "av1": "faster" and a client that decodes AV1 faster: AV1 where it is
+		// not padded (2560x1440); at 1920x1080 it never replaces HEVC.
+		{"av1 faster at 2560x1440", av1Aligned, "", 2560, 1440, fastAV1, proto.Prefs{}, "av1_amf_helper", "", AV1Faster},
+		{"av1 faster at 1920x1080", av1Aligned, "", 1920, 1080, fastAV1, proto.Prefs{}, "hevc_amf_helper", "", AV1Faster},
+		{"no alignment in the caps", av1Any, "", 1920, 1080, all, av1, "av1_amf_helper", "", ""},
+		{"forced in the host config", av1Aligned, "av1_amf_helper", 1920, 1080, all, proto.Prefs{}, "av1_amf_helper", "", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Config{Capture: "test", Pipeline: "helper", TestWidth: c.w, TestHeight: c.h, Encoder: c.enc, AV1: c.cfgAV1}
+			cfg.Defaults()
+			l := &fakeLauncher{caps: helperCaps(c.av1+","+fakeHEVC+","+fakeH264, `"dda"`, false)}
+			rec := &ctrlRecorder{}
+			s := &Session{
+				a: &Agent{cfg: &cfg, caps: &media.Caps{Encoders: []media.EncoderInfo{{Name: "libx264", Family: "h264", Vendor: "software"}}},
+					inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch},
+				hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: c.decoders}, prefs: c.prefs,
+				tried: map[string]bool{}, usage: map[string]string{}, ctx: context.Background(), ctrl: rec,
+				log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			if n := s.openPipeline(); n != "" {
+				t.Fatalf("pipeline notice %q", n)
+			}
+			defer func() { s.vid().Stop() }()
+			p, err := s.buildParams(c.prefs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := rec.notices(t)
+			if p.Encoder.Name != c.want || (c.notice == "") != (len(got) == 0) || (c.notice != "" && (len(got) != 1 || got[0] != c.notice)) {
+				t.Fatalf("encoder %s, notices %q; want %s, %q", p.Encoder.Name, got, c.want, c.notice)
+			}
+			if helper, _, _ := s.onHelper(); !helper {
+				t.Fatal("the session left the helper")
+			}
+		})
+	}
+}
+
 // fakeDisplayRequest records what a session does with its display request.
 type fakeDisplayRequest struct {
 	mu  *sync.Mutex

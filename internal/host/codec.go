@@ -17,8 +17,9 @@ import (
 // failed in this session (usableEncoder). A GPU without an AV1 encoder (AMD
 // before RDNA3, NVIDIA before RTX 40) fails av1_amf's or av1_nvenc's test
 // encode, so AV1 is simply not there. RDNA3's AV1 encoder pads pictures that
-// are not 64x16-aligned (the step 1.7 probe: Caps.Pads); chooseEncoder then
-// gives way to HEVC, and here such an encoder never replaces another family.
+// are not 64x16-aligned (the step 1.7 probe, or the native helper's caps:
+// Session.alignment); chooseEncoder then gives way to HEVC, and here such an
+// encoder never replaces another family.
 //
 // Client side: the hello's decoders (isConfigSupported; hw: a hardware
 // decoder that does not hold frames back) and their timing: a 1920x1080

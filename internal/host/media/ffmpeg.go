@@ -677,7 +677,12 @@ func (c *Caps) SetAlignment(enc string, a Alignment) {
 // Pads reports whether an encoder pads a w x h picture: w or h is not a
 // multiple of its alignment. An unknown size (0) is not checked.
 func (c *Caps) Pads(enc string, w, h int) bool {
-	a := c.Alignment(enc)
+	return c.Alignment(enc).Pads(w, h)
+}
+
+// Pads reports whether a w x h picture is padded at this alignment: w or h
+// is not a multiple of it. An unknown size (0) is not checked.
+func (a Alignment) Pads(w, h int) bool {
 	return w > 0 && h > 0 && (a.W > 1 && w%a.W != 0 || a.H > 1 && h%a.H != 0)
 }
 

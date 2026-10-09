@@ -661,15 +661,14 @@ func (s *Session) currentPrefs() proto.Prefs {
 
 // chooseEncoder negotiates the codec between the browser's decoders and the
 // host's encoders for a w x h picture (0, 0: size unknown); why says how
-// (negotiateEncoder). An encoder that would pad that size (Caps.Pads; AV1 on
-// RDNA3 at 1920x1080) gives way to HEVC, else H.264, also when the client
-// asks for its codec; notice tells the user why ("" when nothing changed). An
-// encoder forced in the host config is kept: its padding is announced for the
-// client to crop.
+// (negotiateEncoder). An encoder that would pad that size (alignment; AV1 on
+// RDNA3 at 1920x1080, on either pipeline) gives way to HEVC, else H.264, also
+// when the client asks for its codec; notice tells the user why ("" when
+// nothing changed). An encoder forced in the host config is kept: its
+// padding is announced for the client to crop.
 func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, why, notice string, err error) {
 	e, why, err = s.negotiateEncoder(prefs, w, h, true)
-	caps := s.a.caps
-	if err != nil || !caps.Pads(e.Name, w, h) {
+	if err != nil || !s.alignment(e).Pads(w, h) {
 		return e, why, "", err
 	}
 	if e.Name == s.a.cfg.Encoder {
@@ -679,8 +678,8 @@ func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInf
 	// Hardware encoders first, HEVC before H.264.
 	for _, hwOnly := range []bool{true, false} {
 		for _, fam := range []string{"hevc", "h264"} {
-			if alt, ok := s.pickEncoder(fam, hwOnly, func(c media.EncoderInfo) bool { return !caps.Pads(c.Name, w, h) }); ok {
-				a := caps.Alignment(e.Name)
+			if alt, ok := s.pickEncoder(fam, hwOnly, func(c media.EncoderInfo) bool { return !s.alignment(c).Pads(w, h) }); ok {
+				a := s.alignment(e)
 				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
 					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
 				return alt, why + "; " + e.Name + " pads this size", fmt.Sprintf("%s on this GPU needs %d×%d-aligned sizes; using %s",
@@ -690,6 +689,18 @@ func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInf
 	}
 	// Nothing else works end-to-end: keep it, VideoConfig announces the crop.
 	return e, why, "", nil
+}
+
+// alignment returns encoder e's coded-size alignment: for the native
+// helper's encoders its caps' (alignW/alignH of the codec; AV1 on RDNA3:
+// 64x16), for FFmpeg's the probe's (Caps.Alignment, step 1.7).
+func (s *Session) alignment(e media.EncoderInfo) media.Alignment {
+	if !e.Helper {
+		return s.a.caps.Alignment(e.Name)
+	}
+	_, _, c := s.onHelper()
+	cc := c.Codecs[e.Family]
+	return media.Alignment{W: max(cc.AlignW, 1), H: max(cc.AlignH, 1)}
 }
 
 // familyNames are the codec families as users know them.
@@ -736,7 +747,6 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 // the first in its order. The encoders are the session's (encoders: the
 // native helper's first while the session runs on it).
 func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e media.EncoderInfo, why string, err error) {
-	caps := s.a.caps
 	client := s.clientDecoders()
 	usable := s.usableEncoder
 	if s.a.cfg.Encoder != "" {
@@ -765,7 +775,7 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e 
 				continue
 			}
 			if e, ok := s.pickEncoder(fam, tier.hwEnc, nil); ok {
-				cands = append(cands, codecCandidate{enc: e, dec: d, pads: caps.Pads(e.Name, w, h)})
+				cands = append(cands, codecCandidate{enc: e, dec: d, pads: s.alignment(e).Pads(w, h)})
 			}
 		}
 		if len(cands) > 0 {
