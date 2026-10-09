@@ -1813,7 +1813,7 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 	}
 	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	m := s.deliveryMeter()
-	start := startPos(m) // the video window measures the frame's delivery from here
+	ws := startWrite(m) // the video window measures the frame's delivery from here
 	if _, err := st.Write(b); err != nil {
 		if s.send.finish(of, outCancelled) {
 			st.CancelWrite()
@@ -1825,9 +1825,9 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 	}
 	if m2 := s.deliveryMeter(); m2 != nil {
 		if m2 != m {
-			start = math.MaxUint64 // the path changed during the write
+			ws.pos = math.MaxUint64 // the path changed during the write
 		}
-		s.win.sent(m2, start, time.Now()) // in flight until the peer acknowledged what was sent up to here
+		s.win.sent(m2, ws, time.Now()) // in flight until the peer acknowledged what was sent up to here
 	}
 	if !s.send.finish(of, outDone) {
 		return // cancelled as its write completed: reported lost

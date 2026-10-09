@@ -4043,12 +4043,14 @@ What changed (GUIDE 2.7; docs/ARCHITECTURE.md "Send priorities"):
   (the frames in flight sent within the last 1.25 × the recent min RTT, at most as many as the
   frame rate sends in that time, rounded up): two on a LAN. *Falls short*: the last 8
   acknowledged frames took more than 1.5 × as long to be delivered (acknowledgement of a frame's
-  first byte to that of its mark) as the pacer took to send them, with at least 20 ms of pacing
-  among them. A frame is in flight from its write's return until the peer acknowledged
-  everything the connection had sent by then: the media congestion controller's new delivery
-  positions (`cc.Media.Delivery`: ack-eliciting bytes sent; acknowledged or declared lost,
-  resynchronised with quic-go's own bytes in flight at every send, which also covers lost MTU
-  probes the controller never hears of; `Progress()` is signalled on every ACK or loss;
+  first byte to that of its mark) as the sender took to send them (the pacer's time, or the
+  write's own where longer, less the time the congestion window held it: `cc.Media.WindowLimited`;
+  "Under load" below), with at least 20 ms of pacing among them. A frame is in flight from its
+  write's return until the peer acknowledged everything the connection had sent by then: the
+  media congestion controller's new delivery positions (`cc.Media.Delivery`: ack-eliciting
+  bytes sent; acknowledged or declared lost, resynchronised with quic-go's own bytes in flight
+  at every send, which also covers lost MTU probes the controller never hears of;
+  `Progress()` is signalled on every ACK or loss;
   `DeliveredAt(pos)`, when that position was reached; `RecentMinRTT()`, the smallest round trip
   of the last 1.5–2 s, 0 before the first, which the window keeps from before a shortfall while
   it lasts; `PacingRate()`). frameSender opens the next frame's
@@ -4279,6 +4281,75 @@ against 195 frames up to 13 ms in the run of the first version: the busy browser
 acknowledgements no longer hold frames; 3 frame-queue overflows, `sender=write`, an encoder burst
 as recorded in 2.2, not the window).
 
+Under load (fix after the merge): `TestDatagramLatencyBehindVideo` passed alone but failed in
+every whole-package run while the sandbox's load was ~10 on its 4 CPUs (frame latency p50 50.3
+vs 31.0 ms on the 4 → 40 ms round-trip path, p95 98.4 vs 42.9 ms; p95 50.3 vs 33.9 ms with
+jitter), and CI (`go test ./...`, packages in parallel, on a 2-vCPU runner) would too. Measured
+with a scratch build that logged each shortfall's evidence, the package pinned to two CPUs
+(`taskset -c 0,1`) and busy loops on them:
+
+1. *Mostly the measurement*: each "no cost" case ran 2–3 s without the window and then 2–3 s
+   with it, so the halves met different load. In 5 of the 7 failed comparisons of the first
+   reproductions the window had held no frame at all (it then only keeps its records), and the
+   runs without the window swung as far on their own (round-trip step frame latency p50 52.9 ms
+   without against 31.3 ms with, jitter p50 108.3 vs 30.2 ms, nothing held either time).
+2. *A real gate error on a busy host*: "falls short" compared a frame's delivery with the
+   pacer's nominal time for its bytes. When the sender itself runs late (quic-go's send loop
+   starved: the frame's write took 10–33 ms where the pacer needs 14 ms) the bytes leave late and
+   arrive as late: no queue builds, yet the stretched delivery read as a shortfall. Over the 8
+   samples behind the false shortfalls on 200 Mbit/s paths: delivery / pacer time 1.51–1.87,
+   delivery / write time 0.98–1.31. The window then held 1–13 frames per case on paths with
+   capacity to spare (with 5 busy loops 21 frames in 15 cases; once 13, with 159 frames received
+   against 172 without). On a gaming PC whose CPU the game keeps busy that adds the wait for an
+   acknowledgement to frames for nothing. (Separately, 10 ms of jitter can stretch the first two
+   samples past the ratio, which holds a frame at the start: seen twice in 9 instrumented runs,
+   one frame held; unchanged.)
+
+Fix (`window.go`, `cc/media.go`): a sample's sender time is the pacer's, or the frame's write
+duration where that was longer, less the time the congestion window held the write back
+(`cc.Media.WindowLimited`: from a packet `CanSend` refused to the next one it allowed; quic-go
+asks before every packet and after every ACK). A late sender delays both ends alike and no longer
+reads as a shortfall; waiting for the congestion window is the path's doing, so a backlog that
+fills it before the window holds still shows. `TestWindowShortfall`: writes taking 2.5 × the
+pacer's time and delivered as slowly are no shortfall, a path three times slower than that late
+sender is, and a drop to 40 % shows within three frames also when the congestion window held
+each write 15 of its 25 ms; `TestMediaWindowLimited`. After the fix, same conditions (6 busy
+loops, 4 runs and one with `-race`): no false shortfall on a path with capacity to spare, 0
+frames held there; the 10 Mbit/s backlog still found after two frames (delivery 28–33 ms
+against 14 ms paced), audio p50 37–39 ms against 102–124 ms without the window (52.7 against
+101.5 ms with `-race`).
+
+Test: every case runs without and with the window at the same time over two identical paths
+(`measureDatagramLatency`, same frame sizes), so both see the same load (13 s instead of 26 s).
+The "no cost" cases now also require the window to hold at most 2 frames (exact, whatever the
+timing; the old gate under load held up to 13), and a latency with the window may exceed the one
+without by the margin (5 ms p50, 15 ms p95) or by 15 % of the one without where that is more:
+these paths' own latencies are 6–31 ms, so the share only counts where load inflated them, and
+there two sessions side by side still differ by that much with nothing held (frame latency p50
++6 to +23 ms at 41–80 ms under `-race` beside 3 busy loops). A check that fails on the first
+measurement is judged on three, by the majority. Forcing the gate on (a window that holds
+whenever it is full) still fails all three measurements: jitter p50 104–105 vs 25–26 ms with
+115–129 frames held, round-trip step p95 237–247 vs 32–33 ms, 142–146 vs 179–180 frames.
+`TestFrameSenderWindow` "goes out before its deadline" timed the hold from when the test
+goroutine saw the first two frames done, which a loaded machine wakes late (43–44 ms measured
+for the 50 ms hold, twice); it now takes the hold's start and the stream's close as frameSender
+recorded them.
+
+Before (03b8e8e) and after, alternated run by run in the same conditions: `taskset -c 0,1 go
+test ./...` without `internal/e2e` (a 2-vCPU runner, packages in parallel, nothing else of ours
+running): before 3 of 3 runs failed (jitter frame
+latency p95 49.7 vs 29.4, 68.2 vs 33.9, 93.3 vs 32.4 ms), after 5 of 5 passed. `internal/host`
+on CPUs 0,1 beside 5 busy loops: before 10 of 20 runs failed (four rounds: 5, 1, 3, 1 of 5);
+after, `TestDatagramLatencyBehindVideo` passed 10 of 10 (the last two rounds) and the package 9
+of 10 (once `TestFrameSenderWindow`, fixed before the last round, which passed 5 of 5). With
+`-race` beside 3 busy loops: before 6 of 15 failed, after 10 of 10 passed (a comparison was
+measured again in 5 of them and held on the majority; at most 2 frames held in a case). Without
+extra load, after: the test alone 5 of 5, the package 3 of 3 and once with `-race`, nothing
+measured twice; with the 10 Mbit/s backlog audio p50 42.8–49.4 ms with the window against
+103.6–106.6 ms without (87–88 frames held), on the other paths frame latency p50 within 1 ms
+either way and no frame held. `internal/e2e` passed under the shared lock; gofmt and `go vet`
+(Linux, Windows) clean.
+
 Hardware checks (host.json `"pipeline": "auto"` with recon-encoder.exe next to recon-host.exe;
 overlay Ctrl+Alt+Shift+S; host log `$env:APPDATA\KlouditRecon\host.log`; `__recon.lastStats` in
 the browser console):
@@ -4314,7 +4385,13 @@ the browser console):
   `sender=window` say the window held a frame at the time), the one-way delay p95 during the dip
   under the baseline + 30 ms, the target back within 10 s; compare with the same run under
   `RECON_TEST_FAULTS=no-window`.
-- NVIDIA: unverified (no NVIDIA host available). Test: the three AMD tests above with
+- AMD RDNA3 (RX 7900 XT): unverified. Test (a busy host CPU, "Under load"): a 10-minute `lan`
+  run while a CPU-bound game (or `prime95` small FFTs on all threads) keeps every core of the host
+  busy: `window_held` stays 0 or near it (record the largest and `window_max_ms`), the overlay's
+  capture→drawn p95 within a frame interval of the same run under `RECON_TEST_FAULTS=no-window`;
+  then the backlog test above with the same CPU load: the round trip during the step at most
+  60 % of the one without the window.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD tests above with
   hevc_nvenc_helper (and av1_nvenc_helper on RTX 40+), same steps and pass criteria.
 - Browsers (vendor-independent, T10): unverified. Test: stream once each from current Chrome,
   Edge, Firefox (≥ 155 for send groups) and Safari 26.4 on the direct path and record the
