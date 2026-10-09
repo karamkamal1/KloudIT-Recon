@@ -9434,3 +9434,28 @@ alternative. It would stop the user from editing `host.json` and running `recon-
   other none. Put host.json back.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test, with the NVENC
   helper).
+
+### Behind a reverse proxy or tunnel: -trust-proxy takes the proxy's address
+
+Problem: README tells Cloudflare Tunnel and other proxy users to pass the proxy's address with
+`-trust-proxy`, but the gateway read each entry as a CIDR and silently dropped anything else, so
+`-trust-proxy 127.0.0.1` (or `RECON_TRUST_PROXY=127.0.0.1`) trusted nothing. Every login then came
+from the proxy's address: all clients shared one 10/min login bucket and one user+IP lockout, so
+anyone on the internet could keep the owner locked out by failing the admin password, and the
+audit log showed only the proxy.
+
+Fix: an entry may be an address (taken as /32 or /128) or a CIDR; anything else stops the gateway
+at startup with an error naming it. `install-gateway.sh --trust-proxy <address>` (repeatable; also
+`create-lxc.sh`) stores `RECON_TRUST_PROXY` in gateway.env, which upgrades keep; the compose file
+lists the variable; README and SECURITY.md say what goes wrong without it.
+
+- Verified here: `internal/gateway` `TestTrustProxy` (bare IPv4 and IPv6 addresses, CIDRs,
+  refused entries, `New` failing on one; the client's address read from `X-Forwarded-For` only
+  behind a trusted proxy); `bash -n` of both installers.
+- Gateway check (not GPU-specific, no AMD or NVIDIA step): in the LXC, with `cloudflared` on the
+  same container forwarding to `https://127.0.0.1:8443`, run `install-gateway.sh --trust-proxy
+  127.0.0.1` (or add `RECON_TRUST_PROXY=127.0.0.1` to gateway.env and restart): sign in through
+  the tunnel, then `journalctl -u recon-gateway` and the audit log show your public IP, not
+  127.0.0.1. Fail the password five times from a phone on mobile data: the phone is locked out,
+  a sign-in from another network still works. `RECON_TRUST_PROXY=cloudflared` makes the service
+  fail to start, with `trust-proxy "cloudflared"` in the journal.
