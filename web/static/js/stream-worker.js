@@ -282,6 +282,57 @@ async function readAll(stream) {
   return { buf: out, first, reset };
 }
 
+// "Datagram + FEC" video mode (GUIDE 2.5, fec.js): over a high round trip the
+// host may send a frame as datagram shards with Reed-Solomon parity instead of
+// on its own stream. fecRx rebuilds the frame and hands it on exactly as a
+// frame stream would (onFrameBytes); the shards a frame lacks once its shards
+// stop coming it asks for again (NACK) while there is time, then gives the
+// frame up (onFecLost: a loss, as a gap that outlasted its wait). Clients on
+// WebTransport offer it in their hello (hello.fec); WebSocket has no
+// datagrams.
+const fecRx = new FecReceiver({
+  deliver: (buf, recv, first, repaired) => onFrameBytes(buf, recv, first, repaired),
+  lost: (gen, seq, why) => onFecLost(gen, seq, why),
+  // A NACK is due before the frame's give-up time: the transport's input
+  // class where it has one (GUIDE 2.7's send priorities: its telemetry
+  // datagrams are dropped while their queue stands still), else its only
+  // datagram writer.
+  nack: (b) => (transport?.sendInputDatagram ?? transport?.sendDatagram)?.(b),
+  rtt: () => clock.minRtt || clock.rtt,
+  interval: () => 1000 / (video.cfg?.fps || 60),
+});
+const fecTimer = { id: 0, at: Infinity };
+
+// Runs fecRx's NACKs, give-ups and loss accounting when due.
+function fecSchedule() {
+  const due = fecRx.nextDue();
+  if (due >= fecTimer.at) return;
+  clearTimeout(fecTimer.id);
+  fecTimer.at = due;
+  if (due === Infinity) return;
+  fecTimer.id = setTimeout(() => {
+    fecTimer.at = Infinity;
+    fecRx.tick(now());
+    fecSchedule();
+  }, Math.max(1, due - now()));
+}
+
+function onFecShard(d) {
+  fecRx.shard(d, now());
+  fecSchedule();
+}
+
+// A frame sent as shards that could not be rebuilt in time: lost (not
+// reported by the host), at once instead of after the gap timeout.
+function onFecLost(gen, seq, why) {
+  const cfg = video.cfg;
+  if (!cfg || gen !== cfg.gen || gen === video.lostGen || seq < video.expectSeq) return;
+  post('log', { text: `frame ${gen}/${seq} lost: its shards could not be rebuilt in time (${why})` });
+  video.fecLost.add(seq);
+  if (video.fecLost.size > 256) video.fecLost.delete(video.fecLost.values().next().value);
+  if (video.ready) checkGap();
+}
+
 // Send priorities (GUIDE 2.7). The client sends input (the input stream:
 // keys, buttons, wheel, text; datagrams: mouse motion, gamepads), control (the
 // control stream: key-frame requests, losses, settings) and telemetry
@@ -346,57 +397,6 @@ function telemetrySender(w, prio, isClosed) {
     pending.push(t);
     w.write(b).catch(() => {}).finally(() => { pending.shift(); });
   };
-}
-
-// "Datagram + FEC" video mode (GUIDE 2.5, fec.js): over a high round trip the
-// host may send a frame as datagram shards with Reed-Solomon parity instead of
-// on its own stream. fecRx rebuilds the frame and hands it on exactly as a
-// frame stream would (onFrameBytes); the shards a frame lacks once its shards
-// stop coming it asks for again (NACK) while there is time, then gives the
-// frame up (onFecLost: a loss, as a gap that outlasted its wait). Clients on
-// WebTransport offer it in their hello (hello.fec); WebSocket has no
-// datagrams.
-const fecRx = new FecReceiver({
-  deliver: (buf, recv, first, repaired) => onFrameBytes(buf, recv, first, repaired),
-  lost: (gen, seq, why) => onFecLost(gen, seq, why),
-  // A NACK is due before the frame's give-up time: the transport's input
-  // class where it has one (GUIDE 2.7's send priorities: its telemetry
-  // datagrams are dropped while their queue stands still), else its only
-  // datagram writer.
-  nack: (b) => (transport?.sendInputDatagram ?? transport?.sendDatagram)?.(b),
-  rtt: () => clock.minRtt || clock.rtt,
-  interval: () => 1000 / (video.cfg?.fps || 60),
-});
-const fecTimer = { id: 0, at: Infinity };
-
-// Runs fecRx's NACKs, give-ups and loss accounting when due.
-function fecSchedule() {
-  const due = fecRx.nextDue();
-  if (due >= fecTimer.at) return;
-  clearTimeout(fecTimer.id);
-  fecTimer.at = due;
-  if (due === Infinity) return;
-  fecTimer.id = setTimeout(() => {
-    fecTimer.at = Infinity;
-    fecRx.tick(now());
-    fecSchedule();
-  }, Math.max(1, due - now()));
-}
-
-function onFecShard(d) {
-  fecRx.shard(d, now());
-  fecSchedule();
-}
-
-// A frame sent as shards that could not be rebuilt in time: lost (not
-// reported by the host), at once instead of after the gap timeout.
-function onFecLost(gen, seq, why) {
-  const cfg = video.cfg;
-  if (!cfg || gen !== cfg.gen || gen === video.lostGen || seq < video.expectSeq) return;
-  post('log', { text: `frame ${gen}/${seq} lost: its shards could not be rebuilt in time (${why})` });
-  video.fecLost.add(seq);
-  if (video.fecLost.size > 256) video.fecLost.delete(video.fecLost.values().next().value);
-  if (video.ready) checkGap();
 }
 
 async function openWebTransport(url, hashes, label, timeoutMs) {

@@ -3101,6 +3101,23 @@ async function lossRun(name, faults, seconds, prefs = {}) {
     // queue overflowing as a new generation starts on a starved host):
     // nothing to recover from, a key frame is rung 2's only answer.
     keyFrameLosses: (hl.match(/msg="no recovery frame possible[^\n]*? from_seq=0 /g) || []).length,
+    // Losses (the hook's drops, deadline cancels) whose generation a restart
+    // replaced (congestion, bitrate recovery: frequent on a starved host)
+    // before the encoder answered them: the new generation's key frame ends
+    // the client's wait, no recovery frame can come.
+    supersededLosses: (() => {
+      const open = new Map();
+      let n = 0;
+      for (const l of hl.split('\n')) {
+        let m;
+        if ((m = l.match(/msg="recovering from a loss".*? gen=(\d+) from_seq=(\d+) why=(deadline|"test fault")/))) open.set(`${m[1]}/${m[2]}`, +m[1]);
+        else if ((m = l.match(/msg="(?:loss recovered|no recovery frame possible[^"]*)".*? gen=(\d+) from_seq=(\d+)/))) open.delete(`${m[1]}/${m[2]}`);
+        else if ((m = l.match(/msg="encoder ready".*? gen=(\d+)/))) {
+          for (const [k, g] of open) if (g !== +m[1]) { open.delete(k); n++; }
+        }
+      }
+      return n;
+    })(),
     hostLog: hl,
     // The decoder's own error lines, not the key-frame requests they cause.
     decoderErrors: con.filter((l) => l.includes('decoder error:')).length,
@@ -3275,12 +3292,13 @@ async function checkLossHandling() {
   const losses = r.dropped + r.cancelled;
   check('reference recovery (software stand-in): dropped frames recovered by a recovery frame, frames up to it not decoded, no key-frame request or restart for a loss',
     r.cfg?.recovery === 'invalidate' && r.dropped >= 3 && r.client.hostDropped >= losses - 1 &&
-      r.recoveredByFrame >= losses - 2 && r.recoveredByFrame >= 0.9 * hostRec &&
-      r.client.recovered >= losses - 2 && r.client.discarded + r.hostDiscarded > 0 && r.client.rejected === 0 && r.decoderErrors === 0 &&
+      r.recoveredByFrame >= losses - 2 - r.supersededLosses && r.recoveredByFrame >= 0.9 * hostRec &&
+      r.client.recovered >= losses - 2 - r.supersededLosses && r.client.discarded + r.hostDiscarded > 0 && r.client.rejected === 0 && r.decoderErrors === 0 &&
       lossKeys === 0 && refRestarts <= refAllow &&
       !r.keyWhileDecoding['frame lost'] && r.fps >= 10,
     `${r.cfg?.encoder} recovery ${r.cfg?.recovery}: host dropped ${r.dropped} and cancelled ${r.cancelled} (of ${r.delayed} delayed 200 ms), ` +
-      `asked the encoder to recover ${r.recovering}, answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}; ` +
+      `asked the encoder to recover ${r.recovering}, answered by recovery frame ${r.recoveredByFrame} / by key frame ${r.recoveredByKey}` +
+      `${r.supersededLosses ? ` (${r.supersededLosses} losses unanswered: their generation replaced by a restart first)` : ''}; ` +
       `client told ${r.client.hostDropped} (${r.hostDiscarded} not sent while it waited, in ${r.hostDiscardRuns} reports), ` +
       `recovered ${r.client.recovered} by recovery frame and ${r.client.recoveredByKey} by key frame, ${r.client.discarded} frames discarded meanwhile ` +
       `(${r.lateSkips} times without waiting for a late frame before the recovery frame), ` +
@@ -3917,6 +3935,7 @@ try {
       }
     }
     writeFileSync(inputLog, '');
+    const scC0 = cpuTimes(); // the stream's whole life (its cumulative counters)
     await page.goto(`${base}/`);
     await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), { ...PREFS_2D, ...sc.prefs });
     await page.evaluate((on) => (on ? localStorage.setItem('e2e.hdrDisplay', '1') : localStorage.removeItem('e2e.hdrDisplay')), !!sc.hdr);
@@ -4040,11 +4059,19 @@ try {
       }));
       const p = st?.prio;
       const total = p ? p.telemetrySent + p.telemetryDropped : 0;
+      // Where the CPUs had nothing to spare during the stream (2-vCPU
+      // runners), the worker runs the writes' resolutions late, so the queue
+      // seems to stand still far more often: the share dropped is no measure
+      // then. Still required: drops only with a stall, and telemetry flowing.
+      const scIdle = idleShare(scC0, cpuTimes());
+      const prioStarved = scIdle != null && scIdle < STARVED_IDLE;
       check(`${sc.name}: send priorities feature-detected; telemetry gives way to input only while the datagram queue stalls`,
         !!p && p.sendOrder === api.sendOrder && p.sendGroup === api.sendGroup && p.datagramWritables === api.datagramWritables &&
-          total > 100 && p.telemetryDropped <= total * 0.15 && (p.telemetryDropped === 0 || p.telemetryStallMs > 50),
+          total > 100 && (p.telemetryDropped <= total * 0.15 || (prioStarved && p.telemetrySent > 100)) &&
+          (p.telemetryDropped === 0 || p.telemetryStallMs > 50),
         p ? `sendOrder ${p.sendOrder}, send groups ${p.sendGroup}, datagram queues ${p.datagramWritables} (browser API: ${JSON.stringify(api)}); ` +
-          `telemetry ${p.telemetrySent} sent, ${p.telemetryDropped} dropped, longest stall ${p.telemetryStallMs} ms` : 'no prio in the stats');
+          `telemetry ${p.telemetrySent} sent, ${p.telemetryDropped} dropped, longest stall ${p.telemetryStallMs} ms; ${idleNote(scIdle)} during the stream` +
+          `${prioStarved && p.telemetryDropped > total * 0.15 ? ' (more than 15 % dropped: judged on the stalls)' : ''}` : 'no prio in the stats');
     } else {
       check(`${sc.name}: no send priorities over WebSocket`, st && st.prio === null);
     }
