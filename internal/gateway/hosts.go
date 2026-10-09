@@ -88,7 +88,7 @@ func (s *Server) handleHostControl(conn *quic.Conn) {
 		return
 	}
 	ip := hostIP(conn.RemoteAddr())
-	if !s.loginIP.Allow("host-auth:" + ip) {
+	if !s.loginIP.Allow("host-auth:" + rateKey(ip)) {
 		conn.CloseWithError(4, "too many attempts")
 		return
 	}

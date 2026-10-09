@@ -33,14 +33,24 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **First run:** the admin account can only be created with a random **setup token** that is
   printed in the log and stored in a 0600 file, which is deleted after use. Someone else on your
   LAN can't claim a fresh gateway.
-- **Brute force:** per-IP token bucket (10/min) plus exponential lockout per user+IP after 5
-  failures (1 min, doubling up to 1 h). Keying on user+IP stops attackers from locking you out.
+- **Brute force:** per-client token bucket (10/min) plus exponential lockout per user+client
+  after 5 failures (1 min, doubling up to 1 h). A client is an IPv4 address or an IPv6 /64 (one
+  subscriber's block: a home or a VPS has more addresses than anyone could try from). Keying on
+  user+client stops attackers from locking you out.
   Behind a reverse proxy or tunnel (Cloudflare Tunnel, Nginx) that holds only while the gateway
   trusts the proxy's `X-Forwarded-For` (`-trust-proxy` / `RECON_TRUST_PROXY`): otherwise every
   request comes from the proxy's IP, all clients share one bucket and one lockout per user. An
   entry the gateway cannot read as an address or CIDR stops it at startup instead of being
   dropped.
   Every attempt is audited.
+- **2FA codes** are bounded per account, not per client: only someone who has the password gets
+  that far, so an address pool must not buy more guesses. One password login may try 3 codes
+  (then it expires and the password is asked again), and 5 wrong codes on an account, from any
+  addresses, refuse that account's 2FA everywhere for 1 min, doubling up to 1 h (`totp_locked`
+  in the audit log). That is a few dozen guesses a day at most, against 3 valid codes in a
+  million. It also means someone who has your password can keep your 2FA refused: change the
+  password from a session that is still signed in, or with the account recovery in the README
+  (stopping the gateway for it also clears the lock).
 - **Sessions:** 256-bit random tokens stored only as SHA-256 hashes. The cookie is
   `__Host-recon` (`Secure; HttpOnly; SameSite=Strict; Path=/`). Sessions expire after 72 h idle
   and 30 days absolute, are capped at 20 per user, and changing your password signs out every

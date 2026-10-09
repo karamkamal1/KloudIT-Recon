@@ -82,7 +82,7 @@ func (s *Server) secure(next http.Handler) http.Handler {
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			h.Set("Cache-Control", "no-store")
-			if !s.apiIP.Allow(s.clientIP(r)) {
+			if !s.apiIP.Allow(rateKey(s.clientIP(r))) {
 				jsonError(w, http.StatusTooManyRequests, "too many requests")
 				return
 			}

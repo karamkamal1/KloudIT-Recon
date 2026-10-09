@@ -76,7 +76,9 @@ type Server struct {
 
 	loginIP   *limiter
 	apiIP     *limiter
-	lockouts  *lockout
+	lockouts  *lockout   // per user and client (rateKey)
+	totpLocks *lockout   // per user, from every address: wrong 2FA codes
+	totpMu    sync.Mutex // one 2FA code check at a time (checkTOTP)
 	hashSem   chan struct{}
 	setupTok  string
 	setupMu   sync.Mutex
@@ -90,9 +92,9 @@ type relayTicket struct {
 }
 
 type pendingLogin struct {
-	user string
-	exp  time.Time
-	ip   string
+	user  string
+	exp   time.Time
+	tries int // 2FA codes checked against it (under ticketMu)
 }
 
 type staticFile struct {
@@ -122,13 +124,14 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	}
 	s := &Server{
 		cfg: cfg, log: log, store: store, audit: audit,
-		hosts:    newRegistry(),
-		tickets:  map[string]*relayTicket{},
-		pending:  map[string]*pendingLogin{},
-		loginIP:  newLimiter(10, 5),
-		apiIP:    newLimiter(600, 120),
-		lockouts: newLockout(),
-		hashSem:  make(chan struct{}, 2),
+		hosts:     newRegistry(),
+		tickets:   map[string]*relayTicket{},
+		pending:   map[string]*pendingLogin{},
+		loginIP:   newLimiter(10, 5),
+		apiIP:     newLimiter(600, 120),
+		lockouts:  newLockout(),
+		totpLocks: newLockout(),
+		hashSem:   make(chan struct{}, 2),
 	}
 	ports, err := parseRelayPorts(cfg.RelayPorts)
 	if err != nil {

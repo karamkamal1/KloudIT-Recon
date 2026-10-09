@@ -9968,6 +9968,41 @@ lists the variable; README and SECURITY.md say what goes wrong without it.
   a sign-in from another network still works. `RECON_TRUST_PROXY=cloudflared` makes the service
   fail to start, with `trust-proxy "cloudflared"` in the journal.
 
+### 2FA codes bounded per account, IPv6 clients per /64
+
+Problem: once someone had the password, nothing bounded the 2FA codes they could try. Wrong codes
+counted only towards the user+IP lockout, the pending login survived every wrong code for its 5
+minutes, and the per-IP limits keyed on the full address, so each IPv6 address (a /64 holds
+2^64) brought 5 more guesses and a check costs no Argon2. A probe evaluated 2000 wrong codes
+against one pending login from 400 addresses in 0.7 s, after which the right code still signed
+in: with 3 valid codes in a million, a /64 or a proxy pool works through 2FA in minutes.
+
+Fix (`internal/gateway/api.go` `checkTOTP`, `ratelimit.go` `rateKey`):
+- One password login may try 3 codes; the third wrong one ends it ("this login expired, start
+  again": the login page goes back to the password).
+- The account's 2FA locks after 5 wrong codes from any addresses (1 min, doubling up to 1 h,
+  audited once per lock as `totp_locked`); while locked every code is refused, the right one too.
+  Only a password holder reaches this step, so outsiders cannot use it to lock the owner out.
+- Code checks run one at a time, so a burst of concurrent guesses cannot all pass the lock
+  before the first failure is counted.
+- The per-client limits (login and API buckets, user+client lockouts, host-auth bucket) key an
+  IPv6 client on its /64; IPv4 (also IPv4-mapped) stays per address. Audit entries, session
+  records and the UDP relay's source check keep the full address.
+- Not done: binding the pending login to the address that entered the password. With the two
+  bounds above it adds nothing, and it would refuse users whose network changes the public
+  address between the two requests (see SECURITY.md's known limitations).
+
+- Verified here: `internal/gateway` `TestTOTPGuessLimits` (fresh /64 per request: 3 codes per
+  login, the 5th wrong code locks the account, the right code is refused while locked and
+  accepted after) fails on the old code at the third wrong code;
+  `TestTOTPConcurrentGuesses` (12 concurrent wrong codes: 5 checked, 7 refused) fails without
+  the serialisation; `TestRateKey` (/64 keys, 6th request from one /64 refused). `go test -race`.
+- Gateway check (not GPU-specific, no AMD or NVIDIA step): with a 2FA account, sign in with the
+  password and type three wrong codes: the page says the login expired and asks for the password
+  again. Sign in again and type two more wrong codes, then the right one: "too many wrong codes
+  for this account, try again in 1m0s", and the audit log has `totp_locked`. After a minute the
+  right code signs in.
+
 ## Final review: AMD Direct Capture sRGB and 10-bit surfaces
 
 Problem: the NV12 / P010 conversion could not read two kinds of texture AMD Direct Capture can

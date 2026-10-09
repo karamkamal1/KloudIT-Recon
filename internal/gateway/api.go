@@ -65,7 +65,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	if !s.loginIP.Allow(ip) {
+	if !s.loginIP.Allow(rateKey(ip)) {
 		jsonError(w, http.StatusTooManyRequests, "too many attempts, wait a minute")
 		return
 	}
@@ -121,7 +121,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	if !s.loginIP.Allow(ip) {
+	if !s.loginIP.Allow(rateKey(ip)) {
 		s.audit.Log("login_ratelimited", "", ip, "")
 		jsonError(w, http.StatusTooManyRequests, "too many attempts, wait a minute")
 		return
@@ -134,7 +134,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	lockKey := req.Username + "|" + ip // per user+IP, so a remote attacker cannot lock the owner out
+	lockKey := req.Username + "|" + rateKey(ip) // per user+client, so a remote attacker cannot lock the owner out
 	if locked, d := s.lockouts.Locked(lockKey); locked {
 		jsonError(w, http.StatusTooManyRequests, fmt.Sprintf("account temporarily locked, try again in %s", d.Round(time.Second)))
 		return
@@ -154,7 +154,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if u.TOTPSecret != "" {
 		pending := auth.RandomToken(24)
 		s.ticketMu.Lock()
-		s.pending[auth.TokenHash(pending)] = &pendingLogin{user: u.Username, exp: time.Now().Add(5 * time.Minute), ip: ip}
+		s.pending[auth.TokenHash(pending)] = &pendingLogin{user: u.Username, exp: time.Now().Add(5 * time.Minute)}
 		s.ticketMu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"totpRequired": true, "pending": pending})
 		return
@@ -168,7 +168,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	if !s.loginIP.Allow(ip) {
+	if !s.loginIP.Allow(rateKey(ip)) {
 		jsonError(w, http.StatusTooManyRequests, "too many attempts, wait a minute")
 		return
 	}
@@ -180,40 +180,86 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	h := auth.TokenHash(req.Pending)
 	s.ticketMu.Lock()
-	pl := s.pending[auth.TokenHash(req.Pending)]
+	pl := s.pending[h]
 	s.ticketMu.Unlock()
 	if pl == nil || time.Now().After(pl.exp) {
 		jsonError(w, http.StatusUnauthorized, "login expired, start again")
 		return
 	}
-	if locked, d := s.lockouts.Locked(pl.user + "|" + ip); locked {
+	lockKey := pl.user + "|" + rateKey(ip)
+	if locked, d := s.lockouts.Locked(lockKey); locked {
 		jsonError(w, http.StatusTooManyRequests, fmt.Sprintf("account temporarily locked, try again in %s", d.Round(time.Second)))
 		return
 	}
+	if code, msg := s.checkTOTP(h, pl.user, strings.TrimSpace(req.Code), ip); code != http.StatusOK {
+		jsonError(w, code, msg)
+		return
+	}
+	s.lockouts.Success(lockKey)
+	s.startSession(w, r, pl.user)
+}
+
+// totpTries is how many 2FA codes one password login may try.
+const totpTries = 3
+
+// checkTOTP checks the 2FA code of the pending login h of user. Only someone
+// who has the password gets here, so the bounds are the login and the
+// account, not the address the codes come from: totpTries codes per password
+// login, and the account's 2FA locks after 5 wrong codes from anywhere (1
+// minute, doubling up to 1 hour). This cannot lock the owner out from outside,
+// and someone with a /64 of IPv6 addresses or a proxy pool cannot work
+// through the codes. Checks run one at a time (they cost no Argon2), so a
+// burst of concurrent guesses cannot all pass the lock before the first
+// failure is counted.
+func (s *Server) checkTOTP(h, user, code, ip string) (int, string) {
+	s.totpMu.Lock()
+	defer s.totpMu.Unlock()
+	if locked, d := s.totpLocks.Locked(user); locked {
+		return http.StatusTooManyRequests, fmt.Sprintf("too many wrong codes for this account, try again in %s", d.Round(time.Second))
+	}
+	s.ticketMu.Lock()
+	pl := s.pending[h]
+	last := false
+	if pl != nil {
+		pl.tries++
+		if last = pl.tries >= totpTries; last {
+			delete(s.pending, h)
+		}
+	}
+	s.ticketMu.Unlock()
+	if pl == nil {
+		return http.StatusUnauthorized, "login expired, start again"
+	}
 	ok := false
 	_ = s.store.Update(func(st *state) error {
-		u := st.Users[pl.user]
+		u := st.Users[user]
 		if u == nil || u.TOTPSecret == "" {
 			return nil
 		}
-		if c, valid := auth.VerifyTOTP(u.TOTPSecret, strings.TrimSpace(req.Code), time.Now(), u.TOTPLast); valid {
+		if c, valid := auth.VerifyTOTP(u.TOTPSecret, code, time.Now(), u.TOTPLast); valid {
 			u.TOTPLast = c
 			ok = true
 		}
 		return nil
 	})
-	if !ok {
-		s.lockouts.Fail(pl.user + "|" + ip)
-		s.audit.Log("totp_failed", pl.user, ip, "")
-		jsonError(w, http.StatusUnauthorized, "invalid code")
-		return
+	if ok {
+		s.ticketMu.Lock()
+		delete(s.pending, h)
+		s.ticketMu.Unlock()
+		s.totpLocks.Success(user)
+		return http.StatusOK, ""
 	}
-	s.ticketMu.Lock()
-	delete(s.pending, auth.TokenHash(req.Pending))
-	s.ticketMu.Unlock()
-	s.lockouts.Success(pl.user + "|" + ip)
-	s.startSession(w, r, pl.user)
+	s.lockouts.Fail(user + "|" + rateKey(ip))
+	s.audit.Log("totp_failed", user, ip, "")
+	if d := s.totpLocks.Fail(user); d > 0 {
+		s.audit.Log("totp_locked", user, ip, fmt.Sprintf("2FA refused from every address for %s after repeated wrong codes", d))
+	}
+	if last {
+		return http.StatusUnauthorized, fmt.Sprintf("invalid code; after %d wrong codes this login expired, start again", totpTries)
+	}
+	return http.StatusUnauthorized, "invalid code"
 }
 
 // ---------------------------------------------------------------------------
