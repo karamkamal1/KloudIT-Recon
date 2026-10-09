@@ -2759,6 +2759,83 @@ async function checkSettingsAfterFailedConnect() {
   }
 }
 
+// A saved setting this PC or browser does not offer (final review). Saved
+// settings are per browser, not per PC: here HEVC (the test host has no
+// HEVC encoder) and 120 fps on a host whose maxFps is 60. The drawer's
+// select showed its first option (Auto, 30 fps) while the saved value went
+// on to the host, so the host's "Codec hevc is not available end-to-end"
+// warning came at every session start, and picking the Auto it showed fired
+// no change. Now each select shows the saved value, disabled, labelled with
+// what is used instead, and the host is asked for Auto where this browser
+// decodes no HEVC (headless Chromium here: no warning at all) or the PC's
+// welcome of an earlier connection of the page lists no HEVC encoder (the
+// page then plays a browser that decodes HEVC: one warning, none in the
+// next session); picking Auto and 60 fps saves them.
+async function checkUnavailableSettings() {
+  await withHostConfig({ maxFps: 60 }, () => restartHost({}, 'host-maxfps-60'));
+  // The warnings of a session: in the console (this client logs notices) or
+  // on the screen (a toast lasts 6 s; an older client logs none).
+  const notices = async (from) => Math.max(consoleLines.slice(from).filter((l) => l.includes('not available end-to-end')).length,
+    await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].filter((t) => t.textContent.includes('not available end-to-end')).length));
+  // The video codec and frame rate selects (by their labels), tagged for selectOption.
+  const shown = () => page.evaluate(() => {
+    const sel = (re, tag) => {
+      const s = [...document.querySelectorAll('#drawer label')].find((l) => re.test(l.textContent.trim()))?.parentElement.querySelector('select');
+      if (!s) return null;
+      s.dataset.e2e = tag;
+      const o = s.options[s.selectedIndex];
+      return { value: s.value, text: o?.textContent || '', disabled: !!o?.disabled };
+    };
+    return { codec: sel(/^(video )?codec$/i, 'codec'), fps: sel(/^frame rate$/i, 'fps') };
+  });
+  // A stream with the saved HEVC and 120 fps; fakeHevc: the page's
+  // capabilities say this browser decodes HEVC (in software).
+  const stream = async (fakeHevc) => {
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, ...PREFS_2D, path: 'auto', transport: 'auto', codec: 'hevc', fps: 120 });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    const real = await page.evaluate((fake) => { const v = window.__caps.codecs.hevc; if (fake) window.__caps.codecs.hevc ||= 'sw'; return v || null; }, fakeHevc);
+    const con = consoleLines.length;
+    await page.click('#btn-start');
+    await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    await sleep(1500); // (the session's first notices)
+    return { real, warnings: await notices(con), shown: await shown() };
+  };
+  try {
+    const a = await stream(false);
+    await endStream();
+    const b = await stream(true);
+    await sleep(6000); // (the first session's toasts go)
+    // A second session in this page (the drawer's Reconnect, which opens the drawer).
+    const con1 = consoleLines.length;
+    await page.evaluate(() => {
+      window.__recon.conn = null;
+      [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Reconnect')).click();
+    });
+    await page.waitForFunction(() => window.__recon.streaming && window.__recon.conn, null, { timeout: 30000 });
+    await sleep(1500);
+    const n2 = await notices(con1);
+    await shown(); // (tags the rebuilt drawer's selects)
+    if (!(await page.evaluate(() => document.getElementById('drawer').classList.contains('open')))) await page.keyboard.press('Control+Alt+Shift+KeyO');
+    await page.selectOption('[data-e2e=codec]', 'auto', { timeout: 5000 }).catch(() => {});
+    await page.selectOption('[data-e2e=fps]', '60', { timeout: 5000 }).catch(() => {});
+    const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('recon.prefs.v1') || '{}'));
+    const sel = (x) => `"${x?.text}" (${x?.value}${x?.disabled ? ', disabled' : ''})`;
+    check('a saved setting this PC or browser does not offer: the select shows it, labelled with what is used instead; the host is asked for Auto once the codec is known missing (no warning); Auto and 60 fps can be picked',
+      (a.real || (a.warnings === 0 && a.shown.codec?.value === 'hevc' && a.shown.codec.disabled && /browser does not decode it: Auto is used/.test(a.shown.codec.text))) &&
+        a.shown.fps?.value === '120' && a.shown.fps.disabled && /at most 60 fps/.test(a.shown.fps.text) &&
+        b.shown.codec?.value === 'hevc' && b.shown.codec.disabled && /PC does not encode it: Auto is used/.test(b.shown.codec.text) && b.warnings === 1 && n2 === 0 &&
+        saved.codec === 'auto' && +saved.fps === 60,
+      `this browser decodes HEVC: ${a.real || 'no'}; codec select ${sel(a.shown.codec)}, frame rate ${sel(a.shown.fps)}, ${a.warnings} "not available end-to-end" warning(s); ` +
+        `as a browser that decodes HEVC: codec select ${sel(b.shown.codec)}, ${b.warnings} warning(s), in the page's next session ${n2}; ` +
+        `after picking Auto and 60 fps: saved codec ${saved.codec}, fps ${saved.fps}`);
+  } finally {
+    await endStream();
+    await restartHost({}, 'host');
+  }
+}
+
 // A hardware decoder that keeps failing (final review): the worker's
 // VideoDecoder replaced, from the worker's start, by one that reports
 // prefer-hardware supported for what this browser decodes, but whose
@@ -4849,6 +4926,7 @@ try {
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
   if (want('paste dialog')) await checkPasteDialog().catch((e) => check('paste dialog scenario', false, e.message));
   if (want('settings after a failed connection')) await checkSettingsAfterFailedConnect().catch((e) => check('settings after a failed connection scenario', false, e.message));
+  if (want('settings not offered here')) await checkUnavailableSettings().catch((e) => check('settings not offered here scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

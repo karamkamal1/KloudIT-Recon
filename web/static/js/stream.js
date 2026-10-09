@@ -63,13 +63,27 @@ function hostPrefs() {
     h = Math.round(screen.height * devicePixelRatio) & ~1;
   }
   return {
-    codec: prefs.codec, bitrate: Math.round(prefs.bitrate * 1000), fps: +prefs.fps, width: w, height: h,
+    codec: codecAsked(), bitrate: Math.round(prefs.bitrate * 1000), fps: +prefs.fps, width: w, height: h,
     monitor: +prefs.monitor, audio: !!prefs.audio, audioCodec: prefs.audioCodec, cursor: prefs.cursor, quality: prefs.quality,
     adaptive: prefs.adaptive !== false,
     // HDR10 (step 4.5): the setting and the display; the worker adds what
     // its renderer and decoders can do (stream-worker.js hdrPrefs).
     hdr: { mode: prefs.hdr, display: hdrDisplay() },
   };
+}
+
+// The codec family the host is asked for. Saved settings are per browser,
+// not per PC: a family this browser cannot decode, or that this PC cannot
+// encode (the welcome of an earlier connection of this page), goes as Auto,
+// which the host chooses anyway, only with its "not available end-to-end"
+// warning at every session start. The drawer shows the setting as not
+// available here.
+function codecAsked() {
+  const f = prefs.codec;
+  if (f === 'auto') return f;
+  const dec = window.__caps?.codecs;
+  const enc = S.welcome?.encoders;
+  return (dec && !dec[f]) || (enc && !enc.some((e) => encoderFamily(e) === f)) ? 'auto' : f;
 }
 
 // HDR10 (step 4.5): the display is in HDR mode (Windows HDR on, macOS XDR),
@@ -496,7 +510,10 @@ function onWorker(m) {
       break;
     case 'cursor': onCursorShape(m.shape); break;
     case 'cursorPos': onCursorPos(m); break;
-    case 'notice': toast(m.msg, m.level === 'error' ? 'error' : m.level === 'warn' ? 'warn' : 'info', 6000); break;
+    case 'notice':
+      console.log('[recon] notice:', m.msg); // (a toast goes in seconds)
+      toast(m.msg, m.level === 'error' ? 'error' : m.level === 'warn' ? 'warn' : 'info', 6000);
+      break;
     case 'stats': onStats(m); break;
     case 'renderer': onRenderer(m.info); break;
     case 'gone': onCanvasGone(m.slot); break;
@@ -1395,10 +1412,18 @@ function field(label, control, hint) {
 }
 
 // Controls keep their ids (set-<key>) when the drawer is rebuilt (each
-// welcome), so the focus stays on the same control.
-function select(key, options, onChange) {
+// welcome), so the focus stays on the same control. A saved value the
+// options do not hold (saved settings are per browser, not per PC: a codec
+// this PC or browser lacks, a frame rate above the PC's maxFps, a display it
+// does not have) is shown as it is, labelled by missing(value) with what is
+// used instead, and cannot be picked again. (Before, the select showed its
+// first option while the saved value went on to the host, and picking that
+// option changed nothing: a select fires no change for the value it shows.)
+function select(key, options, onChange, missing = (v) => `${v} · not available here`) {
   const s = el('select', { id: `set-${key}` });
-  for (const [v, l] of options) s.append(el('option', { value: v, selected: String(prefs[key]) === String(v) }, l));
+  const cur = String(prefs[key]);
+  if (!options.some(([v]) => String(v) === cur)) s.append(el('option', { value: cur, selected: true, disabled: true }, missing(prefs[key])));
+  for (const [v, l] of options) s.append(el('option', { value: v, selected: String(v) === cur }, l));
   s.addEventListener('change', () => { prefs[key] = s.value; savePrefs(); onChange?.(); });
   return s;
 }
@@ -1512,16 +1537,18 @@ function buildDrawer() {
   d.replaceChildren(
     el('h3', {}, 'Stream settings', el('button', { id: 'drawer-close', class: 'btn-icon btn-ghost', 'aria-label': 'Close', onclick: toggleDrawer }, '✕')),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Video'),
-      field('Codec', select('codec', codecOpts, applyLive), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
+      field('Codec', select('codec', codecOpts, applyLive,
+        (v) => `${codecName[v] || v} · ${caps.codecs[v] ? 'this PC does not encode it' : 'this browser does not decode it'}: Auto is used`), 'Auto: HEVC with hardware at both ends, unless this browser decodes another codec clearly faster (timed while connecting). HEVC/AV1 give more quality per bit than H.264.'),
       field('Bitrate', el('div', { class: 'range-row' }, bitrate, out), 'LAN: 50–150 Mbps. Internet: match your upload speed.'),
-      field('Frame rate', select('fps', fpsOpts, applyLive)),
+      field('Frame rate', select('fps', fpsOpts, applyLive,
+        (v) => `${v} fps · ${+v > maxFps ? `this PC streams at most ${maxFps} fps` : 'not available here'}`)),
       // "Native" sends no size: the host streams its display at its own size,
       // or, where it streams a virtual display (host config virtualDisplay),
       // one at this screen's size (vdisplay.RequestedMode).
       field('Resolution', select('resolution', [['native', 'Native (host display, or this screen on a virtual display)'], ['client', 'Match this screen'], ['2160', '3840×2160'], ['1440', '2560×1440'], ['1080', '1920×1080'], ['900', '1600×900'], ['720', '1280×720']], applyLive),
         'Native: the PC display at its own size; where the PC streams a virtual display (host.json "virtualDisplay"), one at this screen\'s size. Other sizes are downscaled on the GPU (Windows Graphics Capture), or get a virtual display of that size.'),
       field('Encoder preset', select('quality', [['speed', 'Lowest latency'], ['balanced', 'Balanced'], ['quality', 'Best quality']], applyLive)),
-      monOpts.length > 1 ? field('Display', select('monitor', monOpts, applyLive)) : null,
+      monOpts.length > 1 ? field('Display', select('monitor', monOpts, applyLive, (v) => `Display ${+v + 1} · not on this PC: the first display is used`)) : null,
       check('adaptive', 'Adaptive bitrate on congestion', () => { post({ type: 'prefs', prefs: { adaptive: prefs.adaptive } }); applyLive(); }),
     ),
     el('div', { class: 'group' }, el('div', { class: 'gtitle' }, 'Input'),

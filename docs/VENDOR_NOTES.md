@@ -82,7 +82,7 @@ host.log lines over a run (T5) gives each run its own file instead: `-log
    4.2, 4.3 and 4.4 (decoders, renderers, pacing), 4.6 (input, audio), FSR (Phase 5 client-side
    upscaling), "Final review: browser client" (Decoder Prefer software, a tab hidden while
    connecting, a failing hardware decoder, WebGPU device loss, the drawer by keyboard, the
-   settings after a failed connection). With
+   settings after a failed connection, a saved codec another PC does not offer). With
    `"capture": "amf"` also "Final review: AMD Direct Capture sRGB and 10-bit surfaces" (its
    `--self-test-convert=hw`, sRGB swap chain and 10-bit SDR checks; the 10-bit HDR one in stage
    8) and "Final review: deploy and install", README's `capture` row. "Final review: host
@@ -10684,6 +10684,42 @@ waiting for its endpoints.
   the splash; Reset to defaults, close it: the next retry streams over the relay (overlay:
   Transport … relay). Repeat with *Direct to PC only* and Use Network path Auto on the splash.
   In Safari: *Direct to PC only* is greyed out in the drawer.
+
+### Saved settings this PC or browser does not offer
+
+Problem: saved settings are per browser, not per PC, but when a saved value was not among a
+drawer select's options (a codec the PC does not encode or the browser does not decode, a frame
+rate above the PC's `maxFps`, a display index the PC does not have) the select showed its first
+option while the saved value kept going to the host. The user saw "Auto (best available)" or
+"30 fps" and got something else; for the codec the host warned "Codec hevc is not available
+end-to-end; choosing automatically." at every session start, and picking the Auto the select
+already showed did nothing (a select fires no change for the value it shows), so the warning
+could only be cleared by picking another codec and then Auto again.
+
+Fix: a saved value the options do not hold is shown as the selected option, disabled (it cannot
+be picked again), and labelled with what is used instead: "HEVC / H.265 · this browser does not
+decode it: Auto is used" (or "this PC does not encode it"), "120 fps · this PC streams at most
+60 fps", "Display 3 · not on this PC: the first display is used". Picking any other option saves
+it. The host is asked for Auto instead of a codec family this browser cannot decode, or that the
+PC's welcome of an earlier connection of the page lists no encoder for (the host would choose
+automatically anyway): the warning comes at most once per page. The saved setting itself stays,
+for the PCs that have the codec. The page also writes the host's notices to the console log
+(`[recon] notice: …`), as a toast goes in seconds.
+
+- Verified here: browser E2E scenario "settings not offered here" (`E2E_ONLY='settings not
+  offered here'`; the host restarted with `"maxFps": 60`, saved HEVC and 120 fps; the test host
+  has no HEVC encoder): headless Chromium decodes no HEVC, so the codec select reads "HEVC / H.265
+  · this browser does not decode it: Auto is used" (disabled), Frame rate "120 fps · this PC
+  streams at most 60 fps", and no warning comes. With the page's capabilities saying HEVC decodes
+  (in software): "… this PC does not encode it: Auto is used", one warning in the first session
+  (the welcome not yet known), none in the page's next session (the drawer's Reconnect); picking
+  Auto and 60 fps saves them. Against the old client: the selects read "Auto (best available)"
+  and "30 fps", and the warning came in every session (1, 1, 1).
+- Not GPU-specific (no AMD or NVIDIA step). Test on any client: Settings → Codec *AV1* while
+  streaming from the RX 7900 XT PC, then connect from the same browser to a PC without an AV1
+  encoder (an RX 6000 or GTX 10-series GPU): the codec select reads "AV1 · this PC does not
+  encode it: Auto is used"; after a Reconnect no "Codec av1 is not available end-to-end"
+  warning; picking Auto saves it.
 
 ## Final review: host agent, second round
 
