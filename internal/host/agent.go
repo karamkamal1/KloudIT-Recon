@@ -224,7 +224,11 @@ func (a *Agent) monitors() []platform.Monitor {
 	return mons
 }
 
-func (a *Agent) cursorSupported() bool { return runtime.GOOS == "windows" && a.cfg.Capture != "test" }
+// cursorOnPlatform: the agent can read the host's pointer (Windows; tests
+// set it).
+var cursorOnPlatform = runtime.GOOS == "windows"
+
+func (a *Agent) cursorSupported() bool { return cursorOnPlatform && a.cfg.Capture != "test" }
 
 func (a *Agent) features() []string {
 	f := []string{"text", "keyboard", "mouse"}

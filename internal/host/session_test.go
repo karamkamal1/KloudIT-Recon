@@ -1060,3 +1060,49 @@ func TestProbeSample(t *testing.T) {
 		t.Fatalf("test pattern sample %+v", p)
 	}
 }
+
+// TestCursorLoopAfterVideoCursor: a session that starts with the client's
+// cursor setting "video" sends no pointer (the video shows it); when the
+// client switches to its local cursor mid-session (a live settings change,
+// whose video restart leaves the pointer out of the video), the host's
+// pointer shape and position follow at once. Before, the loop ended at the
+// start of such a session, and the client drew a plain arrow from then on.
+func TestCursorLoopAfterVideoCursor(t *testing.T) {
+	onPlatform, gc, ci := cursorOnPlatform, getCursor, cursorImage
+	t.Cleanup(func() { cursorOnPlatform, getCursor, cursorImage = onPlatform, gc, ci })
+	cursorOnPlatform = true
+	getCursor = func() (platform.CursorState, error) {
+		return platform.CursorState{Visible: true, X: 960, Y: 540, Handle: 7}, nil
+	}
+	cursorImage = func(h uint64) (*platform.CursorShape, error) {
+		return &platform.CursorShape{ID: h, W: 1, H: 1, RGBA: []byte{1, 2, 3, 255}}, nil
+	}
+	s, _, ctrl := testSession(t, testFaults{})
+	dc := &dgConn{Conn: s.c}
+	s.c = dc
+	s.a.cfg = &Config{}
+	s.prefs = proto.Prefs{Cursor: "video"}
+	s.monitor = platform.Monitor{W: 1920, H: 1080}
+	go s.cursorLoop()
+	time.Sleep(60 * time.Millisecond)
+	dc.mu.Lock()
+	n := len(dc.sent)
+	dc.mu.Unlock()
+	if hasMsg(ctrl.messages(t), `"t":"cursor"`) || n != 0 {
+		t.Fatalf("pointer sent while the video shows it: %q, %d datagrams", ctrl.messages(t), n)
+	}
+	s.prefsMu.Lock()
+	s.prefs.Cursor = "local"
+	s.prefsMu.Unlock()
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		dc.mu.Lock()
+		n = len(dc.sent)
+		dc.mu.Unlock()
+		if hasMsg(ctrl.messages(t), `"t":"cursor"`, `"id":7`, `"png":`) && n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no pointer after switching to the local cursor: %q, %d datagrams", ctrl.messages(t), n)
+		}
+	}
+}

@@ -10758,3 +10758,29 @@ Fix:
   5. Put a file `vdisplay-restore.json` next to host.json (copy the one from step 4 before it is
      replayed) and restart the agent: it stays there untouched and host.log says nothing about it.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### The local cursor after starting with the cursor in the video
+
+Problem: the loop that sends the host pointer's shape and position for the client to draw
+(`cursorLoop`) looked at the client's cursor setting once, when the session started. A session
+that started with Cursor "In the video stream" (the client's saved setting) never ran it; when
+the user switched to the local cursor in the settings drawer, the live change restarted the video
+without the pointer, but no shape or position was ever sent: desktop mode showed a plain browser
+arrow (no I-beam, resize arrows or hidden cursor), and in game mode (pointer lock) a game's menu
+cursor was not drawn at all until a reconnect.
+
+Fix: the loop runs for the whole session wherever the agent reads the pointer (Windows, not
+`drawCursor`). While the setting is "video" it sends nothing; when the client switches to its
+local cursor, the current shape (or hidden) and position go out at once, as at the start of a
+session (a shape sent before in the session goes without its image: the client keeps it).
+
+- Verified here: `internal/host` `TestCursorLoopAfterVideoCursor` (the pointer reads faked): no
+  cursor message and no position datagram while the setting is "video"; the shape with its PNG
+  and a position follow within a few ms of the switch to "local". Before the fix the loop had
+  ended and nothing came within 2 s.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific (any pipeline). Test: in the stream's
+  settings drawer set Cursor to "In the video stream" and reconnect (the saved setting), then set
+  it to "Local": hovering text shows the I-beam and window edges the resize arrows at once, with
+  no reconnect; in game mode (Ctrl+Alt+Shift+M) a game's or the desktop's menu pointer is drawn.
+  Switch back to "In the video stream": the pointer is in the video only (no second pointer).
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

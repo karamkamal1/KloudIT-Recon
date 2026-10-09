@@ -2519,8 +2519,21 @@ func (s *Session) releasePads() {
 // ---------------------------------------------------------------------------
 // Cursor (local rendering in the browser = zero-latency pointer)
 
+// The host pointer's state and shapes (tests replace them).
+var (
+	getCursor   = platform.GetCursor
+	cursorImage = platform.CursorImage
+)
+
+// cursorLoop sends the host pointer's shape (control messages) and position
+// (datagrams) for the client to draw it locally, for the whole session when
+// the agent reads the pointer and does not draw it into the video itself.
+// While the client's cursor setting is "video" (the video shows the pointer)
+// it sends nothing; the client can switch to its local cursor mid-session (a
+// live settings change), and the current shape and position then follow at
+// once, as they do at the start.
 func (s *Session) cursorLoop() {
-	if !s.a.cursorSupported() || s.a.cfg.DrawCursor || s.currentPrefs().Cursor == "video" {
+	if !s.a.cursorSupported() || s.a.cfg.DrawCursor {
 		return
 	}
 	t := time.NewTicker(8 * time.Millisecond)
@@ -2530,24 +2543,29 @@ func (s *Session) cursorLoop() {
 	var lastX, lastY uint16
 	var seq uint32
 	sent := map[uint64]bool{}
+	resend := true // the shape (or hidden) and position, whatever was sent before
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-t.C:
 		}
-		cs, err := platform.GetCursor()
+		if s.currentPrefs().Cursor == "video" {
+			resend = true
+			continue
+		}
+		cs, err := getCursor()
 		if err != nil {
 			continue
 		}
 		if s.cursorInVideo.Load() {
 			cs.Visible = false // the stream shows the pointer already (a WGC capture that could not leave it out)
 		}
-		if cs.Visible != lastVisible || (cs.Visible && cs.Handle != lastHandle) {
+		if resend || cs.Visible != lastVisible || (cs.Visible && cs.Handle != lastHandle) {
 			lastVisible, lastHandle = cs.Visible, cs.Handle
 			msg := proto.CursorShape{T: "cursor", ID: cs.Handle, Hidden: !cs.Visible}
 			if cs.Visible && !sent[cs.Handle] {
-				if shape, err := platform.CursorImage(cs.Handle); err == nil {
+				if shape, err := cursorImage(cs.Handle); err == nil {
 					img := &image.NRGBA{Pix: shape.RGBA, Stride: shape.W * 4, Rect: image.Rect(0, 0, shape.W, shape.H)}
 					var pb bytes.Buffer
 					if png.Encode(&pb, img) == nil {
@@ -2565,12 +2583,13 @@ func (s *Session) cursorLoop() {
 		if m.W > 1 && m.H > 1 {
 			nx := clampU16((cs.X - m.X) * 65535 / (m.W - 1))
 			ny := clampU16((cs.Y - m.Y) * 65535 / (m.H - 1))
-			if nx != lastX || ny != lastY {
+			if resend || nx != lastX || ny != lastY {
 				lastX, lastY = nx, ny
 				seq++
 				_ = s.c.SendDatagram(proto.CursorPos(seq, cs.Visible, nx, ny))
 			}
 		}
+		resend = false
 	}
 }
 
