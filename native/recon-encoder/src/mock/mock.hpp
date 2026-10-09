@@ -55,6 +55,13 @@ private:
 // HDR10 stream although the canned one is 8-bit H.264), so capture and the
 // colour conversion run for real on a host without an encoder backend; the
 // converted frames are ignored.
+// Phase 5 session wiring (part B) plumbing: setRoi is accepted (caps roi
+// "importance") and logged, one line per call, as "mock: setRoi N rect(s):
+// x,y wxh weight w ..." (the canned pictures do not change); start's
+// sliceOutput N is taken (caps sliceOutput true) and every frame reports N
+// parts, the first one ready when the frame went into its queue (submit) and
+// the frame when receive() hands it out, so the ring's slice fields and
+// recon-host's stage summary can be tested without AMF.
 // It enforces the init() / release() contract: an init() after a start that
 // failed after init() succeeded fails unless release() was called in between.
 class ReplayEncoder : public Backend {
@@ -105,6 +112,7 @@ private:
     RateParams pendingRate_;
     uint32_t gen_ = 0;
     bool svc_ = false;       // svcLayers 2
+    int slices_ = 0;         // start sliceOutput (emulated)
     bool copyNext_ = false;  // the next frame is the copy of the next canned P frame
 };
 

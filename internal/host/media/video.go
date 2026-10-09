@@ -51,7 +51,15 @@ type Frame struct {
 	// the synthetic GPU source). FFmpeg reports none.
 	Dirty    float64
 	HasDirty bool
-	Data     []byte
+	// FirstSliceUs: host clock when the encoder had the frame's first slice
+	// / tile ready (native helper sub-frame output, StartParams.SliceOutput;
+	// 0 = it came out whole). The frame still goes out whole: EncodeDoneUs -
+	// FirstSliceUs is what sending it slice by slice could gain.
+	FirstSliceUs uint64
+	// Reencoded: the encoder encoded this frame a second time at a higher QP
+	// because the first encode was oversized (StartParams.ReencodeOversized).
+	Reencoded bool
+	Data      []byte
 }
 
 // maxCaptureToEncoded bounds plausible capture->encoded times; anything else
@@ -250,6 +258,9 @@ func (v *Video) Recover(gen uint8, lostFrom uint32) error {
 
 // Ack: unused (no long-term references).
 func (v *Video) Ack(gen uint8, seq uint32) {}
+
+// SetFocus: the FFmpeg command line has no regions of interest.
+func (v *Video) SetFocus(Focus) error { return ErrNoROI }
 
 // Start launches a new encoder generation. If urgent is true the current
 // generation is stopped immediately (its frames are useless to the client, e.g.

@@ -5,6 +5,9 @@ package encoder
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"image"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -835,14 +839,14 @@ func TestHelperIntegrationWGC(t *testing.T) {
 func TestHelperIntegrationPhase5(t *testing.T) {
 	h := launchMock(t)
 	cc := h.Caps().Codecs["h264"]
-	if cc.LiveFPS != "seamless" || !cc.InstanceSelect || cc.HWInstances != 2 || cc.Reencode || cc.MaxTemporalLayers != 2 {
+	if cc.LiveFPS != "seamless" || !cc.InstanceSelect || cc.HWInstances != 2 || cc.Reencode || cc.MaxTemporalLayers != 2 ||
+		cc.ROI != "importance" || !cc.SliceOutput {
 		t.Fatalf("mock caps %+v", cc)
 	}
 	two := 2
 	for _, p := range []StartParams{
 		{Codec: "h264", FPS: 60, Kbps: 4000, SVCLayers: 3},
 		{Codec: "h264", FPS: 60, Kbps: 4000, ReencodeOversized: 3},
-		{Codec: "h264", FPS: 60, Kbps: 4000, SliceOutput: 2},
 		{Codec: "h264", FPS: 60, Kbps: 4000, EncoderInstance: &two},
 	} {
 		var he *HelperError
@@ -896,6 +900,79 @@ func TestHelperIntegrationPhase5(t *testing.T) {
 			t.Fatal("no stats with fps 20 (and the bitrate unchanged)")
 		}
 	}
+}
+
+// TestHelperIntegrationSlicesAndROI: the mock's emulated sub-frame output and
+// its ROI (Phase 5 wiring B plumbing): started sliceOutput 2, every frame
+// with 2 slices and a first-slice time between its submit and its output
+// through the ring (the stats say the same); setRoi accepted (the mock logs
+// the rects) and cleared, the stream unharmed.
+func TestHelperIntegrationSlicesAndROI(t *testing.T) {
+	logs := &lockedBuf{}
+	h, err := Launch(Options{Exe: helperExe(t), Backend: "mock", LogLevel: "debug",
+		Log: slog.New(slog.NewTextHandler(io.MultiWriter(logs, testLogWriter{t}), &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+	st, err := h.Start(StartParams{Codec: "h264", FPS: 60, Kbps: 4000, SliceOutput: 2})
+	if err != nil || st.SliceOutput != 2 {
+		t.Fatalf("start: %+v %v", st, err)
+	}
+	rects := FocusROI(320, 180, 320, 180, &image.Point{X: 160, Y: 90}, FocusOptions{CenterSize: -1})
+	if err := h.SetROI(rects); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		f := nextFrame(t, h)
+		if f.Slices != 2 || f.FirstSliceQPC < f.SubmitQPC || f.FirstSliceQPC > f.OutputQPC || f.FirstSliceQPC == 0 {
+			t.Fatalf("frame %d: slices %d, submit %d first slice %d output %d", f.FrameID, f.Slices, f.SubmitQPC, f.FirstSliceQPC, f.OutputQPC)
+		}
+	}
+	if err := h.SetROI(nil); err != nil {
+		t.Fatal(err)
+	}
+	nextFrame(t, h)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		set, cleared := logs.has(fmt.Sprintf("mock: setRoi 1 rect(s): %d,%d %dx%d weight 6;", rects[0].X, rects[0].Y, rects[0].W, rects[0].H)),
+			logs.has("mock: setRoi 0 rect(s):")
+		if set && cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the mock did not log the regions set (%v) and cleared (%v)", set, cleared)
+		}
+	}
+	for deadline := time.After(2 * time.Second); ; {
+		select {
+		case s := <-h.Stats():
+			if s.Slices == 2 && s.FirstSliceQPC != 0 {
+				return
+			}
+		case err := <-h.Errors():
+			t.Fatalf("helper error: %v", err)
+		case <-deadline:
+			t.Fatal("no stats with slices")
+		}
+	}
+}
+
+// lockedBuf collects log output.
+type lockedBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuf) has(s string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Contains(b.buf.String(), s)
 }
 
 // TestHelperIntegrationSVC: the mock's two temporal layers (Phase 5 SVC):

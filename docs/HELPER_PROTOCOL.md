@@ -11,7 +11,8 @@ ignores unknown types) and new slot flag bits (step 3.2 added all three; step 3.
 slot flag SEQ_START (bit 4); step 3.9 added the HDR10 fields and the `captureChanged` reason
 `hdr`; Phase 5 added the fields of "Phase 5 features", two slot flags (DIRTY, bit 5, and
 DISCARDABLE, bit 6) and the slot's `dirtyPpm` in formerly reserved bytes; step 3.8 the
-`lavc` backend and `started.encoder`).
+`lavc` backend and `started.encoder`; Phase 5 wiring B the slot flag REENCODED (bit 7) and the
+slot's `slices` / `firstSliceQpc` in formerly reserved bytes).
 
 ## Lifecycle
 
@@ -373,9 +374,10 @@ helpers). `dirtyPct` is the same share in whole percent, rounded up (any change 
 1; -1 unknown; before Phase 5 it was a sum of rect areas, overlaps counted twice).
 `discardable` (Phase 5): no later frame references this one (see "Temporal SVC"; ring flag
 DISCARDABLE). With `reencodeOversized`, a re-encoded frame adds
-`"reencoded":true,"oversizeBytes":N` (the first encode's size; `bytes` is what went out); with
-`sliceOutput`, `"slices":N,"firstSliceQpc":Q` (the parts it came out in and when the first
-one did).
+`"reencoded":true,"oversizeBytes":N` (the first encode's size; `bytes` is what went out; ring
+flag REENCODED); with `sliceOutput`, `"slices":N,"firstSliceQpc":Q` (the parts it came out in
+and when the first one did; also in the ring slot, which the frame reaches recon-host with:
+the stats message follows the ring write and may be dropped).
 
 `dropped` frames add `"reason"`: `ringFull` (recon-host did not keep up) or `tooLarge`
 (bigger than a slot). `recovery` frames add `"refFloor"`. `kbps`/`vbvFrames`/`fps` are
@@ -469,7 +471,7 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 |---|---|---|
 | 0 | u64 | `seq`: the write index `n` this slot was written at |
 | 8 | u64 | `frameId`: helper frame counter, from 1, +1 per captured frame |
-| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it), bit 5 DIRTY (`dirtyPpm` valid; Phase 5), bit 6 DISCARDABLE (no later frame references this one; Phase 5) |
+| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it), bit 5 DIRTY (`dirtyPpm` valid; Phase 5), bit 6 DISCARDABLE (no later frame references this one; Phase 5), bit 7 REENCODED (encoded a second time at a higher QP: start `reencodeOversized`, stats `reencoded`; Phase 5 wiring B) |
 | 20 | u32 | `gen`: encoder generation inside this helper (bumped on an in-helper re-init) |
 | 24 | u32 | `payloadOffset` from the slot start (>= 128) |
 | 28 | u32 | `payloadSize` in bytes |
@@ -485,7 +487,9 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 | 88 | u32 | `width`: the coded frame width (`started.codedWidth`) |
 | 92 | u32 | `height`: the coded frame height |
 | 96 | u32 | `dirtyPpm`: the dirty share (stats `dirty`) in parts per million, valid with DIRTY (Phase 5; older helpers: 0 and no flag = unknown) |
-| 100..127 | | reserved (0) |
+| 100 | u32 | `slices`: the parts the frame came out of the encoder in with start `sliceOutput` (stats `slices`); 0 = whole (Phase 5 wiring B; older helpers: 0) |
+| 104 | i64 | `firstSliceQpc`: when the first part was ready (stats `firstSliceQpc`), valid with `slices` > 0 |
+| 112..127 | | reserved (0) |
 | `payloadOffset` | bytes | bitstream: an Annex-B access unit (H.264/HEVC) or an AV1 temporal unit |
 
 ### Producer (helper output thread; one encoder per ring)
@@ -1170,19 +1174,21 @@ production (the installed LGPL build has no libx264).
 GUIDE 9's differentiators, helper and Go client side (`internal/host/encoder`). Sessions use
 temporal SVC (thinning), the dirty share (static desktop bitrate) and frame-rate changes
 (`SetFPS`) since Phase 5 wiring A (docs/ARCHITECTURE.md "Rate control"; docs/VENDOR_NOTES.md
-"Phase 5 wiring A"); ROI, the engine choice, re-encoding and slice output not yet
-(docs/VENDOR_NOTES.md "Phase 5 (helper features)" has the integration notes and the hardware
-checks). All additive: older helpers omit the new fields.
+"Phase 5 wiring A"), and the cursor / crosshair ROI (from the pointer input), the engine choice,
+re-encoding and slice output since Phase 5 wiring B (host config `roi`, `encoderInstance`,
+`reencodeOversized`, `sliceOutput`; docs/ARCHITECTURE.md "Regions of interest and the encoder
+options"; docs/VENDOR_NOTES.md "Phase 5 wiring B" has the hardware checks). All additive: older
+helpers omit the new fields.
 
 | Feature | Control | Caps | Reported | AMF | NVENC | mock |
 |---|---|---|---|---|---|---|
 | temporal SVC | `start` `svcLayers` 2 (up to `maxTemporalLayers`) | `maxTemporalLayers` | `started.svcLayers`; per frame `temporalLayer`, `discardable` (stats, ring) | yes | where `SUPPORT_TEMPORAL_SVC` | 2 layers (non-reference copies) |
-| cursor / crosshair ROI | `setRoi` (Go `FocusROI`) | `roi` | | importance map | QP delta map | ignored |
+| cursor / crosshair ROI | `setRoi` (Go `FocusROI`) | `roi` | | importance map | QP delta map | `importance`: accepted and logged |
 | dirty share | | | stats `dirty`, `dirtyPct`; ring `dirtyPpm` + DIRTY | (any capture: DDA, AMD Direct Capture) | | |
 | FPS before resolution | `setRate` `fps` alone (Go `SetFPS`) | `liveFps` | `started.liveFps`; stats `fps` | `FRAMERATE` (VERIFY no IDR) | `NvEncReconfigureEncoder` | pacing only |
 | dedicated encode engine | `start` `encoderInstance` (Go `EncoderInstanceFor`) | `instanceSelect`, `hwInstances` | `started.encoderInstance` (read back) | `INSTANCE_INDEX` | no (split-frame) | 2 "engines" |
-| re-encode oversized frames | `start` `reencodeOversized` | `reencode` | stats `reencoded`, `oversizeBytes` | no | `DISABLE_ENC_STATE_ADVANCE` | no |
-| sub-frame tile / slice output | `start` `sliceOutput` | `sliceOutput` | `started.sliceOutput`; stats `slices`, `firstSliceQpc` | `OUTPUT_MODE` `SLICE` / `TILE` | no (`unsupported`) | no |
+| re-encode oversized frames | `start` `reencodeOversized` | `reencode` | stats `reencoded`, `oversizeBytes`; ring REENCODED | no | `DISABLE_ENC_STATE_ADVANCE` | no |
+| sub-frame tile / slice output | `start` `sliceOutput` | `sliceOutput` | `started.sliceOutput`; stats `slices`, `firstSliceQpc`; ring `slices`, `firstSliceQpc` | `OUTPUT_MODE` `SLICE` / `TILE` | no (`unsupported`) | emulated (the first part when the frame was queued) |
 
 **Temporal SVC.** With `svcLayers` 2 the encoders use hierarchical P: the base layer (0) on
 every second frame after a key frame, referencing only base-layer frames; the enhancement
@@ -1212,7 +1218,13 @@ crosshair (a sixth, weight 8), scaled to the stream, rounded outwards, clipped. 
 turn them into AMF's GRAY32 importance map (64x64 blocks, H.264 16x16; 5 + weight / 2, the
 highest wins) or NVENC's QP delta map (16 / 32 / 64 blocks; -weight, AV1 -4 x weight);
 `--self-test-encoder` checks the maps of the exact rects Go's `TestFocusROI` pins for
-1920x1080, and `--self-test-nvenc` the map NVENC receives.
+1920x1080, and `--self-test-nvenc` the map NVENC receives. NVENC's map is a QP delta map
+(`NV_ENC_QP_MAP_DELTA`) beside spatial AQ, not GUIDE 2's emphasis map with AQ off: the emphasis
+level map is H.264-only and refused with AQ (nvEncodeAPI.h `qpMapMode`), so caps `roi`
+`emphasis` means the delta map. recon-host sends `setRoi` from the pointer input
+(docs/ARCHITECTURE.md "Regions of interest and the encoder options"): at most every 100 ms,
+only when the regions move, again after every new helper's `started`; an `error` with
+`"re":"setRoi"` stops it for that helper.
 
 **Dirty share.** See `stats` `dirty` above: DDA and AMD Direct Capture report the regions
 that changed with every image, and the helper turns them into the share of the picture.
@@ -1231,15 +1243,17 @@ AMF re-initializes and NVENC resets the encoder (IDR).
 **Dedicated encode engine.** `encoderInstance` selects the VCN engine on AMF
 (`INSTANCE_INDEX`; refused when it is not below `hwInstances`, read back for `started`), so a
 stream can stay off the engine Adrenalin's recording (ReLive, Instant Replay) uses (VERIFY
-which). Go `EncoderInstanceFor("dedicated", caps)` gives engine 1 where `instanceSelect` and
-`hwInstances` > 1, else the default; a number picks that engine. NVENC refuses it
-(`instanceSelect` false: the driver spreads a frame over its engines itself).
+which). Go `EncoderInstanceFor("dedicated", caps)` (host config `encoderInstance`; `auto` keeps
+the default) gives engine 1 where `instanceSelect` and `hwInstances` > 1, else the default; a
+number picks that engine. NVENC refuses it (`instanceSelect` false: the driver spreads a frame
+over its engines itself).
 
 **Re-encoding oversized frames.** NVENC only; see "NVENC encoder backend". AMF has no encode
 without advancing the state (`reencode` false; GUIDE 9: "AMD skip").
 
-**Sub-frame tile / slice output (experiment).** AMF only, `sliceOutput` N: `OUTPUT_MODE`
-`SLICE` (AV1 `TILE`, one tile per tile group OBU) with N slices / tiles per frame; the helper
+**Sub-frame tile / slice output (experiment).** AMF only (and the mock's emulation),
+`sliceOutput` N: `OUTPUT_MODE` `SLICE` (AV1 `TILE`, one tile per tile group OBU) with N slices /
+tiles per frame; the helper
 puts the parts back together and still publishes whole frames, reporting when the first part
 came out (stats `firstSliceQpc`: `outputQpc - firstSliceQpc` is what a sub-frame transport
 could gain; the encode test prints it). More slices cost some compression efficiency.
@@ -1444,8 +1458,13 @@ copy of itself (`h264AsNonReference`, `src/codec/bitstream.hpp`: `nal_ref_idc` 0
 `dec_ref_pic_marking()` left out; layer 1, `discardable`), which decodes to the same picture
 (the same references) and which no frame references, so the stream is key frame, then copy / P
 pairs, and the stream without the discardable frames decodes to the same base-layer pictures
-(`TestHelperIntegrationSVC` checks both with a Windows FFmpeg); no re-encode or sub-frame output
-(`unsupported`). With a GPU capture (`dda`, `amd-direct`, `wgc`,
+(`TestHelperIntegrationSVC` checks both with a Windows FFmpeg); `roi` `importance`: `setRoi` is
+accepted and logged, one line per call (`mock: setRoi N rect(s): x,y wxh weight w; ...`, the
+first four), the canned pictures do not change; `sliceOutput` true: with `sliceOutput` N
+(`started.sliceOutput` N) every frame reports N parts, the first one ready when the frame went
+into its queue (stats and ring `firstSliceQpc` between `submitQpc` and `outputQpc`), so the
+plumbing to recon-host's latency stages is tested without AMF (Phase 5 wiring B); no
+re-encode (`unsupported`). With a GPU capture (`dda`, `amd-direct`, `wgc`,
 `synthetic-gpu`) the mock asks for NV12 input, so capture, pacing, GPU priority and the
 colour conversion run for real on a host without an encoder backend (the converted frames
 are ignored; `--dump-nv12` shows one). With `hdr` from an HDR source it asks for P010, so

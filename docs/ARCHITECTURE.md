@@ -502,7 +502,7 @@ scaled texture coordinates).
 ### Two pipelines: FFmpeg and the native helper
 
 The session drives its video through one interface, `media.Pipeline` (`Start`, `Events`,
-`ForceKeyframe`, `SetRate`, `Recover`, `Ack`, `Capabilities`, ...), and decides what to do from
+`ForceKeyframe`, `SetRate`, `Recover`, `Ack`, `SetFocus`, `Capabilities`, ...), and decides what to do from
 the pipeline's `Capabilities`, never from a vendor:
 
 | | FFmpeg (`media.Video`) | Native helper (`media.HelperVideo`) |
@@ -514,7 +514,9 @@ the pipeline's `Capabilities`, never from a vendor:
 | frame-rate change | a restart (the 2.2 rungs) | in the running encoder (`liveFps` `seamless`: fine steps, `SetFPS`) |
 | thinning (temporal SVC) | non-reference frames from the bitstream (SVT-AV1's low-delay structure) | two temporal layers where the encoder has them, the enhancement layer `Discardable` |
 | static desktop | (no dirty share) | the capture's dirty share caps the bitrate (seamless live bitrate) |
-| stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly) |
+| regions of interest | none (`SetFocus`: `ErrNoROI`) | the encoder's map where its caps have one (`ROI`), from the pointer input |
+| encoder options | none | engine choice, re-encoding oversized frames, sub-frame output, where the caps allow them (below) |
+| stages stamped | capture (wall-clock pts), encode done | present, capture, encoder submit, encode done (QPC, converted exactly); first slice with `sliceOutput` |
 
 **Choosing** (host config `pipeline`: `auto` | `helper` | `ffmpeg`, once per session, logged as
 `video pipeline` with the reason): `auto` uses the helper on Windows when `recon-encoder.exe` is
@@ -555,6 +557,39 @@ adaptive-bitrate streams with the rate-control mode that changed seamlessly (CBR
 controller then changes the bitrate of a qualified seamless encoder every 250 ms, of others less
 often (a flush costs a key frame; see "Rate control"). Without results the helper's caps defaults
 apply.
+
+**Regions of interest and the encoder options** (Phase 5 wiring B; `internal/host/roi.go`,
+`HelperVideo.SetFocus` / `encoderOptions`). Where the helper's encoder has a region of interest
+map (caps `roi` `importance`: AMF `ROI_DATA`, 64x64 blocks, H.264 16x16; `emphasis`: NVENC's QP
+delta map beside spatial AQ, since NVENC's emphasis map proper is H.264-only and needs AQ off;
+`PipelineCaps.ROI`), the session tells it where the player looks, from the input path (the
+helper's captures report no pointer position): the client's absolute pointer positions (desktop
+mouse mode, normalised across the picture the client shows, which is the captured picture) put a
+square around the pointer (`encoder.FocusROI`, an eighth of the source height, weight 6; the
+rest untouched), its relative motion (game mouse mode, pointer lock, where a game hides the
+pointer and draws its crosshair at the centre) a square around the centre (a sixth, weight 8)
+with the rest at weight -2. Host config `roi`: `auto` (default; nothing before the first pointer
+input), `cursor`, `center`, `off`. `roiLoop` polls every 100 ms and hands the focus over only
+when its kind changed or the pointer moved by more than 1/32 of the picture, so the encoder
+builds at most ten maps a second however fast the pointer events come; `HelperVideo` maps it to
+each stream (the capture's size as displayed, scaled to the encoded size), sends `setRoi` only
+when the regions change, gives every helper it starts the current focus right after `started`,
+and stops sending to a helper that answers `setRoi` with an error (then `ROI` is false). Logged:
+`regions of interest` (used, or why not) once per change, `regions of interest: focus` when the
+kind changes. The encoder options come from host config and the caps of the codec each helper
+starts, decided in `withCaps` and logged once per change: `encoderInstance` (`auto`: the
+encoder's default engine; `dedicated`: engine 1 where `instanceSelect` and `hwInstances` > 1,
+i.e. AMF `INSTANCE_INDEX`, e.g. away from Adrenalin's recording; a number), `reencodeOversized`
+(experimental, off: a non-key frame larger than that many average frames is encoded again at a
+higher QP, only with caps `reencode`, i.e. NVENC; counted in `stream stats` `reencoded` from
+the ring flag REENCODED), `sliceOutput` (experimental, off: the encoder hands out N slices /
+tiles per frame, only with caps `sliceOutput`, i.e. AMF; the frames still go out whole, and the
+ring's `firstSliceQpc` becomes `media.Frame.FirstSliceUs`, which the host's stage summary
+reports as `host_encode_first_slice` (encoder submit to first slice) and `host_encode_rest`
+(first slice to whole frame: what a transport sending slices as they come could take off the
+encode stage)). None of them changes the stream's identity: a bitrate change stays in place. A
+helper that refuses a start made with any of them is replaced by one started without them for
+the rest of the session.
 
 **Lifecycle.** The helper the session launched to read its caps starts the stream; while a stream
 is live a spare helper is kept launched (caps read, nothing started), so a restart skips the
@@ -709,7 +744,9 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   `window.__recon.lastStats.stages`, and every 10 s the client sends them to the host
   (`{"t":"stages"}`), which logs them next to the encoder name and vendor, together with its own
   capture→encoded and queue times of the frames the client acknowledged (`0x40`) in the same
-  10 s (`host_capture`, `host_queue`). Hosts announce `stage-hold` in `welcome.features` when
+  10 s (`host_capture`, `host_queue`; with the native helper's sub-frame output also
+  `host_encode_first_slice` and `host_encode_rest`, see "Regions of interest and the encoder
+  options"). Hosts announce `stage-hold` in `welcome.features` when
   they take the hold row; to older hosts (no hold row; at most nine rows before step 3.1b,
   twelve since) the client reports hold and draw as one draw row (decoder output→drawn), as
   before step 4.4.

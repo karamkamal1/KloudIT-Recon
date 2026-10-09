@@ -169,7 +169,7 @@ func TestEncoderInstanceFor(t *testing.T) {
 		want   int // -1 = nil
 		err    bool
 	}{
-		{"", amf, -1, false}, {"default", amf, -1, false},
+		{"", amf, -1, false}, {"default", amf, -1, false}, {"auto", amf, -1, false}, {"auto", nvenc, -1, false},
 		{"dedicated", amf, 1, false}, {"dedicated", nvenc, -1, false}, {"dedicated", one, -1, false},
 		{"0", amf, 0, false}, {" 1 ", amf, 1, false}, {"2", amf, -1, true}, {"-1", amf, -1, true},
 		{"1", nvenc, -1, true}, {"0", nvenc, -1, true}, {"fast", amf, -1, true}, {"0", one, 0, false},

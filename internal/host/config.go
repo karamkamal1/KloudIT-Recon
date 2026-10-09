@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -77,6 +79,30 @@ type Config struct {
 	// older helpers) the rungs 120 / 90 / 60 at or above it, nothing below
 	// 60.
 	FPSFloor int `json:"fpsFloor,omitempty"`
+	// ROI is the encoder's region of interest around where the player looks
+	// (Phase 5 "sharper crosshair / cursor"; native helper encoders with a
+	// region of interest map: AMF, NVENC): "auto" ("" = auto) the pointer
+	// while the client sends absolute pointer positions, the picture's
+	// centre (a game's crosshair) while it sends relative motion (pointer
+	// lock), nothing before either; "cursor" always the pointer; "center"
+	// always the centre; "off" none.
+	ROI string `json:"roi,omitempty"`
+	// EncoderInstance picks the native helper's hardware encode engine
+	// (Phase 5 "dedicated encode engine"; AMF INSTANCE_INDEX, where the GPU
+	// has several and the backend lets a stream choose): "auto" ("" = auto)
+	// the backend's default (engine 0), "dedicated" engine 1 where there is
+	// one, or an engine number (0, 1, ...; also as a JSON number).
+	EncoderInstance engineChoice `json:"encoderInstance,omitempty"`
+	// ReencodeOversized (experimental, 0 = off) has the native helper encode
+	// a non-key frame larger than this many average frames (bitrate / fps)
+	// a second time at a higher QP before it goes out (1.5..100; NVENC,
+	// where the GPU can encode without advancing its state).
+	ReencodeOversized float64 `json:"reencodeOversized,omitempty"`
+	// SliceOutput (experimental, 0 = off) has the native helper's encoder
+	// hand out each frame in this many slices / tiles (1..64; AMF where the
+	// caps allow it). Frames still go out whole: the host's latency stages
+	// measure when the first slice was ready (host_encode_first_slice).
+	SliceOutput int `json:"sliceOutput,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -192,6 +218,21 @@ func LoadConfig(path string) (*Config, error) {
 	if c.StaticKbps < 0 {
 		return nil, fmt.Errorf("%s: staticKbps must not be negative, not %d", path, c.StaticKbps)
 	}
+	switch c.ROI {
+	case "", settingAuto, settingOff, roiCursor, roiCenter:
+	default:
+		return nil, fmt.Errorf("%s: roi must be %q, %q, %q or %q, not %q", path, settingAuto, roiCursor, roiCenter, settingOff, c.ROI)
+	}
+	if _, err := encoder.EncoderInstanceFor(string(c.EncoderInstance), encoder.CodecCaps{InstanceSelect: true, HWInstances: 16}); err != nil {
+		return nil, fmt.Errorf("%s: encoderInstance must be %q, %q or an engine number 0..15, not %q", path, settingAuto, "dedicated",
+			string(c.EncoderInstance))
+	}
+	if r := c.ReencodeOversized; r != 0 && (r < 1.5 || r > 100) {
+		return nil, fmt.Errorf("%s: reencodeOversized must be 0 (off) or 1.5..100 average frames, not %g", path, r)
+	}
+	if c.SliceOutput < 0 || c.SliceOutput > 64 {
+		return nil, fmt.Errorf("%s: sliceOutput must be 0 (off) or 1..64, not %d", path, c.SliceOutput)
+	}
 	if c.FPSFloor != 0 && (c.FPSFloor < 10 || c.FPSFloor > 240) {
 		return nil, fmt.Errorf("%s: fpsFloor must be 0 (default) or 10..240, not %d", path, c.FPSFloor)
 	}
@@ -235,6 +276,38 @@ const (
 	settingAuto = "auto"
 	settingOff  = "off"
 )
+
+// Values of host config "roi" besides auto and off.
+const (
+	roiCursor = "cursor"
+	roiCenter = "center"
+)
+
+// roi returns the region of interest mode: auto, cursor, center or off.
+func (c *Config) roi() string {
+	if c.ROI == "" {
+		return settingAuto
+	}
+	return c.ROI
+}
+
+// engineChoice is host config "encoderInstance": "auto", "dedicated" or an
+// engine number, written as a JSON string or number.
+type engineChoice string
+
+func (e *engineChoice) UnmarshalJSON(b []byte) error {
+	var n int
+	if err := json.Unmarshal(b, &n); err == nil {
+		*e = engineChoice(strconv.Itoa(n))
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("encoderInstance: want \"auto\", \"dedicated\" or an engine number, not %s", b)
+	}
+	*e = engineChoice(s)
+	return nil
+}
 
 // svc reports whether temporal SVC thinning is on (Phase 5): "svc" auto.
 func (c *Config) svc() bool { return c.SVC != settingOff }

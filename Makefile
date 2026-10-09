@@ -48,7 +48,8 @@ helper:
 # Helper integration tests (mock backend, the NVENC backend against its test double
 # recon-fake-nvenc.dll) under Wine, against the mingw build, the session's pipeline
 # on it (media: HelperVideo, the GPU priority table shared with the helper), a session
-# on it (host: the Phase 5 wiring, temporal SVC thinning, static desktop, frame rate) and the
+# on it (host: the Phase 5 wiring, temporal SVC thinning, static desktop, frame rate; part B:
+# encoder engine, sub-frame output stages, regions of interest from the pointer) and the
 # live-bitrate qualification (qualify: recon-host qualify's runs and checks). Wine's D3D11
 # needs an X display with 24-bit colour: run under xvfb-run -a -s "-screen 0 1280x720x24"
 # (Mesa llvmpipe) to include the GPU conversion self-test, the synthetic-gpu pipeline

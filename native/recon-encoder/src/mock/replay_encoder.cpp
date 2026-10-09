@@ -105,11 +105,14 @@ Caps ReplayEncoder::caps() {
     // Phase 5 plumbing checks: setRate's fps re-paces the capture, two
     // "engines" so start's encoderInstance can be exercised (it only shows in
     // started), two temporal layers (the enhancement layer: non-reference
-    // copies of the canned frames); no re-encode or sub-frame output.
+    // copies of the canned frames), ROI and sub-frame output accepted and
+    // reported (mock.hpp); no re-encode.
     h264.liveFps = "seamless";
     h264.hwInstances = kInstances;
     h264.instanceSelect = true;
     h264.maxTemporalLayers = svcError_.empty() ? 2 : 1;
+    h264.roi = "importance";
+    h264.sliceOutput = true;
     c.codecs["h264"] = h264;
     c.capture = {"synthetic"};
     return c;
@@ -125,7 +128,6 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     if (p.svcLayers > 2) return Status::Error("unsupported", "svcLayers " + std::to_string(p.svcLayers) + ": the mock supports 2");
     if (p.svcLayers == 2 && !svcError_.empty()) return Status::Error("unsupported", "svcLayers 2: " + svcError_);
     if (p.reencodeOversized > 0) return Status::Error("unsupported", "reencodeOversized: the mock cannot re-encode (caps reencode false)");
-    if (p.sliceOutput > 0) return Status::Error("unsupported", "sliceOutput: the mock has no slice output (caps sliceOutput false)");
     in = InputSpec{};
     // HDR10: P010 from an HDR source, so the HDR conversion runs too (the
     // canned stream stays what it is, like its size).
@@ -155,6 +157,7 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     gen_ = 0;
     svc_ = p.svcLayers == 2;
     copyNext_ = false;
+    slices_ = std::max(0, p.sliceOutput);
     out.backend = name();
     out.codec = "h264";
     out.width = kClipWidth;  // the canned stream has one size, whatever was asked
@@ -167,6 +170,7 @@ Status ReplayEncoder::init(const StartParams& p, const SourceInfo& src, InputSpe
     out.encoderInstance = std::max(0, p.encoderInstance);
     out.hwInstances = kInstances;
     out.svcLayers = svc_ ? 2 : 1;
+    out.sliceOutput = slices_;
     describeColor(out, hdr ? std::optional<HdrMetadata>(hdrMetadataFor(src.display)) : std::nullopt);
     return Status::Ok();
 }
@@ -235,6 +239,12 @@ Status ReplayEncoder::submit(const EncoderFrame&, const SubmitInfo& info) {
             e.token = buf;
         }
         if (!copy) pos_ = (pos_ + 1) % aus_.size();
+        if (slices_ > 0) {
+            // Sub-frame output emulated: the first part "ready" now, the
+            // whole frame when receive() hands it out.
+            e.slices = slices_;
+            e.firstSliceQpc = qpcNow();
+        }
         queue_.push_back(e);
     }
     cv_.notify_one();
@@ -281,7 +291,19 @@ Status ReplayEncoder::setRate(const RateParams& r) {
     return Status::Ok();
 }
 
-Status ReplayEncoder::setRoi(const std::vector<RoiRect>&) { return Status::Ok(); }
+Status ReplayEncoder::setRoi(const std::vector<RoiRect>& rects) {
+    // Logged so that tests can see what recon-host asked for (the canned
+    // pictures cannot change); recon-host rate-limits its setRoi messages.
+    std::string list;
+    for (size_t i = 0; i < rects.size() && i < 4; ++i) {
+        const RoiRect& r = rects[i];
+        list += " " + std::to_string(r.x) + "," + std::to_string(r.y) + " " + std::to_string(r.w) + "x" + std::to_string(r.h) +
+                " weight " + std::to_string(r.weight) + ";";
+    }
+    if (rects.size() > 4) list += " ...";
+    logf(LogLevel::Info, "mock: setRoi %zu rect(s):%s", rects.size(), list.c_str());
+    return Status::Ok();
+}
 
 void ReplayEncoder::shutdown() {
     {

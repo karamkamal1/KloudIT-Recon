@@ -89,6 +89,9 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	if f.Discardable {
 		flags |= FlagDiscardable
 	}
+	if f.Reencoded {
+		flags |= FlagReencoded
+	}
 	le.PutUint64(s[slotSeq:], w.written)
 	le.PutUint64(s[slotFrameID:], f.FrameID)
 	le.PutUint32(s[slotFlags:], flags)
@@ -108,6 +111,10 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	le.PutUint32(s[slotHeight:], f.Height)
 	if f.Dirty >= 0 {
 		le.PutUint32(s[slotDirtyPPM:], uint32(math.Round(min(1, f.Dirty)*1e6)))
+	}
+	if f.Slices > 0 {
+		le.PutUint32(s[slotSlices:], uint32(f.Slices))
+		le.PutUint64(s[slotFirstSliceQPC:], uint64(f.FirstSliceQPC))
 	}
 	copy(s[slotHeaderSize:], f.Data)
 	if mangle != nil {
