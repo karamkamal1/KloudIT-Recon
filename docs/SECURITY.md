@@ -140,7 +140,10 @@ Admins can view it in the UI.
 
 - The UDP relay matches the browser's UDP source IP against the IP of its HTTPS request. A client
   whose network uses different public IPs for TCP and UDP (some carrier-grade NATs, or TCP over
-  IPv6 and UDP over IPv4) cannot lock an allocation and falls back to the QUIC splice relay.
+  IPv6 and UDP over IPv4) cannot lock an allocation and falls back to the QUIC splice relay. The
+  same happens behind a reverse proxy for HTTPS unless the gateway trusts its `X-Forwarded-For`
+  (`-trust-proxy`). The gateway logs the refused Initial's source and the expected IP once per
+  allocation (`udp relay: refused a QUIC Initial from another IP ...`).
 
 - All authenticated users can reach all hosts. Per-host permissions are not implemented.
 - TOTP secrets are stored in the 0600 state file, not encrypted at rest.

@@ -227,6 +227,11 @@ func (a *allocation) serve() {
 	r := a.r
 	var host, browser peer
 	var boundAt time.Time
+	// refused: the last QUIC Initial from another IP than the browser's HTTPS
+	// request (logged once per allocation, and when the browser never
+	// arrives): a reverse proxy in front of HTTPS without -trust-proxy, or a
+	// browser whose UDP leaves by another address (IPv6 vs IPv4, CGNAT).
+	var refused netip.AddrPort
 	last := time.Now()
 	up := tokenBucket{rate: relayUpRate, burst: relayUpBurst, tokens: relayUpBurst, ts: last}
 	down := tokenBucket{rate: relayDownRate, burst: relayDownBurst, tokens: relayDownBurst, ts: last}
@@ -276,8 +281,15 @@ func (a *allocation) serve() {
 				r.log.Debug("udp relay: host did not bind", "port", a.port, "host", a.req.hostID)
 				return
 			case host.addr.IsValid() && !browser.addr.IsValid() && now.Sub(boundAt) > r.lockWait:
-				r.log.Info("udp relay: the browser never arrived (is the relay port range open in the firewall?)",
-					"port", a.port, "host", a.req.hostID, "user", a.req.user)
+				if refused.IsValid() {
+					r.log.Info("udp relay: the browser never arrived from its HTTPS request's IP (its QUIC Initials came from another IP: "+
+						"behind a reverse proxy the gateway needs -trust-proxy for the proxy's address; else the browser's UDP leaves by another address)",
+						"port", a.port, "host", a.req.hostID, "user", a.req.user, "expected", a.req.clientIP, "refused", refused,
+						"dropped", a.stats.Dropped.Load())
+				} else {
+					r.log.Info("udp relay: the browser never arrived (is the relay port range open in the firewall?)",
+						"port", a.port, "host", a.req.hostID, "user", a.req.user, "dropped", a.stats.Dropped.Load())
+				}
 				return
 			case browser.addr.IsValid() && now.Sub(last) > r.idle:
 				return
@@ -335,7 +347,18 @@ func (a *allocation) serve() {
 		case !browser.addr.IsValid():
 			// Only a QUIC Initial from the requesting IP locks the browser in:
 			// nothing is ever sent to an address before that.
-			if !isQUICInitial(pkt) || !sameClientIP(from.Addr(), a.req.clientIP) || !up.take(n, now) {
+			initial := isQUICInitial(pkt)
+			if initial && !sameClientIP(from.Addr(), a.req.clientIP) {
+				if !refused.IsValid() {
+					r.log.Info("udp relay: refused a QUIC Initial from another IP than the browser's HTTPS request "+
+						"(behind a reverse proxy the gateway needs -trust-proxy for the proxy's address)",
+						"port", a.port, "host", a.req.hostID, "user", a.req.user, "from", from, "expected", a.req.clientIP)
+				}
+				refused = from
+				a.stats.Dropped.Add(1)
+				continue
+			}
+			if !initial || !up.take(n, now) {
 				a.stats.Dropped.Add(1)
 				continue
 			}

@@ -343,6 +343,10 @@ untouched, so you keep WebTransport and the direct path. Other options:
 - **HTTP-only reverse proxies / tunnels** (e.g. Cloudflare Tunnel) carry only TCP. Recon
   detects this and falls back to WebSocket automatically. Pass the proxy's address with
   `-trust-proxy` so rate limiting sees real client IPs.
+- **A reverse proxy for HTTPS only** (Nginx Proxy Manager, Caddy, Traefik on TCP 443/8443) with
+  UDP forwarded to the gateway: pass the proxy's address with `-trust-proxy`, or the UDP relay
+  never works. The relay accepts a browser only from the IP its HTTPS request came from, and
+  without `-trust-proxy` that IP is the proxy's.
 
 ## Configuration
 
@@ -356,7 +360,7 @@ untouched, so you keep WebTransport and the direct path. Other options:
 | `-cert`/`-key` (`RECON_CERT`/`RECON_KEY`) | private CA | Use your own certificate |
 | `-public-addr` (`RECON_PUBLIC_ADDR`) | request host | `host:port` the PCs dial (written into pairing codes; the listen port is added if missing) |
 | `-relay-ports` (`RECON_RELAY_PORTS`) | `8444-8459` | UDP ports of the relay, one per relayed session (ranges and lists, e.g. `40000-40015,40100`); browsers and PCs reach them on the gateway's address, so open or forward them like 8443. The page's CSP lists each port; with more than 32 it allows any port on the gateway's name. `off`: relay only through the QUIC splice on 8443 |
-| `-trust-proxy` | none | CIDR of a reverse proxy whose `X-Forwarded-For` is trusted |
+| `-trust-proxy` | none | CIDR of a reverse proxy whose `X-Forwarded-For` is trusted: rate limiting, the audit log and the UDP relay (which accepts a browser only from the IP of its HTTPS request) then see the client's own IP. Needed for the relay whenever a proxy carries the HTTPS while UDP reaches the gateway directly |
 
 On a Linux/LXC install the settings live in `/etc/kloudit-recon/gateway.env` (one
 `RECON_...=value` per line; `systemctl restart recon-gateway` after editing). Re-running the
@@ -457,7 +461,13 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   for 10 minutes or until you reload the page). Open or forward the range, or set
   `-relay-ports` to ports that are open. The gateway log says
   `udp relay: the browser never arrived` (browser side) and the PC's host.log
-  `the gateway's relay port did not answer` (PC side).
+  `the gateway's relay port did not answer` (PC side). If the gateway log says
+  `udp relay: refused a QUIC Initial from another IP than the browser's HTTPS request` (and
+  `never arrived from its HTTPS request's IP`, with `expected=` and `refused=`), the ports are
+  open but the browser's UDP comes from another IP than its HTTPS: with a reverse proxy in front
+  of HTTPS, pass the proxy's address with `-trust-proxy`; otherwise the client's network uses
+  different addresses for TCP and UDP (IPv6 and IPv4, some carrier-grade NATs), which the relay
+  cannot follow (`docs/SECURITY.md`, Known limitations).
 - **The direct path is never used.** Allow UDP 47998 on the PC (the installer adds a
   Private-network rule; mark your network as *Private* in Windows). Some browsers ask for
   local-network access the first time.

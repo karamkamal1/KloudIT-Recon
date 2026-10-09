@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -13,6 +14,8 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -377,6 +380,87 @@ func TestUDPRelayRefusesStrangers(t *testing.T) {
 	}
 	if d, err := c.ReceiveDatagram(ctx); err != nil || string(d) != "still works" {
 		t.Fatalf("datagram %q %v", d, err)
+	}
+}
+
+// syncLog is a slog destination tests read while the relay writes.
+type syncLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// TestUDPRelayIPMismatchLogged: QUIC Initials from another IP than the
+// browser's HTTPS request (a reverse proxy without -trust-proxy, IPv6 vs
+// IPv4) are refused as before, but the gateway says so, once, with the
+// source and the expected IP, and the allocation's end names that cause
+// with the dropped count instead of blaming the firewall; without such
+// Initials it still points at the relay ports.
+func TestUDPRelayIPMismatchLogged(t *testing.T) {
+	logs := &syncLog{}
+	r := newUDPRelay(slog.New(slog.NewTextHandler(logs, nil)), net.IPv4(127, 0, 0, 1), freeUDPPorts(t, 2))
+	t.Cleanup(r.closeAll)
+	r.lockWait = 300 * time.Millisecond
+	serverTLS, _ := relayTLS(t)
+	host := newRelayHost(t, serverTLS, transport.QUICConfig())
+	ended := func(a *allocation) {
+		t.Helper()
+		select {
+		case <-a.done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("allocation kept")
+		}
+	}
+	a := allocate(t, r, "u") // requested from 127.0.0.1
+	if err := host.bind(t, a, a.token); err != nil {
+		t.Fatal(err)
+	}
+	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	initial := make([]byte, 1200)
+	initial[0] = 0xc3
+	copy(initial[1:], []byte{0, 0, 0, 1})
+	for range 3 {
+		other.WriteTo(initial, a.addr())
+	}
+	ended(a)
+	if a.locked.Load() {
+		t.Fatal("locked to the wrong IP")
+	}
+	from := other.LocalAddr().String()
+	out := logs.String()
+	if n := strings.Count(out, "udp relay: refused a QUIC Initial from another IP"); n != 1 ||
+		!strings.Contains(out, "from="+from+" expected=127.0.0.1") {
+		t.Fatalf("%d refusal lines:\n%s", n, out)
+	}
+	if !strings.Contains(out, "udp relay: the browser never arrived from its HTTPS request's IP") ||
+		!strings.Contains(out, "-trust-proxy") || !strings.Contains(out, "expected=127.0.0.1 refused="+from+" dropped=3") ||
+		strings.Contains(out, "is the relay port range open") {
+		t.Fatalf("end of the allocation:\n%s", out)
+	}
+	// Nothing came: the relay ports.
+	b := allocate(t, r, "u")
+	if err := host.bind(t, b, b.token); err != nil {
+		t.Fatal(err)
+	}
+	ended(b)
+	if out := logs.String(); !strings.Contains(out, "udp relay: the browser never arrived (is the relay port range open in the firewall?)") ||
+		!strings.Contains(out, fmt.Sprintf("port=%d host=h user=u dropped=0", b.port)) {
+		t.Fatalf("no browser:\n%s", out)
 	}
 }
 
