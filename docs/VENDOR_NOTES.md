@@ -9139,3 +9139,64 @@ after registration.
   again` and `direct WebTransport endpoint listening`, and a reconnect uses `direct`. Put
   `directPort` back.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### A takeover does not wait on a dead control stream, and its bye arrives
+
+Problem: a new connection replaces the active session on the new session's goroutine, before its
+welcome. `close()` sent the bye through `sendJSON`, which holds the control stream's mutex for a
+write with a 5 s deadline. When the old client's path had died (a Wi-Fi drop, a network switch,
+a reload during an outage), the old session's control writes block once about 1.4 KB are queued
+(the stream's buffer), so the bye waited behind every queued write (`dropped`, `rate`, configs,
+cursor), 5 s each, until the old connection's 20 s idle timeout. The verifiers measured 4-15 s
+of connecting spinner for the new device (the 720p runs at 8-15 s). While checking the fix, a
+second, older problem showed up in the browser E2E: the bye never reached a Chrome client.
+`close()` closed the WebTransport session right after queuing it, and webtransport-go resets the
+session's streams on close, so the bye was dropped in flight (`wt.closed` rejects with
+"Connection lost"). The replaced browser then reconnected after 800 ms and took the session
+back, and the two kept taking it from each other (3 takeovers in 4 s in the E2E against the
+previous tree).
+
+Fix (`internal/host/session.go`):
+- `close()` marks the session closing. A control write still running gets 0.5 s at most
+  (`byeGrace`), and writers queued behind it return at once without writing.
+- The bye is written with its own 0.5 s deadline, and is left out when an earlier write failed:
+  part of a message may be on the stream, so a client could not parse what follows.
+- The host then waits up to 0.5 s for the client to end the session, and only then closes it.
+  The client (`stream-worker.js`) ends the session when it reads a bye. Clients from before this
+  change do not end it; the 0.5 s wait still lets the bye arrive on a live path.
+
+Takeover time: on a live path, about one round trip (32 ms in the E2E). With an older client,
+0.5 s. On a dead path, about 0.5-1 s, where it used to be 5-20 s.
+
+- Verified here:
+  - `internal/host` `TestTakeoverDeadControlPath`: an old control stream whose writes block
+    until their deadline, one write in progress and two queued. The takeover took 20.0 s before
+    the fix; after it, 0.50 s. The queued writes return, the old connection is closed with
+    `CodeReplaced`, and nothing is appended to the torn stream.
+  - `TestTakeoverLiveControlPath`:
+    - The bye arrives whole after a write in progress. When that write is held for 100 ms, the
+      bye waits for it rather than cutting it.
+    - The connection is closed after the client confirms (20 ms) or, with no confirmation, after
+      `byeGrace`.
+  - The verifiers' real-stack test: real gateway and agent, libx264 1280x720 at 12 Mbit/s,
+    client A behind a UDP proxy that then drops everything, client B dialling 1.5 s or 3 s
+    later. B's welcome came after 507 ms and 506 ms; before the fix, 8.0-14.6 s. Live old path:
+    504-506 ms, because that Go client does not confirm.
+  - Browser E2E, new scenario "takeover": page A streams over the direct path, and a second
+    context logged in as the same user starts a stream (page B).
+    - Before the fix: A reconnected and the host logged 3 takeovers.
+    - After it: A shows "Disconnected / Another device connected to this host" with no reconnect
+      scheduled, B keeps streaming, and the host logs 1 takeover (32 ms from takeover to the old
+      session's end).
+    - With the previous client JavaScript (the gateway built from the previous tree): also
+      passes, with 0.5 s.
+- AMD RDNA3 (RX 7900 XT): unverified; not GPU-specific. Test, with two client devices on Wi-Fi:
+  1. Stream from device A.
+  2. Turn A's Wi-Fi off (or pull its cable) and, within a few seconds, start streaming from
+     device B. B's picture appears about as fast as a normal start, about 1 s more at most (it
+     used to sit 5-15 s at the spinner). host.log shows `session replaced by a new connection`
+     and, within about a second, `session ended` for A's session.
+  3. With both devices online, start a stream on B while A streams. A shows "Another device
+     connected to this host" and stays disconnected (no "retrying"), and B keeps the stream
+     for a minute.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

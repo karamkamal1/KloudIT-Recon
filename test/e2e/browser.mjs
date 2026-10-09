@@ -2283,6 +2283,48 @@ async function checkPreStageHoldHost() {
   await endStream();
 }
 
+// Takeover (final review): a session that another connection replaces tells
+// its client with a "bye" on the control stream, which keeps the client from
+// reconnecting (two devices would keep taking the session from each other).
+// Closing the connection resets the session's streams, so the host waits for
+// the client to end the session on the bye (byeGrace at most) before it
+// closes; before, the reset overtook the bye, and the replaced client
+// reconnected. Page A streams, a second browser context with the same login
+// starts a stream (page B): A ends with the host's reason and schedules no
+// reconnect (a retry would come after 800 ms), B keeps the stream.
+async function checkTakeover() {
+  const host = await restartHost({}, 'host-takeover');
+  await startStream({ path: 'direct', transport: 'auto' });
+  const ctx2 = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 }, storageState: await ctx.storageState() });
+  try {
+    const p = await ctx2.newPage();
+    p.on('console', onConsole.bind(p));
+    p.on('pageerror', onPageError);
+    await p.goto(`${base}/`);
+    await p.evaluate((pr) => localStorage.setItem('recon.prefs.v1', JSON.stringify(pr)), { ...PREFS_2D, path: 'direct', transport: 'auto' });
+    await p.click('.host.online a.btn-primary');
+    await p.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    await p.click('#btn-start');
+    await p.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    await until(() => page.evaluate(() => !window.__recon.streaming && !window.__recon.worker), 10000, 'the first client closed').catch(() => {});
+    await sleep(3000);
+    const a = await page.evaluate(() => ({
+      streaming: window.__recon.streaming, worker: !!window.__recon.worker, attempts: window.__recon.attempts,
+      splash: `${document.getElementById('splash-title')?.textContent} / ${document.getElementById('splash-sub')?.textContent}`,
+    }));
+    const b = await p.evaluate(() => ({ streaming: window.__recon.streaming }));
+    const replaced = (host.log.match(/session replaced by a new connection/g) || []).length;
+    check('takeover: the replaced client gets the bye, stops and does not reconnect; the new client keeps the stream',
+      !a.streaming && !a.worker && a.attempts === 0 && /Disconnected/.test(a.splash) && /Another device connected/.test(a.splash) &&
+        b.streaming && replaced === 1,
+      `replaced client: ${JSON.stringify(a)}; new client streaming ${b.streaming}; host: ${replaced} takeover(s)`);
+    await endStream(p);
+  } finally {
+    await ctx2.close();
+  }
+  await endStream();
+}
+
 // Input (step 4.6), on a host with the test hook rumble-echo (it plays a
 // gamepad's triggers back as force feedback, as a game's rumble comes back
 // through ViGEmBus, which this host lacks).
@@ -4218,6 +4260,7 @@ try {
   }
   if (want('pre stage hold host')) await checkPreStageHoldHost().catch((e) => check('host before step 4.4 scenario', false, e.message));
   if (want('input host')) await checkInputHost().catch((e) => check('input (rumble, keyboard lock) scenario', false, e.message));
+  if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
 
   // 3c. Renderers (unit) ---------------------------------------------------------
   const xvfbOk = spawnSync('sh', ['-c', 'command -v Xvfb']).status === 0;

@@ -43,6 +43,15 @@ Every session, whatever its transport, has four logical channels:
 | frames | reliable per frame, independent | **one unidirectional stream per frame**; over a round trip above 15 ms datagram shards with Reed-Solomon parity ([below](#datagram--fec-video)) | `0x02` + frame |
 | datagram | unreliable | QUIC DATAGRAM | `0x03` + datagram |
 
+**One session per host.** A new connection takes the host over. The replaced session sends its
+client a `bye` on the control stream, and the client ends the session on it and does not
+reconnect (otherwise two devices would keep taking the session from each other). The host closes
+the old connection only after that, or after 0.5 s (`byeGrace`): closing it resets the session's
+streams, which would drop a bye still in flight. The takeover never waits longer than that on
+the old control stream. When the old client's path died, the write in progress gets 0.5 s, the
+writes queued behind it are dropped, and a bye that cannot be sent whole is left out, so the new
+session's welcome waits about a second at most.
+
 ### Frame stream
 
 ```

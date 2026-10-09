@@ -2188,7 +2188,14 @@ function onControl(m) {
     case 'audio': onAudioConfig(m); break;
     case 'cursor': post('cursor', { shape: m }); break;
     case 'notice': post('notice', { level: m.level, msg: m.msg }); break;
-    case 'bye': byeReason = m.msg || 'Session ended by the host'; post('notice', { level: 'warn', msg: byeReason }); break;
+    case 'bye':
+      byeReason = m.msg || 'Session ended by the host';
+      post('notice', { level: 'warn', msg: byeReason });
+      // Ending the session tells the host the bye arrived: it waits for that
+      // before it closes the connection, which would reset the stream with a
+      // bye still in flight.
+      transport?.close();
+      break;
     case 'error': post('notice', { level: 'error', msg: m.msg }); break;
   }
 }

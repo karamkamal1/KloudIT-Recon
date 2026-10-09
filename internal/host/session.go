@@ -58,8 +58,15 @@ type Session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	ctrlMu sync.Mutex
+	ctrlMu sync.Mutex // one control write at a time
 	ctrl   transport.BidiStream
+	// ctrlDL guards the control stream's write deadline between the writer
+	// and close(): a writer arms its deadline under it unless the session is
+	// closing, and close() cuts a stalled write short under it.
+	ctrlDL   sync.Mutex
+	ctrlDue  time.Time // deadline of the write in progress (or the last one)
+	closing  bool      // close() ran: no control writes but its bye
+	ctrlTorn bool      // a control write failed, maybe part-way: no framing to append to (ctrlMu)
 
 	hello       proto.Hello
 	prefsMu     sync.Mutex // guards prefs, monitor, codecWhy, alignNotice and amfFallback
@@ -368,8 +375,42 @@ func trunc(s string, n int) string {
 	return s
 }
 
+// byeGrace bounds each wait of a takeover on the replaced session (close):
+// for the control write in progress, for the bye, and for the client to
+// confirm the bye. A live path finishes each in about a round trip; on one
+// that died (the old client lost its network, nothing is acknowledged)
+// writes would block until their 5 s deadline, one after another, while the
+// new session waits for its welcome.
+const byeGrace = 500 * time.Millisecond
+
+// close ends a session that another connection replaces. It runs on the new
+// session's goroutine before that one's welcome, so it waits on this
+// session's control stream for byeGrace at most per step. The bye has to
+// reach the client, or it reconnects and takes the session back: closing
+// the connection resets the session's streams, the control stream with a
+// bye still in flight, so close() first waits for the client to end the
+// session, which it does on the bye.
 func (s *Session) close(reason string) {
-	s.sendJSON(proto.Notice{T: "bye", Level: "info", Msg: reason})
+	s.ctrlDL.Lock()
+	s.closing = true
+	if s.ctrl != nil && (s.ctrlDue.IsZero() || time.Until(s.ctrlDue) > byeGrace) {
+		_ = s.ctrl.SetWriteDeadline(time.Now().Add(byeGrace))
+	}
+	s.ctrlDL.Unlock()
+	sent := false
+	s.ctrlMu.Lock() // writers queued behind the stalled one now return at once
+	if s.ctrl != nil && !s.ctrlTorn {
+		b, _ := json.Marshal(proto.Notice{T: "bye", Level: "info", Msg: reason})
+		_ = s.ctrl.SetWriteDeadline(time.Now().Add(byeGrace))
+		sent = s.writeCtrl(b) == nil
+	}
+	s.ctrlMu.Unlock()
+	if sent {
+		select {
+		case <-s.c.Context().Done():
+		case <-time.After(byeGrace):
+		}
+	}
 	s.cancel()
 	s.c.Close(transport.CodeReplaced, reason)
 }
@@ -416,8 +457,24 @@ func (s *Session) sendJSON(v any) error {
 	if s.ctrl == nil {
 		return errClosed
 	}
-	_ = s.ctrl.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return proto.WriteMsg(s.ctrl, b)
+	s.ctrlDL.Lock()
+	if s.closing {
+		s.ctrlDL.Unlock()
+		return errClosed
+	}
+	s.ctrlDue = time.Now().Add(5 * time.Second)
+	_ = s.ctrl.SetWriteDeadline(s.ctrlDue)
+	s.ctrlDL.Unlock()
+	return s.writeCtrl(b)
+}
+
+// writeCtrl writes one control message; ctrlMu is held.
+func (s *Session) writeCtrl(b []byte) error {
+	err := proto.WriteMsg(s.ctrl, b)
+	if err != nil {
+		s.ctrlTorn = true
+	}
+	return err
 }
 
 func (s *Session) notice(level, msg string) {
