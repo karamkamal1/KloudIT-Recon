@@ -1155,13 +1155,16 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
 
 ## Direct path
 
-1. The host runs a WebTransport server on UDP 47998. Its certificate is self-signed ECDSA P-256,
-   valid for less than 14 days and rotated every 5 days. The host reports the current and previous
-   SHA-256 hashes to the gateway over its tunnel.
+1. The host runs a WebTransport server on UDP 48100 (`directPort`; outside the 47984–48010 that
+   Sunshine and Apollo use). It advertises the direct path to the gateway only while it holds
+   that port: when another program has it, the host retries every 30 s, and it sends a tunnel
+   `direct` message whenever that changes. Its certificate is self-signed ECDSA P-256, valid for
+   less than 14 days and rotated every 5 days. The host reports the current and previous SHA-256
+   hashes to the gateway over its tunnel.
 2. On `POST /api/hosts/{id}/connect`, the gateway returns relay tickets and a **direct ticket**:
    HMAC-SHA256 under a per-tunnel random key, containing host ID, user, 60 s expiry, a nonce and
    the requesting **page origin**.
-3. The browser opens `new WebTransport("https://<pc-ip>:47998/wt", {serverCertificateHashes})`,
+3. The browser opens `new WebTransport("https://<pc-ip>:48100/wt", {serverCertificateHashes})`,
    which verifies the PC's certificate by hash. Its first control message carries the ticket.
 4. The host verifies the HMAC, expiry, host ID and nonce (single use), and checks that the ticket's
    origin equals the WebTransport `Origin` header. Unauthenticated sessions are capped at 8 and

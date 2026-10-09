@@ -175,7 +175,7 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
         │                               │ gateway identity pinned (SPKI);
         │                               │ UDP relay socket, also outbound
         │   direct path (LAN):          │
-        │   WebTransport UDP 47998      │
+        │   WebTransport UDP 48100      │
         │   cert-hash pinned, ticket    │
         ▼                               │
  ┌──────────────────────────────────────┴───────────────────────────┐
@@ -266,7 +266,7 @@ The installer:
 - downloads FFmpeg (an FFmpeg 8.1+ release build, SHA-256 verified)
 - pairs the agent with your gateway
 - registers a hidden **logon task** with highest privileges, so input reaches elevated games
-- opens UDP 47998 for the direct path on Private networks only (it warns if your network is
+- opens UDP 48100 for the direct path on Private networks only (it warns if your network is
   set to Public)
 - installs ViGEmBus for controller support (`-InstallViGEm`)
 - optionally installs the Virtual Display Driver (`-InstallVirtualDisplay`: pinned release,
@@ -415,7 +415,7 @@ The new password (at least 10 characters) is read from stdin.
 | `hdr` | `off` | HDR10 streams (experimental): `auto` streams 10-bit BT.2020 PQ HEVC / AV1 with HDR metadata to browsers that can show it (HDR display, Renderer WebGPU with an extended-range canvas, a 10-bit decoder) when the native encoder helper captures a display in Windows HDR mode (turning Windows HDR on or off restarts the stream in the new mode); `off` never. FFmpeg's captures stay SDR (only its test pattern, `capture` `test`, has an HDR10 version, for tests). The host log's `hdr choice` line and the browser's overlay say why a stream is not HDR (`docs/ARCHITECTURE.md`, "HDR10") |
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | Bitrate defaults and cap |
 | `defaultFps` / `maxFps` | 60 / 240 | Frame-rate default and cap (also capped at the display refresh rate) |
-| `directPort` | 47998 | UDP port for the direct path (0 = relay only) |
+| `directPort` | 48100 | UDP port for the direct path (0 = relay only). Keep it out of 47984–48010, which Sunshine and Apollo use |
 | `directAddr` | auto | Address to advertise for the direct path |
 | `congestion` | `media` | QUIC congestion control of the host's video connections (the direct path and the UDP relay, both end to end with the browser, and the QUIC splice relay's host → gateway data connection, whose gateway → browser leg stays `reno`): `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss: the rate controller backs off instead) or `reno` (quic-go's NewReno, the default before the rate controller) |
 | `svc` | `auto` | Temporal SVC thinning: under congestion the agent leaves out the frames no other frame references, before they are sent (the frame rate drops for the moment, the picture is not damaged, no key frame), and the browser skips them without counting a loss; lasting congestion still lowers the bitrate. `auto` streams the native helper's encoder with two temporal layers where it has them (the enhancement layer is what is left out; on the FFmpeg path only an encoder's own non-reference frames qualify) for browsers that understand it; `off` neither. host.log: `thinning: leaving out discardable frames under congestion`, `thinning ended`, `temporal SVC not used` (why), `stream stats` `thinned`. Unverified on hardware: see `docs/VENDOR_NOTES.md`, Phase 5 wiring A |
@@ -501,9 +501,13 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   of HTTPS, pass the proxy's address with `-trust-proxy`; otherwise the client's network uses
   different addresses for TCP and UDP (IPv6 and IPv4, some carrier-grade NATs), which the relay
   cannot follow (`docs/SECURITY.md`, Known limitations).
-- **The direct path is never used.** Allow UDP 47998 on the PC (the installer adds a
+- **The direct path is never used.** Allow UDP 48100 on the PC (the installer adds a
   Private-network rule; mark your network as *Private* in Windows). Some browsers ask for
-  local-network access the first time.
+  local-network access the first time. If `host.log` says `direct endpoint unavailable: cannot
+  bind its UDP port`, something else listens on that port (Sunshine or Apollo set to it, for
+  example): the agent retries every 30 seconds and offers the direct path once it has the port.
+  To move it, run the installer again with `-DirectPort <port>` (it changes `host.json` and the
+  firewall rule).
 - **Black screen in a game.** Use *borderless/windowed fullscreen*. Some old exclusive-fullscreen
   titles can't be duplicated.
 - **The lock screen and UAC prompts aren't visible.** The agent runs in your desktop session and

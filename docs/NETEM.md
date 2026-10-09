@@ -69,11 +69,11 @@ The impairment has to sit on a Linux machine that the traffic crosses.
 | Path you test | Run it on | Interface |
 |---|---|---|
 | Relay: browser ↔ gateway ↔ PC | the Proxmox node | the gateway container's veth, `veth<CTID>i0` |
-| Direct: browser ↔ PC, UDP 47998 | a Linux client (its own NIC) or a Linux router/bridge in between. The Proxmox node is **not** in this path. | that NIC, with `--port 47998` |
+| Direct: browser ↔ PC, UDP 48100 | a Linux client (its own NIC) or a Linux router/bridge in between. The Proxmox node is **not** in this path. | that NIC, with `--port 48100` |
 | Either, from Windows | the PC or a Windows client | [clumsy](#windows-clumsy) |
 
 **Force the path you test.** With the default Network path, "Auto (direct, then relay)", the
-browser connects straight to the PC on UDP 47998 whenever it can, which is the usual case on a
+browser connects straight to the PC on UDP 48100 whenever it can, which is the usual case on a
 LAN. It uses the relay only if the direct connection doesn't succeed within 2.5 s. An impairment
 on the gateway's veth then never touches the video, and the results look unimpaired. In the
 browser, set Stream settings > Pipeline > Network path to "Relay via gateway" (relay tests) or
@@ -180,14 +180,14 @@ matches, which are available on every kernel.
 
 ```bash
 ./netem.sh apply wan --ct 210 --port 8443,$(seq -s, 8444 8459) --proto udp  # all relay traffic (both legs)
-./netem.sh apply wifi --iface eth0 --port 47998 --proto udp  # Linux client: only the direct path
+./netem.sh apply wifi --iface eth0 --port 48100 --proto udp  # Linux client: only the direct path
 ```
 
 ### On a Linux client or router (direct path)
 
 Set the client's Network path to "Direct to PC only" ([above](#where-to-run-it)). On a Linux
 machine that runs the browser, impair its own NIC:
-`sudo ./netem.sh apply wifi --iface wlan0 --port 47998`. The video arrives on ingress and goes
+`sudo ./netem.sh apply wifi --iface wlan0 --port 48100`. The video arrives on ingress and goes
 through the ifb, so it is dropped and delayed like on a real link. The client's uplink (input,
 ACKs) goes through a local qdisc. On a Linux router or bridge, use the interface that faces the
 client.
@@ -228,7 +228,7 @@ filter.
 
 | Where | Filter |
 |---|---|
-| PC, direct path | `udp and (udp.SrcPort == 47998 or udp.DstPort == 47998)` |
+| PC, direct path | `udp and (udp.SrcPort == 48100 or udp.DstPort == 48100)` |
 | PC, relay path (UDP relay ports and the splice's tunnel to the gateway) | `udp and ((udp.DstPort >= 8443 and udp.DstPort <= 8459) or (udp.SrcPort >= 8443 and udp.SrcPort <= 8459))` |
 | Windows client, to one PC or gateway | `ip.DstAddr == 192.168.1.20 or ip.SrcAddr == 192.168.1.20` |
 

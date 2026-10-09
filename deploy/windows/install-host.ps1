@@ -32,7 +32,9 @@
 .PARAMETER FFmpegPath
   Use an existing ffmpeg.exe (FFmpeg 7.1+; 8.1+ recommended, older builds lack gfxcapture).
 .PARAMETER DirectPort
-  UDP port for direct LAN connections from the browser (0 disables the direct path).
+  UDP port for direct LAN connections from the browser (0 disables the direct path). The
+  default, 48100, stays clear of Sunshine's and Apollo's ports (47984-48010). Earlier versions
+  used 47998; running this installer again moves host.json and the firewall rule to 48100.
 .PARAMETER UpdateFFmpeg
   Download FFmpeg again even if it is already installed (with -InstallLibavcodec: its libraries too).
 .PARAMETER InstallLibavcodec
@@ -68,7 +70,7 @@ param(
     [string]$PairingCode,
     [string]$InstallDir = (Join-Path $env:ProgramFiles 'KlouditRecon'),
     [string]$FFmpegPath,
-    [ValidateRange(0, 65535)][int]$DirectPort = 47998,
+    [ValidateRange(0, 65535)][int]$DirectPort = 48100,
     [switch]$UpdateFFmpeg,
     [switch]$InstallLibavcodec,
     [switch]$InstallViGEm,

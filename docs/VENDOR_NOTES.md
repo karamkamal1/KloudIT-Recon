@@ -414,7 +414,7 @@ in [NETEM.md](NETEM.md#windows-clumsy). The profiles apply to each direction:
 Relay path: the gateway is container 210 on the Proxmox node and the browser client is
 `CLIENT_IP`. First force the relay path in the browser: set Stream settings > Pipeline >
 Network path to "Relay via gateway", then Reconnect (or set `directPort` to 0 in the PC's
-`host.json`). The default, "Auto", connects straight to the PC on UDP 47998 whenever it can, which
+`host.json`). The default, "Auto", connects straight to the PC on UDP 48100 whenever it can, which
 is the usual case on a LAN. The video then never crosses the gateway's veth, and every profile
 looks unimpaired. Before measuring, check that the stats overlay's Transport row starts with
 `webtransport · relay` (not `relay-splice`). Under `wan` (40 ms round trip) it then ends in
@@ -434,10 +434,10 @@ folder:
 ```
 
 `--host CLIENT_IP` impairs only the gateway ↔ browser leg. Without it the video crosses the
-impaired veth twice, once on each relay leg. For the direct path (UDP 47998), set Network path to
+impaired veth twice, once on each relay leg. For the direct path (UDP 48100), set Network path to
 "Direct to PC only" and check that the Transport row starts with `webtransport · direct` (under
 `wan` followed by `· datagrams + FEC`, as on the relay). The Proxmox node is not in
-this path. Run `./netem.sh apply <profile> --iface <nic> --port 47998` on a Linux client, or use
+this path. Run `./netem.sh apply <profile> --iface <nic> --port 48100` on a Linux client, or use
 the clumsy settings from NETEM.md on the PC or a Windows client.
 
 Report each metric as `lan / wifi / wan / capdrop` per vendor. Give the netem.sh status line for
@@ -466,7 +466,7 @@ found in the recording. NVIDIA results stay "unverified" until an NVIDIA host is
   (`pct exec 210 -- tc qdisc add dev eth0 root netem delay 10ms`). The kernel allows it in a user
   namespace (verified below); Proxmox's AppArmor profile and module loading are not verified.
 - Windows clumsy profiles: unverified (no Windows in the sandbox). Test: on the PC, run clumsy 0.3
-  as administrator with filter `icmp or (udp and (udp.SrcPort == 47998 or udp.DstPort == 47998))`
+  as administrator with filter `icmp or (udp and (udp.SrcPort == 48100 or udp.DstPort == 48100))`
   and the settings from NETEM.md. From the client, ping the PC 1000 times at 10/s. For `wifi`,
   tune Throttle *Chance* until the RTT spread is about 0–30 ms; for `wan`, expect RTT +40 ms and
   about 1 % loss. clumsy only touches packets that match its filter, so for `capdrop` add iperf3's
@@ -3748,7 +3748,7 @@ Hardware checks:
   to=` of at least 25500 within 10 s after T50; the changes are `changing the bitrate in the
   encoder` (no `restarting video reason=congestion`). Record the decreases (`why=`), the
   `stream stats` lines and the overlay's capture→drawn p95 during the dip. Repeat on the direct
-  path (netem on a Linux client: `./netem.sh apply capdrop --iface <nic> --port 47998`), where
+  path (netem on a Linux client: `./netem.sh apply capdrop --iface <nic> --port 48100`), where
   the decreases start from the connection's acknowledged rate, and with `pipeline` `ffmpeg`
   (hevc_amf, restarts: expect `congestion: lowering bitrate ... urgent=true` at the drop and the
   target back in 5–9 s, as in the namespace run with libx264).
@@ -4466,7 +4466,7 @@ the browser console):
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (datagram delay behind a video backlog, A/B): direct
   path to a Linux client with Chrome (Network path "Direct to PC only"); on the client
-  `sudo ./netem.sh apply capdrop --iface <nic> --port 47998 --rates 50,10,50 --queue-ms 300` (a
+  `sudo ./netem.sh apply capdrop --iface <nic> --port 48100 --rates 50,10,50 --queue-ms 300` (a
   deep router buffer; docs/NETEM.md); stream hevc_amf_helper at 1920×1080 60 fps, 30 Mbit/s with
   Settings → Adaptive bitrate off (the rate controller then leaves the backlog in place) and a
   moving scene; from +20 s to +40 s (the 10 Mbit/s step) note the overlay's `round trip (avg)`
@@ -4490,7 +4490,7 @@ the browser console):
   video), no `frame queue overflow` lines that do not also show without the window
   (`RECON_TEST_FAULTS=no-window`, same steps), and the overlay's fps stays at the stream's.
 - AMD RDNA3 (RX 7900 XT): unverified. Test (2.2 acceptance with the window): `capdrop` (0.4) on
-  the direct path (netem on the Linux client, `--port 47998`: on the relay paths the window sees
+  the direct path (netem on the Linux client, `--port 48100`: on the relay paths the window sees
   only the host → gateway leg) with Adaptive bitrate on: no `frame queue overflow` (lines with
   `sender=window` say the window held a frame at the time), the one-way delay p95 during the dip
   under the baseline + 30 ms, the target back within 10 s; compare with the same run under
@@ -8744,7 +8744,7 @@ Hardware and real-network checks:
 
 - AMD RDNA3 (RX 7900 XT): unverified. Test (datagram + FEC over a real WAN): stream from the AMD
   host with the client behind 40 ms of RTT (a remote client, or netem on a Linux router:
-  `./netem.sh apply wan --iface <nic> --port 47998` raised to 1 % and then 3 % loss with
+  `./netem.sh apply wan --iface <nic> --port 48100` raised to 1 % and then 3 % loss with
   `tc qdisc change dev <nic> root netem delay 20ms loss 1%`), HEVC 1920×1080 60 fps at 20 and
   50 Mbit/s, 10 minutes per setting, once with host.json `"fec": "off"` and once with the
   default. host.log: `video transport mode="datagram + FEC" why="round trip" rtt_ms=…` and the
@@ -9098,3 +9098,44 @@ fixed.
   box lines are the same width.
 - AMD RDNA3 (RX 7900 XT): unverified; this is the plan for running the checks.
 - NVIDIA: unverified (no NVIDIA host available); likewise.
+
+## Final review: host agent
+
+Findings of the final review about the PC agent's session and transport code. Each item: the
+problem, the fix, what was verified here, the check on hardware.
+
+### The direct path's port (Sunshine and Apollo)
+
+Problem: the default `directPort` 47998 is the video port of Sunshine and Apollo (base port 47989
++ 9), and Apollo is a setup these docs support (SudoVDA). The agent holds the port from logon, so
+a Moonlight session on the same PC could not bind its video socket (the Moonlight baseline in
+LATENCY_RIG.md runs exactly that). When Sunshine held the port first, the agent only logged a
+warning, kept advertising the direct path to the gateway, and every browser waited 2.5 s for it
+before using a relay; it also logged `direct WebTransport endpoint listening` before binding.
+Fix: the default is UDP 48100, outside 47984-48010 (`DefaultDirectPort`; the installer's
+`-DirectPort` default and firewall rule follow, and running it again moves an existing install).
+The agent binds the port itself before serving, advertises the direct path to the gateway only
+while it holds the port, logs `listening` after the bind, and on a failed bind logs `direct
+endpoint unavailable: cannot bind its UDP port` once and retries every 30 s; each change is sent
+to the gateway as a tunnel `direct` message (old gateways already accept it: it is the
+certificate-rotation message), and a bind that lands while the tunnel registers is sent right
+after registration.
+
+- Verified here: `internal/host` `TestDirectAdvertisedOnlyWhileBound` (another socket holds the
+  port: nothing advertised and no tunnel message; the port freed: bound within the retry, one
+  `direct` message with the port and hashes; stopped: withdrawn) fails without the bind check
+  and passes with it; `TestDefaultDirectPortAvoidsSunshine`; `go test -race ./internal/host`;
+  the Go integration test and the browser E2E stream over the direct path on a free port as
+  before.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: with Sunshine (or Apollo) installed and Moonlight
+  paired, the Recon agent running with the default `host.json`: start a Moonlight stream; it
+  starts (before the fix it failed while the agent held 47998). Then end it and stream from the
+  browser: the overlay's Transport row reads `webtransport · direct`, and
+  `Get-Process -Id (Get-NetUDPEndpoint -LocalPort 48100).OwningProcess` is `recon-hostw`. Then set
+  `"directPort": 47998` in `host.json`, restart the agent while a Moonlight stream runs: host.log
+  has `direct endpoint unavailable` (no `listening` line), and the browser connects through a
+  relay at once, without the 2.5 s direct attempt: in DevTools > Network the response of
+  `POST /api/hosts/<id>/connect` has no `direct` member. End the Moonlight stream: within 30 s host.log has `direct endpoint port is free
+  again` and `direct WebTransport endpoint listening`, and a reconnect uses `direct`. Put
+  `directPort` back.
+- NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).

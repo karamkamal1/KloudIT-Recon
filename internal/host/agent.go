@@ -71,6 +71,9 @@ type Agent struct {
 	tunnel    transport.BidiStream // control stream to the gateway
 	tunnelMu  sync.Mutex
 	directRot *tlsutil.Rotating // certificate of the direct path and the UDP relay
+	// directUp: the direct endpoint holds its UDP port. The gateway is told
+	// about the direct path only while it does.
+	directUp atomic.Bool
 
 	relayMu sync.Mutex
 	relay   *relayServer // UDP relay socket, started on the first allocation
@@ -434,7 +437,7 @@ func (a *Agent) sendTunnel(m proto.TunnelMsg) {
 }
 
 func (a *Agent) directInfo() *proto.DirectInfo {
-	if a.cfg.DirectPort <= 0 || a.directRot == nil {
+	if a.cfg.DirectPort <= 0 || a.directRot == nil || !a.directUp.Load() {
 		return nil
 	}
 	return &proto.DirectInfo{Port: a.cfg.DirectPort, Addr: a.cfg.DirectAddr, Hashes: a.directRot.HashesB64()}
@@ -495,6 +498,10 @@ func (a *Agent) gatewayOnce(ctx context.Context) error {
 		a.tunnel = nil
 		a.tunnelMu.Unlock()
 	}()
+	if (reg.Direct == nil) != (a.directInfo() == nil) {
+		// The direct endpoint bound or lost its port while registering.
+		a.sendTunnel(proto.TunnelMsg{T: "direct", Direct: a.directInfo(), Relay: a.relayInfo()})
+	}
 	a.log.Info("connected to gateway", "gateway", p.Gateway, "host", p.Name)
 	// `recon-host pair` may point this PC at another host entry or gateway
 	// while connected: notice it and reconnect.
@@ -675,10 +682,46 @@ func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort, "congestion", a.cfg.congestion())
-	if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
-		a.log.Warn("direct endpoint stopped (relay still works)", "err", err)
+	failing := false
+	for {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: a.cfg.DirectPort})
+		if err != nil {
+			if !failing {
+				// Sunshine and Apollo use UDP 47998-48000 and 48010 while they stream.
+				a.log.Warn("direct endpoint unavailable: cannot bind its UDP port, retrying (streams go through the gateway; "+
+					"if another program holds the port, set another directPort in host.json)", "port", a.cfg.DirectPort, "err", err)
+				failing = true
+			}
+		} else {
+			if failing {
+				a.log.Info("direct endpoint port is free again", "port", a.cfg.DirectPort)
+				failing = false
+			}
+			a.setDirectUp(true)
+			a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort, "congestion", a.cfg.congestion())
+			err = srv.Serve(conn)
+			conn.Close()
+			a.setDirectUp(false)
+			if ctx.Err() != nil {
+				return nil
+			}
+			a.log.Warn("direct endpoint stopped (relay still works); retrying", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(directRetry):
+		}
 	}
-	<-ctx.Done()
-	return nil
+}
+
+// directRetry is how often the direct endpoint tries to bind its port again.
+var directRetry = 30 * time.Second
+
+// setDirectUp records whether the direct endpoint holds its port and tells
+// the gateway when that changes, so browsers are not sent to a closed port.
+func (a *Agent) setDirectUp(up bool) {
+	if a.directUp.Swap(up) != up {
+		a.sendTunnel(proto.TunnelMsg{T: "direct", Direct: a.directInfo(), Relay: a.relayInfo()})
+	}
 }

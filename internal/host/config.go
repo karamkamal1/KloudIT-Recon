@@ -206,9 +206,14 @@ func DefaultConfigPath() string {
 	return filepath.Join(d, "kloudit-recon", "host.json")
 }
 
+// DefaultDirectPort is the direct path's UDP port. It stays clear of the
+// ports Sunshine and Apollo use (TCP and UDP 47984-48010), which a PC
+// streaming to Moonlight as well would otherwise contend for.
+const DefaultDirectPort = 48100
+
 // LoadConfig reads the config file (a missing file yields defaults).
 func LoadConfig(path string) (*Config, error) {
-	c := &Config{Audio: true, Gamepad: true, DirectPort: 47998}
+	c := &Config{Audio: true, Gamepad: true, DirectPort: DefaultDirectPort}
 	b, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err

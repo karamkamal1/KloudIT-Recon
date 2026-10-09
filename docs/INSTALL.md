@@ -287,7 +287,10 @@ On any device on your home network (laptop, another PC, tablet), open
   Esc to leave.
 - **Ctrl+Alt+Shift+M**: game mouse mode (raw relative mouse). Use it for first-person games.
 - **Ctrl+Alt+Shift+S**: the performance overlay. **Transport** should read
-  `webtransport · direct` at home.
+  `webtransport · direct` at home. If it reads a relay instead, see README, Troubleshooting,
+  "The direct path is never used": the PC must hold UDP 48100, which `host.log` reports
+  (`direct WebTransport endpoint listening`, or `direct endpoint unavailable` while another
+  program holds the port).
 - **Ctrl+Alt+Shift+O**: settings (bitrate, frame rate, codec, resolution, audio).
 - Controllers: press a button after the stream starts. A "Controller connected" message appears.
 
@@ -411,6 +414,11 @@ in the bundle). Check these once:
   only.
 - **Run `recon-host.exe qualify`** once with no stream running (Useful commands), and again after
   graphics driver updates.
+- **Direct path port.** The direct path moved from UDP 47998 to **UDP 48100**: 47998 is the
+  video port of Sunshine and Apollo, and a Moonlight session on the same PC could not start
+  while the agent held it. The installer (step 3 above) changes `directPort` in `host.json` and
+  the firewall rule; add `-DirectPort 47998` to keep the old port. A firewall or router rule of
+  your own for 47998 needs the new port.
 - **Congestion control.** `"congestion"` now defaults to `media` (the PC paces its video at the
   session's bitrate and leaves backing off to its rate controller). Nothing to do; `"reno"` in
   `host.json` brings back the old behaviour if a network misbehaves with it.
