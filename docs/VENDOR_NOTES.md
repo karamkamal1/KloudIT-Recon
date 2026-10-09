@@ -10830,3 +10830,21 @@ on the FFmpeg path. README, ARCHITECTURE and the config comment say so.
   overlay's latency line shows send→draw (no capture or present stage); remove the setting and
   restart: capture→draw comes back.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### defaultKbps and defaultFps are for clients that name no value
+
+Problem: README listed host.json `defaultKbps` (30000) and `defaultFps` (60) as the bitrate and
+frame-rate defaults, but the browser always sends its own Bitrate and Frame rate settings (30
+Mbit/s and 60 fps until changed in the stream's settings drawer), and the host uses its defaults
+only when a client sends none. Setting `"defaultKbps": 80000` changed no browser's stream.
+
+Fix (documentation): README's rows and the config comment say that these keys apply only to a
+client that names no value, that the browser's own settings decide its stream, and that
+`maxKbps` / `maxFps` are the caps that do apply. Behaviour is unchanged: having the browser
+take the host's defaults until its user picks a value would need a protocol change (the hello
+already carries the browser's values) and is left for later. `recon-host probe` keeps showing a
+browser at its own defaults (60 fps, 30 Mbit/s), which is what a browser sends.
+
+- Verified here: documentation only (and a config comment); `internal/host` passes.
+- AMD RDNA3 (RX 7900 XT): nothing to check on hardware (no behaviour change).
+- NVIDIA: nothing to check on hardware (no behaviour change).

@@ -137,6 +137,8 @@ type Config struct {
 	// path and the UDP relay) | on (regardless of the round trip) | off.
 	FEC string `json:"fec,omitempty"`
 
+	// DefaultKbps and DefaultFPS apply only to a client whose prefs name no
+	// bitrate or frame rate: the browser always sends its own settings.
 	DefaultKbps int  `json:"defaultKbps"`
 	MaxKbps     int  `json:"maxKbps"`
 	DefaultFPS  int  `json:"defaultFps"`
