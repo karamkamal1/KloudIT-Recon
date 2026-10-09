@@ -1425,7 +1425,9 @@ func (s *Session) checkOut() {
 	for _, c := range s.send.due(s.ladderIn(lossOutgoing, 0, 0), len(s.frameQ) > 0, time.Now()) {
 		f := c.of.f
 		if c.step.act == actDiscard {
-			c.of.st.CancelWrite()
+			if c.of.st != nil { // nil: a shard frame the video window holds (sendFEC)
+				c.of.st.CancelWrite()
+			}
 			s.discard(f, c.step)
 			c.of.release()
 			continue
@@ -1440,7 +1442,9 @@ func (s *Session) checkOut() {
 		// window holds) frees frameSender, whose next frames must find the
 		// wait for the answer to it.
 		s.lostFrame(f, "deadline")
-		c.of.st.CancelWrite()
+		if c.of.st != nil {
+			c.of.st.CancelWrite()
+		}
 		c.of.release()
 	}
 }
@@ -1894,7 +1898,7 @@ func (s *Session) frameSender() {
 		// Datagram shards (fec.go). They bypass the stream path below;
 		// sendFEC puts them through the video window (GUIDE 2.7) itself
 		// (fec.go, "Send priorities").
-		if s.useFEC() && s.sendFEC(f, n) {
+		if s.useFEC() && s.sendFEC(f, n, num) {
 			continue
 		}
 		s.sendOpening.Store(true)

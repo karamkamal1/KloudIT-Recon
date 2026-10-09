@@ -8788,8 +8788,9 @@ docs/ARCHITECTURE.md "Datagram + FEC video", Sending):
   release time; the frame's deadline (rung 1 between shards) starts after the hold, and after a
   hold the ladder is also asked before the first shard, so a frame the client would discard
   meanwhile is not sent (a placeholder is not in the send state's list, so checkOut cannot
-  release its hold early: it ends at its bound). The test hooks (delay, drop) bypass the window
-  as on frame streams. writeShards records the frame in flight after its last shard
+  release its hold early: it ends at its bound; since the final review the placeholder is in the
+  list while it is held, see "Final review: host agent"). The test hooks (delay, drop) bypass
+  the window as on frame streams. writeShards records the frame in flight after its last shard
   (`videoWindow.sentDatagrams`: from the meter's sent position before its first shard to at
   least that plus its shards' bytes, because SendDatagram only queues them). Not done: waiting
   between a frame's shards for acknowledgements; while the path falls short, the shards of the
@@ -9200,3 +9201,33 @@ Takeover time: on a live path, about one round trip (32 ms in the E2E). With an 
      connected to this host" and stays disconnected (no "retrying"), and B keeps the stream
      for a minute.
 - NVIDIA: unverified (no NVIDIA host available); not GPU-specific (the same test).
+
+### A shard frame the video window holds is released when a loss makes it useless
+
+Problem: in the "datagram + FEC" mode, sendFEC held a frame in the video window through a
+placeholder `outFrame` that had no `gone` channel and was not in the send state's list. A wait
+for the answer to a loss (Session.loss → setWait → checkOut) therefore could not discard it.
+The hold ran on to its bound (up to three quarters of the frame's deadline, 250 ms at most), and
+only then did writeShards discard the frame. The recovery frame queued behind it waited that
+long; a frame stream in the same place is released at once. The case needs the window gate to
+be engaged, which happens exactly when losses do. Fix: the placeholder gets a `gone` channel and
+the frame's number, and is registered in the send state's list (held) for the length of the
+hold. checkOut's discard then releases it as it releases a held frame stream (no stream to
+reset: `st` is nil). sendFEC takes it out of the list after the hold (`sendState.unhold`), and
+when checkOut discarded it meanwhile, returns without sending anything; the discard has already
+been reported once.
+
+- Verified here: `internal/host` `TestFECVideoWindow/discarded_while_held` (10 fps, a path that
+  falls short, frame 2 held, the loss of frame 1 reported). The hold ended 147 ms after the
+  loss before the fix and within a few ms after it; the frame is not sent and is counted as
+  discarded once. `go test -race ./internal/host`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (datagram + FEC with reference recovery, a path short
+  of the setting): the helper with AMF `ltr`, Network path "Direct to PC only", a Linux client
+  with `sudo ./netem.sh apply wan --iface <nic> --port 48100` and the stream's bitrate set
+  above what the link carries (or `capdrop` `--rates 50,10,50`). Set `"logLevel": "debug"`.
+  host.log has `video transport mode="datagram + FEC"`. In `stream stats`, `window_held` is
+  above 0 and `discarded` rises after losses. The overlay's recovery stalls (the `Freezes` row,
+  and `freeze:` lines in `__recon.logs` naming `until gen G seq S`) are no longer than with
+  `"fec": "off"` on the same link: a recovery frame does not wait behind a held, discarded
+  frame.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with NVENC `invalidate` recovery.

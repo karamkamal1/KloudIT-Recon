@@ -343,7 +343,8 @@ instead as datagrams with forward error correction:
   So shard frames go through the same video window as frame streams (GUIDE 2.7, "Send
   priorities"): sendFEC holds the frame in `admit()` before it is cut (a hold re-stamps
   `send_us`, which the data shards carry; the frame's deadline starts after it), a frame the
-  client would discard meanwhile is not sent, and the frame is recorded in flight after its last
+  client would discard meanwhile is not sent (a wait for the answer to a loss that starts during
+  the hold discards it and ends the hold at once, as for a held frame stream), and the frame is recorded in flight after its last
   shard (`sentDatagrams`: at least its shards' bytes past where its first shard started, as
   quic-go only queues them), so the window counts shard frames as it counts streams. What one
   frame's shards put in the queue while the path falls short stays (at most 32 shards, about

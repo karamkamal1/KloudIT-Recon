@@ -52,8 +52,10 @@ import (
 // outFrame without a stream: the frame, opened, a deadline from its bytes
 // with the shards' overhead; a hold re-stamps h.SendUs, which the data
 // shards carry, so before Cut), its deadline (rung 1, writeShards) starts
-// after the hold, a frame the client would discard meanwhile is not sent,
-// and writeShards records it in the window after its last shard
+// after the hold, a frame the client would discard meanwhile is not sent
+// (the placeholder is in the send state's list while it is held, so a wait
+// that starts then discards it and ends the hold at once, checkOut), and
+// writeShards records it in the window after its last shard
 // (sentDatagrams), so the window counts shard frames in flight as it counts
 // streams. For the window's shortfall gate the shards' "write" is their
 // hand-over, from the first shard's SendDatagram to the last one's return
@@ -328,11 +330,11 @@ func (s *Session) fecReport(r proto.RateReport, now time.Time) {
 	}
 }
 
-// sendFEC sends frame f (the nth frameSender took) as shards: the bytes a
-// frame stream would carry, cut, with parity. It returns false, having sent
-// nothing, when the frame cannot go as shards (the caller sends it on a
-// stream).
-func (s *Session) sendFEC(f *media.Frame, n int) bool {
+// sendFEC sends frame f (the nth frameSender took, num in the send state) as
+// shards: the bytes a frame stream would carry, cut, with parity. It returns
+// false, having sent nothing, when the frame cannot go as shards (the caller
+// sends it on a stream).
+func (s *Session) sendFEC(f *media.Frame, n int, num uint64) bool {
 	s.sendSince.Store(time.Now().UnixNano())
 	s.applyCongestionTarget()
 	h, ext := videoHeader(f, s.hello.V, s.a.clock(), s.thinning.mask(f.Gen, f.Seq))
@@ -349,9 +351,18 @@ func (s *Session) sendFEC(f *media.Frame, n int) bool {
 	held := false
 	if !drop && delay == 0 {
 		// The video window (GUIDE 2.7; the top of this file). The test
-		// hooks bypass it, as on frame streams.
-		ph := &outFrame{f: f, opened: time.Now(), deadline: s.frameDeadline(s.fecWireEstimate(len(buf)))}
-		if held = s.admit(ph) > 0; held && h.Flags&proto.FrameFlagExt != 0 {
+		// hooks bypass it, as on frame streams. While the window holds the
+		// frame, a placeholder stands for it in the send state's list, as
+		// a held frame stream does: a wait for the answer to a loss that
+		// starts meanwhile (checkOut) discards it and ends the hold at once.
+		ph := &outFrame{f: f, n: num, opened: time.Now(), deadline: s.frameDeadline(s.fecWireEstimate(len(buf))),
+			gone: make(chan struct{}), held: true}
+		s.send.register(ph)
+		held = s.admit(ph) > 0
+		if !s.send.unhold(ph) {
+			return true // discarded while held: checkOut reported it
+		}
+		if held && h.Flags&proto.FrameFlagExt != 0 {
 			h.SendUs = s.a.clock() // handed to the transport now: the wait is host queue
 			h.Marshal(buf)
 		}

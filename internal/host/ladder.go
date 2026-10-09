@@ -271,7 +271,7 @@ type takenFrame struct {
 // test hook, will write late).
 type outFrame struct {
 	f  *media.Frame
-	st transport.SendStream
+	st transport.SendStream // nil: the placeholder of a shard frame the video window holds (sendFEC)
 	// Partial delivery (GUIDE 2.4, Session.writeFrame): the prefix of the
 	// stream to mark reliable (0: none, the connection has no partial
 	// delivery) and how much of it was written and marked
@@ -349,6 +349,19 @@ func (s *sendState) register(of *outFrame) {
 	s.mu.Lock()
 	s.out = append(s.out, of)
 	s.mu.Unlock()
+}
+
+// unhold takes the placeholder of a shard frame the video window held
+// (sendFEC) out of the list once the hold is over; false if checkOut
+// discarded the frame meanwhile (and reported it).
+func (s *sendState) unhold(of *outFrame) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !of.state.CompareAndSwap(outWriting, outDone) {
+		return false
+	}
+	s.remove(of)
+	return true
 }
 
 // start begins a registered frame stream's deadline now: the frame goes to

@@ -152,14 +152,24 @@ func TestFECVideoWindow(t *testing.T) {
 			s.frameQ <- frame(seq)
 		}
 		waitCond(t, "two frames as shards", func() bool { f, _ := dc.shardFrames(t); return len(f) == 2 })
+		waitCond(t, "the third frame held", func() bool { return s.windowSince.Load() != 0 })
 		time.Sleep(2 * time.Millisecond)
+		lost := time.Now()
 		s.lostFrame(&media.Frame{Gen: 1, Seq: 1}, "test") // the client now waits for the answer to seq 1
-		// The hold ends at three quarters of the frame's deadline (10 fps:
-		// at most 150 ms); the frame is then discarded, not sent.
+		// The wait discards the held frame and ends its hold at once, as
+		// for a frame stream (checkOut), not at three quarters of its
+		// deadline (10 fps: up to 150 ms), which would hold back the
+		// recovery frame behind it.
 		waitCond(t, "the hold to end", func() bool { return s.windowSince.Load() == 0 })
+		if d := time.Since(lost); d > 40*time.Millisecond {
+			t.Errorf("the hold of a discarded frame ended %v after the loss", d)
+		}
 		time.Sleep(20 * time.Millisecond)
 		if _, seen := dc.shardFrames(t); seen[2] {
 			t.Fatal("a frame the client would discard was sent as shards after its hold")
+		}
+		if n := s.stats.discarded.Load(); n != 1 {
+			t.Errorf("%d frames discarded, want 1", n)
 		}
 		if rec, _, _ := p.state(); len(rec) != 1 || rec[0] != "1/1" {
 			t.Fatalf("recover calls %v, want [1/1]", rec)
