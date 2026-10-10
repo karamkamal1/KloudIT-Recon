@@ -782,14 +782,14 @@ func (v *HelperVideo) read(pr *helperProc) {
 			}
 			if he != nil && he.Re == "setRoi" {
 				// The encoder does not take the map: stop sending it to
-				// this helper (one warning, not one per pointer move).
+				// this helper (one warning, not one per pointer move),
+				// logged before Capabilities can report ROI off.
 				v.mu.Lock()
-				first := !pr.roiRefused
-				pr.roiRefused = true
-				v.mu.Unlock()
-				if first {
+				if !pr.roiRefused {
+					pr.roiRefused = true
 					v.log.Warn("encoder helper refused the regions of interest: none sent to it again", "err", err)
 				}
+				v.mu.Unlock()
 				continue
 			}
 			v.log.Warn("encoder helper error", "err", err)
