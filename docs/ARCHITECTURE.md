@@ -790,7 +790,10 @@ chooses automatically:
 An encoder that would pad the session's picture size gives way to HEVC, else H.264, with a
 notice ("AV1 on this GPU needs 64×16-aligned sizes; using HEVC"), also when the client asks
 for AV1, on either pipeline (the native helper's AV1 gives way to the helper's HEVC); an
-encoder forced in host.json (`encoder`) is kept. When a padded picture is
+encoder forced in host.json (`encoder`) is kept. The size checked is the one the encoder's
+pipeline encodes: FFmpeg's ddagrab and AMD Direct Capture stream the monitor's size, the native
+helper scales any capture to the client's Resolution (a 2560×1440 monitor at 1920×1080 is
+checked at 1920×1080 there, a 3440×1440 one at 1280×720 at 1280×536). When a padded picture is
 streamed anyway (a host-forced encoder, nothing else decodes, or a size only the capture
 knows), the video config announces `codedWidth`/`codedHeight`/`cropRight`/`cropBottom` and the
 client draws only the top-left `width`×`height` (2D: `drawImage` source rectangle; WebGPU:

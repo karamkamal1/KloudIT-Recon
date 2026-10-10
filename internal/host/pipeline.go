@@ -417,8 +417,7 @@ func (s *Session) helperFits(prefs proto.Prefs, drawCursor bool, mon platform.Mo
 	encs := s.helperEncs
 	s.pipeMu.Unlock()
 	p := s.a.sessionParams(prefs, mon, s.captureBackend(prefs, mon, s.onVirtualDisplay()), s.hello.V >= proto.HelloVersionFrameExt)
-	w, h := p.OutputSize()
-	if e, _, err := s.negotiateEncoder(prefs, w, h, false); err != nil || !e.Helper {
+	if e, _, err := s.negotiateEncoder(prefs, s.pictureSizes(p, prefs, mon), false); err != nil || !e.Helper {
 		return fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", e.Name, encoderNames(encs)), true
 	}
 	return "", false

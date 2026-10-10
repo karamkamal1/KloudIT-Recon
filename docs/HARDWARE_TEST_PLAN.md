@@ -423,11 +423,15 @@ review: RESET_STREAM_AT boundary after the peer's STOP_SENDING")
 **4.2 Codecs and the AV1 guard on the helper** (T9; VENDOR_NOTES "Final review: host agent,
 third round", "The AV1 alignment guard on the native helper")
 
-- **Do**: run 2.2 again on the helper. Then set `"encoder": "av1_amf_helper"` and stream the
-  1920×1080 desktop.
+- **Do**: run 2.2 again on the helper. With the desktop at 2560×1440, Codec AV1 and Resolution
+  1920×1080, stream once with `"capture": "amf"` in host.json (the helper scales the capture;
+  FFmpeg would stream 2560×1440 there) and once without it. Then set
+  `"encoder": "av1_amf_helper"` and stream the 1920×1080 desktop.
 - **Pass**:
   - At 1920×1080 with Codec AV1: the toast, then `hevc_amf_helper` and `Video 1920×1080 HEVC`.
   - At 2560×1440: `av1_amf_helper` and no toast.
+  - At 2560×1440 with Resolution 1920×1080, both times: the toast, `hevc_amf_helper`,
+    `Video 1920×1080 HEVC`, and host.log's `codec choice ... size=1920x1080`.
   - Forced AV1: host.log `coded picture is padded, client crops ... coded=1920x1088
     crop_bottom=8`, the overlay `(coded 1920×1088, cropped)`, and no grey rows at the bottom.
 - **If not, send**: as in 2.2, and the `alignW`/`alignH` of caps.json.

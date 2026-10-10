@@ -110,29 +110,34 @@ func TestHelperSource(t *testing.T) {
 		prefs   proto.Prefs
 		want    string
 	}{
-		{"native", "auto", platform.Monitor{W: 2560, H: 1440, DXGIOutput: 1, HMonitor: 7}, proto.Prefs{}, "ddagrab out=1 0x0"},
+		{"native", "auto", platform.Monitor{W: 2560, H: 1440, DXGIOutput: 1, HMonitor: 7}, proto.Prefs{}, "ddagrab out=1 0x0 encodes 2560x1440"},
 		{"larger than the monitor", "auto", platform.Monitor{W: 1920, H: 1080, DXGIOutput: 0}, proto.Prefs{Width: 2560, Height: 1440},
-			"ddagrab out=0 0x0"},
-		{"same aspect", "auto", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1920, Height: 1080}, "ddagrab out=0 1920x1080"},
+			"ddagrab out=0 0x0 encodes 1920x1080"},
+		{"same aspect", "auto", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1920, Height: 1080}, "ddagrab out=0 1920x1080 encodes 1920x1080"},
 		{"ultrawide host, 16:9 client", "auto", platform.Monitor{W: 3440, H: 1440}, proto.Prefs{Width: 1920, Height: 1080},
-			"ddagrab out=0 1920x804"},
+			"ddagrab out=0 1920x804 encodes 1920x804"},
 		{"16:9 host, 16:10 client", "gfxcapture", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1920, Height: 1200},
-			"gfxcapture out=0 1920x1080"},
+			"gfxcapture out=0 1920x1080 encodes 1920x1080"},
 		{"portrait host", "amf", platform.Monitor{W: 1080, H: 1920, Rotated: true}, proto.Prefs{Width: 1920, Height: 1080},
-			"amf out=0 608x1080"},
+			"amf out=0 608x1080 encodes 608x1080"},
 		{"taller than the monitor only", "auto", platform.Monitor{W: 2560, H: 1080}, proto.Prefs{Width: 1920, Height: 1200},
-			"ddagrab out=0 1920x810"},
+			"ddagrab out=0 1920x810 encodes 1920x810"},
 		{"window", "auto", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1280, Height: 1024, Window: "Notepad"},
-			"gfxcapture out=0 0x0 window=Notepad"},
+			"gfxcapture out=0 0x0 encodes 0x0 window=Notepad"},
+		{"test pattern", "test", platform.Monitor{W: 2560, H: 1440}, proto.Prefs{Width: 1920, Height: 1080}, "test out=0 0x0 encodes 1600x900"},
 	} {
 		s := &Session{a: &Agent{cfg: &Config{Capture: c.capture}}}
 		p := media.Params{Source: media.Source{Backend: "ddagrab"}, DrawCursor: true}
+		if c.capture == "test" { // sessionParams: the test pattern at testWidth x testHeight, with padding FFmpeg adds
+			p = media.Params{Source: media.Source{Backend: "test", NativeW: 1600, NativeH: 900}, TestPad: 8}
+		}
 		s.helperSource(&p, c.prefs, c.mon)
-		got := fmt.Sprintf("%s out=%d %dx%d", p.Source.Backend, p.Source.Output, p.Width, p.Height)
+		w, h := p.HelperOutputSize() // what the alignment guard checks
+		got := fmt.Sprintf("%s out=%d %dx%d encodes %dx%d", p.Source.Backend, p.Source.Output, p.Width, p.Height, w, h)
 		if p.Source.Window != "" {
 			got += " window=" + p.Source.Window
 		}
-		if got != c.want || p.DrawCursor || p.Source.NativeW != c.mon.W || p.Source.HMonitor != c.mon.HMonitor {
+		if got != c.want || p.DrawCursor || c.capture != "test" && (p.Source.NativeW != c.mon.W || p.Source.HMonitor != c.mon.HMonitor) {
 			t.Errorf("%s: %s (%+v), want %s", c.name, got, p.Source, c.want)
 		}
 	}

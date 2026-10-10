@@ -1913,9 +1913,13 @@ Hardware checks:
      helper) the same, with `hevc_amf_helper` (from the helper's caps alignment: "Final review:
      host agent, third round"); run it there and with `"pipeline": "ffmpeg"`.
   3. Desktop at 2560×1440 (or a 1440p monitor), Codec AV1, Resolution Native. Pass: no toast;
-     overlay `Video 2560×1440 AV1`; host.log `encoder ready … codec=av01…` with `av1_amf`. The
-     picture has no green or grey line at the bottom edge. On a 1440p monitor also pick
-     Resolution 1920×1080 (gfxcapture scales to exactly 1920×1080). Pass: the HEVC toast again.
+     overlay `Video 2560×1440 AV1`; host.log `encoder ready … codec=av01…` with `av1_amf`
+     (`av1_amf_helper` on the helper). The picture has no green or grey line at the bottom
+     edge. On a 1440p monitor also pick Resolution 1920×1080 (gfxcapture scales to exactly
+     1920×1080). Pass: the HEVC toast again. On the default pipeline (the helper, which scales
+     any capture) the same also with `"capture": "amf"` or `"ddagrab"` in host.json:
+     `hevc_amf_helper` and host.log `codec choice … size=1920x1080` ("Final review: gaps after
+     the verification").
   4. Crop path and the A7 VERIFY (codedHeight vs displayHeight in Chrome): set
      `"encoder": "av1_amf"` in host.json (a host-forced encoder is kept), restart the agent and
      stream the 1920×1080 desktop. Pass: no toast; host.log `coded picture is padded, client
@@ -11400,3 +11404,48 @@ the mock applies the same rule.
   applies.
 - Intel (Quick Sync, libavcodec backend): unverified (no Intel host). Test: during a 30-minute
   stream on `hevc_qsv` (3.8 wiring) host.log has no `did not finish frame` line.
+
+## Final review: gaps after the verification
+
+Gaps the independent verification of the final-review fixes and the security sweep found. Each
+item: the problem, the fix, what was verified here, the check on hardware.
+
+### The AV1 alignment guard at the size the native helper scales to
+
+Problem: "The AV1 alignment guard on the native helper" (third round) took the helper's
+alignment, but still checked the size FFmpeg would encode (`Params.OutputSize`): the monitor's
+size for ddagrab and AMD Direct Capture, the client's unfitted Resolution for gfxcapture. The
+helper scales any capture itself, to the largest size with the monitor's aspect ratio within the
+client's Resolution (`helperSource`), after the encoder was chosen. So with a 2560×1440 monitor,
+Codec AV1 and Resolution 1920×1080 on the default pipeline, with `"capture": "ddagrab"`, `"amf"`
+or `"auto"` without FFmpeg's gfxcapture, the guard checked 2560×1440 (aligned) and the helper
+streamed AV1 at 1920×1080, coded 1920×1088, with no notice; a 3440×1440 monitor at 1280×720
+(helper: 1280×536) the same. The reverse also happened: a 1920×1080 monitor at 1280×720 gave
+way to HEVC with the notice although the helper's 1280×720 is aligned.
+
+Fix: the session computes the picture size per pipeline (`picSizes`: FFmpeg's
+`Params.OutputSize`, and the helper's `Params.HelperOutputSize` after `helperSource`) and checks
+each encoder at the size its pipeline encodes, in the encoder choice, the automatic codec choice
+(chooseFamily's decode times at the first choice's size) and the helper's own check at session
+start (`helperFits`). host.log's `codec choice` and `coded-size alignment` lines give that size.
+
+- Verified here: `internal/host` `TestAlignmentGuardHelperScaled` (a fake AMF helper with 64×16
+  AV1 caps, `openPipeline` and `buildParams` with a stubbed monitor): 2560×1440 at 1920×1080
+  with capture ddagrab, amf, auto without and with gfxcapture, and 3440×1440 at 1280×720 with
+  gfxcapture give `hevc_amf_helper` with the notice at the helper's size (1920×1080, 1280×536);
+  auto with AV1 the only hardware decoder the same; Native 2560×1440 and a 1920×1080 monitor at
+  1280×720 keep `av1_amf_helper` without a notice; the session stays on the helper. Before the
+  fix six of the eight cases failed (five streamed padded AV1 without a notice, one gave way
+  needlessly). `TestHelperSource` checks `HelperOutputSize` for each capture, a window (0×0,
+  unknown) and the helper's synthetic source (its own size, no `testPad`).
+  `TestAlignmentGuardHelper`, `TestAlignmentGuard`, `TestCodecSelection` and `TestProbeSample`
+  pass unchanged.
+- AMD RDNA3 (RX 7900 XT): unverified. Test (hardware test plan 4.2): desktop at 2560×1440, on the
+  default pipeline (host.log `video pipeline pipeline=helper backend=amf`), Settings → Codec AV1,
+  Resolution 1920×1080; once with `"capture": "amf"` in host.json, once without. Pass both
+  times: the toast "AV1 on this GPU needs 64×16-aligned sizes; using HEVC", the overlay's
+  `hevc_amf_helper` and `Video 1920×1080 HEVC`, host.log `codec choice encoder=hevc_amf_helper
+  … size=1920x1080`, and no `coded picture is padded` line. Resolution Native: `av1_amf_helper`
+  at 2560×1440 without a toast.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same settings on an RTX 40/50 host
+  stream `av1_nvenc_helper` at 1920×1080 without a toast (NVENC's caps report 1×1).

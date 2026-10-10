@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1168,6 +1169,80 @@ func TestAlignmentGuardHelper(t *testing.T) {
 			got := rec.notices(t)
 			if p.Encoder.Name != c.want || (c.notice == "") != (len(got) == 0) || (c.notice != "" && (len(got) != 1 || got[0] != c.notice)) {
 				t.Fatalf("encoder %s, notices %q; want %s, %q", p.Encoder.Name, got, c.want, c.notice)
+			}
+			if helper, _, _ := s.onHelper(); !helper {
+				t.Fatal("the session left the helper")
+			}
+		})
+	}
+}
+
+// TestAlignmentGuardHelperScaled: the guard checks the size the helper
+// encodes, which scales a monitor to the client's resolution (helperSource),
+// whatever FFmpeg's capture of the same session would stream. A 2560x1440
+// monitor at the client's 1920x1080 with capture ddagrab, amf or auto without
+// FFmpeg's gfxcapture (FFmpeg: 2560x1440), and a 3440x1440 monitor at
+// 1280x720 with gfxcapture (FFmpeg letterboxes to 1280x720, the helper fits
+// 1280x536), give way to HEVC with the notice; a 1920x1080 monitor at
+// 1280x720 keeps AV1 (FFmpeg's 1920x1080 would pad). Before, the guard
+// checked FFmpeg's size and the helper streamed padded AV1 without a notice.
+func TestAlignmentGuardHelperScaled(t *testing.T) {
+	const av1Aligned = `"av1":{"maxW":8192,"maxH":4352,"forceIdr":true,"recovery":"ltr","maxLtr":2,"liveBitrate":"seamless","alignW":64,"alignH":16}`
+	all := []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc", HW: true}, {Family: "h264", HW: true}}
+	av1Only := []proto.DecoderInfo{{Family: "av1", HW: true}, {Family: "hevc"}, {Family: "h264"}}
+	ddagrab := map[string]bool{"ddagrab": true}
+	both := map[string]bool{"ddagrab": true, "gfxcapture": true}
+	const notice = "AV1 on this GPU needs 64×16-aligned sizes; using HEVC"
+	for _, c := range []struct {
+		name       string
+		capture    string
+		filters    map[string]bool // FFmpeg's capture filters
+		monW, monH int
+		decoders   []proto.DecoderInfo
+		prefs      proto.Prefs
+		want       string
+		size       string // the helper's picture
+		notice     string
+	}{
+		{"1440p monitor at 1080p, ddagrab", "ddagrab", ddagrab, 2560, 1440, all, proto.Prefs{Codec: "av1", Width: 1920, Height: 1080}, "hevc_amf_helper", "1920x1080", notice},
+		{"1440p monitor at 1080p, amf", "amf", ddagrab, 2560, 1440, all, proto.Prefs{Codec: "av1", Width: 1920, Height: 1080}, "hevc_amf_helper", "1920x1080", notice},
+		{"1440p monitor at 1080p, auto without gfxcapture", "auto", ddagrab, 2560, 1440, all, proto.Prefs{Codec: "av1", Width: 1920, Height: 1080}, "hevc_amf_helper", "1920x1080", notice},
+		{"1440p monitor at 1080p, auto with gfxcapture", "auto", both, 2560, 1440, all, proto.Prefs{Codec: "av1", Width: 1920, Height: 1080}, "hevc_amf_helper", "1920x1080", notice},
+		{"3440x1440 monitor at 720p, auto with gfxcapture", "auto", both, 3440, 1440, all, proto.Prefs{Codec: "av1", Width: 1280, Height: 720}, "hevc_amf_helper", "1280x536", notice},
+		{"auto codec, AV1 the only hardware decoder, 1440p monitor at 1080p", "ddagrab", ddagrab, 2560, 1440, av1Only, proto.Prefs{Width: 1920, Height: 1080}, "hevc_amf_helper", "1920x1080", notice},
+		{"1440p monitor at native size", "ddagrab", ddagrab, 2560, 1440, all, proto.Prefs{Codec: "av1"}, "av1_amf_helper", "2560x1440", ""},
+		{"1080p monitor at 720p, ddagrab", "ddagrab", ddagrab, 1920, 1080, all, proto.Prefs{Codec: "av1", Width: 1280, Height: 720}, "av1_amf_helper", "1280x720", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Config{Capture: c.capture, Pipeline: "helper"}
+			cfg.Defaults()
+			l := &fakeLauncher{caps: helperCaps(av1Aligned+","+fakeHEVC+","+fakeH264, `"dda","amd-direct"`, true)}
+			rec := &ctrlRecorder{}
+			mon := platform.Monitor{W: c.monW, H: c.monH, Hz: 60, Primary: true, Name: "M"}
+			s := &Session{
+				a: &Agent{cfg: &cfg, caps: &media.Caps{Filters: c.filters, Encoders: []media.EncoderInfo{{Name: "libx264", Family: "h264", Vendor: "software"}}},
+					inj: input.NewInjector(nil), hostClock: media.NewHostClock(), launchHelper: l.launch,
+					listMonitors: func() []platform.Monitor { return []platform.Monitor{mon} }},
+				hello: proto.Hello{V: proto.HelloVersionFrameExt, Decoders: c.decoders}, prefs: c.prefs,
+				tried: map[string]bool{}, usage: map[string]string{}, ctx: context.Background(), ctrl: rec,
+				log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			if n := s.openPipeline(); n != "" {
+				t.Fatalf("pipeline notice %q", n)
+			}
+			defer func() { s.vid().Stop() }()
+			if helper, _, _ := s.onHelper(); !helper {
+				t.Fatal("the session is not on the helper")
+			}
+			p, err := s.buildParams(c.prefs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := rec.notices(t)
+			w, h := p.HelperOutputSize()
+			if size := fmt.Sprintf("%dx%d", w, h); p.Encoder.Name != c.want || size != c.size ||
+				(c.notice == "") != (len(got) == 0) || (c.notice != "" && (len(got) != 1 || got[0] != c.notice)) {
+				t.Fatalf("encoder %s at %s, notices %q; want %s at %s, %q", p.Encoder.Name, size, got, c.want, c.size, c.notice)
 			}
 			if helper, _, _ := s.onHelper(); !helper {
 				t.Fatal("the session left the helper")

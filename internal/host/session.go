@@ -660,17 +660,47 @@ func (s *Session) currentPrefs() proto.Prefs {
 	return s.prefs
 }
 
+// picSizes are the picture sizes a session's encoders get (0, 0: unknown):
+// FFmpeg's (Params.OutputSize) and the native helper's, which scales any
+// capture to the client's resolution (Params.HelperOutputSize after
+// helperSource): a 2560x1440 monitor at the client's 1920x1080 is 2560x1440
+// on FFmpeg's ddagrab and 1920x1080 on the helper.
+type picSizes struct{ ffmpegW, ffmpegH, helperW, helperH int }
+
+// of returns the size encoder e gets.
+func (z picSizes) of(e media.EncoderInfo) (w, h int) {
+	if e.Helper {
+		return z.helperW, z.helperH
+	}
+	return z.ffmpegW, z.ffmpegH
+}
+
+// pictureSizes returns the picture sizes for p (sessionParams for prefs on
+// monitor mon) on either pipeline.
+func (s *Session) pictureSizes(p media.Params, prefs proto.Prefs, mon platform.Monitor) picSizes {
+	var z picSizes
+	z.ffmpegW, z.ffmpegH = p.OutputSize()
+	s.helperSource(&p, prefs, mon)
+	z.helperW, z.helperH = p.HelperOutputSize()
+	return z
+}
+
 // chooseEncoder negotiates the codec between the browser's decoders and the
-// host's encoders for a w x h picture (0, 0: size unknown); why says how
-// (negotiateEncoder). An encoder that would pad that size (alignment; AV1 on
-// RDNA3 at 1920x1080, on either pipeline) gives way to HEVC, else H.264, also
+// host's encoders for the session's picture (z: its size per pipeline); why
+// says how (negotiateEncoder). An encoder that would pad the size it gets
+// (alignment; AV1 on RDNA3 at 1920x1080, on either pipeline, also where the
+// helper scales a larger monitor to it) gives way to HEVC, else H.264, also
 // when the client asks for its codec; notice tells the user why ("" when
 // nothing changed). An encoder forced in the host config is kept: its
 // padding is announced for the client to crop.
-func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInfo, why, notice string, err error) {
-	e, why, err = s.negotiateEncoder(prefs, w, h, true)
-	if err != nil || !s.alignment(e).Pads(w, h) {
+func (s *Session) chooseEncoder(prefs proto.Prefs, z picSizes) (e media.EncoderInfo, why, notice string, err error) {
+	e, why, err = s.negotiateEncoder(prefs, z, true)
+	if err != nil {
 		return e, why, "", err
+	}
+	w, h := z.of(e)
+	if !s.alignment(e).Pads(w, h) {
+		return e, why, "", nil
 	}
 	if e.Name == s.a.cfg.Encoder {
 		s.log.Debug("forced encoder pads this size, the client crops", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h))
@@ -679,7 +709,7 @@ func (s *Session) chooseEncoder(prefs proto.Prefs, w, h int) (e media.EncoderInf
 	// Hardware encoders first, HEVC before H.264.
 	for _, hwOnly := range []bool{true, false} {
 		for _, fam := range []string{"hevc", "h264"} {
-			if alt, ok := s.pickEncoder(fam, hwOnly, func(c media.EncoderInfo) bool { return !s.alignment(c).Pads(w, h) }); ok {
+			if alt, ok := s.pickEncoder(fam, hwOnly, func(c media.EncoderInfo) bool { return !s.alignment(c).Pads(z.of(c)) }); ok {
 				a := s.alignment(e)
 				s.log.Debug("encoder would pad this size, using another codec", "encoder", e.Name, "size", fmt.Sprintf("%dx%d", w, h),
 					"alignment", fmt.Sprintf("%dx%d", a.W, a.H), "using", alt.Name)
@@ -740,15 +770,16 @@ func (s *Session) pickEncoder(fam string, hwOnly bool, ok func(media.EncoderInfo
 }
 
 // negotiateEncoder picks the encoder by configuration, preference and the
-// browser's decoders, for a w x h picture (0, 0: unknown); why says how, for
-// the log; notify: tell the user when the codec they asked for is not
-// available, once until they ask for another (buildParams runs again for
-// every encoder restart). Automatically: the first tier of autoTiers with a
-// family both ends can use, the family in it by chooseFamily (codec.go: HEVC
-// by default, a family the client decodes clearly faster instead), with
-// software encoding the first in its order. The encoders are the session's
-// (encoders: the native helper's first while the session runs on it).
-func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e media.EncoderInfo, why string, err error) {
+// browser's decoders, for the session's picture (z: its size per pipeline);
+// why says how, for the log; notify: tell the user when the codec they asked
+// for is not available, once until they ask for another (buildParams runs
+// again for every encoder restart). Automatically: the first tier of
+// autoTiers with a family both ends can use, the family in it by
+// chooseFamily (codec.go: HEVC by default, a family the client decodes
+// clearly faster instead), with software encoding the first in its order.
+// The encoders are the session's (encoders: the native helper's first while
+// the session runs on it).
+func (s *Session) negotiateEncoder(prefs proto.Prefs, z picSizes, notify bool) (e media.EncoderInfo, why string, err error) {
 	client := s.clientDecoders()
 	usable := s.usableEncoder
 	if s.a.cfg.Encoder != "" {
@@ -790,14 +821,16 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, w, h int, notify bool) (e 
 				continue
 			}
 			if e, ok := s.pickEncoder(fam, tier.hwEnc, nil); ok {
-				cands = append(cands, codecCandidate{enc: e, dec: d, pads: s.alignment(e).Pads(w, h)})
+				cands = append(cands, codecCandidate{enc: e, dec: d, pads: s.alignment(e).Pads(z.of(e))})
 			}
 		}
 		if len(cands) > 0 {
 			// Software encoding keeps its order: the host's CPU cost, which
-			// the client's decode times do not tell.
+			// the client's decode times do not tell. Decode times compare at
+			// the size the first choice gets (on the helper, the helper's).
 			c, why := cands[0], "first choice"
 			if tier.hwEnc {
+				w, h := z.of(c.enc)
 				c, why = chooseFamily(cands, policy, w, h)
 			}
 			return c.enc, "auto, " + tier.name + ": " + why, nil
@@ -911,11 +944,12 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 			s.leaveHelper(why)
 		}
 	}
-	outW, outH := p.OutputSize()
-	enc, why, notice, err := s.chooseEncoder(prefs, outW, outH)
+	sizes := s.pictureSizes(p, prefs, mon)
+	enc, why, notice, err := s.chooseEncoder(prefs, sizes)
 	if err != nil {
 		return media.Params{}, err
 	}
+	outW, outH := sizes.of(enc)
 	if helper, encs, _ := s.onHelper(); helper && !enc.Helper {
 		s.leaveHelper(fmt.Sprintf("the codec negotiated with this browser (%s) is not one of the helper's (%s)", enc.Name, encoderNames(encs)))
 	}

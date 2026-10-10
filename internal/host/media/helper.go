@@ -382,6 +382,28 @@ func (v *HelperVideo) liveFPS(pr *helperProc) bool {
 	return false // restart: a new helper
 }
 
+// HelperOutputSize returns the size of the picture the native helper's
+// encoder gets for p (startParams), or 0, 0 when only the capture knows it
+// (a window): the size p asks for (the helper scales any capture to it),
+// else the monitor's; the synthetic source at its own size (no TestPad).
+// Params.OutputSize is FFmpeg's, which cannot scale ddagrab and AMD Direct
+// Capture.
+func (p Params) HelperOutputSize() (w, h int) {
+	src := p.Source
+	switch {
+	case src.Backend == "test":
+		if src.NativeW <= 0 || src.NativeH <= 0 {
+			return 1280, 720
+		}
+		return src.NativeW, src.NativeH
+	case p.Width > 0 && p.Height > 0:
+		return p.Width, p.Height
+	case src.Window != "":
+		return 0, 0
+	}
+	return src.NativeW, src.NativeH
+}
+
 // startParams turns a generation's parameters into the helper's start
 // message: capture method and monitor from the source, rate control CBR when
 // the rate controller may change the bitrate (else the encoder's low-latency

@@ -294,7 +294,8 @@ ignored by recon-host.
   For the automatic codec choice (step 4.2, `internal/host/codec.go`, docs/ARCHITECTURE.md
   "Codec negotiation") this is the host side on the helper path, as the probe's test encodes
   are on the FFmpeg path: a codec in `codecs` is available, one only in `unavailable` is not
-  (no GPU-name rules), and `alignW`/`alignH` decide whether it pads a session's picture size.
+  (no GPU-name rules), and `alignW`/`alignH` decide whether it pads a session's picture size
+  (the size the helper encodes: the capture scaled to the client's resolution).
 
 `started` reports what the encoder actually does (the mock always produces 320x180):
 
