@@ -11471,3 +11471,31 @@ with `//`.
   (`/%5C`, `/%09/`, `//`, and `/%3Fe2e%3D1%23top` reaching `/?e2e=1#top`) are unchanged.
 - Not GPU-specific: no AMD or NVIDIA check. Browser check: sign in, then open
   `https://<gateway>/login?next=/.//example.com`: the dashboard opens, not example.com.
+
+### The DLLs next to a configured ffmpeg.exe
+
+Problem: `platform.AdminOnly` (the elevated agent's check of where it runs code from, "FFmpeg and
+its libraries only from places administrators control") checked a folder and every file directly
+in it, but for a file such as a configured `ffmpeg.exe` only the file and its folder. A shared
+FFmpeg build loads `avcodec-*.dll`, `avutil-*.dll` and the rest from the exe's folder first, so a
+sibling DLL whose own ACL let the user write it passed, and the elevated FFmpeg loaded it: the
+same UAC bypass the check exists to stop, for a folder that is otherwise administrators' only.
+
+Fix (`internal/host/platform/adminonly_windows.go`): for a file, AdminOnly checks the file, its
+folder and every other file directly in that folder with `CheckPrivateSD` (as it did for a
+folder), then the folders above as before (`adminOnlyPaths` lists them).
+
+- Verified here: `internal/host/platform` `TestAdminOnlyPaths` (Windows test binary under Wine
+  9): for `ffmpeg.exe` in a folder with `avcodec-62.dll`, `avutil-60.dll` and a subfolder, the
+  checks are the exe, the folder and both DLLs (not the subfolder), and for the folder the same
+  set; the folders above up to the drive's root follow. With the previous rule (siblings only for
+  a folder) it fails: the exe's checks were the exe and its folder only. `TestAdminOnly`,
+  `TestCheckPrivateSD` and `TestCheckAncestorSD` pass unchanged; `GOOS=windows go vet` passes.
+- Not GPU-specific (no AMD or NVIDIA step). Test on a Windows host with the agent installed:
+  from an elevated prompt copy a shared FFmpeg build (BtbN `ffmpeg-n8.1-latest-win64-gpl-shared`)
+  to `C:\Program Files\FFmpeg`, then `icacls "C:\Program Files\FFmpeg\bin\avcodec-62.dll" /grant
+  "%USERNAME%:M"`; set `"ffmpeg": "C:\\Program Files\\FFmpeg\\bin\\ffmpeg.exe"` in host.json and
+  restart the agent: host.log has `host config "ffmpeg" ignored: C:\Program
+  Files\FFmpeg\bin\avcodec-62.dll: ... may change it` and the agent uses its own FFmpeg. Remove
+  the grant (`icacls ... /remove "%USERNAME%"`) and restart: no warning, `probing ffmpeg ...
+  ffmpeg=C:\Program Files\FFmpeg\bin\ffmpeg.exe`.

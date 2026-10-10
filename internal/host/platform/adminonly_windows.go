@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -39,51 +40,66 @@ func AgentStateDir() (string, error) {
 }
 
 // AdminOnly returns an error unless only administrators and the system can
-// change path, a file or folder on a local drive, and what runs from it: path
-// and the folder it is in pass CheckPrivateSD (a folder also with the files
-// directly in it, which is where Windows looks for the DLLs they load), and
-// no folder above lets anyone else rename or replace its entries
+// change path, a file or folder on a local drive, and what runs from it: path,
+// the folder it is in (path itself for a folder) and every file directly in
+// that folder pass CheckPrivateSD (Windows looks there first for the DLLs a
+// program in it loads: a shared FFmpeg build's avcodec next to ffmpeg.exe),
+// and no folder above lets anyone else rename or replace its entries
 // (checkAncestorSD). No component may be a link (reparse point), and path
 // must exist (a missing one could be created later). The error names the part
 // of path that fails.
 func AdminOnly(path string) error {
-	path, err := filepath.Abs(path)
+	private, ancestors, err := adminOnlyPaths(path)
 	if err != nil {
 		return err
 	}
-	if v := filepath.VolumeName(path); len(v) != 2 || v[1] != ':' {
-		return fmt.Errorf("%s: not on a local drive", path)
-	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	dir, check := path, []string{path}
-	if fi.IsDir() {
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				check = append(check, filepath.Join(path, e.Name()))
-			}
-		}
-	} else {
-		dir = filepath.Dir(path)
-		check = append(check, dir)
-	}
-	for _, p := range check {
+	for _, p := range private {
 		if err := checkPath(p, CheckPrivateSD); err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
 	}
-	for a := filepath.Dir(dir); ; a = filepath.Dir(a) {
+	for _, a := range ancestors {
 		if err := checkPath(a, checkAncestorSD); err != nil {
 			return fmt.Errorf("%s: %w", a, err)
 		}
+	}
+	return nil
+}
+
+// adminOnlyPaths returns what AdminOnly checks for path: private, path, the
+// folder it is in (for a file) and the other files directly in that folder;
+// ancestors, the folders above that folder up to the drive's root.
+func adminOnlyPaths(path string) (private, ancestors []string, err error) {
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if v := filepath.VolumeName(path); len(v) != 2 || v[1] != ':' {
+		return nil, nil, fmt.Errorf("%s: not on a local drive", path)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	dir := path
+	private = []string{path}
+	if !fi.IsDir() {
+		dir = filepath.Dir(path)
+		private = append(private, dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, e := range entries {
+		if p := filepath.Join(dir, e.Name()); !e.IsDir() && !strings.EqualFold(p, path) {
+			private = append(private, p)
+		}
+	}
+	for a := filepath.Dir(dir); ; a = filepath.Dir(a) {
+		ancestors = append(ancestors, a)
 		if filepath.Dir(a) == a {
-			return nil
+			return private, ancestors, nil
 		}
 	}
 }

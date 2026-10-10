@@ -190,9 +190,10 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   runs FFmpeg (`ffmpeg`, else next to it or on PATH) and has the helper load FFmpeg's libraries
   (`helperFFmpegDir`) only from its install folder (Program Files, or a folder the installer
   restricts to administrators, as for `recon-host.exe` itself) or from a local folder only
-  administrators can change: the file or folder, the folder it is in and, for a folder, the
-  files in it pass the check above, no folder above lets anyone else rename or delete its
-  entries, and no part is a link. A configured path that fails is ignored for the default
+  administrators can change: the file or folder, the folder it is in and the files directly in
+  that folder (where Windows looks first for the DLLs a program there loads, such as a shared
+  FFmpeg build's next to `ffmpeg.exe`) pass the check above, no folder above lets anyone else
+  rename or delete its entries, and no part is a link. A configured path that fails is ignored for the default
   (`host config "ffmpeg" ignored` in host.log); without an elevated token (a standard user's
   agent) nothing is checked, since nothing is gained.
 - For the same reason the elevated agent writes no file in a folder the user can change: there,

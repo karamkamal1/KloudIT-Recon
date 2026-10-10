@@ -3,6 +3,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -88,6 +89,51 @@ func TestAdminOnly(t *testing.T) {
 			t.Errorf("AdminOnly(%s) accepted", p)
 		} else {
 			t.Logf("%s: %v", p, err)
+		}
+	}
+}
+
+// TestAdminOnlyPaths: for ffmpeg.exe AdminOnly checks the file, its folder
+// and the other files in that folder (the DLLs of a shared FFmpeg build,
+// which Windows loads from the exe's folder first), as for a folder, but not
+// the folders in it; then every folder above up to the drive's root. Before,
+// a file's sibling DLLs were not checked: one whose own ACL let the user
+// write it passed.
+func TestAdminOnlyPaths(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "ffmpeg.exe")
+	for _, f := range []string{exe, filepath.Join(dir, "avcodec-62.dll"), filepath.Join(dir, "avutil-60.dll")} {
+		if err := os.WriteFile(f, []byte("MZ"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "presets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var above []string
+	for a := filepath.Dir(dir); ; a = filepath.Dir(a) {
+		above = append(above, a)
+		if filepath.Dir(a) == a {
+			break
+		}
+	}
+	dlls := []string{filepath.Join(dir, "avcodec-62.dll"), filepath.Join(dir, "avutil-60.dll")}
+	for _, c := range []struct {
+		path    string
+		private []string
+	}{
+		{exe, append([]string{exe, dir}, dlls...)},
+		{dir, append([]string{dir}, append(dlls, exe)...)},
+	} {
+		private, ancestors, err := adminOnlyPaths(c.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(private)), slices.Sorted(slices.Values(c.private))) || private[0] != c.path {
+			t.Errorf("%s: checks %q, want %q (the path first)", c.path, private, c.private)
+		}
+		if !slices.Equal(ancestors, above) {
+			t.Errorf("%s: folders above %q, want %q", c.path, ancestors, above)
 		}
 	}
 }
