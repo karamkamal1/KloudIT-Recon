@@ -69,7 +69,12 @@ func LoadOrCreateCA(dir, name string, c *Constraints) (*CA, error) {
 // constraints c (nil: none). The constraints extension is not marked
 // critical, as the CA/Browser Forum allows for constrained CAs: verifiers
 // that know it (Windows, macOS and iOS, Chrome, Firefox, Go, OpenSSL) enforce
-// it, and one that does not still accepts the CA.
+// it, and one that does not still accepts the CA. Name constraints limit only
+// the names a certificate is for, not its purpose: the CA's extended key
+// usage, TLS server authentication only (what Issue's certificates are for),
+// keeps a verifier that applies a CA's EKU to its chain (Windows' certificate
+// store, Go) from accepting a code-signing or e-mail certificate made with
+// its key.
 func CreateCA(dir, name string, c *Constraints) (*CA, error) {
 	certPath := filepath.Join(dir, "ca.crt")
 	keyPath := filepath.Join(dir, "ca.key")
@@ -86,6 +91,7 @@ func CreateCA(dir, name string, c *Constraints) (*CA, error) {
 		BasicConstraintsValid: true,
 		MaxPathLenZero:        true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	if c != nil {
 		tmpl.PermittedDNSDomains = c.Domains

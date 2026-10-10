@@ -11499,3 +11499,39 @@ folder), then the folders above as before (`adminOnlyPaths` lists them).
   Files\FFmpeg\bin\avcodec-62.dll: ... may change it` and the agent uses its own FFmpeg. Remove
   the grant (`icacls ... /remove "%USERNAME%"`) and restart: no warning, `probing ffmpeg ...
   ffmpeg=C:\Program Files\FFmpeg\bin\ffmpeg.exe`.
+
+### The private CA is for TLS servers, and for the gateway's own tailnet
+
+Problem: "The private CA vouches only for the gateway (name constraints)" limited the names the
+CA can vouch for, but not what for: with no extended key usage, a device that installed
+`ca.crt` as a trusted root would accept a code-signing or S/MIME certificate made with a leaked
+`ca.key` for any name (name constraints limit TLS server names, not other purposes), and
+SECURITY.md's "vouches only for the gateway" overstated it. The base constraint `ts.net` also
+covered every tailnet's MagicDNS names and Tailscale Funnel's public hosts. Not a regression:
+before the name constraints the CA had no limit at all.
+
+Fix: a new CA (`tlsutil.CreateCA`) carries the extended key usage TLS server authentication,
+which is all the gateway's certificates (`CA.Issue`) are for. `caConstraints` narrows `ts.net`
+to the gateway's tailnet (`tail1234.ts.net`) when one of its names is in one
+(`-name gw.tail1234.ts.net`); without such a name it keeps `ts.net`, so a tailnet name
+configured later needs no new CA, and SECURITY.md says that this covers all of `ts.net`. A CA
+made earlier is kept as it is (SECURITY.md says how to replace it).
+
+- Verified here: `internal/gateway` `TestPrivateCAConstrained` (the CA's EKU is server
+  authentication only; certificates for code signing and e-mail protection made with its key
+  fail Go's chain verification, one for server authentication passes; the gateway's HTTPS
+  certificate verifies for every name as before) and `TestCATailnet` (with `gw.tail1234.ts.net`
+  configured: `pc.tail1234.ts.net` permitted, `gw.tail9999.ts.net`, `funnel-host.ts.net` and
+  `ts.net` not; two tailnets; `*.Tail1234.ts.net`; without a tailnet name all of `ts.net`).
+  Against the previous code both fail (EKU empty, the code-signing and e-mail certificates
+  verify; every tailnet permitted). OpenSSL 3.0.13 on a CA from `CreateCA`: `openssl verify
+  -purpose sslserver` of a server certificate is OK, `-purpose smimesign` of an e-mail
+  certificate fails with "error 26 at 1 depth lookup: unsuitable certificate purpose" (the CA's
+  EKU); `openssl x509 -ext extendedKeyUsage` shows "TLS Web Server Authentication".
+- Not GPU-specific (no AMD or NVIDIA step). Test on a client: with a new gateway data directory
+  (or after replacing the CA as SECURITY.md says), install `ca.crt` on Windows
+  (`certlm.msc` → Trusted Root Certification Authorities): its Details tab lists Enhanced Key
+  Usage "Server Authentication" and its General tab "Ensures the identity of a remote
+  computer" only; the dashboard opens without a warning in Chrome and Edge. With
+  `-name gw.<tailnet>.ts.net`, `openssl x509 -in ca.crt -noout -ext nameConstraints` lists
+  `DNS:<tailnet>.ts.net`, not `DNS:ts.net`.

@@ -106,12 +106,19 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   (`localhost`, `.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`, Tailscale's
   `.ts.net`), private, loopback, link-local and Tailscale/CGNAT addresses (RFC 1918,
   100.64.0.0/10, fc00::/7), and the names and addresses the gateway has when it creates the CA
-  (its host name, `-name` / `RECON_NAMES`, public addresses). A device that installs `ca.crt`
-  does not trust it for other websites, so a leaked `ca.key` cannot impersonate your bank or mail
-  to it. A `-name` added later that the CA does not cover makes the gateway create a new CA
-  (logged as a warning): install the new `ca.crt` in place of the old one. An address the CA does
-  not cover (a new public IPv6 address of the gateway) is left out of the HTTPS certificate:
-  name it with `-name` to reach the gateway by it. A CA made by a gateway from before this has no
+  (its host name, `-name` / `RECON_NAMES`, public addresses). `.ts.net` is narrowed to the
+  gateway's tailnet (`<tailnet>.ts.net`) when one of those names is in one (`gw.tail1234.ts.net`);
+  without such a name it covers all of `ts.net`, which includes other tailnets' names and
+  Tailscale Funnel's public hosts. A device that installs `ca.crt` does not trust it for other
+  websites, so a leaked `ca.key` cannot impersonate your bank or mail to it. Name constraints
+  limit names, not purposes: the CA is also limited to TLS server authentication (extended key
+  usage), so a verifier that applies a CA's extended key usage to its chain (Windows' certificate
+  store, OpenSSL, Go) refuses a code-signing or e-mail certificate made with a leaked `ca.key`. A
+  CA made before this has all of `ts.net` and no extended key usage; replace it as below to get
+  both. A `-name` added later that the CA does not cover makes the gateway create a new CA (logged
+  as a warning): install the new `ca.crt` in place of the old one. An address the CA does not
+  cover (a new public IPv6 address of the gateway) is left out of the HTTPS certificate: name it
+  with `-name` to reach the gateway by it. A CA made by a gateway from before this has no
   constraints and can vouch for any website; the gateway warns at every start. To replace it,
   delete `ca.crt` and `ca.key` in the data directory, restart the gateway, and install the new
   `ca.crt` in place of the old one on every device.

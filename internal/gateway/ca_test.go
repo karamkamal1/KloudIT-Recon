@@ -2,10 +2,16 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"io"
 	"log/slog"
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
 	"github.com/karamkamal1/kloudit-recon/web"
@@ -44,6 +50,29 @@ func TestPrivateCAConstrained(t *testing.T) {
 	}
 	first := s.ca.DER
 
+	// For TLS servers only: a code-signing or e-mail certificate made with
+	// the CA's key is refused by a verifier that applies the CA's EKU to the
+	// chain (Go here; Windows' certificate store too).
+	if eku := s.ca.Cert.ExtKeyUsage; len(eku) != 1 || eku[0] != x509.ExtKeyUsageServerAuth {
+		t.Errorf("the CA's extended key usage %v, want server authentication only", eku)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(s.ca.Cert)
+	for _, u := range []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning, x509.ExtKeyUsageEmailProtection, x509.ExtKeyUsageServerAuth} {
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: "recon.example.com"}, DNSNames: []string{"recon.example.com"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{u}}
+		key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, s.ca.Cert, &key.PublicKey, s.ca.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, _ := x509.ParseCertificate(der)
+		_, err = leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{u}})
+		if (err == nil) != (u == x509.ExtKeyUsageServerAuth) {
+			t.Errorf("a certificate for extended key usage %d made with the CA's key: verify error %v", u, err)
+		}
+	}
+
 	// Same names: the same CA.
 	if s = start("recon.example.com", "203.0.113.7"); !bytes.Equal(s.ca.DER, first) {
 		t.Fatal("the CA was made again for the same names")
@@ -64,5 +93,31 @@ func TestPrivateCAConstrained(t *testing.T) {
 	}
 	if s.ca.Constrained() {
 		t.Fatal("an older CA was replaced")
+	}
+}
+
+// TestCATailnet: a configured name in a tailnet narrows the CA's ts.net to
+// that tailnet, so it cannot vouch for another tailnet's names or Tailscale
+// Funnel's public hosts; without one the CA keeps ts.net (a tailnet name
+// configured later needs no new CA).
+func TestCATailnet(t *testing.T) {
+	for _, c := range []struct {
+		names []string
+		want  map[string]bool
+	}{
+		{[]string{"gw.tail1234.ts.net", "recon.example.com"}, map[string]bool{
+			"gw.tail1234.ts.net": true, "pc.tail1234.ts.net": true, "recon.example.com": true, "gw.lan": true, "100.101.102.103": true,
+			"gw.tail9999.ts.net": false, "funnel-host.ts.net": false, "ts.net": false}},
+		{[]string{"*.Tail1234.ts.net", "gw.tail5678.ts.net"}, map[string]bool{
+			"gw.tail1234.ts.net": true, "gw.tail5678.ts.net": true, "gw.tail9999.ts.net": false}},
+		{[]string{"recon.example.com", "ts.net.example.org"}, map[string]bool{
+			"gw.tail1234.ts.net": true, "gw.tail9999.ts.net": true, "ts.net.example.org": true}},
+	} {
+		cs := caConstraints(c.names)
+		for n, want := range c.want {
+			if got := tlsutil.Permits(cs.Domains, cs.Ranges, n); got != want {
+				t.Errorf("names %v: the CA permits %s: %v, want %v (domains %v)", c.names, n, got, want, cs.Domains)
+			}
+		}
 	}
 }

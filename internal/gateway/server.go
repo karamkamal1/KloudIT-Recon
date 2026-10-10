@@ -228,6 +228,9 @@ const caName = "KloudIT Recon Local CA"
 // MagicDNS names and addresses (100.64.0.0/10, fd7a:115c:a1e0::/48 in
 // fc00::/7), RFC 1918, loopback and link-local. Besides these, only the names
 // and addresses the gateway has when it creates the CA (caConstraints).
+// MagicDNS names are <machine>.<tailnet>.ts.net: ts.net covers every
+// tailnet's names and Tailscale Funnel's public hosts, so with a configured
+// name in a tailnet the CA covers that tailnet only (caConstraints).
 var (
 	caBaseDomains = []string{"localhost", "local", "lan", "home", "home.arpa", "internal", "localdomain", "ts.net"}
 	caBaseRanges  = func() []*net.IPNet {
@@ -244,9 +247,24 @@ var (
 // caConstraints are the name constraints of a new private CA: the base ones
 // plus each of names they do not cover (the configured names, this machine's
 // name and public addresses). A device that installs ca.crt then trusts it for
-// these alone, so a leaked ca.key cannot vouch for other websites.
+// these alone, so a leaked ca.key cannot vouch for other websites. A name in a
+// tailnet (gw.tail1234.ts.net) narrows ts.net to that tailnet
+// (tail1234.ts.net); without one the CA keeps all of ts.net, so a tailnet
+// name configured later needs no new CA.
 func caConstraints(names []string) *tlsutil.Constraints {
 	c := &tlsutil.Constraints{Domains: slices.Clone(caBaseDomains), Ranges: slices.Clone(caBaseRanges)}
+	var tailnets []string
+	for _, n := range names {
+		l := strings.Split(strings.TrimPrefix(strings.ToLower(n), "*."), ".")
+		if len(l) >= 3 && l[len(l)-2] == "ts" && l[len(l)-1] == "net" && l[len(l)-3] != "" {
+			if t := strings.Join(l[len(l)-3:], "."); !slices.Contains(tailnets, t) {
+				tailnets = append(tailnets, t)
+			}
+		}
+	}
+	if len(tailnets) > 0 {
+		c.Domains = append(slices.DeleteFunc(c.Domains, func(d string) bool { return d == "ts.net" }), tailnets...)
+	}
 	for _, n := range names {
 		if tlsutil.Permits(c.Domains, c.Ranges, n) {
 			continue
