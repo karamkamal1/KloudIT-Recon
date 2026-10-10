@@ -4561,12 +4561,15 @@ try {
 
   // The login page's ?next= (signed in: it redirects at once) stays on the
   // gateway: the URL parser reads a backslash as '/' and drops tabs, so
-  // '/\evil.example' and '/<TAB>/evil.example' name another host.
+  // '/\evil.example' and '/<TAB>/evil.example' name another host; dot
+  // segments resolve '/.//evil.example', '/%2e//evil.example' and
+  // '/a/..//evil.example' to the path '//evil.example', another host again.
   if (want('login redirect')) {
     const offsite = [];
     const evil = (u) => u.hostname === 'evil.example';
     await page.route(evil, (r) => { offsite.push(r.request().url()); return r.abort(); });
-    for (const [q, dest] of [['/%5Cevil.example', '/'], ['/%09/evil.example%2Fx', '/'], ['//evil.example', '/'], ['/%3Fe2e%3D1%23top', '/?e2e=1#top']]) {
+    for (const [q, dest] of [['/%5Cevil.example', '/'], ['/%09/evil.example%2Fx', '/'], ['//evil.example', '/'], ['/.//evil.example', '/'],
+      ['/%252e//evil.example%2Fx', '/'], ['/a/..//evil.example', '/'], ['/%3Fe2e%3D1%23top', '/?e2e=1#top']]) {
       offsite.length = 0;
       // 'commit': the redirect can come before the login page's load event.
       const at = await page.goto(`${base}/login?next=${q}`, { waitUntil: 'commit' })

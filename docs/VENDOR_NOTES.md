@@ -11449,3 +11449,25 @@ start (`helperFits`). host.log's `codec choice` and `coded-size alignment` lines
   at 2560×1440 without a toast.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same settings on an RTX 40/50 host
   stream `av1_nvenc_helper` at 1920×1080 without a toast (NVENC's caps report 1×1).
+
+### The login page's redirect and dot segments
+
+Problem: the fix in "The login page's redirect stays on the gateway" resolved `?next=` against
+the gateway's origin but then redirected to the resolved path, query and fragment. Resolving
+removes dot segments, so `?next=/.//evil.example`, `?next=/%252e//evil.example` (the value
+`/%2e//evil.example`) and `?next=/a/..//evil.example` became the path `//evil.example`, which
+`location.replace` reads as a protocol-relative URL: a user already signed in went to
+`https://evil.example/` with no interaction. The check before that fix (a value starting with
+`/` and not `//`) kept these on the gateway.
+
+Fix (`web/static/js/login.js`): `next()` returns the resolved absolute URL (`u.href`, on the
+gateway's origin by the existing check) and refuses (`/`) a value whose resolved path starts
+with `//`.
+
+- Verified here: browser E2E section "login redirect" (headless Chromium 141, signed in, its new
+  cases `/.//evil.example`, `/%252e//evil.example%2Fx` and `/a/..//evil.example`): with the
+  previous login.js the three went to `https://evil.example/` and `https://evil.example/x`
+  (13 of 16 checks passed); with the fix all 16 pass and they stay on `/`; the earlier cases
+  (`/%5C`, `/%09/`, `//`, and `/%3Fe2e%3D1%23top` reaching `/?e2e=1#top`) are unchanged.
+- Not GPU-specific: no AMD or NVIDIA check. Browser check: sign in, then open
+  `https://<gateway>/login?next=/.//example.com`: the dashboard opens, not example.com.
