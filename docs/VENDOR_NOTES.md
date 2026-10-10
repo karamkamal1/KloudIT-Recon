@@ -11472,6 +11472,45 @@ with `//`.
 - Not GPU-specific: no AMD or NVIDIA check. Browser check: sign in, then open
   `https://<gateway>/login?next=/.//example.com`: the dashboard opens, not example.com.
 
+### The page's CSP names a host's endpoints only on its stream page
+
+Problem: every page's CSP (login and the dashboard included, signed in or not) listed the
+direct endpoint of every online PC and the UDP relay ports in `connect-src`. Since "The direct
+path and the UDP relay over IPv6 (the page's CSP)", a PC whose tunnel reaches the gateway over
+IPv6 is listed as `https://*:<port>`, and a page opened at an IPv6 address with more than 32
+relay ports allows `https://*:*`: once any PC was on IPv6, a script injected into any page
+could send data to any host on that port. The header also told an unauthenticated visitor of
+the login page every online PC's address and direct port.
+
+Fix (`internal/gateway/routes.go` `csp`, `web/static/js/stream.js`): `connect-src` is `'self'`
+on every page. The stream page and its worker script, requested in a live login session and
+naming a PC (`/stream?host=<id>`, `/js/stream-worker.js?host=<id>`), add that PC's direct
+endpoint and the relay ports. The stream page now creates its worker with `?host=`: Chromium
+applies a dedicated worker's own script response CSP to the worker's connections, not the
+page's (checked in the sandbox's Chromium 141: a page allowing a source with a worker whose
+response does not allow it is blocked, and the reverse connects), and a 304 revalidation
+updates that CSP (the worker is created at each connect, after `/connect`, so it lists the
+PC's current endpoint).
+
+- Verified here: `go test ./internal/gateway/ -run TestCSPConnectSources` (through the
+  gateway's handler, with a session and without): the stream page and the worker at
+  `[fd00::1]:8443`, `gw.lan:8443` and `192.0.2.1` list only the named PC's endpoint (IPv6:
+  `https://*:48100`; IPv4 and names exact) and the relay ports; a PC without a direct path or
+  offline gives the relay ports only; the dashboard, login, another script, the API, the stream
+  page without `?host=`, without a session, with an expired session or an unknown cookie give
+  `'self'` only; 40 relay ports give `https://*:*` at an IPv6 address on the stream page and
+  `'self'` on the dashboard. Against the previous `routes.go` it fails (login listed
+  `https://*:48100 https://*:48102 https://192.0.2.10:48101 https://pc.lan:48103` and the relay
+  ports). Browser E2E: the new check "CSP connect-src: the host's endpoints on the stream page
+  and its worker only" and every streaming scenario (direct, relay, splice, WebSocket), whose
+  worker now loads with `?host=`, pass: the whole browser E2E (Chromium 141, under the shared
+  lock, with the login redirect fix above) passed 311 of 311 checks.
+- Not GPU-specific (no AMD or NVIDIA step). Browser check: in Chrome's DevTools (Network),
+  the dashboard's and the login page's `Content-Security-Policy` have `connect-src 'self'`;
+  the stream page's and the `stream-worker.js?host=…` request's list the PC's direct endpoint
+  and the relay ports; the stream connects `webtransport · direct` (and `· relay` with the
+  direct path blocked, hardware test plan 8.7).
+
 ### The DLLs next to a configured ffmpeg.exe
 
 Problem: `platform.AdminOnly` (the elevated agent's check of where it runs code from, "FFmpeg and

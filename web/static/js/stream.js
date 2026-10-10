@@ -393,7 +393,10 @@ async function connect() {
   S.renderer = null;
   S.bakeoff = null;
   const canvases = stageCanvases(S.present.paths);
-  const w = new Worker('/js/stream-worker.js', { type: 'module', name: 'recon-stream' });
+  // ?host=: the worker script's CSP allows this host's direct endpoint and
+  // the relay ports (the gateway lists them only for the stream page and its
+  // worker; the worker's connections follow its own script's policy).
+  const w = new Worker(`/js/stream-worker.js?host=${encodeURIComponent(hostId)}`, { type: 'module', name: 'recon-stream' });
   S.worker = w;
   // A worker being torn down (reconnect) still posts its last messages.
   w.onmessage = (ev) => { if (S.worker === w) onWorker(ev.data); };

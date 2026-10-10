@@ -772,7 +772,7 @@ async function closeHeaded() {
 // less) and flush() calls (never while streaming). Returns a function that
 // reads the counts.
 async function watchDecoder() {
-  const w = page.workers().filter((x) => x.url().endsWith('/js/stream-worker.js')).pop();
+  const w = page.workers().filter((x) => x.url().includes('/js/stream-worker.js')).pop();
   if (!w) return null;
   await w.evaluate(() => {
     const h = { decodes: 0, maxQueue: 0, flushes: 0 };
@@ -2128,7 +2128,7 @@ async function checkPickRule() {
 // scenario): without requestAnimationFrame in the worker the page's animation
 // frames tick it; with one that never calls back, the watchdog draws from a
 // timer (and logs it); with it restored, its ticks are used again.
-const streamWorker = () => page.workers().filter((x) => x.url().endsWith('/js/stream-worker.js')).pop();
+const streamWorker = () => page.workers().filter((x) => x.url().includes('/js/stream-worker.js')).pop();
 
 async function setPacing(mode) {
   await page.evaluate((m) => {
@@ -2874,7 +2874,7 @@ async function checkUnavailableSettings() {
 // decoder after every error and never showed a picture.
 async function checkHardwareDecoderFailure() {
   const install = (w) => {
-    if (!w.url().endsWith('/js/stream-worker.js')) return;
+    if (!w.url().includes('/js/stream-worker.js')) return;
     w.evaluate(() => {
       const Real = VideoDecoder;
       const hw = (c) => c?.hardwareAcceleration === 'prefer-hardware';
@@ -3484,7 +3484,7 @@ function restartsByReason(log) {
 // "[e2e: waiting for a key frame for N ms; ...]" or "[e2e: decoding, last
 // chunk fed N ms ago; ...]" and "worker timers up to N ms late in the last 2 s]".
 async function instrumentWorker(w) {
-  if (!w.url().endsWith('/js/stream-worker.js')) return;
+  if (!w.url().includes('/js/stream-worker.js')) return;
   await w.evaluate(() => {
     if (self.__e2eKey) return;
     // blockedMs: how long the worker's event loop held its 50 ms ticker more
@@ -3906,7 +3906,7 @@ async function checkLossHandling() {
   // A run the stream moves on from before it can tell, made to happen: the
   // decoder gets no chunks from the test on (no output, no error) until the
   // client resets it for the backlog and asks for a key frame.
-  const sw = page.workers().find((w) => w.url().endsWith('/js/stream-worker.js'));
+  const sw = page.workers().find((w) => w.url().includes('/js/stream-worker.js'));
   await sw.evaluate(() => {
     const p = VideoDecoder.prototype;
     const { decode, reset } = p;
@@ -5002,6 +5002,27 @@ try {
   check('anonymous API access rejected', st === 401, `status ${st}`);
   const csp = (await (await ap.goto(`${base}/`)).allHeaders())['content-security-policy'] || '';
   check('strict CSP served', csp.includes("script-src 'self'") && csp.includes("frame-ancestors 'none'"));
+  // connect-src: only the stream page and its worker, in a login session,
+  // name the host's direct endpoint and the relay ports (the worker's
+  // connections follow its own script's policy); every other page, and the
+  // stream page without a session, connect only to the gateway.
+  {
+    const connectSrc = (h) => ((h['content-security-policy'] || '').split(';').map((d) => d.trim()).find((d) => d.startsWith('connect-src ')) || '');
+    const hid = (await page.evaluate(async () => (await (await fetch('/api/hosts')).json()).hosts.find((h) => h.online)?.id)) || '';
+    const got = async (req, path) => connectSrc((await req.get(`${base}${path}`)).headers());
+    const signed = page.context().request;
+    const dash = await got(signed, '/');
+    const login = connectSrc(csp ? { 'content-security-policy': csp } : {});
+    const worker = await got(signed, `/js/stream-worker.js?host=${encodeURIComponent(hid)}`);
+    const stream = await got(signed, `/stream?host=${encodeURIComponent(hid)}`);
+    const anonStream = await got(anon.request, `/stream?host=${encodeURIComponent(hid)}`);
+    const direct = `https://127.0.0.1:${directPort}`;
+    const sources = worker.split(' ');
+    const relay = relayPorts.every((p) => sources.includes(`https://127.0.0.1:${p}`));
+    check('CSP connect-src: the host\'s endpoints on the stream page and its worker only', hid !== '' && dash === "connect-src 'self'" &&
+      login === "connect-src 'self'" && anonStream === "connect-src 'self'" && sources.includes(direct) && relay && stream === worker,
+      `dashboard "${dash}", anonymous "${login}" / "${anonStream}", worker "${worker}", stream "${stream}"`);
+  }
   await anon.close();
   void status;
 } catch (e) {

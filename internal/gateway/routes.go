@@ -92,37 +92,66 @@ func (s *Server) secure(next http.Handler) http.Handler {
 	})
 }
 
-// csp allows connections to self, every host's direct endpoint and the UDP
-// relay ports (under the name the page was loaded from).
+// csp allows connections to self. The stream page and its worker (cspHost:
+// /stream and /js/stream-worker.js naming a host, requested in a live login
+// session) also get that host's direct endpoint and the UDP relay ports (under
+// the name the page was loaded from); the worker's connections follow its own
+// script's policy (Chromium applies a dedicated worker's response CSP, not the
+// page's). Every other page (login, the dashboard) connects only to the
+// gateway, so a script injected there cannot send data to the wildcard
+// sources an IPv6 endpoint needs (cspSource), and an unauthenticated request
+// learns no host's address from the header.
 func (s *Server) csp(r *http.Request) string {
 	connect := []string{"'self'"}
-	seen := map[string]bool{}
-	add := func(src string) {
-		if !seen[src] {
-			seen[src] = true
-			connect = append(connect, src)
+	if id := s.cspHost(r); id != "" {
+		seen := map[string]bool{}
+		add := func(src string) {
+			if !seen[src] {
+				seen[src] = true
+				connect = append(connect, src)
+			}
 		}
-	}
-	s.hosts.mu.Lock()
-	for _, hc := range s.hosts.hosts {
-		if addr, port := hc.directEndpoint(); addr != "" {
-			add(cspSource(addr, strconv.Itoa(port)))
+		if hc := s.hosts.get(id); hc != nil {
+			if addr, port := hc.directEndpoint(); addr != "" {
+				add(cspSource(addr, strconv.Itoa(port)))
+			}
 		}
-	}
-	s.hosts.mu.Unlock()
-	if s.relay != nil {
-		host := requestHostname(r)
-		if len(s.relay.ports) > 32 {
-			add(cspSource(host, "*"))
-		} else {
-			for _, p := range s.relay.ports {
-				add(cspSource(host, strconv.Itoa(p)))
+		if s.relay != nil {
+			host := requestHostname(r)
+			if len(s.relay.ports) > 32 {
+				add(cspSource(host, "*"))
+			} else {
+				for _, p := range s.relay.ports {
+					add(cspSource(host, strconv.Itoa(p)))
+				}
 			}
 		}
 	}
 	return "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; " +
 		"connect-src " + strings.Join(connect, " ") + "; worker-src 'self'; manifest-src 'self'; media-src 'self' blob:; " +
 		"frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+}
+
+// cspHost returns the host (?host=) a request for the stream page or its
+// worker names, "" for any other request or one without a live login session.
+func (s *Server) cspHost(r *http.Request) string {
+	switch r.URL.Path {
+	case "/stream", "/stream.html", "/js/stream-worker.js":
+	default:
+		return ""
+	}
+	id := r.URL.Query().Get("host")
+	if id == "" {
+		return ""
+	}
+	c, err := r.Cookie(cookieName)
+	if err != nil || c.Value == "" {
+		return ""
+	}
+	if _, _, ok := s.liveSession(auth.TokenHash(c.Value), time.Now()); !ok {
+		return ""
+	}
+	return id
 }
 
 // cspSource is the connect-src source for https://host:port (port "*": any
@@ -195,21 +224,8 @@ func (s *Server) authed(h func(http.ResponseWriter, *http.Request, *User, *Login
 			return
 		}
 		th := auth.TokenHash(c.Value)
-		var ls LoginSession
-		var u User
-		ok := false
 		now := time.Now()
-		s.store.View(func(st *state) {
-			p := st.Sessions[th]
-			if p == nil || now.Sub(p.LastSeen) > s.cfg.SessionIdle || now.Sub(p.Created) > s.cfg.SessionMax {
-				return
-			}
-			usr := st.Users[p.Username]
-			if usr == nil {
-				return
-			}
-			ls, u, ok = *p, *usr, true
-		})
+		ls, u, ok := s.liveSession(th, now)
 		if !ok {
 			clearCookie(w)
 			jsonError(w, http.StatusUnauthorized, "session expired")
@@ -234,6 +250,23 @@ func (s *Server) authed(h func(http.ResponseWriter, *http.Request, *User, *Login
 		}
 		h(w, r, &u, &ls)
 	})
+}
+
+// liveSession returns the login session with token hash th and its user, ok
+// false when there is none, it has expired at now or its user is gone.
+func (s *Server) liveSession(th string, now time.Time) (ls LoginSession, u User, ok bool) {
+	s.store.View(func(st *state) {
+		p := st.Sessions[th]
+		if p == nil || now.Sub(p.LastSeen) > s.cfg.SessionIdle || now.Sub(p.Created) > s.cfg.SessionMax {
+			return
+		}
+		usr := st.Users[p.Username]
+		if usr == nil {
+			return
+		}
+		ls, u, ok = *p, *usr, true
+	})
+	return ls, u, ok
 }
 
 func clearCookie(w http.ResponseWriter) {

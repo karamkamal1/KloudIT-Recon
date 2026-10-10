@@ -83,13 +83,15 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - **WebSocket / WebTransport / UDP relay allocation:** need a same-origin `Origin` and a
   **single-use ticket** (192-bit, 60 s, bound to user and host, stored only as a hash).
 - **Headers:** a strict CSP (`script-src 'self'`, no inline script or style,
-  `frame-ancestors 'none'`, `connect-src` limited to self, the hosts' known direct endpoints and
+  `frame-ancestors 'none'`, `connect-src` limited to self; only the stream page and its worker
+  script, requested in a login session for a host (`?host=`), add that host's direct endpoint and
   the UDP relay ports on the name the page was loaded from; with more than 32 relay ports, any
   port on that name. CSP cannot name an IPv6 address: a direct endpoint at one, and the relay
   ports of a page opened at one, are allowed as any host on that port, or any https endpoint
-  with more than 32 relay ports), COOP/COEP (cross-origin isolation), CORP, `nosniff`,
-  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, Permissions-Policy, and HSTS when a
-  real certificate is configured.
+  with more than 32 relay ports. The login page and the dashboard allow self only, and an
+  unauthenticated request learns no host's address from the header), COOP/COEP (cross-origin
+  isolation), CORP, `nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+  Permissions-Policy, and HSTS when a real certificate is configured.
 - **Input limits:** JSON bodies are capped at 64 KiB with unknown fields rejected; control
   messages at 1 MiB, input events at 64 KiB, frames at 32 MiB, datagrams at 1200 B; strict parsing
   of every binary event.
