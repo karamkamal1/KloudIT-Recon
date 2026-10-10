@@ -197,7 +197,8 @@ async function checkProbe(name, method = null, rate = 30) {
   check(`${name}: frame barcode = seq on >= 90 % of sampled frames, capture→drawn histogram${method ? ` (read back by ${method})` : ''}`,
     pr?.mode === 'seq' && pr.sampled >= 10 && share >= 0.9 && hist > 0 && l?.n === hist && (!method || pr.method === method),
     pr ? `${pr.sampled} sampled (${pr.method}): ${matched} match seq (${(100 * share).toFixed(0)} %), ${pr.invalid} invalid, ${pr.mismatched} mismatched, ` +
-      `${pr.implausible} implausible, ${pr.skipped} skipped; capture→drawn p50/p95/p99 ${l ? `${l.p50}/${l.p95}/${l.p99} ms (n ${l.n})` : '—'}` +
+      `${pr.implausible} implausible, ${pr.skipped} skipped, ${pr.readbackFailed || 0} readbacks not completed (not sampled); ` +
+      `capture→drawn p50/p95/p99 ${l ? `${l.p50}/${l.p95}/${l.p99} ms (n ${l.n})` : '—'}` +
       `${pr.lastInvalid ? `; last invalid: seq ${pr.lastInvalid.seq}, cells ${pr.lastInvalid.luma}` : ''}` : 'no probe state');
   results.push({ probe: name, summary: pr });
   return pr;

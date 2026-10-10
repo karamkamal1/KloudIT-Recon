@@ -1998,7 +1998,7 @@ const PROBE_RANGE = [-100, 5000]; // ms; outside: implausible (clock or barcode 
 const PROBE_MAX_SAMPLES = 36000; // per-sample log for the export (5 h at 2/s)
 const probe = {
   mode: 'off', features: [], wallOffsetUs: null, epoch: 0, count: 0, inflight: 0, method: '',
-  startedAt: 0, sampled: 0, valid: 0, invalid: 0, mismatched: 0, implausible: 0, skipped: 0, noStamp: 0,
+  startedAt: 0, sampled: 0, valid: 0, invalid: 0, mismatched: 0, implausible: 0, skipped: 0, noStamp: 0, readbackFailed: 0,
   hist: new Map(), pageToCapture: new Map(), samples: [], lastError: '', lastInvalid: null,
 };
 
@@ -2008,7 +2008,7 @@ function updateProbeMode() {
   if (mode === probe.mode) return;
   Object.assign(probe, {
     mode, epoch: probe.epoch + 1, count: 0, method: '', startedAt: now(), sampled: 0, valid: 0, invalid: 0,
-    mismatched: 0, implausible: 0, skipped: 0, noStamp: 0, hist: new Map(), pageToCapture: new Map(), samples: [], lastInvalid: null,
+    mismatched: 0, implausible: 0, skipped: 0, noStamp: 0, readbackFailed: 0, hist: new Map(), pageToCapture: new Map(), samples: [], lastInvalid: null,
   });
   post('log', { text: `latency probe: ${mode}${mode === 'off' && prefs.latencyProbe ? ' (host sends no wall-clock offset)' : ''}` });
 }
@@ -2032,7 +2032,10 @@ function probeSample(req, drawn) {
   luma.then((l) => probeResult(req, drawn, l), (e) => {
     if (e?.message !== probe.lastError) post('log', { text: `latency probe readback failed: ${e?.message}` });
     probe.lastError = e?.message;
-    probeResult(req, drawn, null);
+    // A readback that did not complete (e.g. its fence did not pass in time
+    // on a starved software GPU) says nothing about the picture drawn: it is
+    // counted apart, not as an invalid barcode.
+    if (req.epoch === probe.epoch) probe.readbackFailed++;
   }).finally(() => { probe.inflight--; });
 }
 
@@ -2157,7 +2160,7 @@ function probeSummary(full) {
     mode: probe.mode, from: probe.mode === 'seq' ? 'capture' : 'page', every: PROBE_EVERY, method: probe.method,
     durationS: +((now() - probe.startedAt) / 1000).toFixed(1),
     sampled: probe.sampled, valid: probe.valid, invalid: probe.invalid, mismatched: probe.mismatched,
-    implausible: probe.implausible, skipped: probe.skipped, noStamp: probe.noStamp,
+    implausible: probe.implausible, skipped: probe.skipped, noStamp: probe.noStamp, readbackFailed: probe.readbackFailed,
     latency: histSummary(probe.hist), pageToCapture: histSummary(probe.pageToCapture), lastInvalid: probe.lastInvalid,
     histogram: Object.fromEntries([...probe.hist.entries()].sort((a, b) => a[0] - b[0])),
   };
