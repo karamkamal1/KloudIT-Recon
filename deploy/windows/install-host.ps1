@@ -33,7 +33,9 @@
   Where to install (default: Program Files\KlouditRecon). The logon task runs the agent from
   there elevated, so a folder outside Program Files is restricted to administrators (owner
   Administrators, users read and run), with everything already in it; a folder that is or
-  holds a link (junction, symbolic link) is refused.
+  holds a link (junction, symbolic link) is refused, and so is one below a folder that lets
+  non-administrators rename or delete what is in it (one a user made, D:\Games): install
+  directly under a drive's root (C:\KlouditRecon) or in Program Files.
 .PARAMETER FFmpegPath
   Use an existing ffmpeg.exe (FFmpeg 7.1+; 8.1+ recommended, older builds lack gfxcapture). The
   agent runs elevated and runs it only from a folder that only administrators can change, such
@@ -199,8 +201,22 @@ function Protect-AdminFolder([string]$dir, [switch]$Recurse) {
 # Creates $dir if needed and gives it to administrators for the files the elevated agent writes:
 # owner Administrators and exactly these entries (no inherited ones, none an earlier owner
 # added): Administrators and SYSTEM full control, and the icacls grant $reader. The files in it
-# get the same. A folder that is or holds a link (reparse point) is refused.
+# get the same. A folder that is or holds a link (reparse point) is refused. One that is there
+# already but fails the agent's rule (another owner, or others may change it: ProgramData lets
+# every user create folders, so a user could have made it first) is put aside and made anew,
+# not given a new ACL: a program could hold it open with the access it had, which a new ACL
+# does not take away.
 function Protect-AgentFolder([string]$dir, [string]$reader) {
+    if (Test-Path -LiteralPath $dir) {
+        Assert-NoLinks $dir
+        $acl = Get-PathAcl $dir
+        $why = Get-AclProblem $acl.Owner $acl.Rules $WriteRights
+        if ($why) {
+            $aside = "$dir.untrusted-" + [guid]::NewGuid().ToString('N').Substring(0, 8)
+            [IO.Directory]::Move($dir, $aside)
+            Write-Warning "$dir was not made by this installer ($why); moved it to $aside and made a new one. Delete $aside when you do not need what is in it."
+        }
+    }
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     Assert-NoLinks $dir
     icacls $dir /setowner '*S-1-5-32-544' | Out-Null
@@ -215,6 +231,92 @@ function Protect-AgentFolder([string]$dir, [string]$reader) {
         if ($LASTEXITCODE -eq 0) { icacls $f.FullName /reset | Out-Null }
         if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $($f.FullName) (icacls exit code $LASTEXITCODE)." }
     }
+}
+# The agent's ACL rules (internal/host/platform: CheckPrivateSD, checkAncestorSD) for a file or
+# folder's owner ($owner, a SID) and its allow rules ($rules: Sid, Rights, InheritOnly): the owner
+# is Administrators, SYSTEM or TrustedInstaller, and no rule gives anyone else one of $mask's
+# rights ($WriteRights: change it or what is in it; $ReplaceRights: rename or delete what is in
+# it, or grant itself that); with -SkipInheritOnly, rules that only reach what is created inside
+# do not count. Returns why not, or $null.
+$AdminSids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$OwnerSids = @('S-1-3-0', 'S-1-3-4') # CREATOR OWNER, OWNER RIGHTS: the owner, one of the above
+$WriteRights = 0x500D0156   # write data, append, write EA, delete child, write attributes, delete, write DAC, write owner, generic write, generic all
+$ReplaceRights = 0x100D0040 # delete child, delete, write DAC, write owner, generic all
+function Get-AclProblem([string]$owner, $rules, [int]$mask, [switch]$SkipInheritOnly) {
+    if ($owner -notin $AdminSids) { return "owned by $(Get-SidName $owner)" }
+    foreach ($r in $rules) {
+        if ($SkipInheritOnly -and $r.InheritOnly) { continue }
+        if ((([int]$r.Rights) -band $mask) -ne 0 -and $r.Sid -notin ($AdminSids + $OwnerSids)) {
+            return ('{0} may change it (rights 0x{1:X8})' -f (Get-SidName $r.Sid), [int]$r.Rights)
+        }
+    }
+    $null
+}
+function Get-SidName([string]$sid) {
+    try { ([Security.Principal.SecurityIdentifier]$sid).Translate([Security.Principal.NTAccount]).Value } catch { $sid }
+}
+# The owner and allow rules of $path, for Get-AclProblem.
+function Get-PathAcl([string]$path) {
+    $acl = Get-Acl -LiteralPath $path
+    $rules = @(foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($r.AccessControlType -eq 'Allow') {
+                [pscustomobject]@{ Sid = $r.IdentityReference.Value; Rights = [int]$r.FileSystemRights
+                    InheritOnly = ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0 }
+            }
+        })
+    [pscustomobject]@{ Owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value; Rules = $rules }
+}
+# The folders above a custom install folder. The agent runs what is in its install folder
+# elevated, trusting it by its path, so no one but administrators may rename or delete an entry
+# on the way there: whoever can rename the folder or one above it can put a folder of their own
+# with its programs in its place. Each folder above must pass the rule the agent applies to them
+# (checkAncestorSD). A folder directly under a drive's root passes (the root lets users add
+# folders, not rename or delete them); one under a folder a user made does not (D:\Games made by
+# a user, or by this script, inherits "Authenticated Users: Modify" from the drive's root).
+function Assert-AdminAncestors([string]$dir) {
+    $full = [IO.Path]::GetFullPath($dir).TrimEnd('\', '/')
+    for ($a = [IO.Path]::GetDirectoryName($full); $a; $a = [IO.Path]::GetDirectoryName($a)) {
+        $acl = Get-PathAcl $a
+        $why = Get-AclProblem $acl.Owner $acl.Rules $ReplaceRights -SkipInheritOnly
+        if ($why) {
+            throw ("$a, a folder above $dir, is not restricted to administrators ($why): its owner or that " +
+                "account could replace $dir and the programs the agent runs elevated from it. Install under " +
+                "Program Files (the default) or directly under a drive's root (C:\KlouditRecon), or restrict $a first.")
+        }
+    }
+}
+# The number of names (hard links) the file $path has. An elevated read or write of a file with
+# more than one reaches it under its other names too, which can be anywhere on the volume.
+function Get-LinkCount([string]$path) {
+    if (-not ('Recon.FileLinks' -as [type])) {
+        Add-Type -Namespace Recon -Name FileLinks -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct Info {
+    public uint Attributes, CreatedLow, CreatedHigh, AccessedLow, AccessedHigh, WrittenLow, WrittenHigh;
+    public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+}
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, out Info info);
+'@
+    }
+    $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try {
+        $info = New-Object 'Recon.FileLinks+Info'
+        if (-not [Recon.FileLinks]::GetFileInformationByHandle($fs.SafeFileHandle, [ref]$info)) {
+            throw "Could not read the link count of $path (error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+        }
+        [int]$info.Links
+    } finally { $fs.Dispose() }
+}
+# Writes $text (UTF-8 without a byte-order mark) to a new file under a random name next to $path
+# and renames it over $path, as recon-host writes host.json (platform.ReplaceFile): never into a
+# file that is there.
+function Write-NewFile([string]$path, [string]$text) {
+    $tmp = "$path." + [guid]::NewGuid().ToString('N') + '.tmp'
+    $bytes = (New-Object Text.UTF8Encoding $false).GetBytes($text)
+    $fs = New-Object IO.FileStream($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+    Move-Item -LiteralPath $tmp -Destination $path -Force
 }
 # Whether $dir is inside Program Files, whose access Windows already limits to administrators.
 function Test-InProgramFiles([string]$dir) {
@@ -244,6 +346,9 @@ if ($PairingCode -and $PairingCode.Trim() -notmatch '^recon1:[A-Za-z0-9_-]+$') {
 
 # --- Binaries ----------------------------------------------------------------
 Write-Step "Installing agent to $InstallDir"
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+$customDir = -not (Test-InProgramFiles $InstallDir)
+if ($customDir) { Assert-AdminAncestors $InstallDir } # before the agent is stopped
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 # Stop the agent and any encoder it started (ffmpeg / recon-encoder can outlive it
 # for a moment), and wait for them to exit so their files can be replaced.
@@ -251,11 +356,11 @@ $old = @(Get-Process -Name 'recon-hostw', 'recon-host' -ErrorAction SilentlyCont
     @(Get-Process -Name 'ffmpeg', 'recon-encoder' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir\*" })
 $old | Stop-Process -Force -ErrorAction SilentlyContinue
 $old | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 # The logon task runs the agent from here elevated, and the agent starts recon-encoder.exe,
 # FFmpeg and the helper's FFmpeg libraries from here: outside Program Files, only
-# administrators may change the folder (see Protect-AdminFolder).
-if (-not (Test-InProgramFiles $InstallDir)) {
+# administrators may change the folder (see Protect-AdminFolder) and the folders above it
+# (Assert-AdminAncestors).
+if ($customDir) {
     Protect-AdminFolder $InstallDir -Recurse
     Write-Step "Restricted $InstallDir to administrators (users read and run)"
 }
@@ -431,6 +536,15 @@ if ($InstallVirtualDisplay) {
 $cfgDir = Join-Path $env:APPDATA 'KlouditRecon'
 $cfgPath = Join-Path $cfgDir 'host.json'
 New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+# The folder is yours: any program you run can change it, and this script runs elevated. It reads
+# and writes host.json there only while neither the folder nor anything in it is a link (reparse
+# point) and host.json has no other name (hard link): either would make the elevated read or
+# write reach a file elsewhere. It writes host.json as a new file renamed over the old one, and
+# changes no permissions there (a new ACL would reach a hard-linked file elsewhere as well).
+Assert-NoLinks $cfgDir
+if ((Test-Path -LiteralPath $cfgPath) -and ($n = Get-LinkCount $cfgPath) -gt 1) {
+    throw "$cfgPath has $n names (hard links); remove the others, or delete it and pair again."
+}
 # The files the agent writes (host.log and its rotation, the virtual display's restore journal)
 # go to ProgramData\KlouditRecon\<user>, which only administrators can change (you can read it),
 # not next to host.json: the logon task runs the agent elevated, and any program you run could
@@ -461,11 +575,17 @@ if ($virtualDisplayReady -and -not $cfg.Contains('virtualDisplay')) {
     Write-Step 'host.json: "virtualDisplay": "auto" (a stream the monitor cannot show 1:1 gets a virtual monitor, the primary display while it runs; "off" turns it off)'
 }
 # UTF-8 without a byte-order mark (Set-Content -Encoding UTF8 adds one in PowerShell 5.1).
-[IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
-# Owner-only access: the file holds the host token.
+Write-NewFile $cfgPath ($cfg | ConvertTo-Json -Depth 5)
+# host.json holds the PC's token: only you, SYSTEM and administrators should read it. The folder
+# has that from your profile; this script does not change it (see above), it only checks.
 # (SIDs instead of names: "Administrators" is localised on non-English Windows.)
-icacls $cfgDir /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restrict access to $cfgDir (icacls exit code $LASTEXITCODE)." }
+$readers = @((Get-PathAcl $cfgDir).Rules | Where-Object {
+        $_.Sid -notin ($AdminSids + $OwnerSids + $identity.User.Value) -and (([int]$_.Rights) -band 0x90000001) -ne 0 })
+if ($readers) {
+    Write-Warning ("Others can read $cfgDir ($((@($readers | ForEach-Object { Get-SidName $_.Sid }) | Select-Object -Unique) -join ', ')), " +
+        "and host.json in it holds this PC's token. From a PowerShell that is not elevated, run: " +
+        "icacls `"$cfgDir`" /inheritance:r /grant:r `"${env:USERNAME}:(OI)(CI)F`" *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F")
+}
 
 $exe = Join-Path $InstallDir 'recon-host.exe'
 $exeW = Join-Path $InstallDir 'recon-hostw.exe'

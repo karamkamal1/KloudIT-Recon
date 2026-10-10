@@ -14,6 +14,7 @@ import (
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 	"github.com/karamkamal1/kloudit-recon/internal/host/vdisplay"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/transport"
@@ -487,9 +488,5 @@ func (c *Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return platform.ReplaceFile(path, b)
 }

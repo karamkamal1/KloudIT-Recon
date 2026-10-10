@@ -236,6 +236,19 @@ wiring, their AMD lines)
   encoder" checks too.
 - **If not, send**: the caps output and the session's host.log lines.
 
+**1.6 Folders others can change** (VENDOR_NOTES "Final review: gaps after the verification":
+"The installer around folders others can change"; run it before 1.1 on a fresh PC, or after
+`uninstall-host.ps1`, and install again as 1.1 afterwards)
+
+- **Do**: the four checks of that section's Windows test: an install under a folder a standard
+  user made (`C:\Games\Recon`), a `C:\ProgramData\KlouditRecon` a standard user made before
+  the install, a junction in `%APPDATA%\KlouditRecon`, and `notes.txt` there before uninstalling.
+- **Pass**: the first stops with `is not restricted to administrators` and changes nothing; the
+  second is moved aside with a warning and the new folder's owner is Administrators; the third
+  stops with `is a link (reparse point)`; the uninstaller leaves the folder with `notes.txt` and
+  a warning, and removes host.json.
+- **If not, send**: the installer's output and `icacls` of the folders named.
+
 ### Stage 2: The FFmpeg pipeline (`"pipeline": "ffmpeg"`)
 
 This is the fallback path, and the one with the fewest moving parts. Set `"pipeline": "ffmpeg"`

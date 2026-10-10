@@ -180,7 +180,8 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
 - FFmpeg runs as a child process with an argument list (no shell). The only free-text option (the
   window-title regex) is checked against a strict allow-list and escaped for the filtergraph,
   which blocks filter injection such as `movie=`.
-- The host config holding the token is created in the user's profile with owner-only ACLs.
+- The host config holding the token is in the user's profile, which only the user, SYSTEM and
+  Administrators can read (the installer warns when the folder lets anyone else read it).
 - The firewall rule for the direct path covers only the Private and Domain profiles and only the
   agent executable. The UDP relay needs no inbound rule: the host's relay socket sends to the
   gateway's allocation ports first, and it is the PC's stateful firewall (and a NAT in front of
@@ -202,9 +203,9 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   administrators can change: the file or folder, the folder it is in and the files directly in
   that folder (where Windows looks first for the DLLs a program there loads, such as a shared
   FFmpeg build's next to `ffmpeg.exe`) pass the check above, no folder above lets anyone else
-  rename or delete its entries, and no part is a link. A configured path that fails is ignored for the default
-  (`host config "ffmpeg" ignored` in host.log); without an elevated token (a standard user's
-  agent) nothing is checked, since nothing is gained.
+  rename or delete its entries, and no part is a link. A configured path that fails is ignored for
+  the default (`host config "ffmpeg" ignored` in host.log); without an elevated token (a standard
+  user's agent) nothing is checked, since nothing is gained.
 - For the same reason the elevated agent writes no file in a folder the user can change: there,
   any program the user runs could turn the folder or its files into links (a junction to
   `\RPC Control` and object manager symbolic links) that make the elevated agent create, append
@@ -222,6 +223,27 @@ Browser ──(TLS/QUIC, session cookie, CSRF token)──► Gateway ──(QUI
   commands you start yourself still write there: `recon-host pair` (host.json; the installer
   runs it elevated once with `-PairingCode`) and `recon-host qualify` (`live-bitrate.json`, and
   its working files in `%TEMP%`); run them from a PowerShell that is not elevated where you can.
+  Both write a new file under a random name and rename it over the old one, so a link or hard
+  link planted in the folder is replaced, not written through.
+- The installer and the uninstaller run elevated and still work in that folder. The installer
+  reads and rewrites `host.json` (as a new file renamed over the old one) only while neither
+  the folder nor anything in it is a link and `host.json` has no other name (hard link), and it
+  changes no permissions there: the folder keeps your profile's ACL (you, SYSTEM and
+  Administrators), and the installer only warns, with the `icacls` command to run unelevated,
+  when others may read it. A new ACL would reach a hard-linked file elsewhere as well. The
+  uninstaller deletes only the files recon-host and the installer write there, each by its name
+  (a link as a link), and the folder when that empties it. What remains is a race: a program
+  you run that swaps the folder for a link between the installer's check and its write could
+  still redirect that write. Run the installer only while no untrusted program runs as you.
+- The installer gives `%ProgramData%\KlouditRecon` and `<user>` in it their ACL only when it
+  made them, or when they already pass the agent's check: a folder there that someone else made
+  (every user may create folders in ProgramData) is moved aside (`KlouditRecon.untrusted-…`)
+  and made anew, since a program could hold it open with the access it had. A custom
+  `-InstallDir` outside Program Files is refused when a folder above it lets anyone but
+  administrators rename or delete what is in it (the rule the agent applies to the folders above
+  the places it runs code from): the logon task runs `recon-hostw.exe` from the install folder
+  elevated, and whoever could rename it could put a folder of their own in its place. A folder
+  directly under a drive's root, such as `C:\KlouditRecon`, passes.
 
 ## Gateway hardening (systemd)
 

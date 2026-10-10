@@ -23,6 +23,33 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([S
     throw 'Run this script from an elevated PowerShell (Run as administrator).'
 }
 
+# %APPDATA%\KlouditRecon is the user's own folder: any program the user runs can put links
+# (junctions, symbolic links) in it, or make it one, and turn this elevated script's recursive
+# delete into a delete elsewhere. Only the files recon-host and the installer write there are
+# removed, each by its name and not through a link (a link is removed itself), then the folder if
+# that empties it; anything else is left, with a warning, for the user to delete.
+function Remove-ConfigFolder([string]$dir) {
+    $item = Get-Item -LiteralPath $dir -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        [IO.Directory]::Delete($dir) # the link, not what it points at
+        return
+    }
+    $ours = '^(host\.json|live-bitrate\.json|host\.log|host\.log\.old|vdisplay-restore\.json)(\.tmp|\.[0-9]+\.tmp|\.[0-9a-f]{32}\.tmp)?$'
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Force)) {
+        if ($f.Name -notmatch $ours) { continue }
+        if ($f.PSIsContainer) {
+            if (($f.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [IO.Directory]::Delete($f.FullName) }
+            continue
+        }
+        [IO.File]::Delete($f.FullName) # a symbolic link or a hard link: only this name
+    }
+    if (@(Get-ChildItem -LiteralPath $dir -Force).Count -eq 0) {
+        [IO.Directory]::Delete($dir)
+    } else {
+        Write-Warning "Left $dir, which holds files KloudIT Recon did not write there; delete it yourself from a PowerShell that is not elevated."
+    }
+}
+
 Stop-ScheduledTask -TaskName 'KloudIT Recon Host' -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'KloudIT Recon Host' -Confirm:$false -ErrorAction SilentlyContinue
 Get-NetFirewallRule -DisplayName 'KloudIT Recon host (direct path)' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -59,7 +86,7 @@ if ($RemoveVirtualDisplay) {
 if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
 if (-not $KeepConfig) {
     $cfgDir = Join-Path $env:APPDATA 'KlouditRecon'
-    if (Test-Path $cfgDir) { Remove-Item -Recurse -Force $cfgDir }
+    if (Test-Path -LiteralPath $cfgDir) { Remove-ConfigFolder $cfgDir }
     $stateRoot = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'KlouditRecon'
     $stateDir = Join-Path $stateRoot (($identity.Name -split '\\')[-1])
     if (Test-Path -LiteralPath $stateDir) { Remove-Item -LiteralPath $stateDir -Recurse -Force }

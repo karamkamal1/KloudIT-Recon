@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 )
 
 // FileName is the results file, next to the host config (host.json).
@@ -111,11 +112,7 @@ func (r *Results) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return platform.ReplaceFile(path, append(b, '\n'))
 }
 
 // Load reads a results file; a missing file is (nil, nil).

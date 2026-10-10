@@ -11574,3 +11574,88 @@ made earlier is kept as it is (SECURITY.md says how to replace it).
   computer" only; the dashboard opens without a warning in Chrome and Edge. With
   `-name gw.<tailnet>.ts.net`, `openssl x509 -in ca.crt -noout -ext nameConstraints` lists
   `DNS:<tailnet>.ts.net`, not `DNS:ts.net`.
+
+### The installer around folders others can change
+
+Problem (three security-sweep findings, the third from before this review):
+- A custom `-InstallDir` outside Program Files was restricted to administrators
+  (`Protect-AdminFolder`), but not the folders above it, and the agent trusts what is in its
+  install folder by its path (`checkCodePath`). Under a folder a user made (`D:\Games`, which
+  inherits "Authenticated Users: Modify" from the drive's root), that user could rename the
+  install folder and put a folder of their own, with their own `recon-hostw.exe`, in its place:
+  the logon task then runs it elevated.
+- `Protect-AgentFolder` reused `%ProgramData%\KlouditRecon` and `<user>` in it when they were
+  already there and only gave them a new ACL. Every user may create folders in ProgramData, so
+  a user could have made them first and kept a handle open with the access they had, which a
+  new ACL does not take away.
+- In the user's own `%APPDATA%\KlouditRecon` the elevated installer read and wrote host.json
+  with no link check (`WriteAllText` writes through a hard link into the file it shares), ran
+  `icacls` with inheritable grants on the folder (which reaches every file in it, a hard link to
+  a system file included: the CVE-2019-0841 pattern), and the elevated uninstaller removed the
+  folder with `Remove-Item -Recurse` (Windows PowerShell 5.1 follows junctions in it).
+
+Fix (`deploy/windows/install-host.ps1`, `uninstall-host.ps1`, `internal/host/platform/files.go`):
+- `Assert-AdminAncestors`: before anything is stopped, every folder above a custom install
+  folder must pass the rule the agent applies to the folders above the places it runs code from
+  (`checkAncestorSD`: owned by Administrators, SYSTEM or TrustedInstaller, no rule for the
+  folder itself gives anyone else delete, delete-child, write-DAC or write-owner); otherwise the
+  installer stops and says to install in Program Files or directly under a drive's root.
+  `Get-AclProblem` is the agent's rule in PowerShell (`Get-PathAcl` reads `Get-Acl`).
+- `Protect-AgentFolder`: a folder already there that fails the agent's own check
+  (`CheckPrivateSD`: another owner, or others may change it) is moved aside to
+  `<folder>.untrusted-<8 hex>` with a warning and made anew; the installer's own folder from an
+  earlier run passes and is kept with its log.
+- The config folder: the installer refuses links in it (`Assert-NoLinks`) and a host.json with
+  more than one name (`Get-LinkCount`, `GetFileInformationByHandle`), writes host.json as a new
+  file under a random name renamed over the old one (`Write-NewFile`), and no longer changes the
+  folder's ACL: it has the profile's (the user, SYSTEM, Administrators) by inheritance, and the
+  installer only warns, with the `icacls` command to run unelevated, when others may read it.
+  `recon-host pair` and `qualify` (Go: `Config.Save`, `qualify.Results.Save`) now write through
+  `platform.ReplaceFile`, a new file created exclusively under a random name and renamed over
+  the old one, instead of `host.json.tmp`, which a planted link would redirect. The uninstaller
+  (`Remove-ConfigFolder`) deletes only the files recon-host and the installer write there, by
+  name and a link as a link, then the folder if that empties it, and otherwise leaves it with a
+  warning. SECURITY.md lists these elevated operations and the race that remains (a program that
+  swaps the folder for a link between the check and the write).
+
+Not done, with reasons: the agent does not check its own install folder at start (the sweep's
+optional item): the logon task starts `recon-hostw.exe` from that folder, so a folder swapped
+for an attacker's runs the attacker's program, and no check inside the agent can catch that;
+only the installer can refuse such a place. A custom install folder that a user made before the
+install is still given the administrators' ACL rather than moved aside (moving it would also
+move an install the script runs from, `-InstallDir` with the script in it); "A custom install
+folder is restricted to administrators" already says to install into a new folder.
+
+- Verified here (no Windows): the parser check of both scripts (pwsh 7); a pwsh script that
+  takes the new functions from the scripts' syntax trees and runs them on Linux with the
+  Windows-only parts stubbed (`Get-PathAcl` by path, `icacls`): `Get-AclProblem` on the SDDL cases
+  of `TestCheckAncestorSD` and `TestCheckPrivateSD` (drive root and Program Files pass as
+  ancestors; a user-made folder, FILE_DELETE_CHILD or WRITE_DAC alone, a user owner fail; the
+  agent folder's ACL passes the private rule, a folder made in ProgramData with Users' write
+  and an inherit-only write fail); `Assert-AdminAncestors` walks every folder up to the root and
+  refuses one that fails, naming it; `Protect-AgentFolder` moves a user-owned folder aside (its
+  planted file goes with it) and keeps its own; `Write-NewFile` over a host.json hard-linked to
+  another file leaves that file unchanged (with the previous `WriteAllText` it was overwritten,
+  and the previous `Protect-AgentFolder` kept the user's folder with its planted file);
+  `Remove-ConfigFolder` removes host.json, live-bitrate.json and both temporary-name patterns,
+  a symbolic link named host.log and a linked folder named vdisplay-restore.json as links (their
+  targets intact), leaves another linked folder and notes.txt with the warning, removes an
+  emptied folder, and only the link when the folder is one; `Get-LinkCount`'s P/Invoke
+  compiles (52-byte structure; the call needs Windows). Go: `internal/host/platform`
+  `TestReplaceFileNoFollow` (a symbolic link planted at `host.json.tmp` and a host.json
+  hard-linked to another file: neither target changes, mode 0600, no temporary file left; with
+  the previous fixed-name `os.WriteFile` the linked file was overwritten); the Windows test
+  binary passes it under Wine 9 too.
+- Not GPU-specific (no AMD or NVIDIA step). Test on Windows (hardware test plan 1.6): as a
+  standard user `mkdir C:\Games`, then elevated `.\install-host.ps1 -InstallDir C:\Games\Recon
+  -NoStart`: it stops with `C:\Games, a folder above C:\Games\Recon, is not restricted to
+  administrators (owned by <PC>\<user>)`; a running agent keeps running and nothing is copied
+  (only the empty folder is made); `-InstallDir
+  C:\KlouditRecon` installs. As a standard user before a first install, `mkdir
+  C:\ProgramData\KlouditRecon`: the installer warns `... was not made by this installer ...;
+  moved it to C:\ProgramData\KlouditRecon.untrusted-...`, and `(Get-Acl
+  C:\ProgramData\KlouditRecon).Owner` is `BUILTIN\Administrators`; a second run warns nothing
+  and host.log stays. As a standard user `cmd /c mklink /J %APPDATA%\KlouditRecon\sub
+  C:\Windows\Temp`: the installer stops (`... is a link (reparse point)`); remove it. `icacls
+  %APPDATA%\KlouditRecon` shows the same entries before and after an install. Put `notes.txt`
+  in that folder and run `uninstall-host.ps1`: it removes host.json and warns `Left ...`.
