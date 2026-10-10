@@ -4676,7 +4676,6 @@ try {
       }
     }
     writeFileSync(inputLog, '');
-    const scC0 = cpuTimes(); // the stream's whole life (its cumulative counters)
     await page.goto(`${base}/`);
     await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify({ stats: true, ...p })), { ...PREFS_2D, ...sc.prefs });
     await page.evaluate((on) => (on ? localStorage.setItem('e2e.hdrDisplay', '1') : localStorage.removeItem('e2e.hdrDisplay')), !!sc.hdr);
@@ -4700,6 +4699,11 @@ try {
     await page.click('#btn-start');
     await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
     const firstFrameMs = Date.now() - t0;
+    // The stream's whole life (its cumulative counters) from its first frame
+    // on: not the page load and the connection before it, which leave the
+    // CPUs idle for seconds where a path times out (the splice scenario's
+    // UDP relay, 3 s) and so hid a stream that had no CPU to spare.
+    const scC0 = cpuTimes();
     if (sc.blockUdpRelay) await ctx.unroute('**/api/relay/udp*', blockRoute);
     const conn = await page.evaluate(() => window.__recon.conn);
     check(`${sc.name}: connected`, conn.transport === sc.expect[0] && conn.path === sc.expect[1] && conn.renderer === sc.prefs.renderer,
