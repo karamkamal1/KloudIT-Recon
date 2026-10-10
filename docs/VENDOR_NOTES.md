@@ -11659,3 +11659,17 @@ folder is restricted to administrators" already says to install into a new folde
   C:\Windows\Temp`: the installer stops (`... is a link (reparse point)`); remove it. `icacls
   %APPDATA%\KlouditRecon` shows the same entries before and after an install. Put `notes.txt`
   in that folder and run `uninstall-host.ps1`: it removes host.json and warns `Left ...`.
+
+### Runs with these changes
+
+On the section's last code commit (7cc95f2): `gofmt -l` prints nothing; `go vet ./...` and
+`GOOS=windows go vet ./...` pass; `go test` of every package but `internal/e2e` passes, and
+`go test -race` of the changed tests (`internal/host` alignment guard, codec choice, helper
+source and probe sample; `internal/gateway` CSP and CA; `internal/host/platform`) passes. Under
+the shared lock `go test ./internal/e2e/...` passes (201 s) and the whole browser E2E (Chromium
+141) passes 311 of 311 checks (also 311 of 311 before the CA, AdminOnly and installer commits).
+`make helper-test` under Wine 9 with Xvfb passes (78 tests pass, 9 skip: no FFmpeg shared
+build, AMF or NVENC runtime); without an X display two tests that need Wine's D3D11 device
+(`TestHelperVideoStallRestart`, `TestQualifyNvencTestDouble`) fail at device creation
+(`DXGI_ERROR_UNSUPPORTED`), as the Makefile says to run it under Xvfb. Both installer scripts
+parse with pwsh 7, and the pwsh run of their new functions passes 20 of 20 checks.
