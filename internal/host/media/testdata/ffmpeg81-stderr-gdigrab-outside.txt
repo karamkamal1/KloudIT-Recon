@@ -1,0 +1,3 @@
+[in#0 @ 00007fffff36c340] Capture area (1280,0),(2560,720) extends outside window area (0,0),(1280,720)Error opening input: I/O error
+Error opening input file desktop.
+Error opening input files: I/O error

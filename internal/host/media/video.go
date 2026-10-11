@@ -84,6 +84,9 @@ type VideoEvent struct {
 	Failed       *Params
 	Live         bool
 	EncoderFault bool
+	// Capture, with Err: the capture failure FFmpeg's stderr shows
+	// (ClassifyCapture; Fault CaptureFaultNone when none is recognised).
+	CaptureFailure CaptureFailure
 	// HealFrames, with Config: how many frames after a lost one the
 	// generation's encoder needs to restore the picture by itself
 	// (HealFrames of its arguments; 0: a lost frame needs a key frame).
@@ -437,12 +440,13 @@ func (v *Video) read(pr *encProc, stdout io.Reader) {
 				}
 				msg := pr.stderr.String()
 				fault := encoderFault(msg, pr.params.Encoder.Name)
+				cf := ClassifyCapture(msg)
 				if msg == "" {
 					msg = err.Error()
 				}
 				failed := pr.params
 				v.emit(VideoEvent{Err: fmt.Errorf("encoder %s exited: %s", pr.params.Encoder.Name, msg), Failed: &failed, Live: live,
-					EncoderFault: fault})
+					EncoderFault: fault, CaptureFailure: cf})
 			}
 			return
 		}

@@ -33,6 +33,10 @@ func caps81(t *testing.T) *Caps {
 		t.Fatal(err)
 	}
 	c.Filters = parseFilters(out) // as Probe does
+	if out, err = os.ReadFile("testdata/ffmpeg81-devices.txt"); err != nil {
+		t.Fatal(err)
+	}
+	c.Devices = parseDevices(out)
 	if out, err = os.ReadFile("testdata/ffmpeg81-h-vsrc_amf.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +115,7 @@ func TestWriteReport(t *testing.T) {
 		want = append(want, "            "+l)
 	}
 	want = append(want,
-		"capture:    ddagrab=true gfxcapture=true vsrc_amf=true",
+		"capture:    ddagrab=true gfxcapture=true vsrc_amf=true gdigrab=true",
 		"session:    ddagrab output 0 at its native size, 60 fps, 30 Mbit/s, quality balanced, adaptive bitrate, capture timestamps (command lines below)")
 	if len(lines) < len(want) || !slices.Equal(lines[:len(want)], want) {
 		t.Fatalf("report head:\n%s\nwant:\n%s", strings.Join(lines[:min(len(lines), len(want))], "\n"), strings.Join(want, "\n"))

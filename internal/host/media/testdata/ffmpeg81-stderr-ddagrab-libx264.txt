@@ -1,0 +1,9 @@
+[Parsed_ddagrab_0 @ 00007fffff387a80] Failed to create D3D11VA device.
+[Parsed_ddagrab_0 @ 00007fffff387a80] Failed to configure output pad on Parsed_ddagrab_0
+[fc#0 @ 00007fffff36b1c0] Error configuring filter graph: Unknown error occurred
+[fc#0 @ 00007fffff36b1c0] Task finished with error code: -1313558101 (Unknown error occurred)
+[vost#0:0/libx264 @ 00007fffff36e2c0] [enc:libx264 @ 00007fffff36e9c0] Could not open encoder before EOF
+[vost#0:0/libx264 @ 00007fffff36e2c0] Task finished with error code: -22 (Invalid argument)
+[fc#0 @ 00007fffff36b1c0] Terminating thread with return code -1313558101 (Unknown error occurred)
+[vost#0:0/libx264 @ 00007fffff36e2c0] Terminating thread with return code -22 (Invalid argument)
+[out#0/nut @ 00007fffff36c780] Nothing was written into output file, because at least one of its streams received no packets.

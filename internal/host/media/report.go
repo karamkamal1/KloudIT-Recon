@@ -23,7 +23,15 @@ func (c *Caps) WriteReport(w io.Writer, sample func(EncoderInfo) Params) {
 	for _, l := range version {
 		fmt.Fprintf(w, "            %s\n", l)
 	}
-	fmt.Fprintf(w, "capture:    ddagrab=%v gfxcapture=%v vsrc_amf=%v\n", c.Filters["ddagrab"], c.Filters["gfxcapture"], c.Filters["vsrc_amf"])
+	fmt.Fprintf(w, "capture:    ddagrab=%v gfxcapture=%v vsrc_amf=%v gdigrab=%v\n", c.Filters["ddagrab"], c.Filters["gfxcapture"],
+		c.Filters["vsrc_amf"], c.CanGDIGrab())
+	if why := c.GPUCaptureBlocked(); why != "" {
+		use := "using gdigrab (GDI: more CPU and latency)"
+		if !c.CanGDIGrab() {
+			use = "no gdigrab in this ffmpeg either: sessions cannot capture the screen"
+		}
+		fmt.Fprintf(w, "capture:    ddagrab unavailable (%s): %s\n", why, use)
+	}
 	session := ""
 	for _, e := range c.Encoders {
 		p := sample(e)
@@ -66,6 +74,8 @@ func describeSample(p Params) string {
 		src = fmt.Sprintf("AMD Direct Capture (vsrc_amf) of output %d at its native size", p.Source.Output)
 	case "gfxcapture", "x11grab":
 		src = fmt.Sprintf("%s of a %dx%d monitor", p.Source.Backend, p.Source.NativeW, p.Source.NativeH)
+	case "gdigrab":
+		src = fmt.Sprintf("gdigrab (GDI) of the %dx%d monitor at (%d,%d)", p.Source.NativeW, p.Source.NativeH, p.Source.X, p.Source.Y)
 	case "test":
 		src = fmt.Sprintf("test pattern %dx%d", p.Source.NativeW, p.Source.NativeH)
 	default:

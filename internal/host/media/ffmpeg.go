@@ -39,9 +39,12 @@ type EncoderInfo struct {
 
 // Caps is the result of probing the local ffmpeg build and GPU.
 type Caps struct {
-	FFmpeg   string
-	Version  string
-	Filters  map[string]bool
+	FFmpeg  string
+	Version string
+	Filters map[string]bool
+	// Devices are the capture input devices this build has (probeDevices:
+	// gdigrab).
+	Devices  map[string]bool
 	Encoders []EncoderInfo     // usable encoders, best first
 	Rejected map[string]string // encoder built into ffmpeg -> why its test encode failed
 	options  map[string]map[string]bool
@@ -57,6 +60,9 @@ type Caps struct {
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
 	hdrTest      bool // HDRTestGraph and libsvtav1's 10-bit HDR10 encode work
+	// gpuCapture says why GPU capture (ddagrab, gfxcapture) cannot work on
+	// this PC (CheckGPUCapture; "" = it can, or the probe could not tell).
+	gpuCapture string
 	// intraRefresh holds the periodic intra refresh mode (IntraRefreshOn,
 	// IntraRefreshSingleSlice) of the encoders that run with one.
 	intraRefresh map[string]string
@@ -168,6 +174,8 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
 	c.Filters = parseFilters(out)
+	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-devices").Output()
+	c.Devices = parseDevices(out)
 	if c.Filters["vsrc_amf"] {
 		help, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-h", "filter=vsrc_amf").Output()
 		if err := checkAMFCapture(help, c.Filters); err != nil {
@@ -206,6 +214,23 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			mu.Unlock()
 			if err != nil && log != nil {
 				log.Info("test pattern frame barcode unavailable", "err", err)
+			}
+		}()
+	}
+	if c.Filters["ddagrab"] {
+		wg.Add(1)
+		go func() { // alongside the encoder tests, like the barcode's
+			defer wg.Done()
+			blocked, detail := CheckGPUCapture(ctx, ffmpeg)
+			mu.Lock()
+			c.gpuCapture = blocked
+			mu.Unlock()
+			switch {
+			case blocked != "" && log != nil:
+				log.Warn("no GPU screen capture on this PC: sessions capture with GDI (gdigrab), which costs more CPU", "reason", blocked,
+					"ffmpeg", detail, "gdigrab", c.CanGDIGrab())
+			case detail != "" && log != nil:
+				log.Info("GPU screen capture test inconclusive, sessions use it", "detail", detail)
 			}
 		}()
 	}
@@ -480,6 +505,22 @@ func testBarcode(ctx context.Context, ffmpeg string) error {
 var probeFilters = []string{"ddagrab", "gfxcapture", "vsrc_amf", "hwmap", "hwdownload", "scale_vaapi", "vpp_qsv", "realtime",
 	"testsrc2", "settb", "setpts", "drawbox", "select", "split", "crop", "overlay", "zscale"}
 
+// probeDevices are the input devices BuildArgs may use.
+var probeDevices = []string{"gdigrab"}
+
+// parseDevices returns which of probeDevices "ffmpeg -devices" lists as
+// input (demuxing) devices: " D  gdigrab         GDI API Windows frame
+// grabber".
+func parseDevices(out []byte) map[string]bool {
+	m := map[string]bool{}
+	for _, d := range probeDevices {
+		if regexp.MustCompile(`(?m)^\s*DE?\s+` + regexp.QuoteMeta(d) + `\s`).Match(out) {
+			m[d] = true
+		}
+	}
+	return m
+}
+
 // parseFilters returns which of probeFilters "ffmpeg -filters" lists.
 func parseFilters(out []byte) map[string]bool {
 	m := map[string]bool{}
@@ -691,14 +732,17 @@ func (a Alignment) Pads(w, h int) bool {
 
 // Source selects what is captured.
 type Source struct {
-	Backend  string // ddagrab | gfxcapture | amf | x11grab | test
+	Backend  string // ddagrab | gfxcapture | amf | gdigrab | x11grab | test
 	Output   int    // ddagrab output_idx / amf monitor_index: DXGI output index on adapter 0
 	HMonitor uint64 // gfxcapture monitor handle
 	Window   string // gfxcapture window title regex (optional)
 	Display  string // x11grab display, e.g. ":0.0"
-	X, Y     int    // x11grab offset
-	NativeW  int    // native size of the captured surface (x11grab/test; ddagrab and gfxcapture: the monitor's, informational)
-	NativeH  int
+	X, Y     int    // x11grab offset; gdigrab: the monitor's top-left corner on the virtual desktop (physical pixels)
+	// NativeW x NativeH is the native size of the captured surface
+	// (x11grab, test; gdigrab: the area it captures; ddagrab and
+	// gfxcapture: the monitor's, informational).
+	NativeW int
+	NativeH int
 }
 
 // Params fully describes one encoder generation.
@@ -776,7 +820,7 @@ func (p Params) OutputSize() (w, h int) {
 			w, h = 1280, 720
 		}
 		return w, h + p.TestPad
-	case "x11grab":
+	case "x11grab", "gdigrab":
 		w, h = p.Source.NativeW, p.Source.NativeH
 		if p.Width > 0 && p.Height > 0 && w > 0 && h > 0 {
 			return FitAspect(p.Width, p.Height, w, h)
@@ -964,6 +1008,29 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		// "Non-monotonic DTS" warning). The wall clock in µs keeps them
 		// apart, also when the client gets no capture stamps.
 		clock = true
+	case "gdigrab":
+		// GDI (BitBlt of the screen DC into system memory): no GPU
+		// needed. Exactly the monitor's rectangle of the virtual desktop,
+		// in physical pixels as the agent (per-monitor DPI aware) lists
+		// monitors, which is what the screen DC's BitBlt takes; gdigrab
+		// scales the desktop size it checks the area against to physical
+		// pixels (DESKTOPHORZRES / HORZRES), whatever FFmpeg's own DPI
+		// awareness, but not its origin: with display scaling a monitor
+		// left of or above the main one can fail that check (FFmpeg:
+		// "extends outside window area"). gdigrab grabs every frame
+		// interval, changed or not. No fps probing: a frame of a large
+		// desktop exceeds the probe size anyway, and FFmpeg's "not enough
+		// frames to estimate rate" warning would lead every failure's text.
+		if !c.CanGDIGrab() {
+			return nil, errors.New("this ffmpeg build lacks the gdigrab input device (GDI screen capture: a Windows build)")
+		}
+		if p.Source.NativeW < 2 || p.Source.NativeH < 2 {
+			return nil, fmt.Errorf("gdigrab: no area to capture (%dx%d)", p.Source.NativeW, p.Source.NativeH)
+		}
+		args = append(args, "-fpsprobesize", "0", "-f", "gdigrab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor,
+			"-offset_x", strconv.Itoa(p.Source.X), "-offset_y", strconv.Itoa(p.Source.Y),
+			"-video_size", fmt.Sprintf("%dx%d", p.Source.NativeW, p.Source.NativeH), "-i", "desktop")
+		chain = "[0:v]null"
 	case "x11grab":
 		args = append(args, "-f", "x11grab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor)
 		if p.Source.NativeW > 0 {
@@ -1004,7 +1071,13 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		chain += fmt.Sprintf(",pad=w=iw:h=ih+%d:x=0:y=0:color=white", p.TestPad)
 	}
 
-	// Convert into what the encoder accepts.
+	// Convert into what the encoder accepts. A system-memory source
+	// (gdigrab, x11grab) is scaled on the CPU, in the same swscale pass as
+	// the conversion.
+	cpuScale := ""
+	if p.Width > 0 && p.Height > 0 && !gpuFrames {
+		cpuScale = fmt.Sprintf(",scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", p.Width, p.Height)
+	}
 	switch {
 	case gpuFrames && (e.Vendor == "nvidia" || e.Vendor == "amd"):
 		// NVENC and AMF consume D3D11 textures directly, AMF also vsrc_amf's
@@ -1020,11 +1093,13 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		chain += ",format=nv12,hwupload"
 	case p.HDR:
 		chain += ",format=yuv420p10le"
+	case e.HW:
+		// NVENC, AMF and QSV take system-memory frames and upload them
+		// themselves; NV12 is the format all three take (QSV takes no
+		// yuv420p, and would turn BGRA into 4:4:4 HEVC).
+		chain += cpuScale + ",format=nv12"
 	default:
-		if p.Width > 0 && p.Height > 0 && !gpuFrames {
-			chain += fmt.Sprintf(",scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", p.Width, p.Height)
-		}
-		chain += ",format=yuv420p"
+		chain += cpuScale + ",format=yuv420p"
 	}
 	if p.Width > 0 && p.Height > 0 && e.Vendor == "vaapi" {
 		chain += fmt.Sprintf(",scale_vaapi=w=%d:h=%d", p.Width, p.Height)
