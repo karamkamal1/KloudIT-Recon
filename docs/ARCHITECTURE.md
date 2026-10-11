@@ -1370,6 +1370,14 @@ client's next attempts then leave out both paths for 10 minutes and go on to the
 whose ticket the gateway checks. The direct path is always tried first: on a LAN, or over Tailscale /
 WireGuard (subnet routing to the PC's address, or `directAddr` set to the PC's tailnet address),
 the browser reaches the PC without the gateway in the media path. The relay is the last resort.
+The overlay's Transport row says why a connection is not on the direct path (`direct: no answer in
+2.5 s: UDP 48100 blocked ...`, `refused after N ms: ...`, no direct endpoint, the settings). At
+start the agent checks whether Windows Firewall lets the direct port in on each connected network
+(the network's profile, the firewall's state and the inbound rules for the port or the agent's
+program) and warns with the fix where it does not: the installer's rule covers Private and Domain
+networks, so on a network Windows set to Public the browser's handshake gets no answer and Auto
+streams through the relay (`direct path blocked by Windows Firewall on this network`, `fix=`;
+`recon-host probe` prints the same; VENDOR_NOTES "First hardware run: the direct path on the LAN").
 
 Packet size: every QUIC endpoint (`transport.QUICConfig`: the host's direct and UDP-relay servers,
 its tunnels, the gateway's HTTP/3 and splice listeners) starts at 1232-byte UDP payloads

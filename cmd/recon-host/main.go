@@ -159,6 +159,7 @@ func main() {
 			fmt.Println("error:", err)
 		}
 		host.ProbeHelper(context.Background(), cfg, os.Stdout)
+		host.ProbeDirectPath(context.Background(), cfg, os.Stdout)
 		mons, _ := platform.Monitors()
 		for _, m := range mons {
 			fmt.Printf("monitor %d:  %s %dx%d@%dHz at (%d,%d) primary=%v dxgi=%d\n", m.Index, m.Name, m.W, m.H, m.Hz, m.X, m.Y, m.Primary, m.DXGIOutput)

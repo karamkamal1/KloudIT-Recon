@@ -12312,3 +12312,83 @@ numbers with both off, within a seed's noise).
      once.
 - NVIDIA: unverified (no NVIDIA host available). Test: steps 1-3 with `hevc_nvenc_helper` and
   DDA on an RTX 40/50 host. Pass: the same lines.
+
+## First hardware run: the direct path on the LAN
+
+### What the log shows
+
+Every session of the first run took `path=relay` (`relay socket ready`, `session started ...
+path=relay`): the browser streamed through the gateway's UDP relay although it was on the PC's
+own network and the agent listened on the direct port (`direct WebTransport endpoint listening
+port=48100` at start). Nothing said why: the agent cannot see the browser's attempt fail, and
+the browser's overlay showed `webtransport · relay` alone.
+
+### Cause
+
+`install-host.ps1` opens UDP 48100 for Private and Domain networks only (Windows treats Public
+networks as untrusted) and warns once, at install time, when a network is set to Public. A
+network Windows set to Public (what it picks for a new network unless told otherwise) keeps
+the port closed: the browser's QUIC handshake gets no answer and Auto moves on to the relay after
+2.5 s. The log cannot confirm the profile; the re-check below does.
+
+### The fix
+
+- **The agent** checks at start, in the background, whether Windows Firewall lets the direct
+  port in on each connected network (`internal/host/firewall.go`; PowerShell:
+  `Get-NetConnectionProfile`, `Get-NetFirewallProfile`, and the enabled inbound rules for UDP on
+  the port or for `recon-hostw.exe`). Allowed where the firewall is off for the network's
+  profile, its default lets inbound traffic in, or an allow rule covers the profile and the
+  program, and no block rule does. Blocked networks get a warning with the fix:
+  `direct path blocked by Windows Firewall on this network: browsers on it stream through the
+  gateway's relay port=48100 network=... profile=Public why="the network is Public, and the
+  firewall rule \"KloudIT Recon host (direct path)\" (Domain, Private) does not cover Public
+  networks" fix="Set-NetConnectionProfile -InterfaceIndex 12 -NetworkCategory Private"`; with no
+  rule at all the fix is the `New-NetFirewallRule` command (or the installer again); a block rule
+  is named. Allowed networks log `direct path: Windows Firewall lets it in on this network`.
+- **`recon-host.exe probe`** prints the same check: `direct path: UDP 48100 on network "..."
+  (Ethernet, Public): BLOCKED (browsers on this network stream through the relay): ...` and a
+  `fix (administrator PowerShell):` line.
+- **The overlay's Transport row** says why a connection is not on the direct path, after
+  `direct:` (`stream-worker.js` `connect`, `directFailure`): `no answer in 2.5 s: UDP 48100
+  blocked (PC firewall: a Public network? host.log says)` for an attempt that timed out,
+  `refused after N ms: ...` for one something answered and refused, `the PC offers no direct
+  endpoint (its agent has none up: host.log)`, `skipped: the PC refused a ticket a moment ago`,
+  `Network path is "Relay via gateway"`, `needs WebTransport`.
+- **Docs**: `docs/INSTALL.md` step 8, "The direct path is not used at home" (the overlay's
+  reasons, the host.log line, `Get-NetConnectionProfile` / `Set-NetConnectionProfile
+  -InterfaceIndex <n> -NetworkCategory Private` / `Get-NetFirewallRule -DisplayName 'KloudIT Recon
+  host (direct path)'`); README, Troubleshooting, "The direct path is never used".
+
+### Verified here
+
+- `TestDirectFindings` (`internal/host/firewall_test.go`) judges the PowerShell's JSON: the
+  owner's case (a Public network, the installer's Domain/Private rule: blocked, fix
+  `Set-NetConnectionProfile -InterfaceIndex 12 -NetworkCategory Private`), a Private network and
+  a domain network (allowed), a rule for any profile and program (allowed), the firewall off for
+  Public (allowed), a rule for another program's path (blocked, `New-NetFirewallRule`), a block
+  rule (blocked, named), no rule on a Public network (both fixes); a rule's program with
+  `%ProgramFiles%` matched case-insensitively; the logged warning with its `fix`; the script's
+  quoting of a path with an apostrophe.
+- The PowerShell (`firewallScript`) parses with no errors under pwsh 7 and prints the JSON
+  (`{"Profiles":[],"Firewall":[],"Rules":[]}` on Linux, which has none of the NetSecurity
+  cmdlets). Not run on Windows here; `GOOS=windows go vet` passes for `firewall_windows.go`.
+- The browser E2E's "settings after a failed connection" section: with the connect response's
+  direct URL pointed at a closed port, the stream comes up over the relay and `directWhy` (the
+  Transport row's reason) reads `no answer in 2.5 s: UDP <port> blocked ...`; with no direct
+  endpoint in the response it reads `the PC offers no direct endpoint ...`.
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test (any GPU: this is Windows networking):
+  1. `Get-NetConnectionProfile` in PowerShell; note the network's `NetworkCategory`. Restart the
+     agent (`Stop-ScheduledTask` / `Start-ScheduledTask` on the logon task) and read host.log.
+     Pass: on a Public network, `direct path blocked by Windows Firewall on this network` with
+     `profile=Public` and the `Set-NetConnectionProfile` fix; on a Private one, `direct path:
+     Windows Firewall lets it in on this network`. `recon-host.exe probe` prints the same.
+  2. Connect from a browser on the same network (Network path Auto). Pass on a Public network:
+     the overlay's Transport row reads `webtransport · relay · direct: no answer in 2.5 s: UDP
+     48100 blocked ...`.
+  3. Run the printed fix in an administrator PowerShell and reconnect (no agent restart). Pass:
+     Transport `webtransport · direct`, session started `path=direct`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same steps on any NVIDIA host (no
+  GPU dependency); pass the same.

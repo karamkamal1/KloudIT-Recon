@@ -562,9 +562,14 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   of HTTPS, pass the proxy's address with `-trust-proxy`; otherwise the client's network uses
   different addresses for TCP and UDP (IPv6 and IPv4, some carrier-grade NATs), which the relay
   cannot follow (`docs/SECURITY.md`, Known limitations).
-- **The direct path is never used.** Allow UDP 48100 on the PC (the installer adds a
-  Private-network rule; mark your network as *Private* in Windows). Some browsers ask for
-  local-network access the first time. If `host.log` says `direct endpoint unavailable: cannot
+- **The direct path is never used.** The overlay's Transport row says why after `direct:`. Allow
+  UDP 48100 on the PC: the installer adds a rule for Private and Domain networks, so a network
+  Windows set to *Public* (the first hardware run's) keeps the port closed. `host.log` warns at
+  start (`direct path blocked by Windows Firewall on this network`, with `fix=`) and
+  `recon-host.exe probe` prints the same check; the fix is
+  `Set-NetConnectionProfile -InterfaceIndex <n> -NetworkCategory Private` in an administrator
+  PowerShell (`docs/INSTALL.md`, step 8, "The direct path is not used at home"). Some browsers ask
+  for local-network access the first time. If `host.log` says `direct endpoint unavailable: cannot
   bind its UDP port`, something else listens on that port (Sunshine or Apollo set to it, for
   example): the agent retries every 30 seconds and offers the direct path once it has the port.
   To move it, run the installer again with `-DirectPort <port>` (it changes `host.json` and the

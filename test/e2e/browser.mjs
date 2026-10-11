@@ -2771,9 +2771,12 @@ async function checkPasteDialog() {
 // the "Could not connect" splash its Settings button opens the drawer above
 // the splash with the focus in it (the hotkey toggles it too), Reset to
 // defaults puts every setting back, saved too, and the next attempt streams
-// over a relay. Then, with no direct path in the connect response at all,
-// the splash names the setting that leaves nothing to try and offers Network
-// path Auto, which is saved and streams.
+// over a relay, whose Transport row says why not direct (no answer in
+// 2.5 s: the UDP port blocked; the first hardware run streamed through the
+// relay on the PC's own network without a word why). Then, with no direct
+// path in the connect response at all, the splash names the setting that
+// leaves nothing to try and offers Network path Auto, which is saved and
+// streams, its Transport row saying the PC offers no direct endpoint.
 async function checkSettingsAfterFailedConnect() {
   let mode = 'blocked';
   const rewrite = async (route) => {
@@ -2827,13 +2830,14 @@ async function checkSettingsAfterFailedConnect() {
     await page.keyboard.press('Escape');
     const streamed = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 45000 }).then(() => true, () => false);
     const path1 = await page.evaluate(() => window.__recon.conn?.path);
+    const why1 = await page.evaluate(() => window.__recon.conn?.directWhy || '');
     check('settings after a failed connection: the splash offers the settings (button and hotkey), the drawer opens above it with the focus inside, Reset to defaults saves the defaults and the next attempt streams over a relay',
       /Could not connect|Disconnected/.test(first.text) && first.settings && first.auto && opened.open && opened.onTop && opened.focus && opened.controls >= 15 && opened.path === 'direct' &&
         !escaped.open && hotkey.open && hotkey.focus && reset.prefs.path === 'auto' && reset.prefs.bitrate === 30 && reset.prefs.pacing === 'latency' && reset.drawer.path === 'auto' &&
-        streamed && path1 !== 'direct',
+        streamed && path1 !== 'direct' && /^no answer in 2\.\d s: UDP \d+ blocked/.test(why1),
       `splash: "${first.text.slice(0, 120)}", Settings ${first.settings ? 'shown' : 'missing'}, Network path Auto ${first.auto ? 'shown' : 'missing'}; drawer from the button: ${JSON.stringify(opened)}; ` +
         `Escape: ${escaped.open ? 'still open' : 'closed'}; hotkey: ${hotkey.open ? 'open' : 'closed'}, focus ${hotkey.focus ? 'inside' : 'outside'}; after Reset: saved path ${reset.prefs.path}, bitrate ${reset.prefs.bitrate}, pacing ${reset.prefs.pacing}, select ${reset.drawer.path}; ` +
-        `then ${streamed ? `streaming over ${path1}` : 'no stream'}`);
+        `then ${streamed ? `streaming over ${path1} (direct: ${why1})` : 'no stream'}`);
     await endStream();
 
     // No direct path at all: the reason names the setting, Network path Auto from the splash.
@@ -2847,10 +2851,12 @@ async function checkSettingsAfterFailedConnect() {
     await page.click('#btn-path-auto', { timeout: 3000 }).catch(() => {});
     const streamed2 = await page.waitForFunction(() => window.__recon.streaming, null, { timeout: 30000 }).then(() => true, () => false);
     const path2 = await page.evaluate(() => window.__recon.conn?.path);
+    const why2 = await page.evaluate(() => window.__recon.conn?.directWhy || '');
     const after = await saved();
     check('settings after a failed connection: with no direct path the splash names Network path "Direct to PC only", and its Use Network path Auto saves Auto and streams',
-      /Direct to PC only/.test(second.text) && /no direct path/.test(second.text) && second.auto && second.settings && streamed2 && path2 !== 'direct' && after.path === 'auto',
-      `splash: "${second.text.slice(0, 160)}", Network path Auto ${second.auto ? 'shown' : 'missing'}; then ${streamed2 ? `streaming over ${path2}` : 'no stream'}, saved path ${after.path}`);
+      /Direct to PC only/.test(second.text) && /no direct path/.test(second.text) && second.auto && second.settings && streamed2 && path2 !== 'direct' && after.path === 'auto' &&
+        /offers no direct endpoint/.test(why2),
+      `splash: "${second.text.slice(0, 160)}", Network path Auto ${second.auto ? 'shown' : 'missing'}; then ${streamed2 ? `streaming over ${path2} (direct: ${why2})` : 'no stream'}, saved path ${after.path}`);
   } finally {
     await ctx.unroute('**/api/hosts/*/connect', rewrite);
     await endStream();

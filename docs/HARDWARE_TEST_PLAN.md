@@ -260,7 +260,11 @@ in host.json for the whole stage and remove it at the end.
   60 fps, Resolution Native). Play a game or a full-screen video. Open the overlay.
 - **Look at**:
   - The overlay's **Encoder** row reads `hevc_amf` (no `_helper`), **Transport** reads
-    `webtransport · direct`, and **Codec** says `(HW)`.
+    `webtransport · direct`, and **Codec** says `(HW)`. A relay there (the first hardware run's
+    every session) is the direct port closed: the row says why after `direct:`, and host.log's
+    start says `direct path blocked by Windows Firewall on this network` with the fix (a network
+    set to Public; `docs/INSTALL.md` step 8, "The direct path is not used at home"; VENDOR_NOTES
+    "First hardware run: the direct path on the LAN").
   - host.log has `video pipeline pipeline=ffmpeg config=ffmpeg`, then `encoder ready ...
     codec=hev1...`, and a `stream stats` line every 10 s.
 - **Pass**:
