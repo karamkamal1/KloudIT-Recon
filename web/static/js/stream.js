@@ -221,10 +221,14 @@ async function audioChannel() {
 // bake-off on the live stream (stream-worker.js; the pick is a heuristic,
 // renderers.js pickPath: the 2D default unless another path is clearly
 // better); the pick and the numbers are stored here (localStorage, per
-// browser major version and OS: a browser update measures again). A path
-// chosen in the settings is used as is.
+// browser major version and OS: a browser update measures again). A pick the
+// bake-off could not conclude (a stream short of frames left a path
+// unmeasured: pickPath's conclusive) is stored as provisional: the next
+// connection measures again, BAKE_TRIES times in all, and only then keeps
+// it. A path chosen in the settings is used as is.
 
 const PRESENT_KEY = 'recon.present.v2';
+const BAKE_TRIES = 3;
 try { localStorage.removeItem('recon.present.v1'); } catch {} // picked by a noisier rule
 
 function deviceKey() {
@@ -258,7 +262,7 @@ function presentPlan() {
   if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [S.lost2D === prefs.renderer ? 'canvas2d' : prefs.renderer] };
   if (S.present2D) return { mode: 'auto', paths: ['canvas2d'] };
   const s = storedPresent();
-  if (s) return { mode: 'auto', paths: [s.winner] };
+  if (s && !(s.provisional && s.tries < BAKE_TRIES)) return { mode: 'auto', paths: [s.winner] };
   return { mode: 'bakeoff', paths: [...PATHS] };
 }
 
@@ -306,10 +310,23 @@ function onBakeoff(result) {
   streamHints();
   if (!result.winner) return;
   const v = S.videoCfg;
-  storePresent({
+  const rec = {
     key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
     video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
-  });
+  };
+  if (result.conclusive === false) {
+    // Measured on a stream short of frames: for this session, and again on
+    // the next connection (BAKE_TRIES in all, then it stays).
+    const prev = storedPresent();
+    rec.provisional = true;
+    rec.tries = (prev?.provisional ? prev.tries || 0 : 0) + 1;
+    storePresent(rec);
+    toast(rec.tries < BAKE_TRIES
+      ? `Renderer: ${LABELS[result.winner]} for now: the stream was short of frames to measure every path; Auto measures again on the next connection.`
+      : `Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline → Measure renderers again.`, 'info', 5000);
+    return;
+  }
+  storePresent(rec);
   toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
 }
 
@@ -1141,7 +1158,8 @@ function presentRows(st, row) {
   ];
   const res = b?.done ? b : storedPresent();
   if (res?.results) {
-    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}`, `draw p50/p95 · display p50 · fps${res.pacing ? ` (pacing: ${res.pacing})` : ''}`));
+    const prov = res.provisional || res.conclusive === false ? ' · provisional' : '';
+    rows.push(row(`  bake-off${res.at ? ` (${res.at.slice(0, 10)})` : ''}${prov}`, `draw p50/p95 · display p50 · fps${res.pacing ? ` (pacing: ${res.pacing})` : ''}`));
     for (const p of PATHS) {
       const x = res.results[p];
       if (!x) continue;
@@ -1398,7 +1416,8 @@ function presentHint() {
     return 'Auto tries each renderer on the live stream for about 10 s on the first connection: a desynchronized context first, the 2D canvas ' +
       'unless another draws clearly faster. A heuristic: the latency rig decides.';
   }
-  return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}.`;
+  const prov = s.provisional && s.tries < BAKE_TRIES ? `; provisional, measured again on the next connection (try ${s.tries} of ${BAKE_TRIES})` : '';
+  return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}${prov}.`;
 }
 
 // A labelled control: the label names it (for assistive technology; the

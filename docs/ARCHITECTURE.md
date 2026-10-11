@@ -1143,7 +1143,14 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   more than 1 ms faster (p50) in every round: a near tie keeps the default. The pick keeps
   drawing, the other canvases go, and the main thread stores it with why and every path's
   numbers in `localStorage` (`recon.present.v2`) for this browser major version and OS; the
-  next connections use it on a single canvas. A stored pick that no longer starts falls back to
+  next connections use it on a single canvas. A pick on a stream short of frames is not
+  conclusive: where even the path that drew the most drew under 80 % of the stream's frame rate
+  (at most the display's refresh), a path out for too few samples or for dropping frames says
+  nothing about that path (the first hardware run: the rate control had starved the stream to
+  6-12 of 60 fps, WebGL2 and WebGPU were out for too few samples and the 2D canvas, "the only
+  path left", was stored for good). Such a pick draws for the session and is stored as
+  provisional: the next connection measures again, three tries in all, after which the last
+  pick stays (the overlay marks it *provisional*). A stored pick that no longer starts falls back to
   2D on its canvas and is forgotten; a pick that fails 30 draws in a row (a lost context, frames
   that do not upload) is forgotten and the client reconnects with the 2D canvas. The overlay
   lists the per-path draw p50/p95, display p50, fps and why a path is out, and the reason for

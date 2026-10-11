@@ -438,7 +438,10 @@ async function checkAudio(name) {
 // (Xvfb) when there is one, where all three paths work; headless, WebGPU is
 // unavailable and the bake-off runs with the other two. The bake-off runs
 // with frame pacing Smooth (step 4.4): every path draws on the display
-// refresh, across the switches.
+// refresh, across the switches. A pick made on a stream short of frames
+// (pickPath not conclusive: a starved machine here) is stored as provisional
+// and the next connection measures again; three such picks in a row and the
+// last one stays (the main thread's handling on simulated results).
 const PRESENT_KEY = 'recon.present.v2';
 
 async function checkBakeoff() {
@@ -526,11 +529,18 @@ async function checkBakeoff() {
     // CPUs had nothing to spare during the bake-off, a path that drew fewer
     // must be one the rule left out for it (out: too few samples).
     const enough = (p) => res[p]?.draw?.n >= 30 || (bStarved && res[p]?.out === 'too few samples' && res[p].draw?.n >= 1);
+    // Stored for good, or (a path out for too few samples or dropping
+    // frames while the stream was short of frames) as provisional.
+    const short = rule.expectFps > 0 && Math.max(0, ...all.map((p) => res[p]?.fps || 0)) < rule.minShare * rule.expectFps;
+    const provisional = short && all.some((p) => res[p]?.out === 'too few samples' || res[p]?.out === 'drops frames');
+    const storedAs = provisional ? stored?.provisional === true && stored.tries === 1 && result?.conclusive === false
+      : !stored?.provisional && result?.conclusive === true;
     check(`renderer auto: bake-off on the live stream measures ${all.join(', ')} in two rounds, Auto's pick keeps drawing and is stored`,
       !!result?.winner && result.winner === want && measured.length >= 2 && all.every((p) => enough(p) && res[p].drawRounds?.length === 2 && res[p].display.n >= 1) &&
-        !!result.why && st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && stored.why === result.why &&
+        !!result.why && st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && stored.why === result.why && storedAs &&
         canvases.length === 1 && canvases[0] === result.winner && overlay.includes('bake-off') && overlay.includes('★ ') && overlay.includes(result.why) && (st.fps > 20 || br.ok),
-      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: ${result?.winner} (${result?.why}; rule wants ${want}); ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
+      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: ${result?.winner} (${result?.why}; rule wants ${want}; conclusive ${result?.conclusive}, ` +
+        `stream ${rule.expectFps} fps expected; stored ${stored?.provisional ? `provisional, try ${stored.tries}` : 'for good'}); ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
         `canvases left: ${canvases.join(', ')}; stored key ${stored?.key}; ${st?.fps?.toFixed(1)} fps after${br.note}; ` +
         `during the bake-off CPUs ${bIdle == null ? '?' : (100 * bIdle).toFixed(0)} % idle (median second ${bMedian == null ? '?' : (100 * bMedian).toFixed(0)} %)`);
     await checkHygiene('renderer auto (bake-off switches)', calls, st);
@@ -559,19 +569,59 @@ async function checkBakeoff() {
     const st2 = await page.evaluate(() => window.__recon.lastStats);
     const br2 = starvedRate(st2?.fps ?? 0, 30, 2 / 3, bw2);
     const canvases2 = await page.evaluate(() => document.querySelectorAll('#stage canvas').length);
-    check('renderer auto: the next connection draws with the stored winner at once (no bake-off, one canvas)',
-      !!stored && st2?.renderer?.name === stored.winner && st2.renderer.mode === 'auto' && !st2.renderer.bake && canvases2 === 1 && (st2.fps > 20 || br2.ok),
-      `${st2?.renderer?.name} (mode ${st2?.renderer?.mode}, bake-off ${JSON.stringify(st2?.renderer?.bake)}), ${canvases2} canvas, ${st2?.fps?.toFixed(1)} fps${br2.note}`);
+    if (stored?.provisional) {
+      check('renderer auto: after a provisional pick (the stream was short of frames) the next connection measures again',
+        !!st2?.renderer?.bake && !st2.renderer.bake.done && canvases2 > 1,
+        `${st2?.renderer?.name} (mode ${st2?.renderer?.mode}, bake-off ${JSON.stringify(st2?.renderer?.bake)}), ${canvases2} canvases`);
+    } else {
+      check('renderer auto: the next connection draws with the stored winner at once (no bake-off, one canvas)',
+        !!stored && st2?.renderer?.name === stored.winner && st2.renderer.mode === 'auto' && !st2.renderer.bake && canvases2 === 1 && (st2.fps > 20 || br2.ok),
+        `${st2?.renderer?.name} (mode ${st2?.renderer?.mode}, bake-off ${JSON.stringify(st2?.renderer?.bake)}), ${canvases2} canvas, ${st2?.fps?.toFixed(1)} fps${br2.note}`);
+    }
+    // The main thread's handling of picks the bake-off could not conclude
+    // (the worker's message, simulated): provisional twice, measured again
+    // on the next connection; the third stays.
+    const prov = await page.evaluate((k) => {
+      const r = window.__recon;
+      const result = { winner: 'canvas2d', why: 'the only path left; the stream gave 12 of 60 frames per second, too few to measure every path',
+        conclusive: false, results: {}, pacing: 'latency' };
+      localStorage.removeItem(k);
+      const out = [];
+      for (let i = 0; i < 3; i++) {
+        r.worker.onmessage({ data: { type: 'bakeoff', result } });
+        const s = JSON.parse(localStorage.getItem(k) || 'null');
+        out.push({ provisional: s?.provisional, tries: s?.tries, toast: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent).filter((t) => t.startsWith('Renderer:')).pop() });
+      }
+      return out;
+    }, PRESENT_KEY);
+    check('renderer auto: a pick on a stream short of frames is stored as provisional with a toast that Auto measures again, the third in a row stays',
+      prov.every((x, i) => x.provisional === true && x.tries === i + 1) && /measures again on the next connection/.test(prov[0].toast) &&
+        /measures again on the next connection/.test(prov[1].toast) && /Measure renderers again/.test(prov[2].toast),
+      JSON.stringify(prov));
     await page.evaluate(() => [...document.querySelectorAll('#drawer button')].find((b) => b.textContent.includes('Measure renderers again')).click());
     const cleared = await page.evaluate((k) => localStorage.getItem(k), PRESENT_KEY);
     check('renderer auto: "Measure renderers again" clears the stored result', cleared === null);
     await endStream();
 
+    // A provisional pick (first of three tries) is measured again on the
+    // next connection.
+    if (stored && !stored.provisional) {
+      await page.evaluate(([k, rec]) => localStorage.setItem(k, JSON.stringify(rec)), [PRESENT_KEY, { ...stored, provisional: true, tries: 1 }]);
+      await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
+      const again = await until(() => page.evaluate(() => {
+        const b = window.__recon.lastStats?.renderer?.bake;
+        return b && !b.done ? { bake: b, canvases: document.querySelectorAll('#stage canvas').length } : null;
+      }), 10000, 'a bake-off').catch(() => null);
+      check('renderer auto: a provisional stored pick is measured again on the next connection', !!again && again.canvases > 1, JSON.stringify(again));
+      await endStream();
+    }
+
     // A stored WebGL2 pick that stops drawing (its context lost: the worker's
     // test hook) is given up after 30 failed draws in a row.
     if (res.webgl2?.error || !stored) return;
     await page.goto(`${base}/`);
-    await page.evaluate(([k, rec]) => localStorage.setItem(k, JSON.stringify(rec)), [PRESENT_KEY, { ...stored, winner: 'webgl2', why: 'set by the test' }]);
+    // Stored as the third provisional pick in a row: it stays (no bake-off).
+    await page.evaluate(([k, rec]) => localStorage.setItem(k, JSON.stringify(rec)), [PRESENT_KEY, { ...stored, winner: 'webgl2', why: 'set by the test', provisional: true, tries: 3 }]);
     await startStream({ path: 'auto', transport: 'auto', renderer: 'auto', fps: 30 });
     const gl = await until(() => page.evaluate(() => (window.__recon.lastStats?.renderer?.name === 'webgl2' ? window.__recon.lastStats : null)), 10000, 'webgl2 drawing').catch(() => null);
     await page.evaluate(() => window.__recon.worker.postMessage({ type: 'loseContext' }));
@@ -2078,7 +2128,12 @@ async function checkHdrStream(sc) {
 // Auto's pick at unit level (step 4.3, renderers.js pickPath) on made-up
 // bake-off numbers, among them the review run's (WebGL2 drew 0.2 ms faster
 // and its display estimate was 2.6 ms lower by a few outliers: noise, the 2D
-// canvas is desynchronized and stays).
+// canvas is desynchronized and stays) and the first hardware run's (the
+// stream starved to 6-12 of 60 fps by the rate control: WebGL2 and WebGPU
+// out for too few samples, the 2D canvas "the only path left"; stored for
+// good then). With the stream's frame rate, a path out for too few samples
+// or dropping frames while even the best path drew under 80 % of it makes
+// the pick not conclusive (stream.js: provisional, measured again).
 async function checkPickRule() {
   const cases = await page.evaluate(async () => {
     const R = await import('/js/renderers.js');
@@ -2102,12 +2157,27 @@ async function checkPickRule() {
         canvas2d: mk({ fps: 12 }), webgl2: mk({ desynchronized: false }) }],
       ['too few samples everywhere', null, { canvas2d: 'too few samples', webgl2: 'too few samples' }, {
         canvas2d: mk({ draw: { p50: 0.6, n: 10 } }), webgl2: mk({ display: { n: 0 } }) }],
+      ['the first hardware run (its numbers): a stream starved to 12 of 60 fps, WebGL2 and WebGPU too few samples: the 2D canvas, provisional', 'canvas2d',
+        { webgl2: 'too few samples', webgpu: 'too few samples' }, {
+          canvas2d: mk({ desynchronized: null, draw: { p50: 0.59, n: 31 }, display: { p50: 2.24, n: 29 }, drawRounds: [0.62, 0.55], fps: 12.3 }),
+          webgl2: mk({ desynchronized: false, draw: { p50: 0.24, n: 27 }, display: { p50: 2.25, n: 27 }, drawRounds: [0.27, 0.22], fps: 10.1 }),
+          webgpu: mk({ desynchronized: null, draw: { p50: 0.43, n: 27 }, display: { p50: 2.37, n: 27 }, drawRounds: [0.51, 0.38], fps: 10.1 }) },
+        { expectFps: 60, conclusive: false }],
+      ['a stream at its rate (30 fps), WebGPU draws too few itself: conclusive', 'canvas2d', { webgpu: 'too few samples' }, {
+        canvas2d: mk(), webgl2: mk(), webgpu: mk({ desynchronized: null, fps: 9, draw: { p50: 3, n: 20 } }) }, { expectFps: 30, conclusive: true }],
+      ['a starved stream, every path measured: conclusive (the draw stage does not depend on the frame rate)', 'canvas2d', {}, {
+        canvas2d: mk({ fps: 14 }), webgl2: mk({ fps: 14 }) }, { expectFps: 60, conclusive: true }],
+      ['a starved stream, WebGL2 drew fewer frames: provisional', 'canvas2d', { webgl2: 'drops frames' }, {
+        canvas2d: mk({ fps: 20 }), webgl2: mk({ fps: 12 }) }, { expectFps: 60, conclusive: false }],
     ];
-    return list.map(([name, want, out, res]) => ({ name, want, out, got: R.pickPath(res, 1000 / 60) }));
+    return list.map(([name, want, out, res, o = {}]) => ({
+      name, want, out, conclusive: o.conclusive ?? want !== null, got: R.pickPath(res, 1000 / 60, R.PICK, o.expectFps || 0),
+    }));
   });
   for (const c of cases) {
     const outOK = Object.entries(c.out).every(([p, why]) => c.got.out[p] === why) && Object.keys(c.got.out).length === Object.keys(c.out).length;
-    check(`Auto's pick (unit): ${c.name}`, c.got.winner === c.want && outOK, `${c.got.winner} (${c.got.why}); out ${JSON.stringify(c.got.out)}`);
+    check(`Auto's pick (unit): ${c.name}`, c.got.winner === c.want && outOK && c.got.conclusive === c.conclusive,
+      `${c.got.winner} (${c.got.why}); out ${JSON.stringify(c.got.out)}; conclusive ${c.got.conclusive}`);
   }
 }
 

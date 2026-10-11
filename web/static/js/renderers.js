@@ -65,19 +65,32 @@ export const LABELS = { canvas2d: '2D canvas', webgl2: 'WebGL2', webgpu: 'WebGPU
 //          p50 is lower by more than marginMs in every round (a near tie
 //          keeps the default)
 //
-// Returns { winner (null: none measured), why, out: { path: reason } }.
+// expectFps is the frame rate the stream should give every path (the
+// stream's, at most the display's refresh; 0: unknown). Where even the path
+// that drew the most drew less than minShare of it, the stream itself was
+// short of frames (a starved stream: the host's rate control backed off,
+// frames lost on the way), and a path out for too few samples or for
+// dropping frames says nothing about that path: the pick is not conclusive
+// (stream.js keeps it for the session and measures again on the next
+// connection, BAKE_TRIES times at most, rather than storing it).
+//
+// Returns { winner (null: none measured), why, out: { path: reason },
+// conclusive }.
 export const PICK = { minDraw: 30, minDisplay: 8, minShare: 0.8, marginMs: 1 };
 
-export function pickPath(results, refreshMs = 1000 / 60, rule = PICK) {
+export function pickPath(results, refreshMs = 1000 / 60, rule = PICK, expectFps = 0) {
   const out = {};
   let pool = PATHS.filter((p) => results[p] && !results[p].error);
+  const best = Math.max(0, ...pool.filter((p) => !results[p].lost).map((p) => results[p].fps || 0));
+  const short = expectFps > 0 && best < rule.minShare * expectFps;
   const drop = (test) => { for (const p of pool) { const why = test(results[p]); if (why) out[p] = why; } pool = pool.filter((p) => !out[p]); };
   drop((x) => (x.lost ? 'context lost' : x.errors ? 'draw errors' : x.draw?.n >= rule.minDraw && x.display?.n >= rule.minDisplay ? '' : 'too few samples'));
   const fps = Math.max(0, ...pool.map((p) => results[p].fps));
   if (fps >= 10) drop((x) => (x.fps < rule.minShare * fps ? 'drops frames' : ''));
   const disp = Math.min(...pool.map((p) => results[p].display.p50));
   drop((x) => (x.display.p50 > disp + refreshMs ? 'display lags' : ''));
-  if (!pool.length) return { winner: null, why: 'no path measured', out };
+  const conclusive = !(short && Object.values(out).some((why) => why === 'too few samples' || why === 'drops frames'));
+  if (!pool.length) return { winner: null, why: 'no path measured', out, conclusive: false };
   const desync = pool.filter((p) => results[p].desynchronized === true);
   const byDesync = desync.length > 0 && desync.length < pool.length;
   if (byDesync) pool = desync;
@@ -88,10 +101,11 @@ export function pickPath(results, refreshMs = 1000 / 60, rule = PICK) {
     return r.length > 0 && r.length === d.length && r.every((v, i) => v !== null && d[i] !== null && v + rule.marginMs < d[i]);
   };
   const clear = pool.filter((p) => p !== def && faster(p)).sort((a, b) => results[a].draw.p50 - results[b].draw.p50);
-  if (clear.length) return { winner: clear[0], why: `draws over ${rule.marginMs} ms faster than ${LABELS[def]} in every round`, out };
-  let why = pool.length > 1 ? `no other path draws over ${rule.marginMs} ms faster` : 'the only path left';
-  if (byDesync) why = pool.length > 1 ? `desynchronized; ${why}` : 'the only desynchronized context';
-  return { winner: def, why, out };
+  let why = clear.length ? `draws over ${rule.marginMs} ms faster than ${LABELS[def]} in every round`
+    : pool.length > 1 ? `no other path draws over ${rule.marginMs} ms faster` : 'the only path left';
+  if (byDesync && !clear.length) why = pool.length > 1 ? `desynchronized; ${why}` : 'the only desynchronized context';
+  if (!conclusive) why += `; the stream gave ${best} of ${Math.round(expectFps)} frames per second, too few to measure every path`;
+  return { winner: clear[0] || def, why, out, conclusive };
 }
 
 export function withTimeout(p, ms, what) {

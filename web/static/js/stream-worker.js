@@ -662,6 +662,8 @@ function noAttempt(ep) {
 //             work take turns on the live stream, their draw and display
 //             stages (Phase 0) are measured, Auto's pick (pickPath) stays
 //             and the main thread stores it (localStorage) with the numbers
+//             (one made on a stream short of frames as provisional: measured
+//             again on the next connection)
 //
 // A path Auto picked that then fails FAIL_STREAK draws in a row (a lost
 // context, frames that do not upload) is given up: the main thread forgets
@@ -1074,16 +1076,24 @@ function bakeFinish() {
       fps: b.dur[path] ? +((1000 * recs.length) / b.dur[path]).toFixed(1) : 0, errors: b.errors[path], lost: !!r.lost,
     };
   }
-  const pick = pickPath(results, pres.refreshMs);
+  // Every path should have drawn the stream's frames (at most one per
+  // display refresh): a stream short of them (starved) cannot tell the paths
+  // apart by their frame counts (pickPath: not conclusive).
+  const expectFps = Math.min(video.cfg?.fps || 0, 1000 / pres.refreshMs);
+  const pick = pickPath(results, pres.refreshMs, PICK, expectFps);
   for (const [p, why] of Object.entries(pick.out)) results[p].out = why;
   const winner = pick.winner;
   const pacing = pacingOf(PATHS.flatMap((p) => b.recs[p]?.flat() || []));
-  b.result = { winner, why: pick.why, results, pacing, rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs } };
+  b.result = {
+    winner, why: pick.why, conclusive: pick.conclusive, results, pacing,
+    rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), expectFps: +expectFps.toFixed(1), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs },
+  };
   const txt = (p) => {
     const x = results[p];
     return x.error ? `${p} unavailable` : `${p} draw p50 ${x.draw.p50 ?? '—'} ms (rounds ${x.drawRounds.join('/')}), display p50 ${x.display.p50 ?? '—'} ms, ${x.fps} fps${x.out ? ` (${x.out})` : ''}`;
   };
-  post('log', { text: `presentation bake-off (frame pacing ${pacing}): ${winner ? `${winner} (${pick.why})` : 'inconclusive'}; ${PATHS.map(txt).join('; ')}` });
+  const verdict = winner ? `${winner} (${pick.why})${pick.conclusive ? '' : ', provisional'}` : 'inconclusive';
+  post('log', { text: `presentation bake-off (frame pacing ${pacing}): ${verdict}; ${PATHS.map(txt).join('; ')}` });
   post('bakeoff', { result: b.result });
   // The winner stays (inconclusive: the first path); the others go once it has drawn.
   const keep = pres.list.find((r) => r.name === winner) || pres.list[0];
