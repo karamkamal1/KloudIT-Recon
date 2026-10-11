@@ -12581,3 +12581,23 @@ power-on changed the mode (the capture loss right after).
   `encoder ready` if not, and whether the display came on by itself.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same with `hevc_nvenc_helper` on
   an RTX 40/50 host (the watchdog is in the capture, not the encoder). Pass: the same.
+
+### Runs with the review fixes (the four sections above)
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
+- `go test` passes for every package but `internal/e2e` (18 packages, 2 without tests); under
+  the shared lock `go test ./internal/e2e/...` passes (202 s). `go test -race
+  ./internal/host/... ./internal/transport/...` passes (9 packages; `internal/host` 282 s).
+- `node --check` passes on the 16 files of `web/static/js` and on `browser.mjs`.
+- `make build` and `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make
+  helper-test WINE=/usr/lib/wine/wine64` passes: 80 top-level tests pass and 9 skip (no AMF, AMD
+  Direct Capture, WGC or libavcodec in the sandbox), `TestHelperIntegrationFirstImage` and the
+  pacer self-test's `first-image watchdog` among them.
+- `TestHDRTestStream` with the Windows FFmpeg 8.1 build under Wine, under the lock: passes
+  twice (`BT.2020 codes`).
+- The whole browser E2E (Chromium 141) under the lock: the first run had 315 of 317 checks: "datagram
+  + FEC: every frame arrives as shards" failed on its last fps sample (39.5, CPUs 25 % idle) and
+  "drop test: a run the stream moved on from first" on a new generation that came before the
+  decoder's backlog reset (`generation 3 replaced it`), both timing under a starved CPU, neither
+  in code these changes touch. The one re-run: 317 of 317 (10 min), "WebGPU HDR10" with
+  `BT.601 patch codes` (the sandbox's FFmpeg 6.1).
