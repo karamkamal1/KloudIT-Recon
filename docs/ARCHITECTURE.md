@@ -662,11 +662,20 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     base (sending at R into a path of capacity C grows the queue by (R − C) / C per second, so
     C = R / (1 + growth)): it sees a capacity drop at once, while the delivered rates still hold
     the time before it. A decrease starts from at least half the target, whatever these say (a
-    tenth of a second's stall leaves next to nothing acknowledged). The next decrease waits until this one is in the encoder
-    (its config went live, or the helper's encoder announced the rate) and the policy's hold
-    more (150 ms for a qualified seamless encoder, 300 ms for one assumed seamless, 500 ms for a
-    flushing one, 1 s for an FFmpeg restart: its key frame and start-up); losses count again
-    300 ms after that.
+    tenth of a second's stall leaves next to nothing acknowledged). Frames that do not arrive
+    while the path acknowledges nothing at all are a stall of the link (Wi-Fi: the medium busy),
+    not a capacity, which goes on acknowledging what it carries: no decision on them for 250 ms
+    (`stallMax`). A delay decrease on a stall that slipped through (the ACKs held too, or the
+    stall's late frames) is undone within a second (`checkUndo`) when the delay is back under its
+    target within 100 ms of the frames arriving again and the path acknowledged at least 90 % of
+    what the session sent before the decrease, the backlog arriving at once; a capacity drop never
+    acknowledges more than the new capacity (host.log `bitrate recovery ... why=undo`, `stream
+    stats` `stalls`, `undone`; the first hardware run's cascade from 118 to 23 Mbit/s, VENDOR_NOTES
+    "First hardware run: the static desktop during a game"). The next decrease waits until this one
+    is in the encoder (its config went live, or the helper's encoder announced the rate) and the
+    policy's hold more (150 ms for a qualified seamless encoder, 300 ms for one assumed seamless,
+    500 ms for a flushing one, 1 s for an FFmpeg restart: its key frame and start-up); losses count
+    again 300 ms after that.
   - *Level shifts.* A delay that stays where a delay decrease found it (within the margin), the
     decrease in effect since, is a step of the path's one-way delay (a relay's route; a clock
     correction an older client does not report) rather than a queue: a queue behind a rate the

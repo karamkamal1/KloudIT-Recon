@@ -34,6 +34,12 @@ import (
 //     nothing. A delay that stays where a delay decrease found it, on a path
 //     that held the sender back neither before nor since, is a step of the
 //     path's delay, not a queue: the base restarts there (levelShift).
+//     Frames that do not arrive while nothing at all is acknowledged are a
+//     stall of the link (Wi-Fi), not a capacity, which goes on
+//     acknowledging what it carries: no decrease on them for stallMax. A
+//     delay decrease on a stall that slipped through (the client's ACKs
+//     held too and arriving in a burst, or a stall's late frames) is undone
+//     when the path then delivers the backlog at once (checkUndo).
 //   - Decrease to rateDecreaseFactor (x0.85) when the delay stays over the
 //     target for overReports consecutive reports and is not falling (a queue
 //     that drains needs no second decrease: the gradient), or more than
@@ -220,6 +226,32 @@ const (
 	// thinOverReports: consecutive reports over the delay target that count
 	// as congestion for thinning (one report alone can be a burst).
 	thinOverReports = 2
+
+	// undoWindow, undoShare, undoDrain: a delay decrease on a stall of the
+	// path is undone. A link that stalls (Wi-Fi: the medium busy, a
+	// power-save interval) holds every frame for 50-150 ms and then
+	// delivers them at once at its own rate: the reports find frames that
+	// do not arrive at all (the pending frame's bound), or frames 40 ms and
+	// more late; the decrease, taken from the next to nothing acknowledged
+	// meanwhile, halved the target (decreaseMinShare), and such decreases
+	// 15-17 s apart took the owner's first run from 118 to 23 Mbit/s in
+	// 17 s and to 10.5 in 32 s (docs/VENDOR_NOTES.md "First hardware run:
+	// the static desktop during a game"). Such a decrease is undone when,
+	// within undoWindow, the delay is back under its target within
+	// undoDrain of the frames arriving again (a queue of the session's own
+	// drains at a fraction of a second per second after a decrease) and
+	// one ackWindow since the decrease acknowledged at least undoShare of
+	// the video the session sent over the rateWindow before it (the
+	// backlog delivered at once). A capacity drop never acknowledges more
+	// than the new capacity, so its decrease stays (TestRateStallUndo,
+	// TestRelaySimCongestion).
+	undoWindow = time.Second
+	undoShare  = 0.9
+	undoDrain  = 100 * time.Millisecond
+	// stallMax: frames that do not arrive while the path acknowledges
+	// nothing at all are a stall of the link, not a capacity (which goes on
+	// acknowledging what it carries): no decrease on them for this long.
+	stallMax = 250 * time.Millisecond
 )
 
 // fpsRungs are the frame rates the controller steps down through at the
@@ -346,7 +378,37 @@ type rateChange struct {
 	fromFPS, toFPS   int
 	down             bool   // a decrease (also: the frame rate goes down)
 	urgent           bool   // at once: an emergency (the client needs a key frame), or a cut of cutUrgent
-	why              string // delay | loss | client | overflow | decoder | recovery
+	why              string // delay | loss | thinning | client | overflow | decoder | recovery | undo
+	basis            rateBasis
+}
+
+// rateBasis is what a decrease was decided on, for the log (applyRate): the
+// queueing delay of the report that decided over the base (bound: frames
+// that did not arrive at all, the oldest one's age) against its target over
+// the base (margin), the share of packets lost, and the rate the decrease
+// started from and why that one (start: "target", "delivered" (what the
+// acknowledgements or the client's receive rate carried), "queue" (the
+// queue's growth), "halving" (decreaseMinShare: next to nothing
+// delivered)).
+type rateBasis struct {
+	qd, margin time.Duration
+	bound      bool
+	lossPct    float64
+	startKbps  int
+	start      string
+}
+
+// rateUndo is a delay decrease on what may be a stall of the path, open to
+// an undo (undoWindow): the target and the last known-good rate before it,
+// the video rate sent over the rateWindow before it, the most the path has
+// acknowledged over one ackWindow since, when frames arrived again (the
+// decision itself where they still arrived, late) and whether the delay was
+// back under its target within undoDrain of that.
+type rateUndo struct {
+	at, resumed    time.Time
+	est, lastGood  float64
+	sentKbps, peak float64
+	drained        bool
 }
 
 // qdSample is a delay sample the over-target test judged: d is the report's
@@ -423,6 +485,7 @@ type rateController struct {
 	nonVideo  int          // kbps of audio and overhead in the acknowledged bytes
 	liveFPS   int          // frame rate of the encoder that streams
 	lastAcked time.Time
+	ackedAt   time.Time // the last report whose acknowledgements carried anything
 	lossFrom  time.Time // losses before are not counted (lossSettle)
 	decodeQ   int
 
@@ -443,6 +506,16 @@ type rateController struct {
 	// Thinning (thinned): the current run of thinned frames started at
 	// thinSince, the newest was thinned at thinLast.
 	thinSince, thinLast time.Time
+	// basis: what the last decrease was decided on (decide hands it out
+	// with the change); undo: a decrease on frames that did not arrive,
+	// open to an undo.
+	basis rateBasis
+	undo  rateUndo
+	// stalls, undos: stalls of the path (frames not arriving while nothing
+	// is acknowledged) and delay decreases undone, since the session began
+	// (stream stats); inStall: the last report was in one.
+	stalls, undos int
+	inStall       bool
 
 	// Feedback.
 	everFeedback bool      // the client has sent feedback
@@ -714,6 +787,9 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 	if fb.lost > 0 || fb.limited > 0 {
 		r.pathAt = now
 	}
+	if fb.ackedValid && fb.acked > 0 {
+		r.ackedAt = now
+	}
 	if fb.ackedValid {
 		if !r.lastAcked.IsZero() && now.After(r.lastAcked) {
 			r.acked = trimCounts(append(r.acked, timedCount{at: now, n: fb.acked, total: fb.lost, span: now.Sub(r.lastAcked), lim: fb.limited}), now, decreaseWindow)
@@ -722,6 +798,7 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 	}
 	r.decodeQ = fb.decodeQ
 	r.delay(now, fb)
+	r.checkUndo(now, fb)
 	if r.fixed || r.applied <= 0 || r.waitLive || now.Before(r.holdUntil) {
 		return rateChange{}, false
 	}
@@ -824,8 +901,22 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 	// socket, and the next has them.
 	qd, ok := fb.qd, fb.owdValid
 	strong := false
+	wasStall := r.inStall
+	r.inStall = false
 	if late := fb.pending - raw; fb.pendingValid && fb.interval <= pendingStallGap &&
 		late > base+max(pendingStrong, 4*r.margin(), raw*5/2) {
+		if fb.ackedValid && fb.acked == 0 && !r.ackedAt.IsZero() && now.Sub(r.ackedAt) < stallMax {
+			if !wasStall {
+				r.stalls++
+			}
+			r.inStall = true
+			// A stall: nothing arrives and nothing is acknowledged. Over
+			// the target for thinning and the frame queue, but no
+			// decrease yet: the link delivers it all when it resumes
+			// (stallMax).
+			r.qdOver, r.overRun = true, r.overRun+1
+			return
+		}
 		r.strongN++
 		qd, ok, strong = max(qd, late), true, r.strongN >= 2
 	} else {
@@ -893,6 +984,91 @@ func (r *rateController) levelShift(now time.Time) bool {
 	r.over, r.overRun, r.qdOver = 0, 0, false
 	r.shiftAt = time.Time{}
 	return true
+}
+
+// baseQD is the base of the queueing delay (the minimum of the last
+// owdWindow; 0 without samples). Called with r.mu held.
+func (r *rateController) baseQD() time.Duration {
+	if len(r.base) == 0 {
+		return 0
+	}
+	b := r.base[0].d
+	for _, s := range r.base {
+		b = min(b, s.d)
+	}
+	return b
+}
+
+// sentKbps is the video rate (kbit/s) the session handed to the transport
+// over the last rateWindow. Called with r.mu held.
+func (r *rateController) sentKbps(now time.Time) float64 {
+	var n int64
+	for _, c := range r.sends {
+		if now.Sub(c.at) <= rateWindow {
+			n += c.n
+		}
+	}
+	return float64(n) * 8 / rateWindow.Seconds() / 1000
+}
+
+// ackedKbps is the video rate (kbit/s) the connection's acknowledgements
+// carried over the last ackWindow, whatever held the sender back (ok false:
+// the reports cover less than half of it, or the acknowledgements are not
+// the client's). Called with r.mu held.
+func (r *rateController) ackedKbps(now time.Time) (float64, bool) {
+	var b int64
+	var span time.Duration
+	for _, c := range r.acked {
+		if now.Sub(c.at) <= ackWindow {
+			b += c.n
+			span += c.span
+		}
+	}
+	if !r.ackDirect || span < ackWindow/2 {
+		return 0, false
+	}
+	return max(0, float64(b)*8/span.Seconds()/1000-float64(r.nonVideo)), true
+}
+
+// checkUndo undoes a delay decrease on a stall of the path (decrease:
+// rateUndo) once the path shows it was a stall, not a capacity: within
+// undoWindow the delay is back under its target within undoDrain of the
+// frames arriving again, and one ackWindow since the decrease acknowledged
+// at least undoShare of the video sent over the rateWindow before it (the
+// backlog delivered at once). The target and the last known-good rate go
+// back to what they were; the encoder gets it with the policy's gap since
+// the decrease (decide). Called with r.mu held.
+func (r *rateController) checkUndo(now time.Time, fb feedback) {
+	u := &r.undo
+	if u.at.IsZero() {
+		return
+	}
+	if v, ok := r.ackedKbps(now); ok {
+		u.peak = max(u.peak, v)
+	}
+	if fb.owdValid && u.resumed.IsZero() {
+		u.resumed = now
+	}
+	under := fb.owdValid && !r.qdOver && r.strongN == 0
+	if under && !u.resumed.IsZero() && now.Sub(u.resumed) <= undoDrain {
+		u.drained = true
+	}
+	switch {
+	case now.Sub(u.at) > undoWindow, !u.drained && !u.resumed.IsZero() && now.Sub(u.resumed) > undoDrain:
+		*u = rateUndo{} // too late, or a queue that drains slowly: the session's own
+		return
+	case !u.drained || !under || u.sentKbps <= 0 || u.peak < undoShare*u.sentKbps:
+		return
+	}
+	r.est = min(max(r.est, u.est), r.limit())
+	r.lastGood, r.passedGood = u.lastGood, time.Time{}
+	r.over, r.overRun = 0, 0
+	if r.waitLive {
+		r.settled(now) // the decrease no longer needs confirming
+	}
+	r.pending = "undo"
+	r.undos++
+	*u = rateUndo{}
 }
 
 // margin is the target queueing delay over the base. Called with r.mu held.
@@ -1064,21 +1240,38 @@ func (r *rateController) carried(now time.Time) (float64, bool) {
 func (r *rateController) decrease(now time.Time, why string) (rateChange, bool) {
 	// The rate the path saw: an increase the encoder has not taken yet (a
 	// policy that takes changes seconds apart) never reached it.
-	cur := min(r.est, float64(r.applied))
+	cur, start := min(r.est, float64(r.applied)), "target"
 	if d, ok := r.carried(now); ok && d < cur {
-		cur = d
+		cur, start = d, "delivered"
 	}
 	if d, ok := r.queueCapacity(); ok && why == "delay" && d < cur {
-		cur = d
+		cur, start = d, "queue"
 	}
 	// At most a halving at once: a stall of a tenth of a second (the
 	// host's, the client's or the path's) leaves the last ackWindow with
-	// next to nothing acknowledged.
-	cur = max(cur, r.est*decreaseMinShare)
+	// next to nothing acknowledged (and where the delay decision rested on
+	// frames not arriving at all, the path delivering them at once
+	// afterwards undoes it: checkUndo).
+	if h := r.est * decreaseMinShare; cur < h {
+		cur, start = h, "halving"
+	}
+	prevEst, prevGood := r.est, r.lastGood
 	r.lastGood, r.passedGood = cur, time.Time{}
 	shiftQD, shift := time.Duration(0), false
+	r.basis = rateBasis{margin: r.margin(), lossPct: 100 * r.lossFraction(), startKbps: int(math.Round(cur)), start: start}
 	if n := len(r.recentQD); n > 0 {
 		shiftQD, shift = r.recentQD[n-1].d, r.recentQD[n-1].ownOK
+		r.basis.qd, r.basis.bound = shiftQD-r.baseQD(), !shift
+	}
+	// A delay decrease on frames that did not arrive, or on a delay far
+	// over the target (where the pending frame's bound would have decided
+	// too: a stall's late frames), is open to an undo (checkUndo).
+	r.undo = rateUndo{}
+	if why == "delay" && (r.basis.bound || r.basis.qd > pendingStrong) {
+		r.undo = rateUndo{at: now, est: prevEst, lastGood: prevGood, sentKbps: r.sentKbps(now)}
+		if !r.basis.bound {
+			r.undo.resumed = now // the frames still arrive, late
+		}
 	}
 	r.over, r.loss, r.lastDecrease, r.recentQD = 0, r.loss[:0], now, r.recentQD[:0]
 	r.thinSince = now // thinning that goes on decreases again only after another thinSustain
@@ -1229,7 +1422,7 @@ func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
 	}
 	from := r.est
 	to := from * rateEmergencyFactor
-	why := "decoder"
+	why, start, startKbps := "decoder", "target", from
 	if overflow {
 		why = "overflow"
 		r.passedGood = time.Time{}
@@ -1242,12 +1435,16 @@ func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
 			// rate (at most a halving).
 			to = min(to, max(v/cc.PacingGain, from*decreaseMinShare))
 			r.lastGood = v
+			start, startKbps = "acked", v
 		case ok:
 			// At most a halving, as in decrease: frames that stalled for
 			// a tenth of a second leave next to nothing acknowledged.
 			d = max(d, from*decreaseMinShare)
 			to = min(to, d*rateDecreaseFactor)
 			r.lastGood = d
+			if d*rateDecreaseFactor < from*rateEmergencyFactor {
+				start, startKbps = "delivered", d
+			}
 		default:
 			r.lastGood = to / rateDecreaseFactor
 		}
@@ -1267,10 +1464,12 @@ func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
 	}
 	r.est = to
 	r.lastDecrease = now
+	r.undo, r.basis = rateUndo{}, rateBasis{startKbps: int(math.Round(startKbps)), start: start}
 	r.over, r.loss = 0, r.loss[:0]
 	r.waitLive, r.waitKbps, r.decidedAt = true, int(math.Round(to)), now
 	r.holdUntil, r.lossFrom = now.Add(liveTimeout), now.Add(liveTimeout)
-	c := rateChange{fromKbps: r.applied, toKbps: int(math.Round(to)), fromFPS: r.appliedFP, toFPS: r.fps, down: true, urgent: true, why: why}
+	c := rateChange{fromKbps: r.applied, toKbps: int(math.Round(to)), fromFPS: r.appliedFP, toFPS: r.fps, down: true, urgent: true, why: why,
+		basis: r.basis}
 	r.applied, r.lastApply, r.pending = c.toKbps, now, ""
 	return c, true
 }
@@ -1392,8 +1591,20 @@ func (r *rateController) decide(now time.Time) (rateChange, bool) {
 		}
 	}
 	c := rateChange{fromKbps: r.applied, toKbps: kbps, fromFPS: r.appliedFP, toFPS: r.fps, down: down, urgent: urgent, why: why}
+	if down && why == r.pending {
+		c.basis = r.basis
+	}
 	r.applied, r.appliedFP, r.lastApply, r.pending = kbps, r.fps, now, ""
 	return c, true
+}
+
+// stallCounts returns the stalls of the path the controller has seen (frames
+// not arriving while nothing was acknowledged: no decrease) and the delay
+// decreases it undone (checkUndo), since the session began.
+func (r *rateController) stallCounts() (stalls, undos int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stalls, r.undos
 }
 
 // decreasedAt returns when the controller last decided a decrease.

@@ -825,7 +825,7 @@ UDP relay")
      relay`), stream HEVC 1080p60 of constant motion at 30 Mbit/s for 2 minutes, then at
      154 Mbit/s for 2 minutes.
   3. Reconnect twice within a minute while the PC is busy (a game loading).
-  4. Run `Select-String $log -Pattern 'frame queue overflow|key frame deferred|no recovery frame possible|loss recovered|congestion: lowering|bitrate recovery: raising|thinning:|stream stats' | Select-Object -Last 80`.
+  4. Run `Select-String $log -Pattern 'frame queue overflow|key frame deferred|no recovery frame possible|loss recovered|congestion: lowering|bitrate recovery: raising|thinning:|stream stats|static desktop|desktop changes' | Select-Object -Last 80`.
 - **Pass**:
   - The overlay's target reaches the setting (or what the encoder makes) within a few seconds
     and stays there, not "(backed off)", at ~60 fps.
@@ -835,7 +835,11 @@ UDP relay")
     few hundred milliseconds apart (the first run: `key_frames=0` throughout, but 764 losses
     answered by recovery frames, each behind the last one's overflow).
   - No `congestion: lowering bitrate ... why=delay` in the first 10 s after a reconnect while
-    the RTT is steady.
+    the RTT is steady, and no run of decreases with `start=halving` 15-20 s apart (the first
+    run's 118 → 51 → 23 Mbit/s; `stream stats` `stalls` and `undone` count the link's stalls and
+    the decreases undone on them: VENDOR_NOTES "First hardware run: the static desktop during a
+    game").
+  - No `static desktop: lowering the bitrate` while the game runs.
   - The bake-off rows of the overlay without *provisional*, all three paths measured.
 - **If not, send**:
   - those lines with `"logLevel": "debug"` (`rate report decision`);

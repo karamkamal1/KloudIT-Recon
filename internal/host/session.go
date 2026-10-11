@@ -2098,12 +2098,15 @@ func (l *rateLog) level(c rateChange, now time.Time, normal slog.Level) (slog.Le
 
 // applyRate puts a change of the rate controller into effect (setRate) and
 // logs it (rateLog); decreases also tell the user, at most once per 30 s.
+// delayMs is an older client's own delay report (why "client"); the
+// controller's own decisions log what they were decided on (rateAttrs).
 func (s *Session) applyRate(c rateChange, delayMs int) {
 	_, ceiling := s.rate.kbps()
 	reason := "bitrate recovery"
 	if c.down {
 		reason = "congestion"
-		attrs := []any{"from", c.fromKbps, "to", c.toKbps, "why", c.why, "fps", c.toFPS, "delayMs", delayMs, "urgent", c.urgent}
+		attrs := append([]any{"from", c.fromKbps, "to", c.toKbps, "why", c.why, "fps", c.toFPS}, rateAttrs(c, delayMs)...)
+		attrs = append(attrs, "urgent", c.urgent)
 		lvl, n := s.rateLog.level(c, time.Now(), slog.LevelWarn)
 		if n > 0 {
 			attrs = append(attrs, "suppressed", n)
@@ -2114,6 +2117,11 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 		}
 	} else {
 		attrs := []any{"from", c.fromKbps, "to", c.toKbps, "fps", c.toFPS, "max", ceiling}
+		if c.why == "undo" {
+			// A delay decrease on frames that did not arrive, undone: the
+			// path delivered them at once (a stall, not a capacity).
+			attrs = append(attrs, "why", "undo")
+		}
 		lvl, n := s.rateLog.level(c, time.Now(), slog.LevelInfo)
 		if n > 0 {
 			attrs = append(attrs, "suppressed", n)
@@ -2123,6 +2131,34 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 	if err := s.setRate(c.toKbps, c.toFPS, c.urgent, reason); err != nil {
 		s.log.Warn("bitrate change failed", "reason", reason, "err", err)
 	}
+}
+
+// rateAttrs are the log attributes of what a decrease was decided on
+// (rateBasis): for the delay, the queueing delay over the 2 s base of the
+// report that decided (delay_ms; frames_late: the age of frames that did not
+// arrive at all, the pending bound) and its target over the base
+// (delay_target_ms); for losses the share lost (loss_pct); the rate the
+// decrease started from (start_kbps) and what that was (start: target,
+// delivered, queue, halving; acked for a key frame's overflow). An older
+// client's own report ("client") has its delayMs.
+func rateAttrs(c rateChange, delayMs int) []any {
+	b := c.basis
+	var a []any
+	switch c.why {
+	case "client":
+		return []any{"delayMs", delayMs}
+	case "delay":
+		a = append(a, "delay_ms", b.qd.Milliseconds(), "delay_target_ms", b.margin.Milliseconds())
+		if b.bound {
+			a = append(a, "frames_late", true)
+		}
+	case "loss":
+		a = append(a, "loss_pct", math.Round(b.lossPct*10)/10)
+	}
+	if b.start != "" {
+		a = append(a, "start_kbps", b.startKbps, "start", b.start)
+	}
+	return a
 }
 
 // rateLoop advances the rate controller every rateTick: increases, changes
@@ -3303,6 +3339,8 @@ func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale st
 func (s *Session) statsLoop() {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
+	var lastLost, lastAcked uint64
+	var lastStalls, lastUndos int
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -3353,6 +3391,24 @@ func (s *Session) statsLoop() {
 		}
 		args = append(args, "kbps_est", int(est), "fps_target", fpsTarget, "queue_margin_ms", margin.Milliseconds(),
 			"loss_pct", fmt.Sprintf("%.2f", loss*100))
+		// The path in the last 10 s: packets the host's QUIC declared lost
+		// (on the UDP relay the connection is end to end, the relay only
+		// forwards: the gateway's "udp relay: session ended" counts what it
+		// dropped itself), stalls (frames not arriving while nothing was
+		// acknowledged: no decrease) and delay decreases undone (a stall
+		// after all: the backlog arrived at once).
+		if c := s.ccCounters(); c.ok {
+			lost, acked := c.lost-min(lastLost, c.lost), c.total-c.lost-min(lastAcked, c.total-c.lost)
+			lastLost, lastAcked = c.lost, c.total-c.lost
+			pct := 0.0
+			if lost+acked > 0 {
+				pct = float64(lost) / float64(lost+acked) * 100
+			}
+			args = append(args, "cc_lost", lost, "cc_lost_pct", fmt.Sprintf("%.2f", pct))
+		}
+		stalls, undos := s.rate.stallCounts()
+		args = append(args, "stalls", stalls-lastStalls, "undone", undos-lastUndos)
+		lastStalls, lastUndos = stalls, undos
 		// The "datagram + FEC" mode (fec.go): frames sent as shards, the
 		// parity's share of the data shards, the bytes on the wire beyond the
 		// frames' (parity, headers, repairs), the client's shard loss, NACKs

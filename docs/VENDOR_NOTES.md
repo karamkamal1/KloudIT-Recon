@@ -12100,3 +12100,215 @@ probes copied into the tree (not committed) and the simulations; all were real.
   Both are in this sandbox's list of earlier intermittent failures. A rerun of their sections
   ("loss handling", "hardware decoder failure") passed 23 of 23.
 - `node --check` passes on the changed scripts.
+
+## First hardware run: the static desktop during a game
+
+The owner's `host.log` of the first run (host `52f801f`; 4362 lines, five sessions on the UDP
+relay between 10:30 and 10:43, HEVC 1080p60 on the RX 7900 XT, settings 30, 151 and 154 Mbit/s)
+read against the rate fix (`a20376f`, "First hardware run: rate control on the UDP relay"):
+what the fix already covers, what it did not, and what was done about that. The direct path and
+the HDR10 probe have sections of their own (below).
+
+### What the log shows
+
+- **The static-desktop cut during a game.** 30 `static desktop: lowering the bitrate` and 28
+  `desktop changes: full bitrate back`, 21 of the cuts in the 151 Mbit/s session `5LpSw86_`
+  (six minutes of a game). From cut to restore: median 1.1 s (0.07-40 s), 13 of 28 within a
+  second. At the cut `activity_pct` was 0 in 17 of them (a quarter of the target), 0.003-4.4 in
+  the rest (the linear share); at the restore 6-100, the next frame the compositor drew. They
+  came in the game's quieter stretches, some while the stream carried 30-47 frames a second
+  (10:38:43, 10:38:55; idle repeats are 10 a second): new images that read as unchanged.
+- **The first overflow, 128 ms after a restore.** At 30 Mbit/s with no loss: `desktop changes:
+  full bitrate back kbps=30000 activity_pct=100` at 10:31:45.675 (the end of an 11 s capture
+  loss, `DXGI_ERROR_INVALID_CALL`, cut to 7500 before it), then `frame queue overflow frames=7
+  pts_span_ms=93 sender_busy_ms=22 cc_target_kbps=30360 cc_lost=0` at 10:31:45.803 and
+  `congestion: lowering bitrate from=30000 to=12750 why=overflow`.
+- **`delayMs=0` on every decrease.** All 23 `congestion: lowering bitrate` lines (20
+  `why=delay`, 3 `why=overflow`) say `delayMs=0`.
+- **A cascade without loss.** In `5LpSw86_` 118196 → 51315 at 10:38:44, 52901 → 22904 at
+  10:39:01, 24433 → 10541 at 10:39:16 (118 → 23 Mbit/s in 17 s, 10.5 in 32 s), and 154000 →
+  65450 twice at the 154 Mbit/s setting (10:39:41, 10:39:47): each × 0.425-0.434, that is
+  0.85 × the halving floor (`decreaseMinShare`: the rate the decrease started from was under
+  half the target). Each came within 0.6 s of a static cut or a thinning episode, with
+  `loss_pct=0.00`, `cc_lost=0` all session, and `owd_max_ms` 38-154 per 10 s around them on a
+  13-21 ms round trip. What
+  made the frames late is not in the log (`logLevel` info: no `rate report decision` lines).
+- **One-way delay at the floor.** `htWXUUEu` at 2000 kbit/s (10:32:22-10:33:12): `owd_avg_ms`
+  214-329, `owd_max_ms` 685-1088 per 10 s, 37 overflows; `6HvYapbC` (10:40:15-10:41:45)
+  127-153 and 357-559, 653 overflows, 9-12 fps.
+- **`cc_lost=43` on the LAN.** The host QUIC's count of packets it declared lost, since the
+  connection began: 0 at the first overflow (10:31:45.8), 43 by the next (10:31:52.4), none
+  after; 1 and 8 in two other sessions, 0 in `5LpSw86_`. The client reported no loss
+  (`loss_pct=0.00` in all 72 `stream stats`).
+- **Thinning.** 347 episodes of 1-5 frames: 295 `why=queue`, 50 `why=delay`, 2
+  `why=deadline`; 264 of them in the two sessions at the floor (`htWXUUEu` 66, `6HvYapbC` 198).
+
+### Why the game read as a still picture
+
+The helper's dirty share (`dirtyShare` in `dda_capture.cpp` and `amd_direct_capture.cpp`) was the
+union of the capture's rects over the picture. DDA hands out a present that names no region (a
+game that flips past the compositor: independent flip, DirectFlip, also in borderless windowed
+mode) with `LastPresentTime` set and no metadata (`TotalMetadataBufferSize` 0), or metadata with
+no move or dirty rects; AMD Direct Capture's flip can have an empty list. The union of nothing is
+0: every frame of the game counted as unchanged, the meter's activity was 0 a second later and
+the cap cut; each frame the compositor did draw (a menu's animation, an overlay) restored, and
+the first frames after a restore were encoded at the full target after a stretch at a quarter of
+it. WebRTC's DXGI capturer treats a frame without metadata as all changed for the same reason.
+The sandbox has no DDA; the hardware re-check below confirms it.
+
+### The fix
+
+- **Helper** (`src/capture/dirty.hpp` `presentedDirtyFraction`): a presented image with no
+  region is 1, all of it (DDA: no metadata, or only empty rects; AMD Direct Capture: an empty
+  list); a caret is still its own share and idle repeats still 0. The synthetic-gpu source takes
+  a test start parameter `testDirty` (`none`: presents with no region; `zero`: presents reported
+  unchanged, the old helper's reading) for the tests, refused with other captures
+  (`docs/HELPER_PROTOCOL.md`).
+- **recon-host** (`internal/host/activity.go`, `encoder.ActivityMeter`): three signals must agree
+  before a cut, and for longer:
+  - the share: at most 0.2 % changed per frame, as before;
+  - new images: at most five a second (`QuietImages`; idle repeats, `media.Frame.Repeat`, do not
+    count). A game or a video presents far more often whatever its dirty share says, so an older
+    helper that still reads a game as unchanged is not cut either;
+  - the encoder's output: under half the static floor (a still picture costs a CBR encoder
+    without filler data next to nothing);
+  - all of it for `staticHold` (3 s; was a second of activity under 0.2 %). A cut the picture
+    ends within 10 s doubles the next hold, up to 30 s (hysteresis: content that changes every
+    few seconds is not cut and restored over and over); a longer cut sets it back.
+  The restore is as before: at once, with the VBV of one frame at the full target while capped,
+  so the first frame with motion is no larger than a frame at the full target.
+  `static desktop: lowering the bitrate` now logs `images`, `output_kbps` and `still_ms`;
+  `desktop changes: full bitrate back` logs `next_hold_ms`.
+
+### The rest of the log against the fix
+
+- **The first overflow** (128 ms after the restore at 30 Mbit/s): covered by `a20376f`'s queue
+  rule. `TestOwnerLogFirstOverflow` (`internal/host/ownerlog_test.go`) replays the log's numbers
+  through `queueOverflows`: the frame being written was on schedule (a frame of the full target
+  paced at 1.2 × 30360 kbit/s takes 14 ms; its deadline is two frame intervals, 33 ms), reached
+  the queue 115 ms ago and the delay was not over its target: no overflow. With the delay over
+  the target, or the frame past its deadline, the same queue overflows (`why=delay`,
+  `why=deadline`). The static fix also takes away the restores during a game.
+- **`delayMs=0`**: the field is an older client's own delay report (`{"t":"congestion"}`); the
+  rate reports' decisions passed 0. Now a decrease logs what it was decided on
+  (`session.go` `rateAttrs`, `TestRateAttrs`): `delay_ms` (the queueing delay over the 2 s base of
+  the report that decided), `delay_target_ms`, `frames_late=true` where frames did not arrive at
+  all (the pending frame's bound), `loss_pct` for losses, and `start_kbps` with `start`: what the
+  decrease started from (`target`, `delivered`, `queue`, `halving`; `acked` for a key frame's
+  overflow). An older client's report keeps `delayMs`.
+- **The cascade**: the halvings started from next to nothing. On the UDP relay the decrease
+  starts from what the acknowledgements carried where the path held the sender back
+  (`a20376f`): during a stall of the link (Wi-Fi: the medium busy, a power-save interval) that is
+  nothing, and the decrease is clamped at half the target. Two changes in
+  `internal/host/bitrate.go`:
+  - **The stall rule** (`stallMax`, 250 ms): frames that do not arrive while the path
+    acknowledges nothing at all are a stall, not a capacity (a smaller capacity goes on
+    acknowledging what it carries): no decision on them for 250 ms (counted: `stream stats`
+    `stalls`).
+  - **The undo** (`checkUndo`: `undoWindow` 1 s, `undoShare` 0.9, `undoDrain` 100 ms): a delay
+    decrease on frames that did not arrive or arrived far over the target is undone (target and
+    last known-good rate back) when, within a second, the delay is back under its target within
+    100 ms of the frames arriving again and one `ackWindow` acknowledged at least 90 % of the
+    video sent before the decrease: the backlog delivered at once. A capacity drop never
+    acknowledges more than the new capacity, so its decrease stays. Logged as `bitrate recovery:
+    raising bitrate ... why=undo`; counted in `stream stats` `undone`.
+  `TestRateStallUndo`: a 100 ms stall with nothing acknowledged decides nothing (one stall
+  counted); a 400 ms outage whose backlog then arrives at once halves and is undone, one whose
+  frames are lost keeps its decrease; ACKs trickling during the stall and the backlog at once:
+  undone, its frames lost: kept; a capacity drop to 40 %: a decrease from what was delivered,
+  kept. `TestRelaySimCongestion` and the 24-seed capdrop simulations are unchanged (the numbers in
+  "First hardware run: rate control on the UDP relay").
+- **One-way delay at the floor and the overflow storms**: the recovery-frame cycle of that
+  section; `TestRelaySimFirstHardwareRun` now also logs thinning episodes and the one-way delay:
+  from the floor with the owner's recovery frames after an outage, p50/p95 17 / 39-40 ms (at
+  154 Mbit/s 15 / 35 ms), 3-4 overflows (the outage), one thinning episode.
+- **`cc_lost=43`**: the host's QUIC is end to end with the browser on the UDP relay; the gateway
+  forwards in order (a 1 Gbit/s token bucket, 8 MB socket buffers) and counts what it drops
+  itself in `udp relay: session ended ... dropped=` (not in this log). The 43 came in the 6.5 s
+  after the restore at 30 Mbit/s (one-way delay up to 245 ms in that window): packets lost on the
+  way or acknowledged after their loss timer (a stall: a spurious loss). None of the 23 decreases
+  was `why=loss`. A count since the connection began says nothing about when; `stream stats`
+  now has `cc_lost` and `cc_lost_pct` per 10 s.
+- **Thinning cycles**: 264 of the 347 episodes were the floor's recovery-frame cycle, and
+  `why=queue` thinning (frames behind a key or recovery frame paced out on schedule) no longer
+  counts as congestion since `a20376f`. The simulations bound the episodes: at most 3 per run
+  in `TestRelaySimStaticDesktop` (each case has 0-1).
+
+### The regression simulation
+
+`TestRelaySimStaticDesktop` (`internal/host/ratesim_relay_test.go`) runs the session's static
+cap (`staticCap` with its `ActivityMeter`) in the relay simulation: the encoder follows the
+cap's bitrate and VBV, a still picture is idle repeats with a caret (300-800 byte frames), a
+present after a still stretch is as large as a frame at the full target. `ownerMenu` is the log's
+game: 60 presents a second reported unchanged (the old helper's reading), a composed frame of
+36 % every 1.5 s. `wifiPauses` holds the link 30, 60 or 90 ms about every 1.7 s (one-way delay
+spikes as the log's), one way or both ways (the client's ACKs and reports held too). Two seeds
+each; "before" is `a20376f`: its `activity.go` and `encoder/activity.go`, the stall rule and the
+undo off (a scratch copy, not committed).
+
+| case (2 seeds) | before (`a20376f`) | now |
+|---|---|---|
+| game menu at 30 Mbit/s, presents reported unchanged | 26 cuts and 26 restores in 40 s, the encoder under the target 33 % of the time | no cut, 30 Mbit/s, 60 fps, no overflow |
+| game menu at 151 Mbit/s, encoder making 10 Mbit/s | 26 cuts and 26 restores | no cut, 151 Mbit/s |
+| the same with Wi-Fi stalls | 3 cuts, 8 delay decreases, the floor (2000 / 2836 kbit/s), mean 28 / 29 Mbit/s, last 10 s 2.9 / 8.0 | no cut, no decrease, 151 Mbit/s throughout, 59.5-59.7 fps |
+| the same, stalls both ways | 14-15 delay decreases, the floor, mean 9.5 Mbit/s | 0 / 2 decreases (both undone), mean 151 / 148 Mbit/s |
+| game at 30 Mbit/s, Wi-Fi stalls | 8 delay decreases, the floor, mean 7.0 / 9.7 Mbit/s, last 10 s 2.5 | 7 / 6 decreases (0 / 1 undone), lowest 20.3 / 20.1, mean 26.9 / 26.8, last 10 s 27.4 / 28.7 Mbit/s |
+| the same, stalls both ways | 13-15 delay decreases, the floor, mean 6.0 / 5.5 Mbit/s | 3 / 7 decreases (2 / 5 undone), lowest 14.3 / 12.8, mean 29.2 / 28.0 Mbit/s |
+| a still desktop for 12 s, then the game (30 / 151 Mbit/s) | one cut, one restore | one cut (after 3 s still), one restore, no overflow, host queue p95 10-12 ms / 0.1 ms after the restore |
+
+Every case ends at 57.5-60 fps with at most one thinning episode and no frame-queue overflow;
+`TestRelaySimFirstHardwareRun`'s cases are unchanged by the stall rule and the undo (the same
+numbers with both off, within a seed's noise).
+
+### Verified here
+
+- **The helper** (mingw build, under Wine 9 with xvfb):
+  - `--self-test-pacer` has the dirty share's new cases: no metadata → 1, only empty rects → 1,
+    a caret → its share, overlapping rects counted once, an empty picture → -1.
+  - `TestHelperIntegrationGameDirty` runs the helper (synthetic-gpu source, mock encoder) with
+    `testDirty`: refused with the synthetic capture; `none`: every present reaches recon-host as
+    dirty 1; `zero` (the old helper's reading): dirty 0. Either way the source presents all the
+    time (at least 60 presents in 2.5 s at 30 fps) and an `ActivityMeter` never takes it for a
+    still picture after the first 1.1 s.
+- **recon-host** (`go test ./internal/host/...`):
+  - `TestActivityMeter`: idle repeats with a caret are static; a game at 60 fps with dirty 0 is
+    not (more than five images), five images a second are, six are not; `AddFrame` with sizes.
+  - `TestStaticCap`: a still picture is cut after the 3 s hold and only with the output under
+    half the floor; a game whose presents read unchanged (or as all changed) is never cut, nor a
+    menu with a composed frame every 1.5 s; a cut the picture ends within 10 s doubles the next
+    hold (3, 6, then 12 s: content still for 11 s and changing for 1 is cut twice in 90 s, not
+    every 12 s), a long cut sets it back; content that changes every 5 s is cut once.
+  - `TestStaticCapRateController`, and `TestSessionStaticDesktop` (the session with the mock
+    pipeline: two seconds of a game with dirty 0 and no rate change, then idle repeats with a
+    caret, cut once).
+  - **The rest of the log**: `TestOwnerLogFirstOverflow`, `TestRateAttrs`, `TestRateStallUndo`
+    (above).
+  - **The simulations**: `TestRelaySimStaticDesktop` (the table), `TestRelaySimFirstHardwareRun`
+    and `TestRelaySimCongestion` (unchanged), `TestRateSimCapdrop` over 24 seeds per policy
+    (the same medians and worst seeds as "First hardware run: rate control on the UDP relay",
+    "now"), `TestRateSimProfiles`, `TestRateSimKeyFrames`.
+  - `TestHelperIntegrationGameDirty` and the session's mock-helper tests also run in
+    `make helper-test` (below).
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: default pipeline (`hevc_amf_helper`, DDA capture),
+  1080p60, `"logLevel": "debug"`, the overlay open.
+  1. A game in fullscreen and in borderless windowed mode, 2 minutes each, at 30 Mbit/s and once
+     at 151 Mbit/s: its menu left idle for a minute, then play. Pass: no `static desktop:
+     lowering the bitrate` at all; the overlay's target at the setting (or at what the encoder
+     makes) within a few seconds and staying there; no `frame queue overflow`; `stream stats`
+     `static_desktop=false`, `stalls` and `undone` small (a few per 10 s at most), `cc_lost_pct`
+     under 0.5. If a cut does come, send its line (`images`, `output_kbps`, `still_ms`) and the
+     debug `static desktop: bitrate` lines before it.
+  2. The desktop: idle with Notepad's caret blinking for 10 s, then drag a window. Pass: one
+     `static desktop: lowering the bitrate` after about 3 s still (`images` 0-5, `still_ms` about
+     3000), `desktop changes: full bitrate back` on the drag with no overflow and no key frame.
+  3. Over Wi-Fi on the client: 2 minutes of the game at 151 Mbit/s. Pass: no cascade of
+     `congestion: lowering bitrate ... why=delay ... start=halving`; `undone` > 0 where one came.
+     Send the `congestion:` lines (now with `delay_ms`, `delay_target_ms`, `frames_late`,
+     `start_kbps`, `start`) and `stream stats` if the target keeps falling.
+  4. AMD Direct Capture (`"capture": "amf"`, experimental, where the driver offers it): step 1
+     once.
+- NVIDIA: unverified (no NVIDIA host available). Test: steps 1-3 with `hevc_nvenc_helper` and
+  DDA on an RTX 40/50 host. Pass: the same lines.
