@@ -328,72 +328,161 @@ func TestSessionLiveFPS(t *testing.T) {
 
 // TestStaticCap: the static-desktop cap on a fake clock: a cut to the floor
 // (a quarter of the target, at least 2000; host config staticKbps) with the
-// VBV kept at one full-target frame once the desktop was static for the
-// meter's second and the last change is a second old; the full target back
-// with the first frame that changes; partial activity in between; nothing
-// with an unknown share, a pipeline that is not live, or staticBitrate off.
+// VBV kept at one full-target frame once the picture has been still for the
+// hold (3 s: idle repeats, a caret's new image twice a second, a small
+// encoder output); the full target back with the first frame that changes,
+// and the next hold twice as long after a short cut; partial activity in
+// between; never for a game's presents, whatever their dirty share (0 from
+// helpers before the first hardware run's fix, 1 since, a menu's composed
+// frame now and then: the owner's log), nor for an encoder making half the
+// floor; nothing with an unknown share, a pipeline that is not live, or
+// staticBitrate off.
 func TestStaticCap(t *testing.T) {
 	t0 := time.Unix(1000, 0)
-	type step struct {
-		ms    int
-		dirty float64 // < 0: unknown
-	}
-	run := func(c *staticCap, target int, live bool, steps []step) (out []string) {
+	// A source: the frame at ms (nil: none), every 4 ms.
+	type source func(ms int) *media.Frame
+	run := func(c *staticCap, target int, live bool, to int, src source) (out []string) {
 		c.generation(t0, target, target, live)
-		for _, s := range steps {
-			f := &media.Frame{Dirty: s.dirty, HasDirty: s.dirty >= 0}
+		for ms := 0; ms <= to; ms += 4 {
+			f := src(ms)
+			if f == nil {
+				continue
+			}
 			c.mu.Lock()
-			ch, ok := c.frame(t0.Add(time.Duration(s.ms)*time.Millisecond), f, target, live)
+			ch, ok := c.frame(t0.Add(time.Duration(ms)*time.Millisecond), f, target, live)
 			c.mu.Unlock()
 			if ok {
-				out = append(out, fmt.Sprintf("%d:%d/%.1f", s.ms, ch.kbps, ch.vbv))
+				out = append(out, fmt.Sprintf("%d:%d/%.1f", ms, ch.kbps, ch.vbv))
 			}
 		}
 		return out
 	}
-	static := func(from, to int, dirty float64) []step {
-		var s []step
-		for ms := from; ms <= to; ms += 20 {
-			s = append(s, step{ms, dirty})
-		}
-		return s
-	}
 	caret := 40.0 / (1920 * 1080)
-	steps := append(static(0, 1400, caret), step{1420, 0.3})
-	steps = append(steps, static(1440, 3000, 0)...)
-	got := run(&staticCap{on: true}, 20000, true, steps)
-	want := []string{"1000:5000/4.0", "1420:20000/0.0", "2440:5000/4.0"}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("static, motion, static: %v, want %v", got, want)
+	repeat := &media.Frame{HasDirty: true, Repeat: true, Data: make([]byte, 200)}
+	// still: idle repeats every 100 ms, a caret's new image every 500 ms
+	// (share, size: what it reports, as the frame's), between from and to.
+	still := func(share float64, size int) source {
+		return func(ms int) *media.Frame {
+			switch {
+			case ms%500 == 0:
+				return &media.Frame{Dirty: share, HasDirty: share >= 0, Data: make([]byte, size)}
+			case ms%100 == 0:
+				return repeat
+			}
+			return nil
+		}
 	}
-	// Partial activity (2 % changed): between the floor and the target,
-	// linearly; small moves wait.
-	got = run(&staticCap{on: true}, 20000, true, append(static(0, 1100, caret), static(1120, 1300, 0.02)...))
-	if fmt.Sprint(got) != "[1000:5000/4.0 1120:10625/1.9]" {
+	// game: new images at 60 fps (every 16 ms) with this share.
+	game := func(share float64) source {
+		return func(ms int) *media.Frame {
+			if ms%16 != 0 {
+				return nil
+			}
+			return &media.Frame{Dirty: share, HasDirty: true, Data: make([]byte, 40000)}
+		}
+	}
+	join := func(parts ...any) source { // ms boundary, source, ms boundary, source...
+		return func(ms int) *media.Frame {
+			var cur source
+			for i := 0; i+1 < len(parts); i += 2 {
+				if ms >= parts[i].(int) {
+					cur = parts[i+1].(source)
+				}
+			}
+			return cur(ms)
+		}
+	}
+	once := func(at int, share float64) source { // a single frame that changes share of the picture
+		return func(ms int) *media.Frame {
+			if ms == at {
+				return &media.Frame{Dirty: share, HasDirty: true, Data: make([]byte, 20000)}
+			}
+			return still(caret, 600)(ms)
+		}
+	}
+	// Still: cut after the hold. A window opens: back at once. Still again:
+	// cut twice the hold after the window left the meter (the cut lasted
+	// 0.5 s); still for 12 s more, motion: the hold is back to 3 s.
+	src := join(0, still(caret, 600), 3500, once(3500, 0.3), 3504, still(caret, 600), 23000, once(23000, 0.3), 23004, still(caret, 600))
+	got := run(&staticCap{on: true}, 20000, true, 28000, src)
+	want := []string{"3000:5000/4.0", "3500:20000/0.0", "10600:5000/4.0", "23000:20000/0.0", "27100:5000/4.0"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("still, motion, still: %v, want %v", got, want)
+	}
+	// Partial activity (2 % changed twice a second): between the floor and
+	// the target, linearly, after the hold.
+	if got := run(&staticCap{on: true}, 20000, true, 3500, still(0.02, 600)); fmt.Sprint(got) != "[3000:10625/1.9]" {
 		t.Fatalf("partial activity: %v", got)
 	}
 	// Host config staticKbps; the VBV bound.
-	if got := run(&staticCap{on: true, kbps: 1000}, 20000, true, static(0, 1100, 0)); fmt.Sprint(got) != "[1000:1000/20.0]" {
+	if got := run(&staticCap{on: true, kbps: 1000}, 20000, true, 3500, still(0, 100)); fmt.Sprint(got) != "[3000:1000/20.0]" {
 		t.Fatalf("staticKbps 1000: %v", got)
 	}
-	if got := run(&staticCap{on: true, kbps: 100}, 20000, true, static(0, 1100, 0)); fmt.Sprint(got) != "[1000:100/30.0]" {
+	if got := run(&staticCap{on: true, kbps: 100}, 20000, true, 3500, still(0, 1)); fmt.Sprint(got) != "[3000:100/30.0]" {
 		t.Fatalf("staticKbps 100: %v", got)
+	}
+	// The owner's game menu (docs/VENDOR_NOTES.md "First hardware run: the
+	// static desktop during a game"): presents at 60 fps that DDA handed
+	// out without dirty rects, a frame the compositor drew (36 % of the
+	// picture) every 1.5 s. 52f801f cut it to the floor after a second
+	// and restored it with the composed frame, every 1-2 s.
+	menu := func(ms int) *media.Frame {
+		f := game(0)(ms)
+		if f != nil && ms%1500 < 16 {
+			f.Dirty = 0.363
+		}
+		return f
 	}
 	for name, c := range map[string]struct {
 		cap    *staticCap
 		target int
 		live   bool
-		dirty  float64
+		src    source
 	}{
-		"unknown share":             {&staticCap{on: true}, 20000, true, -1},
-		"not live":                  {&staticCap{on: true}, 20000, false, 0},
-		"staticBitrate off":         {&staticCap{}, 20000, true, 0},
-		"target below the floor":    {&staticCap{on: true}, 1500, true, 0},
-		"staticKbps above a target": {&staticCap{on: true, kbps: 30000}, 20000, true, 0},
+		"a game, presents reported unchanged": {&staticCap{on: true}, 30000, true, game(0)},
+		"a game, presents counted whole":      {&staticCap{on: true}, 30000, true, game(1)},
+		"a game menu with a composed frame":   {&staticCap{on: true}, 30000, true, menu},
+		"a game menu at 151 Mbit/s":           {&staticCap{on: true}, 151000, true, menu},
+		"a caret-sized change at 60 fps":      {&staticCap{on: true}, 30000, true, game(caret)},
+		"an encoder making half the floor": {&staticCap{on: true}, 20000, true, func(ms int) *media.Frame {
+			f := still(0, 0)(ms)
+			if f != nil {
+				f = &media.Frame{HasDirty: true, Repeat: f.Repeat, Dirty: f.Dirty, Data: make([]byte, 32000)}
+			}
+			return f
+		}},
+		"unknown share":             {&staticCap{on: true}, 20000, true, still(-1, 100)},
+		"not live":                  {&staticCap{on: true}, 20000, false, still(0, 100)},
+		"staticBitrate off":         {&staticCap{}, 20000, true, still(0, 100)},
+		"target below the floor":    {&staticCap{on: true}, 1500, true, still(0, 100)},
+		"staticKbps above a target": {&staticCap{on: true, kbps: 30000}, 20000, true, still(0, 100)},
 	} {
-		if got := run(c.cap, c.target, c.live, static(0, 3000, c.dirty)); len(got) != 0 {
+		if got := run(c.cap, c.target, c.live, 20000, c.src); len(got) != 0 {
 			t.Errorf("%s: %v", name, got)
 		}
+	}
+	// Content that changes every 4 s (still for 4 s, a window for 1 s):
+	// cut after 3 s, the next hold 6 s, more than such content is ever still.
+	blink := func(ms int) *media.Frame {
+		if ms%5000 >= 4000 {
+			return game(0.3)(ms)
+		}
+		return still(caret, 600)(ms)
+	}
+	if got := run(&staticCap{on: true}, 20000, true, 60000, blink); fmt.Sprint(got) != "[3000:5000/4.0 4000:20000/0.0]" {
+		t.Fatalf("content that changes every 5 s: %v, want one cut", got)
+	}
+	// Content still for 11 s and changing for 1: the hold doubles with each
+	// short cut (3, 6, then 12 s: longer than it is ever still).
+	slow := func(ms int) *media.Frame {
+		if ms%12000 >= 11000 {
+			return game(0.3)(ms)
+		}
+		return still(caret, 600)(ms)
+	}
+	want = []string{"3000:5000/4.0", "11008:20000/0.0", "19000:5000/4.0", "23008:20000/0.0"}
+	if got := run(&staticCap{on: true}, 20000, true, 90000, slow); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("content still for 11 s at a time: %v, want %v", got, want)
 	}
 	// A generation that goes live below the target (a helper restarted at
 	// a capped rate) is capped (the rate controller hears its target): the
@@ -413,30 +502,30 @@ func TestStaticCap(t *testing.T) {
 	}
 	// The encoder's rate changed in place by someone else (a settings change
 	// while capped: the pipeline announces it): followed, and cut again a
-	// second later on a still static desktop.
+	// second later on a still static desktop (the hold had passed).
 	c = &staticCap{on: true}
-	got = run(c, 20000, true, static(0, 1100, 0))
-	if k := c.rate(t0.Add(1100*time.Millisecond), 5000, 20000, true); k != 20000 {
+	got = run(c, 20000, true, 3100, still(0, 100))
+	if k := c.rate(t0.Add(3100*time.Millisecond), 5000, 20000, true); k != 20000 {
 		t.Fatalf("the cut announced: the rate controller hears %d, want its target", k)
 	}
 	if k := (&staticCap{on: true}).rate(t0, 5000, 20000, false); k != 5000 {
 		t.Fatalf("a rate below the target from a pipeline that is not live: the rate controller hears %d", k)
 	}
-	if k := c.rate(t0.Add(1200*time.Millisecond), 20000, 20000, true); k != 20000 {
+	if k := c.rate(t0.Add(3200*time.Millisecond), 20000, 20000, true); k != 20000 {
 		t.Fatalf("the change announced: the rate controller hears %d", k)
 	}
-	if c.capped || c.sent != 20000 || fmt.Sprint(got) != "[1000:5000/4.0]" {
+	if c.capped || c.sent != 20000 || fmt.Sprint(got) != "[3000:5000/4.0]" {
 		t.Fatalf("after an announced change: capped %v sent %d (%v)", c.capped, c.sent, got)
 	}
 	var again []string
-	for ms := 1220; ms <= 2300; ms += 20 {
+	for ms := 3300; ms <= 10000; ms += 100 {
 		c.mu.Lock()
-		if ch, ok := c.frame(t0.Add(time.Duration(ms)*time.Millisecond), &media.Frame{HasDirty: true}, 20000, true); ok {
+		if ch, ok := c.frame(t0.Add(time.Duration(ms)*time.Millisecond), repeat, 20000, true); ok {
 			again = append(again, fmt.Sprintf("%d:%d", ms, ch.kbps))
 		}
 		c.mu.Unlock()
 	}
-	if fmt.Sprint(again) != "[2200:5000]" {
+	if fmt.Sprint(again) != "[4200:5000]" {
 		t.Fatalf("cut again: %v", again)
 	}
 }
@@ -452,7 +541,7 @@ func TestStaticCapRateController(t *testing.T) {
 		h := newCtl(t, 20000, 60, seamless)
 		h.outKbps = 500
 		if capped {
-			h.static = &staticCap{on: true}
+			h.static = &staticCap{on: true, hold: time.Second}
 			h.static.generation(h.clock, 20000, 20000, true)
 		}
 		h.run(3*time.Second, flat(20*time.Millisecond))
@@ -492,13 +581,18 @@ func TestStaticCapRateController(t *testing.T) {
 	}
 }
 
-// TestSessionStaticDesktop: a static desktop (the helper's dirty share)
-// lowers the encoder's bitrate and the media congestion controller's target
-// while the rate controller keeps its own; the first frame that changes gets
-// the full bitrate back before it is sent; a change of the rate controller
-// meanwhile stays capped.
+// TestSessionStaticDesktop: a static desktop (the helper's idle repeats and
+// a caret's dirty share) lowers the encoder's bitrate and the media
+// congestion controller's target once it has been still for the hold, while
+// the rate controller keeps its own; the first frame that changes gets the
+// full bitrate back before it is sent; a change of the rate controller
+// meanwhile stays capped. A game's presents that the helper reports as
+// unchanged (the first hardware run) are never a static desktop.
 func TestSessionStaticDesktop(t *testing.T) {
 	r := newP5Rig(t, fakeSVCH264, proto.HelloVersionRecovery, Config{}, "seamless")
+	r.s.static.mu.Lock()
+	r.s.static.hold = 500 * time.Millisecond
+	r.s.static.mu.Unlock()
 	frame := func(id uint64, dirty float64) *encoder.Frame {
 		fr := &encoder.Frame{FrameID: id, LTRSlot: -1, Dirty: dirty, CaptureQPC: int64(2 * id), OutputQPC: int64(2*id + 1), Data: p5Frame}
 		if id == 1 {
@@ -510,11 +604,27 @@ func TestSessionStaticDesktop(t *testing.T) {
 	id := uint64(1)
 	r.publish(t, frame(id, 1))
 	waitMsg(t, r.ctrl, `"t":"video"`, `"gen":1`)
-	// A second and a half of a still desktop (a blinking caret), 60 fps.
-	for i := 0; i < 90; i++ {
+	// Two seconds of a game whose presents the helper reports as unchanged
+	// (a game flipping past the compositor, before the helper's fix), 60 fps:
+	// nothing changes.
+	for i := 0; i < 120; i++ {
 		r.clock.add(16 * time.Millisecond)
 		id++
-		r.publish(t, frame(id, 0.0001))
+		r.publish(t, frame(id, 0))
+	}
+	noMsg(t, r.f, "setRate")
+	// A still desktop: idle repeats every 100 ms, a blinking caret's new
+	// image every 500 ms, for two and a half seconds (the game leaves the
+	// meter's second, then the hold).
+	for i := 0; i < 25; i++ {
+		r.clock.add(100 * time.Millisecond)
+		id++
+		fr := frame(id, 0)
+		fr.Repeat = true
+		if i%5 == 0 {
+			fr = frame(id, 0.0001)
+		}
+		r.publish(t, fr)
 	}
 	m := expectFakeMsg(t, r.f, "setRate")
 	if m["kbps"] != float64(5000) || m["vbvFrames"] != float64(4) {
@@ -529,9 +639,11 @@ func TestSessionStaticDesktop(t *testing.T) {
 	// The helper announces the cut with its next frame: the client hears
 	// 5000, the rate controller its own 20000 (its measurements are in
 	// units of its target).
-	r.clock.add(16 * time.Millisecond)
+	r.clock.add(100 * time.Millisecond)
 	id++
-	r.publish(t, frame(id, 0.0001))
+	rep := frame(id, 0)
+	rep.Repeat = true
+	r.publish(t, rep)
 	waitMsg(t, r.ctrl, `"t":"rate"`, `"bitrate":5000`)
 	r.s.rate.mu.Lock()
 	heard := r.s.rate.liveKbps

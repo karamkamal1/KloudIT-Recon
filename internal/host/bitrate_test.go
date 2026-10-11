@@ -72,12 +72,13 @@ func (h *ctlHarness) apply(c rateChange) {
 	h.r.live(h.static.rate(h.clock, enc, c.toKbps, true), c.toFPS)
 }
 
-// frame feeds a frame of the static desktop to the cap (as staticFrame) and
-// the encoder's rate it calls for to the controller (as videoEvents).
+// frame feeds a frame of the static desktop (an idle repeat) to the cap (as
+// staticFrame) and the encoder's rate it calls for to the controller (as
+// videoEvents).
 func (h *ctlHarness) frame() {
 	target, _ := h.r.kbps()
 	h.static.mu.Lock()
-	c, ok := h.static.frame(h.clock, &media.Frame{HasDirty: true}, target, true)
+	c, ok := h.static.frame(h.clock, &media.Frame{HasDirty: true, Repeat: true}, target, true)
 	h.static.mu.Unlock()
 	if ok {
 		h.r.live(h.static.rate(h.clock, c.kbps, target, true), 0)

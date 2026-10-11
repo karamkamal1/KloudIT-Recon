@@ -153,7 +153,7 @@ void common(const char* name, const std::vector<int64_t>& presents, const std::v
 
 // The dirty-area share of capture/dirty.hpp (GUIDE 5: the rate controller
 // cuts the bitrate on a static desktop): union, clipping, the long-list
-// fallback and merging two deliveries.
+// fallback, a present that names no region, and merging two deliveries.
 void testDirty() {
     const char* name = "dirty area (union of rects)";
     const auto near = [](double a, double b) { return a > b - 1e-9 && a < b + 1e-9; };
@@ -178,6 +178,15 @@ void testDirty() {
     expect(dirtyFraction(many.data(), many.size(), 200, 200) == 1.0, name, "long list not capped at 1");
     many.assign(kMaxDirtyUnionRects + 1, DirtyRect{0, 0, 1, 1});
     expect(near(dirtyFraction(many.data(), many.size(), 1000, 1000), double(kMaxDirtyUnionRects + 1) / 1e6), name, "long list not summed");
+    // A presented image whose capture names no region (a game flipping
+    // past the compositor: DDA hands out its presents without metadata) is
+    // the whole picture, not an unchanged one; named regions count as above.
+    const DirtyRect nothing[] = {{60, 60, 60, 80}, {-20, -20, -10, -10}};
+    expect(presentedDirtyFraction(nullptr, 0, 1920, 1080) == 1.0, name, "a present without metadata not the whole picture");
+    expect(presentedDirtyFraction(nothing, 2, 100, 100) == 1.0, name, "a present with only empty rects not the whole picture");
+    expect(near(presentedDirtyFraction(&caret, 1, 1920, 1080), c), name, "a present with a caret not the caret");
+    expect(near(presentedDirtyFraction(overlap, 2, 200, 200), 17500.0 / 40000.0), name, "a present's rects not their union");
+    expect(presentedDirtyFraction(nullptr, 0, 0, 1080) == -1, name, "an empty picture not unknown");
     expect(mergeDirty(0.25f, 0.5f) == 0.75f && mergeDirty(0.75f, 0.5f) == 1.0f && mergeDirty(-1, 0.5f) == -1 && mergeDirty(0, 0) == 0, name,
            "merging two deliveries");
     std::printf("  %-36s ok\n", name);

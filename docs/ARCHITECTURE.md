@@ -746,19 +746,27 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     uses LTR anyway; invalidation or LTR still answers losses).
   - *Static desktop* (`internal/host/activity.go`, GUIDE 9 "dirty rects"): the native helper's
     captures report the share of the picture that changed with every frame (DDA and AMD Direct
-    Capture dirty rects; `media.Frame.Dirty`). While at most 0.2 % changed per frame over the last
-    second (a caret, a clock; the pointer is not in the helper's video) the encoder's target goes
-    down to host config `staticKbps` (default a quarter of the rate controller's target, at least
-    2 Mbit/s), linearly back towards the target between 0.2 % and 5 %, lower at most once a
-    second; a frame that changes raises it at once, before that frame is queued (so it goes out
-    at the new pacing rate): the full target from 5 % changed, the linear share below that (about
-    37 % of the target at 1 %). It caps what the encoder is told, never what the rate controller
-    decides (the lower of the two: it cannot fight the congestion control; a restore needs no
-    ramp); the controller is told the encoder runs at its target meanwhile (its fill, the
-    delivered rates and the queue's growth are measured in units of its target: told the capped
-    rate, a decrease would start from the cap and no increase could pass 1.2 × the cap). The cap
-    keeps the VBV at one frame of the full target (`vbvFrames` target / cap) so the first frame
-    with motion, encoded before anyone knows it moved, is not starved. Only on
+    Capture dirty rects; `media.Frame.Dirty`; an image the source presented whose capture names
+    no changed region, as DDA hands out a game that flips past the compositor, counts as all of
+    it) and which frames are idle repeats (`media.Frame.Repeat`). The picture is still while, over
+    the last second, at most 0.2 % changed per frame (a caret, a clock; the pointer is not in the
+    helper's video), the capture had at most five new images (a game or a video presents far more
+    often, whatever its dirty rects say) and the encoder made less than half the static floor.
+    Once it has been still for 3 s (twice as long after each cut the picture ended within 10 s, up
+    to 30 s: content that changes every few seconds is not cut and restored over and over), the
+    encoder's target goes down to host config `staticKbps` (default a quarter of the rate
+    controller's target, at least 2 Mbit/s), linearly back towards the target between 0.2 % and
+    5 %, lower at most once a second; a frame that changes raises it at once, before that frame is
+    queued (so it goes out at the new pacing rate): the full target from 5 % changed or with more
+    than five new images a second, the linear share below that (about 37 % of the target at 1 %).
+    The first hardware run had it cut a running game every second or two (docs/VENDOR_NOTES.md
+    "First hardware run: the static desktop during a game"). It caps what the encoder is told,
+    never what the rate controller decides (the lower of the two: it cannot fight the congestion
+    control; a restore needs no ramp); the controller is told the encoder runs at its target
+    meanwhile (its fill, the delivered rates and the queue's growth are measured in units of its
+    target: told the capped rate, a decrease would start from the cap and no increase could pass 1.2
+    × the cap). The cap keeps the VBV at one frame of the full target (`vbvFrames` target / cap) so
+    the first frame with motion, encoded before anyone knows it moved, is not starved. Only on
     a seamless live bitrate (a cap that costs key frames is worth nothing); FFmpeg reports no
     dirty share, and an unknown share never lowers anything. Host config `staticBitrate` `off`
     turns it off; host.log logs `static desktop: lowering the bitrate` and `desktop changes: full

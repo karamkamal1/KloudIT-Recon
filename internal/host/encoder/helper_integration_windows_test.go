@@ -1232,6 +1232,58 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	}
 }
 
+// A game's presents for the static-desktop rule (docs/VENDOR_NOTES.md "First
+// hardware run: the static desktop during a game"): the GPU test source with
+// start "testDirty" presents without pauses. "none": presents whose capture
+// names no changed region, as DDA hands out a game that flips past the
+// compositor, reach recon-host as the whole picture (dirty 1); "zero":
+// presents reported as unchanged (what helpers before that rule reported);
+// either way an ActivityMeter never takes the stream for a still picture
+// (more than five new images a second) and suggests the whole ceiling. And
+// "testDirty" with another capture is refused.
+func TestHelperIntegrationGameDirty(t *testing.T) {
+	h := launchMock(t)
+	if _, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", FPS: 30, Kbps: 4000, TestDirty: "none"}); err == nil ||
+		!strings.Contains(err.Error(), "testDirty") {
+		t.Fatalf("testDirty with capture synthetic: %v", err)
+	}
+	for _, mode := range []string{"none", "zero"} {
+		t.Run(mode, func(t *testing.T) {
+			h := launchMock(t)
+			const w, hgt, fps = 320, 180, 30
+			_, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: w, Height: hgt, FPS: fps, Kbps: 4000, TestDirty: mode})
+			var he *HelperError
+			if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+				t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+			}
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			var m ActivityMeter
+			want := map[string]float64{"none": 1, "zero": 0}[mode]
+			presents, start := 0, time.Now()
+			for time.Since(start) < 2500*time.Millisecond {
+				f := nextFrame(t, h)
+				now := time.Now()
+				m.Add(now, f)
+				if f.Repeat {
+					continue
+				}
+				presents++
+				if f.FrameID > 1 && f.Dirty != want {
+					t.Fatalf("frame %d: dirty %v, want %v", f.FrameID, f.Dirty, want)
+				}
+				if time.Since(start) > 1100*time.Millisecond && (m.Static(now) || m.SuggestKbps(now, 20000, 2000) != 20000) {
+					t.Fatalf("frame %d: a game's presents taken for a still picture (%d images in the last second)", f.FrameID, m.Images(now))
+				}
+			}
+			if presents < fps*2 {
+				t.Fatalf("%d presents in 2.5 s at %d fps: the source must present all the time", presents, fps)
+			}
+		})
+	}
+}
+
 // The synthetic GPU source's high-motion mode (start "motion", the live-bitrate
 // qualification's source, step 3.6): presents without pauses (no idle
 // repeats), every image noisy, the barcode readable over it; and "motion"

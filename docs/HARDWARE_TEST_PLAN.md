@@ -1098,10 +1098,15 @@ round", "A late discardable frame is no loss")
 
 **13.3 Static desktop** (VENDOR_NOTES Phase 5 wiring A)
 
-- **Do**: stream an idle desktop with Notepad's caret blinking, then drag a window.
+- **Do**: stream an idle desktop with Notepad's caret blinking, then drag a window. Then a game:
+  its menu (left idle for a minute) and play.
 - **Pass**:
-  - Within ~2 s, `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`.
+  - Within ~4 s, `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`
+    (`images` 0-5, `still_ms` about 3000).
   - On the drag, `desktop changes: full bitrate back kbps=30000`, with no blur and no key frame.
+  - In the game, menu included: no `static desktop: lowering the bitrate` at all (the first
+    hardware run had one every second or two: VENDOR_NOTES "First hardware run: the static
+    desktop during a game").
 
 **13.4 Regions of interest** (VENDOR_NOTES Phase 5 wiring B)
 

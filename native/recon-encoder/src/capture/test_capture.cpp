@@ -26,12 +26,20 @@
 // 1000 cd/m2 patch top right at PQ code 769 = P010 Y 722.5) and "rgba16"
 // (R16G16B16A16_UNORM, which the conversion cannot read: the helper must give
 // up with the fatal capture_failed). Not with motion.
+//
+// start's testDirty plays a game's presents for the static-desktop rule
+// (docs/VENDOR_NOTES.md "First hardware run: the static desktop during a
+// game"): no pauses, and presents whose capture names no changed region
+// ("none": as DDA hands out a game that flips past the compositor, through
+// presentedDirtyFraction, so dirty 1) or that report nothing changed ("zero":
+// what helpers before that rule reported, dirty 0).
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <vector>
 
+#include "capture/dirty.hpp"
 #include "capture/paced_capture.hpp"
 #include "d3d/convert.hpp"
 #include "d3d/device.hpp"
@@ -83,6 +91,7 @@ private:
     int64_t start_ = 0, presentPeriod_ = 0, nextPresent_ = 0;
     uint64_t presents_ = 0;
     bool motion_ = false;
+    std::string testDirty_;  // start's testDirty: "" | "none" | "zero"
     uint32_t noise_ = 0x9e3779b9u;  // xorshift32 state of the motion noise
 };
 
@@ -147,6 +156,7 @@ Status GpuTestCapture::init(const StartParams& p) {
         for (uint32_t y = 0; y < src_.height; ++y) hdrGreen_.push_back(pqCode(160.0 * y / src_.height));
     }
     motion_ = p.motion;
+    testDirty_ = p.testDirty;
     const int64_t freq = qpcFrequency();
     presentPeriod_ = freq / std::min(240, 2 * p.fps);
     start_ = nextPresent_ = qpcNow();
@@ -158,10 +168,10 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
     const int64_t freq = qpcFrequency();
     const int64_t deadline = qpcNow() + int64_t(timeoutMs) * freq / 1000;
     for (;;) {
-        // 1 s of presents, then 0.6 s without any (motion: no pause).
+        // 1 s of presents, then 0.6 s without any (motion, testDirty: no pause).
         const int64_t cycle = freq * 16 / 10;
         const int64_t phase = (nextPresent_ - start_) % cycle;
-        if (phase >= freq && !motion_) nextPresent_ += cycle - phase;
+        if (phase >= freq && !motion_ && testDirty_.empty()) nextPresent_ += cycle - phase;
         if (nextPresent_ > deadline) {
             sleepUntil(deadline);
             return stopping() ? Next::Stopped : Next::Timeout;
@@ -181,6 +191,8 @@ Next GpuTestCapture::acquire(int timeoutMs, Acquired& a, Status&) {
         a.presentQpc = present;
         a.captureQpc = qpcNow();
         a.dirty = 1;  // the whole test image changes
+        if (testDirty_ == "none") a.dirty = float(presentedDirtyFraction(nullptr, 0, src_.width, src_.height));
+        if (testDirty_ == "zero") a.dirty = 0;
         return Next::Frame;
     }
 }

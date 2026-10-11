@@ -76,6 +76,12 @@ type StartParams struct {
 	// BT.2020 PQ), "rgba16" (a format the conversion cannot read); "" = 8-bit
 	// BGRA (FP16 with HDR).
 	TestFormat string `json:"testFormat,omitempty"`
+	// TestDirty (capture synthetic-gpu only, tests): a game's presents for
+	// the static-desktop rule: no pauses, and presents whose capture names no
+	// changed region ("none": as DDA hands out a game that flips past the
+	// compositor; the helper counts them as the whole picture) or that report
+	// nothing changed ("zero": what helpers before that rule reported).
+	TestDirty string `json:"testDirty,omitempty"`
 
 	// Phase 5 experiments (zero = off). ReencodeOversized: a non-key frame
 	// larger than this many average frames (bitrate / fps) is encoded again at

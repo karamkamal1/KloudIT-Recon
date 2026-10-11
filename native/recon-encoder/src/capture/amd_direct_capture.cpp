@@ -249,7 +249,10 @@ void AmdDirectCapture::followHdr(bool wasHdr) {
 
 // The share of the surface its DIRTY_RECTS (an AMFBuffer of AMFRect, the
 // same left / top / right / bottom layout as DirtyRect) cover, each region
-// counted once; -1 when the surface carries none.
+// counted once; -1 when the surface carries none. Every surface is a flip
+// (WAIT_FOR_PRESENT), so a list that names no region counts as the whole
+// picture (presentedDirtyFraction, capture/dirty.hpp), as DDA's frames
+// without metadata.
 float AmdDirectCapture::dirtyShare(amf::AMFSurface* s, amf_int32 w, amf_int32 h) {
     static_assert(sizeof(AMFRect) == sizeof(DirtyRect), "AMFRect is four amf_int32");
     amf::AMFInterfacePtr iface;
@@ -261,7 +264,7 @@ float AmdDirectCapture::dirtyShare(amf::AMFSurface* s, amf_int32 w, amf_int32 h)
     if (!rects && n) return -1;
     std::vector<DirtyRect> r(n);
     for (size_t i = 0; i < n; ++i) r[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
-    return float(dirtyFraction(r.data(), r.size(), uint32_t(w), uint32_t(h)));
+    return float(presentedDirtyFraction(r.data(), r.size(), uint32_t(w), uint32_t(h)));
 }
 
 Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {

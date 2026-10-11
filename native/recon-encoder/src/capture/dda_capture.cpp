@@ -324,28 +324,34 @@ Status DdaCapture::copyIn(ID3D11Texture2D* tex) {
 // The share of the image this frame changed: the union of the move rects'
 // destinations and the dirty rects (GetFrameMoveRects / GetFrameDirtyRects, in
 // the desktop texture's own, unrotated coordinates like w x h), each region
-// counted once (capture/dirty.hpp). 0 when the frame has no metadata, -1 when
-// it cannot be read. Not for the first frame of a duplication (acquire).
+// counted once. Only for frames whose image was presented (LastPresentTime
+// set; acquire skips the others), so metadata that names no region (none at
+// all, TotalMetadataBufferSize 0, as for a game that flips past the
+// compositor, or no rects in it) counts as the whole picture, not as nothing
+// (presentedDirtyFraction, capture/dirty.hpp). -1 when it cannot be read.
+// Not for the first frame of a duplication (acquire).
 float DdaCapture::dirtyShare(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h) {
-    if (!fi.TotalMetadataBufferSize || !w || !h) return fi.TotalMetadataBufferSize ? -1.0f : 0.0f;
-    meta_.resize(fi.TotalMetadataBufferSize);
+    if (!w || !h) return -1;
     rects_.clear();
-    UINT used = 0;
-    std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
-    if (FAILED(dup_->GetFrameMoveRects(UINT(meta_.size()), reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(meta_.data()), &used))) {
-        return -1;
+    if (fi.TotalMetadataBufferSize) {
+        meta_.resize(fi.TotalMetadataBufferSize);
+        UINT used = 0;
+        std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
+        if (FAILED(dup_->GetFrameMoveRects(UINT(meta_.size()), reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(meta_.data()), &used))) {
+            return -1;
+        }
+        const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(meta_.data());
+        for (UINT i = 0; i < used / sizeof(DXGI_OUTDUPL_MOVE_RECT); ++i) {
+            const RECT& d = moves[i].DestinationRect;
+            rects_.push_back({int32_t(d.left), int32_t(d.top), int32_t(d.right), int32_t(d.bottom)});
+        }
+        if (FAILED(dup_->GetFrameDirtyRects(UINT(meta_.size()), reinterpret_cast<RECT*>(meta_.data()), &used))) return -1;
+        const auto* rects = reinterpret_cast<const RECT*>(meta_.data());
+        for (UINT i = 0; i < used / sizeof(RECT); ++i) {
+            rects_.push_back({int32_t(rects[i].left), int32_t(rects[i].top), int32_t(rects[i].right), int32_t(rects[i].bottom)});
+        }
     }
-    const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(meta_.data());
-    for (UINT i = 0; i < used / sizeof(DXGI_OUTDUPL_MOVE_RECT); ++i) {
-        const RECT& d = moves[i].DestinationRect;
-        rects_.push_back({int32_t(d.left), int32_t(d.top), int32_t(d.right), int32_t(d.bottom)});
-    }
-    if (FAILED(dup_->GetFrameDirtyRects(UINT(meta_.size()), reinterpret_cast<RECT*>(meta_.data()), &used))) return -1;
-    const auto* rects = reinterpret_cast<const RECT*>(meta_.data());
-    for (UINT i = 0; i < used / sizeof(RECT); ++i) {
-        rects_.push_back({int32_t(rects[i].left), int32_t(rects[i].top), int32_t(rects[i].right), int32_t(rects[i].bottom)});
-    }
-    return float(dirtyFraction(rects_.data(), rects_.size(), w, h));
+    return float(presentedDirtyFraction(rects_.data(), rects_.size(), w, h));
 }
 
 Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {

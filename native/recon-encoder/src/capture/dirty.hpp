@@ -28,6 +28,19 @@ constexpr size_t kMaxDirtyUnionRects = 256;
 // caret reported twice) are counted once. 0 for an empty list or picture.
 double dirtyFraction(const DirtyRect* rects, size_t count, uint32_t width, uint32_t height);
 
+// The share (0..1) of a presented image that changed, from the rects its
+// capture names for it: dirtyFraction, except where they name no region at
+// all (no rects, or only empty ones), which counts as the whole picture. The
+// source did present a new image (DDA: LastPresentTime set; AMD Direct
+// Capture: a flip), so something changed, and Windows did not say what: a
+// game that flips past the compositor (independent flip, DirectFlip) has its
+// presents duplicated without dirty or move rects. Counted as unchanged, a
+// running game read as a static desktop and had its bitrate cut
+// (docs/VENDOR_NOTES.md "First hardware run: the static desktop during a
+// game"); WebRTC's DXGI capturer likewise takes the whole desktop as updated
+// when a frame's region cannot be told. -1 for an empty picture.
+double presentedDirtyFraction(const DirtyRect* rects, size_t count, uint32_t width, uint32_t height);
+
 // Two deliveries merged into one (the pacer kept only the newest image, so
 // the encoder sees both changes): their sum, at most 1 (an upper bound: the
 // rects of the dropped image are gone). -1 (unknown) if either is unknown.

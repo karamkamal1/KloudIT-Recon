@@ -142,6 +142,14 @@ struct StartParams {
     // (R10G10B10A2_UNORM: sRGB-coded; with hdr BT.2020 PQ, an HDR10 swap
     // chain), "rgba16" (R16G16B16A16_UNORM, which the conversion cannot read).
     std::string testFormat;
+    // synthetic-gpu only (tests): the dirty metadata of its presents, and a
+    // source that presents without pauses (a game): "" (the whole image
+    // changes, dirty 1; with pauses), "none" (presents that name no changed
+    // region, as DDA hands out a game's that flips past the compositor:
+    // presentedDirtyFraction), "zero" (presents reported as unchanged, dirty
+    // 0: what helpers before that rule reported for them; recon-host must
+    // not take them for a static desktop either).
+    std::string testDirty;
     // Phase 5 experiments (optional, off by default; caps say where they work).
     // reencodeOversized: a non-key frame larger than this many average frames
     // (bitrate / fps) is encoded once more at a higher QP before it goes out

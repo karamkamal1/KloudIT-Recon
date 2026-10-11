@@ -51,6 +51,10 @@ type Frame struct {
 	// the synthetic GPU source). FFmpeg reports none.
 	Dirty    float64
 	HasDirty bool
+	// Repeat: an idle re-submit of the previous image (native helper: the
+	// capture had no new image for idleRepeatMs). A still desktop is mostly
+	// repeats; a game or a video presents new images (activity.go).
+	Repeat bool
 	// FirstSliceUs: host clock when the encoder had the frame's first slice
 	// / tile ready (native helper sub-frame output, StartParams.SliceOutput;
 	// 0 = it came out whole). The frame still goes out whole: EncodeDoneUs -

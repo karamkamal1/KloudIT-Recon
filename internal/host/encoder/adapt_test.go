@@ -64,38 +64,62 @@ func TestActivityMeter(t *testing.T) {
 	if _, ok := m.Activity(t0); ok || m.Static(t0) || m.SuggestKbps(t0, 20000, 2000) != 20000 {
 		t.Fatal("no frames: not unknown")
 	}
-	// A static desktop with a blinking caret and idle repeats.
-	for i := 0; i < 60; i++ {
-		f := &Frame{Dirty: 40.0 / (1920 * 1080)}
-		if i%10 == 9 {
-			f = &Frame{Repeat: true, Dirty: -1} // a repeat counts as unchanged whatever it says
+	// A static desktop: idle repeats every 100 ms, a blinking caret's new
+	// image every 500 ms.
+	for ms := 0; ms <= 1000; ms += 100 {
+		f := &Frame{Repeat: true, Dirty: -1, Data: make([]byte, 300)} // a repeat counts as unchanged whatever it says
+		if ms%500 == 0 {
+			f = &Frame{Dirty: 40.0 / (1920 * 1080), Data: make([]byte, 600)}
 		}
-		m.Add(at(i*16), f)
+		m.Add(at(ms), f)
 	}
-	now := at(59 * 16)
-	if !m.Static(now) || m.SuggestKbps(now, 20000, 2000) != 5000 {
-		t.Fatalf("static: %v, %d kbps", m.Static(now), m.SuggestKbps(now, 20000, 2000))
+	now := at(1000)
+	if !m.Static(now) || m.SuggestKbps(now, 20000, 2000) != 5000 || m.Images(now) != 3 {
+		t.Fatalf("static: %v, %d kbps, %d images", m.Static(now), m.SuggestKbps(now, 20000, 2000), m.Images(now))
+	}
+	if o := m.OutputKbps(now); o != float64(8*300+2*600+600)*8/1000 {
+		t.Fatalf("output %.1f kbps", o)
 	}
 	if m.SuggestKbps(now, 20000, 8000) != 8000 {
 		t.Fatal("floor ignored")
 	}
 	// A window opens: 30 % changed -> the whole ceiling at once.
-	m.Add(at(1000), &Frame{Dirty: 0.3})
-	if m.Static(at(1000)) || m.SuggestKbps(at(1000), 20000, 2000) != 20000 {
+	m.Add(at(1050), &Frame{Dirty: 0.3})
+	if m.Static(at(1050)) || m.SuggestKbps(at(1050), 20000, 2000) != 20000 {
 		t.Fatal("motion did not restore the ceiling")
 	}
 	// ... and is remembered for the window (1 s), then static again.
-	for ms := 1016; ms <= 1900; ms += 16 {
-		m.Add(at(ms), &Frame{Dirty: 0})
+	for ms := 1100; ms <= 2000; ms += 100 {
+		m.Add(at(ms), &Frame{Repeat: true})
 	}
-	if k := m.SuggestKbps(at(1900), 20000, 2000); k != 20000 {
-		t.Fatalf("window: %d kbps at 1.9 s", k)
+	if k := m.SuggestKbps(at(2000), 20000, 2000); k != 20000 {
+		t.Fatalf("window: %d kbps at 2.0 s", k)
 	}
-	for ms := 1916; ms <= 2100; ms += 16 {
-		m.Add(at(ms), &Frame{Dirty: 0})
-	}
+	m.Add(at(2100), &Frame{Repeat: true})
 	if k := m.SuggestKbps(at(2100), 20000, 2000); k != 5000 {
 		t.Fatalf("window: %d kbps at 2.1 s", k)
+	}
+	// A game whose presents report nothing changed (a game flipping past
+	// the compositor, as helpers before the first hardware run's fix
+	// reported it) or a caret-sized change: 60 new images a second is
+	// motion, whatever the share. Six in a second already are; five are not.
+	var game ActivityMeter
+	for i := 0; i <= 60; i++ {
+		game.AddFrame(at(i*16), 0, false, 0)
+	}
+	if game.Static(at(960)) || game.SuggestKbps(at(960), 20000, 2000) != 20000 || game.Images(at(960)) != 61 {
+		t.Fatalf("a game's presents without dirty rects: static %v, %d kbps", game.Static(at(960)), game.SuggestKbps(at(960), 20000, 2000))
+	}
+	var few ActivityMeter
+	for i := 0; i < 5; i++ {
+		few.AddFrame(at(i*200), 0.0001, false, 0)
+	}
+	if !few.Static(at(800)) {
+		t.Fatal("five new images a second not still")
+	}
+	few.AddFrame(at(900), 0.0001, false, 0)
+	if few.Static(at(900)) || few.SuggestKbps(at(900), 20000, 2000) != 20000 {
+		t.Fatal("six new images a second still")
 	}
 	// Small changes scale linearly between StaticBelow and FullAbove.
 	var lin ActivityMeter
@@ -108,15 +132,17 @@ func TestActivityMeter(t *testing.T) {
 	if _, ok := lin.Activity(t0); ok || lin.SuggestKbps(t0, 20000, 0) != 20000 {
 		t.Fatal("unknown share not reported as unknown")
 	}
-	// AddShare: the share alone, as recon-host's frames carry it.
+	// AddFrame: the share, the repeat and the size alone, as recon-host's
+	// frames carry them; a negative share is unknown, a repeat unchanged.
 	var sh ActivityMeter
-	sh.AddShare(t0, 0.001)
-	if !sh.Static(t0) || sh.SuggestKbps(t0, 20000, 2000) != 5000 {
-		t.Fatal("AddShare: static share not static")
+	sh.AddFrame(t0, 0.001, false, 1000)
+	sh.AddFrame(t0.Add(10*time.Millisecond), -1, true, 1000)
+	if !sh.Static(t0.Add(10*time.Millisecond)) || sh.SuggestKbps(t0, 20000, 2000) != 5000 || sh.OutputKbps(t0.Add(10*time.Millisecond)) != 16 {
+		t.Fatal("AddFrame: static share not static")
 	}
-	sh.AddShare(t0.Add(10*time.Millisecond), -1)
-	if _, ok := sh.Activity(t0.Add(10 * time.Millisecond)); ok {
-		t.Fatal("AddShare: negative share not unknown")
+	sh.AddFrame(t0.Add(20*time.Millisecond), -1, false, 0)
+	if _, ok := sh.Activity(t0.Add(20 * time.Millisecond)); ok {
+		t.Fatal("AddFrame: negative share not unknown")
 	}
 }
 

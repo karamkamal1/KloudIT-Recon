@@ -936,6 +936,7 @@ func (v *HelperVideo) convert(pr *helperProc, f *encoder.Frame, data []byte, cap
 	// Only frames the client cannot miss stay: a recovery frame whose
 	// refFloor was not usable is no recovery frame for the client either.
 	fr.Discardable = f.Droppable() && !fr.Recovery
+	fr.Repeat = f.Repeat
 	if f.Dirty >= 0 {
 		fr.Dirty, fr.HasDirty = min(f.Dirty, 1), true
 		if f.Repeat {
