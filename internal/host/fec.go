@@ -514,8 +514,10 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 		r = old + (r-old)/30
 	}
 	fs.ratio.Store(r)
-	// The pacer model counts what went on the wire.
+	// The pacer model counts what went on the wire; the fill, as the
+	// client counts a frame, its bytes.
 	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), wire, s.videoPacingBps())
+	s.rate.sent(frameBytes)
 	s.stats.frames.Add(1)
 	s.stats.bytes.Add(int64(frameBytes))
 	if h.Flags&proto.FrameFlagExt != 0 {

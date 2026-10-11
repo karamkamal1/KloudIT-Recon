@@ -468,7 +468,7 @@ func TestStaticCapRateController(t *testing.T) {
 			h.loss = 0
 		case "thinning":
 			for i := 0; i < 24; i++ {
-				h.r.thinned()
+				h.r.thinned(true)
 				h.run(50*time.Millisecond, flat(20*time.Millisecond))
 			}
 		}

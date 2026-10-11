@@ -161,7 +161,10 @@ nothing is corrupted, no key frame is needed and the encoder does not change. Co
 the rate controller's last two reports over its delay target (or a frame far over it that does not
 arrive), two or more frames waiting in the frame queue behind the one being sent, a frame stream
 still being written past its deadline (or the last frame written that slowly, on a stream or as
-datagram shards). A thinned frame gets
+datagram shards). Thinning for the delay or a frame past its deadline is the path's congestion
+(the rate controller holds its increases and, when it lasts, decreases); thinning only for
+frames waiting behind one being paced out on schedule (a key frame at a low bitrate) is the
+host's own queue and changes nothing in the rate controller. A thinned frame gets
 no `dropped` report, no recovery and no acknowledgement; every frame sent after it carries the
 `thinned` mask, so the client skips its seq at once, neither waiting for it nor taking it for a
 loss (frame-to-frame freeze accounting treats the frames around it as consecutive). A loss the
@@ -315,7 +318,14 @@ running encoder (never from a vendor). Its rungs, cheapest first:
    without rung 2 (with the bitrate cut), and for a `skip` loss intra refresh did not heal in time:
    an IDR in the running encoder where the pipeline forces one (the helper: never an encoder
    restart), else a new encoder generation (the FFmpeg path keeps its restart). Under `keyframe` the
-   client gives the generation up, so the host sends nothing more of it either.
+   client gives the generation up, so the host sends nothing more of it either. In the running
+   encoder one key frame at a time: one asked for while frameSender writes a key frame is forced
+   once that write is done (`key frame deferred: one is being sent`, once however often it is
+   asked), and a loss of frames after a key frame of their generation that is still being written
+   is a key frame at once, not rung 2 (nothing after that key frame has reached the client, so no
+   LTR after it is acknowledged: the encoder could only answer with another IDR, behind the one
+   still going out). At a low bitrate a key frame is many frame budgets: two in a row only queue
+   behind each other at the pacing rate (the first hardware run's key-frame storm, below).
 
 `stream stats` counts the ladder's work every 10 s: `deadline_drops` (rung 1), `discarded` (frames
 not sent while the client waited for a recovery or key frame), `recovered` / `recovered_by_key`
@@ -439,7 +449,7 @@ instead as datagrams with forward error correction:
 | `0x23` rumble | H→C | idx, u8 large motor, u8 small motor | force feedback from ViGEmBus; a running state re-sent every 100 ms, a stop 3 times |
 | `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, ping: u32 min RTT µs; pong: u64 host µs | NTP-style clock sync, minimum-RTT sample; the ping's min RTT (since step 4.6; 16-byte pings before) picks the Opus frame |
 | `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, the ACKs of reference recovery, and the rate controller's feedback from clients without rate reports |
-| `0x41` rate report | C→H | flags, gen, 0, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 [, u32 shards, u32 shardsLost] | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
+| `0x41` rate report | C→H | flags, gen, owdGen, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 [, u32 shards, u32 shardsLost] [, u32 owdSeq, i32 clockShiftUs] | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
 | `0x42` FEC NACK | C→H | gen, count, 0, u32 seq, count × (u16 base, u8 need, u8 0) | the shards a frame sent as datagrams still needs ([above](#datagram--fec-video)) |
 
 **Rate report** (`proto.RateReport`, 40 bytes, GUIDE 2.2). Flags: bit 0 the delays are valid
@@ -455,7 +465,17 @@ minus `encodeDoneUs`, or `send_us` without the extension: the 0x40 ack's measure
 (clients of hosts that list `video-fec`): 8 more bytes, of the frames' first transmissions (data
 and parity, not repairs) the shards received and those that never arrived, both counted when
 the client accounts a frame (max(100 ms, 2 × RTT) after its first transmission is through), so
-they cover the same frames; the host sizes its parity from them. Hosts list
+they cover the same frames; the host sizes its parity from them. Flag bit 3 (since the first
+hardware run's fixes; every client sends it with the delays): `owdGen` (the byte after `gen`,
+0 before) and `owdSeq` (8 more bytes after the shard counters, or after the first 40) name the
+frame whose delay the p50 is, and `clockShiftUs` how far the client's clock offset has moved
+since its first sync (a better ping sample corrects it; the delays were measured with the
+moved offset, and the client drops the delays it measured with the old one). The host takes
+that frame's own pacer share off the p50 (frames that complete out of order, after a
+retransmission, are not the frames `lastSeq` newly covers, and the median of those was taken
+off before) and subtracts `clockShiftUs` from both delays: a corrected offset is no change of
+the path's delay. Hosts before it read neither (the byte was reserved, the block is past what
+they read). Hosts list
 `rate-report` in `welcome.features`; clients that see it send the report and stop sending their
 own delay-based `{"t":"congestion"}` (the decoder's `reason:"decoder"` one stays). Older hosts
 never see a 0x41 (the client sends it only on the feature); older clients keep their own delay
@@ -604,8 +624,11 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     the host's own pacer explains (`internal/host/ratefeedback.go`: the media congestion
     controller paces at 1.2 × the target, so a key frame takes several frame intervals to go out
     and delays itself and the frames behind it, with no network queue at all; the share is a
-    fluid model of the pacer, at most the measured encodeDone → written time, so a host queue the
-    congestion window causes stays in the signal). The target is the minimum of the last 2 s plus
+    fluid model of the pacer, what it had queued draining at the rate it had (a raised target
+    does not drain it faster), at most the measured encodeDone → written time, so a host queue the
+    congestion window causes stays in the signal; that of the frame whose delay the p50 is, where
+    the report names it). The delays are on the scale of the client's first clock sync (less the
+    report's `clockShiftUs`). The target is the minimum of the last 2 s plus
     8 ms, wider on a jittery path (4 × the mean change between reports, at most 50 ms: Wi-Fi's
     bursts are not a queue). Frames that stop arriving altogether (a capacity drop: the queue
     fills, the frames wait for retransmissions, nothing completes) are seen from the oldest
@@ -617,11 +640,20 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   - *Decrease* ×0.85 when the delay stays over the target for 3 reports in a row and is not
     falling (a queue that drains needs no second decrease), or when more than 2 % of the
     packets of the last second were lost (10 % while video goes as datagram shards with parity,
-    [above](#datagram--fec-video)); from the rate the path delivered when that is lower
-    than the target: on the direct path and the UDP relay (the host's QUIC connection ends at the
-    browser) the connection's acknowledged bytes of the last 100 ms (less audio and overhead), else the client's receive rate of the last 250 ms or 1 s, divided
-    by the encoder's fill (its output as a share of its target over the last second: encoders do
-    not hit their target exactly). A delay decrease also starts from the capacity the queue's
+    [above](#datagram--fec-video)); from the lower of the target and the encoder's rate (an
+    increase a slow policy has not applied yet never reached the path), or from the rate the path
+    delivered when that is lower: on the direct path and the UDP relay (the host's QUIC
+    connection ends at the browser) the connection's acknowledged bytes of the last 100 ms (less
+    audio and overhead), but only where the path held the sender back (its congestion window for
+    a quarter of those 100 ms, packets lost in them, or acknowledgements under 90 % of what the
+    session sent over the last 250 ms: a queue building; otherwise the sender had nothing more to
+    send, a source slower than the session's frame rate, frames thinned or paced out, and the
+    acknowledged rate is its own, not the path's, as BBR's application-limited samples), else the
+    client's receive rate of the last 250 ms or 1 s; divided by the fill (what the session
+    handed to the transport as a share of the encoder's target over the last second, by time:
+    encoders do not hit their target exactly, frames the session left out (thinned, dropped in
+    an overflow) never reached the path, and a source slower than the session's frame rate, a
+    game menu at 12 fps, sends larger frames at the same bitrate). A delay decrease also starts from the capacity the queue's
     growth implies when the queue grows by 0.25 s per second or more and stands 20 ms over the
     base (sending at R into a path of capacity C grows the queue by (R − C) / C per second, so
     C = R / (1 + growth)): it sees a capacity drop at once, while the delivered rates still hold
@@ -631,6 +663,18 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     more (150 ms for a qualified seamless encoder, 300 ms for one assumed seamless, 500 ms for a
     flushing one, 1 s for an FFmpeg restart: its key frame and start-up); losses count again
     300 ms after that.
+  - *Level shifts.* A delay that stays where a delay decrease found it (within the margin), the
+    decrease in effect since, is a step of the path's one-way delay (a relay's route; a clock
+    correction an older client does not report) rather than a queue: a queue behind a rate the
+    path cannot carry keeps growing until a decrease is enough, and then drains. The base would
+    read the step as a queue for its 2 s (a decrease on every report after each hold: the first
+    hardware run's cascade to the floor); instead it restarts at that decrease. Only where the
+    path held the sender back neither in the 2 s before that decrease nor since (no losses, the
+    congestion window never waited for acknowledgements: `cc.Media.WindowLimited`): a queue
+    standing at the capacity after a decrease that just reached it looks the same in the delay,
+    but comes with losses at a full bottleneck queue or a window waiting for acknowledgements,
+    and keeps decreasing. Not for frames that do not arrive, nor for a frame-rate step at the
+    floor (it sends as much).
   - *Increase* continuously: +5 %/s near the last known-good rate (what the path delivered at the
     last decrease), up to +25 %/s far below it (more than 10 % below: linearly to 40 % below),
     and accelerating by 5 %/s per second once above it (the capacity grew); never above the
@@ -641,7 +685,13 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     sent 1 s ago that no report covered, from a client that reports: on the QUIC splice and
     WebSocket relay paths the gateway buffers what its client leg cannot carry).
   - *Emergencies* as before: a host frame-queue overflow (the backlog is dropped and reported,
-    `{"t":"dropped"}`) or a client that flushed its decoder (`{"t":"congestion","reason":
+    `{"t":"dropped"}`; the queue overflows at 6 frames only where the network does not keep up:
+    the frame being sent has been with the sender past its deadline, rung 1's, its own sending
+    time at the pacing rate plus an interval, or the rate controller's last report found the
+    delay over its target; behind a frame paced out on schedule on a path that carries it, a key
+    frame at a low bitrate or a scene change, frames wait their turn, up to 128, as the pacer
+    catches up: dropping them cost a recovery, after a key frame another key frame, at a low
+    bitrate the next overflow again) or a client that flushed its decoder (`{"t":"congestion","reason":
     "decoder"}`) cuts at once by 25 % (an overflow at least to 0.85 × the delivered rate, but
     from at least half the target, as a decrease) with an urgent restart (an overflow under
     reference recovery on a seamless encoder: the cut in place, the dropped frames answered by a
@@ -649,7 +699,8 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     any other decrease (the old generation that still streams is what overflows: the starting
     one takes over at once; with nothing starting a key frame follows, unless a recovery frame
     answers the dropped frames); a decoder flush also caps
-    later increases at 85 % of the bitrate it cut from, until the settings change. An older
+    later increases at 85 % of the bitrate it cut from (never below the floor), until the
+    settings change. An older
     client's delay report (`{"t":"congestion"}`) decreases like the controller's own decision.
   - *Frame rate* (GUIDE 9 "FPS before resolution"). At the floor (2 Mbit/s, or the setting if
     lower) a decrease lowers the frame rate a rung instead (resolution is not changed); the frame
@@ -720,9 +771,12 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     delay (`report_owd_p50_ms`, `_p95_ms`, `_max_ms`), the continuous target (`kbps_est`), the
     frame rate (`fps_target`), the margin (`queue_margin_ms`) and the loss (`loss_pct`). The
     controller's tests include a millisecond simulation of the whole path (encoder, frame
-    queue, pacer, bottleneck, Wi-Fi gate, client reports: `internal/host/ratesim_test.go`) and
+    queue, pacer, bottleneck, Wi-Fi gate, client reports: `internal/host/ratesim_test.go`), the
+    first hardware run's scenario with the session's real parts (an AMF-like encoder over a
+    ~20 ms UDP relay, the media congestion controller, the video window, the ladder, thinning,
+    the client's reports and clock: `internal/host/ratesim_relay_test.go`) and
     a capdrop run between network namespaces (`test/netem/capdrop.sh`); docs/VENDOR_NOTES.md 2.2
-    has the numbers.
+    and "First hardware run: rate control on the UDP relay" have the numbers.
 - **QUIC congestion control:** quic-go is vendored in `third_party/quic-go` with one hook,
   `quic.Config.Congestion` (a controller factory) plus `(*quic.Conn).CongestionControl()`
   (see `third_party/README.md`). Host config `congestion` picks it for the host's video
@@ -732,7 +786,11 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
   off for it) or `reno` (quic-go's NewReno):
   pacing = 1.2 × the session's send rate (encoder bitrate + audio bitrate + 200 kbit/s for
   headers and small datagrams; re-applied with every frame, since a path migration replaces
-  the controller), window = pacing × (min RTT + 2 frame intervals), no window cut on a single
+  the controller), window = pacing × (min RTT + 2 frame intervals: the session's, or the
+  interval of the frames the encoder produced over the last second where that is longer, at
+  most 250 ms; a 12 fps game menu sends five times larger frames at the same bitrate, and a
+  window of two 60 fps frames would not take one of them: the wait for acknowledgements read as
+  a queue), no window cut on a single
   loss (losses are counted for the application's rate controller); only persistent congestion
   (RFC 9002: lost packets whose send times span more than 3 × PTO with no ACK in between)
   collapses the window to two packets.

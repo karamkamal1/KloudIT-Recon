@@ -88,7 +88,10 @@ const HW_FAIL_WINDOW_MS = 10000;
 const ERROR_BACKOFF_MS = 2000;
 const FAMILY_NAMES = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
 
-const clock = { offset: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0 };
+// first: the offset of the first sync; the rate reports carry how far the
+// offset moved since (a better sample corrects it), so the host's delay base
+// does not read the correction as a change of the path's delay.
+const clock = { offset: null, first: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0 };
 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
@@ -141,9 +144,10 @@ const congestion = { owdHist: [], over: 0, lastSent: 0 };
 // Rate reports (GUIDE 2.2): to hosts that list P.FEATURE_RATE_REPORT the
 // client reports every RATE_REPORT_MS what it received (cumulative frames,
 // bytes, losses, audio packets; the one-way delays of the frames since the
-// last report; the newest frame; the decoder's backlog), and the host's rate
-// controller decides the bitrate from them. Counters are cumulative so a lost
-// report costs only its delay samples.
+// last report, which frame the p50 is and how far the clock offset they were
+// measured with moved since the first sync; the newest frame; the decoder's
+// backlog), and the host's rate controller decides the bitrate from them.
+// Counters are cumulative so a lost report costs only its delay samples.
 const RATE_REPORT_MS = 25;
 const fb = { on: false, timer: 0, sent: 0, frames: 0, bytes: 0, lost: 0, audio: 0, owd: [], gen: -1, lastSeq: 0 };
 
@@ -152,11 +156,16 @@ function sendRateReport() {
   let flags = 0;
   let p50 = 0;
   let max = 0;
+  let mid = null;
   if (fb.owd.length) {
-    const o = fb.owd.sort((a, b) => a - b);
-    p50 = o[(o.length - 1) >> 1];
-    max = o[o.length - 1];
-    flags |= P.RATE_REPORT_OWD;
+    // [delay, gen, seq]: the host takes the p50 frame's own pacer share off
+    // its delay (frames that complete out of order are not the frames the
+    // newest one covers).
+    const o = fb.owd.sort((a, b) => a[0] - b[0]);
+    mid = o[(o.length - 1) >> 1];
+    p50 = mid[0];
+    max = o[o.length - 1][0];
+    flags |= P.RATE_REPORT_OWD | P.RATE_REPORT_OWD_FRAME;
     fb.owd = [];
   }
   if (fb.gen >= 0) flags |= P.RATE_REPORT_FRAME;
@@ -169,6 +178,7 @@ function sendRateReport() {
   transport.sendDatagram(P.rateReport({
     flags, gen: Math.max(0, fb.gen), timeMs: now(), lastSeq: fb.lastSeq, frames: fb.frames, bytes: fb.bytes,
     owdP50Us: p50 * 1000, owdMaxUs: max * 1000, lost: fb.lost, audio: fb.audio,
+    owdGen: mid ? mid[1] : 0, owdSeq: mid ? mid[2] : 0, clockShiftUs: clock.offset !== null && clock.first !== null ? (clock.offset - clock.first) * 1000 : 0,
     // The decoder's backlog: chunks in the decoder and waiting in front of it
     // (MAX_DECODE_QUEUE), as checkDecoderBacklog counts it.
     decodeQueue: video.inflight.size + video.queue.length,
@@ -182,7 +192,7 @@ function sendRateReport() {
 function rateReportFrame(h, bytes, recv, repaired) {
   fb.frames++;
   fb.bytes += bytes;
-  if (clock.offset !== null && fb.owd.length < 1000 && !repaired) fb.owd.push(recv - hostToLocal(sentUs(h)));
+  if (clock.offset !== null && fb.owd.length < 1000 && !repaired) fb.owd.push([recv - hostToLocal(sentUs(h)), h.gen, h.seq]);
   if (fb.gen < 0 || isNewerGen(h.gen, fb.gen)) {
     fb.gen = h.gen;
     fb.lastSeq = h.seq;
@@ -233,7 +243,12 @@ function onPong(d) {
   clock.samples = clock.samples.filter((s) => t1 - s.at < 30000).slice(-40);
   let best = clock.samples[0];
   for (const s of clock.samples) if (s.rtt < best.rtt) best = s;
+  // A new offset: the delays measured with the old one go (the next rate
+  // report's are all on the new one, whose change since the first sync it
+  // carries).
+  if (clock.offset !== null && best.offset !== clock.offset) fb.owd = [];
   clock.offset = best.offset;
+  if (clock.first === null) clock.first = best.offset;
   clock.minRtt = best.rtt;
 }
 

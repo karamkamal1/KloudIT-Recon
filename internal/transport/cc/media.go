@@ -147,6 +147,12 @@ func MediaFactory(rtt congestion.RTTStats, initialMaxDatagramSize congestion.Byt
 	return NewMedia(rtt, initialMaxDatagramSize)
 }
 
+// SetClock replaces the controller's clock (congestion.Now) for the
+// timestamps it takes itself (WindowLimited, a loss's DeliveredAt): a
+// simulation drives it with its own time. Call it before the controller is
+// used.
+func (m *Media) SetClock(now func() congestion.Time) { m.now = now }
+
 // SetTargetBitrate sets the application's current target bitrate in bit/s.
 func (m *Media) SetTargetBitrate(bps int64) {
 	m.targetBitrate.Store(max(bps, minTargetBitrate))
@@ -416,7 +422,7 @@ func (m *Media) OnCongestionEvent(pn congestion.PacketNumber, lostBytes, _ conge
 	}
 	m.lostPackets.Add(1)
 	m.lostBytes.Add(uint64(lostBytes))
-	m.advance(m.donePos.Load()+uint64(lostBytes), congestion.Now())
+	m.advance(m.donePos.Load()+uint64(lostBytes), m.now())
 	if m.persistentCongestion(pn) {
 		m.collapse()
 	}

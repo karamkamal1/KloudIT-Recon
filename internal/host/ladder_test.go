@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -132,6 +133,60 @@ func TestFrameDeadline(t *testing.T) {
 		}
 		if got := frameDeadline(interval, c.bytes, c.pacingBps); (got - c.want).Abs() > 2*time.Microsecond {
 			t.Errorf("%d fps, %d bytes at %.0f bit/s: %v, want %v", c.fps, c.bytes, c.pacingBps, got, c.want)
+		}
+	}
+}
+
+// TestQueueOverflows: the frame queue overflows at frameQueueFrames only
+// where the network does not keep up: the frame being sent is past its
+// deadline (its own sending time at the pacing rate plus an interval), or
+// the path's delay is over the target; behind a frame paced out on
+// schedule (a key frame at a low bitrate) frames wait, up to frameQueueMax.
+func TestQueueOverflows(t *testing.T) {
+	const ms = time.Millisecond
+	interval := time.Second / 60
+	key := 200_000 // bytes: 667 ms at 2.4 Mbit/s
+	for _, c := range []struct {
+		name      string
+		queued    int
+		congested bool
+		sending   bool
+		busy      time.Duration
+		bytes     int
+		want      bool
+	}{
+		{"few frames, congested", frameQueueFrames - 1, true, true, time.Second, key, false},
+		{"behind a key frame on schedule", frameQueueFrames, false, true, 300 * ms, key, false},
+		{"behind a key frame on schedule, many", frameQueueMax - 1, false, true, 600 * ms, key, false},
+		{"behind a key frame past its deadline", frameQueueFrames, false, true, 700 * ms, key, true},
+		{"behind a small frame past its deadline", frameQueueFrames, false, true, 40 * ms, 5000, true},
+		{"behind a small frame in time", frameQueueFrames, false, true, 20 * ms, 5000, false},
+		{"the delay over the target", frameQueueFrames, true, true, 10 * ms, key, true},
+		{"the delay over the target, nothing sending", frameQueueFrames, true, false, 0, 0, true},
+		{"the sender between two frames (it takes the next at once)", frameQueueFrames, false, false, 0, 0, false},
+		{"a stream that does not open", frameQueueFrames, false, true, 200 * ms, 5000, true},
+		{"at the bound", frameQueueMax, false, true, 10 * ms, key, true},
+	} {
+		if got := queueOverflows(c.queued, c.congested, c.sending, c.busy, c.bytes, interval, 2.4e6); got != c.want {
+			t.Errorf("%s: overflows %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestPacedInterval: the congestion window is sized for the frames the
+// encoder produces: the session's interval, or a slower source's (up to
+// maxPacedInterval).
+func TestPacedInterval(t *testing.T) {
+	const ms = time.Millisecond
+	for _, c := range []struct{ interval, source, want time.Duration }{
+		{16 * ms, 0, 16 * ms},
+		{16 * ms, 10 * ms, 16 * ms},
+		{16 * ms, 83 * ms, 83 * ms},
+		{16 * ms, time.Second, maxPacedInterval},
+		{500 * ms, time.Second, 500 * ms},
+	} {
+		if got := pacedInterval(c.interval, c.source); got != c.want {
+			t.Errorf("pacedInterval(%v, %v) = %v, want %v", c.interval, c.source, got, c.want)
 		}
 	}
 }
@@ -718,6 +773,151 @@ func TestOverflowRecovered(t *testing.T) {
 			}
 			if l := logs.lines(`msg="restarting video" reason="queue overflow" urgent=true takeover=true`); len(l) != btoi(c.starting) {
 				t.Fatalf("takeover log %q", l)
+			}
+		})
+	}
+}
+
+// TestFrameQueueBehindKeyFrame runs videoEvents and frameSender with a key
+// frame whose write stands still (a large key frame paced out at a low
+// bitrate). Frames queue behind it without an overflow while it is on
+// schedule and the path's delay is in its target, and all go out once it is
+// written: no recovery, no key frame. With the delay over the target, or
+// with the key frame past its deadline, the queue overflows at
+// frameQueueFrames; the dropped frames follow the key frame still being
+// sent, so no recovery frame is possible and the key frame they cost is
+// forced once that one's write is done, and only one however often it is
+// asked for meanwhile.
+func TestFrameQueueBehindKeyFrame(t *testing.T) {
+	type rig struct {
+		s    *Session
+		c    *fakeConn
+		p    *ladderPipeline
+		logs *lockedLog
+	}
+	setup := func(t *testing.T, keyBytes int) rig {
+		s, c, _ := testSession(t, testFaults{})
+		s.frameQ = make(chan *media.Frame, frameQueueMax)
+		c.stall = map[int]bool{0: true}
+		logs := &lockedLog{}
+		s.log = slog.New(slog.NewTextHandler(logs, nil))
+		p := &ladderPipeline{caps: media.PipelineCaps{Recovery: proto.RecoveryLTR, ForceIDR: true, LiveBitrate: true},
+			events: make(chan media.VideoEvent)}
+		s.video = p
+		s.healConfig(&proto.VideoConfig{Gen: 1, Recovery: proto.RecoveryLTR}, 0)
+		s.setCongestionTarget(media.Params{BitrateKbps: 2000, FPS: 60}) // video pacing 2.4 Mbit/s
+		s.rate.mu.Lock()
+		s.rate.applied, s.rate.est, s.rate.lastDecrease = 2000, 2000, time.Now() // no cut: the key frame alone
+		s.rate.mu.Unlock()
+		go s.videoEvents()
+		go s.frameSender()
+		p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: 0, Key: true, Data: make([]byte, keyBytes)}}
+		for deadline := time.Now().Add(5 * time.Second); !s.keyBeingSent(1, 1) || len(c.snapshot()) == 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the key frame is not being written")
+			}
+		}
+		return rig{s: s, c: c, p: p, logs: logs}
+	}
+	frames := func(r rig, from, to uint32) {
+		for seq := from; seq < to; seq++ {
+			r.p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: seq, Data: bytes.Repeat([]byte{byte(seq)}, 100)}}
+		}
+	}
+	// waitLog waits for n log lines with substr (videoEvents takes a frame
+	// before it handles it).
+	waitLog := func(t *testing.T, r rig, substr string, n int) []string {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			if l := r.logs.lines(substr); len(l) >= n {
+				return l
+			} else if time.Now().After(deadline) {
+				t.Fatalf("log %q, want %d lines with %s", r.logs.lines(""), n, substr)
+			}
+		}
+	}
+	waitKeys := func(t *testing.T, r rig, n int) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			if _, keys, _ := r.p.state(); keys == n {
+				return
+			} else if time.Now().After(deadline) {
+				t.Fatalf("%d key frames, want %d", keys, n)
+			}
+		}
+	}
+
+	t.Run("on schedule", func(t *testing.T) {
+		r := setup(t, 300_000) // 1 s at 2.4 Mbit/s
+		frames(r, 1, 21)
+		for deadline := time.Now().Add(5 * time.Second); len(r.s.frameQ) < 20 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+		if l := r.logs.lines(`msg="frame queue overflow"`); len(l) != 0 || len(r.s.frameQ) != 20 {
+			t.Fatalf("%d frames queued, overflow %q; want all 20 queued", len(r.s.frameQ), l)
+		}
+		r.c.release(0)
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			closed := 0
+			for _, x := range r.c.snapshot() {
+				if x.closed {
+					closed++
+				}
+			}
+			if closed == 21 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d of 21 frames sent", closed)
+			}
+		}
+		if rec, keys, starts := r.p.state(); len(rec) != 0 || keys != 0 || len(starts) != 0 {
+			t.Fatalf("recover %v, key frames %d, starts %v; want none", rec, keys, starts)
+		}
+	})
+
+	for _, c := range []struct {
+		name     string
+		keyBytes int
+		set      func(r rig)
+	}{
+		{"the delay over the target", 300_000, func(r rig) {
+			r.s.rate.mu.Lock()
+			r.s.rate.qdOver = true
+			r.s.rate.mu.Unlock()
+		}},
+		{"past its deadline", 100, func(rig) { time.Sleep(60 * time.Millisecond) }}, // deadline 33 ms
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := setup(t, c.keyBytes)
+			c.set(r)
+			frames(r, 1, uint32(frameQueueFrames)+2)
+			if l := waitLog(t, r, `msg="frame queue overflow"`, 1); len(l) != 1 || !strings.Contains(l[0], "frames=7") {
+				t.Fatalf("overflow log %q, want 7 frames dropped", l)
+			}
+			waitLog(t, r, `msg="key frame deferred: one is being sent"`, 1)
+			if l := r.logs.lines(`msg="no recovery frame possible, forcing a key frame" gen=1 from_seq=1`); len(l) != 1 ||
+				!strings.Contains(l[0], "a key frame before the loss is still being sent") {
+				t.Fatalf("ladder log %q", l)
+			}
+			if l := r.logs.lines(`msg="key frame deferred: one is being sent"`); len(l) != 1 {
+				t.Fatalf("deferral log %q", l)
+			}
+			r.s.requestKeyframe("frame lost") // the client's request for the same loss
+			if err := r.s.keyframe("decoder error"); err != nil {
+				t.Fatal(err)
+			}
+			if rec, keys, _ := r.p.state(); len(rec) != 0 || keys != 0 {
+				t.Fatalf("recover %v, %d key frames while the key frame is being written; want none", rec, keys)
+			}
+			r.c.release(0)
+			waitKeys(t, r, 1)
+			time.Sleep(50 * time.Millisecond)
+			if _, keys, starts := r.p.state(); keys != 1 || len(starts) != 0 {
+				t.Fatalf("%d key frames, starts %v after the write; want one IDR", keys, starts)
+			}
+			if l := r.logs.lines(`msg="key frame deferred: one is being sent"`); len(l) != 1 {
+				t.Fatalf("deferral logged %d times, want once", len(l))
 			}
 		})
 	}

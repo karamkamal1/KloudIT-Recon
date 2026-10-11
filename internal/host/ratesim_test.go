@@ -123,12 +123,14 @@ func runSim(c simConfig) simResult {
 	nextKey := c.keyEvery
 	var frameQ []int
 	cur := -1
+	var curStart time.Duration
 
 	// Transport.
 	var tokens float64
 	var inflight int
 	var retx []simPkt
 	var lostPkts, ackedPkts, ackedBytes uint64
+	var limited time.Duration // the window held the sender back (cc.Media.WindowLimited)
 	var acks, detect, wire, gate []simTimed
 	var bq []simPkt
 	var bqBytes int
@@ -203,7 +205,13 @@ func runSim(c simConfig) simResult {
 			seq++
 			res.frames = append(res.frames, f)
 			r.output(f.bytes)
-			if len(frameQ) >= 6 {
+			sending := cur >= 0 && !res.frames[cur].done
+			busy, curBytes := time.Duration(0), 0
+			if sending {
+				busy, curBytes = now-curStart, res.frames[cur].bytes
+			}
+			video := 1.2*float64(pacerKbps+c.audioKbps+ccOverheadKbps)*1000 - float64((c.audioKbps+ccOverheadKbps)*1000)
+			if queueOverflows(len(frameQ), r.delayOver(), sending, busy, curBytes, time.Second/time.Duration(liveFPS), video) {
 				// The session drops the queue, cuts (an emergency) or
 				// hurries a starting generation: the old one stops.
 				res.overflows = append(res.overflows, now)
@@ -229,20 +237,25 @@ func runSim(c simConfig) simResult {
 		burst := max(rate*0.002, 10*simPktBytes)
 		tokens = min(tokens+rate/1000, burst)
 		minRTT := 2 * c.prop
-		window := max(int(rate*(minRTT+2*time.Second/time.Duration(liveFPS)).Seconds()), 32*simPktBytes)
+		window := max(int(rate*(minRTT+2*pacedInterval(time.Second/time.Duration(liveFPS), r.frameInterval())).Seconds()), 32*simPktBytes)
 		for {
 			if cur >= 0 && !res.frames[cur].done && res.frames[cur].unsent <= simPktBytes {
 				res.frames[cur].done = true // the write returned: the session records the frame
 				f := res.frames[cur]
-				video := 1.2*float64(pacerKbps+c.audioKbps+ccOverheadKbps)*1000 - float64((c.audioKbps+ccOverheadKbps)*1000)
+				video := paceBps - float64((c.audioKbps+ccOverheadKbps)*1000)
 				if c.noComp {
 					video = 0
 				}
 				track.sent(f.gen, f.seq, uint64(f.encodeDone.Microseconds())+1, uint64(now.Microseconds())+1, f.bytes, video)
+				r.sent(f.bytes)
 			}
 			if (cur < 0 || res.frames[cur].unsent == 0) && len(frameQ) > 0 {
 				cur, frameQ = frameQ[0], frameQ[1:]
+				curStart = now
 				continue
+			}
+			if inflight >= window && (len(retx) > 0 || cur >= 0 && res.frames[cur].unsent > 0) {
+				limited += time.Millisecond
 			}
 			if tokens < simPktBytes || inflight >= window {
 				break
@@ -366,7 +379,7 @@ func runSim(c simConfig) simResult {
 				comp, _ = track.cover(rr.Gen, rr.LastSeq)
 			}
 			fb, ok := rf.fromReport(rr, clock(), comp, ccCounters{ok: true, lost: lostPkts, total: lostPkts + ackedPkts, acked: ackedBytes,
-				nonVideoKbps: c.audioKbps + ccOverheadKbps})
+				limited: limited, nonVideoKbps: c.audioKbps + ccOverheadKbps})
 			if !ok {
 				continue
 			}
