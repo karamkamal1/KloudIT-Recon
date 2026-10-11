@@ -12188,13 +12188,23 @@ The sandbox has no DDA; the hardware re-check below confirms it.
 
 ### The rest of the log against the fix
 
-- **The first overflow** (128 ms after the restore at 30 Mbit/s): covered by `a20376f`'s queue
-  rule. `TestOwnerLogFirstOverflow` (`internal/host/ownerlog_test.go`) replays the log's numbers
-  through `queueOverflows`: the frame being written was on schedule (a frame of the full target
-  paced at 1.2 × 30360 kbit/s takes 14 ms; its deadline is two frame intervals, 33 ms), reached
-  the queue 115 ms ago and the delay was not over its target: no overflow. With the delay over
-  the target, or the frame past its deadline, the same queue overflows (`why=delay`,
-  `why=deadline`). The static fix also takes away the restores during a game.
+- **The first overflow** (128 ms after the restore at 30 Mbit/s): the overflow goes, the loss
+  stays. 37 ms after the overflow the log has `frame stream cancelled seq=120 why="past its
+  deadline" ... age_ms=59 deadline_ms=59`: the frame being written at the overflow
+  (`sender_busy_ms=22`), with a 59 ms deadline. `frameDeadline` is unchanged since `52f801f`,
+  and 59 ms at 1.2 × 30360 kbit/s is a frame of about 190 KB: AMF overshot the cap's VBV (one
+  frame at the full target, 63 KB) about 3× on the restore frame after the capture loss, and the
+  path held it past its deadline. `TestOwnerLogFirstOverflow` (`internal/host/ownerlog_test.go`)
+  replays that: through `a20376f`'s `queueOverflows` the queue was on schedule (busy 22 ms of
+  the 59, reached it 115 ms ago, the delay not over its target): no overflow, so neither the
+  7-frame drop nor the overflow's cut 30000 → 12750 (with the delay over the target, or the
+  frame past its deadline, the same queue overflows: `why=delay`, `why=deadline`). But rung 1
+  (`ladder.go`, unchanged since `52f801f`) still cancels seq 120 at 59 ms, rung 2 asks for a
+  recovery frame, and the frames queued behind seq 120 reference it, so they are discarded
+  until the recovery frame comes: the client still sees that loss and its recovery frame. (An
+  earlier version of this note replayed it with an invented frame of the full target and a
+  33 ms deadline, and said the queue rule prevents it.) The static fix also takes away the
+  restores during a game.
 - **`delayMs=0`**: the field is an older client's own delay report (`{"t":"congestion"}`); the
   rate reports' decisions passed 0. Now a decrease logs what it was decided on
   (`session.go` `rateAttrs`, `TestRateAttrs`): `delay_ms` (the queueing delay over the 2 s base of

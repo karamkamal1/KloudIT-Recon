@@ -18,24 +18,32 @@ import (
 
 // TestOwnerLogFirstOverflow: the log's first frame-queue overflow, at
 // 30 Mbit/s with no loss (cc_lost=0), 128 ms after the static-desktop cap
-// gave the full bitrate back: frames=7 (six queued and the new one),
-// pts_span_ms=93, sender_busy_ms=22, sender=write, cc_target_kbps=30360. At
-// 52f801f six queued frames overflowed whatever made them wait. Now the
-// frame being written is on schedule (a frame of the full target, the most
-// the cap's VBV lets the first frame after a restore be, paced at 1.2 x
-// 30360 kbit/s takes 14 ms; its deadline is two frame intervals, 33 ms), it
-// reached the queue 115 ms ago (under frameQueueAge), and the delay was not
-// over its target: no overflow. With the delay over the target, or the
-// frame past its deadline, the same queue still overflows.
+// gave the full bitrate back at the end of an 11 s capture loss: frames=7 (six
+// queued and the new one), pts_span_ms=93, sender_busy_ms=22, sender=write,
+// cc_target_kbps=30360. 37 ms later the frame being written then, seq 120,
+// was cancelled past its deadline: "frame stream cancelled seq=120 ...
+// age_ms=59 deadline_ms=59". A 59 ms deadline at 1.2 x 30360 kbit/s is a
+// frame of about 190 KB: AMF overshot the cap's VBV (one frame at the full
+// target, 63 KB) about 3x on the restore frame, and the path held it past its
+// deadline. At 52f801f six queued frames overflowed whatever made them wait.
+// Now that queue is on schedule (busy 22 ms of the 59, reached 115 ms ago,
+// the delay not over its target): no overflow, so neither the 7-frame drop
+// nor the overflow's cut (30000 -> 12750). With the delay over the target, or
+// the frame past its deadline, the same queue still overflows. And the loss
+// stays: rung 1 cancels seq 120 at 59 ms (a newer frame waits), rung 2 asks
+// the encoder for a recovery frame, and the frames queued behind seq 120
+// reference it, so they are discarded until the recovery frame comes.
 func TestOwnerLogFirstOverflow(t *testing.T) {
 	interval := time.Second / 60
-	frame := 30360 * 1000 / 8 / 60 // bytes: a frame at the full target
-	deadline := frameDeadline(interval, frame, 1.2*30360*1000)
+	pacing := 1.2 * 30360 * 1000 // bit/s
+	frame := int((59*time.Millisecond - interval).Seconds() * pacing / 8)
+	deadline := frameDeadline(interval, frame, pacing)
+	if d := deadline - 59*time.Millisecond; d < -time.Millisecond || d > time.Millisecond || frame < 3*30360*1000/8/60 {
+		t.Fatalf("a %d-byte frame (%.1f full-target frames) at 36.4 Mbit/s: deadline %v, want the log's 59 ms", frame,
+			float64(frame)/(30360*1000/8/60), deadline)
+	}
 	q := queueLoad{queued: 6, sending: true, busy: 22 * time.Millisecond, deadline: deadline, lag: 93*time.Millisecond + 22*time.Millisecond,
 		interval: interval, burst: deadline}
-	if deadline != 2*interval {
-		t.Fatalf("deadline %v of a %d-byte frame at 36.4 Mbit/s, want two frame intervals", deadline, frame)
-	}
 	if why := queueOverflows(q); why != "" {
 		t.Fatalf("the log's first overflow: %q, want none", why)
 	}
@@ -45,6 +53,26 @@ func TestOwnerLogFirstOverflow(t *testing.T) {
 	late.busy = deadline + time.Millisecond
 	if queueOverflows(congested) != "delay" || queueOverflows(late) != "deadline" {
 		t.Fatalf("the same queue with the delay over the target: %q, past its deadline: %q", queueOverflows(congested), queueOverflows(late))
+	}
+	// The log's cancel of seq 120 at 59 ms: rung 1, then rung 2.
+	out := ladderIn{event: lossOutgoing, gen: 1, seq: 120, age: 59 * time.Millisecond, deadline: deadline, newer: true, live: 1,
+		mode: proto.RecoveryLTR, forceIDR: true}
+	if st := ladder(out); st.rung != 1 || st.act != actCancel {
+		t.Fatalf("seq 120 at 59 ms: %+v, want rung 1's cancel", st)
+	}
+	lost := ladderIn{event: lossConfirmed, gen: 1, seq: 120, live: 1, mode: proto.RecoveryLTR, forceIDR: true}
+	if st := ladder(lost); st.rung != 2 || st.act != actRecover {
+		t.Fatalf("seq 120 lost: %+v, want rung 2's recovery frame", st)
+	}
+	wait := lossWait{active: true, gen: 1, from: 120, rung: 2}
+	queued := ladderIn{event: lossOutgoing, gen: 1, seq: 121, live: 1, mode: proto.RecoveryLTR, wait: wait}
+	answer := queued
+	answer.seq, answer.recovery, answer.refFloor = 128, true, 119
+	if st := ladder(queued); st.act != actDiscard {
+		t.Fatalf("seq 121 behind the lost seq 120: %+v, want discarded", st)
+	}
+	if st := ladder(answer); !st.endsWait {
+		t.Fatalf("the recovery frame: %+v, want the end of the wait", st)
 	}
 }
 
