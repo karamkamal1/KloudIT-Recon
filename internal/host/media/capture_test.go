@@ -36,6 +36,8 @@ func TestClassifyCapture(t *testing.T) {
 		r.consume(bufio.NewReader(f))
 		return r.String()
 	}
+	// FFmpeg's line says these best (failureNotice): no sentence.
+	noText := map[string]bool{"DXGI_ERROR_INVALID_CALL": true, "E_OUTOFMEMORY": true}
 	for _, c := range []struct {
 		name, stderr string
 		fault        CaptureFault
@@ -59,6 +61,12 @@ func TestClassifyCapture(t *testing.T) {
 			CaptureTransient, "Desktop duplication access denied"},
 		{"DXGI_ERROR_ACCESS_LOST", "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: 887a0026 | [fc#0 @ 0000021b] Error while filtering: External library error",
 			CaptureTransient, "AcquireNextFrame failed: 887a0026"},
+		// A driver reset, and AcquireNextFrame codes without a sentence.
+		{"DXGI_ERROR_DEVICE_REMOVED", "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: 887a0005", CaptureTransient, "AcquireNextFrame failed: 887a0005"},
+		{"DXGI_ERROR_DEVICE_HUNG", "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: 887a0006", CaptureTransient, "AcquireNextFrame failed: 887a0006"},
+		{"DXGI_ERROR_DEVICE_RESET", "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: 887a0007", CaptureTransient, "AcquireNextFrame failed: 887a0007"},
+		{"DXGI_ERROR_INVALID_CALL", "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: 887a0001", CaptureTransient, "AcquireNextFrame failed: 887a0001"},
+		{"E_OUTOFMEMORY", "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: 8007000e", CaptureTransient, "AcquireNextFrame failed: 8007000e"},
 		{"mode change", "[Parsed_ddagrab_0 @ 0000020a] Output parameters changed!", CaptureTransient, "Output parameters changed!"},
 		{"four duplications", "[Parsed_ddagrab_0 @ 0000020a] Too many open duplication sessions", CaptureTransient, "Too many open duplication sessions"},
 		{"session disconnected", "[Parsed_ddagrab_0 @ 0000020a] Failed duplicating output", CaptureTransient, "Failed duplicating output"},
@@ -75,7 +83,7 @@ func TestClassifyCapture(t *testing.T) {
 		{"empty", "", CaptureFaultNone, ""},
 	} {
 		got := ClassifyCapture(c.stderr)
-		if got.Fault != c.fault || got.Line != c.line || (got.Line != "") != (got.Text != "") {
+		if got.Fault != c.fault || got.Line != c.line || (got.Line != "" && !noText[c.name]) != (got.Text != "") {
 			t.Errorf("%s: %+v, want fault %d line %q", c.name, got, c.fault, c.line)
 		}
 		if strings.ContainsAny(got.Text, "()") || strings.HasSuffix(got.Text, ".") {
@@ -84,6 +92,16 @@ func TestClassifyCapture(t *testing.T) {
 	}
 	if got := ClassifyCapture(userReport).Text; got != "no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset" {
 		t.Errorf("the user's case reads %q", got)
+	}
+	// Only ACCESS_LOST is a mode change; a driver reset reads as one.
+	for hr, want := range map[string]string{
+		"887a0026": "Desktop Duplication lost the display: a display mode change, or a full-screen program took it over",
+		"887a0005": "the graphics driver was reset or updated, or stopped responding",
+		"887a0007": "the graphics driver was reset or updated, or stopped responding",
+	} {
+		if got := ClassifyCapture("[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: " + hr).Text; got != want {
+			t.Errorf("AcquireNextFrame %s reads %q, want %q", hr, got, want)
+		}
 	}
 }
 
@@ -310,6 +328,84 @@ func TestCheckGPUCapture(t *testing.T) {
 		time.Since(start) > 5*time.Second { // the caller's deadline, not gpuCaptureTimeout
 		t.Fatalf("a check that hangs: %q, %q after %v", blocked, detail, time.Since(start))
 	}
+}
+
+// TestCheckDDA opens ddagrab on the output asked for (a session's display):
+// it opens, or Desktop Duplication refuses it with the failure classified.
+func TestCheckDDA(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-ins are shell scripts")
+	}
+	dir := t.TempDir()
+	args := filepath.Join(dir, "args")
+	script := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\necho \"$@\" > "+args+"\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	ok, f, detail := CheckDDA(context.Background(), script("opens", "exit 0"), 2)
+	b, _ := os.ReadFile(args)
+	if !ok || f.Fault != CaptureFaultNone || detail != "" || !strings.Contains(string(b), "-filter_complex ddagrab=output_idx=2:framerate=10:draw_mouse=0 -frames:v 1") {
+		t.Fatalf("opens: %v %+v %q, command %q", ok, f, detail, b)
+	}
+	ok, f, detail = CheckDDA(context.Background(), script("refused", "echo '[Parsed_ddagrab_0 @ 0000020a] Selected output not supported' >&2; exit 1"), 1)
+	if ok || f.Fault != CaptureUnsupported || detail != "Selected output not supported" {
+		t.Fatalf("refused: %v %+v %q", ok, f, detail)
+	}
+}
+
+// TestProbeGPUCaptureInBackground: the probe does not wait for its GPU
+// capture check beyond its encoder tests (a ddagrab that waits for a first
+// frame must not delay the agent's start); the finding follows, and
+// GPUCaptureDone says when. The report waits for it.
+func TestProbeGPUCaptureInBackground(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in is a shell script")
+	}
+	dir := t.TempDir()
+	wine, err := filepath.Abs("testdata/ffmpeg81-stderr-ddagrab-libx264.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ff := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+case "$*" in
+*ddagrab=output_idx*) sleep 1.5; cat ` + wine + ` >&2; exit 171 ;;
+*-version*) echo "ffmpeg version n8.1.3 Copyright (c) 2000-2026" ;;
+*-filters*) echo " ... ddagrab           |->V       Grab Windows Desktop images using Desktop Duplication API" ;;
+*-devices*) echo " D  gdigrab         GDI API Windows frame grabber" ;;
+*-encoders*) echo " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)" ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(ff, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	c, err := Probe(context.Background(), ff, nil)
+	took := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.GPUCaptureDone():
+		t.Fatalf("the probe waited %v for its GPU capture check", took)
+	default:
+	}
+	if took > 1200*time.Millisecond || c.GPUCaptureBlocked() != "" || !c.CanGDIGrab() || len(c.Encoders) != 1 {
+		t.Fatalf("probe after %v: finding %q, gdigrab %v, encoders %v", took, c.GPUCaptureBlocked(), c.CanGDIGrab(), c.Encoders)
+	}
+	var out bytes.Buffer
+	c.WriteReport(&out, func(e EncoderInfo) Params {
+		return Params{Encoder: e, FPS: 60, BitrateKbps: 30000, Source: Source{Backend: "gdigrab", NativeW: 1280, NativeH: 720}}
+	})
+	if c.GPUCaptureBlocked() != "no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset" ||
+		!strings.Contains(out.String(), "capture:    ddagrab unavailable (no Direct3D 11 video device") {
+		t.Fatalf("after the check: %q; report:\n%s", c.GPUCaptureBlocked(), out.String())
+	}
+	t.Logf("probe %v, check %v", took.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
 }
 
 // TestWriteReportGDI: on a PC without GPU capture, "recon-host probe" (and

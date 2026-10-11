@@ -85,16 +85,20 @@ type Session struct {
 	// GDI capture (gdi.go): gdi says why the session captures with GDI
 	// after Desktop Duplication kept refusing its display ("" = it does
 	// not), ddaRefused counts those refusals since a generation last went
-	// live, gdiNoted is the last reason for GDI logged and told the user.
-	gdi        string
-	ddaRefused int
-	gdiNoted   string
+	// live and ddaRefusedAt is when the first of them came, gdiNoted is the
+	// last reason for GDI logged and told the user.
+	gdi          string
+	ddaRefused   int
+	ddaRefusedAt time.Time
+	gdiNoted     string
 	// The last restart notice (restartNotice), when it was sent, and
 	// whether a generation went live since.
 	restartNote   string
 	restartNoteAt time.Time
 	liveSinceNote bool
-	gpuWatch      atomic.Bool // watchGPUCapture runs
+	gpuWatch      atomic.Bool    // watchGPUCapture runs
+	gdiWatch      atomic.Bool    // watchGDIDisplay runs
+	watches       sync.WaitGroup // those two (they end with the session's context; tests wait)
 
 	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
 	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()
@@ -365,7 +369,7 @@ func (s *Session) run() error {
 
 	s.prefs = s.hello.Prefs
 	s.fecInit()
-	s.a.recheckGPUCapture() // in the background: for the sessions after this one
+	s.a.recheckGPUCapture() // in the background: for this session's watch (watchGPUCapture) and the sessions after it
 	// A virtual display first: the pipeline captures it (the helper's caps
 	// list its output) and the welcome lists it. Released (removed after the
 	// linger) once the video has stopped.
@@ -919,11 +923,7 @@ func (a *Agent) sessionParams(prefs proto.Prefs, mon platform.Monitor, backend s
 	case "ddagrab", "amf":
 		// "amf" needs the encoder: buildParams (useAMFCapture) decides. Both
 		// capture the whole monitor at its native size.
-		out := mon.DXGIOutput
-		if out < 0 {
-			out = mon.Index
-		}
-		p.Source = media.Source{Backend: "ddagrab", Output: out, NativeW: mon.W, NativeH: mon.H}
+		p.Source = media.Source{Backend: "ddagrab", Output: ddaOutput(mon), NativeW: mon.W, NativeH: mon.H}
 	}
 	// The test pattern carries each frame's Seq as a barcode (welcome feature
 	// barcode-seq): the client checks the picture it draws against the header.
@@ -994,6 +994,9 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 		}
 		return s.buildParams(prefs)
 	}
+	if p.Source.Backend == "gdigrab" {
+		s.watchGDIDisplay() // gdigrab does not follow a change of the display
+	}
 	s.chooseHDR(&p, prefs)
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
@@ -1027,8 +1030,10 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 // probe" prints the ffmpeg command line for: a current browser client at its
 // default settings (the first monitor at its native size, 60 fps, 30 Mbit/s,
 // balanced quality, local cursor) on this host's configuration, by the
-// agent's own rules. Call platform.EnableDPIAwareness first, as the agent does.
+// agent's own rules, with the probe's GPU capture finding (it waits for that
+// check). Call platform.EnableDPIAwareness first, as the agent does.
 func ProbeSample(cfg *Config, caps *media.Caps) func(media.EncoderInfo) media.Params {
+	<-caps.GPUCaptureDone()
 	a := &Agent{cfg: cfg, caps: caps}
 	return a.probeSample(a.monitors()[0])
 }
@@ -1513,6 +1518,10 @@ func (s *Session) encoderLive() {
 	s.prefsMu.Unlock()
 }
 
+// maxVideoFailures is how many failed generations in a row (none went live
+// since) a session restarts: the next failure ends it.
+const maxVideoFailures = 6
+
 // handleEncoderFailure handles a failure event (ev.Err) of the video manager.
 // Only a generation that failed to start because of its encoder counts
 // against the encoder (encoderFailed). A generation that had gone live, or
@@ -1523,8 +1532,8 @@ func (s *Session) encoderLive() {
 // leaves that capture (noteCaptureFailure), and the restart on ddagrab tests
 // the encoder. A GPU capture that cannot work here (captureFailed: no
 // Direct3D 11 video device, Desktop Duplication refusing the display) moves
-// the session to GDI capture at once: that restart is no failure of its
-// own, and its notice is noteGDI's. Identical restart notices are not
+// the session to GDI capture: the GPU capture's failures do not count
+// against it, and its notice is noteGDI's. Identical restart notices are not
 // repeated (restartNotice); host.log has every failure with FFmpeg's error.
 func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	err := ev.Err
@@ -1532,11 +1541,11 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live, "encoder_fault", ev.EncoderFault)
 	gdi := s.captureFailed(ev)
 	if gdi {
-		s.failures--
+		s.failures = 0 // GDI is a capture of its own: its restarts start afresh, the first at once
 	} else if !s.noteCaptureFailure(ev) && ev.Failed != nil && ev.EncoderFault && !ev.Live {
 		s.encoderFailed(*ev.Failed)
 	}
-	if s.failures > 6 {
+	if s.failures > maxVideoFailures {
 		s.notice("error", "Video encoder keeps failing: "+media.PlainFFmpegError(err.Error()))
 		s.end("video encoder keeps failing", "failures", s.failures)
 		return

@@ -174,8 +174,13 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 	}
 	gpuCapture := "ok"
-	if why := caps.GPUCaptureBlocked(); why != "" {
-		gpuCapture = "unavailable: " + why
+	select {
+	case <-caps.GPUCaptureDone():
+		if why := caps.GPUCaptureBlocked(); why != "" {
+			gpuCapture = "unavailable: " + why
+		}
+	default:
+		gpuCapture = "checking" // a finding is logged when the check ends
 	}
 	log.Info("ffmpeg ready", "version", caps.Version, "encoders", strings.Join(names, ","),
 		"ddagrab", caps.Filters["ddagrab"], "gfxcapture", caps.Filters["gfxcapture"], "vsrc_amf", caps.Filters["vsrc_amf"],

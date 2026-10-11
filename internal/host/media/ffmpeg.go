@@ -60,9 +60,10 @@ type Caps struct {
 	captureClock bool // CaptureClockFilter and a µs encoder time base work
 	barcode      bool // BarcodeFilter draws readable frame barcodes
 	hdrTest      bool // HDRTestGraph and libsvtav1's 10-bit HDR10 encode work
-	// gpuCapture says why GPU capture (ddagrab, gfxcapture) cannot work on
-	// this PC (CheckGPUCapture; "" = it can, or the probe could not tell).
-	gpuCapture string
+	// gpuCapture is the probe's check of GPU capture (ddagrab, gfxcapture;
+	// CheckGPUCapture): why it cannot work on this PC (GPUCaptureBlocked);
+	// nil: no check (no ddagrab).
+	gpuCapture *gpuCaptureCheck
 	// intraRefresh holds the periodic intra refresh mode (IntraRefreshOn,
 	// IntraRefreshSingleSlice) of the encoders that run with one.
 	intraRefresh map[string]string
@@ -172,10 +173,14 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 	}
 	c.Version, c.VersionInfo = parseVersion(out)
 
+	devices := make(chan []byte, 1)
+	go func() { // next to -filters: no extra start-up time
+		out, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-devices").Output()
+		devices <- out
+	}()
 	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-filters").Output()
 	c.Filters = parseFilters(out)
-	out, _ = quietCmd(ctx, ffmpeg, "-hide_banner", "-devices").Output()
-	c.Devices = parseDevices(out)
+	c.Devices = parseDevices(<-devices)
 	if c.Filters["vsrc_amf"] {
 		help, _ := quietCmd(ctx, ffmpeg, "-hide_banner", "-h", "filter=vsrc_amf").Output()
 		if err := checkAMFCapture(help, c.Filters); err != nil {
@@ -218,13 +223,20 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 		}()
 	}
 	if c.Filters["ddagrab"] {
-		wg.Add(1)
-		go func() { // alongside the encoder tests, like the barcode's
-			defer wg.Done()
+		// Alongside the encoder tests, and not waited for: it takes a
+		// fraction of a second, but up to gpuCaptureTimeout where ddagrab
+		// opens and waits for a first frame (a display that is off), which
+		// must not delay the agent's start. Its finding follows
+		// (GPUCaptureDone); a session that starts before it finds out by
+		// its own capture failing.
+		chk := &gpuCaptureCheck{done: make(chan struct{})}
+		c.gpuCapture = chk
+		go func() {
 			blocked, detail := CheckGPUCapture(ctx, ffmpeg)
-			mu.Lock()
-			c.gpuCapture = blocked
-			mu.Unlock()
+			chk.mu.Lock()
+			chk.why = blocked
+			chk.mu.Unlock()
+			close(chk.done)
 			switch {
 			case blocked != "" && log != nil:
 				log.Warn("no GPU screen capture on this PC: sessions capture with GDI (gdigrab), which costs more CPU", "reason", blocked,

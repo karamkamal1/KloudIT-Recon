@@ -19,10 +19,20 @@ var (
 	procEnumDisplaySettingsW          = user32.NewProc("EnumDisplaySettingsW")
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDPIAware            = user32.NewProc("SetProcessDPIAware")
+	procGetSystemMetrics              = user32.NewProc("GetSystemMetrics")
 	dxgi                              = windows.NewLazySystemDLL("dxgi.dll")
 	procCreateDXGIFactory1            = dxgi.NewProc("CreateDXGIFactory1")
 	iidIDXGIFactory1                  = windows.GUID{Data1: 0x770aae78, Data2: 0xf26f, Data3: 0x4dba, Data4: [8]byte{0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}}
 )
+
+// RemoteSession reports whether this process's Windows session is a remote
+// desktop (RDP) client session now (GetSystemMetrics(SM_REMOTESESSION)),
+// whose display Desktop Duplication refuses.
+func RemoteSession() bool {
+	const smRemoteSession = 0x1000
+	r, _, _ := procGetSystemMetrics.Call(smRemoteSession)
+	return r != 0
+}
 
 // EnableDPIAwareness makes all coordinates (monitors, cursor, SendInput) physical
 // pixels, matching what the capture API sees. Call once at startup.

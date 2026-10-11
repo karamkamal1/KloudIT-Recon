@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,9 +56,9 @@ const (
 type CaptureFailure struct {
 	Fault CaptureFault
 	// Text says what happened, for the user: lower case, no final stop, no
-	// parentheses (notices put it in some; "" when nothing was
-	// recognised). Line is FFmpeg's line it was read from, without its log
-	// context.
+	// parentheses (notices put it in some; "" when nothing was recognised,
+	// or no sentence says more than FFmpeg's line). Line is FFmpeg's line it
+	// was read from, without its log context.
 	Text string
 	Line string
 }
@@ -77,6 +79,9 @@ var (
 	gdiSource = []string{"gdigrab", "in#"}
 )
 
+// driverReset is the sentence for Desktop Duplication losing its GPU device.
+const driverReset = "the graphics driver was reset or updated, or stopped responding"
+
 // captureRules are the failures ClassifyCapture recognises, by FFmpeg 8.1's
 // messages (libavfilter/vsrc_ddagrab.c, vsrc_gfxcapture_winrt.cpp,
 // libavdevice/gdigrab.c).
@@ -93,8 +98,16 @@ var captureRules = []captureRule{
 		"Windows does not let programs capture the secure desktop: a UAC prompt or the lock screen"},
 	{ddaSource, "Too many open duplication sessions", CaptureTransient,
 		"too many programs capture the screen at once: Desktop Duplication allows four"},
-	{ddaSource, "AcquireNextFrame failed", CaptureTransient,
+	// AcquireNextFrame's HRESULT (vsrc_ddagrab.c logs it as "%lx"): only
+	// DXGI_ERROR_ACCESS_LOST is a mode change; a driver reset has its own
+	// sentence, and any other code keeps FFmpeg's line (failureNotice), so
+	// distinct errors read differently and are not taken for one another.
+	{ddaSource, "AcquireNextFrame failed: 887a0026", CaptureTransient,
 		"Desktop Duplication lost the display: a display mode change, or a full-screen program took it over"},
+	{ddaSource, "AcquireNextFrame failed: 887a0005", CaptureTransient, driverReset}, // DXGI_ERROR_DEVICE_REMOVED
+	{ddaSource, "AcquireNextFrame failed: 887a0006", CaptureTransient, driverReset}, // DXGI_ERROR_DEVICE_HUNG
+	{ddaSource, "AcquireNextFrame failed: 887a0007", CaptureTransient, driverReset}, // DXGI_ERROR_DEVICE_RESET
+	{ddaSource, "AcquireNextFrame failed", CaptureTransient, ""},
 	{ddaSource, "Output parameters changed", CaptureTransient,
 		"the display's resolution or format changed"},
 	{ddaSource, "Failed duplicating output", CaptureTransient,
@@ -162,47 +175,97 @@ func PlainFFmpegError(s string) string {
 // frame (a display that is off, a desktop that does not draw): a test that
 // times out is no finding. Generous: the probe runs it next to a dozen
 // encoder tests, which on a small VM at logon can delay FFmpeg's start by
-// seconds (under Wine 5 s were not always enough).
+// seconds (under Wine 5 s were not always enough). The probe does not wait
+// for it beyond those tests (gpuCaptureCheck), so a check that waits for a
+// frame does not delay the agent's start.
 const gpuCaptureTimeout = 10 * time.Second
 
-// CheckGPUCapture opens ddagrab on output 0 for one frame, as a session's
-// capture does, and returns why GPU capture (ddagrab, gfxcapture: the same
-// D3D11VA device) cannot work on this PC: no Direct3D 11 video device
-// (CaptureNoDevice; detail is FFmpeg's line). It returns "" when the capture
-// opened (detail ""), and when it failed for another reason (the secure
-// desktop at logon, a mode change) or timed out, which a session can get
-// past; detail then says what happened. The test takes a fraction of a
-// second.
-func CheckGPUCapture(ctx context.Context, ffmpeg string) (blocked, detail string) {
+// CheckDDA opens ddagrab on DXGI output output (output_idx) for one frame,
+// as a session's capture does, and reports whether it opened. When it did
+// not, f is the capture failure FFmpeg's stderr shows (Fault
+// CaptureFaultNone where none is recognised) and detail says what happened:
+// FFmpeg's line, "no frame within ..." (a display that is off, a desktop
+// that does not draw), or the exit status and FFmpeg's last lines. The test
+// takes a fraction of a second.
+func CheckDDA(ctx context.Context, ffmpeg string, output int) (ok bool, f CaptureFailure, detail string) {
 	ctx, cancel := context.WithTimeout(ctx, gpuCaptureTimeout)
 	defer cancel()
 	var stderr bytes.Buffer
 	cmd := quietCmd(ctx, ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-		"-filter_complex", "ddagrab=output_idx=0:framerate=10:draw_mouse=0", "-frames:v", "1", "-f", "null", "-")
+		"-filter_complex", fmt.Sprintf("ddagrab=output_idx=%d:framerate=10:draw_mouse=0", output), "-frames:v", "1", "-f", "null", "-")
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err == nil {
-		return "", ""
+		return true, CaptureFailure{}, ""
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return "", "no frame within " + gpuCaptureTimeout.String()
+		return false, CaptureFailure{}, "no frame within " + gpuCaptureTimeout.String()
 	}
-	if f := ClassifyCapture(stderr.String()); f.Fault == CaptureNoDevice {
-		return f.Text, f.Line
-	} else if f.Line != "" {
-		return "", f.Line
+	if f = ClassifyCapture(stderr.String()); f.Line != "" {
+		return false, f, f.Line
 	}
-	return "", err.Error() + ": " + PlainFFmpegError(causeLines(stderr.String(), 3))
+	return false, f, err.Error() + ": " + PlainFFmpegError(causeLines(stderr.String(), 3))
+}
+
+// CheckGPUCapture opens ddagrab on output 0 for one frame (CheckDDA) and
+// returns why GPU capture (ddagrab, gfxcapture: the same D3D11VA device)
+// cannot work on this PC: no Direct3D 11 video device (CaptureNoDevice;
+// detail is FFmpeg's line). It returns "" when the capture opened (detail
+// ""), and when it failed for another reason (the secure desktop at logon,
+// a mode change) or timed out, which a session can get past; detail then
+// says what happened.
+func CheckGPUCapture(ctx context.Context, ffmpeg string) (blocked, detail string) {
+	ok, f, detail := CheckDDA(ctx, ffmpeg, 0)
+	switch {
+	case ok:
+		return "", ""
+	case f.Fault == CaptureNoDevice:
+		return f.Text, detail
+	}
+	return "", detail
+}
+
+// gpuCaptureCheck is the probe's GPU capture check (CheckGPUCapture), which
+// may finish after Probe returns: Probe does not wait for it beyond its
+// encoder tests.
+type gpuCaptureCheck struct {
+	mu   sync.Mutex
+	why  string        // why GPU capture cannot work ("" = it can, or the check could not tell)
+	done chan struct{} // closed when the check has finished
+}
+
+// finishedCheck is a check that found why.
+func finishedCheck(why string) *gpuCaptureCheck {
+	c := &gpuCaptureCheck{why: why, done: make(chan struct{})}
+	close(c.done)
+	return c
 }
 
 // GPUCaptureBlocked returns why FFmpeg's GPU capture (ddagrab, gfxcapture)
-// cannot work on this PC, from the probe's CheckGPUCapture, or "" when it can
-// or the probe could not tell.
-func (c *Caps) GPUCaptureBlocked() string { return c.gpuCapture }
+// cannot work on this PC, from the probe's CheckGPUCapture, or "" when it can,
+// the probe could not tell, or its check has not finished (GPUCaptureDone).
+func (c *Caps) GPUCaptureBlocked() string {
+	if c.gpuCapture == nil {
+		return ""
+	}
+	c.gpuCapture.mu.Lock()
+	defer c.gpuCapture.mu.Unlock()
+	return c.gpuCapture.why
+}
+
+// GPUCaptureDone is closed once the probe's GPU capture check has finished
+// (at once where it ran none): GPUCaptureBlocked has its finding then. It
+// finishes within its own limit (gpuCaptureTimeout).
+func (c *Caps) GPUCaptureDone() <-chan struct{} {
+	if c.gpuCapture == nil {
+		return finishedCheck("").done
+	}
+	return c.gpuCapture.done
+}
 
 // SetGPUCaptureBlocked records why GPU capture cannot work ("" = it can), as
-// the probe does (tests).
-func (c *Caps) SetGPUCaptureBlocked(why string) { c.gpuCapture = why }
+// a finished check of the probe's (tests). A copy of the Caps keeps its own.
+func (c *Caps) SetGPUCaptureBlocked(why string) { c.gpuCapture = finishedCheck(why) }
 
 // CanGDIGrab reports whether this FFmpeg build has the gdigrab input device
 // (Windows builds).

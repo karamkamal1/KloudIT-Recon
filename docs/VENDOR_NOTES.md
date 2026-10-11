@@ -11704,8 +11704,8 @@ source):
   failure's text. A window (`window`) is not captured alone: GDI captures its monitor
   (`title=` is an exact title in gdigrab, not the regex the protocol carries); host.log says so.
 - **Detection.** The probe opens `ddagrab=output_idx=0` for one frame (`-loglevel error -frames:v 1
-  -f null -`, 10 s timeout) next to its encoder tests (no extra start-up time) and parses `ffmpeg
-  -devices` for gdigrab. Only `Failed to create D3D11VA device` from ddagrab is a finding
+  -f null -`, 10 s timeout) next to its encoder tests (since the review fixes below it does not
+  wait for it beyond them) and parses `ffmpeg -devices` for gdigrab. Only `Failed to create D3D11VA device` from ddagrab is a finding
   (`Caps.GPUCaptureBlocked`); a timeout (a display that is off) or another failure (the secure
   desktop at logon) is not. With a finding, `auto`, `ddagrab`, `gfxcapture` and `amf` capture with
   gdigrab. `recon-host probe` prints `capture:    ddagrab unavailable (no Direct3D 11 video device:
@@ -11719,13 +11719,16 @@ source):
   that opens lifts it: a GPU driver installed, or one that was being updated, Windows shows the
   Basic Display Adapter meanwhile). A GPU PC can hit this error at run time too, while its graphics
   driver resets (TDR) or updates: a session that lost GPU capture that way (the probe had found it)
-  keeps streaming with GDI, checks every minute (`watchGPUCapture`) and restarts its video on the
-  GPU once a capture opens, with `GPU screen capture works again: capturing on the GPU.`, so a GPU
-  PC is never left on GDI; the text says so (`no Direct3D 11 video device: a PC or VM without a
+  keeps streaming with GDI, checks every minute (`watchGPUCapture`; since the review fixes below
+  every session on GDI where it would capture on the GPU does) and restarts its video on the GPU
+  once a capture opens, with `GPU screen capture works again: capturing on the GPU.`, so a GPU PC
+  is never left on GDI; the text says so (`no Direct3D 11 video device: a PC or VM without a
   GPU, or a graphics driver being installed or reset`). Desktop Duplication refusing the display (`Selected output not
   supported` = DXGI_ERROR_UNSUPPORTED, `Failed to enumerate DXGI output`, `Invalid output
   duplication argument` = E_INVALIDARG) twice in a row without a live generation in between moves
-  only that session (a mode change can cause one; a remote desktop session every one). Kept on
+  only that session (a mode change can cause one; a remote desktop session every one; replaced by
+  the review fixes below: at once in a remote desktop session, else after 5 s of refusals, and
+  not for the rest of the session). Kept on
   Desktop Duplication and retried as before: `Desktop duplication access denied` (E_ACCESSDENIED:
   the secure desktop, which GDI cannot capture either), `AcquireNextFrame failed: 887a0026`
   (DXGI_ERROR_ACCESS_LOST), `Output parameters changed!`, `Too many open duplication sessions`,
@@ -11833,12 +11836,13 @@ Not verified (needs real hardware):
   `"pipeline": "ffmpeg"`: Win+L and back, a UAC prompt (`Start-Process notepad -Verb RunAs`), a
   resolution change: each time the stream comes back on ddagrab (`starting encoder ...
   capture=ddagrab`), never `capturing with GDI`, one toast per kind (HARDWARE_TEST_PLAN G4). Over
-  RDP (G5): record whether ddagrab works in the RDP session or the session moves to GDI after
-  two `Selected output not supported` / `Failed to enumerate DXGI output` failures, and that the
-  next session from the console uses ddagrab. `"capture": "gdigrab"` with `"pipeline": "ffmpeg"`
-  streams hevc_amf from system memory (`format=nv12`): record capture→drawn p50 against ddagrab.
-  A driver reset mid-stream (`dxcap -forcetdr`, G6): the stream returns to ddagrab by itself,
-  at once or after a minute or two on GDI (checked every minute; `GPU screen capture works again`).
+  RDP (G5): record whether ddagrab works in the RDP session or the session moves to GDI (since
+  the review fixes below: at its first `Selected output not supported` / `Failed to enumerate
+  DXGI output` failure, `remote_session=true`), and that the stream returns to ddagrab after
+  `tscon` to the console. `"capture": "gdigrab"` with `"pipeline": "ffmpeg"` streams hevc_amf
+  from system memory (`format=nv12`): record capture→drawn p50 against ddagrab. A driver reset
+  mid-stream (`dxcap -forcetdr`, G6): the stream returns to ddagrab by itself, at once or after
+  about a minute on GDI (checked every minute; `GPU screen capture works again`).
 - NVIDIA: unverified (no NVIDIA host available). Test: the AMD steps with NVENC; with `"capture":
   "gdigrab"` the stream is `hevc_nvenc` fed NV12 from system memory (no `hwupload` in the
   command line: NVENC uploads it); GPU priority stays as configured.
@@ -11859,3 +11863,123 @@ Xvfb: `recon-host.exe probe` of e7dd25a prints the `ddagrab unavailable` line, a
 `TestSessionGDIWindows` passes three runs in a row. The browser E2E with the Windows host under
 Wine (`E2E_HOST_BIN`, new `E2E_HOST_CAPTURE=auto`) could not run: the agent never reaches the
 gateway (`wsaioctl: winapi error #10045`, see above).
+
+## Capture review fixes: GPU-less VM capture
+
+A review of the five commits above found eight issues (two pairs of them the same). All were
+confirmed in the code (and gdigrab's in FFmpeg 8.1's gdigrab.c) and fixed:
+
+- **GDI did not follow a change of the display's resolution or layout.** gdigrab computes its
+  rectangle once (`read_header`'s `clip_rect`) and BitBlts it every frame; it neither re-checks
+  it nor fails when the desktop changes size, and nothing restarted a GDI generation. A VM on the
+  Basic Display Adapter whose resolution is raised after connecting, an RDP client resizing its
+  session, or `tscon` to the console then streamed the old rectangle (black areas, or the desktop
+  cut off) until something else restarted FFmpeg. Now `watchGDIDisplay` (one per session, from
+  its first GDI generation) compares the GDI generation's rectangle with the session's monitor
+  every second (`monitorNow`: its virtual display, else the one the client chose; the monitor
+  list as buildParams reads it), and when they still differ after 300 ms restarts the video,
+  overlapped, on the new rectangle, with input mapped to it: host.log `display changed
+  monitor="1280x720 at (0,0) is now 1024x768 at (0,0)"`, `restarting video reason="display
+  changed" urgent=false`. Also with host config `"capture": "gdigrab"`.
+- **A GPU PC could stay on GDI for the rest of a session after two Desktop Duplication refusals
+  about 0.3-1 s apart** (`Selected output not supported`, `Failed to enumerate DXGI output`: a
+  DisplayPort monitor off, on another input or re-plugged, a topology change; Microsoft documents
+  DXGI_ERROR_UNSUPPORTED from DuplicateOutput as one to retry after a desktop switch or mode
+  change), with no way back. Now the session moves to GDI for refusals at once only in a remote
+  desktop session (`GetSystemMetrics(SM_REMOTESESSION)`, `platform.RemoteSession`), elsewhere
+  only once the refusals have lasted 5 s with no live generation in between (the restarts until
+  then retry Desktop Duplication, as for any capture failure), or rather than end the session at
+  its seventh failure in a row. The switch resets the failure count (GDI is a capture of its own;
+  its first start is at once). The switch log has `refusals=N over=...s remote_session=...`, the
+  notice says `capturing with GDI until it works again`.
+- **Session-level GDI and a probe finding were never checked again within the session.**
+  `watchGPUCapture` now runs for every session that captures with GDI where it would capture on
+  the GPU (not only after a finding made at run time), from its first such generation to its end.
+  While its generation captures with GDI it checks, every minute, what moved it there: the
+  agent's finding (ddagrab on output 0, `checkGPUCaptureAgain`, shared with session starts), else
+  the session's refusals (`media.CheckDDA` on the session's own output, `ddaCapturesAgain`); once
+  that opens it restarts on the GPU, overlapped, with `GPU screen capture works again: capturing
+  on the GPU.` Its first look takes the result of a check a session start began for a finding a
+  minute old, so a session started on GDI because the agent started at an RDP logon (RDP sessions
+  render on the Basic Render Driver unless the "use hardware graphics adapters for all RDS
+  sessions" policy is on) returns to ddagrab within a second of that check after `tscon` to the
+  console, not a minute later or never. On a PC without a GPU the check fails in a fraction of a
+  second, once a minute while a stream runs.
+- **The watch checked every 2 minutes, not every minute, and acted one period late.** The re-check
+  was skipped when the last one had ended less than a minute before, which every other tick was.
+  Now a check is stamped when it starts, the watch asks for one at most half a period old
+  (sessions starting share it), waits for its result and restarts at once.
+- **Notices coalesced distinct Desktop Duplication errors under the wrong cause.** Every
+  `AcquireNextFrame failed: <hr>` read as "a display mode change, or a full-screen program took
+  it over". Now only 887a0026 (DXGI_ERROR_ACCESS_LOST) does; 887a0005/887a0006/887a0007
+  (DEVICE_REMOVED/HUNG/RESET) read `the graphics driver was reset or updated, or stopped
+  responding`; any other code shows FFmpeg's line (`Screen capture failed, retrying:
+  AcquireNextFrame failed: 887a0001`), so distinct errors are distinct notices.
+- **The probe's GPU capture check could add up to 10 s to the agent's start.** Probe now runs it
+  next to the encoder tests without waiting for it beyond them (`Caps.GPUCaptureDone`; the
+  finding is read under a lock when it arrives); host.log's `ffmpeg ready` says
+  `gpu_capture=checking` then, and the check logs its finding when it ends. `recon-host probe`
+  (WriteReport, ProbeSample) waits for it, so its output is unchanged. `ffmpeg -devices` runs next
+  to `-filters` instead of after it.
+- **README**: the `pipeline` row lists `gdigrab` with the captures only FFmpeg has.
+
+Deviations: none from the fixes asked for. The session check of its own output runs only for
+sessions on GDI for Desktop Duplication's refusals; the agent's finding is checked on output 0
+as before. The watches are per session and idle (one timer each) while the session is not on GDI.
+
+Verified in the sandbox (Linux, Wine 9.0 with Xvfb, no GPU; the Windows FFmpeg
+`n8.1.3-14-g330caae0c1-20261006` build):
+
+- `TestGDIFollowsDisplayWindows` (new, Windows test binary under Wine in a virtual desktop,
+  `explorer /desktop=recon,1280x720`, with `RECON_TEST_FFMPEG` and `RECON_TEST_DISPLAY_CHANGE`):
+  a session streams gdigrab + libx264 at 1280x720, the test changes the resolution to 1024x768
+  (ChangeDisplaySettingsW), the session logs `display changed monitor="1280x720 at (0,0) is now
+  1024x768 at (0,0)"`, generation 2's encoder is ready at 1024x768 and streams 10 frames 1.4-1.5 s
+  after the change, pointer input maps to 1024x768. The same binary without the watch: generation
+  2 never came (30 s), generation 1 kept streaming 1280x720.
+- `TestSessionGDIWindows` passes under Wine with the probe's check in the background (the test
+  waits for `GPUCaptureDone`); `recon-host.exe probe` under Wine prints the same `capture:
+  ddagrab unavailable (...)`, `session: gdigrab ...` and command lines as before.
+- Go tests (`internal/host`): `TestGDIFollowsDisplay` (two monitors: the primary raised to
+  1920x1080 moves the session's second monitor from x=1280 to 1920, then that one set to
+  1600x901; each a restart with the new `-offset_x/-offset_y/-video_size`, pointer input mapped,
+  no restart without a change, also with `"capture": "gdigrab"`), `TestWatchSessionGDI` (refusals
+  past the window, GDI, a check of the session's output 1 that is still refused, one that opens,
+  the overlapped restart on ddagrab output 1, both notices, no more checks),
+  `TestWatchGPUCaptureCadence` (production ratio of the intervals, 200 ms: 10 checks in 10
+  periods, back on the GPU 3 ms after the check opened; with the old age gate the same test
+  counted 5), `TestWatchGPUCaptureFirstLook` (a minute-old finding: the session start's check is
+  taken by the session's first look, no tick needed), `TestCaptureFailedGDI` (two quick refusals
+  stay on ddagrab, 5 s of them move the session, a live generation starts a new run, a remote
+  desktop session moves at once, the sixth failure in a row moves rather than ends),
+  `TestFailureNoticeDDAErrors`; `internal/host/media`: `TestClassifyCapture` (887a0026,
+  887a0005/6/7, codes without a sentence), `TestCheckDDA`, `TestProbeGPUCaptureInBackground` (a
+  stand-in ffmpeg whose ddagrab check takes 1.5 s: Probe returns after 7 ms without the finding,
+  the report waits for it and prints it).
+
+Not verified (needs real hardware):
+
+- GPU-less Windows VM (the reporter's Proxmox VM): unverified. Test: docs/HARDWARE_TEST_PLAN.md
+  G2's resolution change (Settings > Display while streaming: the whole desktop at the new size
+  within about 2 s, clicks land, host.log `display changed`) and G3's RDP window resize and
+  `tscon`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: HARDWARE_TEST_PLAN G4 (`"pipeline": "ffmpeg"`: the
+  monitor off for 3 s stays on ddagrab with no `capturing with GDI`; off for 30 s, record
+  host.log, and if the session moved to GDI it is back on ddagrab within about a minute of the
+  monitor coming back), G5 (RDP: `remote_session=true` in the switch line, or the D3D11VA
+  finding; after `tscon` to the console the stream is back on ddagrab within about a minute; an
+  agent restarted inside an RDP session, then `tscon`, then a new stream: ddagrab within its first
+  seconds), G6 (a TDR: the toast names a driver reset, back on ddagrab within about a minute).
+  Also check that `GetSystemMetrics(SM_REMOTESESSION)` is 1 in an RDP session for the agent
+  started by the logon task, and 0 at the console after `tscon`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD steps above with NVENC.
+
+### Runs with these changes
+
+`gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass; `go test` of every
+package but `internal/e2e` passes, and `go test -race -count=3` of the GDI, capture, watch,
+notice and display tests passes. Under the shared lock `go test ./internal/e2e/...` passes (202
+s), and the browser E2E (Linux host, capture "test") filtered to `^WebTransport direct$|loss
+handling` passed 59 of 59 checks. Under Wine 9 with Xvfb: `TestSessionGDIWindows` and
+`TestGDIFollowsDisplayWindows` (in a Wine virtual desktop) pass, and `recon-host.exe probe`
+prints the `ddagrab unavailable` line and gdigrab's command lines.

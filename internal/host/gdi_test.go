@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,8 +102,10 @@ var gdiMonitors = []platform.Monitor{
 
 func gdiAgent(cfg Config, caps *media.Caps) *Agent {
 	cfg.Defaults()
-	return &Agent{cfg: &cfg, caps: caps, inj: input.NewInjector(nil), hostClock: media.NewHostClock(),
+	a := &Agent{cfg: &cfg, caps: caps, inj: input.NewInjector(nil), hostClock: media.NewHostClock(),
 		listMonitors: func() []platform.Monitor { return gdiMonitors }, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	a.gpuCap.at = time.Now() // the probe's finding, as NewAgent
+	return a
 }
 
 // TestCaptureChoiceGDI: the capture source by FFmpeg's capture sources and
@@ -312,16 +315,21 @@ func TestCaptureFailedGDI(t *testing.T) {
 
 	t.Run("Desktop Duplication refuses the display", func(t *testing.T) {
 		a := gdiAgent(Config{Capture: "auto"}, gdiTestCaps("", true))
-		s, ctrl := gdiSession(a, nil)
+		logs := &lockedLog{}
+		s, ctrl := gdiSession(a, logs)
 		s.cancel()
 		p := next(t, s)
-		fail(s, p, refused, false) // a mode change can cause one: retried
-		if p = next(t, s); p.Source.Backend != "ddagrab" || s.failures != 1 {
-			t.Fatalf("after one refusal: %s, %d failures", p.Source.Backend, s.failures)
+		fail(s, p, refused, false) // a monitor switched off or re-plugged refuses for a moment: retried
+		fail(s, next(t, s), refused, false)
+		if p = next(t, s); p.Source.Backend != "ddagrab" || s.failures != 2 {
+			t.Fatalf("after two quick refusals: %s, %d failures", p.Source.Backend, s.failures)
 		}
+		s.prefsMu.Lock()
+		s.ddaRefusedAt = time.Now().Add(-ddaRefusalWindow) // the refusals have lasted
+		s.prefsMu.Unlock()
 		fail(s, p, refused, false)
-		if p = next(t, s); p.Source.Backend != "gdigrab" || s.failures != 1 {
-			t.Fatalf("after two refusals: %s, %d failures", p.Source.Backend, s.failures)
+		if p = next(t, s); p.Source.Backend != "gdigrab" || s.failures != 0 {
+			t.Fatalf("after refusals for %v: %s, %d failures", ddaRefusalWindow, p.Source.Backend, s.failures)
 		}
 		if a.gpuCaptureBlocked() != "" {
 			t.Fatal("one session's refusals taken for the PC's")
@@ -329,8 +337,56 @@ func TestCaptureFailedGDI(t *testing.T) {
 		got := msgs(t, ctrl)
 		if len(got) != 2 || got[0] != "warn: Screen capture failed, retrying: Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support." ||
 			!strings.HasPrefix(got[1], "warn: Screen capture on the GPU failed (Desktop Duplication cannot capture this display") ||
-			!strings.HasSuffix(got[1], "capturing with GDI for this session, which uses more CPU and adds latency.") {
+			!strings.HasSuffix(got[1], "capturing with GDI until it works again, which uses more CPU and adds latency.") {
 			t.Fatalf("notices %q", got)
+		}
+		if l := logs.lines(`msg="GPU screen capture failed: capturing with GDI (gdigrab)"`); len(l) != 1 ||
+			!strings.Contains(l[0], `for="this session"`) || !strings.Contains(l[0], "refusals=3") || !strings.Contains(l[0], "remote_session=false") {
+			t.Fatalf("switch log %q", l)
+		}
+	})
+
+	t.Run("the display comes back within the window", func(t *testing.T) {
+		a := gdiAgent(Config{Capture: "auto"}, gdiTestCaps("", true))
+		s, _ := gdiSession(a, nil)
+		s.cancel()
+		fail(s, next(t, s), refused, false)
+		fail(s, next(t, s), refused, false)
+		s.encoderLive() // the next ddagrab generation went live: the display is back
+		s.prefsMu.Lock()
+		s.ddaRefusedAt = time.Now().Add(-time.Hour) // what an older run of refusals would have left
+		s.prefsMu.Unlock()
+		fail(s, next(t, s), refused, false) // a new run starts
+		if p := next(t, s); p.Source.Backend != "ddagrab" {
+			t.Fatalf("refused, refused, live, refused: %s", p.Source.Backend)
+		}
+	})
+
+	t.Run("a remote desktop session", func(t *testing.T) {
+		defer func(f func() bool) { remoteSession = f }(remoteSession)
+		remoteSession = func() bool { return true }
+		a := gdiAgent(Config{Capture: "auto"}, gdiTestCaps("", true))
+		s, _ := gdiSession(a, nil)
+		s.cancel()
+		fail(s, next(t, s), refused, false) // refused every time there: at once
+		if p := next(t, s); p.Source.Backend != "gdigrab" {
+			t.Fatalf("after one refusal in a remote session: %s", p.Source.Backend)
+		}
+	})
+
+	t.Run("GDI rather than the end of the session", func(t *testing.T) {
+		a := gdiAgent(Config{Capture: "auto"}, gdiTestCaps("", true))
+		s, _ := gdiSession(a, nil)
+		s.cancel()
+		for i := 1; i < maxVideoFailures; i++ { // quick failures (a fast PC)
+			fail(s, next(t, s), refused, false)
+		}
+		if p := next(t, s); p.Source.Backend != "ddagrab" || s.failures != maxVideoFailures-1 {
+			t.Fatalf("after %d quick refusals: %s, %d failures", maxVideoFailures-1, p.Source.Backend, s.failures)
+		}
+		fail(s, next(t, s), refused, false) // the next one would end the session
+		if p := next(t, s); p.Source.Backend != "gdigrab" || s.failures != 0 {
+			t.Fatalf("after %d refusals: %s, %d failures", maxVideoFailures, p.Source.Backend, s.failures)
 		}
 	})
 
@@ -587,7 +643,7 @@ exit 1
 	s, ctrl := gdiSession(a, logs)
 	s.prefs = proto.Prefs{Monitor: 1, FPS: 30}
 	s.video = media.NewVideo(caps, s.log, a.clock)
-	defer func() { s.cancel(); s.video.Stop() }()
+	defer stopGDISession(s)
 	go s.videoEvents()
 	start := time.Now()
 	if err := s.startVideo(false, ""); err != nil {
@@ -684,7 +740,7 @@ func TestWatchGPUCapture(t *testing.T) {
 	s, ctrl := gdiSession(a, logs)
 	a.log = s.log
 	s.video = media.NewVideo(caps, s.log, a.clock)
-	defer func() { s.cancel(); s.video.Stop() }()
+	defer stopGDISession(s)
 	if err := s.startVideo(false, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -727,5 +783,351 @@ func TestWatchGPUCapture(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // the watch has ended: no more checks
 	if n := checks.Load(); n != 2 {
 		t.Fatalf("%d checks after GPU capture came back", n)
+	}
+}
+
+// stopGDISession ends a session of these tests: its context, its watches
+// (which read the intervals the next test sets), its video.
+func stopGDISession(s *Session) {
+	s.cancel()
+	s.watches.Wait()
+	s.video.Stop()
+}
+
+// sleepingFFmpeg is a stand-in for FFmpeg whose generations start and never
+// stream or end; each run's arguments are a line of the file args.
+func sleepingFFmpeg(t *testing.T) (ff, args string) {
+	t.Helper()
+	dir := t.TempDir()
+	ff, args = filepath.Join(dir, "ffmpeg"), filepath.Join(dir, "args")
+	if err := os.WriteFile(ff, []byte("#!/bin/sh\necho \"$*\" >> "+args+"\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return ff, args
+}
+
+// ffmpegRuns returns the arguments of each run of a sleepingFFmpeg.
+func ffmpegRuns(args string) []string {
+	b, _ := os.ReadFile(args)
+	if s := strings.TrimSpace(string(b)); s != "" {
+		return strings.Split(s, "\n")
+	}
+	return nil
+}
+
+// waitUntil polls ok for up to 10 s, and fails the test with what and the
+// session's log after that.
+func waitUntil(t *testing.T, logs *lockedLog, what string, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		if ok() {
+			return
+		}
+	}
+	t.Fatalf("%s; log:\n%s", what, strings.Join(logs.lines(""), "\n"))
+}
+
+// currentBackend is the capture of the session's starting or streaming
+// generation.
+func currentBackend(s *Session) string {
+	p, _ := s.vid().Current()
+	return p.Source.Backend
+}
+
+// noticeLines are the session's notices as "level: text".
+func noticeLines(t *testing.T, c *fakeCtrl) []string {
+	var out []string
+	for _, n := range ctrlNotices(t, c) {
+		out = append(out, n.Level+": "+n.Msg)
+	}
+	return out
+}
+
+// TestWatchSessionGDI: a session that moved to GDI for Desktop
+// Duplication's refusals of its display (a monitor off past the window, a
+// remote desktop session handed to the console) checks ddagrab on its own
+// output while it streams, and once that opens goes back to it, overlapped
+// and with a notice: it does not stay on GDI for the rest of the session.
+func TestWatchSessionGDI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in encoder is a shell script")
+	}
+	defer func(w, r time.Duration) { gpuCaptureWatchEvery, ddaRefusalWindow = w, r }(gpuCaptureWatchEvery, ddaRefusalWindow)
+	gpuCaptureWatchEvery, ddaRefusalWindow = 20*time.Millisecond, 0
+	var checks atomic.Int32
+	var outputs []int
+	var mu sync.Mutex
+	checkDDA = func(ctx context.Context, ffmpeg string, output int) (bool, media.CaptureFailure, string) {
+		mu.Lock()
+		outputs = append(outputs, output)
+		mu.Unlock()
+		if checks.Add(1) == 1 {
+			f := media.ClassifyCapture("[Parsed_ddagrab_0 @ 0000020a] Selected output not supported")
+			return false, f, f.Line // still refused
+		}
+		return true, media.CaptureFailure{}, ""
+	}
+	checkGPUCapture = func(context.Context, string) (string, string) {
+		t.Error("the PC's GPU capture checked: the session's display was refused, the PC has GPU capture")
+		return "", ""
+	}
+	t.Cleanup(func() { checkDDA, checkGPUCapture = media.CheckDDA, media.CheckGPUCapture })
+	caps := gdiTestCaps("", true)
+	caps.FFmpeg, _ = sleepingFFmpeg(t)
+	a := gdiAgent(Config{Capture: "auto"}, caps)
+	logs := &lockedLog{}
+	s, ctrl := gdiSession(a, logs)
+	a.log = s.log
+	s.prefs = proto.Prefs{Monitor: 1}
+	s.video = media.NewVideo(caps, s.log, a.clock)
+	defer stopGDISession(s)
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.vid().Current()
+	if p.Source.Backend != "ddagrab" || p.Source.Output != 1 {
+		t.Fatalf("first generation: %+v", p.Source)
+	}
+	const refused = "[Parsed_ddagrab_0 @ 0000020a] Selected output not supported | [Parsed_ddagrab_0 @ 0000020a] Failed to configure output pad on Parsed_ddagrab_0"
+	s.handleEncoderFailure(media.VideoEvent{Err: errors.New("encoder libx264 exited: " + refused), Failed: &p, CaptureFailure: media.ClassifyCapture(refused)})
+	waitUntil(t, logs, "no GDI generation after the refusals", func() bool { return currentBackend(s) == "gdigrab" })
+	waitUntil(t, logs, "not back on Desktop Duplication", func() bool { return currentBackend(s) == "ddagrab" })
+	if p, _ := s.vid().Current(); p.Source.Output != 1 || s.sessionGDI() != "" {
+		t.Fatalf("back on %+v, session finding %q", p.Source, s.sessionGDI())
+	}
+	mu.Lock()
+	got := fmt.Sprint(outputs)
+	mu.Unlock()
+	if checks.Load() != 2 || got != "[1 1]" {
+		t.Fatalf("checks of outputs %s, want the session's output twice (the first still refused)", got)
+	}
+	want := []string{"warn: Screen capture on the GPU failed (Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support): capturing with GDI until it works again, which uses more CPU and adds latency.",
+		"info: GPU screen capture works again: capturing on the GPU."}
+	if got := noticeLines(t, ctrl); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("notices %q, want %q", got, want)
+	}
+	for _, l := range []string{`msg="Desktop Duplication captures the session's display again" output=1`,
+		`msg="restarting video" reason="GPU screen capture works again" urgent=false`} {
+		if n := len(logs.lines(l)); n != 1 {
+			t.Fatalf("%d lines %s", n, l)
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // on the GPU: no more checks
+	if n := checks.Load(); n != 2 {
+		t.Fatalf("%d checks after Desktop Duplication came back", n)
+	}
+}
+
+// TestWatchGPUCaptureCadence: the watch checks once per period, also with the
+// production ratio of the session starts' re-check age to the period (a
+// check is stamped when it starts, and the watch's age is half a period), and
+// restarts on the GPU as soon as a check opens, not at its next tick.
+func TestWatchGPUCaptureCadence(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in encoder is a shell script")
+	}
+	const period = 200 * time.Millisecond
+	defer func(r, w time.Duration) { gpuCaptureRecheck, gpuCaptureWatchEvery = r, w }(gpuCaptureRecheck, gpuCaptureWatchEvery)
+	gpuCaptureRecheck, gpuCaptureWatchEvery = period, period
+	var mu sync.Mutex
+	var checks int
+	var opened time.Time
+	var open atomic.Bool
+	checkGPUCapture = func(context.Context, string) (string, string) {
+		time.Sleep(5 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		checks++
+		if open.Load() {
+			opened = time.Now()
+			return "", ""
+		}
+		return noDevice, "Failed to create D3D11VA device."
+	}
+	t.Cleanup(func() { checkGPUCapture = media.CheckGPUCapture })
+	caps := gdiTestCaps(noDevice, true) // the probe's finding
+	caps.FFmpeg, _ = sleepingFFmpeg(t)
+	a := gdiAgent(Config{Capture: "auto"}, caps)
+	logs := &lockedLog{}
+	s, _ := gdiSession(a, logs)
+	a.log = s.log
+	s.video = media.NewVideo(caps, s.log, a.clock)
+	defer stopGDISession(s)
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if b := currentBackend(s); b != "gdigrab" {
+		t.Fatalf("first generation: %s", b)
+	}
+	time.Sleep(10*period + period/2)
+	mu.Lock()
+	n := checks
+	mu.Unlock()
+	if n < 9 || n > 11 {
+		t.Fatalf("%d checks in 10 watch periods, want one per period", n)
+	}
+	open.Store(true)
+	waitUntil(t, logs, "not back on the GPU", func() bool { return currentBackend(s) == "ddagrab" })
+	back := time.Now()
+	mu.Lock()
+	delay := back.Sub(opened)
+	mu.Unlock()
+	if delay > period/2 {
+		t.Fatalf("back on the GPU %v after the check opened, want at once (period %v)", delay, period)
+	}
+	t.Logf("%d checks in 10 periods; back on the GPU %v after the check opened", n, delay.Round(time.Millisecond))
+}
+
+// TestWatchGPUCaptureFirstLook: an agent whose finding of no GPU capture is
+// a minute old (it started at a remote desktop logon, where sessions render
+// on the Basic Render Driver; then the user moved to the console) has it
+// checked again at a session start. The session starts on GDI meanwhile and
+// takes that check's result at once, not at its watch's first tick a period
+// later, and goes back to the GPU.
+func TestWatchGPUCaptureFirstLook(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in encoder is a shell script")
+	}
+	defer func(w time.Duration) { gpuCaptureWatchEvery = w }(gpuCaptureWatchEvery)
+	gpuCaptureWatchEvery = time.Hour // no tick in this test
+	release := make(chan struct{})
+	var checks atomic.Int32
+	checkGPUCapture = func(context.Context, string) (string, string) {
+		checks.Add(1)
+		<-release
+		return "", ""
+	}
+	t.Cleanup(func() { checkGPUCapture = media.CheckGPUCapture })
+	caps := gdiTestCaps(noDevice, true)
+	caps.FFmpeg, _ = sleepingFFmpeg(t)
+	a := gdiAgent(Config{Capture: "auto"}, caps)
+	a.gpuCap.at = time.Now().Add(-2 * gpuCaptureRecheck)
+	logs := &lockedLog{}
+	s, ctrl := gdiSession(a, logs)
+	a.log = s.log
+	s.video = media.NewVideo(caps, s.log, a.clock)
+	defer stopGDISession(s)
+	a.recheckGPUCapture() // the session start's (run), in the background
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if b := currentBackend(s); b != "gdigrab" {
+		t.Fatalf("first generation: %s", b)
+	}
+	close(release) // the check opens
+	waitUntil(t, logs, "not back on the GPU", func() bool { return currentBackend(s) == "ddagrab" })
+	if n := checks.Load(); n != 1 {
+		t.Fatalf("%d checks, want the session start's only", n)
+	}
+	want := []string{"warn: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency.",
+		"info: GPU screen capture works again: capturing on the GPU."}
+	if got := noticeLines(t, ctrl); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("notices %q, want %q", got, want)
+	}
+}
+
+// TestGDIFollowsDisplay: gdigrab keeps the rectangle it started with (it
+// neither follows nor fails when the desktop changes: reproduced under Wine),
+// so a session that captures with GDI watches its monitor and, when the
+// layout or the resolution changes, restarts the video (overlapped) on the
+// new rectangle and maps input to it; an unchanged display restarts nothing.
+// The host config asks for gdigrab here: the watch does not depend on a
+// finding.
+func TestGDIFollowsDisplay(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in encoder is a shell script")
+	}
+	defer func(d time.Duration) { gdiDisplayEvery = d }(gdiDisplayEvery)
+	gdiDisplayEvery = 20 * time.Millisecond
+	caps := gdiTestCaps("", true)
+	var args string
+	caps.FFmpeg, args = sleepingFFmpeg(t)
+	a := gdiAgent(Config{Capture: "gdigrab"}, caps)
+	var mons atomic.Pointer[[]platform.Monitor]
+	set := func(m ...platform.Monitor) { mons.Store(&m) }
+	primary := platform.Monitor{Index: 0, Name: `\\.\DISPLAY1`, W: 1280, H: 720, Primary: true, Hz: 60, DXGIOutput: 0}
+	second := platform.Monitor{Index: 1, Name: `\\.\DISPLAY2`, X: 1280, W: 1920, H: 1080, Hz: 60, DXGIOutput: 1}
+	set(primary, second)
+	a.listMonitors = func() []platform.Monitor { return *mons.Load() }
+	rec := &recordingBackend{}
+	a.inj = input.NewInjector(rec)
+	logs := &lockedLog{}
+	s, _ := gdiSession(a, logs)
+	a.log = s.log
+	s.prefs = proto.Prefs{Monitor: 1}
+	s.video = media.NewVideo(caps, s.log, a.clock)
+	defer stopGDISession(s)
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	area := func(x, y, w, h int) string {
+		return fmt.Sprintf("-offset_x %d -offset_y %d -video_size %dx%d -i desktop", x, y, w, h)
+	}
+	waitUntil(t, logs, "no first run", func() bool { return len(ffmpegRuns(args)) == 1 })
+	if r := ffmpegRuns(args); !strings.Contains(r[0], area(1280, 0, 1920, 1080)) {
+		t.Fatalf("first run %q", r[0])
+	}
+	time.Sleep(10 * gdiDisplayEvery)
+	if r := ffmpegRuns(args); len(r) != 1 {
+		t.Fatalf("restarted with no change: %q", r)
+	}
+	pointer := func() input.Rect {
+		_ = a.inj.MoveAbs(0, 0)
+		return rec.target
+	}
+	for i, c := range []struct {
+		name            string
+		primary, second platform.Monitor
+		how             string
+	}{
+		// The primary display raised to 1920x1080 moves the second one.
+		{"layout", platform.Monitor{Index: 0, Name: `\\.\DISPLAY1`, W: 1920, H: 1080, Primary: true, Hz: 60, DXGIOutput: 0},
+			platform.Monitor{Index: 1, Name: `\\.\DISPLAY2`, X: 1920, W: 1920, H: 1080, Hz: 60, DXGIOutput: 1},
+			"1920x1080 at (1280,0) is now 1920x1080 at (1920,0)"},
+		// The session's display set to 1600x900 (an odd height captured even).
+		{"resolution", platform.Monitor{Index: 0, Name: `\\.\DISPLAY1`, W: 1920, H: 1080, Primary: true, Hz: 60, DXGIOutput: 0},
+			platform.Monitor{Index: 1, Name: `\\.\DISPLAY2`, X: 1920, W: 1600, H: 901, Hz: 60, DXGIOutput: 1},
+			"1920x1080 at (1920,0) is now 1600x901 at (1920,0)"},
+	} {
+		set(c.primary, c.second)
+		waitUntil(t, logs, c.name+": no restart", func() bool { return len(ffmpegRuns(args)) == i+2 })
+		m := c.second
+		if r := ffmpegRuns(args); !strings.Contains(r[i+1], area(m.X, m.Y, m.W&^1, m.H&^1)) {
+			t.Fatalf("%s: run %q", c.name, r[i+1])
+		}
+		if got := pointer(); got != (input.Rect{X: m.X, Y: m.Y, W: m.W, H: m.H}) {
+			t.Fatalf("%s: pointer input maps to %+v", c.name, got)
+		}
+		if l := logs.lines(`msg="display changed" monitor="` + c.how + `"`); len(l) != 1 {
+			t.Fatalf("%s: change log %q", c.name, logs.lines(`msg="display changed"`))
+		}
+	}
+	if l := logs.lines(`msg="restarting video" reason="display changed" urgent=false`); len(l) != 2 {
+		t.Fatalf("restarts %q", l)
+	}
+	time.Sleep(10 * gdiDisplayEvery)
+	if r := ffmpegRuns(args); len(r) != 3 {
+		t.Fatalf("restarted with no change: %q", r)
+	}
+}
+
+// TestFailureNoticeDDAErrors: Desktop Duplication's AcquireNextFrame errors
+// read as what they are, and distinct ones are distinct notices: a mode
+// change, a driver reset (once for two in a row), and a code no sentence
+// covers (FFmpeg's line).
+func TestFailureNoticeDDAErrors(t *testing.T) {
+	a := gdiAgent(Config{Capture: "auto"}, gdiTestCaps("", true))
+	s, ctrl := gdiSession(a, nil)
+	s.cancel()
+	for _, hr := range []string{"887a0026", "887a0005", "887a0005", "887a0001"} {
+		line := "[Parsed_ddagrab_0 @ 0000020a] AcquireNextFrame failed: " + hr
+		s.restartNotice(failureNotice(media.VideoEvent{Err: errors.New("encoder hevc_amf exited: " + line + " | [fc#0 @ 0000021b] Error while filtering"),
+			CaptureFailure: media.ClassifyCapture(line)}))
+	}
+	want := []string{"warn: Screen capture failed, retrying: Desktop Duplication lost the display: a display mode change, or a full-screen program took it over.",
+		"warn: Screen capture failed, retrying: The graphics driver was reset or updated, or stopped responding.",
+		"warn: Screen capture failed, retrying: AcquireNextFrame failed: 887a0001"}
+	if got := noticeLines(t, ctrl); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("notices %q, want %q", got, want)
 	}
 }

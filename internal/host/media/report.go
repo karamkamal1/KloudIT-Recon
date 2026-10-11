@@ -25,6 +25,7 @@ func (c *Caps) WriteReport(w io.Writer, sample func(EncoderInfo) Params) {
 	}
 	fmt.Fprintf(w, "capture:    ddagrab=%v gfxcapture=%v vsrc_amf=%v gdigrab=%v\n", c.Filters["ddagrab"], c.Filters["gfxcapture"],
 		c.Filters["vsrc_amf"], c.CanGDIGrab())
+	<-c.GPUCaptureDone() // the probe's check, within its own limit
 	if why := c.GPUCaptureBlocked(); why != "" {
 		use := "using gdigrab (GDI: more CPU and latency)"
 		if !c.CanGDIGrab() {

@@ -572,22 +572,35 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
   and gfxcapture both open FFmpeg's D3D11VA device (a Direct3D 11 device with video support),
   which a PC or VM without a GPU does not have (the Microsoft Basic Display Adapter and Basic
   Render Driver): every start fails with `Failed to create D3D11VA device.` The probe opens
-  ddagrab for one frame next to its encoder tests (no extra start-up time; a timeout or a failure
-  of the moment, such as the secure desktop at logon, is no finding), and where that is the error
-  the agent captures with gdigrab: the monitor's rectangle in physical pixels
+  ddagrab for one frame next to its encoder tests and does not wait for it beyond them (it takes a
+  fraction of a second, but up to its 10 s limit where ddagrab waits for a first frame, a display
+  that is off: the finding then follows in the background, `Caps.GPUCaptureDone`; a timeout or a
+  failure of the moment, such as the secure desktop at logon, is no finding), and where that is
+  the error the agent captures with gdigrab: the monitor's rectangle in physical pixels
   (`-offset_x/-offset_y -video_size`), at the stream's frame rate, the cursor drawn only for
   clients that want it, `settb/setpts=time(0)` right after the source as on the GPU paths, scaled
   and converted on the CPU in one swscale pass (yuv420p for software encoders, NV12 for
   NVENC/AMF/QSV). At run time the session classifies FFmpeg's stderr (`media.ClassifyCapture`, by
   the capture source's log context): no D3D11VA device moves the session, and the agent's later
-  sessions, to GDI at once (the agent re-checks a minute later, in the background, so a driver
-  installed meanwhile brings GPU capture back; a session that lost GPU capture while it ran, as in
-  a driver reset or update where Windows shows the Basic Display Adapter for a while, checks every
-  minute and restarts its video on the GPU once it works); Desktop Duplication refusing the
-  display (DXGI_ERROR_UNSUPPORTED, no such output, E_INVALIDARG) twice in a row moves only that
-  session; the secure desktop (E_ACCESSDENIED), DXGI_ERROR_ACCESS_LOST and size changes keep
-  Desktop Duplication, which the restart retries, because GDI cannot capture the secure desktop
-  either. One notice says so; an identical restart notice is not repeated until a generation has
+  sessions, to GDI at once; Desktop Duplication refusing the display (DXGI_ERROR_UNSUPPORTED, no
+  such output, E_INVALIDARG) moves only that session, at once in a remote desktop session
+  (`SM_REMOTESESSION`), elsewhere after 5 s of refusals with no live generation in between (a
+  monitor switched off or re-plugged refuses for a moment; Microsoft documents
+  DXGI_ERROR_UNSUPPORTED as one to retry after a mode change), or rather than end the session at
+  its seventh failure. The secure desktop (E_ACCESSDENIED), DXGI_ERROR_ACCESS_LOST and size
+  changes keep Desktop Duplication, which the restart retries, because GDI cannot capture the
+  secure desktop either. While a session captures with GDI where it would capture on the GPU,
+  `watchGPUCapture` checks what moved it there every minute (ddagrab on output 0 for the agent's
+  finding, shared with session starts; ddagrab on the session's own output for its refusals; its
+  first look takes the result of a check a session start began, for a finding a minute old) and
+  restarts the video on the GPU, overlapped, once that opens: a driver reset or update (Windows
+  shows the Basic Display Adapter meanwhile), an agent started at a remote desktop logon (RDP
+  sessions render on the Basic Render Driver), a session handed to the console. gdigrab computes
+  its rectangle once and never fails when the desktop changes size, so `watchGDIDisplay` compares
+  the generation's rectangle with the monitor every second and restarts it, overlapped, on the
+  new one (input follows), as the helper's `capture resized` does. Known failures read as a
+  sentence (AcquireNextFrame: only 887a0026 is a mode change, 887a0005/6/7 a driver reset, other
+  codes show FFmpeg's line); an identical restart notice is not repeated until a generation has
   gone live and a minute has passed.
 
 - **AMD Direct Capture (experimental, `capture: "amf"`):** FFmpeg 8.1's `vsrc_amf` in

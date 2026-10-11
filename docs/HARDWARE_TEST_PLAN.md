@@ -1206,12 +1206,15 @@ items G4 to G6 on the AMD PC.
   -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size WxH -i desktop` under `libx264`; `helper:     no
   usable encoder`; one installer warning, `This PC has no GPU screen capture ...` (not also "No GPU
   encoder works" and the helper's); `ffmpeg ready ... gdigrab=true gpu_capture="unavailable: no
-  Direct3D 11 video device: ..."`.
+  Direct3D 11 video device: ..."` (or `gpu_capture=checking` followed by `no GPU screen capture
+  on this PC: sessions capture with GDI`: the agent does not wait for that test).
 - **If not, send**: the probe output, the installer's output and host.log.
 
 **G2. Stream from the console**
 - **Do**: connect from a browser with the defaults; then Resolution 1280×720 and Frame rate 30 in
-  the settings drawer; move windows and play a video on the VM for a minute.
+  the settings drawer; move windows and play a video on the VM for a minute. Then, while
+  streaming, change the VM's display resolution (Settings > Display, e.g. 1024×768 and back to
+  the original), and with Proxmox's console, resize the console window if it resizes the display.
 - **Look at**: the toasts, the overlay (Encoder, fps, latency), host.log, Task Manager on the VM.
 - **Pass**: the picture appears within about 2 s, with one toast, `No GPU screen capture on this PC
   (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or
@@ -1220,7 +1223,11 @@ items G4 to G6 on the AMD PC.
   and the VM's CPU use at the defaults and at 1280×720@30). The pointer moves where you click
   (desktop mouse mode), on the right monitor with two. host.log: `video pipeline pipeline=ffmpeg ...
   reason="it has no usable encoder"` (one helper launch, no `trying another backend`), `capturing
-  with GDI (gdigrab)`, `starting encoder gen=1 ... capture=gdigrab`, no `encoder failed`.
+  with GDI (gdigrab)`, `starting encoder gen=1 ... capture=gdigrab`, no `encoder failed`. After
+  each resolution change the picture shows the whole desktop at its new size within about 2 s
+  (no black bars, nothing cut off), and clicks land where they should; host.log `display changed
+  monitor="WxH at (0,0) is now W'xH' at (0,0)"`, `restarting video reason="display changed"`
+  and an `encoder ready` line with the new size.
 - **If not, send**: host.log, a screenshot of the overlay, the numbers above.
 
 **G3. Remote desktop**
@@ -1230,23 +1237,33 @@ items G4 to G6 on the AMD PC.
   ([System.Diagnostics.Process]::GetCurrentProcess().SessionId) /dest:console`, and connect.
 - **Look at**: whether the picture appears, the toasts, host.log (`encoder failed`, `capturing
   with GDI`).
-- **Pass**: RDP connected: the stream shows the RDP session's desktop (with GDI). Disconnected:
-  no capture works (record what happens: a black picture, or failures such as `Screen capture
-  failed, retrying: GDI screen capture failed: is the session locked or disconnected?`), and
-  each kind of failure shows one toast, not a stack. After `tscon`: the stream works as in G2.
+- **Pass**: RDP connected: the stream shows the RDP session's desktop (with GDI); resizing the
+  RDP client's window (which resizes the session) restarts the stream at the new size as in G2.
+  Disconnected: no capture works (record what happens: a black picture, or failures such as
+  `Screen capture failed, retrying: GDI screen capture failed: is the session locked or
+  disconnected?`), and each kind of failure shows one toast, not a stack. After `tscon`: the
+  stream works as in G2, at the console's size.
 - **If not, send**: host.log and what the browser showed in each case.
 
 **G4. A GPU PC keeps Desktop Duplication through outages (AMD PC)**
 - **Do**: on the AMD PC with `"pipeline": "ffmpeg"`, stream; press Win+L (lock screen) and sign
   in again after 5 s; trigger a UAC prompt (`Start-Process notepad -Verb RunAs`) and answer it;
-  change the display resolution and back.
+  change the display resolution and back; switch the monitor off (or to another input) for 3 s
+  and back; then for 30 s and back.
 - **Look at**: host.log after each, the toasts, `recon-host probe`.
 - **Pass**: probe shows `capture:    ddagrab=true ...` and no `ddagrab unavailable` line. After
   each outage the stream comes back on ddagrab (`starting encoder ... capture=ddagrab`), never
   `capturing with GDI`; each kind of outage shows its toast once (`Screen capture failed,
   retrying: Windows does not let programs capture the secure desktop: ...` or `... Desktop
-  Duplication lost the display: ...`). A lock screen that lasts longer than the session's seven
-  restarts (about 10 s) ends the session as before (`video encoder keeps failing`).
+  Duplication lost the display: ...`). The monitor off for 3 s: back on ddagrab, no `capturing
+  with GDI` (refusals for less than 5 s are retried). Off for 30 s: record what host.log shows
+  (`Selected output not supported` / `Failed to enumerate DXGI output` for 5 s, then `GPU screen
+  capture failed: capturing with GDI (gdigrab) for="this session" ... refusals=N over=5.xs
+  remote_session=false`, or other failures); if the session moved to GDI, it is back on
+  ddagrab within about a minute after the monitor is on again (`Desktop Duplication captures the
+  session's display again`, `GPU screen capture works again: capturing on the GPU.`). A lock
+  screen that lasts longer than the session's seven restarts (about 10 s) ends the session as
+  before (`video encoder keeps failing`).
 - **If not, send**: host.log.
 
 **G5. Remote desktop into the GPU PC (AMD PC)**
@@ -1254,11 +1271,18 @@ items G4 to G6 on the AMD PC.
   RDP client is connected.
 - **Look at**: host.log (`encoder failed`, `GPU screen capture failed: capturing with GDI`), the
   toasts.
-- **Pass**: either ddagrab works in the RDP session (record it), or after two failures
-  (`Selected output not supported`, or `Failed to enumerate DXGI output`) the session captures
-  with GDI and says `Screen capture on the GPU failed (Desktop Duplication cannot ...):
-  capturing with GDI for this session ...` once; the next session from the console uses ddagrab
-  again.
+- **Pass**: either ddagrab works in the RDP session (record it), or after its first failure
+  (`Selected output not supported`, or `Failed to enumerate DXGI output`: `remote_session=true`
+  in the `GPU screen capture failed` line; `Failed to create D3D11VA device` where the RDP
+  session renders on the Basic Render Driver) the session captures with GDI and says `Screen
+  capture on the GPU failed (Desktop Duplication cannot ...): capturing with GDI until it works
+  again ...` (or `No GPU screen capture on this PC (...)`) once. Then hand the session to the
+  console (`tscon ... /dest:console`, as in G3) while streaming: within about a minute the stream
+  is back on ddagrab (`GPU screen capture works again: capturing on the GPU.`). A session started
+  from the console after that starts on ddagrab, or returns to it within a second or two of its
+  start. Also restart the agent while signed in over RDP (`Stop-ScheduledTask` /
+  `Start-ScheduledTask`), tscon to the console and connect after a minute: the stream returns to
+  ddagrab within its first seconds.
 - **If not, send**: host.log.
 
 **G6. A graphics driver reset during a stream (AMD PC)**
@@ -1268,9 +1292,12 @@ items G4 to G6 on the AMD PC.
 - **Look at**: the toasts, host.log (`GPU screen capture failed`, `GPU screen capture works
   again`, `starting encoder ... capture=`), for 3 minutes.
 - **Pass**: the stream comes back on ddagrab by itself, either at once (the reset was over by the
-  restart) or after `No GPU screen capture on this PC (...)` on GDI for a minute or two (checked every minute),
-  then `GPU screen capture works again: capturing on the GPU.` and `capture=ddagrab`. The next
-  session starts on ddagrab.
+  restart) or after `No GPU screen capture on this PC (...)` on GDI for about a minute (checked
+  every minute), then `GPU screen capture works again: capturing on the GPU.` and
+  `capture=ddagrab`. A toast for the live generation's end, if any, names a driver reset
+  (`Screen capture failed, retrying: The graphics driver was reset or updated, or stopped
+  responding.`: AcquireNextFrame 887a0005/887a0006/887a0007 in host.log), not a display mode
+  change. The next session starts on ddagrab.
 - **If not, send**: host.log.
 
 ## Not covered by these two hosts

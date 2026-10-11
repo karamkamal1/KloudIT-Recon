@@ -343,7 +343,9 @@ before this version kept retrying the GPU capture; this version captures with GD
 says so once (`No GPU screen capture on this PC (no Direct3D 11 video device: a PC or VM without
 a GPU, or a graphics driver being installed or reset): capturing with GDI, which uses more CPU
 and adds latency.`). Upgrade the agent (see Upgrading). `host.log` then has `ffmpeg ready ...
-gdigrab=true gpu_capture="unavailable: no Direct3D 11 video device: ..."` at the start and
+gdigrab=true gpu_capture="unavailable: no Direct3D 11 video device: ..."` at the start (or
+`gpu_capture=checking` and, a moment later, `no GPU screen capture on this PC: sessions capture
+with GDI`) and
 `capturing with GDI (gdigrab)` per stream; a stream whose GPU capture fails this way after the
 start logs `GPU screen capture failed: capturing with GDI (gdigrab)` with FFmpeg's line
 (`ffmpeg="Failed to create D3D11VA device."`). Sign in on the VM's console, or keep a remote
