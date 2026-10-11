@@ -12100,3 +12100,18 @@ probes copied into the tree (not committed) and the simulations; all were real.
   Both are in this sandbox's list of earlier intermittent failures. A rerun of their sections
   ("loss handling", "hardware decoder failure") passed 23 of 23.
 - `node --check` passes on the changed scripts.
+
+### Runs with the review's fixes
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
+- `go test` passes for all 18 packages with tests but `internal/e2e` (`internal/host` 63 s:
+  `TestRateSimCapdrop` over 24 seeds per policy, the relay simulation's 19 + 6 cases). Under
+  the shared lock `go test ./internal/e2e/...` passes (201 s).
+- `go test -race ./internal/host/... ./internal/transport/...` passes (`internal/host` 253 s).
+- `node --check` passes on `web/static/js/*.js` and `test/e2e/browser.mjs` (no script changed);
+  `make build` builds both binaries.
+- The whole browser E2E (Chromium 141) under the shared lock: 316 of 317 checks, then 317 of
+  317 on the one rerun. The failure was "datagram + FEC: every frame arrives as shards and is
+  rebuilt": 747 frames in 12 s, 0 given up, 0 bad, but the last fps sample 43.7 against the
+  check's 45 (CPUs 24 % idle), a momentary dip of the shared CPU; the rerun had 743 frames and
+  passed.
