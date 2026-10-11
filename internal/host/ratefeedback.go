@@ -52,8 +52,10 @@ type sendTrack struct {
 	ring    [sendTrackLen]sentFrame
 	n       uint64 // frames recorded
 	covered uint64 // frames [0, covered) are covered
-	backlog float64
-	lastUs  uint64
+	// The pacer model at lastUs: bytes it has yet to send (backlog), and
+	// the rate it drains them at (bytes/s).
+	backlog, rate float64
+	lastUs        uint64
 }
 
 // sent records a frame whose write returned at doneUs. paceBps is the pacing
@@ -66,9 +68,12 @@ func (t *sendTrack) sent(gen uint8, seq uint32, encodeDoneUs, doneUs uint64, byt
 	if paceBps > 0 && encodeDoneUs > 0 && doneUs >= encodeDoneUs {
 		rate := paceBps * (1 - paceOverhead) / 8 // bytes/s
 		if t.lastUs != 0 && encodeDoneUs > t.lastUs {
-			t.backlog = max(0, t.backlog-rate*float64(encodeDoneUs-t.lastUs)/1e6)
+			// At the rate the pacer had until now: a target raised since
+			// (this frame's write returns at the new rate) did not drain
+			// what came before it any faster.
+			t.backlog = max(0, t.backlog-t.rate*float64(encodeDoneUs-t.lastUs)/1e6)
 		}
-		t.lastUs = max(t.lastUs, encodeDoneUs)
+		t.lastUs, t.rate = max(t.lastUs, encodeDoneUs), rate
 		t.backlog += float64(bytes)
 		burst := max(rate*0.002, minPaceBurst)
 		model := uint64(max(0, t.backlog-burst) / rate * 1e6)
@@ -126,6 +131,23 @@ func (t *sendTrack) pending(nowUs uint64) (time.Duration, bool) {
 	return time.Duration(nowUs-f.encodeDoneUs-f.comp) * time.Microsecond, true
 }
 
+// compOf returns the pacer share of a recent frame (ok false: unknown),
+// covering nothing: the frame whose one-way delay a report names
+// (proto.RateReportOWDFrame).
+func (t *sendTrack) compOf(gen uint8, seq uint32) (time.Duration, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	from := uint64(0)
+	if t.n > sendTrackLen {
+		from = t.n - sendTrackLen
+	}
+	k, ok := t.find(gen, seq, from)
+	if !ok {
+		return 0, false
+	}
+	return time.Duration(t.ring[k%sendTrackLen].comp) * time.Microsecond, true
+}
+
 // frame returns a recent frame's record (for acks), covering it and the
 // frames before it.
 func (t *sendTrack) frame(gen uint8, seq uint32) (sentFrame, bool) {
@@ -166,9 +188,10 @@ type rateFeedback struct {
 	acks     []ackSample
 	acksFrom time.Time
 	// The media congestion controller's counters at the last report (lost,
-	// lost + acknowledged packets, acknowledged bytes); reset when a path
-	// migration replaced it.
+	// lost + acknowledged packets, acknowledged bytes, the time its window
+	// held the sender back); reset when a path migration replaced it.
 	ccLost, ccTotal, ccAcked uint64
+	ccLimited                time.Duration
 	ccHave                   bool
 	// Raw one-way delay p50s and maxima over the stats period, for the log.
 	owds   []time.Duration
@@ -192,12 +215,17 @@ func (f *rateFeedback) reportsActive(now time.Time) bool {
 type ccCounters struct {
 	ok                 bool // the connection has the media congestion controller
 	lost, total, acked uint64
-	nonVideoKbps       int // audio and overhead in the acknowledged bytes
+	limited            time.Duration // the time its congestion window held the sender back (WindowLimited)
+	nonVideoKbps       int           // audio and overhead in the acknowledged bytes
 }
 
 // fromReport converts a report that arrived at now; comp is the pacer share
-// of the frames it covers, cc the media congestion controller's counters
-// (without them the client's own loss count is used). ok is false for a
+// of the frame whose one-way delay is the report's p50 where the report names
+// it (proto.RateReportOWDFrame), else the median of the frames it covers; cc
+// the media congestion controller's counters (without them the client's own
+// loss count is used). The delays are put on the scale of the client's first
+// clock sync (less ClockShiftUs): a better sync sample later moves the
+// client's offset, which is no change of the path's delay. ok is false for a
 // report not newer than the last one (its client clock): a reordered or
 // duplicated datagram, whose counters would make wrapped differences; the
 // next report's differences cover its frames.
@@ -221,9 +249,13 @@ func (f *rateFeedback) fromReport(r proto.RateReport, now time.Time, comp time.D
 	f.last, f.have, f.lastAt = r, true, now
 	f.ccDelta(&fb, cc)
 	if r.Flags&proto.RateReportOWD != 0 {
+		var shift time.Duration
+		if r.Flags&proto.RateReportOWDFrame != 0 {
+			shift = time.Duration(r.ClockShiftUs) * time.Microsecond
+		}
 		fb.owdValid = true
-		fb.owd = time.Duration(r.OWDP50Us) * time.Microsecond
-		fb.owdMax = time.Duration(r.OWDMaxUs) * time.Microsecond
+		fb.owd = time.Duration(r.OWDP50Us)*time.Microsecond - shift
+		fb.owdMax = time.Duration(r.OWDMaxUs)*time.Microsecond - shift
 		fb.qd = fb.owd - comp
 		f.note(fb.owd, fb.owdMax)
 	}
@@ -236,13 +268,14 @@ func (f *rateFeedback) ccDelta(fb *feedback, cc ccCounters) {
 	if !cc.ok {
 		return
 	}
-	if !f.ccHave || cc.lost < f.ccLost || cc.total < f.ccTotal || cc.acked < f.ccAcked {
-		f.ccLost, f.ccTotal, f.ccAcked, f.ccHave = cc.lost, cc.total, cc.acked, true
+	if !f.ccHave || cc.lost < f.ccLost || cc.total < f.ccTotal || cc.acked < f.ccAcked || cc.limited < f.ccLimited {
+		f.ccLost, f.ccTotal, f.ccAcked, f.ccLimited, f.ccHave = cc.lost, cc.total, cc.acked, cc.limited, true
 		return
 	}
 	fb.lost, fb.total = int64(cc.lost-f.ccLost), int64(cc.total-f.ccTotal)
 	fb.ackedValid, fb.acked, fb.nonVideoKbps = true, int64(cc.acked-f.ccAcked), cc.nonVideoKbps
-	f.ccLost, f.ccTotal, f.ccAcked = cc.lost, cc.total, cc.acked
+	fb.limited = cc.limited - f.ccLimited
+	f.ccLost, f.ccTotal, f.ccAcked, f.ccLimited = cc.lost, cc.total, cc.acked, cc.limited
 }
 
 // ack records a client's frame ack (clients without rate reports).

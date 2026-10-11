@@ -56,6 +56,10 @@ export const FEATURE_RATE_REPORT = 'rate-report';
 export const RATE_REPORT_OWD = 1; // owdP50Us / owdMaxUs valid
 export const RATE_REPORT_FRAME = 2; // gen / lastSeq name a received frame
 export const RATE_REPORT_SHARDS = 4; // shards / shardsLost follow (48 bytes)
+// RATE_REPORT_OWD_FRAME: owdGen / owdSeq name the frame whose delay owdP50Us
+// is, clockShiftUs the change of the client's clock offset since its first
+// sync (8 bytes after the shard counters, or after the first 40 bytes).
+export const RATE_REPORT_OWD_FRAME = 8;
 // "Datagram + FEC" video mode (GUIDE 2.5, fec.js; mirror of
 // internal/proto/fec.go): clients on WebTransport send hello.fec =
 // HELLO_FEC_VERSION, and a host that may send them video frames as shards
@@ -280,14 +284,17 @@ export function frameAck(gen, seq, owdUs, decodeUs) {
 
 /**
  * The rate report datagram (mirror of proto.RateReport, 40 bytes; 48 with
- * RATE_REPORT_SHARDS: the video shards received and lost): the counters
- * (frames, bytes, lost, audio, shards, shardsLost) are cumulative and wrap at
- * 2^32; the one-way delays (µs) are those of the frames since the previous
- * report.
+ * RATE_REPORT_SHARDS: the video shards received and lost; 8 more with
+ * RATE_REPORT_OWD_FRAME: the frame whose delay the p50 is and the clock's
+ * correction): the counters (frames, bytes, lost, audio, shards, shardsLost)
+ * are cumulative and wrap at 2^32; the one-way delays (µs) are those of the
+ * frames since the previous report.
  */
 export function rateReport(r) {
   const shards = (r.flags & RATE_REPORT_SHARDS) !== 0;
-  const b = new Uint8Array(shards ? 48 : 40);
+  const owdFrame = (r.flags & RATE_REPORT_OWD_FRAME) !== 0;
+  const n = shards ? 48 : 40;
+  const b = new Uint8Array(n + (owdFrame ? 8 : 0));
   const v = new DataView(b.buffer);
   const u32 = (x) => Math.floor(x) >>> 0;
   const i32 = (x) => Math.max(-2147483648, Math.min(2147483647, Math.round(x)));
@@ -306,6 +313,11 @@ export function rateReport(r) {
   if (shards) {
     v.setUint32(40, u32((r.shards || 0) % 4294967296), true);
     v.setUint32(44, u32((r.shardsLost || 0) % 4294967296), true);
+  }
+  if (owdFrame) {
+    b[3] = (r.owdGen || 0) & 0xff;
+    v.setUint32(n, u32((r.owdSeq || 0) % 4294967296), true);
+    v.setInt32(n + 4, i32(r.clockShiftUs || 0), true);
   }
   return b;
 }

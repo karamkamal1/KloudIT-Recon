@@ -123,12 +123,18 @@ func runSim(c simConfig) simResult {
 	nextKey := c.keyEvery
 	var frameQ []int
 	cur := -1
+	var curStart time.Duration
+	var qburst queueBurst // Session.sendBurst
+	// paced: the video bitrate the media congestion controller paces for
+	// (Session.applyCongestionTarget).
+	paced := func() int { return int(pacedVideoKbps(int64(pacerKbps), r.outputKbps())) }
 
 	// Transport.
 	var tokens float64
 	var inflight int
 	var retx []simPkt
 	var lostPkts, ackedPkts, ackedBytes uint64
+	var limited time.Duration // the window held the sender back (cc.Media.WindowLimited)
 	var acks, detect, wire, gate []simTimed
 	var bq []simPkt
 	var bqBytes int
@@ -193,6 +199,7 @@ func runSim(c simConfig) simResult {
 		if encOn && now >= nextFrame {
 			nextFrame += time.Second / time.Duration(liveFPS)
 			size := float64(liveKbps) * 1000 / 8 / float64(liveFPS) * c.fill * (0.8 + 0.4*rng.Float64())
+			isKey := key
 			if key {
 				size *= c.keyFactor
 				key = false
@@ -202,8 +209,14 @@ func runSim(c simConfig) simResult {
 			f.pkts = (f.bytes + simPktBytes - 1) / simPktBytes
 			seq++
 			res.frames = append(res.frames, f)
-			r.output(f.bytes)
-			if len(frameQ) >= 6 {
+			r.output(f.bytes, isKey)
+			video := 1.2*float64(paced()+c.audioKbps+ccOverheadKbps)*1000 - float64((c.audioKbps+ccOverheadKbps)*1000)
+			q := queueLoad{queued: len(frameQ), congested: r.delayOver(), interval: time.Second / time.Duration(liveFPS), burst: qburst.within(clock())}
+			if cur >= 0 && !res.frames[cur].done {
+				q.sending, q.busy, q.lag = true, now-curStart, now-res.frames[cur].encodeDone
+				q.deadline = frameDeadline(q.interval, res.frames[cur].bytes, video)
+			}
+			if queueOverflows(q) != "" {
 				// The session drops the queue, cuts (an emergency) or
 				// hurries a starting generation: the old one stops.
 				res.overflows = append(res.overflows, now)
@@ -224,25 +237,31 @@ func runSim(c simConfig) simResult {
 
 		// Sender: frameSender hands the next frame to QUIC when the write of
 		// the last returned (all but its last packet paced out).
-		paceBps := 1.2 * float64(pacerKbps+c.audioKbps+ccOverheadKbps) * 1000
+		paceBps := 1.2 * float64(paced()+c.audioKbps+ccOverheadKbps) * 1000
 		rate := paceBps / 8
 		burst := max(rate*0.002, 10*simPktBytes)
 		tokens = min(tokens+rate/1000, burst)
 		minRTT := 2 * c.prop
-		window := max(int(rate*(minRTT+2*time.Second/time.Duration(liveFPS)).Seconds()), 32*simPktBytes)
+		window := max(int(rate*(minRTT+2*pacedInterval(time.Second/time.Duration(liveFPS), r.frameInterval())).Seconds()), 32*simPktBytes)
 		for {
 			if cur >= 0 && !res.frames[cur].done && res.frames[cur].unsent <= simPktBytes {
 				res.frames[cur].done = true // the write returned: the session records the frame
 				f := res.frames[cur]
-				video := 1.2*float64(pacerKbps+c.audioKbps+ccOverheadKbps)*1000 - float64((c.audioKbps+ccOverheadKbps)*1000)
+				video := paceBps - float64((c.audioKbps+ccOverheadKbps)*1000)
 				if c.noComp {
 					video = 0
 				}
 				track.sent(f.gen, f.seq, uint64(f.encodeDone.Microseconds())+1, uint64(now.Microseconds())+1, f.bytes, video)
+				r.sent(f.bytes)
 			}
 			if (cur < 0 || res.frames[cur].unsent == 0) && len(frameQ) > 0 {
 				cur, frameQ = frameQ[0], frameQ[1:]
+				curStart = now
+				qburst.note(frameDeadline(time.Second/time.Duration(liveFPS), res.frames[cur].bytes, paceBps-float64((c.audioKbps+ccOverheadKbps)*1000)), clock())
 				continue
+			}
+			if inflight >= window && (len(retx) > 0 || cur >= 0 && res.frames[cur].unsent > 0) {
+				limited += time.Millisecond
 			}
 			if tokens < simPktBytes || inflight >= window {
 				break
@@ -366,7 +385,7 @@ func runSim(c simConfig) simResult {
 				comp, _ = track.cover(rr.Gen, rr.LastSeq)
 			}
 			fb, ok := rf.fromReport(rr, clock(), comp, ccCounters{ok: true, lost: lostPkts, total: lostPkts + ackedPkts, acked: ackedBytes,
-				nonVideoKbps: c.audioKbps + ccOverheadKbps})
+				limited: limited, nonVideoKbps: c.audioKbps + ccOverheadKbps})
 			if !ok {
 				continue
 			}

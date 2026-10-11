@@ -374,6 +374,15 @@ func TestSessionFEC(t *testing.T) {
 	if s.stats.frames.Load() != n {
 		t.Errorf("%d frames counted sent", s.stats.frames.Load())
 	}
+	// The frame queue's rule (queueOverflows) judged the frames by their
+	// shards: the last one's bytes on the wire, parity and shard headers
+	// included (more than the stream bytes with the largest frame extension),
+	// and its deadline from them (Session.sending).
+	if b, stream := int(s.sendBytes.Load()), proto.FrameHeaderLen+64+len(frames[n-1].Data); b <= stream ||
+		time.Duration(s.sendDeadline.Load()) != s.frameDeadline(b) {
+		t.Errorf("the queue rule saw %d bytes (stream %d), deadline %v; want the shards' bytes and their deadline %v",
+			b, stream, time.Duration(s.sendDeadline.Load()), s.frameDeadline(b))
+	}
 	// Full-size shards fit the connection's first packets
 	// (transport.InitialPacketSize): no frame was lost to shrinking them.
 	if l := log.lines("smaller shards"); len(l) > 0 {

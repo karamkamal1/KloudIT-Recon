@@ -7,6 +7,7 @@ import (
 
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
+	"github.com/karamkamal1/kloudit-recon/internal/transport/cc"
 )
 
 // Video bitrate control (GUIDE 2.2): a delay-based rate controller in the
@@ -17,7 +18,9 @@ import (
 //
 //   - Queueing delay: the one-way delay of the frames a report covers (p50),
 //     less what the host's own pacer explains (sendTrack: a key frame paced
-//     out at 1.2 x the target delays itself and the frames behind it). The
+//     out at 1.2 x the target delays itself and the frames behind it; that of
+//     the p50's own frame where the report names it), on the scale of the
+//     client's first clock sync (fromReport). The
 //     target is the minimum of the last owdWindow plus queueMargin, wider on a
 //     path whose own jitter is wider (jitterGain x the mean change between
 //     reports, at most queueMarginMax): Wi-Fi's bursts must not read as a
@@ -28,16 +31,21 @@ import (
 //     a stall of the client itself: what it lacks may wait in its own
 //     socket; a report more than pendingStallGap after the previous one is
 //     not judged by it at all). The first owdWarmup of samples decides
-//     nothing.
+//     nothing. A delay that stays where a delay decrease found it, on a path
+//     that held the sender back neither before nor since, is a step of the
+//     path's delay, not a queue: the base restarts there (levelShift).
 //   - Decrease to rateDecreaseFactor (x0.85) when the delay stays over the
 //     target for overReports consecutive reports and is not falling (a queue
 //     that drains needs no second decrease: the gradient), or more than
 //     lossThreshold of the packets were lost in the last lossWindow. The
 //     factor applies to the rate the path delivered, where that is lower
 //     than the target (carried): on the direct path what the connection's
-//     acknowledgements carried in the last ackWindow, else the client's
-//     receive rate (the lower of decreaseWindow and rateWindow), both divided
-//     by the encoder's fill; after a capacity drop that is the new capacity.
+//     acknowledgements carried in the last ackWindow where the path held the
+//     sender back (else nothing: the sender's own rate is no measure of the
+//     path's), else the client's receive rate (the lower of decreaseWindow
+//     and rateWindow), both divided by the fill (what the session sent
+//     against the target, by time); after a capacity drop that is the new
+//     capacity.
 //     A delay decrease also starts from the capacity the queue's growth
 //     implies (queueCapacity), which sees a capacity drop before the
 //     delivered rates do. The next decrease waits until this one is in the
@@ -49,9 +57,15 @@ import (
 //     (the path's capacity grew); never above the user's setting (ceiling), the
 //     decoder's cap, or recvHeadroom (1.2) x the delivered rate (the receive
 //     rate divided by the encoder's fill: encoders do not hit their target).
-//   - Emergencies as in 1.5: a host frame-queue overflow or a client whose
-//     decoder fell behind cuts at once (rateEmergencyFactor) with an urgent
-//     restart, but not within rateEmergencyGap of any other decrease.
+//   - Emergencies as in 1.5: a host frame-queue overflow (queueOverflows:
+//     only where the network does not keep up, or a backlog that does not
+//     drain) or a client whose decoder fell behind cuts at once
+//     (rateEmergencyFactor) with an urgent restart, but not within
+//     rateEmergencyGap of any other decrease; an overflow behind a key frame
+//     past its deadline (signalKeyOverflow) cuts even then, to what lets the
+//     next key frame fit. No increase within rateEmergencyGap of any
+//     overflow, cut or not. The decoder's cap lifts after rateDecoderHold,
+//     twice as long with each further flush.
 //   - At the floor, the frame rate goes down a rung (120 -> 90 -> 60) with
 //     each decrease before anything else, and back up once the bitrate is
 //     well above the floor (1.5 x, or at the limit where that is lower), a
@@ -66,9 +80,10 @@ import (
 //     would take 120 fps to the floor within a second.
 //   - Thinning (Phase 5 temporal SVC, thin.go): the session leaves out
 //     discardable frames under congestion at once, a short spike's answer;
-//     while it does nothing increases (thinQuiet), and thinning that goes on
-//     for thinSustain decreases like the delay ("thinning"): a lasting
-//     shortage is the bitrate's to answer, not the frame rate's.
+//     while it does for the path's pressure nothing increases (thinQuiet),
+//     and thinning that goes on for thinSustain decreases like the delay
+//     ("thinning"): a lasting shortage is the bitrate's to answer, not the
+//     frame rate's. Thinning for the host's own queue alone changes nothing.
 //
 // The continuous target reaches the encoder at most as often as its pipeline
 // can take changes (ratePolicy): a qualified seamless encoder every 250 ms, a
@@ -82,8 +97,15 @@ const (
 	rateDecreaseFactor  = 0.85 // a congestion decrease
 	rateEmergencyFactor = 0.75 // a frame-queue overflow or a decoder flush
 	// rateDecoderPct: after a client flushed its decoder (signalDecoder) at
-	// bitrate B, increases stop at this share of B until the settings change.
-	rateDecoderPct = 85
+	// bitrate B, increases stop at this share of B for rateDecoderHold (or
+	// until the settings change): a decoder that fell behind once (the
+	// renderer bake-off at the start, a tab switch, a burst of key frames)
+	// may keep up at the setting, and a cap for good would leave the stream
+	// backed off. One that cannot flushes again and caps again, each time
+	// for twice as long (up to 8 x rateDecoderHold): a flush, a frozen
+	// picture and a cut every half minute would be worse than the cap.
+	rateDecoderPct  = 85
+	rateDecoderHold = 30 * time.Second
 	// rateEmergencyGap is the minimum time between two emergency cuts.
 	rateEmergencyGap = 2 * time.Second
 	// rateTick is how often the session advances the controller (increases,
@@ -129,6 +151,13 @@ const (
 	rateWindow     = time.Second            // receive and encoder output rates (the increase cap)
 	decreaseWindow = 250 * time.Millisecond // ... for a decrease: what the path carries now
 	ackWindow      = 100 * time.Millisecond // acknowledged bytes: the connection's delivery rate now
+	// ackLimited, ackShort: the acknowledged rate is the path's only when
+	// the congestion window held the sender back for at least ackLimited of
+	// ackWindow, packets were lost in it, or the path acknowledged less than
+	// ackShort of the video the session sent over decreaseWindow
+	// (ackDelivered).
+	ackLimited = 0.25
+	ackShort   = 0.9
 	// decreaseMinShare: a decrease starts from at least this share of the
 	// target, whatever the delivered rate or the queue's growth say.
 	decreaseMinShare = 0.5
@@ -212,9 +241,20 @@ const (
 	signalOverflow
 	// signalDecoder: the client flushed its decoder, which fell behind. An
 	// emergency like signalOverflow; a cut also caps later increases at
-	// rateDecoderPct of the bitrate the decoder fell behind at, since the
-	// delay does not show the client's decode capacity.
+	// rateDecoderPct of the bitrate the decoder fell behind at (for
+	// rateDecoderHold), since the delay does not show the client's decode
+	// capacity.
 	signalDecoder
+	// signalKeyOverflow: the frame queue overflowed behind a key frame that
+	// is past its deadline: the path did not carry the key frame at the
+	// pacing rate, and the key frame that answers the loss comes at the
+	// bitrate the encoder has then (at a low bitrate many frame budgets): at
+	// an unchanged bitrate the next overflow and the next key frame, a
+	// storm. It cuts like signalOverflow, to at most what the path's
+	// acknowledgements carried over PacingGain (the key frame then goes out
+	// at the rate the path carries), and also within rateEmergencyGap of
+	// another decrease (the session sends it once per key frame).
+	signalKeyOverflow
 )
 
 // applyPolicy is how often the encoder of a pipeline takes bitrate changes.
@@ -238,6 +278,15 @@ type applyPolicy struct {
 	// frame (PipelineCaps.LiveFPS): the frame-rate ladder at the floor
 	// steps through encoder.FPSSteps, fpsHoldLive apart.
 	fineFPS bool
+	// recvCarried: where the acknowledgements say nothing of the path (not
+	// path-limited: ackDelivered), a decrease starts from the client's
+	// receive rate (carried). A policy whose changes are seconds apart sits
+	// at a cut's rate until the next change: starting it from what the path
+	// delivered over the last 250 ms and second, not from the target, keeps
+	// the cycle in a capacity dip (a cut, a few steps up, a cut) under the
+	// capacity (docs/VENDOR_NOTES.md, "First hardware run: rate control on
+	// the UDP relay", review).
+	recvCarried bool
 }
 
 // ratePolicy picks the apply policy for the pipeline that streams: a live
@@ -250,13 +299,13 @@ func ratePolicy(c media.PipelineCaps) applyPolicy {
 	fine := c.LiveFPS && c.LiveBitrate && !c.LiveBitrateFlush
 	switch {
 	case c.LiveBitrate && !c.LiveBitrateFlush && c.LiveBitrateMeasured:
-		return applyPolicy{"seamless", 0, 250 * time.Millisecond, 0.02, 150 * time.Millisecond, 0, fine}
+		return applyPolicy{"seamless", 0, 250 * time.Millisecond, 0.02, 150 * time.Millisecond, 0, fine, false}
 	case c.LiveBitrate && !c.LiveBitrateFlush:
-		return applyPolicy{"seamless (assumed)", 0, time.Second, 0.03, 300 * time.Millisecond, 0, fine}
+		return applyPolicy{"seamless (assumed)", 0, time.Second, 0.03, 300 * time.Millisecond, 0, fine, false}
 	case c.LiveBitrate:
-		return applyPolicy{"flush", 250 * time.Millisecond, 2 * time.Second, 0.05, 500 * time.Millisecond, 0, false}
+		return applyPolicy{"flush", 250 * time.Millisecond, 2 * time.Second, 0.05, 500 * time.Millisecond, 0, false, true}
 	}
-	return applyPolicy{"restart", 500 * time.Millisecond, time.Second, 0.05, time.Second, 0.75, false}
+	return applyPolicy{"restart", 500 * time.Millisecond, time.Second, 0.05, time.Second, 0.75, false, false}
 }
 
 // feedback is one receive report as the controller reads it.
@@ -283,10 +332,12 @@ type feedback struct {
 	decodeQ      int   // the client's decoder backlog (frames)
 	// acked: bytes the media congestion controller saw acknowledged since
 	// the previous report (ackedValid), of which nonVideoKbps worth are
-	// audio and overhead.
+	// audio and overhead; limited: how long its congestion window held the
+	// sender back meanwhile (cc.Media.WindowLimited).
 	ackedValid   bool
 	acked        int64
 	nonVideoKbps int
+	limited      time.Duration
 }
 
 // rateChange is a bitrate (and frame-rate) change for the encoder.
@@ -319,6 +370,8 @@ type timedCount struct {
 	at       time.Time
 	n, total int64
 	span     time.Duration
+	lim      time.Duration // acknowledged bytes (n; total: packets lost): of span, the time the congestion window held the sender back
+	key      bool          // encoder output: a key frame
 }
 
 // rateController decides the session's video bitrate. Methods are safe for
@@ -342,18 +395,27 @@ type rateController struct {
 	pending   string      // why of a change decided but not yet applied
 
 	// Delay.
-	base      []timedDelay // qd samples of the last owdWindow
-	jitter    float64      // seconds: mean |qd change| between reports (RFC 3550 style, 1/16)
-	lastQD    time.Duration
-	haveQD    bool
-	firstQD   time.Time  // the first delay sample (owdWarmup)
-	strongN   int        // consecutive reports with a pending frame far over the target
-	qdOver    bool       // the last report's delay was over the target
-	over      int        // consecutive reports over the target (reset by a decrease)
-	overRun   int        // ... not reset by a decrease (thinning: overTarget)
-	recentQD  []qdSample // the last overReports+1 samples, oldest first
+	base     []timedDelay // qd samples of the last owdWindow
+	jitter   float64      // seconds: mean |qd change| between reports (RFC 3550 style, 1/16)
+	lastQD   time.Duration
+	haveQD   bool
+	firstQD  time.Time  // the first delay sample (owdWarmup)
+	strongN  int        // consecutive reports with a pending frame far over the target
+	qdOver   bool       // the last report's delay was over the target
+	over     int        // consecutive reports over the target (reset by a decrease)
+	overRun  int        // ... not reset by a decrease (thinning: overTarget)
+	recentQD []qdSample // the last overReports+1 samples, oldest first
+	// shiftAt, shiftQD: the last delay decrease and the queueing delay it
+	// was decided on (levelShift); zero: none in the last owdWindow, or the
+	// path held the sender back (pathAt) within owdWindow before it.
+	shiftAt   time.Time
+	shiftQD   time.Duration
+	pathAt    time.Time // the last report with packets lost or the congestion window holding the sender back
 	recv      []timedCount
-	out       []timedCount // encoder output: n bytes, total the bytes its target asked for
+	out       []timedCount // encoder output: n bytes, total the bytes its target asked for since the previous frame
+	sends     []timedCount // bytes handed to the transport, total as out
+	lastOut   time.Time
+	lastSend  time.Time
 	loss      []timedCount
 	acked     []timedCount // acknowledged bytes per report (span: host time since the previous)
 	ackDirect bool         // the acknowledgements come from the client (setPath)
@@ -365,14 +427,17 @@ type rateController struct {
 	decodeQ   int
 
 	// Decisions.
-	lastDecrease  time.Time // last decrease (any): emergencies are rateEmergencyGap apart from it
-	waitLive      bool      // a decrease is decided; the encoder has not confirmed it
-	waitKbps      int       // ... at this rate
-	decidedAt     time.Time // when
-	holdUntil     time.Time // no delay or loss decrease and no increase before
-	lastGood      float64   // kbps the path delivered at the last decrease (0: none yet)
-	passedGood    time.Time // when est went above lastGood (zero: below it)
-	decoderCap    int       // kbps: increases stop here after a decoder flush; 0: none
+	lastDecrease  time.Time     // last decrease (any): emergencies are rateEmergencyGap apart from it
+	waitLive      bool          // a decrease is decided; the encoder has not confirmed it
+	waitKbps      int           // ... at this rate
+	decidedAt     time.Time     // when
+	holdUntil     time.Time     // no delay or loss decrease and no increase before
+	lastGood      float64       // kbps the path delivered at the last decrease (0: none yet)
+	passedGood    time.Time     // when est went above lastGood (zero: below it)
+	decoderCap    int           // kbps: increases stop here after a decoder flush; 0: none
+	decoderCapAt  time.Time     // the flush that set it (rateDecoderHold)
+	decoderHold   time.Duration // how long it holds: rateDecoderHold, doubling with each flush
+	overflowAt    time.Time     // the last frame-queue overflow, cut or not: no increase for rateEmergencyGap
 	lastFPSChange time.Time
 	lastTick      time.Time
 	// Thinning (thinned): the current run of thinned frames started at
@@ -466,9 +531,9 @@ func (r *rateController) target(ceiling, fps int) (int, int) {
 func (r *rateController) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.est, r.fps, r.decoderCap, r.lastGood = 0, 0, 0, 0
+	r.est, r.fps, r.decoderCap, r.lastGood, r.decoderHold = 0, 0, 0, 0, 0
 	r.waitLive, r.pending = false, ""
-	r.holdUntil, r.lastDecrease, r.passedGood = time.Time{}, time.Time{}, time.Time{}
+	r.holdUntil, r.lastDecrease, r.passedGood, r.shiftAt, r.overflowAt = time.Time{}, time.Time{}, time.Time{}, time.Time{}, time.Time{}
 	r.over = 0
 }
 
@@ -511,16 +576,98 @@ func (r *rateController) settled(now time.Time) {
 	r.loss = r.loss[:0]
 }
 
-// output records an encoded frame of n bytes (the encoder's output rate).
-func (r *rateController) output(n int) {
+// output records an encoded frame of n bytes (key: a key frame): the
+// source's frame interval (frameInterval) and the encoder's output rate
+// (outputKbps).
+func (r *rateController) output(n int, key bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
-	want := int64(0)
-	if r.liveKbps > 0 && r.liveFPS > 0 {
-		want = int64(r.liveKbps) * 1000 / 8 / int64(r.liveFPS)
+	r.out = trimCounts(append(r.out, timedCount{at: now, n: int64(n), total: r.wanted(&r.lastOut, now), key: key}), now, rateWindow)
+}
+
+// outputKbps is the rate (kbit/s) the encoder makes at its live target:
+// its output over the last rateWindow, without its key frames, as a share of
+// what the target asked for over the same time (by time, as the fill), times
+// the live target (0: unknown, fewer than 5 frames). Encoders miss their
+// target: one at its QP limit (a large picture at a low bitrate) makes far
+// more, and the pacer must keep up with that or the host's frame queue grows
+// without end (pacedVideoKbps), from the first frames on. Key frames are left
+// out: a key frame is a burst the pacer spreads at its gain, as before.
+func (r *rateController) outputKbps() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	var n, want int64
+	frames := 0
+	for _, c := range r.out {
+		if now.Sub(c.at) > rateWindow {
+			continue
+		}
+		frames++
+		want += c.total
+		if !c.key {
+			n += c.n
+		}
 	}
-	r.out = trimCounts(append(r.out, timedCount{at: now, n: int64(n), total: want}), now, rateWindow)
+	if frames < 5 || want <= 0 || r.liveKbps <= 0 {
+		return 0
+	}
+	return float64(n) / float64(want) * float64(r.liveKbps)
+}
+
+// sent records a frame of n bytes the session handed to the transport (its
+// stream's write returned, or its shards went out): the fill. Frames the
+// session dropped (a queue overflow), thinned or discarded never reach the
+// path, so they are no part of what the path is measured against.
+func (r *rateController) sent(n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	r.sends = trimCounts(append(r.sends, timedCount{at: now, n: int64(n), total: r.wanted(&r.lastSend, now)}), now, rateWindow)
+}
+
+// wanted is what the encoder's target asks for (bytes) in the time since
+// *last (at most rateWindow; a frame interval for the first), and moves *last
+// to now: a source that sends fewer frames than the session's frame rate (a
+// still picture, a game menu, idle repeats) is measured by its time, not by
+// its frame count. Called with r.mu held.
+func (r *rateController) wanted(last *time.Time, now time.Time) int64 {
+	if r.liveKbps <= 0 || r.liveFPS <= 0 {
+		return 0
+	}
+	dt := time.Second / time.Duration(r.liveFPS)
+	if !last.IsZero() {
+		dt = min(max(0, now.Sub(*last)), rateWindow)
+	}
+	*last = now
+	return int64(float64(r.liveKbps) * 1000 / 8 * dt.Seconds())
+}
+
+// frameInterval is the mean time between the frames the encoder produced
+// over the last rateWindow (0: fewer than two): longer than the session's
+// frame interval for a source that sends fewer frames (a still picture, a
+// game menu), whose frames are then larger. The encoder's, not the
+// sender's: congestion delays the sending, not the source.
+func (r *rateController) frameInterval() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	n := 0
+	var first, last time.Time
+	for _, c := range r.out {
+		if now.Sub(c.at) <= rateWindow {
+			if n == 0 {
+				first = c.at
+			}
+			last = c.at
+			n++
+		}
+	}
+	if n < 2 {
+		return 0
+	}
+	return last.Sub(first) / time.Duration(n-1)
 }
 
 // setPath tells the controller whether the session's connection ends at the
@@ -564,9 +711,12 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 	if fb.total > 0 && !now.Before(r.lossFrom) {
 		r.loss = trimCounts(append(r.loss, timedCount{at: now, n: fb.lost, total: fb.total}), now, lossWindow)
 	}
+	if fb.lost > 0 || fb.limited > 0 {
+		r.pathAt = now
+	}
 	if fb.ackedValid {
 		if !r.lastAcked.IsZero() && now.After(r.lastAcked) {
-			r.acked = trimCounts(append(r.acked, timedCount{at: now, n: fb.acked, span: now.Sub(r.lastAcked)}), now, ackWindow)
+			r.acked = trimCounts(append(r.acked, timedCount{at: now, n: fb.acked, total: fb.lost, span: now.Sub(r.lastAcked), lim: fb.limited}), now, decreaseWindow)
 		}
 		r.lastAcked, r.nonVideo = now, fb.nonVideoKbps
 	}
@@ -576,7 +726,7 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 		return rateChange{}, false
 	}
 	switch {
-	case r.over >= overReports && !r.draining():
+	case r.over >= overReports && !r.draining() && !r.levelShift(now):
 		return r.decrease(now, "delay")
 	case r.lossFraction() > r.lossLimit():
 		return r.decrease(now, "loss")
@@ -598,10 +748,26 @@ func (r *rateController) overTarget() bool {
 	return r.overRun >= thinOverReports || r.strongN > 0
 }
 
+// delayOver reports whether the last report found the path's delay over
+// the target (or a frame far over it that does not arrive): the frame
+// queue's congestion test (Session.queueFull), where one report is enough
+// (queueOverflows also needs a backlog of frameQueueFrames).
+func (r *rateController) delayOver() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.qdOver || r.strongN > 0
+}
+
 // thinned records that the session left out a frame under congestion
 // (temporal SVC thinning): no increase for thinQuiet, and thinning that goes
-// on for thinSustain decreases the bitrate (report).
-func (r *rateController) thinned() {
+// on for thinSustain decreases the bitrate (report). path: the pressure was
+// the path's (the delay, a frame stream past its deadline); thinning for the
+// host's own frame queue alone (a key frame or a burst paced out at the
+// pacing rate) is no congestion: it holds and decreases nothing.
+func (r *rateController) thinned(path bool) {
+	if !path {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock()
@@ -695,6 +861,40 @@ func (r *rateController) draining() bool {
 	return n > overReports && r.recentQD[n-1].d < r.recentQD[0].d-drainingBy
 }
 
+// levelShift reports whether a delay over the target is a step of the
+// path's one-way delay rather than a queue, and if so makes it the new base:
+// a delay decrease less than owdWindow ago found the delay at the same level
+// (within the margin), and the decrease, in effect since, changed nothing.
+// A queue behind a rate the path cannot carry keeps growing until a decrease
+// is enough, and then drains (draining); a delay that stays put whatever the
+// rate is the path's (a relay's route, a client's clock corrected by a
+// better sync sample), and the base, the minimum of the last owdWindow, would
+// read it as a queue for that long: a decrease on every report after each
+// hold (GCC decides on the delay's trend for the same reason). The base
+// window then restarts at that decrease. Not where the path held the sender
+// back within the base window (pathAt): a queue standing at the capacity
+// after a decrease that just reached it looks the same in the delay, but
+// comes with losses at a full bottleneck queue or a congestion window
+// waiting for acknowledgements. Called with r.mu held.
+func (r *rateController) levelShift(now time.Time) bool {
+	n := len(r.recentQD)
+	if r.shiftAt.IsZero() || now.Sub(r.shiftAt) > owdWindow || n == 0 || !r.pathAt.IsZero() && now.Sub(r.pathAt) <= owdWindow {
+		return false
+	}
+	last := r.recentQD[n-1]
+	if !last.ownOK || last.d > r.shiftQD+r.margin() {
+		return false // still growing, or frames that do not arrive
+	}
+	i := 0
+	for i < len(r.base)-1 && r.base[i].at.Before(r.shiftAt) {
+		i++
+	}
+	r.base = r.base[i:]
+	r.over, r.overRun, r.qdOver = 0, 0, false
+	r.shiftAt = time.Time{}
+	return true
+}
+
 // margin is the target queueing delay over the base. Called with r.mu held.
 func (r *rateController) margin() time.Duration {
 	j := time.Duration(jitterGain * r.jitter * float64(time.Second))
@@ -715,16 +915,23 @@ func (r *rateController) lossFraction() float64 {
 	return float64(lost) / float64(total)
 }
 
-// fill is the encoder's output as a share of its target over the last
-// rateWindow: encoders do not hit their target exactly (libx264 gives about
-// 80 % of 30 Mbit/s on the test pattern, a still desktop far less), so a
-// rate the path carries is worth rate / fill of target. ok is false with
-// fewer than 5 frames or less than half the window. Called with r.mu held.
+// fill is what the session sent as a share of the encoder's target over the
+// last rateWindow, by time: encoders do not hit their target exactly
+// (libx264 gives about 80 % of 30 Mbit/s on the test pattern, a still
+// desktop far less), and the session leaves frames out (thinning, a queue
+// overflow, frames the client would discard), so a rate the path carries is
+// worth rate / fill of target. ok is false with fewer than 5 frames or less
+// than half the window. Called with r.mu held.
 func (r *rateController) fill(now time.Time) (float64, bool) {
+	return windowFill(r.sends, now)
+}
+
+// windowFill is the bytes of s over rateWindow as a share of their totals.
+func windowFill(s []timedCount, now time.Time) (float64, bool) {
 	var n, want int64
 	var first time.Time
 	frames := 0
-	for _, c := range r.out {
+	for _, c := range s {
 		if now.Sub(c.at) <= rateWindow {
 			if frames == 0 {
 				first = c.at
@@ -765,31 +972,79 @@ func (r *rateController) delivered(now time.Time, window time.Duration) (float64
 // when complete), which after a capacity drop is the new capacity, but only
 // on the host's own connection: used where that ends at the client (the
 // direct path and the UDP relay; on the splice relay paths it ends at the
-// gateway). Called with r.mu held.
+// gateway). And only where the path held the sender back: its congestion
+// window for at least ackLimited of the window, a queue that lost packets
+// in it, or a path that acknowledged markedly less than the session sent
+// (ackShort over decreaseWindow: a queue building). Otherwise the sender had
+// nothing more to send (a source slower than the session's frame rate,
+// frames thinned or paced out) and the acknowledged rate is its own, not the
+// path's (as BBR's application-limited samples). Called with r.mu held.
 func (r *rateController) ackDelivered(now time.Time) (float64, bool) {
-	var b int64
-	var span time.Duration
+	video, ok := r.ackVideo(now)
+	f, fok := r.fill(now)
+	if !ok || !fok {
+		return 0, false
+	}
+	return video / f, true
+}
+
+// ackVideo is the video rate (kbit/s) the connection's acknowledgements
+// carried over the last ackWindow, ok only where the path held the sender
+// back (ackDelivered, which divides it by the fill). Called with r.mu held.
+func (r *rateController) ackVideo(now time.Time) (float64, bool) {
+	var b, lost int64
+	var span, lim time.Duration
+	var longB int64
+	var longSpan time.Duration
 	for _, c := range r.acked {
 		if now.Sub(c.at) <= ackWindow {
 			b += c.n
+			lost += c.total
 			span += c.span
+			lim += c.lim
 		}
+		longB += c.n
+		longSpan += c.span
 	}
-	f, ok := r.fill(now)
-	if !r.ackDirect || span < ackWindow/2 || !ok {
+	if !r.ackDirect || span < ackWindow/2 {
+		return 0, false
+	}
+	if lost == 0 && float64(lim) < ackLimited*float64(span) && !r.ackFallsShort(now, longB, longSpan) {
 		return 0, false
 	}
 	video := float64(b)*8/span.Seconds()/1000 - float64(r.nonVideo)
-	return max(0, video) / f, true
+	return max(0, video), true
+}
+
+// ackFallsShort reports whether the video the path acknowledged (b bytes
+// over span, the acknowledged reports of the last decreaseWindow, less audio
+// and overhead) is less than ackShort of what the session sent over the same
+// time. Called with r.mu held.
+func (r *rateController) ackFallsShort(now time.Time, b int64, span time.Duration) bool {
+	if span < decreaseWindow/2 {
+		return false
+	}
+	var sent int64
+	for _, c := range r.sends {
+		if now.Sub(c.at) <= span {
+			sent += c.n
+		}
+	}
+	acked := float64(b) - float64(r.nonVideo)*1000/8*span.Seconds()
+	return sent > 0 && acked < ackShort*float64(sent)
 }
 
 // carried is the rate a decrease starts from: on the direct path what the
-// acknowledgements carried, else (or without them) the lower of the
-// receive rates over decreaseWindow and rateWindow (ok false: none is
+// acknowledgements carried while the path held the sender back (none
+// otherwise: the path carried all it was given; a policy with recvCarried
+// then goes on to the receive rates), else (or without them) the lower of
+// the receive rates over decreaseWindow and rateWindow (ok false: none is
 // known). Called with r.mu held.
 func (r *rateController) carried(now time.Time) (float64, bool) {
-	if d, ok := r.ackDelivered(now); ok {
-		return d, true
+	if r.ackDirect && len(r.acked) > 0 {
+		if d, ok := r.ackDelivered(now); ok || !r.pol().recvCarried {
+			return d, ok
+		}
 	}
 	d1, ok1 := r.delivered(now, decreaseWindow)
 	d2, ok2 := r.delivered(now, rateWindow)
@@ -807,7 +1062,9 @@ func (r *rateController) carried(now time.Time) (float64, bool) {
 // change if the encoder may take it now (else tick applies it). Called with
 // r.mu held.
 func (r *rateController) decrease(now time.Time, why string) (rateChange, bool) {
-	cur := r.est
+	// The rate the path saw: an increase the encoder has not taken yet (a
+	// policy that takes changes seconds apart) never reached it.
+	cur := min(r.est, float64(r.applied))
 	if d, ok := r.carried(now); ok && d < cur {
 		cur = d
 	}
@@ -819,9 +1076,24 @@ func (r *rateController) decrease(now time.Time, why string) (rateChange, bool) 
 	// next to nothing acknowledged.
 	cur = max(cur, r.est*decreaseMinShare)
 	r.lastGood, r.passedGood = cur, time.Time{}
+	shiftQD, shift := time.Duration(0), false
+	if n := len(r.recentQD); n > 0 {
+		shiftQD, shift = r.recentQD[n-1].d, r.recentQD[n-1].ownOK
+	}
 	r.over, r.loss, r.lastDecrease, r.recentQD = 0, r.loss[:0], now, r.recentQD[:0]
 	r.thinSince = now // thinning that goes on decreases again only after another thinSustain
 	to := max(r.floor(), cur*rateDecreaseFactor)
+	// A delay decrease of the bitrate on the reports' own delays (not on
+	// frames that do not arrive, not a frame-rate step at the floor, which
+	// sends as much), on a path that has not held the sender back for the
+	// base window, is what a level shift is told by (levelShift). Where it
+	// did (losses at a full bottleneck queue, the congestion window waiting
+	// for acknowledgements) a delay that stays put after the decrease is a
+	// queue standing at the capacity, not a step of the path's delay.
+	r.shiftAt = time.Time{}
+	if why == "delay" && shift && to < r.est && (r.pathAt.IsZero() || now.Sub(r.pathAt) > owdWindow) {
+		r.shiftAt, r.shiftQD = now, shiftQD
+	}
 	if to >= r.est && !r.fpsDown(now) {
 		return rateChange{}, false // at the floor, and at the lowest frame rate
 	}
@@ -929,9 +1201,12 @@ func (r *rateController) fpsHold() time.Duration {
 // decreaseMinShare of the target), in the encoder at once, but not within
 // rateEmergencyGap of the last decrease of any kind: right after one, the old
 // generation (or rate) that still streams overflows the queue, and the
-// session only hurries the switch. A decoder flush that cuts also caps
-// later increases (rateDecoderPct of the bitrate it cut from) until reset.
-// Nothing is cut at the floor, or before the first generation.
+// session only hurries the switch. An overflow behind a key frame past its
+// deadline (signalKeyOverflow) cuts even then. Any overflow, cut or not,
+// holds the increases for rateEmergencyGap. A decoder flush that cuts also
+// caps later increases (rateDecoderPct of the bitrate it cut from) for
+// rateDecoderHold, twice as long with each further flush. Nothing is cut at
+// the floor, or before the first generation.
 func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -945,31 +1220,50 @@ func (r *rateController) congestion(sig rateSignal) (rateChange, bool) {
 		}
 		return r.decrease(now, "client")
 	}
-	if !r.lastDecrease.IsZero() && now.Sub(r.lastDecrease) < rateEmergencyGap {
+	overflow := sig == signalOverflow || sig == signalKeyOverflow
+	if overflow {
+		r.overflowAt = now
+	}
+	if sig != signalKeyOverflow && !r.lastDecrease.IsZero() && now.Sub(r.lastDecrease) < rateEmergencyGap {
 		return rateChange{}, false
 	}
 	from := r.est
 	to := from * rateEmergencyFactor
 	why := "decoder"
-	if sig == signalOverflow {
+	if overflow {
 		why = "overflow"
-		if d, ok := r.carried(now); ok {
+		r.passedGood = time.Time{}
+		v, ackOK := r.ackVideo(now)
+		d, ok := r.carried(now)
+		switch {
+		case sig == signalKeyOverflow && ackOK:
+			// The key frame went out at the path's rate, not the pacer's:
+			// the next one, paced at PacingGain x the target, at about that
+			// rate (at most a halving).
+			to = min(to, max(v/cc.PacingGain, from*decreaseMinShare))
+			r.lastGood = v
+		case ok:
 			// At most a halving, as in decrease: frames that stalled for
 			// a tenth of a second leave next to nothing acknowledged.
 			d = max(d, from*decreaseMinShare)
 			to = min(to, d*rateDecreaseFactor)
 			r.lastGood = d
-		} else {
+		default:
 			r.lastGood = to / rateDecreaseFactor
 		}
-		r.passedGood = time.Time{}
 	}
 	to = max(to, r.floor())
 	if to >= from {
 		return rateChange{}, false
 	}
-	if c := int(from * rateDecoderPct / 100); sig == signalDecoder && (r.decoderCap == 0 || c < r.decoderCap) {
+	// Never below the floor: the increases' limit would take the target
+	// under it.
+	if c := max(int(r.floor()), int(from*rateDecoderPct/100)); sig == signalDecoder && (r.decoderCap == 0 || c < r.decoderCap) {
 		r.decoderCap = c
+	}
+	if sig == signalDecoder {
+		r.decoderCapAt = now
+		r.decoderHold = min(max(rateDecoderHold, 2*r.decoderHold), 8*rateDecoderHold)
 	}
 	r.est = to
 	r.lastDecrease = now
@@ -1000,6 +1294,9 @@ func (r *rateController) tick(stalled bool) (rateChange, bool) {
 	if r.waitLive && now.Sub(r.decidedAt) >= liveTimeout {
 		r.settled(now)
 	}
+	if r.decoderCap > 0 && now.Sub(r.decoderCapAt) >= max(r.decoderHold, rateDecoderHold) {
+		r.decoderCap = 0 // the decoder had its time: increases probe again
+	}
 	if r.mayIncrease(now, stalled) {
 		r.increase(now, dt)
 	}
@@ -1011,12 +1308,17 @@ func (r *rateController) tick(stalled bool) (rateChange, bool) {
 }
 
 // mayIncrease reports whether nothing holds an increase: no decrease under
-// way or draining, fresh feedback (frames covered in the last
-// feedbackFresh) with the delay under the target and the client's decoder
-// keeping up, no stalled path; a client that never sent feedback gets
-// increases noFeedbackQuiet after the last decrease. Called with r.mu held.
+// way or draining, no frame-queue overflow in the last rateEmergencyGap (an
+// overflow refused a cut is no less a sign the path or the sender does not
+// keep up), fresh feedback (frames covered in the last feedbackFresh) with
+// the delay under the target and the client's decoder keeping up, no
+// stalled path; a client that never sent feedback gets increases
+// noFeedbackQuiet after the last decrease. Called with r.mu held.
 func (r *rateController) mayIncrease(now time.Time, stalled bool) bool {
 	if r.waitLive || now.Before(r.holdUntil) || !r.thinLast.IsZero() && now.Sub(r.thinLast) < thinQuiet {
+		return false
+	}
+	if !r.overflowAt.IsZero() && now.Sub(r.overflowAt) < rateEmergencyGap {
 		return false
 	}
 	if !r.everFeedback {

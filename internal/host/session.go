@@ -140,10 +140,27 @@ type Session struct {
 	displayHeld bool
 
 	// sendSince: unix ns when frameSender took the frame it sends (0: it
-	// waits for one); sendOpening: it still waits for the frame's stream.
-	// For the overflow log (logOverflow).
-	sendSince   atomic.Int64
-	sendOpening atomic.Bool
+	// waits for one), sendBytes its size as it goes on the wire (stream
+	// bytes, or its shards), sendDeadline its deadline (rung 1's, ns),
+	// sendDoneUs when the encoder delivered it (host clock), sendKind what
+	// it is (frameKind); sendOpening: it still waits for the frame's stream;
+	// sendBurst: the longest deadline of a frame taken recently. For the
+	// frame queue's overflow (queueOverflows) and its log (logOverflow).
+	sendSince    atomic.Int64
+	sendBytes    atomic.Int64
+	sendDeadline atomic.Int64
+	sendDoneUs   atomic.Uint64
+	sendKind     atomic.Uint32
+	sendOpening  atomic.Bool
+	sendBurst    queueBurst
+	// sendKey: the frame frameSender sends is a key frame (keyMark; 0:
+	// not), keyDue: a key frame asked for meanwhile is forced once its
+	// write is done (keyframe).
+	sendKey atomic.Uint64
+	keyDue  atomic.Bool
+	// keyCut: the key frame (keyMark) an overflow behind it already cut the
+	// bitrate for (signalKeyOverflow: once per key frame).
+	keyCut atomic.Uint64
 	// send: the frame streams being written and the loss the client waits
 	// on, for the loss-recovery ladder (ladder.go); discards: the frames it
 	// discarded and has not reported yet.
@@ -249,7 +266,7 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 	s := &Session{
 		a: a, c: c, meta: meta, id: auth.RandomToken(6),
 		ctx: ctx, cancel: cancel,
-		frameQ:      make(chan *media.Frame, 6),
+		frameQ:      make(chan *media.Frame, frameQueueMax),
 		pipeSwap:    make(chan struct{}, 1),
 		rttSeen:     make(chan struct{}, 1),
 		rumbleGo:    make(chan struct{}, 1),
@@ -1194,6 +1211,46 @@ func (s *Session) startVideoLog(urgent bool, reason string, quiet bool) error {
 // audio bitrates.
 const ccOverheadKbps = 200
 
+// maxPacedInterval bounds the frame interval the congestion window is sized
+// for (pacedInterval).
+const maxPacedInterval = 250 * time.Millisecond
+
+// encoderPaceHeadroom: the pacer sends at least this multiple of what the
+// encoder makes (pacedVideoKbps). Under cc.PacingGain: an encoder near its
+// target, whose output over a second varies by a few percent, is paced at
+// 1.2 x the target as before; it takes 4 % over the target to change the
+// pacing (at 1.2 x what the encoder makes, a second's noise moved the
+// flushing and restart policies' capdrop dips).
+const encoderPaceHeadroom = 1.15
+
+// pacedVideoKbps is the video bitrate the media congestion controller paces
+// for (at cc.PacingGain x it): the encoder's target (videoKbps), or, where the
+// encoder makes more (outputKbps, rateController.outputKbps: an encoder at
+// its QP limit, a large picture at a low bitrate, makes far more than a low
+// target), enough to send that at encoderPaceHeadroom x. Paced at 1.2 x the
+// target, an encoder that makes 1.3 x fills the host's frame queue without
+// end, a wait the rate controller never sees (the pacer model explains it:
+// sendTrack) while every frame goes out on its own schedule. Paced over what
+// it makes, the frames reach a path that carries them at once, a key frame's
+// or a scene change's backlog drains, and a path that does not carry them
+// shows it in the delay and the losses, which the rate controller answers.
+func pacedVideoKbps(videoKbps int64, outputKbps float64) int64 {
+	return max(videoKbps, int64(math.Ceil(outputKbps*encoderPaceHeadroom/cc.PacingGain)))
+}
+
+// pacedInterval is the frame interval the media congestion controller's
+// window is sized for (pacing rate x (min RTT + 2 frame intervals): two
+// frames in the network): the session's, or the interval of the frames the
+// encoder actually produced where that is longer (source; 0 unknown), at
+// most maxPacedInterval. A source slower than the session's frame rate (a game
+// menu at 12 fps, idle repeats of a still picture) sends larger frames at
+// the same bitrate; a window of two session frames would not take one of
+// them, and the wait for the acknowledgements the window then makes reads
+// as a queue in the path (the pacer explains only its own share).
+func pacedInterval(interval, source time.Duration) time.Duration {
+	return min(max(interval, source), max(interval, maxPacedInterval))
+}
+
 // ccTarget is what the session sends besides audio and overhead.
 type ccTarget struct {
 	videoKbps     int64
@@ -1217,7 +1274,7 @@ func (s *Session) setCongestionTarget(p media.Params) {
 // connection's current path and returns it in kbit/s (0: reno). A path
 // migration, also the client's NAT rebinding, replaces the controller with one
 // at the defaults, so frameSender re-applies the target for every frame; that
-// also picks up audio starting or stopping.
+// also picks up audio starting or stopping, and the source's frame interval.
 func (s *Session) applyCongestionTarget() int64 {
 	t := s.ccTarget.Load()
 	if t == nil {
@@ -1228,8 +1285,9 @@ func (s *Session) applyCongestionTarget() int64 {
 		return 0
 	}
 	// Frames sent as shards (fec.go) carry parity and shard headers too.
-	kbps := t.videoKbps + s.fecOverheadKbps(t.videoKbps) + s.audioKbps.Load() + ccOverheadKbps
-	m.SetTarget(kbps*1000, t.frameInterval)
+	video := pacedVideoKbps(t.videoKbps, s.rate.outputKbps())
+	kbps := video + s.fecOverheadKbps(video) + s.audioKbps.Load() + ccOverheadKbps
+	m.SetTarget(kbps*1000, pacedInterval(t.frameInterval, s.rate.frameInterval()))
 	return kbps
 }
 
@@ -1304,19 +1362,27 @@ func (s *Session) videoEvents() {
 			if ev.Frame.Reencoded {
 				s.stats.reencoded.Add(1)
 			}
-			s.rate.output(len(ev.Frame.Data))
+			s.rate.output(len(ev.Frame.Data), ev.Frame.Key)
 			s.staticFrame(ev.Frame)
 			if s.a.cfg != nil && s.a.cfg.CaptureTimestamps == "off" {
 				// No capture stamps on any pipeline: FFmpeg then makes
 				// none, the native helper always measures its own.
 				ev.Frame.CaptureUs, ev.Frame.PresentUs = 0, 0
 			}
-			select {
-			case s.frameQ <- ev.Frame:
+			why, queued := s.queueFull(), false
+			if why == "" {
+				select {
+				case s.frameQ <- ev.Frame:
+					queued = true
+				default:
+					why = "full"
+				}
+			}
+			if queued {
 				// A newer frame is ready: a frame stream past its deadline
 				// gives way to it (rung 1).
 				s.checkOut()
-			default:
+			} else {
 				// The network cannot keep up: drop what is queued and this
 				// frame (the client is told at once) and cut the bitrate.
 				// The loss is answered by the ladder: a recovery frame
@@ -1329,10 +1395,11 @@ func (s *Session) videoEvents() {
 				// (urgentRestart, or only that where a recovery frame
 				// answers the loss).
 				dropped := append(s.drainQueue(), ev.Frame)
-				s.logOverflow(dropped)
+				key := s.keyOverflow(why)
+				s.logOverflow(dropped, why, key)
 				s.reportDropped(dropped, "queue overflow")
 				recovered := s.overflowLoss(dropped)
-				if !s.overflowCut(recovered) {
+				if !s.overflowCut(recovered, key) {
 					switch {
 					case !recovered:
 						s.urgentRestart("queue overflow")
@@ -1345,13 +1412,18 @@ func (s *Session) videoEvents() {
 	}
 }
 
-// logOverflow records what led to a frame-queue overflow: the span of the
-// dropped frames' timestamps and of their encodeDone times (frames the
-// encoder delivered in a burst of its own, or a sender that stood still for
-// their whole span), what the sender was doing and for how long, and the
-// media congestion controller's window.
-func (s *Session) logOverflow(fs []*media.Frame) {
-	attrs := []any{"frames", len(fs)}
+// logOverflow records what led to a frame-queue overflow (why:
+// queueOverflows' reason; key: behind a key frame past its deadline,
+// keyOverflow): the span of the dropped frames' timestamps and of their
+// encodeDone times (frames the encoder delivered in a burst of its own, or a
+// sender that stood still for their whole span), what the sender was doing
+// and for how long (and the size of its frame on the wire, and its kind),
+// and the media congestion controller's window.
+func (s *Session) logOverflow(fs []*media.Frame, why string, key bool) {
+	attrs := []any{"frames", len(fs), "why", why, "sender_bytes", s.sendBytes.Load(), "sender_kind", frameKinds[s.sendKind.Load()]}
+	if key {
+		attrs = append(attrs, "key_cut", true)
+	}
 	if n := len(fs); n > 1 {
 		attrs = append(attrs, "pts_span_ms", (fs[n-1].PtsUs-fs[0].PtsUs)/1000,
 			"encode_done_span_ms", (int64(fs[n-1].EncodeDoneUs)-int64(fs[0].EncodeDoneUs))/1000)
@@ -1374,6 +1446,152 @@ func (s *Session) logOverflow(fs []*media.Frame) {
 			"cc_lost", st.LostPackets)
 	}
 	s.log.Info("frame queue overflow", attrs...)
+}
+
+// The host's frame queue (videoEvents -> frameSender). A frame that waits in
+// it is late, but whether dropping the queue helps depends on why it waits.
+// Behind a frame being paced out on schedule on a path that carries it (a
+// key frame, a scene change or an encoder's burst, sent at the pacing rate of
+// 1.2 x the target, with the delay within its target) every frame waits its
+// turn and the pacer catches up, while dropping the queue costs a recovery,
+// and after a key frame, whose LTR slots the frames dropped would have
+// filled, another key frame: at a low bitrate, where a key frame is many
+// frame budgets, the next overflow again, a storm of key frames at a few
+// frames per second. A sender the path holds back (the congestion window,
+// the video window's shortfall, a stream it cannot open), or a path whose
+// delay is over the rate controller's target (a capacity drop: the backlog
+// would drain only as fast as the encoder's rate stays under the new
+// capacity), means the network does not keep up: there the queue is latency
+// to drop at once. So the queue overflows when frameQueueFrames frames wait
+// and the frame being sent has been with the sender past its deadline
+// (rung 1's frameDeadline as the frame goes on the wire: its own sending
+// time at the pacing rate plus a frame interval, at least two intervals and
+// 25 ms; for shards, their bytes with parity and headers) or the path is
+// congested, or when frameQueueMax frames wait whatever the reason.
+//
+// A backlog that does not drain is latency too, whatever the schedule: the
+// pacer keeps up with the encoder's output (pacedVideoKbps), but where it
+// did not (an encoder whose output just grew, a sender slower than its pacer)
+// every frame would go out on time and the queue grow to frameQueueMax (two
+// seconds at 60 fps), unseen by the rate controller. So it also overflows
+// when frameQueueFrames frames wait and the frame being sent reached the
+// queue more than frameQueueAge ago, or more than a frame interval past the
+// longest deadline of a frame taken in the last frameQueueBurst where that is
+// longer: behind a large frame on schedule the frames after it wait at most
+// about its deadline, less as the pacer catches up (paced at least
+// encoderPaceHeadroom x the encoder's output, it drains by about an eighth of
+// the time that passes).
+const (
+	frameQueueFrames = 6
+	frameQueueMax    = 128
+	frameQueueAge    = 250 * time.Millisecond
+	frameQueueBurst  = 2 * time.Second
+)
+
+// queueLoad is what the frame queue's overflow rule (queueOverflows) looks
+// at.
+type queueLoad struct {
+	queued    int  // frames waiting
+	congested bool // the rate controller's last report found the delay over its target (rateController.delayOver)
+	// The sender, if it is sending (sending): it has had its frame for busy,
+	// the frame's deadline is deadline, and it reached the queue lag ago (its
+	// wait there and busy).
+	sending             bool
+	busy, deadline, lag time.Duration
+	burst               time.Duration // the longest deadline of a frame taken in the last frameQueueBurst
+	interval            time.Duration // the session's frame interval
+}
+
+// queueOverflows reports why a frame arriving at the frame queue overflows
+// it (above), or "": "full" (frameQueueMax), "delay" (the path is
+// congested), "deadline" (the frame being sent is past its deadline) or
+// "backlog" (a backlog that does not drain).
+func queueOverflows(q queueLoad) string {
+	switch {
+	case q.queued >= frameQueueMax:
+		return "full"
+	case q.queued < frameQueueFrames:
+		return ""
+	case q.congested:
+		return "delay"
+	case q.sending && q.busy > q.deadline:
+		return "deadline"
+	case q.sending && q.lag > max(frameQueueAge, q.burst+q.interval):
+		return "backlog"
+	}
+	return ""
+}
+
+// queueBurst is the longest deadline of a frame frameSender took in the last
+// frameQueueBurst (queueOverflows' backlog bound): a frame with a longer one
+// replaces it, any frame one older than that. Written by frameSender only.
+type queueBurst struct{ d, at atomic.Int64 }
+
+func (b *queueBurst) note(d time.Duration, now time.Time) {
+	if now.UnixNano()-b.at.Load() > int64(frameQueueBurst) || int64(d) >= b.d.Load() {
+		b.d.Store(int64(d))
+		b.at.Store(now.UnixNano())
+	}
+}
+
+func (b *queueBurst) within(now time.Time) time.Duration {
+	if now.UnixNano()-b.at.Load() > int64(frameQueueBurst) {
+		return 0
+	}
+	return time.Duration(b.d.Load())
+}
+
+// frameKinds names a frame's kind for the overflow log (frameKind).
+var frameKinds = [...]string{"frame", "key", "recovery"}
+
+// frameKind indexes frameKinds.
+func frameKind(f *media.Frame) uint32 {
+	switch {
+	case f.Key:
+		return 1
+	case f.Recovery:
+		return 2
+	}
+	return 0
+}
+
+// sending records what frameSender sends now, for the frame queue's rule
+// (queueFull) and its log: f as bytes on the wire with deadline.
+func (s *Session) sending(f *media.Frame, bytes int, deadline time.Duration) {
+	s.sendBytes.Store(int64(bytes))
+	s.sendDeadline.Store(int64(deadline))
+	s.sendDoneUs.Store(f.EncodeDoneUs)
+	s.sendKind.Store(frameKind(f))
+	s.sendBurst.note(deadline, time.Now())
+}
+
+// queueFull applies queueOverflows to the session's frame queue now and
+// returns why it overflows, or "".
+func (s *Session) queueFull() string {
+	q := queueLoad{queued: len(s.frameQ), congested: s.rate.delayOver(), interval: time.Second / 60}
+	if t := s.ccTarget.Load(); t != nil {
+		q.interval = t.frameInterval
+	}
+	now := time.Now()
+	if at := s.sendSince.Load(); at != 0 {
+		q.sending = true
+		q.busy = now.Sub(time.Unix(0, at))
+		q.deadline = time.Duration(s.sendDeadline.Load())
+		q.lag = q.busy
+		if e, c := s.sendDoneUs.Load(), s.a.clock(); e != 0 && c > e {
+			q.lag = max(q.lag, time.Duration(c-e)*time.Microsecond)
+		}
+	}
+	q.burst = s.sendBurst.within(now)
+	return queueOverflows(q)
+}
+
+// keyOverflow reports whether an overflow for why is one behind a key frame
+// past its deadline that has not cut the bitrate yet (signalKeyOverflow,
+// once per key frame).
+func (s *Session) keyOverflow(why string) bool {
+	k := s.sendKey.Load()
+	return why == "deadline" && k != 0 && s.keyCut.Swap(k) != k
 }
 
 // drainQueue discards the queued frames and returns them, oldest first.
@@ -1623,6 +1841,18 @@ func (s *Session) loss(ev lossEvent, gen uint8, seq uint32, why string) ladderSt
 		in.forceIDR = v.Capabilities().ForceIDR
 	}
 	st := ladder(in)
+	if st.act == actRecover && s.keyBeingSent(gen, seq) {
+		// The lost frames follow a key frame of their generation that is
+		// still being sent: nothing after it has reached the client, so no
+		// long-term reference after it is acknowledged, and the encoder
+		// could only answer with another key frame now, behind the one
+		// still going out (at a low bitrate, where a key frame is many
+		// frame budgets, the next overflow again). The key frame comes once
+		// that one is out (keyframe).
+		in.recoverFailed = true
+		st = ladder(in)
+		st.why += ": a key frame before the loss is still being sent"
+	}
 	if st.act == actRecover {
 		// A loss that joins the client's wait (its answer lost) is recovered
 		// from the wait's first loss (sendState.recoverFrom).
@@ -1859,16 +2089,21 @@ func (s *Session) congestion(delayMs int, sig rateSignal) bool {
 }
 
 // overflowCut cuts the bitrate for a frame-queue overflow (congestion with
-// signalOverflow) and reports whether it did. recovered: the ladder answered
-// the dropped frames with a recovery frame (rung 2), so an encoder that
-// changes its bitrate seamlessly takes the cut without the emergency's key
-// frame (GUIDE 2.3: an IDR only where rung 2 is unavailable).
-func (s *Session) overflowCut(recovered bool) bool {
+// signalOverflow; key: behind a key frame past its deadline,
+// signalKeyOverflow) and reports whether it did. recovered: the ladder
+// answered the dropped frames with a recovery frame (rung 2), so an encoder
+// that changes its bitrate seamlessly takes the cut without the emergency's
+// key frame (GUIDE 2.3: an IDR only where rung 2 is unavailable).
+func (s *Session) overflowCut(recovered, key bool) bool {
 	caps := s.vid().Capabilities()
 	s.rate.setPolicy(ratePolicy(caps))
-	c, ok := s.rate.congestion(signalOverflow)
+	sig := signalOverflow
+	if key {
+		sig = signalKeyOverflow
+	}
+	c, ok := s.rate.congestion(sig)
 	if !ok {
-		s.log.Debug("congestion: bitrate kept", "signal", signalOverflow)
+		s.log.Debug("congestion: bitrate kept", "signal", sig)
 		return false
 	}
 	if recovered && caps.LiveBitrate && !caps.LiveBitrateFlush {
@@ -1996,16 +2231,13 @@ func (s *Session) ccCounters() ccCounters {
 		nonVideo += s.fecOverheadKbps(t.videoKbps) // parity and shard headers (fec.go)
 	}
 	return ccCounters{ok: true, lost: st.LostPackets, total: st.LostPackets + st.AckedPackets, acked: st.AckedBytes,
-		nonVideoKbps: int(nonVideo)}
+		limited: m.WindowLimited(), nonVideoKbps: int(nonVideo)}
 }
 
 // rateReport feeds a client's receive report to the rate controller.
 func (s *Session) rateReport(r proto.RateReport) {
 	s.fecReport(r, time.Now())
-	var comp time.Duration
-	if r.Flags&proto.RateReportFrame != 0 {
-		comp, _ = s.track.cover(r.Gen, r.LastSeq)
-	}
+	comp := reportComp(&s.track, r)
 	fb, ok := s.fb.fromReport(r, time.Now(), comp, s.ccCounters())
 	if !ok {
 		return // out of order
@@ -2026,6 +2258,23 @@ func (s *Session) rateReport(r proto.RateReport) {
 			s.log.Warn("rate change dropped: the rate loop is behind")
 		}
 	}
+}
+
+// reportComp covers the frames a client's report names (lastSeq and before)
+// and returns the pacer share to take off its delay: that of the frame its
+// p50 delay is (proto.RateReportOWDFrame), else the median of the frames it
+// newly covers.
+func reportComp(t *sendTrack, r proto.RateReport) time.Duration {
+	var comp time.Duration
+	if r.Flags&proto.RateReportFrame != 0 {
+		comp, _ = t.cover(r.Gen, r.LastSeq)
+	}
+	if r.Flags&(proto.RateReportOWD|proto.RateReportOWDFrame) == proto.RateReportOWD|proto.RateReportOWDFrame {
+		if c, ok := t.compOf(r.OWDGen, r.OWDSeq); ok {
+			comp = c
+		}
+	}
+	return comp
 }
 
 // videoPacingBps is the pacing rate available to video frames (bit/s): the
@@ -2101,13 +2350,36 @@ func (s *Session) requestKeyframe(reason string) {
 	}
 }
 
+// keyMark is how sendKey names a key frame being sent.
+func keyMark(gen uint8, seq uint32) uint64 { return 1<<40 | uint64(gen)<<32 | uint64(seq) }
+
+// keyBeingSent reports whether frameSender is sending a key frame of
+// generation gen from before frame seq.
+func (s *Session) keyBeingSent(gen uint8, seq uint32) bool {
+	k := s.sendKey.Load()
+	return k != 0 && uint8(k>>32) == gen && uint32(k) < seq
+}
+
 // keyframe makes the next frame a key frame of a new generation (the
 // ladder's rung 4): in the running encoder where the pipeline can force one
 // (Capabilities().ForceIDR: the native helper, never a restart), else with a
 // new generation started at once (FFmpeg's command line cannot force one),
-// built afresh from the settings.
+// built afresh from the settings. In the running encoder one key frame at a
+// time: asked for while frameSender sends one, it is forced once that one's
+// write is done (two would only queue behind each other at the pacing rate).
 func (s *Session) keyframe(reason string) error {
 	v := s.vid()
+	if !ladder(ladderIn{event: lossKeyRequest, forceIDR: v.Capabilities().ForceIDR}).restart && s.sendKey.Load() != 0 {
+		was := s.keyDue.Swap(true)
+		// frameSender forces it when the write is done (it takes keyDue
+		// after clearing sendKey); a write done meanwhile left it to us.
+		if s.sendKey.Load() != 0 || !s.keyDue.Swap(false) {
+			if !was {
+				s.log.Info("key frame deferred: one is being sent", "reason", reason)
+			}
+			return nil
+		}
+	}
 	s.stats.keyframes.Add(1)
 	if !ladder(ladderIn{event: lossKeyRequest, forceIDR: v.Capabilities().ForceIDR}).restart {
 		err := v.ForceKeyframe()
@@ -2183,6 +2455,12 @@ func (s *Session) frameSender() {
 	for n := 1; ; n++ {
 		var f *media.Frame
 		s.sendSince.Store(0)
+		if s.sendKey.Swap(0) != 0 && s.keyDue.Swap(false) && s.ctx.Err() == nil {
+			// The key frame asked for while one was being sent: now.
+			if err := s.keyframe("key frame deferred while one was being sent"); err != nil {
+				s.log.Warn("deferred key frame failed", "err", err)
+			}
+		}
 		select {
 		case <-s.ctx.Done():
 			return
@@ -2200,6 +2478,12 @@ func (s *Session) frameSender() {
 			continue // left out under congestion: no loss (thin.go)
 		}
 		s.reportDiscards(0) // a frame goes out again: the run before it is complete
+		est := proto.FrameHeaderLen + 64 + len(f.Data)
+		s.sending(f, est, s.frameDeadline(est))
+		s.sendSince.Store(time.Now().UnixNano())
+		if f.Key {
+			s.sendKey.Store(keyMark(f.Gen, f.Seq))
+		}
 		// Datagram shards (fec.go). They bypass the stream path below;
 		// sendFEC puts them through the video window (GUIDE 2.7) itself
 		// (fec.go, "Send priorities").
@@ -2207,7 +2491,6 @@ func (s *Session) frameSender() {
 			continue
 		}
 		s.sendOpening.Store(true)
-		s.sendSince.Store(time.Now().UnixNano())
 		s.applyCongestionTarget()
 		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 		st, err := s.c.OpenUniStreamSync(ctx)
@@ -2229,6 +2512,7 @@ func (s *Session) frameSender() {
 		}
 		buf = append(buf, f.Data...)
 		of := &outFrame{f: f, st: st, n: num, opened: time.Now(), deadline: s.frameDeadline(len(buf)), gone: make(chan struct{}), held: true}
+		s.sending(f, len(buf), of.deadline)
 		// A frame the ladder may cancel when it is late: look again at
 		// its deadline (a newer frame queued later looks too).
 		in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)
@@ -2328,6 +2612,7 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 	}
 	st.Close()
 	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), len(b), s.videoPacingBps())
+	s.rate.sent(len(b))
 	s.stats.frames.Add(1)
 	s.stats.bytes.Add(int64(len(b)))
 	if h.Flags&proto.FrameFlagExt != 0 {

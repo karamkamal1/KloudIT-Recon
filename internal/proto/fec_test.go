@@ -134,3 +134,54 @@ console.log(Buffer.from(P.rateReport({ flags: P.RATE_REPORT_SHARDS | P.RATE_REPO
 		t.Fatalf("protocol.js rateReport with shards: %+v (%d bytes), want %+v", got, len(jb), r)
 	}
 }
+
+// TestRateReportOWDFrame: the delay frame block (the frame whose one-way
+// delay the p50 is, the client clock's correction) follows the shard
+// counters or the first 40 bytes; a report whose flag promises it but ends
+// before reads without it; hosts before it read the rest as before; and
+// protocol.js builds the same bytes (needs node).
+func TestRateReportOWDFrame(t *testing.T) {
+	for _, r := range []RateReport{
+		{Flags: RateReportOWD | RateReportFrame | RateReportOWDFrame, Gen: 3, TimeMs: 5, LastSeq: 9, Frames: 7, Bytes: 8, OWDP50Us: 15000,
+			OWDMaxUs: 30000, OWDGen: 2, OWDSeq: 0xfffffff0, ClockShiftUs: -12345},
+		{Flags: RateReportOWD | RateReportShards | RateReportOWDFrame, Gen: 3, TimeMs: 5, LastSeq: 9, Frames: 7, Bytes: 8, OWDP50Us: 15000,
+			Shards: 100, ShardsLost: 2, OWDGen: 3, OWDSeq: 8, ClockShiftUs: 7000},
+	} {
+		b := r.Marshal()
+		want := RateReportLen + RateReportOWDFrameLen
+		if r.Flags&RateReportShards != 0 {
+			want = RateReportShardsLen + RateReportOWDFrameLen
+		}
+		if len(b) != want {
+			t.Fatalf("%d bytes, want %d", len(b), want)
+		}
+		if got, ok := ParseRateReport(b); !ok || got != r {
+			t.Fatalf("round trip: %+v %v, want %+v", got, ok, r)
+		}
+		got, ok := ParseRateReport(b[:want-1])
+		if !ok || got.Flags&RateReportOWDFrame != 0 || got.OWDSeq != 0 || got.ClockShiftUs != 0 || got.Frames != r.Frames || got.Shards != r.Shards {
+			t.Fatalf("short report with the delay frame flag: %+v %v", got, ok)
+		}
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
+	script := `
+const P = await import(process.argv[1]);
+console.log(Buffer.from(P.rateReport({ flags: P.RATE_REPORT_OWD | P.RATE_REPORT_SHARDS | P.RATE_REPORT_OWD_FRAME, gen: 3, timeMs: 5, lastSeq: 9,
+  frames: 7, bytes: 8, owdP50Us: 15000, owdMaxUs: 0, lost: 0, audio: 0, decodeQueue: 0, shards: 100, shardsLost: 2,
+  owdGen: 259, owdSeq: 2 ** 32 + 8, clockShiftUs: 6999.6 })).toString('hex'));`
+	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js)).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	jb, _ := hex.DecodeString(strings.TrimSpace(string(out)))
+	want := RateReport{Flags: RateReportOWD | RateReportShards | RateReportOWDFrame, Gen: 3, TimeMs: 5, LastSeq: 9, Frames: 7, Bytes: 8,
+		OWDP50Us: 15000, Shards: 100, ShardsLost: 2, OWDGen: 3, OWDSeq: 8, ClockShiftUs: 7000}
+	if got, ok := ParseRateReport(jb); !ok || got != want {
+		t.Fatalf("protocol.js rateReport with the delay frame: %+v (%d bytes), want %+v", got, len(jb), want)
+	}
+}

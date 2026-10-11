@@ -283,51 +283,44 @@ func TestLateDiscardableFrame(t *testing.T) {
 }
 
 // TestThinPressure: the signals that count as congestion for thinning: the
-// rate controller over its delay target, two frames waiting, a frame stream
-// past its deadline (or the last one written that slowly).
+// rate controller over its delay target, a frame stream past its deadline
+// (or the last one written that slowly), two frames waiting; all but the
+// last are the path's (they hold and lower the bitrate), two frames waiting
+// alone are the host's own queue (a key frame or a burst being paced out).
 func TestThinPressure(t *testing.T) {
 	s, _, _ := testSession(t, testFaults{})
 	now := time.Now()
-	if why := s.thinPressure(1, now); why != "" {
-		t.Fatalf("idle session under pressure: %s", why)
+	want := func(at time.Time, why string, path bool, what string) {
+		t.Helper()
+		if w, p := s.thinPressure(1, at); w != why || p != path {
+			t.Fatalf("%s: %q (path %v), want %q (path %v)", what, w, p, why, path)
+		}
 	}
+	want(now, "", false, "idle session")
 	s.rate.mu.Lock()
 	s.rate.overRun = thinOverReports
 	s.rate.mu.Unlock()
-	if why := s.thinPressure(1, now); why != "delay" {
-		t.Fatalf("over the delay target: %q", why)
-	}
+	want(now, "delay", true, "over the delay target")
 	s.rate.mu.Lock()
 	s.rate.overRun = 0
 	s.rate.mu.Unlock()
 	s.frameQ <- &media.Frame{}
-	if why := s.thinPressure(1, now); why != "" {
-		t.Fatalf("one frame waiting: %q", why)
-	}
+	want(now, "", false, "one frame waiting")
 	s.frameQ <- &media.Frame{}
-	if why := s.thinPressure(1, now); why != "queue" {
-		t.Fatalf("two frames waiting: %q", why)
-	}
-	s.drainQueue()
+	want(now, "queue", false, "two frames waiting")
 	of := &outFrame{f: &media.Frame{}, st: &fakeStream{}, opened: now.Add(-30 * time.Millisecond), deadline: 50 * time.Millisecond}
 	s.send.register(of)
-	if why := s.thinPressure(1, now); why != "" {
-		t.Fatalf("a stream within its deadline: %q", why)
-	}
+	want(now, "queue", false, "two frames waiting behind a stream within its deadline")
 	of.opened = now.Add(-60 * time.Millisecond)
-	if why := s.thinPressure(1, now); why != "deadline" {
-		t.Fatalf("a stream past its deadline: %q", why)
-	}
+	want(now, "deadline", true, "two frames waiting behind a stream past its deadline")
+	s.drainQueue()
+	want(now, "deadline", true, "a stream past its deadline")
 	s.send.finish(of, outDone)
-	if why := s.thinPressure(1, now); why != "deadline" {
-		t.Fatalf("the last stream written slowly: %q", why)
-	}
+	want(now, "deadline", true, "the last stream written slowly")
 	quick := &outFrame{f: &media.Frame{}, st: &fakeStream{}, opened: time.Now(), deadline: time.Second}
 	s.send.register(quick)
 	s.send.finish(quick, outDone)
-	if why := s.thinPressure(1, time.Now()); why != "" {
-		t.Fatalf("after a quick write: %q", why)
-	}
+	want(time.Now(), "", false, "after a quick write")
 }
 
 // TestThinShardsAfterSlowStream: the deadline pressure follows the frames

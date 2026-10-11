@@ -347,6 +347,11 @@ func (s *Session) sendFEC(f *media.Frame, n int, num uint64) bool {
 	s.fec.mu.Lock()
 	maxShard := s.fec.maxShard
 	s.fec.mu.Unlock()
+	// The frame queue's rule judges the frame by what goes on the wire:
+	// its shards with parity and headers take longer to pace out than its
+	// stream bytes would (queueOverflows).
+	est := s.fecWireEstimate(len(buf))
+	s.sending(f, est, s.frameDeadline(est))
 	drop, delay := s.a.faults.at(n)
 	held := false
 	if !drop && delay == 0 {
@@ -355,7 +360,7 @@ func (s *Session) sendFEC(f *media.Frame, n int, num uint64) bool {
 		// frame, a placeholder stands for it in the send state's list, as
 		// a held frame stream does: a wait for the answer to a loss that
 		// starts meanwhile (checkOut) discards it and ends the hold at once.
-		ph := &outFrame{f: f, n: num, opened: time.Now(), deadline: s.frameDeadline(s.fecWireEstimate(len(buf))),
+		ph := &outFrame{f: f, n: num, opened: time.Now(), deadline: s.frameDeadline(est),
 			gone: make(chan struct{}), held: true}
 		s.send.register(ph)
 		held = s.admit(ph) > 0
@@ -377,6 +382,7 @@ func (s *Session) sendFEC(f *media.Frame, n int, num uint64) bool {
 		wire += len(d)
 	}
 	of := &outFrame{f: f, opened: time.Now(), deadline: s.frameDeadline(wire)}
+	s.sending(f, wire, of.deadline)
 	if drop {
 		s.lostFrame(f, "test fault") // as if every shard was lost
 		return true
@@ -514,8 +520,10 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 		r = old + (r-old)/30
 	}
 	fs.ratio.Store(r)
-	// The pacer model counts what went on the wire.
+	// The pacer model counts what went on the wire; the fill, as the
+	// client counts a frame, its bytes.
 	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), wire, s.videoPacingBps())
+	s.rate.sent(frameBytes)
 	s.stats.frames.Add(1)
 	s.stats.bytes.Add(int64(frameBytes))
 	if h.Flags&proto.FrameFlagExt != 0 {

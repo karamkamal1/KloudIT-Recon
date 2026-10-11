@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/karamkamal1/kloudit-recon/internal/fec"
 	"github.com/karamkamal1/kloudit-recon/internal/host/media"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
@@ -132,6 +134,92 @@ func TestFrameDeadline(t *testing.T) {
 		}
 		if got := frameDeadline(interval, c.bytes, c.pacingBps); (got - c.want).Abs() > 2*time.Microsecond {
 			t.Errorf("%d fps, %d bytes at %.0f bit/s: %v, want %v", c.fps, c.bytes, c.pacingBps, got, c.want)
+		}
+	}
+}
+
+// TestQueueOverflows: the frame queue overflows at frameQueueFrames only
+// where the network does not keep up: the frame being sent is past its
+// deadline (its own sending time at the pacing rate plus an interval), or
+// the path's delay is over the target; or where a backlog does not drain:
+// the frame being sent reached the queue more than frameQueueAge ago, or more
+// than an interval past the longest recent deadline. Behind a frame paced
+// out on schedule (a key frame at a low bitrate) frames wait, up to
+// frameQueueMax.
+func TestQueueOverflows(t *testing.T) {
+	const ms = time.Millisecond
+	interval := time.Second / 60
+	key := frameDeadline(interval, 200_000, 2.4e6) // 667 ms at 2.4 Mbit/s, + an interval
+	small := frameDeadline(interval, 5000, 2.4e6)  // 33 ms
+	for _, c := range []struct {
+		name string
+		q    queueLoad
+		want string
+	}{
+		{"few frames, congested", queueLoad{queued: frameQueueFrames - 1, congested: true, sending: true, busy: time.Second, deadline: key, lag: time.Second, burst: key}, ""},
+		{"behind a key frame on schedule", queueLoad{queued: frameQueueFrames, sending: true, busy: 300 * ms, deadline: key, lag: 300 * ms, burst: key}, ""},
+		{"behind a key frame on schedule, many", queueLoad{queued: frameQueueMax - 1, sending: true, busy: 600 * ms, deadline: key, lag: 600 * ms, burst: key}, ""},
+		{"behind a key frame past its deadline", queueLoad{queued: frameQueueFrames, sending: true, busy: 700 * ms, deadline: key, lag: 700 * ms, burst: key}, "deadline"},
+		{"behind a small frame past its deadline", queueLoad{queued: frameQueueFrames, sending: true, busy: 40 * ms, deadline: small, lag: 40 * ms, burst: small}, "deadline"},
+		{"behind a small frame in time", queueLoad{queued: frameQueueFrames, sending: true, busy: 20 * ms, deadline: small, lag: 20 * ms, burst: small}, ""},
+		{"the delay over the target", queueLoad{queued: frameQueueFrames, congested: true, sending: true, busy: 10 * ms, deadline: key, lag: 10 * ms, burst: key}, "delay"},
+		{"the delay over the target, nothing sending", queueLoad{queued: frameQueueFrames, congested: true}, "delay"},
+		{"the sender between two frames (it takes the next at once)", queueLoad{queued: frameQueueFrames}, ""},
+		{"a stream that does not open", queueLoad{queued: frameQueueFrames, sending: true, busy: 200 * ms, deadline: small, lag: 200 * ms, burst: small}, "deadline"},
+		{"at the bound", queueLoad{queued: frameQueueMax, sending: true, busy: 10 * ms, deadline: key, lag: 10 * ms, burst: key}, "full"},
+		// The frames after a key frame, each on schedule: they waited
+		// about the key frame's sending time, less as the pacer catches up.
+		{"after a key frame on schedule", queueLoad{queued: 30, sending: true, busy: 10 * ms, deadline: small, lag: 650 * ms, burst: key}, ""},
+		// Frames on schedule that wait ever longer (an encoder that makes
+		// more than the pacer sends): no deadline passes, the wait grows.
+		{"a backlog that does not drain", queueLoad{queued: frameQueueFrames, sending: true, busy: 10 * ms, deadline: small, lag: 300 * ms, burst: small}, "backlog"},
+		{"a backlog under the age bound", queueLoad{queued: frameQueueFrames, sending: true, busy: 10 * ms, deadline: small, lag: 200 * ms, burst: small}, ""},
+		{"a backlog past a key frame's allowance", queueLoad{queued: 40, sending: true, busy: 10 * ms, deadline: small, lag: key + interval + 10*ms, burst: key}, "backlog"},
+		{"a backlog of few frames", queueLoad{queued: frameQueueFrames - 1, sending: true, busy: 10 * ms, deadline: small, lag: time.Second}, ""},
+	} {
+		c.q.interval = interval
+		if got := queueOverflows(c.q); got != c.want {
+			t.Errorf("%s: overflows %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestQueueBurst: the backlog bound's allowance is the longest deadline of
+// a frame taken in the last frameQueueBurst.
+func TestQueueBurst(t *testing.T) {
+	var b queueBurst
+	t0 := time.Unix(1000, 0)
+	if got := b.within(t0); got != 0 {
+		t.Fatalf("empty: %v", got)
+	}
+	b.note(400*time.Millisecond, t0)
+	b.note(30*time.Millisecond, t0.Add(time.Second))
+	if got := b.within(t0.Add(frameQueueBurst)); got != 400*time.Millisecond {
+		t.Errorf("within the window: %v, want the key frame's 400 ms", got)
+	}
+	if got := b.within(t0.Add(frameQueueBurst + time.Millisecond)); got != 0 {
+		t.Errorf("after it: %v, want 0", got)
+	}
+	b.note(30*time.Millisecond, t0.Add(frameQueueBurst+time.Millisecond))
+	if got := b.within(t0.Add(frameQueueBurst + 2*time.Millisecond)); got != 30*time.Millisecond {
+		t.Errorf("a new frame after the window: %v, want 30 ms", got)
+	}
+}
+
+// TestPacedInterval: the congestion window is sized for the frames the
+// encoder produces: the session's interval, or a slower source's (up to
+// maxPacedInterval).
+func TestPacedInterval(t *testing.T) {
+	const ms = time.Millisecond
+	for _, c := range []struct{ interval, source, want time.Duration }{
+		{16 * ms, 0, 16 * ms},
+		{16 * ms, 10 * ms, 16 * ms},
+		{16 * ms, 83 * ms, 83 * ms},
+		{16 * ms, time.Second, maxPacedInterval},
+		{500 * ms, time.Second, 500 * ms},
+	} {
+		if got := pacedInterval(c.interval, c.source); got != c.want {
+			t.Errorf("pacedInterval(%v, %v) = %v, want %v", c.interval, c.source, got, c.want)
 		}
 	}
 }
@@ -720,6 +808,272 @@ func TestOverflowRecovered(t *testing.T) {
 				t.Fatalf("takeover log %q", l)
 			}
 		})
+	}
+}
+
+// TestFrameQueueBehindKeyFrame runs videoEvents and frameSender with a key
+// frame whose write stands still (a large key frame paced out at a low
+// bitrate). Frames queue behind it without an overflow while it is on
+// schedule and the path's delay is in its target, and all go out once it is
+// written: no recovery, no key frame. With the delay over the target, or
+// with the key frame past its deadline, the queue overflows at
+// frameQueueFrames; the dropped frames follow the key frame still being
+// sent, so no recovery frame is possible and the key frame they cost is
+// forced once that one's write is done, and only one however often it is
+// asked for meanwhile.
+func TestFrameQueueBehindKeyFrame(t *testing.T) {
+	type rig struct {
+		s    *Session
+		c    *fakeConn
+		p    *ladderPipeline
+		logs *lockedLog
+	}
+	setup := func(t *testing.T, keyBytes int) rig {
+		s, c, _ := testSession(t, testFaults{})
+		s.frameQ = make(chan *media.Frame, frameQueueMax)
+		c.stall = map[int]bool{0: true}
+		logs := &lockedLog{}
+		s.log = slog.New(slog.NewTextHandler(logs, nil))
+		p := &ladderPipeline{caps: media.PipelineCaps{Recovery: proto.RecoveryLTR, ForceIDR: true, LiveBitrate: true},
+			events: make(chan media.VideoEvent)}
+		s.video = p
+		s.healConfig(&proto.VideoConfig{Gen: 1, Recovery: proto.RecoveryLTR}, 0)
+		s.setCongestionTarget(media.Params{BitrateKbps: 2000, FPS: 60}) // video pacing 2.4 Mbit/s
+		s.rate.mu.Lock()
+		s.rate.applied, s.rate.est, s.rate.lastDecrease = 2000, 2000, time.Now() // no cut: the key frame alone
+		s.rate.mu.Unlock()
+		go s.videoEvents()
+		go s.frameSender()
+		p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: 0, Key: true, Data: make([]byte, keyBytes)}}
+		for deadline := time.Now().Add(5 * time.Second); !s.keyBeingSent(1, 1) || len(c.snapshot()) == 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the key frame is not being written")
+			}
+		}
+		return rig{s: s, c: c, p: p, logs: logs}
+	}
+	frames := func(r rig, from, to uint32) {
+		for seq := from; seq < to; seq++ {
+			r.p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: seq, Data: bytes.Repeat([]byte{byte(seq)}, 100)}}
+		}
+	}
+	// waitLog waits for n log lines with substr (videoEvents takes a frame
+	// before it handles it).
+	waitLog := func(t *testing.T, r rig, substr string, n int) []string {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			if l := r.logs.lines(substr); len(l) >= n {
+				return l
+			} else if time.Now().After(deadline) {
+				t.Fatalf("log %q, want %d lines with %s", r.logs.lines(""), n, substr)
+			}
+		}
+	}
+	waitKeys := func(t *testing.T, r rig, n int) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			if _, keys, _ := r.p.state(); keys == n {
+				return
+			} else if time.Now().After(deadline) {
+				t.Fatalf("%d key frames, want %d", keys, n)
+			}
+		}
+	}
+
+	t.Run("on schedule", func(t *testing.T) {
+		r := setup(t, 300_000) // 1 s at 2.4 Mbit/s
+		frames(r, 1, 21)
+		for deadline := time.Now().Add(5 * time.Second); len(r.s.frameQ) < 20 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+		if l := r.logs.lines(`msg="frame queue overflow"`); len(l) != 0 || len(r.s.frameQ) != 20 {
+			t.Fatalf("%d frames queued, overflow %q; want all 20 queued", len(r.s.frameQ), l)
+		}
+		r.c.release(0)
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+			closed := 0
+			for _, x := range r.c.snapshot() {
+				if x.closed {
+					closed++
+				}
+			}
+			if closed == 21 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d of 21 frames sent", closed)
+			}
+		}
+		if rec, keys, starts := r.p.state(); len(rec) != 0 || keys != 0 || len(starts) != 0 {
+			t.Fatalf("recover %v, key frames %d, starts %v; want none", rec, keys, starts)
+		}
+	})
+
+	for _, c := range []struct {
+		name     string
+		keyBytes int
+		set      func(r rig)
+	}{
+		{"the delay over the target", 300_000, func(r rig) {
+			r.s.rate.mu.Lock()
+			r.s.rate.qdOver = true
+			r.s.rate.mu.Unlock()
+		}},
+		{"past its deadline", 100, func(rig) { time.Sleep(60 * time.Millisecond) }}, // deadline 33 ms
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := setup(t, c.keyBytes)
+			c.set(r)
+			frames(r, 1, uint32(frameQueueFrames)+2)
+			if l := waitLog(t, r, `msg="frame queue overflow"`, 1); len(l) != 1 || !strings.Contains(l[0], "frames=7") {
+				t.Fatalf("overflow log %q, want 7 frames dropped", l)
+			}
+			waitLog(t, r, `msg="key frame deferred: one is being sent"`, 1)
+			if l := r.logs.lines(`msg="no recovery frame possible, forcing a key frame" gen=1 from_seq=1`); len(l) != 1 ||
+				!strings.Contains(l[0], "a key frame before the loss is still being sent") {
+				t.Fatalf("ladder log %q", l)
+			}
+			if l := r.logs.lines(`msg="key frame deferred: one is being sent"`); len(l) != 1 {
+				t.Fatalf("deferral log %q", l)
+			}
+			r.s.requestKeyframe("frame lost") // the client's request for the same loss
+			if err := r.s.keyframe("decoder error"); err != nil {
+				t.Fatal(err)
+			}
+			if rec, keys, _ := r.p.state(); len(rec) != 0 || keys != 0 {
+				t.Fatalf("recover %v, %d key frames while the key frame is being written; want none", rec, keys)
+			}
+			r.c.release(0)
+			waitKeys(t, r, 1)
+			time.Sleep(50 * time.Millisecond)
+			if _, keys, starts := r.p.state(); keys != 1 || len(starts) != 0 {
+				t.Fatalf("%d key frames, starts %v after the write; want one IDR", keys, starts)
+			}
+			if l := r.logs.lines(`msg="key frame deferred: one is being sent"`); len(l) != 1 {
+				t.Fatalf("deferral logged %d times, want once", len(l))
+			}
+		})
+	}
+
+	// Past its deadline above the floor, right after another decrease: the
+	// overflow cuts all the same (signalKeyOverflow), so that the key frame
+	// forced after this one comes at a bitrate the path carried; a second
+	// overflow behind the same key frame does not cut again.
+	t.Run("past its deadline, a cut once per key frame", func(t *testing.T) {
+		r := setup(t, 100)
+		r.s.rate.mu.Lock()
+		r.s.rate.applied, r.s.rate.est = 8000, 8000
+		r.s.rate.mu.Unlock()
+		time.Sleep(60 * time.Millisecond) // deadline 33 ms
+		frames(r, 1, uint32(frameQueueFrames)+2)
+		if l := waitLog(t, r, `msg="frame queue overflow"`, 1); !strings.Contains(l[0], "why=deadline") || !strings.Contains(l[0], "sender_kind=key") ||
+			!strings.Contains(l[0], "key_cut=true") {
+			t.Fatalf("overflow log %q, want why=deadline behind a key frame, cut", l)
+		}
+		if cur, _ := r.s.rate.kbps(); cur != 6000 {
+			t.Fatalf("target %d after the overflow behind the key frame, want 6000 (0.75 x, within the gap of the last decrease)", cur)
+		}
+		frames(r, uint32(frameQueueFrames)+2, 2*uint32(frameQueueFrames)+3)
+		if l := waitLog(t, r, `msg="frame queue overflow"`, 2); strings.Contains(l[1], "key_cut") {
+			t.Fatalf("second overflow log %q, want no second cut", l[1])
+		}
+		if cur, _ := r.s.rate.kbps(); cur != 6000 {
+			t.Fatalf("target %d after a second overflow behind the same key frame, want 6000", cur)
+		}
+		r.c.release(0)
+	})
+}
+
+// TestFrameQueueBacklog: a frame sent within its deadline that the encoder
+// delivered more than frameQueueAge ago (an encoder that makes more than the
+// pacer sends: every frame on schedule, the wait growing) overflows the
+// queue at frameQueueFrames ("backlog"); one that waited less does not.
+func TestFrameQueueBacklog(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		waited   time.Duration
+		overflow bool
+	}{
+		{"waited 400 ms", 400 * time.Millisecond, true},
+		{"waited 100 ms", 100 * time.Millisecond, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, conn, _ := testSession(t, testFaults{})
+			s.frameQ = make(chan *media.Frame, frameQueueMax)
+			conn.stall = map[int]bool{0: true}
+			logs := &lockedLog{}
+			s.log = slog.New(slog.NewTextHandler(logs, nil))
+			p := &ladderPipeline{caps: media.PipelineCaps{Recovery: proto.RecoveryLTR, ForceIDR: true, LiveBitrate: true},
+				events: make(chan media.VideoEvent)}
+			s.video = p
+			s.healConfig(&proto.VideoConfig{Gen: 1, Recovery: proto.RecoveryLTR}, 0)
+			s.setCongestionTarget(media.Params{BitrateKbps: 2000, FPS: 60}) // 45 KB: 150 ms at 2.4 Mbit/s, deadline 167 ms
+			go s.videoEvents()
+			go s.frameSender()
+			done := s.a.clock()
+			time.Sleep(c.waited) // the frame waited this long since the encoder delivered it
+			p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: 0, EncodeDoneUs: done, Data: make([]byte, 45000)}}
+			for deadline := time.Now().Add(5 * time.Second); len(conn.snapshot()) == 0; time.Sleep(time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatal("the frame is not being written")
+				}
+			}
+			for seq := uint32(1); seq <= frameQueueFrames+1; seq++ {
+				p.events <- media.VideoEvent{Frame: &media.Frame{Gen: 1, Seq: seq, EncodeDoneUs: s.a.clock(), Data: bytes.Repeat([]byte{byte(seq)}, 100)}}
+			}
+			for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
+				l := logs.lines(`msg="frame queue overflow"`)
+				switch {
+				case c.overflow && len(l) > 0:
+					if !strings.Contains(l[0], "why=backlog") || !strings.Contains(l[0], "frames=7") {
+						t.Fatalf("overflow log %q, want 7 frames for a backlog", l)
+					}
+					conn.release(0)
+					return
+				case !c.overflow && len(l) > 0:
+					t.Fatalf("overflow %q, want none", l)
+				case !c.overflow && len(s.frameQ) == frameQueueFrames+1:
+					conn.release(0)
+					return
+				case time.Now().After(deadline):
+					t.Fatalf("%d frames queued, overflow %q", len(s.frameQ), l)
+				}
+			}
+		})
+	}
+}
+
+// TestQueueOverflowsShards: a frame sent as datagram shards is judged by its
+// bytes on the wire (parity and shard headers: Session.sending in sendFEC).
+// A 25-budget key frame at 2 Mbit/s whose shards go out on schedule overflows
+// nothing; judged by its stream bytes, its own sending time would be past
+// that deadline with 18 frames queued behind it, and the storm of key frames
+// the queue rule ends would come back on every path with auto FEC (the UDP
+// relay).
+func TestQueueOverflowsShards(t *testing.T) {
+	const stream = 104254 // bytes: 25 x the budget at 2 Mbit/s, 60 fps
+	var enc fec.Encoder
+	_, dgs, err := enc.Cut(make([]byte, stream), 1, 1, proto.MaxShardPayload, func(k int) int { return fec.Parity(k, 0.02) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := 0
+	for _, d := range dgs {
+		wire += len(d)
+	}
+	interval := time.Second / 60
+	pace := 2.4e6 * float64(wire) / stream // the congestion target carries the shards' overhead (fecOverheadKbps)
+	hand := time.Duration(float64(wire) * 8 / pace * float64(time.Second))
+	q := queueLoad{queued: int(hand / interval), sending: true, busy: hand, lag: hand, interval: interval,
+		deadline: frameDeadline(interval, wire, pace)}
+	q.burst = q.deadline
+	if got := queueOverflows(q); got != "" {
+		t.Fatalf("shards (%d bytes for %d) handed over in %v, deadline %v, %d queued: overflow %q, want none", wire, stream, hand, q.deadline, q.queued, got)
+	}
+	q.deadline = frameDeadline(interval, stream, pace) // judged by the stream bytes
+	q.burst = q.deadline
+	if got := queueOverflows(q); got != "deadline" {
+		t.Fatalf("judged by its stream bytes (deadline %v): overflow %q, want deadline", q.deadline, got)
 	}
 }
 

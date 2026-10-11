@@ -461,10 +461,12 @@ func ParseFrameAck(b []byte) (FrameAck, bool) {
 const FeatureRateReport = "rate-report"
 
 // RateReportLen is the size of a RateReport datagram; RateReportShardsLen
-// with the shard counters (RateReportShards).
+// with the shard counters (RateReportShards); RateReportOWDFrameLen is the
+// size of the delay frame block (RateReportOWDFrame) that follows them.
 const (
-	RateReportLen       = 40
-	RateReportShardsLen = 48
+	RateReportLen         = 40
+	RateReportShardsLen   = 48
+	RateReportOWDFrameLen = 8
 )
 
 // RateReport flags.
@@ -475,21 +477,35 @@ const (
 	// bytes; clients that receive video shards, GUIDE 2.5). Hosts before
 	// them read the first 40 bytes.
 	RateReportShards byte = 4
+	// RateReportOWDFrame: OWDGen (the byte after Gen) / OWDSeq name the
+	// frame whose one-way delay is OWDP50Us, and ClockShiftUs says how far
+	// the client's clock offset has moved since its first sync (the delays
+	// were measured with the moved offset); RateReportOWDFrameLen bytes
+	// after the shard counters (or after the first 40 bytes without them).
+	// Hosts before it read neither (their reserved byte and the bytes after
+	// the end).
+	RateReportOWDFrame byte = 8
 )
 
 // RateReport is the client's receive report for the host's rate controller
 // (DgRateReport, every 20-50 ms):
 //
-//	u8 type 0x41 | u8 flags | u8 gen | u8 0 | u32 timeMs | u32 lastSeq |
+//	u8 type 0x41 | u8 flags | u8 gen | u8 owdGen | u32 timeMs | u32 lastSeq |
 //	u32 frames | u32 bytes | i32 owdP50Us | i32 owdMaxUs | u32 lost |
 //	u32 audio | u16 decodeQueue | u16 0 [| u32 shards | u32 shardsLost]
+//	[| u32 owdSeq | i32 clockShiftUs]
 //
 // The counters are cumulative since the client connected (they wrap), so a
 // lost report loses nothing but its delay samples: the host takes the
 // difference to the last report it got. The one-way delays are those of the
 // frames received since the previous report (last byte received minus the
 // frame's encodeDoneUs, or SendUs without the extension, on the client's
-// synchronised clock: the same measure as the 0x40 ack).
+// synchronised clock: the same measure as the 0x40 ack). owdGen / owdSeq
+// (RateReportOWDFrame) name the frame whose delay the p50 is: the host
+// takes its own pacer share off that frame's delay (frames that complete out
+// of order, after a retransmission, make the frames covered by lastSeq a
+// different set from those whose delays were measured), and clockShiftUs
+// the client's clock corrections since its first sync.
 type RateReport struct {
 	Flags   byte
 	Gen     uint8  // generation of LastSeq
@@ -503,6 +519,11 @@ type RateReport struct {
 	Lost               uint32 // frames lost on the way (gap timeout; not those the host reported dropped) + audio packets lost
 	Audio              uint32 // audio packets received
 	DecodeQueue        uint16 // frames handed to the decoder and not yet out of it
+	// The frame whose one-way delay is OWDP50Us, and the client's clock
+	// offset change since its first sync, µs (RateReportOWDFrame).
+	OWDGen       uint8
+	OWDSeq       uint32
+	ClockShiftUs int32
 	// Video shards ("datagram + FEC" mode, RateReportShards): of the
 	// frames' first transmissions (data and parity, not repairs), those
 	// received and those that never arrived, both counted when the client
@@ -529,11 +550,20 @@ func ParseRateReport(b []byte) (RateReport, bool) {
 		Audio:       le.Uint32(b[32:]),
 		DecodeQueue: le.Uint16(b[36:]),
 	}
+	n := RateReportLen
 	if r.Flags&RateReportShards != 0 {
 		if len(b) < RateReportShardsLen {
 			r.Flags &^= RateReportShards
 		} else {
 			r.Shards, r.ShardsLost = le.Uint32(b[40:]), le.Uint32(b[44:])
+			n = RateReportShardsLen
+		}
+	}
+	if r.Flags&RateReportOWDFrame != 0 {
+		if len(b) < n+RateReportOWDFrameLen {
+			r.Flags &^= RateReportOWDFrame
+		} else {
+			r.OWDGen, r.OWDSeq, r.ClockShiftUs = b[3], le.Uint32(b[n:]), int32(le.Uint32(b[n+4:]))
 		}
 	}
 	return r, true
@@ -546,7 +576,11 @@ func (r RateReport) Marshal() []byte {
 	if r.Flags&RateReportShards != 0 {
 		n = RateReportShardsLen
 	}
-	b := make([]byte, n)
+	end := n
+	if r.Flags&RateReportOWDFrame != 0 {
+		end += RateReportOWDFrameLen
+	}
+	b := make([]byte, end)
 	le := binary.LittleEndian
 	b[0], b[1], b[2] = DgRateReport, r.Flags, r.Gen
 	le.PutUint32(b[4:], r.TimeMs)
@@ -561,6 +595,11 @@ func (r RateReport) Marshal() []byte {
 	if n == RateReportShardsLen {
 		le.PutUint32(b[40:], r.Shards)
 		le.PutUint32(b[44:], r.ShardsLost)
+	}
+	if end > n {
+		b[3] = r.OWDGen
+		le.PutUint32(b[n:], r.OWDSeq)
+		le.PutUint32(b[n+4:], uint32(r.ClockShiftUs))
 	}
 	return b
 }
