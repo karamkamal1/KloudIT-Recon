@@ -12471,6 +12471,22 @@ which the pattern's own checks (the barcode, the PQ levels) never relied on.
   8.1 build's 3 raw frames of the graph pass the new check (a scratch test, not committed);
   `TestHDRTestPatches` and the browser E2E's "WebGPU HDR10" scenario on the sandbox's 6.1 as
   before.
+- Review: the two checks of the stream itself still wanted BT.601's codes, so on exactly the
+  builds the probe now accepts they failed at the patches instead of at the probe:
+  `TestHDRTestStream` (`media.test.exe` under Wine with the 8.1 build: `frame 0: patch red
+  decodes as 238/418/848, want 260/396/848`) and the browser E2E's `HDR_PATCHES` /
+  `hdrPixels` (`codeOff <= 8`). Both now take either matrix as the probe does, all patches in
+  one: `hdrPatchesOff` in `hdr_test.go` (the largest difference in the nearer matrix;
+  `TestHDRPatchesOff`: 6.1's and 8.1's decoded codes pass within 2, a mix is 24 off, a red far
+  from both 61), and `HDR_PATCHES` carries the BT.2020 codes of the coloured patches
+  (236/416/848, 512/268/200, 104/848/484, `HDRTestPatch.Y2020/Cb2020/Cr2020`) with `hdrPixels`
+  taking the nearer set (its check line names it). The 8.1 build's SVT-AV1 also decoded one
+  frame's always-black barcode cell as 61 and a cell as 67 where the test wanted exactly 64:
+  the barcode's codes are now checked within 8 as the patches (the barcode itself still reads
+  exactly). `TestHDRTestStream` passes with the 8.1 build under Wine (twice: `BT.2020 codes`)
+  and with the sandbox's 6.1 (`BT.601 codes`). `hdrPixels` was run alone under node with 6.1's
+  codes (ok, 2 off, BT.601), 8.1's (ok, 2 off, BT.2020) and a mix (refused, 24 off); the whole
+  E2E runs here on 6.1 only (no Linux FFmpeg 7.1+ in the sandbox).
 - AMD RDNA3 (RX 7900 XT): unverified. Test: restart the agent and read the start of host.log.
   Pass: no `HDR10 test pattern unavailable` line; with `"capture": "test"` and HDR on, the
   stream's top-left patches show the HDR test pattern.

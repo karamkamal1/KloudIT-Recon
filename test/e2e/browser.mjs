@@ -2014,30 +2014,41 @@ async function checkHdrUnit(haveX) {
 // frames that cannot be copied (test hook): the client withdraws its offer
 // and the host returns to SDR.
 const HDR_STREAM = { w: 480, h: 270, fps: 15 };
-// media.HDRTestPatches: x (32 px wide, the top 48 rows), name, 10-bit codes.
+// media.HDRTestPatches: x (32 px wide, the top 48 rows), name, 10-bit codes
+// in BT.601's table (Y, Cb, Cr) and, for the coloured ones, in the BT.2020
+// matrix (Y2020, Cb2020, Cr2020): FFmpeg 7.1 and later draw them in BT.2020,
+// older builds in BT.601 (the grey ones are the same in both); the host's
+// probe accepts either (checkHDRTestFrames), so the stream carries either.
 const HDR_PATCHES = [[160, 'black', [64, 512, 512]], [192, '100 cd/m2', [508, 512, 512]], [224, '200 cd/m2', [572, 512, 512]], [256, '1000 cd/m2', [724, 512, 512]],
-  [288, '4000 cd/m2', [856, 512, 512]], [320, '10000 cd/m2', [940, 512, 512]], [352, 'red', [260, 396, 848]], [384, 'green', [452, 288, 228]], [416, 'blue', [140, 848, 456]]];
+  [288, '4000 cd/m2', [856, 512, 512]], [320, '10000 cd/m2', [940, 512, 512]], [352, 'red', [260, 396, 848], [236, 416, 848]],
+  [384, 'green', [452, 288, 228], [512, 268, 200]], [416, 'blue', [140, 848, 456], [104, 848, 484]]];
 
 async function hdrCheckOnce() {
   await page.evaluate((points) => { window.__recon.hdrCheck = null; window.__recon.worker.postMessage({ type: 'hdrCheck', points }); }, HDR_PATCHES.map(([x]) => [x + 16, 24]));
   return until(() => page.evaluate(() => window.__recon.hdrCheck), 8000, 'HDR pixel check');
 }
 
+// The canvas pixels at the patches against the CPU reference of the codes
+// the frame carried, and those codes against the host's: all patches within
+// 8 codes of one matrix's (BT.601 or BT.2020, HDR_PATCHES), not a mix.
 function hdrPixels(res) {
   const rows = [];
   let ok = !!res && !res.error && res.values?.length === HDR_PATCHES.length;
   let worst = 0;
-  let codeOff = 0;
-  HDR_PATCHES.forEach(([, name, want], i) => {
+  const off = { 'BT.601': 0, 'BT.2020': 0 };
+  HDR_PATCHES.forEach(([, name, want601, want2020 = want601], i) => {
     const code = res?.codes?.[i];
     if (!code) { ok = false; return; }
-    codeOff = Math.max(codeOff, ...code.map((v, k) => Math.abs(v - want[k])));
+    off['BT.601'] = Math.max(off['BT.601'], ...code.map((v, k) => Math.abs(v - want601[k])));
+    off['BT.2020'] = Math.max(off['BT.2020'], ...code.map((v, k) => Math.abs(v - want2020[k])));
     const ref = hdrReference(code, { mode: res.mode, white: res.white, space: res.space, peak: res.peak });
     const v = res.values[i];
     worst = Math.max(worst, ...v.map((g, k) => Math.abs(g - ref[k])));
     if (!hdrClose(v, ref, res.mode)) { ok = false; rows.push(`${name} codes ${code.join('/')}: ${v.map((x) => x.toFixed(4)).join(',')} vs ${ref.map((x) => x.toFixed(4)).join(',')}`); }
   });
-  return { ok: ok && codeOff <= 8, worst, codeOff, rows };
+  const matrix = off['BT.2020'] < off['BT.601'] ? 'BT.2020' : 'BT.601';
+  const codeOff = off[matrix];
+  return { ok: ok && codeOff <= 8, worst, codeOff, matrix, rows };
 }
 
 async function checkHdrStream(sc) {
@@ -2069,8 +2080,8 @@ async function checkHdrStream(sc) {
     !!u && !u.active && /off for HDR streams/.test(u.why || ''), JSON.stringify({ mode: u?.mode, active: u?.active, in: u?.in, out: u?.out, why: u?.why }));
   const px = hdrPixels(await hdrCheckOnce().catch((e) => ({ error: e.message })));
   check(`${name}: canvas pixels at the test pattern's patches (greys 0-10000 cd/m2, colours) = the CPU reference of the codes the frame carried; those codes = the host's (within 8)`,
-    px.ok, `worst ${px.worst.toFixed(4)}, codes off by at most ${px.codeOff}${px.rows.length ? `; ${px.rows.join('; ')}` : ''}`);
-  results.push({ hdrStream: name, cfg, hdr: h, pixels: { worst: px.worst, codeOff: px.codeOff } });
+    px.ok, `worst ${px.worst.toFixed(4)}, codes off by at most ${px.codeOff} (${px.matrix} patch codes)${px.rows.length ? `; ${px.rows.join('; ')}` : ''}`);
+  results.push({ hdrStream: name, cfg, hdr: h, pixels: { worst: px.worst, codeOff: px.codeOff, matrix: px.matrix } });
   console.log(`  ${name}: HDR path ${path}; plane copy (copyTo + writeTexture, CPU) p50 ${h?.copy?.p50} ms, p95 ${h?.copy?.p95} ms, ${(h?.bytes / 1e6).toFixed(2)} MB/frame`);
 
   // HDR Off from the drawer: tone-mapped at once, then an SDR generation.
