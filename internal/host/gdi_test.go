@@ -26,7 +26,7 @@ import (
 // The first hardware report: a Proxmox VM without a GPU, FFmpeg's ddagrab
 // failing every start with "Failed to create D3D11VA device." (gdi.go).
 
-const noDevice = "no Direct3D 11 video device: a PC or VM without a GPU"
+const noDevice = "no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset"
 
 // wineStderr is FFmpeg 8.1's real stderr for the user's ddagrab + libx264
 // generation, recorded under Wine (no Direct3D 11 video device either).
@@ -385,7 +385,7 @@ func TestCaptureFailedGDI(t *testing.T) {
 			}
 			fail(s, p, wineStderr(t), false)
 		}
-		if got := msgs(t, ctrl); len(got) != 1 || got[0] != "warn: Screen capture failed, retrying: No Direct3D 11 video device: a PC or VM without a GPU." {
+		if got := msgs(t, ctrl); len(got) != 1 || got[0] != "warn: Screen capture failed, retrying: No Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset." {
 			t.Fatalf("notices %q", got)
 		}
 	})
@@ -652,5 +652,80 @@ func TestProbeSampleGDI(t *testing.T) {
 		if _, err := caps.BuildArgs(p); err != nil {
 			t.Fatalf("%s: %v", capture, err)
 		}
+	}
+}
+
+// TestWatchGPUCapture: a GPU PC whose GPU capture fails at run time with no
+// Direct3D 11 video device (its graphics driver resets or updates: Windows
+// shows the Basic Display Adapter meanwhile) streams with GDI, checks again
+// in the background, and once GPU capture works restarts the video on it,
+// with a notice: it does not stay on GDI.
+func TestWatchGPUCapture(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in encoder is a shell script")
+	}
+	defer func(r, w time.Duration) { gpuCaptureRecheck, gpuCaptureWatchEvery = r, w }(gpuCaptureRecheck, gpuCaptureWatchEvery)
+	gpuCaptureRecheck, gpuCaptureWatchEvery = 20*time.Millisecond, 20*time.Millisecond
+	var checks atomic.Int32
+	checkGPUCapture = func(ctx context.Context, ffmpeg string) (string, string) {
+		if checks.Add(1) == 1 {
+			return noDevice, "Failed to create D3D11VA device." // still resetting
+		}
+		return "", ""
+	}
+	t.Cleanup(func() { checkGPUCapture = media.CheckGPUCapture })
+	caps := gdiTestCaps("", true) // the probe found GPU capture
+	caps.FFmpeg = filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(caps.FFmpeg, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := gdiAgent(Config{Capture: "auto"}, caps)
+	logs := &lockedLog{}
+	s, ctrl := gdiSession(a, logs)
+	a.log = s.log
+	s.video = media.NewVideo(caps, s.log, a.clock)
+	defer func() { s.cancel(); s.video.Stop() }()
+	if err := s.startVideo(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.vid().Current()
+	if p.Source.Backend != "ddagrab" {
+		t.Fatalf("first generation: %s", p.Source.Backend)
+	}
+	s.handleEncoderFailure(media.VideoEvent{Err: errors.New("encoder libx264 exited: " + wineStderr(t)), Failed: &p,
+		CaptureFailure: media.ClassifyCapture(wineStderr(t))})
+	backend := func() string {
+		p, _ := s.vid().Current()
+		return p.Source.Backend
+	}
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if ok() {
+				return
+			}
+		}
+		t.Fatalf("%s; log:\n%s", what, strings.Join(logs.lines(""), "\n"))
+	}
+	waitFor("no GDI generation after the failure", func() bool { return backend() == "gdigrab" })
+	waitFor("not back on the GPU", func() bool { return backend() == "ddagrab" })
+	if n := checks.Load(); n != 2 {
+		t.Fatalf("%d checks, want 2 (the first still failed)", n)
+	}
+	var got []string
+	for _, n := range ctrlNotices(t, ctrl) {
+		got = append(got, n.Level+": "+n.Msg)
+	}
+	want := []string{"warn: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency.",
+		"info: GPU screen capture works again: capturing on the GPU."}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("notices %q, want %q", got, want)
+	}
+	if l := logs.lines(`msg="restarting video" reason="GPU screen capture works again" urgent=false`); len(l) != 1 {
+		t.Fatalf("restart %q", l)
+	}
+	time.Sleep(100 * time.Millisecond) // the watch has ended: no more checks
+	if n := checks.Load(); n != 2 {
+		t.Fatalf("%d checks after GPU capture came back", n)
 	}
 }

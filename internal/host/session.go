@@ -94,6 +94,7 @@ type Session struct {
 	restartNote   string
 	restartNoteAt time.Time
 	liveSinceNote bool
+	gpuWatch      atomic.Bool // watchGPUCapture runs
 
 	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
 	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()

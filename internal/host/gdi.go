@@ -21,13 +21,20 @@ import (
 // alike. A session whose Desktop Duplication keeps refusing its display (a
 // remote desktop session) moves to GDI for itself. Capture failures the
 // same capture gets past (the secure desktop, a mode change) keep it.
+//
+// A GPU PC can look like a PC without one for a while: while its graphics
+// driver resets (TDR) or is updated, Windows shows the Basic Display Adapter
+// and D3D11VA device creation fails the same way. GDI keeps such a stream
+// going, and the finding is checked again (recheckGPUCapture,
+// watchGPUCapture) so the PC goes back to GPU capture once its driver is
+// there.
 
 // gpuCaptureRecheck is how long a finding of no GPU capture holds before a
 // session start checks again (in the background: the session that starts
 // does not wait). A GPU driver installed, or one that was being updated
-// when the finding was made (Windows shows the Basic Display Adapter for
-// it), brings GPU capture back without an agent restart.
-const gpuCaptureRecheck = time.Minute
+// when the finding was made, brings GPU capture back without an agent
+// restart. Tests shorten it.
+var gpuCaptureRecheck = time.Minute
 
 // checkGPUCapture is media.CheckGPUCapture (tests replace it).
 var checkGPUCapture = media.CheckGPUCapture
@@ -59,6 +66,16 @@ func (a *Agent) noGPUCapture(why string) {
 	a.gpuCap.mu.Lock()
 	defer a.gpuCap.mu.Unlock()
 	a.gpuCap.found, a.gpuCap.why, a.gpuCap.at = true, why, time.Now()
+}
+
+// gpuCaptureLostLive reports whether the finding of no GPU capture in force
+// is a session's, made while the agent ran (the probe had found GPU capture
+// working, or could not tell): a graphics driver reset or update, more likely
+// than a PC without a GPU.
+func (a *Agent) gpuCaptureLostLive() bool {
+	a.gpuCap.mu.Lock()
+	defer a.gpuCap.mu.Unlock()
+	return a.gpuCap.found && a.gpuCap.why != ""
 }
 
 // recheckGPUCapture checks GPU capture again in the background when the
@@ -207,9 +224,59 @@ func (s *Session) noteGDI(backend string, window bool) {
 	s.log.Info("capturing with GDI (gdigrab)", attrs...)
 	if pc {
 		s.notice("warn", "No GPU screen capture on this PC ("+why+"): capturing with GDI, which uses more CPU and adds latency.")
+		if s.a.gpuCaptureLostLive() {
+			s.watchGPUCapture()
+		}
 	} else {
 		s.notice("warn", "Screen capture on the GPU failed ("+why+"): capturing with GDI for this session, which uses more CPU and adds latency.")
 	}
+}
+
+// gpuCaptureWatchEvery is how often a session on GDI after a finding made
+// at run time checks whether GPU capture works again (watchGPUCapture;
+// tests shorten it).
+var gpuCaptureWatchEvery = time.Minute
+
+// watchGPUCapture runs while the session captures with GDI after a session
+// found no Direct3D 11 video device at run time (gpuCaptureLostLive: a
+// graphics driver reset or update, where the probe had found GPU capture).
+// Every gpuCaptureWatchEvery it has the finding checked again
+// (recheckGPUCapture, in the background), and once GPU capture works it
+// restarts the video on it (overlapped, so the picture does not stop), so a
+// GPU PC does not stay on GDI. A session that moved to GDI for its own
+// display's sake (sessionGDI) stays. One watch per session at a time.
+func (s *Session) watchGPUCapture() {
+	if !s.gpuWatch.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.gpuWatch.Store(false)
+		t := time.NewTicker(gpuCaptureWatchEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-t.C:
+			}
+			if s.a.gpuCaptureBlocked() != "" {
+				s.a.recheckGPUCapture()
+				continue
+			}
+			s.prefsMu.Lock()
+			s.gdiNoted = "" // a later loss is told again
+			s.prefsMu.Unlock()
+			if s.sessionGDI() != "" {
+				return
+			}
+			s.log.Info("GPU screen capture works again: restarting the video on it")
+			s.notice("info", "GPU screen capture works again: capturing on the GPU.")
+			if err := s.startVideo(false, "GPU screen capture works again"); err != nil {
+				s.log.Warn("restart on GPU screen capture failed", "err", err)
+			}
+			return
+		}
+	}()
 }
 
 // restartNoticeRepeat is how long an identical restart notice is held back

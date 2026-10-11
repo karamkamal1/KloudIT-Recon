@@ -82,7 +82,7 @@ var (
 // libavdevice/gdigrab.c).
 var captureRules = []captureRule{
 	{gpuSources, "Failed to create D3D11VA device", CaptureNoDevice,
-		"no Direct3D 11 video device: a PC or VM without a GPU"},
+		"no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset"},
 	{ddaSource, "Selected output not supported", CaptureUnsupported,
 		"Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support"},
 	{ddaSource, "Failed to enumerate DXGI output", CaptureUnsupported,

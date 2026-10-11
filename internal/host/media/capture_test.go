@@ -82,7 +82,7 @@ func TestClassifyCapture(t *testing.T) {
 			t.Errorf("%s: text %q has parentheses or a final stop (notices embed it)", c.name, got.Text)
 		}
 	}
-	if got := ClassifyCapture(userReport).Text; got != "no Direct3D 11 video device: a PC or VM without a GPU" {
+	if got := ClassifyCapture(userReport).Text; got != "no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset" {
 		t.Errorf("the user's case reads %q", got)
 	}
 }
@@ -127,7 +127,7 @@ func TestParseDevices(t *testing.T) {
 // probe's real option lists), as on a PC whose GPU capture failed.
 func gdiCaps(t *testing.T) *Caps {
 	c := caps81(t)
-	c.SetGPUCaptureBlocked("no Direct3D 11 video device: a PC or VM without a GPU")
+	c.SetGPUCaptureBlocked("no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset")
 	return c
 }
 
@@ -287,7 +287,7 @@ func TestCheckGPUCapture(t *testing.T) {
 		name, body      string
 		blocked, detail string
 	}{
-		{"no device", "echo \"$@\" > " + args + "; cat " + wine + " >&2; exit 171", "no Direct3D 11 video device: a PC or VM without a GPU",
+		{"no device", "echo \"$@\" > " + args + "; cat " + wine + " >&2; exit 171", "no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset",
 			"Failed to create D3D11VA device."},
 		{"secure desktop", "echo '[Parsed_ddagrab_0 @ 0000020a] Desktop duplication access denied' >&2; exit 1", "",
 			"Desktop duplication access denied"},
@@ -327,7 +327,7 @@ func TestWriteReportGDI(t *testing.T) {
 	t.Logf("report:\n%s", out)
 	for _, s := range []string{
 		"capture:    ddagrab=true gfxcapture=true vsrc_amf=true gdigrab=true\n",
-		"capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU): using gdigrab (GDI: more CPU and latency)\n",
+		"capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): using gdigrab (GDI: more CPU and latency)\n",
 		"session:    gdigrab (GDI) of the 1280x800 monitor at (0,0), 60 fps, 30 Mbit/s, quality balanced, adaptive bitrate, capture timestamps (command lines below)\n",
 		"encoder:    libx264      h264  software\n            ffmpeg -hide_banner -loglevel warning -nostdin -fpsprobesize 0 -f gdigrab -framerate 60 -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size 1280x800 -i desktop -filter_complex \"[0:v]null,settb=AVTB,setpts=time(0)*1000000,format=yuv420p[v]\" -map \"[v]\" -c:v libx264 ",
 		"encoder:    hevc_nvenc   hevc  nvidia\n            ffmpeg -hide_banner -loglevel warning -nostdin -fpsprobesize 0 -f gdigrab ",
@@ -339,7 +339,7 @@ func TestWriteReportGDI(t *testing.T) {
 	c.Devices["gdigrab"] = false
 	buf.Reset()
 	c.WriteReport(&buf, sample)
-	if !strings.Contains(buf.String(), "capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU): no gdigrab in this ffmpeg either: sessions cannot capture the screen\n") ||
+	if !strings.Contains(buf.String(), "capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): no gdigrab in this ffmpeg either: sessions cannot capture the screen\n") ||
 		!strings.Contains(buf.String(), "no command line: this ffmpeg build lacks the gdigrab input device") {
 		t.Fatalf("report without gdigrab:\n%s", buf.String())
 	}
