@@ -281,6 +281,7 @@ PC's card then shows **Online**.
 | If you see… | Do this |
 |---|---|
 | `NVENC needs a newer NVIDIA driver` / `No GPU encoder works` | Update the graphics driver, then `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`. The `unusable:` lines say why each GPU encoder failed. |
+| `This PC has no GPU screen capture` (`capture: ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): using gdigrab`) | Expected on a PC or virtual machine without a graphics card (Windows shows only the *Microsoft Basic Display Adapter*): streams work, captured with GDI and encoded on the CPU, with more latency and CPU use. See "Running on a PC or VM without a GPU" in the README. A PC with a GPU: install its driver, then run the installer again. |
 | `The native encoder helper (recon-encoder.exe) cannot encode on this PC` (`helper: no usable encoder`, `does not run` or `not installed`) | Streams still work, through FFmpeg, but a lost frame costs a key frame and bitrate changes restart the encoder. The `unavailable:` lines under `helper:` say why for each backend (`amf`, `nvenc`, `lavc`). Usually: update the graphics driver (NVIDIA needs 570 or newer), then restart the agent as above. `not installed`: the bundle had no `recon-encoder.exe` (a self-built one without mingw-w64); use the CI bundle. |
 | `Network '…' is set to Public` | Run the `Set-NetConnectionProfile` command it prints (see step 6). |
 | `has not reached the gateway yet` | Check `Test-NetConnection 192.168.1.50 -Port 8443` (TCP). The agent itself needs **UDP** 8443, which third-party firewalls or VPN clients can block. Also check that the pairing code was created while browsing via `https://192.168.1.50:8443`. |
@@ -332,6 +333,22 @@ set `"pipeline": "ffmpeg"` in `%APPDATA%\KlouditRecon\host.json` and restart the
 then use FFmpeg only. Please report what happened, with `host.log`. Delete the line again to go
 back. To check a new PC stage by stage, starting with that FFmpeg-only setting, follow
 [HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md).
+
+**The stream never starts and the browser repeats `Video encoder restarted (encoder libx264
+exited: [Parsed_ddagrab_0 @ 000002bda68effc0] Failed to create D3D11VA device. |
+[Parsed_ddagrab_0 @ 000002bda68effc0] Failed to configure outpu)`.** The PC has no Direct3D 11
+video device for GPU screen capture: a virtual machine without a GPU (Proxmox's default display,
+Windows' *Microsoft Basic Display Adapter*), or a GPU whose driver is missing. An agent from
+before this version kept retrying the GPU capture; this version captures with GDI instead and
+says so once (`No GPU screen capture on this PC (no Direct3D 11 video device: a PC or VM without
+a GPU, or a graphics driver being installed or reset): capturing with GDI, which uses more CPU
+and adds latency.`). Upgrade the agent (see Upgrading). `host.log` then has `ffmpeg ready ...
+gdigrab=true gpu_capture="unavailable: no Direct3D 11 video device: ..."` at the start and
+`capturing with GDI (gdigrab)` per stream; a stream whose GPU capture fails this way after the
+start logs `GPU screen capture failed: capturing with GDI (gdigrab)` with FFmpeg's line
+(`ffmpeg="Failed to create D3D11VA device."`). Sign in on the VM's console, or keep a remote
+desktop session connected: a disconnected remote desktop session has no display to capture
+(README, "Running on a PC or VM without a GPU").
 
 **On the PC, for the best results** (GUIDE section 12):
 

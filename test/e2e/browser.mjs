@@ -93,6 +93,9 @@ function freeUdpPort() {
 //   E2E_HOST_CMD='["xvfb-run","-a","/usr/lib/wine/wine64"]'  E2E_HOST_FFMPEG=/path/to/ffmpeg.exe
 // Under Wine the agent runs elevated, so it runs only an ffmpeg.exe inside its own folder
 // (dist/host-windows-amd64/ffmpeg/bin/ffmpeg.exe): Wine reports every file as the user's.
+// E2E_HOST_CAPTURE replaces the host's capture "test", e.g. "auto": under Wine (no Direct3D 11
+// video device, like a PC or VM without a GPU) the agent then captures the X display with GDI
+// (gdigrab); the test pattern's barcode checks do not apply to such a stream.
 const hostCmd = process.env.E2E_HOST_CMD ? JSON.parse(process.env.E2E_HOST_CMD) : [];
 const hostBin = process.env.E2E_HOST_BIN ? join(root, process.env.E2E_HOST_BIN) : null;
 const nativeInputLog = !hostBin; // the logging input backend only exists on non-Windows hosts
@@ -4598,6 +4601,7 @@ try {
   // datagram + FEC scenario turns it on (checkFec).
   const hostCfg = { capture: 'test', testWidth: 960, testHeight: 540, testPad: TEST_PAD, directPort, directAddr: '127.0.0.1', audio: true, logLevel: 'debug', hdr: 'auto', fec: 'off' };
   if (process.env.E2E_HOST_FFMPEG) hostCfg.ffmpeg = process.env.E2E_HOST_FFMPEG;
+  if (process.env.E2E_HOST_CAPTURE) hostCfg.capture = process.env.E2E_HOST_CAPTURE;
   writeFileSync(cfgPath, JSON.stringify(hostCfg));
   const pair = run('recon-host', ['-config', cfgPath, 'pair', code], {}, 'pair');
   await new Promise((r) => pair.on('exit', r));

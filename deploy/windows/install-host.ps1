@@ -640,12 +640,22 @@ Write-Host $probe
 if ($probe -match 'minimum required Nvidia driver[^|\r\n]*') {
     Write-Warning "NVENC needs a newer NVIDIA driver ($($Matches[0].Trim())). Update it (NVIDIA App or nvidia.com), then run Stop-ScheduledTask '$TaskName'; Start-ScheduledTask '$TaskName'."
 }
-if ($probe -notmatch '(?m)^encoder:\s+\S+\s+\S+\s+(nvidia|amd|intel)') {
+# A PC or VM without a GPU (only the Microsoft Basic Display Adapter): no GPU screen capture
+# ("capture: ddagrab unavailable (...)" above), so streams capture with GDI and encode on the CPU.
+# The GPU encoder and helper warnings below would only repeat that.
+$noGpu = $probe -match '(?m)^capture:\s+ddagrab unavailable'
+if ($noGpu) {
+    Write-Warning ('This PC has no GPU screen capture (no Direct3D 11 video device: a PC or VM without a GPU, or a GPU without its driver). ' +
+        'Streams work, but capture with GDI and encode on the CPU: expect more CPU use and latency than on a gaming PC. ' +
+        'If the PC has a GPU, install its driver, then run the installer again. ' +
+        'See "Running on a PC or VM without a GPU" in the README.')
+}
+if (-not $noGpu -and $probe -notmatch '(?m)^encoder:\s+\S+\s+\S+\s+(nvidia|amd|intel)') {
     Write-Warning 'No GPU encoder works, so video will be encoded on the CPU (higher latency). Install or update the graphics driver; the "unusable:" lines above say why each GPU encoder failed.'
 }
 # The native encoder helper is the default video pipeline on AMD and NVIDIA (the "helper:" lines
 # above); without a usable backend sessions stream through FFmpeg's command line instead.
-if ($probe -match '(?m)^helper:\s+(no usable encoder|does not run|not installed)') {
+if (-not $noGpu -and $probe -match '(?m)^helper:\s+(no usable encoder|does not run|not installed)') {
     Write-Warning ('The native encoder helper (recon-encoder.exe) cannot encode on this PC, so streams use FFmpeg: ' +
         'a lost frame then costs a key frame and bitrate changes restart the encoder. The "helper:" and "unavailable:" lines above say why; ' +
         "update the graphics driver (NVIDIA: 570 or newer), then run Stop-ScheduledTask '$TaskName'; Start-ScheduledTask '$TaskName'.")

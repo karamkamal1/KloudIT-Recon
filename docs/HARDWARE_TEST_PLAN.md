@@ -1187,6 +1187,92 @@ the results in the `NVIDIA:` lines. What differs:
 | 14 | T8 with HAGS on and off, and `nvenc` in place of `amf` in the lines. |
 | 15-16 | Not GPU-specific: the same. |
 
+## A PC or VM without a GPU (the first hardware report)
+
+The first report came from a Windows VM on Proxmox without a GPU (Windows showed only the
+*Microsoft Basic Display Adapter*): every stream failed with `Video encoder restarted (encoder
+libx264 exited: [Parsed_ddagrab_0 @ ...] Failed to create D3D11VA device. | ...)`, five toasts
+in a row. Such a PC now captures with GDI (VENDOR_NOTES, "First hardware report: GPU-less VM
+capture"). Run these on that VM (any GPU-less Windows 10/11 VM or PC), signed in on its console;
+items G4 to G6 on the AMD PC.
+
+**G1. Probe and install**
+- **Do**: install as in Stage 1 (or `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`).
+- **Look at**: the `capture:` lines, the `session:` line, the installer's warnings, host.log's
+  `ffmpeg ready` line after the agent starts.
+- **Pass**: `capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU,
+  or a graphics driver being installed or reset): using gdigrab (GDI: more CPU and latency)`;
+  `session:    gdigrab (GDI) of the WxH monitor at (0,0), ...` with `-f gdigrab -framerate 60
+  -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size WxH -i desktop` under `libx264`; `helper:     no
+  usable encoder`; one installer warning, `This PC has no GPU screen capture ...` (not also "No GPU
+  encoder works" and the helper's); `ffmpeg ready ... gdigrab=true gpu_capture="unavailable: no
+  Direct3D 11 video device: ..."`.
+- **If not, send**: the probe output, the installer's output and host.log.
+
+**G2. Stream from the console**
+- **Do**: connect from a browser with the defaults; then Resolution 1280×720 and Frame rate 30 in
+  the settings drawer; move windows and play a video on the VM for a minute.
+- **Look at**: the toasts, the overlay (Encoder, fps, latency), host.log, Task Manager on the VM.
+- **Pass**: the picture appears within about 2 s, with one toast, `No GPU screen capture on this PC
+  (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or
+  reset): capturing with GDI, which uses more CPU and adds latency.`; no `Video encoder restarted`.
+  Encoder `libx264`; the stream holds its frame rate at 1280×720 (record fps, capture→drawn p50/p95
+  and the VM's CPU use at the defaults and at 1280×720@30). The pointer moves where you click
+  (desktop mouse mode), on the right monitor with two. host.log: `video pipeline pipeline=ffmpeg ...
+  reason="it has no usable encoder"` (one helper launch, no `trying another backend`), `capturing
+  with GDI (gdigrab)`, `starting encoder gen=1 ... capture=gdigrab`, no `encoder failed`.
+- **If not, send**: host.log, a screenshot of the overlay, the numbers above.
+
+**G3. Remote desktop**
+- **Do**: sign in to the VM over RDP instead of the console, connect from the browser while the
+  RDP client stays connected; then disconnect the RDP client (close its window) and connect
+  again; then sign in over RDP once more and run, elevated, `tscon
+  ([System.Diagnostics.Process]::GetCurrentProcess().SessionId) /dest:console`, and connect.
+- **Look at**: whether the picture appears, the toasts, host.log (`encoder failed`, `capturing
+  with GDI`).
+- **Pass**: RDP connected: the stream shows the RDP session's desktop (with GDI). Disconnected:
+  no capture works (record what happens: a black picture, or failures such as `Screen capture
+  failed, retrying: GDI screen capture failed: is the session locked or disconnected?`), and
+  each kind of failure shows one toast, not a stack. After `tscon`: the stream works as in G2.
+- **If not, send**: host.log and what the browser showed in each case.
+
+**G4. A GPU PC keeps Desktop Duplication through outages (AMD PC)**
+- **Do**: on the AMD PC with `"pipeline": "ffmpeg"`, stream; press Win+L (lock screen) and sign
+  in again after 5 s; trigger a UAC prompt (`Start-Process notepad -Verb RunAs`) and answer it;
+  change the display resolution and back.
+- **Look at**: host.log after each, the toasts, `recon-host probe`.
+- **Pass**: probe shows `capture:    ddagrab=true ...` and no `ddagrab unavailable` line. After
+  each outage the stream comes back on ddagrab (`starting encoder ... capture=ddagrab`), never
+  `capturing with GDI`; each kind of outage shows its toast once (`Screen capture failed,
+  retrying: Windows does not let programs capture the secure desktop: ...` or `... Desktop
+  Duplication lost the display: ...`). A lock screen that lasts longer than the session's seven
+  restarts (about 10 s) ends the session as before (`video encoder keeps failing`).
+- **If not, send**: host.log.
+
+**G5. Remote desktop into the GPU PC (AMD PC)**
+- **Do**: with `"pipeline": "ffmpeg"`, sign in over RDP and stream from the browser while the
+  RDP client is connected.
+- **Look at**: host.log (`encoder failed`, `GPU screen capture failed: capturing with GDI`), the
+  toasts.
+- **Pass**: either ddagrab works in the RDP session (record it), or after two failures
+  (`Selected output not supported`, or `Failed to enumerate DXGI output`) the session captures
+  with GDI and says `Screen capture on the GPU failed (Desktop Duplication cannot ...):
+  capturing with GDI for this session ...` once; the next session from the console uses ddagrab
+  again.
+- **If not, send**: host.log.
+
+**G6. A graphics driver reset during a stream (AMD PC)**
+- **Do**: with `"pipeline": "ffmpeg"`, stream; force a driver reset (TDR) with `dxcap -forcetdr`
+  (Windows' optional feature *Graphics Tools*, in an elevated prompt), or update the graphics
+  driver while streaming.
+- **Look at**: the toasts, host.log (`GPU screen capture failed`, `GPU screen capture works
+  again`, `starting encoder ... capture=`), for 3 minutes.
+- **Pass**: the stream comes back on ddagrab by itself, either at once (the reset was over by the
+  restart) or after `No GPU screen capture on this PC (...)` on GDI for a minute or two (checked every minute),
+  then `GPU screen capture works again: capturing on the GPU.` and `capture=ddagrab`. The next
+  session starts on ddagrab.
+- **If not, send**: host.log.
+
 ## Not covered by these two hosts
 
 - The `Intel (...)` lines of 3.8 and 3.8 wiring (Quick Sync through the libavcodec backend)

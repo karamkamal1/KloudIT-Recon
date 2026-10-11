@@ -563,9 +563,32 @@ clock sync keeps its lowest-RTT sample).
 ```
 ddagrab / gfxcapture  ──D3D11 texture──►  NVENC / AMF  (QSV: hwmap + vpp_qsv → NV12)
 vsrc_amf (opt-in)     ──AMF surface────►  AMF only
-     │ (no CPU copy)                          │
+gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──► libx264 (NV12 to a GPU encoder)
+     │ (no CPU copy on the GPU paths)         │
      └────────── ffmpeg child process ────────┴──► NUT on stdout ──► Go demuxer ──► frame queue
 ```
+
+- **GDI capture without a GPU (`gdigrab`, `internal/host/gdi.go`, `media/capture.go`):** ddagrab
+  and gfxcapture both open FFmpeg's D3D11VA device (a Direct3D 11 device with video support),
+  which a PC or VM without a GPU does not have (the Microsoft Basic Display Adapter and Basic
+  Render Driver): every start fails with `Failed to create D3D11VA device.` The probe opens
+  ddagrab for one frame next to its encoder tests (no extra start-up time; a timeout or a failure
+  of the moment, such as the secure desktop at logon, is no finding), and where that is the error
+  the agent captures with gdigrab: the monitor's rectangle in physical pixels
+  (`-offset_x/-offset_y -video_size`), at the stream's frame rate, the cursor drawn only for
+  clients that want it, `settb/setpts=time(0)` right after the source as on the GPU paths, scaled
+  and converted on the CPU in one swscale pass (yuv420p for software encoders, NV12 for
+  NVENC/AMF/QSV). At run time the session classifies FFmpeg's stderr (`media.ClassifyCapture`, by
+  the capture source's log context): no D3D11VA device moves the session, and the agent's later
+  sessions, to GDI at once (the agent re-checks a minute later, in the background, so a driver
+  installed meanwhile brings GPU capture back; a session that lost GPU capture while it ran, as in
+  a driver reset or update where Windows shows the Basic Display Adapter for a while, checks every
+  minute and restarts its video on the GPU once it works); Desktop Duplication refusing the
+  display (DXGI_ERROR_UNSUPPORTED, no such output, E_INVALIDARG) twice in a row moves only that
+  session; the secure desktop (E_ACCESSDENIED), DXGI_ERROR_ACCESS_LOST and size changes keep
+  Desktop Duplication, which the restart retries, because GDI cannot capture the secure desktop
+  either. One notice says so; an identical restart notice is not repeated until a generation has
+  gone live and a minute has passed.
 
 - **AMD Direct Capture (experimental, `capture: "amf"`):** FFmpeg 8.1's `vsrc_amf` in
   `wait_for_present` mode delivers each present of DWM or a fullscreen game as an AMF surface on

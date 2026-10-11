@@ -11673,3 +11673,189 @@ build, AMF or NVENC runtime); without an X display two tests that need Wine's D3
 (`TestHelperVideoStallRestart`, `TestQualifyNvencTestDouble`) fail at device creation
 (`DXGI_ERROR_UNSUPPORTED`), as the Makefile says to run it under Xvfb. Both installer scripts
 parse with pwsh 7, and the pwsh run of their new functions passes 20 of 20 checks.
+
+## First hardware report: GPU-less VM capture
+
+The report: KloudIT Recon installed on a Windows VM on Proxmox with no GPU (Windows lists only
+the *Microsoft Basic Display Adapter* / *Basic Render Driver*). Every stream failed, and the
+page showed five identical toasts: `Video encoder restarted (encoder libx264 exited:
+[Parsed_ddagrab_0 @ 000002bda68effc0] Failed to create D3D11VA device. | [Parsed_ddagrab_0 @
+000002bda68effc0] Failed to configure outpu)`. No GPU encoder exists there, the native helper
+has none either, so sessions ran FFmpeg with libx264 (correct), but captured with ddagrab, and
+ddagrab (like gfxcapture) opens FFmpeg's D3D11VA device first: `D3D11CreateDevice` with
+`D3D11_CREATE_DEVICE_VIDEO_SUPPORT` on the default adapter, then `ID3D11VideoDevice` and
+`ID3D11VideoContext` (libavutil/hwcontext_d3d11va.c; the last two fail silently, which is why
+the report has no `Failed to create Direct3D device` line). The Basic Render Driver (WARP) has
+no video support, so every restart failed the same way, and nothing on the PC could capture.
+
+What changed (`internal/host/gdi.go`, `internal/host/media/capture.go`, BuildArgs' `gdigrab`
+source):
+
+- **GDI capture.** Host config `capture` takes `gdigrab` (config validation now refuses unknown
+  values). BuildArgs: `-fpsprobesize 0 -f gdigrab -framerate <fps> -draw_mouse <0|1> -offset_x X
+  -offset_y Y -video_size WxH -i desktop`, the monitor's virtual-desktop rectangle in physical
+  pixels as the per-monitor-DPI-aware agent lists it (an even size: 4:2:0), then
+  `[0:v]null,settb=AVTB,setpts=time(0)*1000000` (Phase 0 capture stamps, as on ddagrab), CPU
+  scaling to the stream's size in the conversion's swscale pass, `format=yuv420p` for software
+  encoders and `format=nv12` for NVENC, AMF and QSV (system-memory frames; QSV takes no yuv420p
+  and would turn BGRA into 4:4:4 HEVC). Absolute pointer input maps to the monitor as before
+  (buildParams). `-fpsprobesize 0`: without it FFmpeg warned `Stream #0: not enough frames to
+  estimate rate` into every stderr (a 1080p frame exceeds the probe size), which led every
+  failure's text. A window (`window`) is not captured alone: GDI captures its monitor
+  (`title=` is an exact title in gdigrab, not the regex the protocol carries); host.log says so.
+- **Detection.** The probe opens `ddagrab=output_idx=0` for one frame (`-loglevel error -frames:v 1
+  -f null -`, 10 s timeout) next to its encoder tests (no extra start-up time) and parses `ffmpeg
+  -devices` for gdigrab. Only `Failed to create D3D11VA device` from ddagrab is a finding
+  (`Caps.GPUCaptureBlocked`); a timeout (a display that is off) or another failure (the secure
+  desktop at logon) is not. With a finding, `auto`, `ddagrab`, `gfxcapture` and `amf` capture with
+  gdigrab. `recon-host probe` prints `capture:    ddagrab unavailable (no Direct3D 11 video device:
+  a PC or VM without a GPU, or a graphics driver being installed or reset): using gdigrab (GDI: more
+  CPU and latency)`, host.log's `ffmpeg ready` has `gdigrab=true gpu_capture="unavailable: ..."`,
+  and the installer shows one warning instead of "No GPU encoder works" and the helper's.
+- **At run time** (`media.ClassifyCapture`, by the capture source's log context: ddagrab,
+  gfxcapture, gdigrab's `in#0`): `Failed to create D3D11VA device` (ddagrab or gfxcapture) moves the
+  session to gdigrab at once, as no failure of its own, and the agent keeps the finding for later
+  sessions; a session start re-checks it in the background once it is a minute old (only a capture
+  that opens lifts it: a GPU driver installed, or one that was being updated, Windows shows the
+  Basic Display Adapter meanwhile). A GPU PC can hit this error at run time too, while its graphics
+  driver resets (TDR) or updates: a session that lost GPU capture that way (the probe had found it)
+  keeps streaming with GDI, checks every minute (`watchGPUCapture`) and restarts its video on the
+  GPU once a capture opens, with `GPU screen capture works again: capturing on the GPU.`, so a GPU
+  PC is never left on GDI; the text says so (`no Direct3D 11 video device: a PC or VM without a
+  GPU, or a graphics driver being installed or reset`). Desktop Duplication refusing the display (`Selected output not
+  supported` = DXGI_ERROR_UNSUPPORTED, `Failed to enumerate DXGI output`, `Invalid output
+  duplication argument` = E_INVALIDARG) twice in a row without a live generation in between moves
+  only that session (a mode change can cause one; a remote desktop session every one). Kept on
+  Desktop Duplication and retried as before: `Desktop duplication access denied` (E_ACCESSDENIED:
+  the secure desktop, which GDI cannot capture either), `AcquireNextFrame failed: 887a0026`
+  (DXGI_ERROR_ACCESS_LOST), `Output parameters changed!`, `Too many open duplication sessions`,
+  `Failed duplicating output`. The switch is one host.log line with FFmpeg's line (`GPU screen
+  capture failed: capturing with GDI (gdigrab) for="this PC" ... ffmpeg="Failed to create D3D11VA
+  device."`; the `encoder failed` line before it has the raw stderr) and one notice (`No GPU screen
+  capture on this PC (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver
+  being installed or reset): capturing with GDI, which uses more CPU and adds latency.`).
+- **Notices.** Known capture failures read as a sentence (`Screen capture failed, retrying:
+  Windows does not let programs capture the secure desktop: a UAC prompt or the lock screen.`);
+  other FFmpeg errors lose their `[Parsed_ddagrab_0 @ 000002bda68effc0]` contexts, which took
+  most of the 160 characters. An identical restart notice is not repeated until a generation
+  went live since and a minute passed (the helper's restart notices too).
+- **Native helper.** `recon-encoder.exe --print-caps` on a desktop without a GPU encoder (the
+  mingw build of this tree under Wine 9, Xvfb): `"backend":"none"`, `"codecs":{}`, `"capture":[]`,
+  `unavailable` amf (amfrt64.dll not found), nvenc (nvEncodeAPI64.dll not found), lavc
+  (libraries not installed), amd-direct, wgc; 1.0 s including Wine's start. The session's
+  first launch reports no usable encoder and the selection ends there: one launch, `video
+  pipeline pipeline=ffmpeg reason="it has no usable encoder" skipped="amf: ...; nvenc: ...;
+  lavc: ..."`, no helper failures to count. The helper is not skipped on the FFmpeg finding:
+  a VM whose passthrough GPU is a second adapter has no D3D11 video device on adapter 0, yet a
+  GPU encoder.
+
+Deviations from the request: E_ACCESSDENIED from DuplicateOutput is not a switch to GDI (the
+request listed it with RDP, and the UAC secure desktop as transient): Microsoft documents it
+for the secure desktop, where GDI fails too, so a GPU PC keeps Desktop Duplication through a
+UAC prompt; a remote desktop session refuses with DXGI_ERROR_UNSUPPORTED, which does switch.
+gdigrab window capture (`title=`) is not implemented. The Windows `recon-host.exe` cannot reach
+the gateway under Wine 9.0: Go 1.23+ calls `WSAIoctl(SIO_UDP_NETRESET)` on every UDP socket,
+which Wine 9.0 does not implement (`dial 127.0.0.1:...: listen udp 0.0.0.0:0: wsaioctl: winapi
+error #10045` in its host.log, browser E2E with `E2E_HOST_BIN`/`E2E_HOST_CAPTURE=auto` timing
+out at "pairing dialog detects the agent"), so the end-to-end run under Wine is the session test
+below (real Windows FFmpeg, real desktop, the session's code, frames out; no network).
+
+Verified in the sandbox (Linux, Wine 9.0 with Xvfb 1280x720, no GPU; the Windows FFmpeg
+`n8.1.3-14-g330caae0c1-20261006` BtbN win64 GPL build the installer downloads):
+
+- The user's error reproduced: the session's exact ddagrab + libx264 command line exits 171 with
+  `[Parsed_ddagrab_0 @ ...] Failed to create D3D11VA device.`, `Failed to configure output pad on
+  Parsed_ddagrab_0`, `Error configuring filter graph`, `[enc:libx264 @ ...] Could not open
+  encoder before EOF` (testdata `ffmpeg81-stderr-ddagrab-libx264.txt`); the probe's test gives
+  the same line with `wrapped_avframe`; gfxcapture fails earlier under Wine (`Failed opening
+  "coremessaging.dll"`), its D3D11VA message is the same string in vsrc_gfxcapture_winrt.cpp.
+- gdigrab under Wine: `ffmpeg -hide_banner -loglevel warning -nostdin -f gdigrab -framerate 60
+  -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size 1280x720 -i desktop -filter_complex
+  "[0:v]settb=AVTB,setpts=time(0)*1000000,format=yuv420p[v]" -map "[v]" -c:v libx264 -preset
+  superfast -tune zerolatency -b:v 30000k -maxrate 30000k -bufsize 750k -g 216000 -bf 0
+  -enc_time_base 1:1000000 -fps_mode passthrough -an -sn -dn -flush_packets 1 -frames:v 180 -f
+  nut -write_index 0 pipe:1`: 180 H.264 frames in 3.07 s (58.6 fps), pts the wall clock in µs;
+  with `-fpsprobesize 0`, `-draw_mouse 1`, `scale=960:540:...,format=nv12`: 960x540, no warning.
+  An area outside the desktop: `[in#0 @ ...] Capture area (1280,0),(2560,720) extends outside
+  window area (0,0),(1280,720)` (testdata `ffmpeg81-stderr-gdigrab-outside.txt`).
+- `recon-host.exe probe` (this tree, Windows build) under Wine prints the `capture: ddagrab
+  unavailable (...): using gdigrab` line, `session: gdigrab (GDI) of the 1280x720 monitor at
+  (0,0), ...` and the gdigrab command line under libx264, libsvtav1 and libaom-av1, `helper:
+  no usable encoder`; the installer's new regexes (pwsh 7) on that output give the one no-GPU
+  warning and neither of the others.
+- `TestSessionGDIWindows` (Windows test binary under Wine, `RECON_TEST_FFMPEG` = that
+  ffmpeg.exe, the real monitor list): the probe finds no GPU capture and a session streams
+  gdigrab + libx264 from generation 1 (first frame 0.6-1.4 s after the start, 30 frames in 1.6-2.3
+  s, capture stamps on every frame, one notice); with the finding cleared (an agent from before),
+  generation 1 fails on ddagrab with FFmpeg's real error, the session switches (`for="this PC"
+  ... ffmpeg="Failed to create D3D11VA device."`) and generation 2 streams gdigrab (first frame
+  1.2-2.4 s after the start), one notice, no restart notice. One run with the check's first limit
+  (5 s) skipped: the probe had made no finding, its ddagrab check timed out next to the encoder
+  tests under Wine; with 10 s it passed three runs in a row. Under Wine only, every generation
+  logs `gpu priority: failed` (gdi32 has no `D3DKMTSetProcessSchedulingPriorityClass`).
+- Go tests: `media`: `TestClassifyCapture` (the Wine stderr files, the user's cut notice, every
+  vsrc_ddagrab.c message above, gdigrab's, lines of other filters and without a context),
+  `TestPlainFFmpegError`, `TestParseDevices` (the real `-devices` output), `TestGDIGrabArgs`
+  (offsets incl. negative, size, fps, cursor, capture stamp position, scaling, yuv420p for
+  libx264/libsvtav1 and nv12 for hevc_nvenc/av1_amf/h264_qsv, no hwdownload/hwmap, refusals),
+  `TestGDIGrabChainRuns` (the chain and encoder arguments through this machine's FFmpeg with a
+  bgra testsrc2 in gdigrab's place: 1366x768 and two downscales come out at OutputSize's size,
+  wall-clock pts), `TestCheckGPUCapture` (stand-in ffmpeg scripts: the Wine stderr, the secure
+  desktop, an unknown error, success, a hang), `TestWriteReportGDI`. `host`:
+  `TestCaptureChoiceGDI` (caps × config × prefs × virtual display × the session's refusals),
+  `TestGDIParams` (area, fps capped at the refresh, cursor, scaling, never up, pointer input),
+  `TestCaptureFailedGDI` (no device: one failure, one notice, the next session starts on GDI;
+  gfxcapture; two refusals; refusals not in a row; the secure desktop and ACCESS_LOST keep
+  ddagrab with one notice per text; no gdigrab in the build), `TestRestartNotice`,
+  `TestRecheckGPUCapture`, `TestWatchGPUCapture` (a GPU PC losing its D3D11 video device at run
+  time: GDI, a check that still fails, one that opens, an overlapped restart on ddagrab, the two
+  notices, no more checks), `TestConfigCapture`, `TestOpenPipelineGPULess` (the helper's caps as
+  `--print-caps` gave them: one launch), `TestProbeSampleGDI`, `TestSessionSwitchesToGDI` (a
+  stand-in ffmpeg that fails ddagrab with the Wine stderr and streams for gdigrab: generation 2
+  streams with capture stamps, `-offset_x -1920 -offset_y 120 -video_size 1920x1080` for the
+  second monitor, one notice).
+
+Not verified (needs real hardware):
+
+- GPU-less Windows VM (the reporter's Proxmox VM, Microsoft Basic Display Adapter): unverified.
+  Test: docs/HARDWARE_TEST_PLAN.md items G1-G3: `recon-host probe` shows `capture:    ddagrab
+  unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being
+  installed or reset): using gdigrab ...`; a stream from the console shows its picture within about
+  2 s with exactly one toast (`No GPU screen capture on this PC ...`), overlay Encoder `libx264`;
+  record fps, capture→drawn p50/p95 and the VM's CPU at the defaults and at 1280×720@30; the pointer
+  lands where you click; a connected RDP session streams with GDI, a disconnected one cannot (record
+  what shows), and after `tscon <session id> /dest:console` it streams again. Also check that on the
+  Basic Display Adapter gdigrab's BitBlt keeps up at 1080p60 (`stream stats` fps), and whether the
+  real Basic Render Driver logs `Failed to create Direct3D device (...)` before the ddagrab line
+  (both are classified the same).
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `recon-host probe` has no `ddagrab unavailable`
+  line and host.log `ffmpeg ready ... gpu_capture=ok`, also when the agent starts at logon. With
+  `"pipeline": "ffmpeg"`: Win+L and back, a UAC prompt (`Start-Process notepad -Verb RunAs`), a
+  resolution change: each time the stream comes back on ddagrab (`starting encoder ...
+  capture=ddagrab`), never `capturing with GDI`, one toast per kind (HARDWARE_TEST_PLAN G4). Over
+  RDP (G5): record whether ddagrab works in the RDP session or the session moves to GDI after
+  two `Selected output not supported` / `Failed to enumerate DXGI output` failures, and that the
+  next session from the console uses ddagrab. `"capture": "gdigrab"` with `"pipeline": "ffmpeg"`
+  streams hevc_amf from system memory (`format=nv12`): record capture→drawn p50 against ddagrab.
+  A driver reset mid-stream (`dxcap -forcetdr`, G6): the stream returns to ddagrab by itself,
+  at once or after a minute or two on GDI (checked every minute; `GPU screen capture works again`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD steps with NVENC; with `"capture":
+  "gdigrab"` the stream is `hevc_nvenc` fed NV12 from system memory (no `hwupload` in the
+  command line: NVENC uploads it); GPU priority stays as configured.
+
+### Runs with these changes
+
+On the section's last code commit (e7dd25a): `gofmt -l` prints nothing; `go vet ./...` and
+`GOOS=windows go vet ./...` pass; `go test` of every package but `internal/e2e` passes, and `go
+test -race` of the GDI, restart-notice, re-check, watch, pipeline and encoder-failure tests
+passes. Under the shared lock `go test ./internal/e2e/...` passes (204 s on 79e4573, 203 s on
+e7dd25a), and the browser E2E (Linux host, capture "test") filtered to `^WebTransport direct$|loss
+handling|wallclock` passed 61 of 62 checks: the one failure, "drop test: a run the stream moved
+on from first ... is inconclusive" (`generation 6 replaced it` instead of the decoder backlog),
+came while Go tests ran next to it outside the lock; run again alone, `^WebTransport
+direct$|loss handling` passed 59 of 59 (the wallclock x11grab probe passed in the first run).
+`node --check test/e2e/browser.mjs` passes; install-host.ps1 parses with pwsh 7. Under Wine 9 with
+Xvfb: `recon-host.exe probe` of e7dd25a prints the `ddagrab unavailable` line, and
+`TestSessionGDIWindows` passes three runs in a row. The browser E2E with the Windows host under
+Wine (`E2E_HOST_BIN`, new `E2E_HOST_CAPTURE=auto`) could not run: the agent never reaches the
+gateway (`wsaioctl: winapi error #10045`, see above).

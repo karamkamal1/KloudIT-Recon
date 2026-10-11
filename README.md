@@ -44,7 +44,8 @@ hardware follow **[docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md)**, an
   - Intel Quick Sync runs through the helper's libavcodec backend (`-InstallLibavcodec`).
 - **FFmpeg as the fallback.** `ddagrab` or `gfxcapture` feed NVENC, AMF or QSV. The agent reads
   FFmpeg's NUT container, which hands over each packet the moment it is encoded (MP4/MKV hold
-  each frame until the next one exists).
+  each frame until the next one exists). On a PC or VM without a GPU it captures with GDI
+  (`gdigrab`) instead and encodes on the CPU (see "Running on a PC or VM without a GPU").
 - **Tuned for latency.**
   - CBR, or AMF's latency-constrained VBR.
   - A 1-3-frame VBV, no B-frames and no lookahead.
@@ -146,7 +147,7 @@ and the PC's `host.json` (Configuration below) change them.
 | | Default |
 |---|---|
 | Video pipeline | the native helper on AMD and NVIDIA, FFmpeg otherwise and as the fallback (`pipeline` `auto`) |
-| Capture | Desktop Duplication (`capture` `auto`) |
+| Capture | Desktop Duplication (`capture` `auto`); GDI on a PC or VM without a GPU |
 | Codec | Auto: HEVC first (`av1` `fallback`) |
 | Bitrate, frame rate, resolution | 30 Mbit/s, 60 fps, *Native* (caps: `maxKbps` 250000, `maxFps` 240) |
 | Encoder preset, adaptive bitrate | Balanced, on |
@@ -229,6 +230,7 @@ browser decodes in hardware, with no CPU contention. The overlay shows your live
  │ recon-host  (Windows 11 gaming PC)                               │
  │ recon-encoder.exe: DDA ─(D3D11)─► AMF/NVENC ─► shared mem ─► Go  │
  │ or ffmpeg: ddagrab/gfxcapture ─► NVENC/AMF/QSV ─► NUT ─► Go      │
+ │ (no GPU: gdigrab, GDI ─► libx264 on the CPU)                     │
  │ WASAPI loopback ─► Opus (pure Go) ─► datagrams                   │
  │ SendInput (scancodes, raw rel/abs mouse) · cursor shapes · ViGEm │
  └──────────────────────────────────────────────────────────────────┘
@@ -426,6 +428,36 @@ untouched, so you keep WebTransport and the direct path. Other options:
   never works. The relay accepts a browser only from the IP its HTTPS request came from, and
   without `-trust-proxy` that IP is the proxy's.
 
+## Running on a PC or VM without a GPU
+
+Recon streams from a PC or virtual machine without a graphics card (a Proxmox VM with the default
+display, Windows showing only the *Microsoft Basic Display Adapter*), but not as well as from a
+gaming PC:
+
+- **What happens.** Windows has no Direct3D 11 video device there, so neither GPU capture
+  (Desktop Duplication, Windows.Graphics.Capture) nor a GPU encoder works. The agent finds this
+  when it starts and captures with GDI (`gdigrab`) and encodes on the CPU (`libx264`).
+  `recon-host probe` and the installer say `capture: ddagrab unavailable (no
+  Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or
+  reset): using gdigrab`; the browser shows `No GPU
+  screen capture on this PC (...): capturing with GDI, which uses more CPU and adds latency.`
+  once per stream.
+- **What it costs.** GDI copies and converts the whole picture on the CPU every frame interval,
+  changed or not, and the CPU encodes it: expect tens of milliseconds more latency and a busy CPU
+  (the overlay's *Encoder* row shows `libx264`). Give the VM several cores, and lower the stream
+  in the settings drawer: Resolution 1280×720 or 1600×900, Frame rate 30 or 60, Codec H.264,
+  Encoder preset *Lowest latency*.
+- **Console, not a disconnected remote desktop.** The agent captures the desktop of the Windows
+  session it runs in. Sign in on the VM's console (Proxmox: the VM's *Console*), or leave a
+  remote desktop (RDP) session connected while you stream: a disconnected RDP session has no
+  display at all, so no capture works, GDI or Desktop Duplication. While an RDP client is
+  connected, Desktop Duplication may refuse its display (a session then moves to GDI by itself).
+  To end an RDP connection and keep the session streamable, hand the session to the console
+  instead of disconnecting: in an elevated PowerShell in that session, `tscon
+  ([System.Diagnostics.Process]::GetCurrentProcess().SessionId) /dest:console`.
+- **With GPU passthrough** (a GPU given to the VM) install its driver: the agent then captures
+  and encodes on that GPU as on any gaming PC (run `recon-host probe` to check).
+
 ## Configuration
 
 **Gateway** flags (environment variables in parentheses):
@@ -464,7 +496,7 @@ PC yourself (your session takes it over) or restart `recon-host` on it.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `capture` | `auto` | `auto`, `ddagrab`, `gfxcapture` or `amf`; what each does depends on the video pipeline (`pipeline`). **Native helper** (the default): `auto` and `ddagrab` capture with Desktop Duplication and the helper scales to the client's size; `gfxcapture` uses Windows.Graphics.Capture (a window always does); `amf` (experimental, never chosen by `auto`) uses the helper's own AMD Direct Capture (AMFDisplayCapture, `amd-direct`; a virtual display uses Desktop Duplication instead). A helper that cannot capture with `amd-direct` (not an AMD GPU, or its probe failed: `recon-host probe` shows `unavailable: amd-direct: ...`) does not stream such a session: it goes to FFmpeg (host.log `video pipeline pipeline=ffmpeg ... reason="the helper cannot capture with amd-direct ..."`), and an AMD Direct Capture that keeps failing counts toward the helper's three failures within 60 s that move the session to FFmpeg. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.2 and "Final review: AMD Direct Capture sRGB and 10-bit surfaces". **FFmpeg** (`pipeline` `ffmpeg`, or a session the helper does not stream): `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion. FFmpeg uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6) |
+| `capture` | `auto` | `auto`, `ddagrab`, `gfxcapture`, `gdigrab` or `amf`; what each does depends on the video pipeline (`pipeline`). **Native helper** (the default): `auto` and `ddagrab` capture with Desktop Duplication and the helper scales to the client's size; `gfxcapture` uses Windows.Graphics.Capture (a window always does); `amf` (experimental, never chosen by `auto`) uses the helper's own AMD Direct Capture (AMFDisplayCapture, `amd-direct`; a virtual display uses Desktop Duplication instead). A helper that cannot capture with `amd-direct` (not an AMD GPU, or its probe failed: `recon-host probe` shows `unavailable: amd-direct: ...`) does not stream such a session: it goes to FFmpeg (host.log `video pipeline pipeline=ffmpeg ... reason="the helper cannot capture with amd-direct ..."`), and an AMD Direct Capture that keeps failing counts toward the helper's three failures within 60 s that move the session to FFmpeg. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.2 and "Final review: AMD Direct Capture sRGB and 10-bit surfaces". **FFmpeg** (`pipeline` `ffmpeg`, or a session the helper does not stream): `auto` (gfxcapture when scaling or capturing a window, else ddagrab), `ddagrab`, `gfxcapture`, or `amf` (experimental: AMD Direct Capture through FFmpeg 8.1's `vsrc_amf`, which hands each present of the game or desktop to an AMD (`*_amf`) encoder as an AMF surface, with no conversion. FFmpeg uses ddagrab instead when the encoder is not AMF, the video must carry the cursor (`drawCursor` or the client's video cursor), the monitor is not on the first GPU or is rotated, or AMD Direct Capture failed earlier in the session; host.log says why. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 1.6). **GDI** (`gdigrab`, always FFmpeg): GDI copies the monitor's rectangle into memory every frame interval, with no GPU (more CPU: the picture is converted, and scaled to the client's size, on the CPU); the cursor is in the video only when the client asks for it. Where GPU capture cannot work at all (no Direct3D 11 video device: a PC or VM without a GPU, see "Running on a PC or VM without a GPU"), `auto`, `ddagrab`, `gfxcapture` and `amf` capture with GDI too: the agent tests it at start (`recon-host probe`: `capture: ddagrab unavailable (...): using gdigrab`), and a session whose GPU capture fails that way switches at once and keeps the finding for later sessions (checked again a minute later, in the background, so a GPU driver installed meanwhile counts; a stream that lost GPU capture while it ran, as during a graphics driver reset or update, checks every minute and goes back to GPU capture once it works). A session whose Desktop Duplication refuses its display twice in a row (`Selected output not supported`: a remote desktop session) captures with GDI for the rest of that session. The secure desktop (a UAC prompt, the lock screen) and display mode changes keep Desktop Duplication, which is retried. host.log `capturing with GDI (gdigrab)` and `GPU screen capture failed: capturing with GDI` say why, and the browser shows it once. GDI captures a window's whole monitor (`window` is not captured alone). Unverified on hardware: see `docs/VENDOR_NOTES.md`, "First hardware report: GPU-less VM capture" |
 | `pipeline` | `auto` | Video pipeline: `auto` streams with the native encoder helper `recon-encoder.exe` (installed next to `recon-host.exe`: DXGI / AMD Direct Capture / WGC capture, AMF or NVENC in the running process, so key frames and bitrate changes need no encoder restart, and a lost frame is answered with a recovery frame from frames the browser acknowledged instead of a key frame: AMF long-term references, NVENC reference invalidation; a frame stream that stalls past its deadline while newer frames wait is then cancelled and recovered the same way, see "The loss-recovery ladder" in `docs/ARCHITECTURE.md`) when it starts, has an encoder for the codec negotiated with the browser and the session needs nothing only FFmpeg offers (the cursor drawn into the video, a window capture without Windows.Graphics.Capture in the helper, `capture` `amf` without AMD Direct Capture in the helper, `capture` `x11grab` or `test`, an FFmpeg `encoder` forced here); otherwise FFmpeg. The order: the helper with the GPU's own encoder (AMF, NVENC), then the helper's libavcodec backend (Intel Quick Sync Video, when its FFmpeg libraries are installed: `helperFFmpegDir`, `helperLibavcodec`; a lost frame then costs a key frame, made in the running encoder), then FFmpeg's command line; each backend encodes only monitors on GPUs of its own vendor (any of them), so a monitor on another vendor's GPU (a hybrid laptop's external port on the discrete GPU) gets that vendor's backend or FFmpeg; when the helper does not start with its own choice of backend, AMF and NVENC are tried by name before FFmpeg. `helper` also streams the test pattern (`capture` `test`) with the helper's synthetic GPU source and tells the user when it cannot use the helper; `ffmpeg` never uses it. Three helper failures within 60 s move the session to FFmpeg (restarts after the first back off; failed restarts within 3 s of a driver reset do not count). host.log says which pipeline a session uses, why, and why the rungs before it were skipped (`video pipeline ... skipped="amf: ...; nvenc: ..."`). Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.1b, 3.5, 2.3 and 3.8 wiring |
 | `helperFFmpegDir` | `ffmpeg-lgpl` next to `recon-host.exe` | Where the native helper's libavcodec backend loads FFmpeg 8.x's shared libraries (`avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll`) from; `install-host.ps1 -InstallLibavcodec` puts BtbN's LGPL build there. A relative path is taken from `recon-host.exe`'s directory. The agent runs elevated and loads them only from its install folder or a folder only administrators can change (owner and ACL checked, like Program Files): another one is ignored for the default (host.log `host config "helperFFmpegDir" ignored`). host.log says at start whether they are there (`native encoder helper installed ... libavcodec=...`) |
 | `helperLibavcodec` | `auto` | `auto`: sessions stream with the helper's libavcodec backend (Intel Quick Sync Video: `h264_qsv`, `hevc_qsv`, `av1_qsv` in the running helper) where it has no AMF or NVENC encoder for them; `off`: they use FFmpeg's command line there instead, and recon-host starts the helper with AMF or NVENC by name, so it never chooses the libavcodec backend or opens a Quick Sync encoder (it still loads the libraries, when installed, to report them in its caps). Recovery is a key frame per loss (no reference recovery), bitrate changes make a key frame unless `recon-host qualify` measured them seamless. Unverified on hardware: see `docs/VENDOR_NOTES.md`, 3.8 wiring |
@@ -503,7 +535,8 @@ encoder when a browser streams the first monitor at the default settings (native
 60 fps, 30 Mbit/s, balanced quality, adaptive bitrate) under this `host.json`; an encoder that
 heals lost frames with periodic intra refresh shows `intra-refresh=` after its name. The
 `session:` line above it says how that session captures: with the default `"capture": "auto"`
-that is ddagrab (other resolutions and window capture use gfxcapture). To try an encoder by hand,
+that is ddagrab (other resolutions and window capture use gfxcapture; gdigrab on a PC without GPU
+capture, after a `capture:    ddagrab unavailable (...)` line). To try an encoder by hand,
 open PowerShell in the folder of `ffmpeg.exe` (the `ffmpeg:` line) and paste its line as
 `.\ffmpeg ...` with `pipe:1` replaced by `-stats -frames:v 600 -y $env:TEMP\test.nut`. ddagrab
 only delivers a frame when the screen or the mouse pointer changes, so keep something moving
@@ -546,7 +579,17 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   lines before it say why (`startup failed`, or a `panic:` / `fatal error:` trace to report).
 - **Video is choppy or latency is high, and the overlay shows a CPU encoder (x264/SVT-AV1).**
   No GPU encoder works. Run `probe` (above): the `unusable:` lines give the reason, usually an
-  outdated GPU driver. Update it and restart the agent.
+  outdated GPU driver. Update it and restart the agent. On a PC or VM without a GPU this is
+  expected: see "Running on a PC or VM without a GPU".
+- **The stream never starts and the browser repeats `Video encoder restarted (encoder libx264
+  exited: [Parsed_ddagrab_0 @ ...] Failed to create D3D11VA device. | ...)`.** An agent from
+  before GDI capture, on a PC or VM without a GPU: install this version, which captures with GDI
+  there (`No GPU screen capture on this PC ...`). If this version still cannot capture, host.log
+  says why (`GPU screen capture failed and this FFmpeg has no gdigrab`: use the installer's
+  FFmpeg, whose Windows build has it).
+- **`Screen capture failed, retrying: ...`.** The capture stopped for a moment (the secure
+  desktop, a display mode change); the same notice is not repeated while it lasts. host.log's
+  `encoder failed` lines have FFmpeg's whole error.
 - **The browser always uses WebSocket.** UDP 8443 is blocked between the browser and the
   gateway, or your browser lacks WebTransport. Check your firewall, port forwarding or proxy.
 - **The overlay's Transport row says `relay-splice` instead of `relay`.** The relay ports (UDP
