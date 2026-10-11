@@ -4,7 +4,9 @@
 // by FramePacer (capture/pacer.hpp). It also raises the timer resolution while
 // the capture exists (TimerResolution) and turns a removed D3D11 device into
 // the fatal device_lost while no frames arrive (a removed device stops
-// presents and frame events without failing every capture API).
+// presents and frame events without failing every capture API). A capture
+// with no image at all 2 s after its start (a display that is off or asleep)
+// wakes the display and says so (FirstImageWatchdog).
 #pragma once
 
 #include <deque>
@@ -55,6 +57,9 @@ private:
     // A removed device_ (only checked when no new image comes: before a
     // repeat and when next() times out, i.e. at most every idleRepeatMs).
     bool deviceLost(Status& err);
+    // No image yet ms after the start: wakes the display and reports it
+    // (captureChanged "noimage").
+    void noImage(int64_t ms);
 
     TimerResolution timerResolution_;  // 1 ms ticks for every wait of the capture thread
     PreciseTimer timer_;
@@ -62,6 +67,7 @@ private:
     HANDLE stop_ = nullptr;  // manual-reset
     std::mutex mu_;          // pacer_ (setFps from the control thread), events_
     FramePacer pacer_;
+    FirstImageWatchdog firstImage_;  // capture thread only
     std::deque<CaptureEvent> events_;
     bool pending_ = false, haveLast_ = false, awake_ = false;
     Acquired pendingInfo_;

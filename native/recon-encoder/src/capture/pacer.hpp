@@ -55,4 +55,28 @@ private:
     int64_t lastDelivered_ = 0;
 };
 
+// FirstImageWatchdog: a capture that has handed out no image at all since it
+// started. DDA hands out nothing while the display is off or asleep (the
+// first hardware run's first session waited 54 s for its first image), and
+// until the first image the pacer has nothing to repeat: the stream stays
+// empty without an error. PacedCapture reports it (captureChanged "noimage",
+// and wakes the display) kFirstMs after the start and every kEveryMs after
+// that while it lasts, and the first image once one comes ("restored").
+class FirstImageWatchdog {
+public:
+    static constexpr int64_t kFirstMs = 2000, kEveryMs = 10000;
+
+    void reset(int64_t qpcFrequency, int64_t now);
+    // A report due at now: the milliseconds since the start without an image
+    // (0: none due, or an image came).
+    int64_t due(int64_t now);
+    // The first image went out at now: the milliseconds it took if it was
+    // reported missing (0: it was not, or this is not the first image).
+    int64_t image(int64_t now);
+
+private:
+    int64_t freq_ = 1, start_ = 0, next_ = 0;
+    bool reported_ = false, done_ = false;
+};
+
 }  // namespace recon

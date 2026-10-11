@@ -43,6 +43,26 @@ void FramePacer::delivered(int64_t now, bool repeat) {
     lastDelivered_ = now;
 }
 
+void FirstImageWatchdog::reset(int64_t qpcFrequency, int64_t now) {
+    freq_ = qpcFrequency > 0 ? qpcFrequency : 1;
+    start_ = now;
+    next_ = now + freq_ * kFirstMs / 1000;
+    reported_ = done_ = false;
+}
+
+int64_t FirstImageWatchdog::due(int64_t now) {
+    if (done_ || now < next_) return 0;
+    reported_ = true;
+    next_ = now + freq_ * kEveryMs / 1000;  // from now: a capture thread held up long reports once
+    return std::max<int64_t>(1, (now - start_) * 1000 / freq_);
+}
+
+int64_t FirstImageWatchdog::image(int64_t now) {
+    if (done_) return 0;
+    done_ = true;
+    return reported_ ? std::max<int64_t>(1, (now - start_) * 1000 / freq_) : 0;
+}
+
 // --- self-test ----------------------------------------------------------------------
 
 namespace {
@@ -192,11 +212,37 @@ void testDirty() {
     std::printf("  %-36s ok\n", name);
 }
 
+// The first-image watchdog: nothing before 2 s, then a report every 10 s
+// while no image comes (a display that is off: the first hardware run's 54 s),
+// the first image with the time it took; an image within 2 s reports nothing.
+void testFirstImage() {
+    const char* name = "first-image watchdog";
+    const int64_t ms = 1000;  // ticks per millisecond (1 tick = 1 us)
+    FirstImageWatchdog w;
+    w.reset(1000000, 5 * ms);
+    std::vector<int64_t> reports;
+    for (int64_t t = 5 * ms; t <= 30 * 1000 * ms; t += 100 * ms) {
+        if (const int64_t r = w.due(t)) reports.push_back(r);
+    }
+    expect(reports.size() == 3 && reports[0] == 2000 && reports[1] == 12000 && reports[2] == 22000, name,
+           "not reported at 2 s, 12 s and 22 s");
+    expect(w.image(54 * 1000 * ms) == 54000 - 5 && w.image(55 * 1000 * ms) == 0 && w.due(90 * 1000 * ms) == 0, name,
+           "the first image after a report not with its time, or reports after it");
+    w.reset(1000000, 0);
+    expect(w.due(1999 * ms) == 0 && w.image(1500 * ms) == 0 && w.due(60 * 1000 * ms) == 0, name,
+           "an image within 2 s reported");
+    w.reset(1000000, 0);
+    expect(w.due(40 * 1000 * ms) == 40000 && w.due(41 * 1000 * ms) == 0 && w.due(50 * 1000 * ms) == 50000, name,
+           "a late look not reported once, then every 10 s");
+    std::printf("  %-36s ok\n", name);
+}
+
 }  // namespace
 
 int runPacerSelfTest() {
     failures = 0;
     testDirty();
+    testFirstImage();
     const int64_t sec = 1000000;
     {
         const char* name = "144 Hz game at 120 fps";

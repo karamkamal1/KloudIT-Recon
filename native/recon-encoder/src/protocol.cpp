@@ -107,7 +107,7 @@ Status parseStart(const json& j, StartParams& p) {
         !optField(j, "intraRefreshFrames", p.intraRefreshFrames, err) || !optField(j, "zeroCopy", p.zeroCopy, err) ||
         !optField(j, "motion", p.motion, err) || !optField(j, "reencodeOversized", p.reencodeOversized, err) ||
         !optField(j, "sliceOutput", p.sliceOutput, err) || !optField(j, "testFormat", p.testFormat, err) ||
-        !optField(j, "testDirty", p.testDirty, err)) {
+        !optField(j, "testDirty", p.testDirty, err) || !optField(j, "testFirstImageMs", p.testFirstImageMs, err)) {
         return bad(err);
     }
     if (p.codec != "h264" && p.codec != "hevc" && p.codec != "av1") return bad("codec must be h264, hevc or av1");
@@ -140,6 +140,8 @@ Status parseStart(const json& j, StartParams& p) {
     }
     if (!p.testDirty.empty() && p.capture != "synthetic-gpu") return bad("testDirty needs capture \"synthetic-gpu\"");
     if (!p.testDirty.empty() && p.testDirty != "none" && p.testDirty != "zero") return bad("testDirty must be none or zero");
+    if (p.testFirstImageMs && p.capture != "synthetic-gpu") return bad("testFirstImageMs needs capture \"synthetic-gpu\"");
+    if (!inRange(p.testFirstImageMs, 0, 60000)) return bad("testFirstImageMs out of range (0..60000)");
     return Status::Ok();
 }
 

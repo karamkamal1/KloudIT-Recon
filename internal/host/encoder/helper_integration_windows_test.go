@@ -1284,6 +1284,88 @@ func TestHelperIntegrationGameDirty(t *testing.T) {
 	}
 }
 
+// The first-image watchdog (docs/VENDOR_NOTES.md "First hardware run: no
+// picture for the first 54 s"): the GPU test source with start
+// "testFirstImageMs" presents nothing for that long, as a display that is off
+// hands DDA nothing. 2 s after the start the helper reports captureChanged
+// "noimage" (how long, and that it tried to wake the display), again every
+// 10 s while it lasts, and "restored" with the time the first image took
+// once frames come; no frame comes before. An image within 2 s reports
+// nothing. "testFirstImageMs" with another capture is refused.
+func TestHelperIntegrationFirstImage(t *testing.T) {
+	h := launchMock(t)
+	if _, err := h.Start(StartParams{Capture: "synthetic", Codec: "h264", FPS: 30, Kbps: 4000, TestFirstImageMs: 3000}); err == nil ||
+		!strings.Contains(err.Error(), "testFirstImageMs") {
+		t.Fatalf("testFirstImageMs with capture synthetic: %v", err)
+	}
+	start := func(t *testing.T, ms int) *Helper {
+		h := launchMock(t)
+		_, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30, Kbps: 4000, TestFirstImageMs: ms})
+		var he *HelperError
+		if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+			t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+		}
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		return h
+	}
+	t.Run("asleep", func(t *testing.T) {
+		const asleep = 3500 * time.Millisecond
+		h := start(t, int(asleep/time.Millisecond))
+		t0 := time.Now()
+		var noImage, restored *CaptureChanged
+		var first time.Duration
+		for restored == nil || first == 0 {
+			select {
+			case c := <-h.CaptureChanges():
+				t.Logf("%.1f s: captureChanged %+v", time.Since(t0).Seconds(), c)
+				switch {
+				case c.Reason == "noimage" && noImage == nil:
+					noImage = &c
+					if since := time.Since(t0); since < 1900*time.Millisecond || since > 3*time.Second || first != 0 {
+						t.Fatalf("noimage %.1f s after the start (first frame after %v), want about 2 s, before any frame", since.Seconds(), first)
+					}
+				case c.Reason == "restored" && noImage != nil:
+					restored = &c
+				default:
+					t.Fatalf("unexpected capture change %+v", c)
+				}
+			case f, ok := <-h.Frames():
+				if !ok {
+					t.Fatalf("helper ended: %v", h.Err())
+				}
+				if first == 0 {
+					first = time.Since(t0)
+					if first < asleep-200*time.Millisecond || !f.Key {
+						t.Fatalf("first frame %+v after %v, want a key frame after about %v", f, first, asleep)
+					}
+				}
+			case <-time.After(8 * time.Second):
+				t.Fatalf("no capture change or frame (noimage %v, restored %v, first frame after %v)", noImage, restored, first)
+			}
+		}
+		if !strings.Contains(noImage.Text, "no image from the capture for 2 s (display off or PC locked?)") ||
+			!strings.Contains(noImage.Text, "the display") || noImage.Width != 0 {
+			t.Fatalf("noimage %+v", noImage)
+		}
+		if !strings.HasPrefix(restored.Text, "first image after 3.") || restored.Width != 640 || restored.Height != 360 {
+			t.Fatalf("restored %+v, want the first image after 3.5 s at the source's 640x360", restored)
+		}
+	})
+	t.Run("awake", func(t *testing.T) {
+		h := start(t, 500)
+		for deadline := time.Now().Add(2500 * time.Millisecond); time.Now().Before(deadline); {
+			select {
+			case c := <-h.CaptureChanges():
+				t.Fatalf("capture change %+v for a first image after 0.5 s", c)
+			case <-h.Frames():
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	})
+}
+
 // The synthetic GPU source's high-motion mode (start "motion", the live-bitrate
 // qualification's source, step 3.6): presents without pauses (no idle
 // repeats), every image noisy, the barcode readable over it; and "motion"

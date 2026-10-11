@@ -82,6 +82,11 @@ type StartParams struct {
 	// compositor; the helper counts them as the whole picture) or that report
 	// nothing changed ("zero": what helpers before that rule reported).
 	TestDirty string `json:"testDirty,omitempty"`
+	// TestFirstImageMs (capture synthetic-gpu only, tests): no present for
+	// this many milliseconds after the start (0..60000), as a display that
+	// is off or asleep hands DDA nothing: the helper's first-image watchdog
+	// reports captureChanged "noimage" after 2 s, then "restored".
+	TestFirstImageMs int `json:"testFirstImageMs,omitempty"`
 
 	// Phase 5 experiments (zero = off). ReencodeOversized: a non-key frame
 	// larger than this many average frames (bitrate / fps) is encoded again at
@@ -353,9 +358,13 @@ type HDRMetadata struct {
 // CaptureChanged reports a change of the capture source. Reason "resized":
 // new size or rotation (the stream keeps its encoded size, scaled; restart the
 // helper to follow); "lost": capture unavailable for now (secure desktop,
-// output gone, mode switch), the last image is repeated; "restored"; "hdr":
-// Windows HDR was turned on or off for the output (HDR says which; the stream
-// keeps its format, restart the helper to follow).
+// output gone, mode switch), the last image is repeated; "restored" (also the
+// first image after a "noimage"); "hdr": Windows HDR was turned on or off for
+// the output (HDR says which; the stream keeps its format, restart the helper
+// to follow); "noimage": the capture has handed out no image at all since the
+// start (2 s, then every 10 s while it lasts: a display that is off or asleep;
+// the helper tried to wake it, Text says how long and whether that worked; no
+// size).
 type CaptureChanged struct {
 	Reason   string `json:"reason"`
 	Width    int    `json:"width"`

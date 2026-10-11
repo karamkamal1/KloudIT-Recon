@@ -1,6 +1,8 @@
 #include "capture/paced_capture.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <string>
 
 #include "capture/dirty.hpp"
 #include "d3d/device.hpp"
@@ -16,6 +18,7 @@ PacedCapture::~PacedCapture() {
 void PacedCapture::startPacing(const StartParams& p, ID3D11Device* device) {
     std::lock_guard<std::mutex> lock(mu_);
     pacer_.reset(qpcFrequency(), p.fps, p.idleRepeatMs, qpcNow());
+    firstImage_.reset(qpcFrequency(), qpcNow());
     pending_ = haveLast_ = false;
     device_ = device;
     if (timerResolution_.periodMs() > 1) logf(LogLevel::Info, "timer resolution: %u ms", timerResolution_.periodMs());
@@ -29,9 +32,31 @@ void PacedCapture::setFps(int fps) {
 }
 
 void PacedCapture::postEvent(CaptureEvent ev) {
-    logf(LogLevel::Info, "capture %s: %dx%d rotation %d %s", ev.reason.c_str(), ev.width, ev.height, ev.rotation, ev.text.c_str());
+    if (ev.width || ev.height) {
+        logf(LogLevel::Info, "capture %s: %dx%d rotation %d %s", ev.reason.c_str(), ev.width, ev.height, ev.rotation, ev.text.c_str());
+    } else {
+        logf(LogLevel::Warn, "capture %s: %s", ev.reason.c_str(), ev.text.c_str());
+    }
     std::lock_guard<std::mutex> lock(mu_);
     events_.push_back(std::move(ev));
+}
+
+void PacedCapture::noImage(int64_t ms) {
+    // Wake the display as user input would: a one-off display request (the
+    // continuous one of next() keeps a display on, it does not turn one
+    // back on everywhere) and a mouse move of zero length (the pointer stays
+    // where it is; it fails where the foreground takes no input from us).
+    SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    const std::string woke = SendInput(1, &in, sizeof(in)) == 1
+                                 ? "woke the display"
+                                 : "could not wake the display (SendInput error " + std::to_string(GetLastError()) + ")";
+    CaptureEvent ev;
+    ev.reason = "noimage";
+    ev.text = "no image from the capture for " + std::to_string(ms / 1000) + " s (display off or PC locked?); " + woke;
+    postEvent(std::move(ev));
 }
 
 bool PacedCapture::takeEvent(CaptureEvent& ev) {
@@ -64,6 +89,9 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             return Next::Stopped;
         }
         const int64_t now = qpcNow();
+        if (!haveLast_ && !pending_) {
+            if (const int64_t ms = firstImage_.due(now)) noImage(ms);
+        }
         FramePacer::Decision d;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -90,6 +118,17 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             out.captureQpc = pendingInfo_.captureQpc;
             out.dirty = pendingInfo_.dirty;
             pending_ = false;
+            if (!haveLast_) {
+                if (const int64_t ms = firstImage_.image(now)) {
+                    char took[32];
+                    std::snprintf(took, sizeof took, "%.1f", double(ms) / 1000);
+                    CaptureEvent ev;
+                    ev.reason = "restored";
+                    ev.width = int(out.width), ev.height = int(out.height), ev.rotation = out.rotation;
+                    ev.text = std::string("first image after ") + took + " s";
+                    postEvent(std::move(ev));
+                }
+            }
             haveLast_ = true;
             std::lock_guard<std::mutex> lock(mu_);
             pacer_.delivered(qpcNow(), false);

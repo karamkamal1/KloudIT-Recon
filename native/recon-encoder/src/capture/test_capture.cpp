@@ -33,6 +33,10 @@
 // ("none": as DDA hands out a game that flips past the compositor, through
 // presentedDirtyFraction, so dirty 1) or that report nothing changed ("zero":
 // what helpers before that rule reported, dirty 0).
+//
+// start's testFirstImageMs holds every present back for that long after the
+// start, as a display that is off or asleep hands DDA nothing: the
+// first-image watchdog (FirstImageWatchdog) reports it and the first image.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -159,7 +163,7 @@ Status GpuTestCapture::init(const StartParams& p) {
     testDirty_ = p.testDirty;
     const int64_t freq = qpcFrequency();
     presentPeriod_ = freq / std::min(240, 2 * p.fps);
-    start_ = nextPresent_ = qpcNow();
+    start_ = nextPresent_ = qpcNow() + int64_t(p.testFirstImageMs) * freq / 1000;
     startPacing(p, dev_.device.Get());
     return Status::Ok();
 }

@@ -1941,8 +1941,8 @@ const resizeSettle = 300 * time.Millisecond
 // captureChanged follows the native helper's capture source: a new size or
 // rotation restarts the stream at the new size (a new helper, overlapped; and
 // maps input to the monitor's new geometry) once it settled, a lost capture
-// (secure desktop, mode switch) is shown to the user. Called by videoEvents
-// only.
+// (secure desktop, mode switch) and one without any image yet (a display
+// that is off) are shown to the user. Called by videoEvents only.
 func (s *Session) captureChanged(c *media.CaptureChange) {
 	s.log.Info("capture changed", "reason", c.Reason, "size", fmt.Sprintf("%dx%d", c.Width, c.Height), "rotation", c.Rotation, "hdr", c.HDR, "text", c.Text)
 	switch c.Reason {
@@ -1961,6 +1961,12 @@ func (s *Session) captureChanged(c *media.CaptureChange) {
 		})
 	case "lost":
 		s.notice("info", "Screen capture is paused ("+trunc(c.Text, 120)+"); the last picture stays until it is back.")
+	case "noimage":
+		// The helper's capture has had no image since it started (the
+		// first hardware run's first session: 54 s of an empty stream, a
+		// display asleep). It tried to wake the display; it says so again
+		// every 10 s while it lasts.
+		s.notice("warn", "No picture from the PC's screen yet: "+trunc(c.Text, 160)+".")
 	case "hdr":
 		// An HDR10 stream follows Windows HDR: a new helper (a new
 		// generation and video config) in the output's new mode.

@@ -173,8 +173,9 @@ type RateChange struct {
 // "resized" (new size or rotation: the stream keeps its size, scaled, until
 // restarted; the next Start starts a new helper even with the same Params),
 // "lost" (capture is impossible for now, the last image is repeated),
-// "restored" or "hdr" (Windows HDR was turned on or off for the output: HDR
-// says which). Restart: the stream no longer is what it was asked for (an
+// "restored", "hdr" (Windows HDR was turned on or off for the output: HDR
+// says which) or "noimage" (no image at all since the helper started: a
+// display that is off or asleep; Text says for how long). Restart: the stream no longer is what it was asked for (an
 // HDR10 stream after an "hdr" change keeps the format it started with), so
 // the session restarts it; the next Start starts a new helper.
 type CaptureChange struct {

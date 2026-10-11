@@ -489,13 +489,24 @@ third round", "The AV1 alignment guard on the native helper")
   1. Change the desktop resolution, then rotate the display to portrait and back.
   2. Press Win+L.
   3. On a 120 Hz monitor, change Frame rate 60 → 120 in the drawer.
+  4. The display asleep (VENDOR_NOTES "First hardware run: no picture for the first 54 s"):
+     disconnect, run `powercfg /change monitor-timeout-ac 1`, leave the PC untouched until its
+     display is off (2 minutes), then connect. Once with the PC unlocked, once locked (Win+L
+     before leaving it). Set the timeout back afterwards.
 - **Pass**:
   - Each resolution or rotation change gives `capture changed reason=resized`, then a new
     `encoder helper started ... size=<new>`. The picture is not squeezed and the mouse lands
     where clicked.
   - Win+L shows the notice "Screen capture is paused (...)".
   - The 60 → 120 change starts no new helper and the overlay's frame rate reaches ~120.
-- **If not, send**: host.log of the changes and a screenshot.
+  - The display asleep: a first frame within a few seconds (`encoder ready ... startup=` under
+    5 s), the PC's display on again. Where it takes longer: `encoder helper: capture noimage:
+    no image from the capture for 2 s (display off or PC locked?); woke the display` and the
+    notice "No picture from the PC's screen yet: ..." in the browser, then `capture restored
+    ... first image after N s`. Locked: the lock screen streams (or `capture changed
+    reason=lost` with the notice "Screen capture is paused").
+- **If not, send**: host.log of the changes and a screenshot; for step 4 the host.log lines
+  from `encoder helper started` to `encoder ready`, and whether the display came on by itself.
 
 **4.6 Settings that need FFmpeg or change the stamps** (VENDOR_NOTES 3.1b; "Final review: host
 agent": "Nothing starts an encoder while the client is hidden"; "Final review: host agent,

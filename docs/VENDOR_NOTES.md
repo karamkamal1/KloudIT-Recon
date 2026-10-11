@@ -12111,6 +12111,11 @@ the HDR10 probe have sections of their own (below).
 
 ### What the log shows
 
+- **No picture for the first 54 s.** The first session's helper started at 10:30:40.682;
+  `encoder ready ... startup=53.969s` came at 10:31:34.458, after five `stream stats` with
+  `fps=0 mbps=0`, and 167 ms after its first frame the capture was lost
+  (`DXGI_ERROR_INVALID_CALL`) until 10:31:45.657. Nothing in the log said why the stream was
+  empty. Section "First hardware run: no picture for the first 54 s" (below).
 - **The static-desktop cut during a game.** 30 `static desktop: lowering the bitrate` and 28
   `desktop changes: full bitrate back`, 21 of the cuts in the 151 Mbit/s session `5LpSw86_`
   (six minutes of a game). From cut to restore: median 1.1 s (0.07-40 s), 13 of 28 within a
@@ -12478,3 +12483,75 @@ which the pattern's own checks (the barcode, the PQ levels) never relied on.
   UDP 40329 blocked (PC firewall: a Public network? host.log says)`, `the PC offers no direct
   endpoint (its agent has none up: host.log)`), "WebGPU HDR10", thinning and bitrate recovery
   among them.
+
+## First hardware run: no picture for the first 54 s
+
+### What the log shows
+
+The owner's first session (`a2UhscTP`, host `52f801f`): `encoder helper started` at
+10:30:40.682, then `stream stats` with `fps=0 mbps=0` at 10:30:50, 10:31:00, 10:31:10, 10:31:20
+and 10:31:30, the helper's first image at 10:31:34.447 (`conversion source: DXGI format 87`),
+`encoder ready ... startup=53.969s` at 10:31:34.458, and 167 ms later `capture lost: ...
+AcquireNextFrame: 0x887A0001 (DXGI_ERROR_INVALID_CALL)` until `capture restored` at
+10:31:45.657. The agent had had no session since 21:39 the day before, so the display was most
+likely asleep (an inference: the log has no power state).
+
+### Cause
+
+DDA hands out nothing while the display is off or asleep (`AcquireNextFrame` times out), and
+until a first image the pacer has nothing to repeat (`FramePacer::decide` waits for ever without
+one): the stream stays empty without an error. Neither keep-awake mechanism of `52f801f` turns
+a display that is already off back on: the capture thread's `ES_CONTINUOUS |
+ES_DISPLAY_REQUIRED` (`paced_capture.cpp`) and the session's display power request
+(`keepDisplayOn`) keep a display on. HelperVideo has no watchdog for a missing first image.
+The first image most likely came when someone moved the mouse at the PC, and the display's
+power-on changed the mode (the capture loss right after).
+
+### The fix
+
+- **The helper** (`FirstImageWatchdog` in `src/capture/pacer.hpp`, used by `PacedCapture`, so
+  DDA, AMD Direct Capture, WGC and the synthetic GPU source): no image at all 2 s after the
+  capture's start wakes the display as user input does (a one-off
+  `SetThreadExecutionState(ES_DISPLAY_REQUIRED)` and a `SendInput` mouse move of zero length:
+  the pointer stays where it is) and reports `captureChanged` `noimage` with `no image from the
+  capture for 2 s (display off or PC locked?); woke the display` (or `could not wake the display
+  (SendInput error N)`); again every 10 s while it lasts. The first image after that reports
+  `restored` with `first image after N s`. The helper's own log line is a warning
+  (`capture noimage: ...`). The synthetic GPU source takes a test start parameter
+  `testFirstImageMs` (no present for that long).
+- **recon-host**: the session logs `capture changed reason=noimage text="..."` and tells the
+  client: the notice "No picture from the PC's screen yet: no image from the capture for 2 s
+  (display off or PC locked?); woke the display." A `restored` is logged. An older recon-host
+  logs the unknown reason and goes on.
+- **Docs**: `docs/HELPER_PROTOCOL.md` (`noimage`, `testFirstImageMs`, the display paragraph),
+  ARCHITECTURE "The PC's display stays on", `docs/HARDWARE_TEST_PLAN.md` 4.5 step 4.
+
+### Verified here
+
+- `--self-test-pacer` (under Wine): `first-image watchdog`: nothing before 2 s, reports at 2, 12
+  and 22 s while no image comes, the first image after 54 s with its time and nothing after it,
+  an image within 2 s reports nothing, a capture thread held up for 40 s reports once.
+- `TestHelperIntegrationFirstImage` (mingw build, under Wine with xvfb; mock encoder, synthetic
+  GPU source): with `testFirstImageMs` 3500 the helper reports `noimage` 2.0 s after the start,
+  before any frame, with `woke the display` (Wine's `SendInput` takes the move), its first frame
+  (a key frame) after 3.5 s and `restored` `first image after 3.5 s` at the source's 640x360;
+  with 500 ms nothing is reported; `testFirstImageMs` with the CPU source is refused.
+- `TestOwnerLogNoFirstImage` (`internal/host/ownerlog_test.go`, the session with the mock
+  helper): two `noimage` reports give two warning notices with the helper's text and two
+  `capture changed reason=noimage` log lines; the first frame and `restored` follow with no
+  further notice.
+- Not verifiable here: whether the zero-length move and the one-off display request turn a
+  sleeping display on (no display in the sandbox; Wine has no power management).
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 4.5 step 4: disconnect,
+  `powercfg /change monitor-timeout-ac 1`, leave the PC untouched until the display is off
+  (2 minutes), connect; once unlocked, once locked (Win+L before leaving). Pass: a first frame
+  within a few seconds (`encoder ready ... startup=` under 5 s) and the display on again; where
+  it takes longer, `capture noimage: ... woke the display` 2 s after `encoder helper started`
+  and the browser's notice "No picture from the PC's screen yet: ...", then `capture restored
+  ... first image after N s` with N under 5. Send the lines from `encoder helper started` to
+  `encoder ready` if not, and whether the display came on by itself.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with `hevc_nvenc_helper` on
+  an RTX 40/50 host (the watchdog is in the capture, not the encoder). Pass: the same.

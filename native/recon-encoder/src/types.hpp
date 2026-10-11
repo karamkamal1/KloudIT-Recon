@@ -150,6 +150,10 @@ struct StartParams {
     // 0: what helpers before that rule reported for them; recon-host must
     // not take them for a static desktop either).
     std::string testDirty;
+    // synthetic-gpu only (tests): no present at all for this many ms after
+    // the start, as a display that is off or asleep hands DDA nothing (the
+    // first-image watchdog, FirstImageWatchdog); 0 = presents from the start.
+    int testFirstImageMs = 0;
     // Phase 5 experiments (optional, off by default; caps say where they work).
     // reencodeOversized: a non-key frame larger than this many average frames
     // (bitrate / fps) is encoded once more at a higher QP before it goes out

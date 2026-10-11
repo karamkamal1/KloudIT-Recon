@@ -85,7 +85,13 @@ Windows display power request (`PowerRequestDisplayRequired`, listed by `powercf
 from its welcome until it ends, cleared while the client is hidden (paused). Without it Windows
 turns the display off after the power plan's timeout when the only input is a controller (a
 virtual pad's input does not count), which freezes the picture; the native helper's capture
-thread also holds `ES_DISPLAY_REQUIRED` while it captures, FFmpeg's capture does not.
+thread also holds `ES_DISPLAY_REQUIRED` while it captures, FFmpeg's capture does not. Neither
+turns back on a display that was already off when the session started (the first hardware
+run's first session: no picture for 54 s, DDA hands out nothing then): the helper's capture
+with no image 2 s after its start wakes the display (a zero-length mouse move and a one-off
+`ES_DISPLAY_REQUIRED`) and reports `captureChanged` `noimage`, again every 10 s while it lasts;
+the session logs it (`capture changed reason=noimage`) and tells the client ("No picture from
+the PC's screen yet: ...").
 
 ### Frame stream
 

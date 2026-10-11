@@ -2,8 +2,12 @@ package host
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
 // The owner's first hardware run (host.log of 52f801f; docs/VENDOR_NOTES.md
@@ -67,5 +71,38 @@ func TestRateAttrs(t *testing.T) {
 		if got := fmt.Sprint(rateAttrs(c.c, c.delayMs)); got != c.want {
 			t.Errorf("%s: %s, want %s", c.c.why, got, c.want)
 		}
+	}
+}
+
+// TestOwnerLogNoFirstImage: the log's first session had no picture for 54 s
+// (helper started 10:30:40.682, "encoder ready ... startup=53.969s", five
+// stream stats with fps=0) and nothing said why: the display was most likely
+// asleep, and DDA hands out nothing then. The helper's first-image watchdog
+// reports captureChanged "noimage" after 2 s and every 10 s while it lasts
+// (having tried to wake the display), and "restored" with the first image:
+// the session logs both and tells the client while the picture is missing.
+func TestOwnerLogNoFirstImage(t *testing.T) {
+	r := newP5Rig(t, fakeSVCH264, proto.HelloVersionRecovery, Config{}, "seamless")
+	const why = "no image from the capture for 2 s (display off or PC locked?); woke the display"
+	r.f.Send(encoder.CaptureChanged{Reason: "noimage", Text: why})
+	waitMsg(t, r.ctrl, `"t":"notice"`, `"level":"warn"`, "No picture from the PC's screen yet: "+why)
+	r.f.Send(encoder.CaptureChanged{Reason: "noimage", Text: "no image from the capture for 12 s (display off or PC locked?); woke the display"})
+	waitMsg(t, r.ctrl, `"t":"notice"`, "for 12 s")
+	r.publish(t, &encoder.Frame{FrameID: 1, Key: true, SeqStart: true, LTRSlot: -1, Data: p5Key, CaptureQPC: 2, OutputQPC: 3})
+	r.f.Send(encoder.CaptureChanged{Reason: "restored", Width: 320, Height: 180, Text: "first image after 12.6 s"})
+	waitMsg(t, r.ctrl, `"t":"video"`, `"gen":1`)
+	for deadline := time.Now().Add(5 * time.Second); len(r.logs.lines(`reason=restored`)) == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no log of the first image")
+		}
+	}
+	if l := r.logs.lines(`msg="capture changed" reason=noimage`); len(l) != 2 || !strings.Contains(l[0], why) {
+		t.Fatalf("log %q", l)
+	}
+	if l := r.logs.lines(`msg="capture changed" reason=restored size=320x180`); len(l) != 1 || !strings.Contains(l[0], "first image after 12.6 s") {
+		t.Fatalf("log %q", l)
+	}
+	if n := strings.Count(strings.Join(r.ctrl.messages(t), "\n"), `"t":"notice"`); n != 2 {
+		t.Fatalf("%d notices, want the two for the missing picture", n)
 	}
 }
