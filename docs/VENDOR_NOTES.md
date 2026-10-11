@@ -1285,7 +1285,9 @@ What changed (B3):
     host.log; a second flush lowers the cap): the raises judge the network delay, not the
     client's decode capacity, so without the cap a client that cannot decode the setting would
     go through flush (an urgent restart, a frozen picture), cut and raise again every few tens of
-    seconds.
+    seconds. (Since the review of the first hardware run's fix, in the 2.2 controller: for 30 s,
+    twice as long with each further flush, at most 4 min; one transient flush no longer caps the
+    session for good.)
   - Raise: every 500 ms the session judges the one-way delay of the frames the client
     acknowledged since the last check (`0x40` frame acks, `OWDUs`: the client's last-byte receive
     time minus the frame's encode-done time on the synchronised clock, so the host queue counts
@@ -11696,17 +11698,29 @@ encoder only assumed seamless: no qualification yet), HEVC 1920×1080 at 60 fps.
 ### Root cause
 
 Two diagnoses read the code against these numbers; a regression simulation with the session's
-real parts (below) reproduced the collapse and confirmed each cause before it was fixed.
+real parts (below) reproduced the collapse and confirmed each cause before it was fixed. A
+review of the fix read the owner's host log (`host.log` of this run, host `52f801f`) against
+the first account of cause 1 and corrected it (below, "Review of the fix").
 
-1. **A key-frame storm from the host's frame queue.** The queue overflowed at six frames
-   whatever made them wait. A key frame at 30 Mbit/s (about 10 × a frame's budget, ~625 KB)
-   paced at 1.2 × the target takes ~140 ms to go out. Six frames (100 ms at 60 fps) waited behind
-   it, the queue overflowed, and each overflow was an emergency cut of 25 %. The frames dropped
-   were the ones after the key frame, so no long-term reference after it was ever acknowledged.
-   The helper answered the loss with another IDR, which overflowed the queue again. That went on
-   down to the floor (2 Mbit/s), where an IDR is about 25 budgets (~100 KB, ~350 ms at the
-   pacing rate) and overflowed the queue every time: a few frames per second, nearly all of them
-   key frames. The transfer p95 of 325 ms is such a key frame being paced out.
+1. **A cycle of recovery frames through the host's frame queue.** The queue overflowed at six
+   frames (100 ms at 60 fps) whatever made them wait. The log has no key frame after the start:
+   all 72 `stream stats` lines say `key_frames=0` and `recovered_by_key=0`, and all 764 `loss
+   recovered` lines say `by="recovery frame"`; there is no `forcing a key frame` and no `no
+   recovery frame possible`. The 154 Mbit/s session (`6HvYapbC`, the second overlay) stayed in
+   generation 1 for all its 1517 lines, with 653 overflows. It went down from 154 Mbit/s by delay
+   decreases (logged at most once per 10 s: 154000 → 65450 after 1.5 s, ~6300 kbit/s 21 s
+   later); from there each overflow (7 frames; `sender_busy_ms`, the time the sender had had its
+   frame when the seventh arrived, p10/p50/p90/max 87/116/232/466 at a congestion target of
+   2000-2900 kbit/s: frames of at least ~25-70 KB, 6-17 frame budgets, still being written)
+   dropped the queue, the loss was answered by an LTR recovery frame of about that size, paced
+   at 1.2 × the target it took longer than six frame intervals, and the next overflow followed
+   behind it, every 120-170 ms, each an emergency cut when 2 s had passed, down to the floor.
+   The transfer p95 of 325 ms is such a recovery frame being paced out (~95 KB at 2.4 Mbit/s). The same queue rule
+   also makes a key-frame storm where the key frame itself takes longer than six intervals (a
+   start at 30 Mbit/s with an IDR of 10 budgets, ~140 ms): the frames dropped after it leave no
+   acknowledged LTR, and the helper answers with another IDR. That is what the regression
+   simulation's start cases show; the owner's run, whose first IDR was evidently smaller, did
+   not have it. The key-frame deferral below is hardening against it, not the owner's cause.
 2. **Nothing climbed back from the floor.** Several faults each held the increases or caused
    another decrease:
    - The encoder's *fill* (output / target) was counted per frame. A source that sends fewer
@@ -11735,8 +11749,8 @@ real parts (below) reproduced the collapse and confirmed each cause before it wa
 
 The frame-rate ladder was not involved: `fpsFloor` defaults to 60, the session's own rate, so
 the ladder had no rung to step down to (the video config stayed at `fps` 60). The 6-12 fps were
-frames lost to the storm. The bake-off then ran on that starved stream and stored its pick for
-good (below).
+frames lost to the overflow cycle. The bake-off then ran on that starved stream and stored its
+pick for good (below).
 
 ### The fix
 
@@ -11744,12 +11758,15 @@ good (below).
   only where the network does not keep up. That means the frame being sent has been with the
   sender past its deadline (rung 1's: its own sending time at the pacing rate plus a frame
   interval), or the rate controller's last report found the delay over its target. Behind a key
-  frame paced out on schedule, frames wait their turn, up to 128. `frame queue overflow` logs
-  `sender_bytes`.
+  frame or a recovery frame paced out on schedule, frames wait their turn. Since the review, a
+  backlog that does not drain overflows too, and the deadline is the frame's on the wire
+  (shards with parity); see "Review of the fix". `frame queue overflow` logs `why`,
+  `sender_bytes` (the frame's size on the wire) and `sender_kind` (`key`, `recovery`, `frame`).
 - One key frame at a time (`Session.keyframe`, `Session.loss`): a key frame asked for while one
   is being written is forced once that write is done (`key frame deferred: one is being sent`).
   A loss after a key frame still being written gets the key frame at once (the ladder's
-  `recoverFailed`), not a recovery that could only become another IDR.
+  `recoverFailed`), not a recovery that could only become another IDR. Hardening against the
+  key-frame storm, which the owner's run did not have (cause 1).
 - Fill by time, over what was sent (`rateController.sent`, `wanted`): bytes handed to the
   transport against what the target asks for over the same time.
 - The delay sample's own frame and the clock's corrections (`0x41` flag bit 3, `owdGen` /
@@ -11769,7 +11786,8 @@ good (below).
   congestion window for a quarter of the 100 ms, losses, or acknowledgements under 90 % of what
   was sent over 250 ms). Otherwise a decrease starts from the lower of the target and the
   encoder's rate.
-- The decoder cap is never below the floor.
+- The decoder cap is never below the floor (and, since the review, lifts after 30 s, twice as
+  long with each further flush).
 - The bake-off on a starved stream (`renderers.js` `pickPath`, `stream.js`): where even the
   best path drew under 80 % of the stream's frame rate (at most the display's refresh), a path
   out for too few samples or for dropping frames makes the pick not conclusive. The pick draws
@@ -11779,8 +11797,7 @@ good (below).
 
 What was not changed: the thresholds of real congestion. The overflow at six frames under
 congestion, the 2 % loss limit, the 8 ms margin, three reports over the target and the decrease
-factors are as before. TestRateSimCapdrop keeps its bounds, except the flushing encoder's
-recovery bound (below).
+factors are as before. TestRateSimCapdrop runs over 24 seeds since the review (below).
 
 ### The regression simulation
 
@@ -11792,8 +11809,12 @@ millisecond by millisecond. The rest is modelled:
 - the encoder: AMF-like. An IDR costs 10 × a frame's budget at 30 Mbit/s and 25 × at 2 Mbit/s, is
   not shrunk by the rate control's debt, and comes after a loss with no acknowledged LTR; P
   frames vary by a log-normal σ 0.35; scene changes come every ~4 s; the encoder fills 95-110 %
-  of its target.
-- the path: a UDP relay with 8 ms ±3 ms each way, 200 Mbit/s with a 50 ms queue.
+  of its target. The owner's recovery frames (cases below): 8 × at 30 Mbit/s to 10 × at
+  2 Mbit/s, not shrunk by the debt either (the log has them at 6-17 budgets, overflow after
+  overflow).
+- the path: a UDP relay with 8 ms ±3 ms each way, 200 Mbit/s with a 50 ms queue. Optionally
+  frames go as datagram shards whose parity and headers add 8-15 % on the wire (delivery stays
+  reliable: the parity's repairs are not modelled).
 - the client: Chrome's acknowledgements, a rate report every 25 ms, and its clock offset.
 
 The policy is the helper's before qualification ("seamless (assumed)").
@@ -11801,97 +11822,212 @@ The policy is the helper's before qualification ("seamless (assumed)").
 `TestRelaySimFirstHardwareRun` (two seeds each) covers:
 
 - the start at 30 Mbit/s with key frames of 10 × and 15 ×;
-- the floor with the last known-good rate there, also with a 12 fps source and with P frames of
-  at least 8 KB;
+- the floor with the last known-good rate there, also with a 12 fps source, with P frames of at
+  least 8 KB (with SVC thinning and without) and 16 KB, and a 3 Mbit/s setting under what the
+  encoder makes at its QP limit (no SVC);
+- the owner's recovery-frame cycle: from the floor, key frames small enough not to overflow at
+  the start, a 200 ms outage at 5 s, recovery frames as in the log; and the same at the 154 Mbit/s
+  setting (the second overlay);
+- frames as shards, +8 % and +15 % on the wire, at the start (also with 15 × key frames) and from
+  the floor;
 - a 12 ms clock correction after 2 s, and 15 ms for a client that does not report it;
-- 0.5 % random loss, also with an old client;
-- the 154 Mbit/s setting with an encoder that makes 60 Mbit/s at most.
+- 0.5 % random loss, also with an old client (12 seeds, the median judged: below);
+- the 154 Mbit/s setting with an encoder that makes 60 Mbit/s at most and a clock correction.
 
 Each must end at least at 80-95 % of the setting at the stream's frame rate, reach 85 % in time
-and decrease at most a few times.
+and decrease at most a few times; and over the whole run, from the first frame, the host queue
+p95 under 50 ms (its maximum under 400 ms: a 25-budget key frame at the floor takes ~350 ms to
+pace out) and the end-to-end p95 under 100 ms (a 12 fps source: 117 and 233 ms, its frames are
+five times larger).
 
-| | before the fix | after |
+The "before" column is the same simulation with the controller of `52f801f`: a scratch tree with
+`bitrate.go` and `ratefeedback.go` from `52f801f`, shims for the methods it lacks (`sent`,
+`frameInterval` and `outputKbps` do nothing; `delayOver` is true, which is the old six-frame
+overflow whatever the reason; `compOf` finds nothing, which is the old median of the newly
+covered frames) and the key-frame deferral taken out of the simulation's glue. (The table in the
+first version of this section came from an earlier version of the simulation; two of its cases
+did not fail the way it said. These are the numbers of the committed simulation.)
+
+| case (2 seeds) | before (52f801f controller) | after |
 |---|---|---|
-| target, last 10 s (all ten cases) | 2000 kbit/s, the floor | the setting (25.5-30 Mbit/s with loss and an old client; 154 Mbit/s capped by the encoder) |
-| frames decoded per second | 3.0 (0.6 for the 12 fps source) | 59.2-60.1 (11.8-12.1) |
-| frame-queue overflows in 40 s | 315-319 (64 at 12 fps) | 0 |
-| end-to-end p50/p95, last 10 s | 373-385 / 414-435 ms | 28 / 44 ms |
-| network + transfer p50 | ~346 ms (a key frame paced at 2.4 Mbit/s) | 21 ms |
-| from the floor to 85 % of 30 Mbit/s | never | 17.2 s |
+| start at 30 Mbit/s, key frames 10 × / 15 ×; from the floor (also P frames ≥ 8 KB with and without SVC, ≥ 16 KB, shards +15 %); shards +8 %; clock corrections 12 ms and 15 ms (old client); 0.5 % loss; a 3 Mbit/s setting with P frames ≥ 8 KB | the floor, 3.0 fps (1.9 with 15 × key frames), 315-325 overflows, end-to-end p95 425-447 ms (626-634 ms) | the setting (3 Mbit/s: 3000), 59.7-60.1 fps, 0-1 overflows, end-to-end p95 42-55 ms |
+| from the floor, 12 fps source | stays at the floor (2000 kbit/s for 40 s: the frame-count fill held every increase), 12.0 fps, no overflow | 30 Mbit/s, 11.9-12.1 fps |
+| from the floor, the owner's recovery frames after an outage (30 / 154 Mbit/s) | 34-85 overflows, each answered by a recovery frame (no IDR after the start), 3-6 decreases; the target 26-30 / 38-103 Mbit/s at the end | 30 / 133-134 Mbit/s (85 % of 154 reached after ~33 s), 3-4 overflows (the outage), end-to-end p95 38-45 ms |
+| 154 Mbit/s setting, clock correction | 7 delay decreases (to ~17 Mbit/s by 4 s), back at the setting after 20-27 s, no overflow | no decrease |
+| 0.5 % loss, old client (12 seeds) | the floor, 3 fps on every seed | median 24.5 Mbit/s; 3 of 12 seeds under 80 % (also 3 of 12 before the review's fixes, other seeds) |
 
-The before numbers have the owner's shape: a few frames per second, nearly all key frames,
-with a transfer p95 of ~350 ms.
+The recovery-frame cases show the owner's mechanism, dozens of overflows each answered by a
+recovery frame, but in the simulation the old controller climbs out of it: its increases
+between the overflows take the target to where a recovery frame no longer takes six frame
+intervals. In the owner's session they were held (the fill and thinning faults of cause 2).
+Most cases' "before" is the start's key-frame storm, which the owner's run evidently did not
+have (cause 1); every case fails on the old controller.
+
+The old client with 0.5 % loss stays fragile: its reports cannot name the frame their delay is,
+a retransmitted frame completing out of order makes the pacer share of other frames lower the
+2 s base, and the loss (which marks the path as holding the sender back) keeps the level-shift
+rule out. 3 of 12 seeds end under 80 % of the setting before the review's fixes and after; the
+test judges the median over 12 seeds.
 
 `TestRelaySimCongestion` checks that real congestion still cuts on the same relay:
 
 - **Capacity 200 → 15 → 200 Mbit/s at 15-30 s.** The first cut comes 149/164 ms after the drop.
-  The one-way delay p95 in the dip is 10/21 ms over the one before it (bound 30). The mean target
-  in the dip is 12.1/11.6 Mbit/s, and the target is back at 85 % 8.6/7.9 s after the capacity
+  The one-way delay p95 in the dip is 5/13 ms over the one before it (bound 30). The mean target
+  in the dip is 11.9/12.0 Mbit/s, and the target is back at 85 % 8.0/5.9 s after the capacity
   returns (bound 10 s).
-- **A 10 Mbit/s path.** The target settles at 6.1-6.8 Mbit/s at 58.6-58.9 fps, never at the
-  floor.
-- **A 25 Mbit/s path.** The target settles at 20.1-20.8 Mbit/s.
+- **A 5, 10, 20 or 25 Mbit/s path from a 30 Mbit/s start.** The target settles at 3.7-3.8,
+  6.6, 15.9-16.0 and 20.5-21.3 Mbit/s at 57.8-59.2 fps, never at the floor. From the third
+  second every second decodes at least 50 frames, with at most 3 key frames forced (5 Mbit/s:
+  decoded per second 0, 3, 57-61, 60, ...; the last overflow at 1.8 s).
 - **5 % random loss.** Loss decreases take the target to the floor.
 
-GUIDE 2.2's capdrop simulations (`TestRateSimCapdrop`, seed 1; 50 → 15 → 50 Mbit/s, a 50 ms
-queue) pass for every policy:
+With the `52f801f` controller every one of these sits at the floor at 3 fps with ~315-355
+overflows; before the review's fixes (`f3cfbc0`, the probe in "Review of the fix") the start on a
+5 Mbit/s path was a storm of key frames for 4-8 s.
 
-- no overflow beyond the allowed one;
-- the dip's delay p95 within 30 ms of before;
-- back at 85 % within 10 s.
+GUIDE 2.2's capdrop simulations (`TestRateSimCapdrop`; 50 → 15 → 50 Mbit/s, a 50 ms queue) run
+over seeds 1-24 for every policy since the review: per seed at most the allowed overflow, the
+target at the setting before the dip and at the end, no decrease before the dip; the median dip
+delay (p95 during the dip less the p95 before it) under 30 ms and the median recovery to 85 %
+within 10 s (the flushing encoder: 12 s); the worst seed's within a ceiling near what each
+policy does now, to catch it getting worse. Over 24 seeds, dip delay median / worst (ms, seeds
+at 30 ms or more) and recovery median / worst (s):
 
-The flushing encoder (a key frame per change, steps 2 s apart) is the exception: its recovery
-bound went from 10 to 15 s. 10 s held for that seed only. Over seeds 1-24 its recovery took a
-median of 11.6 s (at most 15.9 s) before the fix and 11.7 s (at most 17.9 s) after; seed 1 went
-from 9.4 s to 13.7 s, in whole 2 s steps. Its dip delay is a knife edge: the p95 over the 20 s
-window is decided by whether the drop's transient lasts more or less than a second. Over 24 seeds
-the median rose from +20 to +31 ms (12 of 24 over 30 ms, 8 before; at most +73 before, +83
-after).
+| policy | 52f801f | before the review (f3cfbc0) | now | bounds (worst seed) |
+|---|---|---|---|---|
+| seamless | +12 / +17 (0); 5.6 / 7.1 | +12 / +16 (0); 4.9 / 6.4 | +12 / +16 (0); 5.1 / 6.3 | 30 ms; 10 s |
+| seamless, encoder at 80 % | +12 / +15 (0); 4.5 / 6.0 | +12 / +16 (0); 4.2 / 6.0 | +12 / +16 (0); 4.2 / 6.0 | 30 ms; 10 s |
+| seamless, relay | +8 / +17 (0); 5.4 / 7.0 | +8 / +31 (1); 5.2 / 6.9 | +7 / +31 (1); 5.2 / 6.7 | 45 ms; 10 s |
+| restart (FFmpeg) | +17 / +47 (1); 6.6 / 10.0 | +16 / +60 (3); 6.8 / 11.0 | +18 / +44 (1); 6.8 / 11.0 | 60 ms; 12 s |
+| restart, encoder at 80 % | +14 / +23 (0); 7.9 / 9.8 | +13 / +31 (1); 6.7 / 9.0 | +13 / +31 (1); 6.9 / 9.0 | 45 ms; 12 s |
+| flush | +20 / +73 (8); 11.6 / 15.9 | +31 / +83 (12); 11.7 / 17.9 | +21 / +83 (11); 11.1 / 15.1 | 90 ms; 16 s |
 
-The cause is not one change. Removing each fix in turn moved that median between 19 and 31 ms.
-Before the fix, the six-frame queue often overflowed at the drop and threw the backlog away
-(14 overflows in 24 runs, 12 after). Now its backlog peaks at four frames and drains at the
-pacing headroom.
+The flushing encoder's dip is a knife edge: the p95 over the 20 s window is decided by whether
+the drop's transient lasts more or less than a second, and the seeds where the six-frame queue
+overflows at the drop and throws the backlog away (12 of 24 now, 14 before) are the low ones.
+What brought its median back is the receive-rate fallback for slow policies (below). The
+restart policy's worst recovery, 11.0 s against 10.0 s at `52f801f`, is one 1 s step: its last
+cut in the dip lands 1.5 % lower, and 85 % is reached at the next step (seed 7: 25364 against
+25788 kbit/s at 50 s).
 
-The FFmpeg restart policy's 24-seed medians stayed: dip +17 → +16 ms, back 6.6 → 6.8 s. Its
-worst seeds got a little worse: dip at most +47 → +60 ms (1 → 3 of 24 over 30 ms), back at
-most 10.0 → 11.0 s. The seamless encoder's improved: dip +12 → +12 ms (at most +17 → +16), back
-5.6 → 4.9 s, at most 7.1 → 6.4 s.
+### Review of the fix
 
-Seeds 1-8, before → after, back at 85 % (s):
+A review of the fix (ten findings, some overlapping) was checked here, each with the reviewers'
+probes copied into the tree (not committed) and the simulations; all were real.
 
-| policy | before | after |
-|---|---|---|
-| seamless | 2.8-6.9 | 4.1-6.4 |
-| seamless, encoder at 80 % | 2.0-5.9 | 2.8-5.9 |
-| seamless, relay | 4.6-6.3 | 3.4-6.9 |
-| restart (FFmpeg) | 5.4-10.0 | 5.4-11.0 |
-| restart, encoder at 80 % | 4.8-8.6 | 4.1-9.0 |
-| flush | 9.4-13.4 | 9.3-15.6 |
+- **A backlog the rate controller never saw (findings 1 and 6, major).** Where the encoder makes
+  more than the pacer sends (P frames at its QP limit at a low bitrate; the owner's overlay
+  showed 4.7 Mbit/s of output at a 2.0 Mbit/s target), every frame went out on its own schedule,
+  none past its deadline, the pacer model took the wait off every delay sample, and the queue
+  grew to 128 frames (2.1 s at 60 fps, 10.7 s at 12 fps). Confirmed: a 3 Mbit/s setting with
+  P frames of at least 8 KB and no SVC gave a host queue p50/p95/max of 1635/2084/2132 ms;
+  GUIDE 2.2's simulation with an encoder at 1.3 × its target (10 Mbit/s) a one-way delay
+  p50/p95 of 1.63/2.10 s (59/116 ms at `52f801f`), at 1.5 × 0.85/2.07 s. Fixed twice over:
+  - the pacer keeps up with the encoder: the congestion target's video part is the encoder's
+    target or, where its output over the last second without key frames is more, that output
+    × 1.15 / 1.2 (`pacedVideoKbps`, `rateController.outputKbps`). Near its target an encoder
+    is paced as before: it takes 4 % over the target to change the pacing. A headroom of 1.2
+    over the output (the pacing gain itself) moved the flushing and restart policies' capdrop
+    seeds with a second's noise in the output (flush median dip +30 ms, restart worst +68 ms);
+    1.1 left them where they were but drained a scene change's backlog too slowly (a 3 Mbit/s
+    setting under an encoder at its QP limit: host queue p95 97 ms); 1.15 gives 22 ms there and
+    moved only the restart policy's capdrop seeds (worst dip +44 ms against +52 ms at 1.1);
+  - the queue overflows at six frames also when the frame being sent reached it more than
+    250 ms ago, or more than an interval past the longest deadline of a frame taken in the last
+    2 s where that is longer (`why=backlog`): behind a key frame on schedule the frames wait
+    about its deadline, less as the pacer catches up.
+  Now: the 3 Mbit/s case host queue p95 22-23 ms, end-to-end p95 54-55 ms over the whole run;
+  the 1.3 × and 1.5 × encoders 17/19 and 18/20 ms; P frames ≥ 8 KB without SVC from the floor
+  host queue p95 13-14 ms over the whole run (was p50/p95 621/1163 ms in the first 5 s, worst
+  1.61 s); ≥ 16 KB with SVC worst 262 ms (was 1.62 s).
+- **The start a storm of key frames on a path slower than the setting (finding 2, major).**
+  Every key frame paced at 1.2 × the target was past its deadline on such a path, the frames
+  behind it overflowed the queue, the loss became a deferred key frame forced when the write was
+  done, at an unchanged bitrate (the overflow was refused a cut within 2 s of the last
+  decrease), and the target even rose between the overflows. Confirmed (30 Mbit/s setting,
+  50 ms tail-drop queue; frames decoded in each of the first 6 s): 5 Mbit/s path [0 1 2 3 24 59],
+  [0 1 2 2 19 61], [0 1 2 3 3 3] (storming until 7.6 s, 35 overflows, 18 key frames forced
+  behind the previous one), 10 Mbit/s [1 3 4 64 ...] / [1 3 4 4 36 60], 20 Mbit/s storming
+  until 2.1-2.4 s in 2 of 3 seeds. Fixed: an overflow behind a key frame past its deadline cuts
+  even within 2 s of another decrease, once per key frame (`signalKeyOverflow`,
+  `Session.keyOverflow`), to what the path's acknowledgements carried (where it held the sender
+  back) over the pacing gain, at most a halving, so the key frame forced after it fits; and no
+  overflow, cut or refused, lets the target rise for 2 s. Now: 5 Mbit/s [0 3 57 60 60 59],
+  [0 3 61 60 60 56], [0 3 61 60 60 60] (last overflow 1.8 s, 3 key frames); 10 Mbit/s
+  [2 63 58 ...] (0.7 s); 20 Mbit/s one overflow at 0.17 s. `TestRelaySimCongestion` asserts it
+  on 5, 10, 20 and 25 Mbit/s paths.
+- **Shards judged by their stream bytes (findings 3 and 9, minor).** In datagram + FEC mode the
+  queue rule took the frame's deadline from its stream bytes, but its shards are 8-13 % larger on
+  the wire (parity and shard headers), and writeShards' own deadline used them. Confirmed with
+  `fec.Encoder.Cut`: a 25-budget IDR at 2 Mbit/s (104,254 bytes) is 112,936-117,644 bytes on the
+  wire at 0-3 % loss and is handed over after 295-302 ms against the rule's deadline of 295 ms,
+  with 17-18 frames queued: an overflow behind a key frame on schedule. In the simulation with
+  +15 % on the wire and the stream-byte deadline (the old rule, with every other fix): the floor,
+  1.8 fps, 77 overflows, 77 forced key frames. Fixed: frameSender and sendFEC record the frame's
+  bytes on the wire and its deadline from them (`Session.sending`: the estimate before the cut,
+  the shards after it), and the queue rule uses that deadline. `TestQueueOverflowsShards`,
+  `TestSessionFEC` and the simulation's shard cases cover it.
+- **The capdrop acceptance on one seed (findings 4 and 10, minor).** Confirmed (the numbers
+  above: the flushing encoder's median dip +20 → +31 ms, the restart policy's worst +47 →
+  +60 ms and 10.0 → 11.0 s). Now over 24 seeds with median and worst-seed bounds. Removing the
+  level-shift rule for slow policies changed nothing; going back to the client's receive rate
+  where the acknowledgements are not path-limited (the old `carried` fallback) brought the
+  flushing encoder back (median +21 ms, recovery 11.1 s median, 15.1 s worst) but slowed the
+  restart policy's recovery (median 6.8 → 8.8 s), so only the flushing encoder has it
+  (`applyPolicy.recvCarried`).
+- **The decoder cap for good (finding 5, minor).** A decoder flush capped every later increase
+  at 85 % of the bitrate it cut from until the settings changed; one transient flush near the
+  floor (the renderer bake-off at the start, a tab switch, a key-frame burst) left the stream
+  backed off at ~2 Mbit/s for the session. Now the cap lifts 30 s after the flush that set it
+  (`rateDecoderHold`); a decoder that falls behind again caps again, each time for twice as
+  long (at most 4 min: a decoder that cannot keep up would otherwise flush, freeze and cut every
+  half minute, which the cap was there to stop) (`TestRateDecoderCapFloor`,
+  `TestRateDecoderCapHold`).
+- **Root cause 1 (finding 7, major).** The owner's log has no key frame after the start; the
+  collapse was the recovery-frame cycle. Rewritten above; the simulation has the owner's
+  recovery frames now (the "before" column above), and 8.1b asks for the overflowing frame's
+  kind (`sender_kind`) and `why`.
+- **The before column (finding 8, minor).** Regenerated from the committed simulation against
+  the `52f801f` controller (above). The "154 Mbit/s setting, clock correction" case does not
+  reproduce the second overlay's collapse (the old controller is back at the setting after
+  20-27 s); it is described as what it is, and the second overlay's state (from the floor with
+  the owner's recovery frames) is a case of its own. The 12 fps source stayed at the floor at
+  12 fps with no overflow, not at 0.6 fps.
 
 ### Verified here
 
 - `go test ./internal/host/` covers the fixes:
   - **The regression simulation.** `TestRelaySimFirstHardwareRun` and `TestRelaySimCongestion`:
-    all ten owner cases fail before the fix (the table) and pass after; the congestion cases
-    pass.
+    every owner case fails on the `52f801f` controller (the table) and passes now, with the
+    whole-run host-queue and end-to-end bounds; the congestion cases pass, the start on slower
+    paths included.
   - **The controller.** `TestRateAckDelivered`: application-limited acknowledgements say
     nothing, held-back ones do. `TestRateFillByTime`: a 12 fps source fills its target, frames
     left out are not in it. `TestRateDecoderCapFloor`. `TestRateDelayDecrease`: a standing
     queue with the window holding the sender keeps decreasing; a step without that is one
-    decrease. `TestRateEmergency`: nothing sent is no carried rate.
+    decrease. `TestRateEmergency`: nothing sent is no carried rate. Since the review:
+    `TestRateOverflowHold` (an overflow refused a cut holds the increases),
+    `TestRateKeyOverflow` (a cut within the gap, to the acknowledged rate over the pacing
+    gain), `TestRateOutputKbps` (the encoder's output without key frames; the pacer follows it
+    only where it is markedly over the target), `TestRateDecoderCapHold`.
   - **The pacer model and the report.** `TestSendTrackRateChange`: drained at the old rate,
     `compOf`. `TestReportComp`: the named frame's share, the clock shift.
-  - **The frame queue and thinning.** `TestQueueOverflows`, `TestPacedInterval`,
-    `TestThinPressure` (the path flag).
+  - **The frame queue and thinning.** `TestQueueOverflows` (with the backlog rule),
+    `TestQueueBurst`, `TestQueueOverflowsShards`, `TestPacedInterval`, `TestThinPressure` (the
+    path flag).
   - **The session.** `TestFrameQueueBehindKeyFrame` runs `videoEvents` and `frameSender` with a
     stalled key-frame write. 20 frames queue behind a key frame on schedule and all go out, with
     no recovery and no key frame. With the delay over the target, or the key frame past its
     deadline, the seventh frame overflows the queue, and the ladder logs "a key frame before the
     loss is still being sent". The key frame is deferred (logged once) and forced exactly once
-    when the write is done, however often it is asked for meanwhile.
-  - **The 2.2 simulations.** `TestRateSimCapdrop`, `TestRateSimProfiles` and
-    `TestRateSimKeyFrames` pass, with the numbers above.
+    when the write is done, however often it is asked for meanwhile. Above the floor the
+    overflow behind it cuts at once, a second one behind the same key frame does not
+    (`why=deadline`, `sender_kind=key`, `key_cut=true` once). `TestFrameQueueBacklog`: a frame
+    on schedule that the encoder delivered 400 ms ago overflows the queue at seven frames
+    (`why=backlog`), one of 100 ms does not. `TestSessionFEC`: the queue rule saw the last
+    frame's shards, not its stream bytes.
+  - **The 2.2 simulations.** `TestRateSimCapdrop` (24 seeds per policy), `TestRateSimProfiles`
+    and `TestRateSimKeyFrames` pass, with the numbers above.
 - `go test ./internal/proto/`: `TestRateReportOWDFrame` round-trips the new block with and
   without shards. A short datagram clears the flag, and the bytes `protocol.js` writes match.
 - `-race` on the session tests passes (10 runs).
@@ -11915,7 +12051,9 @@ Seeds 1-8, before → after, back at 85 % (s):
     never "(backed off)" for long, ~60 fps.
   - host queue p95 under ~20 ms; capture → drawn p95 under ~60 ms.
   - No `frame queue overflow` and no `congestion: lowering bitrate ... why=overflow`; `stream
-    stats` `key_frames` 0-1 per 10 s.
+    stats` `recovered` and `key_frames` 0-1 each per 10 s (the first run had `key_frames=0`
+    throughout and still collapsed: its 764 losses were answered by recovery frames), and no
+    run of `loss recovered by="recovery frame"` lines a few hundred milliseconds apart.
   - At most occasional `key frame deferred: one is being sent`, and no `no recovery frame
     possible` unless a frame was lost.
   - The bake-off's overlay rows without *provisional*, all three paths measured.
@@ -11926,16 +12064,22 @@ Seeds 1-8, before → after, back at 85 % (s):
 
   If not, send:
   - host.log's `rate report decision` (debug), `congestion:`, `bitrate recovery:`, `frame
-    queue overflow` (with `sender_bytes`: the key frame's size), `thinning:` and `stream stats`
-    lines;
+    queue overflow` (with `why`, `sender_bytes`: the overflowing frame's size on the wire, and
+    `sender_kind`: `key`, `recovery` or `frame`), `loss recovered`, `thinning:` and `stream
+    stats` lines;
   - the overlay's stage rows;
   - the exported latency report.
 
   Also record:
-  - the AMF IDR size at 2 and 30 Mbit/s: the `sender_bytes` of any overflow, or the helper's
-    frame log in `recon-host qualify`. The simulation assumes 25 × and 10 × a frame's budget.
-    The helper runs without HRD and without a maximum access-unit size, so a larger IDR would
-    take proportionally longer to pace out.
+  - the AMF IDR and LTR recovery-frame sizes at 2 and 30 Mbit/s: the `sender_bytes` and
+    `sender_kind` of any overflow, or the helper's frame log in `recon-host qualify`. The
+    simulation assumes IDRs of 25 × and 10 × a frame's budget and, for the owner's cases,
+    recovery frames of 10 × and 8 × (the first run's log: 6-17 budgets at 2-2.9 Mbit/s, partly
+    written). The helper runs without HRD and without a maximum access-unit size, so a larger
+    frame takes proportionally longer to pace out.
+  - a start on a link slower than the setting (8.2's `capdrop` profile applied before
+    connecting, at 30 Mbit/s): at most three `key frame forced: key frame deferred while one was
+    being sent` / `key_cut=true` overflows, ~60 fps within 3 s.
   - one `capdrop` run (8.2, T6) on this build.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same steps on an RTX 40/50 host with
   `hevc_nvenc_helper` (and once with Codec AV1). Pass: the same lines. NVENC's IDR at 2 Mbit/s

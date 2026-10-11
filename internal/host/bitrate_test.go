@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,7 +103,7 @@ func (h *ctlHarness) run(d time.Duration, qd func(t time.Duration) time.Duration
 			if h.static != nil {
 				h.frame()
 			}
-			h.r.output(n)
+			h.r.output(n, false)
 			h.r.sent(n) // the session hands every frame to the transport
 			bytes += int64(float64(n) * h.share)
 			frames++
@@ -493,7 +495,7 @@ func TestRateIncreaseCap(t *testing.T) {
 	}
 	h.share = 1
 	h.r.mu.Lock()
-	h.r.decoderCap = 15000
+	h.r.decoderCap, h.r.decoderCapAt = 15000, h.r.clock()
 	h.r.mu.Unlock()
 	h.run(20*time.Second, flat(20*time.Millisecond))
 	if h.cur() != 15000 {
@@ -609,7 +611,7 @@ func TestRateEmergency(t *testing.T) {
 		t.Fatalf("decoder flush: %+v %v cap %d, want 11250 and a cap of 12750", c, ok, h.r.decoderLimit())
 	}
 	h.apply(c)
-	h.run(30*time.Second, flat(20*time.Millisecond))
+	h.run(25*time.Second, flat(20*time.Millisecond)) // within rateDecoderHold
 	if h.cur() != 12750 {
 		t.Fatalf("target %d after the decoder flush, want the cap 12750", h.cur())
 	}
@@ -942,7 +944,7 @@ func TestRateAckDelivered(t *testing.T) {
 				h.clock = h.clock.Add(time.Millisecond)
 				if !h.clock.Before(nextFrame) {
 					nextFrame = nextFrame.Add(time.Second / 60)
-					h.r.output(frame)
+					h.r.output(frame, false)
 					h.r.sent(frame)
 					sent += frame
 				}
@@ -985,7 +987,7 @@ func TestRateFillByTime(t *testing.T) {
 	}
 	for i := 0; i < 24; i++ {
 		h.clock = h.clock.Add(time.Second / 12)
-		h.r.output(20000 * 1000 / 8 / 12)
+		h.r.output(20000*1000/8/12, false)
 		h.r.sent(20000 * 1000 / 8 / 12)
 	}
 	if f := fill(); f < 0.95 || f > 1.05 {
@@ -996,7 +998,7 @@ func TestRateFillByTime(t *testing.T) {
 	}
 	for i := 0; i < 120; i++ {
 		h.clock = h.clock.Add(time.Second / 60)
-		h.r.output(20000 * 1000 / 8 / 60)
+		h.r.output(20000*1000/8/60, false)
 		if i%2 == 0 {
 			h.r.sent(20000 * 1000 / 8 / 60)
 		}
@@ -1011,7 +1013,9 @@ func TestRateFillByTime(t *testing.T) {
 
 // TestRateDecoderCapFloor: a decoder flush near the floor caps later
 // increases at the floor, never under it (85 % of the bitrate it cut from
-// would be).
+// would be), for rateDecoderHold; then the increases probe again and the
+// target climbs back (a decoder that fell behind once, as the renderer
+// bake-off at the start, must not leave the stream backed off for good).
 func TestRateDecoderCapFloor(t *testing.T) {
 	h := newCtl(t, 2300, 60, seamless)
 	c, ok := h.r.congestion(signalDecoder)
@@ -1022,6 +1026,141 @@ func TestRateDecoderCapFloor(t *testing.T) {
 	h.run(20*time.Second, flat(20*time.Millisecond))
 	if h.cur() != rateFloorKbps {
 		t.Fatalf("target %d, want the floor", h.cur())
+	}
+	h.run(rateDecoderHold, flat(20*time.Millisecond))
+	if h.cur() != 2300 || h.r.decoderLimit() != 0 {
+		t.Fatalf("target %d, cap %d %v after the flush; want the setting 2300 and no cap", h.cur(), h.r.decoderLimit(), rateDecoderHold+20*time.Second)
+	}
+}
+
+// TestRateDecoderCapHold: a decoder that falls behind again caps again, and
+// its hold starts over, twice as long.
+func TestRateDecoderCapHold(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	c, ok := h.r.congestion(signalDecoder)
+	if !ok || h.r.decoderLimit() != 17000 {
+		t.Fatalf("decoder flush at 20000: %+v %v, cap %d; want 17000", c, ok, h.r.decoderLimit())
+	}
+	h.apply(c)
+	h.run(rateDecoderHold-5*time.Second, flat(20*time.Millisecond))
+	if h.cur() != 17000 {
+		t.Fatalf("target %d within the hold, want the cap 17000", h.cur())
+	}
+	c, ok = h.r.congestion(signalDecoder) // again, from the cap
+	if !ok || h.r.decoderLimit() != 14450 {
+		t.Fatalf("second flush at 17000: %+v %v, cap %d; want 14450", c, ok, h.r.decoderLimit())
+	}
+	h.apply(c)
+	h.run(2*rateDecoderHold-time.Second, flat(20*time.Millisecond))
+	if h.cur() != 14450 {
+		t.Fatalf("target %d %v after the second flush, want its cap 14450 (held twice as long)", h.cur(), 2*rateDecoderHold-time.Second)
+	}
+	h.run(15*time.Second, flat(20*time.Millisecond))
+	if h.cur() != 20000 || h.r.decoderLimit() != 0 {
+		t.Fatalf("target %d, cap %d after the second hold, want the setting and no cap", h.cur(), h.r.decoderLimit())
+	}
+	h.r.reset() // new settings: the hold starts from rateDecoderHold again
+	h.r.mu.Lock()
+	hold := h.r.decoderHold
+	h.r.mu.Unlock()
+	if hold != 0 {
+		t.Fatalf("hold %v after reset, want none", hold)
+	}
+}
+
+// TestRateOverflowHold: a frame-queue overflow holds the increases for
+// rateEmergencyGap even when it is refused a cut (within the gap of another
+// decrease): the path or the sender does not keep up.
+func TestRateOverflowHold(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	c, ok := h.r.congestion(signalDelay) // an older client's delay report: a decrease
+	if !ok || c.toKbps != 17000 {
+		t.Fatalf("client delay report: %+v %v, want a decrease to 17000", c, ok)
+	}
+	h.apply(c)
+	h.run(time.Second, flat(20*time.Millisecond))
+	up := h.cur()
+	if up <= 17000 {
+		t.Fatalf("target %d 1 s after the decrease, want increases", up)
+	}
+	if c, ok := h.r.congestion(signalOverflow); ok {
+		t.Fatalf("a cut within the gap: %+v", c)
+	}
+	h.run(1900*time.Millisecond, flat(20*time.Millisecond))
+	if h.cur() != up {
+		t.Fatalf("target %d within %v of an overflow refused a cut, want %d", h.cur(), rateEmergencyGap, up)
+	}
+	h.run(time.Second, flat(20*time.Millisecond))
+	if h.cur() <= up {
+		t.Fatalf("target %d after the hold, want increases again", h.cur())
+	}
+}
+
+// TestRateKeyOverflow: an overflow behind a key frame past its deadline
+// (signalKeyOverflow) cuts even within rateEmergencyGap of another decrease,
+// to what the path's acknowledgements carried over the pacing gain (the next
+// key frame, paced at 1.2 x the target, then goes out at about the path's
+// rate), at most a halving; without path-limited acknowledgements, like an
+// overflow.
+func TestRateKeyOverflow(t *testing.T) {
+	h := newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	acks := func(n int) { // 5 Mbit/s of video acknowledged, packets lost: the path holds the sender back
+		for i := 0; i < n; i++ {
+			h.clock = h.clock.Add(25 * time.Millisecond)
+			h.r.report(feedback{at: h.clock, ackedValid: true, acked: 5_000_000 / 8 / 40, lost: 1, total: 50})
+		}
+	}
+	acks(5)
+	c, ok := h.r.congestion(signalOverflow)
+	if !ok || c.toKbps != 8500 {
+		t.Fatalf("overflow: %+v %v, want 0.85 x half the target (the acknowledged 5000 is under a halving)", c, ok)
+	}
+	h.apply(c)
+	acks(12)
+	if c, ok := h.r.congestion(signalOverflow); ok {
+		t.Fatalf("an overflow cut within the gap: %+v", c)
+	}
+	c, ok = h.r.congestion(signalKeyOverflow)
+	if !ok || !c.down || !c.urgent || c.why != "overflow" || c.toKbps != 4250 || h.r.lastGood != 5000 {
+		t.Fatalf("key overflow: %+v %v, last known-good %.0f; want an urgent cut to 4250 (half of 8500, over 5000 / 1.2) and 5000", c, ok, h.r.lastGood)
+	}
+	h.apply(c)
+	// Without acknowledgements that say anything of the path: 0.75 x.
+	h = newCtl(t, 20000, 60, seamless)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	if c, ok := h.r.congestion(signalKeyOverflow); !ok || c.toKbps != 15000 {
+		t.Fatalf("key overflow without acknowledgements: %+v %v, want 15000", c, ok)
+	}
+}
+
+// TestRateOutputKbps: the encoder's output rate at its live target, without
+// key frames; the pacer follows it where it is markedly over the target
+// (pacedVideoKbps) and not where it is near.
+func TestRateOutputKbps(t *testing.T) {
+	h := newCtl(t, 2000, 60, seamless)
+	if o := h.r.outputKbps(); o != 0 {
+		t.Fatalf("output %.0f before any frame, want 0 (unknown)", o)
+	}
+	h.outKbps = 4000 // P frames at the QP limit: 4 Mbit/s at a 2 Mbit/s target
+	h.run(2*time.Second, flat(20*time.Millisecond))
+	o := h.r.outputKbps()
+	if o < 3900 || o > 4100 {
+		t.Fatalf("output %.0f, want about 4000", o)
+	}
+	h.r.output(500_000, true) // a key frame: a burst the pacer spreads as before
+	if o2 := h.r.outputKbps(); math.Abs(o2-o) > 0.03*o {
+		t.Fatalf("output %.0f after a key frame, want about %.0f", o2, o)
+	}
+	if v := pacedVideoKbps(2000, o); v < int64(o*encoderPaceHeadroom/1.2) || v > int64(o*encoderPaceHeadroom/1.2)+1 {
+		t.Fatalf("paced for %d kbps, want %.0f (the output at %.2f x, through the pacing gain)", v, o*encoderPaceHeadroom/1.2, encoderPaceHeadroom)
+	}
+	for _, out := range []float64{0, 1500, 2000, 2080} {
+		if v := pacedVideoKbps(2000, out); v != 2000 {
+			t.Fatalf("paced for %d kbps with the encoder at %.0f, want the target 2000", v, out)
+		}
 	}
 }
 
@@ -1230,55 +1369,92 @@ func TestReportComp(t *testing.T) {
 // the dip under the baseline's + 30 ms, the bitrate back within 15 % of the
 // setting within 10 s of capacity returning, and staying there; and the
 // other profiles.
+//
+// One seed decides little: the dip's p95 over 20 s depends on whether the
+// drop's transient lasts more or less than a second, and a policy that
+// changes the bitrate seconds apart comes back in whole steps. So the
+// acceptance runs over seeds 1-capdropSeeds and bounds the median (GUIDE
+// 2.2's 30 ms and 10 s) and the worst seed (near what each policy does now,
+// to catch it getting worse). The flushing encoder (a key frame per change,
+// steps 2 s apart, by 5 % from 15 % below the last known-good rate, where its
+// cuts land) takes about five steps from a cut just before the capacity
+// returns: its median recovery bound is 12 s (11.6 s at 52f801f, before the
+// fixes for the first hardware run). docs/VENDOR_NOTES.md ("First hardware
+// run: rate control on the UDP relay") has the numbers before and after.
+const capdropSeeds = 24
 
 func TestRateSimCapdrop(t *testing.T) {
+	const ms = time.Millisecond
 	for _, c := range []struct {
 		name      string
 		policy    applyPolicy
 		fill      float64
 		relay     bool
-		overflows int           // allowed: at the drop, before a restart can take over
-		recover   time.Duration // to 85 % of the setting
+		overflows int // per seed, allowed: at the drop, before a cut is in effect
+		// The worst seed's dip delay over the baseline; the median and the
+		// worst seed's recovery to 85 % of the setting.
+		dipMax           time.Duration
+		backMed, backMax time.Duration
 	}{
-		{"seamless", seamless, 1, false, 0, 10 * time.Second},
-		{"seamless, encoder at 80 %", seamless, 0.8, false, 0, 10 * time.Second},
-		{"seamless, relay", seamless, 1, true, 1, 10 * time.Second},
-		{"restart (FFmpeg)", ratePolicy(restartCaps), 1, false, 0, 10 * time.Second},
-		{"restart (FFmpeg), encoder at 80 %", ratePolicy(restartCaps), 0.8, false, 0, 10 * time.Second},
-		// A flushing encoder (a key frame per change) changes 2 s apart,
-		// by 5 % from 15 % below the last known-good rate, where its cuts
-		// land: from a cut just before the capacity returns that alone is
-		// about five steps (10 s). Its cycle in the dip (a cut, three or
-		// four steps up, a cut) decides how far it is when the capacity
-		// returns, in whole 2 s steps: over seeds 1-24 the target was back
-		// in a median 11.6 s (at most 15.9 s) before the fixes for the first
-		// hardware run, 11.7 s (at most 17.9 s) after; this seed 9.4 s
-		// before, 13.7 s after (docs/VENDOR_NOTES.md, "First hardware run:
-		// rate control on the UDP relay"). 10 s held for this seed only.
-		{"flush", ratePolicy(flushCaps), 1, false, 1, 15 * time.Second},
+		{"seamless", seamless, 1, false, 1, 30 * ms, 10 * time.Second, 10 * time.Second},
+		{"seamless, encoder at 80 %", seamless, 0.8, false, 1, 30 * ms, 10 * time.Second, 10 * time.Second},
+		{"seamless, relay", seamless, 1, true, 1, 45 * ms, 10 * time.Second, 10 * time.Second},
+		{"restart (FFmpeg)", ratePolicy(restartCaps), 1, false, 0, 60 * ms, 10 * time.Second, 12 * time.Second},
+		{"restart (FFmpeg), encoder at 80 %", ratePolicy(restartCaps), 0.8, false, 0, 45 * ms, 10 * time.Second, 12 * time.Second},
+		{"flush", ratePolicy(flushCaps), 1, false, 1, 90 * ms, 12 * time.Second, 16 * time.Second},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			s := runSim(simConfig{dur: 60 * time.Second, fps: 60, ceiling: 30000, capacity: capdropRates(1), queue: 50 * time.Millisecond,
-				prop: time.Millisecond, policy: c.policy, applyDelay: 400 * time.Millisecond, keyFactor: 2, fill: c.fill, audioKbps: 160,
-				relay: c.relay, seed: 1})
-			base, dip := s.owdPct(5*time.Second, 20*time.Second, 0.95), s.owdPct(20*time.Second, 40*time.Second, 0.95)
-			back := s.heldFrom(40*time.Second, 30000*85/100)
-			t.Logf("overflows %v, one-way delay p95 %v before, %v during the dip; back at 85 %% %v after capacity returned; decreases %v\n%s",
-				s.overflows, base, dip, back-40*time.Second, s.decreases(0, s.cfg.dur), s.trace())
-			if len(s.overflows) > c.overflows {
-				t.Errorf("%d frame-queue overflows, want at most %d", len(s.overflows), c.overflows)
+			t.Parallel()
+			var dips, backs []time.Duration
+			var lines []string
+			for seed := uint64(1); seed <= capdropSeeds; seed++ {
+				s := runSim(simConfig{dur: 60 * time.Second, fps: 60, ceiling: 30000, capacity: capdropRates(1), queue: 50 * time.Millisecond,
+					prop: time.Millisecond, policy: c.policy, applyDelay: 400 * time.Millisecond, keyFactor: 2, fill: c.fill, audioKbps: 160,
+					relay: c.relay, seed: seed})
+				base, dip := s.owdPct(5*time.Second, 20*time.Second, 0.95), s.owdPct(20*time.Second, 40*time.Second, 0.95)
+				back := s.heldFrom(40*time.Second, 30000*85/100)
+				if back < 0 {
+					back = time.Hour // never
+				} else {
+					back -= 40 * time.Second
+				}
+				dips, backs = append(dips, dip-base), append(backs, back)
+				lines = append(lines, fmt.Sprintf("seed %2d: overflows %d, one-way delay p95 %v before, %v during the dip; back at 85 %% %v after capacity returned; decreases %v",
+					seed, len(s.overflows), base, dip, back, s.decreases(0, s.cfg.dur)))
+				if len(s.overflows) > c.overflows {
+					t.Errorf("seed %d: %d frame-queue overflows, want at most %d", seed, len(s.overflows), c.overflows)
+				}
+				if s.appliedAt(19*time.Second) != 30000 || s.appliedAt(59*time.Second) != 30000 {
+					t.Errorf("seed %d: target %d before the dip, %d at the end, want the setting", seed, s.appliedAt(19*time.Second), s.appliedAt(59*time.Second))
+				}
+				if dec := s.decreases(0, 20*time.Second); len(dec) > 0 {
+					t.Errorf("seed %d: decreases before the dip: %v", seed, dec)
+				}
 			}
-			if dip >= base+30*time.Millisecond {
-				t.Errorf("one-way delay p95 %v during the dip, want under %v + 30 ms", dip, base)
+			slices.Sort(dips)
+			slices.Sort(backs)
+			med := func(v []time.Duration) time.Duration { return v[len(v)/2] }
+			t.Logf("over %d seeds: dip delay over the baseline median %v, worst %v; back median %v, worst %v",
+				capdropSeeds, med(dips), dips[len(dips)-1], med(backs), backs[len(backs)-1])
+			fail := false
+			if d := med(dips); d >= 30*ms {
+				t.Errorf("median dip delay %v over the baseline, want under 30 ms", d)
+				fail = true
 			}
-			if back < 0 || back-40*time.Second > c.recover {
-				t.Errorf("bitrate back within 15 %% of the setting %v after capacity returned, want %v", back-40*time.Second, c.recover)
+			if d := dips[len(dips)-1]; d >= c.dipMax {
+				t.Errorf("worst seed's dip delay %v over the baseline, want under %v", d, c.dipMax)
+				fail = true
 			}
-			if s.appliedAt(19*time.Second) != 30000 || s.appliedAt(59*time.Second) != 30000 {
-				t.Errorf("target %d before the dip, %d at the end, want the setting", s.appliedAt(19*time.Second), s.appliedAt(59*time.Second))
+			if b := med(backs); b > c.backMed {
+				t.Errorf("median recovery %v, want within %v", b, c.backMed)
+				fail = true
 			}
-			if dec := s.decreases(0, 20*time.Second); len(dec) > 0 {
-				t.Errorf("decreases before the dip: %v", dec)
+			if b := backs[len(backs)-1]; b > c.backMax {
+				t.Errorf("worst seed's recovery %v, want within %v", b, c.backMax)
+				fail = true
+			}
+			if fail || t.Failed() {
+				t.Log("\n" + strings.Join(lines, "\n"))
 			}
 		})
 	}
