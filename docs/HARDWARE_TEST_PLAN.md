@@ -816,6 +816,29 @@ without a session" and "A relayed connection ends with its session")
 - **If not, send**: the gateway log (`pct exec 210 -- journalctl -u recon-gateway -n 200`) and
   host.log.
 
+**8.1b The setting on the UDP relay** (VENDOR_NOTES "First hardware run: rate control on the
+UDP relay")
+
+- **Do**:
+  1. Settings → *Measure renderers again*, Renderer Auto.
+  2. On the default pipeline with Network path Auto ending on the UDP relay (`webtransport ·
+     relay`), stream HEVC 1080p60 of constant motion at 30 Mbit/s for 2 minutes, then at
+     154 Mbit/s for 2 minutes.
+  3. Reconnect twice within a minute while the PC is busy (a game loading).
+  4. Run `Select-String $log -Pattern 'frame queue overflow|key frame deferred|no recovery frame possible|congestion: lowering|bitrate recovery: raising|thinning:|stream stats' | Select-Object -Last 80`.
+- **Pass**:
+  - The overlay's target reaches the setting (or what the encoder makes) within a few seconds
+    and stays there, not "(backed off)", at ~60 fps.
+  - Host queue p95 under ~20 ms and capture → drawn p95 under ~60 ms.
+  - No `frame queue overflow` and no `why=overflow`; `key_frames` 0-1 per `stream stats`.
+  - No `congestion: lowering bitrate ... why=delay` in the first 10 s after a reconnect while
+    the RTT is steady.
+  - The bake-off rows of the overlay without *provisional*, all three paths measured.
+- **If not, send**:
+  - those lines with `"logLevel": "debug"` (`rate report decision`);
+  - the `sender_bytes` of any overflow (the IDR's size; record it at 2 and at 30 Mbit/s);
+  - the overlay's stage rows and the exported latency report.
+
 **8.2 T6: the `capdrop` dip** (VENDOR_NOTES 2.2)
 
 - **Do**:
