@@ -388,19 +388,27 @@ func (s *Session) capture() string {
 // that, when it is not an output of DXGI adapter 0 (ddagrab's output_idx
 // counts those only) or this FFmpeg has no ddagrab. Capture "amf" stays a
 // request, which useAMFCapture turns down for a virtual display. A window
-// is captured as without one (updateVirtualDisplay then removes it).
+// is captured as without one (updateVirtualDisplay then removes it). Where
+// GPU capture cannot work (on this PC, or for this session's display:
+// gdi.go) a GPU capture gives way to GDI (gdigrab), which captures the
+// monitor's rectangle, a virtual display's too.
 func (s *Session) captureBackend(prefs proto.Prefs, mon platform.Monitor, virt bool) string {
-	if !virt || prefs.Window != "" {
-		return s.a.backendFor(prefs)
+	b := s.a.backendFor(prefs)
+	if virt && prefs.Window == "" && b != "gdigrab" {
+		f := s.a.caps.Filters
+		switch {
+		case s.a.cfg.Capture == "gfxcapture", (mon.DXGIOutput < 0 || !f["ddagrab"]) && f["gfxcapture"]:
+			b = "gfxcapture"
+		case s.a.cfg.Capture == "amf":
+			b = "amf"
+		default:
+			b = "ddagrab"
+		}
 	}
-	f := s.a.caps.Filters
-	switch {
-	case s.a.cfg.Capture == "gfxcapture", (mon.DXGIOutput < 0 || !f["ddagrab"]) && f["gfxcapture"]:
-		return "gfxcapture"
-	case s.a.cfg.Capture == "amf":
-		return "amf"
+	if gpuCapture(b) && s.a.caps.CanGDIGrab() && s.sessionGDI() != "" {
+		return "gdigrab"
 	}
-	return "ddagrab"
+	return b
 }
 
 // welcomeMonitors lists the monitors for the welcome: the system's, or the

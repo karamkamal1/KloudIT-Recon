@@ -508,8 +508,8 @@ func (s *Session) helperBlocker(prefs proto.Prefs, drawCursor bool, c *encoder.C
 	cfg := s.a.cfg
 	capture := s.capture()
 	switch {
-	case cfg.Capture == "x11grab":
-		return `capture "x11grab" is FFmpeg's`
+	case cfg.Capture == "x11grab", cfg.Capture == "gdigrab":
+		return fmt.Sprintf("capture %q is FFmpeg's", cfg.Capture)
 	case cfg.Capture == "test" && cfg.pipeline() != media.PipelineHelper:
 		return `the test pattern (capture "test") is FFmpeg's; "pipeline": "helper" streams the helper's synthetic source instead`
 	case cfg.Encoder != "" && !strings.HasSuffix(cfg.Encoder, "_helper"):

@@ -29,7 +29,7 @@ type Config struct {
 	Token      string `json:"token"`
 
 	FFmpeg     string `json:"ffmpeg,omitempty"`
-	Capture    string `json:"capture"` // auto | ddagrab | gfxcapture | x11grab | test | amf (AMD Direct Capture, experimental, opt-in)
+	Capture    string `json:"capture"` // auto | ddagrab | gfxcapture | gdigrab | x11grab | test | amf (AMD Direct Capture, experimental, opt-in)
 	X11Display string `json:"x11Display,omitempty"`
 	Encoder    string `json:"encoder,omitempty"` // force an encoder, e.g. hevc_nvenc
 	DrawCursor bool   `json:"drawCursor"`        // bake the cursor into the video instead of local rendering
@@ -231,6 +231,9 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	c.Defaults()
+	if !validCapture(c.Capture) {
+		return nil, fmt.Errorf("%s: capture must be one of %s, not %q", path, captureValues, c.Capture)
+	}
 	if !transport.ValidCongestion(c.Congestion) {
 		return nil, fmt.Errorf("%s: congestion must be %q or %q, not %q", path, transport.CongestionReno, transport.CongestionMedia, c.Congestion)
 	}
@@ -297,6 +300,21 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	c.path = path
 	return c, nil
+}
+
+// captureValues are host config "capture"'s values: auto (GPU capture where
+// it works, else GDI), FFmpeg's ddagrab (DXGI Desktop Duplication),
+// gfxcapture (Windows.Graphics.Capture), gdigrab (GDI, no GPU needed) and
+// amf (AMD Direct Capture, experimental), x11grab (Linux) and test (a test
+// pattern).
+const captureValues = `"auto", "ddagrab", "gfxcapture", "gdigrab", "amf", "x11grab" or "test"`
+
+func validCapture(v string) bool {
+	switch v {
+	case "auto", "ddagrab", "gfxcapture", "gdigrab", "amf", "x11grab", "test":
+		return true
+	}
+	return false
 }
 
 // congestion returns the congestion controller for the direct server, the UDP

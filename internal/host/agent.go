@@ -60,6 +60,8 @@ type Agent struct {
 	// vd creates sessions' virtual displays (GUIDE 3.7, virtualdisplay.go);
 	// nil: none (tests).
 	vd *vdisplay.Manager
+	// gpuCap: whether FFmpeg's GPU capture works on this PC (gdi.go).
+	gpuCap gpuCaptureState
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -171,9 +173,13 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 			refresh = append(refresh, e.Name+"="+ir)
 		}
 	}
+	gpuCapture := "ok"
+	if why := caps.GPUCaptureBlocked(); why != "" {
+		gpuCapture = "unavailable: " + why
+	}
 	log.Info("ffmpeg ready", "version", caps.Version, "encoders", strings.Join(names, ","),
 		"ddagrab", caps.Filters["ddagrab"], "gfxcapture", caps.Filters["gfxcapture"], "vsrc_amf", caps.Filters["vsrc_amf"],
-		"intra_refresh", strings.Join(refresh, ","))
+		"gdigrab", caps.CanGDIGrab(), "gpu_capture", gpuCapture, "intra_refresh", strings.Join(refresh, ","))
 	be, err := input.NewBackend()
 	if err != nil {
 		return nil, err
@@ -185,6 +191,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		nonces:      map[string]int64{},
 		pairing:     pairingOf(cfg),
 	}
+	a.gpuCap.at = time.Now() // the probe's finding
 	if cfg.path != "" {
 		if fi, err := os.Stat(cfg.path); err == nil {
 			a.cfgMod = fi.ModTime()
