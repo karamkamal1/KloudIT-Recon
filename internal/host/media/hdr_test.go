@@ -273,3 +273,87 @@ func TestHelperSDRNote(t *testing.T) {
 		}
 	}
 }
+
+// TestHDRTestFramesBuilds: the probe's check of the HDR test pattern's strip
+// on the codes two FFmpeg builds make (measured: the sandbox's 6.1 and the
+// Windows 8.1 build of the first hardware run, under Wine): the BT.601
+// table, and FFmpeg 7.1+'s coloured patches in the BT.2020 matrix of the
+// overlay they join (red 237/418/848, green 513/268/201, blue 104/848/484;
+// "HDR10 test pattern unavailable" at the owner's agent start). Both pass;
+// a grey patch off by a code, coloured patches in two matrices, or a red
+// far from either fail.
+func TestHDRTestFramesBuilds(t *testing.T) {
+	const w, h = hdrTestW, hdrTestH
+	frame := func(n int, codes map[string][3]int) []byte {
+		b := make([]byte, w*h*3)
+		put := func(off, v int) { b[off], b[off+1] = byte(v), byte(v>>8) }
+		cw := w / 2
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				put(2*(y*w+x), 64)
+			}
+		}
+		for i := 0; i < w*h/4; i++ {
+			put(2*w*h+2*i, 512)
+			put(2*w*h+w*h/2+2*i, 512)
+		}
+		word := proto.BarcodeWord(uint16(n))
+		for k := 0; k < proto.BarcodeBits; k++ {
+			if word>>proto.BarcodeCellBit(k)&1 == 0 {
+				continue
+			}
+			c, r := k%proto.BarcodeCols, k/proto.BarcodeCols
+			for y := r * proto.BarcodeCell; y < (r+1)*proto.BarcodeCell; y++ {
+				for x := c * proto.BarcodeCell; x < (c+1)*proto.BarcodeCell; x++ {
+					put(2*(y*w+x), 940)
+				}
+			}
+		}
+		for _, p := range HDRTestPatches {
+			c := codes[p.Name]
+			for y := 0; y < HDRTestStrip; y++ {
+				for x := p.X; x < p.X+p.W; x++ {
+					put(2*(y*w+x), c[0])
+					put(2*w*h+2*(y/2*cw+x/2), c[1])
+					put(2*w*h+w*h/2+2*(y/2*cw+x/2), c[2])
+				}
+			}
+		}
+		return b
+	}
+	greys := map[string][3]int{"black": {64, 512, 512}, "100 cd/m2": {508, 512, 512}, "200 cd/m2": {572, 512, 512}, "1000 cd/m2": {724, 512, 512},
+		"4000 cd/m2": {856, 512, 512}, "10000 cd/m2": {940, 512, 512}}
+	with := func(colours map[string][3]int) map[string][3]int {
+		m := map[string][3]int{}
+		for k, v := range greys {
+			m[k] = v
+		}
+		for k, v := range colours {
+			m[k] = v
+		}
+		return m
+	}
+	bt601 := map[string][3]int{"red": {260, 396, 848}, "green": {452, 288, 228}, "blue": {140, 848, 456}}
+	bt2020 := map[string][3]int{"red": {237, 418, 848}, "green": {513, 268, 201}, "blue": {104, 848, 484}}
+	run := func(codes map[string][3]int) error {
+		var b []byte
+		for n := 0; n < 3; n++ {
+			b = append(b, frame(n, codes)...)
+		}
+		return checkHDRTestFrames(b, w, h, 3)
+	}
+	for name, c := range map[string]struct {
+		codes map[string][3]int
+		ok    bool
+	}{
+		"FFmpeg 6.1 (BT.601)":              {with(bt601), true},
+		"FFmpeg 8.1 for Windows (BT.2020)": {with(bt2020), true},
+		"a grey patch a code off":          {with(map[string][3]int{"red": bt601["red"], "green": bt601["green"], "blue": bt601["blue"], "100 cd/m2": {509, 512, 512}}), false},
+		"coloured patches in two matrices": {with(map[string][3]int{"red": bt601["red"], "green": bt2020["green"], "blue": bt2020["blue"]}), false},
+		"a red far from both":              {with(map[string][3]int{"red": {300, 400, 800}, "green": bt2020["green"], "blue": bt2020["blue"]}), false},
+	} {
+		if err := run(c.codes); (err == nil) != c.ok {
+			t.Errorf("%s: %v, want ok %v", name, err, c.ok)
+		}
+	}
+}

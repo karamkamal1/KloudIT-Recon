@@ -12392,3 +12392,53 @@ the port closed: the browser's QUIC handshake gets no answer and Auto moves on t
      Transport `webtransport · direct`, session started `path=direct`.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same steps on any NVIDIA host (no
   GPU dependency); pass the same.
+
+## First hardware run: the HDR10 test pattern probe
+
+At start the owner's agent logged `HDR10 test pattern unavailable err="frame 0: patch red codes
+237/418/848, want 260/396/848"`, so `"capture": "test"` with HDR on could not use the HDR10 test
+pattern on that FFmpeg (8.1, BtbN's build). The probe draws the pattern's patches with `drawbox`
+on a 10-bit BT.2020 PQ picture and checks their codes. FFmpeg 7.1 and later negotiate colour
+spaces through the filter graph, and `drawbox` there converts its RGB colour with the link's
+matrix, BT.2020 NCL; older builds (the sandbox's 6.1) use the BT.601 table. The grey patches
+(the PQ levels) are the same in both; the coloured ones differ by up to ~60 codes.
+
+Measured with the same graph (`HDRTestGraph`, 3 frames at 480×270): the Windows FFmpeg 8.1 build
+(`n8.1-latest-win64-gpl-8.1`, under Wine) gives red 237/418/848, green 513/268/201, blue
+104/848/484; the sandbox's FFmpeg 6.1 gives red 260/396/848, green 452/288/228, blue 140/848/456.
+The BT.2020 matrix's 8-bit codes × 4 for the patches' colours (`0xC00000`, `0x00C000`,
+`0x0000C0`) are 236/416/848, 512/268/200, 104/848/484 (`yuv2020`): within 2 codes.
+
+Fix (`internal/host/media/hdr.go`): `HDRTestPatch` has the BT.2020 codes too; the probe
+(`checkHDRTestFrames`) wants the grey patches exact and the coloured ones all in BT.601's codes,
+or all within 3 codes (`hdrPatchTolerance`) of BT.2020's, not a mix. The BT.2020 codes are the
+right ones for the stream's colour description; the BT.601 ones are slightly other colours,
+which the pattern's own checks (the barcode, the PQ levels) never relied on.
+
+- Verified here: `TestHDRTestFramesBuilds` (both builds' measured codes pass; a grey patch a
+  code off, coloured patches in two matrices and a red far from both fail); the Windows FFmpeg
+  8.1 build's 3 raw frames of the graph pass the new check (a scratch test, not committed);
+  `TestHDRTestPatches` and the browser E2E's "WebGPU HDR10" scenario on the sandbox's 6.1 as
+  before.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: restart the agent and read the start of host.log.
+  Pass: no `HDR10 test pattern unavailable` line; with `"capture": "test"` and HDR on, the
+  stream's top-left patches show the HDR test pattern.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same (FFmpeg only, no GPU
+  dependency).
+
+### Runs with these changes (the three sections above)
+
+- `gofmt -l` prints nothing for the changed files; `go vet ./...` and `GOOS=windows go vet ./...`
+  pass.
+- `go test` passes for every package but `internal/e2e` (18 packages). Under the shared lock
+  `go test ./internal/e2e/...` passes (201 s).
+- `node --check` passes on `stream-worker.js`, `stream.js` and `browser.mjs`.
+- `make build` and `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make
+  helper-test WINE=/usr/lib/wine/wine64` passes: 79 top-level tests pass and 9 skip (no AMF,
+  AMD Direct Capture, WGC or libavcodec in the sandbox), `TestHelperIntegrationGameDirty` and
+  the helper's self-tests among them.
+- The whole browser E2E (Chromium 141) under the lock: 317 of 317 checks passed (10.5 min),
+  "settings after a failed connection" with the Transport row's reasons (`no answer in 2.5 s:
+  UDP 40329 blocked (PC firewall: a Public network? host.log says)`, `the PC offers no direct
+  endpoint (its agent has none up: host.log)`), "WebGPU HDR10", thinning and bitrate recovery
+  among them.
