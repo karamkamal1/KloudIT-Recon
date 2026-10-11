@@ -12105,7 +12105,7 @@ probes copied into the tree (not committed) and the simulations; all were real.
 
 - `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
 - `go test` passes for all 18 packages with tests but `internal/e2e` (`internal/host` 63 s:
-  `TestRateSimCapdrop` over 24 seeds per policy, the relay simulation's 19 + 6 cases). Under
+  `TestRateSimCapdrop` over 24 seeds per policy, the relay simulation's 18 + 6 cases). Under
   the shared lock `go test ./internal/e2e/...` passes (201 s).
 - `go test -race ./internal/host/... ./internal/transport/...` passes (`internal/host` 253 s).
 - `node --check` passes on `web/static/js/*.js` and `test/e2e/browser.mjs` (no script changed);
