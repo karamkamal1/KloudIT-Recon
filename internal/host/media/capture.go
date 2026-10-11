@@ -160,8 +160,10 @@ func PlainFFmpegError(s string) string {
 // gpuCaptureTimeout bounds the GPU capture test. Desktop Duplication hands
 // out the desktop's current image at once, but ddagrab waits for its first
 // frame (a display that is off, a desktop that does not draw): a test that
-// times out is no finding.
-const gpuCaptureTimeout = 5 * time.Second
+// times out is no finding. Generous: the probe runs it next to a dozen
+// encoder tests, which on a small VM at logon can delay FFmpeg's start by
+// seconds (under Wine 5 s were not always enough).
+const gpuCaptureTimeout = 10 * time.Second
 
 // CheckGPUCapture opens ddagrab on output 0 for one frame, as a session's
 // capture does, and returns why GPU capture (ddagrab, gfxcapture: the same

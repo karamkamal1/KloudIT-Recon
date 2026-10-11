@@ -307,7 +307,7 @@ func TestCheckGPUCapture(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	if blocked, detail := CheckGPUCapture(ctx, script("hangs", "exec sleep 30")); blocked != "" || !strings.HasPrefix(detail, "no frame within") ||
-		time.Since(start) > 5*time.Second {
+		time.Since(start) > 5*time.Second { // the caller's deadline, not gpuCaptureTimeout
 		t.Fatalf("a check that hangs: %q, %q after %v", blocked, detail, time.Since(start))
 	}
 }

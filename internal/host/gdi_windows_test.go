@@ -34,7 +34,8 @@ func TestSessionGDIWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if caps.GPUCaptureBlocked() == "" || !caps.CanGDIGrab() {
-		t.Skipf("this desktop has GPU capture (or the build no gdigrab: %v)", caps.CanGDIGrab())
+		blocked, detail := media.CheckGPUCapture(context.Background(), ff)
+		t.Skipf("the probe found no finding (gdigrab %v); checked again: %q, %q", caps.CanGDIGrab(), blocked, detail)
 	}
 	if _, ok := caps.Best("h264"); !ok {
 		t.Skip("no H.264 encoder")
