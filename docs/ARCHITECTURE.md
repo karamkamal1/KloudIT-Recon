@@ -759,10 +759,11 @@ vsrc_amf (opt-in)     ──AMF surface────►  AMF only
     no changed region, as DDA hands out a game that flips past the compositor, counts as all of
     it) and which frames are idle repeats (`media.Frame.Repeat`). The picture is still while, over
     the last second, at most 0.2 % changed per frame (a caret, a clock; the pointer is not in the
-    helper's video), the capture had at most five new images (a game or a video presents far more
-    often, whatever its dirty rects say) and the encoder made less than half the static floor.
-    Once it has been still for 3 s (twice as long after each cut the picture ended within 10 s, up
-    to 30 s: content that changes every few seconds is not cut and restored over and over), the
+    helper's video) and the capture had at most five new images (a game or a video presents far
+    more often, whatever its dirty rects say); what the encoder makes is not asked (it is what the
+    cut lowers: a CBR encoder spending more than the floor on a still picture). Once it has been
+    still for 3 s (twice as long after each cut the picture ended within 10 s, up to 30 s:
+    content that changes every few seconds is not cut and restored over and over), the
     encoder's target goes down to host config `staticKbps` (default a quarter of the rate
     controller's target, at least 2 Mbit/s), linearly back towards the target between 0.2 % and
     5 %, lower at most once a second; a frame that changes raises it at once, before that frame is

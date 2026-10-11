@@ -1110,7 +1110,9 @@ round", "A late discardable frame is no loss")
   its menu (left idle for a minute) and play.
 - **Pass**:
   - Within ~4 s, `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`
-    (`images` 0-5, `still_ms` about 3000).
+    (`images` 0-5, `still_ms` about 3000). Note its `output_kbps` and the `stream stats` `mbps`
+    while `static_desktop=true` (at most 7.5): the cut saves on the wire only where the encoder
+    made more than the cap before it.
   - On the drag, `desktop changes: full bitrate back kbps=30000`, with no blur and no key frame.
   - In the game, menu included: no `static desktop: lowering the bitrate` at all (the first
     hardware run had one every second or two: VENDOR_NOTES "First hardware run: the static

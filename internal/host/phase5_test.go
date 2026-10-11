@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -329,14 +330,16 @@ func TestSessionLiveFPS(t *testing.T) {
 // TestStaticCap: the static-desktop cap on a fake clock: a cut to the floor
 // (a quarter of the target, at least 2000; host config staticKbps) with the
 // VBV kept at one full-target frame once the picture has been still for the
-// hold (3 s: idle repeats, a caret's new image twice a second, a small
-// encoder output); the full target back with the first frame that changes,
-// and the next hold twice as long after a short cut; partial activity in
-// between; never for a game's presents, whatever their dirty share (0 from
-// helpers before the first hardware run's fix, 1 since, a menu's composed
-// frame now and then: the owner's log), nor for an encoder making half the
-// floor; nothing with an unknown share, a pipeline that is not live, or
-// staticBitrate off.
+// hold (3 s: idle repeats, a caret's new image twice a second); the full
+// target back with the first frame that changes, and the next hold twice as
+// long after a short cut; partial activity in between; never for a game's
+// presents, whatever their dirty share (0 from helpers before the first
+// hardware run's fix, 1 since, a menu's composed frame now and then: the
+// owner's log); nothing with an unknown share, a pipeline that is not live,
+// or staticBitrate off. A still picture the encoder spends much on is cut
+// all the same, and the cut lowers what it makes (a CBR encoder without
+// filler data: each frame is what the picture costs, at most the bitrate it
+// is set to).
 func TestStaticCap(t *testing.T) {
 	t0 := time.Unix(1000, 0)
 	// A source: the frame at ms (nil: none), every 4 ms.
@@ -444,21 +447,66 @@ func TestStaticCap(t *testing.T) {
 		"a game menu with a composed frame":   {&staticCap{on: true}, 30000, true, menu},
 		"a game menu at 151 Mbit/s":           {&staticCap{on: true}, 151000, true, menu},
 		"a caret-sized change at 60 fps":      {&staticCap{on: true}, 30000, true, game(caret)},
-		"an encoder making half the floor": {&staticCap{on: true}, 20000, true, func(ms int) *media.Frame {
-			f := still(0, 0)(ms)
-			if f != nil {
-				f = &media.Frame{HasDirty: true, Repeat: f.Repeat, Dirty: f.Dirty, Data: make([]byte, 32000)}
-			}
-			return f
-		}},
-		"unknown share":             {&staticCap{on: true}, 20000, true, still(-1, 100)},
-		"not live":                  {&staticCap{on: true}, 20000, false, still(0, 100)},
-		"staticBitrate off":         {&staticCap{}, 20000, true, still(0, 100)},
-		"target below the floor":    {&staticCap{on: true}, 1500, true, still(0, 100)},
-		"staticKbps above a target": {&staticCap{on: true, kbps: 30000}, 20000, true, still(0, 100)},
+		"unknown share":                       {&staticCap{on: true}, 20000, true, still(-1, 100)},
+		"not live":                            {&staticCap{on: true}, 20000, false, still(0, 100)},
+		"staticBitrate off":                   {&staticCap{}, 20000, true, still(0, 100)},
+		"target below the floor":              {&staticCap{on: true}, 1500, true, still(0, 100)},
+		"staticKbps above a target":           {&staticCap{on: true, kbps: 30000}, 20000, true, still(0, 100)},
 	} {
 		if got := run(c.cap, c.target, c.live, 20000, c.src); len(got) != 0 {
 			t.Errorf("%s: %v", name, got)
+		}
+	}
+	// What the cut saves where the encoder's output follows the bitrate it
+	// is set to: a CBR encoder without filler data makes what the still
+	// picture costs (idle repeats every 100 ms, a caret's image every
+	// 500 ms; after a window drag at 0 the refinement of the new picture
+	// decays from 40 Mbit/s), at most the bitrate it runs at. Cut 3 s after
+	// the drag left the meter's second however much the encoder makes, the
+	// cut lasts while the picture stays still (the encoder making all of the
+	// cap ends nothing), and the encoder makes less: everything over the
+	// floor from the cut on. (With the encoder held to under half the floor
+	// before a cut, as before, none of the three was ever cut.)
+	cbr := func(cost func(time.Duration) float64, on bool) (kbps float64, out []string) {
+		const target, dur = 20000, 30 * time.Second
+		c := &staticCap{on: on}
+		c.generation(t0, target, target, true)
+		set, bits := target, 0.0
+		for at := time.Duration(0); at < dur; at += 100 * time.Millisecond {
+			n := int(math.Min(cost(at), float64(set)) * 1000 / 8 / 10)
+			bits += float64(8 * n)
+			f := &media.Frame{HasDirty: true, Repeat: true, Data: make([]byte, n)}
+			switch {
+			case at == 0:
+				f.Repeat, f.Dirty = false, 0.3 // the drag's last frame
+			case at%(500*time.Millisecond) == 0:
+				f.Repeat, f.Dirty = false, caret
+			}
+			c.mu.Lock()
+			ch, ok := c.frame(t0.Add(at), f, target, true)
+			c.mu.Unlock()
+			if ok {
+				set = ch.kbps
+				out = append(out, fmt.Sprintf("%d:%d", at.Milliseconds(), ch.kbps))
+			}
+		}
+		return bits / 1000 / dur.Seconds(), out
+	}
+	for _, c := range []struct {
+		name     string
+		cost     func(time.Duration) float64
+		minSaved float64 // percent
+	}{
+		{"idle costs 8 Mbit/s", func(time.Duration) float64 { return 8000 }, 30},
+		{"idle costs 15 Mbit/s", func(time.Duration) float64 { return 15000 }, 55},
+		{"refinement decaying over 2 s, then 3 Mbit/s", func(at time.Duration) float64 { return 40000*math.Exp(-at.Seconds()/2) + 3000 }, 1},
+	} {
+		plain, none := cbr(c.cost, false)
+		capped, got := cbr(c.cost, true)
+		saved := 100 * (plain - capped) / plain
+		t.Logf("%s: %.0f kbit/s without the cap, %.0f with it (%.1f %% saved), %v", c.name, plain, capped, saved, got)
+		if len(none) != 0 || fmt.Sprint(got) != "[4100:5000]" || saved < c.minSaved {
+			t.Errorf("%s: %v (without: %v), %.1f %% saved, want one cut at 4.1 s that lasts and at least %.0f %%", c.name, got, none, saved, c.minSaved)
 		}
 	}
 	// Content that changes every 4 s (still for 4 s, a window for 1 s):

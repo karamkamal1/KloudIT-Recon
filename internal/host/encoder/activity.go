@@ -20,9 +20,9 @@ import "time"
 // QuietImages new images in the window is motion, whatever the share.
 //
 // Unknown shares (WGC, the synthetic source, older helpers) make it suggest
-// the ceiling. It also keeps the encoded sizes it is given (OutputKbps): a
-// still picture costs a CBR encoder without filler data next to nothing.
-// Not safe for concurrent use.
+// the ceiling. It also keeps the encoded sizes it is given (OutputKbps, what
+// the encoder made: for the log; it decides nothing, the bitrate a cut sets
+// bounds it). Not safe for concurrent use.
 type ActivityMeter struct {
 	Window      time.Duration // how far back it looks (default 1 s)
 	StaticBelow float64       // largest share that still counts as static (default 0.002: a caret, a clock, a pointer trail)

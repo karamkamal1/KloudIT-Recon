@@ -14,20 +14,22 @@ import (
 // (media.Frame.Dirty: DDA and AMD Direct Capture dirty rects, carried through
 // the ring as Stats.Dirty's dirtyPpm) and which frames are idle repeats of
 // the last image (media.Frame.Repeat: nothing was presented for idleRepeatMs).
-// An encoder.ActivityMeter follows both over a second, and the encoder's
-// output with them. The picture is still while at most 0.2 % changes per
-// frame (a caret, a clock; the pointer is not in the helper's captures), the
-// capture has at most five new images a second (a caret blinks about twice a
-// second; a game or a video presents far more often, whatever its dirty rects
-// say), and the encoder makes less than half the static floor (a still
-// picture costs a CBR encoder without filler data next to nothing; a game's
-// frames fill whatever bitrate they get). Once the picture has been still for
-// staticHold (3 s), the encoder's target goes down to a static floor (host
-// config "staticKbps": by default a quarter of the rate controller's target,
-// at least 2000 kbit/s), linearly back up to the target between 0.2 % and
-// 5 % changed. A CBR encoder then spends less on refining a picture that does
+// An encoder.ActivityMeter follows both over a second (and the encoder's
+// output, for the log). The picture is still while at most 0.2 % changes per
+// frame (a caret, a clock; the pointer is not in the helper's captures) and
+// the capture has at most five new images a second (a caret blinks about
+// twice a second; a game or a video presents far more often, whatever its
+// dirty rects say). Once the picture has been still for staticHold (3 s),
+// the encoder's target goes down to a static floor (host config
+// "staticKbps": by default a quarter of the rate controller's target, at
+// least 2000 kbit/s), linearly back up to the target between 0.2 % and 5 %
+// changed. A CBR encoder then spends less on refining a picture that does
 // not change, and the media congestion controller paces at the lower rate,
-// so fewer bytes go on the wire.
+// so fewer bytes go on the wire. What the encoder makes decides nothing: it
+// is what the cut lowers (a cut that wanted the encoder under half the floor
+// kept it under half the cap, so it saved nothing, and an encoder spending
+// more on a still picture was never cut), and a game or a video is told by
+// its new images.
 //
 // The first hardware run cut a running game this way every second or two:
 // the game flipped past the compositor, DDA handed its presents out without
@@ -35,27 +37,30 @@ import (
 // seconds a frame the compositor did draw restored the bitrate, with a burst
 // of large frames after each restore (docs/VENDOR_NOTES.md "First hardware
 // run: the static desktop during a game"). Since then the helper counts a
-// present that names no region as the whole picture, the new-image count and
-// the encoder's output must agree, and the cut waits for a still picture of
+// present that names no region as the whole picture, the new-image count
+// must agree with the share, and the cut waits for a still picture of
 // several seconds: a cut the picture ends within staticShortCut doubles the
 // next hold (at most staticHoldMax), so content that changes every few
 // seconds is not cut and restored over and over.
 //
 // A frame that changes raises the bitrate at once (in videoEvents, before
 // that frame is queued, so it already goes out at the new pacing rate), with
-// no ramp: to the full target from 5 % changed (a scrolled window, a video),
-// with more than five new images a second or an encoder making half the
-// floor, by the linear share below that (a small window update on a still
-// desktop: about 37 % of the target at 1 %). The rate controller keeps its
+// no ramp: to the full target from 5 % changed (a scrolled window, a video)
+// or with more than five new images a second, by the linear share below
+// that (a small window update on a still desktop: about 37 % of the target
+// at 1 %). The rate controller keeps its
 // own target meanwhile (this caps what the encoder is told, never what the
 // controller decides: always the lower of the two, so it never fights the
 // congestion control), and it is told the encoder runs at that target
 // (controllerKbps): its measurements are in units of its target. While
 // capped the VBV stays the size of one frame at the full target (vbvFrames
 // target / cap), so the first frame with motion, encoded before anyone knows
-// it moved, is no larger than a frame at the full target, which the pacer
-// raised for it carries on schedule (the frame queue overflows only where
-// the network does not keep up: queueOverflows). Only where the pipeline
+// it moved, is meant to be no larger than a frame at the full target, which
+// the pacer raised for it carries on schedule (the frame queue overflows
+// only where the network does not keep up: queueOverflows). An encoder can
+// overshoot it: the first hardware run's AMF made about three such frames'
+// worth after a capture loss, which went past its deadline (rung 1) and cost
+// a recovery frame (TestOwnerLogFirstOverflow). Only where the pipeline
 // changes its bitrate seamlessly in the running encoder
 // (PipelineCaps.LiveBitrate without flush: a cap that costs key frames or
 // restarts is worth nothing); FFmpeg reports no dirty share, and an unknown
@@ -80,10 +85,6 @@ const (
 	staticHold     = 3 * time.Second
 	staticShortCut = 10 * time.Second
 	staticHoldMax  = 30 * time.Second
-	// staticOutputShare: an encoder that makes this share of the static
-	// floor or more (over the meter's window, key frames left out) encodes
-	// a picture that changes, whatever the capture reports.
-	staticOutputShare = 0.5
 )
 
 // staticCap is the session's static-desktop cap on the encoder's bitrate.
@@ -139,14 +140,15 @@ func (c *staticCap) holdTime() time.Duration {
 
 // observe updates whether the picture is still at the rate controller's
 // target: the meter suggests less than the target (few new images, little
-// changed) and the encoder makes less than staticOutputShare of the floor.
-// Called with c.mu held.
+// changed). The encoder's output is not asked: under a cut it is at most the
+// cap, and a still picture the encoder spends much on is what the cut is
+// for. Called with c.mu held.
 func (c *staticCap) observe(now time.Time, target int) {
 	floor := c.floor(target)
 	still := false
 	if target > 0 && floor < target {
 		c.meter.StaticScale = float64(floor) / float64(target)
-		still = c.meter.SuggestKbps(now, target, floor) < target && c.meter.OutputKbps(now) < staticOutputShare*float64(floor)
+		still = c.meter.SuggestKbps(now, target, floor) < target
 	}
 	switch {
 	case !still:

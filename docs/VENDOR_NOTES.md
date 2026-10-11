@@ -12164,19 +12164,20 @@ The sandbox has no DDA; the hardware re-check below confirms it.
   a test start parameter `testDirty` (`none`: presents with no region; `zero`: presents reported
   unchanged, the old helper's reading) for the tests, refused with other captures
   (`docs/HELPER_PROTOCOL.md`).
-- **recon-host** (`internal/host/activity.go`, `encoder.ActivityMeter`): three signals must agree
+- **recon-host** (`internal/host/activity.go`, `encoder.ActivityMeter`): two signals must agree
   before a cut, and for longer:
   - the share: at most 0.2 % changed per frame, as before;
   - new images: at most five a second (`QuietImages`; idle repeats, `media.Frame.Repeat`, do not
     count). A game or a video presents far more often whatever its dirty share says, so an older
     helper that still reads a game as unchanged is not cut either;
-  - the encoder's output: under half the static floor (a still picture costs a CBR encoder
-    without filler data next to nothing);
-  - all of it for `staticHold` (3 s; was a second of activity under 0.2 %). A cut the picture
-    ends within 10 s doubles the next hold, up to 30 s (hysteresis: content that changes every
-    few seconds is not cut and restored over and over); a longer cut sets it back.
+  - both for `staticHold` (3 s; was a second of activity under 0.2 %). A cut the picture ends
+    within 10 s doubles the next hold, up to 30 s (hysteresis: content that changes every few
+    seconds is not cut and restored over and over); a longer cut sets it back.
+  What the encoder makes is not asked (a third signal, the encoder's output under half the static
+  floor, kept the cut from saving anything and came out in review: "Review of the fix" below).
   The restore is as before: at once, with the VBV of one frame at the full target while capped,
-  so the first frame with motion is no larger than a frame at the full target.
+  so the first frame with motion is meant to be no larger than a frame at the full target (AMF
+  overshot that about 3× once in the log: "The rest of the log against the fix").
   `static desktop: lowering the bitrate` now logs `images`, `output_kbps` and `still_ms`;
   `desktop changes: full bitrate back` logs `next_hold_ms`.
 
@@ -12273,9 +12274,9 @@ numbers with both off, within a seed's noise).
 - **recon-host** (`go test ./internal/host/...`):
   - `TestActivityMeter`: idle repeats with a caret are static; a game at 60 fps with dirty 0 is
     not (more than five images), five images a second are, six are not; `AddFrame` with sizes.
-  - `TestStaticCap`: a still picture is cut after the 3 s hold and only with the output under
-    half the floor; a game whose presents read unchanged (or as all changed) is never cut, nor a
-    menu with a composed frame every 1.5 s; a cut the picture ends within 10 s doubles the next
+  - `TestStaticCap`: a still picture is cut after the 3 s hold, however much the encoder makes
+    on it, and the cut lowers what it makes (below); a game whose presents read unchanged (or as
+    all changed) is never cut, nor a menu with a composed frame every 1.5 s; a cut the picture ends within 10 s doubles the next
     hold (3, 6, then 12 s: content still for 11 s and changing for 1 is cut twice in 90 s, not
     every 12 s), a long cut sets it back; content that changes every 5 s is cut once.
   - `TestStaticCapRateController`, and `TestSessionStaticDesktop` (the session with the mock
@@ -12289,6 +12290,38 @@ numbers with both off, within a seed's noise).
     "now"), `TestRateSimProfiles`, `TestRateSimKeyFrames`.
   - `TestHelperIntegrationGameDirty` and the session's mock-helper tests also run in
     `make helper-test` (below).
+
+### Review of the fix: the output test
+
+The fix's third signal, the encoder's output under half the static floor over the last second,
+kept the cut from saving any bitrate. Before a cut the picture counted as still only while the
+encoder made less than half the floor; during one, the first frame of a second over that lifted
+it. So a cut lasted only while the encoder made less than half the rate it was capped to: the
+cap lowered the encoder's setting, never what it sent. And where the encoder spends more than
+the floor on a still picture (a CBR encoder refining a picture that stopped changing, what the
+cut is for) it never came at all. Games and videos are already kept out by the new-image count
+and the helper's whole-picture share for presents without regions, without the output.
+
+Now what the encoder makes decides nothing (`staticCap.observe`; `output_kbps` stays in the log
+lines). `TestStaticCap` models a CBR encoder without filler data (each frame what the still
+picture costs, at most the bitrate it is set to: idle repeats every 100 ms, a caret's image every
+500 ms, target 20 Mbit/s, 30 s after a window drag):
+
+| the still picture costs | before the review | now |
+|---|---|---|
+| 8 Mbit/s | never cut, 0 % saved | cut at 4.1 s (the drag leaves the meter's second, then the 3 s hold) to 5 Mbit/s for the rest, 32.2 % saved |
+| 15 Mbit/s | never cut, 0 % saved | the same cut, 57.3 % saved |
+| refinement from 40 Mbit/s decaying over 2 s, then 3 Mbit/s | never cut, 0 % saved | the same cut, 1.5 % saved (the hold outlasts most of the refinement) |
+
+The test fails with the output test put back. A cut lasts while the picture stays still, the
+encoder making all of the cap included. `TestRelaySimStaticDesktop` is unchanged (the table
+above: no cut in a game, one cut and one restore for the still desktop; its still frames have
+fixed sizes), and so are `TestSessionStaticDesktop` and `TestStaticCapRateController`.
+
+What the cut saves on the owner's hardware is still open. During the first run's cuts
+(`static_desktop=true`) `stream stats` showed 0.32-3.7 Mbit/s under caps of 16-38 Mbit/s: AMF's
+CBR without filler data made less than the cap anyway, so those cuts lowered the pacing and the
+congestion controller's target, not the bytes. Step 2 below now asks for both numbers.
 
 ### Hardware re-check
 
@@ -12304,6 +12337,9 @@ numbers with both off, within a seed's noise).
   2. The desktop: idle with Notepad's caret blinking for 10 s, then drag a window. Pass: one
      `static desktop: lowering the bitrate` after about 3 s still (`images` 0-5, `still_ms` about
      3000), `desktop changes: full bitrate back` on the drag with no overflow and no key frame.
+     Send the cut's `output_kbps` and the `stream stats` `mbps` while `static_desktop=true`:
+     under the cut the encoder makes at most the cap; where it made less before the cut, the
+     cut saved nothing on the wire.
   3. Over Wi-Fi on the client: 2 minutes of the game at 151 Mbit/s. Pass: no cascade of
      `congestion: lowering bitrate ... why=delay ... start=halving`; `undone` > 0 where one came.
      Send the `congestion:` lines (now with `delay_ms`, `delay_target_ms`, `frames_late`,
