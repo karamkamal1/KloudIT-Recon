@@ -200,6 +200,11 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 		return func() { gcancel(); <-done }
 	}
 	stopGateway := runGateway(gw)
+	// The gateway flushes its state into dir as it stops: it must be done
+	// before t.TempDir's RemoveAll (registered first, so run last), or that
+	// fails with "directory not empty". stopGateway is the current gateway's
+	// (restartGateway replaces it).
+	t.Cleanup(func() { stopGateway() })
 	jar, _ := cookiejar.New(nil)
 	e := &env{t: t, logs: logs, base: fmt.Sprintf("https://127.0.0.1:%d", port), client: &http.Client{
 		Jar: jar, Timeout: 10 * time.Second,
@@ -273,7 +278,17 @@ func setup(t *testing.T, hostOpts ...func(*host.Config)) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go agent.Run(ctx)
+	agentDone := make(chan struct{})
+	go func() { defer close(agentDone); agent.Run(ctx) }()
+	t.Cleanup(func() {
+		// The agent writes into dir too (input.log): stop it first.
+		cancel()
+		select {
+		case <-agentDone:
+		case <-time.After(10 * time.Second):
+			t.Log("the host agent was still running 10 s after the test ended")
+		}
+	})
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var hs struct {
