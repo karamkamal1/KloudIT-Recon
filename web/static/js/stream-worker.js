@@ -593,12 +593,18 @@ async function allocateRelay(url) {
 async function connect(ep) {
   const attempts = [];
   const wtOK = typeof WebTransport !== 'undefined' && prefs.transport !== 'websocket';
+  // directWhy: why a connection that is not on the direct path is not (the
+  // overlay's Transport row): the settings, a direct endpoint the PC does not
+  // offer, or how its attempt failed (directFailure).
+  let directWhy = prefs.path === 'relay' ? 'Network path is "Relay via gateway"' : !wtOK ? 'needs WebTransport' : '';
   // skipTicketed: the host refused a ticket a moment ago (its clock or key
   // disagrees with the gateway's): the paths the host authorises are left
   // out for a while, so Auto and Relay reach the splice relay, which the
   // gateway authorises. Direct only has nothing else to try.
   if (wtOK && ep.direct && prefs.path !== 'relay' && !(prefs.skipTicketed && prefs.path !== 'direct')) {
-    attempts.push(['direct', async () => ({ t: await openWebTransport(ep.direct.url, ep.direct.hashes, 'direct', 2500), ticket: ep.direct.ticket })]);
+    attempts.push(['direct', async () => ({ t: await openWebTransport(ep.direct.url, ep.direct.hashes, 'direct', DIRECT_TIMEOUT_MS), ticket: ep.direct.ticket })]);
+  } else if (!directWhy) {
+    directWhy = !ep.direct ? 'the PC offers no direct endpoint (its agent has none up: host.log)' : 'skipped: the PC refused a ticket a moment ago';
   }
   if (wtOK && ep.relay.udp && prefs.path !== 'direct' && !prefs.skipUdpRelay && !prefs.skipTicketed) {
     attempts.push(['relay', async () => {
@@ -621,15 +627,39 @@ async function connect(ep) {
   if (!attempts.length) throw noAttempt(ep);
   let lastErr;
   for (const [label, fn] of attempts) {
+    const t0 = performance.now();
     try {
       post('status', { text: `Connecting (${label})…` });
-      return await fn();
+      const c = await fn();
+      c.directWhy = label === 'direct' ? '' : directWhy;
+      return c;
     } catch (e) {
       lastErr = e;
+      if (label === 'direct') directWhy = directFailure(e, performance.now() - t0, ep.direct.url);
       post('log', { text: `${label} failed: ${e.message}` });
     }
   }
   throw lastErr || new Error('no transport available');
+}
+
+// How long the direct path may take to come up before Auto moves on.
+const DIRECT_TIMEOUT_MS = 2500;
+
+// How the direct path's attempt failed, for the Transport row (the first
+// hardware run streamed through the relay on the PC's own network without a
+// word why). No answer within DIRECT_TIMEOUT_MS: the PC's UDP port is closed
+// on the way (Windows Firewall on a network whose profile is Public, which
+// the installer's rule does not cover; a router between the networks; away
+// from home without a port forward). A quicker failure: something answered
+// and refused it (nothing listens on the port, a certificate that does not
+// match, the PC refused the ticket).
+function directFailure(e, ms, url) {
+  const port = /:(\d+)\/wt$/.exec(url || '')?.[1] || '';
+  const m = e?.message || String(e);
+  if (/timed out/.test(m)) {
+    return `no answer in ${(ms / 1000).toFixed(1)} s: UDP ${port} blocked (PC firewall: a Public network? host.log says)`;
+  }
+  return `refused after ${Math.round(ms)} ms: ${m}`;
 }
 
 // Network path "Direct to PC only" (the one setting that can leave nothing
@@ -2580,7 +2610,7 @@ async function start(msg) {
     return;
   }
   transport = conn.t;
-  post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name });
+  post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name, directWhy: conn.directWhy || '' });
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   const helloDecoders = await tested;

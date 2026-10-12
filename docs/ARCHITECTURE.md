@@ -85,7 +85,13 @@ Windows display power request (`PowerRequestDisplayRequired`, listed by `powercf
 from its welcome until it ends, cleared while the client is hidden (paused). Without it Windows
 turns the display off after the power plan's timeout when the only input is a controller (a
 virtual pad's input does not count), which freezes the picture; the native helper's capture
-thread also holds `ES_DISPLAY_REQUIRED` while it captures, FFmpeg's capture does not.
+thread also holds `ES_DISPLAY_REQUIRED` while it captures, FFmpeg's capture does not. Neither
+turns back on a display that was already off when the session started (the first hardware
+run's first session: no picture for 54 s, DDA hands out nothing then): the helper's capture
+with no image 2 s after its start wakes the display (a zero-length mouse move and a one-off
+`ES_DISPLAY_REQUIRED`) and reports `captureChanged` `noimage`, again every 10 s while it lasts;
+the session logs it (`capture changed reason=noimage`) and tells the client ("No picture from
+the PC's screen yet: ...").
 
 ### Frame stream
 
@@ -698,11 +704,20 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
     base (sending at R into a path of capacity C grows the queue by (R − C) / C per second, so
     C = R / (1 + growth)): it sees a capacity drop at once, while the delivered rates still hold
     the time before it. A decrease starts from at least half the target, whatever these say (a
-    tenth of a second's stall leaves next to nothing acknowledged). The next decrease waits until this one is in the encoder
-    (its config went live, or the helper's encoder announced the rate) and the policy's hold
-    more (150 ms for a qualified seamless encoder, 300 ms for one assumed seamless, 500 ms for a
-    flushing one, 1 s for an FFmpeg restart: its key frame and start-up); losses count again
-    300 ms after that.
+    tenth of a second's stall leaves next to nothing acknowledged). Frames that do not arrive
+    while the path acknowledges nothing at all are a stall of the link (Wi-Fi: the medium busy),
+    not a capacity, which goes on acknowledging what it carries: no decision on them for 250 ms
+    (`stallMax`). A delay decrease on a stall that slipped through (the ACKs held too, or the
+    stall's late frames) is undone within a second (`checkUndo`) when the delay is back under its
+    target within 100 ms of the frames arriving again and the path acknowledged at least 90 % of
+    what the session sent before the decrease, the backlog arriving at once; a capacity drop never
+    acknowledges more than the new capacity (host.log `bitrate recovery ... why=undo`, `stream
+    stats` `stalls`, `undone`; the first hardware run's cascade from 118 to 23 Mbit/s, VENDOR_NOTES
+    "First hardware run: the static desktop during a game"). The next decrease waits until this one
+    is in the encoder (its config went live, or the helper's encoder announced the rate) and the
+    policy's hold more (150 ms for a qualified seamless encoder, 300 ms for one assumed seamless,
+    500 ms for a flushing one, 1 s for an FFmpeg restart: its key frame and start-up); losses count
+    again 300 ms after that.
   - *Level shifts.* A delay that stays where a delay decrease found it (within the margin), the
     decrease in effect since, is a step of the path's one-way delay (a relay's route; a clock
     correction an older client does not report) rather than a queue: a queue behind a rate the
@@ -782,19 +797,28 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
     uses LTR anyway; invalidation or LTR still answers losses).
   - *Static desktop* (`internal/host/activity.go`, GUIDE 9 "dirty rects"): the native helper's
     captures report the share of the picture that changed with every frame (DDA and AMD Direct
-    Capture dirty rects; `media.Frame.Dirty`). While at most 0.2 % changed per frame over the last
-    second (a caret, a clock; the pointer is not in the helper's video) the encoder's target goes
-    down to host config `staticKbps` (default a quarter of the rate controller's target, at least
-    2 Mbit/s), linearly back towards the target between 0.2 % and 5 %, lower at most once a
-    second; a frame that changes raises it at once, before that frame is queued (so it goes out
-    at the new pacing rate): the full target from 5 % changed, the linear share below that (about
-    37 % of the target at 1 %). It caps what the encoder is told, never what the rate controller
-    decides (the lower of the two: it cannot fight the congestion control; a restore needs no
-    ramp); the controller is told the encoder runs at its target meanwhile (its fill, the
-    delivered rates and the queue's growth are measured in units of its target: told the capped
-    rate, a decrease would start from the cap and no increase could pass 1.2 × the cap). The cap
-    keeps the VBV at one frame of the full target (`vbvFrames` target / cap) so the first frame
-    with motion, encoded before anyone knows it moved, is not starved. Only on
+    Capture dirty rects; `media.Frame.Dirty`; an image the source presented whose capture names
+    no changed region, as DDA hands out a game that flips past the compositor, counts as all of
+    it) and which frames are idle repeats (`media.Frame.Repeat`). The picture is still while, over
+    the last second, at most 0.2 % changed per frame (a caret, a clock; the pointer is not in the
+    helper's video) and the capture had at most five new images (a game or a video presents far
+    more often, whatever its dirty rects say); what the encoder makes is not asked (it is what the
+    cut lowers: a CBR encoder spending more than the floor on a still picture). Once it has been
+    still for 3 s (twice as long after each cut the picture ended within 10 s, up to 30 s:
+    content that changes every few seconds is not cut and restored over and over), the
+    encoder's target goes down to host config `staticKbps` (default a quarter of the rate
+    controller's target, at least 2 Mbit/s), linearly back towards the target between 0.2 % and
+    5 %, lower at most once a second; a frame that changes raises it at once, before that frame is
+    queued (so it goes out at the new pacing rate): the full target from 5 % changed or with more
+    than five new images a second, the linear share below that (about 37 % of the target at 1 %).
+    The first hardware run had it cut a running game every second or two (docs/VENDOR_NOTES.md
+    "First hardware run: the static desktop during a game"). It caps what the encoder is told,
+    never what the rate controller decides (the lower of the two: it cannot fight the congestion
+    control; a restore needs no ramp); the controller is told the encoder runs at its target
+    meanwhile (its fill, the delivered rates and the queue's growth are measured in units of its
+    target: told the capped rate, a decrease would start from the cap and no increase could pass 1.2
+    × the cap). The cap keeps the VBV at one frame of the full target (`vbvFrames` target / cap) so
+    the first frame with motion, encoded before anyone knows it moved, is not starved. Only on
     a seamless live bitrate (a cap that costs key frames is worth nothing); FFmpeg reports no
     dirty share, and an unknown share never lowers anything. Host config `staticBitrate` `off`
     turns it off; host.log logs `static desktop: lowering the bitrate` and `desktop changes: full
@@ -1389,6 +1413,14 @@ client's next attempts then leave out both paths for 10 minutes and go on to the
 whose ticket the gateway checks. The direct path is always tried first: on a LAN, or over Tailscale /
 WireGuard (subnet routing to the PC's address, or `directAddr` set to the PC's tailnet address),
 the browser reaches the PC without the gateway in the media path. The relay is the last resort.
+The overlay's Transport row says why a connection is not on the direct path (`direct: no answer in
+2.5 s: UDP 48100 blocked ...`, `refused after N ms: ...`, no direct endpoint, the settings). At
+start the agent checks whether Windows Firewall lets the direct port in on each connected network
+(the network's profile, the firewall's state and the inbound rules for the port or the agent's
+program) and warns with the fix where it does not: the installer's rule covers Private and Domain
+networks, so on a network Windows set to Public the browser's handshake gets no answer and Auto
+streams through the relay (`direct path blocked by Windows Firewall on this network`, `fix=`;
+`recon-host probe` prints the same; VENDOR_NOTES "First hardware run: the direct path on the LAN").
 
 Packet size: every QUIC endpoint (`transport.QUICConfig`: the host's direct and UDP-relay servers,
 its tunnels, the gateway's HTTP/3 and splice listeners) starts at 1232-byte UDP payloads

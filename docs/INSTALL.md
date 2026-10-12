@@ -314,12 +314,40 @@ On any device on your home network (laptop, another PC, tablet), open
   Esc to leave.
 - **Ctrl+Alt+Shift+M**: game mouse mode (raw relative mouse). Use it for first-person games.
 - **Ctrl+Alt+Shift+S**: the performance overlay. **Transport** should read
-  `webtransport · direct` at home. If it reads a relay instead, see README, Troubleshooting,
-  "The direct path is never used": the PC must hold UDP 48100, which `host.log` reports
-  (`direct WebTransport endpoint listening`, or `direct endpoint unavailable` while another
-  program holds the port).
+  `webtransport · direct` at home. If it reads a relay instead, the row says why after
+  `direct:`, and "The direct path is not used at home" below has the fix.
 - **Ctrl+Alt+Shift+O**: settings (bitrate, frame rate, codec, resolution, audio).
 - Controllers: press a button after the stream starts. A "Controller connected" message appears.
+
+**The direct path is not used at home.** On the PC's own network the browser should reach the
+PC directly on UDP 48100. When the overlay's Transport row reads a relay
+(`webtransport · relay` or `relay-splice`) at home, it says why after `direct:`:
+
+- `direct: no answer in 2.5 s: UDP 48100 blocked ...`: the port is closed on the way, almost
+  always by Windows Firewall because Windows set the network to **Public**: the installer's rule
+  covers Private and Domain networks only. The first hardware run streamed every session through
+  the relay this way. `host.log` says so when the agent starts:
+  `direct path blocked by Windows Firewall on this network: browsers on it stream through the
+  gateway's relay`, with the network, its `profile=`, the reason (`why=`) and the fix (`fix=`).
+  `recon-host.exe probe` prints the same check (`direct path: UDP 48100 on network ...: allowed`
+  or `BLOCKED`, and a `fix` line). The fix, in an administrator PowerShell on the PC:
+
+  ```powershell
+  Get-NetConnectionProfile                  # Name, InterfaceIndex, NetworkCategory
+  Set-NetConnectionProfile -InterfaceIndex <InterfaceIndex> -NetworkCategory Private
+  Get-NetFirewallRule -DisplayName 'KloudIT Recon host (direct path)' | Select-Object Profile, Enabled, Action
+  ```
+
+  (or Settings → Network & internet → your connection → *Private network*). Only do this on your
+  own network. If the rule is missing (`no inbound firewall rule allows UDP 48100`), run the
+  installer again or add it with the `New-NetFirewallRule` command `host.log` prints. Reconnect
+  the stream afterwards: no agent restart is needed.
+- `direct: refused after N ms: ...`: something answered and refused: nothing listens on the port
+  (`host.log`: `direct endpoint unavailable`, another program holds it, see README,
+  Troubleshooting) or the PC refused the browser's ticket.
+- `direct: the PC offers no direct endpoint ...`: the agent has no direct endpoint up
+  (`directPort` 0, or the port is taken: `host.log`).
+- `direct: Network path is "Relay via gateway"`: the browser's Settings → Network path says so.
 
 **Which encoder streams.** The overlay's **Encoder** row names it: `hevc_amf_helper` (or
 `hevc_nvenc_helper`, `av1_amf_helper`, ...) is the native encoder helper, a plain name such as

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -45,11 +46,24 @@ const HDRTestStrip = proto.BarcodeRows * proto.BarcodeCell
 // and Cr are the 10-bit codes the stream carries, which the client reads as
 // BT.2020 PQ (Y 64 = 0, 508 ~ 100, 572 ~ 200, 724 ~ 1000, 856 ~ 4000, 940 =
 // 10000 cd/m2).
+//
+// FFmpeg 7.1 and later negotiate colour spaces through a filter graph, and
+// their drawbox converts with the colour space of the link it draws on:
+// here the overlay's BT.2020 NCL, so the coloured patches (red, green, blue;
+// not the grey ones, which every matrix gives alike) come out in the BT.2020
+// matrix's codes (Y2020, Cb2020, Cr2020, within a code or two of its
+// 8-bit conversion x 4), as the owner's Windows FFmpeg 8.1 build does (red
+// 237/418/848 where the BT.601 table has 260/396/848: "HDR10 test pattern
+// unavailable" at the first hardware run's agent start). Those are the right
+// codes for the stream's BT.2020 colour description (older builds' BT.601
+// codes are slightly other colours); the probe accepts either
+// (checkHDRTestFrames).
 type HDRTestPatch struct {
-	Name      string
-	X, W      int
-	RGB       uint32
-	Y, Cb, Cr int
+	Name                  string
+	X, W                  int
+	RGB                   uint32
+	Y, Cb, Cr             int
+	Y2020, Cb2020, Cr2020 int
 }
 
 // hdrTestPatchX is where the patches start (right of the barcode's 128 px).
@@ -68,7 +82,9 @@ var HDRTestPatches = func() []HDRTestPatch {
 	out := make([]HDRTestPatch, len(cols))
 	for i, c := range cols {
 		y, u, v := ccirYUV(c.rgb)
-		out[i] = HDRTestPatch{Name: c.name, X: hdrTestPatchX + 32*i, W: 32, RGB: c.rgb, Y: 4 * y, Cb: 4 * u, Cr: 4 * v}
+		y2, u2, v2 := yuv2020(c.rgb)
+		out[i] = HDRTestPatch{Name: c.name, X: hdrTestPatchX + 32*i, W: 32, RGB: c.rgb, Y: 4 * y, Cb: 4 * u, Cr: 4 * v,
+			Y2020: 4 * y2, Cb2020: 4 * u2, Cr2020: 4 * v2}
 	}
 	return out
 }()
@@ -84,6 +100,22 @@ func ccirYUV(rgb uint32) (y, u, v int) {
 	v = ((fix(0.50000*224.0/255.0)*r - fix(0.41869*224.0/255.0)*g - fix(0.08131*224.0/255.0)*b + half - 1) >> scale) + 128
 	return y, u, v
 }
+
+// yuv2020 converts an RGB colour with the BT.2020 NCL matrix to 8-bit
+// limited range (the codes FFmpeg 7.1+'s drawbox makes on a BT.2020 link,
+// within a code or two).
+func yuv2020(rgb uint32) (y, u, v int) {
+	r, g, b := float64(rgb>>16&0xff)/255, float64(rgb>>8&0xff)/255, float64(rgb&0xff)/255
+	const kr, kb = 0.2627, 0.0593
+	yy := kr*r + (1-kr-kb)*g + kb*b
+	round := func(x float64) int { return int(math.Floor(x + 0.5)) }
+	return round(16 + 219*yy), round(128 + 224*(b-yy)/(2*(1-kb))), round(128 + 224*(r-yy)/(2*(1-kr)))
+}
+
+// hdrPatchTolerance: how far (10-bit codes) a coloured patch of a build
+// that draws in BT.2020 may be from yuv2020's codes x 4 (its own rounding
+// and 8-to-10-bit conversion).
+const hdrPatchTolerance = 3
 
 // HDRTestMetadata is the HDR10 metadata of the test pattern: a BT.2020 / D65
 // mastering display spanning PQ's range (synthetic content, not mastered),
@@ -147,7 +179,8 @@ func svtav1HDRParams(m proto.HDRMetadata) string {
 }
 
 // CanHDRTest reports whether this FFmpeg build ran the HDR10 test pattern in
-// the probe (HDRTestGraph's codes exact, libsvtav1 encoding it at 10 bits).
+// the probe (HDRTestGraph's codes as checkHDRTestFrames wants them, libsvtav1
+// encoding it at 10 bits).
 func (c *Caps) CanHDRTest() bool { return c.hdrTest }
 
 // SetHDRTest records the HDR10 test pattern's probe result (the probe does;
@@ -195,8 +228,10 @@ func testHDRTest(ctx context.Context, ffmpeg string) error {
 }
 
 // checkHDRTestFrames checks raw yuv420p10le frames of HDRTestGraph: frame i's
-// barcode reads i at codes 64 / 940 and every patch has its codes (the
-// middle of each).
+// barcode reads i at codes 64 / 940, every grey patch has its codes (the
+// middle of each), and the coloured ones all have their BT.601 codes, or all
+// their BT.2020 codes within hdrPatchTolerance (HDRTestPatch: FFmpeg 7.1+
+// draws on the overlay's BT.2020 link).
 func checkHDRTestFrames(b []byte, w, h, frames int) error {
 	size := w * h * 3 // 16-bit samples, 4:2:0
 	if len(b) != size*frames {
@@ -217,11 +252,31 @@ func checkHDRTestFrames(b []byte, w, h, frames int) error {
 			return fmt.Errorf("frame %d: barcode reads %d (valid %v)", i, v, ok)
 		}
 		cw := w / 2
+		matrix := "" // the coloured patches': "BT.601" or "BT.2020"
 		for _, p := range HDRTestPatches {
 			x, y := p.X+p.W/2, HDRTestStrip/2
 			cb, cr := at(f, 2*w*h+2*(y/2*cw+x/2)), at(f, 2*w*h+w*h/2+2*(y/2*cw+x/2))
-			if got := at(f, 2*(y*w+x)); got != p.Y || cb != p.Cb || cr != p.Cr {
-				return fmt.Errorf("frame %d: patch %s codes %d/%d/%d, want %d/%d/%d", i, p.Name, got, cb, cr, p.Y, p.Cb, p.Cr)
+			got := at(f, 2*(y*w+x))
+			grey := p.RGB>>16&0xff == p.RGB>>8&0xff && p.RGB>>8&0xff == p.RGB&0xff
+			near := func(a, b int) bool { return a-b <= hdrPatchTolerance && b-a <= hdrPatchTolerance }
+			m := ""
+			switch {
+			case got == p.Y && cb == p.Cb && cr == p.Cr:
+				m = "BT.601"
+			case !grey && near(got, p.Y2020) && near(cb, p.Cb2020) && near(cr, p.Cr2020):
+				m = "BT.2020"
+			default:
+				want := fmt.Sprintf("%d/%d/%d", p.Y, p.Cb, p.Cr)
+				if !grey {
+					want += fmt.Sprintf(" (BT.601) or about %d/%d/%d (BT.2020)", p.Y2020, p.Cb2020, p.Cr2020)
+				}
+				return fmt.Errorf("frame %d: patch %s codes %d/%d/%d, want %s", i, p.Name, got, cb, cr, want)
+			}
+			if !grey {
+				if matrix != "" && m != matrix {
+					return fmt.Errorf("frame %d: patch %s in %s codes, the patches before it in %s", i, p.Name, m, matrix)
+				}
+				matrix = m
 			}
 		}
 	}

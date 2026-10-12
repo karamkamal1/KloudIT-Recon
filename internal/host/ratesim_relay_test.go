@@ -147,6 +147,21 @@ type rsCfg struct {
 	clockErr  []rsStepErr // the client's clock-offset error over time
 	oldClient bool        // reports without the delay frame and the clock shift
 	keyReqAt  time.Duration
+	// static: the session's static-desktop cap (activity.go) is on; picture
+	// is what the source shows at t (nil: presents at srcFPS that change all
+	// of it): still (nothing presented: idle repeats every 100 ms and a
+	// caret's new image every 500 ms, all tiny), or presents at srcFPS whose
+	// capture reports dirty (a game flipping past the compositor: 0, the
+	// owner's first run). The first present after a still picture is as
+	// large as a scene change, at most a frame of the full target (the
+	// cap's VBV).
+	static  bool
+	picture func(t time.Duration) (still bool, dirty float64)
+	// pause: the link holds what it would send at t until the returned
+	// time (0: no pause): a Wi-Fi link's stalls, the delay spikes of the
+	// owner's LAN.
+	pause     func(t time.Duration) time.Duration
+	pauseBack bool // the pauses hold the client's ACKs and reports too (a shared medium)
 	// shards > 0: frames go as datagram shards (fec.go) whose parity and
 	// headers add this share to a frame's bytes on the wire: the link, the
 	// pacer, the congestion target and the pacer model see them, the
@@ -183,6 +198,7 @@ type rsPkt struct {
 	sent    time.Duration
 	acked   bool
 	lost    bool
+	dropped bool // the path dropped it (a full queue, random loss)
 }
 
 type rsChunk struct{ frame, n int }
@@ -216,9 +232,15 @@ type rsTrace struct {
 	// overflowWhy: overflows by queueOverflows' reason.
 	overflowWhy map[string]int
 	idrs        int
-	applied     []int     // the encoder's target at each rate tick
-	decoded     []float64 // frames decoded each second
-	secs        []string  // per-second summary
+	// static: the static-desktop cap's cuts and restores; thinStarts:
+	// thinning episodes.
+	cuts, restores int
+	thinStarts     int
+	undone         int       // delay decreases undone (checkUndo)
+	encoder        []int     // the encoder's bitrate at each rate tick (under the static-desktop cap: below the target)
+	applied        []int     // the encoder's target at each rate tick
+	decoded        []float64 // frames decoded each second
+	secs           []string  // per-second summary
 }
 
 func runRelaySim(c rsCfg) *rsTrace {
@@ -253,7 +275,10 @@ func runRelaySim(c rsCfg) *rsTrace {
 	m := cc.NewMedia(rtt, rsMDS)
 	m.SetClock(func() congestion.Time { return mono(now) })
 	audio := c.audioKbps
-	var encKbps, encFPS int
+	// encKbps: the encoder's bitrate (under the static-desktop cap: below
+	// the rate controller's target ctlKbps).
+	var encKbps, ctlKbps, encFPS int
+	st := &staticCap{on: c.static, now: clock}
 	fecKbps := func(kbps int64) int64 { return int64(float64(kbps) * c.shards) } // Session.fecOverheadKbps
 	// setCC: Session.applyCongestionTarget.
 	setCC := func() {
@@ -275,6 +300,8 @@ func runRelaySim(c rsCfg) *rsTrace {
 		encKbps = c.startKbps
 	}
 	r.live(encKbps, encFPS)
+	ctlKbps = encKbps
+	st.generation(clock(), encKbps, ctlKbps, true)
 	r.setFEC(c.shards > 0)
 	setCC()
 	var (
@@ -363,6 +390,11 @@ func runRelaySim(c rsCfg) *rsTrace {
 	)
 	backDelay := func() time.Duration {
 		d := max(now+c.owd+time.Duration(rng.Float64()*float64(c.jitter)), lastBackArr)
+		if c.pauseBack && c.pause != nil {
+			if until := c.pause(now); until > 0 {
+				d = max(d, until+c.owd) // the link stalls both ways: the client's ACKs and reports wait too
+			}
+		}
 		lastBackArr = d
 		return d
 	}
@@ -403,9 +435,17 @@ func runRelaySim(c rsCfg) *rsTrace {
 			tr.decreases[ch.why]++
 			tr.downAt = append(tr.downAt, now)
 		}
+		if ch.why == "undo" {
+			tr.undone++
+		}
 		logf("RATE %s %d -> %d fps %d why=%s urgent=%v (%s)", map[bool]string{true: "down", false: "up"}[ch.down], ch.fromKbps, ch.toKbps,
 			ch.toFPS, ch.why, ch.urgent, src)
-		encKbps = ch.toKbps
+		// Session.setRate: the static-desktop cap's share of the target.
+		ctlKbps = ch.toKbps
+		st.mu.Lock()
+		encKbps, _ = st.want(clock(), ch.toKbps, true)
+		st.applied(clock(), encKbps, ch.toKbps)
+		st.mu.Unlock()
 		if ch.toFPS > 0 {
 			encFPS = ch.toFPS
 		}
@@ -496,9 +536,11 @@ func runRelaySim(c rsCfg) *rsTrace {
 		return true
 	}
 
-	// The encoder's frame captured at t.
-	encode := func(t time.Duration) {
-		f := &media.Frame{Gen: 1, Seq: seq}
+	// The encoder's frame captured at t: a present whose capture reports
+	// dirty, or (still) an idle repeat or a caret's new image.
+	wasStill := false
+	encode := func(t time.Duration, still, caret bool, dirty float64) {
+		f := &media.Frame{Gen: 1, Seq: seq, Dirty: dirty, HasDirty: true}
 		srcFPS := encFPS
 		if c.srcFPS > 0 {
 			srcFPS = min(c.srcFPS, encFPS)
@@ -536,7 +578,22 @@ func runRelaySim(c rsCfg) *rsTrace {
 			recFrom = -1
 		}
 		var size float64
+		after := wasStill && !still
+		wasStill = still
 		switch {
+		case still && !(idrDue || seq == 0 || rec):
+			// A still picture: an idle repeat, or a caret's new image.
+			kind, size = "still", 300
+			f.Repeat, f.Dirty = !caret, 0
+			if caret {
+				size, f.Dirty = 800, 40.0/(1920*1080)
+			}
+		case after && !(idrDue || seq == 0 || rec):
+			// The first present after a still picture: a scene change at
+			// the encoder's (capped) rate, at most a frame of the full
+			// target (the cap keeps the VBV that large).
+			kind = "scene"
+			size = min(max(budget*fill, frame*fill*c.ratio(c.scene30, c.scene2, encKbps)), float64(ctlKbps)*1000/8/float64(encFPS))
 		case idrDue || seq == 0:
 			f.Key, kind = true, "idr"
 			size = frame * c.ratio(c.idr30, c.idr2, encKbps)
@@ -559,7 +616,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 		// P frames after it, over about half a second, down to the QP
 		// limit; a key frame's size is its own (HRD off), and with recOwn a
 		// recovery frame's.
-		if !f.Key && !(c.recOwn && rec) {
+		if !f.Key && !(c.recOwn && rec) && kind != "still" {
 			size = max(size/(1+rcDebt/(30*budget)), float64(c.pMin))
 		}
 		rcDebt = max(0, rcDebt+size-budget)
@@ -578,7 +635,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 		fidx[f] = len(tr.frames) - 1
 		f.EncodeDoneUs = hostUs(t + lat)
 		encQ = append(encQ, len(tr.frames)-1)
-		if kind != "p" {
+		if kind != "p" && kind != "still" {
 			logf("encoder: %s seq=%d bytes=%d (budget %.0f, %d kbps)", kind, f.Seq, n, budget, encKbps)
 		}
 	}
@@ -589,6 +646,28 @@ func runRelaySim(c rsCfg) *rsTrace {
 		sec.enc++
 		sec.encBytes += af.bytes
 		r.output(af.bytes-rsHdr, af.f.Key)
+		// Session.staticFrame: the cap's change goes to the encoder before
+		// the frame is queued (a restore raises the pacing for this frame),
+		// the helper announces it (VideoEvent.Rate).
+		af.f.Data = rsZero[:min(len(rsZero), af.bytes-rsHdr)]
+		target, _ := r.kbps()
+		st.mu.Lock()
+		was := st.capped
+		sc, ok := st.frame(clock(), af.f, target, true)
+		st.mu.Unlock()
+		if ok {
+			encKbps = sc.kbps
+			setCC()
+			toHost = append(toHost, rsEvent{at: now + 5*time.Millisecond, kind: rsLive, kbps: encKbps, fps: encFPS})
+			switch {
+			case sc.kbps < sc.target && !was:
+				tr.cuts++
+				logf("STATIC cut to %d of %d (images %d, output %.0f kbps, still %v)", sc.kbps, sc.target, sc.images, sc.output, sc.still)
+			case sc.kbps >= sc.target:
+				tr.restores++
+				logf("STATIC restore to %d (activity %.3f, images %d, output %.0f kbps, next hold %v)", sc.kbps, sc.activity, sc.images, sc.output, sc.hold)
+			}
+		}
 		q := queueLoad{queued: len(frameQ), congested: r.delayOver(), interval: time.Second / time.Duration(encFPS), burst: burst.within(clock())}
 		if snd.state != 0 {
 			q.sending, q.busy, q.deadline, q.lag = true, now-snd.since, snd.of.deadline, now-tr.frames[snd.idx].encDone
@@ -697,6 +776,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 
 	nextSec, nextTick := time.Second, rateTick
 	keyReqDone := false
+	stillN := 0
 	for now = 0; now < c.dur; now += rsStep {
 		if c.keyReqAt > 0 && !keyReqDone && now >= c.keyReqAt {
 			keyReqDone = true
@@ -706,9 +786,22 @@ func runRelaySim(c rsCfg) *rsTrace {
 		if c.srcFPS > 0 {
 			srcFPS = min(c.srcFPS, encFPS)
 		}
+		still, dirty := false, 1.0
+		if c.picture != nil {
+			still, dirty = c.picture(now)
+			if wasStill && !still {
+				nextCap = min(nextCap, now) // a present after idle repeats goes out at once
+			}
+		}
 		if now >= nextCap {
-			encode(now)
-			nextCap += time.Second / time.Duration(srcFPS)
+			if still {
+				encode(now, true, stillN%5 == 0, 0)
+				stillN++
+				nextCap += 100 * time.Millisecond
+			} else {
+				encode(now, false, false, dirty)
+				nextCap += time.Second / time.Duration(srcFPS)
+			}
 		}
 		for len(encQ) > 0 && tr.frames[encQ[0]].encDone <= now {
 			idx := encQ[0]
@@ -776,8 +869,9 @@ func runRelaySim(c rsCfg) *rsTrace {
 				if af := tr.frames[e.idx]; af.f.MarkedLTR {
 					ackedLTR[af.f.Seq] = true
 				}
-			case rsLive: // VideoEvent.Rate: the encoder runs at the new rate
-				r.live(e.kbps, e.fps)
+			case rsLive: // VideoEvent.Rate: the encoder runs at the new rate (through the static-desktop cap)
+				target, _ := r.kbps()
+				r.live(st.rate(clock(), e.kbps, target, true), e.fps)
 			}
 		}
 
@@ -800,7 +894,11 @@ func runRelaySim(c rsCfg) *rsTrace {
 			unacked = keep
 		}
 		if len(unacked) > 0 {
-			if p := sent[unacked[0]]; now-max(p.sent, lastAckAt) > rtt.PTO(true) {
+			// The PTO's probe: acknowledged, it shows a packet the path
+			// dropped missing (lost by the packet threshold); one that is
+			// only late (a link that stalls) arrives before it, in order,
+			// and nothing is lost.
+			if p := sent[unacked[0]]; now-max(p.sent, lastAckAt) > rtt.PTO(true) && p.dropped {
 				declareLost(p)
 				unacked = unacked[1:]
 			}
@@ -816,6 +914,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 			}
 			cur, _ := r.kbps()
 			tr.applied = append(tr.applied, cur)
+			tr.encoder = append(tr.encoder, encKbps)
 		}
 
 		// frameSender.
@@ -843,6 +942,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 				if c.svc && af.f.Discardable && !af.f.Key && !af.f.Recovery {
 					if why, path := thinWhy(false, r.overTarget(), send.slow(clock()), len(frameQ)); why != "" {
 						if thin.left(af.f.Gen, af.f.Seq, clock(), why) {
+							tr.thinStarts++
 							logf("thinning starts why=%s seq=%d", why, af.f.Seq)
 						}
 						r.thinned(path)
@@ -921,10 +1021,17 @@ func runRelaySim(c rsCfg) *rsTrace {
 			unacked = append(unacked, p.pn)
 			m.OnPacketSent(mono(now), congestion.ByteCount(inflight), congestion.PacketNumber(p.pn), congestion.ByteCount(p.size), true)
 			if c.capQueue > 0 && linkFree-now > c.capQueue {
+				p.dropped = true
 				continue // the bottleneck's queue is full
+			}
+			if c.pause != nil {
+				if until := c.pause(max(linkFree, now)); until > 0 {
+					linkFree = max(linkFree, until)
+				}
 			}
 			linkFree = max(linkFree, now) + time.Duration(float64(p.size*8)/c.capacity(now)*float64(time.Second))
 			if rng.Float64() < c.loss {
+				p.dropped = true
 				continue
 			}
 			at := max(linkFree+c.owd+time.Duration(rng.Float64()*float64(c.jitter)), lastArrive)
@@ -1033,6 +1140,10 @@ func runRelaySim(c rsCfg) *rsTrace {
 	}
 	return tr
 }
+
+// rsZero backs the simulated frames' Data (only its length is read: the
+// static-desktop cap's encoder output).
+var rsZero = make([]byte, 4<<20)
 
 // simAckedLTR is the helper's LTR choice for a loss from frame from: the
 // newest LTR mark the client acknowledged before it, after the last key
@@ -1313,9 +1424,10 @@ func TestRelaySimFirstHardwareRun(t *testing.T) {
 				if cfg.srcFPS > 0 && cfg.srcFPS < 60 {
 					slow = time.Second/time.Duration(cfg.srcFPS) - time.Second/60
 				}
-				t.Logf("%s seed %d: floor touched %v, last 10 s: target %.0f, %.1f fps; decreases %v, overflows %d %v, forced key frames %d; "+
-					"whole run: host queue p95 %v, max %v, end-to-end p95 %v",
-					c.name, seed, touched, tail, fps, tr.decreases, tr.overflows, tr.overflowWhy, tr.idrs, hq, hqMax, e2e)
+				t.Logf("%s seed %d: floor touched %v, last 10 s: target %.0f, %.1f fps; decreases %v, overflows %d %v, forced key frames %d, thinning episodes %d; "+
+					"whole run: host queue p95 %v, max %v, end-to-end p95 %v, one-way delay p50/p95 %v/%v",
+					c.name, seed, touched, tail, fps, tr.decreases, tr.overflows, tr.overflowWhy, tr.idrs, tr.thinStarts, hq, hqMax, e2e,
+					tr.owd(0, cfg.dur, 0.5), tr.owd(0, cfg.dur, 0.95))
 				dec := 0
 				for _, n := range tr.decreases {
 					dec += n
@@ -1485,4 +1597,168 @@ func TestRelaySimCongestion(t *testing.T) {
 			t.Errorf("decreases %v, target %d at the end: want loss decreases to at most half\n%s", tr.decreases, tr.applied[len(tr.applied)-1], tr.report())
 		}
 	})
+}
+
+// ownerMenu is the picture of the owner's first run with the static-desktop
+// cap toggling (docs/VENDOR_NOTES.md "First hardware run: the static desktop
+// during a game"): a game menu presenting at 60 fps whose presents DDA handed
+// out without dirty rects (the helper reported them as unchanged), and a
+// frame the compositor drew (36 % of the picture, a share the log has) every
+// 1.5 s.
+func ownerMenu(t time.Duration) (bool, float64) {
+	if t%(1500*time.Millisecond) < 17*time.Millisecond {
+		return false, 0.363
+	}
+	return false, 0
+}
+
+// wifiPauses: the link stalls 30, 60 or 90 ms about every 1.7 s (a Wi-Fi
+// link's medium busy, a power-save interval): one-way delay spikes as the
+// owner's report_owd max of 40-150 ms per 10 s on a 13-21 ms round trip.
+func wifiPauses(t time.Duration) time.Duration {
+	const every = 1700 * time.Millisecond
+	k := t / every
+	start := k*every + 300*time.Millisecond
+	if t < start {
+		return 0
+	}
+	if end := start + time.Duration(30*(1+k%3))*time.Millisecond; t < end {
+		return end
+	}
+	return 0
+}
+
+// TestRelaySimStaticDesktop replays the static-desktop cut of the owner's
+// first run against the fixed code (docs/VENDOR_NOTES.md "First hardware
+// run: the static desktop during a game"): with the session's cap on, a game
+// whose presents the helper reported as unchanged is never cut (52f801f cut
+// it to a quarter of the target a second after each composed frame and
+// restored it with the next, every 1-2 s, 30 cuts and 28 restores in the
+// log, each restore followed by a burst of large frames), also at the
+// 151 Mbit/s setting with an encoder making 10 Mbit/s and on a link with
+// Wi-Fi-like stalls (the 118 -> 51 -> 23 Mbit/s cascade); a still desktop is
+// cut once it has been still for the hold, and the game after it (the first
+// frame as large as a frame at the full target) is restored at once and
+// carried without a frame-queue overflow (the log's first overflow, at
+// 30 Mbit/s with no loss, 128 ms after a restore).
+func TestRelaySimStaticDesktop(t *testing.T) {
+	stillThenGame := func(t time.Duration) (bool, float64) {
+		if t < 12*time.Second {
+			return true, 0
+		}
+		return false, 1
+	}
+	for _, c := range []struct {
+		name         string
+		set          func(*rsCfg)
+		cuts         int     // the cap's cuts (and at most as many restores)
+		maxDec       int     // rate decreases at most
+		minEnd       float64 // the mean target over the last 10 s at least this share of the setting
+		minFPS       float64
+		minShare     float64 // the target never under this share of the setting from 2 s on
+		meanShare    float64 // the mean target from 2 s on at least this share of the setting
+		after        time.Duration
+		maxQueueP95  time.Duration // host queue p95 of the frames captured from after on
+		maxQueueMax  time.Duration
+		maxE2EP95    time.Duration
+		noOverflowAt time.Duration // no frame-queue overflow from here on (-1: none at all)
+	}{
+		{"game menu, presents reported unchanged", func(c *rsCfg) { c.picture = ownerMenu }, 0, 0, 0.95, 57, 0.95, 0.95, 0,
+			50 * time.Millisecond, 150 * time.Millisecond, 100 * time.Millisecond, -1},
+		{"game menu at 151 Mbit/s, encoder at 10 Mbit/s", func(c *rsCfg) { c.picture, c.ceiling, c.satKbps = ownerMenu, 151000, 10000 },
+			0, 0, 0.95, 57, 0.95, 0.95, 0, 50 * time.Millisecond, 150 * time.Millisecond, 100 * time.Millisecond, -1},
+		// The stalls: each holds every frame for 30-90 ms, the reports find
+		// frames that do not arrive, and the decrease, taken from the next
+		// to nothing acknowledged, halved the target (0.425 x: the log's
+		// 154000 -> 65450, 118196 -> 51315, 52901 -> 22904, 24433 ->
+		// 10541); the climb back from each halving took longer than the
+		// next stall: the cascade (at a20376f, its static cap toggling too:
+		// 8 halvings, the floor, mean 28 and 29 of 151 Mbit/s). Now nothing
+		// acknowledged at all is a
+		// stall, not a capacity (stallMax), and a decrease on a stall that
+		// slips through is undone once the path delivers the backlog at
+		// once (checkUndo): no two halvings in a row, the mean near the
+		// setting.
+		{"game menu at 151 Mbit/s, encoder at 10 Mbit/s, Wi-Fi stalls", func(c *rsCfg) {
+			c.picture, c.ceiling, c.satKbps, c.pause = ownerMenu, 151000, 10000, wifiPauses
+		}, 0, -1, 0.75, 57, 0.33, 0.8, 0, 50 * time.Millisecond, 150 * time.Millisecond, 150 * time.Millisecond, -1},
+		// Stalls that hold both ways (a shared medium): the client's ACKs
+		// and reports arrive in a burst after each, the reports with
+		// frames that did not arrive while ACKs come in with them; the
+		// decrease on them is undone once the backlog arrives at once
+		// (checkUndo).
+		{"game menu at 151 Mbit/s, encoder at 10 Mbit/s, Wi-Fi stalls both ways", func(c *rsCfg) {
+			c.picture, c.ceiling, c.satKbps, c.pause, c.pauseBack = ownerMenu, 151000, 10000, wifiPauses, true
+		}, 0, -1, 0.75, 57, 0.33, 0.8, 0, 50 * time.Millisecond, 150 * time.Millisecond, 150 * time.Millisecond, -1},
+		// The same stalls under a game that fills its 30 Mbit/s (at
+		// a20376f the floor, mean 7.0 and 9.7 Mbit/s): the frames held by the
+		// stall arrive late (the congestion window held the sender), a
+		// decrease on their delay where it is far over the target and
+		// drains at once is undone.
+		{"game at 30 Mbit/s, Wi-Fi stalls", func(c *rsCfg) { c.picture, c.pause = ownerMenu, wifiPauses }, 0, -1, 0.75, 57, 0.33, 0.8, 0,
+			50 * time.Millisecond, 150 * time.Millisecond, 150 * time.Millisecond, -1},
+		{"game at 30 Mbit/s, Wi-Fi stalls both ways", func(c *rsCfg) { c.picture, c.pause, c.pauseBack = ownerMenu, wifiPauses, true }, 0, -1, 0.75, 57,
+			0.33, 0.8, 0, 50 * time.Millisecond, 150 * time.Millisecond, 150 * time.Millisecond, -1},
+		{"still desktop, then the game at 30 Mbit/s", func(c *rsCfg) { c.picture = stillThenGame }, 1, 0, 0.95, 57, 0.95, 0.95,
+			12 * time.Second, 50 * time.Millisecond, 150 * time.Millisecond, 100 * time.Millisecond, -1},
+		{"still desktop, then the game at 151 Mbit/s, encoder at 60 Mbit/s", func(c *rsCfg) {
+			c.picture, c.ceiling, c.satKbps = stillThenGame, 151000, 60000
+		}, 1, 0, 0.95, 57, 0.95, 0.95, 12 * time.Second, 50 * time.Millisecond, 150 * time.Millisecond, 100 * time.Millisecond, -1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			for seed := uint64(1); seed <= 2; seed++ {
+				cfg := relaySim(c.name, seed)
+				cfg.static = true
+				c.set(&cfg)
+				tr := runRelaySim(cfg)
+				_, tail, fps := tr.summary(10 * time.Second)
+				hq, hqMax, e2e := tr.hostQueue(c.after, cfg.dur, 0.95)
+				lowest := cfg.ceiling
+				for i, a := range tr.applied {
+					if time.Duration(i+1)*rateTick >= 2*time.Second {
+						lowest = min(lowest, a)
+					}
+				}
+				mean := tr.meanApplied(2*time.Second, cfg.dur)
+				capped, enc := 0, 0.0
+				for i, e := range tr.encoder {
+					enc += float64(e) / float64(len(tr.encoder))
+					if e < tr.applied[i] {
+						capped++
+					}
+				}
+				dec := 0
+				for _, n := range tr.decreases {
+					dec += n
+				}
+				t.Logf("%s seed %d: static cuts %d, restores %d, encoder below the target %.0f %% of the time, its mean %.0f; decreases %v, undone %d, lowest target %d, mean %.0f; overflows %d %v; thinning episodes %d; "+
+					"last 10 s: target %.0f, %.1f fps; from %v: host queue p95 %v, max %v, end-to-end p95 %v",
+					c.name, seed, tr.cuts, tr.restores, 100*float64(capped)/float64(len(tr.encoder)), enc, tr.decreases, tr.undone, lowest, mean, tr.overflows, tr.overflowWhy, tr.thinStarts, tail, fps, c.after, hq, hqMax, e2e)
+				fail := ""
+				switch {
+				case tr.cuts != c.cuts || tr.restores > c.cuts:
+					fail = fmt.Sprintf("%d static cuts and %d restores, want %d", tr.cuts, tr.restores, c.cuts)
+				case c.maxDec >= 0 && dec > c.maxDec:
+					fail = fmt.Sprintf("%d decreases, want at most %d", dec, c.maxDec)
+				case float64(lowest) < c.minShare*float64(cfg.ceiling) || mean < c.meanShare*float64(cfg.ceiling):
+					fail = fmt.Sprintf("the target went down to %d, mean %.0f; want at least %.0f, %.0f", lowest, mean,
+						c.minShare*float64(cfg.ceiling), c.meanShare*float64(cfg.ceiling))
+				case tail < c.minEnd*float64(cfg.ceiling) || fps < c.minFPS:
+					fail = fmt.Sprintf("last 10 s: target %.0f, %.1f fps; want %.0f, %.0f", tail, fps, c.minEnd*float64(cfg.ceiling), c.minFPS)
+				case tr.overflows > 0:
+					fail = fmt.Sprintf("%d frame-queue overflows %v", tr.overflows, tr.overflowWhy)
+				case tr.thinStarts > 3:
+					// The log's 347 thinning episodes (a start and an end
+					// line each) came with the overflow cycles.
+					fail = fmt.Sprintf("%d thinning episodes, want at most 3", tr.thinStarts)
+				case hq > c.maxQueueP95 || hqMax > c.maxQueueMax || e2e > c.maxE2EP95:
+					fail = fmt.Sprintf("host queue p95 %v, max %v, end-to-end p95 %v; want under %v, %v, %v", hq, hqMax, e2e, c.maxQueueP95, c.maxQueueMax, c.maxE2EP95)
+				}
+				if fail != "" {
+					t.Errorf("seed %d: %s\n%s", seed, fail, tr.report())
+				}
+			}
+		})
+	}
 }

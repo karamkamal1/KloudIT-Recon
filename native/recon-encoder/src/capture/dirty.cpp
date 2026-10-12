@@ -63,4 +63,10 @@ double dirtyFraction(const DirtyRect* rects, size_t count, uint32_t width, uint3
     return std::min(1.0, area / total);
 }
 
+double presentedDirtyFraction(const DirtyRect* rects, size_t count, uint32_t width, uint32_t height) {
+    if (!width || !height) return -1;
+    const double f = dirtyFraction(rects, count, width, height);
+    return f > 0 ? f : 1.0;
+}
+
 }  // namespace recon

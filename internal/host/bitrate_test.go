@@ -72,12 +72,13 @@ func (h *ctlHarness) apply(c rateChange) {
 	h.r.live(h.static.rate(h.clock, enc, c.toKbps, true), c.toFPS)
 }
 
-// frame feeds a frame of the static desktop to the cap (as staticFrame) and
-// the encoder's rate it calls for to the controller (as videoEvents).
+// frame feeds a frame of the static desktop (an idle repeat) to the cap (as
+// staticFrame) and the encoder's rate it calls for to the controller (as
+// videoEvents).
 func (h *ctlHarness) frame() {
 	target, _ := h.r.kbps()
 	h.static.mu.Lock()
-	c, ok := h.static.frame(h.clock, &media.Frame{HasDirty: true}, target, true)
+	c, ok := h.static.frame(h.clock, &media.Frame{HasDirty: true, Repeat: true}, target, true)
 	h.static.mu.Unlock()
 	if ok {
 		h.r.live(h.static.rate(h.clock, c.kbps, target, true), 0)
@@ -1527,5 +1528,131 @@ func TestRateSimKeyFrames(t *testing.T) {
 	}
 	if n < 5 || s.meanApplied(30*time.Second, cfg.dur) > 10000 {
 		t.Errorf("without the pacer's share: %d decreases, mean %.0f; the comparison wants a spiral down", n, s.meanApplied(30*time.Second, cfg.dur))
+	}
+}
+
+// TestRateStallUndo: a link that stalls (Wi-Fi: the medium busy) holds
+// every frame; the reports find the oldest frame far over the target. While
+// nothing at all is acknowledged that is a stall, not a capacity: no
+// decrease for stallMax (an outage longer than that decreases). Where some
+// acknowledgements still trickle in (a stall that holds the client's ACKs
+// and reports too delivers them in a burst), the delay decrease halves the
+// target (at most a halving: 0.425 x, the first hardware run's 154000 ->
+// 65450); the path then delivers the backlog at once and the decrease is
+// undone (why "undo"), the last known-good rate too. A capacity drop (40 %
+// acknowledged from then on) keeps its decrease, and so does a stall whose
+// frames are lost rather than delivered late.
+func TestRateStallUndo(t *testing.T) {
+	type path struct {
+		stall     time.Duration // from 3 s on nothing arrives for this long
+		ackDuring float64       // meanwhile the share of the sent bytes acknowledged per report
+		share     float64       // from 3 s on, the share of the sent bytes the path delivers (1: all)
+		late      bool          // what the stall held arrives when it ends
+	}
+	run := func(p path, d time.Duration, h *ctlHarness) {
+		const stallFrom = 3 * time.Second
+		nextFrame, nextReport, nextTick := h.clock, h.clock.Add(25*time.Millisecond), h.clock.Add(rateTick)
+		var sent, owed int64
+		frames := 0
+		lastRecv := h.elapsed()
+		for end := h.clock.Add(d); h.clock.Before(end); {
+			h.clock = h.clock.Add(time.Millisecond)
+			t := h.elapsed()
+			stalled := t >= stallFrom && t < stallFrom+p.stall
+			if !h.clock.Before(nextFrame) {
+				nextFrame = nextFrame.Add(time.Second / 60)
+				cur, _ := h.r.kbps()
+				n := cur * 1000 / 8 / 60
+				h.r.output(n, false)
+				h.r.sent(n)
+				sent += int64(n)
+				if !stalled {
+					frames++
+				}
+			}
+			if !h.clock.Before(nextReport) {
+				nextReport = nextReport.Add(25 * time.Millisecond)
+				share := 1.0
+				if t >= stallFrom {
+					share = p.share
+				}
+				fb := feedback{at: h.clock, interval: 25 * time.Millisecond, ackedValid: true}
+				switch {
+				case stalled:
+					fb.acked = int64(float64(sent) * p.ackDuring)
+					if p.late {
+						owed += sent - fb.acked
+					}
+					// The oldest frame the client lacks was encoded when
+					// the stall began.
+					fb.pendingValid, fb.pending = true, t-lastRecv+10*time.Millisecond
+				default:
+					fb.acked = int64(float64(sent)*share) + owed
+					owed = 0
+					fb.frames, fb.bytes = frames, int64(float64(sent)*share)
+					fb.owdValid, fb.qd, fb.owd = true, 2*time.Millisecond, 10*time.Millisecond
+					lastRecv = t
+				}
+				sent, frames = 0, 0
+				if c, ok := h.r.report(fb); ok {
+					h.apply(c)
+				}
+			}
+			if !h.clock.Before(nextTick) {
+				nextTick = nextTick.Add(rateTick)
+				if c, ok := h.r.tick(false); ok {
+					h.apply(c)
+				}
+			}
+		}
+	}
+	for _, c := range []struct {
+		name  string
+		p     path
+		start string // a delay decrease on frames that did not arrive, from this ("": none)
+		undo  bool
+	}{
+		{"a 100 ms stall, nothing acknowledged", path{100 * time.Millisecond, 0, 1, true}, "", false},
+		{"a 400 ms outage, nothing acknowledged, then all of it at once", path{400 * time.Millisecond, 0, 1, true}, "halving", true},
+		{"a 400 ms outage, nothing acknowledged, its frames lost", path{400 * time.Millisecond, 0, 1, false}, "halving", false},
+		{"a stall, ACKs trickling, the backlog delivered at once", path{100 * time.Millisecond, 0.05, 1, true}, "halving", true},
+		{"a stall, ACKs trickling, its frames lost", path{100 * time.Millisecond, 0.05, 1, false}, "halving", false},
+		{"a capacity drop to 40 %", path{100 * time.Millisecond, 0.4, 0.4, false}, "delivered", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newCtl(t, 20000, 60, seamless)
+			run(c.p, 5*time.Second, h)
+			var down, undo *rateChange
+			for i := range h.changes {
+				switch ch := &h.changes[i]; {
+				case ch.down && down == nil:
+					down = ch
+				case ch.why == "undo":
+					undo = ch
+				}
+			}
+			stalls, undos := h.r.stallCounts()
+			if c.start == "" {
+				if len(h.changes) > 0 || stalls != 1 {
+					t.Fatalf("changes %+v, %d stalls counted: want none, one stall", h.changes, stalls)
+				}
+				return
+			}
+			if down == nil || down.why != "delay" || !down.basis.bound || down.basis.start != c.start {
+				t.Fatalf("changes %+v: want a delay decrease on frames that did not arrive, from %s", h.changes, c.start)
+			}
+			h.r.mu.Lock()
+			good := h.r.lastGood
+			h.r.mu.Unlock()
+			if c.undo {
+				if undo == nil || undo.toKbps != 20000 || h.cur() != 20000 || good != 0 || undos != 1 {
+					t.Fatalf("changes %+v, last known-good %.0f: want the decrease undone, back at 20000", h.changes, good)
+				}
+				return
+			}
+			if undo != nil || h.cur() > 12000 {
+				t.Fatalf("changes %+v: want the decrease kept", h.changes)
+			}
+		})
 	}
 }

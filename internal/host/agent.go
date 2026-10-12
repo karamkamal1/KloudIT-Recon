@@ -464,6 +464,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	go rot.Run(ctx.Done())
 	if a.cfg.DirectPort > 0 {
 		go func() { errc <- a.runDirect(ctx, rot) }()
+		go a.checkDirectFirewall(ctx) // where Windows Firewall keeps the direct path closed (firewall.go)
 	}
 	go func() { errc <- a.runGateway(ctx) }()
 	select {

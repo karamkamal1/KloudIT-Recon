@@ -28,7 +28,8 @@ import (
 // the frames after them carry the mask, nothing is reported dropped; the
 // source's pauses (1 s of presents, 0.6 s of idle repeats: dirty share 1,
 // then 0) lower the bitrate and the first present brings it back at once
-// (the activity window shortened to 300 ms for the pause); a frame-rate
+// (the activity window shortened to 300 ms and the hold to 100 ms for the
+// pause); a frame-rate
 // change alone goes to the helper as one, without a new generation.
 func TestSessionHelperMockPhase5(t *testing.T) {
 	exe := os.Getenv("RECON_HELPER_EXE")
@@ -54,6 +55,7 @@ func TestSessionHelperMockPhase5(t *testing.T) {
 	}
 	s.static.on = true
 	s.static.meter.Window = 300 * time.Millisecond
+	s.static.hold = 100 * time.Millisecond
 	if n := s.openPipeline(); n != "" {
 		t.Fatalf("notice %q", n)
 	}

@@ -260,7 +260,11 @@ in host.json for the whole stage and remove it at the end.
   60 fps, Resolution Native). Play a game or a full-screen video. Open the overlay.
 - **Look at**:
   - The overlay's **Encoder** row reads `hevc_amf` (no `_helper`), **Transport** reads
-    `webtransport · direct`, and **Codec** says `(HW)`.
+    `webtransport · direct`, and **Codec** says `(HW)`. A relay there (the first hardware run's
+    every session) is the direct port closed: the row says why after `direct:`, and host.log's
+    start says `direct path blocked by Windows Firewall on this network` with the fix (a network
+    set to Public; `docs/INSTALL.md` step 8, "The direct path is not used at home"; VENDOR_NOTES
+    "First hardware run: the direct path on the LAN").
   - host.log has `video pipeline pipeline=ffmpeg config=ffmpeg`, then `encoder ready ...
     codec=hev1...`, and a `stream stats` line every 10 s.
 - **Pass**:
@@ -485,13 +489,24 @@ third round", "The AV1 alignment guard on the native helper")
   1. Change the desktop resolution, then rotate the display to portrait and back.
   2. Press Win+L.
   3. On a 120 Hz monitor, change Frame rate 60 → 120 in the drawer.
+  4. The display asleep (VENDOR_NOTES "First hardware run: no picture for the first 54 s"):
+     disconnect, run `powercfg /change monitor-timeout-ac 1`, leave the PC untouched until its
+     display is off (2 minutes), then connect. Once with the PC unlocked, once locked (Win+L
+     before leaving it). Set the timeout back afterwards.
 - **Pass**:
   - Each resolution or rotation change gives `capture changed reason=resized`, then a new
     `encoder helper started ... size=<new>`. The picture is not squeezed and the mouse lands
     where clicked.
   - Win+L shows the notice "Screen capture is paused (...)".
   - The 60 → 120 change starts no new helper and the overlay's frame rate reaches ~120.
-- **If not, send**: host.log of the changes and a screenshot.
+  - The display asleep: a first frame within a few seconds (`encoder ready ... startup=` under
+    5 s), the PC's display on again. Where it takes longer: `encoder helper: capture noimage:
+    no image from the capture for 2 s (display off or PC locked?); woke the display` and the
+    notice "No picture from the PC's screen yet: ..." in the browser, then `capture restored
+    ... first image after N s`. Locked: the lock screen streams (or `capture changed
+    reason=lost` with the notice "Screen capture is paused").
+- **If not, send**: host.log of the changes and a screenshot; for step 4 the host.log lines
+  from `encoder helper started` to `encoder ready`, and whether the display came on by itself.
 
 **4.6 Settings that need FFmpeg or change the stamps** (VENDOR_NOTES 3.1b; "Final review: host
 agent": "Nothing starts an encoder while the client is hidden"; "Final review: host agent,
@@ -825,7 +840,7 @@ UDP relay")
      relay`), stream HEVC 1080p60 of constant motion at 30 Mbit/s for 2 minutes, then at
      154 Mbit/s for 2 minutes.
   3. Reconnect twice within a minute while the PC is busy (a game loading).
-  4. Run `Select-String $log -Pattern 'frame queue overflow|key frame deferred|no recovery frame possible|loss recovered|congestion: lowering|bitrate recovery: raising|thinning:|stream stats' | Select-Object -Last 80`.
+  4. Run `Select-String $log -Pattern 'frame queue overflow|key frame deferred|no recovery frame possible|loss recovered|congestion: lowering|bitrate recovery: raising|thinning:|stream stats|static desktop|desktop changes' | Select-Object -Last 80`.
 - **Pass**:
   - The overlay's target reaches the setting (or what the encoder makes) within a few seconds
     and stays there, not "(backed off)", at ~60 fps.
@@ -835,7 +850,11 @@ UDP relay")
     few hundred milliseconds apart (the first run: `key_frames=0` throughout, but 764 losses
     answered by recovery frames, each behind the last one's overflow).
   - No `congestion: lowering bitrate ... why=delay` in the first 10 s after a reconnect while
-    the RTT is steady.
+    the RTT is steady, and no run of decreases with `start=halving` 15-20 s apart (the first
+    run's 118 → 51 → 23 Mbit/s; `stream stats` `stalls` and `undone` count the link's stalls and
+    the decreases undone on them: VENDOR_NOTES "First hardware run: the static desktop during a
+    game").
+  - No `static desktop: lowering the bitrate` while the game runs.
   - The bake-off rows of the overlay without *provisional*, all three paths measured.
 - **If not, send**:
   - those lines with `"logLevel": "debug"` (`rate report decision`);
@@ -1098,10 +1117,17 @@ round", "A late discardable frame is no loss")
 
 **13.3 Static desktop** (VENDOR_NOTES Phase 5 wiring A)
 
-- **Do**: stream an idle desktop with Notepad's caret blinking, then drag a window.
+- **Do**: stream an idle desktop with Notepad's caret blinking, then drag a window. Then a game:
+  its menu (left idle for a minute) and play.
 - **Pass**:
-  - Within ~2 s, `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`.
+  - Within ~4 s, `static desktop: lowering the bitrate kbps=7500 target=30000 vbv_frames=4`
+    (`images` 0-5, `still_ms` about 3000). Note its `output_kbps` and the `stream stats` `mbps`
+    while `static_desktop=true` (at most 7.5): the cut saves on the wire only where the encoder
+    made more than the cap before it.
   - On the drag, `desktop changes: full bitrate back kbps=30000`, with no blur and no key frame.
+  - In the game, menu included: no `static desktop: lowering the bitrate` at all (the first
+    hardware run had one every second or two: VENDOR_NOTES "First hardware run: the static
+    desktop during a game").
 
 **13.4 Regions of interest** (VENDOR_NOTES Phase 5 wiring B)
 

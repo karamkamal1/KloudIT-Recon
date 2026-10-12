@@ -1053,7 +1053,10 @@ function onStats(st) {
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
     row('Loss recovery', recoveryText(v.recovery, st)),
-    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fecNow ? ' · datagrams + FEC' : ''}` : '—'),
+    // Not on the direct path: why not (the attempt's failure, a direct
+    // endpoint the PC does not offer, the settings).
+    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fecNow ? ' · datagrams + FEC' : ''}` +
+      `${S.conn.path !== 'direct' && S.conn.directWhy ? ` · direct: ${S.conn.directWhy}` : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
     st.fec ? fecRow(st.fec, row) : null,
     ...presentRows(st, row),
