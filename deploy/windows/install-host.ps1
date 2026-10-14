@@ -645,10 +645,12 @@ if ($probe -match 'minimum required Nvidia driver[^|\r\n]*') {
 # The GPU encoder and helper warnings below would only repeat that.
 $noGpu = $probe -match '(?m)^capture:\s+ddagrab unavailable'
 if ($noGpu) {
-    Write-Warning ('This PC has no GPU screen capture (no Direct3D 11 video device: a PC or VM without a GPU, or a GPU without its driver). ' +
-        'Streams work, but capture with GDI and encode on the CPU: expect more CPU use and latency than on a gaming PC. ' +
+    # Expected on a VM without a GPU, and handled: a note, not a warning (a yellow WARNING read as
+    # the failure the second hardware report still saw).
+    Write-Host ('Note: This PC has no GPU screen capture (no Direct3D 11 video device: a PC or VM without a GPU, or a GPU without its driver). ' +
+        'Streams work: they capture with GDI and encode on the CPU, at the frame rate and size this CPU keeps up with (the overlay shows it). ' +
         'If the PC has a GPU, install its driver, then run the installer again. ' +
-        'See "Running on a PC or VM without a GPU" in the README.')
+        'See "Running on a PC or VM without a GPU" in the README.') -ForegroundColor Cyan
 }
 if (-not $noGpu -and $probe -notmatch '(?m)^encoder:\s+\S+\s+\S+\s+(nvidia|amd|intel)') {
     Write-Warning 'No GPU encoder works, so video will be encoded on the CPU (higher latency). Install or update the graphics driver; the "unusable:" lines above say why each GPU encoder failed.'
@@ -702,3 +704,4 @@ if (-not $paired) {
 }
 Write-Host '  Tip:    for unattended use enable automatic sign-in and disable the lock screen: the agent'
 Write-Host '          runs in your desktop session and cannot capture the Windows lock screen or UAC prompts.'
+Write-Host "  Help:   & '$exe' report  writes a text file to your desktop to send with a problem (no tokens, keys or passwords)"
