@@ -1449,9 +1449,9 @@ function exportLatency() {
     renderer: S.lastStats?.renderer || null, present: storedPresent(),
     input: S.lastStats?.input || null, inputAckCount: S.lastStats?.inputAckCount || null, clock: S.lastStats?.clock || null, gamepadPolling: pads.rate,
     browser: S.browser ? { ...S.browser.info, gaps: S.browser.gaps, notice: S.browser.notice, resetStreamAt: S.lastStats?.resetStreamAt ?? null } : null,
+    log: S.logs.slice(), // the client's log lines (the bake-off's wait and result, fullscreen, keyboard lock)
   });
 }
-    log: S.logs.slice(), // the client's log lines (the bake-off's wait and result, fullscreen, keyboard lock)
 S.exportLatency = exportLatency;
 // For the end-to-end test (test/e2e/browser.mjs): Renderer Auto's plan and its stored pick's handling.
 Object.assign(S, { presentPlan, presentRecheck, deviceKey });
