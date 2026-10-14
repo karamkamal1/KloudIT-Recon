@@ -90,8 +90,10 @@ const FAMILY_NAMES = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
 
 // first: the offset of the first sync; the rate reports carry how far the
 // offset moved since (a better sample corrects it), so the host's delay base
-// does not read the correction as a change of the path's delay.
-const clock = { offset: null, first: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0 };
+// does not read the correction as a change of the path's delay. best: the
+// sample the offset is from; streamAt: when the first video frame arrived,
+// settleN: pongs to pings sent since (see Clock synchronisation).
+const clock = { offset: null, first: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0, best: null, streamAt: 0, settleN: 0, firstPongAt: 0 };
 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
@@ -150,6 +152,7 @@ const congestion = { owdHist: [], over: 0, lastSent: 0 };
 // Counters are cumulative so a lost report costs only its delay samples.
 const RATE_REPORT_MS = 25;
 const fb = { on: false, timer: 0, sent: 0, frames: 0, bytes: 0, lost: 0, audio: 0, owd: [], gen: -1, lastSeq: 0 };
+// (The delays go into the reports once the clock sync has settled: clock.first.)
 
 function sendRateReport() {
   if (!transport) return;
@@ -192,7 +195,7 @@ function sendRateReport() {
 function rateReportFrame(h, bytes, recv, repaired) {
   fb.frames++;
   fb.bytes += bytes;
-  if (clock.offset !== null && fb.owd.length < 1000 && !repaired) fb.owd.push([recv - hostToLocal(sentUs(h)), h.gen, h.seq]);
+  if (clock.first !== null && fb.owd.length < 1000 && !repaired) fb.owd.push([recv - hostToLocal(sentUs(h)), h.gen, h.seq]);
   if (fb.gen < 0 || isNewerGen(h.gen, fb.gen)) {
     fb.gen = h.gen;
     fb.lastSeq = h.seq;
@@ -212,10 +215,54 @@ const audio = { cfg: null, decoder: null, ring: null, port: null, lastSeq: -1, n
 const AUDIO_MAX_LATE = 64;
 
 // ---------------------------------------------------------------------------
-// Clock synchronisation (NTP-style, keep the minimum-RTT sample)
+// Clock synchronisation (NTP-style). A ping's offset is the host's clock
+// against the middle of its round trip; its error is at most half the round
+// trip (the two directions' share of it unknown), and grows with its age by
+// the two clocks' drift (CLOCK_DRIFT: 100 ppm, a generous crystal tolerance).
+// The offset comes from the sample of the last CLOCK_WINDOW_MS with the
+// smallest such bound, and moves to another only when that one is better by
+// CLOCK_SWITCH_MS (each move empties the delays a rate report has
+// collected). Pings: a burst after the hello, another once the first video
+// frame arrived, then every PING_MS.
+//
+// The rate reports' delays are on the scale of clock.first, which is fixed
+// once the sync has settled: CLOCK_SETTLE pongs to pings sent after the
+// first video frame arrived (else CLOCK_SETTLE_MS after the first pong).
+// Pings sent before that can wait in the host until its datagram loop starts
+// (after the encoder started, hundreds of milliseconds): their round trip is
+// mostly that one-sided wait, and an offset from them is off by half of it
+// (the first hardware runs: report_owd_p50 of ~120 ms in host.log on a LAN,
+// a first offset ~115 ms off). Until then the reports carry no delays; frame
+// acks and the stage stats use the offset of the moment.
+
+const PING_MS = 250;
+const CLOCK_WINDOW_MS = 30000;
+const CLOCK_DRIFT = 1e-4;
+const CLOCK_SWITCH_MS = 0.05;
+const CLOCK_SETTLE = 3;
+const CLOCK_SETTLE_MS = 5000;
 
 function hostToLocal(us) {
   return us / 1000 - (clock.offset ?? 0);
+}
+
+// A sample's error bound at time t (ms): half its round trip plus the drift since.
+const clockBound = (x, t) => x.rtt / 2 + CLOCK_DRIFT * (t - x.at);
+
+// The clock sync's quality for the overlay and the host log: the round trip
+// of the sample in use, its bound and age now, the pongs in the window.
+function clockQuality() {
+  const b = clock.best;
+  if (!b) return null;
+  const t = now();
+  return { minRttMs: +b.rtt.toFixed(2), boundMs: +clockBound(b, t).toFixed(2), ageS: +((t - b.at) / 1000).toFixed(1), samples: clock.samples.length, settled: clock.first !== null };
+}
+
+// The first video frame arrived: the host's datagram loop runs by now.
+function clockStreamStarted() {
+  if (clock.streamAt) return;
+  clock.streamAt = now();
+  for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 20);
 }
 
 function sendPing() {
@@ -240,16 +287,21 @@ function onPong(d) {
   const rtt = t1 - t0;
   clock.rtt = clock.rtt ? clock.rtt * 0.8 + rtt * 0.2 : rtt;
   clock.samples.push({ rtt, offset: hostUs / 1000 - (t0 + rtt / 2), at: t1 });
-  clock.samples = clock.samples.filter((s) => t1 - s.at < 30000).slice(-40);
+  clock.samples = clock.samples.filter((s) => t1 - s.at < CLOCK_WINDOW_MS).slice(-4 * CLOCK_WINDOW_MS / PING_MS);
   let best = clock.samples[0];
-  for (const s of clock.samples) if (s.rtt < best.rtt) best = s;
+  for (const s of clock.samples) if (clockBound(s, t1) < clockBound(best, t1)) best = s;
+  const cur = clock.best && clock.samples.includes(clock.best) ? clock.best : null;
+  if (cur && clockBound(best, t1) > clockBound(cur, t1) - CLOCK_SWITCH_MS) best = cur;
   // A new offset: the delays measured with the old one go (the next rate
   // report's are all on the new one, whose change since the first sync it
   // carries).
   if (clock.offset !== null && best.offset !== clock.offset) fb.owd = [];
+  clock.best = best;
   clock.offset = best.offset;
-  if (clock.first === null) clock.first = best.offset;
-  clock.minRtt = best.rtt;
+  clock.firstPongAt ||= t1;
+  if (clock.streamAt && t0 >= clock.streamAt) clock.settleN++;
+  if (clock.first === null && (clock.settleN >= CLOCK_SETTLE || t1 - clock.firstPongAt >= CLOCK_SETTLE_MS)) clock.first = best.offset;
+  clock.minRtt = Math.min(...clock.samples.map((s) => s.rtt));
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,6 +1359,7 @@ function onFrameBytes(buf, recv, first = recv, repaired = false) {
   h.first = first || recv;
   stats.bytes += buf.length;
   freezeSeen(h.gen, h.seq);
+  clockStreamStarted();
   rateReportFrame(h, buf.length, recv, repaired);
   if (!repaired) checkCongestion(recv - hostToLocal(sentUs(h)));
   onFrame(h);
@@ -2376,6 +2429,10 @@ function onControl(m) {
       probe.features = hostFeatures;
       fb.on = hostFeatures.includes(P.FEATURE_RATE_REPORT);
       if (fb.on && !fb.timer) fb.timer = setInterval(sendRateReport, RATE_REPORT_MS);
+      // Input acknowledgements: the input stream's from now on (its
+      // datagrams' are asked for one by one).
+      inLat.on = hostFeatures.includes(P.FEATURE_INPUT_ACK);
+      if (inLat.on) transport?.sendControl({ t: P.MSG_INPUT_ACK });
       probe.wallOffsetUs = m.wallOffsetUs ?? null;
       hdr.hostOffers = hostFeatures.includes(P.FEATURE_HDR);
       updateProbeMode();
@@ -2416,6 +2473,143 @@ function onControl(m) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Input latency (second hardware run). The page posts each input with its
+// event's time (Event.timeStamp, absolute: the OS event's time; a gamepad's
+// sample time) and the worker writes it to the transport at once: no
+// batching, no timer, input before control before telemetry (GUIDE 2.7).
+// Where the host acknowledges inputs (P.FEATURE_INPUT_ACK) the worker marks
+// one mouse and one gamepad datagram per INPUT_MARK_MS and every key and
+// button press (the input stream's messages, numbered as written), and from
+// each acknowledgement (the host-clock µs the input arrived and was
+// injected) records over INPUT_WINDOW_MS:
+//
+//   total     event -> injected on the host (clock-synced), per class: keys
+//             (key and button presses), mouse (motion), pad
+//   client    event -> handed to the transport (the page's event dispatch,
+//             the hop to this worker, the write)
+//   dispatch  event -> the page handed it on (its event dispatch: a busy
+//             page; client - dispatch is the hop to this worker, a busy
+//             worker)
+//   network   handed to the transport -> arrived at the host (clock-synced)
+//   host      arrived -> injected (host clock only)
+//   rttHalf   event -> injected without the clock sync: client + host + half
+//             of (sent -> acknowledgement here, less the host's part)
+//
+// The overlay shows them (stats.input), and every INPUT_REPORT_MS the host
+// gets the summary (P.MSG_INPUT) with the clock sync's quality and the
+// browser's name and gaps, which it logs.
+
+const INPUT_MARK_MS = 50;
+const INPUT_PENDING_MS = 2000;
+const INPUT_WINDOW_MS = 10000;
+const INPUT_REPORT_MS = 10000;
+const inLat = { on: false, n: 0, pending: new Map(), lastMark: {}, recs: [], lastReport: now(), browser: '', lacks: [] };
+const IN_KINDS = { [P.DG_MOUSE_REL]: P.INPUT_ACK_MOUSE_REL, [P.DG_MOUSE_ABS]: P.INPUT_ACK_MOUSE_ABS, [P.DG_GAMEPAD]: P.INPUT_ACK_GAMEPAD };
+
+// The page's absolute event time (ms since the epoch of performance.timeOrigin) on this worker's clock.
+const eventLocal = (abs) => (Number.isFinite(abs) ? abs - performance.timeOrigin : null);
+
+function inputPending(key, cls, ev, page, sent) {
+  const p = inLat.pending;
+  for (const [k, v] of p) {
+    if (sent - v.sent < INPUT_PENDING_MS) break; // oldest first
+    p.delete(k);
+  }
+  p.set(key, { cls, ev, page, sent });
+}
+
+// An input stream message the page sent (b: its bytes, t: its event's
+// time, h: when the page handed it on; absolute).
+function sendInput(b, t, h) {
+  transport.sendInput(b);
+  const n = ++inLat.n; // numbered as the host reads them
+  const ev = eventLocal(t);
+  if (inLat.on && ev !== null && (b[0] === P.IN_KEY || b[0] === P.IN_MOUSE_BUTTON)) inputPending(`s${n}`, 'keys', ev, eventLocal(h), now());
+}
+
+// An input datagram the page sent: marked for its acknowledgement now and
+// then (one per INPUT_MARK_MS per class), written at once.
+function sendInputDatagram(b, t, h) {
+  const kind = IN_KINDS[b[0]];
+  const ev = eventLocal(t);
+  const cls = kind === P.INPUT_ACK_GAMEPAD ? 'pad' : 'mouse';
+  const mark = inLat.on && kind && ev !== null && b.byteLength >= 8 && now() - (inLat.lastMark[cls] || 0) >= INPUT_MARK_MS;
+  if (mark) P.markInputAck(b);
+  transport.sendInputDatagram(b);
+  if (!mark) return;
+  const t1 = now();
+  inLat.lastMark[cls] = t1;
+  const seq = new DataView(b.buffer, b.byteOffset, b.byteLength).getUint32(4, true);
+  inputPending(`${kind}:${kind === P.INPUT_ACK_GAMEPAD ? b[1] : 0}:${seq}`, cls, ev, eventLocal(h), t1);
+}
+
+function onInputAck(d) {
+  const a = P.parseInputAck(d);
+  if (!a) return;
+  const key = a.kind === P.INPUT_ACK_STREAM ? `s${a.seq}` : `${a.kind}:${a.idx}:${a.seq}`;
+  const p = inLat.pending.get(key);
+  if (!p) return;
+  inLat.pending.delete(key);
+  const t = now();
+  const host = Math.max(0, (a.doneUs - a.recvUs) / 1000);
+  const client = p.sent - p.ev;
+  const r = { t, cls: p.cls, client, dispatch: p.page !== null ? p.page - p.ev : null, host, rttHalf: client + host + Math.max(0, t - p.sent - host) / 2, total: null, network: null };
+  if (clock.offset !== null) {
+    r.total = hostToLocal(a.doneUs) - p.ev;
+    r.network = hostToLocal(a.recvUs) - p.sent;
+  }
+  inLat.recs.push(r);
+  while (inLat.recs.length && inLat.recs[0].t < t - INPUT_WINDOW_MS) inLat.recs.shift();
+}
+
+// Percentiles per row over the window ({ name: { p50, p95, p99, n } }), or null.
+function inputSummary() {
+  const t = now();
+  const recs = inLat.recs.filter((r) => r.t >= t - INPUT_WINDOW_MS);
+  if (!recs.length) return null;
+  const out = {};
+  const add = (name, v) => { const x = pct(v.filter((y) => y !== null && Number.isFinite(y))); if (x) out[name] = x; };
+  for (const cls of ['keys', 'mouse', 'pad']) add(cls, recs.filter((r) => r.cls === cls).map((r) => r.total));
+  add('rtt_half', recs.map((r) => r.rttHalf));
+  add('client', recs.map((r) => r.client));
+  add('dispatch', recs.map((r) => r.dispatch));
+  add('network', recs.map((r) => r.network));
+  add('host', recs.map((r) => r.host));
+  return out;
+}
+
+// Every INPUT_REPORT_MS: the summary to the host (logged there), with the
+// clock sync's quality and the browser's name and gaps.
+function reportInput(sum) {
+  const t = now();
+  if (!inLat.on || !transport || t - inLat.lastReport < INPUT_REPORT_MS) return;
+  inLat.lastReport = t;
+  const rows = Object.entries(sum || {}).map(([name, x]) => ({ name, p50: x.p50, p95: x.p95, p99: x.p99, n: x.n }));
+  const c = clockQuality();
+  transport.sendControl({
+    t: P.MSG_INPUT, rows, browser: inLat.browser || undefined, lacks: inputLacks(),
+    clock: c ? { minRttMs: c.minRttMs, boundMs: c.boundMs, ageS: c.ageS, samples: c.samples } : undefined,
+  });
+}
+
+// The page's list of what the browser lacks, and RESET_STREAM_AT where the
+// host says this connection's QUIC endpoint did not negotiate it (a path
+// that ends at this client: the direct path, the UDP relay).
+function inputLacks() {
+  const out = [...inLat.lacks];
+  if (resetStreamAt() === false && !out.includes('reset-stream-at')) out.push('reset-stream-at');
+  return out.length ? out : undefined;
+}
+
+// Whether this connection negotiated RESET_STREAM_AT (null: unknown: a host
+// before P.FEATURE_INPUT_ACK, WebSocket, the splice relay, whose peer is the
+// gateway).
+function resetStreamAt() {
+  if (!hostFeatures.includes(P.FEATURE_INPUT_ACK) || transport?.kind !== 'webtransport' || !['direct', 'relay'].includes(transport.path)) return null;
+  return hostFeatures.includes(P.FEATURE_RESET_STREAM_AT);
+}
+
 function onDatagram(d) {
   switch (d[0]) {
     case P.DG_AUDIO: onAudioPacket(d); break;
@@ -2427,6 +2621,7 @@ function onDatagram(d) {
     }
     case P.DG_RUMBLE: post('rumble', { idx: d[1], large: d[2], small: d[3] }); break;
     case P.DG_VIDEO_SHARD: onFecShard(d); break;
+    case P.DG_INPUT_ACK: onInputAck(d); break;
   }
 }
 
@@ -2443,6 +2638,8 @@ function postStats() {
   }
   const stages = stageSummary();
   reportStages(stages);
+  const input = inputSummary();
+  reportInput(input);
   const fecFrames = fecRx.stats.frames - fecMode.frames;
   fecMode.frames = fecRx.stats.frames;
   if (fecFrames > 0 || stats.frames > 0) fecMode.on = fecFrames > 0;
@@ -2510,6 +2707,10 @@ function postStats() {
     hw: video.hw,
     synced: clock.offset !== null,
     prio: transport?.prio ? { ...transport.prio } : null, // send priorities (WebTransport only)
+    // Input latency (onInputAck: null without acknowledgements in the
+    // window), the clock sync's quality, whether this connection
+    // negotiated RESET_STREAM_AT (null: unknown).
+    input, inputAcks: inLat.on, clock: clockQuality(), resetStreamAt: resetStreamAt(),
   });
   Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0, lagMin: Infinity });
 }
@@ -2587,6 +2788,8 @@ function openPageControl() {
 
 async function start(msg) {
   prefs = msg.prefs || {};
+  inLat.browser = msg.browser?.label || '';
+  inLat.lacks = msg.browser?.lacks || [];
   pacer.setMode(prefs.pacing);
   if (msg.audioSab) audio.ring = new RingWriter(msg.audioSab);
   if (msg.audioPort) audio.port = msg.audioPort;
@@ -2628,7 +2831,7 @@ async function start(msg) {
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   openPageControl();
   for (let i = 0; i < 5; i++) setTimeout(sendPing, i * 60);
-  const pingTimer = setInterval(sendPing, 1000);
+  const pingTimer = setInterval(sendPing, PING_MS);
   const watchdogTimer = setInterval(videoWatchdog, 250);
   const statsTimer = setInterval(postStats, 500);
   const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset });
@@ -2653,8 +2856,8 @@ self.onmessage = (ev) => {
   const m = ev.data;
   switch (m.type) {
     case 'start': start(m).catch((e) => post('closed', { reason: e.message, retry: true })); break;
-    case 'in': if (pageCtl.input) transport?.sendInput(m.b); break;
-    case 'dg': if (pageCtl.input) transport?.sendInputDatagram(m.b); break;
+    case 'in': if (pageCtl.input && transport) sendInput(m.b, m.t, m.h); break;
+    case 'dg': if (pageCtl.input && transport) sendInputDatagram(m.b, m.t, m.h); break;
     case 'ctl': pageControl(m.m); break;
     case 'prefs':
       prefs = { ...prefs, ...m.prefs };

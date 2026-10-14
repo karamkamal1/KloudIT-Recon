@@ -3018,6 +3018,37 @@ async function checkHardwareDecoderFailure() {
   }
 }
 
+// Input latency (second hardware run, stream-worker.js inLat): the host
+// acknowledges the inputs the client marks (its welcome lists input-ack), and
+// the client turns that into browser event -> injected on the host for the
+// mouse and key presses the scenario just made (clock-synced), with the
+// parts (the page and the hop to the worker, the network, the host) and the
+// round trip's estimate; plausible (under a second: this machine's CPUs are
+// shared by the encoder, the decoder and other work, and every part waits
+// for one). The clock
+// sync has settled (pings after the first video frame) and its error bound
+// is small. The first scenario also checks that the host logs the client's
+// input report (every 10 s) with the mouse and key rows and the clock sync.
+async function checkInputLatency(name, hostProc, log0) {
+  const st = await until(() => page.evaluate(() => {
+    const x = window.__recon.lastStats;
+    return x?.input?.mouse && x.input.keys ? x : null;
+  }), 5000, 'the input latency in the stats').catch(() => page.evaluate(() => window.__recon.lastStats));
+  const x = st?.input;
+  const ok = (r) => r && r.n >= 1 && r.p50 > -2 && r.p95 < 1000;
+  check(`${name}: input latency measured (browser event -> injected on the host: mouse, keys; parts; clock sync settled)`,
+    !!st?.inputAcks && ok(x?.mouse) && ok(x?.keys) && x.client?.p50 >= 0 && x.host?.p50 >= 0 && x.rtt_half?.p50 > 0 && !!st.clock?.settled && st.clock.boundMs < 50,
+    x ? `mouse ${x.mouse?.p50}/${x.mouse?.p95} ms (n ${x.mouse?.n}), keys ${x.keys?.p50}/${x.keys?.p95} (n ${x.keys?.n}); parts p50: browser ${x.client?.p50}, ` +
+      `network ${x.network?.p50}, host ${x.host?.p50}, rtt/2 ${x.rtt_half?.p50}; clock ±${st.clock?.boundMs} ms (RTT ${st.clock?.minRttMs} ms, age ${st.clock?.ageS} s, ` +
+      `${st.clock?.samples} pings, settled ${st.clock?.settled})` : `no input figure (acknowledgements ${st?.inputAcks})`);
+  results.push({ inputLatency: { scenario: name, input: x || null, clock: st?.clock || null } });
+  if (name !== 'WebTransport direct') return;
+  const line = await until(() => (hostProc.log.slice(log0).match(/msg="input latency[^\n]* mouse=[^\n]*/) || [])[0], 15000, 'the input latency line').catch(() => '');
+  check('the host logs the client\'s input latency report (mouse, keys, the clock sync, the browser)',
+    / keys="[\d.]+\/[\d.]+\/[\d.]+ n=\d+"/.test(line) && / mouse="/.test(line) && / clock_bound_ms=[\d.]+/.test(line) && / browser="Chrome \d+"/.test(line),
+    line.replace(/^.*?msg=/, '').slice(0, 300));
+}
+
 // Input (step 4.6), on a host with the test hook rumble-echo (it plays a
 // gamepad's triggers back as force feedback, as a game's rumble comes back
 // through ViGEmBus, which this host lacks).
@@ -3072,8 +3103,11 @@ async function checkInputHost() {
   await triggers(0, 0);
   await until(() => page.evaluate(() => window.__pad.resets.length >= 1), 8000, 'rumble reset').catch(() => {});
   await sleep(600); // the stop's repeats
-  const r = await page.evaluate(() => ({ calls: window.__pad.calls, resets: window.__pad.resets, rumbles: window.__recon.rumbles }));
+  const r = await page.evaluate(() => ({ calls: window.__pad.calls, resets: window.__pad.resets, rumbles: window.__recon.rumbles, input: window.__recon.lastStats?.input }));
   await page.evaluate(() => { window.__pad.present = false; });
+  // The pad's state changes were marked and acknowledged too (input latency).
+  check('gamepad input latency: the pad\'s state changes are acknowledged by the host and measured (browser poll -> injected)',
+    r.input?.pad?.n >= 1 && r.input.pad.p50 > -2 && r.input.pad.p95 < 1000, JSON.stringify(r.input?.pad || null));
   const want = (c) => c.type === 'dual-rumble' && c.strongMagnitude === 1 && Math.abs(c.weakMagnitude - 64 / 255) < 1e-9 && c.duration === 250;
   const on = r.calls.filter(want);
   const gaps = on.slice(1).map((c, i) => c.t - on[i].t);
@@ -4954,6 +4988,7 @@ try {
     await page.mouse.wheel(0, 300);
     await page.keyboard.press('KeyW');
     await page.keyboard.press('ArrowUp');
+    await checkInputLatency(sc.name, hostRun, hostLog0).catch((e) => check(`${sc.name}: input latency`, false, e.message));
     if (!nativeInputLog) {
       await sleep(500);
       const hostProc = procs.find((p) => p.spawnargs.includes('run'));
@@ -4978,10 +5013,12 @@ try {
       const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 5000 }), page.click('#btn-export-latency')]).catch(() => [null]);
       const exp = dl ? JSON.parse(readFileSync(await dl.path(), 'utf8')) : null;
       const expHist = exp?.probe?.histogram ? Object.values(exp.probe.histogram).reduce((a, b) => a + b, 0) : 0;
-      check('overlay "Export latency data" downloads the probe histogram as JSON',
+      check('overlay "Export latency data" downloads the probe histogram as JSON (with the input latency, the clock sync and the browser)',
         exp?.kind === 'kloudit-recon-latency' && exp.probe?.mode === 'seq' && expHist >= (pr?.latency?.n || 1) &&
-          exp.probe.samples?.length === expHist && !!exp.stages?.e2e && exp.video?.encoder === cfg?.encoder,
-        exp ? `${dl.suggestedFilename()}: ${expHist} histogram samples, ${exp.probe.samples?.length} sample rows, stages ${!!exp.stages}` : 'no download');
+          exp.probe.samples?.length === expHist && !!exp.stages?.e2e && exp.video?.encoder === cfg?.encoder &&
+          !!exp.input?.mouse && exp.clock?.boundMs >= 0,
+        exp ? `${dl.suggestedFilename()}: ${expHist} histogram samples, ${exp.probe.samples?.length} sample rows, stages ${!!exp.stages}, ` +
+          `input ${Object.keys(exp.input || {}).join('/') || 'none'}, clock ${JSON.stringify(exp.clock)}, browser ${exp.browser?.label}` : 'no download');
       await page.mouse.move(640, 5); // reveal toolbar
       await sleep(400);
       await page.screenshot({ path: join(outDir, 'stream.png') });
