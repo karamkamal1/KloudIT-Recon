@@ -13215,3 +13215,25 @@ our own, `FramePacer` driven as the self-test's `simulate()` does, 30 s per patt
   and `off`.
 
 ### Runs with these changes
+
+- First fix (51927b4): `gofmt -l` printed nothing for the changed files; `go vet ./...` and
+  `GOOS=windows go vet ./...` passed; `go test` passed for every package but `internal/e2e`,
+  and under the shared lock `go test ./internal/e2e/...` passed (207 s); `make build` and
+  `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64`: 82 top-level tests passed, 9 skipped.
+- The review's fixes (5a470d4, 3699d05, a47914a and the docs): `gofmt -l` prints nothing;
+  `go vet ./...` and `GOOS=windows go vet ./...` pass; `go test -count=1` passes for all 18
+  packages but `internal/e2e` (internal/host 121 s, internal/host/media 120 s); `go test -race
+  -count=1` under the lock passes for `internal/host/encoder`, `internal/host/media` and
+  `internal/host` (339 s); `go test ./internal/e2e/...` under the lock failed once with the
+  load-sensitive `TestStreamingBitrateRecovery` (two client overflow cuts, 4000 -> 3400 and
+  3570 -> 2788, where it wants one: the FFmpeg path's rate control, which nothing here touches;
+  the same test failed under load before, see "2.5 review fixes") and passed on the re-run
+  (207 s); `node --check` on the 16 files in web/static/js and test/e2e/browser.mjs; `make
+  build`; `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64`: 83 top-level tests pass (the new
+  `TestHelperIntegrationGPUPriorityOff` among them), 9 skip (no AMF, AMD Direct Capture, WGC
+  or libavcodec in the sandbox), `--self-test-pacer` ok with the capture-loss cases.
+- No browser code or E2E section changed (the pacer and the capture run only in the native
+  helper on Windows; the browser E2E streams FFmpeg's test source), so the browser E2E was not
+  run for this; it runs in full after the merge.
