@@ -14386,3 +14386,425 @@ our own, `FramePacer` driven as the self-test's `simulate()` does, 30 s per patt
 - No browser code or E2E section changed (the pacer and the capture run only in the native
   helper on Windows; the browser E2E streams FFmpeg's test source), so the browser E2E was not
   run for this; it runs in full after the merge.
+
+## Second hardware run: pacing, rate control and smoothness
+
+The owner's second run (host.log of 2026-10-13, 22:31-22:45; sessions `AzrZQwHx`, `wfOsNRHr`,
+`PEdroDHR`, `va4zyjIu`, `NMLlzRSB`, `gF35iYTL`): the same PC (Windows 11, RX 7900 XT, the native
+helper with `hevc_amf_helper`, DDA), HEVC 1920×1080 at 60 fps, the setting at 154 and then
+250 Mbit/s, a game with constant motion, the client on the same LAN. Every session ran on the
+UDP relay (`path=relay`). The owner: "definitely better but still pretty laggy: it doesn't quite
+feel like running it directly on the host machine". This section is the network side (pacing,
+rate control, smoothness, socket buffers, the link); the VM's error, the direct path, the host's
+capture and the client have sections of their own.
+
+### What the log shows
+
+- The game sessions' `latency stages` rows (p50 / p95 per 10 s): `e2e` 20-38 / 33-85 ms;
+  `network` 5-9 / 11-35 ms; `transfer` (first to last byte of a frame at the client) 4-14 /
+  16-38 ms; host `queue` 0.1 / 4-53 ms; `encode` 3 / 6-12 ms; `capture` 2.5-15 ms p50.
+- **The frames took 11-12 ms to arrive whatever the pacing.** `NMLlzRSB` kept its target at the
+  250 Mbit/s setting for the whole session (no `lowering bitrate` line: pacing at 1.2 × that,
+  300 Mbit/s), yet at 22:40:17 (45.1 Mbit/s at 53.9 fps: 104 KB frames) `transfer` was
+  11.3 / 29.1 ms and at 22:40:27 (58.2 Mbit/s at 50.9 fps: 143 KB) 12.1 / 32.9 ms. At 300 Mbit/s
+  those frames leave the PC in 2.8-3.8 ms; delivered in 11-12 ms they went through something
+  that carried ~75-95 Mbit/s. Where the target was lower the pacing alone fits the figure too
+  (`gF35iYTL` 22:40:59, target 76.8 Mbit/s, pacing 92: a 139 KB frame is 12.1 ms of pacing
+  against 11.8 seen), so the two cannot be told apart there; `NMLlzRSB` can.
+- `kbps_target` moved between 53 and 250 Mbit/s every few lines while what went out (`mbps`)
+  stayed at 25-67 Mbit/s: 36 decreases in the run, 35 of them `why=delay` at `delay_ms` 9-98
+  (`va4zyjIu` 22:39:32: 98) over targets of 8-33 ms, one `why=loss`; 45 `bitrate recovery`
+  raises. 26 decreases started from the target (`start=target`), in game from 1.3 to 2.6 times
+  what the encoder made in the next 10 s (`PEdroDHR` and `gF35iYTL` 1.3-2.1, e.g. `gF35iYTL`
+  22:41:13 from 82877 against 62.7 Mbit/s; median of all 26: 2.5), 5.5-85 times only in windows
+  of a menu or a still desktop: most cuts in game changed nothing on the wire for a step or two.
+- `window_held` up to 185 frames per 10 s (`wfOsNRHr`: 60-170 in most of its lines) with no
+  packet lost.
+- `thinned` 2-92 frames per 10 s: 135 episodes (589 frames) `why=delay`, 62 (208 frames)
+  `why=queue`, 3 `why=deadline`.
+- `report_owd_p50_ms` 107-135 throughout, while the stage rows' network + transfer were 6-20 ms.
+- `cc_lost` of 13-147 packets in some 10 s lines (`va4zyjIu`, `gF35iYTL`) on the LAN relay.
+
+### Causes
+
+1. **A link that carried ~75-95 Mbit/s, and at lower targets the pacing.** A frame's `transfer`
+   is its bytes over the slowest of the pacing and the path. In `NMLlzRSB` the pacing (300
+   Mbit/s) cannot explain 11-12 ms: something on the way carried ~75-95 Mbit/s, most likely a
+   link at 100 Mbit/s (a port or cable negotiated down, a switch, a Wi-Fi link: the client, an
+   Intel UHD 630 machine at 144 Hz and a 1.25 scale, looks like a laptop; or the Proxmox node's
+   port, which the relay crosses in and out) or, less likely, the relay container or the old
+   Chrome's network process (an inference: the log has no link rates; HARDWARE_TEST_PLAN 8.1c
+   step 1 records them, INSTALL "Link speed" tells how to fix one). Behind such a link no pacing
+   or burst shortens a frame: ~12 ms for 140 KB at 95 Mbit/s (only smaller frames, a lower
+   bitrate, take less). Where the target
+   was 60-90 Mbit/s (`gF35iYTL`), the pacing at 1.2 × the target was as slow as that link and
+   explains the figure as well; on a path much faster than the pacing (a gigabit LAN) it is the
+   whole of it, which is what the frame bursts remove.
+2. **The pumping: a per-frame queue at that link, decided on from the target.** Each frame paced
+   at 1.2 × 250 Mbit/s into a ~95 Mbit/s link queues ~8-10 ms there and drains before the next:
+   a real queue every frame met, which the client's one-way delays saw. The rate controller
+   decided on those delays alone, and each decrease from the target went through a dead zone
+   (from 1.3-2.6 times what the encoder made in game, two to six cuts of 15 % before the target
+   was under it, the delay meanwhile
+   unchanged, since a lower target does not shorten a frame the link limits): the swings between
+   250 and 53-90 Mbit/s, with thinning for the delay meanwhile. The relay simulation at 20a5043
+   reproduces it once its path is ~95 Mbit/s instead of 940: 5-7 delay decreases a run, `RATE
+   down 250000 -> 212500 why=delay` followed by +5 %/s recovery raises, as in the log (at
+   120 Mbit/s 0-3, at 150 0-1, at 940 none). The client's own stalls (its worker busy, frames
+   waiting in its process) remain a possible part of the delays, not the finding: the
+   simulation's client stalls alone, at 940 Mbit/s, make no decrease at 20a5043.
+3. **The video window held frames for ACK jitter.** Its shortfall rule compares a frame's
+   delivery time (first byte's ACK to the mark's) with the pacer's time at the pacing rate. At
+   a 250 Mbit/s target a 100 kB frame is 2.7 ms of pacing, and ACKs 1-4 ms late (Chrome's ACK
+   decimation, the relay, Wi-Fi) made that a 1.5 × shortfall: holds of up to 25 ms a frame, host
+   queue p95 up to 53 ms. Behind a ~95 Mbit/s link each frame's delivery also takes 8-10 ms more
+   than its pacing: the simulation at 20a5043 holds 776-859 frames per 30 s at 95 Mbit/s.
+4. **Thinning for frames that left the encoder together** (a hypothesis the 20a5043 log cannot
+   confirm: it logged no frame's lateness). With the game keeping the GPU busy the encoder's
+   latency varies (encode p95 6-12 ms against a p50 of 3), so two frames reach the session at
+   once and the "two frames waiting" rule left one out, most likely with both still on time: a
+   judder for nothing. The simulation with 8 ms of encoder latency jitter shows it.
+5. **`report_owd_p50_ms` was on the client's first clock sync.** The controller keeps the first
+   sync's scale (less `clockShiftUs`) so that a correction is no step of the delay, and the stats
+   line printed that scale: ~100 ms of the 107-135 was the first sync's error (most likely a
+   ping answered late at the session's start), not delay.
+6. **Nobody checked the UDP socket buffers.** The gateway and the host asked for 8 MB and ignored
+   what the kernel gave; an LXC container gets the Proxmox node's `rmem_max` (212992 bytes by
+   default, under 2 ms at 1 Gbit/s). `create-lxc.sh` raises it to 7.5 MB, but a node set up
+   another way gives a burst no room. The `cc_lost` bursts may be that; no counter existed.
+
+### The fix
+
+- **Pacing** (`internal/transport/cc`): the pacer has a second token bucket. Over time it still
+  sends no more than the pacing rate (1.2 × the target) plus a credit of 1.5 frame intervals'
+  worth, but on a path measured at twice the pacing rate or more a frame goes out at the burst
+  rate while the credit lasts: 1.25 × the path's delivery rate, at most 1 Gbit/s. The delivery
+  rate (after the review below): each packet train that went out faster than the pacing rate is
+  measured once, over the whole train (its fast part's bytes acknowledged after its first ACK
+  over the longer of their ACK span and send span, at least 250 µs, from 8 packets on; its last
+  ACK only where it acknowledged as many packets as the train's largest before: a receiver's
+  delayed-ACK timer says nothing about the path); the estimate is the lower median of the last
+  2 s's trains, at least two; a train whose ACKs came over 2 ms later than its sending allows
+  (it outran the path) caps the estimate at its own rate at once. Nothing is burst on a path not
+  measured yet: the pacing rate, and one train a second a probe, its first 20 packets (or the
+  pacer's own 2 ms clump at the pacing rate where that is more) at 2.5 × the pacing rate in
+  clumps no larger than the pacing rate's, never a key or recovery frame (`cc.Media.SkipProbe`,
+  which the session calls for them), not while a queue of 2 ms stands. Bursts are off while a
+  queue stands on the path (the quickest round trip of the last 50-100 ms more than 5 ms over
+  that of the last 10 s), and for 5 s after a train lost 5 % of its packets (at least 3; 10,
+  20 … 80 s when it happens again within twice the hold; no probe meanwhile, measured again
+  after). `cc.Media.Pacing`, `QueueDelay`, `StandingQueue`, `SkipProbe`, `SetBursts`;
+  `stream stats` `pace_mbps`, `burst_mbps`, `burst_est_mbps`, `burst_backoffs`.
+- **The host's pacer model** (`internal/host/pace.go`): the share of a report's delay the host's
+  own pacing explains (`sendTrack`) and the FEC shard writer's lead follow the bursts.
+- **Rate control** (`internal/host/bitrate.go`): on the direct path and the UDP relay a delay
+  over the target counts (decreases, thinning, the pending frame's strong decision, the frame
+  queue's congestion test) only where the host's round trips confirm a queue: their excess over
+  the base (`cc.Media.QueueDelay`, the quickest round trip since the last report) at least half
+  the delay's, or the congestion window or the video window held the sender meanwhile. Behind a
+  link slower than the pacing this is what stops the pumping, for a reason the first version of
+  this section did not give: each report's quickest round trip is a frame's first packet, which
+  meets no queue, so the per-frame queue at the link is not confirmed, and a lower target would
+  not have shortened it anyway while the encoder makes less than the link carries. A queue that
+  outlasts a frame (a capacity drop, frames that do not fit the link) is still confirmed: by
+  the quickest round trip once every packet meets it, or by the window holding the sender. An
+  encoder that makes less than 60 % of its target decreases from max(what it makes, 0.7 ×
+  min(the estimate, the applied target)) (`start=output`): at the 250 setting with the encoder
+  at 60 Mbit/s that is 175 Mbit/s, the decrease to 149 (still about 2.5 times the encoder; the
+  step through the dead zone is shorter, not gone). Frames that do not arrive are judged on the
+  client's current clock sync. Stalls of the link no longer count towards thinning's run.
+  `stream stats`: `report_owd_*` on the client's current sync, `report_clock_shift_ms`,
+  `ack_queue_p50_ms` / `ack_queue_p95_ms`, `delay_unconfirmed` (reports over the target the
+  round trips did not show); a decrease's line has `ack_queue_ms`. `delay_unconfirmed` counting
+  together with a `transfer` of about frame bytes / `burst_est_mbps` is a link at that rate, not
+  the browser (HARDWARE_TEST_PLAN 8.1c).
+- **The video window** (`internal/host/window.go`): frames that went out as soon as they were
+  ready (10 ms or less from the encoder on average) are a shortfall only with a backlog in the
+  path too: they took longer to deliver than they came (over 10 ms carried over), or a queue
+  stands (`StandingQueue` over 10 ms). The rate it measures against is the pacing rate over
+  time, not a frame's burst.
+- **Thinning** (`internal/host/thin.go`): two frames waiting behind the one taken count only when
+  that one waited a frame interval since the encoder finished it.
+- **UDP buffers** (`internal/transport/sockbuf*.go`, `internal/gateway`, `internal/host/relay.go`):
+  the gateway's port 8443 and relay sockets and the host's relay socket read back what the
+  kernel set (Linux's doubled `SO_RCVBUF` halved) and log `UDP socket buffers`, a warning under
+  4 MB; on Linux the relay counts the datagrams the kernel dropped for a full buffer
+  (`SO_RXQ_OVFL`) and logs them with `udp relay: session ended` (`socket_drops`).
+  `docs/INSTALL.md` "UDP buffers" has the sysctl and the checks, "Link speed" how to find and fix
+  a 100 Mbit/s link.
+- **Tests**: `TestRelaySimLAN` (`internal/host/ratesim_lan_test.go`: the second run's session,
+  ~3 ms round trip, a 250 Mbit/s setting, an encoder making 60 Mbit/s at most with 8 ms of
+  latency jitter, the client's worker stalled 8-25 ms about every 250 ms and one time in twenty
+  40-100 ms; a 940 Mbit/s path wired and 300 Mbit/s Wi-Fi, from 80 Mbit/s, the capacity dropping
+  to 40 Mbit/s for 10 s, and since the review a 95 and a 150 Mbit/s link with a 100 ms queue),
+  `TestRelaySimBurstPaths` (`ratesim_burst_test.go`, the review's paths 1.1-1.7 times the
+  pacing rate against the same runs without bursts); the relay simulation's client worker,
+  encoder jitter, thinning episodes that end as `Session.thin` ends them, window holds the rate
+  controller sees, key and recovery frames marked for no probe, `rsCfg.noBursts`;
+  `TestMediaBurst*` (with `TestMediaBurstAckJitter`, `TestMediaBurstStart`,
+  `TestMediaBurstGrowth`), `TestMediaQueueDelay`, `TestRateAckConfirm`,
+  `TestRatePendingClockShift`, `TestUDPRelaySocketDrops`, `TestSocketBuffers`.
+  `TestStreamingRateReports` (`internal/e2e`): its made-up queue now also delays the client's
+  packets, so the host's round trips show it (a decrease, as before), and the same reported
+  delay without that decreases nothing and counts in `delay_unconfirmed`.
+
+### The review of these changes
+
+A review found the burst rate did not follow the path and the causes above misattributed. Each
+finding was confirmed by simulation before the change (overlay runs of the review's scenarios;
+`internal/host` at 20a5043 with the simulation harness of this branch for the "before"):
+
+1. *Cause 1 and the expected gain.* Confirmed: `NMLlzRSB` above. At 20a5043 the second run's
+   session on a 95 Mbit/s link (seeds 1-2) had `transfer` 9.9-10.2 / 21.2-21.9 ms, at
+   150 Mbit/s 6.7 / 16.4-16.9, at 940 1.7 / 8.8-9.1 (the last two with the client's stalls). The first version of this section
+   promised 5-12 ms lower p50 and 15-30 ms lower p95 from "a gigabit LAN"; on a ~100 Mbit/s link
+   the whole branch gains about 2.5 ms of `e2e` p50 (table below), none of it in `transfer`.
+2. *Cause 2.* Confirmed: the decreases reproduce at 20a5043 on a ~95 Mbit/s path (5-7 a run,
+   above), and the ack-confirm gate stops them because each report's quickest round trip is a
+   frame's first packet, not because the delays were the browser's. Rewritten above;
+   `TestRelaySimLAN` "100 Mbit/s link" (with and without client stalls) is the pumping's
+   regression test: at most one delay decrease a run (5-7 at 20a5043).
+3. *8.1c's thresholds needed a fast path.* Rewritten: a link-rate step, the link-limited
+   signature, the thresholds only where `burst_est_mbps` is at least twice `pace_mbps`.
+4. *Misquoted figures.* Corrected above: `delay_ms` 9-98 (was 13-42 / 13-46), `start=target` cuts
+   1.3-2.6 times the encoder's output in game (was "four times"), `start=output` as the code has
+   it, cause 4's "still on time" and the confirmation of the delays marked as what the new
+   fields (`ack_queue_ms`, `delay_unconfirmed`) test.
+5. *The burst rate did not follow the path.* Confirmed: on a 20 Mbit/s path at a 15 Mbit/s
+   setting with ACKs jittered by 3 ms the estimate reached 131 Mbit/s (22 at none, 31 at 1 ms);
+   21 delay decreases in 6 seeds × 60 s on the 20 and 25 Mbit/s paths against none without
+   bursts; on shallow queues loss decreases at 5 and 35 s (after each hold) on 100, 50 and
+   30 Mbit/s paths, none without bursts. Each per-ACK sample was bounded by the send span of a
+   pair of packets, 0 within a pacer clump, and the estimate was the highest of 2 s, so bunched
+   ACKs ratcheted it. Fixed as above (whole-train measure, lower median, the growth cap).
+   `TestMediaBurstAckJitter`: before, 3595-3600 of 3600 frames burst on a 105 Mbit/s path at
+   80 Mbit/s (estimate up to 1.6 Tbit/s: the test's ACKs carry no minimum span), 60 of 3600 on
+   the 20 Mbit/s path; now 0-4 of 3600, the highest estimate 23-32 Mbit/s on the 20 Mbit/s path.
+   The same review runs now: no decrease in the 6-seed deep runs (20 Mbit/s 0, 25 Mbit/s 0;
+   without bursts 0 and 0) and none at all in the shallow ones.
+6. *Bursts before a measure.* Confirmed: a loss decrease at 0.06 s and an overflow decrease at
+   0.17 s in every seed on a 30 Mbit/s path with a 5 ms queue at 25 Mbit/s (a loss decrease at
+   0.06 s on 50 Mbit/s / 4 ms / 40). Fixed as above (no bursts before a measure, small probes,
+   none on key or recovery frames). `TestMediaBurstStart` (a 1.5 × path with a 3 ms queue, the
+   first 5 s): 44 packets dropped and a backoff before, none now. `TestRelaySimBurstPaths`
+   fails at the code before this review in all six paths (1-4 decreases in 17 of 18 runs, none
+   without bursts) and passes now.
+
+What the robust measure costs: ACK jitter now reads low rather than high. A probe's few ACKs
+cannot tell a fast path from a slow one through more jitter than the probe takes to send, so the
+bursts then stay off and the frames are paced as before bursts. In the relay simulation (3 seeds,
+40 s; e2e p50 / p95, `transfer` p50, ms):
+
+| Path | setting | bursts | without bursts |
+|---|---|---|---|
+| 940 Mbit/s, 0.2 ms jitter | 250 | 11.9 / 15.7, 1.0 (estimate 860-890) | 12.5 / 17.2, 1.2 |
+| 940 Mbit/s, 0.5 ms | 250 | 12.1 / 16.0, 1.2 (790-820) | 12.7 / 17.3, 1.3 |
+| 940 Mbit/s, 1 ms | 250 | 13.2 / 17.8, 1.5 (330-500: off) | 13.2 / 17.8, 1.6 |
+| 940 Mbit/s, 1 ms | 80 | 12.7 / 16.5, 1.4 (430-660) | 20.2 / 31.4, 8.2 |
+| 940 Mbit/s, 0.2 ms | 80 | 11.8 / 15.9, 1.0 | 19.9 / 31.7, 8.3 |
+| 300 Mbit/s, 1 ms | 80 | 18.4 / 30.1, 6.6 | 20.5 / 32.4, 8.4 |
+| 200 Mbit/s relay, 1 ms | 30 | 20.7 / 38.5, 6.1 | 26.3 / 43.0, 10.6 |
+| 200 Mbit/s relay, 3 ms (the first run's model) | 30 | 27.5 / 44.2, 10.7 (off) | 27.7 / 44.0, 10.8 |
+| 150 Mbit/s, 1 ms | 250 | 18.0 / 25.6, 6.5 (off: under 2 × 300) | 18.1 / 25.7, 6.5 |
+| 95 Mbit/s, 1 ms | 250 | 22.4 / 34.5, 10.0 (off) | 22.4 / 34.4, 9.9 |
+
+So `TestRelaySimFirstHardwareRun` (the 200 Mbit/s relay with 3 ms of jitter each way) lost what
+the first bursts gave it: its whole-run end-to-end p95 is 43.6-54.6 ms again (44-47 at 20a5043,
+22-26 with the first bursts, which burst on a ratcheted estimate there). On shallow queues the
+probes cost a few packets (`TestRelaySimBurstPaths`: 5-71 more drops in 40 s in 4 of 18 runs,
+e.g. 53 against 48 without bursts on the 30 Mbit/s path with a 5 ms queue whose pacing equals
+its capacity, 71 against 0 on the 100 Mbit/s path with a 3 ms queue at 80 Mbit/s), no
+decrease, each loss doubling the next hold.
+
+### The simulations, before → after
+
+`TestRelaySimLAN`, the last 30 s, seeds 1 / 2 (p50/p95 in ms; "before" is the tree at `20a5043`
+with this branch's simulation harness and cases):
+
+| Case | e2e | transfer | window holds | thinning episodes | delay decreases (run) |
+|---|---|---|---|---|---|
+| wired, 80 Mbit/s | 20.2/31.5, 20.2/31.0 → 12.6/16.3, 12.7/16.7 | 8.2/19.4 → 1.4/2.7 | 0 → 0 | 0 → 0 | 0 → 0 |
+| wired, 250, client stalls | 13.5/20.8, 13.5/20.9 → 13.4/20.1, 13.2/19.8 | 1.7/9.1 → 1.7/8.4 | 0 → 0 | 0 → 0 | 0 → 0 |
+| Wi-Fi (300 Mbit/s), 250, client stalls | 18.9/34.5, 19.1/34.8 → 18.6/32.2, 18.5/34.1 | 4.9/11.7 → 4.9/12.0 | 256, 227 → 2, 1 | 10, 11 → 3, 1 | 0, 1 → 0, 0 |
+| 100 Mbit/s link (95) | 24.9/36.7, 25.5/37.8 → 22.3/33.8, 22.6/34.9 | 9.9/21.9 → 9.9/20.7 | 776, 859 → 10, 23 | 10, 16 → 2, 2 | 6, 7 → 1, 1 |
+| 100 Mbit/s link, client stalls | 25.1/40.0, 25.8/40.2 → 22.8/36.0, 23.2/37.6 | 10.5/24.3 → 10.4/23.5 | 779, 838 → 14, 25 | 10, 11 → 1, 0 | 6, 5 → 0, 0 |
+| 150 Mbit/s link, client stalls | 18.9/28.7, 18.7/29.6 → 18.5/28.1, 18.2/28.0 | 6.7/16.4 → 6.6/16.1 | 238, 202 → 0, 0 | 4, 1 → 0, 0 | 1, 0 → 0, 0 |
+
+The target's mean over the last 30 s on the 100 Mbit/s link: 176-234 Mbit/s before, 216-242
+after (the remaining delay decrease: a cluster of frames the encoder's jitter sent together,
+which the link did hold back 20 ms: the window held them). The capacity drop (940 → 40 → 940
+Mbit/s at 15 and 25 s, a 100 ms queue at the bottleneck) still backs off at once; over 16 seeds
+the first cut comes 151 ms after the drop on average (113 before: the round trips must confirm
+the delay), in the dip (16-25 s) e2e p50 / p95 32.6 / 87.8 ms on average (37.4 / 115.1 before,
+p95 over 100 ms in 4 of 16 runs against 12 of 16), the target 38.7 Mbit/s on average (45.1
+before, under the 40 Mbit/s now); seeds 1 / 2 of the test: first cut 138 / 132 ms, dip e2e
+33.6/90.9 and 29.4/86.0, the target 39 / 38 Mbit/s.
+
+The other relay simulations: `TestRelaySimFirstHardwareRun` (30 Mbit/s on the first run's relay
+model, 200 Mbit/s with 3 ms of jitter each way, whole run): end-to-end p95 43.6-46 ms in the
+start, key-frame, clock-correction and shard cases (44-47 at 20a5043; the bursts stay off
+there, above), 53-55 ms with 0.5 % loss; "loss 0.5 %, old client" over 12 seeds: 2-15 delay
+decreases in 11 of them and final targets of 3.0-30 Mbit/s at 20a5043, no decrease and
+30 Mbit/s now; "from the floor, P frames ≥ 8 KB, no SVC" host queue p95 13 → 31-34 ms (its
+frame-queue overflow at 2 s, on a delay the round trips did not confirm, no longer drops the
+backlog, which drains within a second). `TestRelaySimStaticDesktop` "game at 30 Mbit/s, Wi-Fi
+stalls" (200 Mbit/s, 3 ms): 6-7 delay decreases at 20a5043 (lowest target 20 Mbit/s), none
+now; "both ways" passes its bound (lowest target 12.75 Mbit/s against 9.9, 2-3 delay
+decreases of which 1-2 undone). Clearing the estimate whenever a queue stands (tried during the
+review) failed it (lowest 6.9 Mbit/s, as without bursts): the stalls' queues would have kept
+the bursts from draining what each stall held, so the estimate is kept through a standing queue
+(the bursts only wait for it to go). `TestRelaySimCongestion` on fixed 5,
+10, 20 and 25 Mbit/s paths with a 50 ms queue: the same decreases; the capacity drop's first
+cut 154 / 134 ms after it. `TestRateSimCapdrop` (24 seeds) and `TestRateSimProfiles`
+(`wifi`, `wan`): unchanged.
+
+### Verified here
+
+- `internal/transport/cc`: `TestMediaBurst` (nothing burst before a measure, a key frame that
+  skips the probe at the pacing rate; on a measured gigabit path a 120 kB frame in about a
+  millisecond; a 900 kB key frame no faster than the credit and the pacing rate allow),
+  `TestMediaBurstFollowsPath` (a gigabit path: 1 Gbit/s; 300 Mbit/s: 1.25 × that; 150 and 60
+  Mbit/s against 96 Mbit/s of pacing: the pacing rate; a standing 10 ms queue: the pacing rate,
+  back after it drained), `TestMediaBurstAckJitter` (1 and 3 ms of in-order ACK jitter on paths
+  1.1-1.7 times the pacing rate, deep and shallow queues: at most 36 of 3600 frames burst, at
+  most 4 backoffs in 60 s; a gigabit path with 1 ms of it is burst into), `TestMediaBurstProbe`
+  (on a 150 Mbit/s path no frame faster than the pacing rate, the estimate 150 ± 20 %; a path
+  that got faster is burst into within 3 s), `TestMediaBurstStart`, `TestMediaBurstGrowth` (a
+  gigabit path dropping to 250 Mbit/s: the burst rate 1.25 × 250 Mbit/s three frames later),
+  `TestMediaBurstLoss` (random 1 % loss keeps bursts; a burst's tail lost: off 5 s, measured
+  again and back within 3 s after; again soon after: 10 s), `TestMediaQueueDelay`, and every
+  earlier cc test.
+- `internal/host`: `TestRelaySimLAN`, `TestRelaySimBurstPaths`, `TestRateAckConfirm`,
+  `TestRatePendingClockShift`, `TestRateFeedback`, `TestWindowShortfall` (ACKs 1-4 ms late on
+  frames delivered within their interval: no shortfall), `TestThinPressure`,
+  `TestDatagramLatencyBehindVideo` (into a 10 Mbit/s path: audio one-way p50 105 ms without the
+  window, 47-53 ms with it), every relay and rate simulation above.
+- `internal/gateway` `TestUDPRelaySocketDrops` (a relay socket flooded past its buffer counts the
+  kernel's drops), `internal/transport` `TestSocketBuffers` (a request is read back as the kernel
+  set it; one over `net.core.rmem_max` as capped at it).
+- In the sandbox the gateway logs `UDP socket buffers ... rcvbuf_kb=4096 sndbuf_kb=4096
+  capped=true` (the sandbox's `rmem_max` of 4 MB; no warning at that size).
+
+### Not verifiable here
+
+- What carried the second run's frames at ~75-95 Mbit/s: a 100 Mbit/s link (which one), Wi-Fi,
+  the relay container or the client's network process. HARDWARE_TEST_PLAN 8.1c step 1 records
+  the links' rates; `burst_est_mbps` near 90-100 with `burst_mbps` equal to `pace_mbps` says a
+  link at that rate.
+- Whether part of the owner's delays was the client's own: `delay_unconfirmed` while
+  `transfer` is well under frame bytes / `burst_est_mbps` would be that.
+- Whether the `cc_lost` bursts were the gateway's socket buffers: `socket_drops` and the
+  `UDP socket buffers` line say.
+- Real Chrome ACK timing against the burst measure (the simulation models Chrome's ACK
+  decimation and an in-order jitter, not its pacing of ACKs under load): how often bursts run on
+  the owner's wired LAN is `burst_mbps` against `pace_mbps` in the next run.
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 8.1c (the links' rates,
+  the gateway's `UDP socket buffers` lines, then 5 minutes of a game at 250 Mbit/s and 2 at 80
+  Mbit/s, wired, and 2 minutes on Wi-Fi). Look for: behind a 100 Mbit/s link, `burst_est_mbps`
+  ~90-100, `burst_mbps` = `pace_mbps`, `transfer` p50 ≈ frame KB × 8 / `burst_est_mbps` (~12 ms
+  for 140 KB): the link, to fix per INSTALL "Link speed". Pass: every wired link at 1 Gbit/s;
+  where `burst_est_mbps` is at least twice `pace_mbps`, `transfer` p50 under ~3 ms and p95 under
+  ~10 ms at 80 Mbit/s and `burst_mbps` over `pace_mbps`; at either, host `queue` p95 under
+  ~5 ms, `kbps_target` at the setting while nothing else loads the LAN, `why=delay` decreases at
+  most one a minute, each with `ack_queue_ms` at least half its `delay_ms` or frames the window
+  held; `window_held` and `thinned` 0-5 per 10 s; `report_owd_p50_ms` near the network +
+  transfer stages; `socket_drops=0`; no `cc_lost` right after a `burst_backoffs` hold ends.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with `hevc_nvenc_helper`. Pass:
+  the same (nothing here depends on the encoder's vendor).
+- Proxmox gateway: unverified. Test: `docs/INSTALL.md` "UDP buffers" and "Link speed". Pass:
+  `rcvbuf_kb` and `sndbuf_kb` of 7324, no warning, the node's port at `Speed: 1000Mb/s` or more.
+
+### What else stands between this and "like on the host"
+
+In the order of what they cost per frame on the second run's path:
+
+- **The link**: if it is a 100 Mbit/s link, 10-12 ms of every frame (frame bytes / the link's
+  rate) at 60 fps, which no software setting removes. On gigabit Ethernet end to end it is
+  1-1.5 ms. Until it is fixed, a lower bitrate shortens it in proportion (40 Mbit/s: 83 KB
+  frames, ~7 ms at 95 Mbit/s).
+- **The relay**: every session ran on the UDP relay; `network` p50 5-9 ms on a LAN is most likely
+  the way through the gateway (two hops and a container with one core; an inference, the log has
+  no per-hop times), where the direct path takes about a millisecond (its own section).
+- **Capture**: `capture` p50 of 9-15 ms in several game sessions is the host's capture behind the
+  game's GPU work (its own section).
+- What remains of the network after these changes in the simulation: on a gigabit LAN with
+  little jitter, network ~2 ms and transfer ~1-1.5 ms p50 (13 ms e2e); behind a ~100 Mbit/s link
+  transfer ~10 ms (22-23 ms e2e).
+
+### The commits
+
+`3d693ed` UDP buffers, `ea7b668` Pacing (the round trips' queue measures), `701e22c` Window,
+`003eab8` Rate control, `e13c040` Pacing (frame bursts), `cd0e1c7` Thinning, `39dd35e`
+Simulation, `5acb4fe` Docs, `fd37d2f` UDP buffers (a Linux relay socket without drops logged
+`socket_drops=-1` until then: the kernel attaches its count only once it is not zero; every
+relayed session of the browser E2E below did). The rate control commit comes before the bursts
+because the bursts without it decrease on the client-only delays the faster frames show in the
+relay simulation (`TestRelaySimFirstHardwareRun`: 1-10 delay decreases in 11 of its cases, where
+at most 0-2 are allowed); alone it leaves one case under its bound, as its message says
+(`TestRelaySimStaticDesktop` "game at 30 Mbit/s, Wi-Fi stalls both ways" seed 1: lowest target
+6.9 Mbit/s against 9.9), which the bursts' commit passes. Apart from that case every commit's
+tree was built, vetted (Linux and Windows) and passed `go test` for `internal/host` and the other
+packages it touches (`internal/e2e` on the final tree). Figures in the messages that are off:
+the bursts commit's relay end-to-end p95 (44-47 → 22-26 ms) is that of all the changes together,
+not of the bursts alone, and no longer holds after the review (above); the simulation commit's
+"5-7" thinning episodes in `TestRelaySimStaticDesktop`'s Wi-Fi cases are 1-11 per run (12-18 when
+counted the same way before these changes).
+
+The review's commits: `c9433e1` Pacing (the whole-train measure, the lower median, the growth
+cap, no bursts before a measure, probes, `SkipProbe`, `SetBursts`; `TestRelaySimBurstPaths`),
+`c120bc0` Simulation (the 100 and 150 Mbit/s links; its message's "776-881 frames held" before
+is 776-859 in the test's own runs, corrected in the test's comment), and the docs commit with
+this section.
+
+### Runs with these changes
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
+- `go test` passes for every package but `internal/e2e` (`internal/host` 111 s, the relay and
+  LAN simulations among it; `internal/gateway` passes outside the lock once and under it once,
+  `TestUDPRelayLatencyAndThroughput`'s loopback bulk check failing once outside it, at a load
+  average of 10-46 on 4 CPUs). Under the shared lock `go test ./internal/e2e/...` passes (230 s),
+  `TestStreamingRateReports` with its two runs.
+- `make build`. No script changed (no `node --check` needed).
+- The whole browser E2E (Chromium 141, Playwright 1.56) under the lock, twice, with the other
+  sessions' work leaving the CPUs 13-19 % idle: 310 of 316 checks and 306 of 316. Every failure
+  was a check that judges playback or timing on a starved CPU ("steady real-time playback" and
+  "video decoding" with the decoder getting 46-61 fps and drawing 23-47, the send-priority
+  stall check, the renderer bake-off at 23.5 fps, an inconclusive drop test), each in different
+  scenarios in the two runs and each passing in the other run, plus the first run's wallclock
+  scenario, whose output folder I removed while it ran. The relay scenarios alone once more: 70
+  of 72, the UDP relay's playback at 15 % idle CPU. The datagram + FEC scenario (shards, parity,
+  NACK repairs, a WebSocket session getting frame streams), the WebSocket relay and the QUIC
+  splice, thinning, bitrate recovery and the loss-recovery ladder passed in both full runs. The
+  E2E host's `stream stats` showed `burst_mbps=1000.0` and `pace_mbps` 27-36 on loopback,
+  `burst_backoffs=0`, `report_clock_shift_ms` -1 to -2 and `delay_unconfirmed` 4-10 per 10 s
+  (the headless client's own stalls on the starved CPU).
+
+### Runs with the review's changes
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
+- `go test` passes for every package but `internal/e2e` (18 packages; `internal/host` 93.9 s,
+  `internal/host/media` 98.9 s, `internal/gateway` 35.8 s, `internal/transport` 10.7 s,
+  `internal/transport/cc` 1.4 s).
+- Under the shared lock: `go test ./internal/e2e/...` passes (217 s); `go test -race
+  ./internal/transport/cc ./internal/host` passes (32 s and 474 s).
+- `node --check` of the 16 `web/static/js` files and `test/e2e/browser.mjs` (no script changed);
+  `make build`.
+- The browser E2E's sections this branch touches (`E2E_ONLY='WebTransport|WebSocket relay|udp
+  relay|^fec$|thinning|bitrate recovery|loss handling|send priorities|pacer unit'`; the whole
+  E2E runs after the merge) under the lock, twice, the other sessions' work leaving the CPUs
+  15-18 % idle: 134 of 142 checks, then 140 of 142. The second run's two failures: the direct
+  path's send-priority check (a telemetry stall of 192 ms on the starved CPU) and the datagram +
+  FEC scenario's steady real-time playback (39-54.5 fps, the decoder at 58.4). The first run's
+  eight were the same kind (steady playback and decoding at 41-47 fps on the relay paths, the
+  send-priority stall check on both WebTransport paths, the WebSocket session of the FEC
+  scenario at 18 fps, the loss-recovery ladder with 9 client freezes over 100 ms and one key-frame
+  recovery), each passing in the second run but those two. The E2E host's `stream stats` over
+  loopback: `burst_est_mbps` 4-299 (Chrome's ACKs on the starved CPU come late and bunched, so the
+  measure stays low), bursts in 3 of 30 lines (up to 374 Mbit/s), `burst_backoffs` 0,
+  `delay_unconfirmed` 8-16 per 10 s. (Before the review the same E2E burst at 1000 Mbit/s in
+  every line.)
+- After these runs only a comment in `internal/transport/cc/media.go` changed (the estimate's
+  description), built and its package's tests rerun.

@@ -76,3 +76,52 @@ func TestUDPRelayAnswersFromTheTargetedAddress(t *testing.T) {
 		t.Fatalf("browser got %d bytes from %v, want them from %v", len(b), from, netip.AddrPortFrom(other, port))
 	}
 }
+
+// An allocation socket counts the datagrams the kernel dropped for a full
+// receive buffer (SO_RXQ_OVFL), the relay's share of a session's losses:
+// zero (known) until there are any (the kernel attaches no count then).
+func TestUDPRelaySocketDrops(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetReadBuffer(4096)
+	p := newPktConn(c)
+	if !p.ovfl {
+		t.Skip("no SO_RXQ_OVFL")
+	}
+	s, err := net.DialUDP("udp", nil, c.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	buf := make([]byte, 2000)
+	_, _ = s.Write(make([]byte, 1200))
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, _, err := p.read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := p.socketDrops(); !ok || d != 0 {
+		t.Fatalf("socket drops %d %v before any drop, want 0 true", d, ok)
+	}
+	for range 100 {
+		_, _ = s.Write(make([]byte, 1200))
+	}
+	// The count comes with the datagrams queued after the drops: read what
+	// the buffer held, then one more.
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		if _, _, _, err := p.read(buf); err != nil {
+			break
+		}
+	}
+	_, _ = s.Write(make([]byte, 1200))
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, _, err := p.read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := p.socketDrops(); !ok || d == 0 {
+		t.Fatalf("socket drops %d %v after 100 datagrams into a 4 kB buffer", d, ok)
+	}
+}

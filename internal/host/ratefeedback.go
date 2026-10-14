@@ -12,19 +12,22 @@ import (
 //
 // A frame's one-way delay as the client measures it (last byte received minus
 // the frame's encodeDoneUs) includes the host's own sending: the media
-// congestion controller paces at 1.2 x the target, so a frame larger than
-// the average (a key frame, the first frames of a new FFmpeg generation)
-// takes several frame intervals to go out and delays the frames behind it,
-// for up to a second, with no network queue at all. sendTrack therefore
-// keeps, per frame sent, the share of its sending time the pacer explains: a
-// fluid model of the pacer (a backlog fed with each frame at its encodeDone
-// time and drained at the video's share of the pacing rate, less its burst
-// allowance), but at most the frame's measured encodeDone -> written time
-// (frameSender's Write returns when all but the frame's last packet has been
-// paced out). The rate controller then sees each report's delay minus that
-// share: a queue anywhere else, including the host's own queue while the
-// congestion window blocks sending (which is the network's doing), stays in
-// the signal.
+// congestion controller paces at 1.2 x the target (a frame's burst faster,
+// as far as the burst credit reaches), so a frame larger than the credit (a
+// key frame, the first frames of a new FFmpeg generation) takes several
+// frame intervals to go out and delays the frames behind it, for up to a
+// second, with no network queue at all. sendTrack therefore keeps, per frame
+// sent, the share of its sending time the pacer explains: a fluid model of
+// the pacer (pacerModel: a backlog fed with each frame at its encodeDone
+// time, drained at the video's share of the burst rate while the credit
+// lasts and of the pacing rate after, less its burst allowance), but at most
+// the frame's measured encodeDone -> written time (frameSender's Write
+// returns when all but the frame's last packet has been paced out). The rate
+// controller then sees each report's delay minus that share: a queue
+// anywhere else, including the host's own queue while the congestion window
+// blocks sending (which is the network's doing), stays in the signal; the
+// controller also asks the host's own measure of the path's queue
+// (feedback.ackQD) whether it is the path's.
 
 // sendTrackLen is how many sent frames sendTrack keeps (8 s at 60 fps).
 const sendTrackLen = 512
@@ -33,7 +36,8 @@ const sendTrackLen = 512
 // and frame headers.
 const paceOverhead = 0.04
 
-// minPaceBurst is the pacer's least burst allowance (cc.Media: 10 packets).
+// minPaceBurst is the pacer's least burst allowance (cc.Media: 10 packets);
+// its burst allowance is 2 ms at the burst rate, at least that.
 const minPaceBurst = 12000 // bytes
 
 type sentFrame struct {
@@ -52,31 +56,30 @@ type sendTrack struct {
 	ring    [sendTrackLen]sentFrame
 	n       uint64 // frames recorded
 	covered uint64 // frames [0, covered) are covered
-	// The pacer model at lastUs: bytes it has yet to send (backlog), and
-	// the rate it drains them at (bytes/s).
-	backlog, rate float64
-	lastUs        uint64
+	// The pacer model at lastUs.
+	model  pacerModel
+	lastUs uint64
 }
 
-// sent records a frame whose write returned at doneUs. paceBps is the pacing
-// rate available to video (bit/s; 0: the connection does not pace by the
-// target, nothing is attributed to pacing).
-func (t *sendTrack) sent(gen uint8, seq uint32, encodeDoneUs, doneUs uint64, bytes int, paceBps float64) {
+// sent records a frame whose write returned at doneUs. pace is the pacing
+// available to video (Session.videoPace; rate 0: the connection does not
+// pace by the target, nothing is attributed to pacing).
+func (t *sendTrack) sent(gen uint8, seq uint32, encodeDoneUs, doneUs uint64, bytes int, pace videoPace) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	f := sentFrame{gen: gen, seq: seq, encodeDoneUs: encodeDoneUs, sentUs: doneUs, bytes: bytes}
-	if paceBps > 0 && encodeDoneUs > 0 && doneUs >= encodeDoneUs {
-		rate := paceBps * (1 - paceOverhead) / 8 // bytes/s
+	if pace.rate > 0 && encodeDoneUs > 0 && doneUs >= encodeDoneUs {
 		if t.lastUs != 0 && encodeDoneUs > t.lastUs {
-			// At the rate the pacer had until now: a target raised since
+			// At the pace the pacer had until now: a target raised since
 			// (this frame's write returns at the new rate) did not drain
 			// what came before it any faster.
-			t.backlog = max(0, t.backlog-t.rate*float64(encodeDoneUs-t.lastUs)/1e6)
+			t.model.advance(float64(encodeDoneUs-t.lastUs) / 1e6)
 		}
-		t.lastUs, t.rate = max(t.lastUs, encodeDoneUs), rate
-		t.backlog += float64(bytes)
-		burst := max(rate*0.002, minPaceBurst)
-		model := uint64(max(0, t.backlog-burst) / rate * 1e6)
+		t.lastUs = max(t.lastUs, encodeDoneUs)
+		t.model.pace(pace, paceOverhead)
+		t.model.backlog += float64(bytes)
+		burst := max(t.model.burst*0.002, minPaceBurst)
+		model := uint64(t.model.drain(t.model.backlog-burst) * 1e6)
 		f.comp = min(model, doneUs-encodeDoneUs)
 	}
 	t.ring[t.n%sendTrackLen] = f
@@ -191,11 +194,17 @@ type rateFeedback struct {
 	// lost + acknowledged packets, acknowledged bytes, the time its window
 	// held the sender back); reset when a path migration replaced it.
 	ccLost, ccTotal, ccAcked uint64
-	ccLimited                time.Duration
+	ccLimited, ccHeld        time.Duration
 	ccHave                   bool
-	// Raw one-way delay p50s and maxima over the stats period, for the log.
+	// Raw one-way delay p50s and maxima over the stats period, on the
+	// client's current clock sync, and the last report's clock shift (its
+	// current sync less its first), for the log.
 	owds   []time.Duration
 	owdMax time.Duration
+	shift  time.Duration
+	// The host's own measure of the path's queue each report came with
+	// (ccCounters.queue), for the log.
+	queues []time.Duration
 }
 
 type ackSample struct {
@@ -211,12 +220,16 @@ func (f *rateFeedback) reportsActive(now time.Time) bool {
 	return f.have && now.Sub(f.lastAt) < time.Second
 }
 
-// ccCounters are the media congestion controller's cumulative counters.
+// ccCounters are the media congestion controller's cumulative counters, and
+// its queueing delay since the last report (queueOK false: none measured).
 type ccCounters struct {
 	ok                 bool // the connection has the media congestion controller
 	lost, total, acked uint64
 	limited            time.Duration // the time its congestion window held the sender back (WindowLimited)
 	nonVideoKbps       int           // audio and overhead in the acknowledged bytes
+	queue              time.Duration // cc.Media.QueueDelay
+	queueOK            bool
+	held               time.Duration // the video window's holds in all (videoWindow.holdTime)
 }
 
 // fromReport converts a report that arrived at now; comp is the pacer share
@@ -225,7 +238,11 @@ type ccCounters struct {
 // the media congestion controller's counters (without them the client's own
 // loss count is used). The delays are put on the scale of the client's first
 // clock sync (less ClockShiftUs): a better sync sample later moves the
-// client's offset, which is no change of the path's delay. ok is false for a
+// client's offset, which is no change of the path's delay. That scale keeps
+// the first sync's error, though (the second hardware run's
+// report_owd_p50_ms of ~110 ms where the client's stages had ~20: a first
+// ping answered late at the session's start); fb.shift takes a delay back to
+// the client's current, best sync, which the stats log shows. ok is false for a
 // report not newer than the last one (its client clock): a reordered or
 // duplicated datagram, whose counters would make wrapped differences; the
 // next report's differences cover its frames.
@@ -253,11 +270,11 @@ func (f *rateFeedback) fromReport(r proto.RateReport, now time.Time, comp time.D
 		if r.Flags&proto.RateReportOWDFrame != 0 {
 			shift = time.Duration(r.ClockShiftUs) * time.Microsecond
 		}
-		fb.owdValid = true
+		fb.owdValid, fb.shift = true, shift
 		fb.owd = time.Duration(r.OWDP50Us)*time.Microsecond - shift
 		fb.owdMax = time.Duration(r.OWDMaxUs)*time.Microsecond - shift
 		fb.qd = fb.owd - comp
-		f.note(fb.owd, fb.owdMax)
+		f.note(fb.owd+shift, fb.owdMax+shift, shift)
 	}
 	return fb, true
 }
@@ -268,14 +285,18 @@ func (f *rateFeedback) ccDelta(fb *feedback, cc ccCounters) {
 	if !cc.ok {
 		return
 	}
-	if !f.ccHave || cc.lost < f.ccLost || cc.total < f.ccTotal || cc.acked < f.ccAcked || cc.limited < f.ccLimited {
-		f.ccLost, f.ccTotal, f.ccAcked, f.ccLimited, f.ccHave = cc.lost, cc.total, cc.acked, cc.limited, true
+	if !f.ccHave || cc.lost < f.ccLost || cc.total < f.ccTotal || cc.acked < f.ccAcked || cc.limited < f.ccLimited || cc.held < f.ccHeld {
+		f.ccLost, f.ccTotal, f.ccAcked, f.ccLimited, f.ccHeld, f.ccHave = cc.lost, cc.total, cc.acked, cc.limited, cc.held, true
 		return
+	}
+	fb.ackQD, fb.ackQDValid = cc.queue, cc.queueOK
+	if cc.queueOK && len(f.queues) < 4096 {
+		f.queues = append(f.queues, cc.queue)
 	}
 	fb.lost, fb.total = int64(cc.lost-f.ccLost), int64(cc.total-f.ccTotal)
 	fb.ackedValid, fb.acked, fb.nonVideoKbps = true, int64(cc.acked-f.ccAcked), cc.nonVideoKbps
-	fb.limited = cc.limited - f.ccLimited
-	f.ccLost, f.ccTotal, f.ccAcked, f.ccLimited = cc.lost, cc.total, cc.acked, cc.limited
+	fb.limited, fb.held = cc.limited-f.ccLimited, cc.held-f.ccHeld
+	f.ccLost, f.ccTotal, f.ccAcked, f.ccLimited, f.ccHeld = cc.lost, cc.total, cc.acked, cc.limited, cc.held
 }
 
 // ack records a client's frame ack (clients without rate reports).
@@ -310,31 +331,47 @@ func (f *rateFeedback) fromAcks(now time.Time, cc ccCounters) (feedback, bool) {
 	slices.Sort(raw)
 	slices.Sort(qd)
 	fb.owd, fb.owdMax, fb.qd = raw[(len(raw)-1)/2], raw[len(raw)-1], qd[(len(qd)-1)/2]
-	f.note(fb.owd, fb.owdMax)
+	f.note(fb.owd, fb.owdMax, 0)
 	f.ccDelta(&fb, cc)
 	f.acks, f.acksFrom = f.acks[:0], now
 	return fb, true
 }
 
-// note keeps a report's delays for the stats log. Called with f.mu held.
-func (f *rateFeedback) note(owd, owdMax time.Duration) {
+// note keeps a report's delays (on the client's current clock sync) and
+// clock shift for the stats log. Called with f.mu held.
+func (f *rateFeedback) note(owd, owdMax, shift time.Duration) {
 	if len(f.owds) < 4096 {
 		f.owds = append(f.owds, owd)
 	}
 	f.owdMax = max(f.owdMax, owdMax)
+	f.shift = shift
 }
 
-// stats returns and clears the stats period's one-way delay: p50 and p95 of
-// the reports' p50s and the largest maximum (n = 0: no report had delays).
-func (f *rateFeedback) stats() (p50, p95, maxOWD time.Duration, n int) {
+// feedbackStats is a stats period's feedback: the reports' one-way delays
+// (p50 and p95 of their p50s, the largest maximum; n = 0: no report had
+// delays) on the client's current clock sync and the last report's clock
+// shift, and the host's own measure of the path's queue (p50 and p95 of the
+// reports'; queues = 0: none).
+type feedbackStats struct {
+	n                    int
+	p50, p95, max, shift time.Duration
+	queues               int
+	queueP50, queueP95   time.Duration
+}
+
+// stats returns and clears the stats period's feedback.
+func (f *rateFeedback) stats() feedbackStats {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	n = len(f.owds)
-	if n > 0 {
+	st := feedbackStats{n: len(f.owds), max: f.owdMax, shift: f.shift, queues: len(f.queues)}
+	if n := st.n; n > 0 {
 		slices.Sort(f.owds)
-		p50, p95 = f.owds[min(n-1, n/2)], f.owds[min(n-1, n*95/100)]
+		st.p50, st.p95 = f.owds[min(n-1, n/2)], f.owds[min(n-1, n*95/100)]
 	}
-	maxOWD = f.owdMax
-	f.owds, f.owdMax = f.owds[:0], 0
-	return p50, p95, maxOWD, n
+	if n := st.queues; n > 0 {
+		slices.Sort(f.queues)
+		st.queueP50, st.queueP95 = f.queues[min(n-1, n/2)], f.queues[min(n-1, n*95/100)]
+	}
+	f.owds, f.owdMax, f.queues = f.owds[:0], 0, f.queues[:0]
+	return st
 }

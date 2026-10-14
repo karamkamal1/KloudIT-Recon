@@ -412,8 +412,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_ = udpConn.SetReadBuffer(8 << 20)
-	_ = udpConn.SetWriteBuffer(8 << 20)
+	transport.LogSocketBuffers(s.log, "gateway "+udpConn.LocalAddr().String(), transport.SetSocketBuffers(udpConn, 8<<20))
 	if s.relay != nil {
 		s.relay.ip = udpAddr.IP // allocations listen where the main port does
 		defer s.relay.closeAll()

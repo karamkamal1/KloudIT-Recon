@@ -1087,6 +1087,75 @@ UDP relay")
     `recovery` or `frame`), at 2 and at 30 Mbit/s if there are any;
   - the overlay's stage rows and the exported latency report.
 
+**8.1c Pacing, the link and smoothness on the LAN** (VENDOR_NOTES "Second hardware run: pacing,
+rate control and smoothness")
+
+- **Do**:
+  1. The links' rates. On the PC and on the client (PowerShell):
+     `Get-NetAdapter | Format-Table Name,Status,LinkSpeed`; on a machine that is on Wi-Fi also
+     `netsh wlan show interfaces` (`Receive rate (Mbps)`, `Transmit rate (Mbps)`). On the Proxmox
+     node: `ip -br link`, then `ethtool <port> | grep -E 'Speed|Duplex'` for the physical port
+     under `vmbr0` (the relay's traffic goes in and out of it). Note each.
+  2. On the Proxmox node: `pct exec 210 -- journalctl -u recon-gateway -b --no-pager | grep -i
+     "socket buffers"`; on the PC: `Select-String $log -Pattern 'UDP socket buffers' | Select-Object -Last 1`.
+  3. PC and client wired on the LAN, Network path Auto. In a game with constant motion, stream
+     HEVC 1080p60 at 250 Mbit/s for 5 minutes, then at 80 Mbit/s for 2 minutes. Keep the
+     overlay open.
+  4. Run `Select-String $log -Pattern 'latency stages|stream stats|congestion: lowering|bitrate recovery|thinning' | Select-Object -Last 120`,
+     and on the node `pct exec 210 -- journalctl -u recon-gateway -n 200 --no-pager | grep "session ended"`.
+  5. Repeat step 3 for 2 minutes with the client on Wi-Fi.
+- **Read the game's lines** (`stream stats` and `latency stages` of the same 10 s; a frame's
+  size in KB is `mbps` × 125 / `fps`):
+  - **A link slower than the bursts** (the second run's sessions most likely: 104-143 KB frames
+    took 11-12 ms at 300 Mbit/s of pacing, ~75-95 Mbit/s carried): `burst_est_mbps` near the
+    slowest link's rate (90-100 behind a 100 Mbit/s port, about half the Wi-Fi rate on Wi-Fi),
+    `burst_mbps` equal to `pace_mbps` (bursts stay off below twice `pace_mbps`, by design), the
+    `transfer` p50 about frame KB × 8 / `burst_est_mbps` (12 ms for 140 KB at 95 Mbit/s) at
+    both settings, and `delay_unconfirmed` counting: each frame queues behind its own first
+    packets at the link, which no round trip's quickest packet shows. That is the link, not the
+    browser and not the pacing; nothing in the pacing shortens it (a lower bitrate does, in
+    proportion: smaller frames). Find the slow link in step 1 and fix it (cable, port, switch,
+    power saving; `docs/INSTALL.md` "Link speed"), or use the direct path where it avoids it.
+  - **A path the bursts fit** (every link 1 Gbit/s and `burst_est_mbps` at least twice
+    `pace_mbps`; at the 250 Mbit/s setting that needs 600, which ACK jitter of a millisecond on
+    the LAN can keep the measure under, so 80 Mbit/s is the setting that shows it): `burst_mbps`
+    well over `pace_mbps` (up to 1000), `transfer` p50 under ~3 ms and p95 under ~10 ms.
+    `burst_est_mbps` twice `pace_mbps` with `burst_mbps` equal to it: a queue stood or a
+    backoff held them (`burst_backoffs`).
+  - **A measure that misread the path**: `burst_est_mbps` far over the slowest link's rate
+    (more than ~1.3 times) while `burst_mbps` is over `pace_mbps`, and `cc_lost` or
+    `burst_backoffs` in the same or the next line. Also `cc_lost` in the line 5, 10, 20, 40 or
+    80 s after a `burst_backoffs` (a probe after the hold overflowing a shallow queue). Send those
+    lines.
+  - `burst_est_mbps=0.0`: nothing measured yet (a session's first seconds, after a backoff) or
+    frames under 20 packets (a still desktop): no bursts, as intended. `burst_est_mbps` far
+    under every link's rate with `transfer` near frame KB × 8 / `pace_mbps`: the client's ACKs
+    come late or bunched (a busy client CPU, Wi-Fi), the measure stays low and the frames are
+    paced as before bursts (the sandbox's browser E2E, its CPUs 15-18 % idle, read 4-299 Mbit/s
+    over loopback and burst in 3 of 30 lines); note the client's CPU load.
+- **Pass**:
+  - Step 1: every wired link at 1 Gbit/s (`1 Gbps`, `Speed: 1000Mb/s`). If one is at 100 Mbit/s
+    the link-limited reading above is the expected result, not a failure of the pacing.
+  - Step 2: `UDP socket buffers` lines with `rcvbuf_kb` and `sndbuf_kb` of 4096 or more (7324
+    on the node `create-lxc.sh` set up), no `capped by the kernel` warning; the gateway's
+    `udp relay: session ended` lines (relayed sessions) with `socket_drops=0`.
+  - Only where `burst_est_mbps` is at least twice `pace_mbps`: the fast-path figures above; host
+    `queue` p95 under ~5 ms and `e2e` p95 within ~15 ms of its p50 either way.
+  - `kbps_target` stays at the setting while the game runs (or what the encoder makes, through
+    `start=output` decreases only where a queue really builds); `congestion: lowering bitrate ...
+    why=delay` lines rare (at most one a minute), each with `ack_queue_ms` (the queue the host's
+    own round trips showed) at least half its `delay_ms` or frames the window held; the second
+    run had 35 in 11 minutes, `delay_ms` 9-98.
+  - `window_held` 0-5 per 10 s (the second run: up to 185), `thinned` 0-5 per 10 s wired (up to
+    92), and no `thinning ... why=queue` while frames go out on time.
+  - `report_owd_p50_ms` close to the overlay's network + transfer stages, not 107-135 (the second
+    run's clock offset); `report_clock_shift_ms` is how far the client's clock sync moved since
+    its first.
+  - On Wi-Fi: the target holds through the medium's stalls (`stalls` and `undone` may count),
+    at most a couple of decreases per minute.
+- **If not, send**: step 1's output, the Select-String output, the gateway lines, the overlay's
+  stage rows and the exported latency report.
+
 **8.2 T6: the `capdrop` dip** (VENDOR_NOTES 2.2)
 
 - **Do**:

@@ -21,6 +21,9 @@ func (p *pktConn) read(b []byte) (int, netip.AddrPort, netip.Addr, error) {
 
 func (p *pktConn) sourceOOB(netip.Addr) []byte { return nil }
 
+// socketDrops is not known on this platform.
+func (p *pktConn) socketDrops() (uint32, bool) { return 0, false }
+
 func (p *pktConn) write(b []byte, to netip.AddrPort, _ []byte) error {
 	_, err := p.c.WriteToUDPAddrPort(b, to)
 	return err

@@ -548,6 +548,13 @@ type wtOpts struct {
 	// frame's encodeDoneUs, on a clock synchronised by pings) plus
 	// reportOWD(time since the run started), a queue the test makes up.
 	reportOWD func(time.Duration) time.Duration
+	// sendDelay (if set): every packet the client sends (its ACKs, reports
+	// and pings) leaves sendDelay(time since the run started) late, in
+	// order: a queue on the way that the host's own round trips show, as a
+	// queue in the network does (reportOWD alone is a delay only the
+	// client reports, its own: the host's rate controller does not act on
+	// it).
+	sendDelay func(time.Duration) time.Duration
 	// onFrame (if set) is called for every complete frame with its one-way
 	// delay as measured for the reports (0 before the clock sync).
 	onFrame func(gen uint8, owd time.Duration, bytes int)
@@ -557,6 +564,87 @@ type wtOpts struct {
 	// origin (if set): the page origin the client sends instead of the
 	// gateway's.
 	origin string
+}
+
+// delayConn is a UDP socket whose writes leave delay() late, in order (a
+// queue on the way out). Not an OOB-capable conn: quic-go writes through
+// WriteTo.
+type delayConn struct {
+	c     *net.UDPConn
+	delay func() time.Duration
+	mu    sync.Mutex
+	last  time.Time // the latest packet's departure
+	q     chan delayedPacket
+}
+
+type delayedPacket struct {
+	b    []byte
+	addr net.Addr
+	at   time.Time
+}
+
+func newDelayConn(c *net.UDPConn, delay func() time.Duration) *delayConn {
+	d := &delayConn{c: c, delay: delay, q: make(chan delayedPacket, 4096)}
+	go func() {
+		for p := range d.q {
+			time.Sleep(time.Until(p.at))
+			d.c.WriteTo(p.b, p.addr)
+		}
+	}()
+	return d
+}
+
+func (d *delayConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	d.mu.Lock()
+	at := time.Now().Add(max(0, d.delay()))
+	if at.Before(d.last) {
+		at = d.last
+	}
+	d.last = at
+	d.mu.Unlock()
+	select {
+	case d.q <- delayedPacket{append([]byte(nil), b...), addr, at}:
+	default: // the queue is full: dropped, as a full queue does
+	}
+	return len(b), nil
+}
+
+func (d *delayConn) ReadFrom(b []byte) (int, net.Addr, error) { return d.c.ReadFrom(b) }
+func (d *delayConn) Close() error                             { return d.c.Close() }
+func (d *delayConn) LocalAddr() net.Addr                      { return d.c.LocalAddr() }
+func (d *delayConn) SetDeadline(t time.Time) error            { return d.c.SetDeadline(t) }
+func (d *delayConn) SetReadDeadline(t time.Time) error        { return d.c.SetReadDeadline(t) }
+func (d *delayConn) SetWriteDeadline(t time.Time) error       { return d.c.SetWriteDeadline(t) }
+
+// dialDelayed opens a WebTransport session to rawURL whose client packets
+// leave delay() late (delayConn).
+func dialDelayed(ctx context.Context, t *testing.T, rawURL string, tlsConf *tls.Config, conf *quic.Config, hdr http.Header,
+	delay func() time.Duration) (*http.Response, *webtransport.Session, error) {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	dst, err := net.ResolveUDPAddr("udp", u.Host)
+	if err != nil {
+		return nil, nil, err
+	}
+	uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: dst.IP})
+	if err != nil {
+		return nil, nil, err
+	}
+	tr := &quic.Transport{Conn: newDelayConn(uc, delay)}
+	conn, err := tr.Dial(ctx, dst, tlsConf, conf)
+	if err != nil {
+		tr.Close()
+		return nil, nil, err
+	}
+	t.Cleanup(func() { conn.CloseWithError(0, ""); tr.Close() })
+	cc, err := (&webtransport.Transport{}).NewClientConn(conn)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cc.Dial(ctx, rawURL, hdr)
 }
 
 func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket string, v int, dur time.Duration, prefs proto.Prefs,
@@ -575,7 +663,14 @@ func runWTOpts(t *testing.T, e *env, rawURL string, hashes []string, ticket stri
 	ctx, cancel := context.WithTimeout(context.Background(), dur+15*time.Second)
 	defer cancel()
 	start := time.Now()
-	resp, sess, err := d.Dial(ctx, rawURL, hdr)
+	var resp *http.Response
+	var sess *webtransport.Session
+	var err error
+	if opts.sendDelay != nil {
+		resp, sess, err = dialDelayed(ctx, t, rawURL, pinHashes(hashes), conf, hdr, func() time.Duration { return opts.sendDelay(time.Since(start)) })
+	} else {
+		resp, sess, err = d.Dial(ctx, rawURL, hdr)
+	}
 	if err != nil {
 		t.Fatalf("dial %s: %v (%v)", rawURL, err, resp)
 	}
@@ -1606,22 +1701,42 @@ func TestStreamingBitrateStalledAcks(t *testing.T) {
 
 // Guide step 2.2 with a client that sends rate reports (0x41) and no acks:
 // the welcome asks for them; a queue (the reported one-way delay 50 ms over
-// what the client measures, for half a second) decreases the bitrate
-// ("why=delay"), and once the delay is back the controller raises it to the
-// setting again; the host logs the reports' delays with its stream stats.
+// what the client measures, for half a second, and the client's packets as
+// late meanwhile, so the host's round trips show it too) decreases the
+// bitrate ("why=delay"), and once the delay is back the controller raises it
+// to the setting again; the host logs the reports' delays with its stream
+// stats. The same reported delay without the round trips showing it is the
+// client's own (a busy browser): no decrease, the stats count the reports
+// (delay_unconfirmed).
 func TestStreamingRateReports(t *testing.T) {
 	e := setup(t)
 	tk := e.connectInfo()
-	from := e.logs.Len()
 	owd := func(t time.Duration) time.Duration {
 		if t >= 4*time.Second && t < 4500*time.Millisecond {
 			return 50 * time.Millisecond
 		}
 		return 0
 	}
-	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3, 16*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+	from := e.logs.Len()
+	r := runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3, 12*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
 		wtOpts{reportOWD: owd})
 	cuts, why := rateChanges(t, e, from, "congestion: lowering bitrate")
+	stats := e.logs.lines(from, `msg="stream stats"`)
+	t.Logf("the client's own delay: %d frames, cuts %v (%v), stream stats %q", r.frames, cuts, why, stats)
+	if !slices.ContainsFunc(stats, func(l string) bool {
+		return !strings.Contains(l, " delay_unconfirmed=0") && strings.Contains(l, " delay_unconfirmed=")
+	}) {
+		t.Errorf("no stream stats counting the unconfirmed reports: %q", stats)
+	}
+	if len(cuts) != 0 {
+		t.Errorf("cuts %v %v on a delay the round trips did not show, want none", cuts, why)
+	}
+
+	tk = e.connectInfo()
+	from = e.logs.Len()
+	r = runWTOpts(t, e, tk.Direct.URL, tk.Direct.Hashes, tk.Direct.Ticket, 3, 16*time.Second, proto.Prefs{FPS: 30, BitrateKbps: 4000},
+		wtOpts{reportOWD: owd, sendDelay: owd})
+	cuts, why = rateChanges(t, e, from, "congestion: lowering bitrate")
 	raises, _ := rateChanges(t, e, from, "bitrate recovery: raising bitrate")
 	t.Logf("%d frames, configs (bitrate, max) %v, cuts %v (%v), raises %v", r.frames, r.bitrates, cuts, why, raises)
 	if !r.welcome || !r.rateReportFeature {

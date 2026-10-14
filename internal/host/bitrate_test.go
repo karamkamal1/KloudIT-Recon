@@ -24,13 +24,16 @@ type ctlHarness struct {
 	start   time.Time
 	r       *rateController
 	fps     int
-	share   float64      // received share of the encoder's output (1: everything)
-	fill    float64      // the encoder's output as a share of its target (1: hits it)
-	outKbps int          // > 0: the encoder's output whatever its target (a static picture)
-	loss    float64      // share of the reports' packets lost (50 packets per report)
-	held    bool         // the congestion window held the sender back (half of each report's interval)
-	stalled bool         // tick's stalled
-	decodeQ int          // reports' decoder backlog
+	share   float64 // received share of the encoder's output (1: everything)
+	fill    float64 // the encoder's output as a share of its target (1: hits it)
+	outKbps int     // > 0: the encoder's output whatever its target (a static picture)
+	loss    float64 // share of the reports' packets lost (50 packets per report)
+	held    bool    // the congestion window held the sender back (half of each report's interval)
+	stalled bool    // tick's stalled
+	decodeQ int     // reports' decoder backlog
+	// ackQD: the host's own measure of the path's queue each report
+	// carries (feedback.ackQD; nil: none, the delay decides alone).
+	ackQD   func(t time.Duration) time.Duration
 	changes []rateChange // applied changes, in order
 	at      []time.Duration
 	// static: a static desktop under the session's cap (activity.go): the
@@ -122,6 +125,9 @@ func (h *ctlHarness) run(d time.Duration, qd func(t time.Duration) time.Duration
 			if frames > 0 {
 				fb.owdValid, fb.qd = true, qd(h.elapsed())
 				fb.owd = fb.qd + 10*time.Millisecond
+			}
+			if h.ackQD != nil {
+				fb.ackQDValid, fb.ackQD = true, h.ackQD(h.elapsed())
 			}
 			frames, bytes = 0, 0
 			if c, ok := h.r.report(fb); ok {
@@ -227,6 +233,96 @@ func TestRateDelayDecrease(t *testing.T) {
 	h.run(2*time.Second, drain)
 	if d := h.decreases(0); len(d) != 1 {
 		t.Fatalf("decreases %+v, want one (the queue drains after it)", d)
+	}
+}
+
+// TestRateAckConfirm: on a path whose acknowledgements are the client's, a
+// delay over the target decides (a decrease, thinning, the frame queue's
+// congestion test) only where the host's own measure of the path's queue
+// (feedback.ackQD) holds at least half of it: the second hardware run's
+// delay decreases on a LAN whose round trips showed no queue were the
+// client's own delays. A queue that stands on the path still decreases;
+// where the acknowledgements are a relay leg's the delay decides alone.
+func TestRateAckConfirm(t *testing.T) {
+	// 15 ms over the base for 2 s, but round trips at their minimum and
+	// nothing held back: the client's delay.
+	h := newCtl(t, 20000, 60, seamless)
+	h.ackQD = flat(time.Millisecond)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.run(2*time.Second, flat(35*time.Millisecond))
+	if d := h.decreases(0); len(d) != 0 || h.r.overTarget() || h.r.delayOver() || h.r.unconfirmedCount() < 70 {
+		t.Fatalf("decreases %+v, over the target %v (frame queue %v), %d unconfirmed reports: want none, not over, ~80 unconfirmed",
+			d, h.r.overTarget(), h.r.delayOver(), h.r.unconfirmedCount())
+	}
+	// The same with the congestion window holding the sender back: the
+	// queue is the host's, at the path's bidding (the video window's holds
+	// likewise): a decrease.
+	h = newCtl(t, 20000, 60, seamless)
+	h.ackQD = flat(time.Millisecond)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.held = true
+	h.run(100*time.Millisecond, flat(35*time.Millisecond))
+	if d := h.decreases(0); len(d) != 1 {
+		t.Fatalf("decreases %+v with the sender held back, want one", d)
+	}
+	// The same delay in the round trips too: a queue on the path.
+	h = newCtl(t, 20000, 60, seamless)
+	h.ackQD = after(3*time.Second, time.Millisecond, 14*time.Millisecond)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.held = true
+	h.run(100*time.Millisecond, flat(35*time.Millisecond))
+	if d := h.decreases(0); len(d) != 1 || d[0].why != "delay" || !d[0].basis.ackOK || d[0].basis.ackQD != 14*time.Millisecond {
+		t.Fatalf("decreases %+v, want one on the delay with the round trips' 14 ms", d)
+	}
+	// Half of it in the round trips is enough (a queue one way).
+	h = newCtl(t, 20000, 60, seamless)
+	h.ackQD = after(3*time.Second, time.Millisecond, 8*time.Millisecond)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.held = true
+	h.run(100*time.Millisecond, flat(35*time.Millisecond))
+	if d := h.decreases(0); len(d) != 1 {
+		t.Fatalf("decreases %+v, want one: 8 of 15 ms in the round trips", d)
+	}
+	// A relay leg's acknowledgements say nothing of the client's: the delay
+	// decides alone.
+	h = newCtl(t, 20000, 60, seamless)
+	h.r.setPath(false)
+	h.ackQD = flat(time.Millisecond)
+	h.run(3*time.Second, flat(20*time.Millisecond))
+	h.held = true
+	h.run(100*time.Millisecond, flat(35*time.Millisecond))
+	if d := h.decreases(0); len(d) != 1 {
+		t.Fatalf("decreases %+v on a relay leg, want one on the delay alone", d)
+	}
+}
+
+// TestRatePendingClockShift: frames that do not arrive are judged on the
+// client's current clock sync: a first sync 100 ms off (the second hardware
+// run's report_owd_p50_ms of ~110 ms on a ~10 ms path) took frames 60 ms
+// late 200 ms further from deciding, the base and the report's way back
+// both on the first sync's scale.
+func TestRatePendingClockShift(t *testing.T) {
+	r := &rateController{}
+	r.setPolicy(seamless)
+	r.setPath(true)
+	now := time.Unix(1_000_000, 0)
+	r.now = func() time.Time { return now }
+	r.target(20000, 60)
+	r.live(20000, 60)
+	shift := -100 * time.Millisecond
+	report := func(fb feedback) {
+		now = now.Add(25 * time.Millisecond)
+		fb.at, fb.interval = now, 25*time.Millisecond
+		r.report(fb)
+	}
+	for range 60 { // 1.5 s at a 10 ms one-way delay, its p50 frame's pacer share 2 ms
+		report(feedback{frames: 2, owdValid: true, owd: 10*time.Millisecond - shift, qd: 8*time.Millisecond - shift, shift: shift})
+	}
+	// Then no frame arrives: the oldest one the client lacks was encoded
+	// 75 ms before the report reached the host.
+	report(feedback{pendingValid: true, pending: 75 * time.Millisecond})
+	if !r.overTarget() {
+		t.Fatal("a frame 65 ms late (10 ms one way) did not count as far over the target")
 	}
 }
 
@@ -1185,7 +1281,7 @@ func TestSendTrack(t *testing.T) {
 			size = 200000
 		}
 		enc := time.Duration(i) * frame
-		tr.sent(1, uint32(i), us(enc), us(enc+200*time.Millisecond), size, pace)
+		tr.sent(1, uint32(i), us(enc), us(enc+200*time.Millisecond), size, flatPace(pace))
 		c, n := tr.cover(1, uint32(i))
 		if n != 1 {
 			t.Fatalf("frame %d: covered %d", i, n)
@@ -1200,19 +1296,19 @@ func TestSendTrack(t *testing.T) {
 		t.Fatalf("pacer shares around the key frame %v: want it large, then decaying", comps[8:16])
 	}
 	// The measured time bounds it.
-	tr.sent(1, 30, us(30*frame), us(30*frame+time.Millisecond), 200000, pace)
+	tr.sent(1, 30, us(30*frame), us(30*frame+time.Millisecond), 200000, flatPace(pace))
 	if c, _ := tr.cover(1, 30); c != time.Millisecond {
 		t.Fatalf("share %v, want the measured 1 ms", c)
 	}
 	// Without the media congestion controller nothing is attributed.
-	tr.sent(1, 31, us(31*frame), us(31*frame+50*time.Millisecond), 200000, 0)
+	tr.sent(1, 31, us(31*frame), us(31*frame+50*time.Millisecond), 200000, videoPace{})
 	if c, _ := tr.cover(1, 31); c != 0 {
 		t.Fatalf("share %v without pacing, want 0", c)
 	}
 	// cover: the median of the frames it covers; pending: the oldest
 	// uncovered one's age less its share.
 	for i := 32; i < 37; i++ {
-		tr.sent(1, uint32(i), us(time.Duration(i)*frame), us(time.Duration(i)*frame), 1000, 0)
+		tr.sent(1, uint32(i), us(time.Duration(i)*frame), us(time.Duration(i)*frame), 1000, videoPace{})
 	}
 	if p, ok := tr.pending(us(32*frame + 70*time.Millisecond)); !ok || p != 70*time.Millisecond {
 		t.Fatalf("pending %v %v, want 70 ms", p, ok)
@@ -1270,11 +1366,14 @@ func TestRateFeedback(t *testing.T) {
 	r.TimeMs += 25
 	f.fromReport(r, now.Add(75*time.Millisecond), 0, cc)
 	cc.lost, cc.total, cc.acked = 12, 1100, 1.1e6
+	cc.queue, cc.queueOK = 3*time.Millisecond, true
 	r.TimeMs += 25
 	fb, _ = f.fromReport(r, now.Add(100*time.Millisecond), 0, cc)
-	if fb.lost != 2 || fb.total != 100 || !fb.ackedValid || fb.acked != 100000 || fb.nonVideoKbps != 360 {
+	if fb.lost != 2 || fb.total != 100 || !fb.ackedValid || fb.acked != 100000 || fb.nonVideoKbps != 360 ||
+		!fb.ackQDValid || fb.ackQD != 3*time.Millisecond {
 		t.Fatalf("media congestion controller deltas: %+v", fb)
 	}
+	cc.queueOK = false
 	cc.lost, cc.total, cc.acked = 1, 10, 1000 // a new path's controller
 	r.TimeMs += 25
 	if fb, _ := f.fromReport(r, now.Add(125*time.Millisecond), 0, cc); fb.total != 0 || fb.ackedValid {
@@ -1292,8 +1391,23 @@ func TestRateFeedback(t *testing.T) {
 		fb.owdMax != 30*time.Millisecond || fb.qd != 18*time.Millisecond {
 		t.Fatalf("acks: %+v %v", fb, ok)
 	}
-	if p50, p95, mx, n := a.stats(); n != 1 || p50 != 20*time.Millisecond || p95 != 20*time.Millisecond || mx != 30*time.Millisecond {
-		t.Fatalf("stats %v %v %v %d", p50, p95, mx, n)
+	if st := a.stats(); st.n != 1 || st.p50 != 20*time.Millisecond || st.p95 != 20*time.Millisecond || st.max != 30*time.Millisecond {
+		t.Fatalf("stats %+v", st)
+	}
+
+	// The stats log shows the delays on the client's current clock sync:
+	// a first sync 100 ms off (a ping answered late at the start), later
+	// corrected (ClockShiftUs -100 ms), made the controller's scale, the
+	// first's, read 110 ms for a 10 ms path (the second hardware run's
+	// report_owd_p50_ms).
+	var c rateFeedback
+	r = proto.RateReport{Flags: proto.RateReportOWD | proto.RateReportOWDFrame, TimeMs: 1, OWDP50Us: 10000, OWDMaxUs: 12000, ClockShiftUs: -100000}
+	fb, _ = c.fromReport(r, now, 0, ccCounters{})
+	if fb.owd != 110*time.Millisecond || fb.shift != -100*time.Millisecond {
+		t.Fatalf("the controller's scale: owd %v shift %v, want 110ms -100ms", fb.owd, fb.shift)
+	}
+	if st := c.stats(); st.p50 != 10*time.Millisecond || st.max != 12*time.Millisecond || st.shift != -100*time.Millisecond {
+		t.Fatalf("stats %+v, want p50 10ms, max 12ms, shift -100ms", st)
 	}
 }
 
@@ -1311,8 +1425,8 @@ func TestSendTrackRateChange(t *testing.T) {
 	}
 	// A 100 kB key frame at 4 Mbit/s, then the target raised tenfold and a
 	// 10 kB frame 50 ms later.
-	tr.sent(1, 0, us(0), us(300*time.Millisecond), 100000, slow)
-	tr.sent(1, 1, us(50*time.Millisecond), us(310*time.Millisecond), 10000, fast)
+	tr.sent(1, 0, us(0), us(300*time.Millisecond), 100000, flatPace(slow))
+	tr.sent(1, 1, us(50*time.Millisecond), us(310*time.Millisecond), 10000, flatPace(fast))
 	if c, ok := tr.compOf(1, 0); !ok || !near(c, (100000-minPaceBurst)/rate(slow)) {
 		t.Fatalf("key frame's share %v %v", c, ok)
 	}
@@ -1336,7 +1450,7 @@ func TestReportComp(t *testing.T) {
 	var tr sendTrack
 	for i := 0; i < 5; i++ { // shares 10, 20, 30, 40, 50 ms (the measured time bounds them)
 		at := uint64(1_000_000 + i*16_667)
-		tr.sent(1, uint32(i), at, at+uint64(i+1)*10_000, 200000, 1e6)
+		tr.sent(1, uint32(i), at, at+uint64(i+1)*10_000, 200000, flatPace(1e6))
 	}
 	r := proto.RateReport{Flags: proto.RateReportFrame | proto.RateReportOWD, Gen: 1, LastSeq: 4, OWDP50Us: 60000, OWDMaxUs: 90000}
 	if c := reportComp(&tr, r); c != 30*time.Millisecond {

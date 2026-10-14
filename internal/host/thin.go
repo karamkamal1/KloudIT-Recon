@@ -38,7 +38,13 @@ import (
 // nothing in the bitrate.
 
 // thinQueued is how many newer frames waiting behind the one frameSender
-// takes count as a building frame queue.
+// takes count as a building frame queue, when that one waited at least a
+// frame interval since it was encoded (late): frames that leave the encoder
+// together (a GPU the game keeps busy: the second hardware run's encode p95
+// of 9.5 ms against a p50 of 2.8) go out within milliseconds of each other
+// at the pacer's burst rate, and leaving one out would be a judder for
+// nothing (docs/VENDOR_NOTES.md "Second hardware run: pacing, rate control
+// and smoothness").
 const thinQueued = 2
 
 // thinKeep is how many thinned seqs of the current generation are kept: the
@@ -140,21 +146,26 @@ func (s *Session) thinOK() bool {
 
 // thinPressure returns why the path counts as congested for the nth frame
 // frameSender takes (thinning), or "", and whether that is the path's doing
-// (thinWhy).
-func (s *Session) thinPressure(n uint64, now time.Time) (string, bool) {
-	return thinWhy(s.a.faults.thinAt(n), s.rate.overTarget(), s.send.slow(now), len(s.frameQ))
+// (thinWhy); waited is how long that frame has waited since it was encoded
+// (negative: unknown, as late).
+func (s *Session) thinPressure(n uint64, now time.Time, waited time.Duration) (string, bool) {
+	late := waited < 0 || waited >= s.frameInterval()
+	return thinWhy(s.a.faults.thinAt(n), s.rate.overTarget(), s.send.slow(now), len(s.frameQ), late)
 }
 
 // thinWhy is the thinning pressure, the first of: the test hook's simulated
-// congestion (fault), the rate controller's delay over its target (delay),
-// the ladder's deadline pressure (slow: a frame stream written past its
-// deadline, which includes its own sending time) and the frame queue
-// building (queued frames waiting behind the one taken). path: the pressure
-// is the path's; a queue alone, with every frame going out in time, is the
-// host's own: a key frame or an encoder's burst being paced out. Thinning
-// answers both, but only the path's holds the bitrate's increases and
-// lowers it when it lasts (rateController.thinned).
-func thinWhy(fault, delay, slow bool, queued int) (why string, path bool) {
+// congestion (fault), the rate controller's delay over its target (delay;
+// only where its host's own measure of the path's queue confirms it, and
+// never for a stall of the link: rateController.overTarget), the ladder's
+// deadline pressure (slow: a frame stream written past its deadline, which
+// includes its own sending time) and the frame queue building (queued
+// frames waiting behind the one taken, which waited a frame interval
+// already: late). path: the pressure is the path's; a queue alone, with
+// every frame going out in time, is the host's own: a key frame or an
+// encoder's burst being paced out. Thinning answers both, but only the
+// path's holds the bitrate's increases and lowers it when it lasts
+// (rateController.thinned).
+func thinWhy(fault, delay, slow bool, queued int, late bool) (why string, path bool) {
 	switch {
 	case fault:
 		return "test fault", true
@@ -162,7 +173,7 @@ func thinWhy(fault, delay, slow bool, queued int) (why string, path bool) {
 		return "delay", true
 	case slow:
 		return "deadline", true
-	case queued >= thinQueued:
+	case queued >= thinQueued && late:
 		return "queue", false
 	}
 	return "", false
@@ -179,7 +190,11 @@ func (s *Session) thin(f *media.Frame, n uint64) bool {
 	if !f.Discardable || f.Key || f.Recovery || !s.thinOK() {
 		return false
 	}
-	why, path := s.thinPressure(n, now)
+	waited := time.Duration(-1)
+	if f.EncodeDoneUs > 0 {
+		waited = time.Duration(int64(s.a.clock())-int64(f.EncodeDoneUs)) * time.Microsecond
+	}
+	why, path := s.thinPressure(n, now, waited)
 	if why == "" {
 		return false
 	}
