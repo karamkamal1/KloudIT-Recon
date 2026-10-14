@@ -2857,7 +2857,13 @@ async function checkTornControl() {
 // which a check of the toasts at the stream's start never saw. The step is in
 // both directions, so the host's own round trips show it as well (the rate
 // controller's ack-confirm gate, ack_queue_ms of the decrease line); the
-// proxy's datagram counts during it show the stream went through it.
+// proxy's datagram counts during it show the stream went through it. One
+// warning is this sandbox's: the client's "not decoding fast enough" (with
+// its first decoder backlog flush; the host then lowers the bitrate
+// why=decoder, which is no decrease for the step). The recovery after the
+// step restarts the FFmpeg encoder about once a second, and a software
+// decoder short of CPU falls behind. It is accepted only when the CPUs had
+// nothing to spare in the 2 s before that flush (onConsole's note).
 async function checkVM() {
   const host = await restartHost({ RECON_TEST_FAULTS: 'vm' }, 'host-vm');
   const rewrite = async (route) => {
@@ -2883,6 +2889,7 @@ async function checkVM() {
         }
       }).observe(document.body, { childList: true, subtree: true });
     });
+    const con0 = consoleLines.length;
     await page.click('#btn-start');
     await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
     await until(async () => (await page.textContent('#stats').catch(() => '')).includes('CPU limit'), 15000, 'the CPU limit row').catch(() => {});
@@ -2890,16 +2897,25 @@ async function checkVM() {
     await sleep(3000);
     const log0 = host.log.length;
     const via0 = { c2h: fecImpair.c2h, h2c: fecImpair.h2c };
+    const step0 = cpuTimes();
     Object.assign(fecImpair, { delayMs: 60 });
     await sleep(6000);
     const via = { c2h: fecImpair.c2h - via0.c2h, h2c: fecImpair.h2c - via0.h2c };
     Object.assign(fecImpair, { delayMs: 0 });
     await sleep(8000);
-    const cuts = host.log.slice(log0).match(/msg="congestion: lowering bitrate"[^\n]*/g) || [];
+    const stepIdle = idleShare(step0, cpuTimes());
+    const lowered = host.log.slice(log0).match(/msg="congestion: lowering bitrate"[^\n]*/g) || [];
+    const cuts = lowered.filter((l) => !/ why=decoder /.test(l));
     const playing = await page.evaluate(() => window.__recon.streaming && (window.__recon.lastStats?.fps || 0) > 5);
     const toasts = await page.evaluate(() => window.__toastLog);
     const cpu = toasts.find((t) => t.text.startsWith('This stream encodes video on the CPU'));
-    const bad = toasts.filter((t) => /\b(warn|error)\b/.test(t.cls) && !t.text.startsWith('Renderer'));
+    // The decoder notice and the session's first decoder backlog flush (the
+    // one it came with), with the CPUs' idle share in the 2 s before it.
+    const decNotice = toasts.find((t) => t.text.startsWith('This device is not decoding fast enough'));
+    const flush = consoleLines.slice(con0).find((l) => l.includes('requesting key frame (decoder backlog)')) || '';
+    const flushCpu = flush.match(/\[cpu: (\d+) % idle in the last ([\d.]+) s\]/);
+    const decStarved = !!flushCpu && +flushCpu[1] < 100 * STARVED_IDLE;
+    const bad = toasts.filter((t) => /\b(warn|error)\b/.test(t.cls) && !t.text.startsWith('Renderer') && !(t === decNotice && decStarved));
     const limit = (overlay.match(/\d+×\d+ at \d+ fps, fastest preset \(asked: [^)]*\): what the CPU keeps up with/) || [''])[0];
     const audioOff = overlay.includes('off: no sound output device on the PC');
     const logged = /msg="cpu budget: software encoding"[^\n]* rung=3 /.test(host.log) && /audio: no sound output device on this PC/.test(host.log);
@@ -2909,8 +2925,11 @@ async function checkVM() {
       /at 30 fps, fastest preset \(asked: \d+×\d+ at 60 fps\)/.test(limit) && audioOff && logged,
     `CPU notice ${cpu ? `"${cpu.cls}"` : 'missing'}; warning/error toasts ${JSON.stringify(bad.map((t) => t.text.slice(0, 80)))}; ` +
       `all toasts ${JSON.stringify(toasts.map((t) => `${t.cls.replace('toast', '').trim() || 'plain'}: ${t.text.slice(0, 50)}`))}; ` +
+      `decoder notice ${!decNotice ? 'none' : `with the CPUs ${flushCpu ? `${flushCpu[1]} % idle in the ${flushCpu[2]} s` : '? % idle'} before its decoder backlog flush ` +
+        `(${decStarved ? 'no CPU to spare: the sandbox\'s, accepted' : 'not starved: a warning'})`}; ` +
       `delay step: the proxy carried ${via.h2c} datagrams to the browser and ${via.c2h} from it, ` +
-      `${cuts.length} "congestion: lowering bitrate" lines (${(cuts[0] || '').replace(/^.*?from=/, 'from=').replace(/ urgent=.*$/, '')}), playing after it ${playing}; ` +
+      `${cuts.length} "congestion: lowering bitrate" lines${lowered.length > cuts.length ? ` (and ${lowered.length - cuts.length} why=decoder)` : ''} ` +
+      `(${(cuts[0] || '').replace(/^.*?from=/, 'from=').replace(/ urgent=.*$/, '')}), playing after it ${playing}, ${idleNote(stepIdle)} in it and the 8 s after; ` +
       `overlay "${limit}", audio off ${audioOff}; host log ${logged ? 'has' : 'lacks'} the budget's and the sound device's lines`);
   } finally {
     Object.assign(fecImpair, { delayMs: 0, loss: 0 });
@@ -5210,8 +5229,9 @@ const FSR_STREAM = { w: 480, h: 270, fps: 15 };
 const PREFS_2D = { rendererV: 2, renderer: 'canvas2d' };
 const consoleLines = [];
 // The CPUs' times every 0.5 s (cpuTimes), for the idle share in the 2 s
-// before a "frame lost" key-frame request, which onConsole appends to the
-// line (starvedKeyRequest).
+// before a "frame lost" key-frame request (starvedKeyRequest) or a decoder
+// backlog flush (the VM check's decoder notice), which onConsole appends to
+// the line.
 const cpuHist = [];
 const cpuTimer = setInterval(() => {
   const c = cpuTimes();
@@ -5237,15 +5257,16 @@ function waitingInLog(recent) {
 const onConsole = function (m) {
   let text = m.text();
   const recent = pageLogs.get(this) || [];
-  if (text.includes('requesting key frame (frame lost)')) {
+  const lost = text.includes('requesting key frame (frame lost)');
+  if (lost) {
     const again = waitingInLog(recent);
     if (again !== null) text += ` [log: waiting for a key frame, asked again ${again} times by the watchdog]`;
-    if (cpuHist.length) {
-      const t = Date.now();
-      const from = cpuHist.find(([at]) => at >= t - 2000) || cpuHist[0];
-      const idle = idleShare(from[1], cpuTimes());
-      if (idle != null) text += ` [cpu: ${(100 * idle).toFixed(0)} % idle in the last ${((t - from[0]) / 1000).toFixed(1)} s]`;
-    }
+  }
+  if ((lost || text.includes('requesting key frame (decoder backlog)')) && cpuHist.length) {
+    const t = Date.now();
+    const from = cpuHist.find(([at]) => at >= t - 2000) || cpuHist[0];
+    const idle = idleShare(from[1], cpuTimes());
+    if (idle != null) text += ` [cpu: ${(100 * idle).toFixed(0)} % idle in the last ${((t - from[0]) / 1000).toFixed(1)} s]`;
   }
   recent.push(text);
   if (recent.length > 300) recent.splice(0, 100);
