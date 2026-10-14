@@ -5012,9 +5012,9 @@ async function checkFec() {
 // A UDP proxy in front of the host's direct port that delays each datagram
 // delayMs and loses a share `loss` of them, each direction (netem's wan
 // profile in user space: the sandbox kernel has no sch_netem). The browser
-// is sent to it by rewriting the direct URL of the connect answer; its port
-// is one of the gateway's relay ports, held, so the page's CSP allows it and
-// the gateway skips it.
+// is sent to it by directViaProxy (the connect answer's url and candidates
+// both point at it); its port is one of the gateway's relay ports, held, so
+// the page's CSP allows it and the gateway skips it.
 function impairProxy(sock, targetPort) {
   const up = dgram.createSocket('udp4');
   up.bind(0, '127.0.0.1');
