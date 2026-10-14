@@ -14,6 +14,9 @@ func Monitors() ([]Monitor, error) {
 // RemoteSession is false outside Windows.
 func RemoteSession() bool { return false }
 
+// OSInfo is empty outside Windows.
+func OSInfo() (os, machine string) { return "", "" }
+
 // DesktopState knows nothing outside Windows: the desktop is never away.
 func DesktopState() Desktop { return Desktop{} }
 

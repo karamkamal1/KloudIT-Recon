@@ -8,6 +8,8 @@
 //	recon-host qualify       measure the native helper's live bitrate changes (GUIDE 3.6)
 //	recon-host vdisplay      create a virtual display for a while (hardware test),
 //	                         or (-restore) undo a stopped agent's (uninstall)
+//	recon-host report        write a diagnostics report to send with a problem
+//	                         (no tokens, keys or passwords)
 package main
 
 import (
@@ -52,6 +54,12 @@ Usage:
   recon-host [flags] vdisplay -restore     put back the displays a stopped agent's virtual
                                            display left changed (its restore journal next
                                            to the config); stop the agent first
+  recon-host [flags] report [-o file] [-lines 400] [-hostlog path] [-quick]
+                                           write a diagnostics report (versions, Windows and
+                                           the machine, desktop, GPUs, monitors, sound, the
+                                           config without secrets, the probe, the end of
+                                           host.log) into one text file to send with a
+                                           problem; it has no tokens, keys or passwords
   recon-host version
 
 Flags:
@@ -185,6 +193,8 @@ func main() {
 		if err := vdisplayTest(cfg, flag.Args()[1:], log); err != nil {
 			fatal(err)
 		}
+	case "report":
+		os.Exit(reportCmd(*cfgPath, flag.Args()[1:]))
 	case "run":
 		if supervising {
 			exe, err := os.Executable()
