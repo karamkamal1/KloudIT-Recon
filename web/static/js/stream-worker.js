@@ -437,12 +437,20 @@ function telemetrySender(w, prio, isClosed) {
   };
 }
 
-async function openWebTransport(url, hashes, label, timeoutMs) {
+// The options of every WebTransport: datagrams required, the browser's
+// low-latency congestion control where it has one, the server's certificate
+// pinned by hash (the PC's is self-signed: the direct path and the UDP relay
+// end at it).
+function wtOptions(hashes) {
   const opts = { requireUnreliable: true, congestionControl: 'low-latency' };
   if (hashes && hashes.length) {
     opts.serverCertificateHashes = hashes.map((h) => ({ algorithm: 'sha-256', value: b64(h) }));
   }
-  const wt = new WebTransport(url, opts);
+  return opts;
+}
+
+async function openWebTransport(url, hashes, label, timeoutMs) {
+  const wt = new WebTransport(url, wtOptions(hashes));
   wt.closed.catch(() => {});
   try {
     await withTimeout(wt.ready, timeoutMs, `WebTransport ${label}`);
@@ -450,6 +458,12 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
     try { wt.close(); } catch {}
     throw e;
   }
+  return wrapWebTransport(wt, label);
+}
+
+// The transport over a WebTransport that is up: its control and input
+// streams, datagram writers, and run(), which reads it until it closes.
+async function wrapWebTransport(wt, label) {
   const { ctrl, input, dgInput, dgTelemetry, prio } = await openSendChannels(wt);
   const cw = ctrl.writable.getWriter();
   const iw = input.writable.getWriter();
@@ -595,14 +609,24 @@ async function connect(ep) {
   const wtOK = typeof WebTransport !== 'undefined' && prefs.transport !== 'websocket';
   // directWhy: why a connection that is not on the direct path is not (the
   // overlay's Transport row): the settings, a direct endpoint the PC does not
-  // offer, or how its attempt failed (directFailure).
+  // offer, or how its attempt failed (directFailure). tried: each of the
+  // direct path's addresses and how its attempt went (raceDirect). Both go
+  // to the host in the hello, which logs them (host.log says why a session
+  // streams through the gateway).
   let directWhy = prefs.path === 'relay' ? 'Network path is "Relay via gateway"' : !wtOK ? 'needs WebTransport' : '';
+  let tried = [];
   // skipTicketed: the host refused a ticket a moment ago (its clock or key
   // disagrees with the gateway's): the paths the host authorises are left
   // out for a while, so Auto and Relay reach the splice relay, which the
   // gateway authorises. Direct only has nothing else to try.
   if (wtOK && ep.direct && prefs.path !== 'relay' && !(prefs.skipTicketed && prefs.path !== 'direct')) {
-    attempts.push(['direct', async () => ({ t: await openWebTransport(ep.direct.url, ep.direct.hashes, 'direct', DIRECT_TIMEOUT_MS), ticket: ep.direct.ticket })]);
+    attempts.push(['direct', async () => {
+      const r = await raceDirect(directCandidates(ep.direct), ep.direct.hashes, DIRECT_TIMEOUT_MS);
+      tried = r.tried;
+      const t = await wrapWebTransport(r.wt, 'direct');
+      t.addr = hostOf(r.cand.url);
+      return { t, ticket: ep.direct.ticket };
+    }]);
   } else if (!directWhy) {
     directWhy = !ep.direct ? 'the PC offers no direct endpoint (its agent has none up: host.log)' : 'skipped: the PC refused a ticket a moment ago';
   }
@@ -632,10 +656,14 @@ async function connect(ep) {
       post('status', { text: `Connecting (${label})…` });
       const c = await fn();
       c.directWhy = label === 'direct' ? '' : directWhy;
+      c.direct = { why: c.directWhy, tried };
       return c;
     } catch (e) {
       lastErr = e;
-      if (label === 'direct') directWhy = directFailure(e, performance.now() - t0, ep.direct.url);
+      if (label === 'direct') {
+        tried = e.tried || tried;
+        directWhy = directFailure(e, performance.now() - t0, ep.direct);
+      }
       post('log', { text: `${label} failed: ${e.message}` });
     }
   }
@@ -645,21 +673,146 @@ async function connect(ep) {
 // How long the direct path may take to come up before Auto moves on.
 const DIRECT_TIMEOUT_MS = 2500;
 
-// How the direct path's attempt failed, for the Transport row (the first
-// hardware run streamed through the relay on the PC's own network without a
-// word why). No answer within DIRECT_TIMEOUT_MS: the PC's UDP port is closed
-// on the way (Windows Firewall on a network whose profile is Public, which
-// the installer's rule does not cover; a router between the networks; away
-// from home without a port forward). A quicker failure: something answered
-// and refused it (nothing listens on the port, a certificate that does not
-// match, the PC refused the ticket).
-function directFailure(e, ms, url) {
-  const port = /:(\d+)\/wt$/.exec(url || '')?.[1] || '';
-  const m = e?.message || String(e);
-  if (/timed out/.test(m)) {
-    return `no answer in ${(ms / 1000).toFixed(1)} s: UDP ${port} blocked (PC firewall: a Public network? host.log says)`;
+// The direct path's addresses, in the order the gateway gives them (the
+// connect answer's direct.candidates: the PC's address on this browser's
+// network first; gateways before it give one URL).
+function directCandidates(d) {
+  const c = Array.isArray(d?.candidates) ? d.candidates.filter((x) => typeof x?.url === 'string') : [];
+  return c.length ? c : d?.url ? [{ url: d.url }] : [];
+}
+
+const hostOf = (url) => /^https:\/\/([^/]+)\//.exec(url || '')?.[1] || url;
+
+// How long after the previous address the next one starts (happy eyeballs,
+// RFC 8305's connection attempt delay): the gateway's first choice wins when
+// several answer, and one that fails early lets the next start at once.
+const DIRECT_STAGGER_MS = 100;
+
+// raceDirect starts a WebTransport to every address of the direct path, the
+// first at once and each next one DIRECT_STAGGER_MS after the one before (or
+// as soon as every one started has failed), and resolves with the first that
+// comes up within timeoutMs ({ wt, cand, tried }); the others are closed. It
+// rejects when none does, with tried on the error. tried: per address its
+// url, kind and note (the gateway's), the time to its outcome and the
+// outcome ("connected", "no answer", "refused: ...", "abandoned": another
+// came up first, "not tried").
+function raceDirect(cands, hashes, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const tried = cands.map((c) => ({ url: c.url, kind: c.kind || '', note: c.note || '', ms: 0, result: 'not tried' }));
+    const wts = [];
+    const starts = [];
+    let next = 0;
+    let pending = 0;
+    let done = false;
+    let timer = 0;
+    const end = () => {
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(deadline);
+      for (let j = 0; j < wts.length; j++) {
+        if (tried[j].result !== 'pending') continue;
+        tried[j].result = 'abandoned';
+        tried[j].ms = Math.round(performance.now() - starts[j]);
+        try { wts[j].close(); } catch {}
+      }
+    };
+    const failed = () => {
+      if (done || pending > 0 || next < cands.length) return;
+      end();
+      reject(Object.assign(new Error(`direct path: ${tried.map((a) => `${hostOf(a.url)} ${a.result}`).join(', ') || 'no address'}`), { tried }));
+    };
+    const start = () => {
+      if (done || next >= cands.length) return;
+      const i = next++;
+      const a = tried[i];
+      starts[i] = performance.now();
+      let wt;
+      try {
+        wt = new WebTransport(cands[i].url, wtOptions(hashes));
+      } catch (e) {
+        a.result = `refused: ${e?.message || e}`;
+        start();
+        failed();
+        return;
+      }
+      wts[i] = wt;
+      a.result = 'pending';
+      pending++;
+      wt.closed.catch(() => {});
+      wt.ready.then(() => {
+        pending--;
+        a.ms = Math.round(performance.now() - starts[i]);
+        if (done) {
+          a.result = 'connected, not needed';
+          try { wt.close(); } catch {}
+          return;
+        }
+        a.result = 'connected';
+        end();
+        resolve({ wt, cand: cands[i], tried });
+      }, (e) => {
+        pending--;
+        if (a.result !== 'pending') return; // closed here (no answer, abandoned)
+        a.ms = Math.round(performance.now() - starts[i]);
+        a.result = `refused: ${e?.message || e}`;
+        // Every one started has failed: the next one now.
+        if (!done && pending === 0) {
+          clearTimeout(timer);
+          tick();
+        }
+        failed();
+      });
+    };
+    const tick = () => {
+      start();
+      if (!done && next < cands.length) timer = setTimeout(tick, DIRECT_STAGGER_MS);
+    };
+    const deadline = setTimeout(() => {
+      if (done) return;
+      for (let j = 0; j < wts.length; j++) {
+        if (tried[j].result !== 'pending') continue;
+        tried[j].result = 'no answer';
+        tried[j].ms = Math.round(performance.now() - starts[j]);
+      }
+      end();
+      reject(Object.assign(new Error(`WebTransport direct timed out after ${timeoutMs} ms`), { tried }));
+    }, timeoutMs);
+    if (!cands.length) {
+      done = true;
+      clearTimeout(deadline);
+      reject(Object.assign(new Error('the PC offers no direct address'), { tried }));
+      return;
+    }
+    tick();
+  });
+}
+
+// How the direct path's attempt failed, for the Transport row and the host
+// log (the first hardware run streamed through the relay on the PC's own
+// network without a word why). No answer within DIRECT_TIMEOUT_MS from any
+// address: the browser's packets do not reach the PC (Windows Firewall on a
+// network whose profile is Public, which the installer's rule does not
+// cover; a router between the networks; away from home without a port
+// forward), or the PC's answers do not reach the browser (a route back
+// through a VPN): the PC's host.log tells these apart (a line per failed
+// handshake, none for packets that never came). A quicker failure:
+// something answered and refused it (nothing listens on the port, a
+// certificate that does not match, the content security policy).
+function directFailure(e, ms, direct) {
+  const tried = e?.tried || [];
+  const port = /:(\d+)\/wt$/.exec(tried[0]?.url || direct?.url || '')?.[1] || '';
+  const silent = tried.filter((a) => a.result === 'no answer');
+  const refused = tried.filter((a) => a.result.startsWith('refused'));
+  const list = (as) => as.map((a) => hostOf(a.url)).join(', ');
+  if (silent.length || (!refused.length && /timed out/.test(e?.message || ''))) {
+    const also = refused.length ? `; refused by ${list(refused)}: ${refused[0].result.slice(9)}` : '';
+    return `no answer in ${(ms / 1000).toFixed(1)} s: UDP ${port} blocked, or the PC's answers lost on the way (${list(silent) || 'the PC'}; ` +
+      `the PC's host.log says which)${also}`;
   }
-  return `refused after ${Math.round(ms)} ms: ${m}`;
+  if (refused.length) {
+    return `refused after ${refused[0].ms} ms by ${list(refused)}: ${refused[0].result.slice(9)}`;
+  }
+  return `refused after ${Math.round(ms)} ms: ${e?.message || e}`;
 }
 
 // Network path "Direct to PC only" (the one setting that can leave nothing
@@ -2610,7 +2763,7 @@ async function start(msg) {
     return;
   }
   transport = conn.t;
-  post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name, directWhy: conn.directWhy || '' });
+  post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name, directWhy: conn.directWhy || '', addr: transport.addr || '' });
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   const helloDecoders = await tested;
@@ -2624,6 +2777,7 @@ async function start(msg) {
     client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: { ...msg.hostPrefs, hdr: hdrPrefs() },
     // Video frames as datagram shards (GUIDE 2.5): WebTransport only.
     ...(transport.kind === 'webtransport' && prefs.fec !== 'off' ? { fec: P.HELLO_FEC_VERSION } : {}),
+    direct: conn.direct, // how the direct path went (the host logs it)
   });
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   openPageControl();

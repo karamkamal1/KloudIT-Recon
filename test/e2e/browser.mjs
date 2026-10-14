@@ -55,7 +55,7 @@
 // an HDR display: a 10-bit PQ AV1 stream presented with extended range,
 // checked to the pixel, then HDR Off live (tone-mapped, then an SDR stream).
 // E2E_ONLY=<regex> runs the scenarios and sections whose names match
-// (development).
+// (development); E2E_CHROME=<path> runs the main page in another Chromium.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -2502,6 +2502,98 @@ async function checkTicketRefused() {
   await endStream();
 }
 
+// The direct path's addresses (VENDOR_NOTES "Second hardware run: direct path
+// on the LAN"): the second hardware run streamed every session through the
+// gateway's relay on the PC's own network, and nothing said why. The gateway
+// offered one address and the browser tried that one. Now the gateway offers
+// every address of the PC (the host's directAddr list here), the browser
+// starts them all, each DIRECT_STAGGER_MS after the one before, keeps the
+// first that answers and tells the host how each went, which the host logs at
+// the session's start; the host also logs every handshake that fails on its
+// side. Three causes, reproduced:
+//  - the first address does not answer (as a Tailscale address does for a
+//    browser off the tailnet; here 127.0.0.3, where a socket swallows every
+//    datagram): the second, 127.0.0.1, connects, with no 2.5 s wait;
+//  - a certificate the browser refuses (the connect answer's hashes do not
+//    match the PC's certificate): every address fails at once, the stream
+//    goes through the relay, and the overlay, the host's session line and
+//    its handshake line say the certificate was refused;
+//  - the PC's answers lost on the way back (a proxy that passes the
+//    browser's datagrams to the PC and drops the PC's, as a route back
+//    through a VPN does): no answer, and the host log says the answers did
+//    not reach the browser.
+async function checkDirectCandidates() {
+  const sink = dgram.createSocket('udp4');
+  await new Promise((res, rej) => { sink.once('error', rej); sink.bind(directPort, '127.0.0.3', res); });
+  let route = null;
+  const answer = (edit) => async (r) => {
+    const resp = await r.fetch();
+    const body = await resp.json();
+    if (body.direct) edit(body.direct);
+    await r.fulfill({ response: resp, json: body });
+  };
+  const setRoute = async (edit) => {
+    if (route) await ctx.unroute('**/api/hosts/*/connect', route);
+    route = edit ? answer(edit) : null;
+    if (route) await ctx.route('**/api/hosts/*/connect', route);
+  };
+  const sessionLine = (log) => /msg="direct path: (connected|not used by this session)[^\n]*/.exec(log)?.[0] || '';
+  try {
+    await withHostConfig({ directAddr: '127.0.0.3, 127.0.0.1' }, async () => {
+      const host = await restartHost({}, 'host-direct-addrs');
+      const listening = /msg="direct WebTransport endpoint listening"[^\n]*/.exec(host.log)?.[0] || '';
+      let log0 = host.log.length;
+      await startStream({ path: 'auto', transport: 'auto' });
+      const conn = await page.evaluate(() => window.__recon.conn);
+      let line = sessionLine(host.log.slice(log0));
+      const first = new RegExp(`127\\.0\\.0\\.3:${directPort} \\(override, host config directAddr\\): (abandoned|no answer) after (\\d+) ms`).exec(line);
+      const second = new RegExp(`127\\.0\\.0\\.1:${directPort} \\(override, host config directAddr\\): connected after (\\d+) ms`).exec(line);
+      check('direct path addresses: the first does not answer, the next one connects at once (the browser starts them all) and the host log says how each went',
+        conn?.path === 'direct' && conn.addr === `127.0.0.1:${directPort}` && /addrs=/.test(listening) && !!first && !!second && +second[1] < 2000 && /msg="direct path: connected"/.test(line),
+        `streaming over ${conn?.path} ${conn?.addr || ''}; host: ${line.replace(/^.*?tried=/, 'tried=').slice(0, 300) || 'no direct path line'}; ${listening.replace(/^.*?addrs=/, 'listening on ').slice(0, 160)}`);
+      await endStream();
+
+      // A certificate the browser refuses.
+      // (The addresses that answer: the swallowed one would add "no answer".)
+      await setRoute((d) => {
+        d.hashes = [Buffer.alloc(32, 7).toString('base64')];
+        d.candidates = (d.candidates || []).filter((c) => !c.url.includes('127.0.0.3'));
+      });
+      log0 = host.log.length;
+      await startStream({ path: 'auto', transport: 'auto' });
+      const c2 = await page.evaluate(() => window.__recon.conn);
+      line = sessionLine(host.log.slice(log0));
+      const hs = await until(() => /[^\n]*msg="direct path: a browser's connection failed in its handshake"[^\n]*refused the PC's certificate[^\n]*/.exec(host.log.slice(log0))?.[0], 8000, 'the handshake line').catch(() => '');
+      check('direct path addresses: a certificate the browser refuses sends the stream through the relay at once, and the overlay and the host log say so',
+        c2?.path === 'relay' && /^refused after \d+ ms by /.test(c2.directWhy || '') && /not used by this session/.test(line) && /why="refused after/.test(line) &&
+          /level=INFO/.test(hs),
+        `streaming over ${c2?.path} (direct: ${c2?.directWhy}); host: ${line.replace(/^.*?why=/, 'why=').slice(0, 260) || 'no direct path line'}; handshake: ${hs.replace(/^.*?from=/, 'from=').slice(0, 200) || 'no line'}`);
+      await setRoute(null);
+      await endStream();
+
+      // The PC's answers lost on the way back.
+      fecImpair.h2cOff = true;
+      fecImpair.delayMs = 0;
+      fecImpair.loss = 0;
+      await setRoute((d) => { d.candidates = [{ url: `https://127.0.0.1:${fecProxyPort}/wt`, kind: 'lan', note: 'e2e one-way proxy' }]; d.url = d.candidates[0].url; });
+      log0 = host.log.length;
+      await startStream({ path: 'auto', transport: 'auto' });
+      const c3 = await page.evaluate(() => window.__recon.conn);
+      line = sessionLine(host.log.slice(log0));
+      const lost = await until(() => /[^\n]*msg="direct path: a browser's connection failed in its handshake"[^\n]*answers did not reach it[^\n]*/.exec(host.log.slice(log0))?.[0], 15000, 'the handshake line').catch(() => '');
+      check('direct path addresses: answers lost on the way back: no answer, the stream goes through the relay, and the host log says the PC\'s answers did not reach the browser',
+        c3?.path === 'relay' && /^no answer in 2\.\d s/.test(c3.directWhy || '') && /not used by this session/.test(line) && /level=INFO/.test(lost),
+        `streaming over ${c3?.path} (direct: ${c3?.directWhy}); host: ${line.replace(/^.*?why=/, 'why=').slice(0, 200) || 'no direct path line'}; handshake: ${lost.replace(/^.*?from=/, 'from=').slice(0, 260) || 'no line'}; proxy dropped ${fecImpair.lostH2c} datagrams from the host`);
+      await endStream();
+    });
+  } finally {
+    fecImpair.h2cOff = false;
+    await setRoute(null).catch(() => {});
+    sink.close();
+  }
+  await restartHost({}, 'host-default-addrs');
+}
+
 // Torn control stream (final review): the host writes a control message in
 // part (test hook torn-control: its first clock message, 5 s in) and goes
 // on, as hosts did before the final review after a control write that hit
@@ -2797,7 +2889,10 @@ async function checkSettingsAfterFailedConnect() {
     const r = await route.fetch();
     const body = await r.json();
     if (mode === 'none') delete body.direct;
-    else if (body.direct) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+    else if (body.direct) {
+      body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+      body.direct.candidates = [{ url: body.direct.url }];
+    }
     await route.fulfill({ response: r, json: body });
   };
   await ctx.route('**/api/hosts/*/connect', rewrite);
@@ -4406,7 +4501,8 @@ async function checkFec() {
 function impairProxy(sock, targetPort) {
   const up = dgram.createSocket('udp4');
   up.bind(0, '127.0.0.1');
-  const st = { delayMs: 0, loss: 0, c2h: 0, h2c: 0, lostC2h: 0, lostH2c: 0 };
+  // h2cOff: drop every datagram from the host (its answers lost on the way back).
+  const st = { delayMs: 0, loss: 0, h2cOff: false, c2h: 0, h2c: 0, lostC2h: 0, lostH2c: 0 };
   let client = null;
   sock.on('message', (m, r) => {
     client = r;
@@ -4417,7 +4513,7 @@ function impairProxy(sock, targetPort) {
   up.on('message', (m) => {
     st.h2c++;
     if (!client) return;
-    if (Math.random() < st.loss) { st.lostH2c++; return; }
+    if (st.h2cOff || Math.random() < st.loss) { st.lostH2c++; return; }
     const c = client;
     setTimeout(() => sock.send(m, c.port, c.address), st.delayMs);
   });
@@ -4558,8 +4654,12 @@ const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(d
 await until(() => existsSync(join(dir, 'gw', 'setup-token.txt')), 10000, 'gateway setup token');
 const setupToken = readFileSync(join(dir, 'gw', 'setup-token.txt'), 'utf8').trim();
 
+// E2E_CHROME=<path>: another Chromium build for the main (headless) page,
+// e.g. an older Chrome for Testing (the owner's Chrome 122 for the direct
+// path sections: VENDOR_NOTES "Second hardware run: direct path on the LAN").
 const browser = await chromium.launch({
   headless: true,
+  ...(process.env.E2E_CHROME ? { executablePath: process.env.E2E_CHROME } : {}),
   args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
 });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
@@ -5055,6 +5155,7 @@ try {
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
+  if (want('direct candidates')) await checkDirectCandidates().catch((e) => check('direct path addresses scenario', false, e.message));
   if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));

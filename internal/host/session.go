@@ -372,6 +372,7 @@ func (s *Session) run() error {
 	}
 	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80),
 		"decoders", decoderSummary(s.hello.Decoders), "reset_stream_at", s.resetStreamAt)
+	s.logDirectReport(s.hello.Direct) // direct.go: why this session is (not) on the direct path
 
 	// One active session per host: a new connection takes over, unless the
 	// gateway revoked the user's access since it authorised this one.

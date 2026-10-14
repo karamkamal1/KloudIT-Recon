@@ -258,7 +258,7 @@ func TestDirectHandshakeWhy(t *testing.T) {
 		{&quic.IdleTimeoutError{}, 5 * time.Second, "never completed the handshake", false},
 		{&quic.TransportError{Remote: true, ErrorCode: quic.TransportErrorCode(0x100 + 42)}, 20 * time.Millisecond, "refused the PC's certificate", false},
 		{&quic.ApplicationError{Remote: true}, 30 * time.Millisecond, "another of the PC's addresses answered first", true},
-		{&quic.TransportError{Remote: true, ErrorCode: quic.NoError}, 2600 * time.Millisecond, "gave up waiting", false},
+		{&quic.TransportError{Remote: true, ErrorCode: quic.NoError}, 2600 * time.Millisecond, "gave up the handshake: the PC's answers did not reach it", false},
 		{&quic.TransportError{Remote: true, ErrorCode: quic.ProtocolViolation}, time.Second, "the browser closed it", false},
 	} {
 		why, expected := directHandshakeWhy(tc.err, tc.after)

@@ -3,6 +3,7 @@ package proto
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Control channel messages. Every message is a JSON object with a "t" field.
@@ -20,6 +21,59 @@ type Hello struct {
 	// GUIDE 2.5, proto/fec.go): set by clients on a transport with
 	// datagrams (WebTransport), 0 otherwise and from clients before it.
 	FEC int `json:"fec,omitempty"`
+	// Direct is how this connection's direct path went (clients since the
+	// second hardware run): the host logs it at the session's start, so its
+	// log says why a session streams through the gateway. Nil from older
+	// clients.
+	Direct *DirectReport `json:"direct,omitempty"`
+}
+
+// DirectReport is the client's account of its direct path attempts
+// (Hello.Direct).
+type DirectReport struct {
+	// Why the connection is not on the direct path ("" when it is).
+	Why   string          `json:"why,omitempty"`
+	Tried []DirectAttempt `json:"tried,omitempty"`
+}
+
+// DirectAttempt is one direct address the client tried.
+type DirectAttempt struct {
+	URL    string `json:"url"`
+	Kind   string `json:"kind,omitempty"` // DirectAddr.Kind
+	Note   string `json:"note,omitempty"` // why the gateway put it where it is (e.g. "the browser's network")
+	Ms     int    `json:"ms"`             // from the attempt's start to its outcome
+	Result string `json:"result"`         // "connected", "no answer", "refused: ...", "abandoned", ...
+}
+
+// Summary is the report as one line for a log.
+func (r *DirectReport) Summary() string {
+	if r == nil {
+		return ""
+	}
+	if len(r.Tried) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(r.Tried))
+	for _, a := range r.Tried {
+		host := a.URL
+		if u := strings.TrimPrefix(host, "https://"); u != host {
+			host, _, _ = strings.Cut(u, "/")
+		}
+		s := host
+		if a.Kind != "" || a.Note != "" {
+			s += " (" + strings.Trim(a.Kind+", "+a.Note, ", ") + ")"
+		}
+		if a.Result == "not tried" {
+			parts = append(parts, s+": not tried")
+			continue
+		}
+		if why, ok := strings.CutPrefix(a.Result, "refused: "); ok {
+			parts = append(parts, fmt.Sprintf("%s: refused after %d ms: %s", s, a.Ms, why))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s after %d ms", s, a.Result, a.Ms))
+	}
+	return strings.Join(parts, "; ")
 }
 
 type ClientInfo struct {

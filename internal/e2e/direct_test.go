@@ -1,0 +1,243 @@
+package e2e
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/quic-go/webtransport-go"
+
+	"github.com/karamkamal1/kloudit-recon/internal/proto"
+	"github.com/karamkamal1/kloudit-recon/internal/transport"
+)
+
+// connectAnswer is the connect answer with the direct path's candidates.
+type connectAnswer struct {
+	Relay struct {
+		UDP string `json:"udp"`
+	} `json:"relay"`
+	Direct *struct {
+		URL        string   `json:"url"`
+		Hashes     []string `json:"hashes"`
+		Ticket     string   `json:"ticket"`
+		Candidates []struct {
+			URL  string `json:"url"`
+			Kind string `json:"kind"`
+			Note string `json:"note"`
+		} `json:"candidates"`
+	} `json:"direct"`
+}
+
+func (e *env) connectAnswer() connectAnswer {
+	var a connectAnswer
+	if err := e.do("POST", "/api/hosts/"+e.hostID+"/connect", map[string]string{}, &a); err != nil {
+		e.t.Fatal(err)
+	}
+	if a.Direct == nil || len(a.Direct.Candidates) == 0 || a.Direct.Candidates[0].URL != a.Direct.URL {
+		e.t.Fatalf("connect answer without direct candidates: %+v", a.Direct)
+	}
+	return a
+}
+
+// wtClient is a minimal streaming client on one WebTransport session: its
+// control messages and the frames it receives, in order.
+type wtClient struct {
+	t    *testing.T
+	sess *webtransport.Session
+	c    transport.Conn
+	ctrl transport.BidiStream
+
+	mu     sync.Mutex
+	msgs   []map[string]any
+	frames []clientFrame
+}
+
+type clientFrame struct {
+	gen  uint8
+	seq  uint32
+	key  bool
+	at   time.Time
+	conn *wtClient
+}
+
+func clientHello(ticket string, prefs proto.Prefs) proto.Hello {
+	return proto.Hello{
+		T: "hello", V: proto.HelloVersionRecovery, Ticket: ticket,
+		Client:   proto.ClientInfo{UA: "go-e2e", Width: 1920, Height: 1080, DPR: 1, Hz: 60},
+		Decoders: []proto.DecoderInfo{{Family: "h264", HW: false}},
+		Audio:    proto.AudioCaps{Opus: true},
+		Prefs:    prefs,
+	}
+}
+
+// dialClient opens a session at rawURL and sends hello; frames go to sink
+// (the client itself if nil), as a browser hands the frames of every
+// connection of a session to one decoder.
+func dialClient(t *testing.T, e *env, rawURL string, hashes []string, hello proto.Hello, sink *wtClient) *wtClient {
+	t.Helper()
+	d := &webtransport.Transport{TLSClientConfig: pinHashes(hashes), QUICConfig: transport.QUICConfig()}
+	hdr := http.Header{}
+	hdr.Set("Origin", e.base)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, sess, err := d.Dial(ctx, rawURL, hdr)
+	if err != nil {
+		t.Fatalf("dial %s: %v (%v)", rawURL, err, resp)
+	}
+	cl := &wtClient{t: t, sess: sess, c: transport.FromWebTransport(sess)}
+	if sink == nil {
+		sink = cl
+	}
+	t.Cleanup(func() { sess.CloseWithError(0, "") })
+	cl.ctrl, err = cl.c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl.ctrl.Write([]byte{proto.StreamKindControl})
+	b, _ := json.Marshal(hello)
+	proto.WriteMsg(cl.ctrl, b)
+	in, err := cl.c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Write([]byte{proto.StreamKindInput})
+	go func() {
+		for {
+			m, err := proto.ReadMsg(cl.ctrl, proto.MaxControlMsg)
+			if err != nil {
+				return
+			}
+			var x map[string]any
+			json.Unmarshal(m, &x)
+			cl.mu.Lock()
+			cl.msgs = append(cl.msgs, x)
+			cl.mu.Unlock()
+		}
+	}()
+	go func() {
+		for {
+			if _, err := cl.c.ReceiveDatagram(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			u, err := cl.c.AcceptUniStream(context.Background())
+			if err != nil {
+				return
+			}
+			go func() {
+				b, err := io.ReadAll(u)
+				if err != nil {
+					return
+				}
+				h, _, _, err := proto.ParseFrame(b)
+				if err != nil {
+					return
+				}
+				sink.mu.Lock()
+				sink.frames = append(sink.frames, clientFrame{gen: h.Gen, seq: h.Seq, key: h.Flags&proto.FrameFlagKey != 0, at: time.Now(), conn: cl})
+				sink.mu.Unlock()
+			}()
+		}
+	}()
+	return cl
+}
+
+// waitMsg waits for a control message of type typ and returns it.
+func (cl *wtClient) waitMsg(typ string, d time.Duration) map[string]any {
+	cl.t.Helper()
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		cl.mu.Lock()
+		for _, m := range cl.msgs {
+			if m["t"] == typ {
+				cl.mu.Unlock()
+				return m
+			}
+		}
+		cl.mu.Unlock()
+	}
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.t.Fatalf("no %q message in %s (got %v)", typ, d, cl.msgs)
+	return nil
+}
+
+// frameCount returns how many frames arrived (on the connection from, if set).
+func (cl *wtClient) frameCount(from *wtClient) int {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	n := 0
+	for _, f := range cl.frames {
+		if from == nil || f.conn == from {
+			n++
+		}
+	}
+	return n
+}
+
+// waitLogLine waits for a log line with every one of subs from log offset from.
+func (e *env) waitLogLine(t *testing.T, from int, d time.Duration, subs ...string) string {
+	t.Helper()
+	for deadline := time.Now().Add(d); ; time.Sleep(20 * time.Millisecond) {
+		if l := e.logs.lines(from, subs...); len(l) > 0 {
+			return l[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no log line with %q", subs)
+			return ""
+		}
+	}
+}
+
+// The client's account of its direct path attempts (Hello.Direct) is in the
+// host log at the session's start, so host.log alone says why a session
+// streams through the gateway (VENDOR_NOTES "Second hardware run: direct path
+// on the LAN"); and the connect answer lists the direct path's candidates,
+// directAddr first.
+func TestDirectReportLogged(t *testing.T) {
+	e := setup(t)
+	ans := e.connectAnswer()
+	if c := ans.Direct.Candidates[0]; !strings.HasPrefix(c.URL, "https://127.0.0.1:") || c.Kind != proto.DirectKindOverride || c.Note != "host config directAddr" {
+		t.Fatalf("first direct candidate %+v", c)
+	}
+
+	from := e.logs.Len()
+	a, err := e.allocRelay(ans.Relay.UDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := clientHello(a.Ticket, defaultPrefs)
+	h.Direct = &proto.DirectReport{
+		Why: "no answer in 2.5 s: UDP 48100 blocked, or the PC's answers lost on the way",
+		Tried: []proto.DirectAttempt{
+			{URL: ans.Direct.URL, Kind: "lan", Note: "the browser's network 192.168.5.0/24", Ms: 2500, Result: "no answer"},
+			{URL: "https://100.101.102.103:48100/wt", Kind: "tailscale", Ms: 2400, Result: "no answer"},
+		},
+	}
+	cl := dialClient(t, e, a.URL, a.Hashes, h, nil)
+	cl.waitMsg("welcome", 10*time.Second)
+	l := e.waitLogLine(t, from, 5*time.Second, `msg="direct path: not used by this session, it streams through the gateway"`, "path=relay")
+	if !strings.Contains(l, `why="no answer in 2.5 s: UDP 48100 blocked`) ||
+		!strings.Contains(l, "(lan, the browser's network 192.168.5.0/24): no answer after 2500 ms; 100.101.102.103:48100 (tailscale): no answer after 2400 ms") {
+		t.Fatalf("relay session's direct path line: %s", l)
+	}
+	cl.sess.CloseWithError(0, "")
+
+	ans = e.connectAnswer()
+	from = e.logs.Len()
+	h = clientHello(ans.Direct.Ticket, defaultPrefs)
+	h.Direct = &proto.DirectReport{Tried: []proto.DirectAttempt{{URL: ans.Direct.URL, Kind: "override", Note: "host config directAddr", Ms: 3, Result: "connected"}}}
+	cl = dialClient(t, e, ans.Direct.URL, ans.Direct.Hashes, h, nil)
+	cl.waitMsg("welcome", 10*time.Second)
+	l = e.waitLogLine(t, from, 5*time.Second, `msg="direct path: connected"`, "path=direct")
+	if !strings.Contains(l, "(override, host config directAddr): connected after 3 ms") {
+		t.Fatalf("direct session's line: %s", l)
+	}
+}

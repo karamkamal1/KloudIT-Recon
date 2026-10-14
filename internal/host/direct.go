@@ -599,6 +599,12 @@ func (l *directHandshakeLog) failed(a *Agent, hs *directHandshake, cause error) 
 		"after_ms", time.Since(hs.start).Milliseconds(), "why", why, "err", cause)
 }
 
+// directAnswersLost explains a handshake whose answers never reached the
+// browser (its packets reached the PC: the connection exists).
+const directAnswersLost = "the PC's answers did not reach it. They leave from the address the browser sent to, so a route " +
+	"back that does not lead to the browser (a VPN, or a Tailscale subnet route the PC accepts that covers the LAN) or an " +
+	"outbound filter loses them"
+
 // directHandshakeWhy says what a handshake's end means: expected is true for
 // an end that is no fault (the browser gave up a parallel attempt another of
 // the PC's addresses won).
@@ -609,21 +615,42 @@ func directHandshakeWhy(err error, after time.Duration) (why string, expected bo
 	var ito *quic.IdleTimeoutError
 	switch {
 	case errors.As(err, &hto) || errors.As(err, &ito):
-		return "the browser never completed the handshake: the PC's answers did not reach it. They leave from the address the " +
-			"browser sent to, so a route back that does not lead to the browser (a VPN, or a Tailscale subnet route the PC " +
-			"accepts that covers the LAN) or an outbound filter loses them", false
+		return "the browser never completed the handshake: " + directAnswersLost, false
 	case errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError():
 		return "the browser refused the PC's certificate: the hash the gateway gave it does not match (a gateway or agent " +
 			"older than the other) or its clock is outside the certificate's validity", false
 	case errors.As(err, &te) && te.Remote && te.ErrorCode == quic.NoError, errors.As(err, &ae) && ae.Remote:
 		if after >= 2*time.Second {
-			// The browser waits 2.5 s for an address (DIRECT_TIMEOUT_MS).
-			return "the browser gave up waiting for the handshake: the PC's answers did not reach it (see the line " +
-				"\"the browser never completed the handshake\")", false
+			// The client gives an address 2.5 s (DIRECT_TIMEOUT_MS);
+			// Chrome ends a handshake without answers after 4 s ("No
+			// recent network activity").
+			return "the browser gave up the handshake: " + directAnswersLost, false
 		}
 		return "the browser ended it (another of the PC's addresses answered first)", true
 	case errors.As(err, &te) && te.Remote:
 		return "the browser closed it: " + te.Error(), false
 	}
 	return "", false
+}
+
+// ---------------------------------------------------------------------------
+// The client's report
+
+// logDirectReport logs the client's account of its direct path attempts
+// (Hello.Direct at the session's start): the host log alone then says why a
+// session streams through the gateway, and which of the PC's addresses
+// answered. Clients before it send none.
+func (s *Session) logDirectReport(r *proto.DirectReport) {
+	if r == nil {
+		return
+	}
+	if s.meta.Path == "direct" {
+		s.log.Info("direct path: connected", "tried", r.Summary())
+		return
+	}
+	why := r.Why
+	if why == "" {
+		why = "the client gave no reason"
+	}
+	s.log.Info("direct path: not used by this session, it streams through the gateway", "why", why, "tried", r.Summary())
 }

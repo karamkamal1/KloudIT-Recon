@@ -1055,7 +1055,7 @@ function onStats(st) {
     row('Loss recovery', recoveryText(v.recovery, st)),
     // Not on the direct path: why not (the attempt's failure, a direct
     // endpoint the PC does not offer, the settings).
-    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fecNow ? ' · datagrams + FEC' : ''}` +
+    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${S.conn.addr ? ` ${S.conn.addr}` : ''}${st.fecNow ? ' · datagrams + FEC' : ''}` +
       `${S.conn.path !== 'direct' && S.conn.directWhy ? ` · direct: ${S.conn.directWhy}` : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
     st.fec ? fecRow(st.fec, row) : null,
