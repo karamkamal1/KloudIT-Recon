@@ -168,6 +168,18 @@ type rsCfg struct {
 	// frame-queue rule and rung 1 judge the frame by them; delivery stays
 	// reliable (the parity's repairs are not modelled).
 	shards float64
+	// clientStall: the client's worker is busy until the returned time (0:
+	// it is not; nil: never): a frame that completes meanwhile is seen,
+	// and its delay measured, when the worker is free again, and the rate
+	// report waits as long; the browser's network stack, a process of its
+	// own, acknowledges the packets on time (the second hardware run's
+	// stage report: transfer p95 ~20 ms of frames whose p50 is 0.1 ms).
+	clientStall func(t time.Duration) time.Duration
+	// encJitter: the encoder's latency varies by up to this much more (a
+	// GPU the game keeps busy: encode p95 9.5 ms against p50 2.8 in the
+	// same report); frames leave it in order, so a late one holds back
+	// the next and they reach the session together.
+	encJitter time.Duration
 }
 
 func (c *rsCfg) ratio(r30, r2 float64, kbps int) float64 {
@@ -182,11 +194,14 @@ type rsFrame struct {
 	kind     string
 	capture  time.Duration
 	encDone  time.Duration
-	status   string // encoding, queued, holding, writing, sent, overflow, discarded, thinned, cancelled
-	sendAt   time.Duration
+	status   string        // encoding, queued, holding, writing, sent, overflow, discarded, thinned, cancelled
+	taken    time.Duration // frameSender took it from the frame queue
+	sendAt   time.Duration // its write began (after any window hold)
 	unsent   int
 	rcvBytes int
-	recv     time.Duration // complete at the client (0: never)
+	first    time.Duration // its first byte at the client
+	complete bool          // its last byte arrived
+	recv     time.Duration // complete at the client, as its worker sees it (0: never)
 	decoded  time.Duration
 }
 
@@ -315,6 +330,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 		nextCap   time.Duration
 		nextScene = time.Duration(-1)
 		rcDebt    float64
+		lastDone  time.Duration // the previous frame's encodeDone: the encoder finishes its frames in order
 	)
 	if c.sceneEvery > 0 {
 		nextScene = time.Duration(rng.ExpFloat64() * float64(c.sceneEvery))
@@ -387,6 +403,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 		nextReport  = 25 * time.Millisecond
 		cDecodeNext = 0
 		cMinRTT     = 2*c.owd + time.Millisecond
+		cWorker     []int // frames complete in the network stack, not yet taken by the worker
 	)
 	backDelay := func() time.Duration {
 		d := max(now+c.owd+time.Duration(rng.Float64()*float64(c.jitter)), lastBackArr)
@@ -561,6 +578,9 @@ func runRelaySim(c rsCfg) *rsTrace {
 		}
 		kind := "p"
 		lat := 2*time.Millisecond + time.Duration(rng.Float64()*float64(time.Millisecond))
+		if c.encJitter > 0 {
+			lat += time.Duration(rng.Float64() * float64(c.encJitter))
+		}
 		scene := nextScene >= 0 && t >= nextScene
 		if scene {
 			nextScene = t + time.Duration(rng.ExpFloat64()*float64(c.sceneEvery))
@@ -631,9 +651,11 @@ func runRelaySim(c rsCfg) *rsTrace {
 		pos++
 		seq++
 		n := max(200, int(size))
-		tr.frames = append(tr.frames, rsFrame{f: f, bytes: n + rsHdr, kind: kind, capture: t, encDone: t + lat, status: "encoding"})
+		done := max(t+lat, lastDone)
+		lastDone = done
+		tr.frames = append(tr.frames, rsFrame{f: f, bytes: n + rsHdr, kind: kind, capture: t, encDone: done, status: "encoding"})
 		fidx[f] = len(tr.frames) - 1
-		f.EncodeDoneUs = hostUs(t + lat)
+		f.EncodeDoneUs = hostUs(done)
 		encQ = append(encQ, len(tr.frames)-1)
 		if kind != "p" && kind != "still" {
 			logf("encoder: %s seq=%d bytes=%d (budget %.0f, %d kbps)", kind, f.Seq, n, budget, encKbps)
@@ -941,6 +963,9 @@ func runRelaySim(c rsCfg) *rsTrace {
 					sec.discarded++
 					continue
 				}
+				if frames, dur, why, ok := thin.ended(clock()); ok { // Session.thin
+					logf("thinning ended frames=%d duration=%v why=%s", frames, dur, why)
+				}
 				if c.svc && af.f.Discardable && !af.f.Key && !af.f.Recovery {
 					late := now-af.encDone >= time.Second/time.Duration(encFPS) // Session.thinPressure
 					if why, path := thinWhy(false, r.overTarget(), send.slow(clock()), len(frameQ), late); why != "" {
@@ -960,7 +985,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 				burst.note(of.deadline, clock()) // Session.sending
 				send.register(of)
 				snd = sender{state: 1, of: of, idx: idx, until: now + min(of.deadline-of.deadline/windowLead, maxWindowHold), since: now}
-				af.status = "holding"
+				af.status, af.taken = "holding", now
 				fallthrough
 			case 1:
 				of := snd.of
@@ -1091,16 +1116,28 @@ func runRelaySim(c rsCfg) *rsTrace {
 				continue
 			}
 			af := &tr.frames[p.frame]
+			if af.rcvBytes == 0 {
+				af.first = now
+			}
 			af.rcvBytes += p.payload
-			if af.rcvBytes >= wireOf(af.bytes) && af.recv == 0 && af.status == "sent" {
-				af.recv = now
-				sec.rcvBytes += af.bytes
-				cr.Frames++
-				cr.Bytes += uint32(af.bytes)
-				cOwd = append(cOwd, owdSample{now - af.encDone + cErr, af.f.Seq})
-				if !cHave || af.f.Seq > cr.LastSeq {
-					cr.Gen, cr.LastSeq, cHave = 1, af.f.Seq, true
-				}
+			if af.rcvBytes >= wireOf(af.bytes) && af.recv == 0 && !af.complete && af.status == "sent" {
+				af.complete = true
+				cWorker = append(cWorker, p.frame)
+			}
+		}
+		// The worker takes the complete frames when it is free.
+		busy := c.clientStall != nil && c.clientStall(now) > 0
+		for len(cWorker) > 0 && !busy {
+			idx := cWorker[0]
+			cWorker = cWorker[1:]
+			af := &tr.frames[idx]
+			af.recv = now
+			sec.rcvBytes += af.bytes
+			cr.Frames++
+			cr.Bytes += uint32(af.bytes)
+			cOwd = append(cOwd, owdSample{now - af.encDone + cErr, af.f.Seq})
+			if !cHave || af.f.Seq > cr.LastSeq {
+				cr.Gen, cr.LastSeq, cHave = 1, af.f.Seq, true
 			}
 		}
 		if cAckTimer > 0 && now >= cAckTimer {
@@ -1108,7 +1145,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 			cPending, cSinceAck, cAckTimer = nil, 0, 0
 		}
 		clientDecode()
-		if now >= nextReport {
+		if now >= nextReport && !busy {
 			nextReport = max(nextReport, now-25*time.Millisecond) + 25*time.Millisecond + time.Duration(rng.Float64()*float64(2*time.Millisecond))
 			cr.TimeMs = uint32(now.Milliseconds()) + 1
 			cr.Flags = 0
@@ -1732,6 +1769,18 @@ func TestRelaySimStaticDesktop(t *testing.T) {
 					}
 				}
 				mean := tr.meanApplied(2*time.Second, cfg.dur)
+				// At most 3 thinning episodes (the start's key frame among
+				// them), and one more for each stall of the link of 60 ms
+				// or more (wifiPauses: two in three): the frames that
+				// queued meanwhile go out at once after it, a discardable
+				// one or two of them left out. (Until the second hardware
+				// run the simulation counted only the first episode: it
+				// never ended one, as Session.thin does; 12-18 with the
+				// stalls then.)
+				maxThin := 3
+				if cfg.pause != nil {
+					maxThin += 2 * int(cfg.dur/(3*1700*time.Millisecond)+1)
+				}
 				capped, enc := 0, 0.0
 				for i, e := range tr.encoder {
 					enc += float64(e) / float64(len(tr.encoder))
@@ -1759,10 +1808,10 @@ func TestRelaySimStaticDesktop(t *testing.T) {
 					fail = fmt.Sprintf("last 10 s: target %.0f, %.1f fps; want %.0f, %.0f", tail, fps, c.minEnd*float64(cfg.ceiling), c.minFPS)
 				case tr.overflows > 0:
 					fail = fmt.Sprintf("%d frame-queue overflows %v", tr.overflows, tr.overflowWhy)
-				case tr.thinStarts > 3:
+				case tr.thinStarts > maxThin:
 					// The log's 347 thinning episodes (a start and an end
 					// line each) came with the overflow cycles.
-					fail = fmt.Sprintf("%d thinning episodes, want at most 3", tr.thinStarts)
+					fail = fmt.Sprintf("%d thinning episodes, want at most %d", tr.thinStarts, maxThin)
 				case hq > c.maxQueueP95 || hqMax > c.maxQueueMax || e2e > c.maxE2EP95:
 					fail = fmt.Sprintf("host queue p95 %v, max %v, end-to-end p95 %v; want under %v, %v, %v", hq, hqMax, e2e, c.maxQueueP95, c.maxQueueMax, c.maxE2EP95)
 				}
