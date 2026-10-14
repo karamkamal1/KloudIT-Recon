@@ -1125,10 +1125,11 @@ function onResize(w, h) {
 // A stream under bakeMinFps() (a still desktop: the PC repeats its last
 // picture ~10 times a second) gives no path enough samples: the bake-off
 // waits for it to move (a game, a video, the mouse) up to BAKE.giveUpMs,
-// then ends unmeasured. The main thread shows its start-up toolbar and
-// hints when the waiting begins ('bakeWaiting'), so measuring starts
-// BAKE.hintsMs after that at the earliest (the toolbar gone).
-const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, steadyMs: 1000, waitMs: 15000, giveUpMs: 60000, hintsMs: 3500 };
+// then ends unmeasured. The main thread shows its start-up toolbar (3 s)
+// and hints (the game-mode toast, 5 s) when the waiting begins
+// ('bakeWaiting'), so measuring starts BAKE.hintsMs after that at the
+// earliest (both gone).
+const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, steadyMs: 1000, waitMs: 15000, giveUpMs: 60000, hintsMs: 5500 };
 
 // The least frame rate that gives every path PICK.minDraw samples, with a
 // quarter to spare (15 fps).

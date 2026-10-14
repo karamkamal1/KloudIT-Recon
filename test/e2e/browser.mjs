@@ -472,10 +472,15 @@ async function checkBakeoff() {
     const bc0 = cpuTimes();
     // Until the result: the start-up toolbar or game-mode hint over the
     // canvas while the paths are measured? (Other toasts, e.g. a decoder
-    // warning on a loaded machine, are listed, not failed.)
+    // warning on a loaded machine, are listed, not failed.) They come with
+    // the result, or once the bake-off waits for a steady stream (a stream
+    // short of frames at the warm-up's end: then it measures after they
+    // have gone).
     const covered = [];
     const other = new Set();
     let samples = 0;
+    let waitHints = false;
+    let waits = 0;
     const cpuSecs = [[Date.now(), bc0]]; // the CPUs' times about every second of the bake-off
     const result = await until(async () => {
       if (Date.now() - cpuSecs[cpuSecs.length - 1][0] >= 1000) cpuSecs.push([Date.now(), cpuTimes()]);
@@ -485,8 +490,13 @@ async function checkBakeoff() {
       }));
       if (x.r) return x.r;
       if (x.bake && !x.bake.done && !x.bake.warming) {
-        samples++;
         const hint = x.toasts.some((t) => t.startsWith('Game mode'));
+        if (x.bake.waiting) {
+          waits++;
+          waitHints ||= x.bar || hint;
+          return null;
+        }
+        samples++;
         if (x.bar || hint) covered.push(`${x.bar ? 'toolbar ' : ''}${hint ? 'game-mode hint ' : ''}in slot ${x.bake.slot}`);
         for (const t of x.toasts) if (!t.startsWith('Game mode')) other.add(t);
       }
@@ -503,10 +513,11 @@ async function checkBakeoff() {
       bar: !document.getElementById('toolbar').classList.contains('hide'),
       toasts: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent),
     }));
-    check('renderer auto: the start-up toolbar and game-mode hint stay off the canvas while the bake-off measures and follow its result',
-      !!result && samples >= 5 && !covered.length && after.bar && after.toasts.some((t) => t.startsWith('Game mode')) && after.toasts.some((t) => t.startsWith('Renderer:')),
+    const hintsAfter = after.bar && after.toasts.some((t) => t.startsWith('Game mode'));
+    check('renderer auto: the start-up toolbar and game-mode hint stay off the canvas while the bake-off measures and follow its result (or come while it waits for a steady stream)',
+      !!result && samples >= 5 && !covered.length && (hintsAfter || waitHints) && after.toasts.some((t) => t.startsWith('Renderer:')),
       `${samples} samples while measuring${covered.length ? `, covered: ${covered.slice(0, 3).join('; ')}` : ''}${other.size ? `, other toasts: ${JSON.stringify([...other])}` : ''}; ` +
-        `after the result: toolbar ${after.bar ? 'shown' : 'hidden'}, toasts ${JSON.stringify(after.toasts)}`);
+        `${waits} samples waiting for a steady stream${waits ? ` (hints then: ${waitHints})` : ''}; after the result: toolbar ${after.bar ? 'shown' : 'hidden'}, toasts ${JSON.stringify(after.toasts)}`);
     // The winner takes over with its next frame, then the other canvases go.
     await until(() => page.evaluate(() => document.querySelectorAll('#stage canvas').length === 1), 5000, 'one canvas').catch(() => {});
     const bw = await rateWindow(1500); // stats updates from the winner
