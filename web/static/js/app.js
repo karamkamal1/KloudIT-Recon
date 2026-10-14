@@ -268,12 +268,13 @@ async function showCaps() {
   for (const [fam, v] of Object.entries(c.codecs)) {
     box.append(el('span', { class: `badge ${v === 'hw' ? 'good' : v ? '' : 'bad'}` }, `${fam.toUpperCase()} ${v === 'hw' ? 'HW' : v === 'sw' ? 'SW' : '✗'}`));
   }
-  // An old browser, or one without what the client uses (browser.js).
+  // An old browser, or one without what the client uses (browser.js): in
+  // orange where a gap costs latency.
   const info = browserInfo();
   const gaps = browserGaps();
   const notice = browserNotice(info, gaps);
-  box.append(el('span', { class: `badge ${notice ? 'warn' : ''}`, id: 'browser-badge', title: gaps.map((g) => `${g.name}: ${g.why}`).join('\n') || undefined }, info.label));
-  if (notice) box.append(el('p', { class: 'browser-notice', id: 'browser-notice' }, notice));
+  box.append(el('span', { class: `badge ${notice?.warn ? 'warn' : ''}`, id: 'browser-badge', title: gaps.map((g) => `${g.name}: ${g.why}`).join('\n') || undefined }, info.label));
+  if (notice) box.append(el('p', { class: `browser-notice${notice.warn ? ' warn' : ''}`, id: 'browser-notice' }, notice.text));
 }
 
 async function init() {

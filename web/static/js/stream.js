@@ -1227,18 +1227,20 @@ function fecRow(f, row) {
     `loss ${loss.toFixed(2)} % · rebuilt ${f.rebuilt} · repaired ${f.repaired} (${f.nacks} NACKs) · lost ${f.lost}`, f.lost ? 'warn' : '');
 }
 
-// This browser (browser.js) when it is older than the tested Chromium or
-// lacks what the tested Chromium has (its notice, the row's tooltip): the
-// overlay's row, with everything it lacks (also what the tested Chromium
-// lacks too, and RESET_STREAM_AT where the host says this connection did
-// not negotiate it). Not shown otherwise, so the overlay keeps its height.
+// This browser (browser.js) when it lacks what the tested Chromium has (an
+// old one: its notice is the row's tooltip; a current one on a platform
+// without it, e.g. Keyboard Lock on Android): the overlay's row, with
+// everything it lacks (also what the tested Chromium lacks too, and
+// RESET_STREAM_AT where the host says this connection did not negotiate
+// it), in orange where a gap costs latency. Not shown otherwise, so the
+// overlay keeps its height.
 function browserRow(st, row) {
   const b = S.browser;
-  if (!b?.notice) return null;
+  if (!b?.notice && !b?.gaps.some((g) => g.tested)) return null;
   const lacks = b.gaps.map((g) => g.name);
   if (st.resetStreamAt === false) lacks.push('RESET_STREAM_AT');
-  const r = row('Browser', `${b.info.label}${lacks.length ? ` · lacks ${lacks.join(', ')}` : ''}`, 'warn');
-  r.title = b.notice;
+  const r = row('Browser', `${b.info.label}${lacks.length ? ` · lacks ${lacks.join(', ')}` : ''}`, b.warn ? 'warn' : '');
+  if (b.notice) r.title = b.notice;
   return r;
 }
 
@@ -1824,7 +1826,8 @@ async function boot() {
   await me();
   const info = browserInfo();
   const gaps = browserGaps();
-  S.browser = { info, gaps, notice: browserNotice(info, gaps) };
+  const notice = browserNotice(info, gaps);
+  S.browser = { info, gaps, notice: notice?.text || '', warn: !!notice?.warn };
   const [caps, hz] = await Promise.all([capabilities(), measureHz()]);
   window.__caps = caps;
   S.hz = hz;
@@ -1833,9 +1836,10 @@ async function boot() {
   box.append(b(caps.webtransport, 'WebTransport'), b(caps.webcodecs, 'WebCodecs'), b(caps.isolated, 'Lock-free audio'), b(caps.webgpu, 'WebGPU'), el('span', { class: 'badge' }, `${hz} Hz display`));
   for (const [f, v] of Object.entries(caps.codecs)) if (v) box.append(el('span', { class: `badge ${v === 'hw' ? 'good' : ''}` }, `${f.toUpperCase()} ${v.toUpperCase()}`));
   // An old browser, or one without what the client uses (browser.js): said
-  // here, in the overlay and to the host's log.
-  box.append(el('span', { class: `badge ${S.browser.notice ? 'warn' : ''}`, id: 'browser-badge', title: S.browser.notice || undefined }, S.browser.info.label));
-  if (S.browser.notice) box.after(el('p', { class: 'browser-notice', id: 'browser-notice' }, S.browser.notice));
+  // here (in orange where a gap costs latency), in the overlay and to the
+  // host's log.
+  box.append(el('span', { class: `badge ${S.browser.warn ? 'warn' : ''}`, id: 'browser-badge', title: S.browser.notice || undefined }, S.browser.info.label));
+  if (S.browser.notice) box.after(el('p', { class: `browser-notice${S.browser.warn ? ' warn' : ''}`, id: 'browser-notice' }, S.browser.notice));
   if (!caps.webcodecs) {
     splash('Browser not supported', 'This browser lacks WebCodecs. Use a current Chrome, Edge, Firefox or Safari.', {});
     return;

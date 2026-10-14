@@ -2787,10 +2787,16 @@ async function checkDrawerKeyboard() {
 // (HDR10). Played in a second context with Chrome 122's user agent and
 // those two members removed from the page (the worker keeps its own; its
 // gaps are the page's, which it reports): the dashboard's "This browser"
-// card and the stream page's splash say how old it is, what it lacks and to
-// update it; the overlay has a Browser row; the host logs the browser and
-// what it lacks with the input latency. The browser the test runs (Chromium
-// 141, or E2E_CHROMIUM's) shows the notice only where it is older.
+// card and the stream page's splash say how old it is, what it lacks and
+// that an update brings it, as information (neither gap costs latency by
+// itself: no "lower latency" promise, no orange); the overlay has a Browser
+// row; the host logs the browser and what it lacks with the input latency.
+// The browser the test runs (Chromium 141, or E2E_CHROMIUM's) shows the
+// notice only where it is older. At unit level (browser.js on stand-in
+// globals): no notice for a Chromium without gaps however old, nor for a
+// current one lacking what its platform lacks (Keyboard Lock on Android);
+// "lower latency" and orange only for a gap that costs it (WebTransport);
+// "1 version".
 const CHROME_122_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.128 Safari/537.36';
 async function checkOldBrowser() {
   await page.goto(`${base}/`);
@@ -2798,8 +2804,30 @@ async function checkOldBrowser() {
   const own = await page.evaluate(() => ({ badge: document.getElementById('browser-badge')?.textContent, notice: document.getElementById('browser-notice')?.textContent || null }));
   const major = +(/(\d+)/.exec(browser.version()) || [])[1];
   check(`old browser: the dashboard names this browser (${browser.version()}) and gives the notice only where it is older than Chromium 141`,
-    own.badge === `Chrome ${major}` && (major < 141 ? /versions older than Chromium 141.*Update Chrome for lower latency/.test(own.notice || '') : own.notice === null),
+    own.badge === `Chrome ${major}` && (major < 141 ? /versions? older than Chromium 141/.test(own.notice || '') : own.notice === null),
     JSON.stringify(own));
+  const units = await page.evaluate(async () => {
+    const B = await import('/js/browser.js');
+    const ua = (v, os = 'Windows NT 10.0; Win64; x64') => `Mozilla/5.0 (${os}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v}.0.0.0 Safari/537.36`;
+    const C = function () {};
+    const proto = (...m) => { const f = function () {}; for (const k of m) f.prototype[k] = undefined; return f; };
+    const all = {
+      WebTransport: C, VideoDecoder: C, onpointerrawupdate: null, OffscreenCanvasRenderingContext2D: proto('getContextAttributes'),
+      GPUCanvasContext: proto('getConfiguration'), WebTransportSendStream: proto(), navigator: { gpu: {}, keyboard: { lock() {} } },
+    };
+    const n = (v, g, os) => B.browserNotice(B.browserInfo(ua(v, os)), B.browserGaps(g));
+    return {
+      'Chrome 140 without gaps': n(140, all),
+      'Chrome 150 on Android without Keyboard Lock': n(150, { ...all, navigator: { gpu: {} } }, 'Linux; Android 14; Pixel 8'),
+      'Chrome 140 without the 2D canvas report': n(140, { ...all, OffscreenCanvasRenderingContext2D: proto() }),
+      'Chrome 96 without WebTransport': n(96, { ...all, WebTransport: undefined }),
+    };
+  });
+  const u = Object.values(units);
+  check('old browser (unit): no notice without a gap an update closes; "lower latency" and orange only for a gap that costs it',
+    u[0] === null && u[1] === null && u[2]?.warn === false && /^Chrome 140 is 1 version older than .*; it lacks the 2D canvas's low-latency report .*\. Updating Chrome brings it\.$/.test(u[2]?.text || '') &&
+      u[3]?.warn === true && /^Chrome 96 is 45 versions older .* lacks WebTransport\. Update Chrome for lower latency\.$/.test(u[3]?.text || ''),
+    Object.entries(units).map(([k, v]) => `${k}: ${v ? `${v.warn ? '[warn] ' : ''}${v.text}` : 'none'}`).join(' | '));
   const old = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 }, userAgent: CHROME_122_UA, storageState: await ctx.storageState() });
   await old.addInitScript(() => {
     delete OffscreenCanvasRenderingContext2D.prototype.getContextAttributes;
@@ -2816,9 +2844,9 @@ async function checkOldBrowser() {
     await p.goto(`${base}/`);
     await p.waitForSelector('#browser-notice', { timeout: 10000 });
     const dash = await p.evaluate(() => ({ badge: document.getElementById('browser-badge')?.textContent, cls: document.getElementById('browser-badge')?.className, notice: document.getElementById('browser-notice')?.textContent }));
-    const want = /^Chrome 122 is \d+ versions older than Chromium 141, which this client is tested with; it lacks the 2D canvas's low-latency report \(getContextAttributes in the worker\)(, HDR canvas output \(GPUCanvasContext\.getConfiguration\))?\. Update Chrome for lower latency\.$/;
-    check('old browser (Chrome 122 emulated): the dashboard says how old it is, what it lacks of what the client uses and to update it',
-      dash.badge === 'Chrome 122' && /warn/.test(dash.cls) && want.test(dash.notice || ''), JSON.stringify(dash));
+    const want = /^Chrome 122 is \d+ versions older than Chromium 141, which this client is tested with; it lacks the 2D canvas's low-latency report \(getContextAttributes in the worker\)(, HDR canvas output \(GPUCanvasContext\.getConfiguration\))?\. Updating Chrome brings (them|it)\.$/;
+    check('old browser (Chrome 122 emulated): the dashboard says how old it is, what it lacks of what the client uses and that an update brings it (information: no latency promise)',
+      dash.badge === 'Chrome 122' && !/warn/.test(dash.cls) && want.test(dash.notice || ''), JSON.stringify(dash));
     const log0 = hostProc.log.length;
     await p.evaluate((pr) => localStorage.setItem('recon.prefs.v1', JSON.stringify(pr)), { stats: true, ...PREFS_2D, path: 'auto', transport: 'auto' });
     await p.click('.host.online a.btn-primary');
@@ -3209,8 +3237,9 @@ async function checkHardwareDecoderFailure() {
 // sync has settled (pings after the first video frame) and its error bound
 // is small; the pings carried the minimum round trip once a second at most
 // (the host's FEC auto mode decides after five of them, a span of seconds,
-// though the client pings every 250 ms). The first scenario also checks that the host logs the client's
-// input report (every 10 s) with the mouse and key rows and the clock sync.
+// though the client pings every 250 ms). The first scenario also checks
+// that the host logs the client's input report (every 10 s) with the mouse
+// and key rows and the clock sync.
 async function checkInputLatency(name, hostProc, log0) {
   // More mouse motion, 80 ms apart (one marked datagram per 50 ms): one
   // datagram or its acknowledgement lost on this loaded machine must not

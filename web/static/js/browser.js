@@ -8,7 +8,10 @@
 // build): a gap it does not have is one an update closes, verified (Chrome
 // for Testing 122 against it; docs/VENDOR_NOTES.md, "Second hardware run:
 // browser presentation and input latency"). A gap it has too (tested:
-// false) is listed in the overlay, not offered as a reason to update.
+// false) is listed in the overlay, not offered as a reason to update. A gap
+// is marked latency only where going without it costs latency by itself
+// (TCP's head-of-line blocking, mouse motion held to the next frame), not
+// where it only hides a report.
 
 export const TESTED = { name: 'Chromium', major: 141 };
 
@@ -38,7 +41,7 @@ export function browserGaps(g = globalThis) {
   if (!('onpointerrawupdate' in g)) add('pointerrawupdate', 'raw mouse events (pointerrawupdate)', 'mouse motion waits for the next animation frame, up to a display refresh', true);
   if (typeof g.OffscreenCanvasRenderingContext2D === 'function' && !proto(g, 'OffscreenCanvasRenderingContext2D', 'getContextAttributes')) {
     add('canvas2d-attributes', "the 2D canvas's low-latency report (getContextAttributes in the worker)",
-      'the 2D canvas cannot say whether it got low-latency (desynchronized) presentation, which Renderer Auto weighs', true);
+      'the 2D canvas cannot say whether it got low-latency (desynchronized) presentation; Renderer Auto ranks it after a context that reports it granted', false);
   }
   if (!g.navigator?.gpu) add('webgpu', 'WebGPU', 'no zero-copy renderer, no FSR upscaling, no HDR10', false);
   else if (typeof g.GPUCanvasContext === 'function' && !proto(g, 'GPUCanvasContext', 'getConfiguration')) {
@@ -52,17 +55,27 @@ export function browserGaps(g = globalThis) {
 }
 
 /**
- * The notice for an old Chromium-based browser, or for any browser with
- * gaps the tested Chromium does not have ('' when none is due): what it
- * lacks, and the way out (update it; another engine: Chrome or Edge).
+ * The notice for this browser ({ text, warn }, or null when none is due):
+ * for a Chromium-based browser older than the tested one that lacks what the
+ * tested one has, what an update brings; for another engine that lacks it,
+ * that Chrome or Edge has it. Lower latency is promised (and warn set) only
+ * where a gap costs latency by itself. A current browser's own gaps (Keyboard
+ * Lock on Android, what the tested Chromium lacks too) are no reason to
+ * update: the overlay's Browser row lists them.
  */
 export function browserNotice(info, gaps) {
-  const old = info.chromium > 0 && info.chromium < TESTED.major;
   const fix = gaps.filter((x) => x.tested);
-  if (!old && !fix.length) return '';
-  const head = old ? `${info.label} is ${TESTED.major - info.chromium} versions older than ${TESTED.name} ${TESTED.major}, which this client is tested with` : info.label;
-  const lacks = fix.length ? `${old ? '; it' : ''} lacks ${fix.map((x) => x.name).join(', ')}` : '';
-  const way = info.chromium > 0 ? `Update ${info.name === 'Browser' ? 'the browser' : info.name} for lower latency.`
-    : `Chrome or Edge (${TESTED.name} ${TESTED.major} or newer) has ${fix.length > 1 ? 'them' : 'it'}.`;
-  return `${head}${lacks}. ${way}`;
+  const old = info.chromium > 0 && info.chromium < TESTED.major;
+  if (!fix.length || (info.chromium > 0 && !old)) return null;
+  const warn = fix.some((x) => x.latency);
+  const lacks = `lacks ${fix.map((x) => x.name).join(', ')}`;
+  const them = fix.length > 1 ? 'them' : 'it';
+  if (!old) return { text: `${info.label} ${lacks}. Chrome or Edge (${TESTED.name} ${TESTED.major} or newer) has ${them}.`, warn };
+  const k = TESTED.major - info.chromium;
+  const name = info.name === 'Browser' ? 'the browser' : info.name;
+  return {
+    text: `${info.label} is ${k} version${k === 1 ? '' : 's'} older than ${TESTED.name} ${TESTED.major}, which this client is tested with; it ${lacks}. ` +
+      (warn ? `Update ${name} for lower latency.` : `Updating ${name} brings ${them}.`),
+    warn,
+  };
 }
