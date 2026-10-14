@@ -14,6 +14,12 @@ func Monitors() ([]Monitor, error) {
 // RemoteSession is false outside Windows.
 func RemoteSession() bool { return false }
 
+// DesktopState knows nothing outside Windows: the desktop is never away.
+func DesktopState() Desktop { return Desktop{} }
+
+// ConnectToConsole is unsupported outside Windows.
+func ConnectToConsole() error { return ErrUnsupported }
+
 // D3D11VideoDevice is unsupported outside Windows.
 func D3D11VideoDevice() error { return ErrUnsupported }
 

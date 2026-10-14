@@ -98,7 +98,10 @@ type Session struct {
 	liveSinceNote bool
 	gpuWatch      atomic.Bool    // watchGPUCapture runs
 	gdiWatch      atomic.Bool    // watchGDIDisplay runs
-	watches       sync.WaitGroup // those two (they end with the session's context; tests wait)
+	watches       sync.WaitGroup // those two and watchDesktop (they end with the session's context; tests wait)
+	// desk: whether the session's Windows desktop is on a screen to capture
+	// (desktop.go: locked, a secure desktop, disconnected).
+	desk deskState
 
 	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
 	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()
@@ -411,6 +414,10 @@ func (s *Session) run() error {
 	go s.videoEvents()
 	if s.fec.avail {
 		go s.fecRepairs()
+	}
+	if watchDesktops {
+		s.prepareDesktop() // a session a remote desktop client left disconnected: to the console first
+		s.watchDesktop()
 	}
 	if err := s.startVideo(false, ""); err != nil {
 		s.notice("error", "Could not start video: "+err.Error())
@@ -1741,7 +1748,9 @@ func (s *Session) encoderLive() {
 const maxVideoFailures = 6
 
 // handleEncoderFailure handles a failure event (ev.Err) of the video manager.
-// Only a generation that failed to start because of its encoder counts
+// A generation that failed while the session's desktop is away (locked, a
+// secure desktop, disconnected: awaitDesktop) waits for it and counts for
+// nothing. Only a generation that failed to start because of its encoder counts
 // against the encoder (encoderFailed). A generation that had gone live, or
 // whose capture source failed, does not: a capture outage of a few seconds
 // (a UAC prompt, the lock screen, a display mode change) fails every restart
@@ -1757,6 +1766,9 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	err := ev.Err
 	s.failures++
 	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live, "encoder_fault", ev.EncoderFault)
+	if s.awaitDesktop(ev) {
+		return // the session's desktop is away (locked, disconnected): the video restarts when it is back
+	}
 	gdi := s.captureFailed(ev)
 	if gdi {
 		s.failures = 0 // GDI is a capture of its own: its restarts start afresh, the first at once

@@ -129,6 +129,12 @@ type Config struct {
 	// caps allow it). Frames still go out whole: the host's latency stages
 	// measure when the first slice was ready (host_encode_first_slice).
 	SliceOutput int `json:"sliceOutput,omitempty"`
+	// ConsoleSession "auto" ("" = auto) moves this Windows session to the
+	// console when a stream finds it disconnected (a remote desktop client
+	// closed it: nothing draws its desktop), as "tscon <session>
+	// /dest:console" does, unless another user is signed in at the console
+	// (desktop.go); "off": never, the stream waits for the user to do it.
+	ConsoleSession string `json:"consoleSession,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -261,7 +267,7 @@ func LoadConfig(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("%s: helperLibavcodec must be %q or %q, not %q", path, libavcodecAuto, libavcodecOff, c.HelperLibavcodec)
 	}
-	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}} {
+	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}, {"consoleSession", c.ConsoleSession}} {
 		if v.val != "" && v.val != settingAuto && v.val != settingOff {
 			return nil, fmt.Errorf("%s: %s must be %q or %q, not %q", path, v.key, settingAuto, settingOff, v.val)
 		}

@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"os"
 	"testing"
 	"time"
 	"unsafe"
@@ -110,4 +111,14 @@ func TestD3D11VideoDevice(t *testing.T) {
 	start := time.Now()
 	err = D3D11VideoDevice()
 	t.Logf("D3D11 video device: %v (%v)", err, time.Since(start).Round(time.Microsecond))
+}
+
+// TestDesktopState reads this session's state and input desktop: at an
+// unlocked console (and under Wine) the desktop is there.
+func TestDesktopState(t *testing.T) {
+	d := DesktopState()
+	t.Logf("desktop %+v away %q", d, d.Away())
+	if os.Getenv("RECON_TEST_DESKTOP_AWAY") == "" && d.Away() != "" {
+		t.Fatalf("the desktop is away (%s): run this at an unlocked, connected desktop", d.Away())
+	}
 }
