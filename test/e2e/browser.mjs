@@ -3207,7 +3207,9 @@ async function checkHardwareDecoderFailure() {
 // shared by the encoder, the decoder and other work, and every part waits
 // for one). The clock
 // sync has settled (pings after the first video frame) and its error bound
-// is small. The first scenario also checks that the host logs the client's
+// is small; the pings carried the minimum round trip once a second at most
+// (the host's FEC auto mode decides after five of them, a span of seconds,
+// though the client pings every 250 ms). The first scenario also checks that the host logs the client's
 // input report (every 10 s) with the mouse and key rows and the clock sync.
 async function checkInputLatency(name, hostProc, log0) {
   // More mouse motion, 80 ms apart (one marked datagram per 50 ms): one
@@ -3240,10 +3242,11 @@ async function checkInputLatency(name, hostProc, log0) {
   const acks = c ? `; marked ${c.marked}, acknowledged ${c.acked}, unacknowledged in 5 s ${c.expired} (of them late ${c.late})` : '';
   const ok = (r) => !!r && r.n >= 1 && r.p50 > -2 && r.p95 < 1000;
   check(`${name}: input latency measured (browser event -> injected on the host: mouse, keys; parts; clock sync settled)`,
-    !!st?.inputAcks && ok(x?.mouse) && ok(x?.keys) && x.client?.p50 >= 0 && x.host?.p50 >= 0 && x.rtt_half?.p50 > 0 && !!st.clock?.settled && st.clock.boundMs < 50,
+    !!st?.inputAcks && ok(x?.mouse) && ok(x?.keys) && x.client?.p50 >= 0 && x.host?.p50 >= 0 && x.rtt_half?.p50 > 0 && !!st.clock?.settled && st.clock.boundMs < 50 &&
+      st.clock.rttReports >= 1 && st.clock.rttReports <= st.clock.sinceS + 1.5,
     x ? `mouse ${x.mouse?.p50}/${x.mouse?.p95} ms (n ${x.mouse?.n}), keys ${x.keys?.p50}/${x.keys?.p95} (n ${x.keys?.n}); parts p50: browser ${x.client?.p50}, ` +
       `network ${x.network?.p50}, host ${x.host?.p50}, rtt/2 ${x.rtt_half?.p50}; clock ±${st.clock?.boundMs} ms (RTT ${st.clock?.minRttMs} ms, age ${st.clock?.ageS} s, ` +
-      `${st.clock?.samples} pings, settled ${st.clock?.settled})${acks}` : `no input figure (acknowledgements ${st?.inputAcks}${acks})`);
+      `${st.clock?.samples} pings, settled ${st.clock?.settled}; min RTT in ${st.clock?.rttReports} pings over ${st.clock?.sinceS} s)${acks}` : `no input figure (acknowledgements ${st?.inputAcks}${acks})`);
   results.push({ inputLatency: { scenario: name, input: x || null, clock: st?.clock || null } });
   if (name !== 'WebTransport direct') return;
   // The first report with both (one from before the key presses has only the mouse).

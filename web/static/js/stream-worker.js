@@ -93,7 +93,7 @@ const FAMILY_NAMES = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
 // does not read the correction as a change of the path's delay. best: the
 // sample the offset is from; streamAt: when the first video frame arrived,
 // settleN: pongs to pings sent since (see Clock synchronisation).
-const clock = { offset: null, first: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0, best: null, streamAt: 0, settleN: 0, firstPongAt: 0 };
+const clock = { offset: null, first: null, samples: [], pingId: 0, pings: new Map(), rtt: 0, minRtt: 0, best: null, streamAt: 0, settleN: 0, firstPongAt: 0, rttSentAt: -Infinity, rttReports: 0 };
 
 const stats = {
   frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0,
@@ -234,8 +234,16 @@ const AUDIO_MAX_LATE = 64;
 // (the first hardware runs: report_owd_p50 of ~120 ms in host.log on a LAN,
 // a first offset ~115 ms off). Until then the reports carry no delays; frame
 // acks and the stage stats use the offset of the moment.
+//
+// The minimum round trip goes to the host in one ping per RTT_REPORT_MS at
+// most (the others carry none): the host's FEC auto mode decides after five
+// of them (internal/host/fec.go fecRTTReports), a span of seconds that keeps
+// a loaded browser's slow first pongs (decoder start, the renderer
+// bake-off's contexts) out of a LAN's decision, as at the 1 s ping cadence
+// the gate was set for; the audio frame size follows it too (step 4.6).
 
 const PING_MS = 250;
+const RTT_REPORT_MS = 1000;
 const CLOCK_WINDOW_MS = 30000;
 const CLOCK_DRIFT = 1e-4;
 const CLOCK_SWITCH_MS = 0.05;
@@ -250,12 +258,17 @@ function hostToLocal(us) {
 const clockBound = (x, t) => x.rtt / 2 + CLOCK_DRIFT * (t - x.at);
 
 // The clock sync's quality for the overlay and the host log: the round trip
-// of the sample in use, its bound and age now, the pongs in the window.
+// of the sample in use, its bound and age now, the pongs in the window; and
+// the pings that carried the minimum round trip since the first pong (sinceS
+// ago; at most one a second: RTT_REPORT_MS).
 function clockQuality() {
   const b = clock.best;
   if (!b) return null;
   const t = now();
-  return { minRttMs: +b.rtt.toFixed(2), boundMs: +clockBound(b, t).toFixed(2), ageS: +((t - b.at) / 1000).toFixed(1), samples: clock.samples.length, settled: clock.first !== null };
+  return {
+    minRttMs: +b.rtt.toFixed(2), boundMs: +clockBound(b, t).toFixed(2), ageS: +((t - b.at) / 1000).toFixed(1), samples: clock.samples.length, settled: clock.first !== null,
+    rttReports: clock.rttReports, sinceS: +((t - clock.firstPongAt) / 1000).toFixed(1),
+  };
 }
 
 // The first video frame arrived: the host's datagram loop runs by now.
@@ -272,8 +285,14 @@ function sendPing() {
   clock.pings.set(id, t0);
   if (clock.pings.size > 20) clock.pings.delete(clock.pings.keys().next().value);
   // The minimum RTT of the last 30 s tells the host whether this is a LAN
-  // (5 ms Opus frames) or a WAN (10 ms; step 4.6).
-  transport.sendDatagram(P.ping(id, t0, clock.minRtt));
+  // (5 ms Opus frames) or a WAN (10 ms; step 4.6), and FEC auto whether to
+  // send video as datagrams: once per RTT_REPORT_MS.
+  const report = clock.minRtt > 0 && t0 - clock.rttSentAt >= RTT_REPORT_MS;
+  if (report) {
+    clock.rttSentAt = t0;
+    clock.rttReports++;
+  }
+  transport.sendDatagram(P.ping(id, t0, report ? clock.minRtt : 0));
 }
 
 function onPong(d) {
