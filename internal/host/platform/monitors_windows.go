@@ -119,7 +119,13 @@ func refreshRate(device []uint16) int {
 	if r, _, _ := procEnumDisplaySettingsW.Call(uintptr(unsafe.Pointer(&device[0])), enumCurrentSettings, uintptr(unsafe.Pointer(&dm[0]))); r == 0 {
 		return 0
 	}
-	return int(*(*uint32)(unsafe.Pointer(&dm[184]))) // dmDisplayFrequency
+	// dmDisplayFrequency; 0 and 1 mean the hardware's default rate (display-
+	// only adapters of VMs report them): unknown, not a 1 Hz display that
+	// would cap a stream's frame rate at its floor.
+	if hz := int(*(*uint32)(unsafe.Pointer(&dm[184]))); hz > 1 {
+		return hz
+	}
+	return 0
 }
 
 type comObj struct{ vtbl *[64]uintptr }

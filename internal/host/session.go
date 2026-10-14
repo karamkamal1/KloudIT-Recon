@@ -3041,7 +3041,7 @@ func (s *Session) gamepad(g proto.Gamepad) {
 	pads := s.a.gamepads()
 	if pads == nil {
 		s.padWarn.Do(func() {
-			s.notice("warn", "Gamepad detected, but the host has no ViGEmBus driver installed — controller input is disabled.")
+			s.notice("info", "Gamepad detected, but the host has no ViGEmBus driver installed — controller input is disabled.")
 		})
 		return
 	}
