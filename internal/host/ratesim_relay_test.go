@@ -180,6 +180,9 @@ type rsCfg struct {
 	// same report); frames leave it in order, so a late one holds back
 	// the next and they reach the session together.
 	encJitter time.Duration
+	// noBursts: the media controller paces at the pacing rate only
+	// (cc.Media.SetBursts): what a path does without the frame bursts.
+	noBursts bool
 }
 
 func (c *rsCfg) ratio(r30, r2 float64, kbps int) float64 {
@@ -256,6 +259,10 @@ type rsTrace struct {
 	applied        []int     // the encoder's target at each rate tick
 	decoded        []float64 // frames decoded each second
 	secs           []string  // per-second summary
+	// overflowed: packets the bottleneck's full queue dropped; media: the
+	// media controller's counters at the end.
+	overflowed int
+	media      cc.MediaStats
 }
 
 func runRelaySim(c rsCfg) *rsTrace {
@@ -289,6 +296,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 	rtt := &rsRTT{}
 	m := cc.NewMedia(rtt, rsMDS)
 	m.SetClock(func() congestion.Time { return mono(now) })
+	m.SetBursts(!c.noBursts)
 	audio := c.audioKbps
 	// encKbps: the encoder's bitrate (under the static-desktop cap: below
 	// the rate controller's target ctlKbps).
@@ -980,6 +988,9 @@ func runRelaySim(c rsCfg) *rsTrace {
 					}
 				}
 				setCC()
+				if af.f.Key || af.f.Recovery {
+					m.SkipProbe() // Session.frameSender
+				}
 				of := &outFrame{f: af.f, n: num, opened: clock(), deadline: frameDeadline(time.Second/time.Duration(encFPS), wireOf(af.bytes), videoPacing().rate),
 					gone: make(chan struct{}), held: true}
 				burst.note(of.deadline, clock()) // Session.sending
@@ -1051,6 +1062,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 			m.OnPacketSent(mono(now), congestion.ByteCount(inflight), congestion.PacketNumber(p.pn), congestion.ByteCount(p.size), true)
 			if c.capQueue > 0 && linkFree-now > c.capQueue {
 				p.dropped = true
+				tr.overflowed++
 				continue // the bottleneck's queue is full
 			}
 			if c.pause != nil {
@@ -1179,6 +1191,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 			sec = secStat{}
 		}
 	}
+	tr.media = m.Stats()
 	return tr
 }
 

@@ -2541,6 +2541,14 @@ func (s *Session) frameSender() {
 		if f.Key {
 			s.sendKey.Store(keyMark(f.Gen, f.Seq))
 		}
+		if f.Key || f.Recovery {
+			// No probe for the bursts in this frame's train (cc.Media):
+			// on a path not much faster than the pacing rate its queue
+			// would delay the frame the picture waits for.
+			if m := transport.MediaControl(s.c); m != nil {
+				m.SkipProbe()
+			}
+		}
 		// Datagram shards (fec.go). They bypass the stream path below;
 		// sendFEC puts them through the video window (GUIDE 2.7) itself
 		// (fec.go, "Send priorities").
