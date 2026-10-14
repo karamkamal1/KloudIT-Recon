@@ -753,7 +753,10 @@ func pct(s []time.Duration, p float64) time.Duration { return s[int(p*float64(le
 
 // goodputSeries runs a bulk transfer from the host end (send) to the browser
 // end (recv) for d and returns the received rate per 100 ms (bit/s), without
-// the first second.
+// the first second. A stream or connection that ends before d (the sender
+// ends the stream at d of its own clock, which starts a little earlier) is
+// an error, not a rate of 0 for the rest of the run: a quic-go receiver,
+// for one, closes a connection whose stream holds more than 1000 gaps.
 func goodputSeries(ctx context.Context, send, recv *quic.Conn, target int64, d time.Duration) ([]float64, error) {
 	if m := transport.MediaControl(transport.FromQUIC(send)); m != nil && target > 0 {
 		m.SetTarget(target, time.Second/60)
@@ -783,17 +786,25 @@ func goodputSeries(ctx context.Context, send, recv *quic.Conn, target int64, d t
 	start := time.Now()
 	counts := make([]int64, int(d/bucket)+1)
 	buf := make([]byte, 64<<10)
+	var early error
 	for {
 		n, err := s.Read(buf)
-		if k := int(time.Since(start) / bucket); k < len(counts) {
+		at := time.Since(start)
+		if k := int(at / bucket); k < len(counts) {
 			counts[k] += int64(n)
 		}
-		if err != nil || time.Since(start) > d {
+		if err != nil && at < d-bucket {
+			early = fmt.Errorf("the stream ended after %v: %w", at.Round(time.Millisecond), err)
+		}
+		if err != nil || at > d {
 			break
 		}
 	}
 	s.CancelRead(0)
 	<-errc
+	if early != nil {
+		return nil, early
+	}
 	var out []float64
 	for _, c := range counts[int(time.Second/bucket) : len(counts)-1] {
 		out = append(out, float64(c)*8/bucket.Seconds())
@@ -838,13 +849,14 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 		}
 	}()
 	r := newTestRelay(t, 4)
-	viaRelay := func(t *testing.T) *net.UDPAddr {
+	relay := func(t *testing.T) *allocation {
 		a := allocate(t, r, "u")
 		if err := host.bind(t, a, a.token); err != nil {
 			t.Fatal(err)
 		}
-		return a.addr()
+		return a
 	}
+	viaRelay := func(t *testing.T) *net.UDPAddr { return relay(t).addr() }
 	direct := host.tr.Conn.LocalAddr().(*net.UDPAddr)
 	// dial connects a browser to addr and returns both ends.
 	dial := func(t *testing.T, addr *net.UDPAddr) (browser, hostEnd *quic.Conn) {
@@ -889,24 +901,47 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 		t.Errorf("the relay adds %v to the median round trip, want < 2 ms", added)
 	}
 
-	// 2. Bulk throughput on clean loopback (NewReno both ways is not involved:
-	// the host runs media at a target far above what loopback carries).
-	const fast = 2_000_000_000
-	for _, path := range []string{"direct", "udp relay"} {
+	// 2. Bulk throughput on clean loopback: the relay carries a stream as
+	// fast as the host sends one at a high setting, as the direct path does,
+	// and drops none of it. The media controller paces a bulk sender at
+	// 1.2 x its target, and nothing lowers the target here (no rate
+	// controller): bulkTarget's 600 Mbit/s of pacing is twice that of the
+	// host's highest default setting (maxKbps 250 Mbit/s) and under the
+	// forwarder's own limit (relayDownRate). A target above that limit
+	// measures the overrun, not the relay: the forwarder drops what exceeds
+	// its limit (at 2 Gbit/s one datagram in two, finely interleaved), and
+	// a quic-go receiver closes a connection whose one stream holds more
+	// than 1000 gaps within a second (docs/VENDOR_NOTES.md "Merged second
+	// hardware run: the UDP relay under overload"). TestUDPRelayOverrun has
+	// the overrun.
+	const bulkTarget = 500_000_000
+	var bulk [2]float64
+	for i, path := range []string{"direct", "udp relay"} {
 		addr := direct
+		var a *allocation
 		if path != "direct" {
-			addr = viaRelay(t)
+			a = relay(t)
+			addr = a.addr()
 		}
 		b, h := dial(t, addr)
-		s, err := goodputSeries(ctx, h, b, fast, 2*time.Second)
+		s, err := goodputSeries(ctx, h, b, bulkTarget, 2*time.Second)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("loopback bulk, %s: %v", path, err)
 		}
-		st := summarize(s)
-		t.Logf("loopback bulk, %s: %.0f Mbit/s", path, st.mean/1e6)
-		if st.mean < 50e6 {
-			t.Errorf("%s: %.0f Mbit/s on loopback", path, st.mean/1e6)
+		bulk[i] = summarize(s).mean
+		if a == nil {
+			t.Logf("loopback bulk, %s: %.0f Mbit/s", path, bulk[i]/1e6)
+			continue
 		}
+		t.Logf("loopback bulk, %s: %.0f Mbit/s (%d datagrams to the browser, %d dropped, %d dropped by the kernel)",
+			path, bulk[i]/1e6, a.stats.PktToBrowser.Load(), a.stats.Dropped.Load(), a.stats.SocketDrops.Load())
+		if n := a.stats.Dropped.Load(); n > 0 {
+			t.Errorf("the relay dropped %d datagrams at %d Mbit/s of pacing, under its limit of %d", n, bulkTarget*6/5/1_000_000, relayDownRate*8/1_000_000)
+		}
+	}
+	if bulk[1] < 0.8*bulk[0] || bulk[0] < 50e6 {
+		t.Errorf("loopback bulk at a %d Mbit/s target: udp relay %.0f Mbit/s, direct %.0f Mbit/s: want the relay within 20 %% of the direct path",
+			bulkTarget/1_000_000, bulk[1]/1e6, bulk[0]/1e6)
 	}
 
 	// 3. A lossy browser leg (20 ms each way, 1 % loss each way, like the netem
