@@ -2522,7 +2522,7 @@ function onControl(m) {
 // browser's name and gaps, which it logs.
 
 const INPUT_MARK_MS = 50;
-const INPUT_PENDING_MS = 2000;
+const INPUT_PENDING_MS = 5000;
 const INPUT_WINDOW_MS = 10000;
 const INPUT_REPORT_MS = 10000;
 const inLat = { on: false, n: 0, pending: new Map(), lastMark: {}, recs: [], lastReport: now(), browser: '', lacks: [] };

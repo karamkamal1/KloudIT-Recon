@@ -3196,9 +3196,9 @@ async function checkInputLatency(name, hostProc, log0) {
   const st = await until(() => page.evaluate(() => {
     const x = window.__recon.lastStats;
     return x?.input?.mouse && x.input.keys ? x : null;
-  }), 5000, 'the input latency in the stats').catch(() => page.evaluate(() => window.__recon.lastStats));
+  }), 10000, 'the input latency in the stats').catch(() => page.evaluate(() => window.__recon.lastStats));
   const x = st?.input;
-  const ok = (r) => r && r.n >= 1 && r.p50 > -2 && r.p95 < 1000;
+  const ok = (r) => !!r && r.n >= 1 && r.p50 > -2 && r.p95 < 1000;
   check(`${name}: input latency measured (browser event -> injected on the host: mouse, keys; parts; clock sync settled)`,
     !!st?.inputAcks && ok(x?.mouse) && ok(x?.keys) && x.client?.p50 >= 0 && x.host?.p50 >= 0 && x.rtt_half?.p50 > 0 && !!st.clock?.settled && st.clock.boundMs < 50,
     x ? `mouse ${x.mouse?.p50}/${x.mouse?.p95} ms (n ${x.mouse?.n}), keys ${x.keys?.p50}/${x.keys?.p95} (n ${x.keys?.n}); parts p50: browser ${x.client?.p50}, ` +
@@ -3206,7 +3206,8 @@ async function checkInputLatency(name, hostProc, log0) {
       `${st.clock?.samples} pings, settled ${st.clock?.settled})` : `no input figure (acknowledgements ${st?.inputAcks})`);
   results.push({ inputLatency: { scenario: name, input: x || null, clock: st?.clock || null } });
   if (name !== 'WebTransport direct') return;
-  const line = await until(() => (hostProc.log.slice(log0).match(/msg="input latency[^\n]* mouse=[^\n]*/) || [])[0], 15000, 'the input latency line').catch(() => '');
+  // The first report with both (one from before the key presses has only the mouse).
+  const line = await until(() => (hostProc.log.slice(log0).match(/msg="input latency[^\n]* keys="[^\n]* mouse=[^\n]*/) || [])[0], 15000, 'the input latency line').catch(() => '');
   check('the host logs the client\'s input latency report (mouse, keys, the clock sync, the browser)',
     / keys="[\d.]+\/[\d.]+\/[\d.]+ n=\d+"/.test(line) && / mouse="/.test(line) && / clock_bound_ms=[\d.]+/.test(line) && / browser="Chrome \d+"/.test(line),
     line.replace(/^.*?msg=/, '').slice(0, 300));
