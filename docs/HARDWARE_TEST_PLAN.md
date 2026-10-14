@@ -813,6 +813,91 @@ Use a client with an AMD GPU. Each item's exact steps are in VENDOR_NOTES:
 
 If not, send: the client log and a screenshot for the failing item.
 
+**7.8 The second hardware run's client: renderer, browser, input latency, clock sync**
+(VENDOR_NOTES "Second hardware run: browser presentation and input latency")
+
+The second run drew every session with the 2D canvas from the first run's stored pick, which
+was never measured again, from Chrome 122, and had no measure of the input path. This step
+measures what was missing. The renderer is not expected to change: on the first run's own
+per-path numbers the paths differ by at most 0.35 ms in draw and 0.13 ms in display, and a
+fresh bake-off on this client is expected to keep the 2D canvas. What this step checks is that
+the bake-off runs on a stream it can measure, and the input path's figures.
+
+The bake-off needs a stream at its frame rate: on a still desktop the PC repeats its last
+picture about 10 times a second (the second run's still-desktop windows read 9.8-10.1 fps),
+too few to measure any path. So every connection below starts with something that animates at
+full frame rate on the PC (the game of the second run, or a video), started **before** you
+connect and kept moving until the overlay's Renderer row no longer reads `auto: measuring`.
+
+- **Do**:
+  1. **Still in Chrome 122** (do not update yet; the stored pick is kept per browser version,
+     so only Chrome 122 still has the first run's pick to measure again): open the dashboard and
+     note the **This browser** card (`Chrome 122` and the notice under it). Start the game on
+     the PC, then connect with Renderer *Auto* (do not press *Measure renderers again*) and open
+     the overlay (Ctrl+Alt+Shift+S). Keep the game moving: the Renderer row reads `auto:
+     measuring (warm-up)`, then `(waiting for a steady stream: x of 60 fps)` while the stream is
+     short, then `1/6` … `6/6` while the paths take turns (about 10 s). Note the toast after
+     it, click **Export latency data** (export A), disconnect.
+  2. Update Chrome (`chrome://settings/help`, relaunch) and note the version. Open the
+     dashboard again and note the **This browser** card.
+  3. Start the game, connect with Renderer *Auto* and the overlay open, and keep the game moving
+     until the Renderer row reads `auto` (a first bake-off for the new browser version). Then
+     play the game for 5 minutes on the same path: mouse in game mode (Ctrl+Alt+Shift+M), key
+     presses, and a controller for a minute. Click **Export latency data** (export B).
+  4. Disconnect, connect again, and play 2 more minutes (the stored pick draws at once).
+- **Look at**:
+  - Each export's `log` (the client's log lines): `presentation: Auto measures the renderers
+    again: the stored pick (2D canvas, 2026-10-11) was made by an earlier version of this page
+    on a stream short of frames (12.3 of 60 fps)` (export A only), `presentation bake-off:
+    measuring after N s of waiting for a steady stream (X of 60 frames per second in the last
+    1000 ms)` and `presentation bake-off (frame pacing …): <pick> (<why>); canvas2d draw p50 …
+    fps …; webgl2 …; webgpu …`. The export's `present`: `waitedMs`, `expectFps`, and no
+    `provisional`.
+  - The toasts: in step 1 `Renderer: 2D canvas, Auto's pick (the only context that may be
+    desynchronized: it cannot report it, the others are not). Measured again: the stored pick
+    (2D canvas, 2026-10-11) was made by an earlier version of this page on a stream short of
+    frames (12.3 of 60 fps).`; in step 3 a plain `Renderer: …, Auto's pick (…)` without
+    `Measured again` (the bake-off runs because the browser version is new).
+  - The overlay's **Renderer** rows: the three paths with their draw/display p50 and fps, the ★
+    pick and its reason; and the **context** row (`desynchronized ✓`, `✗` or `not reported`)
+    of the path that won.
+  - The overlay's **Input → host** rows (mouse, keys and buttons, gamepad: p50/p95/p99) and
+    `parts p50: browser x (page y) · network · host · rtt/2` (ending `· n of m unacknowledged`
+    if inputs or their answers were lost), and the **round trip** row's `clock ±x ms`.
+  - host.log: the `input latency p50/p95/p99 ms, last 10 s` lines (`browser=`, `mouse=`,
+    `keys=`, `pad=`, `client=`, `dispatch=`, `network=`, `host=`, `rtt_half=`,
+    `clock_min_rtt_ms=`, `clock_bound_ms=`, `browser_lacks=`), the `latency stages` lines
+    (`renderer=bakeoff` in each bake-off's first windows, then the pick), the `stream stats`
+    lines' `report_owd_p50_ms` next to `owd_avg_ms`, and `video transport` lines (with
+    `fec=auto`: none on the LAN, where the round trip stays under 12 ms).
+- **Pass**:
+  - Both bake-offs measured a stream at its rate: X at least 48 in the `measuring after` line
+    (no `still short, measured all the same`), each path near 60 fps, none out for *too few
+    samples*, the stored pick without *provisional*. Export A's log has the `Measured again`
+    line and step 1's toast says why; step 3's does not. The connection in step 4 has no
+    bake-off. Expected pick both times: the 2D canvas (Chrome 122: the only context that may be
+    desynchronized; the updated Chrome: its 2D canvas reports desynchronized, as Chromium 141's
+    does, WebGL2 not). Another pick is not a failure: send the exports.
+  - Step 1's card: `Chrome 122 is 19 versions older than Chromium 141, …; it lacks the 2D
+    canvas's low-latency report (…), HDR canvas output (…). Updating Chrome brings them.` in
+    grey (no latency promise: neither costs latency by itself). Step 2's card: no notice.
+    `browser="Chrome 1xx"` with the updated version, and `browser_lacks` without
+    `canvas2d-attributes` and `hdr-canvas`.
+  - `mouse` and `keys` p50 at most the stage line's `network` p50 + 3 ms; `client` p50 ≤ 2 ms,
+    of it `dispatch` ≤ 1 ms; `host` p50 ≤ 0.5 ms; `rtt_half` within ±2 ms of `mouse` (the clock
+    sync and the round trip agree); `pad` p50 at most `mouse` + 5 ms (Chrome samples pads on its
+    own clock; the overlay's `pad poll x ms, n new samples/s` shows how often); no
+    `unacknowledged` on the parts row (the export's `inputAckCount`: `expired` 0).
+  - `clock_bound_ms` ≤ 2 on the LAN, and `report_owd_p50_ms` within ~5 ms of `owd_avg_ms`
+    (the second run's ~120 ms against 7-25 was a first clock offset taken before the host's
+    datagram loop ran). No `video transport mode="datagram + FEC" why="round trip"` line on the
+    LAN (the export's `clock.rttReports` about one per second of `clock.sinceS`).
+- **If not, send**: host.log, both exported latency JSONs (they have `log`, `input`,
+  `inputAckCount`, `clock`, `browser`, `present` and `gamepadPolling`), and a screenshot of the
+  overlay with the Renderer and Input rows. If `client` or `dispatch` is high, also whether the
+  overlay was open (it redraws every 0.5 s on the page's main thread) and the CPU load on the
+  client.
+
 ### Stage 8: Relay, WAN and rate control (T4, T6)
 
 All runs use Network path *Relay via gateway* and `"logLevel": "debug"`, after stage 6.

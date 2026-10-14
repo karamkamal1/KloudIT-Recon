@@ -59,8 +59,12 @@ export const LABELS = { canvas2d: '2D canvas', webgl2: 'WebGL2', webgpu: 'WebGPU
 //   out    failed or skipped draws, a lost context, too few samples, fewer
 //          than minShare of the best path's frames per second (from 10 fps
 //          up), or a display p50 more than a refresh above the best
-//   then   a context that reports desynchronized (front-buffer
-//          presentation) before one that does not
+//   then   by low-latency (desynchronized, front-buffer) presentation: a
+//          context that reports it granted before one that cannot report
+//          it (null: the 2D canvas, which asks for it, in Chrome before
+//          OffscreenCanvasRenderingContext2D's getContextAttributes, e.g.
+//          122; Chromium 141's 2D canvas reports it granted) before one
+//          that reports it not granted (false) or has no such mode (WebGPU)
 //   then   the first in PATHS (the 2D default) unless another path's draw
 //          p50 is lower by more than marginMs in every round (a near tie
 //          keeps the default)
@@ -91,9 +95,9 @@ export function pickPath(results, refreshMs = 1000 / 60, rule = PICK, expectFps 
   drop((x) => (x.display.p50 > disp + refreshMs ? 'display lags' : ''));
   const conclusive = !(short && Object.values(out).some((why) => why === 'too few samples' || why === 'drops frames'));
   if (!pool.length) return { winner: null, why: 'no path measured', out, conclusive: false };
-  const desync = pool.filter((p) => results[p].desynchronized === true);
-  const byDesync = desync.length > 0 && desync.length < pool.length;
-  if (byDesync) pool = desync;
+  const top = Math.max(...pool.map((p) => desyncRank(p, results[p])));
+  const byDesync = pool.some((p) => desyncRank(p, results[p]) < top);
+  if (byDesync) pool = pool.filter((p) => desyncRank(p, results[p]) === top);
   const def = pool[0];
   const d = results[def].drawRounds || [];
   const faster = (p) => {
@@ -103,9 +107,44 @@ export function pickPath(results, refreshMs = 1000 / 60, rule = PICK, expectFps 
   const clear = pool.filter((p) => p !== def && faster(p)).sort((a, b) => results[a].draw.p50 - results[b].draw.p50);
   let why = clear.length ? `draws over ${rule.marginMs} ms faster than ${LABELS[def]} in every round`
     : pool.length > 1 ? `no other path draws over ${rule.marginMs} ms faster` : 'the only path left';
-  if (byDesync && !clear.length) why = pool.length > 1 ? `desynchronized; ${why}` : 'the only desynchronized context';
+  if (byDesync && !clear.length) {
+    why = top === 2 ? (pool.length > 1 ? `desynchronized; ${why}` : 'the only desynchronized context')
+      : pool.length > 1 ? `may be desynchronized, cannot report it, the others are not; ${why}`
+        : 'the only context that may be desynchronized: it cannot report it, the others are not';
+  }
   if (!conclusive) why += `; the stream gave ${best} of ${Math.round(expectFps)} frames per second, too few to measure every path`;
   return { winner: clear[0] || def, why, out, conclusive };
+}
+
+// A context's rank by low-latency presentation (pickPath): 2 reports it
+// granted, 1 cannot report it, 0 reports it not granted or has no such mode.
+export function desyncRank(path, r) {
+  if (r.desynchronized === true) return 2;
+  return path !== 'webgpu' && r.desynchronized == null ? 1 : 0;
+}
+
+// When the bake-off measures (stream-worker.js bakeTick, after its warm-up):
+// fps is the frames the stream gave in the last second, expectFps the rate
+// every path should draw (the stream's, at most the display's refresh; 0:
+// unknown), minFps the least that gives every path its rule.minDraw
+// samples, waitedMs the time since the warm-up.
+//
+//   'steady'   fps at least minShare of expectFps: measure
+//   'short'    after t.waitMs, a stream short of that that still gives
+//              minFps: measure all the same (pickPath: provisional where it
+//              leaves a path out)
+//   'wait'     otherwise, until t.giveUpMs: below minFps no path gets enough
+//              samples (a still desktop: the PC repeats its last picture ~10
+//              times a second; the owner's still-desktop windows read 9.8-10.1
+//              fps, and a bake-off there ends "no path measured")
+//   'give up'  after t.giveUpMs below minFps: not measured (nothing stored,
+//              the next connection measures)
+export const BAKE_START = { waitMs: 15000, giveUpMs: 60000 };
+
+export function bakeStart(fps, expectFps, minFps, waitedMs, t = BAKE_START, rule = PICK) {
+  if (!expectFps || fps >= rule.minShare * expectFps) return 'steady';
+  if (fps >= minFps) return waitedMs >= t.waitMs ? 'short' : 'wait';
+  return waitedMs >= t.giveUpMs ? 'give up' : 'wait';
 }
 
 export function withTimeout(p, ms, what) {

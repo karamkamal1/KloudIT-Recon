@@ -8,6 +8,7 @@ import { PATHS, LABELS } from './renderers.js';
 import { PACING, PACING_LABELS } from './pacing.js';
 import { FSR, UPSCALE, UPSCALE_LABELS, upscaleSettings } from './fsr1.js';
 import { HDR_MODES, HDR_WHITES, HDR_WHITE, hdrWhite } from './hdr.js';
+import { browserInfo, browserGaps, browserNotice } from './browser.js';
 
 const $ = (id) => document.getElementById(id);
 const hostId = new URLSearchParams(location.search).get('host');
@@ -102,6 +103,7 @@ const S = {
   present: null, // presentPlan() of this connection
   renderer: null, // the worker's active renderer (info)
   bakeoff: null, // this session's presentation bake-off result
+  hinted: false, // this connection's start-up toolbar and hints were shown (streamHints)
   present2D: false, // Auto's path failed while drawing: the 2D canvas for this page
   lost2D: null, // the path picked in the settings that kept losing its GPU device: the 2D canvas for this page
   presentLost: [], // when that path lost its device (onPresentLost)
@@ -121,7 +123,7 @@ const S = {
   welcome: null,
   keys: new Map(),
   buttons: new Set(),
-  rel: { seq: 0, x: 0, y: 0, settle: [] },
+  rel: { seq: 0, x: 0, y: 0, settle: 0, last: 0, resent: false },
   abs: { seq: 0, last: null, settle: 0 },
   wheel: { y: 0, x: 0 },
   cursor: { cache: new Map(), current: null, visible: true, pos: null },
@@ -132,6 +134,8 @@ const S = {
   get keyboardLock() { return document.fullscreenElement ? this.kbLock : null; },
   set keyboardLock(v) { this.kbLock = v; },
   pointerRaw: null, // the last pointer lock was granted with unadjustedMovement (the browser read the option)
+  browser: null, // browser.js: { info, gaps, notice } (boot)
+  goodStream: 0, // stats in a row with the stream at its rate (presentRecheck)
   rumbles: 0, // force-feedback datagrams played
   audioJitter: null, // the jitter buffer's last report (audio-worklet.js)
   hz: 60,
@@ -142,8 +146,14 @@ const S = {
 const audio = { ctx: null, node: null, gain: null };
 
 const post = (m, transfer) => S.worker?.postMessage(m, transfer || []);
-const sendIn = (b) => post({ type: 'in', b });
-const sendDg = (b) => post({ type: 'dg', b });
+// Input goes to the worker at once, with its event's time (absolute ms: the
+// OS event's time for a DOM event, a gamepad's sample time), from which the
+// worker measures the input latency (stream-worker.js, inLat).
+// h: when the page handed it on (the event's dispatch on this thread is h - t).
+const eventAbs = (e) => (e ? performance.timeOrigin + e.timeStamp : undefined);
+const nowAbs = () => performance.timeOrigin + performance.now();
+const sendIn = (b, e) => post({ type: 'in', b, t: eventAbs(e), h: nowAbs() });
+const sendDg = (b, e, t = eventAbs(e)) => post({ type: 'dg', b, t, h: nowAbs() });
 const sendCtl = (m) => post({ type: 'ctl', m });
 
 // ---------------------------------------------------------------------------
@@ -226,9 +236,24 @@ async function audioChannel() {
 // unmeasured: pickPath's conclusive) is stored as provisional: the next
 // connection measures again, BAKE_TRIES times in all, and only then keeps
 // it. A path chosen in the settings is used as is.
+//
+// A stored pick is measured again (presentStale) when it was made by a
+// page before PRESENT_V (the first hardware run's pick, "the only path
+// left" on a 12 fps stream, had no provisional mark and stayed for good;
+// since PRESENT_V a pick on a stream short of frames is provisional where
+// that left a path unmeasured, pickPath), at another display refresh rate
+// (more than 10 % apart), or more than PRESENT_MAX_DAYS ago (a driver update
+// since). A provisional pick kept
+// after BAKE_TRIES is measured again once a connection that draws with it
+// has had a good stream for GOOD_STREAM_S (presentRecheck): the next
+// connection's bake-off runs on a stream that can tell the paths apart.
 
 const PRESENT_KEY = 'recon.present.v2';
+const PRESENT_V = 3;
+const PRESENT_MAX_DAYS = 30;
 const BAKE_TRIES = 3;
+const GOOD_STREAM_S = 10;
+const PICK_SHARE = 0.8; // renderers.js PICK.minShare: a stream short of frames below this share of its rate
 try { localStorage.removeItem('recon.present.v1'); } catch {} // picked by a noisier rule
 
 function deviceKey() {
@@ -258,12 +283,49 @@ function storePresent(rec) {
   } catch {}
 }
 
+// The frame rate a stored pick's stream should have given every path: the
+// stream's (its video, "1920x1080 60 fps hevc"), at most the display's
+// refresh (expectFps since PRESENT_V; 0: unknown).
+function presentExpectFps(s) {
+  if (s.expectFps > 0) return s.expectFps;
+  const fps = +(/ (\d+(?:\.\d+)?) fps/.exec(s.video || '') || [])[1] || 0;
+  return fps && s.hz > 0 ? Math.min(fps, s.hz) : fps;
+}
+
+// Why a stored pick is measured again ('' when it stands; see above).
+function presentStale(s) {
+  const at = Date.parse(s.at);
+  const best = Math.max(0, ...Object.values(s.results || {}).map((x) => (x && !x.error && !x.lost ? x.fps || 0 : 0)));
+  const expect = presentExpectFps(s);
+  const short = expect > 0 && best < PICK_SHARE * expect;
+  if (!(s.v >= PRESENT_V)) {
+    return `made by an earlier version of this page${short ? ` on a stream short of frames (${best} of ${Math.round(expect)} fps)` : ''}`;
+  }
+  if (s.hz > 0 && S.hz > 0 && Math.abs(s.hz - S.hz) > 0.1 * S.hz) return `made at ${s.hz} Hz; the display refreshes at ${S.hz} Hz now`;
+  if (at && Date.now() - at > PRESENT_MAX_DAYS * 864e5) return `made over ${PRESENT_MAX_DAYS} days ago`;
+  return '';
+}
+
 function presentPlan() {
   if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [S.lost2D === prefs.renderer ? 'canvas2d' : prefs.renderer] };
   if (S.present2D) return { mode: 'auto', paths: ['canvas2d'] };
   const s = storedPresent();
-  if (s && !(s.provisional && s.tries < BAKE_TRIES)) return { mode: 'auto', paths: [s.winner] };
-  return { mode: 'bakeoff', paths: [...PATHS] };
+  const stale = s ? presentStale(s) : '';
+  if (s && !stale && !(s.provisional && s.tries < BAKE_TRIES)) return { mode: 'auto', paths: [s.winner] };
+  return { mode: 'bakeoff', paths: [...PATHS], stale: stale ? `the stored pick (${LABELS[s.winner]}, ${String(s.at).slice(0, 10)}) was ${stale}` : '' };
+}
+
+// A provisional pick kept after BAKE_TRIES draws this connection: once the
+// stream has given its frames (PICK_SHARE of its rate, at most the display's
+// refresh) for GOOD_STREAM_S in a row, the next connection measures again.
+function presentRecheck(st) {
+  const s = S.present?.mode === 'auto' ? storedPresent() : null;
+  if (!s?.provisional || s.tries < BAKE_TRIES || st.renderer?.name !== s.winner) { S.goodStream = 0; return; }
+  const expect = Math.min(S.videoCfg?.fps || 0, S.hz || Infinity);
+  S.goodStream = expect > 0 && st.fps >= PICK_SHARE * expect ? (S.goodStream || 0) + 1 : 0;
+  if (S.goodStream * 0.5 < GOOD_STREAM_S) return; // stats every 0.5 s
+  storePresent({ ...s, tries: 0 });
+  S.logs.push(`${new Date().toISOString()} presentation: the stream gives its frames now; Auto measures the renderers again on the next connection`);
 }
 
 // One canvas per path (a canvas is transferred to the worker once and keeps
@@ -311,8 +373,9 @@ function onBakeoff(result) {
   if (!result.winner) return;
   const v = S.videoCfg;
   const rec = {
-    key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
-    video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
+    v: PRESENT_V, key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
+    video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio, expectFps: result.rule?.expectFps || 0,
+    waitedMs: result.waitedMs ?? null,
   };
   if (result.conclusive === false) {
     // Measured on a stream short of frames: for this session, and again on
@@ -327,7 +390,8 @@ function onBakeoff(result) {
     return;
   }
   storePresent(rec);
-  toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
+  const again = S.present?.stale ? ` Measured again: ${S.present.stale}.` : '';
+  toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}).${again} Settings → Pipeline.`, 'info', again ? 7000 : 4000);
 }
 
 // A path picked in the settings lost its WebGPU device (a driver reset, the
@@ -407,8 +471,10 @@ async function connect() {
   document.title = `${ep.host} · KloudIT Recon`;
   const { sab, port } = await audioChannel().catch(() => ({}));
   S.present = presentPlan();
+  if (S.present.stale) S.logs.push(`${new Date().toISOString()} presentation: Auto measures the renderers again: ${S.present.stale}`);
   S.renderer = null;
   S.bakeoff = null;
+  S.hinted = false;
   const canvases = stageCanvases(S.present.paths);
   // ?host=: the worker script's CSP allows this host's direct endpoint and
   // the relay ports (the gateway lists them only for the stream page and its
@@ -431,6 +497,7 @@ async function connect() {
     },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
+    browser: S.browser ? { label: S.browser.info.label, lacks: S.browser.gaps.map((g) => g.id) } : null,
     audioSab: sab, audioPort: port,
   }, transfer);
   if (document.hidden) sendCtl({ t: 'pause' }); // a reconnect while the tab is hidden
@@ -538,9 +605,11 @@ function onWorker(m) {
       if (!$('drawer').classList.contains('open')) S.surface.focus(); // (the settings, opened on the splash, keep it)
       // During the bake-off nothing covers the canvas (the toolbar has a
       // backdrop filter), so every path is measured alike: the start-up
-      // toolbar and hint come with its result.
+      // toolbar and hint come with its result, or once it waits for a
+      // steady stream (it measures after the toolbar has gone).
       if (S.present?.mode !== 'bakeoff') streamHints();
       break;
+    case 'bakeWaiting': streamHints(); break;
     case 'cursor': onCursorShape(m.shape); break;
     case 'cursorPos': onCursorPos(m); break;
     case 'notice':
@@ -574,6 +643,8 @@ function onWorker(m) {
 
 // Shown once the stream is up: the toolbar for a moment, the game-mode hint.
 function streamHints() {
+  if (S.hinted) return; // once per connection
+  S.hinted = true;
   showToolbar(3000);
   if (prefs.mouse === 'game') toast('Game mode: click the screen to capture the mouse (Esc releases it).', 'info', 5000);
 }
@@ -648,7 +719,7 @@ window.addEventListener('keydown', (e) => {
   e.preventDefault();
   e.stopPropagation();
   S.keys.set(e.code, m);
-  sendIn(P.keyEvent(m[0], m[1], true));
+  sendIn(P.keyEvent(m[0], m[1], true), e);
 }, true);
 
 window.addEventListener('keyup', (e) => {
@@ -658,7 +729,7 @@ window.addEventListener('keyup', (e) => {
   if (!S.keys.has(e.code) && uiFocused(e)) return;
   e.preventDefault();
   S.keys.delete(e.code);
-  sendIn(P.keyEvent(m[0], m[1], false));
+  sendIn(P.keyEvent(m[0], m[1], false), e);
 }, true);
 
 function releaseAll() {
@@ -694,7 +765,7 @@ function contentRect() {
   return { x: r.left + (r.width - w) / 2, y: r.top + (r.height - h) / 2, w, h, scale };
 }
 
-function sendAbs(clientX, clientY) {
+function sendAbs(clientX, clientY, e) {
   const c = contentRect();
   const nx = Math.max(0, Math.min(1, (clientX - c.x) / c.w));
   const ny = Math.max(0, Math.min(1, (clientY - c.y) / c.h));
@@ -703,22 +774,37 @@ function sendAbs(clientX, clientY) {
   if (S.abs.last && S.abs.last[0] === x && S.abs.last[1] === y) return;
   S.abs.last = [x, y];
   const pkt = P.mouseAbs(++S.abs.seq, x, y);
-  sendDg(pkt);
+  sendDg(pkt, e);
   clearTimeout(S.abs.settle);
   S.abs.settle = setTimeout(() => sendDg(P.mouseAbs(++S.abs.seq, x, y)), 40); // loss insurance
 }
 
-function sendRel(dx, dy) {
+function sendRel(dx, dy, e) {
   const r = S.rel;
   r.x += dx;
   r.y += dy;
-  const cx = Math.round(r.x);
-  const cy = Math.round(r.y);
-  sendDg(P.mouseRel(++r.seq, cx, cy));
-  // Totals are cumulative, so re-sending the latest one after motion stops
-  // recovers any datagram that was lost.
-  for (const t of r.settle) clearTimeout(t);
-  r.settle = [40, 150].map((d) => setTimeout(() => sendDg(P.mouseRel(++r.seq, cx, cy)), d));
+  sendDg(P.mouseRel(++r.seq, Math.round(r.x), Math.round(r.y)), e);
+  r.last = performance.now();
+  r.resent = false;
+  if (!r.settle) r.settle = setTimeout(relSettle, REL_SETTLE[0]);
+}
+
+// Totals are cumulative, so re-sending the latest one REL_SETTLE ms after
+// motion stops recovers any datagram that was lost. One timer, moved on
+// while the motion goes on (pointerrawupdate comes at the mouse's polling
+// rate, up to 8000 a second: no timers set and cleared per event).
+const REL_SETTLE = [40, 150];
+function relSettle() {
+  const r = S.rel;
+  const idle = performance.now() - r.last;
+  const due = REL_SETTLE[r.resent ? 1 : 0];
+  if (idle < due) {
+    r.settle = setTimeout(relSettle, due - idle);
+    return;
+  }
+  sendDg(P.mouseRel(++r.seq, Math.round(r.x), Math.round(r.y)));
+  r.settle = r.resent ? 0 : setTimeout(relSettle, REL_SETTLE[1] - idle);
+  r.resent = !r.resent;
 }
 
 const locked = () => document.pointerLockElement === S.surface;
@@ -752,12 +838,12 @@ document.addEventListener(moveEvent, (e) => {
   atTop = top;
   if (!S.streaming) return;
   if (locked()) {
-    if (e.movementX || e.movementY) sendRel(e.movementX, e.movementY);
+    if (e.movementX || e.movementY) sendRel(e.movementX, e.movementY, e);
     return;
   }
   if (prefs.mouse !== 'desktop') return;
   if (!S.surface.contains(e.target) && !S.buttons.size) return;
-  sendAbs(e.clientX, e.clientY);
+  sendAbs(e.clientX, e.clientY, e);
 }, { passive: true });
 
 // Input goes to the stage that holds the canvases (one per presentation path
@@ -773,17 +859,17 @@ function bindSurface(c) {
     }
     if (!locked()) {
       c.setPointerCapture?.(e.pointerId);
-      sendAbs(e.clientX, e.clientY);
+      sendAbs(e.clientX, e.clientY, e);
     }
     if (e.button >= 0 && e.button <= 4 && !S.buttons.has(e.button)) {
       S.buttons.add(e.button);
-      sendIn(P.buttonEvent(e.button, true));
+      sendIn(P.buttonEvent(e.button, true), e);
     }
   });
   c.addEventListener('pointerup', (e) => {
     if (!S.buttons.has(e.button)) return;
     S.buttons.delete(e.button);
-    sendIn(P.buttonEvent(e.button, false));
+    sendIn(P.buttonEvent(e.button, false), e);
   });
   c.addEventListener('contextmenu', (e) => e.preventDefault());
   c.addEventListener('auxclick', (e) => e.preventDefault());
@@ -864,13 +950,19 @@ function onCursorPos(m) {
 }
 
 // ---------------------------------------------------------------------------
-// Gamepads (polled at 250 Hz, sent as loss-tolerant full-state datagrams)
+// Gamepads (polled at 250 Hz, sent as loss-tolerant full-state datagrams).
+// A pad's state carries its sample time (Gamepad.timestamp, this page's
+// clock, where plausible; else the poll's), so the input latency covers the
+// wait for the poll. pads.rate: the polls' interval and how often the
+// browser had a new sample of a pad that changed (its own polling of the
+// device: the overlay's input row), over the last second.
 
-const pads = { timer: 0, state: [] };
+const pads = { timer: 0, state: [], polls: [], samples: [], rate: null };
 
 function padLoop() {
   const gps = navigator.getGamepads ? navigator.getGamepads() : [];
   const t = performance.now();
+  pads.polls.push(t);
   let any = false;
   for (let i = 0; i < 4; i++) {
     const gp = gps[i];
@@ -879,19 +971,26 @@ function padLoop() {
       any = true;
       const s = P.gamepadToXusb(gp);
       const key = `${s.buttons},${s.lt},${s.rt},${s.lx},${s.ly},${s.rx},${s.ry}`;
+      const sampled = gp.timestamp > t - 1000 && gp.timestamp <= t ? gp.timestamp : t;
+      if (st && st.key !== key && gp.timestamp !== st.ts) pads.samples.push(t);
       if (!st || st.key !== key || t - st.sent > 100) {
         const seq = (st?.seq || 0) + 1;
-        pads.state[i] = { key, sent: t, seq };
-        if (S.streaming) sendDg(P.gamepadState(i, true, seq, s));
+        pads.state[i] = { key, sent: t, seq, ts: gp.timestamp };
+        if (S.streaming) sendDg(P.gamepadState(i, true, seq, s), null, st?.key !== key ? performance.timeOrigin + sampled : undefined);
       }
     } else if (st) {
       if (S.streaming) sendDg(P.gamepadState(i, false, st.seq + 1, { buttons: 0, lt: 0, rt: 0, lx: 0, ly: 0, rx: 0, ry: 0 }));
       pads.state[i] = null;
     }
   }
+  while (pads.polls.length && pads.polls[0] < t - 1000) pads.polls.shift();
+  while (pads.samples.length && pads.samples[0] < t - 1000) pads.samples.shift();
+  const n = pads.polls.length;
+  pads.rate = n > 1 ? { pollMs: (pads.polls[n - 1] - pads.polls[0]) / (n - 1), samples: pads.samples.length } : null;
   if (!any && !pads.state.some(Boolean)) {
     clearInterval(pads.timer);
     pads.timer = 0;
+    pads.rate = null;
   }
 }
 
@@ -1026,6 +1125,7 @@ const cls = (v, a, b) => (v === null || v === undefined ? '' : v < a ? 'good' : 
 function onStats(st) {
   S.lastStats = st;
   S.probe = st.probe;
+  presentRecheck(st);
   const pill = $('latency');
   if (st.total !== null && st.total !== undefined) {
     pill.textContent = `${Math.round(st.total)} ms`;
@@ -1049,10 +1149,12 @@ function onStats(st) {
     row('Latency (ms)', 'p50 / p95 / p99'),
     row(lat.from === 'capture' ? 'End-to-end (capture→draw)' : 'Stream latency (send→draw)', pcts(lat.e2e), cls(lat.e2e?.p50, 25, 50)),
     ...STAGE_LABELS.filter(([k]) => lat.stages[k]).map(([k, label]) => row(`  ${label}`, pcts(lat.stages[k]))),
-    row('  round trip (avg)', fmt(st.rtt, 1, ''), cls(st.rtt, 15, 40)),
+    row('  round trip (avg)', `${fmt(st.rtt, 1, '')}${clockText(st.clock)}`, cls(st.rtt, 15, 40)),
+    ...inputRows(st, row, pcts),
   ] : [
     row('Stream latency (send→draw)', `${fmt(st.total)}  (${fmt(st.totalMin, 0, '')}–${fmt(st.totalMax, 0, '')})`, cls(st.total, 25, 50)),
-    row('  round trip', fmt(st.rtt), cls(st.rtt, 15, 40)),
+    row('  round trip', `${fmt(st.rtt)}${clockText(st.clock)}`, cls(st.rtt, 15, 40)),
+    ...inputRows(st, row, pcts),
   ];
   $('stats-body').replaceChildren(...[
     ...latencyRows,
@@ -1074,6 +1176,7 @@ function onStats(st) {
       `${st.fecNow ? ' · datagrams + FEC' : ''}` +
       `${S.conn.path !== 'direct' && S.conn.directWhy ? ` · direct: ${S.conn.directWhy}` : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
+    browserRow(st, row),
     st.fec ? fecRow(st.fec, row) : null,
     ...presentRows(st, row),
     ...upscaleRows(st.renderer, row),
@@ -1090,6 +1193,33 @@ function onStats(st) {
     st.synced ? null : row('Clock', 'syncing…', 'warn'),
   ].filter(Boolean));
   drawSpark(spark);
+}
+
+// The clock sync's error bound (stream-worker.js, clockQuality): the network
+// stage and the input latency are only as exact as this.
+const clockText = (c) => (c ? ` · clock ±${fmt(c.boundMs, 1, ' ms')}${c.settled ? '' : ' (settling)'}` : '');
+
+// Input latency (stream-worker.js, inLat), from hosts that acknowledge
+// inputs: browser event -> injected on the host per class (p50/p95/p99),
+// then the parts' p50 (the browser: the event's dispatch on the page, the
+// hop to the worker and the write; of it the page's share; the network; the
+// host) and the round trip's estimate (no clock sync), the gamepads'
+// polling (pads.rate), and the marked inputs this connection got no
+// acknowledgement for (lost: the input or its acknowledgement; one over 5 s
+// late is not counted in the figures).
+function inputRows(st, row, pcts) {
+  const x = st.input;
+  if (!st.inputAcks) return [];
+  const c = st.inputAckCount;
+  const lost = c && c.expired > c.late ? ` · ${c.expired - c.late} of ${c.marked} unacknowledged` : '';
+  if (!x) return [row('Input → host', `no input in the last 10 s${lost}`)];
+  const p50 = (r) => (r ? fmt(r.p50, 1, '') : '—');
+  const pad = pads.rate ? ` · pad poll ${fmt(pads.rate.pollMs, 1)}, ${pads.rate.samples} new samples/s` : '';
+  return [
+    ...[['mouse', 'mouse'], ['keys', 'keys, buttons'], ['pad', 'gamepad']].filter(([k]) => x[k])
+      .map(([k, label]) => row(`Input → host (${label})`, pcts(x[k]), cls(x[k].p50, 8, 20))),
+    row('  parts p50', `browser ${p50(x.client)} (page ${p50(x.dispatch)}) · network ${p50(x.network)} · host ${p50(x.host)} · rtt/2 ${p50(x.rtt_half)}${pad}${lost}`),
+  ];
 }
 
 // Send priorities (GUIDE 2.7): what this browser schedules by (input before
@@ -1111,6 +1241,23 @@ function fecRow(f, row) {
   const loss = all ? (100 * f.shardsLost) / all : 0;
   return row('  FEC', `${f.frames} frames · parity ${f.shards ? ((100 * f.parity) / f.shards).toFixed(0) : 0} % of shards · ` +
     `loss ${loss.toFixed(2)} % · rebuilt ${f.rebuilt} · repaired ${f.repaired} (${f.nacks} NACKs) · lost ${f.lost}`, f.lost ? 'warn' : '');
+}
+
+// This browser (browser.js) when it lacks what the tested Chromium has (an
+// old one: its notice is the row's tooltip; a current one on a platform
+// without it, e.g. Keyboard Lock on Android): the overlay's row, with
+// everything it lacks (also what the tested Chromium lacks too, and
+// RESET_STREAM_AT where the host says this connection did not negotiate
+// it), in orange where a gap costs latency. Not shown otherwise, so the
+// overlay keeps its height.
+function browserRow(st, row) {
+  const b = S.browser;
+  if (!b?.notice && !b?.gaps.some((g) => g.tested)) return null;
+  const lacks = b.gaps.map((g) => g.name);
+  if (st.resetStreamAt === false) lacks.push('RESET_STREAM_AT');
+  const r = row('Browser', `${b.info.label}${lacks.length ? ` · lacks ${lacks.join(', ')}` : ''}`, b.warn ? 'warn' : '');
+  if (b.notice) r.title = b.notice;
+  return r;
 }
 
 // What a lost frame costs in this generation (VideoConfig.recovery): reference
@@ -1170,7 +1317,8 @@ function presentRows(st, row) {
   const r = st.renderer;
   if (!r) return [row('Renderer', S.conn ? S.conn.renderer : '—')];
   const b = r.bake;
-  const how = r.mode === 'setting' ? 'setting' : b && !b.done ? `auto: measuring ${b.warming ? '(warm-up)' : `${b.slot}/${b.slots}`}` : 'auto';
+  const how = r.mode === 'setting' ? 'setting' : b && !b.done
+    ? `auto: measuring ${b.warming ? '(warm-up)' : b.waiting ? `(waiting for a steady stream: ${b.waitFps} of ${b.expectFps} fps)` : `${b.slot}/${b.slots}`}` : 'auto';
   const rows = [
     row('Renderer', `${LABELS[r.name] || r.name}${r.name !== r.slot ? ` (${LABELS[r.slot] || r.slot} failed)` : ''} · ${how}`),
     row('  context', `${desyncText(r)} · canvas ${r.canvas[0]}×${r.canvas[1]}${r.drawErrors ? ` · ${r.drawErrors} errors` : ''}`, r.desynchronized === false || r.drawErrors ? 'warn' : ''),
@@ -1317,9 +1465,14 @@ function exportLatency() {
     client: { ua: navigator.userAgent, hz: S.hz, dpr: devicePixelRatio, screen: [Math.round(screen.width * devicePixelRatio), Math.round(screen.height * devicePixelRatio)] },
     connection: S.conn, video: S.videoCfg, probe: d.probe, stages: d.stages,
     renderer: S.lastStats?.renderer || null, present: storedPresent(),
+    input: S.lastStats?.input || null, inputAckCount: S.lastStats?.inputAckCount || null, clock: S.lastStats?.clock || null, gamepadPolling: pads.rate,
+    browser: S.browser ? { ...S.browser.info, gaps: S.browser.gaps, notice: S.browser.notice, resetStreamAt: S.lastStats?.resetStreamAt ?? null } : null,
+    log: S.logs.slice(), // the client's log lines (the bake-off's wait and result, fullscreen, keyboard lock)
   });
 }
 S.exportLatency = exportLatency;
+// For the end-to-end test (test/e2e/browser.mjs): Renderer Auto's plan and its stored pick's handling.
+Object.assign(S, { presentPlan, presentRecheck, deviceKey });
 
 async function downloadLatency() {
   const data = await exportLatency();
@@ -1432,10 +1585,13 @@ $('drawer').addEventListener('keydown', (e) => {
 function presentHint() {
   const s = storedPresent();
   if (!s) {
-    return 'Auto tries each renderer on the live stream for about 10 s on the first connection: a desynchronized context first, the 2D canvas ' +
-      'unless another draws clearly faster. A heuristic: the latency rig decides.';
+    return 'Auto tries each renderer on the live stream for about 10 s on the first connection, once the stream gives its frames: ' +
+      'a desynchronized context first, the 2D canvas unless another draws clearly faster. A heuristic: the latency rig decides.';
   }
-  const prov = s.provisional && s.tries < BAKE_TRIES ? `; provisional, measured again on the next connection (try ${s.tries} of ${BAKE_TRIES})` : '';
+  const stale = presentStale(s);
+  const prov = stale ? `; measured again on the next connection: ${stale}`
+    : s.provisional && s.tries < BAKE_TRIES ? `; provisional, measured again on the next connection (try ${s.tries} of ${BAKE_TRIES})`
+      : s.provisional ? '; provisional (the stream was short of frames), measured again after a connection with a steady stream' : '';
   return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}${prov}.`;
 }
 
@@ -1684,6 +1840,10 @@ async function boot() {
     return;
   }
   await me();
+  const info = browserInfo();
+  const gaps = browserGaps();
+  const notice = browserNotice(info, gaps);
+  S.browser = { info, gaps, notice: notice?.text || '', warn: !!notice?.warn };
   const [caps, hz] = await Promise.all([capabilities(), measureHz()]);
   window.__caps = caps;
   S.hz = hz;
@@ -1691,6 +1851,11 @@ async function boot() {
   const b = (ok, label) => el('span', { class: `badge ${ok ? 'good' : 'bad'}` }, `${ok ? '✓' : '✗'} ${label}`);
   box.append(b(caps.webtransport, 'WebTransport'), b(caps.webcodecs, 'WebCodecs'), b(caps.isolated, 'Lock-free audio'), b(caps.webgpu, 'WebGPU'), el('span', { class: 'badge' }, `${hz} Hz display`));
   for (const [f, v] of Object.entries(caps.codecs)) if (v) box.append(el('span', { class: `badge ${v === 'hw' ? 'good' : ''}` }, `${f.toUpperCase()} ${v.toUpperCase()}`));
+  // An old browser, or one without what the client uses (browser.js): said
+  // here (in orange where a gap costs latency), in the overlay and to the
+  // host's log.
+  box.append(el('span', { class: `badge ${S.browser.warn ? 'warn' : ''}`, id: 'browser-badge', title: S.browser.notice || undefined }, S.browser.info.label));
+  if (S.browser.notice) box.after(el('p', { class: `browser-notice${S.browser.warn ? ' warn' : ''}`, id: 'browser-notice' }, S.browser.notice));
   if (!caps.webcodecs) {
     splash('Browser not supported', 'This browser lacks WebCodecs. Use a current Chrome, Edge, Firefox or Safari.', {});
     return;

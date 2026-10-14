@@ -83,10 +83,11 @@ const (
 	fecRTTOn  = 15 * time.Millisecond
 	fecRTTOff = 12 * time.Millisecond
 	// fecRTTReports: auto mode decides once this many of the client's pings
-	// carried its minimum round trip (its first five come within 250 ms of
-	// the start, then one a second): a loaded browser's first round trip
-	// alone can be far above the path's, and once put a LAN on shards for a
-	// frame.
+	// carried its minimum round trip (one a second, from its first pong on;
+	// the client pings every 250 ms since the second hardware run, and puts
+	// it in one of them a second so that this span stays seconds long): a
+	// loaded browser's first round trip alone can be far above the path's,
+	// and once put a LAN on shards for a frame.
 	fecRTTReports = 5
 	// fecMaxKbps is the most video bitrate sent as shards (auto and on): the
 	// browser's datagram path, measured in headless Chromium 141 with

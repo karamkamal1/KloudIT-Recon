@@ -31,8 +31,13 @@ The examples use these values. Replace them with your own:
 - **A monitor connected to the graphics card**, not to the motherboard's video output. If the PC
   will run with the monitor off, an HDMI or DisplayPort dummy plug avoids "no display" problems.
 - **A GitHub account**, to download the build.
-- **Chrome or Edge** on the devices you play from. They have the best support: WebTransport,
-  keyboard lock and raw mouse input. Firefox and Safari work with some limits.
+- **Chrome or Edge** on the devices you play from, **kept up to date**. They have the best
+  support: WebTransport, keyboard lock and raw mouse input. Firefox and Safari work with some
+  limits. An old Chrome still streams, but with less: the second hardware run's Chrome 122
+  (February 2024) lacked features the client uses (the 2D canvas's low-latency report, HDR10
+  output). The dashboard's **This browser** card and the stream page's start screen say so for
+  yours and what an update brings (in orange where what it lacks costs latency); update it from
+  `chrome://settings/help`.
 
 ## 1. Download the build (on the PC)
 
@@ -315,7 +320,10 @@ On any device on your home network (laptop, another PC, tablet), open
 - **Ctrl+Alt+Shift+M**: game mouse mode (raw relative mouse). Use it for first-person games.
 - **Ctrl+Alt+Shift+S**: the performance overlay. **Transport** should read
   `webtransport · direct` at home. If it reads a relay instead, the row says why after
-  `direct:`, and "The direct path is not used at home" below has the fix.
+  `direct:`, and "The direct path is not used at home" below has the fix. **Input → host**
+  is how long your mouse and key presses take to reach the game (the browser's event until the
+  PC injected it); on a home network a few milliseconds. The **round trip** row's
+  `clock ±x ms` is how exact the network and input figures can be.
 - **Ctrl+Alt+Shift+O**: settings (bitrate, frame rate, codec, resolution, audio).
 - Controllers: press a button after the stream starts. A "Controller connected" message appears.
 

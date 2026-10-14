@@ -25,6 +25,7 @@ export const DG_PONG = 0x31;
 export const DG_FRAME_ACK = 0x40;
 export const DG_RATE_REPORT = 0x41;
 export const DG_FEC_NACK = 0x42; // the shards a video frame still needs (fec.js)
+export const DG_INPUT_ACK = 0x24; // host->client: a marked input was injected (parseInputAck)
 
 export const IN_KEY = 1;
 export const IN_MOUSE_BUTTON = 2;
@@ -478,4 +479,43 @@ export function gamepadToXusb(gp) {
     buttons, lt: trig(6), rt: trig(7),
     lx: axis(0, false), ly: axis(1, true), rx: axis(2, false), ry: axis(3, true),
   };
+}
+
+// Input acknowledgements (second hardware run; mirror of
+// internal/proto/inputack.go). A host that lists FEATURE_INPUT_ACK answers
+// the inputs the client marks with DG_INPUT_ACK: the host-clock µs the input
+// arrived and was injected. Marked: a mouse or gamepad datagram with
+// INPUT_ACK_FLAG in its byte 3 (markInputAck); on an input stream, every
+// message after the client's ackStream(id) there, numbered from 1 per stream
+// in the order written (the ackStream message among them), acknowledged
+// with the stream's id in idx. Every ~10 s the client reports its input latency
+// summary ({"t": MSG_INPUT, rows, clock, browser, lacks}), which the host
+// logs. Hosts that list FEATURE_INPUT_ACK also list FEATURE_RESET_STREAM_AT
+// when this client's QUIC endpoint negotiated RESET_STREAM_AT.
+export const FEATURE_INPUT_ACK = 'input-ack';
+export const FEATURE_RESET_STREAM_AT = 'reset-stream-at';
+export const INPUT_ACK_FLAG = 1;
+export const IN_ACK_STREAM = 6;
+export const MSG_INPUT = 'input';
+export const INPUT_ACK_STREAM = 1;
+export const INPUT_ACK_MOUSE_REL = 2;
+export const INPUT_ACK_MOUSE_ABS = 3;
+export const INPUT_ACK_GAMEPAD = 4;
+
+/** The input stream message asking for the acknowledgement of the stream's messages from here on, with id (1-255) in them. */
+export function ackStream(id) {
+  return new Uint8Array([IN_ACK_STREAM, id]);
+}
+
+/** The input datagram b (mouseRel, mouseAbs, gamepadState), marked for its acknowledgement. */
+export function markInputAck(b) {
+  b[3] |= INPUT_ACK_FLAG;
+  return b;
+}
+
+/** A DG_INPUT_ACK datagram: { kind, idx, seq, recvUs, doneUs } (host-clock µs), or null. */
+export function parseInputAck(d) {
+  if (d.byteLength < 24 || d[0] !== DG_INPUT_ACK) return null;
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  return { kind: d[1], idx: d[2], seq: v.getUint32(4, true), recvUs: Number(v.getBigUint64(8, true)), doneUs: Number(v.getBigUint64(16, true)) };
 }

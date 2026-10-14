@@ -55,7 +55,8 @@
 // an HDR display: a 10-bit PQ AV1 stream presented with extended range,
 // checked to the pixel, then HDR Off live (tone-mapped, then an SDR stream).
 // E2E_ONLY=<regex> runs the scenarios and sections whose names match
-// (development); E2E_CHROME=<path> runs the main page in another Chromium.
+// (development). E2E_CHROMIUM=<path> (or E2E_CHROME=<path>) runs them in
+// another Chromium build.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -72,6 +73,11 @@ const { chromium } = pw.default || pw;
 
 const results = [];
 const outDir = process.env.E2E_OUT || join(root, 'test', 'e2e', 'results');
+// E2E_CHROMIUM=<path>: another Chromium build for the scenarios' browsers,
+// e.g. Chrome for Testing 122 (the second hardware run's client) to check
+// that nothing breaks there (docs/VENDOR_NOTES.md, "Second hardware run:
+// browser presentation and input latency").
+const chromiumPath = process.env.E2E_CHROMIUM || process.env.E2E_CHROME || undefined;
 mkdirSync(outDir, { recursive: true });
 
 function freePort() {
@@ -296,12 +302,16 @@ async function checkPresentation(name, path) {
       }
     }
     if (shown) stats.classList.remove('hidden');
-    return { css: [b.width, b.height], dpr: devicePixelRatio, box: window.__recon.box, canvases: document.querySelectorAll('#stage canvas').length, styled, covered: [...covered] };
+    // Chrome before getContextAttributes on an OffscreenCanvas's 2D context
+    // (122: E2E_CHROMIUM) cannot report desynchronized: null there.
+    const reports = typeof OffscreenCanvasRenderingContext2D === 'function' && 'getContextAttributes' in OffscreenCanvasRenderingContext2D.prototype;
+    return { css: [b.width, b.height], dpr: devicePixelRatio, box: window.__recon.box, canvases: document.querySelectorAll('#stage canvas').length, styled, covered: [...covered], reports };
   });
   const want = d.css.map((v) => Math.round(v * d.dpr));
   const sizeOk = !!r && r.canvas[0] === d.box?.w && r.canvas[1] === d.box?.h && Math.abs(d.box.w - want[0]) <= 1 && Math.abs(d.box.h - want[1]) <= 1;
   check(`${name}: ${path} draws on a canvas sized to its box in device pixels, nothing transforms or covers it`,
-    r?.name === path && r.drawErrors === 0 && sizeOk && !d.styled.length && !d.covered.length && d.canvases === 1 && (path !== 'canvas2d' || r.desynchronized === true),
+    r?.name === path && r.drawErrors === 0 && sizeOk && !d.styled.length && !d.covered.length && d.canvases === 1 &&
+      (path !== 'canvas2d' || r.desynchronized === (d.reports ? true : null)),
     `${r?.name}${r?.gpu ? ` (${r.gpu})` : ''}, getContextAttributes().desynchronized ${r?.desynchronized}; canvas ${r?.canvas?.join('x')} for a box of ` +
       `${d.css.map((v) => +v.toFixed(1)).join('x')} CSS px at dpr ${d.dpr} (${d.box?.w}x${d.box?.h}); ${r?.drawErrors} render errors; ${d.canvases} canvas(es); ` +
       `transforms/filters: ${d.styled.join('; ') || 'none'}; covered by: ${d.covered.join(', ') || 'nothing'}`);
@@ -452,7 +462,7 @@ async function checkBakeoff() {
   page = (await headedPage().catch(() => null)) || mainPage;
   const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
   try {
-    const all = page === mainPage ? ['canvas2d', 'webgl2'] : ['canvas2d', 'webgl2', 'webgpu'];
+    let all = page === mainPage ? ['canvas2d', 'webgl2'] : ['canvas2d', 'webgl2', 'webgpu'];
     await page.goto(`${base}/`);
     await page.evaluate((k) => localStorage.removeItem(k), PRESENT_KEY);
     await page.mouse.move(200, 200); // away from the top edge (toolbar)
@@ -463,10 +473,15 @@ async function checkBakeoff() {
     const bc0 = cpuTimes();
     // Until the result: the start-up toolbar or game-mode hint over the
     // canvas while the paths are measured? (Other toasts, e.g. a decoder
-    // warning on a loaded machine, are listed, not failed.)
+    // warning on a loaded machine, are listed, not failed.) They come with
+    // the result, or once the bake-off waits for a steady stream (a stream
+    // short of frames at the warm-up's end: then it measures after they
+    // have gone).
     const covered = [];
     const other = new Set();
     let samples = 0;
+    let waitHints = false;
+    let waits = 0;
     const cpuSecs = [[Date.now(), bc0]]; // the CPUs' times about every second of the bake-off
     const result = await until(async () => {
       if (Date.now() - cpuSecs[cpuSecs.length - 1][0] >= 1000) cpuSecs.push([Date.now(), cpuTimes()]);
@@ -476,8 +491,13 @@ async function checkBakeoff() {
       }));
       if (x.r) return x.r;
       if (x.bake && !x.bake.done && !x.bake.warming) {
-        samples++;
         const hint = x.toasts.some((t) => t.startsWith('Game mode'));
+        if (x.bake.waiting) {
+          waits++;
+          waitHints ||= x.bar || hint;
+          return null;
+        }
+        samples++;
         if (x.bar || hint) covered.push(`${x.bar ? 'toolbar ' : ''}${hint ? 'game-mode hint ' : ''}in slot ${x.bake.slot}`);
         for (const t of x.toasts) if (!t.startsWith('Game mode')) other.add(t);
       }
@@ -494,10 +514,11 @@ async function checkBakeoff() {
       bar: !document.getElementById('toolbar').classList.contains('hide'),
       toasts: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent),
     }));
-    check('renderer auto: the start-up toolbar and game-mode hint stay off the canvas while the bake-off measures and follow its result',
-      !!result && samples >= 5 && !covered.length && after.bar && after.toasts.some((t) => t.startsWith('Game mode')) && after.toasts.some((t) => t.startsWith('Renderer:')),
+    const hintsAfter = after.bar && after.toasts.some((t) => t.startsWith('Game mode'));
+    check('renderer auto: the start-up toolbar and game-mode hint stay off the canvas while the bake-off measures and follow its result (or come while it waits for a steady stream)',
+      !!result && samples >= 5 && !covered.length && (hintsAfter || waitHints) && after.toasts.some((t) => t.startsWith('Renderer:')),
       `${samples} samples while measuring${covered.length ? `, covered: ${covered.slice(0, 3).join('; ')}` : ''}${other.size ? `, other toasts: ${JSON.stringify([...other])}` : ''}; ` +
-        `after the result: toolbar ${after.bar ? 'shown' : 'hidden'}, toasts ${JSON.stringify(after.toasts)}`);
+        `${waits} samples waiting for a steady stream${waits ? ` (hints then: ${waitHints})` : ''}; after the result: toolbar ${after.bar ? 'shown' : 'hidden'}, toasts ${JSON.stringify(after.toasts)}`);
     // The winner takes over with its next frame, then the other canvases go.
     await until(() => page.evaluate(() => document.querySelectorAll('#stage canvas').length === 1), 5000, 'one canvas').catch(() => {});
     const bw = await rateWindow(1500); // stats updates from the winner
@@ -507,6 +528,9 @@ async function checkBakeoff() {
     const canvases = await page.evaluate(() => [...document.querySelectorAll('#stage canvas')].map((c) => `${c.dataset.path}${c.hidden ? ' (hidden)' : ''}`));
     const overlay = await page.textContent('#stats').catch(() => '');
     const res = result?.results || {};
+    // A path this browser does not have at all (Chrome 122 on Xvfb: no
+    // WebGPU adapter; E2E_CHROMIUM) is not one to measure.
+    all = all.filter((p) => !/^(no WebGPU adapter|WebGPU unavailable)$/.test(res[p]?.error || ''));
     const rule = result?.rule || {};
     const row = (p) => (res[p]?.error ? `${p}: unavailable (${res[p].error})`
       : `${p}: draw p50/p95 ${res[p]?.draw?.p50}/${res[p]?.draw?.p95} ms (n ${res[p]?.draw?.n}, rounds ${res[p]?.drawRounds?.join('/')}), ` +
@@ -522,7 +546,10 @@ async function checkBakeoff() {
     if (fps >= 10) pool = pool.filter((p) => res[p].fps >= rule.minShare * fps);
     const disp = Math.min(...pool.map((p) => res[p].display.p50));
     pool = pool.filter((p) => res[p].display.p50 <= disp + rule.refreshMs);
-    if (pool.some((p) => res[p].desynchronized === true)) pool = pool.filter((p) => res[p].desynchronized === true);
+    // Desynchronized granted, then cannot report it (null), then not granted or no such mode (WebGPU).
+    const rank = (p) => (res[p].desynchronized === true ? 2 : p !== 'webgpu' && res[p].desynchronized == null ? 1 : 0);
+    const top = Math.max(...pool.map(rank));
+    pool = pool.filter((p) => rank(p) === top);
     const def = pool[0];
     const d = res[def]?.drawRounds || [];
     const clear = pool.filter((p) => p !== def && res[p].drawRounds.every((v, i) => v !== null && d[i] !== null && v + rule.marginMs < d[i]))
@@ -542,7 +569,8 @@ async function checkBakeoff() {
       !!result?.winner && result.winner === want && measured.length >= 2 && all.every((p) => enough(p) && res[p].drawRounds?.length === 2 && res[p].display.n >= 1) &&
         !!result.why && st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && stored.why === result.why && storedAs &&
         canvases.length === 1 && canvases[0] === result.winner && overlay.includes('bake-off') && overlay.includes('★ ') && overlay.includes(result.why) && (st.fps > 20 || br.ok),
-      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: ${result?.winner} (${result?.why}; rule wants ${want}; conclusive ${result?.conclusive}, ` +
+      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s (waited ${((result?.waitedMs ?? NaN) / 1000).toFixed(1)} s for a steady stream${result?.steadyStart === false ? ', never steady' : ''}): ` +
+        `${result?.winner} (${result?.why}; rule wants ${want}; conclusive ${result?.conclusive}, ` +
         `stream ${rule.expectFps} fps expected; stored ${stored?.provisional ? `provisional, try ${stored.tries}` : 'for good'}); ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
         `canvases left: ${canvases.join(', ')}; stored key ${stored?.key}; ${st?.fps?.toFixed(1)} fps after${br.note}; ` +
         `during the bake-off CPUs ${bIdle == null ? '?' : (100 * bIdle).toFixed(0)} % idle (median second ${bMedian == null ? '?' : (100 * bMedian).toFixed(0)} %)`);
@@ -559,9 +587,11 @@ async function checkBakeoff() {
       `result pacing ${result?.pacing}, stored ${stored?.pacing}; draws by tick source this session ${JSON.stringify(pc)}; ` +
         `CPUs ${bIdle == null ? '?' : (100 * bIdle).toFixed(0)} % idle during the bake-off (median second ${bMedian == null ? '?' : (100 * bMedian).toFixed(0)} %)`);
     results.push({ bakeoff: result, stored });
-    // The client's first stage report (10 s after the worker started) falls
-    // in the bake-off: its frames come from several paths.
-    const stagesLine = await until(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]*/) || [])[0], 12000, 'stage line').catch(() => '');
+    // A stage report of the client (every 10 s from the worker's start) falls
+    // in the bake-off: its frames come from several paths. (The bake-off
+    // starts once the stream gives its frames: not always in the first.)
+    const stagesLine = await until(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]* renderer=bakeoff [^\n]*/) || [])[0], 12000, 'stage line')
+      .catch(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]*/) || [''])[0]);
     check('renderer auto: the host logs a stage window that mixes paths as renderer=bakeoff', / renderer=bakeoff /.test(stagesLine),
       stagesLine.replace(/^.*?msg=/, '').slice(0, 200));
     await endStream();
@@ -707,6 +737,77 @@ async function checkPickedPathLost(path) {
   }
 }
 
+// Renderer Auto's stored pick and when it is measured again (second hardware
+// run, stream.js presentStale / presentRecheck), on the stream page before a
+// connection, from the plan the page would connect with: the first hardware
+// run's pick as that build stored it (no rule version, "the only path left"
+// at 12.3 of 60 fps; it stayed for good and every session of the second run
+// drew with the 2D canvas unmeasured) is measured again, saying why; a
+// current pick stands; one made at another display refresh rate or over 30
+// days ago is measured again; a provisional pick kept after three tries
+// stands, until a connection that draws with it has had a stream at its
+// rate for 10 s (stats every 0.5 s), after which the next one measures again
+// (a slower stream in between starts the count over).
+async function checkStoredPickStale() {
+  await page.goto(`${base}/`);
+  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { ...PREFS_2D, renderer: 'auto' });
+  await page.click('.host.online a.btn-primary');
+  await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+  const out = await page.evaluate((KEY) => {
+    const r = window.__recon;
+    const key = r.deviceKey();
+    const day = 864e5;
+    const owner = {
+      key, winner: 'canvas2d', why: 'the only path left', at: new Date(Date.now() - 3 * day).toISOString(), pacing: 'latency', video: '1920x1080 60 fps hevc', hz: r.hz, dpr: 1.25,
+      results: {
+        canvas2d: { desynchronized: null, draw: { p50: 0.59, n: 31 }, display: { p50: 2.24, n: 29 }, fps: 12.3 },
+        webgl2: { desynchronized: false, draw: { p50: 0.24, n: 27 }, display: { p50: 2.25, n: 27 }, fps: 10.1, out: 'too few samples' },
+        webgpu: { desynchronized: null, draw: { p50: 0.43, n: 27 }, display: { p50: 2.37, n: 27 }, fps: 10.1, out: 'too few samples' },
+      },
+    };
+    const good = {
+      ...owner, v: 3, at: new Date(Date.now() - day).toISOString(), why: 'desynchronized; no other path draws over 1 ms faster', expectFps: 60,
+      results: { canvas2d: { ...owner.results.canvas2d, desynchronized: true, fps: 59.8 }, webgl2: { ...owner.results.webgl2, fps: 59.6, out: undefined } },
+    };
+    const kept = { ...good, provisional: true, tries: 3, results: { canvas2d: { ...good.results.canvas2d, fps: 20 } } };
+    const plan = (rec) => { localStorage.setItem(KEY, JSON.stringify(rec)); const x = r.presentPlan(); return { mode: x.mode, paths: x.paths, stale: x.stale || '' }; };
+    const cases = {
+      owner: plan(owner), good: plan(good), hz: plan({ ...good, hz: r.hz * 2 }), old: plan({ ...good, at: new Date(Date.now() - 40 * day).toISOString() }),
+      kept: plan(kept), shortConclusive: plan({ ...good, results: { canvas2d: { ...good.results.canvas2d, fps: 20 }, webgl2: { ...good.results.webgl2, fps: 20 } } }),
+    };
+    // A connection drawing with the kept pick: 19 good stats, a slow one,
+    // then 20 good ones.
+    localStorage.setItem(KEY, JSON.stringify(kept));
+    const saved = { present: r.present, videoCfg: r.videoCfg };
+    r.present = { mode: 'auto', paths: ['canvas2d'] };
+    r.videoCfg = { fps: 60 };
+    const good1 = { fps: 0.9 * Math.min(60, r.hz), renderer: { name: 'canvas2d' } };
+    const tries = () => JSON.parse(localStorage.getItem(KEY)).tries;
+    for (let i = 0; i < 19; i++) r.presentRecheck(good1);
+    r.presentRecheck({ ...good1, fps: 0.5 * good1.fps });
+    const afterSlow = tries();
+    for (let i = 0; i < 19; i++) r.presentRecheck(good1);
+    const before = tries();
+    r.presentRecheck(good1);
+    const after = tries();
+    Object.assign(r, saved);
+    cases.recheck = { afterSlow, before, after, plan: r.presentPlan().mode, log: r.logs.filter((l) => l.includes('measures the renderers again on the next connection')).pop() || '' };
+    localStorage.removeItem(KEY);
+    return cases;
+  }, PRESENT_KEY);
+  const c = out;
+  check("renderer auto: the first hardware run's stored pick (no rule version, 12.3 of 60 fps) is measured again, saying why",
+    c.owner.mode === 'bakeoff' && /earlier version of this page on a stream short of frames \(12\.3 of 60 fps\)/.test(c.owner.stale), JSON.stringify(c.owner));
+  check('renderer auto: a current pick stands (also one made on a short stream that measured every path: conclusive)',
+    c.good.mode === 'auto' && c.good.paths[0] === 'canvas2d' && !c.good.stale && c.shortConclusive.mode === 'auto', `${JSON.stringify(c.good)}; ${JSON.stringify(c.shortConclusive)}`);
+  check('renderer auto: a pick made at another display refresh rate or over 30 days ago is measured again',
+    c.hz.mode === 'bakeoff' && /Hz now/.test(c.hz.stale) && c.old.mode === 'bakeoff' && /over 30 days ago/.test(c.old.stale), `${JSON.stringify(c.hz)}; ${JSON.stringify(c.old)}`);
+  check('renderer auto: a provisional pick kept after three tries stands until a connection drawing with it has had a stream at its rate for 10 s; then the next one measures again',
+    c.kept.mode === 'auto' && c.recheck.afterSlow === 3 && c.recheck.before === 3 && c.recheck.after === 0 && c.recheck.plan === 'bakeoff' && !!c.recheck.log,
+    `${JSON.stringify(c.kept)}; ${JSON.stringify(c.recheck)}`);
+  await endStream();
+}
+
 // Client-side upscaling in the stream (Phase 5): the WebGPU renderer shows the
 // test stream at half the canvas size each way (FSR_STREAM: 480x270 on the
 // headed page's 960x540 canvas) with upscaling Auto (2x, above 1.05x): FSR 1
@@ -787,7 +888,7 @@ async function headedPage() {
   if (spawnSync('sh', ['-c', 'command -v Xvfb']).status !== 0) return null;
   const disp = await startXvfb('1920x1080x24');
   const b = await chromium.launch({
-    headless: false, env: { ...process.env, DISPLAY: disp },
+    headless: false, env: { ...process.env, DISPLAY: disp }, executablePath: chromiumPath,
     args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
   });
   const c = await b.newContext({ ignoreHTTPSErrors: true, viewport: HEADED_VIEWPORT, deviceScaleFactor: HEADED_DPR, storageState: await ctx.storageState() });
@@ -2183,16 +2284,47 @@ async function checkPickRule() {
         canvas2d: mk({ fps: 14 }), webgl2: mk({ fps: 14 }) }, { expectFps: 60, conclusive: true }],
       ['a starved stream, WebGL2 drew fewer frames: provisional', 'canvas2d', { webgl2: 'drops frames' }, {
         canvas2d: mk({ fps: 20 }), webgl2: mk({ fps: 12 }) }, { expectFps: 60, conclusive: false }],
+      // Chrome 122 has no getContextAttributes on OffscreenCanvasRenderingContext2D: the 2D canvas cannot
+      // report desynchronized (null). Granted (true) before that, before not granted (false) or no such mode (WebGPU).
+      ["Chrome 122: the 2D canvas cannot report desynchronized, WebGL2 reports it granted, near tie: WebGL2", 'webgl2', {}, {
+        canvas2d: mk({ desynchronized: null }), webgl2: mk({ draw: { p50: 0.4, n: 70 }, drawRounds: [0.4, 0.4] }), webgpu: mk({ desynchronized: null }) }],
+      ["Chrome 122: WebGL2 desynchronized and 2 ms faster in both rounds than the 2D canvas that cannot report it", 'webgl2', {}, {
+        canvas2d: mk({ desynchronized: null, draw: { p50: 2.6, n: 70 }, drawRounds: [2.6, 2.6] }), webgl2: mk({ draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
+      ["the owner's Chrome 122 numbers (first hardware run) on a stream at its rate: the 2D canvas, the one that may be desynchronized", 'canvas2d', {}, {
+        canvas2d: mk({ desynchronized: null, draw: { p50: 0.59, n: 180 }, display: { p50: 2.24, n: 180 }, drawRounds: [0.62, 0.55], fps: 60 }),
+        webgl2: mk({ desynchronized: false, draw: { p50: 0.24, n: 180 }, display: { p50: 2.25, n: 180 }, drawRounds: [0.27, 0.22], fps: 60 }),
+        webgpu: mk({ desynchronized: null, draw: { p50: 0.43, n: 180 }, display: { p50: 2.37, n: 180 }, drawRounds: [0.51, 0.38], fps: 60 }) }, { expectFps: 60 }],
+      ['Chrome 122: WebGL2 not desynchronized and 3 ms faster in both rounds than the 2D canvas that cannot report it: the 2D canvas', 'canvas2d', {}, {
+        canvas2d: mk({ desynchronized: null, draw: { p50: 3.6, n: 70 }, drawRounds: [3.6, 3.6] }), webgl2: mk({ desynchronized: false, draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
+      ['an updated Chrome on the owner\'s numbers: the 2D canvas reports desynchronized, WebGL2 not: the 2D canvas', 'canvas2d', {}, {
+        canvas2d: mk({ draw: { p50: 0.59, n: 180 }, drawRounds: [0.62, 0.55] }), webgl2: mk({ desynchronized: false, draw: { p50: 0.24, n: 180 }, drawRounds: [0.27, 0.22] }),
+        webgpu: mk({ desynchronized: null, draw: { p50: 0.43, n: 180 }, drawRounds: [0.51, 0.38] }) }],
+      ['WebGPU (no low-latency mode) 2 ms faster than the desynchronized 2D canvas: the 2D canvas', 'canvas2d', {}, {
+        canvas2d: mk({ draw: { p50: 2.6, n: 70 }, drawRounds: [2.6, 2.6] }), webgpu: mk({ desynchronized: null, draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
     ];
-    return list.map(([name, want, out, res, o = {}]) => ({
-      name, want, out, conclusive: o.conclusive ?? want !== null, got: R.pickPath(res, 1000 / 60, R.PICK, o.expectFps || 0),
-    }));
+    // When the bake-off measures (bakeStart: fps of the last second, the stream's rate, the least that gives
+    // every path its samples (15), the time waited since the warm-up). The owner's still desktop: ~10 fps.
+    const starts = [
+      ['a stream at its rate', 60, 60, 0, 'steady'], ['48 of 60 fps (80 %)', 48, 60, 0, 'steady'], ['an unknown rate', 3, 0, 0, 'steady'],
+      ['30 of 60 fps for 10 s: wait', 30, 60, 10000, 'wait'], ['30 of 60 fps for 15 s: measure all the same', 30, 60, 15000, 'short'],
+      ["a still desktop (10 of 60 fps) for 20 s: wait for it to move", 10, 60, 20000, 'wait'], ['14 of 60 fps for 59 s: wait', 14, 60, 59000, 'wait'],
+      ['a still desktop for 60 s: not measured', 10, 60, 60000, 'give up'],
+    ].map(([name, fps, expect, waited, want]) => ({ name, want, got: R.bakeStart(fps, expect, 15, waited) }));
+    return {
+      picks: list.map(([name, want, out, res, o = {}]) => ({
+        name, want, out, conclusive: o.conclusive ?? want !== null, got: R.pickPath(res, 1000 / 60, R.PICK, o.expectFps || 0),
+      })),
+      starts,
+    };
   });
-  for (const c of cases) {
+  for (const c of cases.picks) {
     const outOK = Object.entries(c.out).every(([p, why]) => c.got.out[p] === why) && Object.keys(c.got.out).length === Object.keys(c.out).length;
     check(`Auto's pick (unit): ${c.name}`, c.got.winner === c.want && outOK && c.got.conclusive === c.conclusive,
       `${c.got.winner} (${c.got.why}); out ${JSON.stringify(c.got.out)}; conclusive ${c.got.conclusive}`);
   }
+  const bad = cases.starts.filter((c) => c.got !== c.want);
+  check(`Auto's bake-off start (unit): ${cases.starts.length} cases, a still desktop waited out, then not measured`, !bad.length,
+    cases.starts.map((c) => `${c.name}: ${c.got}${c.got !== c.want ? ` (want ${c.want})` : ''}`).join('; '));
 }
 
 // Frame pacing (step 4.4), live on a scenario's stream. The drawer's "Frame
@@ -2917,6 +3049,94 @@ async function checkDrawerKeyboard() {
   }
 }
 
+// The old-browser notice (second hardware run: the owner's Chrome 122,
+// browser.js). Chrome 122 lacks two of the features the client uses that
+// the tested Chromium has, found by running Chrome for Testing 122 against
+// it: getContextAttributes on the 2D canvas of an OffscreenCanvas (whether
+// it got low-latency presentation) and GPUCanvasContext.getConfiguration
+// (HDR10). Played in a second context with Chrome 122's user agent and
+// those two members removed from the page (the worker keeps its own; its
+// gaps are the page's, which it reports): the dashboard's "This browser"
+// card and the stream page's splash say how old it is, what it lacks and
+// that an update brings it, as information (neither gap costs latency by
+// itself: no "lower latency" promise, no orange); the overlay has a Browser
+// row; the host logs the browser and what it lacks with the input latency.
+// The browser the test runs (Chromium 141, or E2E_CHROMIUM's) shows the
+// notice only where it is older. At unit level (browser.js on stand-in
+// globals): no notice for a Chromium without gaps however old, nor for a
+// current one lacking what its platform lacks (Keyboard Lock on Android);
+// "lower latency" and orange only for a gap that costs it (WebTransport);
+// "1 version".
+const CHROME_122_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.128 Safari/537.36';
+async function checkOldBrowser() {
+  await page.goto(`${base}/`);
+  await page.waitForSelector('#browser-badge', { timeout: 10000 });
+  const own = await page.evaluate(() => ({ badge: document.getElementById('browser-badge')?.textContent, notice: document.getElementById('browser-notice')?.textContent || null }));
+  const major = +(/(\d+)/.exec(browser.version()) || [])[1];
+  check(`old browser: the dashboard names this browser (${browser.version()}) and gives the notice only where it is older than Chromium 141`,
+    own.badge === `Chrome ${major}` && (major < 141 ? /versions? older than Chromium 141/.test(own.notice || '') : own.notice === null),
+    JSON.stringify(own));
+  const units = await page.evaluate(async () => {
+    const B = await import('/js/browser.js');
+    const ua = (v, os = 'Windows NT 10.0; Win64; x64') => `Mozilla/5.0 (${os}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v}.0.0.0 Safari/537.36`;
+    const C = function () {};
+    const proto = (...m) => { const f = function () {}; for (const k of m) f.prototype[k] = undefined; return f; };
+    const all = {
+      WebTransport: C, VideoDecoder: C, onpointerrawupdate: null, OffscreenCanvasRenderingContext2D: proto('getContextAttributes'),
+      GPUCanvasContext: proto('getConfiguration'), WebTransportSendStream: proto(), navigator: { gpu: {}, keyboard: { lock() {} } },
+    };
+    const n = (v, g, os) => B.browserNotice(B.browserInfo(ua(v, os)), B.browserGaps(g));
+    return {
+      'Chrome 140 without gaps': n(140, all),
+      'Chrome 150 on Android without Keyboard Lock': n(150, { ...all, navigator: { gpu: {} } }, 'Linux; Android 14; Pixel 8'),
+      'Chrome 140 without the 2D canvas report': n(140, { ...all, OffscreenCanvasRenderingContext2D: proto() }),
+      'Chrome 96 without WebTransport': n(96, { ...all, WebTransport: undefined }),
+    };
+  });
+  const u = Object.values(units);
+  check('old browser (unit): no notice without a gap an update closes; "lower latency" and orange only for a gap that costs it',
+    u[0] === null && u[1] === null && u[2]?.warn === false && /^Chrome 140 is 1 version older than .*; it lacks the 2D canvas's low-latency report .*\. Updating Chrome brings it\.$/.test(u[2]?.text || '') &&
+      u[3]?.warn === true && /^Chrome 96 is 45 versions older .* lacks WebTransport\. Update Chrome for lower latency\.$/.test(u[3]?.text || ''),
+    Object.entries(units).map(([k, v]) => `${k}: ${v ? `${v.warn ? '[warn] ' : ''}${v.text}` : 'none'}`).join(' | '));
+  const old = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 }, userAgent: CHROME_122_UA, storageState: await ctx.storageState() });
+  await old.addInitScript(() => {
+    delete OffscreenCanvasRenderingContext2D.prototype.getContextAttributes;
+    if (typeof GPUCanvasContext === 'function') delete GPUCanvasContext.prototype.getConfiguration;
+  });
+  const p = await old.newPage();
+  p.on('console', onConsole.bind(p));
+  p.on('pageerror', onPageError);
+  p.on('worker', instrumentWorker);
+  const hostProc = procs.find((x) => x.spawnargs.includes('run') && x.exitCode === null);
+  const mainPage = page;
+  page = p;
+  try {
+    await p.goto(`${base}/`);
+    await p.waitForSelector('#browser-notice', { timeout: 10000 });
+    const dash = await p.evaluate(() => ({ badge: document.getElementById('browser-badge')?.textContent, cls: document.getElementById('browser-badge')?.className, notice: document.getElementById('browser-notice')?.textContent }));
+    const want = /^Chrome 122 is \d+ versions older than Chromium 141, which this client is tested with; it lacks the 2D canvas's low-latency report \(getContextAttributes in the worker\)(, HDR canvas output \(GPUCanvasContext\.getConfiguration\))?\. Updating Chrome brings (them|it)\.$/;
+    check('old browser (Chrome 122 emulated): the dashboard says how old it is, what it lacks of what the client uses and that an update brings it (information: no latency promise)',
+      dash.badge === 'Chrome 122' && !/warn/.test(dash.cls) && want.test(dash.notice || ''), JSON.stringify(dash));
+    const log0 = hostProc.log.length;
+    await p.evaluate((pr) => localStorage.setItem('recon.prefs.v1', JSON.stringify(pr)), { stats: true, ...PREFS_2D, path: 'auto', transport: 'auto' });
+    await p.click('.host.online a.btn-primary');
+    await p.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    const splash = await p.evaluate(() => document.getElementById('browser-notice')?.textContent || '');
+    await p.click('#btn-start');
+    await p.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    const st = await until(() => p.evaluate(() => (window.__recon.lastStats?.clock ? window.__recon.lastStats : null)), 10000, 'stats');
+    await sleep(600); // an overlay update
+    const overlay = await p.evaluate(() => [...document.querySelectorAll('#stats-body .row')].map((r) => r.textContent).find((t) => t.startsWith('Browser')) || '');
+    const line = await until(() => (hostProc.log.slice(log0).match(/msg="input latency[^\n]*/) || [])[0], 15000, 'the input latency line').catch(() => '');
+    check('old browser (Chrome 122 emulated): the splash and the overlay say so; the host logs the browser and what it lacks',
+      want.test(splash) && /^BrowserChrome 122 · lacks .*low-latency report/.test(overlay) && / browser="Chrome 122"/.test(line) && /browser_lacks=\S*canvas2d-attributes/.test(line),
+      `splash: ${splash.slice(0, 60)}…; overlay: ${overlay}; host: ${line.replace(/^.*?msg=/, '').slice(0, 260)}; reset_stream_at here ${st?.resetStreamAt}`);
+  } finally {
+    page = mainPage;
+    await old.close().catch(() => {});
+  }
+}
+
 // The dashboard for keyboard and screen-reader users (final review). Its
 // dialogs are named by their titles and their inputs by their labels (a
 // label next to an input names nothing: the account's two password fields
@@ -3279,6 +3499,65 @@ async function checkHardwareDecoderFailure() {
   }
 }
 
+// Input latency (second hardware run, stream-worker.js inLat): the host
+// acknowledges the inputs the client marks (its welcome lists input-ack), and
+// the client turns that into browser event -> injected on the host for the
+// mouse and key presses the scenario just made (clock-synced), with the
+// parts (the page and the hop to the worker, the network, the host) and the
+// round trip's estimate; plausible (under a second: this machine's CPUs are
+// shared by the encoder, the decoder and other work, and every part waits
+// for one). The clock
+// sync has settled (pings after the first video frame) and its error bound
+// is small; the pings carried the minimum round trip once a second at most
+// (the host's FEC auto mode decides after five of them, a span of seconds,
+// though the client pings every 250 ms). The first scenario also checks
+// that the host logs the client's input report (every 10 s) with the mouse
+// and key rows and the clock sync.
+async function checkInputLatency(name, hostProc, log0) {
+  // More mouse motion, 80 ms apart (one marked datagram per 50 ms): one
+  // datagram or its acknowledgement lost on this loaded machine must not
+  // leave the mouse row empty.
+  // A key press of its own after them (Shift: the host's checks look for
+  // others): on a starved page the presses before can leave the 10 s window
+  // before the stats are read. Each row is taken from the first stats that
+  // have it: where the page is slow to read, mouse and keys need not share a
+  // window.
+  const vp = page.viewportSize() || { width: 1280, height: 720 };
+  for (let i = 0; i < 5; i++) {
+    await page.mouse.move(Math.round(vp.width * (0.5 + 0.01 * i)), Math.round(vp.height * 0.5));
+    await sleep(80);
+  }
+  await page.keyboard.press('Shift');
+  const seen = {};
+  const read = () => page.evaluate(() => {
+    const y = window.__recon.lastStats;
+    return y && { input: y.input, inputAcks: y.inputAcks, inputAckCount: y.inputAckCount, clock: y.clock };
+  });
+  const st = await until(async () => {
+    const y = await read();
+    for (const k of ['mouse', 'keys']) if (y?.input?.[k] && !seen[k]) seen[k] = y.input;
+    return seen.mouse && seen.keys ? y : null;
+  }, 15000, 'the input latency in the stats').catch(read);
+  const base = seen.mouse || seen.keys || st?.input || null; // the parts: from the stats that had the mouse row
+  const x = base && { ...base, mouse: seen.mouse?.mouse ?? base.mouse, keys: seen.keys?.keys ?? base.keys };
+  const c = st?.inputAckCount;
+  const acks = c ? `; marked ${c.marked}, acknowledged ${c.acked}, unacknowledged in 5 s ${c.expired} (of them late ${c.late})` : '';
+  const ok = (r) => !!r && r.n >= 1 && r.p50 > -2 && r.p95 < 1000;
+  check(`${name}: input latency measured (browser event -> injected on the host: mouse, keys; parts; clock sync settled)`,
+    !!st?.inputAcks && ok(x?.mouse) && ok(x?.keys) && x.client?.p50 >= 0 && x.host?.p50 >= 0 && x.rtt_half?.p50 > 0 && !!st.clock?.settled && st.clock.boundMs < 50 &&
+      st.clock.rttReports >= 1 && st.clock.rttReports <= st.clock.sinceS + 1.5,
+    x ? `mouse ${x.mouse?.p50}/${x.mouse?.p95} ms (n ${x.mouse?.n}), keys ${x.keys?.p50}/${x.keys?.p95} (n ${x.keys?.n}); parts p50: browser ${x.client?.p50}, ` +
+      `network ${x.network?.p50}, host ${x.host?.p50}, rtt/2 ${x.rtt_half?.p50}; clock ±${st.clock?.boundMs} ms (RTT ${st.clock?.minRttMs} ms, age ${st.clock?.ageS} s, ` +
+      `${st.clock?.samples} pings, settled ${st.clock?.settled}; min RTT in ${st.clock?.rttReports} pings over ${st.clock?.sinceS} s)${acks}` : `no input figure (acknowledgements ${st?.inputAcks}${acks})`);
+  results.push({ inputLatency: { scenario: name, input: x || null, clock: st?.clock || null } });
+  if (name !== 'WebTransport direct') return;
+  // The first report with both (one from before the key presses has only the mouse).
+  const line = await until(() => (hostProc.log.slice(log0).match(/msg="input latency[^\n]* keys="[^\n]* mouse=[^\n]*/) || [])[0], 15000, 'the input latency line').catch(() => '');
+  check('the host logs the client\'s input latency report (mouse, keys, the clock sync, the browser)',
+    / keys="[\d.]+\/[\d.]+\/[\d.]+ n=\d+"/.test(line) && / mouse="/.test(line) && / clock_bound_ms=[\d.]+/.test(line) && / browser="Chrome \d+"/.test(line),
+    line.replace(/^.*?msg=/, '').slice(0, 300));
+}
+
 // Input (step 4.6), on a host with the test hook rumble-echo (it plays a
 // gamepad's triggers back as force feedback, as a game's rumble comes back
 // through ViGEmBus, which this host lacks).
@@ -3333,8 +3612,11 @@ async function checkInputHost() {
   await triggers(0, 0);
   await until(() => page.evaluate(() => window.__pad.resets.length >= 1), 8000, 'rumble reset').catch(() => {});
   await sleep(600); // the stop's repeats
-  const r = await page.evaluate(() => ({ calls: window.__pad.calls, resets: window.__pad.resets, rumbles: window.__recon.rumbles }));
+  const r = await page.evaluate(() => ({ calls: window.__pad.calls, resets: window.__pad.resets, rumbles: window.__recon.rumbles, input: window.__recon.lastStats?.input }));
   await page.evaluate(() => { window.__pad.present = false; });
+  // The pad's state changes were marked and acknowledged too (input latency).
+  check('gamepad input latency: the pad\'s state changes are acknowledged by the host and measured (browser poll -> injected)',
+    r.input?.pad?.n >= 1 && r.input.pad.p50 > -2 && r.input.pad.p95 < 1000, JSON.stringify(r.input?.pad || null));
   const want = (c) => c.type === 'dual-rumble' && c.strongMagnitude === 1 && Math.abs(c.weakMagnitude - 64 / 255) < 1e-9 && c.duration === 250;
   const on = r.calls.filter(want);
   const gaps = on.slice(1).map((c, i) => c.t - on[i].t);
@@ -4883,12 +5165,11 @@ const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(d
 await until(() => existsSync(join(dir, 'gw', 'setup-token.txt')), 10000, 'gateway setup token');
 const setupToken = readFileSync(join(dir, 'gw', 'setup-token.txt'), 'utf8').trim();
 
-// E2E_CHROME=<path>: another Chromium build for the main (headless) page,
+// E2E_CHROME=<path> (same as E2E_CHROMIUM): another Chromium build,
 // e.g. an older Chrome for Testing (the owner's Chrome 122 for the direct
 // path sections: VENDOR_NOTES "Second hardware run: direct path on the LAN").
 const browser = await chromium.launch({
-  headless: true,
-  ...(process.env.E2E_CHROME ? { executablePath: process.env.E2E_CHROME } : {}),
+  headless: true, executablePath: chromiumPath,
   args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
 });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
@@ -5283,6 +5564,7 @@ try {
     await page.mouse.wheel(0, 300);
     await page.keyboard.press('KeyW');
     await page.keyboard.press('ArrowUp');
+    await checkInputLatency(sc.name, hostRun, hostLog0).catch((e) => check(`${sc.name}: input latency`, false, e.message));
     if (!nativeInputLog) {
       await sleep(500);
       const hostProc = procs.find((p) => p.spawnargs.includes('run'));
@@ -5307,10 +5589,13 @@ try {
       const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 5000 }), page.click('#btn-export-latency')]).catch(() => [null]);
       const exp = dl ? JSON.parse(readFileSync(await dl.path(), 'utf8')) : null;
       const expHist = exp?.probe?.histogram ? Object.values(exp.probe.histogram).reduce((a, b) => a + b, 0) : 0;
-      check('overlay "Export latency data" downloads the probe histogram as JSON',
+      check('overlay "Export latency data" downloads the probe histogram as JSON (with the input latency, the clock sync and the browser)',
         exp?.kind === 'kloudit-recon-latency' && exp.probe?.mode === 'seq' && expHist >= (pr?.latency?.n || 1) &&
-          exp.probe.samples?.length === expHist && !!exp.stages?.e2e && exp.video?.encoder === cfg?.encoder,
-        exp ? `${dl.suggestedFilename()}: ${expHist} histogram samples, ${exp.probe.samples?.length} sample rows, stages ${!!exp.stages}` : 'no download');
+          exp.probe.samples?.length === expHist && !!exp.stages?.e2e && exp.video?.encoder === cfg?.encoder &&
+          /^Chrome \d+$/.test(exp.browser?.label || '') &&
+          !!exp.input?.mouse && exp.clock?.boundMs >= 0,
+        exp ? `${dl.suggestedFilename()}: ${expHist} histogram samples, ${exp.probe.samples?.length} sample rows, stages ${!!exp.stages}, ` +
+          `input ${Object.keys(exp.input || {}).join('/') || 'none'}, clock ${JSON.stringify(exp.clock)}, browser ${exp.browser?.label}` : 'no download');
       await page.mouse.move(640, 5); // reveal toolbar
       await sleep(400);
       await page.screenshot({ path: join(outDir, 'stream.png') });
@@ -5366,6 +5651,8 @@ try {
   if (want('webgpu device lost')) await checkPickedPathLost('webgpu').catch((e) => check('WebGPU device lost scenario', false, e.message));
   if (want('webgl2 context lost')) await checkPickedPathLost('webgl2').catch((e) => check('WebGL2 context lost scenario', false, e.message));
   await closeHeaded();
+  if (want('stale stored pick')) await checkStoredPickStale().catch((e) => check('renderer auto: stale stored pick scenario', false, e.message));
+  if (want('old browser')) await checkOldBrowser().catch((e) => check('old browser scenario', false, e.message));
 
   if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
   if (want('udp relay reconnects')) await checkUdpRelayReconnects().catch((e) => check('UDP relay reconnects scenario', false, e.message));
