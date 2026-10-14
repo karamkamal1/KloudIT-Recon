@@ -241,6 +241,12 @@ type VideoConfig struct {
 	ColorSpace  *ColorSpace  `json:"colorSpace,omitempty"`
 	HDRMetadata *HDRMetadata `json:"hdrMetadata,omitempty"`
 	HDRNote     string       `json:"hdrNote,omitempty"`
+	// CPULimit says, for a generation encoded on the host's CPU (no GPU
+	// encoder), that it streams below the client's settings because the CPU
+	// keeps up with no more: "1280×720 at 30 fps, fastest preset (asked:
+	// 1920×1080 at 60 fps): ..." (the client's overlay shows it); omitted
+	// otherwise.
+	CPULimit string `json:"cpuLimit,omitempty"`
 }
 
 // ColorSpace is a stream's colour description in WebCodecs' VideoColorSpaceInit

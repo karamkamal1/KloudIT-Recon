@@ -102,6 +102,8 @@ type Session struct {
 	// desk: whether the session's Windows desktop is on a screen to capture
 	// (desktop.go: locked, a secure desktop, disconnected).
 	desk deskState
+	// cpu: the CPU budget of software encoding (cpubudget.go).
+	cpu cpuState
 
 	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
 	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()
@@ -433,6 +435,7 @@ func (s *Session) run() error {
 	go s.roiLoop()
 	go s.statsLoop()
 	go s.rateLoop()
+	go s.cpuLoop()
 	return s.controlLoop()
 }
 
@@ -1021,6 +1024,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	if p.Source.Backend == "gdigrab" {
 		s.watchGDIDisplay() // gdigrab does not follow a change of the display
 	}
+	s.cpuBudget(&p) // encoding on the CPU: what it keeps up with
 	s.chooseHDR(&p, prefs)
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
@@ -1351,6 +1355,7 @@ func (s *Session) videoEvents() {
 			s.rate.live(s.static.generation(s.static.clock(), c.BitrateKbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), c.FPS)
 			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
+			s.cpuConfig(&c)
 			if s.paused.Load() {
 				// Its frames are dropped: a hidden client would wait for
 				// its key frame and ask again and again. Resume starts a
@@ -1365,6 +1370,7 @@ func (s *Session) videoEvents() {
 			if n := s.a.faults.stillAfter; n > 0 && ev.Frame.Seq >= uint32(n) {
 				continue // test hook: a still desktop, the source sends nothing
 			}
+			s.cpuFrame(ev.Frame, time.Now())
 			s.healFrame(ev.Frame)
 			if ev.Frame.Reencoded {
 				s.stats.reencoded.Add(1)

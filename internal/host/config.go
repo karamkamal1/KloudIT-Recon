@@ -135,6 +135,11 @@ type Config struct {
 	// /dest:console" does, unless another user is signed in at the console
 	// (desktop.go); "off": never, the stream waits for the user to do it.
 	ConsoleSession string `json:"consoleSession,omitempty"`
+	// CPUBudget "auto" ("" = auto) streams a session that encodes on the CPU
+	// (no GPU encoder: libx264 of GDI capture) at a frame rate, size and
+	// preset the CPU sustains, measured (cpubudget.go), instead of what the
+	// client asked for; "off": always what the client asked for.
+	CPUBudget string `json:"cpuBudget,omitempty"`
 
 	DirectPort int    `json:"directPort"`           // UDP port for direct WebTransport (0 = off)
 	DirectAddr string `json:"directAddr,omitempty"` // advertised address override
@@ -267,7 +272,8 @@ func LoadConfig(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("%s: helperLibavcodec must be %q or %q, not %q", path, libavcodecAuto, libavcodecOff, c.HelperLibavcodec)
 	}
-	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}, {"consoleSession", c.ConsoleSession}} {
+	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}, {"consoleSession", c.ConsoleSession},
+		{"cpuBudget", c.CPUBudget}} {
 		if v.val != "" && v.val != settingAuto && v.val != settingOff {
 			return nil, fmt.Errorf("%s: %s must be %q or %q, not %q", path, v.key, settingAuto, settingOff, v.val)
 		}

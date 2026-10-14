@@ -975,6 +975,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	gpuFrames := false      // source produces D3D11 frames (amf: AMF surfaces)
 	var testW, testH int    // the test source's size
 	clock := p.CaptureClock // pts = wall-clock capture time in µs
+	stamped := false        // the source's own pts are that already (gdigrab): no CaptureClockFilter
 	var chain string
 	cursor := "0"
 	if p.DrawCursor {
@@ -1049,10 +1050,20 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 		if p.Source.NativeW < 2 || p.Source.NativeH < 2 {
 			return nil, fmt.Errorf("gdigrab: no area to capture (%dx%d)", p.Source.NativeW, p.Source.NativeH)
 		}
+		chain = "[0:v]null"
+		if clock {
+			// gdigrab stamps each frame with the wall clock in µs as it
+			// grabs it (av_gettime(), CaptureClockFilter's clock): kept
+			// (-copyts), the capture stamp counts the time a frame waits in
+			// FFmpeg's queues before the filters, which a stamp taken in the
+			// filters leaves out. On a CPU that does not keep up most of the
+			// latency is there (host cpubudget.go measures it).
+			args = append(args, "-copyts")
+			chain, stamped = "[0:v]settb=AVTB", true
+		}
 		args = append(args, "-fpsprobesize", "0", "-f", "gdigrab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor,
 			"-offset_x", strconv.Itoa(p.Source.X), "-offset_y", strconv.Itoa(p.Source.Y),
 			"-video_size", fmt.Sprintf("%dx%d", p.Source.NativeW, p.Source.NativeH), "-i", "desktop")
-		chain = "[0:v]null"
 	case "x11grab":
 		args = append(args, "-f", "x11grab", "-framerate", strconv.Itoa(p.FPS), "-draw_mouse", cursor)
 		if p.Source.NativeW > 0 {
@@ -1075,7 +1086,7 @@ func (c *Caps) BuildArgs(p Params) ([]string, error) {
 	if p.HDR && (p.Source.Backend != "test" || e.Name != HDRTestEncoder) {
 		return nil, errHDRSource
 	}
-	if clock {
+	if clock && !stamped {
 		// Evaluated as the frame leaves the source (after realtime pacing for
 		// the test source), before any conversion or encoding.
 		chain += "," + CaptureClockFilter

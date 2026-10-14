@@ -211,6 +211,14 @@ func (s *Session) lookAtDesktop() {
 	}
 }
 
+// desktopAway reports whether the session's desktop was away at the last
+// look (watchDesktop).
+func (s *Session) desktopAway() bool {
+	s.desk.mu.Lock()
+	defer s.desk.mu.Unlock()
+	return s.desk.away != ""
+}
+
 // awaitDesktop takes a failed generation whose session's desktop is away
 // (desktopNow) and reports whether it did: the failure does not count
 // against the session (nor its encoder, nor its capture), the user is told

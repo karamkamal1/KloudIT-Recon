@@ -1052,6 +1052,8 @@ function onStats(st) {
     row('Video', `${S.video.w}×${S.video.h} ${v.family ? v.family.toUpperCase() : ''}${v.cropRight || v.cropBottom ? ` (coded ${v.codedWidth}×${v.codedHeight}, cropped)` : ''}`),
     row('Codec', `${v.codec || '—'} ${st.hw ? '(HW)' : '(SW)'}`),
     row('Encoder', `${v.encoder || '—'} · ${v.capture || ''}`),
+    // A PC without a GPU encoder streams below the settings where its CPU keeps up with no more (host cpuBudget).
+    v.cpuLimit ? row('  CPU limit', v.cpuLimit) : null,
     row('Loss recovery', recoveryText(v.recovery, st)),
     // Not on the direct path: why not (the attempt's failure, a direct
     // endpoint the PC does not offer, the settings).
