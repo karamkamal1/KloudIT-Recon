@@ -349,8 +349,26 @@ async function checkFullscreen(name) {
     el = await fsElement(6000);
   }
   const inFs = await sized();
-  // keyboard.lock() resolves asynchronously (slowly on a loaded machine).
-  const kbLock = el ? await until(() => page.evaluate(() => window.__recon.keyboardLock), 8000, 'keyboard lock').catch(() => null) : null;
+  // keyboard.lock() resolves asynchronously. The page grants it within
+  // milliseconds of entering fullscreen (instrumented runs), but on a starved
+  // machine one read of the page's state can take seconds (the WebGPU
+  // scenario's main thread entered fullscreen 18-22 s after the toolbar move
+  // here): polled for 16 s of wall clock, judged on the last state read, not
+  // given up after one slow read. kbLockPending: the request had not settled.
+  const kbCpu0 = cpuTimes();
+  const kbState = () => page.evaluate(() => ({ lock: window.__recon.keyboardLock, pending: !!window.__recon.kbLockPending }));
+  let kb = { lock: null, pending: false };
+  if (el) {
+    const t0 = Date.now();
+    kb = await kbState();
+    while (!kb.lock && Date.now() - t0 < 16000) {
+      await sleep(200);
+      kb = await kbState();
+    }
+  }
+  const kbLock = kb.lock;
+  const kbPending = !kb.lock && kb.pending;
+  const kbIdle = idleShare(kbCpu0, cpuTimes());
   await page.keyboard.press('Control+Alt+Shift+KeyF');
   const left = await until(() => page.evaluate(() => !document.fullscreenElement), 6000, 'leaving fullscreen').catch(() => false);
   const out = await sized();
@@ -362,11 +380,21 @@ async function checkFullscreen(name) {
   // Keyboard Lock (step 4.6): Chromium has navigator.keyboard.lock(). Judged
   // when fullscreen went in and out as asked (on a loaded machine a late
   // toolbar click and the hotkey can cross; the check above reports that).
-  const kbAfter = await until(async () => ((await page.evaluate(() => window.__recon.keyboardLock)) === null ? 'off' : null), 3000, 'keyboard lock released')
-    .then(() => null, () => page.evaluate(() => window.__recon.keyboardLock));
+  // Released with fullscreen: polled the same way (6 s of wall clock).
+  let kbAfter = await page.evaluate(() => window.__recon.keyboardLock);
+  for (const t0 = Date.now(); kbAfter !== null && Date.now() - t0 < 6000;) {
+    await sleep(200);
+    kbAfter = await page.evaluate(() => window.__recon.keyboardLock);
+  }
   const kbLog = (await page.evaluate(() => window.__recon.logs)).filter((l) => l.includes('keyboard lock')).pop() || '';
-  const kbDetail = `in fullscreen: ${kbLock}; after: ${kbAfter}${kbLog ? `; ${kbLog.replace(/^\S+ /, '')}` : ''}`;
-  if (el === 'player' && left) {
+  const kbDetail = `in fullscreen: ${kbLock}${kbPending ? ' (keyboard.lock() still pending after 16 s)' : ''}; after: ${kbAfter}` +
+    `${kbLog ? `; ${kbLog.replace(/^\S+ /, '')}` : ''}; ${idleNote(kbIdle)}`;
+  if (el === 'player' && left && kbPending && kbIdle != null && kbIdle < STARVED_IDLE) {
+    // The request neither granted nor refused while the machine had no CPU
+    // to spare: says nothing about the page (a refusal or a lock that is not
+    // released still fails below).
+    console.log(`- ${name}: Keyboard Lock not judged (no CPU to spare, the request still pending): ${kbDetail}`);
+  } else if (el === 'player' && left) {
     check(`${name}: Keyboard Lock held in fullscreen (navigator.keyboard.lock), released with it`, kbLock === 'keyboard.lock' && kbAfter === null, kbDetail);
   } else {
     console.log(`- ${name}: Keyboard Lock not judged (fullscreen ${el ?? 'not entered'}, left ${left}): ${kbDetail}`);

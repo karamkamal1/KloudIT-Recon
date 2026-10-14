@@ -1090,10 +1090,14 @@ async function toggleFullscreen() {
 document.addEventListener('fullscreenchange', async () => {
   if (document.fullscreenElement) {
     if (typeof navigator.keyboard?.lock === 'function') {
+      // kbLockPending: the request has not settled yet (a starved browser
+      // can take seconds; the E2E tells that from a refusal).
+      S.kbLockPending = true;
       const ok = await navigator.keyboard.lock().then(() => true, (e) => {
         S.logs.push(`${new Date().toISOString()} keyboard lock refused: ${e.message}`);
         return false;
       });
+      S.kbLockPending = false;
       // Still in fullscreen: the lock may resolve after a quick exit.
       if (ok && document.fullscreenElement) S.keyboardLock = 'keyboard.lock';
     }
