@@ -14900,13 +14900,27 @@ then drops what the backlog would otherwise hold: 20-50 % of the telemetry on th
 ### Why the rule stays
 
 Dropping telemetry only while nothing resolves for 50 ms (the queue does not move at all) was
-tried and measured: the telemetry check passed (7 of 820, 2 of 874, 1 of 793 dropped, longest
-stalls 52-102 ms in three runs), but the mouse's input latency (browser event to injected on the
-host) in the WebTransport scenarios went from a p50 of 34-105 ms and a p95 of 87-176 ms (merged
-tree, three runs) to 52-955 ms and 114-1206 ms, one input latency check failing; the WebSocket
-relay's (no shared datagram queue) stayed at 7-25 ms. The mouse datagrams waited behind the
-telemetry the queue now held. So the queue is a real backlog in front of input, and 2.7's rule
-is what keeps the mouse ahead of it; the change was not kept. The send-priorities unit check
+tried and measured in three runs of the merged tree with that rule: the telemetry check passed in
+all nine WebTransport scenario windows (1-11 of 787-874 dropped, longest stalls 52-102 ms). The
+mouse's input latency (browser event to injected on the host; each run's p50 and p95 come from
+2-10 mouse events) against the merged tree's five runs above:
+
+| Scenario | merged 57d2a40, 2.7's rule (5 runs) | the rule that was tried (3 runs) |
+|---|---|---|
+| WebTransport direct | p50 54-105, p95 87-176 ms (n 7-10) | p50 114-461, p95 323-1206 ms (n 7-9) |
+| WebTransport relay | p50 41-154, p95 87-230 ms (n 5-9) | p50 66, 349, 955; p95 177, 349, 976 ms (n 6, 2, 4) |
+| WebTransport relay fallback (splice) | p50 34-159, p95 121-447 ms (n 6-9) | p50 52-84, p95 114-189 ms (n 5) |
+| WebSocket relay (no datagram queue) | p50 13-25 ms | p50 7-16 ms |
+
+Over the three WebTransport scenarios the merged tree's baseline is a p50 of 34-159 ms and a p95
+of 87-447 ms, so the harm does not show in every scenario. It shows in the direct one: each of
+the tried rule's three runs is above each of the merged tree's five, and one failed the input
+latency check (p95 1206 ms, over its 1000 ms limit). In the relay two runs were far above the
+merged range, but from only 2 and 4 mouse events, and the third was inside it. The splice was no
+worse. Where the harm shows, the mouse datagrams waited behind the telemetry the queue now held:
+the queue is a real backlog in front of input, and 2.7's rule is what keeps the mouse ahead of
+it, so the change was not kept (three runs of a rule on a loaded machine are few; the direct
+scenario's separation is the evidence, the relay's is weak). The send-priorities unit check
 now also runs a queue that moves but drains no faster than telemetry comes (one write every
 10 ms, telemetry every 8 ms, an input datagram at 1 s): input waits at most twice the stall time
 (30 ms with the rule; 270 ms, 35 writes deep, with the rule that was tried, which fails it).

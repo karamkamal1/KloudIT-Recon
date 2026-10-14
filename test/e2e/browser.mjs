@@ -3995,9 +3995,11 @@ function fakeWriter(name, log) {
 // comes every 8 ms, an input datagram at 1 s. Telemetry gives way, so the
 // input waits no longer than the queue may stand: dropping telemetry only
 // when nothing resolved for 50 ms let the backlog grow (the queue moved
-// all the time) and the mouse's input latency in that E2E rose to a p50 of
-// 240-960 ms (VENDOR_NOTES "Merged second hardware run: telemetry and
-// frames under load").
+// all the time) and, in that E2E's WebTransport direct scenario, raised the
+// mouse's input latency from a p50 of 54-105 ms (5 runs) to 114-461 ms (3
+// runs); the relay showed it in two runs of few samples, the splice not
+// (VENDOR_NOTES "Merged second hardware run: telemetry and frames under
+// load").
 async function runSlowQueue() {
   const w = fakeWriter('datagrams.writable', []);
   const prio = { sendOrder: false, sendGroup: false, datagramWritables: false, telemetrySent: 0, telemetryDropped: 0, telemetryStallMs: 0 };
