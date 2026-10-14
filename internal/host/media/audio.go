@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"sync"
@@ -39,7 +40,19 @@ type AudioConfig struct {
 	// CaptureChanged, if set, is called (from the capture goroutine) when
 	// the duration of the source's capture packets changes (CaptureMs).
 	CaptureChanged func()
+	// DeviceChanged, if set, is called (from the capture goroutine) with
+	// false when the source finds no sound device (ErrNoAudioDevice: a VM
+	// without one), and with true when it delivers audio again after that.
+	DeviceChanged func(present bool)
 }
+
+// ErrNoAudioDevice: the source has no sound output device to capture (a VM
+// without one, a PC whose device was removed, the Windows Audio service
+// stopped). Audio waits for one quietly (Audio.Start).
+var ErrNoAudioDevice = errors.New("no sound output device")
+
+// noDevicePoll is how often a source without a sound device is tried again.
+var noDevicePoll = 5 * time.Second
 
 // Opus frame durations in ms (step 4.6). The host collects a whole frame
 // before it encodes it, and the client's jitter buffer must hold at least
@@ -206,8 +219,22 @@ func (a *Audio) Start(send func([]byte)) error {
 			codecID = proto.AudioCodecPCM
 		}
 		var last time.Time // the source's last delivery
+		// The source runs sink on this goroutine: noDev (it found no sound
+		// device) and lastErr (the last failure logged, until audio flows
+		// again) need no lock.
+		noDev, lastErr := false, ""
 		sink := func(s []float32) {
 			now := time.Now()
+			lastErr = ""
+			if noDev {
+				noDev = false
+				if a.log != nil {
+					a.log.Info("audio: a sound output device is back", "source", a.src.Name())
+				}
+				if a.cfg.DeviceChanged != nil {
+					a.cfg.DeviceChanged(true)
+				}
+			}
 			frames := len(s) / audioChannels
 			if ms := int32((frames*1000 + audioRate/2) / audioRate); a.capMs.Swap(ms) != ms {
 				if a.log != nil {
@@ -272,19 +299,39 @@ func (a *Audio) Start(send func([]byte)) error {
 				pcm = append(pcm[:0], pcm[frame*audioChannels:]...)
 			}
 		}
+		// A source without a sound device (a VM without one) is tried
+		// again every noDevicePoll, quietly: one log line and one
+		// DeviceChanged(false) per spell, not a warning every few seconds.
+		// Other failures are logged once each until audio flows again.
 		backoff := 500 * time.Millisecond
 		for ctx.Err() == nil {
 			err := a.src.Run(ctx, sink)
 			if ctx.Err() != nil {
 				return
 			}
-			if a.log != nil {
+			wait := backoff
+			switch {
+			case errors.Is(err, ErrNoAudioDevice):
+				wait = noDevicePoll
+				if !noDev {
+					noDev = true
+					if a.log != nil {
+						a.log.Info("audio: no sound output device on this PC: the stream has no sound until one is added", "source", a.src.Name(), "err", err)
+					}
+					if a.cfg.DeviceChanged != nil {
+						a.cfg.DeviceChanged(false)
+					}
+				}
+			case a.log != nil && fmt.Sprint(err) == lastErr:
+				a.log.Debug("audio capture stopped again, restarting", "source", a.src.Name(), "err", err)
+			case a.log != nil:
 				a.log.Warn("audio capture stopped, restarting", "source", a.src.Name(), "err", err)
 			}
+			lastErr = fmt.Sprint(err)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-time.After(wait):
 			}
 			if backoff < 5*time.Second {
 				backoff *= 2

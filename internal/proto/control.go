@@ -341,6 +341,10 @@ type AudioConfig struct {
 	// frame duration, step 4.6): its sequence numbers go on. Any other
 	// config announces a new stream, numbered from 0.
 	SameStream bool `json:"sameStream,omitempty"`
+	// Reason says why audio is off where the client asked for it (Enabled
+	// false): the PC has no sound output device (a VM without one). The
+	// host enables it again, as a new stream, once one delivers audio.
+	Reason string `json:"reason,omitempty"`
 }
 
 // CursorShape carries a cursor image (PNG, base64) for local cursor rendering.

@@ -4,6 +4,7 @@ package media
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -18,8 +19,11 @@ func TestWASAPILoopback(t *testing.T) {
 	var samples int
 	err := WASAPISource{}.Run(ctx, func(s []float32) { samples += len(s) })
 	if err != nil {
+		if errors.Is(err, ErrNoAudioDevice) {
+			t.Skipf("no audio endpoint (ErrNoAudioDevice: audio waits for one quietly): %v", err)
+		}
 		if strings.Contains(err.Error(), "GetDefaultAudioEndpoint") {
-			t.Skipf("no audio endpoint: %v", err)
+			t.Fatalf("GetDefaultAudioEndpoint failed, not as no device: %v", err)
 		}
 		if strings.Contains(err.Error(), "0x88890003") {
 			t.Skipf("loopback capture not implemented by this platform (Wine): %v", err)

@@ -1,13 +1,19 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -326,4 +332,93 @@ console.log(JSON.stringify(vecs.map((v) => P.audioPacketSamples(Uint8Array.from(
 			t.Errorf("datagram %s: protocol.js %d samples, want %d", v.Hex[:min(len(v.Hex), 24)], got[i], v.Want)
 		}
 	}
+}
+
+// deviceSource has no sound device until present is set, then delivers
+// 10 ms of silence every few ms; runs counts its starts.
+type deviceSource struct {
+	present atomic.Bool
+	runs    atomic.Int32
+}
+
+func (*deviceSource) Name() string { return "test-device" }
+
+func (d *deviceSource) Run(ctx context.Context, sink func([]float32)) error {
+	d.runs.Add(1)
+	if !d.present.Load() {
+		return fmt.Errorf("%w: GetDefaultAudioEndpoint: HRESULT 0x80070490", ErrNoAudioDevice)
+	}
+	for ctx.Err() == nil {
+		sink(make([]float32, 960))
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil
+}
+
+// TestAudioNoDevice: on a PC without a sound output device (a VM) audio
+// waits for one quietly: one log line and one DeviceChanged(false), polls
+// every noDevicePoll without logging, and once a device delivers audio
+// DeviceChanged(true) and packets follow. Before, every retry (5 s apart)
+// logged a warning for as long as the agent ran.
+func TestAudioNoDevice(t *testing.T) {
+	defer func(d time.Duration) { noDevicePoll = d }(noDevicePoll)
+	noDevicePoll = 20 * time.Millisecond
+	var logs bytes.Buffer
+	var mu sync.Mutex
+	log := slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	src := &deviceSource{}
+	changes := make(chan bool, 8)
+	a := NewAudio(src, AudioConfig{Codec: "opus", DeviceChanged: func(p bool) { changes <- p }}, log)
+	pkts := make(chan []byte, 256)
+	if err := a.Start(func(p []byte) {
+		select {
+		case pkts <- p:
+		default:
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Stop()
+	if p := <-changes; p {
+		t.Fatal("first change: present")
+	}
+	for src.runs.Load() < 5 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	src.present.Store(true)
+	select {
+	case p := <-changes:
+		if !p {
+			t.Fatal("second change: absent")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no DeviceChanged(true)")
+	}
+	select {
+	case <-pkts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no packet once the device was back")
+	}
+	mu.Lock()
+	out := logs.String()
+	mu.Unlock()
+	if n := strings.Count(out, "no sound output device on this PC"); n != 1 || strings.Contains(out, "level=WARN") ||
+		!strings.Contains(out, "a sound output device is back") {
+		t.Fatalf("log (%d no-device lines):\n%s", n, out)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("%d more changes", len(changes))
+	}
+}
+
+// lockedWriter serialises writes to w.
+type lockedWriter struct {
+	w  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }

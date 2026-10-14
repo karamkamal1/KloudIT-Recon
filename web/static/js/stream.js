@@ -1128,7 +1128,7 @@ function inputRow(row) {
 // fixed), underruns (not the ends of sounds) and packets lost.
 function audioRow(st, row) {
   const c = S.audioCfg;
-  if (!c?.enabled) return row('Audio', 'off');
+  if (!c?.enabled) return row('Audio', c?.reason ? `off: ${c.reason}` : 'off');
   const j = S.audioJitter;
   const buf = j ? `buf ${fmt(j.levelMs, 0, '')}/${fmt(j.targetMs, 0)} ${j.auto ? 'auto' : 'fixed'} · underruns ${j.underruns}` : `buf ${fmt(st.audioMs, 0)}`;
   return row('Audio', `${c.codec} ${fmt(st.audioFrameMs ?? c.frameMs, 0)} · ${buf} · lost ${st.audioLost}`, j?.underruns ? 'warn' : '');

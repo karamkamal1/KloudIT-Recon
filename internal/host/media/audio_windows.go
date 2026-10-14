@@ -5,6 +5,7 @@ package media
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -76,9 +77,31 @@ func (o *comObject) call(slot int, args ...uintptr) error {
 	all := append([]uintptr{uintptr(unsafe.Pointer(o))}, args...)
 	r, _, _ := syscall.SyscallN(o.vtbl[slot], all...)
 	if int32(r) < 0 {
-		return fmt.Errorf("HRESULT 0x%08X", uint32(r))
+		return hresult(uint32(r))
 	}
 	return nil
+}
+
+// hresult is a failed COM call's HRESULT.
+type hresult uint32
+
+func (h hresult) Error() string { return fmt.Sprintf("HRESULT 0x%08X", uint32(h)) }
+
+// HRESULTs that mean there is no sound output device to capture.
+const (
+	hrNotFound          = 0x80070490 // E_NOTFOUND: GetDefaultAudioEndpoint, no render device (a VM without one)
+	hrDeviceInvalidated = 0x88890004 // AUDCLNT_E_DEVICE_INVALIDATED: the device went away
+	hrServiceNotRunning = 0x88890010 // AUDCLNT_E_SERVICE_NOT_RUNNING: the Windows Audio service is stopped (Windows Server's default)
+)
+
+// noDevice wraps err in ErrNoAudioDevice when its HRESULT means there is no
+// sound output device to capture.
+func noDevice(err error) error {
+	var h hresult
+	if errors.As(err, &h) && (h == hrNotFound || h == hrDeviceInvalidated || h == hrServiceNotRunning) {
+		return fmt.Errorf("%w: %w", ErrNoAudioDevice, err)
+	}
+	return err
 }
 
 func (o *comObject) release() {
@@ -102,7 +125,11 @@ type WASAPISource struct{}
 
 func (WASAPISource) Name() string { return "wasapi-loopback" }
 
-func (WASAPISource) Run(ctx context.Context, sink func([]float32)) error {
+func (w WASAPISource) Run(ctx context.Context, sink func([]float32)) error {
+	return noDevice(w.run(ctx, sink))
+}
+
+func (WASAPISource) run(ctx context.Context, sink func([]float32)) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if r, _, _ := procCoInitializeEx.Call(0, 0 /*COINIT_MULTITHREADED*/); int32(r) < 0 {

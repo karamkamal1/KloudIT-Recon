@@ -2779,7 +2779,10 @@ func (s *Session) startAudio() {
 	}
 	// 10 ms frames until the first capture packet says whether 5 ms ones
 	// would save anything (media.Audio.PickFrameMs; applyAudioFrame).
-	s.audio = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, CaptureChanged: s.audioFrameCheck}, s.log)
+	var au *media.Audio
+	au = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, CaptureChanged: s.audioFrameCheck,
+		DeviceChanged: func(present bool) { s.audioDevice(au, present) }}, s.log)
+	s.audio = au
 	s.sendJSON(audioConfig(s.audio, false))
 	err := s.audio.Start(func(pkt []byte) {
 		if !s.paused.Load() {
@@ -2792,6 +2795,22 @@ func (s *Session) startAudio() {
 		return
 	}
 	s.audioKbps.Store(int64(s.audio.Kbps()))
+}
+
+// noAudioDevice is the client's reason for audio being off on a PC without
+// a sound output device (proto.AudioConfig.Reason).
+const noAudioDevice = "no sound output device on the PC"
+
+// audioDevice tells the client that audio a has no sound device to capture
+// (a VM without one: audio off, with the reason for its overlay, no notice)
+// or has one again (a new audio stream). From the capture goroutine: it
+// takes no audio lock (stopAudio holds it while the capture ends).
+func (s *Session) audioDevice(a *media.Audio, present bool) {
+	if !present {
+		s.sendJSON(proto.AudioConfig{T: "audio", Enabled: false, Reason: noAudioDevice})
+		return
+	}
+	s.sendJSON(audioConfig(a, false))
 }
 
 func (s *Session) stopAudio() {
