@@ -222,12 +222,14 @@ func TestDirectReportLogged(t *testing.T) {
 			{URL: ans.Direct.URL, Kind: "lan", Note: "the browser's network 192.168.5.0/24", Ms: 2500, Result: "no answer"},
 			{URL: "https://100.101.102.103:48100/wt", Kind: "tailscale", Ms: 2400, Result: "no answer"},
 		},
+		Clock: time.Now().Add(-2 * time.Hour).UnixMilli(), // a client whose clock is 2 h behind
 	}
 	cl := dialClient(t, e, a.URL, a.Hashes, h, nil)
 	cl.waitMsg("welcome", 10*time.Second)
 	l := e.waitLogLine(t, from, 5*time.Second, `msg="direct path: not used by this session, it streams through the gateway"`, "path=relay")
 	if !strings.Contains(l, `why="no answer in 2.5 s: UDP 48100 blocked`) ||
-		!strings.Contains(l, "(lan, the browser's network 192.168.5.0/24): no answer after 2500 ms; 100.101.102.103:48100 (tailscale): no answer after 2400 ms") {
+		!strings.Contains(l, "(lan, the browser's network 192.168.5.0/24): no answer after 2500 ms; 100.101.102.103:48100 (tailscale): no answer after 2400 ms") ||
+		!strings.Contains(l, `client_clock="2h0m0s behind the PC's: before the PC's certificate is valid`) {
 		t.Fatalf("relay session's direct path line: %s", l)
 	}
 	cl.sess.CloseWithError(0, "")
@@ -289,13 +291,20 @@ func TestSessionMovesToDirect(t *testing.T) {
 	if r["session"] != sid || r["path"] != "direct" {
 		t.Fatalf("resumed %v, want session %s on the direct path", r, sid)
 	}
+	// The host sends over the relay until the client shows it moved.
+	time.Sleep(300 * time.Millisecond)
+	if n := relay.frameCount(direct); n != 0 {
+		t.Fatalf("%d frames on the direct connection before the client took the move", n)
+	}
+	// The client takes it, as the browser does: a ping on the new connection.
+	direct.c.SendDatagram(proto.PingDatagram(1, 0, 0))
 	movedAt := relay.frameCount(nil)
 	for deadline := time.Now().Add(10 * time.Second); relay.frameCount(direct) < 60; time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d frames on the direct connection after the move", relay.frameCount(direct))
 		}
 	}
-	l := e.waitLogLine(t, from, 5*time.Second, `msg="session moved to the direct path`, "session="+sid, "path=direct", "from=relay")
+	l := e.waitLogLine(t, from, 5*time.Second, `msg="session moved to the direct path`, "session="+sid, "path=direct", "from=relay", "taken_ms=")
 	if n := len(e.logs.lines(from, `msg="session started"`)); n != 1 {
 		t.Fatalf("%d session starts: the move started a session", n)
 	}
@@ -364,5 +373,66 @@ func TestSessionMovesToDirect(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if relay.frameCount(direct) <= n {
 		t.Fatal("the session stopped after a refused move")
+	}
+}
+
+// A move the client does not take (review of the second hardware run): the
+// host answered Resumed later than the client waited, and the client closed
+// the new connection (the browser does after 5 s). The host had not moved
+// the session yet (it sends over the relay until the client shows it moved),
+// so the session goes on over the relay, without a restart; the next move,
+// which the client takes by ending its relay control stream, succeeds.
+func TestMoveNotTakenStaysOnRelay(t *testing.T) {
+	e := setup(t)
+	ans := e.connectAnswer()
+	a, err := e.allocRelay(ans.Relay.UDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := e.logs.Len()
+	relay := dialClient(t, e, a.URL, a.Hashes, clientHello(a.Ticket, defaultPrefs), nil)
+	w := relay.waitMsg("welcome", 10*time.Second)
+	token, _ := w["resume"].(string)
+	for deadline := time.Now().Add(10 * time.Second); relay.frameCount(nil) < 30; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d frames over the relay", relay.frameCount(nil))
+		}
+	}
+
+	ans = e.connectAnswer()
+	h := clientHello(ans.Direct.Ticket, defaultPrefs)
+	h.Resume = token
+	gaveUp := dialClient(t, e, ans.Direct.URL, ans.Direct.Hashes, h, relay)
+	gaveUp.waitMsg("resumed", 10*time.Second)
+	gaveUp.sess.CloseWithError(0, "the PC did not answer the move in 5 s")
+	e.waitLogLine(t, from, 5*time.Second, "the move to the direct path was not taken, the session stays where it was", "on=relay")
+	n := relay.frameCount(relay)
+	time.Sleep(time.Second)
+	if got := relay.frameCount(relay); got < n+10 {
+		t.Fatalf("%d frames over the relay in the second after the move was given up", got-n)
+	}
+	if l := e.logs.lines(from, `msg="session moved to the direct path`); len(l) > 0 {
+		t.Fatalf("the host moved a session the client did not move: %s", l[0])
+	}
+	if l := e.logs.lines(from, "ending the session"); len(l) > 0 {
+		t.Fatalf("the session ended: %s", l[0])
+	}
+
+	// The next move, taken by the end of the relay control stream.
+	ans = e.connectAnswer()
+	h = clientHello(ans.Direct.Ticket, defaultPrefs)
+	h.Resume = token
+	direct := dialClient(t, e, ans.Direct.URL, ans.Direct.Hashes, h, relay)
+	direct.waitMsg("resumed", 10*time.Second)
+	relay.ctrl.Close()
+	relay.in.Close()
+	e.waitLogLine(t, from, 5*time.Second, `msg="session moved to the direct path`, "from=relay")
+	for deadline := time.Now().Add(10 * time.Second); relay.frameCount(direct) < 30; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d frames on the direct connection after the move", relay.frameCount(direct))
+		}
+	}
+	if n := len(e.logs.lines(from, `msg="session started"`)); n != 1 {
+		t.Fatalf("%d session starts", n)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,23 +26,37 @@ import (
 // goes on trying the direct path in the background; when one of the PC's
 // addresses answers it opens a session there whose hello carries the
 // session's resume token (Welcome.Resume) and a fresh direct ticket. The
-// running session takes that connection over (Session.adopt): its frames,
-// datagrams and control messages go out on it from then on, and its
-// pipeline, encoder, audio and state stay as they are, so the picture goes
-// on without a restart or a key frame (a frame lost in the switch is a loss
-// like any other: the loss-recovery ladder answers it). The connection
-// before stays open for what is in flight on it until the client closes it,
-// or the host after moveGrace.
+// running session takes that connection over in two steps. Session.adopt
+// answers Resumed on the new connection's control stream and starts reading
+// it (after the current control stream) and its datagrams; frames,
+// datagrams and control go on over the current connection. Once the client
+// shows it moved (commitMove: its first datagram on the new connection, or
+// its end of the current control stream, which it closes when it switches)
+// they go out on the new one; a new connection that ends before that (the
+// client gave up waiting for Resumed) is let go and the session stays where
+// it was (abandonMove). So a host slower than the client's wait never moves
+// a session the client did not. The pipeline, encoder, audio and state stay
+// as they are, so the picture goes on without a restart or a key frame (a
+// frame lost in the switch is a loss like any other: the loss-recovery
+// ladder answers it). The connection before stays open for what is in flight
+// on it until the client closes it, or the host moveGrace after the commit.
 //
 // The direct connection is authorised as any direct session: a ticket the
 // gateway signed for the same user and page origin, single use, checked
-// against the gateway's clock and its revocations; the resume token, sent
-// only over the session's own end-to-end encrypted control stream, ties it
-// to the session.
+// against the gateway's clock and its revocations; the resume token ties it
+// to the session. The token travels on the session's control stream: end to
+// end encrypted on the UDP relay (it ends at the client), seen by the
+// gateway on the splice relay (it ends there), which is the party that
+// signs the tickets anyway.
 
 // moveGrace is how long the connection a session moved away from stays open
 // for the frames and messages in flight on it.
 const moveGrace = 2 * time.Second
+
+// moveConfirmWait bounds how long a move waits for the client to show it
+// moved (the client gives the host 5 s for Resumed, then closes the new
+// connection, which abandons the move at once).
+const moveConfirmWait = 10 * time.Second
 
 // moveInputWait bounds how long input from the new connection waits for the
 // input streams of the connections before it to end (the client closes them
@@ -53,16 +68,35 @@ const moveInputWait = time.Second
 // stream that can change, its resume token, and for a session that moved into
 // another one (the connection it came on carries that one now), that one.
 type sessionMove struct {
-	conn  *moveConn
-	ctrl  *moveStream             // the control stream (set once the session has one)
-	token string                  // Welcome.Resume ("": this session cannot move: the splice, WebSocket)
+	conn *moveConn
+	ctrl *moveStream // the control stream (set once the session has one)
+	// token is Welcome.Resume: "" for a session that cannot move (one on
+	// the direct path). Sessions on either relay get one; a WebSocket
+	// client behind the splice never uses it (the host cannot tell it from
+	// a WebTransport one there).
+	token string
 	path  atomic.Pointer[string]  // the session's path now, for its log lines
 	into  atomic.Pointer[Session] // the session this one's connection moved into
 
 	mu    sync.Mutex
+	pend  *pendingMove  // a move under way (adopt until commitMove or abandonMove)
 	live  int           // open input streams of the session's own (first) connection
-	moved time.Time     // when it moved
+	moved time.Time     // when it moved (adopt)
 	ended chan struct{} // closed and replaced when one of them ends
+}
+
+// pendingMove is a move adopt started: Resumed is on its way to the client
+// over the new connection, the session still sends over the current one.
+type pendingMove struct {
+	n    *Session             // the session that came on the new connection
+	raw  transport.Conn       // the new connection
+	st   transport.BidiStream // its control stream
+	from string               // the path before
+	at   time.Time
+
+	reached  <-chan struct{} // reading reached st: the current control stream ended (the client moved)
+	heard    <-chan struct{} // the new connection's first datagram (the client moved)
+	curEnded <-chan struct{} // the current connection ended meanwhile
 }
 
 // newSessionMove prepares a session on c to move (and, as a connection on
@@ -151,49 +185,127 @@ func (a *Agent) resumeTarget(n *Session) (*Session, string) {
 	return t, ""
 }
 
-// adopt moves the session onto the connection of n (a session on the direct
-// path whose hello carries this session's resume token): its control stream
-// first, whose first message is Resumed, then its frames and datagrams. The
-// connection before is closed after moveGrace.
+// adopt starts moving the session onto the connection of n (a session on
+// the direct path whose hello carries this session's resume token): Resumed
+// first on n's control stream, which from then on is read after the current
+// one, and the new connection's datagrams read with the current one's; the
+// rest waits for the client to take the move (awaitMove). It needs no
+// ctrlMu (nothing else writes to n's control stream yet), so a control
+// write stuck on the current path does not hold Resumed up.
 func (s *Session) adopt(n *Session) error {
 	raw, _ := n.move.conn.current()
-	s.ctrlMu.Lock()
-	defer s.ctrlMu.Unlock()
 	s.ctrlDL.Lock()
 	closing := s.closing
 	s.ctrlDL.Unlock()
-	if closing || s.ctrlTorn || s.ctx.Err() != nil || s.move.ctrl == nil || n.move.ctrl == nil {
+	if closing || s.ctx.Err() != nil || s.move.ctrl == nil || n.move.ctrl == nil {
 		return errClosed
 	}
-	from := s.pathNow()
-	if from == "direct" {
+	st := n.move.ctrl.stream()
+	p := &pendingMove{n: n, raw: raw, st: st, from: s.pathNow(), at: time.Now()}
+	s.move.mu.Lock()
+	switch {
+	case s.move.pend != nil:
+		s.move.mu.Unlock()
+		return errors.New("a move of the session is under way")
+	case p.from == "direct":
+		s.move.mu.Unlock()
 		return errors.New("the session is on the direct path already")
 	}
-	st := n.move.ctrl.stream()
-	s.move.ctrl.swap(st)
+	s.move.pend = p
+	s.move.moved = p.at
+	s.move.mu.Unlock()
+	// In place before Resumed: the client ends the current control stream
+	// and opens input streams on the new connection as soon as it has it.
+	p.reached = s.move.ctrl.add(st)
+	p.heard, p.curEnded = s.move.conn.add(raw)
+	n.move.into.Store(s)
 	b, _ := json.Marshal(proto.Resumed{T: "resumed", Session: s.id, Path: n.meta.Path})
-	_ = s.ctrl.SetWriteDeadline(time.Now().Add(byeGrace))
-	if err := s.writeCtrl(b); err != nil {
-		// The session stays where it was: its control stream back (not
-		// torn: only the new one's write failed), with no read deadline.
-		s.move.ctrl.undo(st)
-		s.ctrlTorn = false
+	_ = st.SetWriteDeadline(time.Now().Add(byeGrace))
+	err := proto.WriteMsg(st, b)
+	_ = st.SetWriteDeadline(time.Time{})
+	if err != nil {
+		s.abandonMove(p, "")
 		return fmt.Errorf("the new connection's control stream: %w", err)
 	}
+	go s.awaitMove(p)
+	return nil
+}
+
+// awaitMove waits for the client to take the move p (or for its end).
+func (s *Session) awaitMove(p *pendingMove) {
+	t := time.NewTimer(moveConfirmWait)
+	defer t.Stop()
+	why := ""
+	select {
+	case <-p.heard: // its first datagram on the new connection
+	case <-p.reached: // it ended the current control stream (or that stream ended)
+	case <-p.curEnded: // the current connection ended: the new one is all there is
+	case <-p.raw.Context().Done():
+	case <-t.C:
+		why = fmt.Sprintf("the client did not take it in %s", moveConfirmWait)
+	case <-s.ctx.Done():
+		return
+	}
+	if why == "" && p.raw.Context().Err() != nil {
+		why = "the client closed the new connection before it took the move (it waited for Resumed in vain)"
+	}
+	if why != "" {
+		s.abandonMove(p, why)
+		_ = transport.CloseConnection(p.raw, transport.CodeNone, "move not taken")
+		return
+	}
+	s.commitMove(p)
+}
+
+// commitMove moves the session onto p's connection: frames, datagrams and
+// control go out on it from now on. The connection before is closed after
+// moveGrace.
+func (s *Session) commitMove(p *pendingMove) {
+	s.ctrlMu.Lock() // a control message is written whole to one stream
+	defer s.ctrlMu.Unlock()
 	s.move.mu.Lock()
-	s.move.moved = time.Now()
+	if s.move.pend != p {
+		s.move.mu.Unlock()
+		return
+	}
+	s.move.pend = nil
 	s.move.mu.Unlock()
-	old := s.move.conn.swap(raw)
-	n.move.into.Store(s)
-	path := n.meta.Path
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.move.ctrl.commit(p.st)
+	old := s.move.conn.commit(p.raw)
+	path := p.n.meta.Path
 	s.move.path.Store(&path)
 	s.rate.setPath(true) // the direct path ends at the client
-	s.log.Info("session moved to the direct path: the stream goes on over it, without a restart", "from", from,
-		"remote", raw.RemoteAddr().String(), "after_s", time.Since(s.start()).Round(time.Second).Seconds())
+	s.log.Info("session moved to the direct path: the stream goes on over it, without a restart", "from", p.from,
+		"remote", p.raw.RemoteAddr().String(), "after_s", time.Since(s.start()).Round(time.Second).Seconds(),
+		"taken_ms", time.Since(p.at).Milliseconds())
 	time.AfterFunc(moveGrace, func() {
 		_ = transport.CloseConnection(old, transport.CodeReplaced, "the session moved to the direct path")
 	})
-	return nil
+}
+
+// abandonMove lets the move p go (why: for the log, "" for none): the
+// session stays on its connection. One whose current control stream or
+// connection ended meanwhile cannot: it ends.
+func (s *Session) abandonMove(p *pendingMove, why string) {
+	s.move.mu.Lock()
+	if s.move.pend != p {
+		s.move.mu.Unlock()
+		return
+	}
+	s.move.pend = nil
+	s.move.mu.Unlock()
+	p.n.move.into.Store(nil)
+	kept := s.move.ctrl.drop(p.st)
+	s.move.conn.drop(p.raw)
+	if why != "" {
+		s.log.Info("direct path: the move to the direct path was not taken, the session stays where it was", "why", why, "on", p.from)
+	}
+	if !kept {
+		s.end("the control stream ended during a move to the direct path")
+	}
 }
 
 // start is when the session started (its connection's first moment is
@@ -226,17 +338,20 @@ func (s *Session) moveCtrl(st transport.BidiStream) transport.BidiStream {
 	return s.move.ctrl
 }
 
-// inputReady reports whether input read from an input stream of s's
-// connection may be injected: for the session s's connection belongs to
-// now (inputSession), the active one, once the input streams of that
-// session's first connection have ended (the client closes them when it
-// moves; moveInputWait at most), so their events come first.
-func (s *Session) inputReady() bool {
+// inputTarget returns the session input read from an input stream of s's
+// connection is for (inputSession: after a move, the session that took the
+// connection over; s itself then runs nothing but resumeInto, so any
+// per-session state input touches, acknowledgements, ROI and the like, must
+// go to the target, never to s) and whether it may be injected now: for the
+// active session, once the input streams of that session's first connection
+// have ended (the client closes them when it moves; moveInputWait at most),
+// so their events come first.
+func (s *Session) inputTarget() (*Session, bool) {
 	t := s.inputSession()
 	if t != s && t.move != nil {
 		t.move.waitOldInput()
 	}
-	return t.inputAllowed()
+	return t, t.inputAllowed()
 }
 
 // inputStream counts an open input stream of s's own connection, for the
@@ -283,7 +398,7 @@ func (s *Session) logBackgroundDirect(r *proto.DirectReport) {
 		return
 	}
 	s.log.Info("direct path: the client's attempt in the background failed, the session stays on the relay",
-		"why", r.Why, "tried", r.Summary())
+		append([]any{"why", r.Why, "tried", r.Summary()}, s.a.clientClockAttr(r)...)...)
 }
 
 // pathHandler adds the session's path now to each of its log lines (after
@@ -323,6 +438,7 @@ type moveConn struct {
 	mu      sync.Mutex
 	cur     transport.Conn
 	conns   []transport.Conn // every connection, the current one last
+	pending *pendingConn     // a connection a move is waiting to make current (add)
 	moved   context.Context  // the current connection's: cancelled when a swap replaces it
 	unmoved context.CancelFunc
 	pumping bool // datagrams are being read (ReceiveDatagram was called)
@@ -333,6 +449,15 @@ type moveConn struct {
 	cancel context.CancelCauseFunc
 }
 
+// pendingConn is a connection a move waits to make current.
+type pendingConn struct {
+	c        transport.Conn
+	heard    chan struct{} // closed at its first datagram
+	curEnded chan struct{} // closed when the current connection ended while this one waited
+	hOnce    sync.Once
+	eOnce    sync.Once
+}
+
 func newMoveConn(c transport.Conn) *moveConn {
 	m := &moveConn{cur: c, conns: []transport.Conn{c}, dgs: make(chan []byte, 256), started: time.Now()}
 	m.ctx, m.cancel = context.WithCancelCause(context.Background())
@@ -341,13 +466,18 @@ func newMoveConn(c transport.Conn) *moveConn {
 	return m
 }
 
-// watch ends m's context when c ends while it is the current connection.
+// watch ends m's context when c ends while it is the current connection,
+// unless a move waits with another (that one goes ahead: curEnded).
 func (m *moveConn) watch(c transport.Conn) {
 	context.AfterFunc(c.Context(), func() {
 		m.mu.Lock()
 		cur := m.cur == c
+		p := m.pending
 		m.mu.Unlock()
-		if cur {
+		switch {
+		case cur && p != nil:
+			p.eOnce.Do(func() { close(p.curEnded) })
+		case cur:
 			m.cancel(context.Cause(c.Context()))
 		}
 	})
@@ -361,29 +491,64 @@ func (m *moveConn) current() (transport.Conn, context.Context) {
 	return m.cur, m.moved
 }
 
-// swap makes c the current connection and returns the one before.
-func (m *moveConn) swap(c transport.Conn) transport.Conn {
+// add makes c the connection a move waits to make current: its datagrams
+// are read with the current one's (heard is closed at the first), and the
+// current connection's end no longer ends m (curEnded is closed instead).
+func (m *moveConn) add(c transport.Conn) (heard, curEnded <-chan struct{}) {
+	p := &pendingConn{c: c, heard: make(chan struct{}), curEnded: make(chan struct{})}
+	m.mu.Lock()
+	m.pending = p
+	curDone := m.cur.Context().Err() != nil
+	m.mu.Unlock()
+	if curDone {
+		close(p.curEnded)
+	}
+	m.watch(c)
+	go m.pump(c, func() { p.hOnce.Do(func() { close(p.heard) }) })
+	return p.heard, p.curEnded
+}
+
+// commit makes c, the connection add waits with, the current connection
+// and returns the one before.
+func (m *moveConn) commit(c transport.Conn) transport.Conn {
 	m.mu.Lock()
 	old := m.cur
 	m.cur = c
 	m.conns = append(m.conns, c)
+	m.pending = nil
 	m.unmoved()
 	m.moved, m.unmoved = context.WithCancel(context.Background())
-	pump := m.pumping
 	m.mu.Unlock()
-	m.watch(c)
-	if pump {
-		go m.pump(c)
+	if c.Context().Err() != nil { // it ended before it became current (watch let it be)
+		m.cancel(context.Cause(c.Context()))
 	}
 	return old
 }
 
-// pump feeds c's datagrams to ReceiveDatagram until c ends.
-func (m *moveConn) pump(c transport.Conn) {
+// drop lets c, the connection add waits with, go: the current one stays,
+// and ends m if it ended meanwhile.
+func (m *moveConn) drop(c transport.Conn) {
+	m.mu.Lock()
+	if m.pending != nil && m.pending.c == c {
+		m.pending = nil
+	}
+	cur := m.cur
+	m.mu.Unlock()
+	if cur.Context().Err() != nil {
+		m.cancel(context.Cause(cur.Context()))
+	}
+}
+
+// pump feeds c's datagrams to ReceiveDatagram until c ends (first, if set,
+// at each one).
+func (m *moveConn) pump(c transport.Conn, first func()) {
 	for {
 		d, err := c.ReceiveDatagram(m.ctx)
 		if err != nil {
 			return
+		}
+		if first != nil {
+			first()
 		}
 		select {
 		case m.dgs <- d:
@@ -400,7 +565,7 @@ func (m *moveConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 		// each later one): a session on a connection that moves into
 		// another never reads its datagrams, which are that one's.
 		m.pumping = true
-		go m.pump(m.cur)
+		go m.pump(m.cur, nil)
 	}
 	m.mu.Unlock()
 	select {
@@ -450,10 +615,13 @@ func (m *moveConn) SendDatagram(b []byte) error {
 }
 
 // Close closes every connection (the ones moved away from may still be in
-// their grace) and ends m's context.
+// their grace, one a move waits with) and ends m's context.
 func (m *moveConn) Close(code uint32, msg string) error {
 	m.mu.Lock()
 	cur, conns := m.cur, m.conns
+	if m.pending != nil {
+		conns = append(slices.Clone(conns), m.pending.c)
+	}
 	m.mu.Unlock()
 	for _, c := range conns {
 		if c != cur {
@@ -485,49 +653,72 @@ func (m *moveConn) MediaControl() *cc.Media {
 }
 
 // moveStream is a session's control stream, which a move replaces: messages
-// are read whole, from each stream before until it ends (the client closes
-// it when it moves; moveGrace at most), then from the new one, so a message
-// the client sent before it moved is still read and a message never spans
-// two streams; writes go to the current one (the session writes one message
-// per Write, under its ctrlMu, which a move holds).
+// are read whole, from each stream until it ends (the client closes the one
+// before when it moves; moveGrace after the commit at most), then from the
+// next, so a message the client sent before it moved is still read and a
+// message never spans two streams; writes go to the current one (the
+// session writes one message per Write, under its ctrlMu, which a commit
+// holds).
 type moveStream struct {
 	mu      sync.Mutex
-	streams []transport.BidiStream // the current one last; the ones before it until read to their end
+	streams []transport.BidiStream // read in this order, each until it ends (the first is being read)
+	w       transport.BidiStream   // the current one: writes go to it
+	reached map[transport.BidiStream]chan struct{}
 
 	rmu  sync.Mutex // one reader
 	rbuf []byte
 }
 
 func newMoveStream(st transport.BidiStream) *moveStream {
-	return &moveStream{streams: []transport.BidiStream{st}}
+	return &moveStream{streams: []transport.BidiStream{st}, w: st, reached: map[transport.BidiStream]chan struct{}{}}
 }
 
 // stream returns the current stream.
 func (m *moveStream) stream() transport.BidiStream {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.streams[len(m.streams)-1]
+	return m.w
 }
 
-// swap makes st the current stream. The one before is read on until it
-// ends, moveGrace at most.
-func (m *moveStream) swap(st transport.BidiStream) {
-	m.mu.Lock()
-	prev := m.streams[len(m.streams)-1]
-	m.streams = append(m.streams, st)
-	m.mu.Unlock()
-	_ = prev.SetReadDeadline(time.Now().Add(moveGrace))
-}
-
-// undo takes back a swap to st (the move failed): the stream before is the
-// current one again, with no read deadline.
-func (m *moveStream) undo(st transport.BidiStream) {
+// add has st read once the streams before it end; the channel is closed
+// when reading reaches it.
+func (m *moveStream) add(st transport.BidiStream) <-chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if n := len(m.streams); n > 1 && m.streams[n-1] == st {
-		m.streams = m.streams[:n-1]
-		_ = m.streams[n-2].SetReadDeadline(time.Time{})
+	m.streams = append(m.streams, st)
+	ch := make(chan struct{})
+	m.reached[st] = ch
+	return ch
+}
+
+// commit makes st (added) the current stream. The ones before it are read
+// on until they end, moveGrace at most.
+func (m *moveStream) commit(st transport.BidiStream) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.w = st
+	for _, x := range m.streams {
+		if x == st {
+			break
+		}
+		_ = x.SetReadDeadline(time.Now().Add(moveGrace))
 	}
+}
+
+// drop takes back an add of st (the move was not taken). It reports false
+// when reading has reached st already: the streams before it ended.
+func (m *moveStream) drop(st transport.BidiStream) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i := slices.Index(m.streams, st)
+	if i == 0 {
+		return false
+	}
+	if i > 0 {
+		m.streams = slices.Delete(m.streams, i, i+1)
+	}
+	delete(m.reached, st)
+	return true
 }
 
 func (m *moveStream) Read(p []byte) (int, error) {
@@ -541,10 +732,16 @@ func (m *moveStream) Read(p []byte) (int, error) {
 		if err != nil {
 			m.mu.Lock()
 			older := len(m.streams) > 1 && m.streams[0] == st
+			var reached chan struct{}
 			if older {
 				m.streams = m.streams[1:] // that stream ended after a move: read on from the next one
+				reached = m.reached[m.streams[0]]
+				delete(m.reached, m.streams[0])
 			}
 			m.mu.Unlock()
+			if reached != nil {
+				close(reached)
+			}
 			if older {
 				continue
 			}

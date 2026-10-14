@@ -2873,6 +2873,10 @@ func (s *Session) inputAllowed() bool {
 	return !s.closing
 }
 
+// inputLoop reads one input stream of s's connection. After a move the
+// connection carries another session (move.go inputTarget): t, resolved per
+// message, is the session the input is for, and every per-session call
+// below goes to t, not s.
 func (s *Session) inputLoop(st transport.BidiStream) {
 	defer st.CancelRead()
 	defer s.inputStream()() // move.go: the order of input across a move
@@ -2882,13 +2886,14 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 		// the session's keyboard and mouse buttons (clients split long text).
 		b, err := proto.ReadMsgSkip(st, proto.MaxInputMsg)
 		if errors.Is(err, proto.ErrTooLarge) {
-			s.log.Warn("input message skipped", "err", err)
+			s.inputSession().log.Warn("input message skipped", "err", err)
 			continue
 		}
 		if err != nil {
 			return
 		}
-		if !s.inputReady() { // move.go: inputAllowed of the session this connection carries
+		t, ok := s.inputTarget() // move.go: the session this connection carries, and its inputAllowed
+		if !ok {
 			return
 		}
 		ev, err := proto.ParseInput(b)
@@ -2908,7 +2913,7 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 			err = inj.Text(ev.Text)
 		}
 		if err != nil {
-			s.log.Debug("inject", "err", err)
+			t.log.Debug("inject", "err", err)
 		}
 	}
 }

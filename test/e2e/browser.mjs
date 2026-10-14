@@ -2581,6 +2581,10 @@ async function checkDirectCandidates() {
       const c3 = await page.evaluate(() => window.__recon.conn);
       line = sessionLine(host.log.slice(log0));
       const lost = await until(() => /[^\n]*msg="direct path: a browser's connection failed in its handshake"[^\n]*answers did not reach it[^\n]*/.exec(host.log.slice(log0))?.[0], 15000, 'the handshake line').catch(() => '');
+      // The page closes its attempt at the race's deadline (2.5 s; the
+      // direct path race unit check), but Chromium sends nothing for a
+      // handshake that never had an answer: its QUIC connection ends at its
+      // own 4 s timeout, which is when the host's line comes (after_ms).
       check('direct path addresses: answers lost on the way back: no answer, the stream goes through the relay, and the host log says the PC\'s answers did not reach the browser',
         c3?.path === 'relay' && /^no answer in 2\.\d s/.test(c3.directWhy || '') && /not used by this session/.test(line) && /level=INFO/.test(lost),
         `streaming over ${c3?.path} (direct: ${c3?.directWhy}); host: ${line.replace(/^.*?why=/, 'why=').slice(0, 200) || 'no direct path line'}; handshake: ${lost.replace(/^.*?from=/, 'from=').slice(0, 260) || 'no line'}; proxy dropped ${fecImpair.lostH2c} datagrams from the host`);
@@ -3672,6 +3676,69 @@ return { full: await run(true), none: await run(false) };
   } finally {
     await ctx2.close();
   }
+}
+
+// The direct path's race (raceDirect, extracted from stream-worker.js and
+// run here on fake WebTransports, review of the second hardware run): every
+// attempt the race leaves is closed, also the ones its deadline marks "no
+// answer" (before, they stayed open in the browser until its own 4 s
+// handshake timeout, at every fallback to the relay and every background
+// try); an address that answers wins over earlier ones that do not.
+async function checkRaceDirectUnit() {
+  const src = readFileSync(join(root, 'web', 'static', 'js', 'stream-worker.js'), 'utf8');
+  const piece = (from, to) => {
+    const a = src.indexOf(from);
+    const b = src.indexOf(to, a);
+    if (a < 0 || b < 0) throw new Error(`${from} not found in stream-worker.js`);
+    return src.slice(a, b);
+  };
+  const code = piece('const hostOf =', '\n\n') + '\n' + piece('const DIRECT_STAGGER_MS', '\n') + '\n' +
+    piece('function raceDirect(', '\n// How the direct path') + '\nraceDirect;';
+  const run = async (behaviours, budget) => {
+    const made = [];
+    // A fake WebTransport: "silent" never answers, "ok@N" comes up after N ms,
+    // "refuse" fails at once; close() rejects a pending ready, as Chrome does.
+    class FakeWT {
+      constructor(url) {
+        const how = behaviours[made.length];
+        this.url = url;
+        this.closedByRace = false;
+        made.push(this);
+        let ok;
+        let no;
+        this.ready = new Promise((res, rej) => { ok = res; no = rej; });
+        this.closed = new Promise(() => {});
+        this.fail = no;
+        this.refused = how === 'refuse';
+        if (this.refused) setTimeout(() => no(new Error('Opening handshake failed.')), 1);
+        const m = /^ok@(\d+)$/.exec(how);
+        if (m) setTimeout(() => { if (!this.closedByRace) ok(); }, +m[1]);
+      }
+      close() { this.closedByRace = true; this.fail(new Error('closed')); }
+    }
+    const sandbox = { WebTransport: FakeWT, wtOptions: () => ({}), performance, setTimeout, clearTimeout, Promise, Math, Error, Object };
+    const raceDirect = vm.runInNewContext(code, sandbox);
+    const cands = behaviours.map((b, i) => ({ url: `https://10.0.0.${i + 1}:48100/wt`, kind: 'lan' }));
+    let out;
+    try {
+      const r = await raceDirect(cands, [], budget);
+      out = { won: r.cand.url, tried: r.tried.map((t) => t.result) };
+    } catch (e) {
+      out = { err: e.message, tried: (e.tried || []).map((t) => t.result) };
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    out.open = made.filter((w) => !w.closedByRace && !w.refused && (!out.won || w.url !== out.won)).length;
+    return out;
+  };
+  const silent = await run(['silent', 'silent'], 400);
+  check('direct path race (unit): no answer from any address: every attempt is closed at the deadline',
+    /timed out after 400 ms/.test(silent.err || '') && silent.tried.join() === 'no answer,no answer' && silent.open === 0, JSON.stringify(silent));
+  const second = await run(['silent', 'ok@20', 'silent'], 1000);
+  check('direct path race (unit): the second address answers: it wins, the others are closed',
+    second.won === 'https://10.0.0.2:48100/wt' && second.tried[0] === 'abandoned' && second.tried[1] === 'connected' && second.open === 0, JSON.stringify(second));
+  const refused = await run(['refuse', 'ok@5'], 1000);
+  check('direct path race (unit): the first address refuses: the next starts at once and wins',
+    refused.won === 'https://10.0.0.2:48100/wt' && /^refused: /.test(refused.tried[0]) && refused.open === 0, JSON.stringify(refused));
 }
 
 async function checkWallclockProbe() {
@@ -5266,6 +5333,7 @@ try {
   if (want('jitter unit')) await checkJitterRule().catch((e) => check('jitter buffer (unit)', false, e.message));
   if (want('self-test logic unit')) await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
   if (want('send priorities unit')) await checkSendPriorities().catch((e) => check('send priorities (unit)', false, e.message));
+  if (want('race direct unit')) await checkRaceDirectUnit().catch((e) => check('direct path race (unit)', false, e.message));
 
   // 3d. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a

@@ -707,19 +707,27 @@ function raceDirect(cands, hashes, timeoutMs) {
   return new Promise((resolve, reject) => {
     const tried = cands.map((c) => ({ url: c.url, kind: c.kind || '', note: c.note || '', ms: 0, result: 'not tried' }));
     const wts = [];
+    const live = []; // started, neither up nor failed yet
     const starts = [];
     let next = 0;
     let pending = 0;
     let done = false;
     let timer = 0;
+    // end closes every attempt still under way, the ones the deadline just
+    // marked "no answer" too: left open, an attempt goes on in the browser
+    // until its own handshake timeout (Chrome: 4 s), and one that comes up
+    // late opens a session on the PC that nobody uses.
     const end = () => {
       done = true;
       clearTimeout(timer);
       clearTimeout(deadline);
       for (let j = 0; j < wts.length; j++) {
-        if (tried[j].result !== 'pending') continue;
-        tried[j].result = 'abandoned';
-        tried[j].ms = Math.round(performance.now() - starts[j]);
+        if (!live[j]) continue;
+        live[j] = false;
+        if (tried[j].result === 'pending') {
+          tried[j].result = 'abandoned';
+          tried[j].ms = Math.round(performance.now() - starts[j]);
+        }
         try { wts[j].close(); } catch {}
       }
     };
@@ -743,11 +751,13 @@ function raceDirect(cands, hashes, timeoutMs) {
         return;
       }
       wts[i] = wt;
+      live[i] = true;
       a.result = 'pending';
       pending++;
       wt.closed.catch(() => {});
       wt.ready.then(() => {
         pending--;
+        live[i] = false;
         a.ms = Math.round(performance.now() - starts[i]);
         if (done) {
           a.result = 'connected, not needed';
@@ -759,6 +769,7 @@ function raceDirect(cands, hashes, timeoutMs) {
         resolve({ wt, cand: cands[i], tried });
       }, (e) => {
         pending--;
+        live[i] = false;
         if (a.result !== 'pending') return; // closed here (no answer, abandoned)
         a.ms = Math.round(performance.now() - starts[i]);
         a.result = `refused: ${e?.message || e}`;
@@ -836,7 +847,10 @@ function directFailure(e, ms, direct) {
 // decoder, the picture and the audio go on. A failed attempt keeps the
 // relay; its outcome goes to the host (a "direct" control message) when it
 // differs from the last one, which the host logs. Only with Network path
-// Auto, on WebTransport, with a host that sends a resume token.
+// Auto, on WebTransport, with a host that sends a resume token. A move the
+// host answers too late (after MOVE_ANSWER_MS the new connection is closed)
+// is one the host lets go: it switches only once this client has (a
+// datagram on the new connection, or the old control stream's end).
 const MOVE_DELAYS_MS = [2000, 8000, 20000, 60000];
 const MOVE_EVERY_MS = 120000;
 const MOVE_ANSWER_MS = 5000; // for the host's "resumed"
@@ -905,7 +919,7 @@ async function tryMove() {
     // The host logs it (once per outcome).
     if (why !== move.told && transport) {
       move.told = why;
-      transport.sendControl({ t: 'direct', direct: { why, tried } });
+      transport.sendControl({ t: 'direct', direct: { why, tried, clock: Date.now() } });
     }
   } finally {
     move.busy = false;
@@ -954,14 +968,18 @@ function moveTo(nt, ticket, tried) {
       },
     });
     nt.done.then((reason) => fail(new Error(`the new connection closed: ${reason}`)));
-    nt.sendControl({ t: 'hello', v: P.HELLO_VERSION, ticket, resume: move.token, client: move.client, direct: { why: '', tried } });
+    nt.sendControl({ t: 'hello', v: P.HELLO_VERSION, ticket, resume: move.token, client: move.client, direct: { why: '', tried, clock: Date.now() } });
   });
 }
 
-// The host moved the session to nt: input, control and telemetry go there now.
+// The host moved the session to nt: input, control and telemetry go there
+// now. The host goes on sending over the old connection until it sees the
+// switch (a datagram on nt, or the end of the old control stream): a ping
+// at once tells it.
 function switchTransport(nt, tried) {
   const old = transport;
   transport = nt;
+  sendPing();
   old.endStreams?.();
   setTimeout(() => old.close(), MOVE_OLD_MS);
   post('log', { text: `moved the session from the ${old.path} path to the direct path (${nt.addr}) without a restart` });
@@ -2932,7 +2950,7 @@ async function start(msg) {
     client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: { ...msg.hostPrefs, hdr: hdrPrefs() },
     // Video frames as datagram shards (GUIDE 2.5): WebTransport only.
     ...(transport.kind === 'webtransport' && prefs.fec !== 'off' ? { fec: P.HELLO_FEC_VERSION } : {}),
-    direct: conn.direct, // how the direct path went (the host logs it)
+    direct: { ...conn.direct, clock: Date.now() }, // how the direct path went, and this PC's clock (the host logs them)
   });
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   openPageControl();
