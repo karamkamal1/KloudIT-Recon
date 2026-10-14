@@ -443,25 +443,37 @@ Standard VGA, Hyper-V's or VMware's display adapter), but not as well as from a 
   being installed or reset): using gdigrab`; the browser shows `No GPU screen capture on this PC
   (...): capturing with GDI, which uses more CPU and adds latency.` once per stream, as
   information (a plain toast, without the yellow or red border of a warning or an error).
-- **What it costs, and the CPU budget.** GDI copies and converts the whole picture on the CPU
-  every frame interval, changed or not, and the CPU encodes it. A small VM (2-4 vCPUs) does not
-  keep up with 1920×1080 at 60 fps, and a CPU that does not keep up adds hundreds of
-  milliseconds (frames wait in FFmpeg's queues). So the agent measures what the CPU encodes when
-  it starts (`software encoding measured` in host.log) and streams at what it keeps up with:
-  the fastest preset first, then 45 or 30 fps, then 1600×900, 1280×720 or 960×540, then 20 fps;
-  the stream itself moves it down when frames fall behind and tries a step up when the CPU has
-  room. The overlay's *CPU limit* row says what it streams and what was asked for (`1920×1080 at
-  30 fps, fastest preset (asked: 1920×1080 at 60 fps): what this PC's CPU encodes`), and a
-  notice says it once. `"cpuBudget": "off"` streams what the client asks for regardless. Give
-  the VM more cores for more; the settings drawer's Resolution and Frame rate still cap the
-  stream. Changing the VM's display resolution while you stream is fine: the stream follows it
-  within a second or two.
+- **What it costs, and the CPU budget.** GDI copies the whole picture into memory on the CPU
+  every frame interval, changed or not (at the monitor's size, whatever size streams), and the
+  CPU converts and encodes it. A small VM (2-4 vCPUs) does not keep up with 1920×1080 at 60 fps,
+  and a CPU that does not keep up adds hundreds of milliseconds (frames wait in FFmpeg's queues:
+  on two CPUs, 1080p at 60 fps delivered 23-27 fps with 350-380 ms from grab to encoded, 1080p
+  at 30 fps with the fastest preset 27-28 fps with 64-68 ms). So the agent measures what the CPU
+  encodes and how fast GDI grabs the screen when it starts, and again while nothing streams
+  (`software encoding measured` in host.log; the best measurement counts), and streams at what
+  the CPU keeps up with: the fastest preset first, then 45 or 30 fps, then 1600×900, 1280×720 or
+  960×540, then 20 fps; the stream itself moves it down when frames fall behind and tries a step
+  up when the CPU has room. The overlay's *CPU limit* row says what it streams and what was asked
+  for (`1920×1080 at 30 fps, fastest preset (asked: 1920×1080 at 60 fps): what the CPU keeps up
+  with`), and an informational notice says it once. `"cpuBudget": "off"` streams what the client
+  asks for regardless. Give the VM more cores for more (the frame rate rises with them), and in
+  Proxmox set the VM's CPU type to `host` (Hardware > Processors > Type): the default
+  (`x86-64-v2-AES`) hides AVX2 from Windows, and libx264 and FFmpeg's conversion are much slower
+  without it (compare `recon-host report`'s `cpu:` line before and after). The settings drawer's
+  Resolution and Frame rate still cap the stream. Changing the VM's display resolution while you
+  stream is fine: the stream follows it within a second or two.
 - **Remote desktop, the console and the lock screen.** The agent captures the desktop of the
   Windows session it runs in. When a remote desktop (RDP) client closed and left that session
-  disconnected (no display at all), the agent moves the session to the console when a stream
-  starts, as `tscon <session> /dest:console` does, unless someone else is signed in there
-  (`"consoleSession": "off"` turns that off; the notice then says how to do it by hand). While an
-  RDP client is connected the stream shows the RDP session's desktop (with GDI). A locked
+  disconnected (no display at all), the agent moves the session to the console while a stream
+  plays (not while its browser tab is hidden) and once it has found it disconnected two seconds in
+  a row, as `tscon <session> /dest:console` does, unless someone else is signed in there. The
+  console then shows the session **unlocked**: on a VM that is the hypervisor's console (Proxmox:
+  the VM's *Console*, which only Proxmox's users see), on a physical PC its own monitor. So by
+  default (`"consoleSession": "auto"`) it does this only on a virtual machine (Windows' firmware
+  names a hypervisor: QEMU/Proxmox, Hyper-V, VMware, VirtualBox, Xen) or a PC without a GPU;
+  `"on"` does it on any PC, `"off"` never (the notice then says how to do it by hand; host.log
+  logs each move as a warning, and `recon-host report` says whether a move would happen). While
+  an RDP client is connected the stream shows the RDP session's desktop (with GDI). A locked
   session, the sign-in screen or a UAC prompt is Windows' secure desktop, which no program but
   SYSTEM's may capture or control: the stream waits (an informational notice says why) and comes
   back by itself within a second of the desktop being back; sign in on the VM's console (Proxmox:
@@ -471,9 +483,18 @@ Standard VGA, Hyper-V's or VMware's display adapter), but not as well as from a 
   Windows Audio service off). The stream then has no sound, quietly: the overlay's *Audio* row
   says `off: no sound output device on the PC`, host.log says it once. Add one (Proxmox:
   Hardware > Add > Audio Device, `ich9-intel-hda`) and the next stream, or the running one within
-  a few seconds of a sound, has audio.
-- **With GPU passthrough** (a GPU given to the VM) install its driver: the agent then captures
-  and encodes on that GPU as on any gaming PC (run `recon-host probe` to check).
+  a few seconds of a sound, has audio. A device that changes (a headset unplugged, HDMI audio
+  re-created when a game switches the display mode) is captured again at once (`audio: the sound
+  output device changed`): a moment of silence, not "Audio off".
+- **With GPU passthrough** (a GPU given to the VM) install its driver, and make the desktop the
+  GPU's: Windows must show the desktop on an output of that GPU, or the agent still captures the
+  virtual display with GDI on the CPU (and only the encoder runs on the GPU). Connect a monitor or
+  an HDMI/DisplayPort dummy plug to the passed-through GPU and set the VM's *Display* to `none`
+  in Proxmox (or make the GPU's output the main display in Windows' display settings). Check it:
+  host.log's `video pipeline pipeline=helper` names the GPU's adapter (or, through FFmpeg,
+  `capture=ddagrab`), not `capturing with GDI (gdigrab)`; `recon-host probe` lists the GPU's
+  encoders and no `ddagrab unavailable`. Then it captures and encodes on that GPU as on any
+  gaming PC.
 - **Something still wrong?** Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" report` in
   PowerShell on the VM: it writes one text file to your desktop with the versions, Windows and the
   machine, the desktop's state, the GPUs, monitors and sound device, the host config, the probe's
@@ -545,8 +566,8 @@ PC yourself (your session takes it over) or restart `recon-host` on it.
 | `virtualDisplayLayout` | `primary` | Where the virtual monitor goes: `primary` (primary display, so games open on it; the other monitors stay on), `extend` (secondary, right of the others) or `only` (the other monitors are off during the session) |
 | `virtualDisplayLinger` | 10 | Seconds a session's virtual display stays after the session ends, so that a client reconnecting with the same size and frame rate gets it back without the desktop being rearranged twice; `0` restores the displays at once (0-600) |
 | `audio`, `audioKbps`, `gamepad` | true, 160, true | Audio and controller support (a PC without a sound output device streams without sound, quietly: see "Running on a PC or VM without a GPU") |
-| `consoleSession` | `auto` | A Windows session that a remote desktop client left disconnected (it has no display, so nothing can be captured) is moved to the console when a stream starts or finds it so, as `tscon <session> /dest:console` does, unless another user is signed in at the console; `off`: never (the stream waits, and its notice says how to do it by hand). A locked session or a UAC prompt is waited for either way |
-| `cpuBudget` | `auto` | Where sessions encode on the CPU (no GPU encoder: a PC or VM without a GPU), stream at the frame rate, size and preset the CPU keeps up with, measured at the agent's start and from the stream (the overlay's *CPU limit* row); `off`: always what the client asks for |
+| `consoleSession` | `auto` | A Windows session that a remote desktop client left disconnected (it has no display, so nothing can be captured) is moved to the console while a stream plays (not while its tab is hidden) and after two looks a second apart find it so, as `tscon <session> /dest:console` does, unless another user is signed in at the console. The console then shows the session unlocked: `auto` does it on a virtual machine (the firmware names a hypervisor) or a PC without a GPU, where the console is the hypervisor's; `on` also on a PC with a GPU, whose own monitor then shows it; `off`: never (the stream waits, and its notice says how to do it by hand). Each move is a warning in host.log. A locked session or a UAC prompt is waited for either way |
+| `cpuBudget` | `auto` | Where a stream encodes on the CPU (a PC or VM without a GPU, or a codec the GPU cannot encode: AV1 before RX 7000 or RTX 40), stream at the frame rate, size and preset the CPU keeps up with: on a PC without a GPU encoder from the agent's measurements of the encoder and of GDI's grab (at its start and again while nothing streams), and from the stream itself (a step down when frames fall behind, a step up when the CPU has room; for Desktop Duplication, which sends frames only when the screen changes, only from how long frames wait). The overlay's *CPU limit* row shows it; `off`: always what the client asks for |
 | `ffmpeg` | auto | Path to `ffmpeg.exe` (FFmpeg 8.1+ recommended: older builds lack `gfxcapture`, used for GPU downscaling and window capture). auto: next to `recon-host.exe` (`ffmpeg\bin`), then PATH. The agent runs elevated, while `host.json` and PATH are the user's own: it runs FFmpeg only from its install folder or a folder only administrators can change (owner and ACL checked, like Program Files), ignores a path set here otherwise (host.log `host config "ffmpeg" ignored`) and searches as for auto |
 | `logLevel` | `info` | `debug` adds detail to host.log: the FFmpeg command line of every encoder generation (`ffmpeg args`), the rate controller's decisions (`rate report decision`, `congestion: bitrate kept`) and every rate change (at the default level `congestion: lowering bitrate` and `bitrate recovery: raising bitrate` come at most once per 10 s per direction, with `suppressed=N`), static-desktop and region-of-interest updates, relay and direct-path connections. The installed agent (the logon task) has no other switch for it; `recon-host -v` does the same for a command run by hand. Several hardware checks in `docs/VENDOR_NOTES.md` read these lines |
 
@@ -615,6 +636,12 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   no screen ...`.** The session's desktop is not on a screen (locked, a UAC prompt, a remote
   desktop client disconnected): the stream waits and comes back by itself (see "Running on a PC
   or VM without a GPU").
+- **`Network congestion: for N s the network has carried less than half the bitrate set ...`.**
+  Information, not an error: the rate controller held the bitrate below half the setting for
+  10 s (host.log `congestion: lowering bitrate why=delay|loss`). The small cuts it makes all the
+  time on any network (a few percent when queueing delay builds, raised again seconds later) are
+  not shown; this build no longer shows the yellow `Network congestion detected — bitrate lowered
+  to X Mbps` for each.
 - **Something else on the PC.** `recon-host report` (in PowerShell: `&
   "$env:ProgramFiles\KlouditRecon\recon-host.exe" report`) writes one text file to your desktop
   with what a problem needs (versions, the machine, desktop, GPUs, sound, config, probe, the end

@@ -1252,9 +1252,13 @@ then the VM finds it has no GPU before its first stream, its handled fallbacks a
 notices, it waits for a locked or disconnected desktop (moving a disconnected one to the
 console), streams at what its CPU keeps up with and stays quiet without a sound device, and
 `recon-host report` collects what a problem needs (VENDOR_NOTES, "Second hardware run: VM without
-a GPU"). Run these on that VM (any GPU-less Windows 10/11 VM or PC), signed in on its console;
-items G4 to G6 on the AMD PC; G7 on the VM again. If anything on the VM shows an error, run
-`recon-host report` there and send the file.
+a GPU"). The review of that work found one more toast every stream showed, on the VM and the
+gaming PC alike: the yellow `Network congestion detected — bitrate lowered to X Mbps`, at most
+every 30 s, for the rate controller's routine cuts (now information, and only for a deep cut that
+lasts). Run these on that VM (any GPU-less Windows 10/11 VM or PC), signed in on its console;
+items G4 to G6 on the AMD PC; G7 on the VM again; G8 if the VM gets a GPU passed through. If
+anything on the VM shows an error, run `recon-host report` there and send the file with the
+toast's exact text.
 
 **G1. Probe and install**
 - **Do**: install as in Stage 1 (or `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`).
@@ -1282,8 +1286,8 @@ items G4 to G6 on the AMD PC; G7 on the VM again. If anything on the VM shows an
 - **Pass**: the picture appears within about 2 s, with an informational toast (a plain border,
   not a warning's yellow or an error's red one) `No GPU screen capture on this PC (no Direct3D 11 video device: a PC or VM without a GPU, or
   a graphics driver being installed or reset): capturing with GDI, which uses more CPU and adds
-  latency.`, and, where the CPU budget limits the stream, a second informational one `This PC
-  encodes video on its CPU (no GPU encoder), which keeps up with ...`; no `Video encoder
+  latency.`, and, where the CPU budget limits the stream, a second informational one `This stream
+  encodes video on the CPU (libx264: no GPU encoder for it), which keeps up with ...`; no `Video encoder
   restarted`, no error toast. Encoder `libx264`; the overlay's *CPU limit* row (when limited)
   says what streams and what was asked for; the stream holds the frame rate it shows (record
   fps, capture→drawn p50/p95, the overlay's capture→encoded p50 and the VM's CPU use at the
@@ -1308,12 +1312,19 @@ items G4 to G6 on the AMD PC; G7 on the VM again. If anything on the VM shows an
 - **Pass**: RDP connected: the stream shows the RDP session's desktop (with GDI); resizing the
   RDP client's window (which resizes the session) restarts the stream at the new size as in G2.
   Disconnected (the RDP client closed): connecting from the browser moves the session to the
-  console by itself (one informational toast `This PC's Windows session was disconnected (a
-  remote desktop client closed): it was moved to the PC's console (session N) to stream it.`;
-  host.log `no desktop on a screen at the session's start reason=disconnected` then `moved the
-  disconnected session to the console (as tscon <session> /dest:console)`), and the stream works
-  as in G2 at the console's size, the console showing the unlocked desktop. Close the RDP client
-  while streaming: the stream pauses for a second or two and comes back the same way. With
+  console by itself, a second after the start (one informational toast `This PC's Windows session
+  was disconnected (a remote desktop client closed): it was moved to the PC's console (session N)
+  to stream it, where it shows unlocked (on a VM: in the hypervisor's console).`; host.log `no
+  desktop on a screen at the session's start reason=disconnected` then, as a warning, `moved the
+  disconnected session to the console (as tscon <session> /dest:console): the console shows it
+  unlocked because="a virtual machine (QEMU ...)"`), and the stream works as in G2 at the
+  console's size, the console showing the unlocked desktop. Close the RDP client while streaming:
+  the stream pauses for two or three seconds and comes back the same way. Hide the browser tab
+  (another tab in front) and close the RDP client: no move while the tab is hidden (no `moved the
+  disconnected session` line); show the tab again and the move follows within about 2 s. If the
+  VM's firmware does not name a hypervisor (`recon-host report`'s `machine:` line; Proxmox can
+  set custom SMBIOS strings) and it has a GPU, it waits as with `off`; set `"consoleSession":
+  "on"`. With
   `"consoleSession": "off"`: the stream waits with the informational toast `This PC's Windows
   session has no screen: ... run "tscon N /dest:console" ...` and no error; after the `tscon` by
   hand it comes back within a second. Lock the VM (Win+L in the stream, or the console's lock):
@@ -1361,7 +1372,14 @@ items G4 to G6 on the AMD PC; G7 on the VM again. If anything on the VM shows an
   from the console after that starts on ddagrab, or returns to it within a second or two of its
   start. Also restart the agent while signed in over RDP (`Stop-ScheduledTask` /
   `Start-ScheduledTask`), tscon to the console and connect after a minute: the stream returns to
-  ddagrab within its first seconds.
+  ddagrab within its first seconds. Last, close the RDP client while streaming (no `tscon`): with
+  the default `"consoleSession": "auto"` the gaming PC (a GPU, no hypervisor) is not moved to the
+  console: the stream waits with one informational toast ending `(Not moved to the console by
+  itself: on a PC with a GPU its own monitor would show the unlocked desktop; host config
+  "consoleSession" "on" allows it.)` and no `moved the disconnected session` line. With
+  `"consoleSession": "on"` the same gives the warning line `moved the disconnected session to the
+  console ... because="host config \"consoleSession\" is \"on\""` about 2 s after the close,
+  and the stream comes back.
 - **If not, send**: host.log.
 
 **G6. A graphics driver reset during a stream (AMD PC)**
@@ -1389,12 +1407,21 @@ items G4 to G6 on the AMD PC; G7 on the VM again. If anything on the VM shows an
 - **Look at**: the toasts (any with a red or yellow border is a failure: note its text), the overlay's
   *Encoder*, *CPU limit*, *Frame rate*, *Audio* and latency rows, host.log's `software encoding
   measured`, `cpu budget:` and `audio:` lines, and the report file.
-- **Pass**: no error or warning toast at all on the VM; the overlay's *CPU limit* row (when the CPU
-  limits) and its frame rate agree, and while the video plays the *capture→encoded* p50 stays
-  under about 3 frame intervals (50 ms at 60 fps, 100 ms at 30); host.log's `cpu budget: the CPU
-  does not keep up, stepping down` lines (if any) come with `measured="F of N fps, capture→encoded
-  p50 X ms"`, and after the video ends a `cpu budget: the CPU keeps up, trying the rung above`
-  within a few minutes. With no sound device: the *Audio* row says `off: no sound output device on
+- **Pass**: no error or warning toast at all on the VM (in particular no `Network congestion
+  detected` toast: an informational `Network congestion: for N s the network has carried less
+  than half ...` is allowed only with a matching run of host.log `congestion: lowering bitrate
+  why=...` lines bringing `to=` below half of `kbps_max`; note any congestion toast with the
+  `congestion: lowering bitrate why=...` lines around its time); the overlay's *CPU limit* row
+  (when the CPU limits) and its frame rate agree, and while the video plays the
+  *capture→encoded* p50 stays under about 3 frame intervals (50 ms at 60 fps, 100 ms at 30).
+  host.log's `software encoding measured` line has `gdi_grab_fps=` with a number (not `not
+  measured`), and a few minutes after the agent's start, with no stream, `software encoding
+  measured again` with `best=`. Count the `cpu budget: the CPU does not keep up, stepping down`
+  lines in each session's first 10 s (from its `session started`): more than 0 means the first
+  rung was too high (send the `software encoding measured` lines and the `cpu budget: software
+  encoding rung=` line with it); later ones (if any) come with `measured="F of N fps,
+  capture→encoded p50 X ms"`, and after the video ends a `cpu budget: the CPU keeps up, trying the
+  rung above` within a few minutes. With no sound device: the *Audio* row says `off: no sound output device on
   the PC`, host.log has one `audio: no sound output device on this PC` line (no repeated `audio
   capture stopped` warnings); with one: audio plays. The report has the `machine:` line naming the
   hypervisor, `Direct3D 11 video device: unavailable (...)`, the `cpu:` line, the host config with
@@ -1402,6 +1429,21 @@ items G4 to G6 on the AMD PC; G7 on the VM again. If anything on the VM shows an
   your token (host.json's `token`) and the pairing code: neither may appear.
 - **If not, send**: the report file (it is made to be sent), a screenshot of the overlay, and the
   text of any toast.
+
+**G8. A VM with a passed-through GPU captures on that GPU (VM with GPU passthrough)**
+- **Do**: give the VM a GPU (Proxmox: Hardware > Add > PCI Device), install its driver, connect a
+  monitor or an HDMI/DisplayPort dummy plug to that GPU and set the VM's *Display* to `none` (or
+  keep Proxmox's display and make the GPU's output the main display in Windows' display
+  settings). Restart the agent and stream; then once with Proxmox's display as the main one.
+- **Look at**: `recon-host probe`, host.log's `video pipeline` and `starting encoder` lines, the
+  overlay's *Encoder* and *Capture* rows.
+- **Pass**: with the GPU's output as the desktop: the probe lists the GPU's encoders and no
+  `ddagrab unavailable`; host.log `video pipeline pipeline=helper` with the GPU's adapter (or,
+  through FFmpeg, `starting encoder ... capture=ddagrab`), no `capturing with GDI (gdigrab)`, no
+  `cpu budget:` and no `software encoding measured` lines. With Proxmox's display as the main one:
+  record what happens (expected: `capturing with GDI (gdigrab)` with a GPU encoder, or the
+  helper's `the monitor ... is on` another adapter); the docs' advice is the first setup.
+- **If not, send**: the probe output, host.log and `recon-host report`.
 
 ## Not covered by these two hosts
 

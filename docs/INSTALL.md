@@ -374,14 +374,20 @@ and adds latency.`, an informational notice). Upgrade the agent (see Upgrading).
 then has `no GPU screen capture on this PC: sessions capture with GDI (gdigrab)` and `ffmpeg
 ready ... gdigrab=true gpu_capture="unavailable: no Direct3D 11 video device: ..."` at the start
 (the agent opens the device itself, so the first stream already captures with GDI), `software
-encoding measured` with what the CPU encodes, and `capturing with GDI (gdigrab)` and `cpu budget:
+encoding measured` with what the CPU encodes and how fast GDI grabs the screen (`gdi_grab_fps`;
+measured again while nothing streams), and `capturing with GDI (gdigrab)` and `cpu budget:
 software encoding` per stream; a stream whose GPU capture fails this way after the start logs
 `GPU screen capture failed: capturing with GDI (gdigrab)` with FFmpeg's line (`ffmpeg="Failed to
-create D3D11VA device."`). A remote desktop session left disconnected is moved to the console when
-a stream starts; a locked session is waited for (README, "Running on a PC or VM without a GPU").
+create D3D11VA device."`). A remote desktop session left disconnected is moved to the console
+while a stream plays, on a VM or a PC without a GPU (the console then shows it unlocked; host
+config `"consoleSession": "on"` does it on any PC, `"off"` never); a locked session is waited for
+(README, "Running on a PC or VM without a GPU"). A VM with a passed-through GPU captures on that
+GPU only when Windows shows the desktop on the GPU's output: connect a monitor or a dummy plug to
+it and set the VM's Display to `none` (README, "With GPU passthrough").
 
 **Anything else that goes wrong on the PC, a VM in particular.** Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe"
-report` in PowerShell on it. It writes `recon-report-<PC>-<time>.txt` to your desktop: versions,
+report` in PowerShell on it. It writes `recon-report-<PC>-<time>.txt` to your desktop (the one
+Explorer shows, OneDrive's included; else the temporary folder) and prints the path: versions,
 Windows and the machine (a VM names its hypervisor), the session's desktop (locked, remote,
 disconnected), the GPUs and the Direct3D 11 video device, monitors, the sound device, the host
 config, the probe's output, what the CPU encodes, and the last 400 lines of host.log. It has no
