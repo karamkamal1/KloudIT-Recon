@@ -161,7 +161,26 @@ func (s *Session) cpuCovers(p media.Params) bool {
 	case !s.a.cfg.cpuBudgetOn(), p.Encoder.HW, p.Encoder.Helper:
 		return false
 	}
-	return p.Source.Backend == "gdigrab" || p.Source.Backend == "ddagrab"
+	return p.Source.Backend == "gdigrab" || p.Source.Backend == "ddagrab" || p.Source.Backend == "test" && s.a.faults.vm
+}
+
+// vmFaults plays a VM without a GPU and a sound device (TestFaultsEnv "vm",
+// TESTS ONLY): no sound device, and a measurement of a CPU that keeps up
+// with the test pattern at 30 fps with the fastest preset.
+func (a *Agent) vmFaults() {
+	a.audioSource = noSoundSource{}
+	w, h := a.cfg.TestWidth, a.cfg.TestHeight
+	a.bench.res, a.bench.ok = media.SoftwareBench{Encoder: "libx264", W: w, H: h, Superfast: 40, Ultrafast: 50}, true
+}
+
+// noSoundSource is the audio source of a PC without a sound output device
+// (TestFaultsEnv "vm").
+type noSoundSource struct{}
+
+func (noSoundSource) Name() string { return "test-no-device" }
+
+func (noSoundSource) Run(context.Context, func([]float32)) error {
+	return fmt.Errorf("%w: TEST fault vm", media.ErrNoAudioDevice)
 }
 
 // applyRung lowers p to rung r: its frame rate and picture height at most

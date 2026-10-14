@@ -218,6 +218,9 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		if a.faults.refRecovery {
 			caps.UseTestRecovery()
 		}
+		if a.faults.vm {
+			a.vmFaults()
+		}
 		log.Warn("TEST fault injection is on: video frames are delayed and dropped on purpose", TestFaultsEnv, v)
 	}
 	return a, nil

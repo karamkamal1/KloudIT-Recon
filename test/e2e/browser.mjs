@@ -2524,6 +2524,35 @@ async function checkTornControl() {
   await endStream();
 }
 
+// A VM without a GPU (second hardware run): the host plays one (test hook
+// vm): no sound device, and a CPU measured to keep up with the test pattern
+// at 30 fps with the fastest preset (the CPU budget). The stream works with
+// no warning or error toast: the budget's notice is informational, the
+// overlay shows the limit and why audio is off.
+async function checkVM() {
+  const host = await restartHost({ RECON_TEST_FAULTS: 'vm' }, 'host-vm');
+  try {
+    await startStream({ path: 'direct', transport: 'auto' });
+    // The notice comes with the first generation, a second or two before the
+    // picture; a toast stays 6 s.
+    const toasts = await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].map((t) => ({ cls: t.className, text: t.textContent })));
+    await until(async () => (await page.textContent('#stats').catch(() => '')).includes('CPU limit'), 15000, 'the CPU limit row').catch(() => {});
+    const overlay = await page.textContent('#stats').catch(() => '');
+    const cpu = toasts.find((t) => t.text.startsWith('This PC encodes video on its CPU'));
+    const bad = toasts.filter((t) => /\b(warn|error)\b/.test(t.cls) && !t.text.startsWith('Renderer'));
+    const limit = (overlay.match(/\d+×\d+ at \d+ fps, fastest preset \(asked: [^)]*\): what this PC's CPU encodes/) || [''])[0];
+    const audioOff = overlay.includes('off: no sound output device on the PC');
+    const logged = /msg="cpu budget: software encoding"[^\n]* rung=3 /.test(host.log) && /audio: no sound output device on this PC/.test(host.log);
+    check('VM without a GPU (test hook vm): the stream works with an informational CPU-limit notice and no warning or error toast; the overlay shows the CPU limit and why audio is off',
+      !!cpu && cpu.cls.includes('info') && !bad.length && /at 30 fps, fastest preset \(asked: \d+×\d+ at 60 fps\)/.test(limit) && audioOff && logged,
+      `CPU notice ${cpu ? `"${cpu.cls}"` : 'missing'}; warning/error toasts ${JSON.stringify(bad.map((t) => t.text.slice(0, 80)))}; overlay "${limit}", audio off ${audioOff}; ` +
+      `host log ${logged ? 'has' : 'lacks'} the budget's and the sound device's lines`);
+  } finally {
+    await endStream();
+    await restartHost({}, 'host-after-vm');
+  }
+}
+
 // Control and input before the hello (final review): the page may send
 // control messages and input as soon as the transport is up, while the
 // worker's hello still waits for the decoder self-test, and the host takes
@@ -5056,6 +5085,7 @@ try {
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
   if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
+  if (want('vm without a gpu')) await checkVM().catch((e) => check('VM without a GPU scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
   if (want('paste dialog')) await checkPasteDialog().catch((e) => check('paste dialog scenario', false, e.message));

@@ -72,6 +72,11 @@ import (
 //	                  failed part-way, and goes on, as hosts did before the
 //	                  final review: the client cannot parse its control
 //	                  stream after it and reconnects
+//	vm                play a VM without a GPU and a sound device where the
+//	                  test pattern can: the audio source finds no sound
+//	                  device, and the CPU budget (cpubudget.go) covers the
+//	                  test capture's software encoder with a measurement of
+//	                  a CPU that keeps up with 30 fps at the fastest preset
 //
 // Frames are counted per session in the order frameSender takes them, from 1;
 // a frame that is due for both is dropped, and a frame due for either is never
@@ -100,11 +105,12 @@ type testFaults struct {
 	thinEvery, thinFor int
 	refuseTickets      bool // Agent.verifyTicket
 	tornControl        bool // Session.wallClockLoop
+	vm                 bool // NewAgent (vmFaults), Session.cpuCovers
 }
 
 func (f testFaults) active() bool {
 	return f.delayEvery > 0 || f.dropEvery > 0 || f.recovery != "" || f.intraRefresh || f.refRecovery || f.stillAfter > 0 ||
-		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0 || f.refuseTickets || f.tornControl
+		f.preStageHold || f.rumbleEcho || f.noWindow || f.thinEvery > 0 || f.fecLoss > 0 || f.refuseTickets || f.tornControl || f.vm
 }
 
 // thinAt reports whether the nth frame (n from 1) is taken under the
@@ -182,6 +188,11 @@ func parseTestFaults(s string) (testFaults, error) {
 				return f, fmt.Errorf("%s: pre-stage-hold takes no value", rule)
 			}
 			f.preStageHold = true
+		case "vm":
+			if val != "" {
+				return f, fmt.Errorf("%s: vm takes no value", rule)
+			}
+			f.vm = true
 		case "rumble-echo":
 			if val != "" {
 				return f, fmt.Errorf("%s: rumble-echo takes no value", rule)
