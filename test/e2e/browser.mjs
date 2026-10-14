@@ -2538,9 +2538,9 @@ async function checkVM() {
     const toasts = await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].map((t) => ({ cls: t.className, text: t.textContent })));
     await until(async () => (await page.textContent('#stats').catch(() => '')).includes('CPU limit'), 15000, 'the CPU limit row').catch(() => {});
     const overlay = await page.textContent('#stats').catch(() => '');
-    const cpu = toasts.find((t) => t.text.startsWith('This PC encodes video on its CPU'));
+    const cpu = toasts.find((t) => t.text.startsWith('This stream encodes video on the CPU'));
     const bad = toasts.filter((t) => /\b(warn|error)\b/.test(t.cls) && !t.text.startsWith('Renderer'));
-    const limit = (overlay.match(/\d+×\d+ at \d+ fps, fastest preset \(asked: [^)]*\): what this PC's CPU encodes/) || [''])[0];
+    const limit = (overlay.match(/\d+×\d+ at \d+ fps, fastest preset \(asked: [^)]*\): what the CPU keeps up with/) || [''])[0];
     const audioOff = overlay.includes('off: no sound output device on the PC');
     const logged = /msg="cpu budget: software encoding"[^\n]* rung=3 /.test(host.log) && /audio: no sound output device on this PC/.test(host.log);
     check('VM without a GPU (test hook vm): the stream works with an informational CPU-limit notice and no warning or error toast; the overlay shows the CPU limit and why audio is off',

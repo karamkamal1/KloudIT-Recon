@@ -206,7 +206,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 	}
 	a.setupHelper()
-	a.startCPUBench() // in the background, where sessions encode on the CPU
+	a.startCPUBench(ctx) // in the background, where sessions encode on the CPU
 	a.setupVirtualDisplays(newVirtualDisplays(a.virtualDisplayOptions()))
 	if v := os.Getenv(TestFaultsEnv); v != "" {
 		if a.faults, err = parseTestFaults(v); err != nil {

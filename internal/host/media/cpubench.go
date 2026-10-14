@@ -17,20 +17,26 @@ import (
 // Xeon vCPUs here with nothing else running. Where the encoder falls behind,
 // FFmpeg's queues fill (8 packets from the capture, 8 frames into the
 // filters, 8 into the encoder) and every frame waits behind them: hundreds
-// of ms of latency (gdigrab + libx264 at 1080p60 on two CPUs under Wine:
-// 16 fps, grab->encoded p50 219 ms, p95 619 ms). Sessions pick a frame rate,
-// size and preset the CPU sustains instead (host cpubudget.go), from this
-// measurement at the agent's start and from the stream itself.
+// of ms of latency (the Windows FFmpeg under Wine on two CPUs, gdigrab of a
+// moving 1920x1080 desktop: libx264 superfast at 60 fps delivered 23-27 fps,
+// grab->encoded p50 347-383 ms, p95 564-711 ms; ultrafast at 30 fps 27-28
+// fps, p50 64-68 ms, p95 113-122 ms). Sessions pick a frame rate, size and
+// preset the CPU sustains instead (host cpubudget.go), from these
+// measurements (the encoder's, BenchSoftware, and GDI's, BenchGrab) and from
+// the stream itself.
 
 // SoftwareBench is BenchSoftware's result: libx264's frame rate at W x H
 // with the session's arguments, at its "superfast" (Quality balanced) and
-// "ultrafast" (Quality speed) presets.
+// "ultrafast" (Quality speed) presets; and, where the caller measured it
+// too (BenchGrab), how fast GDI grabs the desktop at that size.
 type SoftwareBench struct {
 	Encoder   string
 	W, H      int
 	Superfast float64 // frames per second
 	Ultrafast float64
 	Took      time.Duration
+	Grab      float64 // frames per second gdigrab grabbed (0: not measured)
+	GrabErr   string  // why Grab was not measured
 }
 
 // benchFrames is how many frames each BenchSoftware run encodes at most,
@@ -62,7 +68,10 @@ func BenchSoftware(ctx context.Context, ffmpeg string, e EncoderInfo, w, h int) 
 		preset string
 		fps    *float64
 	}{{"superfast", &b.Superfast}, {"ultrafast", &b.Ultrafast}} {
-		fps, err := benchRun(ctx, ffmpeg, b.W, b.H, run.preset)
+		fps, err := benchRun(ctx, ffmpeg, []string{"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=1000", b.W, b.H),
+			"-frames:v", strconv.Itoa(benchFrames)},
+			[]string{"-vf", "format=bgra,format=yuv420p", "-c:v", "libx264", "-preset", run.preset, "-tune", "zerolatency",
+				"-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "667k", "-bf", "0", "-g", "100000"})
 		if err != nil {
 			return b, fmt.Errorf("%s %s: %w", e.Name, run.preset, err)
 		}
@@ -72,17 +81,30 @@ func BenchSoftware(ctx context.Context, ffmpeg string, e EncoderInfo, w, h int) 
 	return b, nil
 }
 
-// benchRun encodes one preset and returns its frame rate after start-up,
+// BenchGrab measures how fast GDI (gdigrab) grabs the desktop's rectangle
+// at x, y, w x h on this PC: frames per second with nothing else of a
+// session running (no conversion, no encoder), as fast as it can. Each frame
+// is a BitBlt of the whole rectangle into system memory, which a session
+// pays at the monitor's size whatever size it streams, on the same CPU as
+// the encoder: the Windows FFmpeg under Wine on two CPUs grabbed a
+// 1920x1080 desktop 39-43 times a second, no more often than libx264
+// ultrafast encoded it there. It needs the session's desktop on a screen
+// (not locked, not disconnected); the agent runs it with BenchSoftware.
+func BenchGrab(ctx context.Context, ffmpeg string, x, y, w, h int) (float64, error) {
+	return benchRun(ctx, ffmpeg, []string{"-fpsprobesize", "0", "-f", "gdigrab", "-framerate", "200", "-draw_mouse", "0",
+		"-offset_x", strconv.Itoa(x), "-offset_y", strconv.Itoa(y), "-video_size", fmt.Sprintf("%dx%d", w&^1, h&^1), "-i", "desktop",
+		"-frames:v", strconv.Itoa(benchFrames)}, []string{"-c:v", "wrapped_avframe"})
+}
+
+// benchRun runs FFmpeg with input (and its options) and output's codec
+// options into the null muxer and returns its frame rate after start-up,
 // read from FFmpeg's -progress lines as they come.
-func benchRun(ctx context.Context, ffmpeg string, w, h int, preset string) (float64, error) {
+func benchRun(ctx context.Context, ffmpeg string, input, output []string) (float64, error) {
 	ctx, cancel := context.WithTimeout(ctx, benchStart+benchLimit+5*time.Second)
 	defer cancel()
-	cmd := quietCmd(ctx, ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats",
-		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=1000", w, h),
-		"-frames:v", strconv.Itoa(benchFrames),
-		"-vf", "format=bgra,format=yuv420p",
-		"-c:v", "libx264", "-preset", preset, "-tune", "zerolatency", "-b:v", "20000k", "-maxrate", "20000k", "-bufsize", "667k",
-		"-bf", "0", "-g", "100000", "-progress", "pipe:1", "-stats_period", "0.1", "-f", "null", "-")
+	args := append([]string{"-hide_banner", "-loglevel", "error", "-nostdin", "-nostats"}, input...)
+	args = append(append(args, output...), "-progress", "pipe:1", "-stats_period", "0.1", "-f", "null", "-")
+	cmd := quietCmd(ctx, ffmpeg, args...)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, err
@@ -123,6 +145,9 @@ func benchRun(ctx context.Context, ffmpeg string, w, h int, preset string) (floa
 		}
 	}
 	if err := cmd.Wait(); err != nil && !cut {
+		if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return 0, ctx.Err() // given up (a session started)
+		}
 		return 0, fmt.Errorf("%v: %s", err, causeLines(stderr.String(), 3))
 	}
 	if t0.IsZero() || f1-f0 < warmup || t1.Sub(t0) <= 0 {

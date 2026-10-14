@@ -210,7 +210,7 @@ func probeReport(ctx context.Context, cfg *Config, w io.Writer) {
 	}
 	a := &Agent{cfg: cfg, caps: caps}
 	mon := a.monitors()[0]
-	b, err := media.BenchSoftware(ctx, ff, caps.Encoders[i], mon.W, mon.H)
+	b, err := measureSoftware(ctx, ff, caps.Encoders[i], mon)
 	if err != nil {
 		fmt.Fprintf(w, "cpu:        software encoding not measured: %v\n", err)
 		return
@@ -222,8 +222,12 @@ func probeReport(ctx context.Context, cfg *Config, w io.Writer) {
 	if at.Quality == "speed" {
 		preset = ", fastest preset"
 	}
-	fmt.Fprintf(w, "cpu:        %s at %dx%d: superfast %.0f fps, ultrafast %.0f fps; a stream asking %s starts at %s%s (rung %d of the CPU budget)\n",
-		b.Encoder, b.W, b.H, b.Superfast, b.Ultrafast, describeParams(p), describeParams(at), preset, r)
+	grab := fmt.Sprintf("%.0f fps", b.Grab)
+	if b.GrabErr != "" {
+		grab = "not measured (" + trunc(b.GrabErr, 160) + ")"
+	}
+	fmt.Fprintf(w, "cpu:        %s at %dx%d: superfast %.0f fps, ultrafast %.0f fps; GDI grab %s; a stream asking %s starts at %s%s "+
+		"(rung %d of the CPU budget)\n", b.Encoder, b.W, b.H, b.Superfast, b.Ultrafast, grab, describeParams(p), describeParams(at), preset, r)
 }
 
 // writeLogTail writes the last lines of host.log (and of host.log.old

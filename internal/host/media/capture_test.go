@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -518,7 +519,19 @@ func TestBenchSoftware(t *testing.T) {
 		t.Skipf("libx264: %v", err)
 	}
 	t.Logf("libx264 1280x720: superfast %.0f fps, ultrafast %.0f fps (%v)", b.Superfast, b.Ultrafast, b.Took.Round(time.Millisecond))
-	if b.Superfast <= 0 || b.Ultrafast <= 0 || b.Took > 2*(benchLimit+time.Second) {
+	// Each run may take benchStart to start and benchLimit to measure (on a
+	// loaded machine the start-up alone took seconds: superfast 32 fps,
+	// ultrafast 32 in 7.1 s at a load of 20, 162 and 185 in 2.0 s alone).
+	if b.Superfast <= 0 || b.Ultrafast <= 0 || b.Took > 2*(benchStart+benchLimit)+5*time.Second {
 		t.Fatalf("bench %+v", b)
+	}
+	// Given up when its context ends (a session starts): no rate, the
+	// context's error.
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(300*time.Millisecond, cancel)
+	start := time.Now()
+	if _, err := BenchSoftware(ctx, ff, EncoderInfo{Name: "libx264", Family: "h264", Vendor: "software"}, 1920, 1080); !errors.Is(err, context.Canceled) ||
+		time.Since(start) > 3*time.Second {
+		t.Fatalf("cancelled after 300 ms: %v after %v", err, time.Since(start).Round(time.Millisecond))
 	}
 }
