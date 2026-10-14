@@ -286,8 +286,8 @@ func runRelaySim(c rsCfg) *rsTrace {
 		m.SetTarget((video+fecKbps(video)+int64(audio+ccOverheadKbps))*1000, pacedInterval(time.Second/time.Duration(encFPS), r.frameInterval()))
 	}
 	wireOf := func(bytes int) int { return bytes + int(float64(bytes)*c.shards) }
-	videoPacing := func() float64 {
-		return max(0, float64(m.TargetBitrate())*cc.PacingGain-float64((audio+ccOverheadKbps)*1000))
+	videoPacing := func() videoPace { // Session.videoPace
+		return videoPaceOf(m.Pacing(), float64((audio+ccOverheadKbps)*1000))
 	}
 	const mode = proto.RecoveryLTR
 
@@ -954,7 +954,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 					}
 				}
 				setCC()
-				of := &outFrame{f: af.f, n: num, opened: clock(), deadline: frameDeadline(time.Second/time.Duration(encFPS), wireOf(af.bytes), videoPacing()),
+				of := &outFrame{f: af.f, n: num, opened: clock(), deadline: frameDeadline(time.Second/time.Duration(encFPS), wireOf(af.bytes), videoPacing().rate),
 					gone: make(chan struct{}), held: true}
 				burst.note(of.deadline, clock()) // Session.sending
 				send.register(of)
@@ -1552,9 +1552,16 @@ func TestRelaySimCongestion(t *testing.T) {
 			dipMean := tr.meanApplied(20*time.Second, 30*time.Second)
 			t.Logf("seed %d: first cut %v after the drop, one-way delay p95 %v before, %v during the dip, mean target in the dip %.0f, back %v after; decreases %v, overflows %d",
 				seed, first, base, dip, dipMean, back, tr.decreases, tr.overflows)
-			if first < 0 || first > 500*time.Millisecond || dip > base+30*time.Millisecond || dipMean > 15000 || back < 0 || back > 10*time.Second {
+			// The dip's delay p95 is the 50 ms queue's until the first cuts
+			// have taken (about its first second): 47-51 ms with frames
+			// paced at 1.2 x the target, whose base was 38-42 ms then
+			// (base + 30 ms). Bursts took the base to 16-20 ms and left
+			// the dip's delay where it was (docs/VENDOR_NOTES.md "Second
+			// hardware run: pacing, rate control and smoothness").
+			limit := max(base+30*time.Millisecond, 55*time.Millisecond)
+			if first < 0 || first > 500*time.Millisecond || dip > limit || dipMean > 15000 || back < 0 || back > 10*time.Second {
 				t.Errorf("seed %d: want a cut within 500 ms, the dip's delay p95 under %v, the target under the 15 Mbit/s, back within 10 s\n%s",
-					seed, base+30*time.Millisecond, tr.report())
+					seed, limit, tr.report())
 			}
 		}
 	})

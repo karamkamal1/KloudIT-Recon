@@ -18,7 +18,9 @@ const (
 	// DefaultFrameInterval is the frame interval until the application sets one.
 	DefaultFrameInterval = time.Second / 60
 	// PacingGain is the pacing rate relative to the target bitrate: headroom for
-	// frame-size variance, retransmissions, audio and input.
+	// frame-size variance, retransmissions, audio and input. It bounds what
+	// the controller sends over time; a frame goes out faster, at the burst
+	// rate (below), as far as the burst credit reaches.
 	PacingGain = 1.2
 
 	minTargetBitrate = 100_000 // bit/s
@@ -33,6 +35,65 @@ const (
 	maxBurstPackets = 10
 	burstDuration   = 2 * time.Millisecond
 	minPacingDelay  = time.Millisecond
+
+	// Frame bursts. Paced at PacingGain x the target, a frame of the target's
+	// average size takes 1/1.2 of a frame interval to send (11.8 ms of
+	// "transfer" p50 in game in the second hardware run, on a LAN that
+	// carries it in about one): latency a path that is not the bottleneck
+	// does not need. The pacer therefore sends at the burst rate while the
+	// burst credit lasts: the bytes the pacing rate earned while the sender
+	// had nothing to send, at most burstFrames frame intervals' worth, so
+	// over any span the controller still sends no more than the pacing rate
+	// plus that credit. The burst rate follows the path: burstProbe x the
+	// highest delivery rate its acknowledgements measured over burstWindow
+	// (trainSample: the spacing of a train's ACKs against its sending),
+	// burstStartGain x the pacing rate before the first measure (WebRTC's
+	// pacer runs at 2.5 x the target), never under the pacing rate nor over
+	// maxBurstRate. A path slower than the bursts shows it in the ACKs'
+	// spacing (the burst rate comes down to it), and one that is not
+	// burstMinGain times faster than the pacing rate is paced at the
+	// pacing rate but for a probe train a second; a path with a queue that
+	// stands (burstQueueMax) is paced at the pacing rate; a train that lost
+	// burstLossShare of its packets (at least burstLossMin), a queue it
+	// overflowed, turns bursts off for burstHold, twice as long each time
+	// it happens again soon after (up to burstHoldMax), as does the brake
+	// after persistent congestion: the pacer then runs at the pacing rate,
+	// as before bursts.
+	burstStartGain = 2.0
+	burstProbe     = 1.25
+	maxBurstRate   = 1_000_000_000 / 8 // bytes/s
+	burstFrames    = 1.5
+	burstWindow    = 2 * time.Second
+	burstLossShare = 0.05
+	burstLossMin   = 3
+	burstHold      = 5 * time.Second
+	burstHoldMax   = 80 * time.Second
+	// burstMinGain: bursts only where the path delivered at least this
+	// many times the pacing rate in the last burstWindow. A path not much
+	// faster than the pacing rate saves a millisecond or two per frame
+	// with them but queues a share of each frame at its bottleneck (a
+	// 20-25 Mbit/s path at a 16-20 Mbit/s target: one-way delay p95 +5-8
+	// ms in the relay simulation). There a train every burstProbeEvery
+	// still goes at burstStartGain x the pacing rate, to find a path that
+	// got faster.
+	burstMinGain    = 2.0
+	burstProbeEvery = time.Second
+	// burstQueueMax: a queue on the path that every packet of the last
+	// burstQueueSlot to 2 x burstQueueSlot met (the smallest round trip of
+	// that time over the recent min RTT: standingQueue) longer than this
+	// holds bursts, while it lasts: the path is the bottleneck now (a
+	// capacity drop, a link that stalls), and the frames are paced at the
+	// pacing rate, as before bursts. The first packets of each burst meet
+	// no queue of the bursts' own making.
+	burstQueueMax  = 5 * time.Millisecond
+	burstQueueSlot = 50 * time.Millisecond
+	// trainGap: ack-eliciting packets sent less than this apart are one
+	// train (a frame's burst, or its pacing); burstSamplePackets: a train's
+	// delivery rate needs this many packets' worth acknowledged after its
+	// first ACK (receivers acknowledge every 2nd to 10th packet).
+	trainGap           = 2 * time.Millisecond
+	burstSamplePackets = 8
+	trainRing          = 16 // trains whose losses are counted
 
 	// RFC 9002 kPersistentCongestionThreshold.
 	persistentCongestionThreshold = 3
@@ -51,11 +112,7 @@ const (
 	// RecentMinRTT's after 2 s; a round trip that grows for good (a route
 	// change) is after 10 s.
 	baseRTTWindow = 10 * time.Second
-	// burstQueueSlot: the queue every packet acknowledged in the last
-	// burstQueueSlot to 2 x burstQueueSlot met (StandingQueue) is the
-	// quickest round trip of that time over the path's base.
-	burstQueueSlot = 50 * time.Millisecond
-	rttBuckets     = 4
+	rttBuckets    = 4
 	// DeliveredAt's record of when done grew: ackLogSize entries, those
 	// less than ackLogResolution apart merged (at least 256 ms back).
 	ackLogSize       = 1024
@@ -64,7 +121,8 @@ const (
 
 // Media is a rate-following congestion controller for real-time video. Unlike
 // NewReno it does not probe for bandwidth: it paces at PacingGain × the
-// application's target bitrate and allows a window of
+// application's target bitrate (each frame's burst faster, as far as the
+// burst credit reaches: see burstStartGain) and allows a window of
 // pacing rate × (min RTT + 2 frame intervals), so the queue it can build is
 // bounded by two frames. A loss does NOT shrink the window; losses are counted
 // (Stats) for the application's rate controller, which lowers the target.
@@ -86,8 +144,31 @@ type Media struct {
 	brakeWindow     atomic.Int64 // bytes; > 0 while recovering from persistent congestion
 
 	// run loop only
-	budget   congestion.ByteCount // pacing budget left after the last packet
+	budget   congestion.ByteCount // pacing budget left after the last packet (at the burst rate)
+	credit   congestion.ByteCount // burst credit left after the last packet (at the pacing rate)
 	lastSent congestion.Time
+	// Bursts (run loop only, but burstRate): the current train and when
+	// its last ack-eliciting packet went out, the recent trains' packets
+	// sent and lost, the first ACK of the newest acknowledged train
+	// (anchor), bytes acknowledged in all (delivered), the highest delivery
+	// rate of each part of burstWindow (bytes/s), the bursts' hold after an
+	// overflow and its length.
+	train         uint32
+	trainAt       congestion.Time
+	trains        [trainRing]trainStat
+	anchor        trainAnchor
+	delivered     uint64
+	bw            [rttBuckets]bwBucket
+	holdUntil     congestion.Time
+	holdLen       time.Duration
+	lastBackoff   congestion.Time
+	probing       bool            // the current train probes (burstMinGain)
+	probeAt       congestion.Time // the last probe train began
+	qSlot         [2]rttBucket    // the smallest RTT sample of the current and the last burstQueueSlot
+	standing      atomic.Int64    // ns: standingQueue as of the last ACK (StandingQueue)
+	burstRate     atomic.Int64    // bytes/s the pacer bursts at (0: not yet computed)
+	burstEst      atomic.Int64    // bytes/s: the delivery rate the burst rate follows (0: none measured)
+	burstBackoffs atomic.Uint64
 	// persistent congestion
 	sent         [sentRingSize]sentRecord // ack-eliciting packets
 	firstAck     congestion.Time          // first RTT sample
@@ -117,9 +198,7 @@ type Media struct {
 	rttBase      [rttBuckets]rttBucket // the same over baseRTTWindow
 	baseMinRTT   atomic.Int64
 	// qMin: the smallest RTT sample since the last QueueDelay (ns; 0: none).
-	qMin     atomic.Int64
-	qSlot    [2]rttBucket // the smallest RTT sample of the current and the last burstQueueSlot
-	standing atomic.Int64 // ns: standingQueue as of the last ACK (StandingQueue)
+	qMin atomic.Int64
 
 	// WindowLimited: the time the window refused the sender before the
 	// current refusal (limitedTotal) and when that began (limitedSince; zero:
@@ -134,8 +213,32 @@ type Media struct {
 }
 
 type sentRecord struct {
-	pn congestion.PacketNumber
-	t  congestion.Time
+	pn    congestion.PacketNumber
+	t     congestion.Time
+	train uint32
+}
+
+// trainStat counts a train's ack-eliciting packets and those lost.
+type trainStat struct {
+	id         uint32
+	sent, lost int
+	backedOff  bool
+}
+
+// trainAnchor is the first ACK of a train: when it arrived, the newest
+// send time among the packets it acknowledged, and delivered after it.
+type trainAnchor struct {
+	train     uint32
+	at, sent  congestion.Time
+	delivered uint64
+	ok        bool
+}
+
+// bwBucket is the highest delivery rate (bytes/s) measured in the n-th part
+// of burstWindow/rttBuckets since the controller's first timestamp (part).
+type bwBucket struct {
+	n   int64
+	max float64
 }
 
 type ackPoint struct {
@@ -199,6 +302,9 @@ func (m *Media) TargetBitrate() int64 { return m.targetBitrate.Load() }
 type MediaStats struct {
 	TargetBitrate int64 // bit/s
 	PacingRate    int64 // bit/s
+	BurstRate     int64 // bit/s: a frame's burst (Pacing)
+	BurstEstimate int64 // bit/s: the delivery rate the bursts measured (0: none in burstWindow)
+	BurstBackoffs uint64
 	Window        int64 // bytes
 	AckedPackets  uint64
 	AckedBytes    uint64
@@ -210,9 +316,13 @@ type MediaStats struct {
 
 // Stats returns counters for the application's rate controller.
 func (m *Media) Stats() MediaStats {
+	p := m.Pacing()
 	return MediaStats{
 		TargetBitrate: m.targetBitrate.Load(),
-		PacingRate:    int64(m.pacingRate() * 8),
+		PacingRate:    p.Rate,
+		BurstRate:     p.Burst,
+		BurstEstimate: m.burstEst.Load() * 8,
+		BurstBackoffs: m.burstBackoffs.Load(),
 		Window:        int64(m.GetCongestionWindow()),
 		AckedPackets:  m.ackedPackets.Load(),
 		AckedBytes:    m.ackedBytes.Load(),
@@ -264,12 +374,171 @@ func (m *Media) DeliveredAt(pos uint64) (time.Time, bool) {
 // relay fallback) within that time.
 func (m *Media) RecentMinRTT() time.Duration { return time.Duration(m.recentMinRTT.Load()) }
 
-// PacingRate is the rate the controller paces at, in bit/s.
+// PacingRate is the rate the controller paces at over time, in bit/s
+// (bursts aside: Pacing).
 func (m *Media) PacingRate() int64 { return int64(m.pacingRate() * 8) }
 
 // pacingRate is in bytes/s.
 func (m *Media) pacingRate() float64 {
 	return float64(m.targetBitrate.Load()) * PacingGain / 8
+}
+
+// Pace is how the controller paces: Rate over time and Burst while the burst
+// credit lasts (bit/s), and the credit's most (bytes): an idle sender's
+// next Credit bytes go out at Burst, what follows at Rate.
+type Pace struct {
+	Rate, Burst int64
+	Credit      int64
+}
+
+// Pacing returns the controller's pacing (any goroutine).
+func (m *Media) Pacing() Pace {
+	b := m.pacingRate()
+	burst := float64(m.burstRate.Load())
+	if burst <= 0 {
+		burst = m.burstFor(b, 0, false, false) // nothing sent yet
+	}
+	return Pace{Rate: int64(b * 8), Burst: int64(max(burst, b) * 8), Credit: int64(m.creditMax(b))}
+}
+
+// burstFor is the burst rate (bytes/s) at pacing rate b with delivery-rate
+// estimate est (0: none), or b while bursts are held or the path is not
+// burstMinGain times faster than b (but a probe train: probe).
+func (m *Media) burstFor(b, est float64, held, probe bool) float64 {
+	if held {
+		return b
+	}
+	p := b * burstStartGain // before the first measure, and a probe
+	if est > 0 {
+		switch {
+		case est >= burstMinGain*b:
+			p = est * burstProbe
+		case !probe:
+			return b
+		}
+	}
+	return min(max(p, b), max(b, maxBurstRate))
+}
+
+// burstAt computes the burst rate at now (run loop only) and publishes it.
+func (m *Media) burstAt(now congestion.Time) float64 {
+	b := m.pacingRate()
+	est := m.bwEstimate(now)
+	m.burstEst.Store(int64(est))
+	p := m.burstFor(b, est, m.brakeWindow.Load() > 0 || now.Before(m.holdUntil) || m.standingQueue(now) > burstQueueMax, m.probing)
+	m.burstRate.Store(int64(p))
+	return p
+}
+
+// StandingQueue is the queue every packet acknowledged in the last 50 to
+// 100 ms met on the path (standingQueue, as of the last ACK; any
+// goroutine).
+func (m *Media) StandingQueue() time.Duration { return time.Duration(m.standing.Load()) }
+
+// standingQueue is how much longer than the path's base round trip
+// (baseRTTWindow) the quickest round trip of the packets acknowledged in the
+// current and the last burstQueueSlot took (0: none acknowledged). Run loop
+// only.
+func (m *Media) standingQueue(now congestion.Time) time.Duration {
+	n := m.part(now, rttBuckets*burstQueueSlot)
+	var low time.Duration
+	for _, b := range m.qSlot {
+		if b.min > 0 && b.n >= n-1 && (low == 0 || b.min < low) {
+			low = b.min
+		}
+	}
+	if low == 0 {
+		return 0
+	}
+	return max(0, low-time.Duration(m.baseMinRTT.Load()))
+}
+
+// creditMax is the most burst credit at pacing rate b (bytes/s): burstFrames
+// frame intervals' worth, at least the pacer's own burst.
+func (m *Media) creditMax(b float64) congestion.ByteCount {
+	d := congestion.ByteCount(b * burstFrames * time.Duration(m.frameInterval.Load()).Seconds())
+	return max(d, m.maxBurst(b))
+}
+
+// part is the number of the part of window/rttBuckets now is in, counted
+// from the first time the run loop handed the controller: the parts' edges
+// do not depend on the monotonic clock's origin (a simulation's runs on
+// their own clocks repeat). Run loop only.
+func (m *Media) part(now congestion.Time, window time.Duration) int64 {
+	if m.epoch.IsZero() {
+		m.epoch = now
+	}
+	return int64(now.Sub(m.epoch) / (window / rttBuckets))
+}
+
+// bwEstimate is the highest delivery rate measured in the last 1.5 to 2 s
+// (bytes/s; 0: none). Run loop only.
+func (m *Media) bwEstimate(now congestion.Time) float64 {
+	n := m.part(now, burstWindow)
+	var hi float64
+	for _, b := range m.bw {
+		if b.n > n-rttBuckets {
+			hi = max(hi, b.max)
+		}
+	}
+	return hi
+}
+
+// trainSample measures a train's delivery rate from the ACK of a packet of
+// it (r, sent at r.t), delivered already counting it: the bytes
+// acknowledged since the train's first ACK over the time since, or over the
+// time between sending the newest packets of the two where that is longer
+// (a path that carries the bursts acknowledges at the rate they were sent,
+// and ACKs that bunch on the way back say nothing faster). Run loop only.
+func (m *Media) trainSample(r sentRecord, now congestion.Time) {
+	a := &m.anchor
+	switch {
+	case !a.ok || int32(r.train-a.train) > 0:
+		*a = trainAnchor{train: r.train, at: now, sent: r.t, delivered: m.delivered, ok: true}
+		return
+	case r.train != a.train:
+		return // an older train's late acknowledgement
+	case now == a.at: // the first ACK's other packets
+		a.sent, a.delivered = max(a.sent, r.t), m.delivered
+		return
+	}
+	n := m.delivered - a.delivered
+	span := max(now.Sub(a.at), r.t.Sub(a.sent))
+	if n < burstSamplePackets*uint64(m.mds()) || span <= 0 {
+		return
+	}
+	v := float64(n) / span.Seconds()
+	k := m.part(now, burstWindow)
+	if b := &m.bw[k%rttBuckets]; b.n != k {
+		*b = bwBucket{k, v}
+	} else {
+		b.max = max(b.max, v)
+	}
+}
+
+// burstLoss counts a lost packet against its train, and turns bursts off
+// when the train lost burstLossShare of its packets (at least burstLossMin):
+// the burst overflowed a queue. Run loop only.
+func (m *Media) burstLoss(r sentRecord, now congestion.Time) {
+	t := &m.trains[r.train%trainRing]
+	if t.id != r.train || t.backedOff {
+		return
+	}
+	t.lost++
+	if t.lost < max(burstLossMin, int(math.Ceil(burstLossShare*float64(t.sent)))) {
+		return
+	}
+	t.backedOff = true
+	if now.Before(m.holdUntil) {
+		return
+	}
+	d := burstHold
+	if !m.lastBackoff.IsZero() && now.Sub(m.lastBackoff) < 2*m.holdLen+burstHold {
+		d = min(2*m.holdLen, burstHoldMax)
+	}
+	m.holdLen, m.holdUntil, m.lastBackoff = d, now.Add(d), now
+	m.bw = [rttBuckets]bwBucket{} // measured with the bursts that overflowed
+	m.burstBackoffs.Add(1)
 }
 
 func (m *Media) mds() congestion.ByteCount {
@@ -326,44 +595,88 @@ func (m *Media) WindowLimited() time.Duration {
 	return d
 }
 
-func (m *Media) maxBurst() congestion.ByteCount {
-	return max(congestion.ByteCount(m.pacingRate()*burstDuration.Seconds()), maxBurstPackets*m.mds())
+// maxBurst is the pacer's burst at rate r (bytes/s): 2 ms of it, at least
+// 10 packets.
+func (m *Media) maxBurst(r float64) congestion.ByteCount {
+	return max(congestion.ByteCount(r*burstDuration.Seconds()), maxBurstPackets*m.mds())
 }
 
-// budgetAt is the pacing budget (token bucket) at time now.
+// burst is the burst rate the pacer runs at (bytes/s; run loop only).
+func (m *Media) burst() float64 {
+	if p := float64(m.burstRate.Load()); p > 0 {
+		return max(p, m.pacingRate())
+	}
+	return m.burstFor(m.pacingRate(), 0, false, false)
+}
+
+// budgetAt is the pacing budget (token bucket at the burst rate) at time now.
 func (m *Media) budgetAt(now congestion.Time) congestion.ByteCount {
+	p := m.burst()
 	if m.lastSent.IsZero() {
-		return m.maxBurst()
+		return m.maxBurst(p)
 	}
 	budget := m.budget
 	if d := now.Sub(m.lastSent); d > 0 {
-		budget += congestion.ByteCount(m.pacingRate() * d.Seconds())
+		budget += congestion.ByteCount(p * d.Seconds())
 	}
-	return min(budget, m.maxBurst())
+	return min(budget, m.maxBurst(p))
+}
+
+// creditAt is the burst credit (token bucket at the pacing rate) at time now.
+func (m *Media) creditAt(now congestion.Time) congestion.ByteCount {
+	b := m.pacingRate()
+	if m.lastSent.IsZero() {
+		return m.creditMax(b)
+	}
+	credit := m.credit
+	if d := now.Sub(m.lastSent); d > 0 {
+		credit += congestion.ByteCount(b * d.Seconds())
+	}
+	return min(credit, m.creditMax(b))
 }
 
 func (m *Media) HasPacingBudget(now congestion.Time) bool {
-	return m.budgetAt(now) >= m.mds()
+	return m.budgetAt(now) >= m.mds() && m.creditAt(now) >= m.mds()
 }
 
-// TimeUntilSend returns when the pacer has budget for a full-size packet
-// again (the zero Time: now).
+// TimeUntilSend returns when the pacer has budget and credit for a full-size
+// packet again (the zero Time: now).
 func (m *Media) TimeUntilSend(congestion.ByteCount) congestion.Time {
-	if m.lastSent.IsZero() || m.budget >= m.mds() {
+	if m.lastSent.IsZero() {
 		return 0
 	}
-	d := time.Duration(math.Ceil(float64(m.mds()-m.budget) / m.pacingRate() * 1e9))
+	var d time.Duration
+	if m.budget < m.mds() {
+		d = time.Duration(math.Ceil(float64(m.mds()-m.budget) / m.burst() * 1e9))
+	}
+	if m.credit < m.mds() {
+		d = max(d, time.Duration(math.Ceil(float64(m.mds()-m.credit)/m.pacingRate()*1e9)))
+	}
+	if d <= 0 {
+		return 0
+	}
 	return m.lastSent.Add(max(d, minPacingDelay))
 }
 
 func (m *Media) OnPacketSent(sentTime congestion.Time, bytesInFlight congestion.ByteCount, pn congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
-	budget := m.budgetAt(sentTime)
+	budget, credit := m.budgetAt(sentTime), m.creditAt(sentTime)
 	m.budget = budget - min(bytes, budget)
+	m.credit = credit - min(bytes, credit)
 	m.lastSent = sentTime
 	if isRetransmittable {
-		m.sent[pn%sentRingSize] = sentRecord{pn: pn, t: sentTime}
+		if m.trainAt.IsZero() || sentTime.Sub(m.trainAt) > trainGap {
+			m.train++
+			m.trains[m.train%trainRing] = trainStat{id: m.train}
+			if m.probing = m.probeAt.IsZero() || sentTime.Sub(m.probeAt) >= burstProbeEvery; m.probing {
+				m.probeAt = sentTime
+			}
+		}
+		m.trainAt = sentTime
+		m.trains[m.train%trainRing].sent++
+		m.sent[pn%sentRingSize] = sentRecord{pn: pn, t: sentTime, train: m.train}
 		m.sentPos.Add(uint64(bytes))
 	}
+	m.burstAt(sentTime) // the rate the next packets go out at
 	// bytesInFlight is quic-go's own count after this packet: it also drops
 	// packets the controller never hears of (lost MTU probes), so done
 	// catches up with them here.
@@ -448,48 +761,15 @@ func bucketMin(bs *[rttBuckets]rttBucket, n int64) time.Duration {
 // receiver's one-way delays it holds nothing of the host's wait before
 // sending (its frame queue, the pacer, a send loop running late) nor of the
 // receiving application's (a browser's worker busy elsewhere: the network
-// stack acknowledges on its own), and no clock offset. One caller: the
-// rate controller, once per receive report.
+// stack acknowledges on its own), and no clock offset. A burst's own queue
+// at a slower bottleneck is not in it either: the first packets of each
+// burst meet none. One caller: the rate controller, once per receive report.
 func (m *Media) QueueDelay() (time.Duration, bool) {
 	q := m.qMin.Swap(0)
 	if q == 0 {
 		return 0, false
 	}
 	return max(0, time.Duration(q)-time.Duration(m.baseMinRTT.Load())), true
-}
-
-// StandingQueue is the queue every packet acknowledged in the last 50 to
-// 100 ms met on the path (standingQueue, as of the last ACK; any
-// goroutine).
-func (m *Media) StandingQueue() time.Duration { return time.Duration(m.standing.Load()) }
-
-// standingQueue is how much longer than the path's base round trip
-// (baseRTTWindow) the quickest round trip of the packets acknowledged in the
-// current and the last burstQueueSlot took (0: none acknowledged). Run loop
-// only.
-func (m *Media) standingQueue(now congestion.Time) time.Duration {
-	n := m.part(now, rttBuckets*burstQueueSlot)
-	var low time.Duration
-	for _, b := range m.qSlot {
-		if b.min > 0 && b.n >= n-1 && (low == 0 || b.min < low) {
-			low = b.min
-		}
-	}
-	if low == 0 {
-		return 0
-	}
-	return max(0, low-time.Duration(m.baseMinRTT.Load()))
-}
-
-// part is the number of the part of window/rttBuckets now is in, counted
-// from the first time the run loop handed the controller: the parts' edges
-// do not depend on the monotonic clock's origin (a simulation's runs on
-// their own clocks repeat). Run loop only.
-func (m *Media) part(now congestion.Time, window time.Duration) int64 {
-	if m.epoch.IsZero() {
-		m.epoch = now
-	}
-	return int64(now.Sub(m.epoch) / (window / rttBuckets))
 }
 
 func (m *Media) OnPacketAcked(pn congestion.PacketNumber, ackedBytes, _ congestion.ByteCount, eventTime congestion.Time) {
@@ -499,8 +779,10 @@ func (m *Media) OnPacketAcked(pn congestion.PacketNumber, ackedBytes, _ congesti
 	m.largestAcked = max(m.largestAcked, pn)
 	m.ackedPackets.Add(1)
 	m.ackedBytes.Add(uint64(ackedBytes))
+	m.delivered += uint64(ackedBytes)
 	if r := m.sent[pn%sentRingSize]; r.pn == pn && !r.t.IsZero() {
 		m.rttSample(eventTime, eventTime.Sub(r.t))
+		m.trainSample(r, eventTime)
 	}
 	m.advance(m.donePos.Load()+uint64(ackedBytes), eventTime)
 	if b := m.brakeWindow.Load(); b > 0 {
@@ -521,7 +803,11 @@ func (m *Media) OnCongestionEvent(pn congestion.PacketNumber, lostBytes, _ conge
 	}
 	m.lostPackets.Add(1)
 	m.lostBytes.Add(uint64(lostBytes))
-	m.advance(m.donePos.Load()+uint64(lostBytes), m.now())
+	now := m.now()
+	m.advance(m.donePos.Load()+uint64(lostBytes), now)
+	if r := m.sent[pn%sentRingSize]; r.pn == pn && !r.t.IsZero() {
+		m.burstLoss(r, now)
+	}
 	if m.persistentCongestion(pn) {
 		m.collapse()
 	}

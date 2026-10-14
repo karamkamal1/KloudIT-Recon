@@ -1281,7 +1281,7 @@ func TestSendTrack(t *testing.T) {
 			size = 200000
 		}
 		enc := time.Duration(i) * frame
-		tr.sent(1, uint32(i), us(enc), us(enc+200*time.Millisecond), size, pace)
+		tr.sent(1, uint32(i), us(enc), us(enc+200*time.Millisecond), size, flatPace(pace))
 		c, n := tr.cover(1, uint32(i))
 		if n != 1 {
 			t.Fatalf("frame %d: covered %d", i, n)
@@ -1296,19 +1296,19 @@ func TestSendTrack(t *testing.T) {
 		t.Fatalf("pacer shares around the key frame %v: want it large, then decaying", comps[8:16])
 	}
 	// The measured time bounds it.
-	tr.sent(1, 30, us(30*frame), us(30*frame+time.Millisecond), 200000, pace)
+	tr.sent(1, 30, us(30*frame), us(30*frame+time.Millisecond), 200000, flatPace(pace))
 	if c, _ := tr.cover(1, 30); c != time.Millisecond {
 		t.Fatalf("share %v, want the measured 1 ms", c)
 	}
 	// Without the media congestion controller nothing is attributed.
-	tr.sent(1, 31, us(31*frame), us(31*frame+50*time.Millisecond), 200000, 0)
+	tr.sent(1, 31, us(31*frame), us(31*frame+50*time.Millisecond), 200000, videoPace{})
 	if c, _ := tr.cover(1, 31); c != 0 {
 		t.Fatalf("share %v without pacing, want 0", c)
 	}
 	// cover: the median of the frames it covers; pending: the oldest
 	// uncovered one's age less its share.
 	for i := 32; i < 37; i++ {
-		tr.sent(1, uint32(i), us(time.Duration(i)*frame), us(time.Duration(i)*frame), 1000, 0)
+		tr.sent(1, uint32(i), us(time.Duration(i)*frame), us(time.Duration(i)*frame), 1000, videoPace{})
 	}
 	if p, ok := tr.pending(us(32*frame + 70*time.Millisecond)); !ok || p != 70*time.Millisecond {
 		t.Fatalf("pending %v %v, want 70 ms", p, ok)
@@ -1425,8 +1425,8 @@ func TestSendTrackRateChange(t *testing.T) {
 	}
 	// A 100 kB key frame at 4 Mbit/s, then the target raised tenfold and a
 	// 10 kB frame 50 ms later.
-	tr.sent(1, 0, us(0), us(300*time.Millisecond), 100000, slow)
-	tr.sent(1, 1, us(50*time.Millisecond), us(310*time.Millisecond), 10000, fast)
+	tr.sent(1, 0, us(0), us(300*time.Millisecond), 100000, flatPace(slow))
+	tr.sent(1, 1, us(50*time.Millisecond), us(310*time.Millisecond), 10000, flatPace(fast))
 	if c, ok := tr.compOf(1, 0); !ok || !near(c, (100000-minPaceBurst)/rate(slow)) {
 		t.Fatalf("key frame's share %v %v", c, ok)
 	}
@@ -1450,7 +1450,7 @@ func TestReportComp(t *testing.T) {
 	var tr sendTrack
 	for i := 0; i < 5; i++ { // shares 10, 20, 30, 40, 50 ms (the measured time bounds them)
 		at := uint64(1_000_000 + i*16_667)
-		tr.sent(1, uint32(i), at, at+uint64(i+1)*10_000, 200000, 1e6)
+		tr.sent(1, uint32(i), at, at+uint64(i+1)*10_000, 200000, flatPace(1e6))
 	}
 	r := proto.RateReport{Flags: proto.RateReportFrame | proto.RateReportOWD, Gen: 1, LastSeq: 4, OWDP50Us: 60000, OWDMaxUs: 90000}
 	if c := reportComp(&tr, r); c != 30*time.Millisecond {

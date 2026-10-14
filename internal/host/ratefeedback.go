@@ -12,19 +12,22 @@ import (
 //
 // A frame's one-way delay as the client measures it (last byte received minus
 // the frame's encodeDoneUs) includes the host's own sending: the media
-// congestion controller paces at 1.2 x the target, so a frame larger than
-// the average (a key frame, the first frames of a new FFmpeg generation)
-// takes several frame intervals to go out and delays the frames behind it,
-// for up to a second, with no network queue at all. sendTrack therefore
-// keeps, per frame sent, the share of its sending time the pacer explains: a
-// fluid model of the pacer (a backlog fed with each frame at its encodeDone
-// time and drained at the video's share of the pacing rate, less its burst
-// allowance), but at most the frame's measured encodeDone -> written time
-// (frameSender's Write returns when all but the frame's last packet has been
-// paced out). The rate controller then sees each report's delay minus that
-// share: a queue anywhere else, including the host's own queue while the
-// congestion window blocks sending (which is the network's doing), stays in
-// the signal.
+// congestion controller paces at 1.2 x the target (a frame's burst faster,
+// as far as the burst credit reaches), so a frame larger than the credit (a
+// key frame, the first frames of a new FFmpeg generation) takes several
+// frame intervals to go out and delays the frames behind it, for up to a
+// second, with no network queue at all. sendTrack therefore keeps, per frame
+// sent, the share of its sending time the pacer explains: a fluid model of
+// the pacer (pacerModel: a backlog fed with each frame at its encodeDone
+// time, drained at the video's share of the burst rate while the credit
+// lasts and of the pacing rate after, less its burst allowance), but at most
+// the frame's measured encodeDone -> written time (frameSender's Write
+// returns when all but the frame's last packet has been paced out). The rate
+// controller then sees each report's delay minus that share: a queue
+// anywhere else, including the host's own queue while the congestion window
+// blocks sending (which is the network's doing), stays in the signal; the
+// controller also asks the host's own measure of the path's queue
+// (feedback.ackQD) whether it is the path's.
 
 // sendTrackLen is how many sent frames sendTrack keeps (8 s at 60 fps).
 const sendTrackLen = 512
@@ -33,7 +36,8 @@ const sendTrackLen = 512
 // and frame headers.
 const paceOverhead = 0.04
 
-// minPaceBurst is the pacer's least burst allowance (cc.Media: 10 packets).
+// minPaceBurst is the pacer's least burst allowance (cc.Media: 10 packets);
+// its burst allowance is 2 ms at the burst rate, at least that.
 const minPaceBurst = 12000 // bytes
 
 type sentFrame struct {
@@ -52,31 +56,30 @@ type sendTrack struct {
 	ring    [sendTrackLen]sentFrame
 	n       uint64 // frames recorded
 	covered uint64 // frames [0, covered) are covered
-	// The pacer model at lastUs: bytes it has yet to send (backlog), and
-	// the rate it drains them at (bytes/s).
-	backlog, rate float64
-	lastUs        uint64
+	// The pacer model at lastUs.
+	model  pacerModel
+	lastUs uint64
 }
 
-// sent records a frame whose write returned at doneUs. paceBps is the pacing
-// rate available to video (bit/s; 0: the connection does not pace by the
-// target, nothing is attributed to pacing).
-func (t *sendTrack) sent(gen uint8, seq uint32, encodeDoneUs, doneUs uint64, bytes int, paceBps float64) {
+// sent records a frame whose write returned at doneUs. pace is the pacing
+// available to video (Session.videoPace; rate 0: the connection does not
+// pace by the target, nothing is attributed to pacing).
+func (t *sendTrack) sent(gen uint8, seq uint32, encodeDoneUs, doneUs uint64, bytes int, pace videoPace) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	f := sentFrame{gen: gen, seq: seq, encodeDoneUs: encodeDoneUs, sentUs: doneUs, bytes: bytes}
-	if paceBps > 0 && encodeDoneUs > 0 && doneUs >= encodeDoneUs {
-		rate := paceBps * (1 - paceOverhead) / 8 // bytes/s
+	if pace.rate > 0 && encodeDoneUs > 0 && doneUs >= encodeDoneUs {
 		if t.lastUs != 0 && encodeDoneUs > t.lastUs {
-			// At the rate the pacer had until now: a target raised since
+			// At the pace the pacer had until now: a target raised since
 			// (this frame's write returns at the new rate) did not drain
 			// what came before it any faster.
-			t.backlog = max(0, t.backlog-t.rate*float64(encodeDoneUs-t.lastUs)/1e6)
+			t.model.advance(float64(encodeDoneUs-t.lastUs) / 1e6)
 		}
-		t.lastUs, t.rate = max(t.lastUs, encodeDoneUs), rate
-		t.backlog += float64(bytes)
-		burst := max(rate*0.002, minPaceBurst)
-		model := uint64(max(0, t.backlog-burst) / rate * 1e6)
+		t.lastUs = max(t.lastUs, encodeDoneUs)
+		t.model.pace(pace, paceOverhead)
+		t.model.backlog += float64(bytes)
+		burst := max(t.model.burst*0.002, minPaceBurst)
+		model := uint64(t.model.drain(t.model.backlog-burst) * 1e6)
 		f.comp = min(model, doneUs-encodeDoneUs)
 	}
 	t.ring[t.n%sendTrackLen] = f

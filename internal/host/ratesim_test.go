@@ -251,7 +251,7 @@ func runSim(c simConfig) simResult {
 				if c.noComp {
 					video = 0
 				}
-				track.sent(f.gen, f.seq, uint64(f.encodeDone.Microseconds())+1, uint64(now.Microseconds())+1, f.bytes, video)
+				track.sent(f.gen, f.seq, uint64(f.encodeDone.Microseconds())+1, uint64(now.Microseconds())+1, f.bytes, flatPace(video))
 				r.sent(f.bytes)
 			}
 			if (cur < 0 || res.frames[cur].unsent == 0) && len(frameQ) > 0 {

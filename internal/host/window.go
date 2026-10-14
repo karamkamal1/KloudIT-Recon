@@ -132,7 +132,8 @@ type deliveryMeter interface {
 	// RecentMinRTT is the path's smallest round trip of the last few
 	// seconds (0: none measured yet).
 	RecentMinRTT() time.Duration
-	// PacingRate is the rate the controller paces at, in bit/s.
+	// PacingRate is the rate the controller paces at over time, in bit/s
+	// (a frame's burst aside).
 	PacingRate() int64
 	// WindowLimited is how long in all the congestion window has kept the
 	// sender from sending.
@@ -166,8 +167,10 @@ type videoWindow struct {
 
 // windowMark is a frame in flight: the connection's sent positions before
 // its write (start) and when it returned (pos), the time when it returned,
-// the pacing rate (bit/s) it went out at, and the write's own time (its
-// duration less the time the congestion window held it back).
+// the pacing rate (bit/s) it went out at (the controller's rate over time:
+// the burst a frame starts with is no measure of what the path must carry),
+// and the write's own time (its duration less the time the congestion
+// window held it back).
 type windowMark struct {
 	start, pos       uint64
 	began, at, ready time.Time // its write began and returned; it was ready (writeStart.ready)

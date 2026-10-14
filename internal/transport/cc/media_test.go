@@ -220,15 +220,17 @@ func TestMediaPacer(t *testing.T) {
 	if m.HasPacingBudget(t0) {
 		t.Fatal("budget left after a full burst")
 	}
-	// 1200 B at 3 MB/s = 400 µs, but at least 1 ms between bursts.
+	// 1200 B at the burst rate before any measure, 2 x 3 MB/s, = 200 µs,
+	// but at least 1 ms between bursts.
 	if next := m.TimeUntilSend(0); next != t0.Add(time.Millisecond) {
 		t.Fatalf("TimeUntilSend = %v after t0, want 1ms", next.Sub(t0))
 	}
-	if m.HasPacingBudget(t0.Add(399*time.Microsecond)) || !m.HasPacingBudget(t0.Add(400*time.Microsecond)) {
-		t.Fatal("budget must refill at the pacing rate")
+	if m.HasPacingBudget(t0.Add(199*time.Microsecond)) || !m.HasPacingBudget(t0.Add(200*time.Microsecond)) {
+		t.Fatal("budget must refill at the burst rate")
 	}
 
-	// Sending whenever allowed for one second averages the pacing rate.
+	// Sending whenever allowed for one second averages the pacing rate,
+	// plus the burst credit an idle pacer starts with.
 	for _, bps := range []int64{20_000_000, 100_000_000} {
 		m, now := newTestMedia(10 * time.Millisecond)
 		m.SetTargetBitrate(bps)
@@ -247,7 +249,7 @@ func TestMediaPacer(t *testing.T) {
 			}
 			t = next
 		}
-		want := float64(bps) * PacingGain / 8
+		want := float64(bps)*PacingGain/8 + float64(m.Pacing().Credit)
 		if d := float64(sent)/want - 1; d > 0.01 || d < -0.01 {
 			t.Errorf("target %d bit/s: sent %d B in 1 s, want %.0f ±1 %%", bps, sent, want)
 		}

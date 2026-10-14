@@ -1,6 +1,7 @@
 package cc
 
 import (
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -89,6 +90,141 @@ func (p *burstPath) frame(n int, lose func(int) bool) time.Duration {
 	took := p.now.Sub(start)
 	p.advance(start.Add(time.Second / 60))
 	return took
+}
+
+// TestMediaBurst: a frame goes out at the burst rate while the burst credit
+// lasts, what is beyond it at the pacing rate; before anything is measured
+// the burst rate is twice the pacing rate.
+func TestMediaBurst(t *testing.T) {
+	// 80 Mbit/s: pacing 96 Mbit/s = 12 MB/s, credit 1.5 frame intervals'
+	// worth = 300 kB, bursts at 24 MB/s.
+	p := newBurstPath(t, 2*time.Millisecond, 80_000_000, 1e12)
+	if pc := p.m.Pacing(); pc.Rate != 96_000_000 || pc.Burst != 192_000_000 || pc.Credit < 299_999 || pc.Credit > 300_000 {
+		t.Fatalf("pacing before any packet %+v", pc)
+	}
+	// A 120 kB frame: 5 ms at the burst rate, not 10 ms at the pacing rate.
+	if took := p.frame(100, nil); took > 5500*time.Microsecond {
+		t.Fatalf("a 120 kB frame took %v to send, want about 5 ms at the burst rate", took)
+	}
+	// Over time no more than the pacing rate and the credit: a 900 kB frame
+	// (a key frame) takes at least (900 - 300) kB / 12 MB/s = 50 ms.
+	p2 := newBurstPath(t, 2*time.Millisecond, 80_000_000, 1e12)
+	if took := p2.frame(750, nil); took < 48*time.Millisecond {
+		t.Fatalf("a 900 kB frame took %v, want at least 50 ms: the credit, then the pacing rate", took)
+	}
+}
+
+// TestMediaBurstFollowsPath: the burst rate grows to what the path carries
+// (a gigabit LAN: maxBurstRate), comes down to burstProbe x a slower path's
+// rate measured by the ACKs' spacing, is the pacing rate on a path not
+// burstMinGain times faster than it, and while a queue stands on the path.
+func TestMediaBurstFollowsPath(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		capacity float64 // bytes/s
+		want     float64 // bytes/s
+	}{
+		{"gigabit LAN", 125e6, maxBurstRate},
+		{"300 Mbit/s", 37.5e6, 37.5e6 * burstProbe},
+		{"150 Mbit/s, under twice the pacing rate", 18.75e6, 12e6},
+		{"60 Mbit/s, under the pacing rate", 7.5e6, 12e6},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := newBurstPath(t, 2*time.Millisecond, 80_000_000, c.capacity)
+			for range 60 {
+				p.frame(100, nil)
+			}
+			got := float64(p.m.Pacing().Burst) / 8
+			if math.Abs(got/c.want-1) > 0.1 {
+				t.Fatalf("burst rate %.1f MB/s after a second of frames, want %.1f MB/s ±10 %%", got/1e6, c.want/1e6)
+			}
+		})
+	}
+	p := newBurstPath(t, 2*time.Millisecond, 80_000_000, 125e6)
+	for range 60 {
+		p.frame(100, nil)
+	}
+	p.queue = 10 * time.Millisecond // every packet's way: a queue that stands
+	for range 10 {
+		p.frame(100, nil)
+	}
+	if pc := p.m.Pacing(); pc.Burst != pc.Rate {
+		t.Fatalf("burst %d bit/s with a 10 ms queue standing, want the pacing rate %d", pc.Burst, pc.Rate)
+	}
+	p.queue = 0
+	for range 10 {
+		p.frame(100, nil)
+	}
+	if pc := p.m.Pacing(); pc.Burst != maxBurstRate*8 {
+		t.Fatalf("burst %d bit/s once the queue drained, want %d again", pc.Burst, maxBurstRate*8)
+	}
+}
+
+// TestMediaBurstProbe: on a path not burstMinGain times faster than the
+// pacing rate one frame a second still goes out at burstStartGain x the
+// pacing rate (a probe for a path that got faster), the others at the
+// pacing rate; a path that did is burst into again from the next probe.
+func TestMediaBurstProbe(t *testing.T) {
+	// 150 Mbit/s against 96 Mbit/s of pacing: a 120 kB frame takes 10 ms at
+	// the pacing rate, 5 ms at twice it.
+	p := newBurstPath(t, 2*time.Millisecond, 80_000_000, 18.75e6)
+	for range 60 {
+		p.frame(100, nil)
+	}
+	fast := 0
+	for range 120 {
+		if took := p.frame(100, nil); took < 7*time.Millisecond {
+			fast++
+		}
+	}
+	if fast != 2 {
+		t.Fatalf("%d frames in 2 s went faster than the pacing rate, want the 2 probes", fast)
+	}
+	// The path gets faster (a gigabit): the next probe measures it.
+	p.capacity = 125e6
+	for range 90 {
+		p.frame(100, nil)
+	}
+	if pc := p.m.Pacing(); pc.Burst != maxBurstRate*8 {
+		t.Fatalf("burst %d bit/s 1.5 s after the path got faster, want %d", pc.Burst, int64(maxBurstRate*8))
+	}
+}
+
+// TestMediaBurstLoss: a train that loses burstLossShare of its packets (a
+// queue its burst overflowed) turns bursts off for burstHold, twice as long
+// when it happens again soon after; random losses do not.
+func TestMediaBurstLoss(t *testing.T) {
+	p := newBurstPath(t, 2*time.Millisecond, 80_000_000, 125e6)
+	for range 30 {
+		p.frame(100, func(i int) bool { return i == 50 }) // 1 %: random loss
+	}
+	if pc := p.m.Pacing(); pc.Burst == pc.Rate {
+		t.Fatal("bursts off after random losses")
+	}
+	p.frame(100, func(i int) bool { return i >= 90 }) // the burst's tail dropped
+	p.frame(100, nil)
+	if pc, s := p.m.Pacing(), p.m.Stats(); pc.Burst != pc.Rate || s.BurstBackoffs != 1 {
+		t.Fatalf("after a burst lost its tail: burst %d, pacing %d, backoffs %d; want bursts off, one backoff", pc.Burst, pc.Rate, s.BurstBackoffs)
+	}
+	for range 60 * 5 {
+		p.frame(100, nil)
+	}
+	if pc := p.m.Pacing(); pc.Burst == pc.Rate {
+		t.Fatal("bursts still off 5 s after the overflow")
+	}
+	p.frame(100, func(i int) bool { return i >= 90 })
+	for range 60 * 6 {
+		p.frame(100, nil)
+	}
+	if pc := p.m.Pacing(); pc.Burst != pc.Rate {
+		t.Fatal("a second overflow soon after the first: bursts back after 6 s, want 10 s off")
+	}
+	for range 60 * 5 {
+		p.frame(100, nil)
+	}
+	if pc := p.m.Pacing(); pc.Burst == pc.Rate {
+		t.Fatal("bursts still off 11 s after the second overflow")
+	}
 }
 
 // TestMediaQueueDelay: the quickest round trip since the last call over the

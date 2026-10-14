@@ -118,7 +118,8 @@ const (
 	fecMaxLoss = 0.2
 	fecBackoff = 30 * time.Second
 
-	// fecQueueAhead bounds how far the shard writer runs ahead of the pacer:
+	// fecQueueAhead bounds how far the shard writer runs ahead of the pacer
+	// (its model: pacerModel, at the frame's burst while the credit lasts):
 	// quic-go sends datagrams in order from one queue (32 deep) ahead of
 	// stream data, so audio, cursor and pong datagrams wait behind every
 	// shard queued before them. The writer keeps at most this much sending
@@ -417,14 +418,17 @@ func (s *Session) fecWireEstimate(n int) int {
 // A frame whose shards all went out is recorded in the video window.
 func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, dgs [][]byte, wire, frameBytes int, held bool) bool {
 	f := of.f
-	pace := s.videoPacingBps()
-	if pace <= 0 {
+	vp := s.videoPace()
+	if vp.rate <= 0 {
 		if t := s.ccTarget.Load(); t != nil {
-			pace = float64(t.videoKbps+s.fecOverheadKbps(t.videoKbps)) * 1000 * 1.2
+			vp = flatPace(float64(t.videoKbps+s.fecOverheadKbps(t.videoKbps)) * 1000 * 1.2)
 		}
 	}
-	ahead := max(2*float64(proto.VideoShardHeaderLen+fr.Size), pace/8*fecQueueAhead.Seconds())
-	var queued float64
+	// The pacer's model: the frame's burst while the credit lasts (an idle
+	// pacer's, between frames), the pacing rate after.
+	var queued pacerModel
+	queued.pace(vp, 0)
+	ahead := max(2*float64(proto.VideoShardHeaderLen+fr.Size), queued.burst*fecQueueAhead.Seconds())
 	last := time.Now()
 	loss := s.a.faults.fecLoss
 	m := s.deliveryMeter()
@@ -448,19 +452,19 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 				return true
 			}
 		}
-		if pace > 0 {
+		if queued.rate > 0 {
 			now := time.Now()
-			queued = max(0, queued-pace/8*now.Sub(last).Seconds())
+			queued.advance(now.Sub(last).Seconds())
 			last = now
-			if queued > ahead {
-				wait := time.Duration((queued - ahead) / (pace / 8) * float64(time.Second))
+			if queued.backlog > ahead {
+				wait := time.Duration(queued.drain(queued.backlog-ahead) * float64(time.Second))
 				select {
 				case <-s.ctx.Done():
 					return true
 				case <-time.After(wait):
 				}
 			}
-			queued += float64(len(d))
+			queued.backlog += float64(len(d))
 		}
 		if loss > 0 && rand.Float64() < loss {
 			continue // test hook: the network lost it
@@ -523,7 +527,7 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 	fs.ratio.Store(r)
 	// The pacer model counts what went on the wire; the fill, as the
 	// client counts a frame, its bytes.
-	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), wire, s.videoPacingBps())
+	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), wire, s.videoPace())
 	s.rate.sent(frameBytes)
 	s.stats.frames.Add(1)
 	s.stats.bytes.Add(int64(frameBytes))

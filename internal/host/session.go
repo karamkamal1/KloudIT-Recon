@@ -2333,8 +2333,9 @@ func reportComp(t *sendTrack, r proto.RateReport) time.Duration {
 	return comp
 }
 
-// videoPacingBps is the pacing rate available to video frames (bit/s): the
-// media congestion controller's pacing less audio and the overhead allowance
+// videoPacingBps is the pacing rate available to video frames over time
+// (bit/s; a frame's burst aside: videoPace): the media congestion
+// controller's pacing less audio and the overhead allowance
 // (setCongestionTarget); 0 with another controller.
 func (s *Session) videoPacingBps() float64 {
 	m := transport.MediaControl(s.c)
@@ -2677,7 +2678,7 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 		return // cancelled as its write completed: reported lost
 	}
 	st.Close()
-	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), len(b), s.videoPacingBps())
+	s.track.sent(f.Gen, f.Seq, f.EncodeDoneUs, s.a.clock(), len(b), s.videoPace())
 	s.rate.sent(len(b))
 	s.stats.frames.Add(1)
 	s.stats.bytes.Add(int64(len(b)))
@@ -3419,7 +3420,7 @@ func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale st
 func (s *Session) statsLoop() {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
-	var lastLost, lastAcked uint64
+	var lastLost, lastAcked, lastBackoffs uint64
 	var lastStalls, lastUndos, lastUnconfirmed int
 	for {
 		select {
@@ -3495,6 +3496,16 @@ func (s *Session) statsLoop() {
 				pct = float64(lost) / float64(lost+acked) * 100
 			}
 			args = append(args, "cc_lost", lost, "cc_lost_pct", fmt.Sprintf("%.2f", pct))
+		}
+		// The pacer (cc.Media): its rate over time, the rate a frame's
+		// burst goes at now and the delivery rate the bursts measured
+		// (0: none in the last 2 s), and the bursts turned off for a queue
+		// they overflowed in the last 10 s.
+		if m := transport.MediaControl(s.c); m != nil {
+			st := m.Stats()
+			args = append(args, "pace_mbps", fmt.Sprintf("%.1f", float64(st.PacingRate)/1e6), "burst_mbps", fmt.Sprintf("%.1f", float64(st.BurstRate)/1e6),
+				"burst_est_mbps", fmt.Sprintf("%.1f", float64(st.BurstEstimate)/1e6), "burst_backoffs", st.BurstBackoffs-min(lastBackoffs, st.BurstBackoffs))
+			lastBackoffs = st.BurstBackoffs
 		}
 		stalls, undos := s.rate.stallCounts()
 		args = append(args, "stalls", stalls-lastStalls, "undone", undos-lastUndos)
