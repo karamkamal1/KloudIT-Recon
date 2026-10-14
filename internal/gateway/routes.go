@@ -112,8 +112,12 @@ func (s *Server) csp(r *http.Request) string {
 			}
 		}
 		if hc := s.hosts.get(id); hc != nil {
-			// Every address of its direct path (the browser tries them all).
-			for _, c := range hc.directCandidates(netip.Addr{}) {
+			// Every address of its direct path any browser may be offered
+			// (it tries them all). The worker keeps this policy for the
+			// page's life: an address the PC gains later (Tailscale coming
+			// up, a new lease) is blocked for its background tries until
+			// the page is reloaded; the others go on.
+			for _, c := range hc.directSources() {
 				add(cspSource(c.host, c.port))
 			}
 		}

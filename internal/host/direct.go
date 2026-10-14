@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -55,8 +56,12 @@ var directRetry = 30 * time.Second
 var directRescan = 30 * time.Second
 
 // maxDirectAddrs bounds the addresses announced (each is one handshake the
-// browser starts) and bound.
+// browser starts).
 const maxDirectAddrs = 8
+
+// maxDirectSocks bounds the sockets the endpoint binds (one per address of
+// the PC, announced or not).
+const maxDirectSocks = 32
 
 // ifaceInfo is one network interface and its addresses.
 type ifaceInfo struct {
@@ -146,53 +151,84 @@ func directKindRank(kind string) int {
 	return 5
 }
 
-// directAddrs picks the PC's addresses the direct endpoint listens on and the
-// gateway offers: up, not loopback, an address a browser could reach
-// (directKind), at most two IPv6 addresses per interface (Windows lists a
-// temporary address next to each stable one), ordered by kind (directKindRank)
-// with route (the address the PC reaches the gateway from) first among its
-// kind.
-func directAddrs(ifs []ifaceInfo, route netip.Addr) []proto.DirectAddr {
+// directAddrs picks the PC's addresses the direct endpoint listens on: up,
+// not loopback, an address a browser could reach (directKind), ordered by
+// kind (directKindRank) with route (the address the PC reaches the gateway
+// from) first among its kind. A virtual switch's address that is route, or
+// on the gateway's network (gwIP), is the PC's own LAN (Hyper-V's external
+// switch takes the physical adapter's address): it gets the kind its
+// address has. The endpoint listens on every one of them (at most
+// maxDirectSocks), so whatever address of the PC a browser reaches (the
+// tunnel's peer address an older gateway offers alone, one directAnnounced
+// leaves out) has a socket that answers from it; it announces
+// directAnnounced(directAddrs(...)).
+func directAddrs(ifs []ifaceInfo, route, gwIP netip.Addr) []proto.DirectAddr {
 	type cand struct {
 		a    proto.DirectAddr
 		rank int
-		n    int
 	}
 	var cs []cand
 	seen := map[netip.Addr]bool{}
+	route = route.Unmap()
 	for _, ifc := range ifs {
 		if !ifc.Up || ifc.Loopback {
 			continue
 		}
-		v6 := 0
 		for _, p := range ifc.Addrs {
 			ip := p.Addr().Unmap()
 			kind := directKind(ip, ifc.Name)
 			if kind == "" || seen[ip] {
 				continue
 			}
-			if ip.Is6() {
-				if v6 >= 2 {
-					continue
-				}
-				v6++
+			if kind == proto.DirectKindVirtual && (ip == route ||
+				(gwIP.IsValid() && p.Bits() > 0 && netip.PrefixFrom(ip, p.Bits()).Masked().Contains(gwIP.Unmap()))) {
+				kind = directKind(ip, "")
 			}
 			seen[ip] = true
-			a := proto.DirectAddr{IP: ip.String(), Bits: p.Bits(), Kind: kind, Iface: ifc.Name, Route: route.IsValid() && ip == route.Unmap()}
+			a := proto.DirectAddr{IP: ip.String(), Bits: p.Bits(), Kind: kind, Iface: ifc.Name, Route: route.IsValid() && ip == route}
 			rank := directKindRank(kind) * 2
 			if !a.Route {
 				rank++
 			}
-			cs = append(cs, cand{a, rank, len(cs)})
+			cs = append(cs, cand{a, rank})
 		}
 	}
 	slices.SortStableFunc(cs, func(x, y cand) int { return x.rank - y.rank })
 	out := make([]proto.DirectAddr, 0, len(cs))
 	for _, c := range cs {
-		if len(out) == maxDirectAddrs {
-			break
-		}
 		out = append(out, c.a)
+	}
+	return out
+}
+
+// directAnnounced is the part of addrs (directAddrs' order) the gateway
+// offers browsers: at most two IPv6 addresses per interface (Windows lists
+// a temporary address next to each stable one, and keeps deprecated ones
+// for days) and maxDirectAddrs in all, the route to the gateway always
+// among them (Windows lists its current temporary address, the one it
+// connects from, after a stable and a deprecated one).
+func directAnnounced(addrs []proto.DirectAddr) []proto.DirectAddr {
+	v6 := map[string]int{}
+	out := make([]proto.DirectAddr, 0, min(len(addrs), maxDirectAddrs))
+	var route *proto.DirectAddr
+	for i, a := range addrs {
+		if ip, _ := netip.ParseAddr(a.IP); ip.Is6() {
+			// The route comes first among its kind: it is one of the two.
+			if v6[a.Iface] >= 2 && !a.Route {
+				continue
+			}
+			v6[a.Iface]++
+		}
+		if len(out) == maxDirectAddrs {
+			if a.Route {
+				route = &addrs[i]
+			}
+			continue
+		}
+		out = append(out, a)
+	}
+	if route != nil {
+		out[len(out)-1] = *route // the route in place of the last
 	}
 	return out
 }
@@ -344,8 +380,10 @@ func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 				addrs = "every address (none of its own found to listen on: the gateway offers its tunnel's peer address)"
 			}
 			// The addresses the gateway offers browsers, in this order after
-			// the one on the browser's own network and host config directAddr.
-			a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort, "congestion", a.cfg.congestion(), "addrs", addrs)
+			// the one on the browser's own network and host config directAddr;
+			// sockets: every address of the PC it listens on (also the ones
+			// not offered: older temporary IPv6 addresses, beyond the cap).
+			a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort, "congestion", a.cfg.congestion(), "addrs", addrs, "sockets", held)
 		}
 		// The gateway learns of the endpoint coming up or going, and of
 		// the addresses it offers browsers changing.
@@ -367,9 +405,10 @@ func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 }
 
 // scan binds the direct port on the PC's addresses that have no socket yet
-// and closes the sockets of addresses that are gone. It returns how many
-// sockets it holds, whether what it announces changed, and the last bind
-// error.
+// and closes the sockets of addresses that are gone from its interfaces
+// (not of ones a cap merely leaves out of what it announces: a live direct
+// session may be on one). It returns how many sockets it holds, whether what
+// it announces changed, and the last bind error.
 func (d *directEndpoint) scan(ctx context.Context, tlsConf *tls.Config) (held int, changed bool, lastErr error) {
 	a := d.a
 	var route, gwIP netip.Addr
@@ -387,8 +426,8 @@ func (d *directEndpoint) scan(ctx context.Context, tlsConf *tls.Config) (held in
 	if err != nil {
 		a.log.Debug("direct path: listing the network interfaces", "err", err)
 	}
-	want := directAddrs(ifs, route)
-	if w := tunnelledLAN(want, route, gwIP); w != d.routeWarn {
+	all := directAddrs(ifs, route, gwIP)
+	if w := tunnelledLAN(all, route, gwIP); w != d.routeWarn {
 		d.routeWarn = w
 		if w != "" {
 			a.log.Warn("the PC reaches the gateway through a tunnel although the gateway is on the PC's own network: a VPN or "+
@@ -400,68 +439,91 @@ func (d *directEndpoint) scan(ctx context.Context, tlsConf *tls.Config) (held in
 	// Host config directAddr entries that are IP addresses of this PC are
 	// listened on too (a loopback address in tests, an address the
 	// interfaces did not list); the others (a name, a port forward's
-	// public address) are only offered, and their bind fails quietly.
+	// public address) are only offered, and their bind fails quietly. So is
+	// a loopback route to the gateway (a gateway on this PC: its tunnel's
+	// peer address, which it offers, is the PC's loopback address).
 	var extra []netip.Addr
+	has := func(ip netip.Addr) bool {
+		return slices.ContainsFunc(all, func(w proto.DirectAddr) bool { return w.IP == ip.String() }) || slices.Contains(extra, ip)
+	}
 	for _, o := range directOverrides(a.cfg.DirectAddr) {
-		if ip, err := netip.ParseAddr(o); err == nil && !slices.ContainsFunc(want, func(w proto.DirectAddr) bool { return w.IP == ip.Unmap().String() }) {
+		if ip, err := netip.ParseAddr(o); err == nil && !has(ip.Unmap()) {
 			extra = append(extra, ip.Unmap())
 		}
+	}
+	if route.IsLoopback() && !has(route) {
+		extra = append(extra, route)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	wild := netip.AddrPort{}
-	if s := d.socks[wild]; s != nil && len(want)+len(extra) > 0 {
+	if s := d.socks[wild]; s != nil && len(all)+len(extra) > 0 {
 		// Addresses of its own to listen on (again): the wildcard socket
 		// holds the port on all of them, so it goes first.
 		s.close()
 		delete(d.socks, wild)
 	}
-	keep := map[netip.AddrPort]bool{}
+	port := uint16(a.cfg.DirectPort)
+	// present: the sockets of addresses the PC still has stay, bound or not
+	// within maxDirectSocks.
+	present := map[netip.AddrPort]bool{}
+	for _, w := range all {
+		if ip, err := netip.ParseAddr(w.IP); err == nil {
+			present[netip.AddrPortFrom(ip, port)] = true
+		}
+	}
+	for _, ip := range extra {
+		present[netip.AddrPortFrom(ip, port)] = true
+	}
+	for ap, s := range d.socks {
+		if ap.IsValid() && !present[ap] {
+			s.close()
+			delete(d.socks, ap)
+		}
+	}
 	bind := func(ap netip.AddrPort) bool {
 		if d.socks[ap] != nil {
-			keep[ap] = true
 			return true
 		}
-		s, err := d.listen(ctx, ap, tlsConf)
+		if len(d.socks) >= maxDirectSocks {
+			return false
+		}
+		s, err := directListen(d, ctx, ap, tlsConf)
 		if err != nil {
 			lastErr = err
 			a.log.Debug("direct path: cannot listen on this address", "addr", ap.String(), "err", err)
 			return false
 		}
 		d.socks[ap] = s
-		keep[ap] = true
 		return true
 	}
-	port := uint16(a.cfg.DirectPort)
 	var bound []proto.DirectAddr
-	for _, w := range want {
+	for _, ip := range extra {
+		bind(netip.AddrPortFrom(ip, port))
+	}
+	for _, w := range all {
 		if ip, err := netip.ParseAddr(w.IP); err == nil && bind(netip.AddrPortFrom(ip, port)) {
 			bound = append(bound, w)
 		}
 	}
-	for _, ip := range extra {
-		bind(netip.AddrPortFrom(ip, port))
-	}
-	if len(keep) == 0 {
+	if len(d.socks) == 0 {
 		// No address of its own to listen on (or none free): the wildcard
 		// socket, as before the per-address sockets. The gateway then
 		// offers its tunnel's peer address (and directAddr).
 		bind(wild)
 	}
-	for ap, s := range d.socks {
-		if !keep[ap] {
-			s.close()
-			delete(d.socks, ap)
-		}
-	}
-	state := directAddrText(bound)
+	announced := directAnnounced(bound)
+	state := directAddrText(announced)
 	if d.socks[wild] != nil {
 		state = "*"
 	}
 	changed = state != d.state || route != d.route
-	d.addrs, d.route, d.state = bound, route, state
+	d.addrs, d.route, d.state = announced, route, state
 	return len(d.socks), changed, lastErr
 }
+
+// directListen is directEndpoint.listen (tests bind elsewhere).
+var directListen = (*directEndpoint).listen
 
 // listen binds one socket (ap: the zero AddrPort for the wildcard address on
 // the direct port) and serves WebTransport on it.
@@ -483,7 +545,7 @@ func (d *directEndpoint) listen(ctx context.Context, ap netip.AddrPort, tlsConf 
 	}
 	s.tr = &quic.Transport{Conn: conn, ConnContext: func(cctx context.Context, ci *quic.ClientInfo) (context.Context, error) {
 		return d.hsLog.started(cctx, d.a, ci.RemoteAddr, local), nil
-	}}
+	}, VerifySourceAddress: d.hsLog.verifySource}
 	quicConf := transport.QUICConfig(transport.WithCongestion(d.a.cfg.congestion()))
 	ln, err := s.tr.ListenEarly(tlsConf, quicConf)
 	if err != nil {
@@ -585,13 +647,68 @@ type directHandshakeKey struct{}
 
 // directHandshakeLog logs the direct endpoint's handshakes that fail: the
 // first failure of a kind from an address in directHandshakeQuiet at Info,
-// the rest at Debug.
+// the rest at Debug. Anyone who can send the port packets can make a
+// handshake fail (an internet scan reaching a port forward or the PC's
+// global IPv6 address, a flood of spoofed Initial packets), and host.log
+// keeps 20 MB and one older file: so only browsers on the PC's own networks
+// (directLocalSource) get Info lines, at most directHandshakeBudget per
+// directHandshakeWindow in all; the others are Debug lines, counted, and
+// one Info line after the window says how many there were. A browser away
+// from home still tells the host how its attempt went (Hello.Direct). And
+// when more than directHandshakeRate connections a second start
+// (verifySource), new ones must first prove their address (a QUIC Retry: one
+// more round trip), so spoofed packets create no connection at all.
 type directHandshakeLog struct {
 	mu   sync.Mutex
 	last map[string]time.Time // remote IP and why -> when it was last logged at Info
+
+	window time.Time // the budget's window started
+	infos  int       // Info lines in the window
+	quiet  int       // failures logged at Debug only in the window (from away, or beyond the budget)
+
+	rateAt time.Time // the second verifySource counts connection attempts in
+	rateN  int
 }
 
-const directHandshakeQuiet = 5 * time.Minute
+const (
+	directHandshakeQuiet  = 5 * time.Minute
+	directHandshakeWindow = 10 * time.Minute
+	directHandshakeBudget = 20
+	directHandshakeRate   = 32
+)
+
+// verifySource is the direct sockets' quic.Transport VerifySourceAddress:
+// a connection attempt beyond directHandshakeRate in a second must first
+// prove its address (Retry). A browser starts one per address of the PC
+// (eight at most) per try.
+func (l *directHandshakeLog) verifySource(net.Addr) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now := time.Now(); now.Sub(l.rateAt) >= time.Second {
+		l.rateAt, l.rateN = now, 0
+	}
+	l.rateN++
+	return l.rateN > directHandshakeRate
+}
+
+// directLocalSource reports whether a handshake from ip comes from one of
+// the PC's own networks: a private, shared (CGNAT: Tailscale), unique local,
+// link-local or loopback address, or one in the prefix of an address the PC
+// listens on (its LAN's global IPv6 prefix).
+func directLocalSource(ip netip.Addr, own []proto.DirectAddr) bool {
+	ip = ip.Unmap()
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || cgnatPrefix.Contains(ip) {
+		return true
+	}
+	for _, a := range own {
+		if o, err := netip.ParseAddr(a.IP); err == nil && a.Bits > 0 && o.BitLen() == ip.BitLen() && a.Bits < o.BitLen() {
+			if netip.PrefixFrom(o, a.Bits).Masked().Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // started is the quic.Transport ConnContext of a direct socket: the first
 // packet of a connection from remote arrived on local.
@@ -633,13 +750,33 @@ func (l *directHandshakeLog) failed(a *Agent, hs *directHandshake, cause error) 
 	ip, _, _ := net.SplitHostPort(hs.remote)
 	level := a.log.Debug
 	if !expected {
+		addr, _ := netip.ParseAddr(ip)
+		a.mu.Lock()
+		d := a.direct
+		a.mu.Unlock()
+		local := directLocalSource(addr, d.announced())
 		l.mu.Lock()
+		now := time.Now()
+		if now.Sub(l.window) >= directHandshakeWindow {
+			if l.quiet > 0 {
+				a.log.Info("direct path: more browser handshakes failed than host.log takes; they were logged at Debug only "+
+					"(from addresses away from the PC's networks, or beyond the budget)", "count", l.quiet,
+					"minutes", int(now.Sub(l.window).Minutes()), "budget", directHandshakeBudget)
+			}
+			l.window, l.infos, l.quiet = now, 0, 0
+		}
 		if l.last == nil {
 			l.last = map[string]time.Time{}
 		}
-		if key := ip + " " + why; time.Since(l.last[key]) > directHandshakeQuiet {
-			l.last[key] = time.Now()
+		key := ip + " " + why
+		switch {
+		case now.Sub(l.last[key]) <= directHandshakeQuiet: // logged a moment ago
+		case local && l.infos < directHandshakeBudget:
+			l.last[key] = now
+			l.infos++
 			level = a.log.Info
+		default:
+			l.quiet++
 		}
 		if len(l.last) > 256 {
 			clear(l.last)
@@ -668,8 +805,11 @@ func directHandshakeWhy(err error, after time.Duration) (why string, expected bo
 	case errors.As(err, &hto) || errors.As(err, &ito):
 		return "the browser never completed the handshake: " + directAnswersLost, false
 	case errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError():
-		return "the browser refused the PC's certificate: the hash the gateway gave it does not match (a gateway or agent " +
-			"older than the other) or its clock is outside the certificate's validity", false
+		// The gateway hands browsers the hashes the agent announced, as
+		// they are, and the relay and the direct path share the certificate.
+		return "the browser refused the PC's certificate: the client's clock is outside the certificate's validity (more than " +
+			"an hour behind the PC's, or days ahead: the session's direct path line says, client_clock), or the connect answer it " +
+			"used is older than the agent's last start (a new certificate: reload the page)", false
 	// A close by the browser's application: quic.ApplicationError, or
 	// APPLICATION_ERROR when the browser sent it in Initial or Handshake
 	// packets (RFC 9000 10.2.3: it closed before it knew the PC had its
@@ -701,12 +841,49 @@ func (s *Session) logDirectReport(r *proto.DirectReport) {
 		return
 	}
 	if s.meta.Path == "direct" {
-		s.log.Info("direct path: connected", "tried", r.Summary())
+		s.log.Info("direct path: connected", append([]any{"tried", r.Summary()}, s.a.clientClockAttr(r)...)...)
 		return
 	}
 	why := r.Why
 	if why == "" {
 		why = "the client gave no reason"
 	}
-	s.log.Info("direct path: not used by this session, it streams through the gateway", "why", why, "tried", r.Summary())
+	s.log.Info("direct path: not used by this session, it streams through the gateway",
+		append([]any{"why", why, "tried", r.Summary()}, s.a.clientClockAttr(r)...)...)
+}
+
+// clientClockAttr is client_clock for a direct path line: how the client's
+// clock (DirectReport.Clock) stands against the PC's, when it is a minute or
+// more off, and whether that puts it outside the PC certificate's validity
+// (the browser then refuses the certificate whatever its hash). The report's
+// trip to the host (milliseconds) does not matter at that scale.
+func (a *Agent) clientClockAttr(r *proto.DirectReport) []any {
+	if r == nil || r.Clock <= 0 {
+		return nil
+	}
+	now := time.Now()
+	at := time.UnixMilli(r.Clock)
+	off := at.Sub(now)
+	rel := "ahead of"
+	if off < 0 {
+		rel = "behind"
+	}
+	txt := fmt.Sprintf("%s %s the PC's", off.Abs().Round(time.Second), rel)
+	var leaf *x509.Certificate
+	if a.directRot != nil {
+		if c, _ := a.directRot.GetCertificate(nil); c != nil {
+			leaf = c.Leaf
+		}
+	}
+	switch {
+	case leaf != nil && at.Before(leaf.NotBefore):
+		txt += ": before the PC's certificate is valid (from " + leaf.NotBefore.UTC().Format(time.RFC3339) +
+			"), so the browser refuses it: set the client's clock (Windows: Settings, Time and language, Date and time, Sync now)"
+	case leaf != nil && at.After(leaf.NotAfter):
+		txt += ": after the PC's certificate expires (" + leaf.NotAfter.UTC().Format(time.RFC3339) +
+			"), so the browser refuses it: set the client's clock (Windows: Settings, Time and language, Date and time, Sync now)"
+	case off.Abs() < time.Minute:
+		return nil
+	}
+	return []any{"client_clock", txt}
 }

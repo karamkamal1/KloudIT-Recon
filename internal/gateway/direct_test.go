@@ -65,7 +65,7 @@ func TestOrderDirect(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b, _ := netip.ParseAddr(tc.browser)
-			got := orderDirect(tc.info, tc.peer, b)
+			got := orderDirect(tc.info, tc.peer, b, maxDirectCands)
 			if hosts(got) != tc.want {
 				t.Fatalf("candidates %q, want %q", hosts(got), tc.want)
 			}
@@ -82,7 +82,7 @@ func TestOrderDirect(t *testing.T) {
 			}
 		})
 	}
-	if c := orderDirect(owner, "192.168.5.10", netip.MustParseAddr("192.168.5.20")); c[1].URL != "https://[2001:db8:5::10]:48100/wt" {
+	if c := orderDirect(owner, "192.168.5.10", netip.MustParseAddr("192.168.5.20"), maxDirectCands); c[1].URL != "https://[2001:db8:5::10]:48100/wt" {
 		t.Fatalf("IPv6 candidate URL %q", c[1].URL)
 	}
 }

@@ -34,13 +34,25 @@ var (
 const maxDirectCands = 8
 
 // directCandidates lists the addresses of the host's direct path in the order
-// the browser at browser (invalid: unknown) should try them ("" when the host
-// offers none).
+// the browser at browser (invalid: unknown) should try them, maxDirectCands
+// at most (none when the host offers none).
 func (hc *hostConn) directCandidates(browser netip.Addr) []directCand {
 	hc.mu.Lock()
 	d := hc.info.Direct
 	hc.mu.Unlock()
-	return orderDirect(d, hc.remoteIP, browser)
+	return orderDirect(d, hc.remoteIP, browser, maxDirectCands)
+}
+
+// directSources lists every address of the host's direct path any browser
+// may be offered (directCandidates for any browser address picks among
+// them), without the cap: the stream page's CSP must allow each one, also
+// the PC's address on a browser's network that ranks low (a virtual
+// switch) and that only that browser's list has within the cap.
+func (hc *hostConn) directSources() []directCand {
+	hc.mu.Lock()
+	d := hc.info.Direct
+	hc.mu.Unlock()
+	return orderDirect(d, hc.remoteIP, netip.Addr{}, 0)
 }
 
 // orderDirect orders the direct endpoint's addresses for a browser at browser:
@@ -57,8 +69,8 @@ func (hc *hostConn) directCandidates(browser netip.Addr) []directCand {
 //     virtual switches (the host's order within each).
 //
 // A host before DirectInfo.Addrs offers Addr or the peer address alone, as
-// before.
-func orderDirect(d *proto.DirectInfo, peer string, browser netip.Addr) []directCand {
+// before. limit bounds the list (0: none).
+func orderDirect(d *proto.DirectInfo, peer string, browser netip.Addr, limit int) []directCand {
 	if d == nil || d.Port == 0 || len(d.Hashes) == 0 {
 		return nil
 	}
@@ -71,7 +83,7 @@ func orderDirect(d *proto.DirectInfo, peer string, browser netip.Addr) []directC
 		if ip, err := netip.ParseAddr(host); err == nil {
 			host = ip.Unmap().String()
 		}
-		if host == "" || seen[host] || len(out) == maxDirectCands {
+		if host == "" || seen[host] || (limit > 0 && len(out) == limit) {
 			return
 		}
 		seen[host] = true

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 	"github.com/karamkamal1/kloudit-recon/internal/tlsutil"
@@ -60,7 +62,12 @@ func TestDirectAddrs(t *testing.T) {
 		{Name: "WireGuard Tunnel", Up: true, Addrs: []netip.Prefix{pfx("10.8.0.2/24")}},
 		{Name: "Ethernet 3", Up: false, Addrs: []netip.Prefix{pfx("192.168.9.9/24")}},
 	}
-	got := directAddrs(ifs, netip.MustParseAddr("192.168.5.10"))
+	gw := netip.MustParseAddr("192.168.5.202")
+	all := directAddrs(ifs, netip.MustParseAddr("192.168.5.10"), gw)
+	if len(all) != 8 || all[3].IP != "2001:db8:5::cafe" {
+		t.Fatalf("every address the endpoint listens on: %+v", all)
+	}
+	got := directAnnounced(all)
 	var s []string
 	for _, a := range got {
 		s = append(s, a.IP+"/"+a.Kind)
@@ -75,7 +82,7 @@ func TestDirectAddrs(t *testing.T) {
 	// The route to the gateway goes first among its kind: a PC whose
 	// Tailscale subnet route covers the LAN reaches the gateway from its
 	// tailnet address, which still comes after the LAN.
-	got = directAddrs(ifs, netip.MustParseAddr("100.101.102.103"))
+	got = directAnnounced(directAddrs(ifs, netip.MustParseAddr("100.101.102.103"), gw))
 	if got[0].IP != "192.168.5.10" || got[0].Route || got[3].IP != "100.101.102.103" || !got[3].Route {
 		t.Fatalf("with the route through Tailscale: %+v", got)
 	}
@@ -98,11 +105,129 @@ func TestDirectAddrs(t *testing.T) {
 	for i := 1; i <= 12; i++ {
 		many = append(many, netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, byte(i), 1}), 24))
 	}
-	if n := len(directAddrs([]ifaceInfo{{Name: "eth0", Up: true, Addrs: many}}, netip.Addr{})); n != maxDirectAddrs {
+	if n := len(directAnnounced(directAddrs([]ifaceInfo{{Name: "eth0", Up: true, Addrs: many}}, netip.Addr{}, netip.Addr{}))); n != maxDirectAddrs {
 		t.Fatalf("%d addresses, want %d", n, maxDirectAddrs)
 	}
 	if o := directOverrides(" pc.example.net, 192.168.5.10;[2001:db8::1]  pc.example.net "); strings.Join(o, "|") != "pc.example.net|192.168.5.10|2001:db8::1" {
 		t.Fatalf("directOverrides %q", o)
+	}
+}
+
+// The caps on what the gateway offers never drop the PC's route to the
+// gateway (review of the second hardware run): Windows lists its current
+// temporary IPv6 address, the one it connects from, after a stable and a
+// deprecated one, and the PC's route may be on an interface the total cap
+// cuts. A Hyper-V external switch ("vEthernet (...)") that carries the PC's
+// LAN address is the LAN, not a virtual switch; WSL's is not.
+func TestDirectAddrsRouteAndCaps(t *testing.T) {
+	names := func(as []proto.DirectAddr) string {
+		var s []string
+		for _, a := range as {
+			x := a.IP + "/" + a.Kind
+			if a.Route {
+				x += "/route"
+			}
+			s = append(s, x)
+		}
+		return strings.Join(s, " ")
+	}
+	eth := []ifaceInfo{{Name: "Ethernet 2", Up: true, Addrs: []netip.Prefix{
+		pfx("192.168.5.10/24"), pfx("2001:db8:5::10/64"), pfx("2001:db8:5::aaaa/64"), pfx("2001:db8:5::bbbb/64"),
+	}}}
+	route := netip.MustParseAddr("2001:db8:5::bbbb")
+	all := directAddrs(eth, route, netip.MustParseAddr("2001:db8:5::1"))
+	if got, want := names(all), "192.168.5.10/lan 2001:db8:5::bbbb/ipv6/route 2001:db8:5::10/ipv6 2001:db8:5::aaaa/ipv6"; got != want {
+		t.Fatalf("listened on %q, want %q", got, want)
+	}
+	if got, want := names(directAnnounced(all)), "192.168.5.10/lan 2001:db8:5::bbbb/ipv6/route 2001:db8:5::10/ipv6"; got != want {
+		t.Fatalf("announced %q, want %q", got, want)
+	}
+
+	// The total cap: twelve LAN addresses and the route on a VPN.
+	var many []netip.Prefix
+	for i := 1; i <= 12; i++ {
+		many = append(many, netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, byte(i), 1}), 24))
+	}
+	ifs := []ifaceInfo{{Name: "eth0", Up: true, Addrs: many}, {Name: "wg0", Up: true, Addrs: []netip.Prefix{pfx("10.8.0.2/24")}}}
+	all = directAddrs(ifs, netip.MustParseAddr("10.8.0.2"), netip.Addr{})
+	got := directAnnounced(all)
+	if len(all) != 13 || len(got) != maxDirectAddrs || got[len(got)-1].IP != "10.8.0.2" || !got[len(got)-1].Route {
+		t.Fatalf("with the route beyond the cap: %d listened on, announced %q", len(all), names(got))
+	}
+
+	// Hyper-V's external switch carries the LAN: by the route, or by the
+	// gateway's network.
+	hv := []ifaceInfo{
+		{Name: "vEthernet (External)", Up: true, Addrs: []netip.Prefix{pfx("192.168.5.10/24")}},
+		{Name: "vEthernet (WSL)", Up: true, Addrs: []netip.Prefix{pfx("172.20.16.1/20")}},
+	}
+	if got, want := names(directAddrs(hv, netip.MustParseAddr("192.168.5.10"), netip.Addr{})), "192.168.5.10/lan/route 172.20.16.1/virtual"; got != want {
+		t.Fatalf("Hyper-V external switch with the route: %q, want %q", got, want)
+	}
+	if got, want := names(directAddrs(hv, netip.Addr{}, netip.MustParseAddr("192.168.5.202"))), "192.168.5.10/lan 172.20.16.1/virtual"; got != want {
+		t.Fatalf("Hyper-V external switch on the gateway's network: %q, want %q", got, want)
+	}
+}
+
+// A rescan keeps the socket of every address the PC still has, also one
+// the caps leave out of what it announces (a new temporary IPv6 address
+// listed ahead of it): a live direct session may be on it. Only an address
+// gone from the interfaces loses its socket.
+func TestDirectScanKeepsPresentSockets(t *testing.T) {
+	ifc := ifaceInfo{Name: "Ethernet 2", Up: true, Addrs: []netip.Prefix{
+		pfx("192.168.5.10/24"), pfx("2001:db8:5::10/64"), pfx("2001:db8:5::aaaa/64"), pfx("2001:db8:5::bbbb/64"),
+	}}
+	defer func(f func() ([]ifaceInfo, error)) { listInterfaces = f }(listInterfaces)
+	listInterfaces = func() ([]ifaceInfo, error) { return []ifaceInfo{ifc}, nil }
+	// The sockets: real ones on loopback, one per address asked for.
+	defer func(f func(*directEndpoint, context.Context, netip.AddrPort, *tls.Config) (*directSock, error)) {
+		directListen = f
+	}(directListen)
+	directListen = func(d *directEndpoint, ctx context.Context, ap netip.AddrPort, c *tls.Config) (*directSock, error) {
+		return d.listen(ctx, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0), c)
+	}
+	rot, err := tlsutil.NewRotating([]string{"recon-host"}, 13*24*time.Hour, 5*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{cfg: &Config{DirectPort: 48100}, log: slog.New(slog.NewTextHandler(&lockedBuffer{}, nil))}
+	d := &directEndpoint{a: a, srv: &webtransport.Server{H3: &http3.Server{}}, socks: map[netip.AddrPort]*directSock{}}
+	defer d.closeAll()
+	tlsConf := http3.ConfigureTLSConfig(&tls.Config{GetCertificate: rot.GetCertificate, MinVersion: tls.VersionTLS13})
+	ap := func(ip string) netip.AddrPort { return netip.AddrPortFrom(netip.MustParseAddr(ip), 48100) }
+	ctx := context.Background()
+
+	if held, _, err := d.scan(ctx, tlsConf); held != 4 || err != nil {
+		t.Fatalf("first scan: %d sockets (%v), want one per address", held, err)
+	}
+	if txt := directAddrText(d.announced()); txt != "192.168.5.10 (Ethernet 2, lan); 2001:db8:5::10 (Ethernet 2, ipv6); 2001:db8:5::aaaa (Ethernet 2, ipv6)" {
+		t.Fatalf("announced %q", txt)
+	}
+	kept := d.socks[ap("2001:db8:5::aaaa")]
+
+	// A new temporary address listed first pushes ::aaaa out of the two
+	// IPv6 addresses announced: its socket stays.
+	ifc.Addrs = []netip.Prefix{pfx("192.168.5.10/24"), pfx("2001:db8:5::cccc/64"), pfx("2001:db8:5::10/64"), pfx("2001:db8:5::aaaa/64"), pfx("2001:db8:5::bbbb/64")}
+	held, changed, _ := d.scan(ctx, tlsConf)
+	if held != 5 || !changed || d.socks[ap("2001:db8:5::aaaa")] != kept || slices.ContainsFunc(d.announced(), func(x proto.DirectAddr) bool { return x.IP == "2001:db8:5::aaaa" }) {
+		t.Fatalf("after a new address: %d sockets, changed %v, ::aaaa's socket kept %v, announced %q", held, changed,
+			d.socks[ap("2001:db8:5::aaaa")] == kept, directAddrText(d.announced()))
+	}
+	select {
+	case <-kept.done:
+		t.Fatal("the socket of an address still present was closed")
+	default:
+	}
+
+	// ::aaaa gone: its socket goes.
+	ifc.Addrs = []netip.Prefix{pfx("192.168.5.10/24"), pfx("2001:db8:5::cccc/64"), pfx("2001:db8:5::10/64"), pfx("2001:db8:5::bbbb/64")}
+	if held, _, _ := d.scan(ctx, tlsConf); held != 4 || d.socks[ap("2001:db8:5::aaaa")] != nil {
+		t.Fatalf("after ::aaaa went: %d sockets", held)
+	}
+	select {
+	case <-kept.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the socket of an address that went is still open")
 	}
 }
 
@@ -289,5 +414,103 @@ func TestDirectHandshakeWhy(t *testing.T) {
 		if !strings.Contains(why, tc.want) || expected != tc.expected {
 			t.Errorf("%v after %s: %q (expected %v), want %q (%v)", tc.err, tc.after, why, expected, tc.want, tc.expected)
 		}
+	}
+}
+
+// Failed handshakes cannot fill host.log (review of the second hardware
+// run): Info lines only for browsers on the PC's own networks, at most
+// directHandshakeBudget per window in all; the rest Debug, counted, and one
+// Info line after the window says how many. A burst of connection attempts
+// beyond directHandshakeRate a second must prove its source (Retry).
+func TestDirectHandshakeLogBudget(t *testing.T) {
+	logs := &lockedBuffer{}
+	a := &Agent{log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		direct: &directEndpoint{addrs: []proto.DirectAddr{{IP: "2001:db8:5::10", Bits: 64, Kind: proto.DirectKindIPv6}}}}
+	var l directHandshakeLog
+	fail := func(remote string) {
+		l.failed(a, &directHandshake{remote: remote, local: "192.168.5.10", start: time.Now().Add(-5 * time.Second)}, &quic.HandshakeTimeoutError{})
+	}
+	count := func(level string) int {
+		n := 0
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "level="+level) && strings.Contains(line, "failed in its handshake") {
+				n++
+			}
+		}
+		return n
+	}
+	// A scan from the internet: Debug only.
+	for i := range 50 {
+		fail(netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, byte(i)}), 5000).String())
+	}
+	if info := count("INFO"); info != 0 {
+		t.Fatalf("%d Info lines for handshakes from away", info)
+	}
+	// Browsers on the PC's networks: the LAN, the tailnet, the LAN's IPv6
+	// prefix. Each once per address and reason, 20 in all.
+	for _, r := range []string{"192.168.5.20:5000", "192.168.5.20:5001", "100.64.7.8:5000", "[2001:db8:5::77]:5000", "[fd00::5]:5000"} {
+		fail(r)
+	}
+	if info := count("INFO"); info != 4 {
+		t.Fatalf("%d Info lines for four local browsers (one twice):\n%s", info, logs.String())
+	}
+	for i := range 30 {
+		fail(netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, 1, byte(i)}), 5000).String())
+	}
+	if info := count("INFO"); info != directHandshakeBudget {
+		t.Fatalf("%d Info lines, want the budget %d", info, directHandshakeBudget)
+	}
+	// After the window: one line with the count, then Info lines again.
+	l.mu.Lock()
+	l.window = l.window.Add(-directHandshakeWindow)
+	l.mu.Unlock()
+	fail("192.168.5.30:5000")
+	// 50 from away, 14 beyond the budget.
+	if !strings.Contains(logs.String(), "count=64") || count("INFO") != directHandshakeBudget+1 {
+		t.Fatalf("after the window:\n%s", logs.String())
+	}
+
+	for i := range directHandshakeRate {
+		if l.verifySource(nil) {
+			t.Fatalf("attempt %d in a second had to prove its address", i+1)
+		}
+	}
+	if !l.verifySource(nil) {
+		t.Fatal("an attempt beyond the rate did not have to prove its address")
+	}
+}
+
+// A browser refuses the PC's certificate when its own clock is outside the
+// certificate's validity, whatever the hash (the gateway passes the agent's
+// hashes on as they are): the direct path lines say where the client's clock
+// (DirectReport.Clock) stands.
+func TestClientClockAttr(t *testing.T) {
+	rot, err := tlsutil.NewRotating([]string{"recon-host"}, 13*24*time.Hour, 5*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{directRot: rot}
+	at := func(off time.Duration) string {
+		kv := a.clientClockAttr(&proto.DirectReport{Clock: time.Now().Add(off).UnixMilli()})
+		if len(kv) == 0 {
+			return ""
+		}
+		return kv[1].(string)
+	}
+	for _, tc := range []struct {
+		off  time.Duration
+		want string
+	}{
+		{-2 * time.Hour, "behind the PC's: before the PC's certificate is valid"},
+		{20 * 24 * time.Hour, "ahead of the PC's: after the PC's certificate expires"},
+		{-5 * time.Minute, "5m0s behind the PC's"},
+		{30 * time.Second, ""},
+	} {
+		if got := at(tc.off); (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("client clock %v off: %q, want %q", tc.off, got, tc.want)
+		}
+	}
+	if kv := a.clientClockAttr(&proto.DirectReport{}); kv != nil {
+		t.Errorf("a report without a clock: %v", kv)
 	}
 }

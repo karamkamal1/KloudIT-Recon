@@ -41,6 +41,11 @@ type DirectReport struct {
 	// Why the connection is not on the direct path ("" when it is).
 	Why   string          `json:"why,omitempty"`
 	Tried []DirectAttempt `json:"tried,omitempty"`
+	// Clock is the client's wall clock when it sent the report (Date.now(),
+	// ms since 1970; 0 from clients before it): the host says when it is
+	// outside the PC certificate's validity, which makes the browser refuse
+	// the certificate whatever its hash.
+	Clock int64 `json:"clock,omitempty"`
 }
 
 // DirectAttempt is one direct address the client tried.
