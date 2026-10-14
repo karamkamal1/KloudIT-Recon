@@ -457,8 +457,13 @@ function onFecLost(gen, seq, why) {
 // cumulative, acks and pings are samples). A pending write alone is no
 // backlog: Chromium resolves datagram writes late enough that a cap of two
 // pending writes dropped 3-28 % of the telemetry in the browser E2E, on
-// paths with nothing to wait for. prio.telemetryStallMs is the longest the
-// queue stood still.
+// paths with nothing to wait for. A queue that moves but drains no faster
+// than telemetry comes is a backlog all the same: a busy browser resolved
+// one write every ~10 ms while each waited 25-135 ms, and a rule that
+// dropped only while nothing resolved let the mouse's datagrams wait
+// behind it for hundreds of milliseconds (VENDOR_NOTES "Merged second
+// hardware run: telemetry and frames under load"). prio.telemetryStallMs is
+// the longest the queue stood still.
 const SEND_ORDER = { input: 1000, control: 100, telemetry: 10 };
 const TELEMETRY_STALL_MS = 50;
 

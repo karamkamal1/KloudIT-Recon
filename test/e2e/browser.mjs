@@ -3971,11 +3971,50 @@ async function checkSendPriorities() {
   const end = workerSrc.indexOf('async function openWebTransport');
   if (start < 0 || end < 0) throw new Error('send priority code not found in stream-worker.js');
   const expr = `(async () => {
+// The sender's clock: the page's, or a simulated one (runSlowQueue).
+let simNow = null;
+const performance = { now: () => simNow ?? self.performance.now() };
 ${workerSrc.slice(start, end)}
-// A writer whose writes stay pending until flush(): a backed-up queue.
+// A writer whose writes stay pending until flush() (a backed-up queue), or
+// one() resolves the oldest; resolved: each resolved write's first byte,
+// write time and resolution time.
 function fakeWriter(name, log) {
   const pending = [];
-  return { name, write: (b) => { log.push([name, b[0]]); return new Promise((res) => pending.push(res)); }, flush: () => pending.splice(0).forEach((r) => r()) };
+  const resolved = [];
+  return {
+    name, resolved, depth: () => pending.length,
+    write: (b) => { log.push([name, b[0]]); const at = performance.now(); return new Promise((res) => pending.push(() => { resolved.push([b[0], at, performance.now()]); res(); })); },
+    flush: () => pending.splice(0).forEach((r) => r()),
+    one: () => pending.shift()?.(),
+  };
+}
+// A shared queue that moves, but no faster than telemetry comes (a busy
+// browser: its datagram writes resolved one every ~10 ms, each 25-35 ms
+// after it was made at the median and 110-135 ms at p95, in the merged
+// second hardware run's E2E): one write leaves every 10 ms, telemetry
+// comes every 8 ms, an input datagram at 1 s. Telemetry gives way, so the
+// input waits no longer than the queue may stand: dropping telemetry only
+// when nothing resolved for 50 ms let the backlog grow (the queue moved
+// all the time) and the mouse's input latency in that E2E rose to a p50 of
+// 240-960 ms (VENDOR_NOTES "Merged second hardware run: telemetry and
+// frames under load").
+async function runSlowQueue() {
+  const w = fakeWriter('datagrams.writable', []);
+  const prio = { sendOrder: false, sendGroup: false, datagramWritables: false, telemetrySent: 0, telemetryDropped: 0, telemetryStallMs: 0 };
+  const telemetry = telemetrySender(w, prio, () => false);
+  const settle = async () => { for (let i = 0; i < 6; i++) await null; }; // the resolutions' callbacks
+  let deepest = 0;
+  for (let t = 0; t <= 1300; t++) {
+    simNow = t;
+    if (t % 10 === 0) w.one();
+    await settle();
+    if (t % 8 === 0) telemetry(Uint8Array.of(0x41));
+    if (t === 1000) w.write(Uint8Array.of(0x21)).catch(() => {});
+    deepest = Math.max(deepest, w.depth());
+  }
+  simNow = null;
+  const input = w.resolved.find(([k]) => k === 0x21);
+  return { prio: { ...prio }, inputWaitMs: input ? input[2] - input[1] : null, deepest };
 }
 async function run(full) {
   const log = [];
@@ -4004,7 +4043,7 @@ async function run(full) {
   telemetry(Uint8Array.of(0x41)); // the queue drained: telemetry goes out again
   return { made: made.map((m) => ({ kind: m.kind, order: m.sendOrder, grouped: m.sendGroup === group })), prio: before, after: { ...ch.prio }, log };
 }
-return { full: await run(true), none: await run(false) };
+return { full: await run(true), none: await run(false), slow: await runSlowQueue() };
 })()`;
   const ctx2 = await browser.newContext({ ignoreHTTPSErrors: true });
   try {
@@ -4025,6 +4064,10 @@ return { full: await run(true), none: await run(false) };
         n.prio.telemetrySent === 2 && n.prio.telemetryDropped === 3 && n.after.telemetrySent === 3 &&
         n.log.filter(([, t]) => t === 0x21).length === 3 && n.log.every(([w]) => w === 'datagrams.writable'),
       JSON.stringify({ prio: n.prio, after: n.after, writes: n.log.length }));
+    const sq = r.slow;
+    check('send priorities (unit): a shared queue that moves but drains no faster than telemetry comes: telemetry gives way, input waits at most twice the stall time',
+      sq.inputWaitMs !== null && sq.inputWaitMs <= 100 && sq.prio.telemetryDropped > 0 && sq.prio.telemetrySent > 0 && sq.deepest <= 10,
+      JSON.stringify(sq));
   } finally {
     await ctx2.close();
   }
