@@ -18,7 +18,8 @@ import (
 // sockets, so a datagram that does not fit the next link is dropped instead of
 // fragmented and both QUIC ends see the real path MTU. With SO_RXQ_OVFL each
 // datagram also brings the count of those the kernel dropped at the socket
-// for a full receive buffer (socketDrops).
+// for a full receive buffer (socketDrops), once there are any: the kernel
+// attaches the count only when it is not zero.
 type pktConn struct {
 	c       *net.UDPConn
 	pktinfo bool
@@ -45,6 +46,7 @@ func newPktConn(c *net.UDPConn) *pktConn {
 		})
 		p.pktinfo = want && (err4 == nil || err6 == nil)
 		p.ovfl = errOvfl == nil
+		p.dropsOK = p.ovfl // none yet: a datagram without the count had none before it
 	}
 	if p.pktinfo || p.ovfl {
 		p.oob = make([]byte, 128)

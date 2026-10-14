@@ -78,7 +78,8 @@ func TestUDPRelayAnswersFromTheTargetedAddress(t *testing.T) {
 }
 
 // An allocation socket counts the datagrams the kernel dropped for a full
-// receive buffer (SO_RXQ_OVFL), the relay's share of a session's losses.
+// receive buffer (SO_RXQ_OVFL), the relay's share of a session's losses:
+// zero (known) until there are any (the kernel attaches no count then).
 func TestUDPRelaySocketDrops(t *testing.T) {
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -95,12 +96,20 @@ func TestUDPRelaySocketDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	buf := make([]byte, 2000)
+	_, _ = s.Write(make([]byte, 1200))
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, _, err := p.read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := p.socketDrops(); !ok || d != 0 {
+		t.Fatalf("socket drops %d %v before any drop, want 0 true", d, ok)
+	}
 	for range 100 {
 		_, _ = s.Write(make([]byte, 1200))
 	}
 	// The count comes with the datagrams queued after the drops: read what
 	// the buffer held, then one more.
-	buf := make([]byte, 2000)
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		if _, _, _, err := p.read(buf); err != nil {
