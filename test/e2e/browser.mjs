@@ -2637,6 +2637,16 @@ async function checkDirectMove() {
       await page.keyboard.press('KeyW');
       keys = await until(() => readFileSync(inputLog, 'utf8').includes('"sc":17'), 5000, 'the key on the host').then(() => 'W reached the host').catch(() => 'no key on the host');
     }
+    // The session's next line after the move (its stream stats come every
+    // 10 s; a rate change can come sooner) must say path=direct: wait for it.
+    if (moved) {
+      await until(() => {
+        const l = host.log.slice(log0);
+        const m = /[^\n]*msg="session moved to the direct path[^\n]*/.exec(l)?.[0];
+        const id = m && / session=(\S+)/.exec(m)?.[1];
+        return id && l.slice(l.indexOf(m) + m.length).includes(` session=${id} path=`);
+      }, 12000, "the session's next line after the move").catch(() => {});
+    }
     const log = host.log.slice(log0);
     const st = await page.evaluate(() => ({ attempts: window.__recon.attempts, streaming: window.__recon.streaming }));
     const sessions = (log.match(/msg="session started"/g) || []).length;
