@@ -942,7 +942,8 @@ func runRelaySim(c rsCfg) *rsTrace {
 					continue
 				}
 				if c.svc && af.f.Discardable && !af.f.Key && !af.f.Recovery {
-					if why, path := thinWhy(false, r.overTarget(), send.slow(clock()), len(frameQ)); why != "" {
+					late := now-af.encDone >= time.Second/time.Duration(encFPS) // Session.thinPressure
+					if why, path := thinWhy(false, r.overTarget(), send.slow(clock()), len(frameQ), late); why != "" {
 						if thin.left(af.f.Gen, af.f.Seq, clock(), why) {
 							tr.thinStarts++
 							logf("thinning starts why=%s seq=%d", why, af.f.Seq)

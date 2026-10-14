@@ -284,15 +284,18 @@ func TestLateDiscardableFrame(t *testing.T) {
 
 // TestThinPressure: the signals that count as congestion for thinning: the
 // rate controller over its delay target, a frame stream past its deadline
-// (or the last one written that slowly), two frames waiting; all but the
-// last are the path's (they hold and lower the bitrate), two frames waiting
-// alone are the host's own queue (a key frame or a burst being paced out).
+// (or the last one written that slowly), two frames waiting behind one that
+// waited a frame interval; all but the last are the path's (they hold and
+// lower the bitrate), two frames waiting alone are the host's own queue (a
+// key frame or a burst being paced out). Frames that just left the encoder
+// together are no queue.
 func TestThinPressure(t *testing.T) {
 	s, _, _ := testSession(t, testFaults{})
 	now := time.Now()
+	late := 20 * time.Millisecond // the taken frame's wait since it was encoded (60 fps)
 	want := func(at time.Time, why string, path bool, what string) {
 		t.Helper()
-		if w, p := s.thinPressure(1, at); w != why || p != path {
+		if w, p := s.thinPressure(1, at, late); w != why || p != path {
 			t.Fatalf("%s: %q (path %v), want %q (path %v)", what, w, p, why, path)
 		}
 	}
@@ -308,6 +311,11 @@ func TestThinPressure(t *testing.T) {
 	want(now, "", false, "one frame waiting")
 	s.frameQ <- &media.Frame{}
 	want(now, "queue", false, "two frames waiting")
+	late = 2 * time.Millisecond
+	want(now, "", false, "two frames waiting that came out of the encoder with the one taken")
+	late = -1
+	want(now, "queue", false, "two frames waiting, the taken one's wait unknown")
+	late = 20 * time.Millisecond
 	of := &outFrame{f: &media.Frame{}, st: &fakeStream{}, opened: now.Add(-30 * time.Millisecond), deadline: 50 * time.Millisecond}
 	s.send.register(of)
 	want(now, "queue", false, "two frames waiting behind a stream within its deadline")
