@@ -173,13 +173,15 @@ std::string formatList(const std::vector<int>& formats) {
     return out.empty() ? "none" : out;
 }
 
-// CAP_COLOR_CONVERSION (amf::AMF_ACCELERATION_TYPE).
+// CAP_COLOR_CONVERSION (amf::AMF_ACCELERATION_TYPE), as the enum names it:
+// AMF documents neither where HARDWARE converts (VCN's own RGB -> YUV unit,
+// EFC, is one candidate) nor which GPU queue GPU uses.
 const char* accelerationName(int64_t v) {
     switch (v) {
     case amf::AMF_ACCEL_NOT_SUPPORTED: return "not supported";
-    case amf::AMF_ACCEL_HARDWARE: return "hardware (VCN)";
-    case amf::AMF_ACCEL_GPU: return "GPU shader";
-    case amf::AMF_ACCEL_SOFTWARE: return "software";
+    case amf::AMF_ACCEL_HARDWARE: return "hardware (AMF_ACCEL_HARDWARE)";
+    case amf::AMF_ACCEL_GPU: return "GPU (AMF_ACCEL_GPU)";
+    case amf::AMF_ACCEL_SOFTWARE: return "software (AMF_ACCEL_SOFTWARE)";
     default: return "not reported";
     }
 }
@@ -1141,9 +1143,11 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
                                                    : "NV12",
          rt.versionText.c_str());
     // Whether the encoder could take the captured BGRA image itself, and
-    // where it would convert it (docs/VENDOR_NOTES.md "Second hardware run:
-    // in-game capture and encoder latency"): CAP_COLOR_CONVERSION GPU means
-    // a shader on the GPU's queues, the same place as the NV12 conversion.
+    // what it says about converting it (docs/VENDOR_NOTES.md "Second hardware
+    // run: in-game capture and encoder latency"): CAP_COLOR_CONVERSION as the
+    // driver reports it. Whether that conversion would wait behind a game
+    // like the helper's NV12 shader is for a measurement (host_gpu), not this
+    // line.
     logf(LogLevel::Info, "amf: input formats %s (native: %s); RGB input converted by: %s", formatList(det_.inputFormats).c_str(),
          formatList(det_.nativeFormats).c_str(), accelerationName(det_.colorConversion));
     if (hdr_) {

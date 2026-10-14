@@ -128,7 +128,7 @@ void printGpuPriorityTable() {
 std::string applyGpuPriority(const std::string& mode, const AdapterInfo& adapter) {
     const std::string decision = gpuPriorityFor(mode, adapter.vendor, adapter.hags);
     if (decision == "off") {
-        logf(LogLevel::Info, "gpu priority: off (%s, %s)", adapter.vendor.c_str(), hagsText(adapter.hags));
+        logf(LogLevel::Info, "gpu priority: off (%s, %s; GPU thread priority left at 0)", adapter.vendor.c_str(), hagsText(adapter.hags));
         return "off";
     }
     const int prio = decision == "high" ? kPriorityHigh : kPriorityRealtime;

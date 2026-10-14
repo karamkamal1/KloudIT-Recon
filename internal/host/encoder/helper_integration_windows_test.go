@@ -1259,6 +1259,79 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 	}
 }
 
+// syncLog collects the helper's log lines (logLoop writes from its own
+// goroutine) and passes them on to the test's log.
+type syncLog struct {
+	t  *testing.T
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.t.Log(string(bytes.TrimRight(p, "\n")))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// start gpuPriority "off" leaves the D3D11 device's GPU thread priority at
+// Windows' default too: the helper says so and never calls
+// SetGPUThreadPriority(7), so HARDWARE_TEST_PLAN 7.8's "off" run carries no
+// GPU priority at all (before the second hardware run's review it still had
+// thread priority 7, and "auto" vs "off" compared two priorities). Wine
+// implements no SetGPUThreadPriority (E_NOTIMPL): there "auto" logs the failed
+// call, which "off" must not make.
+func TestHelperIntegrationGPUPriorityOff(t *testing.T) {
+	for _, mode := range []string{"off", "auto"} {
+		logs := &syncLog{t: t}
+		h, err := Launch(Options{Exe: helperExe(t), Backend: "mock", LogLevel: "debug",
+			Log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		st, err := h.Start(StartParams{Capture: "synthetic-gpu", Codec: "h264", Width: 320, Height: 180, FPS: 30, Kbps: 2000,
+			GPUPriority: mode})
+		var he *HelperError
+		if errors.As(err, &he) && he.Code == "init_failed" && underWine() {
+			h.Close()
+			t.Skipf("no D3D11 device under Wine (needs an X display): %v", err)
+		}
+		if err != nil {
+			h.Close()
+			t.Fatalf("%s: start: %v", mode, err)
+		}
+		nextFrame(t, h)
+		// The device is created before the priority line, and stderr keeps
+		// the order: once that line is in, so is any SetGPUThreadPriority one.
+		deadline := time.Now().Add(3 * time.Second)
+		for !strings.Contains(logs.String(), "gpu priority: ") && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		h.Close()
+		text := logs.String()
+		if !strings.Contains(text, "gpu priority: ") {
+			t.Fatalf("%s: no gpu priority line in the helper's log", mode)
+		}
+		switch {
+		case mode == "off":
+			if st.GPUPriority != "off" || !strings.Contains(text, "gpu priority: off (") ||
+				!strings.Contains(text, "GPU thread priority left at 0") || strings.Contains(text, "SetGPUThreadPriority(7)") {
+				t.Fatalf("off: started.gpuPriority %q, and the log does not say the thread priority was left alone:\n%s", st.GPUPriority, text)
+			}
+		case underWine():
+			if !strings.Contains(text, "SetGPUThreadPriority(7) failed") {
+				t.Fatalf("auto under Wine: no failed SetGPUThreadPriority(7) in the log (the device's priority was not set):\n%s", text)
+			}
+		}
+	}
+}
+
 // A game's presents for the static-desktop rule (docs/VENDOR_NOTES.md "First
 // hardware run: the static desktop during a game"): the GPU test source with
 // start "testDirty" presents without pauses. "none": presents whose capture

@@ -2,6 +2,7 @@
 
 #include <d3d10.h>  // ID3D10Multithread
 
+#include <atomic>
 #include <cstdio>
 
 namespace recon::d3d {
@@ -184,8 +185,15 @@ Status selectOutput(const StartParams& p, OutputRef& out) {
     return noOutput(adapter + " has no output " + std::to_string(p.monitor));
 }
 
+namespace {
+std::atomic<bool> raiseThreadPriority{true};
+}  // namespace
+
+void gpuThreadPriority(bool raise) { raiseThreadPriority = raise; }
+
 Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp) {
-    if (!warp) enableIncreaseBasePriority();  // SetGPUThreadPriority > 0 needs it
+    const bool raise = !warp && raiseThreadPriority;
+    if (raise) enableIncreaseBasePriority();  // SetGPUThreadPriority > 0 needs it
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifndef NDEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;  // debug builds only; dropped below if the SDK layers are missing
@@ -217,12 +225,14 @@ Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp) {
         // SeIncreaseBasePriorityPrivilege) and at most one queued frame.
         ComPtr<IDXGIDevice1> dxgi;
         if (SUCCEEDED(out.device.As(&dxgi))) {
-            hr = dxgi->SetGPUThreadPriority(7);
-            INT got = 0;
-            if (FAILED(hr)) {
-                logf(LogLevel::Warn, "SetGPUThreadPriority(7) failed: %s (run recon-host elevated)", hrText(hr).c_str());
-            } else if (SUCCEEDED(dxgi->GetGPUThreadPriority(&got)) && got != 7) {
-                logf(LogLevel::Warn, "SetGPUThreadPriority(7) succeeded, but the device reports GPU thread priority %d", int(got));
+            if (raise) {
+                hr = dxgi->SetGPUThreadPriority(7);
+                INT got = 0;
+                if (FAILED(hr)) {
+                    logf(LogLevel::Warn, "SetGPUThreadPriority(7) failed: %s (run recon-host elevated)", hrText(hr).c_str());
+                } else if (SUCCEEDED(dxgi->GetGPUThreadPriority(&got)) && got != 7) {
+                    logf(LogLevel::Warn, "SetGPUThreadPriority(7) succeeded, but the device reports GPU thread priority %d", int(got));
+                }
             }
             hr = dxgi->SetMaximumFrameLatency(1);
             if (FAILED(hr)) logf(LogLevel::Warn, "SetMaximumFrameLatency(1) failed: %s", hrText(hr).c_str());
