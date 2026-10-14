@@ -1210,6 +1210,7 @@ function bakeFinish() {
   // apart by their frame counts (pickPath: not conclusive).
   const expectFps = bakeExpectFps();
   const pick = pickPath(results, pres.refreshMs, PICK, expectFps);
+  if (b.gaveUp) pick.why = `not measured: the stream stayed under ${bakeMinFps()} of ${Math.round(expectFps)} frames per second for ${Math.round(b.waitedMs / 1000)} s (a still picture?); Auto measures on the next connection`;
   for (const [p, why] of Object.entries(pick.out)) results[p].out = why;
   const winner = pick.winner;
   const pacing = pacingOf(PATHS.flatMap((p) => b.recs[p]?.flat() || []));
@@ -1229,7 +1230,6 @@ function bakeFinish() {
   pres.next = keep;
   pres.retire = pres.list.filter((r) => r !== keep);
   pres.list = [keep];
-  if (b.gaveUp) pick.why = `not measured: the stream stayed under ${bakeMinFps()} of ${Math.round(expectFps)} frames per second for ${Math.round(b.waitedMs / 1000)} s (a still picture?); Auto measures on the next connection`;
   pres.announce = true;
 }
 
