@@ -301,12 +301,16 @@ async function checkPresentation(name, path) {
       }
     }
     if (shown) stats.classList.remove('hidden');
-    return { css: [b.width, b.height], dpr: devicePixelRatio, box: window.__recon.box, canvases: document.querySelectorAll('#stage canvas').length, styled, covered: [...covered] };
+    // Chrome before getContextAttributes on an OffscreenCanvas's 2D context
+    // (122: E2E_CHROMIUM) cannot report desynchronized: null there.
+    const reports = typeof OffscreenCanvasRenderingContext2D === 'function' && 'getContextAttributes' in OffscreenCanvasRenderingContext2D.prototype;
+    return { css: [b.width, b.height], dpr: devicePixelRatio, box: window.__recon.box, canvases: document.querySelectorAll('#stage canvas').length, styled, covered: [...covered], reports };
   });
   const want = d.css.map((v) => Math.round(v * d.dpr));
   const sizeOk = !!r && r.canvas[0] === d.box?.w && r.canvas[1] === d.box?.h && Math.abs(d.box.w - want[0]) <= 1 && Math.abs(d.box.h - want[1]) <= 1;
   check(`${name}: ${path} draws on a canvas sized to its box in device pixels, nothing transforms or covers it`,
-    r?.name === path && r.drawErrors === 0 && sizeOk && !d.styled.length && !d.covered.length && d.canvases === 1 && (path !== 'canvas2d' || r.desynchronized === true),
+    r?.name === path && r.drawErrors === 0 && sizeOk && !d.styled.length && !d.covered.length && d.canvases === 1 &&
+      (path !== 'canvas2d' || r.desynchronized === (d.reports ? true : null)),
     `${r?.name}${r?.gpu ? ` (${r.gpu})` : ''}, getContextAttributes().desynchronized ${r?.desynchronized}; canvas ${r?.canvas?.join('x')} for a box of ` +
       `${d.css.map((v) => +v.toFixed(1)).join('x')} CSS px at dpr ${d.dpr} (${d.box?.w}x${d.box?.h}); ${r?.drawErrors} render errors; ${d.canvases} canvas(es); ` +
       `transforms/filters: ${d.styled.join('; ') || 'none'}; covered by: ${d.covered.join(', ') || 'nothing'}`);
@@ -457,7 +461,7 @@ async function checkBakeoff() {
   page = (await headedPage().catch(() => null)) || mainPage;
   const hostProc = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
   try {
-    const all = page === mainPage ? ['canvas2d', 'webgl2'] : ['canvas2d', 'webgl2', 'webgpu'];
+    let all = page === mainPage ? ['canvas2d', 'webgl2'] : ['canvas2d', 'webgl2', 'webgpu'];
     await page.goto(`${base}/`);
     await page.evaluate((k) => localStorage.removeItem(k), PRESENT_KEY);
     await page.mouse.move(200, 200); // away from the top edge (toolbar)
@@ -512,6 +516,9 @@ async function checkBakeoff() {
     const canvases = await page.evaluate(() => [...document.querySelectorAll('#stage canvas')].map((c) => `${c.dataset.path}${c.hidden ? ' (hidden)' : ''}`));
     const overlay = await page.textContent('#stats').catch(() => '');
     const res = result?.results || {};
+    // A path this browser does not have at all (Chrome 122 on Xvfb: no
+    // WebGPU adapter; E2E_CHROMIUM) is not one to measure.
+    all = all.filter((p) => !/^(no WebGPU adapter|WebGPU unavailable)$/.test(res[p]?.error || ''));
     const rule = result?.rule || {};
     const row = (p) => (res[p]?.error ? `${p}: unavailable (${res[p].error})`
       : `${p}: draw p50/p95 ${res[p]?.draw?.p50}/${res[p]?.draw?.p95} ms (n ${res[p]?.draw?.n}, rounds ${res[p]?.drawRounds?.join('/')}), ` +
@@ -3178,6 +3185,14 @@ async function checkHardwareDecoderFailure() {
 // is small. The first scenario also checks that the host logs the client's
 // input report (every 10 s) with the mouse and key rows and the clock sync.
 async function checkInputLatency(name, hostProc, log0) {
+  // More mouse motion, 80 ms apart (one marked datagram per 50 ms): one
+  // datagram or its acknowledgement lost on this loaded machine must not
+  // leave the mouse row empty.
+  const vp = page.viewportSize() || { width: 1280, height: 720 };
+  for (let i = 0; i < 5; i++) {
+    await page.mouse.move(Math.round(vp.width * (0.5 + 0.01 * i)), Math.round(vp.height * 0.5));
+    await sleep(80);
+  }
   const st = await until(() => page.evaluate(() => {
     const x = window.__recon.lastStats;
     return x?.input?.mouse && x.input.keys ? x : null;
