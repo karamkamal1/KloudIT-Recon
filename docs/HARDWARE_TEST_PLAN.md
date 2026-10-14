@@ -820,50 +820,79 @@ All runs use Network path *Relay via gateway* and `"logLevel": "debug"`, after s
 **8.0 The direct path on the LAN** (VENDOR_NOTES "Second hardware run: direct path on the LAN";
 run it first, with Network path *Auto*, not the stage's *Relay via gateway*)
 
-The second run streamed every session through the gateway's relay (`path=relay`, network p50
-6-9 ms even on an idle desktop) although the firewall let the direct port in, and nothing in
-host.log said why. host.log now says it for every session.
+The second run streamed every session through the gateway's relay (`path=relay`) although the
+firewall let the direct port in, and nothing in host.log said why. host.log now says it for every
+session. The relay's `network` stage p50 was 5.1-9 ms, but most of that is not the relay: the
+relay forwarder costs microseconds, so on a plain wired LAN the direct path saves under 1 ms; it
+saves several milliseconds only where the relay's traffic takes a detour (a Tailscale or VPN route
+on the PC). A client on Wi-Fi keeps its Wi-Fi hop either way. So this step compares the two paths
+in one session instead of against a fixed number.
 
 - **Do**:
-  1. After an agent restart, on the PC: `Select-String $log -Pattern 'endpoint listening|reaches
+  1. Say whether the client PC is on Wi-Fi or wired (and on Tailscale or not).
+  2. After an agent restart, on the PC: `Select-String $log -Pattern 'endpoint listening|reaches
      the gateway through a tunnel|Windows Firewall' | Select-Object -Last 5`, and
      `Find-NetRoute -RemoteIPAddress 192.168.5.202 | Select-Object InterfaceAlias, IPAddress`
      (the gateway's address), `Find-NetRoute -RemoteIPAddress <the client PC's address> | Select-Object
-     InterfaceAlias, IPAddress`, `Get-NetIPAddress -AddressFamily IPv4 | Select-Object
-     InterfaceAlias, IPAddress, PrefixLength`, and if Tailscale runs, `tailscale status` and
-     whether *Use Tailscale subnets* is on in its menu.
-  2. In Chrome on the client (Settings → Network path *Auto*; check it is not *Relay via
-     gateway*), connect and stream 1 minute. Open the overlay.
-  3. `Select-String $log -Pattern 'direct path|session started|session moved' | Select-Object -Last 15`.
-  4. If the session started on the relay: keep streaming 3 minutes (the client retries the direct
-     path 2, 8, 20, 60 s after the start, then every 2 minutes) and run step 3 again.
+     InterfaceAlias, IPAddress`, `Get-NetIPAddress | Select-Object InterfaceAlias, IPAddress,
+     PrefixLength, AddressState`, and if Tailscale runs, `tailscale status` and whether *Use
+     Tailscale subnets* is on in its menu.
+  3. On the client, check its clock is synced (Windows: Settings → Time & language → Date & time,
+     *Sync now*). In Chrome (Settings → Network path *Auto*; check it is not *Relay via gateway*),
+     connect on an idle desktop and open the overlay. Note its Transport row, `round trip` and the
+     `network` stage.
+  4. `Select-String $log -Pattern 'direct path|session started|session moved|move to the direct
+     path' | Select-Object -Last 15`.
+  5. If the session started on the relay: stay on the idle desktop until `session moved to the
+     direct path` (the client retries 2, 8, 20, 60 s after the start, then every 2 minutes; 3
+     minutes at most), wait one more minute, note the overlay's Transport row, `round trip` and
+     `network` stage again, and run step 4 again.
+  6. The A/B from host.log (the session's 10 s lines before and after the move):
+     `Select-String $log -Pattern 'latency stages' | Select-Object -Last 30 | ForEach-Object { if
+     ($_.Line -match 'path=(\S+).* network="([\d.]+)/') { "$($Matches[1]) network_p50=$($Matches[2])" } }`
+     and `Select-String $log -Pattern 'msg="stream stats"' | Select-Object -Last 30 | ForEach-Object
+     { if ($_.Line -match 'path=(\S+).* mbps=([\d.]+).* loss_pct=([\d.]+) cc_lost=(\d+)') {
+     "$($Matches[1]) mbps=$($Matches[2]) loss_pct=$($Matches[3]) cc_lost=$($Matches[4])" } }`.
 - **Look at**:
   - `direct WebTransport endpoint listening port=48100 ... addrs="192.168.5.x (Ethernet 2, lan,
-    route to the gateway); 100.x (Tailscale, tailscale); ..."`: the LAN address must be there,
-    and should carry `route to the gateway`. If the Tailscale address carries it instead, the
-    next line is `the PC reaches the gateway through a tunnel although the gateway is on the PC's
-    own network ... detail="from 100.x (Tailscale) instead of 192.168.5.x on 192.168.5.0/24
-    (Ethernet 2)"`: the cause of the relay detour, with `fix=`.
+    route to the gateway); 100.x (Tailscale, tailscale); ..." sockets=N`: the LAN address must be
+    there, and should carry `route to the gateway` (the agent listens on all `sockets` addresses
+    and offers the ones in `addrs`). If the Tailscale address carries it instead, the next line is
+    `the PC reaches the gateway through a tunnel although the gateway is on the PC's own network
+    ... detail="from 100.x (Tailscale) instead of 192.168.5.x on 192.168.5.0/24 (Ethernet 2)"`:
+    the relay's detour, with `fix=`.
   - The session's line after `session started`: `direct path: connected tried="192.168.5.x:48100
     (lan, the browser's network 192.168.5.0/24): connected after N ms; ..."`, or `direct path: not
     used by this session, it streams through the gateway why="..." tried="..."` with each
-    address's outcome.
+    address's outcome, and `client_clock=` when the client's clock is a minute or more off.
   - With `no answer` in `tried`: a line `direct path: a browser's connection failed in its
     handshake from=<client>:<port> to=<PC address> ... why="the browser gave up the handshake: the
-    PC's answers did not reach it ..."` means the browser's packets reach the PC and its answers
-    take another route (the tunnel warning above); no such line at all means the browser's
-    packets never reach the PC (a firewall or antivirus on either PC, Wi-Fi client isolation, a
-    VLAN). `refused the PC's certificate` means a hash mismatch (a gateway and an agent of
-    different versions).
-  - The overlay's Transport row: `webtransport · direct 192.168.5.x:48100`, or after a move
-    `... (moved from relay)`; and the network stage p50.
+    PC's answers did not reach it ..."` (`after_ms=` about 4000, Chrome's handshake timeout) means the
+    browser's packets reach the PC and its answers take another route (the tunnel warning above);
+    no such line at all means the browser's packets never reach the PC (a firewall or antivirus
+    on either PC, Wi-Fi client isolation, a VLAN). `refused the PC's certificate` means the
+    client's clock is outside the certificate's validity (`client_clock=` on the session's line
+    says `before the PC's certificate is valid` or `after the PC's certificate expires`) or the
+    page used a connect answer from before the agent's last start (reload it). A line `more
+    browser handshakes failed than host.log takes ... count=N` means handshakes from outside the
+    PC's networks (a scan through a port forward): only their count is logged.
+  - The move: `session moved to the direct path ... from=relay ... taken_ms=N` (`taken_ms`: from
+    the host's `resumed` to the client's switch, about one round trip). A line `the move to the
+    direct path was not taken, the session stays where it was why=...` means the client gave the
+    move up (it waits 5 s for `resumed`); the session goes on over the relay, and the next try
+    moves it.
+  - The A/B (step 6): `network_p50` of the `path=relay` lines against the `path=direct` lines,
+    the overlay's `round trip` before and after, and `cc_lost` / `loss_pct` before and after.
 - **Pass**: the session runs on the direct path (from the start, or `session moved to the direct
   path ... from=relay` within the 3 minutes, with no second `session started` and no visible
-  interruption at the move), and the overlay's network stage p50 is below the relay's 6-9 ms (a
-  wired LAN: about 1-3 ms).
-- **If not, send**: the lines of steps 1 and 3, the outputs of step 1's commands, the overlay's
-  Transport row and the latency export (**Export latency data**), and whether the client PC is
-  on Wi-Fi or wired and on Tailscale.
+  interruption at the move), and the A/B is recorded: the direct path's `network` p50 is not
+  higher than the relay's. A drop of a few milliseconds means the relay took a detour (the tunnel
+  warning, or step 2's `Find-NetRoute` to the gateway naming the Tailscale or VPN interface);
+  under 1 ms is a plain LAN. Loss (`cc_lost`, `loss_pct`) that goes on after the move is in the
+  LAN, the Wi-Fi or the client, not in the relay.
+- **If not, send**: the lines of steps 2, 4 and 6, the outputs of step 2's commands, the
+  overlay's Transport row and `round trip` before and after, the latency export (**Export
+  latency data**), and whether the client PC is on Wi-Fi or wired and on Tailscale.
 
 **8.1 The UDP relay** (VENDOR_NOTES 2.6, "Final review: security", "UDP relay ports held
 without a session" and "A relayed connection ends with its session")

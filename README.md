@@ -80,8 +80,8 @@ hardware follow **[docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md)**, an
 - **Direct path on the LAN.** WebTransport straight to the PC, with certificate-hash pinning
   and a single-use, origin-bound gateway ticket. The PC listens on each of its addresses (LAN,
   IPv6, Tailscale, ...) and the browser tries them all at once, the one on its own network
-  first. A session that had to start on a relay moves to the direct path by itself when it
-  answers, without a restart. Without it:
+  first. With Network path *Auto* over WebTransport, a session that had to start on a relay
+  moves to the direct path by itself when it answers, without a restart. Without it:
   1. The gateway's **UDP relay**, which forwards the datagrams of the same end-to-end QUIC
      connection.
   2. A QUIC splice on the gateway's main port.
@@ -618,9 +618,11 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   it after `direct:`. A `no answer` with a line `direct path: a browser's connection failed in
   its handshake ... the PC's answers did not reach it` means the PC's answers take another route
   (a VPN or Tailscale route that covers the LAN: `host.log` warns at start `the PC reaches the
-  gateway through a tunnel`, with `fix=`); `refused the PC's certificate` means a hash mismatch
-  (update the gateway and the agent together); a `no answer` with no such line means the
-  browser's packets never reach the PC. Allow
+  gateway through a tunnel`, with `fix=`); `refused the PC's certificate` means the client PC's
+  clock is off (the session's line says by how much in `client_clock=`: the certificate is not
+  valid yet for a clock more than an hour behind the PC's, nor for one days ahead; turn on
+  Windows time sync on the client) or a connect answer older than the agent's last start (reload
+  the page); a `no answer` with no such line means the browser's packets never reach the PC. Allow
   UDP 48100 on the PC: the installer adds a rule for Private and Domain networks, so a network
   Windows set to *Public* (the first hardware run's) keeps the port closed. `host.log` warns at
   start (`direct path blocked by Windows Firewall on this network`, with `fix=`) and

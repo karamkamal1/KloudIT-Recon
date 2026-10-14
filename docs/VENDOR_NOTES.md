@@ -12937,10 +12937,41 @@ remote=192.168.5.202:8446` ... `:8451`, the gateway's LXC. The client was on the
 network. host.log said the direct path was up and open: `direct WebTransport endpoint listening
 port=48100` at each agent start and `direct path: Windows Firewall lets it in on this network`
 for `Ethernet 2` (Private) and `Tailscale` (Private), so the first run's cause (a Public network)
-was gone. The relay hop cost the `network` stage (host send → first byte) 6-9 ms at p50 even on
-an idle desktop (`network="6.6/12.7/15.2"` ... `"8.4/24.6/39.9"`), and `cc_lost` 0-147 per
-10 s. Nothing said why the browser had not taken the direct path: the overlay's `direct:`
+was gone. Nothing said why the browser had not taken the direct path: the overlay's `direct:`
 reason stays in the browser, and the report did not include it.
+
+The client's `network` stage (host send → the frame's first byte in the browser's worker) had a
+p50 of 5.1-9 ms in all 62 `latency stages` windows of the run, idle desktop included
+(`network="6.6/14.1/25.5"` at 22:31:13). The first version of this section put all of it on the
+relay hop and promised 1-3 ms on the direct path. The numbers do not support that (review of this
+section, below):
+
+- The `network` stage is the whole one-way trip, not the relay's extra cost
+  (`stream-worker.js`: `s[2] = m.first - sendL`, the host's send time moved to the client's clock
+  by the offset of the lowest-RTT ping). It includes the path, quic-go's send and Chrome's
+  delivery of stream data to the worker, and the clock offset's error.
+- The relay forwarder itself costs microseconds: `TestUDPRelayLatencyAndThroughput` (loopback)
+  measures 21-54 µs added at p50 in this work's 8 runs below (10-50 µs in the review's runs).
+- The first run's host.log (`audio frame size ... path=relay ... client_min_rtt_ms=6.7`) has the
+  lowest round trip through the relay at 6.7 ms. Half of it, 3.35 ms, is the one-way trip; for the
+  direct path to bring the stage from about 6 ms to 1-3 ms, the relay route would have to cost
+  3-5 ms each way: all of the 6.7 ms or more.
+- The floor does not move with load: the 7 windows whose `transfer` p50 is 0.2 ms or less
+  (frames of one or two packets) still have `network` p50 5.2-7.9 ms, at targets from 38 to
+  250 Mbit/s. A fixed cost, not relay queueing. And it is above half the lowest round trip:
+  about 1.7 ms or more of it is stream delivery in quic-go and Chrome's worker (pings are
+  datagrams, frames are streams) or clock offset error, which the direct path keeps.
+- A 6.7 ms lowest round trip is high for a wired LAN (well under 1 ms through a switch and a
+  Proxmox bridge). Wi-Fi on the client explains it on its own, and the direct path keeps the
+  Wi-Fi hop. A detour does too: a Tailscale or VPN subnet route on the PC (cause 1 below), or
+  the gateway LXC's bridge. Only such a detour makes the relay cost milliseconds.
+
+`cc_lost` (0-147 per 10 s) is not the relay's either, as far as the log shows: losses come in 7 of
+the 25 `stream stats` windows under 20 Mbit/s (215 packets) and in 10 of the 28 at 20-60 Mbit/s
+(639 packets), rates the relay forwards with a wide margin (650-995 Mbit/s of bulk transfer on
+loopback in the same test's runs below, 555-956 in the review's). Loss that goes on after a move
+to the direct path is in the LAN, the Wi-Fi or the client's stack (step 8.0 compares the two in
+one session).
 
 ### What happened on the direct path (traced)
 
@@ -12967,8 +12998,13 @@ reason stays in the browser, and the report did not include it.
   profile, the firewall's state, allow and block rules).
 - **The certificate**: the UDP relay sessions ran on the same WebTransport server with the same
   certificate and hash (the relay ends at the host, end to end), so the owner's Chrome accepted
-  it. It is ECDSA P-256 and valid for 13 days and an hour (Chrome's limit for
-  `serverCertificateHashes`: 14 days).
+  it. It is ECDSA P-256 and valid for 13 days (from an hour before it is made; Chrome's limit for
+  `serverCertificateHashes`: 14 days). The gateway hands browsers the hashes the agent announced,
+  as they are (`api.go`: `dh = append(dh, hc.info.Direct.Hashes...)`, before and after this
+  work), so a gateway and an agent of different versions cannot make them disagree. A browser
+  refuses the certificate when its own clock is outside the validity (more than an hour behind
+  the PC's just after the agent starts or renews it, every 5 days; or days ahead), or with a
+  connect answer older than the agent's last start.
 - **Chrome 122** (the owner's, per the first run's latency JSON): the browser E2E's direct path,
   UDP relay and the new sections below pass with Chrome for Testing 122.0.6261.128
   (`E2E_CHROME`): WebTransport with `serverCertificateHashes`, datagrams, the race. It has no
@@ -12976,10 +13012,13 @@ reason stays in the browser, and the report did not include it.
   Chromium 141; none of them matters for the direct path. (Its 2D canvas reports no
   `desynchronized` attribute: `getContextAttributes().desynchronized` is null, a client renderer
   matter, noted for the client work.)
-- **A stale CSP**: the stream worker's CSP lists the direct address. Chrome takes the CSP of a
+- **A stale CSP**: the stream worker's CSP lists the direct addresses. Chrome takes the CSP of a
   `304 Not Modified` revalidation over the cached one (checked with Chrome 122 and 141: a worker
   first served without the address can connect to it after the 304 that lists it), so a cached
-  worker script does not keep an old address.
+  worker script does not keep an old address. A worker keeps its CSP for the page's life,
+  though: an address the PC gains after the page loaded (Tailscale coming up, a new lease) is
+  refused at once for the background tries until the page is reloaded; the other addresses go
+  on.
 
 ### Causes the log cannot tell apart
 
@@ -12987,7 +13026,8 @@ reason stays in the browser, and the report did not include it.
    accepting a subnet route that covers the LAN (Windows clients accept subnet routes by
    default), the PC reaches the gateway through Tailscale and the gateway offers the tailnet or
    the subnet router's address: no answer for a browser off the tailnet, a refusal from a router.
-   The 6-9 ms of the relay hop on a LAN fit a detour through the tunnel too.
+   The relay's traffic then takes the same detour, the one case where the relay costs
+   milliseconds.
 2. **The answers' route**: even at the right LAN address, the PC answered from its wildcard
    socket by the route to the browser; with the same subnet route that is the tunnel, from the
    tailnet address, and the browser drops an answer from an address it did not send to: no
@@ -12997,20 +13037,28 @@ reason stays in the browser, and the report did not include it.
 4. **UDP 48100 dropped between the two PCs** while both reach the gateway: a third-party firewall
    or antivirus, Wi-Fi client isolation, a VLAN.
 
+On a plain LAN with none of these, the old code already offered the right address (the PC's LAN
+address, which the gateway sees its tunnel come from) and the wildcard socket answered from it.
 host.log now tells these apart (below); the next run's host.log alone says which it is.
 
 ### The fix
 
-- **Every address, its own socket** (`internal/host/direct.go`): the agent lists the PC's
-  addresses a browser could reach (LAN, public IPv4, IPv6, Tailscale, VPN, virtual switches;
-  never loopback, link-local or Teredo; at most two IPv6 per interface, eight in all), listens on
-  the direct port of each on its own socket, so an answer leaves from the address the browser
-  sent to and out of its interface (Windows' strong host model), rescans every 30 s, and
-  announces them (`DirectInfo.Addrs`: kind, prefix length, interface, the route to the gateway).
-  `directAddr` may list several addresses or names. Without an address of its own it falls back
-  to the wildcard socket. The start line lists them: `direct WebTransport endpoint listening
-  port=48100 congestion=media addrs="192.168.5.x (Ethernet 2, lan, route to the gateway);
-  100.x (Tailscale, tailscale)"`.
+- **Every address, its own socket** (`internal/host/direct.go`): the agent lists every address of
+  the PC a browser could reach (`directAddrs`: LAN, public IPv4, IPv6, Tailscale, VPN, virtual
+  switches; never loopback, link-local or Teredo; a Hyper-V external switch that carries the
+  route to the gateway or the gateway's network counts as the LAN) and listens on the direct port
+  of each on its own socket (32 at most), so an answer leaves from the address the browser sent
+  to and out of its interface (Windows' strong host model). It announces part of them
+  (`directAnnounced`: at most two IPv6 per interface and eight in all, the route to the gateway
+  always among them; `DirectInfo.Addrs`: kind, prefix length, interface, the route), and listens
+  on the rest too, so any address of the PC a browser reaches has a socket that answers (also
+  the peer address an older gateway offers alone, and a loopback route: a gateway on the PC). It
+  rescans every 30 s and closes only the sockets of addresses gone from the interfaces, never one
+  a cap left out (a live session may be on it). `directAddr` may list several addresses or names.
+  Without an address of its own it falls back to the wildcard socket. The start line lists what
+  it announces: `direct WebTransport endpoint listening port=48100 congestion=media
+  addrs="192.168.5.x (Ethernet 2, lan, route to the gateway); 100.x (Tailscale, tailscale)"
+  sockets=N`.
 - **The tunnel warning**: when the PC's route to the gateway is a Tailscale or VPN address
   although the gateway is on one of its LANs, the agent warns `the PC reaches the gateway through
   a tunnel although the gateway is on the PC's own network ... detail="from 100.x (Tailscale)
@@ -13018,169 +13066,282 @@ host.log now tells these apart (below); the next run's host.log alone says which
   subnets\" on this PC (tailscale set --accept-routes=false); another VPN: exclude the LAN from
   it"` (cause 1 and the relay's detour).
 - **Every address offered, the browser's network first** (`internal/gateway/direct.go`
-  `orderDirect`): the connect answer's `direct.candidates`: the PC's addresses whose prefix
-  contains the browser's address (Tailscale addresses for a browser on the tailnet), then
-  `directAddr`, the PC's route to the gateway, the tunnel's peer address, the rest by kind, each
-  with a note; `direct.url` stays the first for older clients. The CSP lists all of them.
+  `orderDirect`): the connect answer's `direct.candidates` (eight at most): the PC's addresses
+  whose prefix contains the browser's address (Tailscale addresses for a browser on the tailnet),
+  then `directAddr`, the PC's route to the gateway, the tunnel's peer address, the rest by kind,
+  each with a note; `direct.url` stays the first for older clients. The stream page's CSP lists
+  every address any browser may be offered (`directSources`, without the cap).
 - **All addresses at once** (`stream-worker.js` `raceDirect`): the first at once, each next one
-  100 ms later (at once when every started one has failed), the first that comes up wins, the
-  others are closed, all within the 2.5 s. An unreachable address (a tailnet address for a
-  browser off the tailnet) no longer costs the direct path.
+  100 ms later (at once when every started one has failed), the first that comes up wins, all
+  within the 2.5 s; every other attempt is closed, also the ones the deadline marks `no answer`
+  (left open they ran on to Chrome's own 4 s handshake timeout, at every fall back to the relay
+  and every background try). An unreachable address (a tailnet address for a browser off the
+  tailnet) no longer costs the direct path.
 - **Why, in host.log** at each session's start, from the client's report in its hello
   (`Hello.Direct`): `direct path: connected tried="192.168.5.x:48100 (lan, the browser's network
   192.168.5.0/24): connected after 4 ms; 100.x:48100 (tailscale): abandoned after 104 ms"`, or
   `direct path: not used by this session, it streams through the gateway why="..." tried="..."`
-  (each address: connected, no answer, refused after N ms: ..., abandoned, not tried).
+  (each address: connected, no answer, refused after N ms: ..., abandoned, not tried). The report
+  carries the client's clock (`DirectReport.Clock`): `client_clock="2h0m0s behind the PC's:
+  before the PC's certificate is valid (from ...), so the browser refuses it: set the client's
+  clock ..."` when it is outside the certificate's validity, `client_clock="5m0s behind the PC's"`
+  for any offset of a minute or more.
 - **Each failed handshake on the PC's side**: `direct path: a browser's connection failed in its
   handshake from=<browser> to=<PC address> after_ms=N why=...`: `the browser refused the PC's
-  certificate ...` (a TLS alert: a hash that does not match), `the browser gave up the handshake:
-  the PC's answers did not reach it ...` (Chrome closes an unanswered handshake after 4 s with
-  "No recent network activity") or `the browser never completed the handshake: ...` (cause 2).
-  Packets that never reach the PC (cause 4) leave no such line. A browser that drops a losing
-  parallel attempt is not logged (Debug): its close carries no error, or `APPLICATION_ERROR`, the
-  form an application's close takes in Initial and Handshake packets (RFC 9000 10.2.3; also a
-  handshake the browser completed and closed before the PC read its Finished). At most one line
-  per browser address and reason per 5 minutes at Info.
+  certificate: the client's clock is outside the certificate's validity ... or the connect answer
+  it used is older than the agent's last start` (a TLS alert), `the browser gave up the
+  handshake: the PC's answers did not reach it ...` (`after_ms` about 4000: the page closes its
+  attempt at the race's 2.5 s deadline, but Chromium sends nothing for a handshake that never had
+  an answer and its QUIC connection ends at its own 4 s timeout, "No recent network activity") or
+  `the browser never completed the handshake: ...` (cause 2). Packets that
+  never reach the PC (cause 4) leave no such line. A browser that drops a losing parallel attempt
+  is not logged (Debug): its close carries no error, or `APPLICATION_ERROR`, the form an
+  application's close takes in Initial and Handshake packets (RFC 9000 10.2.3; also a handshake
+  the browser completed and closed before the PC read its Finished). Anyone who can send the port
+  packets can fail a handshake (an internet scan through a port forward or at the PC's global
+  IPv6 address, spoofed packets), and host.log keeps 20 MB and one older file: Info lines only for
+  browsers on the PC's own networks (private, CGNAT, unique local, link-local, the PC's own
+  prefixes), one per address and reason per 5 minutes and 20 per 10 minutes in all; the rest are
+  Debug lines, and the next failure after the 10 minutes logs how many (`direct path: more
+  browser handshakes failed than host.log takes ... count=N`). More than 32 connection attempts in
+  a second must prove their address first (a QUIC Retry: one more round trip), so spoofed
+  packets create no connection. A browser away from home still reports its attempt in its hello.
 - **The live session moves to the direct path** (`internal/host/move.go`, `stream-worker.js`
-  `tryMove`): a session on a relay gets a resume token in its welcome; with Network path Auto the
-  client tries the direct path again 2, 8, 20 and 60 s after the welcome and then every
-  2 minutes, each time with a fresh connect answer from the page (a new ticket, the PC's
-  addresses now), racing the addresses as above. The first that answers opens a session whose
-  hello carries the token and the ticket; the host checks the ticket as any direct session's,
-  then the token, user and origin against the running session, and moves it onto the new
-  connection: `resumed` first on the new control stream, then frames, datagrams and control
-  there. The pipeline, encoder, audio, rate controller and loss state stay: no new session,
-  generation or key frame (a frame lost in the switch is a loss the ladder answers). The client
-  ends its old control and input streams at the switch (the host takes the new connection's
-  input after the old stream's, 1 s at most, so a key released right after the move is not
-  pressed again by a late press), closes the old connection after 1 s, the host after 2 s (its
-  QUIC connection: the relay port is released). host.log: `session moved to the direct path: the
-  stream goes on over it, without a restart from=relay remote=... after_s=N`, and the session's
-  lines say `path=direct` from then on (the session logger takes the path at each line). A try
-  that fails is logged once per outcome: `direct path: the client's attempt in the background
-  failed, the session stays on the relay why=... tried=...`. The overlay's Transport row:
-  `webtransport · direct 192.168.5.x:48100 (moved from relay)`.
+  `tryMove`): a session on a relay gets a resume token in its welcome; with Network path Auto
+  over WebTransport the client tries the direct path again 2, 8, 20 and 60 s after the welcome
+  and then every 2 minutes, each time with a fresh connect answer from the page (a new ticket,
+  the PC's addresses now), racing the addresses as above. The first that answers opens a session
+  whose hello carries the token and the ticket; the host checks the ticket as any direct
+  session's, then the token, user and origin against the running session, and answers `resumed`
+  on the new control stream (`adopt`, which no longer waits for the session's control lock, so a
+  control write stuck on the relay does not hold it up). It goes on sending frames, datagrams and
+  control over the relay until the client shows it moved: its first datagram on the new
+  connection (the client sends a ping there at once) or the end of its relay control stream
+  (`commitMove`). A new connection that ends first is let go and the session stays on the relay
+  (`abandonMove`: `direct path: the move to the direct path was not taken, the session stays
+  where it was why=... on=relay`; also after 10 s without a sign): the client closes it when
+  `resumed` takes longer than its 5 s, and before, the host had moved already and the session
+  ended, with a full reconnect. The pipeline, encoder, audio, rate controller and loss state
+  stay: no new session, generation or key frame (a frame lost in the switch is a loss the ladder
+  answers). The client ends its old control and input streams at the switch (the host takes the
+  new connection's input after the old stream's, 1 s at most, so a key released right after the
+  move is not pressed again by a late press; input on the new connection goes to the moved
+  session's own state, never the connection's placeholder session), closes the old connection
+  after 1 s, the host 2 s after the commit (its QUIC connection: the relay port is released).
+  host.log: `session moved to the direct path: the stream goes on over it, without a restart
+  from=relay remote=... after_s=N taken_ms=N`, and the session's lines say `path=direct` from then
+  on (the session logger takes the path at each line). A try that fails is logged once per
+  outcome: `direct path: the client's attempt in the background failed, the session stays on the
+  relay why=... tried=...`. The overlay's Transport row: `webtransport · direct 192.168.5.x:48100
+  (moved from relay)`.
 - **The relay stays the fallback** for remote use, with its tickets, origin checks and the
   gateway's name-constrained CA unchanged; the move adds no path the gateway does not authorise
   (a fresh direct ticket, single use, the same origin and user, checked against the gateway's
-  clock and its revocations), and the resume token only travels on the session's own encrypted
-  control stream.
+  clock and its revocations). The resume token travels on the session's control stream: end to
+  end encrypted on the UDP relay, seen by the gateway on the splice relay (it ends there), the
+  party that signs the tickets anyway. Sessions on either relay get one; a WebSocket client
+  behind the splice never uses it.
+
+### Review of this section's first version
+
+- **The network stage and the expected gain** (major): confirmed, see "What the log shows". The
+  expected gain and step 8.0's pass bar are rewritten (below).
+- **"The relay's cc_lost bursts go with it"**: confirmed unsupported, dropped; step 8.0 compares
+  `cc_lost` and `loss_pct` before and after the move in one session.
+- **"Update the gateway and the agent to the same version" for a refused certificate**: confirmed
+  wrong (the hashes pass through the gateway unchanged); README, INSTALL, the test plan and the
+  agent's own line now say clock or a stale connect answer, and the client's clock is in the
+  direct path lines.
+- **`TestUDPRelayLatencyAndThroughput` failing "under machine load"**: the cause was not shown.
+  Recorded as an open relay issue in "Runs" with this work's runs; the relay forwarder is the
+  relay work's (perf-net) to investigate.
+- **The caps drop the route; a rescan closes live sockets**: confirmed (the review's case:
+  `Ethernet 2` with the route as its third IPv6 address announced without it). Fixed as above
+  (`TestDirectAddrsRouteAndCaps`, `TestDirectScanKeepsPresentSockets`).
+- **raceDirect leaves "no answer" attempts open**: confirmed (`end()` skipped them). Fixed;
+  "direct path race (unit)" in the browser E2E fails before (2 of 2 left open) and passes after.
+  The host's `answers did not reach it` line still comes about 4 s after the attempt
+  (`after_ms=4007` in the browser E2E with the fix): Chromium 141 sends no close for a QUIC
+  handshake that never had an answer when the page closes its WebTransport, and ends that
+  handshake at its own 4 s timeout. What the fix changes is the page's side: no attempt stays
+  open, and one whose answers come late does not open a session on the PC.
+- **The CSP and the connect answer from two capped lists**: confirmed
+  (`TestCSPCoversEveryCandidate` fails before: `192.168.56.1` offered to a browser on
+  `192.168.56.0/24` was not in the CSP). Fixed with the uncapped list; the CSP being fixed for
+  the page's life is documented.
+- **Failed handshakes can fill host.log**: confirmed. Fixed with the budget, the local-source
+  rule and Retry (`TestDirectHandshakeLogBudget`).
+- **Input after a move lands in the placeholder session**: confirmed as a merge hazard (this
+  branch's input loop only used the agent-wide injector). `inputLoop` now resolves the moved
+  session per message (`inputTarget`) and makes every per-session call on it; the perf-client
+  branch's input acknowledgement (`s.ackInputStream`, `s.sendPong`) must use that session when
+  the branches merge.
+- **The host commits a move before the client agrees**: confirmed. Fixed with the two steps
+  above (`TestMoveConnPending`, Go e2e `TestMoveNotTakenStaysOnRelay`).
+- **The token wording, "moves by itself"**: confirmed; the move.go comments, this section, README
+  and INSTALL say where the token is seen and that the move needs Network path Auto over
+  WebTransport.
 
 ### Verified here
 
 - `TestDirectAddrs` (`internal/host/direct_addrs_test.go`): the owner's interfaces (Ethernet 2
   with IPv4, three IPv6 and link-local, Tailscale, a WSL switch, WireGuard, Teredo, a loopback, a
-  down interface): LAN, two IPv6, Tailscale, VPN, virtual, in that order, the route to the gateway
-  first among its kind, at most eight; `tunnelledLAN` warns for a route through Tailscale to a
-  gateway on the LAN, not for a LAN route or a gateway elsewhere. `TestDirectInfoAddrs`.
+  down interface): every reachable address listened on, the announced ones LAN, two IPv6,
+  Tailscale, VPN, virtual, in that order, the route to the gateway first among its kind, at most
+  eight; `tunnelledLAN` warns for a route through Tailscale to a gateway on the LAN, not for a LAN
+  route or a gateway elsewhere. `TestDirectAddrsRouteAndCaps`: the route as the third IPv6
+  address of its interface, the route on a VPN behind twelve LAN addresses, a Hyper-V external
+  switch with the route or on the gateway's network (LAN) next to WSL's (virtual).
+  `TestDirectScanKeepsPresentSockets`: a new temporary IPv6 address listed first pushes one out
+  of the announced addresses and its socket stays open; the address gone, its socket closes.
+  `TestDirectInfoAddrs`.
 - `TestDirectHandshakeDiagnostics`: the endpoint on 127.0.0.1; a client that refuses the
   certificate is logged (`refused the PC's certificate`, Info), one whose answers a forwarder
   drops is logged (`the PC's answers did not reach it`, after the handshake timeout), a
-  completed one is not. `TestDirectHandshakeWhy`. `TestDirectAdvertisedOnlyWhileBound` still
-  passes with the per-address sockets (a wildcard socket of another program holds them off).
+  completed one is not. `TestDirectHandshakeWhy`. `TestDirectHandshakeLogBudget`: 50 failures
+  from away, Debug only; four local browsers (one twice), four Info lines; 30 more, the budget of
+  20; after the window one line with `count=64`; the 33rd attempt in a second must prove its
+  address. `TestClientClockAttr`: 2 h behind (before the certificate), 20 days ahead (after
+  it), 5 min behind, 30 s (nothing). `TestDirectAdvertisedOnlyWhileBound` still passes with the
+  per-address sockets (a wildcard socket of another program holds them off).
 - `TestOrderDirect` (`internal/gateway/direct_test.go`): browser on the LAN, on the LAN over
   IPv6, on the tailnet, behind a subnet router, away, unknown; `directAddr` lists; an older host
-  (one address); `TestCSPConnectSources` with the extra addresses.
+  (one address); `TestCSPConnectSources` with the extra addresses; `TestCSPCoversEveryCandidate`:
+  eight addresses of the PC and a peer that is none of them, every candidate of five browsers in
+  the worker's CSP.
 - `TestDirectReportSummary` (`internal/proto`). `TestMoveStreamReadsWholeMessages`
-  (`internal/host/move_test.go`, also with `-race`, 30 runs): a control stream across a move
-  reads the old stream's messages to its end, also one sent after the host moved, drops a
-  message its end cut off, then reads the new one; a failed move's swap is taken back.
-- Go e2e `TestDirectReportLogged`: the connect answer's candidates, a relay session's and a
-  direct session's report lines in the host log. `TestSessionMovesToDirect`: a session on the UDP
-  relay moves to the direct path: `resumed` with the same session, one `session started`, one
-  generation, the frames' seqs continuing across the move (relay up to 29, direct from 30), no
-  key frame after it, no new video config, `path=direct` on the move line, input over the new
-  connection, the relay connection closed by the host within 5 s, frames going on; a move with
-  another token refused and the session going on. `TestStreamingPaths` and
-  `TestStreamingPathsSmallMTU` pass with the per-address sockets.
-- Browser E2E "direct path addresses" (Chromium 141 and Chrome 122): `directAddr` "127.0.0.3,
-  127.0.0.1" with a socket swallowing everything on 127.0.0.3: `127.0.0.3: abandoned after 115
-  ms; 127.0.0.1: connected after 13 ms` (the browser started the second 100 ms after the first;
-  the old client waited 2.5 s and took the relay); a refused certificate (wrong hashes in the
-  connect answer): the relay at once, `refused after 7 ms by 127.0.0.1, 192.0.2.2: Opening
-  handshake failed.` in the overlay and the session line, and the host's handshake line `the
-  browser refused the PC's certificate`; lost answers (a proxy that drops the PC's datagrams):
-  `no answer in 2.5 s ...` and the host's line `the browser gave up the handshake: the PC's
-  answers did not reach it` after 4.0 s ("No recent network activity after 4002", Chrome's
-  close). "settings after a failed connection" with the new `direct:` text.
-- Browser E2E "direct path move" (Chromium 141 and Chrome 122): the session starts on the UDP relay with a
-  refused certificate, the first background try (2 s after the welcome) is refused the same way
-  and logged by the host (`direct path: the client's attempt in the background failed ...
-  why="refused after 38 ms by ..."`), and the next try, once the connect answer's hashes are
-  right, moves it 8.1 s later: one `session started`, `session moved to the direct path ...
-  from=relay`, `path=direct` on every later line of the session, no reconnect, no freeze and no
-  key frame request in the page's log in the second after the move, `W` reaching the host over
-  the direct path. (The FFmpeg test encoder restarts for each bitrate change of the rate
-  controller, which raised the bitrate after the move on the starved sandbox; the native
-  helper changes the bitrate live.) `TestRateAcrossMove`: the delay drop of a move (a 20 ms
-  detour gone, old-path reports among the first new ones) lowers nothing.
+  (`internal/host/move_test.go`): a control stream across a move reads the old stream's messages
+  to its end, also one sent after the host moved, drops a message its end cut off, then reads the
+  new one; writes stay on the old stream until the commit; a move not taken is dropped, unless
+  reading reached the new stream (the old one ended). `TestMoveConnPending`: a connection a move
+  waits with has its datagrams read (the first signalled), is not current before the commit,
+  is let go without ending the session; the current connection's end while a move waits lets the
+  move go ahead instead of ending the session; a drop after the current one ended ends it; Close
+  closes a waiting connection too.
+- Go e2e `TestDirectReportLogged`: the connect answer's candidates, a relay session's and a direct
+  session's report lines in the host log, `client_clock="2h0m0s behind the PC's: before the PC's
+  certificate is valid` for a client 2 h behind. `TestSessionMovesToDirect`: a session on the UDP
+  relay moves to the direct path: `resumed` with the same session, no frame on the new connection
+  before the client's ping there, then the move (`taken_ms=321` in one run), one `session
+  started`, one generation, the frames' seqs continuing across the move (relay up to 49, direct
+  from 50), no key frame after it, no new video config, `path=direct` on the move line, input
+  over the new connection, the relay connection closed by the host within 5 s, frames going on; a
+  move with another token refused and the session going on. `TestMoveNotTakenStaysOnRelay`: the
+  client closes the new connection after `resumed` without taking the move: `the move to the
+  direct path was not taken ... on=relay`, no move line, no session end, frames going on over the
+  relay; the next move, taken by the end of the relay control stream, succeeds with one `session
+  started`. `TestStreamingPaths` and `TestStreamingPathsSmallMTU` pass with the per-address
+  sockets.
+- Browser E2E "direct path race (unit)": `raceDirect` from `stream-worker.js` on fake
+  WebTransports: no answer from two addresses (both closed at the deadline; 2 of 2 left open
+  before the fix), the second address answers (it wins, the others closed), the first refuses
+  (the next starts at once and wins).
+- Browser E2E "direct path addresses" and "direct path move": see "Runs".
 - Not verifiable here: Windows' source address choice for a wildcard socket on a PC with a
   Tailscale or VPN route over its LAN, and that per-address sockets answer from the right
   interface there (quic-go on Linux has packet information, so the sandbox's wildcard socket
   answered correctly anyway); the Tailscale route detection on a real tailnet; whether Chrome
   on the owner's client reaches 192.168.5.x:48100 at all (a firewall or isolation between the
-  two PCs).
+  two PCs); how much of the `network` stage the direct path removes on the owner's LAN.
 
 ### Expected gain
 
-On the LAN the media path loses the gateway's hop (and a tunnel detour if there is one): the
-`network` stage p50 should drop from 6-9 ms to about 1-3 ms on a wired LAN, end-to-end latency by
-the same 5-7 ms, and the relay's `cc_lost` bursts go with it. A session that starts on the relay
-moves within the first minute (2-60 s) once the direct path answers.
+The direct path takes the gateway's hop out of the media path. Its cost depends on the route:
+
+- **A plain wired LAN without a detour**: under 1 ms off the `network` stage (two LAN crossings
+  and the gateway LXC's bridge instead of one crossing; the forwarder itself costs tens of
+  microseconds). The stage keeps the stream delivery in quic-go and Chrome (about 1.7 ms or more
+  of the second run's 5 ms floor) and the clock offset's error.
+- **A detour through a tunnel** (the agent's `the PC reaches the gateway through a tunnel` warning,
+  or `Find-NetRoute -RemoteIPAddress 192.168.5.202` showing the Tailscale or VPN interface): the
+  detour's cost both ways, possibly several milliseconds, comes off.
+- **A client on Wi-Fi**: the Wi-Fi hop stays on the direct path, and can explain a 5 ms floor on
+  its own; a wired client is the larger gain there.
+
+In the second run's game sessions the larger stages are elsewhere: capture → encoder submit
+(about 11 ms in game) and transfer (10-12 ms: a frame spread over about one frame interval by the
+pacer), which the host and network work addresses. A session that starts on the relay moves within
+the first minute (2-60 s) once the direct path answers; step 8.0 measures the difference in one
+session, before and after the move.
 
 ### Hardware re-check
 
-- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 8.0. Run the agent
-  after the update and look at its start: `direct WebTransport endpoint listening ... addrs=` must
-  list the LAN address (`Ethernet 2, lan`), ideally with `route to the gateway`; a line `the PC
-  reaches the gateway through a tunnel although the gateway is on the PC's own network` names
-  the cause and the fix (turn off *Use Tailscale subnets*). Connect from the client with Network
-  path Auto and look at the session's `direct path: connected` or `direct path: not used by this
-  session ... why= tried=`; with `no answer`, a line `direct path: a browser's connection failed
-  in its handshake ... the PC's answers did not reach it` means the answers take the tunnel, and
-  no such line means the browser's UDP never reaches the PC (a firewall or antivirus on either
-  PC, Wi-Fi client isolation, a VLAN). Pass: `path=direct` from the start or `session moved to
-  the direct path` within 3 minutes, and the overlay's network stage p50 below the relay's 6-9
-  ms. Send the step's lines and command outputs if not.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 8.0. Say first whether
+  the client PC is on Wi-Fi or wired. Run the agent after the update and look at its start:
+  `direct WebTransport endpoint listening ... addrs=` must list the LAN address (`Ethernet 2,
+  lan`), ideally with `route to the gateway`; a line `the PC reaches the gateway through a tunnel
+  although the gateway is on the PC's own network` names the cause and the fix (turn off *Use
+  Tailscale subnets*). Connect from the client with Network path Auto and look at the session's
+  `direct path: connected` or `direct path: not used by this session ... why= tried=` (and
+  `client_clock=` if present); with `no answer`, a line `direct path: a browser's connection
+  failed in its handshake ... the PC's answers did not reach it` means the answers take the
+  tunnel, and no such line means the browser's UDP never reaches the PC (a firewall or antivirus
+  on either PC, Wi-Fi client isolation, a VLAN); `refused the PC's certificate` with a
+  `client_clock` outside the validity means the client's clock. Pass: `path=direct` from the
+  start or `session moved to the direct path` within 3 minutes. Then the A/B, in one session on an
+  idle desktop: the `network` p50 of the `latency stages` lines with `path=relay` before the move
+  against those with `path=direct` after it, the overlay's round trip before and after, and
+  `cc_lost` / `loss_pct` of the `stream stats` lines before and after (loss that goes on after the
+  move is in the LAN, the Wi-Fi or the client, not the relay). Send the step's lines and command
+  outputs.
 - NVIDIA: unverified (no NVIDIA host available). Test: the same steps on an NVIDIA host; nothing
   in the direct path depends on the GPU. Pass: the same.
 
 ### Runs
 
+The first version's runs (before the review): `go test` of the changed packages, the Go e2e suite
+(16 tests) and the browser E2E's direct path, relay, splice and WebSocket scenarios passed then
+(105 of 106 checks, the one failure a frame pacing check at load 12.7), also "direct path
+addresses" and "direct path move" with Chrome for Testing 122.0.6261.128. The review's runs, on
+commits 4ee0dc9 and c1bf94a:
+
 - `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
-- `go test ./internal/proto/ ./internal/gateway/ ./internal/host/ ./internal/transport/` passes
-  (`internal/host` 122 s). `TestUDPRelayLatencyAndThroughput` (gateway, untouched) failed once
-  while other test runs loaded the machine, and passed when run again.
-- Under the shared lock: `go test ./internal/e2e/` passes (215 s, 16 tests, with
-  `TestDirectReportLogged`, `TestSessionMovesToDirect`, `TestStreamingPaths` and
-  `TestStreamingPathsSmallMTU`). One earlier run that started at load 10-12 failed; only the last
-  30 lines of its output were kept, and they show the agent's tunnel to the gateway timing out
-  (`no recent network activity`) in another test. The run after it (load below 1) passed.
-- Under the lock: `go test -race -count=10 -run 'TestMoveStream|TestRateAcrossMove|TestDirectHandshake'
-  ./internal/host/` passes (76 s). In an earlier run, 1 of the 10 runs of
-  `TestDirectHandshakeDiagnostics` logged a completed handshake at Info, because the client
-  closed it before the PC had read its Finished (`APPLICATION_ERROR`). That is fixed in "Each
-  failed handshake" above.
-- `node --check` passes on `stream-worker.js`, `stream.js` and `browser.mjs`. `make build` passes.
-- Browser E2E under the lock (Chromium 141), with the stream scenarios these changes go through
-  (WebTransport direct, relay and splice, WebSocket relay) plus "ticket refused", "settings after
-  a failed connection", "direct path addresses" and "direct path move": 105 of 106 checks pass.
-  The one failure is "WebTransport direct: frame pacing Smooth without requestAnimationFrame",
-  whose worker saw a 10.3 Hz display refresh while the load rose to 12.7 (other test runs); that
-  check passed in the run before it. Earlier runs of the same set:
-  - 103 of 106. Two failures were "WebSocket relay" frame-rate checks (CPUs 2 % idle). The third
-    was the move check, which reported `later lines path=none`: no session line came in the 4 s
-    after the move, so the check now waits for the next line (stream stats, every 10 s).
-  - Then "direct path addresses" and "direct path move" alone: 14 of 14.
-- The whole browser E2E once, while other test runs held the CPUs: 140 checks passed and 9
-  failed, then the run stopped at a page that did not show its start button within 15 s. All 9
-  were frame-rate and pacing checks of "WebTransport direct" and "WebTransport relay" (the relay
-  scenario's decoder got 0.8 fps, timers 1.7 s late). The same scenarios pass in the runs above.
-- Chrome for Testing 122.0.6261.128 (`E2E_CHROME`, the owner's version), under the lock:
-  - "direct path addresses" and "direct path move": 14 of 14, with the build above. The move
-    happened 8.2 s after the hashes were right, with no freeze and no key frame request, 30 fps
-    after it, and `W` reached the host.
-  - An earlier run with WebTransport direct and relay: those scenarios pass. Three checks fail,
-    all in the client renderer and none on the direct path: "canvas2d draws on a canvas sized to
-    its box" on direct and on relay (`getContextAttributes().desynchronized` is null in 122), and
-    "toolbar ... element fullscreen" on direct (the button click missed; the hotkey worked).
+- `go test` of every package but `internal/e2e`: 20 packages pass (`internal/host` 94 s,
+  `internal/host/media` 96 s, `internal/gateway` 35 s), 2 have no tests; 1 min 46 s.
+- Under the shared lock: `go test ./internal/e2e/...` passes, 17 tests, the 2 netem tests skipped
+  (they run from `test/netem/capdrop.sh`), 217 s, with `TestDirectReportLogged`,
+  `TestSessionMovesToDirect` (`taken_ms=321`), `TestMoveNotTakenStaysOnRelay`,
+  `TestStreamingPaths` and `TestStreamingPathsSmallMTU`.
+- Under the lock: `go test -race ./internal/host/ ./internal/gateway/ ./internal/proto/` passes
+  (367 s, 39 s, 3 s), and `go test -race -count=3` of the three direct path e2e tests passes
+  (34 s).
+- `node --check` passes on the 16 scripts in `web/static/js` and `test/e2e/browser.mjs`.
+  `make build` passes.
+- **`TestUDPRelayLatencyAndThroughput`, an open relay issue.** The first version called its one
+  failure load. The review's runs: it failed 1 of 4 completed runs at load 2.29 on 4 CPUs with
+  `loopback bulk, udp relay: 0 Mbit/s` (direct 2325 Mbit/s), a total stall, not a slowdown. This
+  work's 8 runs under the lock at load 0.8-2.2 all passed: the relay added 21-54 µs at p50, bulk
+  through the relay 650-995 Mbit/s (direct 2289-2318), the lossy 40 Mbit/s case 45.5-46.4 Mbit/s
+  on the relay. How a 0 can come out: the test averages the receiver's 1.0-1.9 s window after it
+  accepts the stream, while the sender stops at 2 s of its own clock (`SetWriteDeadline`, then
+  `CancelWrite`); a start-up stall of about a second on the relayed connection (the media
+  controller pacing at a 2 Gbit/s target into a forwarder that drops what it cannot take, then
+  its loss recovery) leaves that window empty. Whether the forwarder stalls or only the test's
+  sender, the per-bucket counts and the relay's drop counters would tell: for the relay work
+  (perf-net), before remote sessions, which stay on the relay, are called fine. This work does
+  not touch the relay.
+- Browser E2E under the lock (Chromium 141), the scenarios these changes go through ("WebTransport
+  direct", "WebTransport relay", the splice, "WebSocket relay", "ticket refused", "settings after
+  a failed connection", "direct path addresses", "direct path move", "direct path race (unit)"):
+  - First run: 103 of 109. "answers lost on the way back" failed on a timing this work had added
+    to it (the host's line within 3.5 s): the line came at `after_ms=4007`, Chromium's own
+    handshake timeout (above); the expectation was taken back. The other 5 were the relay
+    scenarios' frame rate and telemetry checks on a starved machine (CPUs 17-19 % idle, load 6.1
+    at the end): the splice and WebSocket at 44-52 fps of 60 with the decoder getting 59-61 fps,
+    and 24 % and 16 % of the telemetry dropped behind stalled datagram writes on the relay and the
+    splice (allowed: 15 %).
+  - Second run: 106 of 109: every direct path check, among them "direct path move" (moved 8.2 s
+    after the hashes were right, `taken_ms=2`, one `session started`, no freeze and no key frame
+    request in the second after the move, 29.9 fps after it, `W` reached the host), "direct path
+    addresses" (127.0.0.3 abandoned after 121 ms, 127.0.0.1 connected; the refused certificate;
+    the lost answers, `after_ms=3998`) and the three race unit checks. The 3 failures: the splice
+    and WebSocket relay's frame rate (41-50 fps of 60, the decoder getting 59-60 fps, CPUs 16-21 %
+    idle, load 5.3).
+  - Those two scenarios again: 48 of 51 (the same frame rate checks and the splice's telemetry,
+    CPUs 15-19 % idle), then 51 of 51.
+  The relay, splice and WebSocket scenarios do not move (Network path *Relay via gateway*) and run
+  none of the changed client code but the clock in the hello's report; their failures follow the
+  CPU, as in the runs before.
+- Not re-run: Chrome for Testing 122 (its build is no longer in the scratch directory). The
+  client changes since its runs are the race's closes, a ping at the switch and the clock in the
+  report, none of them new to Chrome 122's API.
