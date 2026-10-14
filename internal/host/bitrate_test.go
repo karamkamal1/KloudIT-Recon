@@ -241,8 +241,10 @@ func TestRateDelayDecrease(t *testing.T) {
 // congestion test) only where the host's own measure of the path's queue
 // (feedback.ackQD) holds at least half of it: the second hardware run's
 // delay decreases on a LAN whose round trips showed no queue were the
-// client's own delays. A queue that stands on the path still decreases;
-// where the acknowledgements are a relay leg's the delay decides alone.
+// client's own delays. A queue that stands on the path still decreases, on
+// the round trips alone (nothing held the sender back: a delay step of the
+// network, the browser E2E's VM check); where the acknowledgements are a
+// relay leg's the delay decides alone.
 func TestRateAckConfirm(t *testing.T) {
 	// 15 ms over the base for 2 s, but round trips at their minimum and
 	// nothing held back: the client's delay.
@@ -265,23 +267,40 @@ func TestRateAckConfirm(t *testing.T) {
 	if d := h.decreases(0); len(d) != 1 {
 		t.Fatalf("decreases %+v with the sender held back, want one", d)
 	}
-	// The same delay in the round trips too: a queue on the path.
+	// The same delay in the round trips too, nothing held back: a queue on
+	// the path (with held, as in the case above, the hold alone decides,
+	// whatever the round trips).
 	h = newCtl(t, 20000, 60, seamless)
 	h.ackQD = after(3*time.Second, time.Millisecond, 14*time.Millisecond)
 	h.run(3*time.Second, flat(20*time.Millisecond))
-	h.held = true
 	h.run(100*time.Millisecond, flat(35*time.Millisecond))
 	if d := h.decreases(0); len(d) != 1 || d[0].why != "delay" || !d[0].basis.ackOK || d[0].basis.ackQD != 14*time.Millisecond {
 		t.Fatalf("decreases %+v, want one on the delay with the round trips' 14 ms", d)
 	}
-	// Half of it in the round trips is enough (a queue one way).
+	// Half of it in the round trips is enough (a queue one way); less is
+	// not.
+	for _, c := range []struct {
+		ack  time.Duration
+		want int
+	}{{8 * time.Millisecond, 1}, {7 * time.Millisecond, 0}} {
+		h = newCtl(t, 20000, 60, seamless)
+		h.ackQD = after(3*time.Second, time.Millisecond, c.ack)
+		h.run(3*time.Second, flat(20*time.Millisecond))
+		h.run(100*time.Millisecond, flat(35*time.Millisecond))
+		if d := h.decreases(0); len(d) != c.want {
+			t.Fatalf("decreases %+v, want %d: %v of 15 ms in the round trips", d, c.want, c.ack)
+		}
+	}
+	// A delay step of the network, 60 ms each way (the browser E2E's VM
+	// check through its impairment proxy): the round trips show twice the
+	// one-way delay's step, and the bitrate goes down at once.
 	h = newCtl(t, 20000, 60, seamless)
-	h.ackQD = after(3*time.Second, time.Millisecond, 8*time.Millisecond)
+	h.ackQD = after(3*time.Second, time.Millisecond, 121*time.Millisecond)
 	h.run(3*time.Second, flat(20*time.Millisecond))
-	h.held = true
-	h.run(100*time.Millisecond, flat(35*time.Millisecond))
-	if d := h.decreases(0); len(d) != 1 {
-		t.Fatalf("decreases %+v, want one: 8 of 15 ms in the round trips", d)
+	h.run(2*time.Second, after(3*time.Second, 20*time.Millisecond, 80*time.Millisecond))
+	if c := h.changes; len(c) == 0 || !c[0].down || c[0].why != "delay" || h.at[0] > 3100*time.Millisecond || h.r.unconfirmedCount() != 0 {
+		t.Fatalf("changes %+v at %v, %d unconfirmed reports: want a delay decrease within 100 ms of the step, none unconfirmed",
+			c, h.at, h.r.unconfirmedCount())
 	}
 	// A relay leg's acknowledgements say nothing of the client's: the delay
 	// decides alone.
@@ -289,7 +308,6 @@ func TestRateAckConfirm(t *testing.T) {
 	h.r.setPath(false)
 	h.ackQD = flat(time.Millisecond)
 	h.run(3*time.Second, flat(20*time.Millisecond))
-	h.held = true
 	h.run(100*time.Millisecond, flat(35*time.Millisecond))
 	if d := h.decreases(0); len(d) != 1 {
 		t.Fatalf("decreases %+v on a relay leg, want one on the delay alone", d)
