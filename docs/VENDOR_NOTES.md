@@ -13299,6 +13299,62 @@ a hardware encoder) not done, for the reason under "Deviations". Checks on the b
   fastest preset (asked: 960×556 at 60 fps): what the CPU keeps up with` and `Audio off`. An
   earlier run of the VM section alone: 11 of 11, the step's cut 30000 to 14077 kbps.
 
+### The merged tree: the delay step missed the stream
+
+With every branch of the second hardware run merged (57d2a40) the VM check failed: `delay step:
+0 "congestion: lowering bitrate" lines`, every toast information. It looked like the rate
+controller's ack-confirm gate ("Second hardware run: pacing, rate control and smoothness")
+refusing the step; it was not.
+
+- **How the step is made.** The E2E's UDP impairment proxy (`impairProxy` in `browser.mjs`)
+  holds every datagram `delayMs` in both directions; the check sets 60 ms for 6 s. That is a step
+  of the path's delay (120 ms more round trip), as a route change or netem's `delay` makes, not a
+  queue that grows; the host's own round trips see all of it.
+- **Why it missed.** The check sent the direct path to the proxy by rewriting the connect
+  answer's `direct.url`; the direct path's branch made the browser race every address of
+  `direct.candidates` (`url` is only for clients before them), so the session went to the host's
+  own port and nothing of it passed the proxy: host.log `direct path: connected ...
+  tried="127.0.0.1:<host port> (override, host config directAddr): connected after 10 ms"`, and
+  the stream stats over the step `ack_queue_p50_ms=0 ack_queue_p95_ms=4`. The 9
+  `delay_unconfirmed` reports of those stats were the sandbox's own delays (the CPU starved by
+  the software encoder and decoder), which the gate rightly did not act on. Neither the gate nor
+  the check's expectation was wrong. The FEC comparison (`E2E_FEC_COMPARE`) had the same rewrite.
+- **The fix** (`browser.mjs` `directViaProxy`): the rewrite sets `url` and the candidates to the
+  proxy alone, for the VM check and the FEC comparison; the VM check also requires the proxy to
+  have carried the stream during the step (its datagram counts) and shows the decrease line's
+  `ack_queue_ms`.
+- **With the step through the proxy** the round trips confirm it (three runs): 5 decreases
+  `why=delay` in the step, `ack_queue_ms` 117-125 against `delay_ms` 30-107 (targets 12-43), in
+  two runs one more `why=loss`; 30000 kbps to 2673-6523; the toast `info: Network congestion:
+  for 10 s ...`, no warning. The same check on the VM branch alone (07944de, before the gate):
+  5 decreases, 30000 to 8764 kbps (`delay`, `thinning`, `delay`, `delay`, `loss`). The merged
+  tree goes lower in the same step mostly through the pacing section's rule that a decrease
+  starts from what the encoder makes, at least 0.7 × the target, when it makes under 60 % of
+  the target (`start=output` in its second and third decreases: the CPU-limited encoder made
+  ~10 Mbit/s at 30), not through the gate.
+- **The Go side.** `TestRateAckConfirm` set the congestion window's hold in its cases where the
+  round trips show the queue, and a hold confirms a delay by itself: with `confirmed()` changed
+  to ignore the round trips the test still passed. Its cases now run without the hold, with the
+  boundary (7 of 15 ms: no decrease) and a 60 ms each-way step (round trips 121 ms over their
+  base: a delay decrease within 100 ms, no report unconfirmed); with that change to
+  `confirmed()` it fails, as does `internal/e2e` `TestStreamingRateReports` (real QUIC, the
+  client's packets delayed: it tests the round trips). The other expectations the pacing branch
+  changed (`TestRelaySimCongestion`'s dip bound, `TestRelaySimStaticDesktop`'s thinning
+  episodes, `TestQueueOverflowEscalates`'s encoder output, `TestMediaPacer`'s tolerance) come from
+  the bursts, thinning episodes that end and `start=output`, as its section says; `runSim`
+  (`TestRateSimCapdrop`, `TestRateSimProfiles`) carries no round-trip measure, so the gate does
+  not act there, and the relay simulations' round trips cross their bottleneck's queue.
+
+Runs (worktree `fix-e2e-vm`): `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet
+./...` pass; `node --check browser.mjs`; `make build`. Under the shared lock: `go test
+./internal/host` (92 s; `TestRelaySimLAN`, `TestRelaySimBurstPaths` and every rate and relay
+simulation among them) and `go test ./internal/e2e/...` (230 s) pass. The browser E2E
+(Chromium 141) under the lock, `vm without a gpu` alone, twice: 11 of 11 each (the proxy carried
+2323 and 2767 datagrams to the browser in the step; 6 decreases each, the first `from=30000
+to=17850 why=delay delay_ms=63` / `66`, `ack_queue_ms=119` / `117`). `E2E_FEC_COMPARE=5
+E2E_FEC_COMPARE_RUNS=1`: 12 of 12, every run through the proxy (the client's minimum round trip
+40.7-44.5 ms at 20 ms each way).
+
 ## Second hardware run: direct path on the LAN
 
 ### What the log shows
