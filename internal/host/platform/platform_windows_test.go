@@ -3,7 +3,9 @@
 package platform
 
 import (
+	"os"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -91,5 +93,32 @@ func TestStockCursorImages(t *testing.T) {
 		if shape.W == 0 || shape.H == 0 || opaque == 0 || opaque == shape.W*shape.H {
 			t.Fatalf("cursor %d: implausible image", id)
 		}
+	}
+}
+
+// TestD3D11VideoDevice opens the Direct3D 11 video device FFmpeg's GPU
+// capture opens first, and lists the adapters: under Wine (no video
+// support, as on a VM without a GPU) the device fails; on a GPU PC it opens.
+func TestD3D11VideoDevice(t *testing.T) {
+	as, err := Adapters()
+	if err != nil {
+		t.Fatalf("adapters: %v", err)
+	}
+	for i, a := range as {
+		t.Logf("adapter %d: %q vendor %s (%#x) software=%v", i, a.Name, a.Vendor, a.VendorID, a.Software)
+	}
+	t.Logf("no GPU: %q", NoGPU(as))
+	start := time.Now()
+	err = D3D11VideoDevice()
+	t.Logf("D3D11 video device: %v (%v)", err, time.Since(start).Round(time.Microsecond))
+}
+
+// TestDesktopState reads this session's state and input desktop: at an
+// unlocked console (and under Wine) the desktop is there.
+func TestDesktopState(t *testing.T) {
+	d := DesktopState()
+	t.Logf("desktop %+v away %q", d, d.Away())
+	if os.Getenv("RECON_TEST_DESKTOP_AWAY") == "" && d.Away() != "" {
+		t.Fatalf("the desktop is away (%s): run this at an unlocked, connected desktop", d.Away())
 	}
 }

@@ -1247,8 +1247,18 @@ The first report came from a Windows VM on Proxmox without a GPU (Windows showed
 *Microsoft Basic Display Adapter*): every stream failed with `Video encoder restarted (encoder
 libx264 exited: [Parsed_ddagrab_0 @ ...] Failed to create D3D11VA device. | ...)`, five toasts
 in a row. Such a PC now captures with GDI (VENDOR_NOTES, "First hardware report: GPU-less VM
-capture"). Run these on that VM (any GPU-less Windows 10/11 VM or PC), signed in on its console;
-items G4 to G6 on the AMD PC.
+capture"). The second report said "the VM is still giving me an error", with no detail; since
+then the VM finds it has no GPU before its first stream, its handled fallbacks are informational
+notices, it waits for a locked or disconnected desktop (moving a disconnected one to the
+console), streams at what its CPU keeps up with and stays quiet without a sound device, and
+`recon-host report` collects what a problem needs (VENDOR_NOTES, "Second hardware run: VM without
+a GPU"). The review of that work found one more toast every stream showed, on the VM and the
+gaming PC alike: the yellow `Network congestion detected — bitrate lowered to X Mbps`, at most
+every 30 s, for the rate controller's routine cuts (now information, and only for a deep cut that
+lasts). Run these on that VM (any GPU-less Windows 10/11 VM or PC), signed in on its console;
+items G4 to G6 on the AMD PC; G7 on the VM again; G8 if the VM gets a GPU passed through. If
+anything on the VM shows an error, run `recon-host report` there and send the file with the
+toast's exact text.
 
 **G1. Probe and install**
 - **Do**: install as in Stage 1 (or `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe`).
@@ -1256,12 +1266,15 @@ items G4 to G6 on the AMD PC.
   `ffmpeg ready` line after the agent starts.
 - **Pass**: `capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU,
   or a graphics driver being installed or reset): using gdigrab (GDI: more CPU and latency)`;
-  `session:    gdigrab (GDI) of the WxH monitor at (0,0), ...` with `-f gdigrab -framerate 60
-  -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size WxH -i desktop` under `libx264`; `helper:     no
-  usable encoder`; one installer warning, `This PC has no GPU screen capture ...` (not also "No GPU
-  encoder works" and the helper's); `ffmpeg ready ... gdigrab=true gpu_capture="unavailable: no
-  Direct3D 11 video device: ..."` (or `gpu_capture=checking` followed by `no GPU screen capture
-  on this PC: sessions capture with GDI`: the agent does not wait for that test).
+  `session:    gdigrab (GDI) of the WxH monitor at (0,0), ...` with `-copyts -fpsprobesize 0 -f
+  gdigrab -framerate 60 -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size WxH -i desktop` and
+  `[0:v]settb=AVTB,format=yuv420p` under `libx264`; `helper:     no usable encoder`; one installer
+  note in cyan, `Note: This PC has no GPU screen capture ...` (no yellow WARNING, not also "No GPU
+  encoder works" and the helper's); host.log at the agent's start: `no GPU screen capture on this
+  PC: sessions capture with GDI (gdigrab)` with `device="ID3D11VideoDevice: HRESULT ..."` (or
+  `D3D11CreateDevice with video support: HRESULT ...`) before `ffmpeg ready ... gdigrab=true
+  gpu_capture="unavailable: no Direct3D 11 video device: ..."` (never `gpu_capture=checking`
+  on such a VM), then `software encoding measured ... superfast_fps=... ultrafast_fps=...`.
 - **If not, send**: the probe output, the installer's output and host.log.
 
 **G2. Stream from the console**
@@ -1270,14 +1283,19 @@ items G4 to G6 on the AMD PC.
   streaming, change the VM's display resolution (Settings > Display, e.g. 1024×768 and back to
   the original), and with Proxmox's console, resize the console window if it resizes the display.
 - **Look at**: the toasts, the overlay (Encoder, fps, latency), host.log, Task Manager on the VM.
-- **Pass**: the picture appears within about 2 s, with one toast, `No GPU screen capture on this PC
-  (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or
-  reset): capturing with GDI, which uses more CPU and adds latency.`; no `Video encoder restarted`.
-  Encoder `libx264`; the stream holds its frame rate at 1280×720 (record fps, capture→drawn p50/p95
-  and the VM's CPU use at the defaults and at 1280×720@30). The pointer moves where you click
-  (desktop mouse mode), on the right monitor with two. host.log: `video pipeline pipeline=ffmpeg ...
-  reason="it has no usable encoder"` (one helper launch, no `trying another backend`), `capturing
-  with GDI (gdigrab)`, `starting encoder gen=1 ... capture=gdigrab`, no `encoder failed`. After
+- **Pass**: the picture appears within about 2 s, with an informational toast (a plain border,
+  not a warning's yellow or an error's red one) `No GPU screen capture on this PC (no Direct3D 11 video device: a PC or VM without a GPU, or
+  a graphics driver being installed or reset): capturing with GDI, which uses more CPU and adds
+  latency.`, and, where the CPU budget limits the stream, a second informational one `This stream
+  encodes video on the CPU (libx264: no GPU encoder for it), which keeps up with ...`; no `Video encoder
+  restarted`, no error toast. Encoder `libx264`; the overlay's *CPU limit* row (when limited)
+  says what streams and what was asked for; the stream holds the frame rate it shows (record
+  fps, capture→drawn p50/p95, the overlay's capture→encoded p50 and the VM's CPU use at the
+  defaults and at 1280×720@30). The pointer moves where you click (desktop mouse mode), on the
+  right monitor with two. host.log: `video pipeline pipeline=ffmpeg ... reason="no GPU encoder can
+  work: Windows lists no GPU, only Microsoft Basic Render Driver"` (no helper launch at all),
+  `capturing with GDI (gdigrab)`, `cpu budget: software encoding rung=N asked=... streams=...`,
+  `starting encoder gen=1 ... capture=gdigrab`, no `encoder failed`. After
   each resolution change the picture shows the whole desktop at its new size within about 2 s
   (no black bars, nothing cut off), and clicks land where they should; host.log `display changed
   monitor="WxH at (0,0) is now W'xH' at (0,0)"`, `restarting video reason="display changed"`
@@ -1293,10 +1311,27 @@ items G4 to G6 on the AMD PC.
   with GDI`).
 - **Pass**: RDP connected: the stream shows the RDP session's desktop (with GDI); resizing the
   RDP client's window (which resizes the session) restarts the stream at the new size as in G2.
-  Disconnected: no capture works (record what happens: a black picture, or failures such as
-  `Screen capture failed, retrying: GDI screen capture failed: is the session locked or
-  disconnected?`), and each kind of failure shows one toast, not a stack. After `tscon`: the
-  stream works as in G2, at the console's size.
+  Disconnected (the RDP client closed): connecting from the browser moves the session to the
+  console by itself, a second after the start (one informational toast `This PC's Windows session
+  was disconnected (a remote desktop client closed): it was moved to the PC's console (session N)
+  to stream it, where it shows unlocked (on a VM: in the hypervisor's console).`; host.log `no
+  desktop on a screen at the session's start reason=disconnected` then, as a warning, `moved the
+  disconnected session to the console (as tscon <session> /dest:console): the console shows it
+  unlocked because="a virtual machine (QEMU ...)"`), and the stream works as in G2 at the
+  console's size, the console showing the unlocked desktop. Close the RDP client while streaming:
+  the stream pauses for two or three seconds and comes back the same way. Hide the browser tab
+  (another tab in front) and close the RDP client: no move while the tab is hidden (no `moved the
+  disconnected session` line); show the tab again and the move follows within about 2 s. If the
+  VM's firmware does not name a hypervisor (`recon-host report`'s `machine:` line; Proxmox can
+  set custom SMBIOS strings) and it has a GPU, it waits as with `off`; set `"consoleSession":
+  "on"`. With
+  `"consoleSession": "off"`: the stream waits with the informational toast `This PC's Windows
+  session has no screen: ... run "tscon N /dest:console" ...` and no error; after the `tscon` by
+  hand it comes back within a second. Lock the VM (Win+L in the stream, or the console's lock):
+  one informational toast `The PC is locked: ...`, no `Video encoder keeps failing` however long
+  it stays locked; sign in on the console and the stream is back within a second or two
+  (host.log `the session's desktop is back was=locked waiting=true`, `restarting video
+  reason="the desktop is back"`).
 - **If not, send**: host.log and what the browser showed in each case.
 
 **G4. A GPU PC keeps Desktop Duplication through outages (AMD PC)**
@@ -1316,8 +1351,9 @@ items G4 to G6 on the AMD PC.
   remote_session=false`, or other failures); if the session moved to GDI, it is back on
   ddagrab within about a minute after the monitor is on again (`Desktop Duplication captures the
   session's display again`, `GPU screen capture works again: capturing on the GPU.`). A lock
-  screen that lasts longer than the session's seven restarts (about 10 s) ends the session as
-  before (`video encoder keeps failing`).
+  screen or UAC prompt that lasts longer than 10 s no longer ends the session: one informational
+  toast (`The PC is locked: ...` / `The PC shows a secure screen ...`), the stream back on ddagrab
+  within a second or two of signing in (`restarting video reason="the desktop is back"`).
 - **If not, send**: host.log.
 
 **G5. Remote desktop into the GPU PC (AMD PC)**
@@ -1336,7 +1372,14 @@ items G4 to G6 on the AMD PC.
   from the console after that starts on ddagrab, or returns to it within a second or two of its
   start. Also restart the agent while signed in over RDP (`Stop-ScheduledTask` /
   `Start-ScheduledTask`), tscon to the console and connect after a minute: the stream returns to
-  ddagrab within its first seconds.
+  ddagrab within its first seconds. Last, close the RDP client while streaming (no `tscon`): with
+  the default `"consoleSession": "auto"` the gaming PC (a GPU, no hypervisor) is not moved to the
+  console: the stream waits with one informational toast ending `(Not moved to the console by
+  itself: on a PC with a GPU its own monitor would show the unlocked desktop; host config
+  "consoleSession" "on" allows it.)` and no `moved the disconnected session` line. With
+  `"consoleSession": "on"` the same gives the warning line `moved the disconnected session to the
+  console ... because="host config \"consoleSession\" is \"on\""` about 2 s after the close,
+  and the stream comes back.
 - **If not, send**: host.log.
 
 **G6. A graphics driver reset during a stream (AMD PC)**
@@ -1353,6 +1396,54 @@ items G4 to G6 on the AMD PC.
   responding.`: AcquireNextFrame 887a0005/887a0006/887a0007 in host.log), not a display mode
   change. The next session starts on ddagrab.
 - **If not, send**: host.log.
+
+**G7. The second report's VM: no error, the CPU budget, sound, the report (VM without a GPU)**
+- **Do**: on the VM (2 vCPUs if you can set it, then 4), with this build: run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe"
+  report` first and keep the file. Connect from the browser at the defaults (1920×1080 or the
+  VM's resolution, 60 fps); play a video full screen on the VM (a YouTube video in Edge) for two
+  minutes; open the overlay (Ctrl+Alt+Shift+S). Then close the video and leave the desktop idle for
+  three minutes. Repeat with the VM's sound device removed (Proxmox: no Audio Device) if it has
+  one, and with it added.
+- **Look at**: the toasts (any with a red or yellow border is a failure: note its text), the overlay's
+  *Encoder*, *CPU limit*, *Frame rate*, *Audio* and latency rows, host.log's `software encoding
+  measured`, `cpu budget:` and `audio:` lines, and the report file.
+- **Pass**: no error or warning toast at all on the VM (in particular no `Network congestion
+  detected` toast: an informational `Network congestion: for N s the network has carried less
+  than half ...` is allowed only with a matching run of host.log `congestion: lowering bitrate
+  why=...` lines bringing `to=` below half of `kbps_max`; note any congestion toast with the
+  `congestion: lowering bitrate why=...` lines around its time); the overlay's *CPU limit* row
+  (when the CPU limits) and its frame rate agree, and while the video plays the
+  *capture→encoded* p50 stays under about 3 frame intervals (50 ms at 60 fps, 100 ms at 30).
+  host.log's `software encoding measured` line has `gdi_grab_fps=` with a number (not `not
+  measured`), and a few minutes after the agent's start, with no stream, `software encoding
+  measured again` with `best=`. Count the `cpu budget: the CPU does not keep up, stepping down`
+  lines in each session's first 10 s (from its `session started`): more than 0 means the first
+  rung was too high (send the `software encoding measured` lines and the `cpu budget: software
+  encoding rung=` line with it); later ones (if any) come with `measured="F of N fps,
+  capture→encoded p50 X ms"`, and after the video ends a `cpu budget: the CPU keeps up, trying the
+  rung above` within a few minutes. With no sound device: the *Audio* row says `off: no sound output device on
+  the PC`, host.log has one `audio: no sound output device on this PC` line (no repeated `audio
+  capture stopped` warnings); with one: audio plays. The report has the `machine:` line naming the
+  hypervisor, `Direct3D 11 video device: unavailable (...)`, the `cpu:` line, the host config with
+  `"token": "[redacted]"` and `"gatewayPin": "[redacted]"`, and the end of host.log; search it for
+  your token (host.json's `token`) and the pairing code: neither may appear.
+- **If not, send**: the report file (it is made to be sent), a screenshot of the overlay, and the
+  text of any toast.
+
+**G8. A VM with a passed-through GPU captures on that GPU (VM with GPU passthrough)**
+- **Do**: give the VM a GPU (Proxmox: Hardware > Add > PCI Device), install its driver, connect a
+  monitor or an HDMI/DisplayPort dummy plug to that GPU and set the VM's *Display* to `none` (or
+  keep Proxmox's display and make the GPU's output the main display in Windows' display
+  settings). Restart the agent and stream; then once with Proxmox's display as the main one.
+- **Look at**: `recon-host probe`, host.log's `video pipeline` and `starting encoder` lines, the
+  overlay's *Encoder* and *Capture* rows.
+- **Pass**: with the GPU's output as the desktop: the probe lists the GPU's encoders and no
+  `ddagrab unavailable`; host.log `video pipeline pipeline=helper` with the GPU's adapter (or,
+  through FFmpeg, `starting encoder ... capture=ddagrab`), no `capturing with GDI (gdigrab)`, no
+  `cpu budget:` and no `software encoding measured` lines. With Proxmox's display as the main one:
+  record what happens (expected: `capturing with GDI (gdigrab)` with a GPU encoder, or the
+  helper's `the monitor ... is on` another adapter); the docs' advice is the first setup.
+- **If not, send**: the probe output, host.log and `recon-host report`.
 
 ## Not covered by these two hosts
 

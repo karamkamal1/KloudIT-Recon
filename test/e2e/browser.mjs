@@ -2524,6 +2524,76 @@ async function checkTornControl() {
   await endStream();
 }
 
+// A VM without a GPU (second hardware run): the host plays one (test hook
+// vm): no sound device, and a CPU measured to keep up with the test pattern
+// at 30 fps with the fastest preset (the CPU budget). The stream works with
+// no warning or error toast from its start to its end: the budget's notice
+// is informational, the overlay shows the limit and why audio is off. The
+// direct path runs through the impairment proxy (impairProxy), which adds a
+// delay step of 60 ms each way for 6 s: queueing delay as on the owner's LAN
+// (13-46 ms in the second hardware run), larger. The rate controller lowers
+// the bitrate for it (host.log "congestion: lowering bitrate why=delay");
+// that used to show the warning "Network congestion detected" every 30 s,
+// which a check of the toasts at the stream's start never saw.
+async function checkVM() {
+  const host = await restartHost({ RECON_TEST_FAULTS: 'vm' }, 'host-vm');
+  const rewrite = async (route) => {
+    const resp = await route.fetch();
+    const body = await resp.json();
+    if (body.direct?.url) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${fecProxyPort}/wt`);
+    await route.fulfill({ response: resp, json: body });
+  };
+  await ctx.route('**/api/hosts/*/connect', rewrite);
+  try {
+    Object.assign(fecImpair, { delayMs: 0, loss: 0 });
+    await page.goto(`${base}/`);
+    await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { stats: true, ...PREFS_2D, path: 'direct', transport: 'auto' });
+    await page.click('.host.online a.btn-primary');
+    await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    // Every toast of the stream, with its level (class), from before its
+    // start to its end (a toast stays 6 s).
+    await page.evaluate(() => {
+      window.__toastLog = [];
+      new MutationObserver(() => {
+        for (const t of document.querySelectorAll('#toasts .toast')) {
+          if (!window.__toastLog.some((x) => x.text === t.textContent)) window.__toastLog.push({ cls: t.className, text: t.textContent });
+        }
+      }).observe(document.body, { childList: true, subtree: true });
+    });
+    await page.click('#btn-start');
+    await page.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    await until(async () => (await page.textContent('#stats').catch(() => '')).includes('CPU limit'), 15000, 'the CPU limit row').catch(() => {});
+    const overlay = await page.textContent('#stats').catch(() => '');
+    await sleep(3000);
+    const log0 = host.log.length;
+    Object.assign(fecImpair, { delayMs: 60 });
+    await sleep(6000);
+    Object.assign(fecImpair, { delayMs: 0 });
+    await sleep(8000);
+    const cuts = host.log.slice(log0).match(/msg="congestion: lowering bitrate"[^\n]*/g) || [];
+    const playing = await page.evaluate(() => window.__recon.streaming && (window.__recon.lastStats?.fps || 0) > 5);
+    const toasts = await page.evaluate(() => window.__toastLog);
+    const cpu = toasts.find((t) => t.text.startsWith('This stream encodes video on the CPU'));
+    const bad = toasts.filter((t) => /\b(warn|error)\b/.test(t.cls) && !t.text.startsWith('Renderer'));
+    const limit = (overlay.match(/\d+×\d+ at \d+ fps, fastest preset \(asked: [^)]*\): what the CPU keeps up with/) || [''])[0];
+    const audioOff = overlay.includes('off: no sound output device on the PC');
+    const logged = /msg="cpu budget: software encoding"[^\n]* rung=3 /.test(host.log) && /audio: no sound output device on this PC/.test(host.log);
+    check('VM without a GPU (test hook vm): the stream works with an informational CPU-limit notice and no warning or error toast from start to end, ' +
+      'also through a delay step the rate controller lowers the bitrate for; the overlay shows the CPU limit and why audio is off',
+    !!cpu && cpu.cls.includes('info') && !bad.length && cuts.length > 0 && playing && /at 30 fps, fastest preset \(asked: \d+×\d+ at 60 fps\)/.test(limit) &&
+      audioOff && logged,
+    `CPU notice ${cpu ? `"${cpu.cls}"` : 'missing'}; warning/error toasts ${JSON.stringify(bad.map((t) => t.text.slice(0, 80)))}; ` +
+      `all toasts ${JSON.stringify(toasts.map((t) => `${t.cls.replace('toast', '').trim() || 'plain'}: ${t.text.slice(0, 50)}`))}; ` +
+      `delay step: ${cuts.length} "congestion: lowering bitrate" lines (${(cuts[0] || '').replace(/^.*?from=/, 'from=').slice(0, 90)}), playing after it ${playing}; ` +
+      `overlay "${limit}", audio off ${audioOff}; host log ${logged ? 'has' : 'lacks'} the budget's and the sound device's lines`);
+  } finally {
+    Object.assign(fecImpair, { delayMs: 0, loss: 0 });
+    await ctx.unroute('**/api/hosts/*/connect', rewrite);
+    await endStream();
+    await restartHost({}, 'host-after-vm');
+  }
+}
+
 // Control and input before the hello (final review): the page may send
 // control messages and input as soon as the transport is up, while the
 // worker's hello still waits for the decoder self-test, and the host takes
@@ -5056,6 +5126,7 @@ try {
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
   if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
+  if (want('vm without a gpu')) await checkVM().catch((e) => check('VM without a GPU scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
   if (want('paste dialog')) await checkPasteDialog().catch((e) => check('paste dialog scenario', false, e.message));

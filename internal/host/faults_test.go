@@ -76,6 +76,9 @@ func TestParseTestFaults(t *testing.T) {
 	if f, err := parseTestFaults("fec-loss=0.03"); err != nil || f != (testFaults{fecLoss: 0.03}) || !f.active() {
 		t.Fatalf("fec-loss: %+v %v", f, err)
 	}
+	if f, err := parseTestFaults("vm"); err != nil || f != (testFaults{vm: true}) || !f.active() {
+		t.Fatalf("vm: %+v %v", f, err)
+	}
 	if f, err := parseTestFaults("refuse-tickets,torn-control"); err != nil || f != (testFaults{refuseTickets: true, tornControl: true}) || !f.active() {
 		t.Fatalf("refuse-tickets, torn-control: %+v %v", f, err)
 	}
@@ -85,7 +88,7 @@ func TestParseTestFaults(t *testing.T) {
 		"still", "still=60", "still=after:0", "still=after:x", "still=every:60", "no-window=1",
 		"rate-period=1s", // the 1.5 controller's hook, gone with it (GUIDE 2.2)
 		"thin", "thin=every:10", "thin=every:10:for:10", "thin=every:10:for:0", "thin=every:1:for:1", "thin=each:10:for:3",
-		"pre-stage-hold=1", "rumble-echo=1", "refuse-tickets=1", "torn-control=1", "fec-loss", "fec-loss=0", "fec-loss=0.6", "fec-loss=3%"} {
+		"pre-stage-hold=1", "rumble-echo=1", "refuse-tickets=1", "torn-control=1", "vm=1", "fec-loss", "fec-loss=0", "fec-loss=0.6", "fec-loss=3%"} {
 		if _, err := parseTestFaults(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

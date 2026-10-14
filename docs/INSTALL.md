@@ -281,7 +281,7 @@ PC's card then shows **Online**.
 | If you see… | Do this |
 |---|---|
 | `NVENC needs a newer NVIDIA driver` / `No GPU encoder works` | Update the graphics driver, then `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'`. The `unusable:` lines say why each GPU encoder failed. |
-| `This PC has no GPU screen capture` (`capture: ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): using gdigrab`) | Expected on a PC or virtual machine without a graphics card (Windows shows only the *Microsoft Basic Display Adapter*): streams work, captured with GDI and encoded on the CPU, with more latency and CPU use. See "Running on a PC or VM without a GPU" in the README. A PC with a GPU: install its driver, then run the installer again. |
+| `This PC has no GPU screen capture` (`capture: ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): using gdigrab`) | Expected on a PC or virtual machine without a graphics card (Windows shows only the *Microsoft Basic Display Adapter*): streams work, captured with GDI and encoded on the CPU at the frame rate and size the CPU keeps up with, with more latency and CPU use. See "Running on a PC or VM without a GPU" in the README. A PC with a GPU: install its driver, then run the installer again. |
 | `The native encoder helper (recon-encoder.exe) cannot encode on this PC` (`helper: no usable encoder`, `does not run` or `not installed`) | Streams still work, through FFmpeg, but a lost frame costs a key frame and bitrate changes restart the encoder. The `unavailable:` lines under `helper:` say why for each backend (`amf`, `nvenc`, `lavc`). Usually: update the graphics driver (NVIDIA needs 570 or newer), then restart the agent as above. `not installed`: the bundle had no `recon-encoder.exe` (a self-built one without mingw-w64); use the CI bundle. |
 | `Network '…' is set to Public` | Run the `Set-NetConnectionProfile` command it prints (see step 6). |
 | `has not reached the gateway yet` | Check `Test-NetConnection 192.168.1.50 -Port 8443` (TCP). The agent itself needs **UDP** 8443, which third-party firewalls or VPN clients can block. Also check that the pairing code was created while browsing via `https://192.168.1.50:8443`. |
@@ -370,15 +370,29 @@ Windows' *Microsoft Basic Display Adapter*), or a GPU whose driver is missing. A
 before this version kept retrying the GPU capture; this version captures with GDI instead and
 says so once (`No GPU screen capture on this PC (no Direct3D 11 video device: a PC or VM without
 a GPU, or a graphics driver being installed or reset): capturing with GDI, which uses more CPU
-and adds latency.`). Upgrade the agent (see Upgrading). `host.log` then has `ffmpeg ready ...
-gdigrab=true gpu_capture="unavailable: no Direct3D 11 video device: ..."` at the start (or
-`gpu_capture=checking` and, a moment later, `no GPU screen capture on this PC: sessions capture
-with GDI`) and
-`capturing with GDI (gdigrab)` per stream; a stream whose GPU capture fails this way after the
-start logs `GPU screen capture failed: capturing with GDI (gdigrab)` with FFmpeg's line
-(`ffmpeg="Failed to create D3D11VA device."`). Sign in on the VM's console, or keep a remote
-desktop session connected: a disconnected remote desktop session has no display to capture
-(README, "Running on a PC or VM without a GPU").
+and adds latency.`, an informational notice). Upgrade the agent (see Upgrading). `host.log`
+then has `no GPU screen capture on this PC: sessions capture with GDI (gdigrab)` and `ffmpeg
+ready ... gdigrab=true gpu_capture="unavailable: no Direct3D 11 video device: ..."` at the start
+(the agent opens the device itself, so the first stream already captures with GDI), `software
+encoding measured` with what the CPU encodes and how fast GDI grabs the screen (`gdi_grab_fps`;
+measured again while nothing streams), and `capturing with GDI (gdigrab)` and `cpu budget:
+software encoding` per stream; a stream whose GPU capture fails this way after the start logs
+`GPU screen capture failed: capturing with GDI (gdigrab)` with FFmpeg's line (`ffmpeg="Failed to
+create D3D11VA device."`). A remote desktop session left disconnected is moved to the console
+while a stream plays, on a VM or a PC without a GPU (the console then shows it unlocked; host
+config `"consoleSession": "on"` does it on any PC, `"off"` never); a locked session is waited for
+(README, "Running on a PC or VM without a GPU"). A VM with a passed-through GPU captures on that
+GPU only when Windows shows the desktop on the GPU's output: connect a monitor or a dummy plug to
+it and set the VM's Display to `none` (README, "With GPU passthrough").
+
+**Anything else that goes wrong on the PC, a VM in particular.** Run `& "$env:ProgramFiles\KlouditRecon\recon-host.exe"
+report` in PowerShell on it. It writes `recon-report-<PC>-<time>.txt` to your desktop (the one
+Explorer shows, OneDrive's included; else the temporary folder) and prints the path: versions,
+Windows and the machine (a VM names its hypervisor), the session's desktop (locked, remote,
+disconnected), the GPUs and the Direct3D 11 video device, monitors, the sound device, the host
+config, the probe's output, what the CPU encodes, and the last 400 lines of host.log. It has no
+tokens, keys or passwords. Send it with what you saw (`-quick` leaves out the probe, which takes
+up to a minute; `-o <file>` writes elsewhere).
 
 **On the PC, for the best results** (GUIDE section 12):
 
@@ -539,6 +553,7 @@ in the bundle). Check these once:
 | Proxmox node | `pct enter 210` | Shell inside the container (it has no root password) |
 | PC | `Get-Content "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Tail 30` | Agent log |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" probe` | FFmpeg version, encoders (with their FFmpeg command lines), the native encoder helper's backend and codecs (`helper:`), monitors, controllers |
+| PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" report` | One text file on your desktop to send with a problem: versions, the machine, desktop state, GPUs, sound, config, probe, the end of host.log; no tokens, keys or passwords |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" qualify` | Measure the native encoder's live bitrate changes (about 70 min on AMD, 25 on NVIDIA; `-quality balanced` a third of that; no stream running); sessions use the results (`live-bitrate.json`) |
 | PC | `Stop-ScheduledTask 'KloudIT Recon Host'; Start-ScheduledTask 'KloudIT Recon Host'` | Restart the agent |
 | PC | `& "$env:ProgramFiles\KlouditRecon\recon-host.exe" vdisplay -mode 2560x1440@120 -hold 30s` | Create a virtual display for 30 s and restore the displays (stop the agent first) |

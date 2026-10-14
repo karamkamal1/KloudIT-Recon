@@ -241,6 +241,12 @@ type VideoConfig struct {
 	ColorSpace  *ColorSpace  `json:"colorSpace,omitempty"`
 	HDRMetadata *HDRMetadata `json:"hdrMetadata,omitempty"`
 	HDRNote     string       `json:"hdrNote,omitempty"`
+	// CPULimit says, for a generation encoded on the host's CPU (no GPU
+	// encoder), that it streams below the client's settings because the CPU
+	// keeps up with no more: "1280×720 at 30 fps, fastest preset (asked:
+	// 1920×1080 at 60 fps): ..." (the client's overlay shows it); omitted
+	// otherwise.
+	CPULimit string `json:"cpuLimit,omitempty"`
 }
 
 // ColorSpace is a stream's colour description in WebCodecs' VideoColorSpaceInit
@@ -341,6 +347,10 @@ type AudioConfig struct {
 	// frame duration, step 4.6): its sequence numbers go on. Any other
 	// config announces a new stream, numbered from 0.
 	SameStream bool `json:"sameStream,omitempty"`
+	// Reason says why audio is off where the client asked for it (Enabled
+	// false): the PC has no sound output device (a VM without one). The
+	// host enables it again, as a new stream, once one delivers audio.
+	Reason string `json:"reason,omitempty"`
 }
 
 // CursorShape carries a cursor image (PNG, base64) for local cursor rendering.

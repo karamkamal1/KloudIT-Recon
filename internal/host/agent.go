@@ -62,6 +62,9 @@ type Agent struct {
 	vd *vdisplay.Manager
 	// gpuCap: whether FFmpeg's GPU capture works on this PC (gdi.go).
 	gpuCap gpuCaptureState
+	// bench: what this PC's CPU encodes, where it has no GPU encoder
+	// (cpubudget.go).
+	bench cpuBench
 
 	padsMu  sync.Mutex
 	pads    *platform.Gamepads
@@ -203,6 +206,7 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 	}
 	a.setupHelper()
+	a.startCPUBench(ctx) // in the background, where sessions encode on the CPU
 	a.setupVirtualDisplays(newVirtualDisplays(a.virtualDisplayOptions()))
 	if v := os.Getenv(TestFaultsEnv); v != "" {
 		if a.faults, err = parseTestFaults(v); err != nil {
@@ -213,6 +217,9 @@ func NewAgent(ctx context.Context, cfg *Config, log *slog.Logger) (*Agent, error
 		}
 		if a.faults.refRecovery {
 			caps.UseTestRecovery()
+		}
+		if a.faults.vm {
+			a.vmFaults()
 		}
 		log.Warn("TEST fault injection is on: video frames are delayed and dropped on purpose", TestFaultsEnv, v)
 	}

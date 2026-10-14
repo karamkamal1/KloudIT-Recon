@@ -12926,3 +12926,375 @@ power-on changed the mode (the capture loss right after).
   decoder's backlog reset (`generation 3 replaced it`), both timing under a starved CPU, neither
   in code these changes touch. The one re-run: 317 of 317 (10 min), "WebGPU HDR10" with
   `BT.601 patch codes` (the sandbox's FFmpeg 6.1).
+
+## Second hardware run: VM without a GPU
+
+The owner's second report (build 20a5043) says "the VM is still giving me an error", with no
+screenshot or log. The code of that build was read for every way a GPU-less Windows VM can still
+fail or show an error, and each was reproduced where the sandbox allows (Wine 9 with the Windows
+FFmpeg 8.1 build `n8.1.3-14-g330caae0c1-20261006`, Xvfb, no GPU, no sound server; Linux FFmpeg
+6.1 for the encoder timings; the browser E2E with a test hook). Why the VM still showed an error
+or lagged, by likelihood:
+
+1. **Every stream showed warning toasts.** On a VM that streams fine the client drew `No GPU
+   screen capture on this PC (...): capturing with GDI ...` as a yellow warning (notice level
+   `warn`), once per stream, besides the installer's yellow `WARNING: This PC has no GPU screen
+   capture`. A handled fallback read as the error. And (found by the review of this work, on
+   the VM and the gaming PC alike) every decrease of the rate controller sent the yellow warning
+   `Network congestion detected — bitrate lowered to X Mbps`, at most once every 30 s: the
+   owner's second run on the same LAN has 36 `congestion: lowering bitrate` lines in 45 minutes
+   (35 `why=delay` with `delay_ms` 13-46 against `delay_target_ms` 8-33, the first at new.log:68,
+   and the default level logs at most one per 10 s), routine cuts of a few percent that the
+   controller raises again seconds later. The VM's FFmpeg sessions run the same controller over
+   the same relay path, so a VM stream that played well showed a yellow toast every half minute.
+2. **A remote desktop client closed, or the VM locked: the session ended with an error.** The
+   agent captures only its own Windows session's desktop while that is on a screen. Closing an
+   RDP client (the usual way to reach a VM) leaves the session disconnected (no display at all),
+   and a locked session or a UAC prompt shows the Winlogon desktop, which only SYSTEM may open:
+   every generation failed (gdigrab `Failed to capture image`, ddagrab `Desktop duplication
+   access denied`) and after seven in a row, about 10 s, the session ended with `Video encoder
+   keeps failing`, an error toast.
+3. **The CPU did not keep up: hundreds of milliseconds of lag.** Without a GPU every frame is
+   captured (GDI's BitBlt), converted and encoded (libx264) on the CPU, and the client asks for
+   1920×1080 at 60 fps. On two 2.8 GHz Xeon vCPUs with nothing else running, libx264 `superfast`
+   `zerolatency` with a moving 1080p source made 57 fps (`ultrafast` 76; 720p 121 and 142; 960×540
+   `ultrafast` 235), before GDI and the desktop take their share; GDI's grab itself is a BitBlt of
+   the whole monitor every frame, whatever size streams. Where the encoder falls behind, FFmpeg's
+   thread queues (8 packets from the capture, 8 frames into the filters, 8 into the encoder;
+   `ffmpeg_sched.c`) fill and every frame waits behind them. The review's interleaved A/B, under
+   the E2E lock, the same conditions for every run: the Windows FFmpeg 8.1 under Wine 9, gdigrab
+   of a 1920×1080 Xvfb desktop with a moving 60 fps picture, the session's libx264 arguments,
+   everything pinned to CPUs 0,1, the grab→encoded lag from gdigrab's own pts (`-copyts`) against
+   each frame's arrival, 2 repetitions each (p50/p95):
+
+   | run | delivered | grab→encoded p50 | p95 |
+   |---|---|---|---|
+   | 1080p60 superfast (the settings, before) | 23-27 fps | 347-383 ms | 564-711 ms |
+   | 1080p45 ultrafast (the first rung the encoder measurement alone chose) | 28-29 of 45 fps | 74-76 ms | 108-139 ms |
+   | 1080p30 ultrafast (the first rung now) | 27-28 fps | 64-68 ms | 113-122 ms |
+   | 720p30 ultrafast | 27-29 fps | 52-54 ms | 80-104 ms |
+   | gdigrab alone at 60 fps, no encoder | 39-43 fps | 25-32 ms | 48-76 ms |
+   | gdigrab alone at 30 fps | 26-29 fps | 26-44 ms | 55-105 ms |
+
+   So the settings cost about 350 ms more than a rung the CPU keeps up with, and GDI's grab alone
+   tops out near 40 fps at 1080p there. (The runs this work first reported, `lag-*.txt` of 2.3-3.3
+   fps at the budget's rungs with p50 222-340 ms, ran outside the lock while other agents' tests
+   used the CPUs: contention, not the rungs; the "16 fps, p50 219 ms" run the same.) And the
+   client's capture→encoded row did not show most of it: the capture stamp was taken in the
+   filters (`setpts=time(0)`), after the capture's queue.
+4. **The first stream after the agent's start could fail first.** The finding "no Direct3D 11
+   video device" came only from FFmpeg's ddagrab test, in the background; a test that timed out
+   (a slow VM at logon) or had not ended when a stream started left the session on ddagrab, which
+   failed once (`Failed to create D3D11VA device`) before it moved to GDI, as on the gaming PC's
+   inconclusive `Desktop duplication access denied` at 22:22:09.
+5. **No sound device: a warning every 5 s.** Proxmox adds no audio device by default and Windows
+   Server keeps the Windows Audio service off; WASAPI's GetDefaultAudioEndpoint then fails with
+   E_NOTFOUND, and host.log got `audio capture stopped, restarting` as a warning every 5 s for as
+   long as the agent ran, while the overlay showed an Opus stream with nothing in it.
+6. **The native helper was launched at every session start** only to report `no usable encoder`
+   (about a second each on a small VM).
+
+What changed (each its own commit; the area is `internal/host` unless named):
+
+- **Informational notices** (`gdi.go`, `session.go`): the GDI fallback's notices and the codec
+  fallback's (`Codec X is not available end-to-end`) have level `info`; the client draws them as
+  information. The installer prints a cyan `Note: This PC has no GPU screen capture ...`
+  instead of a yellow WARNING, and names `recon-host report` at its end.
+- **The congestion notice** (`congestnote.go`, review): the rate controller's decreases no longer
+  each send a warning. The user is told only of a bitrate below half its ceiling (the settings'
+  bitrate) for 10 s, once per such spell and at most every 30 s, as information: `Network
+  congestion: for N s the network has carried less than half the bitrate set; streaming at X Mbps
+  instead of Y Mbps. ...`. host.log's `congestion: lowering bitrate` lines are unchanged.
+- **The session's desktop** (`desktop.go`, `platform/desktop_windows.go`): each session reads its
+  session's state every second (WTSSessionInfoEx: disconnected, locked; OpenInputDesktop:
+  `Default` or a secure desktop). A generation that fails while the desktop is away waits for
+  it: the failure does not count (against the session, its encoder or its capture), one
+  informational notice per spell says why and what brings the picture back (`The PC is locked:
+  ...`, `The PC shows a secure screen ...`, `This PC's Windows session has no screen: ... run
+  "tscon N /dest:console" ...`), and the video restarts within a second of the desktop coming
+  back (and every 30 s meanwhile, in case the state is misread). A disconnected session is moved
+  to the console (WTSConnectSessionW, what `tscon <session> /dest:console` calls; the logon
+  task's elevated agent may) at the stream's start before its first generation and while it
+  streams, unless another user is signed in at the console. The console then shows the unlocked
+  desktop, so (review) the move is made only while the stream plays (not while the client's tab
+  is hidden: a forgotten background tab must not put a desktop nobody watches on a monitor,
+  unlocked), only after two looks a second apart found the session disconnected (not a moment
+  of an RDP client taking the session over), and by default (`consoleSession` `auto`) only on a
+  virtual machine (the firmware's machine name names a hypervisor) or a PC without a GPU, whose
+  console only the hypervisor's users see; `on` also on a PC with a GPU, `off` never. Each move
+  is a warning in host.log with why and the console's session; `recon-host report` says whether
+  a move would be made.
+- **The CPU budget** (`cpubudget.go`, `media/cpubench.go`, `media/ffmpeg.go`): a session that
+  encodes on the CPU (a software encoder on FFmpeg of GDI or Desktop Duplication capture; host
+  config `cpuBudget`, default `auto`) streams at a rung the CPU sustains: the settings, the
+  fastest preset (libx264 `ultrafast`), at most 45 then 30 fps, 900, 720 then 540 lines, 20 fps.
+  The first rung comes from measurements where FFmpeg has no hardware encoder and has gdigrab,
+  in the background: libx264 with the session's arguments on a moving BGRA testsrc2 at the main
+  monitor's size, `superfast` and `ultrafast`, at most 2.5 s each after start-up
+  (`media.BenchSoftware`), and (review) gdigrab's grab of the main monitor into the null muxer
+  as fast as it can, at most 2.5 s (`media.BenchGrab`); host.log `software encoding measured ...
+  gdi_grab_fps=N`. The first rung is the first whose frames per second at its size need at most
+  65 % of the measured encode rate and, for GDI, at most 80 % of the grab rate scaled to the
+  captured monitor (30 fps where the grab was not measured: a locked desktop at the start). The
+  agent measures at its start, then (review) every 3 minutes while no session streams, three
+  measurements in all, each given up when a session starts, and the best rate of each kind
+  counts (`software encoding measured again ... best=`): at logon a VM's CPU is busiest, and a
+  measurement there can be a fraction of the CPU (this sandbox: 32/32 fps under a load of 20,
+  162/185 minutes later). Then the stream decides every 2 s from the live generation's frame
+  intervals (gaps over 500 ms, capture stalls, left out) and capture→encoded times: below 85 % of
+  the frame rate (review: GDI and the test pattern only, which deliver every frame interval;
+  Desktop Duplication sends a frame only when the screen changes), or over 2.5 frame intervals
+  (50 ms at least), twice in a row is one rung down, an urgent restart (review: the generation
+  that fell behind stops first, instead of a second capture and encoder beside it on a CPU that
+  does not keep up); 30 s at ease once a wait is over (a minute, doubled after a step up that
+  falls behind within 30 s, at most 10 minutes) one rung up, an overlapped restart
+  (`restarting video reason="the CPU does not keep up"` / `"the CPU has room"`). The overlay's
+  *CPU limit* row (VideoConfig `cpuLimit`) says what streams and what was asked for (`... what
+  the CPU keeps up with`); one informational notice says it per session (`This stream encodes
+  video on the CPU (libx264: no GPU encoder for it) ...`, words that also hold on a GPU PC whose
+  GPU cannot encode the codec). gdigrab's capture stamps are now its own pts (the wall clock in
+  µs at each grab, `-copyts`, `[0:v]settb=AVTB`), so the capture→encoded row and the budget count
+  the queue in front of the filters.
+- **Found before the first stream** (`platform/gpu_windows.go`, `media/capture.go`): the probe
+  opens the Direct3D 11 video device itself (D3D11CreateDevice with VIDEO_SUPPORT on the default
+  adapter, then ID3D11VideoDevice and ID3D11VideoContext, as libavutil's D3D11VA device does:
+  milliseconds, no FFmpeg, no desktop) and where that fails has its finding before it returns;
+  the minute's re-checks check it first. Where it opens, FFmpeg's ddagrab test decides as
+  before. Sessions do not launch the native helper where every DXGI adapter is a software
+  adapter (`platform.NoGPU`: only the Microsoft Basic Render Driver); a passthrough GPU, also as
+  a second adapter, is tried as before.
+- **No sound device is quiet** (`media/audio.go`, `media/audio_windows.go`): E_NOTFOUND and
+  AUDCLNT_E_SERVICE_NOT_RUNNING are `media.ErrNoAudioDevice`; audio logs it once, polls every 5 s
+  silently, and the client gets an audio config with `enabled` false and `reason` (overlay:
+  `Audio off: no sound output device on the PC`), then a new audio stream once a device delivers
+  audio. Other capture failures log once each until audio flows again. (Review:)
+  AUDCLNT_E_DEVICE_INVALIDATED is not "no device": WASAPI returns it when the device in use goes
+  away (a headset unplugged, the default switched, HDMI/DisplayPort audio re-created by a game's
+  display mode switch, which the owner's log has 13 of), on a PC that has sound the whole time.
+  It is `media.ErrAudioDeviceChanged`: the default device is captured again after 100 ms
+  (host.log `audio: the sound output device changed`, informational), a device missing for up
+  to 3 s after it is retried every 100 ms, and only then is it "no sound device". The backoff of
+  other failures starts over once audio flows.
+- **`recon-host report`** (`diagnostics.go`, `cmd/recon-host/report.go`): one text file, by
+  default on the user's desktop (review: the Desktop known folder, which OneDrive's folder backup
+  moves, then `%USERPROFILE%\Desktop`, then the temporary folder, never the current directory,
+  C:\Windows\System32 in an elevated PowerShell; the path is printed), with the version, Windows and the machine (a VM names its
+  hypervisor: `HARDWARE\DESCRIPTION\System\BIOS`), CPUs, elevation, the session's desktop state,
+  the DXGI adapters and the Direct3D 11 video device, monitors, the sound device, the host config,
+  the probe's output (FFmpeg, encoders and command lines, the native helper, the direct path),
+  what the CPU encodes and the budget's first rung, and the last 400 lines of host.log (and of
+  host.log.old before them). It has no tokens, keys or passwords: the config's secret fields are
+  left out and the whole text is scrubbed of their values, pairing codes, secret-named fields and
+  long opaque strings.
+
+What makes a VM without a GPU stream better, on the owner's side (none of it measured on the
+owner's VM; HARDWARE_TEST_PLAN G7 and G8 show it):
+
+- More vCPUs: every frame is grabbed, converted and encoded on the CPU, and the budget streams
+  what the CPU keeps up with (the frame rate rises with the cores).
+- Proxmox CPU type `host` instead of the default `x86-64-v2-AES`, which hides AVX2: libx264 and
+  FFmpeg's conversion use it (compare `recon-host report`'s `cpu:` line before and after).
+- A lower stream in the settings drawer: 1280×720 has under half of 1080p's pixels to convert
+  and encode (GDI still grabs the whole monitor; in the A/B above 720p30 had p50 52-54 ms against
+  1080p30's 64-68 ms).
+- A GPU passed through, with the desktop on it (a monitor or dummy plug on the GPU, the VM's
+  Display `none`): then it streams as the gaming PC does. With Proxmox's display still the main
+  one the agent captures that display with GDI on the CPU and only the encoder runs on the GPU.
+- An audio device (Proxmox: `ich9-intel-hda`) if the stream should have sound.
+
+Deviations from the request:
+
+- The lock screen and UAC prompts still cannot be shown or controlled from the browser: the agent
+  runs in the user's session (the logon task), and the Winlogon desktop is SYSTEM's. The stream
+  waits and says so instead of failing. Capturing it needs the agent to run as a SYSTEM service
+  that switches desktops (as Sunshine does), a change of the agent's design, not made here.
+- Moving a disconnected session to the console is on by default on a VM or a PC without a GPU
+  (`consoleSession` `auto`), because the request is a VM that streams without error. On a
+  physical PC with a GPU `auto` does not move it (its own monitor would show the unlocked
+  desktop); `on` does. A VM whose firmware names no hypervisor (custom SMBIOS strings, set to
+  hide the VM from games' anti-cheat) and has a passed-through GPU counts as a physical PC: set
+  `on` there. Not moved when another user is signed in at the console.
+- (Review, optional, not done:) letting the CPU budget cover GDI capture with a hardware
+  encoder (a VM whose passed-through GPU has no display on it). Its encoder takes frames as fast
+  as they come, so frames do not queue in front of it (the hundreds of milliseconds the budget
+  removes); the grab and its conversion set the frame rate. The remedy is the desktop on the
+  GPU's output (README, "With GPU passthrough"; HARDWARE_TEST_PLAN G8).
+- The budget's step up raises the generation's frame-rate ceiling; the frame rate itself goes up
+  through the rate controller's own frame-rate ladder (its hold time, its feedback), not at once,
+  and a further step up waits until the generation reached the rung's frame rate. `bitrate.go` is
+  another area's: not touched.
+- The browser E2E cannot run the Windows host under Wine (Go's `WSAIoctl(SIO_UDP_NETRESET)`,
+  unimplemented in Wine 9.0, as before), so the browser E2E plays the VM with a new test hook
+  (`RECON_TEST_FAULTS=vm`: no sound device, and the budget covering the test pattern's software
+  encoder with a measurement of a CPU that keeps up with 30 fps at the fastest preset); the
+  Windows pieces run as Windows tests under Wine.
+- VirtIO-GPU, QXL, the Standard VGA, Hyper-V's and VMware's display adapters are display-only
+  (or, VMware's, without D3D11 video): Direct3D renders on the Basic Render Driver there, which
+  has no video support, so the same device test finds them; none of them was run here.
+
+Verified in the sandbox:
+
+- The device test under Wine 9 (as on a VM): D3D11CreateDevice with VIDEO_SUPPORT succeeds, the
+  ID3D11VideoDevice query fails with E_NOINTERFACE (0x80004002), FFmpeg's silent failure behind
+  `Failed to create D3D11VA device` (327 ms with Wine's start of wined3d). Go tests: with the
+  device failing `Probe` has the finding when it returns and FFmpeg's ddagrab test never runs;
+  with it opening the ddagrab test decides (`TestGPUCaptureVideoDevice`); `TestNoGPU`;
+  `TestOpenPipelineNoGPU` (no helper launch with only the Basic Render Driver, one with a
+  passthrough GPU listed after it).
+- `TestSessionGDIWindows` (Windows test binary under Wine, real gdigrab + libx264): the probe
+  found it before the session, first frame 0.9 s after the start, 30 frames in 1.8 s; with the
+  finding cleared it still switches after ddagrab's failure (2.0 s, 3.0 s).
+- The desktop: `DesktopState` under Wine reads session 1 at the console, input desktop `Default`,
+  not locked. Go tests with a stand-in desktop and FFmpeg: a locked session's 12 failures do not
+  end it, one notice, the restart within a look of the unlock, a second spell told again
+  (`TestDesktopLockedWaits`); a disconnected session moved at the start, `off` and a refused move
+  waiting with the instructions and restarting once at the console (`TestDesktopDisconnected`);
+  the retry while away (`TestDesktopRetry`).
+- The CPU budget: Go tests of the rungs and their effects (`TestCPURungs`), the first rung from
+  measurements (`TestBenchRung`: a 4-vCPU VM the settings; a 2-vCPU one with GDI grabbing 40 fps
+  1920×1080 at 30 fps fastest preset, at 45 where GDI grabs 70; 30 fps at most without a grab
+  measurement; a slow one 1600×900 at 30; a slow grab or a very slow CPU 960×540 at 20; the grab
+  rate scaled to a 2560×1440 monitor; nothing from GDI for Desktop Duplication), the stream's
+  step down, the wait, the step up, the doubled wait after a failed one, nothing for hardware
+  encoders or `off` (`TestCPUBudgetSession`), a Desktop Duplication session at 30 of 60 fps with
+  8 ms capture→encoded kept at its rung for six looks and stepped down only when frames waited
+  90 ms (`TestCPUBudgetDesktopDuplication`, the review's scenario that walked rungs 0→3 in
+  12 s before), step downs urgent and step ups overlapped (`TestCPURestart`), the measurements
+  only without a GPU encoder and with gdigrab, repeated while no session streams, the best of
+  each kept, one interrupted by a session's start given up and not counted (`TestCPUBench`); the
+  measurement on this machine's FFmpeg (`TestBenchSoftware`, now bounded by what BenchSoftware
+  allows and checking that a cancelled measurement ends at once: 720p superfast 46, ultrafast 137
+  fps on a loaded machine); `TestCPUBudgetGDIWindows` under Wine on a 1920×1080 Xvfb desktop with
+  a moving picture, under the lock: the agent measured libx264 72/76 fps and gdigrab 65 fps, and
+  a session on a CPU set to encode 1280×720 at 20/25 fps (the review's corrected formula: 8.9 and
+  11.1 fps at 1080p) streamed gdigrab + libx264 at the lowest rung, 960×540 at 20 fps
+  `ultrafast`, scaled by gdigrab's CPU scaling with the Windows FFmpeg, with gdigrab's grab times
+  as capture stamps (frame 19 grab→delivered 40 ms), one informational notice and the overlay
+  text in the video config.
+- The congestion notice: `TestCongestionNote` (a cut of 15 % or to 72 % told nothing; below half
+  for 10.5 s told once per spell; a new spell within 30 s of the last notice not told) and
+  `TestCongestionNoticeSession` (40 routine changes of ±3-15 % no notice; a deep cut held one
+  informational notice, never a warning).
+- The console move: `TestDesktopConsoleMove` (the review's scenario: a paused stream with its
+  session disconnected is not moved, the next looks after the resume move it; single looks
+  disconnected are not moved, two in a row are; `on` on a PC with a GPU moves, `auto` there does
+  not, `auto` on a PC without a GPU does), `TestDesktopDisconnected` (at the start after two
+  looks, the warning log line with the reason and the console's session; `off`, a failed move
+  and a PC with a GPU each one notice saying why), `TestVirtualMachine`,
+  `TestConfigConsoleSession`.
+- Sound: under Wine without a sound server GetDefaultAudioEndpoint gives 0x80070490 (E_NOTFOUND),
+  the VM case, which the Windows test reads as `ErrNoAudioDevice`; Go tests: one log line, one
+  device change each way, packets once a device delivers (`TestAudioNoDevice`), the client's
+  audio config with the reason and no notice (`TestAudioNoSoundDevice`). Review: the HRESULT
+  mapping under Wine (`TestNoDeviceHRESULT`: E_NOTFOUND and SERVICE_NOT_RUNNING no device,
+  DEVICE_INVALIDATED a device change, E_FAIL neither); `TestAudioDeviceChanged`: a device
+  switch's longest gap in the audio 112 ms, a device missing 300 ms after it 317 ms, both with no
+  DeviceChanged (the review's simulation on the earlier commit: 5.012 s and DeviceChanged
+  [false, true]); a device gone for good one DeviceChanged(false).
+- `recon-host report`: the folder (`TestReportDir`: under Wine the Desktop known folder
+  `C:\users\root\Desktop`; on Linux `~/Desktop`, else the temporary folder); a Go test with a token and a pin in the config and a host.log carrying
+  them, a pairing code, a ticket, a password and a key (none of them in the report; the config,
+  the rotated log and a Go stack path are: `TestDiagnosticsNoSecrets`); the Windows build under
+  Wine with FFmpeg 8.1 next to it wrote the session state, `Direct3D 11 video device:
+  unavailable (ID3D11VideoDevice: HRESULT 0x80004002)`, `none (no sound output device:
+  GetDefaultAudioEndpoint: HRESULT 0x80070490)`, the probe with gdigrab's command lines, `cpu:
+  libx264 at 1920x1080: superfast 81 fps, ultrafast 105 fps; a stream asking 1920×1080 at 60 fps
+  starts at 1920×1080 at 60 fps, fastest preset (rung 1 ...)` and the redacted config and log,
+  in 19 s.
+- The browser E2E section `vm without a gpu` (Linux host with `RECON_TEST_FAULTS=vm`): see the
+  runs below.
+
+Not verified (needs real hardware):
+
+- GPU-less Windows VM (the reporter's Proxmox VM): unverified. Test: `docs/HARDWARE_TEST_PLAN.md`
+  G1-G3 and G7. Look for: no toast with a red or yellow border anywhere, `Network congestion
+  detected` included (an informational `Network congestion: for N s ...` only with a run of
+  host.log `congestion: lowering bitrate why=...` lines below half of `kbps_max`; note any
+  congestion toast with those lines); host.log at the start `no GPU screen capture on this PC:
+  sessions capture with GDI (gdigrab)` with `device=...` before `ffmpeg ready`, then `software
+  encoding measured ... superfast_fps=N ultrafast_fps=M gdi_grab_fps=G` (a number, not `not
+  measured`) and, minutes later with no stream, `software encoding measured again ... best=`;
+  per stream `video pipeline pipeline=ffmpeg ... reason="no GPU encoder can work: ..."`, `cpu
+  budget: software encoding rung=R asked=... streams=...`; no `cpu budget: the CPU does not keep
+  up, stepping down` in a session's first 10 s (one there means the first rung was too high:
+  send the `software encoding measured` lines); in game or video the overlay's capture→encoded
+  p50 under about three frame intervals, later step-down lines with their `measured=` where it
+  was over; closing an RDP client while streaming: the warning `moved the disconnected session
+  to the console ... because="a virtual machine (...)"`, the stream back within seconds, and no
+  such line while the browser tab is hidden; Win+L: `The PC is locked` (info), back within a
+  second or two of signing in on the console. Send the `recon-host report` file whatever
+  happens; its session section says whether a disconnected session would be moved and why.
+- VM with a passed-through GPU: unverified. Test: HARDWARE_TEST_PLAN G8: with a monitor or dummy
+  plug on the GPU and the VM's Display `none`, host.log `video pipeline pipeline=helper` with the
+  GPU's adapter or `capture=ddagrab`, never `capturing with GDI (gdigrab)`.
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `recon-host report` on the gaming PC: `Direct3D 11
+  video device: ok`, no `no GPU:` line, no `cpu:` line, `moved to the console: false (on a PC with
+  a GPU ...)`; host.log has no `software encoding measured` and no `cpu budget:` lines unless the
+  stream encodes on the CPU (it never should on the RX 7900 XT, whose AMF encodes H.264, HEVC and
+  AV1: a `cpu budget:` line there is a finding; on an RX 6000 or RTX 30 asking for AV1 it is
+  expected and judges only capture→encoded for Desktop Duplication); no `Network congestion
+  detected` toast in game (the owner's second run would have shown about one every 30 s), an
+  informational `Network congestion: ...` only for a cut below half the bitrate for 10 s; after a
+  game's fullscreen switch (`DXGI_ERROR_ACCESS_LOST`) with HDMI/DP audio, `audio: the sound
+  output device changed` and sound back within a second, never `Audio off` in the overlay.
+  HARDWARE_TEST_PLAN
+  G4: a lock screen or UAC prompt longer than 10 s with `"pipeline": "ffmpeg"` no longer ends the
+  session (`The PC is locked ...` as information, `restarting video reason="the desktop is
+  back"` after signing in); with the helper (the default) the helper's own `capture lost` path
+  handles it as before, plus the one informational lock notice. G5 with the RDP client closed
+  instead of `tscon`: with the default `auto` the gaming PC (a GPU, no hypervisor) is not moved
+  to the console (the notice says `Not moved to the console by itself: on a PC with a GPU ...`);
+  with `"consoleSession": "on"` the session moves to the console by itself and the stream comes
+  back on ddagrab (the device test opens at the console: `GPU screen capture works again`).
+- NVIDIA: unverified (no NVIDIA host available). Test: the AMD steps with NVENC.
+
+### Runs with these changes (the section above)
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass.
+- `go test` passes for every package but `internal/e2e` (`internal/host` 192 s, `internal/host/media`
+  218 s); under the shared lock `go test ./internal/e2e/...` passes (207 s), and `go test -race
+  -count=2` of this section's tests in `internal/host` and `internal/host/media` passes.
+- `node --check` passes on `stream.js` and `browser.mjs`; `make build` and `make windows`; the
+  installer script parses (`pwsh`).
+- Under Wine 9 with the Windows FFmpeg 8.1 build: `TestD3D11VideoDevice`, `TestDesktopState`,
+  `TestCPUBudgetGDIWindows` and `TestSessionGDIWindows` pass, the WASAPI test skips with
+  `ErrNoAudioDevice` (no sound server); `recon-host report` as above.
+- The browser E2E (Chromium 141) under the lock, `vm without a gpu` alone: 11 of 11 checks
+  (`CPU notice "toast info"; warning/error toasts []`, the overlay's `CPU limit` row and `Audio
+  off`). With `WebTransport direct`: 47 of 48; "send priorities feature-detected; telemetry gives
+  way to input only while the datagram queue stalls" failed (telemetry 584 sent, 210 dropped,
+  longest stall 269 ms, CPUs 16 % idle, other areas' tests running at the same time), a check of
+  the datagram queue under a starved CPU in code these changes do not touch.
+  The re-run of `WebTransport direct` alone under the lock: 47 of 47, that check among them.
+
+### Runs with the review's changes
+
+The review's findings were all confirmed (its scratch tests reproduced the paused move to the
+console, the Desktop Duplication walk down three rungs, and the 5.012 s audio gap; the rest by
+reading the code), fixed, and tested as above; one optional part (the budget for GDI capture with
+a hardware encoder) not done, for the reason under "Deviations". Checks on the branch afterwards:
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass; `node --check`
+  passes on the 16 files of `web/static/js` and `browser.mjs`.
+- `go test` of every package but `internal/e2e`: all pass except one run of
+  `internal/gateway`'s `TestUDPRelayLatencyAndThroughput` (udp relay 34.1 against direct 42.6
+  Mbit/s at 1 % loss, the machine at a load of 11 with other agents' tests; this branch does not
+  touch `internal/gateway`), which passed when re-run under the lock (46.0 against 46.4 Mbit/s)
+  with the whole package (34.5 s). `internal/host` 113 s, `internal/host/media` 136 s,
+  `cmd/recon-host` 1.6 s.
+- Under the shared lock: `go test ./internal/e2e/...` passes (207 s); `go test -race -count=1` of
+  the whole `internal/host`, `internal/host/media` and `cmd/recon-host` packages passes (350 s,
+  148 s, 3.9 s; no data race); `make build`, `make helper` and `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64` pass (182 s: 80 tests pass, 9 skip, none fail, in the encoder,
+  media, host and qualify binaries).
+- Under Wine 9 with the Windows FFmpeg 8.1 build, under the lock: `TestCPUBudgetGDIWindows`
+  (libx264 72/76 fps, gdigrab 65 fps measured; the lowest rung 960×540 at 20 fps streamed),
+  `TestNoDeviceHRESULT` and `TestReportDir` pass; `TestWASAPILoopback` skips with
+  `ErrNoAudioDevice` (no sound server).
+- The browser E2E (Chromium 141) under the lock, `WebTransport direct` and `vm without a gpu`: 48
+  of 48. The VM check, now with every toast of the stream and a delay step: toasts `info: This
+  stream encodes video on the CPU (libsvtav1: ...` and `info: Network congestion: for 11 s ...`,
+  no warning or error toast; 5 `congestion: lowering bitrate` lines in the step (30000 to 20206
+  kbps, `why=delay`, `delay_ms=62` against `delay_target_ms=32`); the overlay `960×556 at 30 fps,
+  fastest preset (asked: 960×556 at 60 fps): what the CPU keeps up with` and `Audio off`. An
+  earlier run of the VM section alone: 11 of 11, the step's cut 30000 to 14077 kbps.

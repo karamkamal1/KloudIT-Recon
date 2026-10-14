@@ -600,16 +600,22 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
 - **GDI capture without a GPU (`gdigrab`, `internal/host/gdi.go`, `media/capture.go`):** ddagrab
   and gfxcapture both open FFmpeg's D3D11VA device (a Direct3D 11 device with video support),
   which a PC or VM without a GPU does not have (the Microsoft Basic Display Adapter and Basic
-  Render Driver): every start fails with `Failed to create D3D11VA device.` The probe opens
-  ddagrab for one frame next to its encoder tests and does not wait for it beyond them (it takes a
-  fraction of a second, but up to its 10 s limit where ddagrab waits for a first frame, a display
-  that is off: the finding then follows in the background, `Caps.GPUCaptureDone`; a timeout or a
-  failure of the moment, such as the secure desktop at logon, is no finding), and where that is
-  the error the agent captures with gdigrab: the monitor's rectangle in physical pixels
-  (`-offset_x/-offset_y -video_size`), at the stream's frame rate, the cursor drawn only for
-  clients that want it, `settb/setpts=time(0)` right after the source as on the GPU paths, scaled
-  and converted on the CPU in one swscale pass (yuv420p for software encoders, NV12 for
-  NVENC/AMF/QSV). At run time the session classifies FFmpeg's stderr (`media.ClassifyCapture`, by
+  Render Driver): every start fails with `Failed to create D3D11VA device.` The probe first opens
+  that device itself (`platform.D3D11VideoDevice`: D3D11CreateDevice with VIDEO_SUPPORT on the
+  default adapter, then ID3D11VideoDevice and ID3D11VideoContext, as libavutil's D3D11VA device
+  does; milliseconds, no desktop needed) and where that fails has its finding before it returns,
+  so the first session captures with GDI from its start; where it opens, it opens ddagrab for one
+  frame next to its encoder tests and does not wait for it beyond them (it takes a fraction of a
+  second, but up to its 10 s limit where ddagrab waits for a first frame, a display that is off:
+  the finding then follows in the background, `Caps.GPUCaptureDone`; a timeout or a failure of
+  the moment, such as the secure desktop at logon, is no finding), and where that is the error the
+  agent captures with gdigrab: the monitor's rectangle in physical pixels (`-offset_x/-offset_y
+  -video_size`), at the stream's frame rate, the cursor drawn only for clients that want it,
+  gdigrab's own pts as the capture stamps (the wall clock in µs at each grab, kept with
+  `-copyts`: they count the time frames wait in FFmpeg's queues before the filters), scaled and
+  converted on the CPU in one swscale pass (yuv420p for software encoders, NV12 for
+  NVENC/AMF/QSV). Where Windows lists no GPU at all (DXGI adapters all software:
+  `platform.NoGPU`) sessions do not launch the native helper. At run time the session classifies FFmpeg's stderr (`media.ClassifyCapture`, by
   the capture source's log context): no D3D11VA device moves the session, and the agent's later
   sessions, to GDI at once; Desktop Duplication refusing the display (DXGI_ERROR_UNSUPPORTED, no
   such output, E_INVALIDARG) moves only that session, at once in a remote desktop session
@@ -630,7 +636,62 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
   new one (input follows), as the helper's `capture resized` does. Known failures read as a
   sentence (AcquireNextFrame: only 887a0026 is a mode change, 887a0005/6/7 a driver reset, other
   codes show FFmpeg's line); an identical restart notice is not repeated until a generation has
-  gone live and a minute has passed.
+  gone live and a minute has passed. The notices of handled fallbacks (GDI for no GPU capture,
+  the codec asked for not available) have level `info`, and so has the rate controller's only
+  notice (`congestnote.go`): a bitrate below half its ceiling for 10 s, once per such spell and
+  at most every 30 s; its routine cuts of a few percent (on any path, whenever queueing delay
+  builds) tell the user nothing (they used to send a warning toast every 30 s).
+
+- **The session's desktop (`internal/host/desktop.go`, `platform.DesktopState`):** the agent
+  captures and controls only its own Windows session's desktop, and only while that is on a
+  screen. Every second each session reads its session's state (WTSSessionInfoEx: connected,
+  disconnected, locked) and the input desktop (OpenInputDesktop: `Default`, or the Winlogon
+  secure desktop of the lock screen and UAC prompts, which only SYSTEM may open). A generation
+  that fails while the desktop is away waits for it: no failure counted (the session used to end
+  at its seventh, about 10 s into a lock screen), one informational notice per spell, a restart
+  within a second of the desktop coming back (and every 30 s meanwhile, in case the state is
+  misread). A session a remote desktop client left disconnected is moved to the console
+  (WTSConnectSessionW, as `tscon <session> /dest:console`; the elevated agent may) at the stream's
+  start and while it streams, not while it is paused (a hidden tab), once two looks a second apart
+  found it disconnected, unless another user is signed in there. The console shows it unlocked,
+  so host config `consoleSession` `auto` moves it only on a virtual machine (the firmware's
+  machine name names a hypervisor, `platform.OSInfo`) or a PC without a GPU (`platform.NoGPU`);
+  `on` also on a PC with a GPU; `off` leaves it to the user. A move is a warning in host.log.
+
+- **The CPU budget (`internal/host/cpubudget.go`, `media/cpubench.go`):** a session that encodes
+  on the CPU (a software encoder on FFmpeg of GDI or Desktop Duplication capture; the latter on a
+  GPU PC whose GPU cannot encode the codec) streams at a rung the CPU sustains: the session's
+  settings, the fastest preset (libx264 ultrafast), then at most 45 and 30 fps, 900, 720 and 540
+  lines, 20 fps. The first rung comes from the agent's measurements (where FFmpeg has no hardware
+  encoder, in the background): libx264 with the session's arguments on a moving BGRA testsrc2 at
+  the main monitor's size, superfast and ultrafast (`media.BenchSoftware`), and gdigrab's grab of
+  that monitor into the null muxer as fast as it can (`media.BenchGrab`); the first rung whose
+  frames per second at its size need at most 65 % of the measured encode rate and, for GDI, at
+  most 80 % of the grab rate scaled to the captured monitor (GDI grabs the whole monitor whatever
+  the rung; 30 fps without a grab measurement). The agent measures at its start and again every
+  3 minutes while no session streams (given up when one starts), three times in all, keeping the
+  best rate of each kind: a measurement at logon, the CPU busy, can be a fraction of the CPU's.
+  Then the stream decides every 2 s: frame intervals of the live generation (gaps over 500 ms,
+  capture stalls, left out) and capture→encoded times; below 85 % of the frame rate (GDI and the
+  test pattern only: Desktop Duplication sends a frame only when the screen changes) or over 2.5
+  frame intervals (50 ms at least) twice in a row is one rung down, an urgent restart (the
+  generation that fell behind stops first); 30 s at ease after a wait (a minute, doubling after a
+  step up that fails within 30 s, up to 10 minutes) one rung up, an overlapped restart. Without it
+  a CPU that does not keep up fills FFmpeg's queues (8 packets, 8 frames into the filters, 8 into
+  the encoder): hundreds of ms of latency at a fraction of the frame rate. The video config's
+  `cpuLimit` carries the overlay's text; one informational notice says it per session. A GDI
+  capture with a hardware encoder (a VM whose passed-through GPU has no display on it) is not
+  covered: its encoder takes frames as fast as they come, so they do not queue in front of it;
+  the grab and its conversion set the frame rate.
+
+- **No sound device:** WASAPI's E_NOTFOUND (no render endpoint: VMs) and the Windows Audio
+  service not running are `media.ErrNoAudioDevice`: audio polls every 5 s without logging, and the
+  client gets an audio config with `enabled` false and `reason` (its overlay shows it), then a new
+  audio stream once a device delivers audio. AUDCLNT_E_DEVICE_INVALIDATED (the device in use went
+  away: unplugged, the default switched, HDMI audio re-created by a display mode change) is
+  `media.ErrAudioDeviceChanged`: the default device is captured again after 100 ms, a device
+  missing for up to 3 s after that is retried every 100 ms, and only then is it "no sound
+  device".
 
 - **AMD Direct Capture (experimental, `capture: "amf"`):** FFmpeg 8.1's `vsrc_amf` in
   `wait_for_present` mode delivers each present of DWM or a fullscreen game as an AMF surface on

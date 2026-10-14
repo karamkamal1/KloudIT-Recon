@@ -98,7 +98,14 @@ type Session struct {
 	liveSinceNote bool
 	gpuWatch      atomic.Bool    // watchGPUCapture runs
 	gdiWatch      atomic.Bool    // watchGDIDisplay runs
-	watches       sync.WaitGroup // those two (they end with the session's context; tests wait)
+	watches       sync.WaitGroup // those two and watchDesktop (they end with the session's context; tests wait)
+	// desk: whether the session's Windows desktop is on a screen to capture
+	// (desktop.go: locked, a secure desktop, disconnected).
+	desk deskState
+	// cpu: the CPU budget of software encoding (cpubudget.go).
+	cpu cpuState
+	// cong: the user's notice of a congested network (congestnote.go).
+	cong congestionNote
 
 	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
 	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()
@@ -131,7 +138,6 @@ type Session struct {
 	rate     rateController // video bitrate: the delay-based rate controller (bitrate.go)
 	track    sendTrack      // frames sent, for the rate controller's feedback (ratefeedback.go)
 	fb       rateFeedback   // the client's receive reports (or acks), turned into feedback
-	noticeAt atomic.Int64   // unix ns of the last congestion notice to the user (rate limited)
 	rateLog  rateLog        // how applyRate logs the controller's changes
 
 	// display keeps the PC's display on while set (keepDisplayOn, nil
@@ -412,6 +418,10 @@ func (s *Session) run() error {
 	if s.fec.avail {
 		go s.fecRepairs()
 	}
+	if watchDesktops {
+		s.prepareDesktop() // a session a remote desktop client left disconnected: to the console first
+		s.watchDesktop()
+	}
 	if err := s.startVideo(false, ""); err != nil {
 		s.notice("error", "Could not start video: "+err.Error())
 		return err
@@ -426,6 +436,7 @@ func (s *Session) run() error {
 	go s.roiLoop()
 	go s.statsLoop()
 	go s.rateLoop()
+	go s.cpuLoop()
 	return s.controlLoop()
 }
 
@@ -844,7 +855,7 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, z picSizes, notify bool) (
 		s.codecWarned = warned
 		s.prefsMu.Unlock()
 		if warned != "" && !repeat {
-			s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
+			s.notice("info", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
 		}
 	}
 	policy := s.a.cfg.av1()
@@ -1014,6 +1025,7 @@ func (s *Session) buildParams(prefs proto.Prefs) (media.Params, error) {
 	if p.Source.Backend == "gdigrab" {
 		s.watchGDIDisplay() // gdigrab does not follow a change of the display
 	}
+	s.cpuBudget(&p) // encoding on the CPU: what it keeps up with
 	s.chooseHDR(&p, prefs)
 	s.triedMu.Lock()
 	p.Usage = s.usage[enc.Name]
@@ -1344,6 +1356,7 @@ func (s *Session) videoEvents() {
 			s.rate.live(s.static.generation(s.static.clock(), c.BitrateKbps, target, pc.LiveBitrate && !pc.LiveBitrateFlush), c.FPS)
 			s.setCongestionTarget(media.Params{BitrateKbps: c.BitrateKbps, FPS: c.FPS})
 			s.healConfig(&c, ev.HealFrames)
+			s.cpuConfig(&c)
 			if s.paused.Load() {
 				// Its frames are dropped: a hidden client would wait for
 				// its key frame and ask again and again. Resume starts a
@@ -1358,6 +1371,7 @@ func (s *Session) videoEvents() {
 			if n := s.a.faults.stillAfter; n > 0 && ev.Frame.Seq >= uint32(n) {
 				continue // test hook: a still desktop, the source sends nothing
 			}
+			s.cpuFrame(ev.Frame, time.Now())
 			s.healFrame(ev.Frame)
 			if ev.Frame.Reencoded {
 				s.stats.reencoded.Add(1)
@@ -1741,7 +1755,9 @@ func (s *Session) encoderLive() {
 const maxVideoFailures = 6
 
 // handleEncoderFailure handles a failure event (ev.Err) of the video manager.
-// Only a generation that failed to start because of its encoder counts
+// A generation that failed while the session's desktop is away (locked, a
+// secure desktop, disconnected: awaitDesktop) waits for it and counts for
+// nothing. Only a generation that failed to start because of its encoder counts
 // against the encoder (encoderFailed). A generation that had gone live, or
 // whose capture source failed, does not: a capture outage of a few seconds
 // (a UAC prompt, the lock screen, a display mode change) fails every restart
@@ -1757,6 +1773,9 @@ func (s *Session) handleEncoderFailure(ev media.VideoEvent) {
 	err := ev.Err
 	s.failures++
 	s.log.Warn("encoder failed", "err", err, "attempt", s.failures, "live", ev.Live, "encoder_fault", ev.EncoderFault)
+	if s.awaitDesktop(ev) {
+		return // the session's desktop is away (locked, disconnected): the video restarts when it is back
+	}
 	gdi := s.captureFailed(ev)
 	if gdi {
 		s.failures = 0 // GDI is a capture of its own: its restarts start afresh, the first at once
@@ -2153,7 +2172,8 @@ func (l *rateLog) level(c rateChange, now time.Time, normal slog.Level) (slog.Le
 }
 
 // applyRate puts a change of the rate controller into effect (setRate) and
-// logs it (rateLog); decreases also tell the user, at most once per 30 s.
+// logs it (rateLog); a deep cut that lasts is told to the user
+// (congestionNotice).
 // delayMs is an older client's own delay report (why "client"); the
 // controller's own decisions log what they were decided on (rateAttrs).
 func (s *Session) applyRate(c rateChange, delayMs int) {
@@ -2168,9 +2188,6 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 			attrs = append(attrs, "suppressed", n)
 		}
 		s.log.Log(context.Background(), lvl, "congestion: lowering bitrate", attrs...)
-		if now, last := time.Now().UnixNano(), s.noticeAt.Load(); now-last >= int64(30*time.Second) && s.noticeAt.CompareAndSwap(last, now) {
-			s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(c.toKbps)/1000))
-		}
 	} else {
 		attrs := []any{"from", c.fromKbps, "to", c.toKbps, "fps", c.toFPS, "max", ceiling}
 		if c.why == "undo" {
@@ -2184,6 +2201,7 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 		}
 		s.log.Log(context.Background(), lvl, "bitrate recovery: raising bitrate", attrs...)
 	}
+	s.congestionNotice(c.toKbps, ceiling) // a deep cut that lasts, as information (congestnote.go)
 	if err := s.setRate(c.toKbps, c.toFPS, c.urgent, reason); err != nil {
 		s.log.Warn("bitrate change failed", "reason", reason, "err", err)
 	}
@@ -2767,7 +2785,10 @@ func (s *Session) startAudio() {
 	}
 	// 10 ms frames until the first capture packet says whether 5 ms ones
 	// would save anything (media.Audio.PickFrameMs; applyAudioFrame).
-	s.audio = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, CaptureChanged: s.audioFrameCheck}, s.log)
+	var au *media.Audio
+	au = media.NewAudio(s.a.audioSource, media.AudioConfig{Codec: codec, BitrateKbps: s.a.cfg.AudioKbps, CaptureChanged: s.audioFrameCheck,
+		DeviceChanged: func(present bool) { s.audioDevice(au, present) }}, s.log)
+	s.audio = au
 	s.sendJSON(audioConfig(s.audio, false))
 	err := s.audio.Start(func(pkt []byte) {
 		if !s.paused.Load() {
@@ -2780,6 +2801,22 @@ func (s *Session) startAudio() {
 		return
 	}
 	s.audioKbps.Store(int64(s.audio.Kbps()))
+}
+
+// noAudioDevice is the client's reason for audio being off on a PC without
+// a sound output device (proto.AudioConfig.Reason).
+const noAudioDevice = "no sound output device on the PC"
+
+// audioDevice tells the client that audio a has no sound device to capture
+// (a VM without one: audio off, with the reason for its overlay, no notice)
+// or has one again (a new audio stream). From the capture goroutine: it
+// takes no audio lock (stopAudio holds it while the capture ends).
+func (s *Session) audioDevice(a *media.Audio, present bool) {
+	if !present {
+		s.sendJSON(proto.AudioConfig{T: "audio", Enabled: false, Reason: noAudioDevice})
+		return
+	}
+	s.sendJSON(audioConfig(a, false))
 }
 
 func (s *Session) stopAudio() {
@@ -3004,7 +3041,7 @@ func (s *Session) gamepad(g proto.Gamepad) {
 	pads := s.a.gamepads()
 	if pads == nil {
 		s.padWarn.Do(func() {
-			s.notice("warn", "Gamepad detected, but the host has no ViGEmBus driver installed — controller input is disabled.")
+			s.notice("info", "Gamepad detected, but the host has no ViGEmBus driver installed — controller input is disabled.")
 		})
 		return
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"sync"
@@ -39,7 +40,32 @@ type AudioConfig struct {
 	// CaptureChanged, if set, is called (from the capture goroutine) when
 	// the duration of the source's capture packets changes (CaptureMs).
 	CaptureChanged func()
+	// DeviceChanged, if set, is called (from the capture goroutine) with
+	// false when the source finds no sound device (ErrNoAudioDevice: a VM
+	// without one), and with true when it delivers audio again after that.
+	DeviceChanged func(present bool)
 }
+
+// ErrNoAudioDevice: the source has no sound output device to capture (a VM
+// without one, a PC whose last device was removed, the Windows Audio
+// service stopped). Audio waits for one quietly (Audio.Start).
+var ErrNoAudioDevice = errors.New("no sound output device")
+
+// ErrAudioDeviceChanged: the device the source captured went away (a
+// headset unplugged, HDMI audio re-created by a display mode change, the
+// default device switched). Audio captures the default device again at
+// once (Audio.Start).
+var ErrAudioDeviceChanged = errors.New("the sound output device changed")
+
+// noDevicePoll is how often a source without a sound device is tried
+// again; deviceChangeGrace is how long after a device went away the source
+// is retried every deviceChangeRetry before "no device" counts (a device
+// re-created by a display mode change is missing for a moment).
+var (
+	noDevicePoll      = 5 * time.Second
+	deviceChangeGrace = 3 * time.Second
+	deviceChangeRetry = 100 * time.Millisecond
+)
 
 // Opus frame durations in ms (step 4.6). The host collects a whole frame
 // before it encodes it, and the client's jitter buffer must hold at least
@@ -206,8 +232,25 @@ func (a *Audio) Start(send func([]byte)) error {
 			codecID = proto.AudioCodecPCM
 		}
 		var last time.Time // the source's last delivery
+		// The source runs sink on this goroutine: noDev (it found no sound
+		// device), lastErr (the last failure logged, until audio flows
+		// again), changedAt (when the device in use went away) and backoff
+		// need no lock.
+		noDev, lastErr := false, ""
+		var changedAt time.Time
+		backoff := 500 * time.Millisecond
 		sink := func(s []float32) {
 			now := time.Now()
+			lastErr, changedAt, backoff = "", time.Time{}, 500*time.Millisecond
+			if noDev {
+				noDev = false
+				if a.log != nil {
+					a.log.Info("audio: a sound output device is back", "source", a.src.Name())
+				}
+				if a.cfg.DeviceChanged != nil {
+					a.cfg.DeviceChanged(true)
+				}
+			}
 			frames := len(s) / audioChannels
 			if ms := int32((frames*1000 + audioRate/2) / audioRate); a.capMs.Swap(ms) != ms {
 				if a.log != nil {
@@ -272,21 +315,52 @@ func (a *Audio) Start(send func([]byte)) error {
 				pcm = append(pcm[:0], pcm[frame*audioChannels:]...)
 			}
 		}
-		backoff := 500 * time.Millisecond
+		// A source without a sound device (a VM without one) is tried
+		// again every noDevicePoll, quietly: one log line and one
+		// DeviceChanged(false) per spell, not a warning every few seconds.
+		// A device that went away (ErrAudioDeviceChanged) is retried at
+		// once, and for deviceChangeGrace "no device" is retried every
+		// deviceChangeRetry: a device switch or a display mode change costs
+		// a moment of sound, not noDevicePoll and an "Audio off" in the
+		// client. Other failures are logged once each until audio flows
+		// again, retried after a backoff that starts over once it does.
 		for ctx.Err() == nil {
 			err := a.src.Run(ctx, sink)
 			if ctx.Err() != nil {
 				return
 			}
-			if a.log != nil {
+			wait := backoff
+			switch {
+			case errors.Is(err, ErrAudioDeviceChanged):
+				wait, changedAt = deviceChangeRetry, time.Now()
+				if a.log != nil {
+					a.log.Info("audio: the sound output device changed: capturing the default device again", "source", a.src.Name(), "err", err)
+				}
+			case errors.Is(err, ErrNoAudioDevice) && !changedAt.IsZero() && time.Since(changedAt) < deviceChangeGrace:
+				wait = deviceChangeRetry // the new device may be a moment away
+			case errors.Is(err, ErrNoAudioDevice):
+				wait = noDevicePoll
+				if !noDev {
+					noDev = true
+					if a.log != nil {
+						a.log.Info("audio: no sound output device on this PC: the stream has no sound until one is added", "source", a.src.Name(), "err", err)
+					}
+					if a.cfg.DeviceChanged != nil {
+						a.cfg.DeviceChanged(false)
+					}
+				}
+			case a.log != nil && fmt.Sprint(err) == lastErr:
+				a.log.Debug("audio capture stopped again, restarting", "source", a.src.Name(), "err", err)
+			case a.log != nil:
 				a.log.Warn("audio capture stopped, restarting", "source", a.src.Name(), "err", err)
 			}
+			lastErr = fmt.Sprint(err)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-time.After(wait):
 			}
-			if backoff < 5*time.Second {
+			if wait == backoff && backoff < 5*time.Second {
 				backoff *= 2
 			}
 		}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -183,9 +184,11 @@ func TestGDIGrabArgs(t *testing.T) {
 			t.Fatalf("%s: %v", tc.enc, err)
 		}
 		cursor := map[bool]string{true: "1", false: "0"}[tc.cursor]
-		in := []string{"-hide_banner", "-loglevel", "warning", "-nostdin", "-fpsprobesize", "0", "-f", "gdigrab", "-framerate", "60",
+		// The capture stamps are gdigrab's own (its pts: the wall clock in
+		// µs at the grab), kept with -copyts: they count FFmpeg's queues.
+		in := []string{"-hide_banner", "-loglevel", "warning", "-nostdin", "-copyts", "-fpsprobesize", "0", "-f", "gdigrab", "-framerate", "60",
 			"-draw_mouse", cursor, "-offset_x", "-1920", "-offset_y", "120", "-video_size", "1920x1080", "-i", "desktop",
-			"-filter_complex", "[0:v]null," + CaptureClockFilter + tc.convert + "[v]", "-map", "[v]", "-c:v", tc.enc}
+			"-filter_complex", "[0:v]settb=AVTB" + tc.convert + "[v]", "-map", "[v]", "-c:v", tc.enc}
 		if !slices.Equal(args[:len(in)], in) {
 			t.Errorf("%s:\n got %q\nwant %q", tc.enc, args[:min(len(args), len(in))], in)
 		}
@@ -201,7 +204,7 @@ func TestGDIGrabArgs(t *testing.T) {
 	p := base
 	p.Encoder, p.CaptureClock = enc["libx264"], false
 	if args, err := c.BuildArgs(p); err != nil || !strings.Contains(strings.Join(args, " "), `[0:v]null,format=yuv420p[v]`) ||
-		strings.Contains(strings.Join(args, " "), "enc_time_base") {
+		strings.Contains(strings.Join(args, " "), "enc_time_base") || slices.Contains(args, "-copyts") {
 		t.Fatalf("no capture stamps: %q %v", args, err)
 	}
 	// A build without gdigrab, or no area to capture.
@@ -254,7 +257,9 @@ func TestGDIGrabChainRuns(t *testing.T) {
 		if i < 0 || j < i {
 			t.Fatalf("no gdigrab input in %q", args)
 		}
-		src := []string{"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=s=%dx%d:r=30,format=bgra", sz[0], sz[1]), "-frames:v", "5"}
+		// gdigrab's pts are the wall clock in µs at each grab: the stand-in's
+		// too (its own time base and stamps), which -copyts keeps.
+		src := []string{"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=s=%dx%d:r=30,format=bgra,%s", sz[0], sz[1], CaptureClockFilter), "-frames:v", "5"}
 		args = append(append(slices.Clone(args[:i]), src...), args[j+1:]...)
 		out := filepath.Join(t.TempDir(), "gdi.nut")
 		args[len(args)-1] = out
@@ -425,8 +430,8 @@ func TestWriteReportGDI(t *testing.T) {
 		"capture:    ddagrab=true gfxcapture=true vsrc_amf=true gdigrab=true\n",
 		"capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): using gdigrab (GDI: more CPU and latency)\n",
 		"session:    gdigrab (GDI) of the 1280x800 monitor at (0,0), 60 fps, 30 Mbit/s, quality balanced, adaptive bitrate, capture timestamps (command lines below)\n",
-		"encoder:    libx264      h264  software\n            ffmpeg -hide_banner -loglevel warning -nostdin -fpsprobesize 0 -f gdigrab -framerate 60 -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size 1280x800 -i desktop -filter_complex \"[0:v]null,settb=AVTB,setpts=time(0)*1000000,format=yuv420p[v]\" -map \"[v]\" -c:v libx264 ",
-		"encoder:    hevc_nvenc   hevc  nvidia\n            ffmpeg -hide_banner -loglevel warning -nostdin -fpsprobesize 0 -f gdigrab ",
+		"encoder:    libx264      h264  software\n            ffmpeg -hide_banner -loglevel warning -nostdin -copyts -fpsprobesize 0 -f gdigrab -framerate 60 -draw_mouse 0 -offset_x 0 -offset_y 0 -video_size 1280x800 -i desktop -filter_complex \"[0:v]settb=AVTB,format=yuv420p[v]\" -map \"[v]\" -c:v libx264 ",
+		"encoder:    hevc_nvenc   hevc  nvidia\n            ffmpeg -hide_banner -loglevel warning -nostdin -copyts -fpsprobesize 0 -f gdigrab ",
 	} {
 		if !strings.Contains(out, s) {
 			t.Errorf("report lacks %q", s)
@@ -438,5 +443,95 @@ func TestWriteReportGDI(t *testing.T) {
 	if !strings.Contains(buf.String(), "capture:    ddagrab unavailable (no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset): no gdigrab in this ffmpeg either: sessions cannot capture the screen\n") ||
 		!strings.Contains(buf.String(), "no command line: this ffmpeg build lacks the gdigrab input device") {
 		t.Fatalf("report without gdigrab:\n%s", buf.String())
+	}
+}
+
+// TestGPUCaptureVideoDevice: where the Direct3D 11 video device FFmpeg's GPU
+// capture opens first cannot be opened (a PC or VM without a GPU), the
+// probe has its finding when it returns (the first session captures with
+// GDI from its start, not after a failed ddagrab generation), and the
+// re-check finds it without starting FFmpeg's capture; where it opens, the
+// ddagrab test decides as before.
+func TestGPUCaptureVideoDevice(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in is a shell script")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ddagrab-ran")
+	ff := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+case "$*" in
+*ddagrab=output_idx*) touch ` + marker + `; sleep 1.5; exit 0 ;;
+*-version*) echo "ffmpeg version n8.1.3 Copyright (c) 2000-2026" ;;
+*-filters*) echo " ... ddagrab           |->V       Grab Windows Desktop images using Desktop Duplication API" ;;
+*-devices*) echo " D  gdigrab         GDI API Windows frame grabber" ;;
+*-encoders*) echo " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)" ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(ff, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func(f func() error) { videoDevice = f }(videoDevice)
+	videoDevice = func() error { return fmt.Errorf("ID3D11VideoDevice: HRESULT 0x80004002") }
+	c, err := Probe(context.Background(), ff, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.GPUCaptureDone():
+	default:
+		t.Fatal("no finding when the probe returned")
+	}
+	if c.GPUCaptureBlocked() != NoVideoDevice {
+		t.Fatalf("finding %q", c.GPUCaptureBlocked())
+	}
+	if blocked, detail := CheckGPUCapture(context.Background(), ff); blocked != NoVideoDevice || detail != "ID3D11VideoDevice: HRESULT 0x80004002" {
+		t.Fatalf("re-check: %q, %q", blocked, detail)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("FFmpeg's ddagrab test ran")
+	}
+	videoDevice = func() error { return nil } // a GPU: FFmpeg's test decides, in the background
+	if c, err = Probe(context.Background(), ff, nil); err != nil {
+		t.Fatal(err)
+	}
+	<-c.GPUCaptureDone()
+	if _, err := os.Stat(marker); err != nil || c.GPUCaptureBlocked() != "" {
+		t.Fatalf("with a video device: ddagrab test %v, finding %q", err, c.GPUCaptureBlocked())
+	}
+}
+
+// TestBenchSoftware measures libx264 as the agent does on a PC without a
+// GPU encoder (this machine's FFmpeg; under taskset to two CPUs it is the
+// 2-vCPU VM of the second hardware report's question): a frame rate at each
+// preset, ultrafast not slower than superfast by much.
+func TestBenchSoftware(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	if _, err := BenchSoftware(context.Background(), ff, EncoderInfo{Name: "h264_amf", Family: "h264", HW: true}, 64, 64); err == nil {
+		t.Fatal("a hardware encoder was measured")
+	}
+	b, err := BenchSoftware(context.Background(), ff, EncoderInfo{Name: "libx264", Family: "h264", Vendor: "software"}, 1280, 720)
+	if err != nil {
+		t.Skipf("libx264: %v", err)
+	}
+	t.Logf("libx264 1280x720: superfast %.0f fps, ultrafast %.0f fps (%v)", b.Superfast, b.Ultrafast, b.Took.Round(time.Millisecond))
+	// Each run may take benchStart to start and benchLimit to measure (on a
+	// loaded machine the start-up alone took seconds: superfast 32 fps,
+	// ultrafast 32 in 7.1 s at a load of 20, 162 and 185 in 2.0 s alone).
+	if b.Superfast <= 0 || b.Ultrafast <= 0 || b.Took > 2*(benchStart+benchLimit)+5*time.Second {
+		t.Fatalf("bench %+v", b)
+	}
+	// Given up when its context ends (a session starts): no rate, the
+	// context's error.
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(300*time.Millisecond, cancel)
+	start := time.Now()
+	if _, err := BenchSoftware(ctx, ff, EncoderInfo{Name: "libx264", Family: "h264", Vendor: "software"}, 1920, 1080); !errors.Is(err, context.Canceled) ||
+		time.Since(start) > 3*time.Second {
+		t.Fatalf("cancelled after 300 ms: %v after %v", err, time.Since(start).Round(time.Millisecond))
 	}
 }
