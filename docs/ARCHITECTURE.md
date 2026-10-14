@@ -426,8 +426,9 @@ instead as datagrams with forward error correction:
 - **When.** Host config `fec` (`auto`, the default): for clients whose hello offers it
   (`hello.fec` = 1: WebTransport clients; WebSocket has no datagrams) on the paths where the host's
   QUIC connection ends at the browser (direct and UDP relay; the splice ends at the gateway),
-  while the client's minimum round trip (its pings, decided once five of them carried one: about
-  a second, as a loaded browser's first round trip alone can be far above the path's) is above
+  while the client's minimum round trip (its pings, decided once five of them carried one; the
+  client puts it in one ping a second, though it pings every 250 ms, so the decision comes about
+  5 s in, as a loaded browser's first round trips alone can be far above the path's) is above
   15 ms, back to streams below 12 ms, and the video bitrate is at most 150 Mbit/s (headless Chromium 141 received 150 Mbit/s of
   datagrams without loss in `tools/dgbench`; docs/VENDOR_NOTES.md 2.5); `on` regardless of the
   round trip, `off` never. The welcome lists `video-fec` for such clients. Shard loss above 20 % over
@@ -456,7 +457,7 @@ instead as datagrams with forward error correction:
 | `0x21` mouse abs | C→H | flag, u32 seq, u16 x, u16 y | latest wins |
 | `0x22` gamepad | C→H | idx, connected, flag, u32 seq, XInput state | full snapshot, re-sent every 100 ms |
 | `0x23` rumble | H→C | idx, u8 large motor, u8 small motor | force feedback from ViGEmBus; a running state re-sent every 100 ms, a stop 3 times |
-| `0x24` input ack | H→C | kind, idx, 0, u32 seq, u64 arrived µs, u64 injected µs | to clients of hosts that list `input-ack`: a marked input was injected ([input latency](#input-latency)) |
+| `0x24` input ack | H→C | kind, idx (a gamepad's index; an input stream's id), 0, u32 seq, u64 arrived µs, u64 injected µs | to clients of hosts that list `input-ack`: a marked input was injected ([input latency](#input-latency)) |
 | `0x30/0x31` ping/pong | C↔H | u32 id, f64 t0, ping: u32 min RTT µs; pong: u64 host µs | NTP-style clock sync ([below](#clock-sync-and-latency-accounting)); the ping's min RTT (since step 4.6; 16-byte pings before) picks the Opus frame |
 | `0x40` frame ack | C→H | gen, u32 seq, i32 one-way delay µs, u32 decode µs | sent for every decoded frame (once the clock is synced): telemetry, the ACKs of reference recovery, and the rate controller's feedback from clients without rate reports |
 | `0x41` rate report | C→H | flags, gen, owdGen, u32 time ms, u32 lastSeq, u32 frames, u32 bytes, i32 owd p50 µs, i32 owd max µs, u32 lost, u32 audio, u16 decodeQueue, u16 0 [, u32 shards, u32 shardsLost] [, u32 owdSeq, i32 clockShiftUs] | every 25 ms to hosts whose welcome lists `rate-report`: the rate controller's input (below) |
@@ -502,7 +503,9 @@ before a pause can be lost safely.
 
 `1` key (u16 set-1 scancode, flags down|extended) · `2` mouse button · `3` wheel (WHEEL_DELTA
 units, high resolution) · `4` release-all · `5` UTF-8 text (typed as Unicode keystrokes; the
-host types at most 4096 bytes of one, so the browser splits longer text between code points).
+host types at most 4096 bytes of one, so the browser splits longer text between code points) ·
+`6` acknowledge this stream (u8 id, 1-255: [input latency](#input-latency); hosts before it skip
+it as malformed).
 Messages are length-prefixed, at most 64 KiB: the host skips a larger one and reads on.
 
 ### Input latency
@@ -510,12 +513,17 @@ Messages are length-prefixed, at most 64 KiB: the host skips a larger one and re
 Since the second hardware run the host measures nothing of the input path itself; it tells the
 client when its inputs arrived and were injected. A host that lists `input-ack` in
 `welcome.features` answers each *marked* input with a `0x24` datagram: the kind (`1` input
-stream message, `2` mouse rel, `3` mouse abs, `4` gamepad), the gamepad's index, the input's
-seq (an input stream message's number, from 1 in the order the host reads them) and the host
-clock µs it arrived (read from the stream or datagram) and was injected (the injector's call
-returned). Marked: a `0x20`/`0x21`/`0x22` datagram with bit 0 of its byte 3 set (padding
-before: older hosts ignore it); every input stream message once the client sent
-`{"t":"inputAck"}` on the control stream (the client numbers its writes as the host reads them).
+stream message, `2` mouse rel, `3` mouse abs, `4` gamepad), the gamepad's index or the input
+stream's id, the input's seq (an input stream message's number) and the host clock µs it
+arrived (read from the stream or datagram) and was injected (the injector's call returned).
+Marked: a `0x20`/`0x21`/`0x22` datagram with bit 0 of its byte 3 set (padding before: older
+hosts ignore it); on an input stream, every message after the client's `6` message with the
+stream's id there. The numbering is **per input stream**: the host counts the messages it reads
+on each stream from 1 (the `6` among them), and the client counts its writes per transport
+object (each has its own input stream), sending the `6` with a new id before the first input
+on a transport. A client that moves a live session to another connection (relay to direct)
+writes to a new input stream that starts again from 1 under a new id, so an acknowledgement of
+the old stream matches nothing of the new one's.
 Acks go the pongs' way (a non-blocking queue to a sender goroutine): the datagram loop never
 waits for them, and one that finds the queue full is dropped. The client marks every key and
 mouse-button press and one mouse and one gamepad datagram per 50 ms, and turns the answers into
@@ -1239,10 +1247,16 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   stored result gets a canvas per path (a canvas keeps its context type) and the worker runs a
   bake-off on the live stream after 2 s of warm-up, once the stream gives its frames (80 % of
   its rate, at most the display's refresh, in the last second; after 15 s of waiting it measures
-  all the same): the paths that work take turns, A B C C B A
+  all the same if the stream gives at least 15 fps, the least that gives every path enough
+  samples; `renderers.js` `bakeStart`): the paths that work take turns, A B C C B A
   (no path always measured first), 1.5 s each (the first 250 ms after a switch do not count),
   while display marks are taken as often as the main thread answers; the start-up toolbar and
-  game-mode hint wait for the result, so nothing of the app's covers the canvas meanwhile. Per
+  game-mode hint wait for the result, or come when the bake-off starts waiting (it then measures
+  5.5 s later at the earliest, the toolbar and the hint gone), so nothing of the app's covers the canvas
+  while it measures. A still desktop (the PC repeats its last picture about 10 times a second:
+  the second hardware run's still-desktop windows read 9.8-10.1 fps) is waited out for up to
+  60 s, until something moves; after that the bake-off ends unmeasured (nothing stored, the next
+  connection measures), where measuring 10 fps would have ended "no path measured". Per
   path: the Phase 0 *draw* (draw start → drawn) and *display* (drawn → the main thread's
   next animation frame) stages, the draw p50 per round, the frames per second drawn and the
   failed draws (the result names the frame pacing mode it ran in; the display stage depends
@@ -1251,10 +1265,11 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   display estimate is the same for every path unless one holds the page's frames back, and the
   draw stage is only the worker's draw call. Out: a path with failed draws or a lost context,
   too few samples, fewer than 80 % of the best path's frames per second, or a display p50 more
-  than one refresh above the best. Then a context that reports desynchronized (front-buffer
-  presentation) comes first; one that cannot report it (Chrome before `getContextAttributes`
-  on an OffscreenCanvas's 2D context, e.g. 122) is not left out for that, WebGPU (no such
-  mode) is. The first path (the 2D default) stays unless another draws
+  than one refresh above the best. Then by low-latency (desynchronized, front-buffer)
+  presentation: a context that reports it granted comes before one that cannot report it (the
+  2D canvas in Chrome before `getContextAttributes` on an OffscreenCanvas's 2D context, e.g.
+  122; Chromium 141's 2D canvas reports it granted), which comes before one that reports it not
+  granted or has no such mode (WebGPU). The first path left (the 2D default) stays unless another draws
   more than 1 ms faster (p50) in every round: a near tie keeps the default. The pick keeps
   drawing, the other canvases go, and the main thread stores it with why and every path's
   numbers in `localStorage` (`recon.present.v2`) for this browser major version and OS; the
@@ -1562,7 +1577,9 @@ the encoder started, hundreds of milliseconds): their round trip is mostly that 
 and an offset from them is off by half of it; the second hardware run's host.log shows such a
 first offset, `report_owd_p50_ms` ~120 on a LAN while the frame acks' `owd_avg_ms` read 7-25.
 The overlay's round-trip row shows the bound (`clock ±x ms`) and the host's input latency line
-logs it. Every frame's host timestamps convert to
+logs it. The client's minimum round trip of the last 30 s goes to the host in one ping a second
+at most (the others carry none): the host's FEC auto mode decides after five of them and the
+Opus frame size follows it, both set for that cadence. Every frame's host timestamps convert to
 local time, which gives per-frame one-way delay and stage latencies without synchronised wall
 clocks. Host-side stages (capture→encoded, host queue) need no conversion at all. Congestion
 detection and the `0x40` frame ack keep measuring from `encodeDoneUs` (the pre-extension meaning

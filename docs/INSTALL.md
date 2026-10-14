@@ -34,8 +34,9 @@ The examples use these values. Replace them with your own:
 - **Chrome or Edge** on the devices you play from, **kept up to date**. They have the best
   support: WebTransport, keyboard lock and raw mouse input. Firefox and Safari work with some
   limits. An old Chrome still streams, but with less: the second hardware run's Chrome 122
-  (February 2024) lacked features the client uses. The dashboard's **This browser** card and the
-  stream page's start screen say so for yours (in orange) and what it lacks; update it from
+  (February 2024) lacked features the client uses (the 2D canvas's low-latency report, HDR10
+  output). The dashboard's **This browser** card and the stream page's start screen say so for
+  yours and what an update brings (in orange where what it lacks costs latency); update it from
   `chrome://settings/help`.
 
 ## 1. Download the build (on the PC)
