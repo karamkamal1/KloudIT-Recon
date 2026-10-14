@@ -286,10 +286,12 @@ func TestWindowShortfallShards(t *testing.T) {
 			m := newFakeMeter(10 * time.Millisecond)
 			fi := time.Second / 60
 			now := time.Now()
+			ready := now // the source's frames are ready every fi
 			w.room(m, fi, now)
 			for range 3 { // 30 000 bytes: 10 ms at the fake's 24 Mbit/s
 				start, _ := m.Delivery()
-				ws := writeStart{pos: start, at: now, limited: m.WindowLimited()}
+				ws := writeStart{pos: start, at: now, limited: m.WindowLimited(), ready: ready}
+				ready = ready.Add(fi)
 				m.send(30_000)
 				m.limited.Add(int64(c.held))
 				w.sentDatagrams(m, ws, start+30_000, now.Add(c.wrote))
@@ -299,7 +301,7 @@ func TestWindowShortfallShards(t *testing.T) {
 				w.room(m, fi, now)
 			}
 			w.mu.Lock()
-			short := w.shortfall()
+			short := w.shortfall(m)
 			w.mu.Unlock()
 			if short != c.wantShortage {
 				t.Fatalf("shortfall %v, want %v", short, c.wantShortage)

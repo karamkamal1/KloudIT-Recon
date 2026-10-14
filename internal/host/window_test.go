@@ -34,6 +34,7 @@ import (
 type fakeMeter struct {
 	sent, done atomic.Uint64
 	limited    atomic.Int64
+	standing   atomic.Int64 // ns: StandingQueue
 	progress   chan struct{}
 	minRTT     time.Duration
 	pacing     int64 // bit/s
@@ -55,6 +56,7 @@ func (m *fakeMeter) Progress() <-chan struct{}    { return m.progress }
 func (m *fakeMeter) RecentMinRTT() time.Duration  { return m.minRTT }
 func (m *fakeMeter) PacingRate() int64            { return m.pacing }
 func (m *fakeMeter) WindowLimited() time.Duration { return time.Duration(m.limited.Load()) }
+func (m *fakeMeter) StandingQueue() time.Duration { return time.Duration(m.standing.Load()) }
 func (m *fakeMeter) send(n uint64)                { m.sent.Add(n) }
 func (m *fakeMeter) deliver(upTo uint64)          { m.deliverAt(upTo, time.Now()) }
 
@@ -209,13 +211,15 @@ func TestWindowShortfall(t *testing.T) {
 	m := newFakeMeter(10 * time.Millisecond)
 	fi := time.Second / 60
 	now := time.Now()
+	ready := now // the source's frames are ready every fi
 	w.room(m, fi, now)
 	// write sends a frame of n bytes at now whose write takes wrote, held
 	// of that by the congestion window, and whose first byte the peer
 	// acknowledges rtt later and its mark took after that.
 	write := func(n uint64, rtt, took, wrote, held time.Duration) {
 		start, _ := m.Delivery()
-		ws := writeStart{pos: start, at: now, limited: m.WindowLimited()}
+		ws := writeStart{pos: start, at: now, limited: m.WindowLimited(), ready: ready}
+		ready = ready.Add(fi)
 		m.send(n)
 		m.limited.Add(int64(held))
 		w.sent(m, ws, now.Add(wrote))
@@ -229,7 +233,7 @@ func TestWindowShortfall(t *testing.T) {
 	short := func() bool {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		return w.shortfall()
+		return w.shortfall(m)
 	}
 	frame(30_000, 10*time.Millisecond, 40*time.Millisecond)
 	if short() {
@@ -271,6 +275,7 @@ func TestWindowShortfall(t *testing.T) {
 	// late: each write takes 2.5 times the pacer's time) delivers as late:
 	// no queue builds, nothing to hold datagrams out of.
 	w, m, now = &videoWindow{}, newFakeMeter(10*time.Millisecond), time.Now()
+	ready = now
 	w.room(m, fi, now)
 	for i := range 8 {
 		write(30_000, 10*time.Millisecond, 25*time.Millisecond, 25*time.Millisecond, 0)
@@ -290,6 +295,7 @@ func TestWindowShortfall(t *testing.T) {
 	// 40 % of the pacing rate shows as before when the window held each
 	// write 15 of its 25 ms.
 	w, m, now = &videoWindow{}, newFakeMeter(10*time.Millisecond), time.Now()
+	ready = now
 	w.room(m, fi, now)
 	for range 3 {
 		write(30_000, 10*time.Millisecond, 25*time.Millisecond, 25*time.Millisecond, 15*time.Millisecond)
@@ -297,9 +303,24 @@ func TestWindowShortfall(t *testing.T) {
 	if !short() {
 		t.Fatal("three frames at 40 % of the pacing rate whose writes waited for the window: a shortfall")
 	}
+	// A target far over what the encoder makes: frames paced in 3 ms, their
+	// ACKs 1-4 ms late (more than 1.5 x the pacer's time from the first
+	// byte's to the mark's), each delivered long before the next is ready:
+	// no backlog in the path, no shortfall (the second hardware run's
+	// window held up to 185 frames per 10 s for that).
+	w, m, now = &videoWindow{}, newFakeMeter(10*time.Millisecond), time.Now()
+	ready = now
+	w.room(m, fi, now)
+	for i := range 16 {
+		frame(9_000, 10*time.Millisecond, 4*time.Millisecond+time.Duration(i%4)*time.Millisecond)
+		if short() {
+			t.Fatalf("frame %d delivered within the frame interval: a shortfall", i)
+		}
+	}
 	// Small frames (a still desktop) decide nothing: their
 	// acknowledgements' timing would.
 	w, m, now = &videoWindow{}, newFakeMeter(10*time.Millisecond), time.Now()
+	ready = now
 	w.room(m, fi, now)
 	for range 8 {
 		frame(1_500, 10*time.Millisecond, 25*time.Millisecond)
@@ -906,7 +927,7 @@ func (p *latencyPath) stream(window bool, c latencyCase) (latencyRun, error) {
 					queued[seq].Store(int64(since()))
 				}
 				select {
-				case s.frameQ <- &media.Frame{Gen: 1, Seq: seq, Key: seq == 0, Data: payload[:n]}:
+				case s.frameQ <- &media.Frame{Gen: 1, Seq: seq, Key: seq == 0, Data: payload[:n], EncodeDoneUs: s.a.clock()}: // as the pipelines stamp it
 				default: // the queue is full: the encoder's frame is dropped
 				}
 				seq++

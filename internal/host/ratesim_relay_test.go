@@ -971,6 +971,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 				if d := now - snd.since; d > time.Millisecond {
 					sec.held++
 					sec.holdMax = max(sec.holdMax, d)
+					win.noteHold(d) // Session.admit
 				}
 				send.mu.Lock()
 				of.held, of.opened = false, clock()
@@ -979,7 +980,7 @@ func runRelaySim(c rsCfg) *rsTrace {
 				af.status, af.sendAt, af.unsent = "writing", now, wireOf(af.bytes)
 				sec.hostQMax = max(sec.hostQMax, now-af.encDone)
 				sent0, _ := m.Delivery()
-				snd.ws = writeStart{pos: sent0, at: clock(), limited: m.WindowLimited()}
+				snd.ws = writeStart{pos: sent0, at: clock(), limited: m.WindowLimited(), ready: epoch.Add(af.encDone)}
 				snd.writeAt = now
 				streamQ = append(streamQ, rsChunk{snd.idx, wireOf(af.bytes)})
 				snd.state = 2

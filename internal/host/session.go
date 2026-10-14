@@ -2609,6 +2609,15 @@ func (s *Session) frameSender() {
 	}
 }
 
+// readyAt is when frame f was ready (its encodeDone on the agent's clock),
+// as a time beside now (zero: unknown).
+func (s *Session) readyAt(f *media.Frame, now time.Time) time.Time {
+	if f.EncodeDoneUs == 0 {
+		return time.Time{}
+	}
+	return now.Add(-time.Duration(int64(s.a.clock())-int64(f.EncodeDoneUs)) * time.Microsecond)
+}
+
 // frameDeadline is the deadline of a frame stream of the given size (rung 1:
 // frameDeadline) at the session's frame rate and video pacing rate (the
 // media congestion controller's, else 1.2 x the video bitrate).
@@ -2634,6 +2643,7 @@ func (s *Session) sendFrame(of *outFrame, h proto.FrameHeader, b []byte) {
 	_ = st.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	m := s.deliveryMeter()
 	ws := startWrite(m) // the video window measures the frame's delivery from here
+	ws.ready = s.readyAt(f, ws.at)
 	if err := s.writeFrame(of, b); err != nil {
 		if s.send.finish(of, outCancelled) {
 			st.CancelWrite()

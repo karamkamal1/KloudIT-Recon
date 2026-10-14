@@ -429,7 +429,8 @@ func (s *Session) writeShards(of *outFrame, h proto.FrameHeader, fr *fec.Frame, 
 	loss := s.a.faults.fecLoss
 	m := s.deliveryMeter()
 	ws := startWrite(m) // the video window measures the frame's delivery (and the hand-over's time) from here
-	sent := 0           // bytes handed to the connection
+	ws.ready = s.readyAt(f, ws.at)
+	sent := 0 // bytes handed to the connection
 	for i, d := range dgs {
 		if (i > 0 || held) && i%16 == 0 && s.ctx.Err() == nil {
 			in := s.ladderIn(lossOutgoing, f.Gen, f.Seq)

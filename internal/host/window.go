@@ -28,11 +28,23 @@ import (
 // "Falls short": the path took markedly longer (shortfallRatio) to deliver
 // the recent frames' bytes than the sender took to send them, from the
 // acknowledgement of a frame's first byte to that of its mark (below; the
-// controller's DeliveredAt). Only a bottleneck slower than the sender
-// stretches that: a longer or jittery round trip delays both ends alike, so
-// a path that carries the video is never held back, whatever its round trip
-// does (a relay fallback, Wi-Fi), and a capacity drop is seen within about
-// three frames. Without that evidence frames go out as before the window.
+// controller's DeliveredAt). Where the frames went out as soon as they were
+// ready (they waited less than shortfallBacklog at the host on average: a
+// sender the path does not hold back, the encoder making less than the
+// pacer would send) that needs a backlog over shortfallBacklog in the path
+// too: the frames took longer than they came (the time each took beyond the
+// time until the next one was ready, carried over while it lasts), or the
+// round trips show a queue that stands (the controller's StandingQueue).
+// Only a
+// bottleneck slower than the sender stretches that: a longer or jittery
+// round trip delays both ends alike, so a path that carries the video is
+// never held back, whatever its round trip does (a relay fallback, Wi-Fi),
+// and a capacity drop is seen within about three frames. A path slower than
+// the pacing rate but faster than the encoder's frames come builds no
+// backlog: the frames each go before the next is ready (a target far over
+// what the encoder makes, where the second hardware run's window held up to
+// 185 frames per 10 s for 1-4 ms of ACK jitter on frames paced in a few).
+// Without that evidence frames go out as before the window.
 // The sender's time is the pacer's at its rate, or the write's own where
 // that was longer: on a host whose CPU is busy (a game) quic-go's send loop
 // runs late, the frame's bytes leave late and arrive as late, and no queue
@@ -100,6 +112,10 @@ const (
 	// frames: a still desktop) decides nothing; their acknowledgements'
 	// timing would dominate.
 	shortfallMin = 20 * time.Millisecond
+	// shortfallBacklog: the samples' backlog in the path (paceSample.gap)
+	// over this is a shortfall; a frame's ACKs a few milliseconds late are
+	// not.
+	shortfallBacklog = 10 * time.Millisecond
 )
 
 // deliveryMeter is what the window reads of the connection
@@ -121,6 +137,9 @@ type deliveryMeter interface {
 	// WindowLimited is how long in all the congestion window has kept the
 	// sender from sending.
 	WindowLimited() time.Duration
+	// StandingQueue is the queue every packet of the last 50-100 ms met
+	// on the path, by their round trips.
+	StandingQueue() time.Duration
 }
 
 // videoWindow is frameSender's record of the frames in flight.
@@ -129,16 +148,20 @@ type videoWindow struct {
 	meter deliveryMeter // the controller the marks are positions of
 	marks []windowMark  // the frames in flight, oldest first
 	// paced: the last shortfallFrames acknowledged frames' delivery, the
-	// evidence of a shortfall (npaced written so far).
+	// evidence of a shortfall (npaced written so far); ready: when the last
+	// measured frame was ready.
 	paced  [shortfallFrames]paceSample
 	npaced int
+	ready  time.Time
 	// rtt: the round trip "in transit" is measured against (room).
 	rtt time.Duration
 
 	// For stream stats: frames held, and the longest hold (µs), since the
-	// last report.
-	held    atomic.Int64
-	maxHold atomic.Int64
+	// last report; and for the rate controller the time frames were held in
+	// all (ns: holdTime).
+	held      atomic.Int64
+	maxHold   atomic.Int64
+	holdTotal atomic.Int64
 }
 
 // windowMark is a frame in flight: the connection's sent positions before
@@ -146,21 +169,26 @@ type videoWindow struct {
 // the pacing rate (bit/s) it went out at, and the write's own time (its
 // duration less the time the congestion window held it back).
 type windowMark struct {
-	start, pos uint64
-	at         time.Time
-	pacing     int64
-	own        time.Duration
+	start, pos       uint64
+	began, at, ready time.Time // its write began and returned; it was ready (writeStart.ready)
+	pacing           int64
+	own              time.Duration
 }
 
 // paceSample is how one frame went through the path: took, from the
 // acknowledgement of its first byte to that of its mark, against sent, the
 // time the sender needed to send those bytes: paced, the pacer's at its
-// rate, or the write's own time where that was longer. A bottleneck slower
-// than the sender stretches took; a round trip that is longer or varies
-// delays both acknowledgements alike, and a sender that is late itself
-// delays both ends of the delivery as it delays the sending.
+// rate, or the write's own time where that was longer; and gap, the time
+// from the frame before being ready to this one being ready (the source's
+// pace, which window holds do not stretch), or sent where that is longer. A
+// bottleneck slower than the sender stretches took; a round trip that is
+// longer or varies delays both acknowledgements alike, and a sender that is
+// late itself delays both ends of the delivery as it delays the sending. A
+// path's backlog grows by what a frame took beyond its gap. waited: from
+// the frame being ready to its write's beginning (the host's frame queue,
+// the window's hold).
 type paceSample struct {
-	took, paced, sent time.Duration
+	took, paced, sent, gap, waited time.Duration
 }
 
 // roundTrip is how long a frame stays unacknowledged without any queue: the
@@ -188,7 +216,7 @@ func windowLimit(minRTT, interval time.Duration, recent int) int {
 // start over. Called with w.mu held.
 func (w *videoWindow) inFlight(m deliveryMeter) {
 	if m != w.meter {
-		w.meter, w.marks, w.npaced, w.rtt = m, w.marks[:0], 0, 0
+		w.meter, w.marks, w.npaced, w.rtt, w.ready = m, w.marks[:0], 0, 0, time.Time{}
 		return
 	}
 	_, done := m.Delivery()
@@ -219,21 +247,35 @@ func (w *videoWindow) measure(m deliveryMeter, k windowMark) {
 		return
 	}
 	paced := time.Duration(float64(k.pos-k.start) * 8 / float64(k.pacing) * float64(time.Second))
-	w.paced[w.npaced%shortfallFrames] = paceSample{took: last.Sub(first), paced: paced, sent: max(paced, k.own)}
+	sent, gap := max(paced, k.own), time.Duration(0)
+	if !w.ready.IsZero() {
+		gap = k.ready.Sub(w.ready)
+	}
+	w.ready = k.ready
+	w.paced[w.npaced%shortfallFrames] = paceSample{took: last.Sub(first), paced: paced, sent: sent, gap: max(gap, sent), waited: max(0, k.began.Sub(k.ready))}
 	w.npaced++
 }
 
 // shortfall reports whether the path delivered the last frames' bytes
-// shortfallRatio times slower than the sender sent them (see the top of the
-// file). Called with w.mu held.
-func (w *videoWindow) shortfall() bool {
-	var took, paced, sent time.Duration
-	for _, p := range w.paced[:min(w.npaced, shortfallFrames)] {
+// shortfallRatio times slower than the sender sent them, and, for frames
+// that went out as soon as they were ready, with a backlog over
+// shortfallBacklog in the path (see the top of the file). Called with w.mu
+// held.
+func (w *videoWindow) shortfall(m deliveryMeter) bool {
+	var took, paced, sent, waited, backlog time.Duration
+	n := min(w.npaced, shortfallFrames)
+	for i := w.npaced - n; i < w.npaced; i++ { // oldest first
+		p := w.paced[i%shortfallFrames]
 		took += p.took
 		paced += p.paced
 		sent += p.sent
+		waited += p.waited
+		backlog = max(0, backlog+p.took-p.gap)
 	}
-	return paced >= shortfallMin && float64(took) > shortfallRatio*float64(sent)
+	if paced < shortfallMin || float64(took) <= shortfallRatio*float64(sent) {
+		return false
+	}
+	return waited >= time.Duration(n)*shortfallBacklog || backlog > shortfallBacklog || m.StandingQueue() > shortfallBacklog
 }
 
 // room reports whether another frame may go out at now on m's path: yes
@@ -243,7 +285,7 @@ func (w *videoWindow) room(m deliveryMeter, interval time.Duration, now time.Tim
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.inFlight(m)
-	short := w.shortfall()
+	short := w.shortfall(m)
 	// The path's round trip: its recent min RTT, but while the path falls
 	// short the one from before (lower ones count): the backlog the window
 	// leaves (about a frame) is in every round trip then, and would widen
@@ -271,7 +313,7 @@ func (w *videoWindow) sent(m deliveryMeter, ws writeStart, now time.Time) {
 	defer w.mu.Unlock()
 	w.inFlight(m) // switches to m if the controller changed
 	pos, _ := m.Delivery()
-	w.marks = append(w.marks, windowMark{start: ws.pos, pos: pos, at: now, pacing: m.PacingRate(), own: own})
+	w.marks = append(w.marks, windowMark{start: ws.pos, pos: pos, began: ws.at, at: now, ready: ws.readyAt(), pacing: m.PacingRate(), own: own})
 }
 
 // sentDatagrams records a frame sent as datagram shards (fec.go), handed to
@@ -290,16 +332,26 @@ func (w *videoWindow) sentDatagrams(m deliveryMeter, ws writeStart, end uint64, 
 	defer w.mu.Unlock()
 	w.inFlight(m)
 	pos, _ := m.Delivery()
-	w.marks = append(w.marks, windowMark{start: ws.pos, pos: max(pos, end), at: now, pacing: m.PacingRate(), own: own})
+	w.marks = append(w.marks, windowMark{start: ws.pos, pos: max(pos, end), began: ws.at, at: now, ready: ws.readyAt(), pacing: m.PacingRate(), own: own})
 }
 
 // writeStart is where and when a frame's write began on a path, for sent:
-// the path's sent position (math.MaxUint64: unknown, or another path's) and
-// how long its congestion window had held the sender back by then.
+// the path's sent position (math.MaxUint64: unknown, or another path's), how
+// long its congestion window had held the sender back by then, and when the
+// frame was ready (its encodeDone; zero: at).
 type writeStart struct {
 	pos     uint64
 	at      time.Time
 	limited time.Duration
+	ready   time.Time
+}
+
+// readyAt is when the frame was ready.
+func (ws writeStart) readyAt() time.Time {
+	if ws.ready.IsZero() {
+		return ws.at
+	}
+	return ws.ready
 }
 
 // startWrite records the beginning of a frame's write on m's path (nil: no
@@ -316,6 +368,7 @@ func startWrite(m deliveryMeter) writeStart {
 // noteHold records how long a frame was held.
 func (w *videoWindow) noteHold(d time.Duration) {
 	w.held.Add(1)
+	w.holdTotal.Add(int64(d))
 	us := d.Microseconds()
 	for {
 		m := w.maxHold.Load()
@@ -324,6 +377,10 @@ func (w *videoWindow) noteHold(d time.Duration) {
 		}
 	}
 }
+
+// holdTime is how long the window has held frames in all: the path's
+// shortfall, which the frames' delays then show as the host's queue.
+func (w *videoWindow) holdTime() time.Duration { return time.Duration(w.holdTotal.Load()) }
 
 // stats returns and resets the frames held and the longest hold.
 func (w *videoWindow) stats() (held int64, maxHold time.Duration) {
