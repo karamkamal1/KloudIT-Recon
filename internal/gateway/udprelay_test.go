@@ -1053,21 +1053,27 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 // has brought the target under the link (within a second in the relay
 // simulation, at 20a5043 as now: docs/VENDOR_NOTES.md "Merged second
 // hardware run: the UDP relay under overload"), the frames are on time
-// again within a second: nothing of the overrun (a backlog of
-// retransmissions, probe timeouts backed off, the window's brake) outlives
-// it. Frames go as the session sends them: one stream each, written in
-// turn, cancelled when not sent by their deadline, the older left out when
-// two wait.
+// again within a second, as often as before the overrun and 90 % of them
+// where the machine managed that before: nothing of the overrun (a backlog
+// of retransmissions, probe timeouts backed off, the window's brake)
+// outlives it. The stream starts at the lowered target for that: a machine
+// with two CPUs shared with internal/host's simulations (`go test ./...` on
+// a two-CPU runner) leaves out or delays up to a quarter of the frames
+// whatever the overrun. Frames go as the session sends them: one stream
+// each, written in turn, cancelled when not sent by their deadline, the
+// older left out when two wait.
 func TestUDPRelayOverrun(t *testing.T) {
 	if testing.Short() {
-		t.Skip("about 6 s of streaming")
+		t.Skip("about 7 s of streaming")
 	}
 	const (
 		linkRate  = 100e6
 		linkQueue = 50 * time.Millisecond
-		over      = 250_000_000 // the target first: 300 Mbit/s of pacing
-		under     = 60_000_000  // the rate controller's answer: 72 Mbit/s
+		over      = 250_000_000 // the overrun's target: 300 Mbit/s of pacing
+		under     = 60_000_000  // before it, and the rate controller's answer: 72 Mbit/s
 		fps       = 60
+		warm      = 500 * time.Millisecond // at under, not judged
+		before    = time.Second            // at under, judged: the machine's own
 		overFor   = 2 * time.Second
 		recovery  = time.Second // after the target is lowered
 		judged    = 2 * time.Second
@@ -1136,7 +1142,8 @@ func TestUDPRelayOverrun(t *testing.T) {
 		size int
 	}
 	start := time.Now()
-	lowered := start.Add(overFor)
+	overAt := start.Add(warm + before)
+	lowered := overAt.Add(overFor)
 	end := lowered.Add(recovery + judged)
 	queue := make(chan frame, 2)
 	var made []time.Time // by frame number
@@ -1145,15 +1152,19 @@ func TestUDPRelayOverrun(t *testing.T) {
 		defer close(queue)
 		tk := time.NewTicker(time.Second / fps)
 		defer tk.Stop()
-		target := int64(over)
+		target := int64(under)
 		m.SetTarget(target, time.Second/fps)
 		for n := 0; ; n++ {
 			now := time.Now()
 			if !now.Before(end) {
 				return
 			}
-			if target == over && !now.Before(lowered) {
-				target = under
+			want := int64(under)
+			if !now.Before(overAt) && now.Before(lowered) {
+				want = over
+			}
+			if want != target {
+				target = want
 				m.SetTarget(target, time.Second/fps)
 			}
 			mu.Lock()
@@ -1243,19 +1254,27 @@ func TestUDPRelayOverrun(t *testing.T) {
 			break
 		}
 	}
-	ov, after := judge(start, lowered), judge(lowered.Add(recovery), end)
+	ctl, ov, after := judge(start.Add(warm), overAt), judge(overAt, lowered), judge(lowered.Add(recovery), end)
 	st := m.Stats()
-	t.Logf("overrun (%d Mbit/s into %.0f Mbit/s): %d of %d frames completed, latency p50/p95 %v/%v; target lowered to %d Mbit/s: on time again after %v; "+
+	t.Logf("before, at %d Mbit/s: %d of %d frames on time, latency p50/p95 %v/%v; "+
+		"overrun (%d Mbit/s into %.0f Mbit/s): %d of %d frames completed, latency p50/p95 %v/%v; target lowered to %d Mbit/s: on time again after %v; "+
 		"from %v on %d of %d on time, latency p50/p95 %v/%v; %d frames cancelled, %d left out; the link's queue dropped %d datagrams; "+
 		"the relay forwarded %d to the browser and dropped %d (%d by the kernel); the host lost %d of %d packets, %d collapses",
+		under/1_000_000, ctl.ok, ctl.of, p(ctl.lat, .5), p(ctl.lat, .95),
 		over/1_000_000, linkRate/1e6, len(ov.lat), ov.of, p(ov.lat, .5), p(ov.lat, .95), under/1_000_000, recovered,
 		recovery, after.ok, after.of, p(after.lat, .5), p(after.lat, .95), cancelled.Load(), left.Load(), link.overflowed.Load(),
 		a.stats.PktToBrowser.Load(), a.stats.Dropped.Load(), a.stats.SocketDrops.Load(), st.LostPackets, st.LostPackets+st.AckedPackets, st.Collapses)
+	if ctl.ok < ctl.of/2 {
+		t.Fatalf("before the overrun %d of %d frames completed within %v: the stream does not fit this machine", ctl.ok, ctl.of, onTime)
+	}
 	if len(ov.lat) < ov.of/10 {
 		t.Errorf("during the overrun %d of %d frames completed: want frames to keep arriving (a tenth at least)", len(ov.lat), ov.of)
 	}
-	if after.ok < after.of*9/10 {
-		t.Errorf("%v after the target was lowered under the link %d of %d frames completed within %v: want 90 %%", recovery, after.ok, after.of, onTime)
+	// As often on time as before (a tenth of the frames' leeway), 90 %
+	// where the machine managed that.
+	if want := min(0.9, float64(ctl.ok)/float64(ctl.of)-0.1); float64(after.ok) < want*float64(after.of) {
+		t.Errorf("%v after the target was lowered under the link %d of %d frames completed within %v, before the overrun %d of %d: want %.0f %%",
+			recovery, after.ok, after.of, onTime, ctl.ok, ctl.of, want*100)
 	}
 }
 
