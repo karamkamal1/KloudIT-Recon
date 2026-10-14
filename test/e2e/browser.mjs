@@ -2854,13 +2854,16 @@ async function checkTornControl() {
 // (13-46 ms in the second hardware run), larger. The rate controller lowers
 // the bitrate for it (host.log "congestion: lowering bitrate why=delay");
 // that used to show the warning "Network congestion detected" every 30 s,
-// which a check of the toasts at the stream's start never saw.
+// which a check of the toasts at the stream's start never saw. The step is in
+// both directions, so the host's own round trips show it as well (the rate
+// controller's ack-confirm gate, ack_queue_ms of the decrease line); the
+// proxy's datagram counts during it show the stream went through it.
 async function checkVM() {
   const host = await restartHost({ RECON_TEST_FAULTS: 'vm' }, 'host-vm');
   const rewrite = async (route) => {
     const resp = await route.fetch();
     const body = await resp.json();
-    if (body.direct?.url) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${fecProxyPort}/wt`);
+    directViaProxy(body);
     await route.fulfill({ response: resp, json: body });
   };
   await ctx.route('**/api/hosts/*/connect', rewrite);
@@ -2886,8 +2889,10 @@ async function checkVM() {
     const overlay = await page.textContent('#stats').catch(() => '');
     await sleep(3000);
     const log0 = host.log.length;
+    const via0 = { c2h: fecImpair.c2h, h2c: fecImpair.h2c };
     Object.assign(fecImpair, { delayMs: 60 });
     await sleep(6000);
+    const via = { c2h: fecImpair.c2h - via0.c2h, h2c: fecImpair.h2c - via0.h2c };
     Object.assign(fecImpair, { delayMs: 0 });
     await sleep(8000);
     const cuts = host.log.slice(log0).match(/msg="congestion: lowering bitrate"[^\n]*/g) || [];
@@ -2900,11 +2905,12 @@ async function checkVM() {
     const logged = /msg="cpu budget: software encoding"[^\n]* rung=3 /.test(host.log) && /audio: no sound output device on this PC/.test(host.log);
     check('VM without a GPU (test hook vm): the stream works with an informational CPU-limit notice and no warning or error toast from start to end, ' +
       'also through a delay step the rate controller lowers the bitrate for; the overlay shows the CPU limit and why audio is off',
-    !!cpu && cpu.cls.includes('info') && !bad.length && cuts.length > 0 && playing && /at 30 fps, fastest preset \(asked: \d+×\d+ at 60 fps\)/.test(limit) &&
-      audioOff && logged,
+    !!cpu && cpu.cls.includes('info') && !bad.length && via.h2c > 100 && via.c2h > 0 && cuts.length > 0 && playing &&
+      /at 30 fps, fastest preset \(asked: \d+×\d+ at 60 fps\)/.test(limit) && audioOff && logged,
     `CPU notice ${cpu ? `"${cpu.cls}"` : 'missing'}; warning/error toasts ${JSON.stringify(bad.map((t) => t.text.slice(0, 80)))}; ` +
       `all toasts ${JSON.stringify(toasts.map((t) => `${t.cls.replace('toast', '').trim() || 'plain'}: ${t.text.slice(0, 50)}`))}; ` +
-      `delay step: ${cuts.length} "congestion: lowering bitrate" lines (${(cuts[0] || '').replace(/^.*?from=/, 'from=').slice(0, 90)}), playing after it ${playing}; ` +
+      `delay step: the proxy carried ${via.h2c} datagrams to the browser and ${via.c2h} from it, ` +
+      `${cuts.length} "congestion: lowering bitrate" lines (${(cuts[0] || '').replace(/^.*?from=/, 'from=').replace(/ urgent=.*$/, '')}), playing after it ${playing}; ` +
       `overlay "${limit}", audio off ${audioOff}; host log ${logged ? 'has' : 'lacks'} the budget's and the sound device's lines`);
   } finally {
     Object.assign(fecImpair, { delayMs: 0, loss: 0 });
@@ -5032,6 +5038,18 @@ function impairProxy(sock, targetPort) {
   return st;
 }
 
+// directViaProxy points a connect answer's direct path at the impairment
+// proxy alone. The browser races every address of direct.candidates (the
+// direct path on the LAN; url is the first, for clients before them), so
+// rewriting url alone leaves the host's own address in the race, and the
+// session bypasses the proxy: the VM check's delay step then reached no
+// packet of the stream.
+function directViaProxy(body) {
+  if (!body.direct?.url) return;
+  body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${fecProxyPort}/wt`);
+  body.direct.candidates = [{ url: body.direct.url, kind: 'lan', note: 'e2e impairment proxy' }];
+}
+
 // Datagram + FEC against frame streams (E2E_FEC_COMPARE=<seconds per run>):
 // through impairProxy at 40 ms RTT with 1 % and 3 % loss each way, a direct
 // session per mode (host fec "off": frame streams; "auto": datagram + FEC
@@ -5057,7 +5075,7 @@ async function compareFec(seconds) {
   const rewrite = async (route) => {
     const resp = await route.fetch();
     const body = await resp.json();
-    if (body.direct?.url) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${fecProxyPort}/wt`);
+    directViaProxy(body);
     await route.fulfill({ response: resp, json: body });
   };
   await ctx.route('**/api/hosts/*/connect', rewrite);
