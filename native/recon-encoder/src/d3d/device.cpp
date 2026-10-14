@@ -218,7 +218,12 @@ Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp) {
         ComPtr<IDXGIDevice1> dxgi;
         if (SUCCEEDED(out.device.As(&dxgi))) {
             hr = dxgi->SetGPUThreadPriority(7);
-            if (FAILED(hr)) logf(LogLevel::Warn, "SetGPUThreadPriority(7) failed: %s (run recon-host elevated)", hrText(hr).c_str());
+            INT got = 0;
+            if (FAILED(hr)) {
+                logf(LogLevel::Warn, "SetGPUThreadPriority(7) failed: %s (run recon-host elevated)", hrText(hr).c_str());
+            } else if (SUCCEEDED(dxgi->GetGPUThreadPriority(&got)) && got != 7) {
+                logf(LogLevel::Warn, "SetGPUThreadPriority(7) succeeded, but the device reports GPU thread priority %d", int(got));
+            }
             hr = dxgi->SetMaximumFrameLatency(1);
             if (FAILED(hr)) logf(LogLevel::Warn, "SetMaximumFrameLatency(1) failed: %s", hrText(hr).c_str());
         }

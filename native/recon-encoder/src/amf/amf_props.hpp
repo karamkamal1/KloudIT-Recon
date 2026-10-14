@@ -125,6 +125,9 @@ struct AmfCodecProps {
     const wchar_t* capSliceOutput = nullptr;       // AV1: tile output
     const wchar_t* capMaxRefs = nullptr;
     const wchar_t* capMaxProfile = nullptr;
+    // How the encoder turns RGB input into YUV (AMF_ACCELERATION_TYPE:
+    // hardware = in VCN, GPU = a shader, the header's default; logged at init).
+    const wchar_t* capColorConversion = nullptr;
     amf_int64 profileMain10 = -1;                  // HEVC: a max profile >= this means 10-bit
     const wchar_t* capMaxLtr = nullptr;            // AV1
     const wchar_t* capAlignW = nullptr;            // AV1
@@ -218,6 +221,7 @@ inline const AmfCodecProps& amfH264Props() {
         c.capSliceOutput = AMF_VIDEO_ENCODER_CAP_SUPPORT_SLICE_OUTPUT;
         c.capMaxRefs = AMF_VIDEO_ENCODER_CAP_MAX_REFERENCE_FRAMES;
         c.capMaxProfile = AMF_VIDEO_ENCODER_CAP_MAX_PROFILE;
+        c.capColorConversion = AMF_VIDEO_ENCODER_CAP_COLOR_CONVERSION;
         c.docMaxLtr = 2;  // MAX_LTR_FRAMES "0 … 2"
         return c;
     }();
@@ -312,6 +316,7 @@ inline const AmfCodecProps& amfHevcProps() {
         c.capSliceOutput = AMF_VIDEO_ENCODER_HEVC_CAP_SUPPORT_SLICE_OUTPUT;
         c.capMaxRefs = AMF_VIDEO_ENCODER_HEVC_CAP_MAX_REFERENCE_FRAMES;
         c.capMaxProfile = AMF_VIDEO_ENCODER_HEVC_CAP_MAX_PROFILE;
+        c.capColorConversion = AMF_VIDEO_ENCODER_HEVC_CAP_COLOR_CONVERSION;
         c.profileMain10 = AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN_10;
         c.docMaxLtr = 16;  // MAX_LTR_FRAMES "0 … 16" (shared with SVC; level / DPB limits apply)
         return c;
@@ -414,6 +419,7 @@ inline const AmfCodecProps& amfAv1Props() {
         c.capMaxTemporalLayers = AMF_VIDEO_ENCODER_AV1_CAP_MAX_NUM_TEMPORAL_LAYERS;
         c.capSliceOutput = AMF_VIDEO_ENCODER_AV1_CAP_SUPPORT_TILE_OUTPUT;
         c.capMaxProfile = AMF_VIDEO_ENCODER_AV1_CAP_MAX_PROFILE;
+        c.capColorConversion = AMF_VIDEO_ENCODER_AV1_CAP_COLOR_CONVERSION;
         c.capMaxLtr = AMF_VIDEO_ENCODER_AV1_CAP_MAX_NUM_LTR_FRAMES;
         c.capAlignW = AMF_VIDEO_ENCODER_AV1_CAP_WIDTH_ALIGNMENT_FACTOR;
         c.capAlignH = AMF_VIDEO_ENCODER_AV1_CAP_HEIGHT_ALIGNMENT_FACTOR;
