@@ -817,6 +817,54 @@ If not, send: the client log and a screenshot for the failing item.
 
 All runs use Network path *Relay via gateway* and `"logLevel": "debug"`, after stage 6.
 
+**8.0 The direct path on the LAN** (VENDOR_NOTES "Second hardware run: direct path on the LAN";
+run it first, with Network path *Auto*, not the stage's *Relay via gateway*)
+
+The second run streamed every session through the gateway's relay (`path=relay`, network p50
+6-9 ms even on an idle desktop) although the firewall let the direct port in, and nothing in
+host.log said why. host.log now says it for every session.
+
+- **Do**:
+  1. After an agent restart, on the PC: `Select-String $log -Pattern 'endpoint listening|reaches
+     the gateway through a tunnel|Windows Firewall' | Select-Object -Last 5`, and
+     `Find-NetRoute -RemoteIPAddress 192.168.5.202 | Select-Object InterfaceAlias, IPAddress`
+     (the gateway's address), `Find-NetRoute -RemoteIPAddress <the client PC's address> | Select-Object
+     InterfaceAlias, IPAddress`, `Get-NetIPAddress -AddressFamily IPv4 | Select-Object
+     InterfaceAlias, IPAddress, PrefixLength`, and if Tailscale runs, `tailscale status` and
+     whether *Use Tailscale subnets* is on in its menu.
+  2. In Chrome on the client (Settings → Network path *Auto*; check it is not *Relay via
+     gateway*), connect and stream 1 minute. Open the overlay.
+  3. `Select-String $log -Pattern 'direct path|session started|session moved' | Select-Object -Last 15`.
+  4. If the session started on the relay: keep streaming 3 minutes (the client retries the direct
+     path 2, 8, 20, 60 s after the start, then every 2 minutes) and run step 3 again.
+- **Look at**:
+  - `direct WebTransport endpoint listening port=48100 ... addrs="192.168.5.x (Ethernet 2, lan,
+    route to the gateway); 100.x (Tailscale, tailscale); ..."`: the LAN address must be there,
+    and should carry `route to the gateway`. If the Tailscale address carries it instead, the
+    next line is `the PC reaches the gateway through a tunnel although the gateway is on the PC's
+    own network ... detail="from 100.x (Tailscale) instead of 192.168.5.x on 192.168.5.0/24
+    (Ethernet 2)"`: the cause of the relay detour, with `fix=`.
+  - The session's line after `session started`: `direct path: connected tried="192.168.5.x:48100
+    (lan, the browser's network 192.168.5.0/24): connected after N ms; ..."`, or `direct path: not
+    used by this session, it streams through the gateway why="..." tried="..."` with each
+    address's outcome.
+  - With `no answer` in `tried`: a line `direct path: a browser's connection failed in its
+    handshake from=<client>:<port> to=<PC address> ... why="the browser gave up the handshake: the
+    PC's answers did not reach it ..."` means the browser's packets reach the PC and its answers
+    take another route (the tunnel warning above); no such line at all means the browser's
+    packets never reach the PC (a firewall or antivirus on either PC, Wi-Fi client isolation, a
+    VLAN). `refused the PC's certificate` means a hash mismatch (a gateway and an agent of
+    different versions).
+  - The overlay's Transport row: `webtransport · direct 192.168.5.x:48100`, or after a move
+    `... (moved from relay)`; and the network stage p50.
+- **Pass**: the session runs on the direct path (from the start, or `session moved to the direct
+  path ... from=relay` within the 3 minutes, with no second `session started` and no visible
+  interruption at the move), and the overlay's network stage p50 is below the relay's 6-9 ms (a
+  wired LAN: about 1-3 ms).
+- **If not, send**: the lines of steps 1 and 3, the outputs of step 1's commands, the overlay's
+  Transport row and the latency export (**Export latency data**), and whether the client PC is
+  on Wi-Fi or wired and on Tailscale.
+
 **8.1 The UDP relay** (VENDOR_NOTES 2.6, "Final review: security", "UDP relay ports held
 without a session" and "A relayed connection ends with its session")
 
