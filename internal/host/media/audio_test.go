@@ -422,3 +422,103 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	return l.w.Write(p)
 }
+
+// switchingSource delivers silence; at the n-th delivery of a run it fails
+// as WASAPI does when the device in use goes away (ErrAudioDeviceChanged:
+// AUDCLNT_E_DEVICE_INVALIDATED), and after that its next starts find no
+// device for missing (the new default device appears a moment later, or
+// not: forever).
+type switchingSource struct {
+	failAt  int
+	missing time.Duration
+	forever bool
+	mu      sync.Mutex
+	gone    time.Time // when the device went away
+	failed  bool
+}
+
+func (*switchingSource) Name() string { return "test-switch" }
+
+func (d *switchingSource) Run(ctx context.Context, sink func([]float32)) error {
+	d.mu.Lock()
+	gone, failed := d.gone, d.failed
+	d.mu.Unlock()
+	if failed && (d.forever || time.Since(gone) < d.missing) {
+		return fmt.Errorf("%w: GetDefaultAudioEndpoint: HRESULT 0x80070490", ErrNoAudioDevice)
+	}
+	for i := 0; ctx.Err() == nil; i++ {
+		sink(make([]float32, 960))
+		time.Sleep(10 * time.Millisecond)
+		if !failed && i == d.failAt {
+			d.mu.Lock()
+			d.gone, d.failed = time.Now(), true
+			d.mu.Unlock()
+			return fmt.Errorf("%w: GetNextPacketSize: HRESULT 0x88890004", ErrAudioDeviceChanged)
+		}
+	}
+	return nil
+}
+
+// TestAudioDeviceChanged: the device in use going away (a headset
+// unplugged, HDMI audio re-created by a game's display mode change: WASAPI's
+// AUDCLNT_E_DEVICE_INVALIDATED) is not "no sound device": audio captures the
+// default device again at once, and a device missing for a moment after it
+// is retried quickly; the client is not told "Audio off". Only a device
+// that stays missing past deviceChangeGrace is "no sound device". Before, it
+// was ErrNoAudioDevice: 5 s of silence and DeviceChanged(false, true).
+func TestAudioDeviceChanged(t *testing.T) {
+	defer func(p, g time.Duration) { noDevicePoll, deviceChangeGrace = p, g }(noDevicePoll, deviceChangeGrace)
+	noDevicePoll, deviceChangeGrace = 5*time.Second, 600*time.Millisecond
+	for _, c := range []struct {
+		name    string
+		src     *switchingSource
+		maxGap  time.Duration
+		changes []bool
+	}{
+		{"switched", &switchingSource{failAt: 20}, 400 * time.Millisecond, nil},
+		{"missing 300 ms", &switchingSource{failAt: 20, missing: 300 * time.Millisecond}, 700 * time.Millisecond, nil},
+		{"gone for good", &switchingSource{failAt: 20, forever: true}, -1, []bool{false}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var changes []bool
+			var logs bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &mu}, nil))
+			a := NewAudio(c.src, AudioConfig{Codec: "pcm", DeviceChanged: func(p bool) {
+				mu.Lock()
+				changes = append(changes, p)
+				mu.Unlock()
+			}}, log)
+			var pmu sync.Mutex
+			var last time.Time
+			var gap time.Duration
+			if err := a.Start(func([]byte) {
+				pmu.Lock()
+				now := time.Now()
+				if !last.IsZero() && now.Sub(last) > gap {
+					gap = now.Sub(last)
+				}
+				last = now
+				pmu.Unlock()
+			}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(2 * time.Second)
+			a.Stop()
+			pmu.Lock()
+			defer pmu.Unlock()
+			mu.Lock()
+			defer mu.Unlock()
+			if fmt.Sprint(changes) != fmt.Sprint(c.changes) {
+				t.Fatalf("device changes %v, want %v", changes, c.changes)
+			}
+			if c.maxGap > 0 && gap > c.maxGap {
+				t.Fatalf("longest gap in audio %v, want at most %v", gap.Round(time.Millisecond), c.maxGap)
+			}
+			if out := logs.String(); !strings.Contains(out, "the sound output device changed") || strings.Contains(out, "level=WARN") {
+				t.Fatalf("log:\n%s", out)
+			}
+			t.Logf("longest gap %v, device changes %v", gap.Round(time.Millisecond), changes)
+		})
+	}
+}
