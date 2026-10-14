@@ -369,9 +369,11 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   display's refresh rate, so for the lowest latency pick that rate or more (on a 75 Hz
   display: 90, which streams 75): a frame rate below the display's leaves out some of its
   frames (one in five at 60 on 75 Hz), and the stream looks less smooth than the PC. The
-  native helper sends the others the moment the PC shows them; before the second hardware
-  run they waited up to a frame for their turn (docs/VENDOR_NOTES.md "Second hardware run:
-  in-game capture and encoder latency").
+  native helper sends most of the others the moment the PC shows them when they come
+  regularly; a game on the display's refresh that misses some refreshes (vsync at a frame
+  rate below the display's) still waits, about 4 ms typically and up to ~14 ms, for its
+  turn; before the second hardware run every frame waited, up to a whole frame
+  (docs/VENDOR_NOTES.md "Second hardware run: in-game capture and encoder latency").
 - **Encoder preset**: lowest latency / balanced / best quality.
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer: *Auto* (default, adapts within
