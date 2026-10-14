@@ -132,6 +132,7 @@ const S = {
   get keyboardLock() { return document.fullscreenElement ? this.kbLock : null; },
   set keyboardLock(v) { this.kbLock = v; },
   pointerRaw: null, // the last pointer lock was granted with unadjustedMovement (the browser read the option)
+  goodStream: 0, // stats in a row with the stream at its rate (presentRecheck)
   rumbles: 0, // force-feedback datagrams played
   audioJitter: null, // the jitter buffer's last report (audio-worklet.js)
   hz: 60,
@@ -232,9 +233,24 @@ async function audioChannel() {
 // unmeasured: pickPath's conclusive) is stored as provisional: the next
 // connection measures again, BAKE_TRIES times in all, and only then keeps
 // it. A path chosen in the settings is used as is.
+//
+// A stored pick is measured again (presentStale) when it was made by a
+// page before PRESENT_V (the first hardware run's pick, "the only path
+// left" on a 12 fps stream, had no provisional mark and stayed for good;
+// since PRESENT_V a pick on a stream short of frames is provisional where
+// that left a path unmeasured, pickPath), at another display refresh rate
+// (more than 10 % apart), or more than PRESENT_MAX_DAYS ago (a driver update
+// since). A provisional pick kept
+// after BAKE_TRIES is measured again once a connection that draws with it
+// has had a good stream for GOOD_STREAM_S (presentRecheck): the next
+// connection's bake-off runs on a stream that can tell the paths apart.
 
 const PRESENT_KEY = 'recon.present.v2';
+const PRESENT_V = 3;
+const PRESENT_MAX_DAYS = 30;
 const BAKE_TRIES = 3;
+const GOOD_STREAM_S = 10;
+const PICK_SHARE = 0.8; // renderers.js PICK.minShare: a stream short of frames below this share of its rate
 try { localStorage.removeItem('recon.present.v1'); } catch {} // picked by a noisier rule
 
 function deviceKey() {
@@ -264,12 +280,49 @@ function storePresent(rec) {
   } catch {}
 }
 
+// The frame rate a stored pick's stream should have given every path: the
+// stream's (its video, "1920x1080 60 fps hevc"), at most the display's
+// refresh (expectFps since PRESENT_V; 0: unknown).
+function presentExpectFps(s) {
+  if (s.expectFps > 0) return s.expectFps;
+  const fps = +(/ (\d+(?:\.\d+)?) fps/.exec(s.video || '') || [])[1] || 0;
+  return fps && s.hz > 0 ? Math.min(fps, s.hz) : fps;
+}
+
+// Why a stored pick is measured again ('' when it stands; see above).
+function presentStale(s) {
+  const at = Date.parse(s.at);
+  const best = Math.max(0, ...Object.values(s.results || {}).map((x) => (x && !x.error && !x.lost ? x.fps || 0 : 0)));
+  const expect = presentExpectFps(s);
+  const short = expect > 0 && best < PICK_SHARE * expect;
+  if (!(s.v >= PRESENT_V)) {
+    return `made by an earlier version of this page${short ? ` on a stream short of frames (${best} of ${Math.round(expect)} fps)` : ''}`;
+  }
+  if (s.hz > 0 && S.hz > 0 && Math.abs(s.hz - S.hz) > 0.1 * S.hz) return `made at ${s.hz} Hz; the display refreshes at ${S.hz} Hz now`;
+  if (at && Date.now() - at > PRESENT_MAX_DAYS * 864e5) return `made over ${PRESENT_MAX_DAYS} days ago`;
+  return '';
+}
+
 function presentPlan() {
   if (PATHS.includes(prefs.renderer)) return { mode: 'setting', paths: [S.lost2D === prefs.renderer ? 'canvas2d' : prefs.renderer] };
   if (S.present2D) return { mode: 'auto', paths: ['canvas2d'] };
   const s = storedPresent();
-  if (s && !(s.provisional && s.tries < BAKE_TRIES)) return { mode: 'auto', paths: [s.winner] };
-  return { mode: 'bakeoff', paths: [...PATHS] };
+  const stale = s ? presentStale(s) : '';
+  if (s && !stale && !(s.provisional && s.tries < BAKE_TRIES)) return { mode: 'auto', paths: [s.winner] };
+  return { mode: 'bakeoff', paths: [...PATHS], stale: stale ? `the stored pick (${LABELS[s.winner]}, ${String(s.at).slice(0, 10)}) was ${stale}` : '' };
+}
+
+// A provisional pick kept after BAKE_TRIES draws this connection: once the
+// stream has given its frames (PICK_SHARE of its rate, at most the display's
+// refresh) for GOOD_STREAM_S in a row, the next connection measures again.
+function presentRecheck(st) {
+  const s = S.present?.mode === 'auto' ? storedPresent() : null;
+  if (!s?.provisional || s.tries < BAKE_TRIES || st.renderer?.name !== s.winner) { S.goodStream = 0; return; }
+  const expect = Math.min(S.videoCfg?.fps || 0, S.hz || Infinity);
+  S.goodStream = expect > 0 && st.fps >= PICK_SHARE * expect ? (S.goodStream || 0) + 1 : 0;
+  if (S.goodStream * 0.5 < GOOD_STREAM_S) return; // stats every 0.5 s
+  storePresent({ ...s, tries: 0 });
+  S.logs.push(`${new Date().toISOString()} presentation: the stream gives its frames now; Auto measures the renderers again on the next connection`);
 }
 
 // One canvas per path (a canvas is transferred to the worker once and keeps
@@ -317,8 +370,9 @@ function onBakeoff(result) {
   if (!result.winner) return;
   const v = S.videoCfg;
   const rec = {
-    key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
-    video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio,
+    v: PRESENT_V, key: deviceKey(), winner: result.winner, why: result.why, at: new Date().toISOString(), results: result.results, pacing: result.pacing,
+    video: v ? `${v.width}x${v.height} ${v.fps} fps ${v.codec}` : '', hz: S.hz, dpr: devicePixelRatio, expectFps: result.rule?.expectFps || 0,
+    waitedMs: result.waitedMs ?? null,
   };
   if (result.conclusive === false) {
     // Measured on a stream short of frames: for this session, and again on
@@ -333,7 +387,8 @@ function onBakeoff(result) {
     return;
   }
   storePresent(rec);
-  toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}). Settings → Pipeline.`, 'info', 4000);
+  const again = S.present?.stale ? ` Measured again: ${S.present.stale}.` : '';
+  toast(`Renderer: ${LABELS[result.winner]}, Auto's pick (${result.why}).${again} Settings → Pipeline.`, 'info', again ? 7000 : 4000);
 }
 
 // A path picked in the settings lost its WebGPU device (a driver reset, the
@@ -413,6 +468,7 @@ async function connect() {
   document.title = `${ep.host} · KloudIT Recon`;
   const { sab, port } = await audioChannel().catch(() => ({}));
   S.present = presentPlan();
+  if (S.present.stale) S.logs.push(`${new Date().toISOString()} presentation: Auto measures the renderers again: ${S.present.stale}`);
   S.renderer = null;
   S.bakeoff = null;
   const canvases = stageCanvases(S.present.paths);
@@ -1047,6 +1103,7 @@ const cls = (v, a, b) => (v === null || v === undefined ? '' : v < a ? 'good' : 
 function onStats(st) {
   S.lastStats = st;
   S.probe = st.probe;
+  presentRecheck(st);
   const pill = $('latency');
   if (st.total !== null && st.total !== undefined) {
     pill.textContent = `${Math.round(st.total)} ms`;
@@ -1213,7 +1270,7 @@ function presentRows(st, row) {
   const r = st.renderer;
   if (!r) return [row('Renderer', S.conn ? S.conn.renderer : '—')];
   const b = r.bake;
-  const how = r.mode === 'setting' ? 'setting' : b && !b.done ? `auto: measuring ${b.warming ? '(warm-up)' : `${b.slot}/${b.slots}`}` : 'auto';
+  const how = r.mode === 'setting' ? 'setting' : b && !b.done ? `auto: measuring ${b.warming ? '(warm-up)' : b.waiting ? '(waiting for a steady stream)' : `${b.slot}/${b.slots}`}` : 'auto';
   const rows = [
     row('Renderer', `${LABELS[r.name] || r.name}${r.name !== r.slot ? ` (${LABELS[r.slot] || r.slot} failed)` : ''} · ${how}`),
     row('  context', `${desyncText(r)} · canvas ${r.canvas[0]}×${r.canvas[1]}${r.drawErrors ? ` · ${r.drawErrors} errors` : ''}`, r.desynchronized === false || r.drawErrors ? 'warn' : ''),
@@ -1364,6 +1421,8 @@ function exportLatency() {
   });
 }
 S.exportLatency = exportLatency;
+// For the end-to-end test (test/e2e/browser.mjs): Renderer Auto's plan and its stored pick's handling.
+Object.assign(S, { presentPlan, presentRecheck, deviceKey });
 
 async function downloadLatency() {
   const data = await exportLatency();
@@ -1476,10 +1535,13 @@ $('drawer').addEventListener('keydown', (e) => {
 function presentHint() {
   const s = storedPresent();
   if (!s) {
-    return 'Auto tries each renderer on the live stream for about 10 s on the first connection: a desynchronized context first, the 2D canvas ' +
-      'unless another draws clearly faster. A heuristic: the latency rig decides.';
+    return 'Auto tries each renderer on the live stream for about 10 s on the first connection, once the stream gives its frames: ' +
+      'a desynchronized context first, the 2D canvas unless another draws clearly faster. A heuristic: the latency rig decides.';
   }
-  const prov = s.provisional && s.tries < BAKE_TRIES ? `; provisional, measured again on the next connection (try ${s.tries} of ${BAKE_TRIES})` : '';
+  const stale = presentStale(s);
+  const prov = stale ? `; measured again on the next connection: ${stale}`
+    : s.provisional && s.tries < BAKE_TRIES ? `; provisional, measured again on the next connection (try ${s.tries} of ${BAKE_TRIES})`
+      : s.provisional ? '; provisional (the stream was short of frames), measured again after a connection with a steady stream' : '';
   return `Auto: ${LABELS[s.winner]}, picked ${s.at.slice(0, 10)}${s.why ? ` (${s.why})` : ''}${prov}.`;
 }
 

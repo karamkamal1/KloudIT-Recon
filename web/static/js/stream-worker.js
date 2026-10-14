@@ -827,7 +827,7 @@ async function setupRenderers(msg) {
     const per = (v) => Object.fromEntries(order.map((p) => [p, v()]));
     pres.bake = {
       order, slot: 0, t0: 0, slotStart: 0, lastT: 0, recs: per(() => Array.from({ length: BAKE.rounds }, () => [])), dur: per(() => 0), errors: per(() => 0),
-      done: false, result: null,
+      done: false, result: null, recent: [], started: 0, waitedMs: 0, steady: false,
     };
     post('log', { text: `presentation bake-off: ${order.join(', ')}` });
   }
@@ -1088,7 +1088,11 @@ function onResize(w, h) {
 }
 
 // Presentation bake-off: after BAKE.warmupMs of streaming (decoder warm-up)
-// the paths take turns, A B C C B A (no path always measured first),
+// and once the stream gives its frames (PICK.minShare of the stream's rate,
+// at most the display's refresh, drawn in the last BAKE.steadyMs; at most
+// BAKE.waitMs of waiting for that, then it measures all the same and a
+// short stream makes the pick provisional: pickPath), the paths take turns,
+// A B C C B A (no path always measured first),
 // BAKE.slotMs of drawn frames each (the first BAKE.skipMs after a switch do
 // not count). Meanwhile display marks are taken as often as the main thread
 // answers them. Per path: the draw and display stages (p50, p95, mean), the
@@ -1097,7 +1101,11 @@ function onResize(w, h) {
 // The main thread keeps everything off the canvas while this runs. The
 // result names the frame pacing mode(s) it ran in (step 4.4; the draw stage
 // does not depend on it, the display stage does, alike for every path).
-const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250 };
+const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, steadyMs: 1000, waitMs: 15000 };
+
+// The frame rate every path should draw (the stream's, at most one per
+// display refresh; 0: unknown).
+const bakeExpectFps = () => Math.min(video.cfg?.fps || 0, 1000 / pres.refreshMs);
 
 const baking = () => !!pres.bake && !pres.bake.done;
 
@@ -1119,7 +1127,20 @@ function bakeTick(t, rec) {
   const gap = Math.min(t - b.lastT, 100);
   b.lastT = t;
   if (!b.t0) b.t0 = t;
-  if (t - b.t0 < BAKE.warmupMs) return;
+  if (!b.started) {
+    if (rec) b.recent.push(t);
+    while (b.recent.length && b.recent[0] <= t - BAKE.steadyMs) b.recent.shift();
+    if (t - b.t0 < BAKE.warmupMs) return;
+    // A stream short of frames cannot tell the paths apart: wait for it.
+    const expect = bakeExpectFps();
+    const fps = (1000 * b.recent.length) / BAKE.steadyMs;
+    const steady = !expect || fps >= PICK.minShare * expect;
+    if (!steady && t - b.t0 < BAKE.warmupMs + BAKE.waitMs) return;
+    b.started = t;
+    b.waitedMs = Math.round(t - b.t0 - BAKE.warmupMs);
+    b.steady = steady;
+    post('log', { text: `presentation bake-off: measuring after ${(b.waitedMs / 1000).toFixed(1)} s of waiting for a steady stream (${fps.toFixed(0)} of ${Math.round(expect)} frames per second in the last ${BAKE.steadyMs} ms${steady ? '' : ': still short, measured all the same'})` });
+  }
   if (!b.slotStart) b.slotStart = t;
   if (rec && t - b.slotStart >= BAKE.skipMs && b.recs[path]) {
     b.recs[path][Math.floor(b.slot / b.order.length)].push(rec);
@@ -1161,13 +1182,13 @@ function bakeFinish() {
   // Every path should have drawn the stream's frames (at most one per
   // display refresh): a stream short of them (starved) cannot tell the paths
   // apart by their frame counts (pickPath: not conclusive).
-  const expectFps = Math.min(video.cfg?.fps || 0, 1000 / pres.refreshMs);
+  const expectFps = bakeExpectFps();
   const pick = pickPath(results, pres.refreshMs, PICK, expectFps);
   for (const [p, why] of Object.entries(pick.out)) results[p].out = why;
   const winner = pick.winner;
   const pacing = pacingOf(PATHS.flatMap((p) => b.recs[p]?.flat() || []));
   b.result = {
-    winner, why: pick.why, conclusive: pick.conclusive, results, pacing,
+    winner, why: pick.why, conclusive: pick.conclusive, results, pacing, waitedMs: b.waitedMs, steadyStart: b.steady,
     rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), expectFps: +expectFps.toFixed(1), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs },
   };
   const txt = (p) => {
@@ -1190,7 +1211,7 @@ function bakeState() {
   if (!b) return null;
   if (b.done) return { done: true, ...b.result };
   const warming = !b.t0 || now() - b.t0 < BAKE.warmupMs;
-  return { done: false, warming, path: renderer?.name, slot: b.slot + 1, slots: b.order.length * BAKE.rounds, order: b.order };
+  return { done: false, warming, waiting: !warming && !b.started, path: renderer?.name, slot: b.slot + 1, slots: b.order.length * BAKE.rounds, order: b.order };
 }
 
 // ---------------------------------------------------------------------------

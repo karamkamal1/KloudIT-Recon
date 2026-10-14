@@ -60,7 +60,11 @@ export const LABELS = { canvas2d: '2D canvas', webgl2: 'WebGL2', webgpu: 'WebGPU
 //          than minShare of the best path's frames per second (from 10 fps
 //          up), or a display p50 more than a refresh above the best
 //   then   a context that reports desynchronized (front-buffer
-//          presentation) before one that does not
+//          presentation) before one that does not (reports false, or has
+//          no such mode: WebGPU); a context that cannot report it (null:
+//          Chrome before OffscreenCanvasRenderingContext2D's
+//          getContextAttributes, e.g. 122, for the 2D canvas, which asked
+//          for it) is not left out for that
 //   then   the first in PATHS (the 2D default) unless another path's draw
 //          p50 is lower by more than marginMs in every round (a near tie
 //          keeps the default)
@@ -91,8 +95,9 @@ export function pickPath(results, refreshMs = 1000 / 60, rule = PICK, expectFps 
   drop((x) => (x.display.p50 > disp + refreshMs ? 'display lags' : ''));
   const conclusive = !(short && Object.values(out).some((why) => why === 'too few samples' || why === 'drops frames'));
   if (!pool.length) return { winner: null, why: 'no path measured', out, conclusive: false };
-  const desync = pool.filter((p) => results[p].desynchronized === true);
-  const byDesync = desync.length > 0 && desync.length < pool.length;
+  const notDesync = (p) => results[p].desynchronized === false || (p === 'webgpu' && results[p].desynchronized !== true);
+  const desync = pool.filter((p) => !notDesync(p));
+  const byDesync = pool.some((p) => results[p].desynchronized === true) && desync.length < pool.length;
   if (byDesync) pool = desync;
   const def = pool[0];
   const d = results[def].drawRounds || [];
@@ -103,7 +108,7 @@ export function pickPath(results, refreshMs = 1000 / 60, rule = PICK, expectFps 
   const clear = pool.filter((p) => p !== def && faster(p)).sort((a, b) => results[a].draw.p50 - results[b].draw.p50);
   let why = clear.length ? `draws over ${rule.marginMs} ms faster than ${LABELS[def]} in every round`
     : pool.length > 1 ? `no other path draws over ${rule.marginMs} ms faster` : 'the only path left';
-  if (byDesync && !clear.length) why = pool.length > 1 ? `desynchronized; ${why}` : 'the only desynchronized context';
+  if (byDesync && !clear.length) why = pool.length > 1 ? `desynchronized${pool.some((p) => results[p].desynchronized !== true) ? ' or not reported' : ''}; ${why}` : 'the only desynchronized context';
   if (!conclusive) why += `; the stream gave ${best} of ${Math.round(expectFps)} frames per second, too few to measure every path`;
   return { winner: clear[0] || def, why, out, conclusive };
 }

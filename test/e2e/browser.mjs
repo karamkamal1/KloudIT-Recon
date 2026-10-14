@@ -522,7 +522,8 @@ async function checkBakeoff() {
     if (fps >= 10) pool = pool.filter((p) => res[p].fps >= rule.minShare * fps);
     const disp = Math.min(...pool.map((p) => res[p].display.p50));
     pool = pool.filter((p) => res[p].display.p50 <= disp + rule.refreshMs);
-    if (pool.some((p) => res[p].desynchronized === true)) pool = pool.filter((p) => res[p].desynchronized === true);
+    const notDesync = (p) => res[p].desynchronized === false || (p === 'webgpu' && res[p].desynchronized !== true);
+    if (pool.some((p) => res[p].desynchronized === true)) pool = pool.filter((p) => !notDesync(p));
     const def = pool[0];
     const d = res[def]?.drawRounds || [];
     const clear = pool.filter((p) => p !== def && res[p].drawRounds.every((v, i) => v !== null && d[i] !== null && v + rule.marginMs < d[i]))
@@ -542,7 +543,8 @@ async function checkBakeoff() {
       !!result?.winner && result.winner === want && measured.length >= 2 && all.every((p) => enough(p) && res[p].drawRounds?.length === 2 && res[p].display.n >= 1) &&
         !!result.why && st?.renderer?.name === result.winner && st.renderer.bake?.done && stored?.winner === result.winner && stored.why === result.why && storedAs &&
         canvases.length === 1 && canvases[0] === result.winner && overlay.includes('bake-off') && overlay.includes('★ ') && overlay.includes(result.why) && (st.fps > 20 || br.ok),
-      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s: ${result?.winner} (${result?.why}; rule wants ${want}; conclusive ${result?.conclusive}, ` +
+      `${page === mainPage ? 'headless' : 'headed'}, ${took.toFixed(1)} s (waited ${((result?.waitedMs ?? NaN) / 1000).toFixed(1)} s for a steady stream${result?.steadyStart === false ? ', never steady' : ''}): ` +
+        `${result?.winner} (${result?.why}; rule wants ${want}; conclusive ${result?.conclusive}, ` +
         `stream ${rule.expectFps} fps expected; stored ${stored?.provisional ? `provisional, try ${stored.tries}` : 'for good'}); ${['canvas2d', 'webgl2', 'webgpu'].map(row).join('; ')}; ` +
         `canvases left: ${canvases.join(', ')}; stored key ${stored?.key}; ${st?.fps?.toFixed(1)} fps after${br.note}; ` +
         `during the bake-off CPUs ${bIdle == null ? '?' : (100 * bIdle).toFixed(0)} % idle (median second ${bMedian == null ? '?' : (100 * bMedian).toFixed(0)} %)`);
@@ -559,9 +561,11 @@ async function checkBakeoff() {
       `result pacing ${result?.pacing}, stored ${stored?.pacing}; draws by tick source this session ${JSON.stringify(pc)}; ` +
         `CPUs ${bIdle == null ? '?' : (100 * bIdle).toFixed(0)} % idle during the bake-off (median second ${bMedian == null ? '?' : (100 * bMedian).toFixed(0)} %)`);
     results.push({ bakeoff: result, stored });
-    // The client's first stage report (10 s after the worker started) falls
-    // in the bake-off: its frames come from several paths.
-    const stagesLine = await until(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]*/) || [])[0], 12000, 'stage line').catch(() => '');
+    // A stage report of the client (every 10 s from the worker's start) falls
+    // in the bake-off: its frames come from several paths. (The bake-off
+    // starts once the stream gives its frames: not always in the first.)
+    const stagesLine = await until(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]* renderer=bakeoff [^\n]*/) || [])[0], 12000, 'stage line')
+      .catch(() => (hostProc.log.slice(log0).match(/msg="latency stages[^\n]*/) || [''])[0]);
     check('renderer auto: the host logs a stage window that mixes paths as renderer=bakeoff', / renderer=bakeoff /.test(stagesLine),
       stagesLine.replace(/^.*?msg=/, '').slice(0, 200));
     await endStream();
@@ -705,6 +709,77 @@ async function checkPickedPathLost(path) {
     await endStream();
     page = mainPage;
   }
+}
+
+// Renderer Auto's stored pick and when it is measured again (second hardware
+// run, stream.js presentStale / presentRecheck), on the stream page before a
+// connection, from the plan the page would connect with: the first hardware
+// run's pick as that build stored it (no rule version, "the only path left"
+// at 12.3 of 60 fps; it stayed for good and every session of the second run
+// drew with the 2D canvas unmeasured) is measured again, saying why; a
+// current pick stands; one made at another display refresh rate or over 30
+// days ago is measured again; a provisional pick kept after three tries
+// stands, until a connection that draws with it has had a stream at its
+// rate for 10 s (stats every 0.5 s), after which the next one measures again
+// (a slower stream in between starts the count over).
+async function checkStoredPickStale() {
+  await page.goto(`${base}/`);
+  await page.evaluate((p) => localStorage.setItem('recon.prefs.v1', JSON.stringify(p)), { ...PREFS_2D, renderer: 'auto' });
+  await page.click('.host.online a.btn-primary');
+  await page.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+  const out = await page.evaluate((KEY) => {
+    const r = window.__recon;
+    const key = r.deviceKey();
+    const day = 864e5;
+    const owner = {
+      key, winner: 'canvas2d', why: 'the only path left', at: new Date(Date.now() - 3 * day).toISOString(), pacing: 'latency', video: '1920x1080 60 fps hevc', hz: r.hz, dpr: 1.25,
+      results: {
+        canvas2d: { desynchronized: null, draw: { p50: 0.59, n: 31 }, display: { p50: 2.24, n: 29 }, fps: 12.3 },
+        webgl2: { desynchronized: false, draw: { p50: 0.24, n: 27 }, display: { p50: 2.25, n: 27 }, fps: 10.1, out: 'too few samples' },
+        webgpu: { desynchronized: null, draw: { p50: 0.43, n: 27 }, display: { p50: 2.37, n: 27 }, fps: 10.1, out: 'too few samples' },
+      },
+    };
+    const good = {
+      ...owner, v: 3, at: new Date(Date.now() - day).toISOString(), why: 'desynchronized; no other path draws over 1 ms faster', expectFps: 60,
+      results: { canvas2d: { ...owner.results.canvas2d, desynchronized: true, fps: 59.8 }, webgl2: { ...owner.results.webgl2, fps: 59.6, out: undefined } },
+    };
+    const kept = { ...good, provisional: true, tries: 3, results: { canvas2d: { ...good.results.canvas2d, fps: 20 } } };
+    const plan = (rec) => { localStorage.setItem(KEY, JSON.stringify(rec)); const x = r.presentPlan(); return { mode: x.mode, paths: x.paths, stale: x.stale || '' }; };
+    const cases = {
+      owner: plan(owner), good: plan(good), hz: plan({ ...good, hz: r.hz * 2 }), old: plan({ ...good, at: new Date(Date.now() - 40 * day).toISOString() }),
+      kept: plan(kept), shortConclusive: plan({ ...good, results: { canvas2d: { ...good.results.canvas2d, fps: 20 }, webgl2: { ...good.results.webgl2, fps: 20 } } }),
+    };
+    // A connection drawing with the kept pick: 19 good stats, a slow one,
+    // then 20 good ones.
+    localStorage.setItem(KEY, JSON.stringify(kept));
+    const saved = { present: r.present, videoCfg: r.videoCfg };
+    r.present = { mode: 'auto', paths: ['canvas2d'] };
+    r.videoCfg = { fps: 60 };
+    const good1 = { fps: 0.9 * Math.min(60, r.hz), renderer: { name: 'canvas2d' } };
+    const tries = () => JSON.parse(localStorage.getItem(KEY)).tries;
+    for (let i = 0; i < 19; i++) r.presentRecheck(good1);
+    r.presentRecheck({ ...good1, fps: 0.5 * good1.fps });
+    const afterSlow = tries();
+    for (let i = 0; i < 19; i++) r.presentRecheck(good1);
+    const before = tries();
+    r.presentRecheck(good1);
+    const after = tries();
+    Object.assign(r, saved);
+    cases.recheck = { afterSlow, before, after, plan: r.presentPlan().mode, log: r.logs.filter((l) => l.includes('measures the renderers again on the next connection')).pop() || '' };
+    localStorage.removeItem(KEY);
+    return cases;
+  }, PRESENT_KEY);
+  const c = out;
+  check("renderer auto: the first hardware run's stored pick (no rule version, 12.3 of 60 fps) is measured again, saying why",
+    c.owner.mode === 'bakeoff' && /earlier version of this page on a stream short of frames \(12\.3 of 60 fps\)/.test(c.owner.stale), JSON.stringify(c.owner));
+  check('renderer auto: a current pick stands (also one made on a short stream that measured every path: conclusive)',
+    c.good.mode === 'auto' && c.good.paths[0] === 'canvas2d' && !c.good.stale && c.shortConclusive.mode === 'auto', `${JSON.stringify(c.good)}; ${JSON.stringify(c.shortConclusive)}`);
+  check('renderer auto: a pick made at another display refresh rate or over 30 days ago is measured again',
+    c.hz.mode === 'bakeoff' && /Hz now/.test(c.hz.stale) && c.old.mode === 'bakeoff' && /over 30 days ago/.test(c.old.stale), `${JSON.stringify(c.hz)}; ${JSON.stringify(c.old)}`);
+  check('renderer auto: a provisional pick kept after three tries stands until a connection drawing with it has had a stream at its rate for 10 s; then the next one measures again',
+    c.kept.mode === 'auto' && c.recheck.afterSlow === 3 && c.recheck.before === 3 && c.recheck.after === 0 && c.recheck.plan === 'bakeoff' && !!c.recheck.log,
+    `${JSON.stringify(c.kept)}; ${JSON.stringify(c.recheck)}`);
+  await endStream();
 }
 
 // Client-side upscaling in the stream (Phase 5): the WebGPU renderer shows the
@@ -2183,6 +2258,14 @@ async function checkPickRule() {
         canvas2d: mk({ fps: 14 }), webgl2: mk({ fps: 14 }) }, { expectFps: 60, conclusive: true }],
       ['a starved stream, WebGL2 drew fewer frames: provisional', 'canvas2d', { webgl2: 'drops frames' }, {
         canvas2d: mk({ fps: 20 }), webgl2: mk({ fps: 12 }) }, { expectFps: 60, conclusive: false }],
+      // Chrome 122 has no getContextAttributes on OffscreenCanvasRenderingContext2D: the 2D canvas cannot
+      // report desynchronized (null), which does not leave it out where WebGL2 reports it granted.
+      ["Chrome 122: the 2D canvas cannot report desynchronized, WebGL2 reports it, near tie: the 2D default stays", 'canvas2d', {}, {
+        canvas2d: mk({ desynchronized: null }), webgl2: mk({ draw: { p50: 0.4, n: 70 }, drawRounds: [0.4, 0.4] }), webgpu: mk({ desynchronized: null }) }],
+      ["Chrome 122: WebGL2 desynchronized and 2 ms faster in both rounds than the 2D canvas that cannot report it", 'webgl2', {}, {
+        canvas2d: mk({ desynchronized: null, draw: { p50: 2.6, n: 70 }, drawRounds: [2.6, 2.6] }), webgl2: mk({ draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
+      ['WebGPU (no low-latency mode) 2 ms faster than the desynchronized 2D canvas: the 2D canvas', 'canvas2d', {}, {
+        canvas2d: mk({ draw: { p50: 2.6, n: 70 }, drawRounds: [2.6, 2.6] }), webgpu: mk({ desynchronized: null, draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
     ];
     return list.map(([name, want, out, res, o = {}]) => ({
       name, want, out, conclusive: o.conclusive ?? want !== null, got: R.pickPath(res, 1000 / 60, R.PICK, o.expectFps || 0),
@@ -5074,6 +5157,7 @@ try {
   if (want('webgpu device lost')) await checkPickedPathLost('webgpu').catch((e) => check('WebGPU device lost scenario', false, e.message));
   if (want('webgl2 context lost')) await checkPickedPathLost('webgl2').catch((e) => check('WebGL2 context lost scenario', false, e.message));
   await closeHeaded();
+  if (want('stale stored pick')) await checkStoredPickStale().catch((e) => check('renderer auto: stale stored pick scenario', false, e.message));
 
   if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
   if (want('udp relay reconnects')) await checkUdpRelayReconnects().catch((e) => check('UDP relay reconnects scenario', false, e.message));
