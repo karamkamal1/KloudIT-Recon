@@ -53,6 +53,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace recon {
 
@@ -131,6 +132,56 @@ public:
 private:
     int64_t freq_ = 1, start_ = 0, next_ = 0;
     bool reported_ = false, done_ = false;
+};
+
+// CaptureLoss: a capture whose source went away (DDA's ACCESS_LOST at a
+// game's full-screen switch, a mode change, the secure desktop) and that
+// duplicates it again. The second hardware run had 15 such losses, each over
+// 10-61 ms later; a notice for each ("Screen capture is paused") was noise.
+// So a loss is reported to recon-host (captureChanged "lost", and "restored"
+// with the first image) only when an attempt to duplicate again fails, or when
+// kReportMs pass without an image: also when every new duplication works but
+// is lost again before its first image (DDA during some mode transitions),
+// which without this went on unreported and without a pause between attempts.
+// Attempts: at once after a loss, then after 16, 32, 64, 128 and every 250 ms
+// while they fail or the new duplication is lost again before an image.
+// --self-test-pacer checks it.
+class CaptureLoss {
+public:
+    static constexpr int kFirstRetryMs = 16, kRetryMs = 250, kReportMs = 250;
+
+    void reset(int64_t qpcFrequency);
+    bool active() const { return since_ != 0; }
+    const std::string& why() const { return why_; }
+    int attempts() const { return attempts_; }
+    // The source was lost at now (why). Returns when to duplicate again: at
+    // once for a new loss, after the next pause when a duplication that
+    // worked is lost again before its first image.
+    int64_t lost(int64_t now, const std::string& why);
+    // An attempt to duplicate again failed at now: when to try again.
+    int64_t failed(int64_t now);
+    // Duplicating again worked at now (no image yet).
+    void duplicated(int64_t now);
+    // recon-host is to be told "lost" now: an attempt failed, or kReportMs
+    // passed without an image. True once per loss.
+    bool reportDue(int64_t now);
+    // The first image after the loss came at now; ends the loss. reported:
+    // recon-host was told "lost" (it gets "restored" now).
+    struct End {
+        int64_t imageMs = 0;      // without an image since the loss
+        int64_t duplicateMs = 0;  // until the duplication that delivered it worked
+        int attempts = 0;         // failed attempts and duplications lost again before it
+        bool reported = false;
+    };
+    End image(int64_t now);
+
+private:
+    int64_t pause(int64_t now);
+
+    int64_t freq_ = 1, since_ = 0, duplicatedAt_ = 0;
+    std::string why_;
+    int attempts_ = 0;
+    bool failed_ = false, reported_ = false;
 };
 
 }  // namespace recon

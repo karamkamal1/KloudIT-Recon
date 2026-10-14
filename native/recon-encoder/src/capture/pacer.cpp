@@ -122,6 +122,62 @@ int64_t FirstImageWatchdog::image(int64_t now) {
     return reported_ ? std::max<int64_t>(1, (now - start_) * 1000 / freq_) : 0;
 }
 
+void CaptureLoss::reset(int64_t qpcFrequency) {
+    freq_ = qpcFrequency > 0 ? qpcFrequency : 1;
+    since_ = duplicatedAt_ = 0;
+    why_.clear();
+    attempts_ = 0;
+    failed_ = reported_ = false;
+}
+
+int64_t CaptureLoss::pause(int64_t now) {
+    const int ms = std::min(kRetryMs, kFirstRetryMs << std::min(attempts_++, 4));
+    return now + int64_t(ms) * freq_ / 1000;
+}
+
+int64_t CaptureLoss::lost(int64_t now, const std::string& why) {
+    if (!since_) {
+        since_ = now;
+        why_ = why;
+        attempts_ = 0;
+        duplicatedAt_ = 0;
+        failed_ = reported_ = false;
+        return now;
+    }
+    if (!duplicatedAt_) return now;
+    // Duplicated again and lost again before an image: a loss that keeps
+    // repeating; the next attempt waits like after a failed one.
+    duplicatedAt_ = 0;
+    return pause(now);
+}
+
+int64_t CaptureLoss::failed(int64_t now) {
+    failed_ = true;
+    return pause(now);
+}
+
+void CaptureLoss::duplicated(int64_t now) {
+    if (since_) duplicatedAt_ = now;
+}
+
+bool CaptureLoss::reportDue(int64_t now) {
+    if (!since_ || reported_) return false;
+    if (!failed_ && now - since_ < int64_t(kReportMs) * freq_ / 1000) return false;
+    reported_ = true;
+    return true;
+}
+
+CaptureLoss::End CaptureLoss::image(int64_t now) {
+    End e;
+    if (!since_) return e;
+    e.imageMs = (now - since_) * 1000 / freq_;
+    e.duplicateMs = ((duplicatedAt_ ? duplicatedAt_ : now) - since_) * 1000 / freq_;
+    e.attempts = attempts_;
+    e.reported = reported_;
+    reset(freq_);
+    return e;
+}
+
 // --- self-test ----------------------------------------------------------------------
 
 namespace {
@@ -434,12 +490,73 @@ void testFirstImage() {
     std::printf("  %-36s ok\n", name);
 }
 
+// A lost capture source (DDA): a loss over at the first new duplication is
+// not reported; a failing attempt is, with pauses of 16, 32, 64, 128, 250 ms;
+// so is a loss that comes back before every new duplication's first image
+// (each one then waits too), once 250 ms passed without an image.
+void testCaptureLoss() {
+    const char* name = "capture loss (DDA)";
+    const int64_t ms = 1000;  // ticks per millisecond (1 tick = 1 us)
+    CaptureLoss l;
+    l.reset(1000000);
+    // The second run's case: over 22 ms later, the first attempt worked.
+    expect(l.lost(100 * ms, "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST") == 100 * ms, name, "a new loss not duplicated again at once");
+    l.duplicated(120 * ms);
+    expect(!l.reportDue(121 * ms) && !l.reportDue(122 * ms), name, "a loss over at once reported");
+    CaptureLoss::End e = l.image(122 * ms);
+    expect(e.imageMs == 22 && e.duplicateMs == 20 && e.attempts == 0 && !e.reported && !l.active(), name, "a loss over at once: wrong end");
+    // Failing attempts: reported at the first failure, once; pauses double.
+    l.lost(1000 * ms, "ReleaseFrame: DXGI_ERROR_ACCESS_LOST");
+    std::vector<int64_t> pauses;
+    int64_t t = 1000 * ms;
+    for (int i = 0; i < 6; ++i) {
+        const int64_t next = l.failed(t);
+        pauses.push_back((next - t) / ms);
+        expect(l.reportDue(t) == (i == 0), name, "a failed attempt not reported exactly once");
+        t = next;
+    }
+    expect(pauses == std::vector<int64_t>{16, 32, 64, 128, 250, 250}, name, "pauses after failed attempts not 16, 32, 64, 128, 250, 250 ms");
+    l.duplicated(t);
+    e = l.image(t + 5 * ms);
+    expect(e.reported && e.attempts == 6 && l.lost(5000 * ms, "again") == 5000 * ms, name,
+           "a reported loss not ended by its first image, or the next loss not a new one");
+    // Every new duplication works but is lost again before its first image:
+    // the attempts pause as if they failed, and recon-host hears of it once
+    // 250 ms passed without an image.
+    l.reset(1000000);
+    t = 10000 * ms;
+    expect(l.lost(t, "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST") == t, name, "a new loss not duplicated again at once");
+    pauses.clear();
+    bool reported = false;
+    int64_t reportedAt = 0;
+    for (int i = 0; i < 6; ++i) {
+        l.duplicated(t + ms);
+        const int64_t next = l.lost(t + 2 * ms, "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST");
+        pauses.push_back((next - t - 2 * ms) / ms);
+        for (int64_t u = t + 2 * ms; u < next; u += ms) {
+            if (l.reportDue(u)) {
+                expect(!reported, name, "a repeating loss reported twice");
+                reported = true;
+                reportedAt = u;
+            }
+        }
+        t = next;
+    }
+    expect(pauses == std::vector<int64_t>{16, 32, 64, 128, 250, 250}, name, "a loss lost again before an image: no pauses 16 ... 250 ms");
+    expect(reported && reportedAt == 10250 * ms, name, "a repeating loss not reported 250 ms after it began");
+    l.duplicated(t);
+    e = l.image(t + ms);
+    expect(e.reported && e.attempts == 6, name, "the first image after a reported repeating loss: not reported as restored");
+    std::printf("  %-36s ok\n", name);
+}
+
 }  // namespace
 
 int runPacerSelfTest() {
     failures = 0;
     testDirty();
     testFirstImage();
+    testCaptureLoss();
     const int64_t sec = 1000000;
     {
         const char* name = "144 Hz game at 120 fps";
