@@ -188,6 +188,33 @@ func TestRelaySimLAN(t *testing.T) {
 		{"wired LAN, client stalls, from 80 Mbit/s", func(c *rsCfg) {
 			c.clientStall, c.startKbps = clientStalls(c.seed, c.dur), 80000
 		}, steadyLAN(15*ms, 25*ms, 0)},
+		// The second hardware run's game sessions as the log has them: the
+		// frames took 11-12 ms from first to last byte whatever the pacing
+		// (NMLlzRSB at the 250 Mbit/s setting, 104-143 KB frames, nothing
+		// lowered: 300 Mbit/s of pacing), ~75-95 Mbit/s carried: a
+		// 100 Mbit/s link somewhere on the way (an inference; HARDWARE_TEST_PLAN
+		// 8.1c measures it), a 100 ms queue at it. Each frame paced at 1.2 x
+		// 250 Mbit/s queues ~8-10 ms there. Before: 5-6 delay decreases a
+		// run, the target 176-234 Mbit/s on average over the last 30 s,
+		// 776-881 frames held by the window and 10-15 thinning episodes in
+		// that time, end to end 24.9-25.5 / 36.7-38.1 ms (25.1-25.8 /
+		// 40.0-40.2 with the client's stalls): the pumping and the judder of
+		// the log. Its first second (the 2.5 MB key frame of a 250 Mbit/s
+		// start into the link's 1.2 MB queue: a loss and an overflow
+		// decrease) is the same before and after.
+		{"100 Mbit/s link", func(c *rsCfg) {
+			c.capacity, c.capQueue = func(time.Duration) float64 { return 95e6 }, 100*time.Millisecond
+		}, linkLAN(1, 24*ms, 37*ms)},
+		{"100 Mbit/s link, client stalls", func(c *rsCfg) {
+			c.capacity, c.capQueue = func(time.Duration) float64 { return 95e6 }, 100*time.Millisecond
+			c.clientStall = clientStalls(c.seed, c.dur)
+		}, linkLAN(1, 24*ms, 40*ms)},
+		// The same at 150 Mbit/s: before, one delay decrease (seed 1), 202-238
+		// frames held, end to end 18.7-18.9 / 28.7-29.6 ms.
+		{"150 Mbit/s link, client stalls", func(c *rsCfg) {
+			c.capacity, c.capQueue = func(time.Duration) float64 { return 150e6 }, 100*time.Millisecond
+			c.clientStall = clientStalls(c.seed, c.dur)
+		}, linkLAN(0, 19*ms, 31*ms)},
 		// Real congestion still backs off: the LAN's capacity drops to
 		// 40 Mbit/s for 10 s (Wi-Fi with a neighbour's download), a 100 ms
 		// queue at the access point. Before: the first cut 85-130 ms after
@@ -241,6 +268,27 @@ func TestRelaySimLAN(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// linkLAN judges a LAN behind a link the frames' bursts queue at but the
+// stream fits in: at most delays decreases for a delay (the whole run: the
+// pumping), the target over 80 % of the setting in the last 30 s, end to
+// end under e2e50 and e2e95, at most 3 thinning episodes and 40 frames held
+// by the window.
+func linkLAN(delays int, e2e50, e2e95 time.Duration) func(*rsTrace, rsCfg, lanStats) string {
+	return func(tr *rsTrace, cfg rsCfg, st lanStats) string {
+		n := 0
+		for _, l := range tr.lines {
+			if strings.Contains(l, "RATE down") && strings.Contains(l, "why=delay") {
+				n++
+			}
+		}
+		if n > delays || st.target < 0.8*float64(cfg.ceiling) || st.e2e[0] > e2e50 || st.e2e[1] > e2e95 || st.thinStarts > 3 || st.holds > 40 {
+			return fmt.Sprintf("%d delay decreases, want at most %d; want the target over 80 %% of the setting, end to end under %v/%v, at most 3 thinning episodes and 40 frames held",
+				n, delays, e2e50, e2e95)
+		}
+		return ""
 	}
 }
 
