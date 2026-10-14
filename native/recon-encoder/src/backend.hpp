@@ -33,6 +33,10 @@ struct CapturedFrame {
     uint64_t index = 0;      // capture counter
     int64_t presentQpc = 0;  // when the content was presented (DDA LastPresentTime, AMD flip timestamp); 0 = unknown / repeat
     int64_t captureQpc = 0;  // when the capture API returned the frame (for a repeat: when it was re-submitted)
+    // Per-frame timing (stats readyQpc / deliverQpc): the capture had the
+    // image copied and its metadata read, and the pacer handed it out (the
+    // wait for its output slot in between, capture/pacer.hpp).
+    int64_t readyQpc = 0, deliverQpc = 0;
     uint32_t width = 0, height = 0;  // as displayed (after rotation)
     // Idle re-submit of the previous image: nothing new was presented for
     // StartParams::idleRepeatMs (see the pacing policy in capture/pacer.hpp).

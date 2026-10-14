@@ -443,6 +443,9 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         tex->GetDesc(&td);
         a.presentQpc = fi.LastPresentTime.QuadPart;
         a.captureQpc = now;
+        // The presents since the last image (the pacer's present-interval
+        // estimate: images the capture skipped while it slept for a slot).
+        a.presents = int(std::max<UINT>(1, fi.AccumulatedFrames));
         // The first image of a (re)duplication may differ from the last one
         // delivered everywhere (ACCESS_LOST, a mode change, the secure
         // desktop), whatever its metadata says: all of it counts as changed.

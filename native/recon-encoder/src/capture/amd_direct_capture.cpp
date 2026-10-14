@@ -336,6 +336,7 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         // More presents may be queued: keep only the newest (newest wins),
         // adding up the dirty areas of the ones skipped.
         float dirty = surface ? dirtyShare(surface, lastW_, lastH_) : -1.0f;
+        int presents = 1;
         for (;;) {
             amf::AMFDataPtr more;
             if (comp_->QueryOutput(&more) != AMF_OK || !more) break;
@@ -343,7 +344,9 @@ Next AmdDirectCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             if (!newer) break;
             dirty = mergeDirty(dirty, dirtyShare(newer, lastW_, lastH_));
             surface = newer;
+            ++presents;
         }
+        a.presents = presents;
         amf::AMFPlane* plane = surface ? surface->GetPlaneAt(0) : nullptr;
         if (!plane || !plane->GetNative()) {
             err = Status::Error("capture_failed", "AMD Direct Capture returned a surface without a D3D11 texture");

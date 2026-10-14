@@ -31,8 +31,13 @@ public:
 protected:
     struct Acquired {
         int64_t presentQpc = 0;  // 0 = unknown
-        int64_t captureQpc = 0;
+        int64_t captureQpc = 0;  // the capture API handed the image out
+        int64_t readyQpc = 0;    // acquire() returned it (copied, metadata read): set by next()
         float dirty = -1;  // share of the image that changed (capture/dirty.hpp), -1 = unknown
+        // Presents of the source this image stands for: the ones the capture
+        // skipped since the previous image, and this one (DDA
+        // AccumulatedFrames, AMD Direct Capture's queued surfaces); 1 if unknown.
+        int presents = 1;
     };
 
     // Waits up to timeoutMs (0 = just look) for a new image. On Frame the
@@ -54,6 +59,9 @@ protected:
     bool sleepUntil(int64_t deadlineQpc) { return timer_.sleepUntil(deadlineQpc, stop_); }
 
 private:
+    // A newly acquired image becomes the pending one (newest wins: the dirty
+    // shares of the images it replaces add up).
+    void take(Acquired& a);
     // A removed device_ (only checked when no new image comes: before a
     // repeat and when next() times out, i.e. at most every idleRepeatMs).
     bool deviceLost(Status& err);
