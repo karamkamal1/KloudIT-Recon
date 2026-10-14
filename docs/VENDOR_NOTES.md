@@ -13412,7 +13412,8 @@ three times under it at load averages of 1-4 on the loopback bulk check, `udp re
 load 0.6: perf-net (cddd507) 71 Mbit/s, perf-direct (1f4d746) 963 Mbit/s, both passing. This
 branch changes no Go code but `internal/host/bitrate_test.go`; it is the open relay issue of the
 direct path's runs (a start-up stall through the forwarder at the test's 2 Gbit/s target), more
-frequent with the pacing branch merged, and left to the relay work.
+frequent with the pacing branch merged, and left to the relay work (since explained: "Merged
+second hardware run: the UDP relay under overload").
 
 ## Second hardware run: direct path on the LAN
 
@@ -13641,7 +13642,8 @@ host.log now tells these apart (below); the next run's host.log alone says which
   direct path lines.
 - **`TestUDPRelayLatencyAndThroughput` failing "under machine load"**: the cause was not shown.
   Recorded as an open relay issue in "Runs" with this work's runs; the relay forwarder is the
-  relay work's (perf-net) to investigate.
+  relay work's (perf-net) to investigate. (Explained in "Merged second hardware run: the UDP
+  relay under overload".)
 - **The caps drop the route; a rescan closes live sockets**: confirmed (the review's case:
   `Ethernet 2` with the route as its third IPv6 address announced without it). Fixed as above
   (`TestDirectAddrsRouteAndCaps`, `TestDirectScanKeepsPresentSockets`).
@@ -13806,7 +13808,11 @@ commits 4ee0dc9 and c1bf94a:
   its loss recovery) leaves that window empty. Whether the forwarder stalls or only the test's
   sender, the per-bucket counts and the relay's drop counters would tell: for the relay work
   (perf-net), before remote sessions, which stay on the relay, are called fine. This work does
-  not touch the relay.
+  not touch the relay. *Explained since* ("Merged second hardware run: the UDP relay under
+  overload"): no stall; the forwarder's 1 Gbit/s limit dropped every other datagram of the
+  2 Gbit/s target, and quic-go's receiver closed the relayed connection once its one stream held
+  more than 1000 gaps, before or inside the measured window. The test now measures the relay
+  under that limit; the overrun has tests of its own.
 - Browser E2E under the lock (Chromium 141), the scenarios these changes go through ("WebTransport
   direct", "WebTransport relay", the splice, "WebSocket relay", "ticket refused", "settings after
   a failed connection", "direct path addresses", "direct path move", "direct path race (unit)"):
@@ -15047,3 +15053,172 @@ were not loosened. The steady playback and telemetry checks of these scenarios f
 too while this sandbox runs at today's speed. What would help a slow client in the sandbox and
 on a weak laptop alike (fewer datagrams for the same telemetry, a draw that does not hold the
 worker) are changes to the protocol and the presentation path of their own.
+
+## Merged second hardware run: the UDP relay under overload
+
+`internal/gateway` `TestUDPRelayLatencyAndThroughput`, section 2 ("Bulk throughput on clean
+loopback": the host's media controller at a 2 Gbit/s target, 2 s of bulk on one stream, through
+the gateway's UDP relay forwarder and direct), reported `loopback bulk, udp relay: 0 Mbit/s` in
+10 of 10 runs of the merged tree (4de1e24) under the shared lock at load averages of 0.3-1.3 on
+4 CPUs (direct 1997-2295 Mbit/s); before that 4 of 5 in another session's runs, 1 of 2 on perf-net
+cddd507, 0 of 2 on perf-direct 1f4d746 (939, 191 Mbit/s), and 8 of 8 passes at 650-995 Mbit/s on
+perf-direct earlier. The CI runs `go test ./...`: its build would fail. The open item in "Second
+hardware run: direct path on the LAN" ("Runs") put it down to a start-up stall of about a second
+in the relayed connection's loss recovery. There is no stall: the receiving end closes the
+connection.
+
+### What happened (instrumented)
+
+- **The browser end closed the connection.** With the test's read loop reporting how it ended:
+  `INTERNAL_ERROR (local): too many gaps in received data` after 347, 382 and 467 ms and 1.49 s
+  in four runs of the merged tree; the host's write failed with the same error from the peer. The
+  test averages the receiver's 1.0-2.0 s window: a connection gone before it reads as 0, one gone
+  inside it as a partial rate. quic-go's receiver (`frame_sorter.go`, v0.63.0) closes the
+  connection when one stream's reassembly buffer holds more than 1000 gaps
+  (`protocol.MaxStreamFrameSorterGaps`, a defence against a peer that has it track many small
+  pieces). A temporary counter in the frame sorter read 1001 each time the relayed connection
+  ended; on the direct path at most 53-198.
+- **Where the gaps came from: the forwarder's limit, policed one datagram at a time.** A
+  diagnostic test (not committed) ran the same transfer for 4 s in 100 ms buckets: a wrapper
+  around `cc.Media` (packets and bytes sent, acknowledged and lost, the window's and the pacer's
+  refusals, bytes in flight), quic-go's qlog events at both ends (new and retransmitted stream
+  data, the PTO count, flow-control frames), the allocation's counters (forwarded each way,
+  dropped, `SO_RXQ_OVFL`) and `/proc/net/udp` for the kernel's drops at the host's, the
+  forwarder's and the browser's sockets. (The qlog events' cost slowed both ends enough that
+  those runs lived; without them the connection ended at 270-350 ms, as in the test.) Per
+  100 ms: the host sent 10.8-21.0 k datagrams (1.2-2.4 Gbit/s: its pacing of 2.4 Gbit/s as far
+  as its CPU went), 46-48 % of the bytes retransmissions; the forwarder sent the browser
+  8.3-11.3 k, its limit (`relayDownRate`, 1 Gbit/s; the token bucket's 8 MB burst gone in the
+  first ~60 ms), and the bucket dropped 0.7-12.0 k; the kernel dropped nothing at any of the
+  three sockets; the host declared 45-48 % of its packets lost (7-8 % more than the forwarder
+  dropped: packets only late, the smoothed round trip swinging between 0.4 and 22 ms as the
+  forwarder's socket queue filled and drained); the window 9.8 MB and never full, 0.02-5.4 MB in
+  flight, no collapse, a PTO count of 0, no frame burst (the path never measured; one backoff);
+  the browser read 213-1759 Mbit/s in order per bucket, 931-935 Mbit/s over the run: the
+  forwarder's limit, no congestion collapse. A token bucket that refills at about half the
+  arrival rate passes about every other datagram, so nearly every datagram it forwards opens a
+  gap behind it in the stream's buffer, which (4-32 MB of window) spans thousands of datagrams;
+  retransmissions, lost at the same rate, close gaps slower than they open.
+- **The trees differ in how soon, not in what.** perf-direct 1f4d746 with the same counter: 3 of 4
+  runs ended the same way, later (after 1.16, 1.54 and 1.80 s: 111, 423 and 655 Mbit/s, over the
+  test's 50 Mbit/s floor), the fourth lived with 889 gaps at most (979 Mbit/s); the merged tree's
+  ended within 0.5 s in 3 of 4. How soon the count passes 1000 depends on how finely the drops
+  interleave, that is on the host's send timing against the forwarder's reads; the earlier passes
+  were connections that ended inside the measured window or lived narrowly. The test measured a race
+  against quic-go's limit, not the relay.
+- **Ruled out** by the same counters: a forwarder that stalls or wedges when overrun (it forwarded
+  at its limit to the end; the kernel dropped 0-1253 datagrams at its socket in the runs without
+  qlog), a PTO or backoff spiral (PTO count
+  0), a congestion collapse (in-order goodput at the forwarder's limit to the end), the window's
+  brake (no collapse), the frame bursts (never on), perf-direct's per-address sockets (the test's
+  host is a plain `quic.Transport`).
+
+### What a session sees in the same situation
+
+- **The media controller floods by design.** It paces at 1.2 × the target whatever is lost and
+  leaves backing off to the session's rate controller ("Second hardware run: pacing, rate control
+  and smoothness"); the test has none, so its 2 Gbit/s target stayed. A host at its default maximum
+  (`maxKbps` 250 Mbit/s: 300 Mbit/s of pacing, frame bursts of at most 1 Gbit/s for a credit of 1.5
+  frame intervals, under 1 MB) never reaches the forwarder's limit; one configured over about 830
+  Mbit/s would, and would see it as loss (`why=loss` decreases), like any link's.
+- **quic-go's gap limit.** A session's frames are one stream each: a quic-go receiver closes the
+  connection only for a frame of more than about 2,000 datagrams (2.4 MB) that loses every other
+  one. The browsers' QUIC has its own check (the E2E's Chromium 141 carries
+  `QUIC_TOO_MANY_STREAM_DATA_INTERVALS`), with a limit not measured here (quiche's
+  `kMaxNumDataIntervalsAllowed`, 2 × `kMaxPacketGap`, which its source has at 10 000: as
+  recalled, not checked). The one quic-go receiver of frames in a session is the gateway's QUIC
+  splice (`relay.go`) on its host leg: a 2.5 MB key frame (a 250 Mbit/s start) losing every
+  other datagram there could close it; not seen, not tested here.
+- **The session's rate controller, 250 Mbit/s setting behind a ~100 Mbit/s link** (the relay
+  simulation, `runRelaySim`, at 20a5043 with its own harness and now: the LAN's 1.5 ms each way
+  with 1 ms of jitter, a 95 Mbit/s link with a tail-drop queue, an encoder that fills its target
+  unless capped, 20 s, seeds 1-4; first picture / longest wait between two pictures / longest
+  after 2 s, ms):
+
+  | Case | 20a5043 | now |
+  |---|---|---|
+  | 100 ms queue, the encoder filling it | 265-361 / 131-202 / 53-56 | 265-361 / 131-202 / 55-59 |
+  | 20 ms queue, the same | 266-288 / 97-100 / 51-69 | 279-333 / 95-108 / 50-108 |
+  | 100 ms queue, the encoder at ≤ 150 | 360-363 / 130-133 / 54-61 | 328-330 / 107-110 / 51-56 |
+  | 100 ms queue, from 80 Mbit/s | 112-114 / 51-69 / 51-69 | 112-114 / 55-81 / 55-81 |
+  | 40 Mbit/s link, 50 ms queue | 715-757 / 171-173 / 59-63 | 607-754 / 147-173 / 46-65 |
+
+  Both trees take the target from 250 to 78-79 Mbit/s within a second (a loss decrease at
+  0.16 s on the first key frame, 2.5 MB into the link's 1.2 MB queue, a frame-queue overflow
+  decrease at 0.3 s, then the delay's). The first picture and the waits at the start are the same
+  or shorter now, but on the 20 ms queue, where the first picture comes up to 45 ms later; what
+  follows on that queue is in "Not fixed here".
+- **The transport and the relay**, through the real forwarder with a 100 Mbit/s link and a 50 ms
+  tail-drop queue in front of the browser (`TestUDPRelayOverrun`: frames of target / 60 on a
+  stream each, at 250 Mbit/s for 2 s, then at 60 Mbit/s as the rate controller would have it),
+  three runs each under the lock: at 20a5043 49 of 120 frames completed during the overrun
+  (latency p50 566-692 ms), on time again 83-100 ms after the target was lowered, then 120 of
+  120 on time (p50 14 ms); now 49 of 120 (592-648 ms), 84-100 ms, 120 of 120 (14 ms). The link
+  dropped 18-19 k datagrams, the forwarder none, no collapse. Nothing of the overrun outlives it.
+- **The forwarder flooded** past its limit (`TestUDPRelayFlood`: 300 ms of raw datagrams at
+  1.4-2.1 Gbit/s, six runs): it forwarded 0.75-1.2 Gbit/s (its 8 MB burst, then 1 Gbit/s),
+  dropped the rest (0-18.7 k by its bucket, 5.8-23.1 k more by the kernel at its socket), and
+  100 ms after the flood 200 of 200 probes went through at 0.06-0.13 ms (p95).
+
+### What changed (tests only)
+
+No relay, transport or rate control code: they behave as designed.
+
+- `TestUDPRelayLatencyAndThroughput` section 2 measures the relay against the direct path at a
+  rate under the forwarder's limit: a 500 Mbit/s target (600 Mbit/s of pacing, twice the default
+  maximum's), the relay within 20 % of the direct path and dropping nothing.
+- `goodputSeries` reports a stream or connection that ends before its time (`the stream ended
+  after 368ms: INTERNAL_ERROR (local): too many gaps in received data`) instead of a rate of 0.
+- `TestUDPRelayOverrun` (above; with the target left at the overrun's it fails: 0 of 120 on
+  time) and `TestUDPRelayFlood` (above), with `newShapedLink` (the test link with a bottleneck
+  towards the client: a rate and a tail-drop queue).
+- `TestRelaySimLAN` "100 Mbit/s link, the encoder filling a 250 Mbit/s target": the target under
+  the link within 1.5 s, the first picture within 500 ms, no wait between pictures over 300 ms,
+  none over 100 ms after 2 s, the target over 60 % of the link in the last 30 s (seeds 1 / 2:
+  under after 0.6 s, first picture 273 / 363 ms, waits up to 200 / 132 ms, 55 / 54 ms after 2 s,
+  83.9 / 82.4 Mbit/s).
+
+### Runs
+
+- `TestUDPRelayLatencyAndThroughput` under the lock, 10 runs each at load averages of 0.3-1.5:
+  before (4de1e24) 10 of 10 failed (`udp relay: 0 Mbit/s`, direct 1997-2295); after 10 of 10
+  passed: bulk through the relay 581-587 Mbit/s against direct 559-586, nothing dropped by the
+  forwarder or the kernel, the relay adding 4-70 µs to the round trip at p50, the lossy
+  40 Mbit/s leg 43.2-47.0 Mbit/s on the relay against 45.4-46.4 direct (splice 4.8-5.0).
+- With `TestRelaySim|TestRateSim` of `internal/host` running alongside (load 1.3-3.6), three runs
+  of the three relay tests: all passed (bulk 559-585 against 490-587 direct; after the overrun
+  119-120 of 120 frames on time, latency p95 15-48 ms; the flood's probes at 0.06-0.13 ms).
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass;
+  `go test ./internal/transport/...` passes, and under the lock `go test ./internal/gateway
+  ./internal/host` (41 s, 94 s), with `TestRateSimCapdrop`, `TestRateSimProfiles` and the relay
+  and LAN simulations (`TestRelaySimLAN`, `TestRelaySimBurstPaths`,
+  `TestRelaySimFirstHardwareRun`, `TestRelaySimCongestion`, `TestRelaySimStaticDesktop`)
+  unchanged but for the new case; `make build`. No script changed.
+- The commits: `08d0863` (`TestUDPRelayOverrun`, `TestUDPRelayFlood`, `newShapedLink`),
+  `45e1cae` (section 2 and `goodputSeries`), `02dbabc` (the simulation case) and this section.
+
+### Not fixed here
+
+- **A shallow queue at the link's capacity, after the overrun.** With a 20 ms queue (a small
+  switch buffer) the rate controller now holds the target a little higher (mean 80.9-88.4 Mbit/s
+  over 5-20 s against 76.8-87.3 at 20a5043, 12 seeds) and climbs into the queue's overflow more
+  often: 1-3 loss decreases a run against 1, and a wait between pictures of 90-137 ms (a frame
+  of up to 4 × the average waiting for its retransmission) in 7 of 12 runs against none over
+  69 ms at 20a5043 (without the frame bursts, now: 4 of 12, 86-116 ms). It is the ack-confirm
+  gate's trade ("Second hardware run: pacing, rate control and smoothness": fewer delay
+  decreases, which stopped the pumping behind the 100 ms queue) on a queue too short for a delay
+  to build, not the relay's; for the rate control work. The start there, the overrun this section
+  is about: the first picture after 279-333 ms against 266-288, waits up to 95-108 ms against
+  97-100.
+- **The splice's host leg** and quic-go's 1000-gap limit (above).
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 8.1c on the relay with
+  the 250 Mbit/s setting while the ~100 Mbit/s link is still in the path, a game in motion.
+  Look for: the first `lowering bitrate` lines (`why=loss`, `why=overflow`) within the first
+  second and the target at or under ~95 Mbit/s by 1-2 s; no freeze over ~400 ms at the start and
+  `e2e` p95 under ~50 ms after it; the gateway's `udp relay: session ended` line with `dropped`
+  near 0 (the forwarder's own limit not reached) and `socket_drops=0`.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same with `hevc_nvenc_helper`. Pass:
+  the same (nothing here depends on the encoder's vendor).
