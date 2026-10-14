@@ -14808,3 +14808,127 @@ this section.
   every line.)
 - After these runs only a comment in `internal/transport/cc/media.go` changed (the estimate's
   description), built and its package's tests rerun.
+
+## Merged second hardware run: telemetry and frames under load
+
+The tree that merges the release (20a5043) with the second hardware run's five branches
+(perf-vm 07944de, perf-direct 1f4d746, perf-client b538ad7, perf-host ec894d6, perf-net cddd507;
+57d2a40) passed 341 of 350 checks of the whole browser E2E on 2026-10-14. Eight of the nine
+failures were in the stream scenarios, with the CPUs 16-18 % idle: "send priorities
+feature-detected; telemetry gives way to input only while the datagram queue stalls" on the
+WebTransport direct path, relay and splice (165 of 872, 300 of 821 and 169 of 874 telemetry
+datagrams dropped, longest stalls 150-218 ms) and "steady real-time playback" / "video decoding"
+on the WebTransport relay (40.2 of 60 fps, 16.2 fps superseded), the splice (46-50 fps, 14.3) and
+the WebSocket relay (42.6 fps, 20.0). The last whole green run, of 20a5043 on 2026-10-12, had
+dropped 3-7 % (56 of 799, 51 of 799, 25 of 799) and played 50.7-59.9 fps with 3.9-9.0 fps
+superseded, at 17-21 % idle. (The ninth, the VM without a GPU scenario's, is not this section's.)
+The question was what in the merged code costs more at the same load.
+
+### Nothing in the merged code costs more: 20a5043 fails the same way today
+
+The four stream scenarios (`E2E_ONLY='WebTransport direct|WebTransport relay|WebSocket relay'`,
+with the warm-up stream), under the shared lock, one tree after the other between 11:16 and
+12:12, each tree built from its commit: 20a5043 five times, the merged tree five times, the
+branch tips that change what these scenarios run (perf-client, perf-net, perf-direct, perf-vm)
+twice each; perf-host changes only the native helper's path, which the E2E's test host does
+not use. A sampler read every process's CPU time once a second; "foreign" below is busy CPU
+outside the E2E's processes (other sessions' builds and tests), and the medians leave out
+scenario windows where it was over 60 % of one CPU. Medians per tree (telemetry dropped,
+frames drawn per second in the check's last 1.5 s, superseded per second, the check's CPU idle):
+
+| Tree | direct | relay | splice | WebSocket relay | failed checks per run |
+|---|---|---|---|---|---|
+| 20a5043 (5 runs) | 29 %, 49.0, 12.0, 17 % | 38 %, 46.5, 12.8, 15 % | 36 %, 41.6, 12.8, 14 % | -, 42.3, 15.5, 15 % | 1-7 |
+| merged 57d2a40 (5) | 31 %, 45.9, 16.3, 14 % | 38 %, 46.8, 16.4, 16 % | 37 %, 39.6, 13.7, 14 % | -, 41.5, 13.0, 16 % | 2-9 |
+| perf-client (2) | 29 %, 49.7, 9.3, 15 % | 43 %, 36.3, 15.8, 12 % | 38 %, 40.8, 19.3, 15 % | -, 39.6, 22.7, 15 % | 1-4 |
+| perf-net (2) | 36 %, 40.7, 15.9, 18 % | 32 %, 39.2, 18.2, 14 % | 45 %, 35.8, 22.5, 10 % | -, 35.4, 18.9, 15 % | 2-6 |
+| perf-direct (2) | 45 %, 41.9, 13.4, 15 % | (foreign load) | 41 %, 41.5, 16.5, 13 % | -, 31.5, 18.5, 17 % | 0-6 |
+| perf-vm (2) | 35 %, 45.0, 13.0, 15 % | 30 %, 44.7, 14.7, 17 % | 40 %, 35.3, 18.3, 15 % | -, 35.0, 11.9, 13 % | 1-6 |
+
+The same checks fail on every tree, 20a5043 included (its steady playback in 3 of 5 direct
+windows, its telemetry check in 4 of 5). What each process used in the scenarios' windows
+(medians over all four scenarios, % of one CPU) is the same too: the browser's renderer
+process 1.47 (20a5043) and 1.42 (merged) per decoded frame per second, its GPU process 1.23 and
+1.24 per drawn frame per second, its network process 12 and 12, the host agent 25 and 25, the
+gateway on the relay paths 20 and 19, FFmpeg's encoder 124 and 126. The merged client sends 3-4 %
+more telemetry (856-866 datagrams in the direct scenario against 793-837: perf-client's pings
+every 250 ms and the five after the first frame), which changes none of the figures above.
+
+The suspects, one by one:
+
+- *perf-client's renderer bake-off* runs only with Renderer Auto; these scenarios set the 2D
+  canvas, and no run's console has a `presentation bake-off` line. *The old-browser notice* is
+  user-agent and feature detection at page load. *Input-ack marking* marks inputs, and no input
+  comes during the measured window. *The clock sync* is a few hundred array steps per pong.
+- *perf-direct's background tries* (`tryMove` at 2, 8, 20, 60 s) run only on a relay session
+  with Network path Auto over WebTransport; the relay scenarios set "Relay via gateway", the
+  direct scenario is on the direct path and the WebSocket relay is no WebTransport. No run's
+  console has a `direct path in the background` line or a move. `raceDirect` runs once, at the
+  direct scenario's connect.
+- *perf-net's frame bursts*: over the E2E's loopback the burst measure stays low (Chromium's
+  late, bunched ACKs on the busy CPU: `burst_est_mbps` 0-56 against `pace_mbps` 13-36), so in 15 of
+  16 steady windows of the merged runs `burst_mbps` equals `pace_mbps`: no bursts. The one
+  with them (the WebSocket relay's host to gateway leg at 39 Mbit/s) superseded 14.0 fps, as the
+  others. A burst makes one frame arrive sooner; it does not send frames together. The window
+  held 0-3 frames per 10 s and thinning dropped about as many frames in every tree.
+
+### What changed: the machine
+
+The same code costs more CPU per frame today than on the days of the green run. The 2D canvas's
+draw (its `drawImage` of the 960×540 frame into the 1280×720 canvas; the renderer unchanged since
+step 4.3 on 2026-10-08) took a p50 of 7.5 ms (median of the day's WebTransport direct scenarios,
+2026-10-10, 19 runs), 9.9 ms (10-11, 16 runs) and 9.8 ms (the green run on 10-12); today
+11.7-16.6 ms in every one of the 23 runs above (20a5043 11.95-14.2, merged 11.7-14.2; median of
+all of today's 44 logged runs in the sandbox 14.2). The decoder self-test's AV1 1080p timing
+averaged 3.99-4.49 ms a frame per day from 10-09 to 10-11 (4.18 in the green run) and 5.35 today
+(20a5043 5.4-6.6, merged 4.6-6.0). The CPUs' idle share stays about the same because the stream
+is a closed loop: a browser that is slower per frame draws fewer frames (superseding the rest)
+rather than using more CPU, so 16-18 % idle today is not the load that 17-21 % was two days ago.
+
+At 60 fps the worker that decodes and draws spends 12-15 ms of every 16.7 ms frame interval in the
+2D canvas's draw alone; outputs of the decoder that come while it draws queue up behind it, and
+in Lowest latency pacing the newest of them supersedes the others (step 4.1). That is the
+superseding the playback checks count, on 20a5043 as on the merged tree.
+
+The telemetry: where input and telemetry share Chromium's one datagram writable (Chromium 141 has
+no `datagrams.createWritable`), the queue drained no faster than the telemetry came. Instrumented
+(scratch runs of the merged tree), its writes resolved one every 8-14 ms (p50) while each
+resolved 23-37 ms (p50) and 108-135 ms (p95) after it was written: a queue that moves but holds a
+backlog. 2.7's rule (telemetry dropped while the oldest pending telemetry write is over 50 ms old)
+then drops what the backlog would otherwise hold: 20-50 % of the telemetry on this machine.
+
+### Why the rule stays
+
+Dropping telemetry only while nothing resolves for 50 ms (the queue does not move at all) was
+tried and measured in three runs of the merged tree with that rule: the telemetry check passed in
+all nine WebTransport scenario windows (1-11 of 787-874 dropped, longest stalls 52-102 ms). The
+mouse's input latency (browser event to injected on the host; each run's p50 and p95 come from
+2-10 mouse events) against the merged tree's five runs above:
+
+| Scenario | merged 57d2a40, 2.7's rule (5 runs) | the rule that was tried (3 runs) |
+|---|---|---|
+| WebTransport direct | p50 54-105, p95 87-176 ms (n 7-10) | p50 114-461, p95 323-1206 ms (n 7-9) |
+| WebTransport relay | p50 41-154, p95 87-230 ms (n 5-9) | p50 66, 349, 955; p95 177, 349, 976 ms (n 6, 2, 4) |
+| WebTransport relay fallback (splice) | p50 34-159, p95 121-447 ms (n 6-9) | p50 52-84, p95 114-189 ms (n 5) |
+| WebSocket relay (no datagram queue) | p50 13-25 ms | p50 7-16 ms |
+
+Over the three WebTransport scenarios the merged tree's baseline is a p50 of 34-159 ms and a p95
+of 87-447 ms, so the harm does not show in every scenario. It shows in the direct one: each of
+the tried rule's three runs is above each of the merged tree's five, and one failed the input
+latency check (p95 1206 ms, over its 1000 ms limit). In the relay two runs were far above the
+merged range, but from only 2 and 4 mouse events, and the third was inside it. The splice was no
+worse. Where the harm shows, the mouse datagrams waited behind the telemetry the queue now held:
+the queue is a real backlog in front of input, and 2.7's rule is what keeps the mouse ahead of
+it, so the change was not kept (three runs of a rule on a loaded machine are few; the direct
+scenario's separation is the evidence, the relay's is weak). The send-priorities unit check
+now also runs a queue that moves but drains no faster than telemetry comes (one write every
+10 ms, telemetry every 8 ms, an input datagram at 1 s): input waits at most twice the stall time
+(30 ms with the rule; 270 ms, 35 writes deep, with the rule that was tried, which fails it).
+
+### Not fixed here
+
+Nothing in the merged code is behind these failures, so nothing was changed for them; checks
+were not loosened. The steady playback and telemetry checks of these scenarios fail on 20a5043
+too while this sandbox runs at today's speed. What would help a slow client in the sandbox and
+on a weak laptop alike (fewer datagrams for the same telemetry, a draw that does not hold the
+worker) are changes to the protocol and the presentation path of their own.
