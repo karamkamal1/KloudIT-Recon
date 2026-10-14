@@ -2525,7 +2525,15 @@ const INPUT_MARK_MS = 50;
 const INPUT_PENDING_MS = 5000;
 const INPUT_WINDOW_MS = 10000;
 const INPUT_REPORT_MS = 10000;
-const inLat = { on: false, n: 0, pending: new Map(), lastMark: {}, recs: [], lastReport: now(), browser: '', lacks: [] };
+const inLat = {
+  on: false, n: 0, pending: new Map(), lastMark: {}, recs: [], lastReport: now(), browser: '', lacks: [],
+  // This connection's marked inputs: marked, acknowledged, given up on
+  // (no acknowledgement within INPUT_PENDING_MS: it or its input lost, or
+  // late), and of those acknowledged after all (late; lost: expired - late).
+  count: { marked: 0, acked: 0, expired: 0, late: 0 },
+  gaveUp: new Set(), // the keys of the last INPUT_GAVE_UP given up on (count.late)
+};
+const INPUT_GAVE_UP = 256;
 const IN_KINDS = { [P.DG_MOUSE_REL]: P.INPUT_ACK_MOUSE_REL, [P.DG_MOUSE_ABS]: P.INPUT_ACK_MOUSE_ABS, [P.DG_GAMEPAD]: P.INPUT_ACK_GAMEPAD };
 
 // The page's absolute event time (ms since the epoch of performance.timeOrigin) on this worker's clock.
@@ -2536,8 +2544,12 @@ function inputPending(key, cls, ev, page, sent) {
   for (const [k, v] of p) {
     if (sent - v.sent < INPUT_PENDING_MS) break; // oldest first
     p.delete(k);
+    inLat.count.expired++;
+    inLat.gaveUp.add(k);
+    if (inLat.gaveUp.size > INPUT_GAVE_UP) inLat.gaveUp.delete(inLat.gaveUp.values().next().value);
   }
   p.set(key, { cls, ev, page, sent });
+  inLat.count.marked++;
 }
 
 // An input stream message the page sent (b: its bytes, t: its event's
@@ -2570,8 +2582,12 @@ function onInputAck(d) {
   if (!a) return;
   const key = a.kind === P.INPUT_ACK_STREAM ? `s${a.seq}` : `${a.kind}:${a.idx}:${a.seq}`;
   const p = inLat.pending.get(key);
-  if (!p) return;
+  if (!p) { // late, or an input stream message not measured (a wheel turn)
+    if (inLat.gaveUp.delete(key)) inLat.count.late++;
+    return;
+  }
   inLat.pending.delete(key);
+  inLat.count.acked++;
   const t = now();
   const host = Math.max(0, (a.doneUs - a.recvUs) / 1000);
   const client = p.sent - p.ev;
@@ -2731,7 +2747,7 @@ function postStats() {
     // Input latency (onInputAck: null without acknowledgements in the
     // window), the clock sync's quality, whether this connection
     // negotiated RESET_STREAM_AT (null: unknown).
-    input, inputAcks: inLat.on, clock: clockQuality(), resetStreamAt: resetStreamAt(),
+    input, inputAcks: inLat.on, inputAckCount: inLat.on ? { ...inLat.count } : null, clock: clockQuality(), resetStreamAt: resetStreamAt(),
   });
   Object.assign(stats, { frames: 0, bytes: 0, decodeSum: 0, decodeN: 0, owdSum: 0, owdN: 0, totalSum: 0, sendSum: 0, totalN: 0, totalMin: Infinity, totalMax: 0, lagMin: Infinity });
 }

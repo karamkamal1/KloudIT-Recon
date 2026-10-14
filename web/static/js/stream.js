@@ -1181,18 +1181,22 @@ const clockText = (c) => (c ? ` · clock ±${fmt(c.boundMs, 1, ' ms')}${c.settle
 // inputs: browser event -> injected on the host per class (p50/p95/p99),
 // then the parts' p50 (the browser: the event's dispatch on the page, the
 // hop to the worker and the write; of it the page's share; the network; the
-// host) and the round trip's estimate (no clock sync), and the gamepads'
-// polling (pads.rate).
+// host) and the round trip's estimate (no clock sync), the gamepads'
+// polling (pads.rate), and the marked inputs this connection got no
+// acknowledgement for (lost: the input or its acknowledgement; one over 5 s
+// late is not counted in the figures).
 function inputRows(st, row, pcts) {
   const x = st.input;
   if (!st.inputAcks) return [];
-  if (!x) return [row('Input → host', 'no input in the last 10 s')];
+  const c = st.inputAckCount;
+  const lost = c && c.expired > c.late ? ` · ${c.expired - c.late} of ${c.marked} unacknowledged` : '';
+  if (!x) return [row('Input → host', `no input in the last 10 s${lost}`)];
   const p50 = (r) => (r ? fmt(r.p50, 1, '') : '—');
   const pad = pads.rate ? ` · pad poll ${fmt(pads.rate.pollMs, 1)}, ${pads.rate.samples} new samples/s` : '';
   return [
     ...[['mouse', 'mouse'], ['keys', 'keys, buttons'], ['pad', 'gamepad']].filter(([k]) => x[k])
       .map(([k, label]) => row(`Input → host (${label})`, pcts(x[k]), cls(x[k].p50, 8, 20))),
-    row('  parts p50', `browser ${p50(x.client)} (page ${p50(x.dispatch)}) · network ${p50(x.network)} · host ${p50(x.host)} · rtt/2 ${p50(x.rtt_half)}${pad}`),
+    row('  parts p50', `browser ${p50(x.client)} (page ${p50(x.dispatch)}) · network ${p50(x.network)} · host ${p50(x.host)} · rtt/2 ${p50(x.rtt_half)}${pad}${lost}`),
   ];
 }
 
@@ -1436,7 +1440,7 @@ function exportLatency() {
     client: { ua: navigator.userAgent, hz: S.hz, dpr: devicePixelRatio, screen: [Math.round(screen.width * devicePixelRatio), Math.round(screen.height * devicePixelRatio)] },
     connection: S.conn, video: S.videoCfg, probe: d.probe, stages: d.stages,
     renderer: S.lastStats?.renderer || null, present: storedPresent(),
-    input: S.lastStats?.input || null, clock: S.lastStats?.clock || null, gamepadPolling: pads.rate,
+    input: S.lastStats?.input || null, inputAckCount: S.lastStats?.inputAckCount || null, clock: S.lastStats?.clock || null, gamepadPolling: pads.rate,
     browser: S.browser ? { ...S.browser.info, gaps: S.browser.gaps, notice: S.browser.notice, resetStreamAt: S.lastStats?.resetStreamAt ?? null } : null,
   });
 }

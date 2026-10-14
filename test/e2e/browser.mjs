@@ -3188,22 +3188,37 @@ async function checkInputLatency(name, hostProc, log0) {
   // More mouse motion, 80 ms apart (one marked datagram per 50 ms): one
   // datagram or its acknowledgement lost on this loaded machine must not
   // leave the mouse row empty.
+  // A key press of its own after them (Shift: the host's checks look for
+  // others): on a starved page the presses before can leave the 10 s window
+  // before the stats are read. Each row is taken from the first stats that
+  // have it: where the page is slow to read, mouse and keys need not share a
+  // window.
   const vp = page.viewportSize() || { width: 1280, height: 720 };
   for (let i = 0; i < 5; i++) {
     await page.mouse.move(Math.round(vp.width * (0.5 + 0.01 * i)), Math.round(vp.height * 0.5));
     await sleep(80);
   }
-  const st = await until(() => page.evaluate(() => {
-    const x = window.__recon.lastStats;
-    return x?.input?.mouse && x.input.keys ? x : null;
-  }), 10000, 'the input latency in the stats').catch(() => page.evaluate(() => window.__recon.lastStats));
-  const x = st?.input;
+  await page.keyboard.press('Shift');
+  const seen = {};
+  const read = () => page.evaluate(() => {
+    const y = window.__recon.lastStats;
+    return y && { input: y.input, inputAcks: y.inputAcks, inputAckCount: y.inputAckCount, clock: y.clock };
+  });
+  const st = await until(async () => {
+    const y = await read();
+    for (const k of ['mouse', 'keys']) if (y?.input?.[k] && !seen[k]) seen[k] = y.input;
+    return seen.mouse && seen.keys ? y : null;
+  }, 15000, 'the input latency in the stats').catch(read);
+  const base = seen.mouse || seen.keys || st?.input || null; // the parts: from the stats that had the mouse row
+  const x = base && { ...base, mouse: seen.mouse?.mouse ?? base.mouse, keys: seen.keys?.keys ?? base.keys };
+  const c = st?.inputAckCount;
+  const acks = c ? `; marked ${c.marked}, acknowledged ${c.acked}, unacknowledged in 5 s ${c.expired} (of them late ${c.late})` : '';
   const ok = (r) => !!r && r.n >= 1 && r.p50 > -2 && r.p95 < 1000;
   check(`${name}: input latency measured (browser event -> injected on the host: mouse, keys; parts; clock sync settled)`,
     !!st?.inputAcks && ok(x?.mouse) && ok(x?.keys) && x.client?.p50 >= 0 && x.host?.p50 >= 0 && x.rtt_half?.p50 > 0 && !!st.clock?.settled && st.clock.boundMs < 50,
     x ? `mouse ${x.mouse?.p50}/${x.mouse?.p95} ms (n ${x.mouse?.n}), keys ${x.keys?.p50}/${x.keys?.p95} (n ${x.keys?.n}); parts p50: browser ${x.client?.p50}, ` +
       `network ${x.network?.p50}, host ${x.host?.p50}, rtt/2 ${x.rtt_half?.p50}; clock ±${st.clock?.boundMs} ms (RTT ${st.clock?.minRttMs} ms, age ${st.clock?.ageS} s, ` +
-      `${st.clock?.samples} pings, settled ${st.clock?.settled})` : `no input figure (acknowledgements ${st?.inputAcks})`);
+      `${st.clock?.samples} pings, settled ${st.clock?.settled})${acks}` : `no input figure (acknowledgements ${st?.inputAcks}${acks})`);
   results.push({ inputLatency: { scenario: name, input: x || null, clock: st?.clock || null } });
   if (name !== 'WebTransport direct') return;
   // The first report with both (one from before the key presses has only the mouse).
