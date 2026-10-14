@@ -13355,6 +13355,65 @@ to=17850 why=delay delay_ms=63` / `66`, `ack_queue_ms=119` / `117`). `E2E_FEC_CO
 E2E_FEC_COMPARE_RUNS=1`: 12 of 12, every run through the proxy (the client's minimum round trip
 40.7-44.5 ms at 20 ms each way).
 
+### Review of the merged tree's VM fix
+
+- **A decoder warning the check can still show: confirmed.** With the step through the proxy, the
+  recovery after it raises the bitrate about once a second, and on the FFmpeg path each raise
+  restarts the encoder (`bitrate recovery: raising bitrate`, a new generation and key frame each
+  time). A software decoder short of CPU then falls behind: the client flushes its backlog
+  (`requesting key frame (decoder backlog)`), shows the warning `This device is not decoding fast
+  enough — lowering bitrate ...` and the host lowers the bitrate `why=decoder`. The review's runs
+  of the fix failed on that toast alone once in 8 (load average about 6 on the 4 CPUs; console
+  `freeze: 1105 ms longer than the source`, then the flush and the notice; host.log `congestion:
+  lowering bitrate ... why=decoder` 6 s after the step), which the two passing runs above did not
+  show. Fixed in `checkVM`: `onConsole` now appends the CPUs' idle share in the 2 s before to a
+  decoder backlog flush's line as well (`[cpu: N % idle in the last 1.9 s]`, as for a "frame
+  lost" request), and the check accepts that one notice only when the flush it came with (the
+  session's first) had them below `STARVED_IDLE` (15 %). Its detail names it: `decoder notice
+  with the CPUs N % idle in the 1.7 s before its decoder backlog flush (no CPU to spare: the
+  sandbox's, accepted)` or `(not starved: a warning)`. Every other warning or error toast still
+  fails the check, a `why=decoder` decrease no longer counts as one for the step, and the detail
+  gives the CPUs' idle share over the step and the 8 s after.
+- **How much of the flake that covers.** The natural backlog flushes in these runs came with the
+  CPUs 11-26 % idle in the 2 s before (the warm-up stream: 11, 14 and 17 %; the loss section's
+  streams at 60 fps: 14, 14, 14, 14, 16, 16, 18 and 26 %), about half of them under 15 %. So the
+  check still fails on the notice when it comes with the CPUs a little above the line, which is
+  this sandbox's as well: if the VM check fails on the decoder notice alone with the CPUs under
+  about 30 % idle before the flush, re-run it once, like the steady-playback check. With them
+  well idle (the VM session alone leaves them 38-42 % idle over the step and after here) it is a
+  real failure.
+- **The impairment proxy's comment** still said the browser reaches the proxy by rewriting the
+  direct URL alone, the mistake that made the step miss: confirmed; it now names `directViaProxy`
+  (the connect answer's url and candidates both point at it).
+
+Runs (worktree `fix-e2e-vm`): `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet
+./...` pass; `node --check` passes on the 17 scripts in `web/static/js` and `browser.mjs`; `make
+build`. Under the shared lock `go test ./internal/e2e/...` passes (17 tests, the 2 netem tests
+skipped, 230 s). The browser E2E (Chromium 141) under the lock:
+
+- The check's two branches, with a scratch copy of the worker (not committed) that makes one
+  decoder backlog flush 12 s after the first decode whatever the backlog: with the CPUs 2 % idle
+  before it (other sessions' work) the notice was accepted, 11 of 11; with them 38 % idle the
+  check failed, 10 of 11, listing the notice `(not starved: a warning)`.
+- `vm without a gpu` alone, six runs: 11 of 11 each, no decoder notice; the proxy carried
+  2291-2772 datagrams to the browser in the step and 818-933 from it; 5-6 decreases, the first
+  `from=30000 to=17850 why=delay`, `ack_queue_ms=118-120`; the CPUs 38-42 % idle over the step
+  and after (the five runs with that field).
+- Load to bring the notice about did not: 4 and 16 busy loops at nice 0 over the step and after
+  (11 of 11 each), the browser's renderer pinned to one CPU with two nice -10 loops on it (11 of
+  11), 8 loops at nice -10 (the whole stream starved, `playing after it false`; no notice).
+- `loss handling` (its "frame lost" notes unchanged, the backlog lines now with theirs): 22 of 22.
+
+`go test` of every package but `internal/e2e` passes except `internal/gateway`'s
+`TestUDPRelayLatencyAndThroughput`, which failed 4 of 5 runs on this tree: once outside the lock
+on the lossy leg (relay 40.4 against direct 46.5 Mbit/s, the other packages' tests running), and
+three times under it at load averages of 1-4 on the loopback bulk check, `udp relay: 0 Mbit/s`
+(direct 2178-2266); the fifth, under the lock, passed (221 Mbit/s). Once each under the lock at
+load 0.6: perf-net (cddd507) 71 Mbit/s, perf-direct (1f4d746) 963 Mbit/s, both passing. This
+branch changes no Go code but `internal/host/bitrate_test.go`; it is the open relay issue of the
+direct path's runs (a start-up stall through the forwarder at the test's 2 Gbit/s target), more
+frequent with the pacing branch merged, and left to the relay work.
+
 ## Second hardware run: direct path on the LAN
 
 ### What the log shows
