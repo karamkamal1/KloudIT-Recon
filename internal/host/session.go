@@ -174,8 +174,10 @@ type Session struct {
 	windowSince atomic.Int64
 	meter       func() deliveryMeter
 	// pongs: answers to the client's pings, sent by pongSender so the
-	// datagram loop (input) never waits for the datagram queue.
+	// datagram loop (input) never waits for the datagram queue; also the
+	// acknowledgements of marked inputs (inAck, inputlat.go).
 	pongs chan []byte
+	inAck inputAcks
 	// thinning: discardable frames left out under congestion (thin.go);
 	// static: the encoder's bitrate on a static desktop (activity.go).
 	thinning thinState
@@ -639,7 +641,10 @@ func (s *Session) sendWelcome() error {
 	for _, e := range s.encoders() {
 		w.Encoders = append(w.Encoders, e.Name)
 	}
-	w.Features = append(s.a.features(), proto.FeatureRateReport)
+	w.Features = append(s.a.features(), proto.FeatureRateReport, proto.FeatureInputAck)
+	if s.partial {
+		w.Features = append(w.Features, proto.FeatureResetStreamAt)
+	}
 	if !s.a.faults.preStageHold {
 		w.Features = append(w.Features, proto.FeatureStageHold)
 	}
@@ -2862,10 +2867,13 @@ func (s *Session) inputAllowed() bool {
 func (s *Session) inputLoop(st transport.BidiStream) {
 	defer st.CancelRead()
 	inj := s.a.inj
+	var n uint32 // messages read: the client numbers its writes alike (ackInputStream)
 	for {
 		// A message above the limit is skipped: ending the stream would end
 		// the session's keyboard and mouse buttons (clients split long text).
 		b, err := proto.ReadMsgSkip(st, proto.MaxInputMsg)
+		at := s.a.clock()
+		n++
 		if errors.Is(err, proto.ErrTooLarge) {
 			s.log.Warn("input message skipped", "err", err)
 			continue
@@ -2895,6 +2903,7 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 		if err != nil {
 			s.log.Debug("inject", "err", err)
 		}
+		s.ackInputStream(n, at)
 	}
 }
 
@@ -2907,6 +2916,7 @@ func (s *Session) datagrams() {
 		if len(d) == 0 {
 			continue
 		}
+		at := s.a.clock() // a marked input's arrival (ackInputDatagram)
 		switch d[0] {
 		case proto.DgPing:
 			if p := proto.Pong(d, s.a.clock()); p != nil {
@@ -2924,17 +2934,20 @@ func (s *Session) datagrams() {
 				if dx, dy := s.rel.Update(m.Seq, m.CumX, m.CumY); dx != 0 || dy != 0 {
 					_ = s.a.inj.MoveRel(dx, dy)
 				}
+				s.ackInputDatagram(d, proto.InputAckMouseRel, 0, m.Seq, at)
 			}
 		case proto.DgMouseAbs:
 			if m, ok := proto.ParseMouseAbs(d); ok && s.absGate.Accept(m.Seq) && s.inputAllowed() {
 				s.roi.pointerAbs(m.X, m.Y, time.Now())
 				_ = s.a.inj.MoveAbs(m.X, m.Y)
+				s.ackInputDatagram(d, proto.InputAckMouseAbs, 0, m.Seq, at)
 			}
 		case proto.DgGamepad:
 			// The shared virtual pads take only the active session's
 			// client, as the keyboard and mouse do.
 			if g, ok := proto.ParseGamepad(d); ok && g.Index < 4 && s.padGates[g.Index].Accept(g.Seq) && s.inputAllowed() {
 				s.gamepad(g)
+				s.ackInputDatagram(d, proto.InputAckGamepad, g.Index, g.Seq, at)
 			}
 		case proto.DgRateReport:
 			if r, ok := proto.ParseRateReport(d); ok {
@@ -3221,6 +3234,10 @@ func (s *Session) controlLoop() error {
 			}
 		case "bye":
 			return errClosed
+		case proto.MsgInputAck:
+			s.inAck.stream.Store(true)
+		case proto.MsgInput:
+			s.logInput(b)
 		}
 	}
 }
