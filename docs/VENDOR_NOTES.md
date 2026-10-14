@@ -12926,3 +12926,238 @@ power-on changed the mode (the capture loss right after).
   decoder's backlog reset (`generation 3 replaced it`), both timing under a starved CPU, neither
   in code these changes touch. The one re-run: 317 of 317 (10 min), "WebGPU HDR10" with
   `BT.601 patch codes` (the sandbox's FFmpeg 6.1).
+
+## Second hardware run: browser presentation and input latency
+
+The owner's second run (host build `20a5043`, `report2/host.log` from line 4365): "definitely
+better but still pretty laggy, doesn't feel like running directly on the host". The client:
+Chrome 122 on Windows (February 2024), an Intel UHD 630, a 144 Hz display at a device pixel
+ratio of 1.25, the window 1920×922 (the picture shown at 0.854), every session on the UDP relay.
+This section is the browser's part: how the picture is presented, how input travels, and the
+clock sync both are measured with.
+
+### What the log shows
+
+- **The renderer was never measured on this run.** All 62 `latency stages` lines say
+  `renderer=canvas2d` and none `renderer=bakeoff`: no bake-off ran in any of the six sessions.
+  The 2D canvas came from the first run's stored pick ("the only path left" at 12.3 fps on the
+  starved stream, WebGL2 and WebGPU out for "too few samples").
+- **The client's own stages are small.** Over the 62 windows the p50s are draw 0.5-1.1 ms
+  (median 0.7), hold 0.0-0.1, wait 0.0-0.1, decode 0.4-1.2, and the display estimate 2.0-4.4 ms
+  (median 3.2: the main thread's next animation frame, half a 6.9 ms refresh on average). The
+  in-game 36 ms capture→drawn is the host's capture→encoded (13.5) and the transfer (11.8),
+  then the network (7.6). What the stages cannot show: the compositor and the display after the
+  draw (the display row is the page's next animation frame, not the screen), and the input
+  direction, which had no measurement at all.
+- **A constant ~100 ms in the rate reports' delays.** In every `stream stats` line
+  `report_owd_p50_ms` minus `owd_avg_ms` (the frame acks', measured with the client's current
+  clock offset) is 84-115 ms, per session a steady 97-111 ms (median): the delays the rate
+  reports carry are on the scale of the client's first clock offset, which was ~100 ms off.
+- **No browser version in host.log.** `session started` cuts the user agent at 80 characters,
+  before `Chrome/122`; the version came from the first run's exported latency report.
+
+### Causes
+
+1. **The stored pick outlived its fix.** The first run's build (`52f801f`) stored its pick in
+   `recon.present.v2` without the *provisional* mark, which came after it (First hardware run:
+   rate control on the UDP relay): the later build read a plain stored pick for this browser
+   (`Chrome 122 · Windows`, unchanged) and kept it for good. A pick made on a starved stream
+   was measured again only if it carried the mark.
+2. **Chrome 122 cannot say whether the 2D canvas is low-latency.** Its
+   `OffscreenCanvasRenderingContext2D` has no `getContextAttributes` (Chrome for Testing
+   122.0.6261.128 here; Chromium 141 has it), so the worker's 2D canvas reports
+   `desynchronized` as unknown (`null`; the first run's stored numbers, as the pick rule's unit
+   case has them, show exactly that), and the overlay said "desynchronized not reported". WebGL2
+   reported `false` there (no low-latency WebGL2 for the worker's canvas on the owner's UHD 630
+   and Chrome 122) and WebGPU has no such mode.
+   Auto's rule kept only the paths reporting `true` when any did: where WebGL2 reports `true`
+   (another GPU or driver), Chrome 122's 2D canvas would have been ruled out only for being
+   unable to report.
+3. **The clock sync's first offset was taken from pings that waited in the host.** The host
+   starts its datagram loop (which answers pings) after the encoder started
+   (`session.go` `run`: `go s.datagrams()` after `startVideo`; `encoder ready` comes 360-400 ms
+   after `session started` in this log), and the client sent its first five pings within 240 ms
+   of its hello: their
+   round trip is mostly that one-sided wait, and an offset from them is off by half of it. The
+   client fixed `clock.first`, the scale of every rate report's delays (`clockShiftUs` is
+   relative to it), at the first pong. The rate controller works on differences of those
+   delays, so it was not misled by the constant; the logged `report_owd_*` figures were, and so
+   was any absolute reading of them.
+4. **The input path was not measured, and its parts were not checked.** Inputs go from the
+   page's event to the worker (a message), which writes them to the transport; there was no
+   figure for any part of it. What it does: no batching (every `pointerrawupdate`, key and
+   button goes at once); the mouse's loss insurance set and cleared two timers per motion
+   event (up to 8000 a second with a fast mouse: main-thread work, not a wait); gamepads are
+   polled every 4 ms (the Gamepad API has no events for state changes, and 4 ms is the
+   browser's timer floor); WebTransport `sendOrder`, send groups and separate datagram
+   writables are missing in Chrome 122 and in Chromium 141 alike, so input's priority on the
+   connection is what the host and the queue order give it (input and telemetry datagrams share
+   one queue; telemetry gives way when it stalls, GUIDE 2.7).
+
+### The changes
+
+- **Renderer Auto measures a stale pick again** (`stream.js` `presentStale`, `presentRecheck`;
+  stored picks carry the rule version `v: 3`, `expectFps`, `waitedMs`). Measured again on the
+  next connection: a pick from a page before version 3 (the first run's: the log line and the
+  result's toast say "the stored pick (2D canvas, 2026-10-11) was made by an earlier version of
+  this page on a stream short of frames (12.3 of 60 fps)"), one made at another display refresh
+  rate (more than 10 % apart), one over 30 days old (a driver update since). A provisional pick
+  kept after three tries stands until a connection drawing with it has had a stream at 80 % of
+  its rate for 10 s; then the next connection measures again. The drawer's hint says which
+  applies.
+- **The bake-off waits for a steady stream** (`stream-worker.js` `bakeTick`): after the 2 s
+  warm-up it starts once the last second drew 80 % of the stream's rate (at most the display's
+  refresh), at most 15 s later; then it measures all the same and a short stream makes the pick
+  provisional as before. The log names the wait (`presentation bake-off: measuring after N s of
+  waiting for a steady stream (…)`), the overlay's Renderer row reads `auto: measuring (waiting
+  for a steady stream)`.
+- **A context that cannot report desynchronized is not ruled out for it** (`renderers.js`
+  `pickPath`): where some path reports `true`, the paths reporting `false` and WebGPU (no such
+  mode) give way; Chrome 122's 2D canvas (`null`) stays in, and the 2D default keeps its place
+  unless another path draws over 1 ms faster in every round. The paths' other low-latency
+  options were checked and are as they should be: the 2D canvas and WebGL2 ask for
+  `desynchronized`, WebGL2 without antialiasing, depth or a preserved drawing buffer, WebGPU
+  `alphaMode: "opaque"`; in *Lowest latency* nothing waits for an animation frame or
+  `requestVideoFrameCallback` (a frame is drawn one MessageChannel task after the decoder's
+  output; Smooth waits for the worker's animation frame by design); no path waits for the GPU
+  per frame (WebGL2's readbacks use fences, WebGPU's `mapAsync`, both only for the 1-in-30
+  latency probe).
+- **Input latency** (`internal/proto/inputack.go`, `internal/host/inputlat.go`,
+  `protocol.js`, `stream-worker.js` `inLat`; ARCHITECTURE "Input latency"). Hosts list
+  `input-ack` and answer marked inputs with a `0x24` datagram (arrival and injection on the
+  host clock); the client marks every key and mouse-button press and one mouse and one gamepad
+  datagram per 50 ms, and measures browser event → injected on the host per class (keys, mouse,
+  pad), its parts (event → handed to the transport, of it the page's own dispatch; → arrived at
+  the host; → injected) and the round trip's estimate without the clock sync. The overlay shows
+  `Input → host (mouse)`, `(keys, buttons)`, `(gamepad)` and a `parts p50` row with the
+  gamepads' polling; the export has `input` and `gamepadPolling`; every 10 s the host logs
+  `input latency p50/p95/p99 ms, last 10 s (client: browser event -> injected on the host)` with
+  `browser`, the rows, `clock_min_rtt_ms`, `clock_bound_ms`, `clock_age_s`, `clock_samples` and
+  `browser_lacks`. A marked input unanswered for 5 s is given up and counted (the export's
+  `inputAckCount`: marked, acknowledged, given up, of those answered later; the overlay's parts
+  row ends `· n of m unacknowledged` while some never were). The page posts each input with its
+  event's time; the mouse's loss insurance runs from one timer moved on while the motion lasts.
+- **The clock sync** (`stream-worker.js`; ARCHITECTURE "Clock sync and latency accounting"):
+  pings every 250 ms (was 1 s) and a burst once the first video frame arrived; the offset from
+  the sample with the smallest error bound (half its round trip plus 100 ppm of drift since),
+  moved to another only when it is 0.05 ms better; `clock.first` fixed once the sync has
+  settled (three pongs to pings sent after the first video frame, else 5 s after the first
+  pong), the rate reports carrying delays only from then on. The overlay's round-trip row shows
+  `clock ±x ms`; the input latency line logs it. The host side of the constant (the logged
+  figure, the datagram loop's start) is the network area's.
+- **Old browsers** (`browser.js`; `app.js`, `stream.js`): the dashboard's *This browser* card
+  and the stream page's start screen name the browser (`Chrome 122`) and, for a Chromium-based
+  browser older than the tested Chromium 141 or one lacking what the tested one has, say so in
+  orange: "Chrome 122 is 19 versions older than Chromium 141, which this client is tested with;
+  it lacks the 2D canvas's low-latency report (getContextAttributes in the worker), HDR canvas
+  output (GPUCanvasContext.getConfiguration). Update Chrome for lower latency." The overlay's
+  Browser row lists everything it lacks (also what Chromium 141 lacks too: WebTransport
+  `sendOrder`, and RESET_STREAM_AT where the host says this connection did not negotiate it);
+  the host logs the browser and the ids with the input latency. Hosts that list `input-ack`
+  also list `reset-stream-at` when the client's QUIC endpoint negotiated it.
+
+### Chrome 122 against Chromium 141
+
+Every API the client feature-detects, probed in Chrome for Testing 122.0.6261.128 and in
+Playwright's Chromium 141.0.7390.37 (headless, Linux; a page and a worker on a secure origin):
+
+| API | 122 | 141 | What the client does without it |
+|---|---|---|---|
+| `OffscreenCanvasRenderingContext2D.getContextAttributes` (worker) | no | yes | the 2D canvas's `desynchronized` is unknown (Auto keeps it in) |
+| `GPUCanvasContext.getConfiguration` | no | yes | no HDR10 presentation (already: "getConfiguration: Chrome 131+") |
+| `GPUAdapter.info` | no | yes | the overlay names no WebGPU adapter |
+| `GamepadHapticActuator.effects` | no | yes | rumble plays without checking the list (already) |
+| `scheduler.yield` | no | yes | not used |
+| WebTransport `sendOrder`, `createSendGroup`, `datagrams.createWritable` | no | no | input and telemetry share the queues (GUIDE 2.7) |
+| RESET_STREAM_AT (QUIC) | no (host.log) | no (E2E host log) | a cancelled frame arrives without its header |
+| WebTransport, WebCodecs, WebGPU, `pointerrawupdate`, `getCoalescedEvents`, Keyboard Lock, worker `requestAnimationFrame`, `devicePixelContentBoxSize`, `requestVideoFrameCallback` | yes | yes | |
+
+So an update brings the 2D canvas's low-latency report (Auto can then prefer the canvas that
+says it is desynchronized), HDR10 output and two years of WebTransport, WebCodecs, GPU and
+compositor work that no API probe shows; it does not bring RESET_STREAM_AT or `sendOrder`
+(Chromium 141 has neither). The client's own code uses no JavaScript built-in newer than
+Chrome 122 (searched), and runs there (below).
+
+### Verified here
+
+- **Go**: `TestInputAck` (the acknowledgement's layout; the mark in byte 3 of the three input
+  datagrams, which their parsers ignore), `TestInputReportValid` (what the host logs as given),
+  `TestInputAckJS` (protocol.js reads Go's acknowledgement and marks its datagrams where Go
+  looks; needs node), `TestInputAcks` (a marked datagram is acknowledged with kind, pad, seq,
+  arrival and injection; an unmarked one and the input stream before `inputAck` are not; a full
+  queue drops it without waiting), `TestLogInput` (the log line's rows in order, the clock sync,
+  the browser and its gaps; a report without input; malformed reports dropped).
+- **Browser E2E, Chromium 141** (headless and headed on Xvfb, under the lock): every transport
+  scenario (direct, UDP relay, splice, WebSocket) and the WebGL2, WebGPU, FSR and HDR10 ones
+  measure the input latency with a settled clock sync; the host logs the report with
+  `browser="Chrome 141"`; the export has `input`, `clock` and `browser`; the fake gamepad's
+  state changes are acknowledged. On this machine's loaded CPUs the figures say little about a
+  real client but show the parts working: in the headed scenarios, which had CPU to spare, mouse
+  1.2-3.3 ms and keys 1-10 ms p50 (browser part 1.0-2.2, network 0.4-2.0, host 0.02-0.07 ms,
+  `rtt_half` within ~1 ms of the clock-synced figure); in the headless ones with the CPUs at
+  0-3 % idle, 25-460 ms, nearly all of it the browser part (the page's dispatch 0.5-0.8 ms p50:
+  the hop to the busy worker) and the network one-way (the host's goroutines waiting for a CPU).
+  The renderer checks: the stale-pick cases (the first run's record measured again with its
+  reason, a current pick standing, another refresh rate and a 31-day-old pick measured again, a
+  kept provisional pick measured again after 10 s of a good stream and not after a slow stats
+  sample), the pick rule on Chrome 122's numbers, and the bake-off on the live stream (`waited
+  0.0 s for a steady stream` when the stream was steady; three paths measured, the pick stored,
+  used at once by the next connection). The old-browser checks: no notice for Chromium 141; the
+  emulated Chrome 122 (its user agent, the two members removed) gets the notice on the dashboard
+  and the splash, the overlay's Browser row and `browser="Chrome 122"
+  browser_lacks=canvas2d-attributes,hdr-canvas,send-order,reset-stream-at` in the host log.
+- **Browser E2E in Chrome for Testing 122.0.6261.128** (`E2E_CHROMIUM`, the scenarios and
+  sections the changes touch, under the lock): the client runs there. WebTransport direct,
+  WebSocket relay and WebGL2 stream, decode and draw; input acknowledgements and the clock
+  sync work (`browser="Chrome 122"` in the host log); `reset_stream_at=no`; the dashboard shows
+  the notice by itself (`Chrome 122 is 19 versions older than Chromium 141, …`); the bake-off
+  runs (2D canvas `desynchronized null`, WebGL2 `false`, no WebGPU adapter on Xvfb) and picks
+  WebGL2, which drew over 1 ms faster in both rounds; the stale-pick and pick-rule checks pass.
+  Its failures are the harness's assumptions about Chromium 141 and this machine's load, not the
+  client: a 2D canvas reporting desynchronized and a WebGPU adapter (both now accepted where the
+  browser lacks them), fullscreen and the animation-frame cadence of 122's old headless mode
+  (fullscreen works in its headed browser), and frame-rate checks with the CPUs 0 % idle.
+- **The whole browser E2E, four runs under the lock** on this machine while the other areas'
+  runs shared its CPUs. Two stopped at a headed WebGPU screenshot timing out after 30 s
+  (`page.screenshot: Timeout 30000ms exceeded`) and one at "Page crashed" (resources); the
+  same screenshot timeout stops the base commit 20a5043 at the same place (an A/B run of its
+  build), so it is this machine's, not these changes'. The fourth ran through: 332 checks
+  passed, 4 failed. Two were the input latency check in the WebGPU and FSR scenarios, with
+  SwiftShader drawing on CPUs 2-6 % idle: the worker had the figures (the host logged `keys=` and
+  `mouse=` from them), but the key presses before the check had left the 10 s window by the
+  time the starved page's stats were read; with the counters added for it, 32 of 34 marked
+  inputs had been answered. The check now presses a key of its own and takes each row from the
+  first stats that have it; re-run (WebTransport direct, WebGPU, FSR) all three pass, `marked
+  36, acknowledged 36`. The other two were load, in sections these changes do not touch: FSR's
+  barcode sampling (18 of 26 frames skipped) and the clean-link scenario's key-frame requests
+  (the network area's). In that re-run the WebGPU scenario's Keyboard Lock check failed once
+  (the lock not reported within 8 s of a fullscreen entered by the hotkey), after passing in
+  all four full runs; the next run of the sections these changes touch (WebGPU, the input host,
+  old browser, stale stored pick) passed all 51 checks, Keyboard Lock and the input latency
+  (`marked 36, acknowledged 36`; the gamepad's acknowledged) among them.
+- `go test ./internal/e2e` under the lock (217.7 s), `go test ./internal/proto ./internal/host`;
+  `node --check` on every changed script; `gofmt -l` prints nothing; `go vet` and `GOOS=windows
+  go vet` pass for `internal/proto` and `internal/host`; `make build`.
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 7.8 (the client is the
+  part under test; any host). In short: open the dashboard in the Chrome 122 once (the notice),
+  update Chrome, connect with Renderer Auto and the overlay open, leave the mouse still ~20 s
+  (the bake-off measures again by itself; its toast says why), play 5 minutes with mouse, keys
+  and a controller, export the latency data. Look in host.log for the `input latency` lines
+  (`browser=` the new version, `mouse=`, `keys=`, `pad=`, `client=`, `dispatch=`, `network=`,
+  `host=`, `rtt_half=`, `clock_bound_ms=`, `browser_lacks=`), the `latency stages` lines
+  (`renderer=bakeoff` then the pick) and `stream stats` `report_owd_p50_ms` against
+  `owd_avg_ms`. Pass: the bake-off measured all three paths near 60 fps and stored no
+  provisional pick; `mouse` and `keys` p50 at most the stage line's `network` p50 + 3 ms,
+  `client` ≤ 2 ms (`dispatch` ≤ 1), `host` ≤ 0.5 ms, `rtt_half` within ±2 ms of `mouse`,
+  `clock_bound_ms` ≤ 2, `report_owd_p50_ms` within ~5 ms of `owd_avg_ms`. Send host.log, the
+  exported JSON and an overlay screenshot if not; and whether the overlay was open (it redraws on
+  the page's main thread every 0.5 s) when `client` or `dispatch` is high.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same steps with an RTX 40/50 host;
+  nothing in these changes depends on the host's GPU. Pass: the same.
+- The latency rig (`docs/LATENCY_RIG.md`, HARDWARE_TEST_PLAN 7.3) stays the only measure of
+  what the screen shows: the bake-off's display row is the page's next animation frame, not the
+  display. With the updated Chrome on the UHD 630, 200 rig samples per renderer decide whether
+  Auto's pick is within 1 ms of the fastest.

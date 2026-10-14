@@ -813,6 +813,60 @@ Use a client with an AMD GPU. Each item's exact steps are in VENDOR_NOTES:
 
 If not, send: the client log and a screenshot for the failing item.
 
+**7.8 The second hardware run's client: renderer, browser, input latency, clock sync**
+(VENDOR_NOTES "Second hardware run: browser presentation and input latency")
+
+The second run drew every session with the 2D canvas from the first run's stored pick, which
+was never measured again, from Chrome 122, and had no measure of the input path. This step
+measures what was missing.
+
+- **Do**:
+  1. Before updating Chrome, open the dashboard once in the Chrome 122 the runs used, and note
+     the **This browser** card (a Chrome 122 badge in orange and the notice under it). Then
+     update Chrome (`chrome://settings/help`, relaunch) and note the version.
+  2. In the updated Chrome, connect to the PC with Renderer *Auto* (do not press *Measure
+     renderers again*: the stored pick from the first run is measured again by itself). Open the
+     overlay (Ctrl+Alt+Shift+S) and leave the mouse still for the first ~20 s: the bake-off waits
+     for a steady stream, then the three paths take turns (the Renderer row reads `auto:
+     measuring …`). The toast after it reads `Renderer: …, Auto's pick (…). Measured again: the
+     stored pick (2D canvas, 2026-10-11) was made by an earlier version of this page on a stream
+     short of frames (12.3 of 60 fps).`
+  3. Play the game of the second run for 5 minutes on the same path: mouse in game mode
+     (Ctrl+Alt+Shift+M), key presses, and a controller for a minute. Then click **Export
+     latency data**.
+  4. Disconnect, connect again, and play 2 more minutes (the stored pick draws at once).
+- **Look at**:
+  - The overlay's **Renderer** rows: the bake-off's three paths with their draw/display p50 and
+    fps, the ★ pick and its reason; and the **context** row (`desynchronized ✓`, `✗` or `not
+    reported`) of the path that won.
+  - The overlay's **Input → host** rows (mouse, keys and buttons, gamepad: p50/p95/p99) and
+    `parts p50: browser x (page y) · network · host · rtt/2` (ending `· n of m unacknowledged`
+    if inputs or their answers were lost), and the **round trip** row's `clock ±x ms`.
+  - host.log: the `input latency p50/p95/p99 ms, last 10 s` lines (`browser=`, `mouse=`,
+    `keys=`, `pad=`, `client=`, `dispatch=`, `network=`, `host=`, `rtt_half=`,
+    `clock_min_rtt_ms=`, `clock_bound_ms=`, `browser_lacks=`), the `latency stages` lines
+    (`renderer=bakeoff` in the first session's first windows, then the pick), and the `stream
+    stats` lines' `report_owd_p50_ms` next to `owd_avg_ms`.
+- **Pass**:
+  - The bake-off ran once, on a stream at its rate: each path near 60 fps, none out for *too few
+    samples*, and the stored pick has no *provisional* mark. The second connection has no
+    bake-off.
+  - `browser="Chrome 1xx"` with the updated version, and `browser_lacks` without
+    `canvas2d-attributes` and `hdr-canvas` (Chromium 141 has both). The dashboard shows no
+    notice.
+  - `mouse` and `keys` p50 at most the stage line's `network` p50 + 3 ms; `client` p50 ≤ 2 ms,
+    of it `dispatch` ≤ 1 ms; `host` p50 ≤ 0.5 ms; `rtt_half` within ±2 ms of `mouse` (the clock
+    sync and the round trip agree); `pad` p50 at most `mouse` + 5 ms (Chrome samples pads on its
+    own clock; the overlay's `pad poll x ms, n new samples/s` shows how often); no
+    `unacknowledged` on the parts row (the export's `inputAckCount`).
+  - `clock_bound_ms` ≤ 2 on the LAN, and `report_owd_p50_ms` within ~5 ms of `owd_avg_ms`
+    (the second run's ~120 ms against 7-25 was a first clock offset taken before the host's
+    datagram loop ran).
+- **If not, send**: host.log, the exported latency JSON (it has `input`, `inputAckCount`,
+  `clock`, `browser`, `present` and `gamepadPolling`), and a screenshot of the overlay with the Renderer and Input
+  rows. If `client` or `dispatch` is high, also whether the overlay was open (it redraws every
+  0.5 s on the page's main thread) and the CPU load on the client.
+
 ### Stage 8: Relay, WAN and rate control (T4, T6)
 
 All runs use Network path *Relay via gateway* and `"logLevel": "debug"`, after stage 6.

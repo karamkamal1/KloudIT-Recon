@@ -113,12 +113,18 @@ hardware follow **[docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md)**, an
 - **FSR 1 upscaling** (WebGPU), for a stream shown larger than it is sent.
 - **Live latency readout.** NTP-style clock sync and per-frame host timestamps split *capture →
   on screen* into its stages (p50/p95/p99). A latency probe reads a frame barcode and exports a
-  capture → drawn histogram.
+  capture → drawn histogram. The other direction too: the PC acknowledges inputs, so the
+  overlay shows *Input → host* (your mouse, key and controller events until the PC injected
+  them) and the PC's log records it.
+- **Browser check.** The dashboard and the stream page say when your browser is older than the
+  Chromium this client is tested with (141), or lacks something it uses, and what updating
+  brings.
 
 ### Input and audio
 
 - **Raw mouse.** `pointerrawupdate` and Pointer Lock with `unadjustedMovement`. Motion travels as
-  running totals in datagrams, so a lost datagram delays motion but never drops it.
+  running totals in datagrams, so a lost datagram delays motion but never drops it. Every event
+  goes out at once: no batching, no timers; telemetry gives way to it.
 - **Keyboard.** Scancodes through SendInput. In fullscreen, Keyboard Lock passes Esc, Alt+Tab
   and Win to the PC.
 - **Cursor.** The PC's real cursor shapes are drawn locally.
@@ -375,9 +381,13 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
   fails, and the start screen then offers **Use Network path Auto** and **Settings**. The
   drawer's **Reset to defaults** puts every setting back.
 - **Renderer** *Auto* (default) tries the 2D canvas, WebGL2 and WebGPU on the live stream for
-  about 10 s, on the first connection in a browser, and remembers its pick for that browser
-  version. It leaves the desynchronized 2D canvas only for a path that draws clearly faster.
-  The overlay shows the numbers, and *Measure renderers again* repeats it. This is a heuristic:
+  about 10 s, on the first connection in a browser once the stream runs at its frame rate, and
+  remembers its pick for that browser version. It leaves the desynchronized 2D canvas only for
+  a path that draws clearly faster. It measures again by itself when the stored pick came from
+  an earlier version of the page (the first hardware run's), from a stream too short of frames
+  to compare the paths (once a later connection has a steady stream), from another display
+  refresh rate, or is over 30 days old. The overlay shows the numbers, and *Measure renderers
+  again* repeats it. This is a heuristic:
   pick a renderer yourself after measuring with the latency rig
   ([docs/LATENCY_RIG.md](docs/LATENCY_RIG.md)).
 - **Upscaling** (applies at once): *Auto* (default) upscales with FSR 1 when the picture is shown
