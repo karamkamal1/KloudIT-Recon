@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -622,14 +623,30 @@ func TestUDPRelayLimits(t *testing.T) {
 // splice relay is measured alongside for comparison: its browser leg runs the
 // gateway's own NewReno.
 
-// lossyLink sits in front of server for one client: delay each way, random loss.
+// lossyLink sits in front of server for one client: delay each way, random
+// loss, and towards the client (newShapedLink) a bottleneck: a link of rate
+// bit/s whose tail-drop queue holds queue of it.
 type lossyLink struct {
-	pc, up  *net.UDPConn
-	client  atomic.Pointer[net.UDPAddr]
-	dropped atomic.Int64
+	pc, up     *net.UDPConn
+	client     atomic.Pointer[net.UDPAddr]
+	dropped    atomic.Int64 // random losses
+	overflowed atomic.Int64 // datagrams the bottleneck's full queue dropped
 }
 
 func newLossyLink(t *testing.T, server *net.UDPAddr, delay time.Duration, loss float64) *lossyLink {
+	t.Helper()
+	return newLink(t, server, delay, loss, 0, 0)
+}
+
+// newShapedLink is a link to the client of rate bit/s with a tail-drop queue
+// of queue (a 100 Mbit/s Ethernet link and its switch port's buffer), no
+// delay or loss of its own.
+func newShapedLink(t *testing.T, server *net.UDPAddr, rate float64, queue time.Duration) *lossyLink {
+	t.Helper()
+	return newLink(t, server, 0, 0, rate, queue)
+}
+
+func newLink(t *testing.T, server *net.UDPAddr, delay time.Duration, loss, rate float64, queue time.Duration) *lossyLink {
 	t.Helper()
 	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -644,7 +661,9 @@ func newLossyLink(t *testing.T, server *net.UDPAddr, delay time.Duration, loss f
 		c.SetWriteBuffer(8 << 20)
 	}
 	l := &lossyLink{pc: pc, up: up}
-	pipe := func(seed uint64, read func([]byte) (int, error), write func([]byte)) {
+	// pipe forwards one way; rate > 0: through the bottleneck, whose queue
+	// is the time its last datagram leaves (free) less now.
+	pipe := func(seed uint64, rate float64, read func([]byte) (int, error), write func([]byte)) {
 		type pkt struct {
 			due  time.Time
 			data []byte
@@ -658,6 +677,7 @@ func newLossyLink(t *testing.T, server *net.UDPAddr, delay time.Duration, loss f
 		}()
 		rng := rand.New(rand.NewPCG(seed, 7))
 		defer close(q)
+		var free time.Time
 		for {
 			b := make([]byte, 2048)
 			n, err := read(b)
@@ -668,20 +688,32 @@ func newLossyLink(t *testing.T, server *net.UDPAddr, delay time.Duration, loss f
 				l.dropped.Add(1)
 				continue
 			}
+			due := time.Now()
+			if rate > 0 {
+				if free.Before(due) {
+					free = due
+				}
+				if free.Sub(due) > queue {
+					l.overflowed.Add(1)
+					continue
+				}
+				free = free.Add(time.Duration(float64(n*8) / rate * float64(time.Second)))
+				due = free
+			}
 			select {
-			case q <- pkt{time.Now().Add(delay), b[:n]}:
+			case q <- pkt{due.Add(delay), b[:n]}:
 			default:
 			}
 		}
 	}
-	go pipe(1, func(b []byte) (int, error) {
+	go pipe(1, 0, func(b []byte) (int, error) {
 		n, a, err := pc.ReadFromUDP(b)
 		if err == nil {
 			l.client.Store(a)
 		}
 		return n, err
 	}, func(b []byte) { up.Write(b) })
-	go pipe(2, up.Read, func(b []byte) {
+	go pipe(2, rate, up.Read, func(b []byte) {
 		if a := l.client.Load(); a != nil {
 			pc.WriteToUDP(b, a)
 		}
@@ -954,5 +986,336 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 	if u.mean < 0.85*d.mean || u.cv > d.cv+0.15 {
 		t.Errorf("udp relay %.1f Mbit/s (CV %.2f) vs direct %.1f Mbit/s (CV %.2f): want the direct path's goodput and steadiness",
 			u.mean/1e6, u.cv, d.mean/1e6, d.cv)
+	}
+}
+
+// TestUDPRelayOverrun: a relayed session whose target is far above what its
+// path carries, as when the second hardware run's sessions started at the
+// 250 Mbit/s setting behind a link of ~100 Mbit/s. The media controller
+// paces at 1.2 x the target whatever is lost (cc.Media leaves backing off to
+// the session's rate controller), so the link drops two datagrams in three.
+// What a session needs of the transport and the relay meanwhile: the
+// connection lives and frames still arrive; and once its rate controller
+// has brought the target under the link (within a second in the relay
+// simulation, at 20a5043 as now: docs/VENDOR_NOTES.md "Merged second
+// hardware run: the UDP relay under overload"), the frames are on time
+// again within a second: nothing of the overrun (a backlog of
+// retransmissions, probe timeouts backed off, the window's brake) outlives
+// it. Frames go as the session sends them: one stream each, written in
+// turn, cancelled when not sent by their deadline, the older left out when
+// two wait.
+func TestUDPRelayOverrun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("about 6 s of streaming")
+	}
+	const (
+		linkRate  = 100e6
+		linkQueue = 50 * time.Millisecond
+		over      = 250_000_000 // the target first: 300 Mbit/s of pacing
+		under     = 60_000_000  // the rate controller's answer: 72 Mbit/s
+		fps       = 60
+		overFor   = 2 * time.Second
+		recovery  = time.Second // after the target is lowered
+		judged    = 2 * time.Second
+		deadline  = 100 * time.Millisecond // a frame not sent by then is cancelled
+		onTime    = 100 * time.Millisecond // made to complete at the browser
+	)
+	serverTLS, clientTLS := relayTLS(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	host := newRelayHost(t, serverTLS, transport.QUICConfig(transport.WithCongestion(transport.CongestionMedia)))
+	r := newTestRelay(t, 1)
+	a := allocate(t, r, "u")
+	if err := host.bind(t, a, a.token); err != nil {
+		t.Fatal(err)
+	}
+	link := newShapedLink(t, a.addr(), linkRate, linkQueue)
+	accepted := make(chan *quic.Conn, 1)
+	go func() {
+		if c, err := host.ln.Accept(ctx); err == nil {
+			accepted <- c
+		}
+	}()
+	b, err := loopback(t, "127.0.0.1").Dial(ctx, link.addr(), clientTLS, transport.QUICConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.CloseWithError(0, "")
+	var h *quic.Conn
+	select {
+	case h = <-accepted:
+	case <-ctx.Done():
+		t.Fatal("no connection at the host")
+	}
+	m := transport.MediaControl(transport.FromQUIC(h))
+	if m == nil {
+		t.Fatal("no media controller")
+	}
+
+	// The browser reads each frame's stream to its end. A frame is its
+	// number and when it was made (8 bytes each), then padding.
+	var mu sync.Mutex
+	done := map[int]time.Time{}
+	go func() {
+		for {
+			s, err := b.AcceptUniStream(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				p, err := io.ReadAll(s)
+				if err != nil || len(p) < 16 {
+					return // cancelled
+				}
+				mu.Lock()
+				done[int(binary.BigEndian.Uint64(p))] = time.Now()
+				mu.Unlock()
+			}()
+		}
+	}()
+
+	// The host: a frame of target / fps each frame interval into a queue
+	// of two, written in turn.
+	type frame struct {
+		n    int
+		made time.Time
+		size int
+	}
+	start := time.Now()
+	lowered := start.Add(overFor)
+	end := lowered.Add(recovery + judged)
+	queue := make(chan frame, 2)
+	var made []time.Time // by frame number
+	var cancelled, left atomic.Int64
+	go func() {
+		defer close(queue)
+		tk := time.NewTicker(time.Second / fps)
+		defer tk.Stop()
+		target := int64(over)
+		m.SetTarget(target, time.Second/fps)
+		for n := 0; ; n++ {
+			now := time.Now()
+			if !now.Before(end) {
+				return
+			}
+			if target == over && !now.Before(lowered) {
+				target = under
+				m.SetTarget(target, time.Second/fps)
+			}
+			mu.Lock()
+			made = append(made, now)
+			mu.Unlock()
+			f := frame{n, now, int(target / 8 / fps)}
+			select {
+			case queue <- f:
+			default:
+				select {
+				case <-queue:
+					left.Add(1)
+				default:
+				}
+				queue <- f
+			}
+			<-tk.C
+		}
+	}()
+	buf := make([]byte, over/8/fps)
+	for f := range queue {
+		st, err := h.OpenUniStreamSync(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := buf[:f.size]
+		binary.BigEndian.PutUint64(p, uint64(f.n))
+		binary.BigEndian.PutUint64(p[8:], uint64(f.made.UnixNano()))
+		_ = st.SetWriteDeadline(f.made.Add(deadline))
+		if _, err := st.Write(p); err != nil {
+			st.CancelWrite(0)
+			cancelled.Add(1)
+			continue
+		}
+		st.Close()
+	}
+	time.Sleep(onTime) // the last frames' way
+	if err := context.Cause(b.Context()); err != nil {
+		t.Fatalf("the connection ended: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// span: frames made in [from, to) that completed, of how many, their
+	// latencies (made to complete) and the longest wait between two
+	// completions in order of making.
+	type span struct {
+		ok, of int
+		lat    []time.Duration
+	}
+	judge := func(from, to time.Time) (s span) {
+		for n, at := range made {
+			if at.Before(from) || !at.Before(to) {
+				continue
+			}
+			s.of++
+			if d, ok := done[n]; ok {
+				s.lat = append(s.lat, d.Sub(at))
+				if d.Sub(at) <= onTime {
+					s.ok++
+				}
+			}
+		}
+		slices.Sort(s.lat)
+		return s
+	}
+	p := func(v []time.Duration, q float64) time.Duration {
+		if len(v) == 0 {
+			return -1
+		}
+		return v[min(len(v)-1, int(q*float64(len(v))))].Round(time.Millisecond)
+	}
+	// Recovered: the first frame made after the target was lowered that
+	// completed on time with the half second of frames after it.
+	recovered := time.Duration(-1)
+	for n := range made {
+		if made[n].Before(lowered) {
+			continue
+		}
+		ok := n+fps/2 <= len(made)
+		for k := n; ok && k < n+fps/2; k++ {
+			d, in := done[k]
+			ok = in && d.Sub(made[k]) <= onTime
+		}
+		if ok {
+			recovered = made[n].Sub(lowered).Round(time.Millisecond)
+			break
+		}
+	}
+	ov, after := judge(start, lowered), judge(lowered.Add(recovery), end)
+	st := m.Stats()
+	t.Logf("overrun (%d Mbit/s into %.0f Mbit/s): %d of %d frames completed, latency p50/p95 %v/%v; target lowered to %d Mbit/s: on time again after %v; "+
+		"from %v on %d of %d on time, latency p50/p95 %v/%v; %d frames cancelled, %d left out; the link's queue dropped %d datagrams; "+
+		"the relay forwarded %d to the browser and dropped %d (%d by the kernel); the host lost %d of %d packets, %d collapses",
+		over/1_000_000, linkRate/1e6, len(ov.lat), ov.of, p(ov.lat, .5), p(ov.lat, .95), under/1_000_000, recovered,
+		recovery, after.ok, after.of, p(after.lat, .5), p(after.lat, .95), cancelled.Load(), left.Load(), link.overflowed.Load(),
+		a.stats.PktToBrowser.Load(), a.stats.Dropped.Load(), a.stats.SocketDrops.Load(), st.LostPackets, st.LostPackets+st.AckedPackets, st.Collapses)
+	if len(ov.lat) < ov.of/10 {
+		t.Errorf("during the overrun %d of %d frames completed: want frames to keep arriving (a tenth at least)", len(ov.lat), ov.of)
+	}
+	if after.ok < after.of*9/10 {
+		t.Errorf("%v after the target was lowered under the link %d of %d frames completed within %v: want 90 %%", recovery, after.ok, after.of, onTime)
+	}
+}
+
+// TestUDPRelayFlood: a host that sends far past the forwarder's limit
+// (relayDownRate, after the burst its token bucket allows) has the excess
+// dropped, by the forwarder or by the kernel at the allocation's socket
+// while the forwarder cannot keep up, and the rest forwarded; once the
+// flood ends the forwarder is current again within the time it takes to
+// read what its socket buffer held: nothing stalls or wedges
+// (docs/VENDOR_NOTES.md "Merged second hardware run: the UDP relay under
+// overload").
+func TestUDPRelayFlood(t *testing.T) {
+	r := newTestRelay(t, 1)
+	a := allocate(t, r, "u")
+	udp := func() *net.UDPConn {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadBuffer(8 << 20)
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	host, browser := udp(), udp()
+	buf := make([]byte, 2048)
+	for bound := false; !bound; {
+		host.WriteTo(proto.RelayBindPacket(a.token), a.addr())
+		host.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := host.ReadFrom(buf)
+		bound = err == nil && proto.IsRelayBound(buf[:n])
+		if time.Since(a.created) > 2*time.Second {
+			t.Fatal("no bind")
+		}
+	}
+	initial := make([]byte, 1200)
+	initial[0] = 0xc3
+	copy(initial[1:], []byte{0, 0, 0, 1})
+	browser.WriteTo(initial, a.addr())
+	host.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := host.ReadFrom(buf); err != nil || !a.locked.Load() {
+		t.Fatalf("the Initial was not forwarded (%v) or did not lock the allocation", err)
+	}
+
+	// The browser counts the flood's datagrams and when the last came, and
+	// notes the probes: datagrams that start with 'P', then their number
+	// and when they were sent.
+	const probes = 200
+	var mu sync.Mutex
+	var flooded int
+	var lastFlood time.Time
+	lat := map[int]time.Duration{}
+	go func() {
+		b := make([]byte, 2048)
+		for {
+			n, _, err := browser.ReadFromUDPAddrPort(b)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if n >= 17 && b[0] == 'P' {
+				lat[int(binary.BigEndian.Uint64(b[1:]))] = time.Since(time.Unix(0, int64(binary.BigEndian.Uint64(b[9:]))))
+			} else {
+				flooded++
+				lastFlood = time.Now()
+			}
+			mu.Unlock()
+		}
+	}()
+	// The flood: 300 ms of datagrams as fast as the host's socket takes
+	// them (1.7-2.2 Gbit/s on the sandbox's loopback: past the bucket's
+	// 8 MB within 50 ms, then at about twice its rate).
+	pkt := make([]byte, 1200)
+	pkt[0] = 0x40
+	sent := 0
+	t0 := time.Now()
+	for time.Since(t0) < 300*time.Millisecond {
+		for range 64 {
+			if _, err := host.WriteTo(pkt, a.addr()); err == nil {
+				sent++
+			}
+		}
+	}
+	flood := time.Since(t0)
+	// Probes from 100 ms after the flood, one a millisecond.
+	time.Sleep(100 * time.Millisecond)
+	for i := range probes {
+		p := make([]byte, 1200)
+		p[0] = 'P'
+		binary.BigEndian.PutUint64(p[1:], uint64(i))
+		binary.BigEndian.PutUint64(p[9:], uint64(time.Now().UnixNano()))
+		host.WriteTo(p, a.addr())
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	var l []time.Duration
+	for _, d := range lat {
+		l = append(l, d)
+	}
+	through, last := flooded, lastFlood.Sub(t0)
+	mu.Unlock()
+	slices.Sort(l)
+	p95 := time.Duration(-1)
+	if len(l) > 0 {
+		p95 = l[len(l)*95/100]
+	}
+	t.Logf("flood: %d datagrams in %v (%.0f Mbit/s); the relay forwarded %d of them in %v (%.0f Mbit/s) and dropped %d (%d more by the kernel); "+
+		"%d of %d probes after it arrived, latency p95 %v",
+		sent, flood.Round(time.Millisecond), float64(sent*len(pkt)*8)/flood.Seconds()/1e6, through, last.Round(time.Millisecond),
+		float64(through*len(pkt)*8)/last.Seconds()/1e6, a.stats.Dropped.Load(), a.stats.SocketDrops.Load(), len(l), probes, p95)
+	if limit := relayDownBurst + relayDownRate*last.Seconds() + 64<<10; float64(through*len(pkt)) > limit {
+		t.Errorf("the relay forwarded %d bytes in %v: want no more than its limit, %.0f", through*len(pkt), last, limit)
+	}
+	if len(l) < probes*95/100 || p95 > 50*time.Millisecond {
+		t.Errorf("after the flood %d of %d probes arrived, latency p95 %v: want 95 %% within 50 ms", len(l), probes, p95)
 	}
 }
