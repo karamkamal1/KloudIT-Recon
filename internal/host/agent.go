@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
 	"strings"
@@ -18,8 +17,6 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/webtransport-go"
 
 	"github.com/karamkamal1/kloudit-recon/internal/auth"
 	"github.com/karamkamal1/kloudit-recon/internal/host/encoder"
@@ -85,8 +82,10 @@ type Agent struct {
 	tunnelMu  sync.Mutex
 	directRot *tlsutil.Rotating // certificate of the direct path and the UDP relay
 	// directUp: the direct endpoint holds its UDP port. The gateway is told
-	// about the direct path only while it does.
+	// about the direct path only while it does. direct: the endpoint's
+	// server and sockets (direct.go), set when it starts (a.mu).
 	directUp atomic.Bool
+	direct   *directEndpoint
 
 	relayMu sync.Mutex
 	relay   *relayServer // UDP relay socket, started on the first allocation
@@ -553,13 +552,6 @@ func (a *Agent) sendTunnel(m proto.TunnelMsg) {
 	_ = proto.WriteMsg(a.tunnel, b)
 }
 
-func (a *Agent) directInfo() *proto.DirectInfo {
-	if a.cfg.DirectPort <= 0 || a.directRot == nil || !a.directUp.Load() {
-		return nil
-	}
-	return &proto.DirectInfo{Port: a.cfg.DirectPort, Addr: a.cfg.DirectAddr, Hashes: a.directRot.HashesB64()}
-}
-
 func (a *Agent) gatewayOnce(ctx context.Context) error {
 	p := a.pair()
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -765,89 +757,4 @@ func localMACs(local net.Addr) []string {
 		out = out[:4]
 	}
 	return out
-}
-
-// ---------------------------------------------------------------------------
-// Direct path: the browser connects straight to the host over WebTransport,
-// skipping the gateway hop. Authorised by gateway-signed one-time tickets;
-// the certificate is pinned by hash (no CA needed).
-
-func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
-	sem := make(chan struct{}, 4) // bound concurrent unauthenticated handshakes
-	mux := http.NewServeMux()
-	srv := &webtransport.Server{
-		H3: &http3.Server{
-			Addr:       fmt.Sprintf(":%d", a.cfg.DirectPort),
-			TLSConfig:  http3.ConfigureTLSConfig(&tls.Config{GetCertificate: rot.GetCertificate, MinVersion: tls.VersionTLS13}),
-			Handler:    mux,
-			QUICConfig: transport.QUICConfig(transport.WithCongestion(a.cfg.congestion())),
-			// Lets each session reach its connection's congestion controller.
-			ConnContext: transport.WithQUICConn,
-		},
-		// Any origin may open the session, but the first control message must
-		// carry a gateway-signed ticket bound to that same origin.
-		CheckOrigin: func(*http.Request) bool { return true },
-	}
-	mux.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case sem <- struct{}{}:
-		default:
-			http.Error(w, "busy", http.StatusServiceUnavailable)
-			return
-		}
-		sess, err := srv.Upgrade(w, r)
-		<-sem
-		if err != nil {
-			a.log.Debug("direct upgrade failed", "err", err)
-			return
-		}
-		c := transport.FromWebTransportOver(sess, transport.QUICConnFromContext(r.Context()))
-		a.HandleConn(c, SessionMeta{Path: "direct", RequireTicket: true, Origin: r.Header.Get("Origin")})
-	})
-	go func() {
-		<-ctx.Done()
-		srv.Close()
-	}()
-	failing := false
-	for {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: a.cfg.DirectPort})
-		if err != nil {
-			if !failing {
-				// Sunshine and Apollo use UDP 47998-48000 and 48010 while they stream.
-				a.log.Warn("direct endpoint unavailable: cannot bind its UDP port, retrying (streams go through the gateway; "+
-					"if another program holds the port, set another directPort in host.json)", "port", a.cfg.DirectPort, "err", err)
-				failing = true
-			}
-		} else {
-			if failing {
-				a.log.Info("direct endpoint port is free again", "port", a.cfg.DirectPort)
-				failing = false
-			}
-			a.setDirectUp(true)
-			a.log.Info("direct WebTransport endpoint listening", "port", a.cfg.DirectPort, "congestion", a.cfg.congestion())
-			err = srv.Serve(conn)
-			conn.Close()
-			a.setDirectUp(false)
-			if ctx.Err() != nil {
-				return nil
-			}
-			a.log.Warn("direct endpoint stopped (relay still works); retrying", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(directRetry):
-		}
-	}
-}
-
-// directRetry is how often the direct endpoint tries to bind its port again.
-var directRetry = 30 * time.Second
-
-// setDirectUp records whether the direct endpoint holds its port and tells
-// the gateway when that changes, so browsers are not sent to a closed port.
-func (a *Agent) setDirectUp(up bool) {
-	if a.directUp.Swap(up) != up {
-		a.sendTunnel(proto.TunnelMsg{T: "direct", Direct: a.directInfo(), Relay: a.relayInfo()})
-	}
 }

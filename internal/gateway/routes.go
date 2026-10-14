@@ -112,8 +112,9 @@ func (s *Server) csp(r *http.Request) string {
 			}
 		}
 		if hc := s.hosts.get(id); hc != nil {
-			if addr, port := hc.directEndpoint(); addr != "" {
-				add(cspSource(addr, strconv.Itoa(port)))
+			// Every address of its direct path (the browser tries them all).
+			for _, c := range hc.directCandidates(netip.Addr{}) {
+				add(cspSource(c.host, c.port))
 			}
 		}
 		if s.relay != nil {
@@ -166,30 +167,6 @@ func cspSource(host, port string) string {
 		host = "*"
 	}
 	return "https://" + net.JoinHostPort(host, port)
-}
-
-// directEndpoint is the address and port of the host's direct path ("" when
-// it offers none): the address it advertises, else its tunnel's peer address.
-func (hc *hostConn) directEndpoint() (string, int) {
-	hc.mu.Lock()
-	defer hc.mu.Unlock()
-	d := hc.info.Direct
-	if d == nil || d.Port == 0 || len(d.Hashes) == 0 {
-		return "", 0
-	}
-	addr := d.Addr
-	if addr == "" {
-		addr = hc.remoteIP
-	}
-	return addr, d.Port
-}
-
-func (hc *hostConn) directURL() string {
-	addr, port := hc.directEndpoint()
-	if addr == "" {
-		return ""
-	}
-	return "https://" + net.JoinHostPort(addr, strconv.Itoa(port)) + "/wt"
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

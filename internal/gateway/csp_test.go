@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -85,9 +86,10 @@ func TestCSPConnectSources(t *testing.T) {
 	}{
 		{"[fd00::1]:8443", "/stream?host=v6", tok, []string{"'self'", "https://*:48100", "https://*:8444", "https://*:8445"}},
 		{"gw.lan:8443", "/js/stream-worker.js?host=v6", tok, []string{"'self'", "https://*:48100", "https://gw.lan:8444", "https://gw.lan:8445"}},
-		{"gw.lan:8443", "/stream?host=v6addr", tok, []string{"'self'", "https://*:48102", "https://gw.lan:8444", "https://gw.lan:8445"}},
+		// The advertised address first, then the tunnel's peer address (orderDirect).
+		{"gw.lan:8443", "/stream?host=v6addr", tok, []string{"'self'", "https://*:48102", "https://192.0.2.9:48102", "https://gw.lan:8444", "https://gw.lan:8445"}},
 		{"192.0.2.1", "/js/stream-worker.js?host=v4", tok, []string{"'self'", "https://192.0.2.10:48101", "https://192.0.2.1:8444", "https://192.0.2.1:8445"}},
-		{"gw.lan", "/stream.html?host=named", tok, []string{"'self'", "https://pc.lan:48103", "https://gw.lan:8444", "https://gw.lan:8445"}},
+		{"gw.lan", "/stream.html?host=named", tok, []string{"'self'", "https://pc.lan:48103", "https://192.0.2.11:48103", "https://gw.lan:8444", "https://gw.lan:8445"}},
 		{"gw.lan", "/stream?host=none", tok, []string{"'self'", "https://gw.lan:8444", "https://gw.lan:8445"}},    // no direct path
 		{"gw.lan", "/stream?host=offline", tok, []string{"'self'", "https://gw.lan:8444", "https://gw.lan:8445"}}, // not connected
 		{"gw.lan", "/", tok, []string{"'self'"}},                                        // the dashboard
@@ -128,7 +130,7 @@ func TestCSPConnectSources(t *testing.T) {
 	}
 
 	// The direct URL handed to the browser keeps the address itself.
-	if u := direct("2001:db8::5", "", 48100).directURL(); u != "https://[2001:db8::5]:48100/wt" {
-		t.Errorf("directURL = %q", u)
+	if c := direct("2001:db8::5", "", 48100).directCandidates(netip.Addr{}); len(c) != 1 || c[0].URL != "https://[2001:db8::5]:48100/wt" {
+		t.Errorf("direct candidates %+v", c)
 	}
 }

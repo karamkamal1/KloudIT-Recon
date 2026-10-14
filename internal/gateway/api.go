@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -455,7 +456,7 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, u *User, ls
 			v.Monitors = hc.info.Monitors
 			v.Encoders = hc.info.Encoders
 			hc.mu.Unlock()
-			v.Direct = hc.directURL() != ""
+			v.Direct = len(hc.directCandidates(netip.Addr{})) > 0
 		}
 		out = append(out, v)
 	}
@@ -638,7 +639,10 @@ func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *Us
 		relay["udp"] = "https://" + r.Host + "/api/relay/udp?t=" + newTicket()
 	}
 	resp["relay"] = relay
-	if u := hc.directURL(); u != "" {
+	// The direct path: every address of it, in the order this browser
+	// should try them (directCandidates); url, the first, for clients
+	// before candidates.
+	if cands := hc.directCandidates(s.browserAddr(r)); len(cands) > 0 {
 		origin := "https://" + r.Host
 		tok, err := hc.signHostTicket(proto.DirectTicket{
 			HostID: id, User: ls.Username, Exp: time.Now().Add(60 * time.Second).Unix(), Nonce: auth.RandomToken(12), Origin: origin,
@@ -651,7 +655,8 @@ func (s *Server) handleHostConnect(w http.ResponseWriter, r *http.Request, u *Us
 			}
 			hc.mu.Unlock()
 			if len(dh) > 0 {
-				resp["direct"] = map[string]any{"url": u, "hashes": dh, "ticket": tok}
+				resp["direct"] = map[string]any{"url": cands[0].URL, "candidates": cands, "hashes": dh, "ticket": tok}
+				s.log.Debug("direct path candidates", "host", h.Name, "browser", s.clientIP(r), "candidates", directCandText(cands))
 			}
 		}
 	}
