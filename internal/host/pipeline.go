@@ -79,6 +79,27 @@ func (a *Agent) setupHelper() {
 	a.log.Info("native encoder helper not used", "reason", a.helperMissing, "pipeline", a.cfg.pipeline())
 }
 
+// gpuAdapters is platform.Adapters (tests replace it).
+var gpuAdapters = platform.Adapters
+
+// noGPU returns why no helper backend can encode on this PC, or "": Windows
+// lists no GPU, only the Microsoft Basic Render Driver (a PC or VM without
+// a GPU: platform.NoGPU), where AMF, NVENC and Quick Sync all need their
+// vendor's GPU. Sessions then do not launch the helper only for it to
+// report that (a second at each session start on a small VM). A VM with a
+// passthrough GPU lists it, also as a second adapter: the helper is tried
+// there as on any PC.
+func (a *Agent) noGPU() string {
+	as, err := gpuAdapters()
+	if err != nil {
+		return ""
+	}
+	if why := platform.NoGPU(as); why != "" {
+		return "no GPU encoder can work: " + why
+	}
+	return ""
+}
+
 // helperSlotSize is the frame ring slot size of a helper launched now
 // (encoder.SlotSizeFor): for the largest monitor Windows lists, as a helper
 // may stream any of them (a session's virtual display is listed too, and a
@@ -141,6 +162,9 @@ func (s *Session) openPipeline() (notice string) {
 	why := s.a.helperMissing
 	if why == "" && s.a.launchHelper == nil {
 		why = "no native encoder helper"
+	}
+	if why == "" {
+		why = s.a.noGPU()
 	}
 	if why == "" {
 		why = s.helperBlocker(prefs, drawCursor, nil)

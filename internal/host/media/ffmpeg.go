@@ -222,7 +222,17 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			}
 		}()
 	}
-	if c.Filters["ddagrab"] {
+	if why := noVideoDevice(); c.Filters["ddagrab"] && why != "" {
+		// No Direct3D 11 video device (a PC or VM without a GPU): found
+		// before the probe returns, without FFmpeg or a desktop (the lock
+		// screen, a disconnected session, a display that is off), so the
+		// first session captures with GDI from its start.
+		c.gpuCapture = finishedCheck(NoVideoDevice)
+		if log != nil {
+			log.Info("no GPU screen capture on this PC: sessions capture with GDI (gdigrab), which costs more CPU", "reason", NoVideoDevice,
+				"device", why, "gdigrab", c.CanGDIGrab())
+		}
+	} else if c.Filters["ddagrab"] {
 		// Alongside the encoder tests, and not waited for: it takes a
 		// fraction of a second, but up to gpuCaptureTimeout where ddagrab
 		// opens and waits for a first frame (a display that is off), which
@@ -239,7 +249,7 @@ func Probe(ctx context.Context, ffmpeg string, log *slog.Logger) (*Caps, error) 
 			close(chk.done)
 			switch {
 			case blocked != "" && log != nil:
-				log.Warn("no GPU screen capture on this PC: sessions capture with GDI (gdigrab), which costs more CPU", "reason", blocked,
+				log.Info("no GPU screen capture on this PC: sessions capture with GDI (gdigrab), which costs more CPU", "reason", blocked,
 					"ffmpeg", detail, "gdigrab", c.CanGDIGrab())
 			case detail != "" && log != nil:
 				log.Info("GPU screen capture test inconclusive, sessions use it", "detail", detail)

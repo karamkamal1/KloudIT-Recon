@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/karamkamal1/kloudit-recon/internal/host/platform"
 )
 
 // Screen capture without a GPU, and how FFmpeg's capture sources fail.
@@ -79,6 +81,10 @@ var (
 	gdiSource = []string{"gdigrab", "in#"}
 )
 
+// NoVideoDevice is why FFmpeg's GPU capture cannot work where there is no
+// Direct3D 11 video device (CaptureNoDevice).
+const NoVideoDevice = "no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset"
+
 // driverReset is the sentence for Desktop Duplication losing its GPU device.
 const driverReset = "the graphics driver was reset or updated, or stopped responding"
 
@@ -86,8 +92,7 @@ const driverReset = "the graphics driver was reset or updated, or stopped respon
 // messages (libavfilter/vsrc_ddagrab.c, vsrc_gfxcapture_winrt.cpp,
 // libavdevice/gdigrab.c).
 var captureRules = []captureRule{
-	{gpuSources, "Failed to create D3D11VA device", CaptureNoDevice,
-		"no Direct3D 11 video device: a PC or VM without a GPU, or a graphics driver being installed or reset"},
+	{gpuSources, "Failed to create D3D11VA device", CaptureNoDevice, NoVideoDevice},
 	{ddaSource, "Selected output not supported", CaptureUnsupported,
 		"Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support"},
 	{ddaSource, "Failed to enumerate DXGI output", CaptureUnsupported,
@@ -207,14 +212,33 @@ func CheckDDA(ctx context.Context, ffmpeg string, output int) (ok bool, f Captur
 	return false, f, err.Error() + ": " + PlainFFmpegError(causeLines(stderr.String(), 3))
 }
 
-// CheckGPUCapture opens ddagrab on output 0 for one frame (CheckDDA) and
-// returns why GPU capture (ddagrab, gfxcapture: the same D3D11VA device)
-// cannot work on this PC: no Direct3D 11 video device (CaptureNoDevice;
-// detail is FFmpeg's line). It returns "" when the capture opened (detail
-// ""), and when it failed for another reason (the secure desktop at logon,
-// a mode change) or timed out, which a session can get past; detail then
-// says what happened.
+// videoDevice is platform.D3D11VideoDevice (tests replace it): FFmpeg's
+// D3D11VA device, which ddagrab and gfxcapture open first, opened without
+// FFmpeg.
+var videoDevice = platform.D3D11VideoDevice
+
+// noVideoDevice returns why the Direct3D 11 video device FFmpeg's GPU
+// capture opens first cannot be opened (videoDevice), or "" when it can or
+// the platform has none to check (outside Windows).
+func noVideoDevice() string {
+	if err := videoDevice(); err != nil && !errors.Is(err, platform.ErrUnsupported) {
+		return err.Error()
+	}
+	return ""
+}
+
+// CheckGPUCapture returns why GPU capture (ddagrab, gfxcapture: the same
+// D3D11VA device) cannot work on this PC: no Direct3D 11 video device
+// (CaptureNoDevice). It opens that device itself first (noVideoDevice:
+// milliseconds, no desktop needed; detail is the device's error), then
+// ddagrab on output 0 for one frame (CheckDDA; detail is FFmpeg's line). It
+// returns "" when the capture opened (detail ""), and when it failed for
+// another reason (the secure desktop at logon, a mode change) or timed out,
+// which a session can get past; detail then says what happened.
 func CheckGPUCapture(ctx context.Context, ffmpeg string) (blocked, detail string) {
+	if why := noVideoDevice(); why != "" {
+		return NoVideoDevice, why
+	}
 	ok, f, detail := CheckDDA(ctx, ffmpeg, 0)
 	switch {
 	case ok:

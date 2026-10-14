@@ -4,6 +4,7 @@ package platform
 
 import (
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -92,4 +93,21 @@ func TestStockCursorImages(t *testing.T) {
 			t.Fatalf("cursor %d: implausible image", id)
 		}
 	}
+}
+
+// TestD3D11VideoDevice opens the Direct3D 11 video device FFmpeg's GPU
+// capture opens first, and lists the adapters: under Wine (no video
+// support, as on a VM without a GPU) the device fails; on a GPU PC it opens.
+func TestD3D11VideoDevice(t *testing.T) {
+	as, err := Adapters()
+	if err != nil {
+		t.Fatalf("adapters: %v", err)
+	}
+	for i, a := range as {
+		t.Logf("adapter %d: %q vendor %s (%#x) software=%v", i, a.Name, a.Vendor, a.VendorID, a.Software)
+	}
+	t.Logf("no GPU: %q", NoGPU(as))
+	start := time.Now()
+	err = D3D11VideoDevice()
+	t.Logf("D3D11 video device: %v (%v)", err, time.Since(start).Round(time.Microsecond))
 }

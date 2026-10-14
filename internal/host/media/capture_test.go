@@ -440,3 +440,59 @@ func TestWriteReportGDI(t *testing.T) {
 		t.Fatalf("report without gdigrab:\n%s", buf.String())
 	}
 }
+
+// TestGPUCaptureVideoDevice: where the Direct3D 11 video device FFmpeg's GPU
+// capture opens first cannot be opened (a PC or VM without a GPU), the
+// probe has its finding when it returns (the first session captures with
+// GDI from its start, not after a failed ddagrab generation), and the
+// re-check finds it without starting FFmpeg's capture; where it opens, the
+// ddagrab test decides as before.
+func TestGPUCaptureVideoDevice(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in is a shell script")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ddagrab-ran")
+	ff := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+case "$*" in
+*ddagrab=output_idx*) touch ` + marker + `; sleep 1.5; exit 0 ;;
+*-version*) echo "ffmpeg version n8.1.3 Copyright (c) 2000-2026" ;;
+*-filters*) echo " ... ddagrab           |->V       Grab Windows Desktop images using Desktop Duplication API" ;;
+*-devices*) echo " D  gdigrab         GDI API Windows frame grabber" ;;
+*-encoders*) echo " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)" ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(ff, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func(f func() error) { videoDevice = f }(videoDevice)
+	videoDevice = func() error { return fmt.Errorf("ID3D11VideoDevice: HRESULT 0x80004002") }
+	c, err := Probe(context.Background(), ff, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.GPUCaptureDone():
+	default:
+		t.Fatal("no finding when the probe returned")
+	}
+	if c.GPUCaptureBlocked() != NoVideoDevice {
+		t.Fatalf("finding %q", c.GPUCaptureBlocked())
+	}
+	if blocked, detail := CheckGPUCapture(context.Background(), ff); blocked != NoVideoDevice || detail != "ID3D11VideoDevice: HRESULT 0x80004002" {
+		t.Fatalf("re-check: %q, %q", blocked, detail)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("FFmpeg's ddagrab test ran")
+	}
+	videoDevice = func() error { return nil } // a GPU: FFmpeg's test decides, in the background
+	if c, err = Probe(context.Background(), ff, nil); err != nil {
+		t.Fatal(err)
+	}
+	<-c.GPUCaptureDone()
+	if _, err := os.Stat(marker); err != nil || c.GPUCaptureBlocked() != "" {
+		t.Fatalf("with a video device: ddagrab test %v, finding %q", err, c.GPUCaptureBlocked())
+	}
+}

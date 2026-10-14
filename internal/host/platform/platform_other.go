@@ -14,6 +14,12 @@ func Monitors() ([]Monitor, error) {
 // RemoteSession is false outside Windows.
 func RemoteSession() bool { return false }
 
+// D3D11VideoDevice is unsupported outside Windows.
+func D3D11VideoDevice() error { return ErrUnsupported }
+
+// Adapters is unsupported outside Windows.
+func Adapters() ([]Adapter, error) { return nil, ErrUnsupported }
+
 // PrimaryAdapter is unsupported outside Windows.
 func PrimaryAdapter() (Adapter, error) { return Adapter{}, ErrUnsupported }
 
