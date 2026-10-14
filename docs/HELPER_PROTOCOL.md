@@ -403,7 +403,10 @@ DISCARDABLE). With `reencodeOversized`, a re-encoded frame adds
 `"reencoded":true,"oversizeBytes":N` (the first encode's size; `bytes` is what went out; ring
 flag REENCODED); with `sliceOutput`, `"slices":N,"firstSliceQpc":Q` (the parts it came out in
 and when the first one did; also in the ring slot, which the frame reaches recon-host with:
-the stats message follows the ring write and may be dropped).
+the stats message follows the ring write and may be dropped). Helpers since the second
+hardware run add the frame's per-frame timing where measured: `readyQpc`, `deliverQpc`,
+`lockQpc`, `convertQpc`, `submittedQpc`, `gpuDoneQpc` (see "Per-frame timing"; also in the
+ring slot, flag TIMING).
 
 `dropped` frames add `"reason"`: `ringFull` (recon-host did not keep up) or `tooLarge`
 (bigger than a slot; also the error `frame_too_large`, and DROPPED_TOO_LARGE on the next
@@ -499,7 +502,7 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 |---|---|---|
 | 0 | u64 | `seq`: the write index `n` this slot was written at |
 | 8 | u64 | `frameId`: helper frame counter, from 1, +1 per captured frame |
-| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it), bit 5 DIRTY (`dirtyPpm` valid; Phase 5), bit 6 DISCARDABLE (no later frame references this one; Phase 5), bit 7 REENCODED (encoded a second time at a higher QP: start `reencodeOversized`, stats `reencoded`; Phase 5 wiring B), bit 8 DROPPED_TOO_LARGE (one of the `droppedBefore` frames was larger than a slot's payload, `frame_too_large`, rather than lost to a full ring; final review) |
+| 16 | u32 | `flags`: bit 0 KEY (IDR / key frame with parameter sets), bit 1 RECOVERY (references only acknowledged frames; `refFloor` valid), bit 2 DROPPED_BEFORE (`droppedBefore` > 0), bit 3 REPEAT (idle re-submit of the previous image, `presentQpc` 0), bit 4 SEQ_START (step 3.1b: a key frame that starts a sequence: the stream's first frame, and the IDR that answered a `forceIdr`; the barcode counts frames from it, and recon-host starts a new stream generation on it), bit 5 DIRTY (`dirtyPpm` valid; Phase 5), bit 6 DISCARDABLE (no later frame references this one; Phase 5), bit 7 REENCODED (encoded a second time at a higher QP: start `reencodeOversized`, stats `reencoded`; Phase 5 wiring B), bit 8 DROPPED_TOO_LARGE (one of the `droppedBefore` frames was larger than a slot's payload, `frame_too_large`, rather than lost to a full ring; final review), bit 9 TIMING (`timing` valid: see "Per-frame timing"; second hardware run) |
 | 20 | u32 | `gen`: encoder generation inside this helper (bumped on an in-helper re-init) |
 | 24 | u32 | `payloadOffset` from the slot start (>= 128) |
 | 28 | u32 | `payloadSize` in bytes |
@@ -517,7 +520,8 @@ Slot `i` (write index `n`, `i = n % slotCount`) starts at `headerSize + i * slot
 | 96 | u32 | `dirtyPpm`: the dirty share (stats `dirty`) in parts per million, valid with DIRTY (Phase 5; older helpers: 0 and no flag = unknown) |
 | 100 | u32 | `slices`: the parts the frame came out of the encoder in with start `sliceOutput` (stats `slices`); 0 = whole (Phase 5 wiring B; older helpers: 0) |
 | 104 | i64 | `firstSliceQpc`: when the first part was ready (stats `firstSliceQpc`), valid with `slices` > 0 |
-| 112..127 | | reserved (0) |
+| 112 | 6 x u16 | `timing`, valid with TIMING: the microseconds from `captureQpc` to stats `readyQpc`, `deliverQpc`, `lockQpc`, `convertQpc`, `submittedQpc`, `gpuDoneQpc`, each + 1: 0 = not measured, 65535 = 65534 us or more (second hardware run; older helpers: 0 and no flag) |
+| 124..127 | | reserved (0) |
 | `payloadOffset` | bytes | bitstream: an Annex-B access unit (H.264/HEVC) or an AV1 temporal unit |
 
 ### Producer (helper output thread; one encoder per ring)
@@ -641,10 +645,17 @@ helper right away; the duplication frame is released just before the next
 same). Frames whose `LastPresentTime` is 0 (only the pointer moved) are skipped, except
 the first frame of a duplication, so a static desktop still yields an image (its `dirty`
 is 1: after a re-duplication it may differ from the last image everywhere).
-`DXGI_ERROR_ACCESS_LOST`, `E_ACCESSDENIED` (secure desktop) and a stale DXGI factory
-(`IsCurrent` false: mode, HDR or output changes) recreate the duplication, re-finding the
-output by its GDI name on the same adapter, every 250 ms until it works (`captureChanged`
-`lost` / `restored` / `resized`, and `hdr` when Windows HDR was turned on or off). A removed device (driver reset / TDR) is fatal
+`DXGI_ERROR_ACCESS_LOST`, `DXGI_ERROR_INVALID_CALL`, `E_ACCESSDENIED` (secure desktop), a
+failing `ReleaseFrame` and a stale DXGI factory (`IsCurrent` false: mode, HDR or output
+changes) recreate the duplication at once: on the output object it had while the factory is
+current (a game switching between full screen and the compositor changes no output), else
+re-finding the output by its GDI name on the same adapter; a failed attempt is repeated after
+16, 32, 64, 128 and then every 250 ms. Only a loss that the first attempt does not end is
+reported (`captureChanged` `lost`, then `restored` with `text` "after N ms"), so recon-host
+shows no notice for a game's switch into full screen, which the second hardware run saw 15
+times, each over in 10-60 ms; `resized`, and `hdr` when Windows HDR was turned on or off,
+as before. Every loss logs `dda: capture lost (why), first image N ms later (duplicating
+again: M ms)`: the time the stream repeated the last image. A removed device (driver reset / TDR) is fatal
 (`device_lost`) instead, on every path: a TDR changes the mode, so it usually shows up as
 `DXGI_ERROR_ACCESS_LOST` first and then as a failing `DuplicateOutput`. `AcquireNextFrame`
 holds the device's lock while it waits (Sunshine display_base.cpp), and the encoder uses
@@ -680,7 +691,13 @@ At `start`, with a GPU capture, the helper sets its own process GPU scheduling p
 `auto` (default) = REALTIME, except HIGH on NVIDIA when HAGS is on or unknown (NVIDIA
 encoder hangs with REALTIME + HAGS, Sunshine); `realtime` / `high` force one; `off`
 leaves it. A refused REALTIME is retried as HIGH. The result is `started.gpuPriority` and
-a log line `gpu priority: realtime|high|failed|off (vendor, hags on|off|unknown)`.
+a log line `gpu priority: realtime|high|failed|off (vendor, hags on|off|unknown; the OS
+reports <class>)`: the class read back with `D3DKMTGetProcessSchedulingPriorityClass`
+(second hardware run), a Warn line when it is not the one set. The device's
+`SetGPUThreadPriority(7)` is read back too (`GetGPUThreadPriority`; a Warn line when it
+differs). These say what Windows holds for the process; whether the GPU's scheduler (with
+HAGS: the GPU's own) lets the colour conversion run ahead of a game's work shows in the
+`gpu` row of "Per-frame timing".
 
 This is one decision table with recon-host, which applies it to the FFmpeg encoder process
 (`gpuPriorityClass` in `internal/host/media/gpuprio.go`), for the same config value (host
@@ -697,11 +714,23 @@ GPU captures follow presents (DDA `AcquireNextFrame`, AMD `WAIT_FOR_PRESENT`, WG
 events); there is no capture timer. The policy (`src/capture/pacer.hpp`):
 
 1. Never more than `fps` new images per second: output slots are one frame interval apart
-   and each delivered new image uses one. A frame may use its slot up to a quarter interval
-   early, so present jitter at a matching refresh rate adds no delay; over any stretch of
-   time at most one new image more than `fps` allows.
-2. Presents faster than `fps`: the newest image wins and goes out when its slot opens;
-   older ones are dropped before they are converted or encoded.
+   and each delivered new image uses one. A frame may use its slot up to half an interval
+   early (a quarter until the second hardware run), so present jitter at a matching refresh
+   rate adds no delay and a source presenting a little faster than `fps` keeps its rhythm
+   (2.); over any stretch of time at most one new image more than `fps` allows, new images
+   at least half an interval apart.
+2. Presents faster than `fps`: an image that comes before its slot waits for it, asleep,
+   and the newest image presented by then wins; older ones are dropped before they are
+   converted or encoded. When the slot opens and the source's next present is due less
+   than half an interval later (its present interval: the median of the last 8 intervals
+   between images, per present they stand for, DDA `AccumulatedFrames`), the waiting image
+   is not sent late: the helper waits in the capture API for that present and sends it on
+   arrival, and the waiting image only if it does not come by a quarter of an interval (at
+   most 2 ms) after it was due, at most one frame interval after its own present. Until the
+   second hardware run the waiting image went out when its slot opened, so every image of a
+   75 Hz display streamed at 60 fps waited for the beat of the two rates: capture -> encoder
+   submit 9 ms p50, 15.5 ms p95 in the log; with this rule four of five presents go out on
+   arrival (`--self-test-pacer`: 0.7 ms mean wait instead of the old rule's 7.7).
 3. Nothing new for `idleRepeatMs` (default 100 ms, 20..2000; Sunshine's default minimum is
    10 fps): the last image is submitted again, and again every `idleRepeatMs`, flagged
    `repeat` (stats, slot flag). This keeps the encoder's rate control, the transport and
@@ -713,6 +742,37 @@ events); there is no capture timer. The policy (`src/capture/pacer.hpp`):
    without any delivery, so the long-run rate stays within `fps`.
 
 `setRate` with an `fps` changes the slot interval at once.
+
+### Per-frame timing
+
+Where a frame spends its time between capture and encoder (second hardware run: in game,
+capture -> encoder submit was 9 ms p50 where the idle desktop had 0.1 ms; see
+docs/VENDOR_NOTES.md "Second hardware run: in-game capture and encoder latency"). Stats and
+the ring slot (flag TIMING, `timing`) carry, QPC / microseconds after `captureQpc`, 0 = not
+measured:
+
+| Stamp | When | Measured by |
+|---|---|---|
+| `captureQpc` | the capture API handed the image out (DDA: `AcquireNextFrame` returned) | capture |
+| `readyQpc` | the capture had copied it into its own texture and read its metadata | `PacedCapture` |
+| `deliverQpc` | the frame pacer handed it to the pipeline (the wait for its output slot) | `PacedCapture` |
+| `lockQpc` | the colour conversion held the D3D11 device lock (`ID3D10Multithread::Enter`; other threads, AMF's or NVENC's, may hold it) | `Nv12Converter` |
+| `convertQpc` | the conversion's draws were recorded and `Flush`ed | `Nv12Converter` |
+| `submitQpc` | right before `Backend::submit` | pipeline |
+| `submittedQpc` | `Backend::submit` returned (AMF `SubmitInput` incl. its `AMF_INPUT_FULL` retries, NVENC `nvEncEncodePicture`); 0 when the encoder handed the frame out before the call returned (the mock, which encodes inside it) | pipeline |
+| `gpuDoneQpc` | the GPU had finished the frame's copy and conversion: the converter signals an `ID3D11Fence` after its draws, and a pipeline thread waits for it (`SetEventOnCompletion`) and takes the time it woke | pipeline (only where the device has fences: Windows 10 1703+, WDDM 2.2 drivers; not Wine) |
+| `outputQpc` | the encoded frame came out | backend |
+
+recon-host logs them with each `latency stages` line as `host_copy` (capture -> ready),
+`host_pace` (ready -> deliver), `host_lock` (deliver -> lock), `host_convert` (lock ->
+convert), `host_submit_call` (submit -> submitted), `host_gpu` (convert -> GPU done: what a
+game's GPU work delays the copy and conversion by) and `host_encoder` (the later of
+submitted and GPU done -> output: the encoder once its input was ready), p50/p95/p99 over the
+frames the client acknowledged in the last 10 s, next to `host_capture` (capture -> output).
+Stamps out of order (not capture <= ready <= deliver <= lock <= convert <= submit <=
+submitted <= output, GPU done before the conversion) are left out. AMD Direct Capture
+surfaces that go to the AMF encoder unconverted (zero-copy) have no lock, convert or GPU
+stamps.
 
 ### Colour conversion
 
@@ -909,7 +969,13 @@ texture format): a source that changes size, rotation or format (the capture
 re-initializes after a mode change or an HDR switch; an sRGB-typed or 10-bit game swap
 chain, which the Streaming SDK also refuses to encode directly) ends the helper with the
 fatal `capture_failed`. recon-host restarts it; if the new helper fails the same way, it
-starts with `zeroCopy` false.
+starts with `zeroCopy` false. At init the backend logs the encoder's input formats (those it
+reads natively) and `*_CAP_COLOR_CONVERSION` (`amf: input formats NV12 ... (native: ...);
+RGB input converted by: hardware (VCN) | GPU shader | software | not supported | not
+reported`; the AMF headers name `AMF_ACCEL_GPU` as the default): whether handing the
+encoder the captured BGRA image would move the RGB -> YUV conversion off the GPU's shader
+queues, which a game keeps busy (docs/VENDOR_NOTES.md "Second hardware run: in-game capture
+and encoder latency").
 
 **Per frame.** `FORCE_PICTURE_TYPE` IDR (AV1 `FORCE_FRAME_TYPE` KEY) plus the parameter
 sets (`INSERT_SPS`+`INSERT_PPS` / `INSERT_HEADER` / `FORCE_INSERT_SEQUENCE_HEADER`) for
@@ -1379,9 +1445,11 @@ They run without an encoder GPU and exit 0 (ok), 1 (failed) or 77 (could not run
 
 * `--self-test-pacer`: the frame pacing policy against simulated present patterns
   (144 Hz at 120 fps, 60 Hz with 1 ms jitter, 59.94 Hz, 30 Hz at 60 fps, idle repeats,
-  5 fps, a present 1 ms after an idle repeat, 1000 Hz bursts): fps cap, newest image wins,
-  no image older than one interval, a new image right after a repeat goes out at once,
-  repeat timing; and the dirty share (Phase 5): the union of overlapping, nested, clipped,
+  5 fps, a present 1 ms after an idle repeat, 1000 Hz bursts; since the second hardware run
+  a 75 Hz display, a ~70 fps game with frame-time jitter and a 144 Hz display at 60 fps,
+  with the wait between present and delivery bounded and compared with the old slot rule's
+  on the same presents, and a 75 Hz source that stops at 40 phases): fps cap, newest image wins, no image older than one interval, the last present
+  always goes out, a new image right after a repeat goes out at once, repeat timing; and the dirty share (Phase 5): the union of overlapping, nested, clipped,
   empty and repeated rects, a text caret, the summed fallback for long lists, a presented
   image whose capture names no region (all of it), merging two deliveries.
 * `--self-test-encoder`: the encoder-independent logic of the backends: the reference

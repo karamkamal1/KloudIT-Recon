@@ -365,7 +365,13 @@ Click **Connect**, then **Start streaming**. Click into the picture, press
 - **Bitrate**: 50–150 Mbps on a LAN. Over the internet, stay below your upload speed.
 - **Frame rate** (up to 240) and **resolution** (*Native*: the PC display's own size, or this
   screen's where the PC streams a virtual display, `virtualDisplay` below; other sizes are
-  downscaled on the GPU, or get a virtual display of that size).
+  downscaled on the GPU, or get a virtual display of that size). The PC streams at most its
+  display's refresh rate, so for the lowest latency pick that rate or more (on a 75 Hz
+  display: 90, which streams 75): a frame rate below the display's leaves out some of its
+  frames (one in five at 60 on 75 Hz), and the stream looks less smooth than the PC. The
+  native helper sends the others the moment the PC shows them; before the second hardware
+  run they waited up to a frame for their turn (docs/VENDOR_NOTES.md "Second hardware run:
+  in-game capture and encoder latency").
 - **Encoder preset**: lowest latency / balanced / best quality.
 - **Display**: pick a monitor on multi-monitor PCs.
 - **Audio**: Opus or lossless PCM, plus the jitter buffer: *Auto* (default, adapts within

@@ -813,6 +813,43 @@ Use a client with an AMD GPU. Each item's exact steps are in VENDOR_NOTES:
 
 If not, send: the client log and a screenshot for the failing item.
 
+**7.8 In-game capture and encoder latency** (VENDOR_NOTES "Second hardware run: in-game capture
+and encoder latency")
+
+- **Do**:
+  1. On the 75 Hz host display, stream HEVC 1920×1080 with Frame rate **60** and play the same
+     game as in the second run for 2 minutes (moving the camera, not in a menu). Leave the
+     overlay closed.
+  2. Then Frame rate **90** (the agent streams the display's 75) and play 2 more minutes.
+  3. Then stop the agent, set `"gpuPriority": "off"` in host.json, start it, play 2 minutes at
+     90 again; afterwards remove the line (back to `auto`).
+- **Look at** host.log:
+  - At each helper start: `encoder helper: gpu priority: realtime (amd, hags on; the OS reports
+    realtime)` (a Warn line or another class there means Windows did not keep it), no
+    `SetGPUThreadPriority` warning, no `conversion: no D3D11 fence` line, and `encoder helper:
+    amf: input formats ... RGB input converted by: ...` (copy the whole line).
+  - The `latency stages` lines while playing: the client rows `capture`, `submit`, `encode`
+    and the host rows `host_copy`, `host_pace`, `host_lock`, `host_convert`,
+    `host_submit_call`, `host_gpu`, `host_encoder`.
+  - `encoder helper: dda: capture lost (...), first image N ms later` lines, and whether the
+    browser showed "Screen capture is paused" when the game switched to or from full screen.
+- **Pass**:
+  - At 60 fps on 75 Hz: `submit` p50 ≤ 1.5 ms (the second run: 9.2) and `host_pace` p50 ≤ 1 ms,
+    p95 ≤ 4 ms; `capture` p50 at least 6 ms lower than the second run's 13.5 at the same
+    `encode`; `fps` in `stream stats` ≥ 58.
+  - At 75 fps: `host_pace` p95 ≤ 1 ms.
+  - `host_copy`, `host_lock`, `host_convert` and `host_submit_call` p95 ≤ 1 ms each.
+  - `host_gpu` is recorded, not judged: it is the time the capture copy and the colour
+    conversion wait for the game's GPU work (and run). With p95 above 4 ms at `auto` the
+    conversion queues behind the game: compare it with the `gpuPriority` off run (much higher
+    there: the priority works but not enough; about the same: Windows or the GPU's scheduler
+    does not apply it to these queues).
+  - No "Screen capture is paused" notice for a full-screen switch whose `first image` came
+    within 100 ms.
+- **If not, send**: the `latency stages` and `stream stats` lines of each run, the `gpu
+  priority`, `amf: input formats` and `dda: ...` lines, and which game at which in-game frame
+  rate (the game's own counter or PresentMon).
+
 ### Stage 8: Relay, WAN and rate control (T4, T6)
 
 All runs use Network path *Relay via gateway* and `"logLevel": "debug"`, after stage 6.
