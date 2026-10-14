@@ -18,6 +18,7 @@ import (
 
 	"github.com/karamkamal1/kloudit-recon/internal/auth"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
+	"github.com/karamkamal1/kloudit-recon/internal/transport"
 )
 
 // The UDP relay (guide step 2.6) carries one end-to-end QUIC connection
@@ -96,10 +97,11 @@ type udpRelay struct {
 	ip    net.IP // address the allocation sockets bind to (the -listen host; nil = all)
 	ports []int
 
-	mu     sync.Mutex
-	allocs map[int]*allocation // by port
-	next   int                 // index into ports where the next search starts
-	closed bool
+	mu      sync.Mutex
+	allocs  map[int]*allocation // by port
+	next    int                 // index into ports where the next search starts
+	closed  bool
+	bufOnce sync.Once // the socket buffers' log line
 
 	// Lifetimes (tests shorten them).
 	bindWait, lockWait, idle time.Duration
@@ -148,7 +150,11 @@ type relayStats struct {
 	ToHost, ToBrowser       atomic.Int64 // bytes forwarded
 	PktToHost, PktToBrowser atomic.Int64
 	Dropped                 atomic.Int64 // datagrams from other addresses, over the rate limit, or unsendable
-	Started, Last           time.Time    // browser locked in; last datagram forwarded (set when the allocation ends)
+	// SocketDrops: datagrams the kernel dropped at the allocation's socket
+	// for a full receive buffer (Linux SO_RXQ_OVFL; -1: not known), the
+	// relay's share of the host's packet losses.
+	SocketDrops   atomic.Int64
+	Started, Last time.Time // browser locked in; last datagram forwarded (set when the allocation ends)
 }
 
 // allocate reserves a port and starts forwarding on it. The host still has to
@@ -185,13 +191,19 @@ func (r *udpRelay) allocate(req allocRequest) (*allocation, error) {
 			r.log.Debug("udp relay: port unavailable", "port", port, "err", err)
 			continue
 		}
-		_ = c.SetReadBuffer(8 << 20)
-		_ = c.SetWriteBuffer(8 << 20)
+		// The allocation's socket takes the host's frame bursts (the media
+		// controller's, cc.Media) at up to a gigabit and forwards them one
+		// datagram at a time: what its goroutine cannot take meanwhile
+		// waits in the receive buffer, which the kernel may cap below the
+		// burst (logged once: the cap is the machine's).
+		bufs := transport.SetSocketBuffers(c, 8<<20)
+		r.bufOnce.Do(func() { transport.LogSocketBuffers(r.log, "udp relay", bufs) })
 		r.next = k + 1
 		a := &allocation{
 			r: r, req: req, id: auth.RandomToken(12), port: port, token: token, pc: newPktConn(c),
 			created: time.Now(), bound: make(chan struct{}), done: make(chan struct{}),
 		}
+		a.stats.SocketDrops.Store(-1)
 		r.allocs[port] = a
 		go a.serve()
 		return a, nil
@@ -258,7 +270,7 @@ func (a *allocation) serve() {
 			r.log.Info("udp relay: session ended", "port", a.port, "host", a.req.hostID, "user", a.req.user,
 				"to_browser_mb", fmt.Sprintf("%.1f", float64(a.stats.ToBrowser.Load())/1e6),
 				"to_host_mb", fmt.Sprintf("%.1f", float64(a.stats.ToHost.Load())/1e6),
-				"dropped", a.stats.Dropped.Load(), "after", last.Sub(a.stats.Started).Round(time.Second))
+				"dropped", a.stats.Dropped.Load(), "socket_drops", a.stats.SocketDrops.Load(), "after", last.Sub(a.stats.Started).Round(time.Second))
 			if a.req.onEnd != nil {
 				a.req.onEnd(&a.stats)
 			}
@@ -276,6 +288,9 @@ func (a *allocation) serve() {
 	_ = a.pc.c.SetReadDeadline(deadline)
 	for {
 		n, from, local, err := a.pc.read(buf)
+		if d, ok := a.pc.socketDrops(); ok {
+			a.stats.SocketDrops.Store(int64(d))
+		}
 		now := time.Now()
 		timeout := false
 		if err != nil {

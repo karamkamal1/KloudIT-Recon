@@ -105,8 +105,7 @@ func (a *Agent) relayServer(ctx context.Context) (*relayServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetReadBuffer(8 << 20)
-	_ = conn.SetWriteBuffer(8 << 20)
+	transport.LogSocketBuffers(a.log, "relay", transport.SetSocketBuffers(conn, 8<<20))
 	rs := &relayServer{a: a, conn: conn, allocs: map[netip.AddrPort]*relayAlloc{}}
 	rs.tr = &quic.Transport{Conn: conn, ConnContext: rs.connContext}
 	quicConf := transport.QUICConfig(transport.WithCongestion(a.cfg.congestion()))
