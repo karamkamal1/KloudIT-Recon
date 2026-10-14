@@ -13228,7 +13228,8 @@ our own, `FramePacer` driven as the self-test's `simulate()` does, 30 s per patt
   `internal/host` (339 s); `go test ./internal/e2e/...` under the lock failed once with the
   load-sensitive `TestStreamingBitrateRecovery` (two client overflow cuts, 4000 -> 3400 and
   3570 -> 2788, where it wants one: the FFmpeg path's rate control, which nothing here touches;
-  the same test failed under load before, see "2.5 review fixes") and passed on the re-run
+  the same test failed under load before, see "2.5 Datagram + FEC video (optional)") and passed
+  on the re-run
   (207 s); `node --check` on the 16 files in web/static/js and test/e2e/browser.mjs; `make
   build`; `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make helper-test
   WINE=/usr/lib/wine/wine64`: 83 top-level tests pass (the new
