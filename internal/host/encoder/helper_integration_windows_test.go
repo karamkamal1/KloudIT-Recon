@@ -1211,8 +1211,35 @@ func TestHelperIntegrationGPUPipeline(t *testing.T) {
 			t.Fatalf("frame %d (repeat %v): dirty %v, want %v", f.FrameID, f.Repeat, f.Dirty, want)
 		}
 	}
+	// Per-frame timing (docs/HELPER_PROTOCOL.md "Per-frame timing"): every
+	// frame carries its capture -> submit split, in order; the submit call's
+	// return unless the encoder handed the frame out before it (the mock
+	// encodes inside the call); the GPU's completion where the D3D11 device
+	// has fences (not Wine's).
+	gpuDone, submitted := 0, 0
+	for _, f := range frames {
+		tm := f.Timing
+		if tm == nil {
+			t.Fatalf("frame %d without per-frame timing", f.FrameID)
+		}
+		submit := int32((f.SubmitQPC - f.CaptureQPC) * 1_000_000 / qpc)
+		if tm.Ready < 0 || tm.Deliver < tm.Ready || tm.Lock < tm.Deliver || tm.Convert < tm.Lock || tm.Convert > submit+1 ||
+			tm.Submitted >= 0 && tm.Submitted < submit-1 {
+			t.Fatalf("frame %d: timing %+v with the submit at %d µs", f.FrameID, *tm, submit)
+		}
+		if tm.Submitted >= 0 {
+			submitted++
+		}
+		if tm.GPUDone >= 0 {
+			gpuDone++
+			if tm.GPUDone < tm.Convert-1 {
+				t.Fatalf("frame %d: the GPU finished (%d µs) before the conversion was flushed (%d µs)", f.FrameID, tm.GPUDone, tm.Convert)
+			}
+		}
+	}
 	maxInSecond = maxPerSecond(frames, qpc)
-	t.Logf("%d frames in 3.5 s, %d idle repeats, at most %d in one second", len(frames), repeats, maxInSecond)
+	t.Logf("%d frames in 3.5 s, %d idle repeats, at most %d in one second; the submit call's return measured for %d, the GPU's "+
+		"completion for %d", len(frames), repeats, maxInSecond, submitted, gpuDone)
 	if maxInSecond > fps+2 || maxInSecond < fps*8/10 {
 		t.Fatalf("%d frames in one second at %d fps", maxInSecond, fps)
 	}

@@ -62,6 +62,12 @@ constexpr size_t kSlotHeight = 92;         // u32
 constexpr size_t kSlotDirtyPpm = 96;       // u32 dirty share in parts per million (valid with kFlagDirty; Phase 5)
 constexpr size_t kSlotSlices = 100;        // u32 parts of sub-frame output (start sliceOutput), 0 = whole (Phase 5 wiring B)
 constexpr size_t kSlotFirstSliceQpc = 104; // i64 when the first part was ready (valid with kSlotSlices > 0)
+// Per-frame timing (valid with kFlagTiming; docs/HELPER_PROTOCOL.md
+// "Per-frame timing"): kTimingStamps u16, each the microseconds from
+// kSlotCaptureQpc to readyQpc, deliverQpc, lockQpc, convertQpc, submittedQpc,
+// gpuDoneQpc (FrameStats), + 1; 0 = not measured, 65535 = 65534 us or more.
+constexpr size_t kSlotTiming = 112;
+constexpr int kTimingStamps = 6;
 
 constexpr uint32_t kFlagKey = 1u << 0;
 constexpr uint32_t kFlagRecovery = 1u << 1;
@@ -75,6 +81,9 @@ constexpr uint32_t kFlagReencoded = 1u << 7;    // encoded a second time at a hi
 // A frame dropped right before this one was larger than a slot's payload
 // (frame_too_large), not lost to a full ring (additive: older helpers leave it 0).
 constexpr uint32_t kFlagDroppedTooLarge = 1u << 8;
+// kSlotTiming is valid (additive: helpers before the second hardware run leave it 0).
+constexpr uint32_t kFlagTiming = 1u << 9;
+static_assert(kSlotTiming + 2 * kTimingStamps <= kSlotHeaderSize, "slot header layout");
 }  // namespace ring
 
 enum class WriteResult { Written, Full, TooLarge, Corrupt };
@@ -105,6 +114,7 @@ private:
     HANDLE event_ = nullptr;
     uint32_t slotCount_ = 0;
     uint32_t slotSize_ = 0;
+    int64_t qpcFreq_ = 0;         // the timing offsets' unit (kSlotTiming)
     uint64_t written_ = 0;        // local copy of writeCount
     uint64_t dropped_ = 0;        // total dropped
     uint32_t droppedPending_ = 0; // dropped since the last written slot

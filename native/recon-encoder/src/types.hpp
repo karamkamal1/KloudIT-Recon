@@ -346,6 +346,13 @@ struct FrameStats {
     int64_t firstSliceQpc = 0;  // when the first part came out
     uint64_t bytes = 0;
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0, outputQpc = 0;
+    // Per-frame timing between capture and encoder (docs/HELPER_PROTOCOL.md
+    // "Per-frame timing"; QPC, 0 = not measured): the capture had the image
+    // copied (readyQpc), the pacer handed it out (deliverQpc), the colour
+    // conversion took the device lock (lockQpc) and flushed its work
+    // (convertQpc), Backend::submit returned (submittedQpc), and the GPU had
+    // finished the frame's copy and conversion (gpuDoneQpc).
+    int64_t readyQpc = 0, deliverQpc = 0, lockQpc = 0, convertQpc = 0, submittedQpc = 0, gpuDoneQpc = 0;
     uint64_t refFloor = 0;
     int32_t ltrSlot = -1;
     uint32_t temporalLayer = 0;

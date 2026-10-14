@@ -502,6 +502,23 @@ int runCase(ID3D11Device* dev, d3d::Nv12Converter::Output mode, const Image& img
         chk.fail("%s", s.text.c_str());
         return chk.failures();
     }
+    // Per-frame timing: the lock before the flush, and the GPU timing fence
+    // (where the device has one) at the frame's value once the readback has
+    // waited for the GPU, its completion event set at once.
+    if (!f.lockQpc || f.flushQpc < f.lockQpc) chk.fail("lock / flush stamps %lld / %lld", static_cast<long long>(f.lockQpc),
+                                                      static_cast<long long>(f.flushQpc));
+    if (ID3D11Fence* fence = conv.gpuFence()) {
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!f.fenceValue || fence->GetCompletedValue() < f.fenceValue) {
+            chk.fail("fence value %llu, completed %llu", static_cast<unsigned long long>(f.fenceValue),
+                     static_cast<unsigned long long>(fence->GetCompletedValue()));
+        } else if (!done || FAILED(fence->SetEventOnCompletion(f.fenceValue, done)) || WaitForSingleObject(done, 2000) != WAIT_OBJECT_0) {
+            chk.fail("the fence's completion event was not set");
+        }
+        if (done) CloseHandle(done);
+    } else if (f.fenceValue) {
+        chk.fail("a fence value without a fence");
+    }
     // The pool hands out the other texture while this one is held, and
     // refuses a third conversion while both are held.
     d3d::ConvertedFrame f2, f3;

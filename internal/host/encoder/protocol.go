@@ -412,6 +412,20 @@ type Stats struct {
 	VBVFrames     float64 `json:"vbvFrames"`
 	FPS           int     `json:"fps"`
 	RingDropped   uint64  `json:"ringDropped"` // frames dropped by the helper so far
+
+	// Where capture -> encoded went (helpers since the second hardware run;
+	// 0 = not measured, docs/HELPER_PROTOCOL.md "Per-frame timing"; the ring
+	// carries the same as Frame.Timing): the capture had the image copied
+	// (ReadyQPC), the frame pacer handed it out (DeliverQPC), the colour
+	// conversion had the D3D11 device lock (LockQPC) and flushed its GPU
+	// work (ConvertQPC), the encoder's submit call returned (SubmittedQPC),
+	// and the GPU had finished the frame's copy and conversion (GPUDoneQPC).
+	ReadyQPC     int64 `json:"readyQpc,omitempty"`
+	DeliverQPC   int64 `json:"deliverQpc,omitempty"`
+	LockQPC      int64 `json:"lockQpc,omitempty"`
+	ConvertQPC   int64 `json:"convertQpc,omitempty"`
+	SubmittedQPC int64 `json:"submittedQpc,omitempty"`
+	GPUDoneQPC   int64 `json:"gpuDoneQpc,omitempty"`
 }
 
 // HelperError is an "error" message from the helper. A fatal error ends the

@@ -141,6 +141,12 @@ func TestDecodeMessages(t *testing.T) {
 		s.OversizeBytes != 200046 || s.Slices != 4 || s.FirstSliceQPC != 6 {
 		t.Fatalf("phase 5 stats: %+v %v", m, err)
 	}
+	// Per-frame timing (second hardware run); an older helper's stats (above) have none.
+	m, err = decodeMessage([]byte(`{"t":"stats","frameId":10,"gen":0,"dropped":false,"key":false,"recovery":false,"repeat":false,"dirtyPct":100,"dirty":1,"bytes":900,"presentQpc":1,"captureQpc":2,"submitQpc":7,"outputQpc":12,"ltrSlot":-1,"temporalLayer":0,"refLtrMask":0,"kbps":4000,"vbvFrames":1,"fps":60,"ringDropped":0,"readyQpc":3,"deliverQpc":4,"lockQpc":5,"convertQpc":6,"submittedQpc":8,"gpuDoneQpc":9}`))
+	if s, ok := m.(*Stats); err != nil || !ok || s.ReadyQPC != 3 || s.DeliverQPC != 4 || s.LockQPC != 5 || s.ConvertQPC != 6 ||
+		s.SubmittedQPC != 8 || s.GPUDoneQPC != 9 {
+		t.Fatalf("stats with per-frame timing: %+v %v", m, err)
+	}
 	m, err = decodeMessage([]byte(`{"t":"started","backend":"nvenc","capture":"dda","codec":"hevc","width":1920,"height":1080,"fps":120,"kbps":30000,"svcLayers":2,"liveFps":"seamless","reencodeOversized":4,"sliceOutput":0}`))
 	if s, ok := m.(*Started); err != nil || !ok || s.SVCLayers != 2 || s.LiveFPS != "seamless" || s.ReencodeOversized != 4 || s.SliceOutput != 0 {
 		t.Fatalf("phase 5 started: %+v %v", m, err)

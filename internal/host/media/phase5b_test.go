@@ -327,6 +327,43 @@ func TestHelperVideoSliceStamps(t *testing.T) {
 	}
 }
 
+// TestHelperVideoTiming: a frame's per-frame timing from the helper (ring
+// FlagTiming, µs after the capture) in host time; stamps out of order
+// (after the submit, before the previous one, a GPU completion before the
+// conversion) are not reported, and a frame without timing has none.
+func TestHelperVideoTiming(t *testing.T) {
+	v, _, f, _ := startFocusRig(t, fakeP5BCaps(""), HelperOptions{})
+	clock := v.opt.Clock
+	const capture = 1_016_000
+	for _, c := range []struct {
+		timing *encoder.FrameTiming
+		want   HelperTiming
+	}{
+		// capture, +100 µs ready, +9100 delivered (the pacer), +9150 lock,
+		// +9400 flushed; submit at +9500, returned +9600; GPU done +11000;
+		// encoded at +14000.
+		{&encoder.FrameTiming{Ready: 100, Deliver: 9100, Lock: 9150, Convert: 9400, Submitted: 9600, GPUDone: 11000},
+			HelperTiming{ReadyUs: capture + 100, DeliverUs: capture + 9100, LockUs: capture + 9150, ConvertUs: capture + 9400,
+				SubmittedUs: capture + 9600, GPUDoneUs: capture + 11000}},
+		// Not measured (-1): no conversion (zero-copy), so no GPU time either.
+		{&encoder.FrameTiming{Ready: 50, Deliver: 60, Lock: -1, Convert: -1, Submitted: 9600, GPUDone: 9700},
+			HelperTiming{ReadyUs: capture + 50, DeliverUs: capture + 60, SubmittedUs: capture + 9600}},
+		// Out of order: lock before delivery, convert after the submit, the
+		// submit call returning after the encoded frame.
+		{&encoder.FrameTiming{Ready: 100, Deliver: 200, Lock: 150, Convert: 9800, Submitted: 15000, GPUDone: 9900},
+			HelperTiming{ReadyUs: capture + 100, DeliverUs: capture + 200}},
+		{nil, HelperTiming{}},
+	} {
+		fr := encoder.Frame{FrameID: 2, LTRSlot: -1, Dirty: -1, Data: h264P, Timing: c.timing, CaptureQPC: qpcAt(clock, capture),
+			SubmitQPC: qpcAt(clock, capture+9500), OutputQPC: qpcAt(clock, capture+14000)}
+		f.Publish(&fr)
+		got := nextEvent(t, v).Frame
+		if got == nil || got.Timing != c.want {
+			t.Fatalf("timing %+v: got %+v, want %+v", c.timing, got, c.want)
+		}
+	}
+}
+
 // TestHelperVideoPlainStart: a helper that refuses a start with the Phase 5
 // encoder options (here slice output) is replaced by one started without
 // them, which then streams.

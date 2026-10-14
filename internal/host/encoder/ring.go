@@ -59,6 +59,11 @@ const (
 	slotDirtyPPM      = 96  // u32, valid with FlagDirty (Phase 5)
 	slotSlices        = 100 // u32 parts of sub-frame output, 0 = whole (Phase 5 wiring B)
 	slotFirstSliceQPC = 104 // i64, valid with slotSlices > 0
+	// Per-frame timing (FlagTiming): timingStamps u16, each the µs from
+	// slotCaptureQPC to the FrameTiming stamp + 1; 0 = not measured, 65535 =
+	// 65534 µs or more.
+	slotTiming   = 112
+	timingStamps = 6
 
 	FlagKey           = 1 << 0
 	FlagRecovery      = 1 << 1
@@ -73,6 +78,9 @@ const (
 	// fit a slot (frame_too_large), rather than finding the ring full
 	// (additive: older helpers leave it unset).
 	FlagDroppedTooLarge = 1 << 8
+	// FlagTiming: the slot carries the frame's FrameTiming (helpers since the
+	// second hardware run; additive: older helpers leave it unset).
+	FlagTiming = 1 << 9
 
 	// maxStreamSlotSize bounds SlotSizeFor: an 8K HDR10 picture's slot (66
 	// MB, eight of them half a gigabyte of committed memory) is the largest.
@@ -152,7 +160,25 @@ type Frame struct {
 	Width, Height uint32
 	// QPC ticks (Ring.QPCFrequency per second); PresentQPC is 0 when unknown.
 	PresentQPC, CaptureQPC, SubmitQPC, OutputQPC int64
-	Data                                         []byte
+	// Timing is where capture -> encoded went (FlagTiming), nil when the
+	// helper did not measure it.
+	Timing *FrameTiming
+	Data   []byte
+}
+
+// FrameTiming is a frame's per-frame timing from the helper
+// (docs/HELPER_PROTOCOL.md "Per-frame timing"), µs after CaptureQPC, -1 = not
+// measured; 65534 means that long or longer. Ready: the capture had the
+// image copied; Deliver: the frame pacer handed it out; Lock: the colour
+// conversion had the D3D11 device lock; Convert: it flushed its GPU work;
+// Submitted: the encoder's submit call (from SubmitQPC) returned; GPUDone: the
+// GPU had finished the frame's copy and conversion.
+type FrameTiming struct {
+	Ready, Deliver, Lock, Convert, Submitted, GPUDone int32
+}
+
+func (t *FrameTiming) stamps() [timingStamps]*int32 {
+	return [timingStamps]*int32{&t.Ready, &t.Deliver, &t.Lock, &t.Convert, &t.Submitted, &t.GPUDone}
 }
 
 // RingSize returns the mapping size for a ring geometry.
@@ -291,6 +317,12 @@ func (r *Ring) Next() (*Frame, error) {
 	f.DroppedTooLarge = flags&FlagDroppedTooLarge != 0
 	if n := le.Uint32(s[slotSlices:]); n > 0 && n <= maxSlicesPerFrame {
 		f.Slices, f.FirstSliceQPC = int(n), int64(le.Uint64(s[slotFirstSliceQPC:]))
+	}
+	if flags&FlagTiming != 0 {
+		f.Timing = &FrameTiming{}
+		for i, p := range f.Timing.stamps() {
+			*p = int32(le.Uint16(s[slotTiming+2*i:])) - 1
+		}
 	}
 	r.read++
 	atomic.StoreUint64(r.counter(offReadCount), r.read)

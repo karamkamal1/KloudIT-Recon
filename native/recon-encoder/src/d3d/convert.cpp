@@ -425,6 +425,24 @@ Status Nv12Converter::init(ID3D11Device* device, uint32_t width, uint32_t height
     stagingA_.Reset();
     stagingB_.Reset();
     srvCache_.clear();
+
+    // The GPU timing fence (gpuFence). mingw-w64's d3d11_3.h defines
+    // D3D11_FENCE_FLAG_NONE as 1, the Windows SDK as 0 (a plain fence): 0 is
+    // passed as the value.
+    fence_.Reset();
+    ctx4_.Reset();
+    fenceValue_ = 0;
+    ComPtr<ID3D11Device5> d5;
+    hr = device_->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void**>(d5.GetAddressOf()));
+    if (SUCCEEDED(hr)) hr = ctx_->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void**>(ctx4_.GetAddressOf()));
+    if (SUCCEEDED(hr)) {
+        hr = d5->CreateFence(0, static_cast<D3D11_FENCE_FLAG>(0), __uuidof(ID3D11Fence), reinterpret_cast<void**>(fence_.GetAddressOf()));
+    }
+    if (FAILED(hr)) {
+        fence_.Reset();
+        ctx4_.Reset();
+        logf(LogLevel::Info, "conversion: no D3D11 fence (%s): the GPU's conversion time is not measured", hrText(hr).c_str());
+    }
     return Status::Ok();
 }
 
@@ -578,6 +596,7 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint16_t barco
     // From here on the device lock is held (lock order: device, then pool:
     // an encoder thread may release a frame while it holds the device lock).
     const DeviceLock deviceLock(mt_.Get());
+    const int64_t lockQpc = qpcNow();  // after waiting for the encoder's threads, if they held it
     if (size_t(index) == slots_.size()) {
         slots_.emplace_back();
         Status s = createSlot(slots_.back());
@@ -680,9 +699,14 @@ Status Nv12Converter::convert(ID3D11Texture2D* src, int rotation, uint16_t barco
     ID3D11ShaderResourceView* noSrv[] = {nullptr};
     ctx_->PSSetShaderResources(0, 1, noSrv);
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    uint64_t fenceValue = 0;
+    if (fence_ && SUCCEEDED(ctx4_->Signal(fence_.Get(), fenceValue_ + 1))) fenceValue = ++fenceValue_;
     ctx_->Flush();  // start the GPU work now (OBS texture-amf.cpp flushes before handing a texture to AMF)
 
     out = ConvertedFrame{};
+    out.lockQpc = lockQpc;
+    out.flushQpc = qpcNow();
+    out.fenceValue = fenceValue;
     out.nv12 = slot.nv12.Get();
     out.y = slot.y.Get();
     out.uv = slot.uv.Get();

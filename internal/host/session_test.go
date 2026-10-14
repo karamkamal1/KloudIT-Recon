@@ -271,8 +271,36 @@ func TestHostStages(t *testing.T) {
 	var none hostStages
 	none.sentFrame(&media.Frame{Gen: 1, Seq: 1, SubmitUs: 10, EncodeDoneUs: 50}, 60)
 	none.acked(1, 1, 100)
-	if sum := none.summary(200); sum.firstSlice != "" || sum.sliceRest != "" || sum.queue == "" {
-		t.Fatalf("whole frames: %+v", sum)
+	if sum := none.summary(200); sum.firstSlice != "" || sum.sliceRest != "" || sum.queue == "" || sum.split != [len(splitNames)]string{} {
+		t.Fatalf("whole frames without helper timing: %+v", sum)
+	}
+}
+
+// TestHostStagesSplit: the native helper's per-frame timing splits
+// host_capture into copy, pace, lock, convert, submit_call, gpu and encoder
+// (from the later of the submit call's return and the GPU's completion);
+// parts not measured stay out.
+func TestHostStagesSplit(t *testing.T) {
+	var h hostStages
+	const c = 1_000_000
+	f := &media.Frame{Gen: 1, Seq: 1, CaptureUs: c, SubmitUs: c + 9500, EncodeDoneUs: c + 14000,
+		Timing: media.HelperTiming{ReadyUs: c + 100, DeliverUs: c + 9100, LockUs: c + 9150, ConvertUs: c + 9400,
+			SubmittedUs: c + 9600, GPUDoneUs: c + 11000}}
+	h.sentFrame(f, c+14100)
+	h.acked(1, 1, c+20000)
+	// Zero-copy (no conversion): copy, pace and the submit call only; the
+	// encoder from the submit call's return.
+	g := &media.Frame{Gen: 1, Seq: 2, CaptureUs: c, SubmitUs: c + 200, EncodeDoneUs: c + 3200,
+		Timing: media.HelperTiming{ReadyUs: c + 100, DeliverUs: c + 150, SubmittedUs: c + 300}}
+	h.sentFrame(g, c+3300)
+	h.acked(1, 2, c+20000)
+	sum := h.summary(c + 20000)
+	want := map[string]string{"copy": "0.1/0.1/0.1 n=2", "pace": "9.0/9.0/9.0 n=2", "lock": "0.1/0.1/0.1 n=1",
+		"convert": "0.2/0.2/0.2 n=1", "submit_call": "0.1/0.1/0.1 n=2", "gpu": "1.6/1.6/1.6 n=1", "encoder": "3.0/3.0/3.0 n=2"}
+	for i, name := range splitNames {
+		if sum.split[i] != want[name] {
+			t.Errorf("host_%s %q, want %q", name, sum.split[i], want[name])
+		}
 	}
 }
 

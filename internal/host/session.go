@@ -3246,7 +3246,32 @@ type hostStage struct {
 	// submit -> first slice ready, and first slice -> whole frame (what
 	// sending slices as they come could gain); ms, < 0: not measured.
 	firstSlice, sliceRest float64
+	// capture -> encoded split by the native helper's per-frame timing
+	// (media.HelperTiming, splitNames); ms, < 0: not measured.
+	split [len(splitNames)]float64
 }
+
+// splitNames are the parts of capture -> encoded the native helper's
+// per-frame timing measures, logged as host_<name> (docs/HELPER_PROTOCOL.md
+// "Per-frame timing"): copy (the capture copying the image and reading its
+// metadata), pace (the frame pacer waiting for the image's output slot),
+// lock (waiting for the D3D11 device lock before the colour conversion),
+// convert (recording and flushing the conversion), submit_call (the
+// encoder's submit call), gpu (the copy and conversion waiting for and
+// running on the GPU: what a game's GPU load delays) and encoder (the encoder
+// from the later of its input being ready on the GPU and submitted, to the
+// encoded frame).
+var splitNames = [...]string{"copy", "pace", "lock", "convert", "submit_call", "gpu", "encoder"}
+
+const (
+	splitCopy = iota
+	splitPace
+	splitLock
+	splitConvert
+	splitSubmitCall
+	splitGPU
+	splitEncoder
+)
 
 const stageWindowUs = 10_000_000
 
@@ -3260,9 +3285,36 @@ func (h *hostStages) sentFrame(f *media.Frame, sentUs uint64) {
 		r.firstSlice = float64(f.FirstSliceUs-f.SubmitUs) / 1000
 		r.sliceRest = float64(f.EncodeDoneUs-f.FirstSliceUs) / 1000
 	}
+	r.split = helperSplit(f)
 	h.mu.Lock()
 	h.sent[f.Seq%uint32(len(h.sent))] = r
 	h.mu.Unlock()
+}
+
+// helperSplit is a frame's capture -> encoded split (splitNames) from the
+// native helper's per-frame timing; -1 where a part was not measured.
+func helperSplit(f *media.Frame) (out [len(splitNames)]float64) {
+	for i := range out {
+		out[i] = -1
+	}
+	t := f.Timing
+	part := func(i int, from, to uint64) {
+		if from != 0 && to != 0 && to >= from {
+			out[i] = float64(to-from) / 1000
+		}
+	}
+	if f.CaptureUs != 0 {
+		part(splitCopy, f.CaptureUs, t.ReadyUs)
+	}
+	part(splitPace, t.ReadyUs, t.DeliverUs)
+	part(splitLock, t.DeliverUs, t.LockUs)
+	part(splitConvert, t.LockUs, t.ConvertUs)
+	part(splitSubmitCall, f.SubmitUs, t.SubmittedUs)
+	part(splitGPU, t.ConvertUs, t.GPUDoneUs)
+	if t.SubmittedUs != 0 || t.GPUDoneUs != 0 {
+		part(splitEncoder, max(t.SubmittedUs, t.GPUDoneUs), f.EncodeDoneUs)
+	}
+	return out
 }
 
 func (h *hostStages) acked(gen uint8, seq uint32, now uint64) {
@@ -3287,11 +3339,15 @@ func (h *hostStages) acked(gen uint8, seq uint32, now uint64) {
 // client reports them) over the 10 s before now; "" where nothing was
 // measured: capture->encoded, encoded->sent (queue), and with sub-frame
 // output encoder submit->first slice and first slice->whole frame.
-type stageSummary struct{ capture, queue, firstSlice, sliceRest string }
+type stageSummary struct {
+	capture, queue, firstSlice, sliceRest string
+	split                                 [len(splitNames)]string // capture -> encoded split by the helper's timing
+}
 
 func (h *hostStages) summary(now uint64) stageSummary {
 	h.mu.Lock()
 	var c, q, fs, sr []float64
+	var split [len(splitNames)][]float64
 	for _, r := range h.recs {
 		if now-r.at > stageWindowUs {
 			continue
@@ -3302,10 +3358,19 @@ func (h *hostStages) summary(now uint64) stageSummary {
 		if r.firstSlice >= 0 {
 			fs, sr = append(fs, r.firstSlice), append(sr, r.sliceRest)
 		}
+		for i, v := range r.split {
+			if v >= 0 {
+				split[i] = append(split[i], v)
+			}
+		}
 		q = append(q, r.queue)
 	}
 	h.mu.Unlock()
-	return stageSummary{capture: pctString(c), queue: pctString(q), firstSlice: pctString(fs), sliceRest: pctString(sr)}
+	sum := stageSummary{capture: pctString(c), queue: pctString(q), firstSlice: pctString(fs), sliceRest: pctString(sr)}
+	for i, v := range split {
+		sum.split[i] = pctString(v)
+	}
+	return sum
 }
 
 // pctString formats percentiles with the client's definition (sorted[floor(p*n)]).
@@ -3344,8 +3409,10 @@ var upscaleModes = map[string]bool{"fsr": true, "off": true, "mixed": true}
 
 // logStages records a client's per-stage latency summary next to the encoder
 // that produced the frames, so results can be compared per GPU vendor, and
-// the host's own measurement of its stages (host_capture, host_queue; with
-// sub-frame output host_encode_first_slice and host_encode_rest), with the
+// the host's own measurement of its stages (host_capture, with the native
+// helper's per-frame timing split into host_copy ... host_encoder
+// (splitNames), host_queue; with sub-frame output host_encode_first_slice and
+// host_encode_rest), with the
 // client's presentation path (renderer), frame pacing mode (pacing) and
 // upscaling (upscale) when it names them.
 func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale string) {
@@ -3380,6 +3447,13 @@ func (s *Session) logStages(rows []proto.StageStat, renderer, pacing, upscale st
 	if h := s.hostStages.summary(s.a.clock()); h.queue != "" {
 		if h.capture != "" {
 			args = append(args, "host_capture", h.capture)
+		}
+		// The native helper's split of host_capture (where the frame waited
+		// between the capture and the encoded frame).
+		for i, v := range h.split {
+			if v != "" {
+				args = append(args, "host_"+splitNames[i], v)
+			}
 		}
 		args = append(args, "host_queue", h.queue)
 		if h.firstSlice != "" {

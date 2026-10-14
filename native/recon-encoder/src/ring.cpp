@@ -73,7 +73,8 @@ Status RingWriter::attach(HANDLE mapping, uint64_t size, HANDLE event) {
     slotCount_ = slots;
     slotSize_ = slotSize;
     event_ = event;
-    store<int64_t>(base_ + kOffQpcFrequency, qpcFrequency());
+    qpcFreq_ = qpcFrequency();
+    store<int64_t>(base_ + kOffQpcFrequency, qpcFreq_);
     store<uint32_t>(base_ + kOffHelperPid, GetCurrentProcessId());
     std::atomic_thread_fence(std::memory_order_release);
     return Status::Ok();
@@ -131,6 +132,19 @@ WriteResult RingWriter::write(const EncodedFrame& f) {
     if (f.slices > 0 && f.firstSliceQpc) {
         store<uint32_t>(s + kSlotSlices, static_cast<uint32_t>(f.slices));
         store<int64_t>(s + kSlotFirstSliceQpc, f.firstSliceQpc);
+    }
+    // Per-frame timing, as offsets from the capture (stats readyQpc ... gpuDoneQpc).
+    const int64_t stamps[kTimingStamps] = {f.info.readyQpc, f.info.deliverQpc, f.info.lockQpc, f.info.convertQpc,
+                                           f.submittedQpc,  f.gpuDoneQpc};
+    if (f.info.captureQpc && qpcFreq_ > 0) {
+        bool any = false;
+        for (int i = 0; i < kTimingStamps; ++i) {
+            if (!stamps[i]) continue;
+            const int64_t us = std::max<int64_t>(0, (stamps[i] - f.info.captureQpc) * 1000000 / qpcFreq_);
+            store<uint16_t>(s + kSlotTiming + 2 * size_t(i), static_cast<uint16_t>(std::min<int64_t>(us, 65534) + 1));
+            any = true;
+        }
+        if (any) store<uint32_t>(s + kSlotFlags, flags | kFlagTiming);
     }
     if (f.size) std::memcpy(s + kSlotHeaderSize, f.data, f.size);
 
