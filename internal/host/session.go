@@ -104,6 +104,8 @@ type Session struct {
 	desk deskState
 	// cpu: the CPU budget of software encoding (cpubudget.go).
 	cpu cpuState
+	// cong: the user's notice of a congested network (congestnote.go).
+	cong congestionNote
 
 	pipeMu     sync.Mutex     // guards video, helperEncs and helperCaps
 	video      media.Pipeline // FFmpeg or the native helper (openPipeline); use vid()
@@ -136,7 +138,6 @@ type Session struct {
 	rate     rateController // video bitrate: the delay-based rate controller (bitrate.go)
 	track    sendTrack      // frames sent, for the rate controller's feedback (ratefeedback.go)
 	fb       rateFeedback   // the client's receive reports (or acks), turned into feedback
-	noticeAt atomic.Int64   // unix ns of the last congestion notice to the user (rate limited)
 	rateLog  rateLog        // how applyRate logs the controller's changes
 
 	// display keeps the PC's display on while set (keepDisplayOn, nil
@@ -2171,7 +2172,8 @@ func (l *rateLog) level(c rateChange, now time.Time, normal slog.Level) (slog.Le
 }
 
 // applyRate puts a change of the rate controller into effect (setRate) and
-// logs it (rateLog); decreases also tell the user, at most once per 30 s.
+// logs it (rateLog); a deep cut that lasts is told to the user
+// (congestionNotice).
 // delayMs is an older client's own delay report (why "client"); the
 // controller's own decisions log what they were decided on (rateAttrs).
 func (s *Session) applyRate(c rateChange, delayMs int) {
@@ -2186,9 +2188,6 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 			attrs = append(attrs, "suppressed", n)
 		}
 		s.log.Log(context.Background(), lvl, "congestion: lowering bitrate", attrs...)
-		if now, last := time.Now().UnixNano(), s.noticeAt.Load(); now-last >= int64(30*time.Second) && s.noticeAt.CompareAndSwap(last, now) {
-			s.notice("warn", fmt.Sprintf("Network congestion detected — bitrate lowered to %.1f Mbps", float64(c.toKbps)/1000))
-		}
 	} else {
 		attrs := []any{"from", c.fromKbps, "to", c.toKbps, "fps", c.toFPS, "max", ceiling}
 		if c.why == "undo" {
@@ -2202,6 +2201,7 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 		}
 		s.log.Log(context.Background(), lvl, "bitrate recovery: raising bitrate", attrs...)
 	}
+	s.congestionNotice(c.toKbps, ceiling) // a deep cut that lasts, as information (congestnote.go)
 	if err := s.setRate(c.toKbps, c.toFPS, c.urgent, reason); err != nil {
 		s.log.Warn("bitrate change failed", "reason", reason, "err", err)
 	}
