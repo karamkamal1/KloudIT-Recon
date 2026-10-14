@@ -2481,10 +2481,9 @@ function onControl(m) {
       probe.features = hostFeatures;
       fb.on = hostFeatures.includes(P.FEATURE_RATE_REPORT);
       if (fb.on && !fb.timer) fb.timer = setInterval(sendRateReport, RATE_REPORT_MS);
-      // Input acknowledgements: the input stream's from now on (its
-      // datagrams' are asked for one by one).
+      // Input acknowledgements (asked for on the input stream before its
+      // next message, and per datagram).
       inLat.on = hostFeatures.includes(P.FEATURE_INPUT_ACK);
-      if (inLat.on) transport?.sendControl({ t: P.MSG_INPUT_ACK });
       probe.wallOffsetUs = m.wallOffsetUs ?? null;
       hdr.hostOffers = hostFeatures.includes(P.FEATURE_HDR);
       updateProbeMode();
@@ -2532,7 +2531,8 @@ function onControl(m) {
 // batching, no timer, input before control before telemetry (GUIDE 2.7).
 // Where the host acknowledges inputs (P.FEATURE_INPUT_ACK) the worker marks
 // one mouse and one gamepad datagram per INPUT_MARK_MS and every key and
-// button press (the input stream's messages, numbered as written), and from
+// button press (the input stream's messages, numbered per stream as written;
+// sendInput), and from
 // each acknowledgement (the host-clock µs the input arrived and was
 // injected) records over INPUT_WINDOW_MS:
 //
@@ -2557,7 +2557,7 @@ const INPUT_PENDING_MS = 5000;
 const INPUT_WINDOW_MS = 10000;
 const INPUT_REPORT_MS = 10000;
 const inLat = {
-  on: false, n: 0, pending: new Map(), lastMark: {}, recs: [], lastReport: now(), browser: '', lacks: [],
+  on: false, streamId: 0, pending: new Map(), lastMark: {}, recs: [], lastReport: now(), browser: '', lacks: [],
   // This connection's marked inputs: marked, acknowledged, given up on
   // (no acknowledgement within INPUT_PENDING_MS: it or its input lost, or
   // late), and of those acknowledged after all (late; lost: expired - late).
@@ -2584,12 +2584,25 @@ function inputPending(key, cls, ev, page, sent) {
 }
 
 // An input stream message the page sent (b: its bytes, t: its event's
-// time, h: when the page handed it on; absolute).
+// time, h: when the page handed it on; absolute). Its number is the
+// transport's own (inputN: each transport has its input stream, which the
+// host numbers from 1 as it reads them); the first message on a transport
+// once the host acknowledges inputs is P.ackStream with a new id
+// (inAckId), which the host's acknowledgements of that stream carry: one
+// of an earlier transport's stream (the session moved to another
+// connection) matches nothing of this one's.
 function sendInput(b, t, h) {
-  transport.sendInput(b);
-  const n = ++inLat.n; // numbered as the host reads them
+  const tr = transport;
+  if (inLat.on && !tr.inAckId) {
+    inLat.streamId = (inLat.streamId % 255) + 1;
+    tr.inAckId = inLat.streamId;
+    tr.sendInput(P.ackStream(tr.inAckId));
+    tr.inputN = (tr.inputN || 0) + 1;
+  }
+  tr.sendInput(b);
+  tr.inputN = (tr.inputN || 0) + 1;
   const ev = eventLocal(t);
-  if (inLat.on && ev !== null && (b[0] === P.IN_KEY || b[0] === P.IN_MOUSE_BUTTON)) inputPending(`s${n}`, 'keys', ev, eventLocal(h), now());
+  if (tr.inAckId && ev !== null && (b[0] === P.IN_KEY || b[0] === P.IN_MOUSE_BUTTON)) inputPending(`s${tr.inAckId}:${tr.inputN}`, 'keys', ev, eventLocal(h), now());
 }
 
 // An input datagram the page sent: marked for its acknowledgement now and
@@ -2611,7 +2624,7 @@ function sendInputDatagram(b, t, h) {
 function onInputAck(d) {
   const a = P.parseInputAck(d);
   if (!a) return;
-  const key = a.kind === P.INPUT_ACK_STREAM ? `s${a.seq}` : `${a.kind}:${a.idx}:${a.seq}`;
+  const key = a.kind === P.INPUT_ACK_STREAM ? `s${a.idx}:${a.seq}` : `${a.kind}:${a.idx}:${a.seq}`;
   const p = inLat.pending.get(key);
   if (!p) { // late, or an input stream message not measured (a wheel turn)
     if (inLat.gaveUp.delete(key)) inLat.count.late++;

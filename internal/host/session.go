@@ -175,9 +175,8 @@ type Session struct {
 	meter       func() deliveryMeter
 	// pongs: answers to the client's pings, sent by pongSender so the
 	// datagram loop (input) never waits for the datagram queue; also the
-	// acknowledgements of marked inputs (inAck, inputlat.go).
+	// acknowledgements of marked inputs (inputlat.go).
 	pongs chan []byte
-	inAck inputAcks
 	// thinning: discardable frames left out under congestion (thin.go);
 	// static: the encoder's bitrate on a static desktop (activity.go).
 	thinning thinState
@@ -2867,7 +2866,10 @@ func (s *Session) inputAllowed() bool {
 func (s *Session) inputLoop(st transport.BidiStream) {
 	defer st.CancelRead()
 	inj := s.a.inj
-	var n uint32 // messages read: the client numbers its writes alike (ackInputStream)
+	// Messages read, numbered from 1 per stream as the client numbers its
+	// writes; acknowledged after the client's proto.InAckStream (ackID).
+	var n uint32
+	var ackID byte
 	for {
 		// A message above the limit is skipped: ending the stream would end
 		// the session's keyboard and mouse buttons (clients split long text).
@@ -2883,6 +2885,10 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 		}
 		if !s.inputAllowed() {
 			return
+		}
+		if id, ok := proto.ParseAckStream(b); ok {
+			ackID = id
+			continue
 		}
 		ev, err := proto.ParseInput(b)
 		if err != nil {
@@ -2903,7 +2909,9 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 		if err != nil {
 			s.log.Debug("inject", "err", err)
 		}
-		s.ackInputStream(n, at)
+		if ackID != 0 {
+			s.ackInputStream(ackID, n, at)
+		}
 	}
 }
 
@@ -3234,8 +3242,6 @@ func (s *Session) controlLoop() error {
 			}
 		case "bye":
 			return errClosed
-		case proto.MsgInputAck:
-			s.inAck.stream.Store(true)
 		case proto.MsgInput:
 			s.logInput(b)
 		}

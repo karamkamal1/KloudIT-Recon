@@ -15,10 +15,14 @@ import (
 //
 // Marking: a mouse or gamepad datagram (DgMouseRel, DgMouseAbs, DgGamepad)
 // with InputAckFlag in its byte 3 (zero padding before; hosts before this
-// ignore it); the messages on the input stream all of them once the client
-// sent the control message MsgInputAck, counted from 1 in the order the host
-// reads them (the client counts its writes the same way). Clients before
-// this send neither and get no acknowledgements.
+// ignore it); on an input stream, every message after the client's
+// InAckStream message there. A stream's messages are numbered from 1 in the
+// order the host reads them, the InAckStream one among them (the client
+// counts its writes on that stream the same way); the acknowledgements carry
+// the id the InAckStream message gave the stream, so an acknowledgement of
+// an earlier stream (a client that moved its session to another connection)
+// matches none of a later one's. Clients before this send neither and get
+// no acknowledgements.
 const (
 	DgInputAck byte = 0x24 // host->client: a marked input was injected (InputAck)
 
@@ -35,9 +39,12 @@ const (
 	// InputAckFlag in byte 3 of an input datagram asks for its DgInputAck.
 	InputAckFlag byte = 1
 
-	// MsgInputAck ({"t":"inputAck"}): acknowledge every input stream
-	// message from now on.
-	MsgInputAck = "inputAck"
+	// InAckStream is the input stream message [InAckStream, id] (id 1-255):
+	// acknowledge this stream's messages from here on, with id in the
+	// acknowledgements' idx (ParseAckStream). Hosts before FeatureInputAck
+	// skip it as a malformed input event.
+	InAckStream byte = 6
+
 	// MsgInput ({"t":"input", ...}, InputReport): the client's input
 	// latency summary, every ~10 s.
 	MsgInput = "input"
@@ -45,17 +52,26 @@ const (
 
 // The input an acknowledgement answers (InputAck kind).
 const (
-	InputAckStream   byte = 1 // an input stream message (seq: its number, from 1)
+	InputAckStream   byte = 1 // an input stream message (idx: the stream's id, seq: its number on that stream, from 1)
 	InputAckMouseRel byte = 2 // DgMouseRel (seq: its seq)
 	InputAckMouseAbs byte = 3 // DgMouseAbs (seq: its seq)
 	InputAckGamepad  byte = 4 // DgGamepad (idx: the pad, seq: its seq)
 )
 
+// ParseAckStream returns the stream id of an InAckStream input stream
+// message.
+func ParseAckStream(b []byte) (id byte, ok bool) {
+	if len(b) != 2 || b[0] != InAckStream || b[1] == 0 {
+		return 0, false
+	}
+	return b[1], true
+}
+
 // WantsInputAck reports whether an input datagram carries InputAckFlag.
 func WantsInputAck(d []byte) bool { return len(d) > 3 && d[3]&InputAckFlag != 0 }
 
 // InputAck builds the acknowledgement of an input: kind, idx (the gamepad's
-// index), seq, and the host-clock µs it arrived (recvUs) and was injected
+// index; an input stream's id), seq, and the host-clock µs it arrived (recvUs) and was injected
 // (doneUs), 24 bytes.
 func InputAck(kind, idx byte, seq uint32, recvUs, doneUs uint64) []byte {
 	b := make([]byte, 24)

@@ -9,8 +9,10 @@ import (
 	"testing"
 )
 
-// TestInputAck: the acknowledgement's layout, and the mark in byte 3 of the
-// three input datagrams, which their parsers (hosts before it) ignore.
+// TestInputAck: the acknowledgement's layout, the mark in byte 3 of the
+// three input datagrams, which their parsers (hosts before it) ignore, and
+// the input stream's InAckStream message, which ParseInput (hosts before it)
+// rejects as malformed (they skip it).
 func TestInputAck(t *testing.T) {
 	b := InputAck(InputAckGamepad, 2, 0x01020304, 1_000_000_123, 1_000_000_456)
 	if len(b) != 24 || b[0] != DgInputAck || b[1] != InputAckGamepad || b[2] != 2 || b[3] != 0 {
@@ -35,6 +37,19 @@ func TestInputAck(t *testing.T) {
 	}
 	if _, ok := ParseMouseAbs(abs); !ok {
 		t.Error("a marked DgMouseAbs does not parse")
+	}
+	for _, c := range []struct {
+		b  []byte
+		id byte
+		ok bool
+	}{{[]byte{InAckStream, 7}, 7, true}, {[]byte{InAckStream, 255}, 255, true}, {[]byte{InAckStream, 0}, 0, false},
+		{[]byte{InAckStream}, 0, false}, {[]byte{InAckStream, 1, 0}, 0, false}, {KeyEvent(0x1e, false, true), 0, false}} {
+		if id, ok := ParseAckStream(c.b); id != c.id || ok != c.ok {
+			t.Errorf("ParseAckStream(% x) = %d %v, want %d %v", c.b, id, ok, c.id, c.ok)
+		}
+	}
+	if _, err := ParseInput([]byte{InAckStream, 7}); err == nil {
+		t.Error("ParseInput accepts InAckStream: hosts before it would not skip it")
 	}
 	if _, ok := ParseGamepad(pad); !ok {
 		t.Error("a marked DgGamepad does not parse")
@@ -63,8 +78,9 @@ func TestInputReportValid(t *testing.T) {
 	}
 }
 
-// TestInputAckJS: protocol.js reads the acknowledgement Go builds and marks
-// its input datagrams where WantsInputAck looks (needs node).
+// TestInputAckJS: protocol.js reads the acknowledgement Go builds, marks
+// its input datagrams where WantsInputAck looks and writes the input
+// stream's id message as ParseAckStream reads it (needs node).
 func TestInputAckJS(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -72,13 +88,14 @@ func TestInputAckJS(t *testing.T) {
 	}
 	_, file, _, _ := runtime.Caller(0)
 	js := filepath.Join(filepath.Dir(file), "..", "..", "web", "static", "js", "protocol.js")
-	ack := InputAck(InputAckStream, 0, 4000000001, 1<<40+5, 1<<40+77)
+	ack := InputAck(InputAckStream, 9, 4000000001, 1<<40+5, 1<<40+77)
 	script := `
 const P = await import(process.argv[1]);
 const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 const ack = Uint8Array.from(process.argv[2].match(/../g).map((h) => parseInt(h, 16)));
 console.log(JSON.stringify({
-  ack: P.parseInputAck(ack), short: P.parseInputAck(ack.subarray(0, 20)), consts: [P.DG_INPUT_ACK, P.INPUT_ACK_FLAG, P.INPUT_ACK_STREAM, P.INPUT_ACK_MOUSE_REL, P.INPUT_ACK_MOUSE_ABS, P.INPUT_ACK_GAMEPAD, P.FEATURE_INPUT_ACK, P.FEATURE_RESET_STREAM_AT, P.MSG_INPUT_ACK, P.MSG_INPUT],
+  ack: P.parseInputAck(ack), short: P.parseInputAck(ack.subarray(0, 20)), consts: [P.DG_INPUT_ACK, P.INPUT_ACK_FLAG, P.INPUT_ACK_STREAM, P.INPUT_ACK_MOUSE_REL, P.INPUT_ACK_MOUSE_ABS, P.INPUT_ACK_GAMEPAD, P.FEATURE_INPUT_ACK, P.FEATURE_RESET_STREAM_AT, P.IN_ACK_STREAM, P.MSG_INPUT],
+  stream: hex(P.ackStream(9)),
   marked: [P.markInputAck(P.mouseRel(5, 1, 2)), P.markInputAck(P.mouseAbs(6, 3, 4)), P.markInputAck(P.gamepadState(1, true, 7, { buttons: 0, lt: 0, rt: 0, lx: 0, ly: 0, rx: 0, ry: 0 }))].map(hex),
 }));`
 	out, err := exec.Command(node, "--input-type=module", "-e", script, "file://"+filepath.ToSlash(js), hex.EncodeToString(ack)).Output()
@@ -93,24 +110,28 @@ console.log(JSON.stringify({
 		}
 		Short  any
 		Consts []any
+		Stream string
 		Marked []string
 	}
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if a := got.Ack; a == nil || a.Kind != InputAckStream || a.Seq != 4000000001 || a.RecvUs != 1<<40+5 || a.DoneUs != 1<<40+77 {
+	if a := got.Ack; a == nil || a.Kind != InputAckStream || a.Idx != 9 || a.Seq != 4000000001 || a.RecvUs != 1<<40+5 || a.DoneUs != 1<<40+77 {
 		t.Errorf("protocol.js parseInputAck: %+v", got.Ack)
 	}
 	if got.Short != nil {
 		t.Errorf("protocol.js parsed a short acknowledgement: %v", got.Short)
 	}
 	want := []any{float64(DgInputAck), float64(InputAckFlag), float64(InputAckStream), float64(InputAckMouseRel), float64(InputAckMouseAbs), float64(InputAckGamepad),
-		FeatureInputAck, FeatureResetStreamAt, MsgInputAck, MsgInput}
+		FeatureInputAck, FeatureResetStreamAt, float64(InAckStream), MsgInput}
 	for i := range want {
 		if i >= len(got.Consts) || got.Consts[i] != want[i] {
 			t.Errorf("protocol.js constant %d = %v, want %v", i, got.Consts, want)
 			break
 		}
+	}
+	if id, ok := ParseAckStream(mustHex(got.Stream)); !ok || id != 9 {
+		t.Errorf("protocol.js ackStream(9) = %s: Go reads %d %v", got.Stream, id, ok)
 	}
 	for i, h := range got.Marked {
 		b, _ := hex.DecodeString(h)

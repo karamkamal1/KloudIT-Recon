@@ -485,21 +485,27 @@ export function gamepadToXusb(gp) {
 // internal/proto/inputack.go). A host that lists FEATURE_INPUT_ACK answers
 // the inputs the client marks with DG_INPUT_ACK: the host-clock µs the input
 // arrived and was injected. Marked: a mouse or gamepad datagram with
-// INPUT_ACK_FLAG in its byte 3 (markInputAck); every input stream message,
-// numbered from 1 in the order written, once the client sent
-// {"t": MSG_INPUT_ACK}. Every ~10 s the client reports its input latency
+// INPUT_ACK_FLAG in its byte 3 (markInputAck); on an input stream, every
+// message after the client's ackStream(id) there, numbered from 1 per stream
+// in the order written (the ackStream message among them), acknowledged
+// with the stream's id in idx. Every ~10 s the client reports its input latency
 // summary ({"t": MSG_INPUT, rows, clock, browser, lacks}), which the host
 // logs. Hosts that list FEATURE_INPUT_ACK also list FEATURE_RESET_STREAM_AT
 // when this client's QUIC endpoint negotiated RESET_STREAM_AT.
 export const FEATURE_INPUT_ACK = 'input-ack';
 export const FEATURE_RESET_STREAM_AT = 'reset-stream-at';
 export const INPUT_ACK_FLAG = 1;
-export const MSG_INPUT_ACK = 'inputAck';
+export const IN_ACK_STREAM = 6;
 export const MSG_INPUT = 'input';
 export const INPUT_ACK_STREAM = 1;
 export const INPUT_ACK_MOUSE_REL = 2;
 export const INPUT_ACK_MOUSE_ABS = 3;
 export const INPUT_ACK_GAMEPAD = 4;
+
+/** The input stream message asking for the acknowledgement of the stream's messages from here on, with id (1-255) in them. */
+export function ackStream(id) {
+  return new Uint8Array([IN_ACK_STREAM, id]);
+}
 
 /** The input datagram b (mouseRel, mouseAbs, gamepadState), marked for its acknowledgement. */
 export function markInputAck(b) {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"sync/atomic"
 
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
@@ -15,17 +14,10 @@ import (
 // were injected (the injector's call returned), and logs the client's
 // summary of "browser event -> injected on the host" every ~10 s.
 
-// inputAcks is a session's state for them.
-type inputAcks struct {
-	stream atomic.Bool // the client asked for every input stream message's (proto.MsgInputAck)
-}
-
-// ackInputStream acknowledges input stream message n (from 1), read at
-// recvUs and handled by now, where the client asked for them.
-func (s *Session) ackInputStream(n uint32, recvUs uint64) {
-	if s.inAck.stream.Load() {
-		s.sendPong(proto.InputAck(proto.InputAckStream, 0, n, recvUs, s.a.clock()))
-	}
+// ackInputStream acknowledges message n (from 1) of the input stream the
+// client gave the id (proto.InAckStream), read at recvUs and handled by now.
+func (s *Session) ackInputStream(id byte, n uint32, recvUs uint64) {
+	s.sendPong(proto.InputAck(proto.InputAckStream, id, n, recvUs, s.a.clock()))
 }
 
 // ackInputDatagram acknowledges input datagram d (kind, the gamepad's idx,

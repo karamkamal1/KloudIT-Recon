@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/karamkamal1/kloudit-recon/internal/host/input"
 	"github.com/karamkamal1/kloudit-recon/internal/proto"
 )
 
 // TestInputAcks: a marked input datagram gets its acknowledgement (kind,
 // pad, seq, arrival and injection on the host clock), an unmarked one none;
-// input stream messages only once the client asked (proto.MsgInputAck).
+// an input stream message's carries the stream's id and its number.
 func TestInputAcks(t *testing.T) {
 	s, _, _ := testSession(t, testFaults{})
 	s.pongs = make(chan []byte, 8)
@@ -41,20 +44,91 @@ func TestInputAcks(t *testing.T) {
 	if r, d := binary.LittleEndian.Uint64(b[8:]), binary.LittleEndian.Uint64(b[16:]); r != recv || d < r {
 		t.Errorf("arrived %d, injected %d", r, d)
 	}
-	s.ackInputStream(3, 50)
-	if b := got(); b != nil {
-		t.Fatalf("input stream message acknowledged before the client asked: % x", b)
-	}
-	s.inAck.stream.Store(true)
-	s.ackInputStream(3, 50)
-	if b := got(); len(b) != 24 || b[1] != proto.InputAckStream || binary.LittleEndian.Uint32(b[4:]) != 3 || binary.LittleEndian.Uint64(b[8:]) != 50 {
+	s.ackInputStream(5, 3, 50)
+	if b := got(); len(b) != 24 || b[1] != proto.InputAckStream || b[2] != 5 || binary.LittleEndian.Uint32(b[4:]) != 3 || binary.LittleEndian.Uint64(b[8:]) != 50 {
 		t.Fatalf("input stream acknowledgement % x", b)
 	}
 	// A full queue drops the acknowledgement: the datagram loop never waits.
 	for range 8 {
 		s.pongs <- nil
 	}
-	s.ackInputStream(4, 60)
+	s.ackInputStream(5, 4, 60)
+}
+
+// inputStream is an input stream's client side as the host reads it.
+type inputStream struct {
+	io.Reader
+	fakeCtrl
+}
+
+func (st *inputStream) Read(b []byte) (int, error) { return st.Reader.Read(b) }
+
+func inputStreamOf(msgs ...[]byte) *inputStream {
+	var buf bytes.Buffer
+	for _, m := range msgs {
+		_ = proto.WriteMsg(&buf, m)
+	}
+	return &inputStream{Reader: &buf}
+}
+
+type keyBackend struct {
+	input.Backend
+	keys int
+}
+
+func (b *keyBackend) Key(uint16, bool, bool) error { b.keys++; return nil }
+func (b *keyBackend) Button(uint8, bool) error     { return nil }
+func (b *keyBackend) Wheel(int16, int16) error     { return nil }
+
+// TestInputLoopAcks: the host numbers an input stream's messages from 1 per
+// stream, as the client numbers its writes per transport, and acknowledges
+// those after the client's proto.InAckStream with that stream's id. A
+// session moved to another connection (a new input stream, the same
+// session) starts again from 1 under the new id: an acknowledgement of the
+// earlier stream cannot match one of the later stream's inputs.
+func TestInputLoopAcks(t *testing.T) {
+	s, _, _ := testSession(t, testFaults{})
+	kb := &keyBackend{}
+	s.a.inj = input.NewInjector(kb)
+	s.a.active = s
+	s.pongs = make(chan []byte, 16)
+	key := proto.KeyEvent(0x1e, false, true)
+	up := proto.KeyEvent(0x1e, false, false)
+	type ack struct {
+		id  byte
+		seq uint32
+	}
+	acks := func() (out []ack) {
+		for {
+			select {
+			case b := <-s.pongs:
+				if len(b) != 24 || b[0] != proto.DgInputAck || b[1] != proto.InputAckStream {
+					t.Fatalf("not an input stream acknowledgement: % x", b)
+				}
+				out = append(out, ack{b[2], binary.LittleEndian.Uint32(b[4:])})
+			default:
+				return out
+			}
+		}
+	}
+	// The first connection: a key before the client asked (not acknowledged), then its id 1.
+	s.inputLoop(inputStreamOf(key, []byte{proto.InAckStream, 1}, up, []byte{proto.InMouseButton, 0, 1}, []byte{proto.InWheel, 0, 120, 0, 0, 0}))
+	if got, want := acks(), []ack{{1, 3}, {1, 4}, {1, 5}}; !slices.Equal(got, want) {
+		t.Errorf("first stream: acknowledged %v, want %v", got, want)
+	}
+	// The second connection's input stream (id 2): numbered from 1 again.
+	s.inputLoop(inputStreamOf([]byte{proto.InAckStream, 2}, key, up))
+	if got, want := acks(), []ack{{2, 2}, {2, 3}}; !slices.Equal(got, want) {
+		t.Errorf("second stream: acknowledged %v, want %v", got, want)
+	}
+	// A stream that never asks gets none.
+	s.inputLoop(inputStreamOf(key, up))
+	if got := acks(); len(got) != 0 {
+		t.Errorf("a stream without InAckStream acknowledged: %v", got)
+	}
+	if kb.keys != 6 {
+		t.Errorf("%d keys injected, want 6", kb.keys)
+	}
 }
 
 // TestLogInput: the client's report is logged with its rows in order, its
