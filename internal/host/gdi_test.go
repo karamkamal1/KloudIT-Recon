@@ -279,7 +279,7 @@ func TestCaptureFailedGDI(t *testing.T) {
 			t.Fatalf("after the failure: %s, agent finding %q", p.Source.Backend, a.gpuCaptureBlocked())
 		}
 		next(t, s) // a later restart: no second notice
-		want := []string{"warn: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency."}
+		want := []string{"info: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency."}
 		if got := msgs(t, ctrl); strings.Join(got, "\n") != strings.Join(want, "\n") {
 			t.Fatalf("notices %q, want %q", got, want)
 		}
@@ -297,7 +297,7 @@ func TestCaptureFailedGDI(t *testing.T) {
 			t.Fatalf("next session captures with %s", p.Source.Backend)
 		}
 		next(t, s2)
-		if got := msgs(t, ctrl2); len(got) != 1 || !strings.HasPrefix(got[0], "warn: No GPU screen capture on this PC") {
+		if got := msgs(t, ctrl2); len(got) != 1 || !strings.HasPrefix(got[0], "info: No GPU screen capture on this PC") {
 			t.Fatalf("next session's notices %q", got)
 		}
 	})
@@ -336,7 +336,7 @@ func TestCaptureFailedGDI(t *testing.T) {
 		}
 		got := msgs(t, ctrl)
 		if len(got) != 2 || got[0] != "warn: Screen capture failed, retrying: Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support." ||
-			!strings.HasPrefix(got[1], "warn: Screen capture on the GPU failed (Desktop Duplication cannot capture this display") ||
+			!strings.HasPrefix(got[1], "info: Screen capture on the GPU failed (Desktop Duplication cannot capture this display") ||
 			!strings.HasSuffix(got[1], "capturing with GDI until it works again, which uses more CPU and adds latency.") {
 			t.Fatalf("notices %q", got)
 		}
@@ -807,7 +807,7 @@ func TestWatchGPUCapture(t *testing.T) {
 	for _, n := range ctrlNotices(t, ctrl) {
 		got = append(got, n.Level+": "+n.Msg)
 	}
-	want := []string{"warn: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency.",
+	want := []string{"info: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency.",
 		"info: GPU screen capture works again: capturing on the GPU."}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("notices %q, want %q", got, want)
@@ -936,7 +936,7 @@ func TestWatchSessionGDI(t *testing.T) {
 	if checks.Load() != 2 || got != "[1 1]" {
 		t.Fatalf("checks of outputs %s, want the session's output twice (the first still refused)", got)
 	}
-	want := []string{"warn: Screen capture on the GPU failed (Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support): capturing with GDI until it works again, which uses more CPU and adds latency.",
+	want := []string{"info: Screen capture on the GPU failed (Desktop Duplication cannot capture this display: a remote desktop session, or a display mode it does not support): capturing with GDI until it works again, which uses more CPU and adds latency.",
 		"info: GPU screen capture works again: capturing on the GPU."}
 	if got := noticeLines(t, ctrl); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("notices %q, want %q", got, want)
@@ -1054,7 +1054,7 @@ func TestWatchGPUCaptureFirstLook(t *testing.T) {
 	if n := checks.Load(); n != 1 {
 		t.Fatalf("%d checks, want the session start's only", n)
 	}
-	want := []string{"warn: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency.",
+	want := []string{"info: No GPU screen capture on this PC (" + noDevice + "): capturing with GDI, which uses more CPU and adds latency.",
 		"info: GPU screen capture works again: capturing on the GPU."}
 	if got := noticeLines(t, ctrl); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("notices %q, want %q", got, want)

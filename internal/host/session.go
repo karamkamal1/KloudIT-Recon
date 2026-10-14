@@ -844,7 +844,7 @@ func (s *Session) negotiateEncoder(prefs proto.Prefs, z picSizes, notify bool) (
 		s.codecWarned = warned
 		s.prefsMu.Unlock()
 		if warned != "" && !repeat {
-			s.notice("warn", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
+			s.notice("info", fmt.Sprintf("Codec %s is not available end-to-end; choosing automatically.", prefs.Codec))
 		}
 	}
 	policy := s.a.cfg.av1()

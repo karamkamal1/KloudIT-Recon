@@ -225,13 +225,13 @@ func (s *Session) captureFailed(ev media.VideoEvent) bool {
 	return true
 }
 
-// noteGDI logs, and tells the user, once per reason why the session's next
-// generation captures with GDI (backend gdigrab) where it would capture on
-// the GPU: no GPU capture on this PC, or Desktop Duplication refusing the
-// session's display (captureFailed); and starts the session's watch that
-// goes back to the GPU (watchGPUCapture). Not when the host config asks for
-// gdigrab. window: the client asked for a window, which GDI does not
-// capture alone.
+// noteGDI logs, and tells the user (an informational notice), once per
+// reason why the session's next generation captures with GDI (backend
+// gdigrab) where it would capture on the GPU: no GPU capture on this PC, or
+// Desktop Duplication refusing the session's display (captureFailed); and
+// starts the session's watch that goes back to the GPU (watchGPUCapture).
+// Not when the host config asks for gdigrab. window: the client asked for a
+// window, which GDI does not capture alone.
 func (s *Session) noteGDI(backend string, window bool) {
 	if backend != "gdigrab" || s.a.cfg.Capture == "gdigrab" {
 		return
@@ -256,10 +256,12 @@ func (s *Session) noteGDI(backend string, window bool) {
 		attrs = append(attrs, "window", "not captured alone: GDI captures the whole monitor")
 	}
 	s.log.Info("capturing with GDI (gdigrab)", attrs...)
+	// Informational: the stream works, this says how (an error or warning
+	// toast for a fallback that is handled read as a failure on a VM).
 	if pc {
-		s.notice("warn", "No GPU screen capture on this PC ("+why+"): capturing with GDI, which uses more CPU and adds latency.")
+		s.notice("info", "No GPU screen capture on this PC ("+why+"): capturing with GDI, which uses more CPU and adds latency.")
 	} else {
-		s.notice("warn", "Screen capture on the GPU failed ("+why+"): capturing with GDI until it works again, which uses more CPU and adds latency.")
+		s.notice("info", "Screen capture on the GPU failed ("+why+"): capturing with GDI until it works again, which uses more CPU and adds latency.")
 	}
 }
 
