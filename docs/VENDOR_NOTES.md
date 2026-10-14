@@ -15158,25 +15158,39 @@ connection.
 - **The forwarder flooded** past its limit (`TestUDPRelayFlood`: 300 ms of raw datagrams at
   1.4-2.1 Gbit/s, six runs): it forwarded 0.75-1.2 Gbit/s (its 8 MB burst, then 1 Gbit/s),
   dropped the rest (0-18.7 k by its bucket, 5.8-23.1 k more by the kernel at its socket), and
-  100 ms after the flood 200 of 200 probes went through at 0.06-0.13 ms (p95).
+  100 ms after the flood 200 of 200 probes went through at 0.06-0.13 ms (p95). Against a limit
+  of 100 Mbit/s after a 1 MB burst, which any machine overruns (the review's case, below), it
+  forwarded 99-102 % of what the limit allowed of the flood in every run.
 
 ### What changed (tests only)
 
-No relay, transport or rate control code: they behave as designed.
+No transport or rate control code: they behave as designed. In the relay only this: its limit
+towards the browser is a field of the relay (`downRate`, `downBurst`, set to `relayDownRate` and
+`relayDownBurst` as before) that a test lowers.
 
 - `TestUDPRelayLatencyAndThroughput` section 2 measures the relay against the direct path at a
   rate under the forwarder's limit: a 500 Mbit/s target (600 Mbit/s of pacing, twice the default
-  maximum's), the relay within 20 % of the direct path and dropping nothing.
+  maximum's), dropping nothing, from the stream's first byte: the relay's average over the
+  whole transfer within 20 % of the direct path's and no 300 ms of it under half the direct
+  path's median 100 ms (a stall of more than about 150 ms anywhere, the start included).
 - `goodputSeries` reports a stream or connection that ends before its time (`the stream ended
-  after 368ms: INTERNAL_ERROR (local): too many gaps in received data`) instead of a rate of 0.
+  after 368ms: INTERNAL_ERROR (local): too many gaps in received data`) instead of a rate of 0,
+  and counts from the stream's first byte (section 3 leaves out the first second, as before).
 - `TestUDPRelayOverrun` (above; with the target left at the overrun's it fails: 0 of 120 on
-  time) and `TestUDPRelayFlood` (above), with `newShapedLink` (the test link with a bottleneck
-  towards the client: a rate and a tail-drop queue).
+  time), with `newShapedLink` (the test link with a bottleneck towards the client: a rate and a
+  tail-drop queue). The stream starts at 60 Mbit/s for 1.5 s, and the frames after the recovery
+  second must be on time as often as in its last second (a tenth of leeway), at 90 % where the
+  machine managed that.
+- `TestUDPRelayFlood` (above), against the forwarder's own limit and against 100 Mbit/s after a
+  1 MB burst: forwarded no more than the limit allows over the time, and at least 90 % of the
+  lesser of what the forwarder read (the host's datagrams less the kernel's drops at its socket)
+  and what the limit allows of the flood as the host sent it; the 100 Mbit/s case skips, saying
+  so, where the forwarder read no more than its limit.
 - `TestRelaySimLAN` "100 Mbit/s link, the encoder filling a 250 Mbit/s target": the target under
   the link within 1.5 s, the first picture within 500 ms, no wait between pictures over 300 ms,
   none over 100 ms after 2 s, the target over 60 % of the link in the last 30 s (seeds 1 / 2:
   under after 0.6 s, first picture 273 / 363 ms, waits up to 200 / 132 ms, 55 / 54 ms after 2 s,
-  83.9 / 82.4 Mbit/s).
+  83.9 / 82.4 Mbit/s). The same behind a 20 ms queue, bounded at today's state (below).
 
 ### Runs
 
@@ -15209,8 +15223,122 @@ No relay, transport or rate control code: they behave as designed.
   decreases, which stopped the pumping behind the 100 ms queue) on a queue too short for a delay
   to build, not the relay's; for the rate control work. The start there, the overrun this section
   is about: the first picture after 279-333 ms against 266-288, waits up to 95-108 ms against
-  97-100.
+  97-100. The brief's bar for a session (no freeze longer than at 20a5043) is not met on this
+  queue. `TestRelaySimLAN` "100 Mbit/s link, 20 ms queue, the encoder filling a 250 Mbit/s
+  target" holds today's state so that it cannot widen unnoticed: after the first 2 s no wait
+  between pictures over 140 ms (its harness, with the encoder's latency jitter, seeds 1-12:
+  62-121 ms, 2-10 loss decreases a run; the 100 ms bound of the 100 ms queue's case would fail
+  seeds 11 and 12). The rate control work tightens it.
 - **The splice's host leg** and quic-go's 1000-gap limit (above).
+
+### The review of these changes
+
+Five findings, all confirmed; two of them the same (the 20 ms queue).
+
+- **`TestUDPRelayFlood` could pass without overrunning anything.** Its flood goes as fast as the
+  host's socket takes it: on two CPUs shared with `internal/host`'s simulations (`go test ./...`
+  on a two-CPU runner) the review's three runs flooded at 0.78-1.0 Gbit/s, the bucket dropped
+  nothing, and one run forwarded 24 640 of 24 640 datagrams. Here, in 16 more such runs, the
+  floods went at 0.3-1.4 Gbit/s and the bucket at the forwarder's own limit dropped nothing in any
+  of them (nor in 5 runs on four CPUs while other sessions loaded them to a load average of 7).
+  Now the flood also runs against a limit of 100 Mbit/s after a 1 MB burst (the relay's
+  `downRate` and `downBurst`, which the test lowers), which every run overran: its bucket dropped
+  2.1-68.5 k datagrams (floods of 0.17-2.3 Gbit/s). That case skips, saying so, where the
+  forwarder read no more than its limit; at the forwarder's own limit a run that does not reach
+  the bucket logs it (four CPUs at a low load reach it: dropped 2.0-15.8 k in 15 of 16 runs).
+- **No lower bound on what is forwarded.** A forwarder that wedged once overrun (forwarding
+  nothing until the host had been quiet for 20 ms) passed every relay test. Confirmed with the
+  same mutant: `TestUDPRelayFlood` of 9f9e910 passed 3 of 3 runs. Now the forwarder must forward
+  at least 90 % of the lesser of what it read (what the host sent less the kernel's drops at
+  its socket, `SO_RXQ_OVFL`: not the forwarder's own count) and what the limit allows of the
+  flood as the host sent it (a bucket the test runs over the host's write times, so a pause of
+  the host's own is not the forwarder's to make up). Unmutated it forwarded 99-102 % of that at
+  100 Mbit/s in 32 runs on two and four CPUs at load averages up to 7, and 99.5-107 % at its own
+  limit. The mutant now fails 3 of 3 runs (the 100 Mbit/s case forwarded 956-993 of 4000-4005
+  allowed; at its own limit 14.9-17.6 k of 38.2-38.3 k where the bucket was reached), and 3 of 3
+  again when it does not count what it drops (919-975 of 3999-4003; at its own limit 31.6-32.1 k
+  of 38.2-38.3 k).
+- **Section 2 of `TestUDPRelayLatencyAndThroughput` averaged only the receiver's 1.0-2.0 s.**
+  Confirmed with the review's mutants: a forwarder that sleeps 800 ms after 3000 datagrams to the
+  browser passed section 2 of 9f9e910 (587 against 587 Mbit/s; the test failed only in section
+  3), and one that sleeps 250 ms after 60 000 failed it narrowly (445 and 452 against 586 and
+  587, the line at 80 %). Now `goodputSeries` counts from the stream's first byte, and section 2
+  compares the average over the whole transfer and requires no 300 ms of the relay under half
+  the direct path's median 100 ms. A floor on single 100 ms windows was tried first and dropped:
+  on two CPUs with the simulations and other sessions' load the scheduler alone took one relay
+  window to 105 Mbit/s against a direct median of 365. Both mutants now fail: the 800 ms stall
+  both checks (359-360 against 585-586 Mbit/s, the slowest 300 ms at 0), the 250 ms one the
+  second (520-521 against 585-586, the average passing; the slowest 300 ms at 142-143 against a
+  median of 587). Unmutated: the relay's slowest 300 ms at 540-587 Mbit/s against direct
+  averages of 584-587 on four CPUs, 225-476 against 361-478 on two with the simulations.
+- **The 20 ms queue (two findings).** Confirmed with the committed harness (`lanRelay`, the
+  encoder's latency jitter, 40 s, seeds 1-12): behind the 20 ms queue the target under the link
+  after 400-500 ms, the first picture after 240-338 ms, waits up to 101-181 ms, after the first
+  2 s 62-121 ms, 2-10 loss decreases a run; `overrunLAN`'s 100 ms bound after 2 s fails seeds 11
+  (121 ms) and 12 (102 ms). Behind the 100 ms queue: 53-99 ms after 2 s, one loss decrease
+  each. The case is in `TestRelaySimLAN` now with that bound at 140 ms and a comment naming this
+  open item ("Not fixed here"); seeds 1 / 2: 82 / 83 ms, 4 / 4 loss decreases. The relay is not
+  the defect, but the brief's bar for the session is not met on that queue.
+
+Found while running the checks, not in the review's list:
+
+- **`TestUDPRelayOverrun` on two CPUs with the simulations** failed 6 of 9 runs: 93-103 of
+  119-120 frames on time after the recovery second (the line at 90 %), latency p50 45-49 ms
+  against 14 ms on four CPUs, the host's writer leaving out 102-114 frames against 74-77: the
+  machine, not the overrun. The stream now starts at the lowered target, and the frames after
+  the recovery must be on time as often as before the overrun (a tenth of leeway), at 90 % where
+  the machine managed that. Three runs in the same conditions passed (before 59 / 54 / 46 of 60
+  on time, after 119 / 100 / 104 of 120); on four CPUs 48 of 49 or 60 of 60 before and 120 of
+  120 after in every run; with the target never lowered it fails (0 of 120 after, 60 of 60
+  before).
+- **`TestFrameQueueBehindKeyFrame` "past its deadline, a cut once per key frame"** failed once
+  under `-race` (`target 8000 after the overflow behind the key frame, want 6000`) while the
+  package's simulations ran on every CPU: the session logs the overflow (`logOverflow`) before it
+  applies the cut (`overflowCut`), and the test reads the target as soon as the log line is
+  there. The test alone passed 20 of 20 runs with `-race` and 30 of 30 without, and the
+  package's `-race` run passed on a second try (495 s). Neither file is this branch's; left for
+  the rate control work (poll the target, or log after the cut).
+
+Corrections to the commit messages (not amended): 8225569's "forwarded 3847-4069 of 3939-4129
+allowed (94-102 %) in 25 runs" mixes in runs of an intermediate version that took the allowance
+as the burst plus the rate over the flood's whole duration; with the committed computation it is
+3933-4069 of 3939-4035 (99-102 %) in 22 runs. 92cef62's "failed in 4 of 6 runs: 96-103 of 120"
+is 6 of 9 runs, 93-103 of 119-120.
+
+The commits: 8225569 (the flood's two limits and lower bound, section 2, the relay's limit
+fields), bdd1bef (the 20 ms queue's case), 92cef62 (the overrun's baseline) and this section.
+Runs of the review's changes (92cef62; this section's commit changes only this file):
+
+- `gofmt -l` prints nothing; `go vet ./...` and `GOOS=windows go vet ./...` pass; `node --check`
+  on the 17 files of `web/static/js` and `test/e2e/browser.mjs` passes; `make build`.
+- Under the lock: `go test` of every package but `internal/e2e`: 18 ok (`internal/gateway`
+  44.1 s, `internal/host` 113.2 s, `internal/host/media` 115.9 s), 2 without tests;
+  `go test ./internal/e2e/...` ok (231.4 s); `go test -race ./internal/gateway/...
+  ./internal/transport/... ./internal/host/`: gateway 47.0 s, transport 12.3 s, transport/cc
+  35.0 s ok, `internal/host` the failure above, then ok on the re-run (494.9 s).
+- The three relay tests 10 times under the lock (load averages 0.7-1.4): 30 of 30 passed. The
+  relay added 30-68 µs to the median round trip; bulk 578-588 Mbit/s through the relay against
+  584-587 direct, the slowest 300 ms 540-587, the first 100 ms 569-592, 105.9-107.6 k datagrams
+  forwarded, none dropped by the forwarder or the kernel; the lossy 40 Mbit/s leg 45.9-46.9
+  Mbit/s on the relay against 45.6-47.0 direct (splice 4.8-5.3). The overrun: 60 of 60 on time
+  before, 48-49 of 120 completed during it, on time again 83-102 ms after the target was lowered,
+  then 120 of 120 (p50 14 ms). The flood at the forwarder's limit: 1.5-2.1 Gbit/s, its bucket
+  dropping 2.0-14.0 k and the kernel 5.6-15.7 k, forwarded 99.5-107 % of the lesser of read and
+  allowed; at 100 Mbit/s: 1.4-2.3 Gbit/s, 100-100.2 %, dropped 40.7-68.5 k, the kernel none;
+  200 of 200 probes after each flood, p95 72-119 µs.
+- The browser E2E's relay scenarios (`E2E_ONLY='WebTransport relay|splice|WebSocket relay|udp
+  relay'`, 75 checks) under the lock, load averages 0.7-9.6 (other sessions' builds and tests):
+  this tree 6 runs from the worktree, 70-73 passed, and 3 runs built from `git archive`, 71-74;
+  4de1e24 built from `git archive`, alternated with them in the same hour, 8 runs, 70-75 (two
+  green). Every failure on both trees is one of the checks "Merged second hardware run:
+  telemetry and frames under load" has failing on 20a5043 too at this machine's speed: steady
+  real-time playback and video decoding (half-second rates down to 20-46 fps of 60, the CPUs
+  15-19 % idle) and the send priorities' telemetry share (25-49 % dropped). In all 17 runs the
+  UDP relay's own checks passed: the WebTransport relay scenario connected on
+  `webtransport/relay`, the host that cannot bind fell back to the splice and the next connect
+  skipped the UDP relay, six reconnects stayed on the UDP relay and released their ports. The
+  browser path's code is the same on both trees (no client, host or transport change; in the
+  gateway only the limit's fields).
 
 ### Hardware re-check
 
