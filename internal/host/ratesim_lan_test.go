@@ -215,6 +215,36 @@ func TestRelaySimLAN(t *testing.T) {
 			c.capacity, c.capQueue = func(time.Duration) float64 { return 150e6 }, 100*time.Millisecond
 			c.clientStall = clientStalls(c.seed, c.dur)
 		}, linkLAN(0, 19*ms, 31*ms)},
+		// The overrun as a session meets it (TestUDPRelayOverrun has the
+		// transport's and the relay's part): the 250 Mbit/s setting behind
+		// the 100 Mbit/s link with a game the encoder makes as much of as
+		// the target allows, three times what the link carries. The first
+		// key frame (2.5 MB into the link's 1.2 MB queue) brings a loss and
+		// a frame-queue overflow decrease, and the target is under the link
+		// within a second; the first picture after 273-363 ms, no wait
+		// between pictures over 200 ms. The same session without the
+		// encoder's latency jitter: first picture 265-361 ms, waits up to
+		// 131-202 ms, both at 20a5043 and now (docs/VENDOR_NOTES.md "Merged
+		// second hardware run: the UDP relay under overload").
+		{"100 Mbit/s link, the encoder filling a 250 Mbit/s target", func(c *rsCfg) {
+			c.capacity, c.capQueue = func(time.Duration) float64 { return 95e6 }, 100*time.Millisecond
+			c.satKbps = 0
+		}, overrunLAN(95e6, 100*ms)},
+		// The same behind a 20 ms queue (a small switch buffer), where what
+		// follows the overrun is longer than at 20a5043: the target, held a
+		// little higher, climbs into the queue's overflow more often (2-10
+		// loss decreases a run in seeds 1-12) and a frame waits for its
+		// retransmission. Its bound records today's state, not the goal: no
+		// wait between pictures over 140 ms after the first 2 s (seeds
+		// 1-12: 62-121 ms; seeds 1 / 2: 82 / 83 ms). Without the encoder's
+		// latency jitter 20a5043 had 46-69 ms and one loss decrease a run,
+		// this tree 50-137 ms and 1-3 (docs/VENDOR_NOTES.md "Merged second
+		// hardware run: the UDP relay under overload", "Not fixed here":
+		// the rate control work's to bring back and tighten).
+		{"100 Mbit/s link, 20 ms queue, the encoder filling a 250 Mbit/s target", func(c *rsCfg) {
+			c.capacity, c.capQueue = func(time.Duration) float64 { return 95e6 }, 20*time.Millisecond
+			c.satKbps = 0
+		}, overrunLAN(95e6, 140*ms)},
 		// Real congestion still backs off: the LAN's capacity drops to
 		// 40 Mbit/s for 10 s (Wi-Fi with a neighbour's download), a 100 ms
 		// queue at the access point. Before: the first cut 85-130 ms after
@@ -260,7 +290,7 @@ func TestRelaySimLAN(t *testing.T) {
 				st := tr.lan(10*time.Second, cfg.dur)
 				fail := c.check(tr, cfg, st)
 				t.Logf("%s seed %d, last 30 s: %v; decreases %v, overflows %d", c.name, seed, st, tr.decreases, tr.overflows)
-				if n := len(tr.lines); strings.HasPrefix(tr.lines[n-1], "first cut") {
+				if n := len(tr.lines); strings.HasPrefix(tr.lines[n-1], "first cut") || strings.HasPrefix(tr.lines[n-1], "overrun:") {
 					t.Logf("%s seed %d: %s", c.name, seed, tr.lines[n-1])
 				}
 				if fail != "" {
@@ -301,6 +331,49 @@ func steadyLAN(e2e50, e2e95 time.Duration, thin int) func(*rsTrace, rsCfg, lanSt
 		if st.dec > 0 || st.target < 0.95*float64(cfg.ceiling) || st.e2e[0] > e2e50 || st.e2e[1] > e2e95 || st.thinStarts > thin || st.holds > 20 {
 			return fmt.Sprintf("want no decrease, the target at the setting, end to end under %v/%v, at most %d thinning episodes and 20 frames held",
 				e2e50, e2e95, thin)
+		}
+		return ""
+	}
+}
+
+// overrunLAN judges a session that starts far above the link's capacity
+// (bit/s): the target under what the link carries within a second and a
+// half, the first picture within 500 ms, no wait between two pictures over
+// 300 ms and none over late after the first two seconds, and the target
+// over 60 % of the capacity in the last 30 s.
+func overrunLAN(capacity float64, late time.Duration) func(*rsTrace, rsCfg, lanStats) string {
+	return func(tr *rsTrace, cfg rsCfg, st lanStats) string {
+		under := time.Duration(-1)
+		for i, a := range tr.applied {
+			if float64(a)*1000 <= capacity {
+				under = time.Duration(i+1) * rateTick
+				break
+			}
+		}
+		var dec []time.Duration
+		for _, f := range tr.frames {
+			if f.decoded > 0 {
+				dec = append(dec, f.decoded)
+			}
+		}
+		if len(dec) == 0 {
+			return "no picture"
+		}
+		slices.Sort(dec)
+		var wait, after time.Duration
+		for i := 1; i < len(dec); i++ {
+			wait = max(wait, dec[i]-dec[i-1])
+			if dec[i-1] >= 2*time.Second {
+				after = max(after, dec[i]-dec[i-1])
+			}
+		}
+		tr.lines = append(tr.lines, fmt.Sprintf("overrun: the target under the link after %v, the first picture after %v, the longest wait between two %v, after 2 s %v; %d loss decreases",
+			under, dec[0].Round(time.Millisecond), wait.Round(time.Millisecond), after.Round(time.Millisecond), tr.decreases["loss"]))
+		if under < 0 || under > 1500*time.Millisecond || dec[0] > 500*time.Millisecond || wait > 300*time.Millisecond || after > late ||
+			st.target*1000 < 0.6*capacity {
+			return fmt.Sprintf("the target under the link after %v, the first picture after %v, waits up to %v, after 2 s %v, the target %.0f kbps in the last 30 s: "+
+				"want under within 1.5 s, a picture within 500 ms, waits under 300 ms and after 2 s under %v, the target over 60 %% of the link",
+				under, dec[0], wait, after, st.target, late)
 		}
 		return ""
 	}
