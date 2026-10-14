@@ -8,6 +8,7 @@ import { PATHS, LABELS } from './renderers.js';
 import { PACING, PACING_LABELS } from './pacing.js';
 import { FSR, UPSCALE, UPSCALE_LABELS, upscaleSettings } from './fsr1.js';
 import { HDR_MODES, HDR_WHITES, HDR_WHITE, hdrWhite } from './hdr.js';
+import { browserInfo, browserGaps, browserNotice } from './browser.js';
 
 const $ = (id) => document.getElementById(id);
 const hostId = new URLSearchParams(location.search).get('host');
@@ -132,6 +133,7 @@ const S = {
   get keyboardLock() { return document.fullscreenElement ? this.kbLock : null; },
   set keyboardLock(v) { this.kbLock = v; },
   pointerRaw: null, // the last pointer lock was granted with unadjustedMovement (the browser read the option)
+  browser: null, // browser.js: { info, gaps, notice } (boot)
   goodStream: 0, // stats in a row with the stream at its rate (presentRecheck)
   rumbles: 0, // force-feedback datagrams played
   audioJitter: null, // the jitter buffer's last report (audio-worklet.js)
@@ -493,6 +495,7 @@ async function connect() {
     },
     hostPrefs: hostPrefs(),
     client: { ua: navigator.userAgent, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio), dpr: devicePixelRatio, hz: S.hz },
+    browser: S.browser ? { label: S.browser.info.label, lacks: S.browser.gaps.map((g) => g.id) } : null,
     audioSab: sab, audioPort: port,
   }, transfer);
   if (document.hidden) sendCtl({ t: 'pause' }); // a reconnect while the tab is hidden
@@ -1151,6 +1154,7 @@ function onStats(st) {
     row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fecNow ? ' · datagrams + FEC' : ''}` +
       `${S.conn.path !== 'direct' && S.conn.directWhy ? ` · direct: ${S.conn.directWhy}` : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
+    browserRow(st, row),
     st.fec ? fecRow(st.fec, row) : null,
     ...presentRows(st, row),
     ...upscaleRows(st.renderer, row),
@@ -1211,6 +1215,21 @@ function fecRow(f, row) {
   const loss = all ? (100 * f.shardsLost) / all : 0;
   return row('  FEC', `${f.frames} frames · parity ${f.shards ? ((100 * f.parity) / f.shards).toFixed(0) : 0} % of shards · ` +
     `loss ${loss.toFixed(2)} % · rebuilt ${f.rebuilt} · repaired ${f.repaired} (${f.nacks} NACKs) · lost ${f.lost}`, f.lost ? 'warn' : '');
+}
+
+// This browser (browser.js) when it is older than the tested Chromium or
+// lacks what the tested Chromium has (its notice, the row's tooltip): the
+// overlay's row, with everything it lacks (also what the tested Chromium
+// lacks too, and RESET_STREAM_AT where the host says this connection did
+// not negotiate it). Not shown otherwise, so the overlay keeps its height.
+function browserRow(st, row) {
+  const b = S.browser;
+  if (!b?.notice) return null;
+  const lacks = b.gaps.map((g) => g.name);
+  if (st.resetStreamAt === false) lacks.push('RESET_STREAM_AT');
+  const r = row('Browser', `${b.info.label}${lacks.length ? ` · lacks ${lacks.join(', ')}` : ''}`, 'warn');
+  r.title = b.notice;
+  return r;
 }
 
 // What a lost frame costs in this generation (VideoConfig.recovery): reference
@@ -1418,6 +1437,7 @@ function exportLatency() {
     connection: S.conn, video: S.videoCfg, probe: d.probe, stages: d.stages,
     renderer: S.lastStats?.renderer || null, present: storedPresent(),
     input: S.lastStats?.input || null, clock: S.lastStats?.clock || null, gamepadPolling: pads.rate,
+    browser: S.browser ? { ...S.browser.info, gaps: S.browser.gaps, notice: S.browser.notice, resetStreamAt: S.lastStats?.resetStreamAt ?? null } : null,
   });
 }
 S.exportLatency = exportLatency;
@@ -1790,6 +1810,9 @@ async function boot() {
     return;
   }
   await me();
+  const info = browserInfo();
+  const gaps = browserGaps();
+  S.browser = { info, gaps, notice: browserNotice(info, gaps) };
   const [caps, hz] = await Promise.all([capabilities(), measureHz()]);
   window.__caps = caps;
   S.hz = hz;
@@ -1797,6 +1820,10 @@ async function boot() {
   const b = (ok, label) => el('span', { class: `badge ${ok ? 'good' : 'bad'}` }, `${ok ? '✓' : '✗'} ${label}`);
   box.append(b(caps.webtransport, 'WebTransport'), b(caps.webcodecs, 'WebCodecs'), b(caps.isolated, 'Lock-free audio'), b(caps.webgpu, 'WebGPU'), el('span', { class: 'badge' }, `${hz} Hz display`));
   for (const [f, v] of Object.entries(caps.codecs)) if (v) box.append(el('span', { class: `badge ${v === 'hw' ? 'good' : ''}` }, `${f.toUpperCase()} ${v.toUpperCase()}`));
+  // An old browser, or one without what the client uses (browser.js): said
+  // here, in the overlay and to the host's log.
+  box.append(el('span', { class: `badge ${S.browser.notice ? 'warn' : ''}`, id: 'browser-badge', title: S.browser.notice || undefined }, S.browser.info.label));
+  if (S.browser.notice) box.after(el('p', { class: 'browser-notice', id: 'browser-notice' }, S.browser.notice));
   if (!caps.webcodecs) {
     splash('Browser not supported', 'This browser lacks WebCodecs. Use a current Chrome, Edge, Firefox or Safari.', {});
     return;

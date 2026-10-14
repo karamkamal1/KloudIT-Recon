@@ -1,4 +1,5 @@
 import { api, me, el, toast, capabilities, setCSRF } from './api.js';
+import { browserInfo, browserGaps, browserNotice } from './browser.js';
 
 const $ = (id) => document.getElementById(id);
 let user = null;
@@ -267,6 +268,12 @@ async function showCaps() {
   for (const [fam, v] of Object.entries(c.codecs)) {
     box.append(el('span', { class: `badge ${v === 'hw' ? 'good' : v ? '' : 'bad'}` }, `${fam.toUpperCase()} ${v === 'hw' ? 'HW' : v === 'sw' ? 'SW' : '✗'}`));
   }
+  // An old browser, or one without what the client uses (browser.js).
+  const info = browserInfo();
+  const gaps = browserGaps();
+  const notice = browserNotice(info, gaps);
+  box.append(el('span', { class: `badge ${notice ? 'warn' : ''}`, id: 'browser-badge', title: gaps.map((g) => `${g.name}: ${g.why}`).join('\n') || undefined }, info.label));
+  if (notice) box.append(el('p', { class: 'browser-notice', id: 'browser-notice' }, notice));
 }
 
 async function init() {

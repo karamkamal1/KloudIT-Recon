@@ -55,7 +55,7 @@
 // an HDR display: a 10-bit PQ AV1 stream presented with extended range,
 // checked to the pixel, then HDR Off live (tone-mapped, then an SDR stream).
 // E2E_ONLY=<regex> runs the scenarios and sections whose names match
-// (development).
+// (development). E2E_CHROMIUM=<path> runs them in another Chromium build.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -72,6 +72,11 @@ const { chromium } = pw.default || pw;
 
 const results = [];
 const outDir = process.env.E2E_OUT || join(root, 'test', 'e2e', 'results');
+// E2E_CHROMIUM=<path>: another Chromium build for the scenarios' browsers,
+// e.g. Chrome for Testing 122 (the second hardware run's client) to check
+// that nothing breaks there (docs/VENDOR_NOTES.md, "Second hardware run:
+// browser presentation and input latency").
+const chromiumPath = process.env.E2E_CHROMIUM || undefined;
 mkdirSync(outDir, { recursive: true });
 
 function freePort() {
@@ -862,7 +867,7 @@ async function headedPage() {
   if (spawnSync('sh', ['-c', 'command -v Xvfb']).status !== 0) return null;
   const disp = await startXvfb('1920x1080x24');
   const b = await chromium.launch({
-    headless: false, env: { ...process.env, DISPLAY: disp },
+    headless: false, env: { ...process.env, DISPLAY: disp }, executablePath: chromiumPath,
     args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
   });
   const c = await b.newContext({ ignoreHTTPSErrors: true, viewport: HEADED_VIEWPORT, deviceScaleFactor: HEADED_DPR, storageState: await ctx.storageState() });
@@ -2739,6 +2744,66 @@ async function checkDrawerKeyboard() {
         `section titles ${desc.contrast.toFixed(1)}:1`);
   } finally {
     await endStream();
+  }
+}
+
+// The old-browser notice (second hardware run: the owner's Chrome 122,
+// browser.js). Chrome 122 lacks two of the features the client uses that
+// the tested Chromium has, found by running Chrome for Testing 122 against
+// it: getContextAttributes on the 2D canvas of an OffscreenCanvas (whether
+// it got low-latency presentation) and GPUCanvasContext.getConfiguration
+// (HDR10). Played in a second context with Chrome 122's user agent and
+// those two members removed from the page (the worker keeps its own; its
+// gaps are the page's, which it reports): the dashboard's "This browser"
+// card and the stream page's splash say how old it is, what it lacks and to
+// update it; the overlay has a Browser row; the host logs the browser and
+// what it lacks with the input latency. The browser the test runs (Chromium
+// 141, or E2E_CHROMIUM's) shows the notice only where it is older.
+const CHROME_122_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.128 Safari/537.36';
+async function checkOldBrowser() {
+  await page.goto(`${base}/`);
+  await page.waitForSelector('#browser-badge', { timeout: 10000 });
+  const own = await page.evaluate(() => ({ badge: document.getElementById('browser-badge')?.textContent, notice: document.getElementById('browser-notice')?.textContent || null }));
+  const major = +(/(\d+)/.exec(browser.version()) || [])[1];
+  check(`old browser: the dashboard names this browser (${browser.version()}) and gives the notice only where it is older than Chromium 141`,
+    own.badge === `Chrome ${major}` && (major < 141 ? /versions older than Chromium 141.*Update Chrome for lower latency/.test(own.notice || '') : own.notice === null),
+    JSON.stringify(own));
+  const old = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 }, userAgent: CHROME_122_UA, storageState: await ctx.storageState() });
+  await old.addInitScript(() => {
+    delete OffscreenCanvasRenderingContext2D.prototype.getContextAttributes;
+    if (typeof GPUCanvasContext === 'function') delete GPUCanvasContext.prototype.getConfiguration;
+  });
+  const p = await old.newPage();
+  p.on('console', onConsole.bind(p));
+  p.on('pageerror', onPageError);
+  p.on('worker', instrumentWorker);
+  const hostProc = procs.find((x) => x.spawnargs.includes('run') && x.exitCode === null);
+  const mainPage = page;
+  page = p;
+  try {
+    await p.goto(`${base}/`);
+    await p.waitForSelector('#browser-notice', { timeout: 10000 });
+    const dash = await p.evaluate(() => ({ badge: document.getElementById('browser-badge')?.textContent, cls: document.getElementById('browser-badge')?.className, notice: document.getElementById('browser-notice')?.textContent }));
+    const want = /^Chrome 122 is \d+ versions older than Chromium 141, which this client is tested with; it lacks the 2D canvas's low-latency report \(getContextAttributes in the worker\)(, HDR canvas output \(GPUCanvasContext\.getConfiguration\))?\. Update Chrome for lower latency\.$/;
+    check('old browser (Chrome 122 emulated): the dashboard says how old it is, what it lacks of what the client uses and to update it',
+      dash.badge === 'Chrome 122' && /warn/.test(dash.cls) && want.test(dash.notice || ''), JSON.stringify(dash));
+    const log0 = hostProc.log.length;
+    await p.evaluate((pr) => localStorage.setItem('recon.prefs.v1', JSON.stringify(pr)), { stats: true, ...PREFS_2D, path: 'auto', transport: 'auto' });
+    await p.click('.host.online a.btn-primary');
+    await p.waitForSelector('#btn-start:not(.hidden)', { timeout: 15000 });
+    const splash = await p.evaluate(() => document.getElementById('browser-notice')?.textContent || '');
+    await p.click('#btn-start');
+    await p.waitForFunction(() => window.__recon && window.__recon.streaming, null, { timeout: 30000 });
+    const st = await until(() => p.evaluate(() => (window.__recon.lastStats?.clock ? window.__recon.lastStats : null)), 10000, 'stats');
+    await sleep(600); // an overlay update
+    const overlay = await p.evaluate(() => [...document.querySelectorAll('#stats-body .row')].map((r) => r.textContent).find((t) => t.startsWith('Browser')) || '');
+    const line = await until(() => (hostProc.log.slice(log0).match(/msg="input latency[^\n]*/) || [])[0], 15000, 'the input latency line').catch(() => '');
+    check('old browser (Chrome 122 emulated): the splash and the overlay say so; the host logs the browser and what it lacks',
+      want.test(splash) && /^BrowserChrome 122 · lacks .*low-latency report/.test(overlay) && / browser="Chrome 122"/.test(line) && /browser_lacks=\S*canvas2d-attributes/.test(line),
+      `splash: ${splash.slice(0, 60)}…; overlay: ${overlay}; host: ${line.replace(/^.*?msg=/, '').slice(0, 260)}; reset_stream_at here ${st?.resetStreamAt}`);
+  } finally {
+    page = mainPage;
+    await old.close().catch(() => {});
   }
 }
 
@@ -4676,7 +4741,7 @@ await until(() => existsSync(join(dir, 'gw', 'setup-token.txt')), 10000, 'gatewa
 const setupToken = readFileSync(join(dir, 'gw', 'setup-token.txt'), 'utf8').trim();
 
 const browser = await chromium.launch({
-  headless: true,
+  headless: true, executablePath: chromiumPath,
   args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
 });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
@@ -5099,6 +5164,7 @@ try {
       check('overlay "Export latency data" downloads the probe histogram as JSON (with the input latency, the clock sync and the browser)',
         exp?.kind === 'kloudit-recon-latency' && exp.probe?.mode === 'seq' && expHist >= (pr?.latency?.n || 1) &&
           exp.probe.samples?.length === expHist && !!exp.stages?.e2e && exp.video?.encoder === cfg?.encoder &&
+          /^Chrome \d+$/.test(exp.browser?.label || '') &&
           !!exp.input?.mouse && exp.clock?.boundMs >= 0,
         exp ? `${dl.suggestedFilename()}: ${expHist} histogram samples, ${exp.probe.samples?.length} sample rows, stages ${!!exp.stages}, ` +
           `input ${Object.keys(exp.input || {}).join('/') || 'none'}, clock ${JSON.stringify(exp.clock)}, browser ${exp.browser?.label}` : 'no download');
@@ -5158,6 +5224,7 @@ try {
   if (want('webgl2 context lost')) await checkPickedPathLost('webgl2').catch((e) => check('WebGL2 context lost scenario', false, e.message));
   await closeHeaded();
   if (want('stale stored pick')) await checkStoredPickStale().catch((e) => check('renderer auto: stale stored pick scenario', false, e.message));
+  if (want('old browser')) await checkOldBrowser().catch((e) => check('old browser scenario', false, e.message));
 
   if (want('udp relay host blocked')) await checkUdpRelayHostBlocked().catch((e) => check('UDP relay, host cannot bind', false, e.message));
   if (want('udp relay reconnects')) await checkUdpRelayReconnects().catch((e) => check('UDP relay reconnects scenario', false, e.message));
