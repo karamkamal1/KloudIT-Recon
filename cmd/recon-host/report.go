@@ -17,7 +17,7 @@ import (
 // and says where. It has no tokens, keys or passwords.
 func reportCmd(cfgPath string, args []string) int {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
-	out := fs.String("o", "", "the report file (default: recon-report-<PC>-<time>.txt on your desktop, else here)")
+	out := fs.String("o", "", "the report file (default: recon-report-<PC>-<time>.txt on your desktop, else in the temporary folder)")
 	lines := fs.Int("lines", 400, "how many of host.log's last lines")
 	hostLog := fs.String("hostlog", "", "the agent's log (default: the one the logon task writes, %ProgramData%\\KlouditRecon\\<user>\\host.log)")
 	quick := fs.Bool("quick", false, "leave out the probe (FFmpeg, encoders, helper, direct path, CPU measurement: up to a minute)")
@@ -71,14 +71,24 @@ func defaultHostLog() string {
 	return ""
 }
 
-// reportDir is the user's desktop where there is one, else the current
-// directory.
+// reportDir is the user's desktop where there is one (desktopDir: on
+// Windows the Desktop known folder, which OneDrive's backup moves to
+// OneDrive\Desktop; %USERPROFILE%\Desktop then is not the one shown), else
+// the temporary folder: not the current directory, which in an elevated
+// PowerShell is C:\Windows\System32. The report says the full path.
 func reportDir() string {
-	if home, err := os.UserHomeDir(); err == nil {
-		d := filepath.Join(home, "Desktop")
+	for _, d := range desktopDirs() {
 		if st, err := os.Stat(d); err == nil && st.IsDir() {
 			return d
 		}
 	}
-	return "."
+	return os.TempDir()
+}
+
+// homeDesktop is the home folder's Desktop, where there is a home folder.
+func homeDesktop() []string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return []string{filepath.Join(home, "Desktop")}
+	}
+	return nil
 }
