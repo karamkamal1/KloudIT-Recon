@@ -16,10 +16,19 @@
 // (recon-host draws the cursor on the client; GUIDE 3.2).
 //
 // DXGI_ERROR_ACCESS_LOST (mode change, full-screen switch, desktop switch),
-// E_ACCESSDENIED (secure desktop) and a stale DXGI factory recreate the
-// duplication every 250 ms until it works again; meanwhile the last image is
-// repeated, recon-host gets captureChanged "lost" / "restored", and a new size
-// or rotation gives "resized" (the stream keeps its encoded size, scaled).
+// E_ACCESSDENIED (secure desktop), a failing ReleaseFrame and a stale DXGI
+// factory recreate the duplication at once, and while that fails again after
+// 16, 32, 64, 128 and then every 250 ms; meanwhile the last image is
+// repeated. A game switching between full-screen and composed presentation
+// loses the duplication that way (15 times in the second hardware run), and
+// duplicating again took 10-60 ms there: only a loss that the first new
+// duplication does not end gives recon-host captureChanged "lost" (and then
+// "restored"), which it shows to the user; every loss logs how long the
+// capture was without an image ("dda: ... lost ..., first image N ms
+// later"). DuplicateOutput is tried on the output object the duplication had
+// while the DXGI factory is current (a full-screen switch changes no output)
+// and on the output found again by name otherwise. A new size or rotation
+// gives "resized" (the stream keeps its encoded size, scaled).
 // Turning Windows HDR on or off for the output also recreates the
 // duplication; it gives captureChanged "hdr".
 //
@@ -68,7 +77,8 @@ namespace {
 
 using d3d::ComPtr;
 
-constexpr int kRetryMs = 250;
+constexpr int kRetryMs = 250;        // longest wait between attempts to duplicate again
+constexpr int kFirstRetryMs = 16;    // the first wait after a failed attempt, doubled up to kRetryMs
 constexpr UINT kAcquireSliceMs = 2;  // longest single AcquireNextFrame wait (holds the device lock)
 constexpr int kLockGapUs = 500;      // pause between slices, outside the device lock
 
@@ -126,8 +136,13 @@ private:
 
     Status duplicate();
     Status reacquire();
-    void releaseHeld();
-    void lose(const std::string& why, bool report = true);
+    // Releases the acquired frame; its result (DXGI_ERROR_INVALID_CALL, "the
+    // frame was already released", counts as success, as in Sunshine
+    // display_base.cpp release_frame).
+    HRESULT releaseHeld();
+    // The duplication is gone (why): duplicate again at once. Reported to
+    // recon-host only when that does not work (acquire).
+    void lose(const std::string& why);
     Status copyIn(ID3D11Texture2D* tex);
     float dirtyShare(const DXGI_OUTDUPL_FRAME_INFO& fi, uint32_t w, uint32_t h);
 
@@ -139,7 +154,13 @@ private:
     ComPtr<IDXGIOutputDuplication> dup_;
     bool held_ = false;   // an acquired frame is not released yet
     bool first_ = true;   // first frame of a duplication: taken even without LastPresentTime
-    bool lost_ = false;
+    // A loss in progress: since when (QPC, 0 = none), why, whether recon-host
+    // was told (captureChanged "lost"), failed attempts to duplicate again,
+    // and when the duplication worked again (0 = not yet).
+    int64_t lostSince_ = 0, restoredAt_ = 0;
+    std::string lostWhy_;
+    bool lostReported_ = false;
+    int retries_ = 0;
     int64_t nextRetry_ = 0;
     int64_t lastProtectedWarn_ = 0;
     int rotation_ = 0;
@@ -218,53 +239,61 @@ Status DdaCapture::duplicate() {
     return Status::Ok();
 }
 
-void DdaCapture::releaseHeld() {
+HRESULT DdaCapture::releaseHeld() {
+    HRESULT hr = S_OK;
     if (held_ && dup_) {
         std::lock_guard<d3d::DxgiGate> gate(d3d::dxgiGate());
-        dup_->ReleaseFrame();
+        hr = dup_->ReleaseFrame();
     }
     held_ = false;
+    return hr == DXGI_ERROR_INVALID_CALL ? S_OK : hr;
 }
 
-void DdaCapture::lose(const std::string& why, bool report) {
+void DdaCapture::lose(const std::string& why) {
     releaseHeld();
     dup_.Reset();
-    nextRetry_ = qpcNow();  // retry at once, then every kRetryMs
-    if (report && !lost_) {
-        lost_ = true;
-        CaptureEvent ev;
-        ev.reason = "lost";
-        ev.width = int(dispW_), ev.height = int(dispH_), ev.rotation = rotation_;
-        ev.hdr = color_.hdr;
-        ev.text = why;
-        postEvent(ev);
+    nextRetry_ = qpcNow();  // retry at once, then after kFirstRetryMs, doubling up to kRetryMs
+    if (!lostSince_) {
+        lostSince_ = nextRetry_;
+        lostWhy_ = why;
+        retries_ = 0;
+        restoredAt_ = 0;
     }
 }
 
 Status DdaCapture::reacquire() {
-    if (!factory_ || !factory_->IsCurrent()) {
-        factory_.Reset();
-        CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory_.GetAddressOf()));
-    }
-    // The output object can be stale after a mode change: look it up again by
-    // name, on the adapter our device lives on.
-    d3d::OutputRef ref;
-    Status s = d3d::findOutput(output_.adapterInfo.luidValue, output_.deviceName, ref);
-    if (!s.ok) return s;
-    output_.output = ref.output;
-    output_.desc = ref.desc;
     const uint32_t oldW = dispW_, oldH = dispH_;
     const int oldRot = rotation_;
     const bool oldHdr = color_.hdr;
-    s = duplicate();
-    if (!s.ok) return s;
+    // While the factory is current no display configuration changed (a game
+    // switching between full screen and the compositor changes none): the
+    // output object is still good, and finding it again (a new factory, every
+    // adapter and output enumerated) is time the capture is without images.
+    Status s = factory_ && factory_->IsCurrent() ? duplicate() : Status::Error("init_failed", "display configuration changed");
+    if (!s.ok) {
+        if (!factory_ || !factory_->IsCurrent()) {
+            factory_.Reset();
+            CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory_.GetAddressOf()));
+        }
+        // The output object can be stale after a mode change: look it up
+        // again by name, on the adapter our device lives on.
+        d3d::OutputRef ref;
+        s = d3d::findOutput(output_.adapterInfo.luidValue, output_.deviceName, ref);
+        if (!s.ok) return s;
+        output_.output = ref.output;
+        output_.desc = ref.desc;
+        s = duplicate();
+        if (!s.ok) return s;
+    }
     CaptureEvent ev;
     ev.width = int(dispW_), ev.height = int(dispH_), ev.rotation = rotation_;
     ev.hdr = color_.hdr;
-    if (lost_) {
-        lost_ = false;
+    if (lostReported_) {
+        lostReported_ = false;
         ev.reason = "restored";
+        ev.text = "after " + std::to_string((qpcNow() - lostSince_) * 1000 / qpcFrequency()) + " ms";
         postEvent(ev);
+        ev.text.clear();
     }
     if (color_.hdr != oldHdr) {
         // The stream keeps its format (top of file); recon-host may restart
@@ -365,7 +394,7 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
             // Display configuration changed (mode, HDR, outputs): re-find the
             // output and duplicate it again (DXGI recommends checking every
             // frame). Reported as lost only if that does not work at once.
-            lose("display configuration changed", false);
+            lose("display configuration changed");
         }
         if (!dup_) {
             if (now < nextRetry_) {
@@ -373,19 +402,39 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
                 sleepUntil(std::min(nextRetry_, deadline));
                 continue;
             }
+            const int64_t tried = qpcNow();
             Status s = reacquire();
             if (!s.ok) {
                 // A removed device cannot duplicate anything again: fatal now
                 // rather than retrying every kRetryMs for good.
                 if (d3d::deviceRemoved(dev_.device.Get(), "dda: " + s.text, err)) return Next::Error;
-                if (!lost_) lose(s.text);
-                nextRetry_ = qpcNow() + int64_t(kRetryMs) * freq / 1000;
-                logf(LogLevel::Debug, "dda: %s", s.text.c_str());
+                if (!lostSince_) lose(s.text);
+                if (!lostReported_) {
+                    // Not over at once: recon-host shows it to the user.
+                    lostReported_ = true;
+                    CaptureEvent ev;
+                    ev.reason = "lost";
+                    ev.width = int(dispW_), ev.height = int(dispH_), ev.rotation = rotation_;
+                    ev.hdr = color_.hdr;
+                    ev.text = lostWhy_ == s.text ? s.text : lostWhy_ + "; duplicating again: " + s.text;
+                    postEvent(ev);
+                }
+                const int wait = std::min(kRetryMs, kFirstRetryMs << std::min(retries_++, 4));
+                nextRetry_ = qpcNow() + int64_t(wait) * freq / 1000;
+                logf(LogLevel::Debug, "dda: %s (next attempt in %d ms)", s.text.c_str(), wait);
                 continue;
             }
-            logf(LogLevel::Info, "dda: duplicating %s again (%ux%u rotation %d)", output_.desc.name.c_str(), dispW_, dispH_, rotation_);
+            restoredAt_ = qpcNow();
+            logf(LogLevel::Info, "dda: duplicating %s again (%ux%u rotation %d): DuplicateOutput took %.1f ms, %d failed before",
+                 output_.desc.name.c_str(), dispW_, dispH_, rotation_, double(restoredAt_ - tried) * 1000 / double(freq), retries_);
         }
-        releaseHeld();
+        if (const HRESULT rh = releaseHeld(); FAILED(rh)) {
+            // The duplication is gone (ACCESS_LOST): duplicate again now
+            // rather than learn it from the next AcquireNextFrame.
+            if (d3d::deviceRemoved(dev_.device.Get(), "ReleaseFrame: " + d3d::hrText(rh), err)) return Next::Error;
+            lose("ReleaseFrame: " + d3d::hrText(rh));
+            continue;
+        }
         DXGI_OUTDUPL_FRAME_INFO fi{};
         ComPtr<IDXGIResource> res;
         // A short slice: AcquireNextFrame holds the device lock while it waits,
@@ -429,6 +478,16 @@ Next DdaCapture::acquire(int timeoutMs, Acquired& a, Status& err) {
         }
         const bool first = first_;
         first_ = false;
+        if (first && lostSince_) {
+            // The capture was without an image from the loss until now: what
+            // the stream misses (the last image is repeated meanwhile).
+            const int64_t since = now - lostSince_;
+            logf(LogLevel::Info, "dda: capture lost (%s), first image %.1f ms later (duplicating again: %.1f ms)", lostWhy_.c_str(),
+                 double(since) * 1000 / double(freq), double(restoredAt_ ? restoredAt_ - lostSince_ : since) * 1000 / double(freq));
+            lostSince_ = restoredAt_ = 0;
+            lostWhy_.clear();
+            retries_ = 0;
+        }
         ComPtr<ID3D11Texture2D> tex;
         if (FAILED(res.As(&tex))) {
             err = Status::Error("capture_failed", "the duplicated frame is not a D3D11 texture", true);

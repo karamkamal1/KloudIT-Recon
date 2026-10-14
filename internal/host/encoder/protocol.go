@@ -358,8 +358,11 @@ type HDRMetadata struct {
 // CaptureChanged reports a change of the capture source. Reason "resized":
 // new size or rotation (the stream keeps its encoded size, scaled; restart the
 // helper to follow); "lost": capture unavailable for now (secure desktop,
-// output gone, mode switch), the last image is repeated; "restored" (also the
-// first image after a "noimage"); "hdr": Windows HDR was turned on or off for
+// output gone, mode switch), the last image is repeated (DDA, since the
+// second hardware run: only a loss that duplicating the output again at once
+// did not end, so a game's switch into full screen, over in 10-60 ms, gives
+// none); "restored" (also the first image after a "noimage"; Text: how long
+// the loss lasted where known); "hdr": Windows HDR was turned on or off for
 // the output (HDR says which; the stream keeps its format, restart the helper
 // to follow); "noimage": the capture has handed out no image at all since the
 // start (2 s, then every 10 s while it lasts: a display that is off or asleep;
