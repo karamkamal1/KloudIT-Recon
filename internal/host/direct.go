@@ -670,7 +670,12 @@ func directHandshakeWhy(err error, after time.Duration) (why string, expected bo
 	case errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError():
 		return "the browser refused the PC's certificate: the hash the gateway gave it does not match (a gateway or agent " +
 			"older than the other) or its clock is outside the certificate's validity", false
-	case errors.As(err, &te) && te.Remote && te.ErrorCode == quic.NoError, errors.As(err, &ae) && ae.Remote:
+	// A close by the browser's application: quic.ApplicationError, or
+	// APPLICATION_ERROR when the browser sent it in Initial or Handshake
+	// packets (RFC 9000 10.2.3: it closed before it knew the PC had its
+	// Finished, also a handshake it completed and closed at once).
+	case errors.As(err, &te) && te.Remote && (te.ErrorCode == quic.NoError || te.ErrorCode == quic.ApplicationErrorErrorCode),
+		errors.As(err, &ae) && ae.Remote:
 		if after >= 2*time.Second {
 			// The client gives an address 2.5 s (DIRECT_TIMEOUT_MS);
 			// Chrome ends a handshake without answers after 4 s ("No

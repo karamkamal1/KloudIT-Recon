@@ -279,6 +279,9 @@ func TestDirectHandshakeWhy(t *testing.T) {
 		{&quic.IdleTimeoutError{}, 5 * time.Second, "never completed the handshake", false},
 		{&quic.TransportError{Remote: true, ErrorCode: quic.TransportErrorCode(0x100 + 42)}, 20 * time.Millisecond, "refused the PC's certificate", false},
 		{&quic.ApplicationError{Remote: true}, 30 * time.Millisecond, "another of the PC's addresses answered first", true},
+		// An application close in a Handshake packet (RFC 9000 10.2.3).
+		{&quic.TransportError{Remote: true, ErrorCode: quic.ApplicationErrorErrorCode}, 10 * time.Millisecond, "another of the PC's addresses answered first", true},
+		{&quic.TransportError{Remote: true, ErrorCode: quic.ApplicationErrorErrorCode}, 4 * time.Second, "gave up the handshake", false},
 		{&quic.TransportError{Remote: true, ErrorCode: quic.NoError}, 2600 * time.Millisecond, "gave up the handshake: the PC's answers did not reach it", false},
 		{&quic.TransportError{Remote: true, ErrorCode: quic.ProtocolViolation}, time.Second, "the browser closed it", false},
 	} {
