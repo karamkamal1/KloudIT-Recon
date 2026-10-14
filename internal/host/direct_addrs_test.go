@@ -243,8 +243,18 @@ func TestDirectHandshakeDiagnostics(t *testing.T) {
 		t.Fatalf("lost answers logged as %q", l)
 	}
 
-	// A connection the client completes and closes is no failure.
-	before := strings.Count(logs.String(), "failed in its handshake")
+	// A connection the client completes and closes is no failure (at most a
+	// Debug line where its close overtakes the handshake's completion).
+	infoFailures := func() int {
+		n := 0
+		for _, l := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(l, "level=INFO") && strings.Contains(l, "failed in its handshake") {
+				n++
+			}
+		}
+		return n
+	}
+	before := infoFailures()
 	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
 	c, err := quic.DialAddr(ctx, target.String(), accept, transport.QUICConfig())
 	cancel()
@@ -253,7 +263,7 @@ func TestDirectHandshakeDiagnostics(t *testing.T) {
 	}
 	c.CloseWithError(0, "")
 	time.Sleep(300 * time.Millisecond)
-	if n := strings.Count(logs.String(), "failed in its handshake"); n != before {
+	if n := infoFailures(); n != before {
 		t.Fatalf("a completed handshake was logged as failed:\n%s", logs.String())
 	}
 }

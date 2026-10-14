@@ -617,6 +617,11 @@ func (l *directHandshakeLog) accepted(c *quic.Conn) {
 		case <-c.HandshakeComplete():
 			hs.done.Store(true)
 		case <-c.Context().Done():
+			select {
+			case <-c.HandshakeComplete(): // completed, then closed at once
+				hs.done.Store(true)
+			default:
+			}
 		}
 	}()
 }
