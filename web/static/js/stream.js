@@ -103,6 +103,7 @@ const S = {
   present: null, // presentPlan() of this connection
   renderer: null, // the worker's active renderer (info)
   bakeoff: null, // this session's presentation bake-off result
+  hinted: false, // this connection's start-up toolbar and hints were shown (streamHints)
   present2D: false, // Auto's path failed while drawing: the 2D canvas for this page
   lost2D: null, // the path picked in the settings that kept losing its GPU device: the 2D canvas for this page
   presentLost: [], // when that path lost its device (onPresentLost)
@@ -473,6 +474,7 @@ async function connect() {
   if (S.present.stale) S.logs.push(`${new Date().toISOString()} presentation: Auto measures the renderers again: ${S.present.stale}`);
   S.renderer = null;
   S.bakeoff = null;
+  S.hinted = false;
   const canvases = stageCanvases(S.present.paths);
   // ?host=: the worker script's CSP allows this host's direct endpoint and
   // the relay ports (the gateway lists them only for the stream page and its
@@ -590,9 +592,11 @@ function onWorker(m) {
       if (!$('drawer').classList.contains('open')) S.surface.focus(); // (the settings, opened on the splash, keep it)
       // During the bake-off nothing covers the canvas (the toolbar has a
       // backdrop filter), so every path is measured alike: the start-up
-      // toolbar and hint come with its result.
+      // toolbar and hint come with its result, or once it waits for a
+      // steady stream (it measures after the toolbar has gone).
       if (S.present?.mode !== 'bakeoff') streamHints();
       break;
+    case 'bakeWaiting': streamHints(); break;
     case 'cursor': onCursorShape(m.shape); break;
     case 'cursorPos': onCursorPos(m); break;
     case 'notice':
@@ -626,6 +630,8 @@ function onWorker(m) {
 
 // Shown once the stream is up: the toolbar for a moment, the game-mode hint.
 function streamHints() {
+  if (S.hinted) return; // once per connection
+  S.hinted = true;
   showToolbar(3000);
   if (prefs.mouse === 'game') toast('Game mode: click the screen to capture the mouse (Esc releases it).', 'info', 5000);
 }
@@ -1293,7 +1299,8 @@ function presentRows(st, row) {
   const r = st.renderer;
   if (!r) return [row('Renderer', S.conn ? S.conn.renderer : '—')];
   const b = r.bake;
-  const how = r.mode === 'setting' ? 'setting' : b && !b.done ? `auto: measuring ${b.warming ? '(warm-up)' : b.waiting ? '(waiting for a steady stream)' : `${b.slot}/${b.slots}`}` : 'auto';
+  const how = r.mode === 'setting' ? 'setting' : b && !b.done
+    ? `auto: measuring ${b.warming ? '(warm-up)' : b.waiting ? `(waiting for a steady stream: ${b.waitFps} of ${b.expectFps} fps)` : `${b.slot}/${b.slots}`}` : 'auto';
   const rows = [
     row('Renderer', `${LABELS[r.name] || r.name}${r.name !== r.slot ? ` (${LABELS[r.slot] || r.slot} failed)` : ''} · ${how}`),
     row('  context', `${desyncText(r)} · canvas ${r.canvas[0]}×${r.canvas[1]}${r.drawErrors ? ` · ${r.drawErrors} errors` : ''}`, r.desynchronized === false || r.drawErrors ? 'warn' : ''),
@@ -1444,6 +1451,7 @@ function exportLatency() {
     browser: S.browser ? { ...S.browser.info, gaps: S.browser.gaps, notice: S.browser.notice, resetStreamAt: S.lastStats?.resetStreamAt ?? null } : null,
   });
 }
+    log: S.logs.slice(), // the client's log lines (the bake-off's wait and result, fullscreen, keyboard lock)
 S.exportLatency = exportLatency;
 // For the end-to-end test (test/e2e/browser.mjs): Renderer Auto's plan and its stored pick's handling.
 Object.assign(S, { presentPlan, presentRecheck, deviceKey });

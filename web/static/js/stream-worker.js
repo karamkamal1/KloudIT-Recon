@@ -16,7 +16,7 @@
 
 import * as P from './protocol.js';
 import { runSelfTests, helloDecoder } from './decoder-selftest.js';
-import { createRenderer, LABELS, PATHS, PICK, pickPath, Samples, withTimeout } from './renderers.js';
+import { createRenderer, LABELS, PATHS, PICK, pickPath, bakeStart, Samples, withTimeout } from './renderers.js';
 import { Pacer } from './pacing.js';
 import { FecReceiver } from './fec.js';
 import { HDR_CODECS, HDR_WHITE, hdrWhite, sourcePeak } from './hdr.js';
@@ -827,7 +827,7 @@ async function setupRenderers(msg) {
     const per = (v) => Object.fromEntries(order.map((p) => [p, v()]));
     pres.bake = {
       order, slot: 0, t0: 0, slotStart: 0, lastT: 0, recs: per(() => Array.from({ length: BAKE.rounds }, () => [])), dur: per(() => 0), errors: per(() => 0),
-      done: false, result: null, recent: [], started: 0, waitedMs: 0, steady: false,
+      done: false, result: null, recent: [], started: 0, waitedMs: 0, steady: false, fps: 0, waitSince: 0, gaveUp: false,
     };
     post('log', { text: `presentation bake-off: ${order.join(', ')}` });
   }
@@ -1091,7 +1091,8 @@ function onResize(w, h) {
 // and once the stream gives its frames (PICK.minShare of the stream's rate,
 // at most the display's refresh, drawn in the last BAKE.steadyMs; at most
 // BAKE.waitMs of waiting for that, then it measures all the same and a
-// short stream makes the pick provisional: pickPath), the paths take turns,
+// short stream makes the pick provisional: pickPath; renderers.js
+// bakeStart), the paths take turns,
 // A B C C B A (no path always measured first),
 // BAKE.slotMs of drawn frames each (the first BAKE.skipMs after a switch do
 // not count). Meanwhile display marks are taken as often as the main thread
@@ -1101,7 +1102,18 @@ function onResize(w, h) {
 // The main thread keeps everything off the canvas while this runs. The
 // result names the frame pacing mode(s) it ran in (step 4.4; the draw stage
 // does not depend on it, the display stage does, alike for every path).
-const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, steadyMs: 1000, waitMs: 15000 };
+//
+// A stream under bakeMinFps() (a still desktop: the PC repeats its last
+// picture ~10 times a second) gives no path enough samples: the bake-off
+// waits for it to move (a game, a video, the mouse) up to BAKE.giveUpMs,
+// then ends unmeasured. The main thread shows its start-up toolbar and
+// hints when the waiting begins ('bakeWaiting'), so measuring starts
+// BAKE.hintsMs after that at the earliest (the toolbar gone).
+const BAKE = { warmupMs: 2000, rounds: 2, slotMs: 1500, skipMs: 250, steadyMs: 1000, waitMs: 15000, giveUpMs: 60000, hintsMs: 3500 };
+
+// The least frame rate that gives every path PICK.minDraw samples, with a
+// quarter to spare (15 fps).
+const bakeMinFps = () => Math.ceil((1.25 * PICK.minDraw) / (BAKE.rounds * (BAKE.slotMs - BAKE.skipMs) / 1000));
 
 // The frame rate every path should draw (the stream's, at most one per
 // display refresh; 0: unknown).
@@ -1134,12 +1146,26 @@ function bakeTick(t, rec) {
     // A stream short of frames cannot tell the paths apart: wait for it.
     const expect = bakeExpectFps();
     const fps = (1000 * b.recent.length) / BAKE.steadyMs;
-    const steady = !expect || fps >= PICK.minShare * expect;
-    if (!steady && t - b.t0 < BAKE.warmupMs + BAKE.waitMs) return;
+    const waited = t - b.t0 - BAKE.warmupMs;
+    let how = bakeStart(fps, expect, bakeMinFps(), waited, BAKE);
+    b.fps = fps;
+    if (how !== 'steady' && !b.waitSince) {
+      b.waitSince = t;
+      post('bakeWaiting');
+    }
+    if (b.waitSince && t - b.waitSince < BAKE.hintsMs && how !== 'give up') how = 'wait';
+    if (how === 'wait') return;
+    b.waitedMs = Math.round(waited);
+    b.steady = how === 'steady';
+    const rate = `${fps.toFixed(0)} of ${Math.round(expect)} frames per second in the last ${BAKE.steadyMs} ms`;
+    if (how === 'give up') {
+      b.gaveUp = true;
+      post('log', { text: `presentation bake-off: not measured: the stream stayed under ${bakeMinFps()} frames per second for ${(b.waitedMs / 1000).toFixed(0)} s (${rate}; a still picture?)` });
+      bakeFinish();
+      return;
+    }
     b.started = t;
-    b.waitedMs = Math.round(t - b.t0 - BAKE.warmupMs);
-    b.steady = steady;
-    post('log', { text: `presentation bake-off: measuring after ${(b.waitedMs / 1000).toFixed(1)} s of waiting for a steady stream (${fps.toFixed(0)} of ${Math.round(expect)} frames per second in the last ${BAKE.steadyMs} ms${steady ? '' : ': still short, measured all the same'})` });
+    post('log', { text: `presentation bake-off: measuring after ${(b.waitedMs / 1000).toFixed(1)} s of waiting for a steady stream (${rate}${b.steady ? '' : ': still short, measured all the same'})` });
   }
   if (!b.slotStart) b.slotStart = t;
   if (rec && t - b.slotStart >= BAKE.skipMs && b.recs[path]) {
@@ -1188,8 +1214,8 @@ function bakeFinish() {
   const winner = pick.winner;
   const pacing = pacingOf(PATHS.flatMap((p) => b.recs[p]?.flat() || []));
   b.result = {
-    winner, why: pick.why, conclusive: pick.conclusive, results, pacing, waitedMs: b.waitedMs, steadyStart: b.steady,
-    rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), expectFps: +expectFps.toFixed(1), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs },
+    winner, why: pick.why, conclusive: pick.conclusive, results, pacing, waitedMs: b.waitedMs, steadyStart: b.steady, gaveUp: b.gaveUp,
+    rule: { ...PICK, refreshMs: +pres.refreshMs.toFixed(2), expectFps: +expectFps.toFixed(1), rounds: BAKE.rounds, slotMs: BAKE.slotMs, skipMs: BAKE.skipMs, minFps: bakeMinFps() },
   };
   const txt = (p) => {
     const x = results[p];
@@ -1203,6 +1229,7 @@ function bakeFinish() {
   pres.next = keep;
   pres.retire = pres.list.filter((r) => r !== keep);
   pres.list = [keep];
+  if (b.gaveUp) pick.why = `not measured: the stream stayed under ${bakeMinFps()} of ${Math.round(expectFps)} frames per second for ${Math.round(b.waitedMs / 1000)} s (a still picture?); Auto measures on the next connection`;
   pres.announce = true;
 }
 
@@ -1211,7 +1238,11 @@ function bakeState() {
   if (!b) return null;
   if (b.done) return { done: true, ...b.result };
   const warming = !b.t0 || now() - b.t0 < BAKE.warmupMs;
-  return { done: false, warming, waiting: !warming && !b.started, path: renderer?.name, slot: b.slot + 1, slots: b.order.length * BAKE.rounds, order: b.order };
+  const waiting = !warming && !b.started;
+  return {
+    done: false, warming, waiting, waitFps: waiting ? Math.round(b.fps) : null, expectFps: Math.round(bakeExpectFps()),
+    path: renderer?.name, slot: b.slot + 1, slots: b.order.length * BAKE.rounds, order: b.order,
+  };
 }
 
 // ---------------------------------------------------------------------------

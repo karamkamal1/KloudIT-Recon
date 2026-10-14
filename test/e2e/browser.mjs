@@ -534,8 +534,10 @@ async function checkBakeoff() {
     if (fps >= 10) pool = pool.filter((p) => res[p].fps >= rule.minShare * fps);
     const disp = Math.min(...pool.map((p) => res[p].display.p50));
     pool = pool.filter((p) => res[p].display.p50 <= disp + rule.refreshMs);
-    const notDesync = (p) => res[p].desynchronized === false || (p === 'webgpu' && res[p].desynchronized !== true);
-    if (pool.some((p) => res[p].desynchronized === true)) pool = pool.filter((p) => !notDesync(p));
+    // Desynchronized granted, then cannot report it (null), then not granted or no such mode (WebGPU).
+    const rank = (p) => (res[p].desynchronized === true ? 2 : p !== 'webgpu' && res[p].desynchronized == null ? 1 : 0);
+    const top = Math.max(...pool.map(rank));
+    pool = pool.filter((p) => rank(p) === top);
     const def = pool[0];
     const d = res[def]?.drawRounds || [];
     const clear = pool.filter((p) => p !== def && res[p].drawRounds.every((v, i) => v !== null && d[i] !== null && v + rule.marginMs < d[i]))
@@ -2271,23 +2273,46 @@ async function checkPickRule() {
       ['a starved stream, WebGL2 drew fewer frames: provisional', 'canvas2d', { webgl2: 'drops frames' }, {
         canvas2d: mk({ fps: 20 }), webgl2: mk({ fps: 12 }) }, { expectFps: 60, conclusive: false }],
       // Chrome 122 has no getContextAttributes on OffscreenCanvasRenderingContext2D: the 2D canvas cannot
-      // report desynchronized (null), which does not leave it out where WebGL2 reports it granted.
-      ["Chrome 122: the 2D canvas cannot report desynchronized, WebGL2 reports it, near tie: the 2D default stays", 'canvas2d', {}, {
+      // report desynchronized (null). Granted (true) before that, before not granted (false) or no such mode (WebGPU).
+      ["Chrome 122: the 2D canvas cannot report desynchronized, WebGL2 reports it granted, near tie: WebGL2", 'webgl2', {}, {
         canvas2d: mk({ desynchronized: null }), webgl2: mk({ draw: { p50: 0.4, n: 70 }, drawRounds: [0.4, 0.4] }), webgpu: mk({ desynchronized: null }) }],
       ["Chrome 122: WebGL2 desynchronized and 2 ms faster in both rounds than the 2D canvas that cannot report it", 'webgl2', {}, {
         canvas2d: mk({ desynchronized: null, draw: { p50: 2.6, n: 70 }, drawRounds: [2.6, 2.6] }), webgl2: mk({ draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
+      ["the owner's Chrome 122 numbers (first hardware run) on a stream at its rate: the 2D canvas, the one that may be desynchronized", 'canvas2d', {}, {
+        canvas2d: mk({ desynchronized: null, draw: { p50: 0.59, n: 180 }, display: { p50: 2.24, n: 180 }, drawRounds: [0.62, 0.55], fps: 60 }),
+        webgl2: mk({ desynchronized: false, draw: { p50: 0.24, n: 180 }, display: { p50: 2.25, n: 180 }, drawRounds: [0.27, 0.22], fps: 60 }),
+        webgpu: mk({ desynchronized: null, draw: { p50: 0.43, n: 180 }, display: { p50: 2.37, n: 180 }, drawRounds: [0.51, 0.38], fps: 60 }) }, { expectFps: 60 }],
+      ['Chrome 122: WebGL2 not desynchronized and 3 ms faster in both rounds than the 2D canvas that cannot report it: the 2D canvas', 'canvas2d', {}, {
+        canvas2d: mk({ desynchronized: null, draw: { p50: 3.6, n: 70 }, drawRounds: [3.6, 3.6] }), webgl2: mk({ desynchronized: false, draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
+      ['an updated Chrome on the owner\'s numbers: the 2D canvas reports desynchronized, WebGL2 not: the 2D canvas', 'canvas2d', {}, {
+        canvas2d: mk({ draw: { p50: 0.59, n: 180 }, drawRounds: [0.62, 0.55] }), webgl2: mk({ desynchronized: false, draw: { p50: 0.24, n: 180 }, drawRounds: [0.27, 0.22] }),
+        webgpu: mk({ desynchronized: null, draw: { p50: 0.43, n: 180 }, drawRounds: [0.51, 0.38] }) }],
       ['WebGPU (no low-latency mode) 2 ms faster than the desynchronized 2D canvas: the 2D canvas', 'canvas2d', {}, {
         canvas2d: mk({ draw: { p50: 2.6, n: 70 }, drawRounds: [2.6, 2.6] }), webgpu: mk({ desynchronized: null, draw: { p50: 0.6, n: 70 }, drawRounds: [0.6, 0.6] }) }],
     ];
-    return list.map(([name, want, out, res, o = {}]) => ({
-      name, want, out, conclusive: o.conclusive ?? want !== null, got: R.pickPath(res, 1000 / 60, R.PICK, o.expectFps || 0),
-    }));
+    // When the bake-off measures (bakeStart: fps of the last second, the stream's rate, the least that gives
+    // every path its samples (15), the time waited since the warm-up). The owner's still desktop: ~10 fps.
+    const starts = [
+      ['a stream at its rate', 60, 60, 0, 'steady'], ['48 of 60 fps (80 %)', 48, 60, 0, 'steady'], ['an unknown rate', 3, 0, 0, 'steady'],
+      ['30 of 60 fps for 10 s: wait', 30, 60, 10000, 'wait'], ['30 of 60 fps for 15 s: measure all the same', 30, 60, 15000, 'short'],
+      ["a still desktop (10 of 60 fps) for 20 s: wait for it to move", 10, 60, 20000, 'wait'], ['14 of 60 fps for 59 s: wait', 14, 60, 59000, 'wait'],
+      ['a still desktop for 60 s: not measured', 10, 60, 60000, 'give up'],
+    ].map(([name, fps, expect, waited, want]) => ({ name, want, got: R.bakeStart(fps, expect, 15, waited) }));
+    return {
+      picks: list.map(([name, want, out, res, o = {}]) => ({
+        name, want, out, conclusive: o.conclusive ?? want !== null, got: R.pickPath(res, 1000 / 60, R.PICK, o.expectFps || 0),
+      })),
+      starts,
+    };
   });
-  for (const c of cases) {
+  for (const c of cases.picks) {
     const outOK = Object.entries(c.out).every(([p, why]) => c.got.out[p] === why) && Object.keys(c.got.out).length === Object.keys(c.out).length;
     check(`Auto's pick (unit): ${c.name}`, c.got.winner === c.want && outOK && c.got.conclusive === c.conclusive,
       `${c.got.winner} (${c.got.why}); out ${JSON.stringify(c.got.out)}; conclusive ${c.got.conclusive}`);
   }
+  const bad = cases.starts.filter((c) => c.got !== c.want);
+  check(`Auto's bake-off start (unit): ${cases.starts.length} cases, a still desktop waited out, then not measured`, !bad.length,
+    cases.starts.map((c) => `${c.name}: ${c.got}${c.got !== c.want ? ` (want ${c.want})` : ''}`).join('; '));
 }
 
 // Frame pacing (step 4.4), live on a scenario's stream. The drawer's "Frame
