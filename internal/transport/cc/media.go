@@ -44,7 +44,18 @@ const (
 	// RecentMinRTT is the smallest RTT sample of the last recentRTTWindow,
 	// kept in rttBuckets parts (so it reaches back 1.5 to 2 s).
 	recentRTTWindow = 2 * time.Second
-	rttBuckets      = 4
+	// baseRTTWindow: the queue the path's packets meet (QueueDelay,
+	// standingQueue) is measured over the smallest RTT sample of the last
+	// 7.5 to 10 s: a queue that stands for a few seconds (a capacity drop
+	// the rate controller is answering) is not the path's base, as it is
+	// RecentMinRTT's after 2 s; a round trip that grows for good (a route
+	// change) is after 10 s.
+	baseRTTWindow = 10 * time.Second
+	// burstQueueSlot: the queue every packet acknowledged in the last
+	// burstQueueSlot to 2 x burstQueueSlot met (StandingQueue) is the
+	// quickest round trip of that time over the path's base.
+	burstQueueSlot = 50 * time.Millisecond
+	rttBuckets     = 4
 	// DeliveredAt's record of when done grew: ackLogSize entries, those
 	// less than ackLogResolution apart merged (at least 256 ms back).
 	ackLogSize       = 1024
@@ -103,6 +114,12 @@ type Media struct {
 	// loop only) and of the whole window (ns; 0: no sample yet).
 	rttMin       [rttBuckets]rttBucket
 	recentMinRTT atomic.Int64
+	rttBase      [rttBuckets]rttBucket // the same over baseRTTWindow
+	baseMinRTT   atomic.Int64
+	// qMin: the smallest RTT sample since the last QueueDelay (ns; 0: none).
+	qMin     atomic.Int64
+	qSlot    [2]rttBucket // the smallest RTT sample of the current and the last burstQueueSlot
+	standing atomic.Int64 // ns: standingQueue as of the last ACK (StandingQueue)
 
 	// WindowLimited: the time the window refused the sender before the
 	// current refusal (limitedTotal) and when that began (limitedSince; zero:
@@ -112,6 +129,8 @@ type Media struct {
 	limitedSince congestion.Time
 	limited      bool
 	now          func() congestion.Time
+	// epoch: the first time the run loop handed the controller (part).
+	epoch congestion.Time
 }
 
 type sentRecord struct {
@@ -125,7 +144,8 @@ type ackPoint struct {
 }
 
 // rttBucket is the smallest RTT sample of the n-th part of
-// recentRTTWindow/rttBuckets since the monotonic clock's start (0: none).
+// recentRTTWindow/rttBuckets since the controller's first timestamp (part)
+// (0: none).
 type rttBucket struct {
 	n   int64
 	min time.Duration
@@ -378,19 +398,98 @@ func (m *Media) rttSample(now congestion.Time, rtt time.Duration) {
 	if rtt <= 0 {
 		return
 	}
-	n := int64(now) / int64(recentRTTWindow/rttBuckets)
+	n := m.part(now, recentRTTWindow)
 	if b := &m.rttMin[n%rttBuckets]; b.n != n || b.min == 0 {
 		*b = rttBucket{n, rtt}
 	} else {
 		b.min = min(b.min, rtt)
 	}
+	m.recentMinRTT.Store(int64(bucketMin(&m.rttMin, n)))
+	n = m.part(now, baseRTTWindow)
+	if b := &m.rttBase[n%rttBuckets]; b.n != n || b.min == 0 {
+		*b = rttBucket{n, rtt}
+	} else {
+		b.min = min(b.min, rtt)
+	}
+	m.baseMinRTT.Store(int64(bucketMin(&m.rttBase, n)))
+	k := m.part(now, rttBuckets*burstQueueSlot)
+	if b := &m.qSlot[k%2]; b.n != k || b.min == 0 {
+		*b = rttBucket{k, rtt}
+	} else {
+		b.min = min(b.min, rtt)
+	}
+	m.standing.Store(int64(m.standingQueue(now)))
+	for {
+		q := m.qMin.Load()
+		if q != 0 && q <= int64(rtt) || m.qMin.CompareAndSwap(q, int64(rtt)) {
+			break
+		}
+	}
+}
+
+// bucketMin is the smallest sample of the parts of a window up to part n (0:
+// none).
+func bucketMin(bs *[rttBuckets]rttBucket, n int64) time.Duration {
 	var low time.Duration
-	for _, b := range m.rttMin {
+	for _, b := range bs {
 		if b.min > 0 && b.n > n-rttBuckets && (low == 0 || b.min < low) {
 			low = b.min
 		}
 	}
-	m.recentMinRTT.Store(int64(low))
+	return low
+}
+
+// QueueDelay returns how much longer than the path's base round trip (the
+// smallest of the last 7.5 to 10 s: baseRTTWindow) the quickest round trip
+// of the packets acknowledged since the last call took (false: none was
+// acknowledged). That excess is a queue
+// every one of those packets met on the path, either way, measured by the
+// host's own clock from each packet's sending to its ACK: unlike the
+// receiver's one-way delays it holds nothing of the host's wait before
+// sending (its frame queue, the pacer, a send loop running late) nor of the
+// receiving application's (a browser's worker busy elsewhere: the network
+// stack acknowledges on its own), and no clock offset. One caller: the
+// rate controller, once per receive report.
+func (m *Media) QueueDelay() (time.Duration, bool) {
+	q := m.qMin.Swap(0)
+	if q == 0 {
+		return 0, false
+	}
+	return max(0, time.Duration(q)-time.Duration(m.baseMinRTT.Load())), true
+}
+
+// StandingQueue is the queue every packet acknowledged in the last 50 to
+// 100 ms met on the path (standingQueue, as of the last ACK; any
+// goroutine).
+func (m *Media) StandingQueue() time.Duration { return time.Duration(m.standing.Load()) }
+
+// standingQueue is how much longer than the path's base round trip
+// (baseRTTWindow) the quickest round trip of the packets acknowledged in the
+// current and the last burstQueueSlot took (0: none acknowledged). Run loop
+// only.
+func (m *Media) standingQueue(now congestion.Time) time.Duration {
+	n := m.part(now, rttBuckets*burstQueueSlot)
+	var low time.Duration
+	for _, b := range m.qSlot {
+		if b.min > 0 && b.n >= n-1 && (low == 0 || b.min < low) {
+			low = b.min
+		}
+	}
+	if low == 0 {
+		return 0
+	}
+	return max(0, low-time.Duration(m.baseMinRTT.Load()))
+}
+
+// part is the number of the part of window/rttBuckets now is in, counted
+// from the first time the run loop handed the controller: the parts' edges
+// do not depend on the monotonic clock's origin (a simulation's runs on
+// their own clocks repeat). Run loop only.
+func (m *Media) part(now congestion.Time, window time.Duration) int64 {
+	if m.epoch.IsZero() {
+		m.epoch = now
+	}
+	return int64(now.Sub(m.epoch) / (window / rttBuckets))
 }
 
 func (m *Media) OnPacketAcked(pn congestion.PacketNumber, ackedBytes, _ congestion.ByteCount, eventTime congestion.Time) {
