@@ -82,6 +82,10 @@ func writeDiagnostics(ctx context.Context, o DiagnosticsOptions, w io.Writer) {
 		default:
 			fmt.Fprintf(w, "the desktop is away (%s): streams wait for it\n", why)
 		}
+		if o.Config != nil {
+			move, why := (&Agent{cfg: o.Config}).consoleMove()
+			fmt.Fprintf(w, "a session a remote desktop client left disconnected is moved to the console: %v (%s)\n", move, why)
+		}
 	} else {
 		fmt.Fprintln(w, "not Windows: no session state")
 	}

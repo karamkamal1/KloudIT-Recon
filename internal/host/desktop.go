@@ -3,6 +3,7 @@ package host
 import (
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,14 +25,28 @@ import (
 // the video restarts as soon as the desktop is back. A disconnected session
 // is moved to the console first (host config "consoleSession": as "tscon
 // <session> /dest:console" does, when nobody else is signed in there), which
-// gives it the console's display, unlocked.
+// gives it the console's display, unlocked: by default ("auto") only on a
+// virtual machine or a PC without a GPU, whose console only the
+// hypervisor's users see, not on a PC whose own monitor would show the
+// unlocked desktop ("on" moves it there too); only while the stream plays
+// (not while the client is hidden), and only after consoleLooks looks in a
+// row found it disconnected (not a moment of an RDP client taking the
+// session over).
 
-// desktopState is platform.DesktopState and connectConsole
-// platform.ConnectToConsole (tests replace them).
+// desktopState is platform.DesktopState, connectConsole
+// platform.ConnectToConsole and osInfo platform.OSInfo (tests replace them).
 var (
 	desktopState   = platform.DesktopState
 	connectConsole = platform.ConnectToConsole
+	osInfo         = platform.OSInfo
 )
+
+// consoleOn: host config "consoleSession" "on" (also on a PC with a GPU).
+const consoleOn = "on"
+
+// consoleLooks is how many looks in a row (desktopEvery apart) must find
+// the session disconnected before it is moved to the console.
+var consoleLooks = 2
 
 // watchDesktops: sessions look at their desktop (Windows; tests set it).
 var watchDesktops = runtime.GOOS == "windows"
@@ -64,12 +79,46 @@ type deskState struct {
 	consoleAt  time.Time // when a move to the console was last tried
 	consoleErr string    // why it failed ("": it worked, or none was tried)
 	watching   bool      // watchDesktop runs
+	discLooks  int       // looks in a row that found the session disconnected
 }
 
-// consoleSession reports whether a session left disconnected by a remote
-// desktop client is moved to the console: host config "consoleSession"
-// auto ("" = auto), not off.
-func (c *Config) consoleSession() bool { return c != nil && c.ConsoleSession != settingOff }
+// consoleMove reports whether a session left disconnected by a remote
+// desktop client is moved to the console, and why (or why not): host
+// config "consoleSession" "on"; "auto" ("" = auto) on a virtual machine (the
+// firmware names a hypervisor) or a PC without a GPU, whose console only
+// the hypervisor's users see; never with "off". A PC with a GPU is not a VM
+// as far as "auto" knows (a VM with a passthrough GPU whose firmware names
+// no hypervisor: set "on").
+func (a *Agent) consoleMove() (bool, string) {
+	switch a.cfg.ConsoleSession {
+	case settingOff:
+		return false, `host config "consoleSession" is "off"`
+	case consoleOn:
+		return true, `host config "consoleSession" is "on"`
+	}
+	if _, machine := osInfo(); virtualMachine(machine) {
+		return true, "a virtual machine (" + machine + ")"
+	}
+	if why := a.noGPU(); why != "" {
+		return true, "a PC without a GPU"
+	}
+	return false, `on a PC with a GPU its own monitor would show the unlocked desktop; host config "consoleSession" "on" allows it`
+}
+
+// virtualMachine reports whether the firmware's machine name (OSInfo) is a
+// hypervisor's: QEMU/KVM (Proxmox: "QEMU Standard PC (Q35 + ICH9, 2009)"),
+// Hyper-V ("Microsoft Corporation Virtual Machine"), VMware, VirtualBox,
+// Xen, Parallels, bhyve.
+func virtualMachine(machine string) bool {
+	m := strings.ToLower(machine)
+	for _, h := range []string{"qemu", "kvm", "virtual machine", "vmware", "virtualbox", "innotek", "xen", "parallels", "bochs",
+		"bhyve", "proxmox", "standard pc ("} {
+		if strings.Contains(m, h) {
+			return true
+		}
+	}
+	return false
+}
 
 // desktopNow reads the session's desktop and returns why it is away ("" when
 // it is there, or for captures of no Windows desktop: the test pattern,
@@ -89,16 +138,24 @@ func desktopAttrs(d platform.Desktop) []any {
 }
 
 // prepareDesktop runs before the session's first generation: a session
-// that a remote desktop client left disconnected is moved to the console
-// (toConsole), and the start waits up to consoleSettle for its desktop, so
-// the first generation has one to capture.
+// that a remote desktop client left disconnected (on consoleLooks looks,
+// desktopEvery apart) is moved to the console (toConsole), and the start
+// waits up to consoleSettle for its desktop, so the first generation has
+// one to capture.
 func (s *Session) prepareDesktop() {
 	why, d := s.desktopNow()
 	if why == "" {
 		return
 	}
 	s.log.Info("no desktop on a screen at the session's start", append([]any{"reason", why}, desktopAttrs(d)...)...)
-	if why != platform.DesktopDisconnected || !s.toConsole(d) {
+	if move, _ := s.a.consoleMove(); why != platform.DesktopDisconnected || !move {
+		return
+	}
+	for i := 1; i < consoleLooks && why == platform.DesktopDisconnected; i++ {
+		time.Sleep(desktopEvery)
+		why, d = s.desktopNow()
+	}
+	if why != platform.DesktopDisconnected || s.paused.Load() || !s.toConsole(d) {
 		return
 	}
 	for end := time.Now().Add(consoleSettle); time.Now().Before(end) && s.ctx.Err() == nil; {
@@ -109,11 +166,11 @@ func (s *Session) prepareDesktop() {
 	}
 }
 
-// toConsole moves the session to the console (connectConsole) where the
-// host config allows it and no move was tried within consoleRetry, and
+// toConsole moves the session to the console (connectConsole) where
+// consoleMove allows it and no move was tried within consoleRetry, and
 // reports whether it did.
 func (s *Session) toConsole(d platform.Desktop) bool {
-	if !s.a.cfg.consoleSession() {
+	if move, _ := s.a.consoleMove(); !move {
 		return false
 	}
 	s.desk.mu.Lock()
@@ -134,18 +191,31 @@ func (s *Session) toConsole(d platform.Desktop) bool {
 		s.log.Warn("cannot move the disconnected session to the console", append([]any{"err", err}, desktopAttrs(d)...)...)
 		return false
 	}
-	s.log.Info("moved the disconnected session to the console (as tscon <session> /dest:console)", desktopAttrs(d)...)
+	_, why := s.a.consoleMove()
+	s.log.Warn("moved the disconnected session to the console (as tscon <session> /dest:console): the console shows it unlocked",
+		append([]any{"because", why}, desktopAttrs(d)...)...)
 	s.notice("info", fmt.Sprintf("This PC's Windows session was disconnected (a remote desktop client closed): it was moved to the PC's console "+
-		"(session %d) to stream it.", d.Session))
+		"(session %d) to stream it, where it shows unlocked (on a VM: in the hypervisor's console).", d.Session))
 	return true
+}
+
+// consolePending reports whether a disconnected session is to be moved to
+// the console (consoleMove allows it and no move failed): its notice waits
+// for the move, which watchDesktop makes while the stream plays once
+// consoleLooks looks in a row found it disconnected, or for its failure.
+func (s *Session) consolePending() bool {
+	move, _ := s.a.consoleMove()
+	s.desk.mu.Lock()
+	defer s.desk.mu.Unlock()
+	return move && s.desk.consoleErr == ""
 }
 
 // watchDesktop looks at the session's desktop every desktopEvery until the
 // session ends (one per session, Windows): it logs when the desktop goes
 // away and comes back, tells the user why it is away (desktopNotice), moves
-// a disconnected session to the console (toConsole), and restarts the video
-// once the desktop is back where a generation failed meanwhile
-// (awaitDesktop).
+// a disconnected session to the console (toConsole: while the stream plays,
+// after consoleLooks looks in a row), and restarts the video once the
+// desktop is back where a generation failed meanwhile (awaitDesktop).
 func (s *Session) watchDesktop() {
 	s.desk.mu.Lock()
 	if s.desk.watching {
@@ -184,6 +254,12 @@ func (s *Session) lookAtDesktop() {
 	if why == "" {
 		s.desk.waiting, s.desk.noted = false, ""
 	}
+	if why == platform.DesktopDisconnected {
+		s.desk.discLooks++
+	} else {
+		s.desk.discLooks = 0
+	}
+	looks := s.desk.discLooks
 	s.desk.mu.Unlock()
 	switch {
 	case why != "" && why != prev:
@@ -192,10 +268,12 @@ func (s *Session) lookAtDesktop() {
 		s.log.Info("the session's desktop is back", "was", prev, "waiting", waiting)
 	}
 	if why != "" {
-		if why == platform.DesktopDisconnected && s.toConsole(d) {
+		if why == platform.DesktopDisconnected && !s.paused.Load() && looks >= consoleLooks && s.toConsole(d) {
 			return // the next look sees whether it came back
 		}
-		s.desktopNotice(why, d)
+		if why != platform.DesktopDisconnected || !s.consolePending() {
+			s.desktopNotice(why, d)
+		}
 		if !retry || s.ctx.Err() != nil || s.paused.Load() {
 			return
 		}
@@ -239,8 +317,8 @@ func (s *Session) awaitDesktop(ev media.VideoEvent) bool {
 	s.desk.mu.Unlock()
 	s.log.Info("video waits for the session's desktop", append([]any{"reason", why, "failed", ev.Err}, desktopAttrs(d)...)...)
 	s.watchDesktop() // where the session start did not (tests)
-	if why == platform.DesktopDisconnected && s.toConsole(d) {
-		return true
+	if why == platform.DesktopDisconnected && s.consolePending() {
+		return true // watchDesktop moves it to the console (or says why it could not)
 	}
 	s.desktopNotice(why, d)
 	return true
@@ -269,9 +347,9 @@ func (s *Session) desktopNotice(why string, d platform.Desktop) {
 	case platform.DesktopDisconnected:
 		msg = fmt.Sprintf("This PC's Windows session has no screen: a remote desktop client disconnected from it. Sign in at the PC "+
 			"itself, or run \"tscon %d /dest:console\" as administrator in that session; the stream comes back by itself.", d.Session)
-		switch {
-		case !s.a.cfg.consoleSession():
-			msg += ` (host config "consoleSession" is "off".)`
+		switch move, why := s.a.consoleMove(); {
+		case !move:
+			msg += " (Not moved to the console by itself: " + why + ".)"
 		case consoleErr != "":
 			msg += " (Moving it to the console failed: " + trunc(consoleErr, 80) + ".)"
 		}

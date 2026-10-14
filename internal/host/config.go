@@ -130,10 +130,12 @@ type Config struct {
 	// measure when the first slice was ready (host_encode_first_slice).
 	SliceOutput int `json:"sliceOutput,omitempty"`
 	// ConsoleSession "auto" ("" = auto) moves this Windows session to the
-	// console when a stream finds it disconnected (a remote desktop client
-	// closed it: nothing draws its desktop), as "tscon <session>
-	// /dest:console" does, unless another user is signed in at the console
-	// (desktop.go); "off": never, the stream waits for the user to do it.
+	// console when a playing stream finds it disconnected (a remote desktop
+	// client closed it: nothing draws its desktop), as "tscon <session>
+	// /dest:console" does, unless another user is signed in at the console,
+	// on a virtual machine or a PC without a GPU (desktop.go): the console
+	// then shows it unlocked; "on": also on a PC with a GPU, whose own
+	// monitor shows it; "off": never, the stream waits for the user to do it.
 	ConsoleSession string `json:"consoleSession,omitempty"`
 	// CPUBudget "auto" ("" = auto) streams a session that encodes on the CPU
 	// (no GPU encoder: libx264 of GDI capture) at a frame rate, size and
@@ -272,11 +274,15 @@ func LoadConfig(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("%s: helperLibavcodec must be %q or %q, not %q", path, libavcodecAuto, libavcodecOff, c.HelperLibavcodec)
 	}
-	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}, {"consoleSession", c.ConsoleSession},
-		{"cpuBudget", c.CPUBudget}} {
+	for _, v := range []struct{ key, val string }{{"svc", c.SVC}, {"staticBitrate", c.StaticBitrate}, {"cpuBudget", c.CPUBudget}} {
 		if v.val != "" && v.val != settingAuto && v.val != settingOff {
 			return nil, fmt.Errorf("%s: %s must be %q or %q, not %q", path, v.key, settingAuto, settingOff, v.val)
 		}
+	}
+	switch c.ConsoleSession {
+	case "", settingAuto, consoleOn, settingOff:
+	default:
+		return nil, fmt.Errorf("%s: consoleSession must be %q, %q or %q, not %q", path, settingAuto, consoleOn, settingOff, c.ConsoleSession)
 	}
 	if c.StaticKbps < 0 {
 		return nil, fmt.Errorf("%s: staticKbps must not be negative, not %d", path, c.StaticKbps)
