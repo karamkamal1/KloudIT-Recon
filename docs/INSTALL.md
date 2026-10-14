@@ -98,7 +98,7 @@ cd gateway-linux-amd64
 The script:
 
 1. Downloads the Debian 12 template if needed.
-2. Raises the node's UDP buffer limit for QUIC.
+2. Raises the node's UDP buffer limit for QUIC (see [UDP buffers](#udp-buffers)).
 3. Creates an unprivileged container (1 core, 512 MB, nesting on, starts on boot) and installs
    the gateway as a hardened systemd service.
 4. Waits until the gateway is listening.
@@ -462,6 +462,42 @@ For it to work:
 - Use a wired connection. The PC and the gateway must be on the same network/VLAN.
 
 After waking, the PC shows as online only once Windows has signed in (see step 6).
+
+## UDP buffers
+
+On a LAN each video frame leaves the PC as a burst, at up to 1 Gbit/s for a millisecond or two.
+Every socket on the way must hold that burst while the program reading it is busy for a moment:
+the gateway's UDP sockets, and on the PC the agent's. Linux caps what a program may ask for at
+`net.core.rmem_max` / `net.core.wmem_max`: 212992 bytes by default, under 2 ms at a gigabit. A
+container cannot raise its own limit; it has the Proxmox node's. `create-lxc.sh` raises the
+node's to 7.5 MB (`/etc/sysctl.d/90-kloudit-recon.conf`) when they are lower. Windows has no
+such cap.
+
+**Check** the gateway's log after it starts:
+
+```bash
+pct exec 210 -- journalctl -u recon-gateway -b --no-pager | grep -i "socket buffers"
+```
+
+`msg="UDP socket buffers" socket="gateway ..." wanted_kb=8192 rcvbuf_kb=7324 sndbuf_kb=7324
+capped=true` is fine (the 7.5 MB the script set; `capped` only says it is under the 8 MB asked
+for); the same line with `socket="udp relay"` comes with the first relayed session. A warning
+`UDP socket buffers capped by the kernel` (under 4 MB) means the node's limit is too low: on the
+**Proxmox node** run
+
+```bash
+printf 'net.core.rmem_max=7500000\nnet.core.wmem_max=7500000\n' > /etc/sysctl.d/90-kloudit-recon.conf
+sysctl -p /etc/sysctl.d/90-kloudit-recon.conf
+pct exec 210 -- systemctl restart recon-gateway
+```
+
+and check again. On the PC, host.log has the same line for its relay socket (`socket=relay`).
+
+**Drops**: each relayed session ends with `udp relay: session ended ... socket_drops=N` in the
+gateway's log: the datagrams the kernel dropped because the relay socket's buffer was full (-1:
+not counted on this platform). It should be 0. With the buffers at 7.5 MB and drops still there,
+the container is short of CPU (give it a second core: `pct set 210 --cores 2`). The container's
+own counters: `pct exec 210 -- grep -A1 '^Udp:' /proc/net/snmp` (`RcvbufErrors`).
 
 ## Upgrading
 

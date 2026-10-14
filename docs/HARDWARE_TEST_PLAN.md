@@ -863,6 +863,42 @@ UDP relay")
     `recovery` or `frame`), at 2 and at 30 Mbit/s if there are any;
   - the overlay's stage rows and the exported latency report.
 
+**8.1c Pacing and smoothness on the LAN** (VENDOR_NOTES "Second hardware run: pacing, rate
+control and smoothness")
+
+- **Do**:
+  1. On the Proxmox node: `pct exec 210 -- journalctl -u recon-gateway -b --no-pager | grep -i
+     "socket buffers"`; on the PC: `Select-String $log -Pattern 'UDP socket buffers' | Select-Object -Last 1`.
+  2. PC and client wired on the LAN, Network path Auto. In a game with constant motion, stream
+     HEVC 1080p60 at 250 Mbit/s for 5 minutes, then at 80 Mbit/s for 2 minutes. Keep the
+     overlay open.
+  3. Run `Select-String $log -Pattern 'latency stages|stream stats|congestion: lowering|bitrate recovery|thinning' | Select-Object -Last 120`,
+     and on the node `pct exec 210 -- journalctl -u recon-gateway -n 200 --no-pager | grep "session ended"`.
+  4. Repeat step 2 for 2 minutes with the client on Wi-Fi.
+- **Pass**:
+  - Step 1: `UDP socket buffers` lines with `rcvbuf_kb` and `sndbuf_kb` of 4096 or more (7324
+    on the node `create-lxc.sh` set up), no `capped by the kernel` warning; the gateway's
+    `udp relay: session ended` lines (relayed sessions) with `socket_drops=0`.
+  - Wired, the `latency stages` rows' `transfer` p50 under ~3 ms and p95 under ~10 ms at
+    80 Mbit/s (the second run: p50 4-14 ms, p95 16-38 ms), host `queue` p95 under ~5 ms, and
+    `e2e` p95 within ~15 ms of its p50.
+  - `stream stats`: `burst_mbps` well over `pace_mbps` (hundreds on a gigabit LAN, at most
+    1000), `burst_est_mbps` near what the link carries, `burst_backoffs` 0 in most lines.
+  - `kbps_target` stays at the setting while the game runs (or what the encoder makes, through
+    `start=output` decreases only where a queue really builds); `congestion: lowering bitrate ...
+    why=delay` lines rare, each with `ack_queue_ms` (the queue the host's own round trips showed)
+    at least half its `delay_ms`; `delay_unconfirmed` counts the reports over the delay target
+    the round trips did not confirm (the client's own stalls: no decrease).
+  - `window_held` 0-5 per 10 s (the second run: up to 185), `thinned` 0-5 per 10 s wired (up to
+    92), and no `thinning ... why=queue` while frames go out on time.
+  - `report_owd_p50_ms` close to the overlay's network + transfer stages (a few ms on the LAN),
+    not 107-135 (the second run's clock offset); `report_clock_shift_ms` is how far the client's
+    clock sync moved since its first.
+  - On Wi-Fi: the target holds through the medium's stalls (`stalls` and `undone` may count),
+    at most a couple of decreases per minute.
+- **If not, send**: the Select-String output, the gateway lines, the overlay's stage rows and the
+  exported latency report, and whether the PC and the client were wired.
+
 **8.2 T6: the `capdrop` dip** (VENDOR_NOTES 2.2)
 
 - **Do**:

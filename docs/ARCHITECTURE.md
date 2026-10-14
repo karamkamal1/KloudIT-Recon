@@ -165,8 +165,13 @@ none) can be left out without breaking the decoding of any other frame. Under co
 does so before the frame is sent: the frame rate drops for the moment (halves with two layers),
 nothing is corrupted, no key frame is needed and the encoder does not change. Congestion is any of:
 the rate controller's last two reports over its delay target (or a frame far over it that does not
-arrive), two or more frames waiting in the frame queue behind the one being sent, a frame stream
-still being written past its deadline (or the last frame written that slowly, on a stream or as
+arrive; on the direct path and the UDP relay only a delay the host's round trips confirm, and never
+for a stall of the link: [Rate control](#the-capture--encode-pipeline-host)), two or more frames
+waiting in the frame queue behind the one being sent when that one waited a frame interval since
+the encoder output it (frames that leave the encoder together, a GPU the game keeps busy, go out
+within milliseconds of each other at the pacer's burst rate: leaving one out would be a judder for
+nothing; the second hardware run left out 208 frames in 62 episodes that way, and 589 in 135 for
+the delay), a frame stream still being written past its deadline (or the last frame written that slowly, on a stream or as
 datagram shards). Thinning for the delay or a frame past its deadline is the path's congestion
 (the rate controller holds its increases and, when it lasts, decreases); thinning only for
 frames waiting behind one being paced out on schedule (a key frame at a low bitrate) is the
@@ -546,8 +551,17 @@ the host's frame queue.
 deliver their bytes (from the acknowledgement of a frame's first byte to that of its mark:
 `cc.Media.DeliveredAt`, a record of when the delivery position grew) as the sender took to send
 them, with at least 20 ms of pacing in those samples: a bottleneck under 2/3 of the pacing rate
-(0.8 × the target bitrate). The sender's time for a frame is the pacer's (bytes / pacing rate),
-or its write's own duration where that was longer, less the time the congestion window held the
+(0.8 × the target bitrate). Where the frames went out as soon as they were ready (they waited
+less than 10 ms on average from the encoder's output to their write: the path does not hold the
+sender back) that also needs a backlog in the path: the frames took longer to deliver than they
+came (what each took beyond the time until the next one was ready, carried over while it lasts,
+over 10 ms), or the round trips show a queue that stands (`cc.Media.StandingQueue` over 10 ms).
+A path slower than the pacing rate but faster than the encoder's output builds no backlog: each
+frame is delivered before the next is ready (a target far over what the encoder makes, where the
+second hardware run's window held up to 185 frames per 10 s for ACKs 1-4 ms late on frames paced
+in a few milliseconds). The rate is the pacing rate over time, not a frame's burst. The sender's
+time for a frame is the pacer's (bytes / pacing rate), or its write's own duration where that was
+longer, less the time the congestion window held the
 write back (`cc.Media.WindowLimited`: from a packet the window refused to the next it allowed).
 On a host whose CPU is busy (a game) quic-go's send loop runs late: the frame leaves late and
 arrives as late, no queue builds in the network, and a hold would only add the wait for an
@@ -667,14 +681,26 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
   acknowledged bytes of the media congestion controller.
   - *Queueing delay.* A report's one-way delay p50, less the share of the frames' sending time
     the host's own pacer explains (`internal/host/ratefeedback.go`: the media congestion
-    controller paces at 1.2 × the target, so a key frame takes several frame intervals to go out
-    and delays itself and the frames behind it, with no network queue at all; the share is a
-    fluid model of the pacer, what it had queued draining at the rate it had (a raised target
-    does not drain it faster), at most the measured encodeDone → written time, so a host queue the
-    congestion window causes stays in the signal; that of the frame whose delay the p50 is, where
-    the report names it). The delays are on the scale of the client's first clock sync (less the
-    report's `clockShiftUs`). The target is the minimum of the last 2 s plus
-    8 ms, wider on a jittery path (4 × the mean change between reports, at most 50 ms: Wi-Fi's
+    controller paces at 1.2 × the target beyond a frame's burst, so a key frame takes several
+    frame intervals to go out and delays itself and the frames behind it, with no network queue
+    at all; the share is a fluid model of the pacer (`internal/host/pace.go`: what it had queued
+    draining at the burst rate while the credit lasts, then at the pacing rate it had; a raised
+    target does not drain it faster), at most the measured encodeDone → written time, so a host
+    queue the congestion window causes stays in the signal; that of the frame whose delay the p50
+    is, where the report names it). The delays are on the scale of the client's first clock sync
+    (less the report's `clockShiftUs`; `stream stats` `report_owd_p50_ms` is on the client's
+    current sync, as the stage rows are, and `report_clock_shift_ms` is how far that moved since
+    the first: the second hardware run's `report_owd_p50_ms` of 107-135 ms was the first sync's
+    offset, not a delay). On the direct path and the UDP relay a report's delay over the target
+    counts (decreases, thinning, the pending frame's strong decision) only where the host's own
+    round trips confirm a queue: the quickest round trip since the previous report over the
+    quickest of the last 10 s (`cc.Media.QueueDelay`) is at least half the report's delay over
+    its base, or the congestion window or the video window held the sender back meanwhile (their
+    queue is in the host, not in the round trips). A delay the round trips do not show is the
+    client's own (its worker or socket stalled, its clock stepped): `stream stats`
+    `delay_unconfirmed` counts those reports, `ack_queue_p50_ms` / `ack_queue_p95_ms` the queue the
+    round trips showed, and a decrease's log line has `ack_queue_ms`. The target is the minimum of
+    the last 2 s plus 8 ms, wider on a jittery path (4 × the mean change between reports, at most 50 ms: Wi-Fi's
     bursts are not a queue). Frames that stop arriving altogether (a capacity drop: the queue
     fills, the frames wait for retransmissions, nothing completes) are seen from the oldest
     frame the client lacks: far over the target (40 ms, and more than a frame that waits for one
@@ -703,7 +729,11 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
     growth implies when the queue grows by 0.25 s per second or more and stands 20 ms over the
     base (sending at R into a path of capacity C grows the queue by (R − C) / C per second, so
     C = R / (1 + growth)): it sees a capacity drop at once, while the delivered rates still hold
-    the time before it. A decrease starts from at least half the target, whatever these say (a
+    the time before it. Where the encoder makes less than 60 % of its target (a game at a high
+    setting: the second hardware run's 35-65 Mbit/s at 250), a decrease starts from what it
+    makes, at least 0.7 × the target (`start=output`): from the target it took the stream through
+    that dead zone a step per hold, a lower target slowing nothing until it was under the
+    encoder's output. A decrease starts from at least half the target, whatever these say (a
     tenth of a second's stall leaves next to nothing acknowledged). Frames that do not arrive
     while the path acknowledges nothing at all are a stall of the link (Wi-Fi: the medium busy),
     not a capacity, which goes on acknowledging what it carries: no decision on them for 250 ms
@@ -871,7 +901,28 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
   without key frames at 1.15 ×: an encoder at its QP limit, a large picture at a low bitrate,
   makes far more than a low target, and paced at 1.2 × the target its frames would wait in the
   host's queue without end, every one on its own schedule, a wait the rate controller never
-  sees; near its target an encoder is paced as before), window = pacing × (min RTT + 2 frame intervals: the session's, or the
+  sees; near its target an encoder is paced as before). That is the rate over time; each frame
+  starts as a **burst** (`cc.Media.Pacing`, a second token bucket): while a credit lasts (1.5
+  frame intervals' worth at the pacing rate, earned at the pacing rate while the pacer had
+  nothing to send) the packets go out at the burst rate, the rest at the pacing rate, so a frame
+  of the target's size leaves in a fraction of its interval instead of 0.83 of it (on a LAN at
+  80 Mbit/s 1.4 ms instead of 8 ms; the second hardware run's `transfer` stage p50 of 5-13 ms
+  was that), and nothing goes faster than the pacing rate for longer than the credit. The burst
+  rate follows the path: 1.25 × the highest delivery rate the ACKs of the frames' packet trains
+  measured over 2 s (a train: packets sent less than 2 ms apart; its rate is its bytes over the
+  longer of its ACK span and its send span, from 8 packets on), never under the pacing rate,
+  never over 1 Gbit/s, and 2 × the pacing rate before the first measure. Only a path that
+  delivered at least twice the pacing rate gets bursts: on one not much faster than the pacing
+  rate a frame would save a millisecond or two but queue a share of itself at the bottleneck
+  (a 20-25 Mbit/s path at a 16-20 Mbit/s target: one-way delay p95 4-8 ms higher in the relay
+  simulation), so it is paced at the pacing rate, but for one frame a second that still goes at
+  2 × the pacing rate to find a path that got faster. It is the pacing rate
+  (no bursts) while a queue stands on the path (the quickest round trip of the last 50-100 ms
+  more than 5 ms over the quickest of the last 10 s: the path is the bottleneck now) and for 5 s
+  after a train lost 5 % of its packets (at least 3: a queue the burst overflowed; again within
+  twice that hold doubles it, up to 80 s); random losses do not count. `stream stats` has
+  `pace_mbps`, `burst_mbps`, `burst_est_mbps` and `burst_backoffs`. Window = pacing ×
+  (min RTT + 2 frame intervals: the session's, or the
   interval of the frames the encoder produced over the last second where that is longer, at
   most 250 ms; a 12 fps game menu sends five times larger frames at the same bitrate, and a
   window of two 60 fps frames would not take one of them: the wait for acknowledgements read as
@@ -1497,6 +1548,16 @@ does not reach the port within 2 s, in which case the gateway answers the alloca
 
 Overhead: on loopback the relay adds 20–40 µs to the median round trip (direct about 210 µs,
 relayed about 250 µs) and forwards about 1 Gbit/s on one core (the direct path: 2.3 Gbit/s).
+
+Socket buffers: a frame's burst (up to 1 Gbit/s on a LAN, above) arrives faster than a relay
+goroutine that is descheduled for a few milliseconds takes it, so the gateway's sockets (port
+8443 and each allocation port) and the host's relay socket ask for 8 MB each way and read back
+what the kernel set (Linux reports `SO_RCVBUF` doubled: halved; inside an LXC container the cap
+is the Proxmox node's `net.core.rmem_max` / `wmem_max`). The gateway logs `UDP socket buffers`
+once per socket kind (`rcvbuf_kb`, `sndbuf_kb`, `capped`), the host the same for `relay` in
+host.log, as a warning below 4 MB (`docs/INSTALL.md`, "UDP buffers"). On Linux the relay reads
+the kernel's count of datagrams it dropped for a full buffer (`SO_RXQ_OVFL`) and logs it with
+`udp relay: session ended` (`socket_drops`; -1 where the platform has none).
 
 ### QUIC splice (fallback) and WebSocket
 
