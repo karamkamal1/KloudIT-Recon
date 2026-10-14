@@ -207,9 +207,12 @@ func TestAudioSourcePause(t *testing.T) {
 		t.Fatalf("sequence after the pause: %d, %d", seq, binary.LittleEndian.Uint16(p4[2:]))
 	}
 	// 1440 + the dropped 336 + the pause less the chunk's own 10 ms (a
-	// loaded machine stretches the sleep).
+	// loaded machine stretches the sleep). The source stamps its last
+	// delivery when it handles the 336-frame chunk, which can run just after
+	// the sleep began (packet 2 comes out before that chunk is handled): up
+	// to 5 ms of the pause can fall before that stamp on a loaded machine.
 	jump := int(binary.LittleEndian.Uint32(p3[4:])) - 1440 - 336
-	if lo := 48 * int((pause - 10*time.Millisecond).Milliseconds()); jump < lo || jump > lo+48*300 {
+	if lo := 48 * int((pause - 15*time.Millisecond).Milliseconds()); jump < lo || jump > lo+48*300 {
 		t.Fatalf("pts moved on by %d samples (%.1f ms) after a %v pause", jump, float64(jump)/48, pause)
 	}
 	if d := binary.LittleEndian.Uint32(p4[4:]) - binary.LittleEndian.Uint32(p3[4:]); d != 480 {
