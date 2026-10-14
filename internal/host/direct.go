@@ -197,6 +197,38 @@ func directAddrs(ifs []ifaceInfo, route netip.Addr) []proto.DirectAddr {
 	return out
 }
 
+// tunnelledLAN says how the PC reaches the gateway through a tunnel (route,
+// its address towards gwIP, is a Tailscale or VPN address) although the
+// gateway is on the network of one of its own LAN addresses ("" when it does
+// not): a subnet route through the tunnel covers the LAN (Tailscale on
+// Windows accepts subnet routes by default). The relay's datagrams then take
+// the tunnel both ways, and on Windows the direct path's answers to a browser
+// on the LAN may too (they leave by the route to the browser).
+func tunnelledLAN(addrs []proto.DirectAddr, route, gwIP netip.Addr) string {
+	if !route.IsValid() || !gwIP.IsValid() {
+		return ""
+	}
+	var via *proto.DirectAddr
+	for i := range addrs {
+		if ip, err := netip.ParseAddr(addrs[i].IP); err == nil && ip == route {
+			via = &addrs[i]
+		}
+	}
+	if via == nil || (via.Kind != proto.DirectKindTailscale && via.Kind != proto.DirectKindVPN) {
+		return ""
+	}
+	for _, a := range addrs {
+		ip, err := netip.ParseAddr(a.IP)
+		if err != nil || a.Bits <= 0 || a.Kind == proto.DirectKindTailscale || a.Kind == proto.DirectKindVPN || ip.BitLen() != gwIP.BitLen() {
+			continue
+		}
+		if p := netip.PrefixFrom(ip, a.Bits).Masked(); p.Contains(gwIP) {
+			return fmt.Sprintf("from %s (%s) instead of %s on %s (%s)", via.IP, via.Iface, a.IP, p, a.Iface)
+		}
+	}
+	return ""
+}
+
 // directOverrides splits host config directAddr: one address or name, or
 // several separated by commas or spaces, offered first in that order.
 func directOverrides(s string) []string {
@@ -237,6 +269,9 @@ type directEndpoint struct {
 	addrs []proto.DirectAddr             // the PC's addresses being announced (bound)
 	route netip.Addr                     // the PC's address towards the gateway at the last scan
 	state string                         // the sockets for the log ("*": the wildcard socket alone)
+	// routeWarn: the tunnelled route to the gateway last warned about
+	// (tunnelledLAN), "" when there is none.
+	routeWarn string
 
 	hsLog directHandshakeLog
 }
@@ -337,9 +372,11 @@ func (a *Agent) runDirect(ctx context.Context, rot *tlsutil.Rotating) error {
 // error.
 func (d *directEndpoint) scan(ctx context.Context, tlsConf *tls.Config) (held int, changed bool, lastErr error) {
 	a := d.a
-	var route netip.Addr
+	var route, gwIP netip.Addr
 	if gw := a.pair().Gateway; gw != "" {
 		if ua, err := net.ResolveUDPAddr("udp", gw); err == nil {
+			gwIP, _ = netip.AddrFromSlice(ua.IP)
+			gwIP = gwIP.Unmap()
 			if la, ok := outboundLocalAddr(ua).(*net.UDPAddr); ok {
 				route, _ = netip.AddrFromSlice(la.IP)
 				route = route.Unmap()
@@ -351,6 +388,15 @@ func (d *directEndpoint) scan(ctx context.Context, tlsConf *tls.Config) (held in
 		a.log.Debug("direct path: listing the network interfaces", "err", err)
 	}
 	want := directAddrs(ifs, route)
+	if w := tunnelledLAN(want, route, gwIP); w != d.routeWarn {
+		d.routeWarn = w
+		if w != "" {
+			a.log.Warn("the PC reaches the gateway through a tunnel although the gateway is on the PC's own network: a VPN or "+
+				"Tailscale route covers the LAN, so the relay's traffic takes the tunnel and the PC's answers to browsers on the LAN "+
+				"may too", "gateway", gwIP.String(), "detail", w,
+				"fix", "Tailscale: turn off \"Use Tailscale subnets\" on this PC (tailscale set --accept-routes=false); another VPN: exclude the LAN from it")
+		}
+	}
 	// Host config directAddr entries that are IP addresses of this PC are
 	// listened on too (a loopback address in tests, an address the
 	// interfaces did not list); the others (a name, a port forward's

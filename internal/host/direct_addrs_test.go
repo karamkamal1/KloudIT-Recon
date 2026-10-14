@@ -79,6 +79,17 @@ func TestDirectAddrs(t *testing.T) {
 	if got[0].IP != "192.168.5.10" || got[0].Route || got[3].IP != "100.101.102.103" || !got[3].Route {
 		t.Fatalf("with the route through Tailscale: %+v", got)
 	}
+	// That route is a tunnel although the gateway is on the LAN: warned.
+	if w := tunnelledLAN(got, netip.MustParseAddr("100.101.102.103"), netip.MustParseAddr("192.168.5.202")); w !=
+		"from 100.101.102.103 (Tailscale) instead of 192.168.5.10 on 192.168.5.0/24 (Ethernet 2)" {
+		t.Fatalf("tunnelled route: %q", w)
+	}
+	if w := tunnelledLAN(got, netip.MustParseAddr("192.168.5.10"), netip.MustParseAddr("192.168.5.202")); w != "" {
+		t.Fatalf("the LAN route warned: %q", w)
+	}
+	if w := tunnelledLAN(got, netip.MustParseAddr("100.101.102.103"), netip.MustParseAddr("203.0.113.7")); w != "" {
+		t.Fatalf("a gateway away from the LAN warned: %q", w)
+	}
 	if txt := directAddrText(got[:1]); txt != "192.168.5.10 (Ethernet 2, lan)" {
 		t.Fatalf("log text %q", txt)
 	}
