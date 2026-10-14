@@ -438,8 +438,8 @@ func runRelaySim(c rsCfg) *rsTrace {
 		if ch.why == "undo" {
 			tr.undone++
 		}
-		logf("RATE %s %d -> %d fps %d why=%s urgent=%v (%s)", map[bool]string{true: "down", false: "up"}[ch.down], ch.fromKbps, ch.toKbps,
-			ch.toFPS, ch.why, ch.urgent, src)
+		logf("RATE %s %d -> %d fps %d why=%s urgent=%v (%s) start=%s %d qd=%v ack_qd=%v", map[bool]string{true: "down", false: "up"}[ch.down], ch.fromKbps, ch.toKbps,
+			ch.toFPS, ch.why, ch.urgent, src, ch.basis.start, ch.basis.startKbps, ch.basis.qd.Round(time.Millisecond), ch.basis.ackQD.Round(time.Millisecond))
 		// Session.setRate: the static-desktop cap's share of the target.
 		ctlKbps = ch.toKbps
 		st.mu.Lock()
@@ -850,8 +850,10 @@ func runRelaySim(c rsCfg) *rsTrace {
 				}
 			case rsReport: // Session.rateReport
 				rr := e.rr
-				f, ok := fb.fromReport(rr, clock(), reportComp(&track, rr), ccCounters{ok: true, lost: ccLost, total: ccTotal, acked: ccAcked,
-					limited: m.WindowLimited(), nonVideoKbps: audio + ccOverheadKbps + int(fecKbps(int64(encKbps)))})
+				cnt := ccCounters{ok: true, lost: ccLost, total: ccTotal, acked: ccAcked,
+					limited: m.WindowLimited(), nonVideoKbps: audio + ccOverheadKbps + int(fecKbps(int64(encKbps))), held: win.holdTime()}
+				cnt.queue, cnt.queueOK = m.QueueDelay() // Session.ccQueue
+				f, ok := fb.fromReport(rr, clock(), reportComp(&track, rr), cnt)
 				if !ok {
 					break
 				}

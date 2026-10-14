@@ -31,7 +31,16 @@ import (
 //     a stall of the client itself: what it lacks may wait in its own
 //     socket; a report more than pendingStallGap after the previous one is
 //     not judged by it at all). The first owdWarmup of samples decides
-//     nothing. A delay that stays where a delay decrease found it, on a path
+//     nothing. Where the connection's acknowledgements are the client's,
+//     a delay over the target counts only when the host's own measure of
+//     the path's queue (cc.Media.QueueDelay: the round trips of the packets
+//     acknowledged since the previous report, over their recent minimum)
+//     holds at least ackConfirm of it (confirmed): a delay the round trips
+//     do not show is the client's (its worker busy: the second hardware
+//     run's 35 delay decreases on a LAN at 3-15 times the bitrate the
+//     encoder made, docs/VENDOR_NOTES.md "Second hardware run: pacing,
+//     rate control and smoothness") or the host's own wait before sending,
+//     neither of which a lower bitrate drains. A delay that stays where a delay decrease found it, on a path
 //     that held the sender back neither before nor since, is a step of the
 //     path's delay, not a queue: the base restarts there (levelShift).
 //     Frames that do not arrive while nothing at all is acknowledged are a
@@ -167,7 +176,12 @@ const (
 	// decreaseMinShare: a decrease starts from at least this share of the
 	// target, whatever the delivered rate or the queue's growth say.
 	decreaseMinShare = 0.5
-	recvHeadroom     = 1.2 // increases stop at this multiple of the delivered rate
+	// appLimitedShare, appLimitedMinShare: an encoder that makes less than
+	// appLimitedShare of its target decreases from what it makes, from at
+	// least appLimitedMinShare of the target (decrease).
+	appLimitedShare    = 0.6
+	appLimitedMinShare = 0.7
+	recvHeadroom       = 1.2 // increases stop at this multiple of the delivered rate
 	// drainingBy: the delay is falling (no decrease) when it is this much
 	// below the delay overReports reports earlier.
 	drainingBy = 2 * time.Millisecond
@@ -226,6 +240,12 @@ const (
 	// thinOverReports: consecutive reports over the delay target that count
 	// as congestion for thinning (one report alone can be a burst).
 	thinOverReports = 2
+
+	// ackConfirm: a delay over the base counts as the path's when the
+	// queue its packets met by the host's own measure is at least this
+	// share of it (confirmed): a queue on the way to the client is in both,
+	// a reverse one adds to the round trips only.
+	ackConfirm = 0.5
 
 	// undoWindow, undoShare, undoDrain: a delay decrease on a stall of the
 	// path is undone. A link that stalls (Wi-Fi: the medium busy, a
@@ -370,6 +390,17 @@ type feedback struct {
 	acked        int64
 	nonVideoKbps int
 	limited      time.Duration
+	// ackQD: the queue the path's packets met since the previous report by
+	// the host's own measure (cc.Media.QueueDelay: their round trips over
+	// the recent minimum; ackQDValid false: none acknowledged, or not the
+	// media controller); shift: the client's clock shift the delays were
+	// taken back by (their scale's error since its first sync).
+	ackQDValid bool
+	ackQD      time.Duration
+	shift      time.Duration
+	// held: how long the video window held frames meanwhile (the path's
+	// shortfall: the queue it keeps at the host).
+	held time.Duration
 }
 
 // rateChange is a bitrate (and frame-rate) change for the encoder.
@@ -388,7 +419,8 @@ type rateChange struct {
 // the base (margin), the share of packets lost, and the rate the decrease
 // started from and why that one (start: "target", "delivered" (what the
 // acknowledgements or the client's receive rate carried), "queue" (the
-// queue's growth), "halving" (decreaseMinShare: next to nothing
+// queue's growth), "output" (what the encoder makes, far under its target:
+// appLimitedShare), "halving" (decreaseMinShare: next to nothing
 // delivered)).
 type rateBasis struct {
 	qd, margin time.Duration
@@ -396,6 +428,10 @@ type rateBasis struct {
 	lossPct    float64
 	startKbps  int
 	start      string
+	// ackQD: the host's own measure of the path's queue on the report that
+	// decided (feedback.ackQD; ackOK false: none).
+	ackQD time.Duration
+	ackOK bool
 }
 
 // rateUndo is a delay decrease on what may be a stall of the path, open to
@@ -516,6 +552,18 @@ type rateController struct {
 	// (stream stats); inStall: the last report was in one.
 	stalls, undos int
 	inStall       bool
+	// unconfirmed: reports whose delay was over the target but not by the
+	// host's own measure (confirmed), since the session began (stream
+	// stats); shift: the client's clock shift of the last report with
+	// delays (feedback.shift).
+	unconfirmed int
+	shift       time.Duration
+	// lastAckQD, lastAckOK: the last report's feedback.ackQD (for the
+	// decrease's log); qdOverRaw: the last report's delay was over the
+	// target, confirmed or not (an undo needs it under: checkUndo).
+	lastAckQD time.Duration
+	lastAckOK bool
+	qdOverRaw bool
 
 	// Feedback.
 	everFeedback bool      // the client has sent feedback
@@ -670,7 +718,11 @@ func (r *rateController) output(n int, key bool) {
 func (r *rateController) outputKbps() float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	now := r.clock()
+	return r.outputAt(r.clock())
+}
+
+// outputAt is outputKbps at now. Called with r.mu held.
+func (r *rateController) outputAt(now time.Time) float64 {
 	var n, want int64
 	frames := 0
 	for _, c := range r.out {
@@ -784,7 +836,7 @@ func (r *rateController) report(fb feedback) (rateChange, bool) {
 	if fb.total > 0 && !now.Before(r.lossFrom) {
 		r.loss = trimCounts(append(r.loss, timedCount{at: now, n: fb.lost, total: fb.total}), now, lossWindow)
 	}
-	if fb.lost > 0 || fb.limited > 0 {
+	if fb.lost > 0 || fb.limited > 0 || fb.held > 0 {
 		r.pathAt = now
 	}
 	if fb.ackedValid && fb.acked > 0 {
@@ -874,8 +926,9 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 		if r.haveQD {
 			r.jitter += ((fb.qd - r.lastQD).Abs().Seconds() - r.jitter) / 16
 		}
-		r.lastQD, r.haveQD = fb.qd, true
+		r.lastQD, r.haveQD, r.shift = fb.qd, true, fb.shift
 	}
+	r.lastAckQD, r.lastAckOK = fb.ackQD, fb.ackQDValid && r.ackDirect
 	if len(r.base) == 0 {
 		return
 	}
@@ -892,7 +945,12 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 	}
 	// Frames that stopped arriving: the oldest one the client lacks has been
 	// on its way pending - raw (the report's way back is at most the raw
-	// base, on a symmetric path). Far over the target the controller does
+	// base, on a symmetric path), which is on the host's clock: raw and the
+	// base it is judged against are taken to the client's current clock
+	// sync for it (rawNow, baseNow; the scale of the first sync, the
+	// controller's, keeps that sync's error, which took the second hardware
+	// run's pending frames ~200 ms further from deciding than they were),
+	// and its result back to the controller's scale. Far over the target the controller does
 	// not wait for overReports: a capacity drop overflows the host's frame
 	// queue within a few frame intervals, and no frame completes meanwhile
 	// (they wait for retransmissions). The first such report counts as one
@@ -903,22 +961,30 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 	strong := false
 	wasStall := r.inStall
 	r.inStall = false
-	if late := fb.pending - raw; fb.pendingValid && fb.interval <= pendingStallGap &&
-		late > base+max(pendingStrong, 4*r.margin(), raw*5/2) {
+	rawNow, baseNow := max(0, raw+r.shift), base+r.shift
+	if late := fb.pending - rawNow; fb.pendingValid && fb.interval <= pendingStallGap &&
+		late > baseNow+max(pendingStrong, 4*r.margin(), rawNow*5/2) {
 		if fb.ackedValid && fb.acked == 0 && !r.ackedAt.IsZero() && now.Sub(r.ackedAt) < stallMax {
 			if !wasStall {
 				r.stalls++
 			}
 			r.inStall = true
 			// A stall: nothing arrives and nothing is acknowledged. Over
-			// the target for thinning and the frame queue, but no
-			// decrease yet: the link delivers it all when it resumes
-			// (stallMax).
-			r.qdOver, r.overRun = true, r.overRun+1
+			// the target for the frame queue, but no decrease yet: the
+			// link delivers it all when it resumes (stallMax). Nor
+			// thinning (overRun): the frames it would leave out wait in
+			// the stalled link with the rest and arrive at once with it,
+			// a judder for nothing.
+			r.qdOver, r.overRun = true, 0
 			return
 		}
-		r.strongN++
-		qd, ok, strong = max(qd, late), true, r.strongN >= 2
+		if r.confirmed(fb, late-baseNow) {
+			r.strongN++
+			qd, ok, strong = max(qd, late-r.shift), true, r.strongN >= 2
+		} else {
+			r.strongN = 0
+			r.unconfirmed++
+		}
 	} else {
 		r.strongN = 0
 	}
@@ -930,6 +996,11 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 	}
 	r.recentQD = append(r.recentQD, qdSample{at: now, d: qd, own: fb.qd, ownOK: fb.owdValid && qd == fb.qd})
 	r.qdOver = qd > base+r.margin()
+	r.qdOverRaw = r.qdOver
+	if r.qdOver && !strong && !r.confirmed(fb, qd-base) {
+		r.qdOver = false
+		r.unconfirmed++
+	}
 	if r.qdOver {
 		r.overRun++
 	} else {
@@ -943,6 +1014,25 @@ func (r *rateController) delay(now time.Time, fb feedback) {
 	default:
 		r.over = 0
 	}
+}
+
+// confirmed reports whether a delay d over the base (a report's queueing
+// delay, or the bound of a frame that does not arrive) is the path's: where
+// the acknowledgements are the client's, the host's own measure of the queue
+// the path's packets met meanwhile (fb.ackQD) holds at least ackConfirm of
+// it, or the path held the sender back meanwhile (its congestion window, the
+// video window: the queue is then the host's, at the path's bidding). A
+// delay neither shows is the client's (its worker busy, frames waiting in
+// its own process, a clock correction) or the host's own wait before
+// sending (a send loop running late): no queue a lower bitrate drains.
+// Without the measure (nothing acknowledged meanwhile: an outage, which the
+// stall test judges; a relay leg's acknowledgements) the delay decides
+// alone. Called with r.mu held.
+func (r *rateController) confirmed(fb feedback, d time.Duration) bool {
+	if !r.ackDirect || !fb.ackQDValid || fb.limited > 0 || fb.held > 0 {
+		return true
+	}
+	return float64(fb.ackQD) >= ackConfirm*float64(d)
 }
 
 // draining reports whether the delay is falling: the last sample is
@@ -1049,7 +1139,7 @@ func (r *rateController) checkUndo(now time.Time, fb feedback) {
 	if fb.owdValid && u.resumed.IsZero() {
 		u.resumed = now
 	}
-	under := fb.owdValid && !r.qdOver && r.strongN == 0
+	under := fb.owdValid && !r.qdOverRaw && r.strongN == 0
 	if under && !u.resumed.IsZero() && now.Sub(u.resumed) <= undoDrain {
 		u.drained = true
 	}
@@ -1247,6 +1337,16 @@ func (r *rateController) decrease(now time.Time, why string) (rateChange, bool) 
 	if d, ok := r.queueCapacity(); ok && why == "delay" && d < cur {
 		cur, start = d, "queue"
 	}
+	// An encoder that makes far less than its target (a game's picture at
+	// a high setting: the second hardware run's 40-65 Mbit/s at 250) is not
+	// slowed by a lower target until the target is under what it makes:
+	// decreases from the target took the stream through that dead zone a
+	// step per hold, the queue standing meanwhile. Such a decrease starts
+	// from what the encoder makes, at least appLimitedMinShare of the target
+	// (a still desktop's encoder makes next to nothing).
+	if out := r.outputAt(now); out > 0 && out < appLimitedShare*float64(r.liveKbps) && out < cur {
+		cur, start = max(out, appLimitedMinShare*min(r.est, float64(r.applied))), "output"
+	}
 	// At most a halving at once: a stall of a tenth of a second (the
 	// host's, the client's or the path's) leaves the last ackWindow with
 	// next to nothing acknowledged (and where the delay decision rested on
@@ -1258,7 +1358,8 @@ func (r *rateController) decrease(now time.Time, why string) (rateChange, bool) 
 	prevEst, prevGood := r.est, r.lastGood
 	r.lastGood, r.passedGood = cur, time.Time{}
 	shiftQD, shift := time.Duration(0), false
-	r.basis = rateBasis{margin: r.margin(), lossPct: 100 * r.lossFraction(), startKbps: int(math.Round(cur)), start: start}
+	r.basis = rateBasis{margin: r.margin(), lossPct: 100 * r.lossFraction(), startKbps: int(math.Round(cur)), start: start,
+		ackQD: r.lastAckQD, ackOK: r.lastAckOK}
 	if n := len(r.recentQD); n > 0 {
 		shiftQD, shift = r.recentQD[n-1].d, r.recentQD[n-1].ownOK
 		r.basis.qd, r.basis.bound = shiftQD-r.baseQD(), !shift
@@ -1605,6 +1706,15 @@ func (r *rateController) stallCounts() (stalls, undos int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.stalls, r.undos
+}
+
+// unconfirmedCount returns the reports whose delay was over the target but
+// not by the host's own measure of the path's queue (confirmed), since the
+// session began.
+func (r *rateController) unconfirmedCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.unconfirmed
 }
 
 // decreasedAt returns when the controller last decided a decrease.

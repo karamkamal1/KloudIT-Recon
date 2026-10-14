@@ -510,8 +510,12 @@ func TestQueueOverflowEscalates(t *testing.T) {
 		s.a.caps.FFmpeg = stall // the next generation stays starting
 		// The generation has streamed for longer than the FFmpeg policy's
 		// gap between changes (else the next rate-loop tick applies it).
+		// The test picture makes far less than its target: forget what the
+		// encoder made, else the decrease starts from that (appLimitedShare)
+		// and not from the target this test follows.
 		s.rate.mu.Lock()
 		s.rate.lastApply = time.Now().Add(-time.Second)
+		s.rate.out = nil
 		s.rate.mu.Unlock()
 		s.congestion(120, signalDelay)
 		keepCutWindowOpen(s)

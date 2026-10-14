@@ -2192,10 +2192,12 @@ func (s *Session) applyRate(c rateChange, delayMs int) {
 // rateAttrs are the log attributes of what a decrease was decided on
 // (rateBasis): for the delay, the queueing delay over the 2 s base of the
 // report that decided (delay_ms; frames_late: the age of frames that did not
-// arrive at all, the pending bound) and its target over the base
-// (delay_target_ms); for losses the share lost (loss_pct); the rate the
+// arrive at all, the pending bound), its target over the base
+// (delay_target_ms) and the host's own measure of the path's queue meanwhile
+// (ack_queue_ms: the round trips' excess, which confirmed it); for losses
+// the share lost (loss_pct); the rate the
 // decrease started from (start_kbps) and what that was (start: target,
-// delivered, queue, halving; acked for a key frame's overflow). An older
+// delivered, queue, output, halving; acked for a key frame's overflow). An older
 // client's own report ("client") has its delayMs.
 func rateAttrs(c rateChange, delayMs int) []any {
 	b := c.basis
@@ -2207,6 +2209,9 @@ func rateAttrs(c rateChange, delayMs int) []any {
 		a = append(a, "delay_ms", b.qd.Milliseconds(), "delay_target_ms", b.margin.Milliseconds())
 		if b.bound {
 			a = append(a, "frames_late", true)
+		}
+		if b.ackOK {
+			a = append(a, "ack_queue_ms", b.ackQD.Milliseconds())
 		}
 	case "loss":
 		a = append(a, "loss_pct", math.Round(b.lossPct*10)/10)
@@ -2240,7 +2245,7 @@ func (s *Session) rateLoop() {
 		s.rate.setPolicy(ratePolicy(s.vid().Capabilities()))
 		now := time.Now()
 		if !s.fb.reportsActive(now) {
-			if fb, ok := s.fb.fromAcks(now, s.ccCounters()); ok {
+			if fb, ok := s.fb.fromAcks(now, s.ccQueue(s.ccCounters())); ok {
 				if c, ok := s.rate.report(fb); ok {
 					s.applyRate(c, int(fb.qd.Milliseconds()))
 				}
@@ -2273,14 +2278,23 @@ func (s *Session) ccCounters() ccCounters {
 		nonVideo += s.fecOverheadKbps(t.videoKbps) // parity and shard headers (fec.go)
 	}
 	return ccCounters{ok: true, lost: st.LostPackets, total: st.LostPackets + st.AckedPackets, acked: st.AckedBytes,
-		limited: m.WindowLimited(), nonVideoKbps: int(nonVideo)}
+		limited: m.WindowLimited(), nonVideoKbps: int(nonVideo), held: s.win.holdTime()}
+}
+
+// ccQueue adds the media congestion controller's queueing delay since the
+// last report to c (cc.Media.QueueDelay: one reader, the rate feedback).
+func (s *Session) ccQueue(c ccCounters) ccCounters {
+	if m := transport.MediaControl(s.c); m != nil && c.ok {
+		c.queue, c.queueOK = m.QueueDelay()
+	}
+	return c
 }
 
 // rateReport feeds a client's receive report to the rate controller.
 func (s *Session) rateReport(r proto.RateReport) {
 	s.fecReport(r, time.Now())
 	comp := reportComp(&s.track, r)
-	fb, ok := s.fb.fromReport(r, time.Now(), comp, s.ccCounters())
+	fb, ok := s.fb.fromReport(r, time.Now(), comp, s.ccQueue(s.ccCounters()))
 	if !ok {
 		return // out of order
 	}
@@ -3406,7 +3420,7 @@ func (s *Session) statsLoop() {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
 	var lastLost, lastAcked uint64
-	var lastStalls, lastUndos int
+	var lastStalls, lastUndos, lastUnconfirmed int
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -3449,11 +3463,21 @@ func (s *Session) statsLoop() {
 		held, maxHold := s.win.stats()
 		args = append(args, "window_held", held, "window_max_ms", maxHold.Milliseconds())
 		// The rate controller's view: the one-way delay of the client's
-		// reports (p50/p95 of their p50s, the largest maximum), the
-		// continuous target, the frame rate, the queueing-delay margin and
-		// the packet loss of the last second.
-		if p50, p95, mx, n := s.fb.stats(); n > 0 {
-			args = append(args, "report_owd_p50_ms", p50.Milliseconds(), "report_owd_p95_ms", p95.Milliseconds(), "report_owd_max_ms", mx.Milliseconds())
+		// reports (p50/p95 of their p50s, the largest maximum; on the
+		// client's current clock sync, and how far that moved since its
+		// first, which the controller's own scale keeps), the continuous
+		// target, the frame rate, the queueing-delay margin and the packet
+		// loss of the last second.
+		fst := s.fb.stats()
+		if fst.n > 0 {
+			args = append(args, "report_owd_p50_ms", fst.p50.Milliseconds(), "report_owd_p95_ms", fst.p95.Milliseconds(),
+				"report_owd_max_ms", fst.max.Milliseconds(), "report_clock_shift_ms", fst.shift.Milliseconds())
+		}
+		// The host's own measure of the path's queue over the reports
+		// (cc.Media.QueueDelay: the quickest round trip of each report's
+		// time over the recent minimum), which confirms their delays.
+		if fst.queues > 0 {
+			args = append(args, "ack_queue_p50_ms", fst.queueP50.Milliseconds(), "ack_queue_p95_ms", fst.queueP95.Milliseconds())
 		}
 		args = append(args, "kbps_est", int(est), "fps_target", fpsTarget, "queue_margin_ms", margin.Milliseconds(),
 			"loss_pct", fmt.Sprintf("%.2f", loss*100))
@@ -3475,6 +3499,12 @@ func (s *Session) statsLoop() {
 		stalls, undos := s.rate.stallCounts()
 		args = append(args, "stalls", stalls-lastStalls, "undone", undos-lastUndos)
 		lastStalls, lastUndos = stalls, undos
+		// Reports over the delay target that the round trips did not
+		// confirm (the client's own delay, not the path's: no decrease,
+		// no thinning).
+		unconf := s.rate.unconfirmedCount()
+		args = append(args, "delay_unconfirmed", unconf-lastUnconfirmed)
+		lastUnconfirmed = unconf
 		// The "datagram + FEC" mode (fec.go): frames sent as shards, the
 		// parity's share of the data shards, the bytes on the wire beyond the
 		// frames' (parity, headers, repairs), the client's shard loss, NACKs
