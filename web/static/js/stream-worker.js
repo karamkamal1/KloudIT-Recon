@@ -471,7 +471,7 @@ async function wrapWebTransport(wt, label) {
   cw.write(Uint8Array.of(P.KIND_CONTROL)).catch(swallow);
   iw.write(Uint8Array.of(P.KIND_INPUT)).catch(swallow);
   let closed = false;
-  return {
+  const self = {
     kind: 'webtransport',
     path: label,
     prio,
@@ -480,6 +480,12 @@ async function wrapWebTransport(wt, label) {
     sendInputDatagram: (b) => { if (!closed) dgInput.write(b).catch(swallow); },
     sendDatagram: telemetrySender(dgTelemetry, prio, () => closed), // acks, rate reports, pings
     close: () => { closed = true; try { wt.close({ closeCode: 0, reason: 'bye' }); } catch {} },
+    // The session moved to another connection: this one's control and input
+    // streams end (the host reads the new connection's input after this
+    // one's, so a key released right after the move is not pressed again by
+    // a press still on its way here); frames and datagrams in flight on it
+    // still arrive until it closes.
+    endStreams: () => { closed = true; cw.close().catch(swallow); iw.close().catch(swallow); },
     async run(h) {
       // A control message that does not parse (a torn stream: a host that
       // went on writing after a write that failed part-way) leaves nothing
@@ -529,7 +535,7 @@ async function wrapWebTransport(wt, label) {
       uniLoop.catch(() => {});
       try {
         const info = await wt.closed;
-        if (info?.closeCode === P.CLOSE_AUTH) authRefused = true;
+        if (info?.closeCode === P.CLOSE_AUTH && transport === self) authRefused = true;
         return info?.reason || 'connection closed';
       } catch (e) {
         return e?.message || 'connection lost';
@@ -538,6 +544,7 @@ async function wrapWebTransport(wt, label) {
       }
     },
   };
+  return self;
 }
 
 async function openWebSocket(url) {
@@ -813,6 +820,152 @@ function directFailure(e, ms, direct) {
     return `refused after ${refused[0].ms} ms by ${list(refused)}: ${refused[0].result.slice(9)}`;
   }
   return `refused after ${Math.round(ms)} ms: ${e?.message || e}`;
+}
+
+// Moving to the direct path (VENDOR_NOTES "Second hardware run: direct path
+// on the LAN"). A session that came up on a relay (the direct path did not
+// answer in time, or not at all) goes on trying the direct path in the
+// background: after MOVE_DELAYS_MS, then every MOVE_EVERY_MS. Each attempt
+// asks the page for a fresh connect answer (a new direct ticket and the
+// PC's addresses now), races the addresses as connect() does, and opens a
+// session there whose hello carries the host's resume token (Welcome.resume)
+// and the ticket. The host moves the running session onto it and answers
+// "resumed": from then on input, control and telemetry go out on the new
+// connection, frames and datagrams arrive on both until the old one closes
+// (after MOVE_OLD_MS; the host closes it too), and nothing restarts: the
+// decoder, the picture and the audio go on. A failed attempt keeps the
+// relay; its outcome goes to the host (a "direct" control message) when it
+// differs from the last one, which the host logs. Only with Network path
+// Auto, on WebTransport, with a host that sends a resume token.
+const MOVE_DELAYS_MS = [2000, 8000, 20000, 60000];
+const MOVE_EVERY_MS = 120000;
+const MOVE_ANSWER_MS = 5000; // for the host's "resumed"
+const MOVE_OLD_MS = 1000; // the old connection's frames in flight
+const move = {
+  token: '', // Welcome.resume
+  tries: 0,
+  timer: 0,
+  busy: false,
+  pending: null, // the new connection while the host has not answered
+  told: '', // the outcome last sent to the host
+  handlers: null, // the session's transport handlers (start)
+  client: null, // the hello's client info
+  epWait: null, // resolves with the page's connect answer
+};
+
+function scheduleMove() {
+  clearTimeout(move.timer);
+  move.timer = 0;
+  if (!move.token || !transport || transport.kind !== 'webtransport' || transport.path === 'direct' || prefs.path !== 'auto' ||
+    prefs.skipTicketed || typeof WebTransport === 'undefined') return;
+  const delay = MOVE_DELAYS_MS[move.tries] ?? MOVE_EVERY_MS;
+  move.timer = setTimeout(tryMove, delay);
+}
+
+// The page's connect answer (it holds the CSRF token the gateway's API wants).
+function freshEndpoints() {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { move.epWait = null; reject(new Error('no connect answer from the page in 10 s')); }, 10000);
+    move.epWait = (m) => {
+      clearTimeout(t);
+      move.epWait = null;
+      if (m.error) reject(new Error(m.error));
+      else resolve(m.ep);
+    };
+    post('needEndpoints', {});
+  });
+}
+
+async function tryMove() {
+  if (move.busy || !transport || transport.path === 'direct') return;
+  move.busy = true;
+  move.tries++;
+  const t0 = performance.now();
+  let ep = null;
+  let tried = [];
+  try {
+    ep = await freshEndpoints();
+    if (!ep?.direct) throw new Error('the PC offers no direct endpoint (its agent has none up: host.log)');
+    const r = await raceDirect(directCandidates(ep.direct), ep.direct.hashes, DIRECT_TIMEOUT_MS);
+    tried = r.tried;
+    let nt;
+    try {
+      nt = await wrapWebTransport(r.wt, 'direct');
+    } catch (e) {
+      try { r.wt.close(); } catch {}
+      throw e;
+    }
+    nt.addr = hostOf(r.cand.url);
+    await moveTo(nt, ep.direct.ticket, tried);
+  } catch (e) {
+    tried = e.tried || tried;
+    const why = ep?.direct && e.tried ? directFailure(e, performance.now() - t0, ep.direct) : e.message;
+    post('log', { text: `direct path in the background: ${why}` });
+    post('directWhy', { why });
+    // The host logs it (once per outcome).
+    if (why !== move.told && transport) {
+      move.told = why;
+      transport.sendControl({ t: 'direct', direct: { why, tried } });
+    }
+  } finally {
+    move.busy = false;
+    scheduleMove();
+  }
+}
+
+// moveTo opens the session on nt with the resume token and moves to it when
+// the host answers "resumed".
+function moveTo(nt, ticket, tried) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      move.pending = null;
+      nt.close();
+      reject(e);
+    };
+    const timer = setTimeout(() => fail(new Error(`the PC did not answer the move in ${MOVE_ANSWER_MS / 1000} s`)), MOVE_ANSWER_MS);
+    const h = move.handlers;
+    move.pending = nt;
+    nt.done = nt.run({
+      ...h,
+      control: (m) => {
+        if (!settled) {
+          if (m?.t === 'resumed') {
+            if (!transport || move.handlers !== h) {
+              fail(new Error('the session ended meanwhile'));
+              return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            move.pending = null;
+            switchTransport(nt, tried);
+            resolve();
+            return;
+          }
+          if (m?.t === 'error' || m?.t === 'bye') {
+            fail(new Error(`the PC refused the move: ${m.msg}`));
+            return;
+          }
+        }
+        h.control(m);
+      },
+    });
+    nt.done.then((reason) => fail(new Error(`the new connection closed: ${reason}`)));
+    nt.sendControl({ t: 'hello', v: P.HELLO_VERSION, ticket, resume: move.token, client: move.client, direct: { why: '', tried } });
+  });
+}
+
+// The host moved the session to nt: input, control and telemetry go there now.
+function switchTransport(nt, tried) {
+  const old = transport;
+  transport = nt;
+  old.endStreams?.();
+  setTimeout(() => old.close(), MOVE_OLD_MS);
+  post('log', { text: `moved the session from the ${old.path} path to the direct path (${nt.addr}) without a restart` });
+  post('moved', { path: nt.path, addr: nt.addr, from: old.path, tried });
 }
 
 // Network path "Direct to PC only" (the one setting that can leave nothing
@@ -2533,6 +2686,8 @@ function onControl(m) {
       hdr.hostOffers = hostFeatures.includes(P.FEATURE_HDR);
       updateProbeMode();
       post('welcome', { info: m });
+      move.token = m.resume || ''; // the session may move to the direct path (hosts since the second hardware run)
+      scheduleMove();
       break;
     case 'clock': if (Number.isFinite(m.wallOffsetUs)) probe.wallOffsetUs = m.wallOffsetUs; updateProbeMode(); break;
     case 'video': onVideoConfig(m); break;
@@ -2785,10 +2940,22 @@ async function start(msg) {
   const pingTimer = setInterval(sendPing, 1000);
   const watchdogTimer = setInterval(videoWatchdog, 250);
   const statsTimer = setInterval(postStats, 500);
-  const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset });
+  // The session's connection may change (a move to the direct path):
+  // the session ends when the connection it is on ends.
+  move.handlers = { control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset };
+  move.client = msg.client;
+  let on = transport;
+  let reason = await (on.done = on.run(move.handlers));
+  while (transport && transport !== on) {
+    on = transport;
+    reason = await on.done;
+  }
+  clearTimeout(move.timer);
+  move.token = '';
+  move.pending?.close();
   if (authRefused && conn.ticket) {
-    post('log', { text: `the host refused the ${transport.path} path's ticket: the next attempts skip the paths it authorises for 10 minutes` });
-    post('ticketRefused', { path: transport.path });
+    post('log', { text: `the host refused the ${on.path} path's ticket: the next attempts skip the paths it authorises for 10 minutes` });
+    post('ticketRefused', { path: on.path });
   }
   clearInterval(pingTimer);
   clearInterval(statsTimer);
@@ -2810,6 +2977,7 @@ self.onmessage = (ev) => {
     case 'in': if (pageCtl.input) transport?.sendInput(m.b); break;
     case 'dg': if (pageCtl.input) transport?.sendInputDatagram(m.b); break;
     case 'ctl': pageControl(m.m); break;
+    case 'endpoints': move.epWait?.(m); break; // the page's connect answer for a move to the direct path
     case 'prefs':
       prefs = { ...prefs, ...m.prefs };
       updateProbeMode();
@@ -2834,6 +3002,9 @@ self.onmessage = (ev) => {
     case 'loseContext': renderer?.loseContext(); break; // test hook: the active path's GPU context is lost
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
+      clearTimeout(move.timer);
+      move.token = '';
+      move.pending?.close();
       if (transport) {
         if (pageCtl.open) transport.sendControl({ t: 'bye' }); // (not in place of the hello)
         setTimeout(() => transport?.close(), 50);

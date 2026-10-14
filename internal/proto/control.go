@@ -26,10 +26,17 @@ type Hello struct {
 	// log says why a session streams through the gateway. Nil from older
 	// clients.
 	Direct *DirectReport `json:"direct,omitempty"`
+	// Resume (with a direct ticket) moves the session whose Welcome.Resume
+	// this is onto this connection instead of starting one: the client found
+	// the direct path while it streamed through the relay. The host answers
+	// Resumed on this connection, or an error and closes it (the session
+	// goes on where it was).
+	Resume string `json:"resume,omitempty"`
 }
 
 // DirectReport is the client's account of its direct path attempts
-// (Hello.Direct).
+// (Hello.Direct, and ClientMsg.Direct for the attempts it makes in the
+// background while it streams through the relay).
 type DirectReport struct {
 	// Why the connection is not on the direct path ("" when it is).
 	Why   string          `json:"why,omitempty"`
@@ -74,6 +81,15 @@ func (r *DirectReport) Summary() string {
 		parts = append(parts, fmt.Sprintf("%s: %s after %d ms", s, a.Result, a.Ms))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// Resumed answers a hello with Resume: the session now runs on this
+// connection (its control stream, frames and datagrams). Path is the
+// connection's path ("direct").
+type Resumed struct {
+	T       string `json:"t"` // "resumed"
+	Session string `json:"session"`
+	Path    string `json:"path"`
 }
 
 type ClientInfo struct {
@@ -220,6 +236,12 @@ type Welcome struct {
 	// The latency test page draws the wall clock into the picture; the client
 	// converts it to the host clock with this. Refreshed by Clock messages.
 	WallOffsetUs int64 `json:"wallOffsetUs,omitempty"`
+	// Resume is the token with which a connection on the direct path takes
+	// this session over (Hello.Resume), set while the session is not on the
+	// direct path and the host has a direct endpoint: the client goes on
+	// trying the direct path in the background and moves the live session
+	// there when it answers. Absent from hosts before it.
+	Resume string `json:"resume,omitempty"`
 }
 
 // Clock refreshes Welcome.WallOffsetUs every few seconds (clients with hello
@@ -417,7 +439,7 @@ type Notice struct {
 
 // ClientMsg is the union of client->host control messages after Hello.
 type ClientMsg struct {
-	T       string      `json:"t"` // settings | keyframe | lost | congestion | stages | pause | resume | bye
+	T       string      `json:"t"` // settings | keyframe | lost | congestion | stages | pause | resume | direct | bye
 	Prefs   *Prefs      `json:"prefs,omitempty"`
 	DelayMs int         `json:"delayMs,omitempty"`
 	Reason  string      `json:"reason,omitempty"` // "congestion": CongestionDecoder, or "" (one-way delay grew)
@@ -438,6 +460,10 @@ type ClientMsg struct {
 	// with FSR 1 (fsr | off, or mixed when it changed; Phase 5): the draw and
 	// display rows depend on it. Empty from clients before it.
 	Upscale string `json:"upscale,omitempty"`
+	// Direct ("direct"): the client's direct path attempts in the background
+	// while the session streams through the relay (sent when their outcome
+	// changes); the host logs them.
+	Direct *DirectReport `json:"direct,omitempty"`
 }
 
 // MsgLost is the type of the message ({"t":"lost","gen":g,"fromSeq":s}) in

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -51,6 +52,7 @@ type wtClient struct {
 	sess *webtransport.Session
 	c    transport.Conn
 	ctrl transport.BidiStream
+	in   transport.BidiStream
 
 	mu     sync.Mutex
 	msgs   []map[string]any
@@ -101,11 +103,11 @@ func dialClient(t *testing.T, e *env, rawURL string, hashes []string, hello prot
 	cl.ctrl.Write([]byte{proto.StreamKindControl})
 	b, _ := json.Marshal(hello)
 	proto.WriteMsg(cl.ctrl, b)
-	in, err := cl.c.OpenStreamSync(ctx)
+	cl.in, err = cl.c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	in.Write([]byte{proto.StreamKindInput})
+	cl.in.Write([]byte{proto.StreamKindInput})
 	go func() {
 		for {
 			m, err := proto.ReadMsg(cl.ctrl, proto.MaxControlMsg)
@@ -239,5 +241,128 @@ func TestDirectReportLogged(t *testing.T) {
 	l = e.waitLogLine(t, from, 5*time.Second, `msg="direct path: connected"`, "path=direct")
 	if !strings.Contains(l, "(override, host config directAddr): connected after 3 ms") {
 		t.Fatalf("direct session's line: %s", l)
+	}
+}
+
+// A session that streams through the UDP relay moves onto the direct path
+// when the client finds it (VENDOR_NOTES "Second hardware run: direct path on
+// the LAN"): a connection on the direct path whose hello carries the
+// session's resume token (from its welcome) and a fresh direct ticket takes
+// the running session over. The stream goes on without a new session, a
+// new encoder generation or a restart: the frames continue on the new
+// connection, the host logs the move and path=direct from then on, input
+// comes over the new connection, and the host closes the relay connection
+// after its grace. A connection with another token is refused and the
+// session goes on.
+func TestSessionMovesToDirect(t *testing.T) {
+	e := setup(t)
+	os.Truncate(e.logPath, 0)
+	ans := e.connectAnswer()
+	a, err := e.allocRelay(ans.Relay.UDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := e.logs.Len()
+	relay := dialClient(t, e, a.URL, a.Hashes, clientHello(a.Ticket, defaultPrefs), nil)
+	w := relay.waitMsg("welcome", 10*time.Second)
+	token, _ := w["resume"].(string)
+	if token == "" {
+		t.Fatalf("a relay session's welcome has no resume token: %v", w)
+	}
+	for deadline := time.Now().Add(10 * time.Second); relay.frameCount(nil) < 30; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d frames over the relay", relay.frameCount(nil))
+		}
+	}
+	started := e.logs.lines(from, `msg="session started"`)
+	if len(started) != 1 || !strings.Contains(started[0], "path=relay") {
+		t.Fatalf("session start: %q", started)
+	}
+	sid := strings.Fields(strings.SplitN(started[0], "session=", 2)[1])[0]
+
+	// The move: a fresh ticket from the gateway, the resume token from the welcome.
+	ans = e.connectAnswer()
+	h := clientHello(ans.Direct.Ticket, defaultPrefs)
+	h.Resume = token
+	direct := dialClient(t, e, ans.Direct.URL, ans.Direct.Hashes, h, relay)
+	r := direct.waitMsg("resumed", 10*time.Second)
+	if r["session"] != sid || r["path"] != "direct" {
+		t.Fatalf("resumed %v, want session %s on the direct path", r, sid)
+	}
+	movedAt := relay.frameCount(nil)
+	for deadline := time.Now().Add(10 * time.Second); relay.frameCount(direct) < 60; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d frames on the direct connection after the move", relay.frameCount(direct))
+		}
+	}
+	l := e.waitLogLine(t, from, 5*time.Second, `msg="session moved to the direct path`, "session="+sid, "path=direct", "from=relay")
+	if n := len(e.logs.lines(from, `msg="session started"`)); n != 1 {
+		t.Fatalf("%d session starts: the move started a session", n)
+	}
+	// The frames go on: one generation, seqs continuing across the move.
+	relay.mu.Lock()
+	frames := append([]clientFrame(nil), relay.frames...)
+	relay.mu.Unlock()
+	gens := map[uint8]bool{}
+	var lastRelay, firstDirect uint32
+	keysAfter := 0
+	for i, f := range frames {
+		gens[f.gen] = true
+		if f.conn == relay && f.seq > lastRelay {
+			lastRelay = f.seq
+		}
+		if f.conn == direct && (firstDirect == 0 || f.seq < firstDirect) {
+			firstDirect = f.seq
+		}
+		if i >= movedAt && f.key {
+			keysAfter++
+		}
+	}
+	if len(gens) != 1 || firstDirect == 0 || firstDirect > lastRelay+3 {
+		t.Fatalf("frames across the move: generations %v, last on the relay %d, first on the direct path %d", gens, lastRelay, firstDirect)
+	}
+	direct.mu.Lock()
+	for _, m := range direct.msgs {
+		if m["t"] == "video" {
+			t.Errorf("a new video config after the move: %v", m)
+		}
+	}
+	direct.mu.Unlock()
+	t.Logf("moved after %d frames: %s; relay frames up to seq %d, direct from seq %d, %d key frames after the move",
+		movedAt, l[strings.Index(l, "msg="):], lastRelay, firstDirect, keysAfter)
+
+	// Input over the new connection (the relay connection's input stream
+	// ends first, as the client closes it when it moves).
+	relay.in.Close()
+	proto.WriteMsg(direct.in, proto.KeyEvent(0x1e, false, true))
+	proto.WriteMsg(direct.in, proto.KeyEvent(0x1e, false, false))
+	direct.c.SendDatagram(proto.MouseRelDatagram(1, 12, -10))
+	checkInput(t, e.logPath)
+
+	// The host closes the relay connection after the grace.
+	select {
+	case <-relay.sess.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay connection is still open 5 s after the move")
+	}
+	n := relay.frameCount(direct)
+	time.Sleep(500 * time.Millisecond)
+	if relay.frameCount(direct) <= n {
+		t.Fatal("no frames after the relay connection closed")
+	}
+
+	// Another token: refused, the session goes on.
+	ans = e.connectAnswer()
+	h = clientHello(ans.Direct.Ticket, defaultPrefs)
+	h.Resume = "not-the-token"
+	bad := dialClient(t, e, ans.Direct.URL, ans.Direct.Hashes, h, nil)
+	if m := bad.waitMsg("error", 5*time.Second); !strings.Contains(m["msg"].(string), "move refused") {
+		t.Fatalf("a move with another token: %v", m)
+	}
+	e.waitLogLine(t, from, 5*time.Second, "the client's move of its session onto this connection refused", "resume token")
+	n = relay.frameCount(direct)
+	time.Sleep(500 * time.Millisecond)
+	if relay.frameCount(direct) <= n {
+		t.Fatal("the session stopped after a refused move")
 	}
 }

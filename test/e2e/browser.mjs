@@ -2594,6 +2594,88 @@ async function checkDirectCandidates() {
   await restartHost({}, 'host-default-addrs');
 }
 
+// A live session moves to the direct path (VENDOR_NOTES "Second hardware run:
+// direct path on the LAN"): it starts on the relay because the browser
+// refuses the direct path's certificate (the connect answer's hashes do not
+// match), the browser goes on trying the direct path in the background (2 s
+// after the welcome, then 8 s, ...; the first try fails the same way, which
+// the host logs), and once the hashes are right the next try moves the
+// running session onto the direct path. The same host session goes on: no
+// new session, no reconnect, no freeze or key frame request in the second
+// after the move, the host logs the move and path=direct from then on, and
+// keys reach the host over the direct path.
+async function checkDirectMove() {
+  const host = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const bad = async (r) => {
+    const resp = await r.fetch();
+    const body = await resp.json();
+    if (body.direct) body.direct.hashes = [Buffer.alloc(32, 9).toString('base64')];
+    await r.fulfill({ response: resp, json: body });
+  };
+  await ctx.route('**/api/hosts/*/connect', bad);
+  let routed = true;
+  const log0 = host.log.length;
+  const con0 = consoleLines.length;
+  try {
+    // 30 fps at 8 Mbit/s: the software decoder keeps up on a shared CPU (a
+    // decoder backlog restarts the FFmpeg test encoder, which says nothing
+    // about the move).
+    await startStream({ path: 'auto', transport: 'auto', fps: 30, bitrate: 8 });
+    const c0 = await page.evaluate(() => window.__recon.conn);
+    const bg = await until(() => /[^\n]*msg="direct path: the client's attempt in the background failed[^\n]*/.exec(host.log.slice(log0))?.[0], 20000, 'the background attempt').catch(() => '');
+    await ctx.unroute('**/api/hosts/*/connect', bad);
+    routed = false;
+    const t0 = Date.now();
+    const moved = await until(() => page.evaluate(() => (window.__recon.conn?.path === 'direct' && window.__recon.conn.movedFrom) || null), 30000, 'the move').catch(() => null);
+    const movedAfter = Date.now() - t0;
+    const w = await rateWindow(3000);
+    const wr = starvedRate(w.fps, 30, 0.5, w);
+    let keys = 'not checked (no input log)';
+    if (nativeInputLog && moved) {
+      writeFileSync(inputLog, '');
+      await page.focus('#stage').catch(() => {});
+      await page.keyboard.press('KeyW');
+      keys = await until(() => readFileSync(inputLog, 'utf8').includes('"sc":17'), 5000, 'the key on the host').then(() => 'W reached the host').catch(() => 'no key on the host');
+    }
+    const log = host.log.slice(log0);
+    const st = await page.evaluate(() => ({ attempts: window.__recon.attempts, streaming: window.__recon.streaming }));
+    const sessions = (log.match(/msg="session started"/g) || []).length;
+    const moveLine = /[^\n]*msg="session moved to the direct path[^\n]*/.exec(log)?.[0] || '';
+    const sid = / session=(\S+)/.exec(moveLine)?.[1];
+    const afterMove = moveLine ? log.slice(log.indexOf(moveLine) + moveLine.length) : '';
+    // The move restarts nothing (the host starts no encoder for it; the
+    // rate controller's changes restart the FFmpeg test encoder, reported),
+    // and the picture goes on: no freeze and no key frame request in the
+    // page's log in the second after it, unless the CPU had none to spare.
+    const restarts = (afterMove.match(/msg="starting encoder"/g) || []).length;
+    const causes = [...afterMove.matchAll(/restarting video[^\n]*reason="([^"]+)"|congestion: lowering bitrate[^\n]*why=(\w+)/g)].map((m) => m[1] || m[2]);
+    const starved = w.idle != null && w.idle < STARVED_IDLE;
+    const pageLog = await page.evaluate(() => window.__recon.logs.slice());
+    const movedAt = pageLog.find((l) => l.includes('moved the session from the relay path'))?.slice(0, 24);
+    const atMove = movedAt ? pageLog.filter((l) => {
+      const d = Date.parse(l.slice(0, 24)) - Date.parse(movedAt);
+      return d >= 0 && d <= 1000 && /freeze:|requesting key frame/.test(l);
+    }) : ['no move in the page log'];
+    const smooth = atMove.length === 0 || (starved && movedAt);
+    const laterPaths = [...afterMove.matchAll(new RegExp(`session=${sid} path=(\\S+)`, 'g'))].map((m) => m[1]);
+    const page0 = consoleLines.slice(con0);
+    const keyReq = page0.filter((l) => /requesting key frame/.test(l)).length;
+    check('direct path move: a session on the relay moves to the direct path when it answers: same session, no reconnect, no freeze at the move, keys reach the host over it',
+      c0?.path === 'relay' && /refused after/.test(bg) && moved === 'relay' && sessions === 1 && /from=relay/.test(moveLine) && smooth &&
+        laterPaths.length > 0 && laterPaths.every((p) => p === 'direct') && st.attempts === 0 && st.streaming && (w.fps >= 20 || wr.ok) &&
+        (!nativeInputLog || keys === 'W reached the host'),
+      `started over ${c0?.path} (direct: ${c0?.directWhy || '-'}); background try: ${bg.replace(/^.*?why=/, 'why=').slice(0, 140) || 'no line'}; ` +
+        `moved ${moved ? `from ${moved} ${movedAfter} ms after the hashes were right` : 'never'}; host: ${sessions} session start(s), ${restarts} encoder start(s) after the move` +
+        `${causes.length ? ` (${causes.join(', ')})` : ''}, ` +
+        `later lines path=${[...new Set(laterPaths)].join('/') || 'none'}; ${moveLine.replace(/^.*?msg=/, 'msg=').slice(0, 200) || 'no move line'}; ` +
+        `client retries ${st.attempts}, ${w.fps.toFixed(1)} fps after${wr.note}; in the second after the move: ${atMove.map((l) => l.slice(25, 90)).join(' | ') || 'no freeze, no key frame request'}; ` +
+        `${keyReq} key frame request(s) in the scenario; ${keys}`);
+  } finally {
+    if (routed) await ctx.unroute('**/api/hosts/*/connect', bad).catch(() => {});
+    await endStream();
+  }
+}
+
 // Torn control stream (final review): the host writes a control message in
 // part (test hook torn-control: its first clock message, 5 s in) and goes
 // on, as hosts did before the final review after a control write that hit
@@ -5156,6 +5238,7 @@ try {
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
   if (want('direct candidates')) await checkDirectCandidates().catch((e) => check('direct path addresses scenario', false, e.message));
+  if (want('direct move')) await checkDirectMove().catch((e) => check('direct path move scenario', false, e.message));
   if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
   if (want('drawer keyboard')) await checkDrawerKeyboard().catch((e) => check('settings drawer keyboard scenario', false, e.message));
