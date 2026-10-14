@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -85,9 +86,10 @@ func TestCSPConnectSources(t *testing.T) {
 	}{
 		{"[fd00::1]:8443", "/stream?host=v6", tok, []string{"'self'", "https://*:48100", "https://*:8444", "https://*:8445"}},
 		{"gw.lan:8443", "/js/stream-worker.js?host=v6", tok, []string{"'self'", "https://*:48100", "https://gw.lan:8444", "https://gw.lan:8445"}},
-		{"gw.lan:8443", "/stream?host=v6addr", tok, []string{"'self'", "https://*:48102", "https://gw.lan:8444", "https://gw.lan:8445"}},
+		// The advertised address first, then the tunnel's peer address (orderDirect).
+		{"gw.lan:8443", "/stream?host=v6addr", tok, []string{"'self'", "https://*:48102", "https://192.0.2.9:48102", "https://gw.lan:8444", "https://gw.lan:8445"}},
 		{"192.0.2.1", "/js/stream-worker.js?host=v4", tok, []string{"'self'", "https://192.0.2.10:48101", "https://192.0.2.1:8444", "https://192.0.2.1:8445"}},
-		{"gw.lan", "/stream.html?host=named", tok, []string{"'self'", "https://pc.lan:48103", "https://gw.lan:8444", "https://gw.lan:8445"}},
+		{"gw.lan", "/stream.html?host=named", tok, []string{"'self'", "https://pc.lan:48103", "https://192.0.2.11:48103", "https://gw.lan:8444", "https://gw.lan:8445"}},
 		{"gw.lan", "/stream?host=none", tok, []string{"'self'", "https://gw.lan:8444", "https://gw.lan:8445"}},    // no direct path
 		{"gw.lan", "/stream?host=offline", tok, []string{"'self'", "https://gw.lan:8444", "https://gw.lan:8445"}}, // not connected
 		{"gw.lan", "/", tok, []string{"'self'"}},                                        // the dashboard
@@ -128,7 +130,45 @@ func TestCSPConnectSources(t *testing.T) {
 	}
 
 	// The direct URL handed to the browser keeps the address itself.
-	if u := direct("2001:db8::5", "", 48100).directURL(); u != "https://[2001:db8::5]:48100/wt" {
-		t.Errorf("directURL = %q", u)
+	if c := direct("2001:db8::5", "", 48100).directCandidates(netip.Addr{}); len(c) != 1 || c[0].URL != "https://[2001:db8::5]:48100/wt" {
+		t.Errorf("direct candidates %+v", c)
+	}
+}
+
+// The stream page's CSP allows every address any browser may be offered,
+// not only the first maxDirectCands of a list for no browser in particular
+// (review of the second hardware run): with eight addresses of the PC and a
+// peer address that is none of them, the PC's address on a virtual switch
+// ranks last, and only a browser on that switch's network gets it within
+// its cap, first.
+func TestCSPCoversEveryCandidate(t *testing.T) {
+	s, _ := newLoginServer(t, false)
+	info := &proto.DirectInfo{Port: 48100, Hashes: []string{"h"}, Addrs: []proto.DirectAddr{
+		{IP: "192.168.5.10", Bits: 24, Kind: proto.DirectKindLAN, Iface: "Ethernet 2", Route: true},
+		{IP: "2001:db8:5::10", Bits: 64, Kind: proto.DirectKindIPv6, Iface: "Ethernet 2"},
+		{IP: "2001:db8:5::11", Bits: 64, Kind: proto.DirectKindIPv6, Iface: "Ethernet 2"},
+		{IP: "100.101.102.103", Bits: 32, Kind: proto.DirectKindTailscale, Iface: "Tailscale"},
+		{IP: "fd7a:115c:a1e0::1", Bits: 128, Kind: proto.DirectKindTailscale, Iface: "Tailscale"},
+		{IP: "172.20.0.1", Bits: 20, Kind: proto.DirectKindVirtual, Iface: "vEthernet (WSL)"},
+		{IP: "172.30.0.1", Bits: 20, Kind: proto.DirectKindVirtual, Iface: "vEthernet (Default Switch)"},
+		{IP: "192.168.56.1", Bits: 24, Kind: proto.DirectKindVirtual, Iface: "VirtualBox Host-Only Network"},
+	}}
+	hc := &hostConn{remoteIP: "192.168.5.2", info: proto.TunnelMsg{Direct: info}}
+	s.hosts.hosts["pc"] = hc
+	tok := signIn(t, s, "owner")
+	src := connectSrc(s, "gw.lan", "/js/stream-worker.js?host=pc", tok)
+	for _, browser := range []string{"192.168.56.101", "192.168.5.20", "100.64.7.8", "172.20.3.4", "203.0.113.9"} {
+		cands := hc.directCandidates(netip.MustParseAddr(browser))
+		if len(cands) == 0 || len(cands) > maxDirectCands {
+			t.Fatalf("browser %s: %d candidates", browser, len(cands))
+		}
+		for _, c := range cands {
+			if !slices.Contains(src, cspSource(c.host, c.port)) {
+				t.Errorf("candidate %s (%s) offered to a browser at %s is not in the worker's CSP %v", c.host, c.Note, browser, src)
+			}
+		}
+	}
+	if c := hc.directCandidates(netip.MustParseAddr("192.168.56.101")); c[0].host != "192.168.56.1" {
+		t.Fatalf("a browser on the host-only network gets %q first", c[0].host)
 	}
 }

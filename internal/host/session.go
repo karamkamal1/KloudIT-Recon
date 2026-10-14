@@ -51,6 +51,10 @@ type Session struct {
 	meta SessionMeta
 	id   string
 	log  *slog.Logger
+	// move: the connection and control stream a connection on the direct
+	// path can take over (move.go); nil for sessions built without
+	// newSession (tests).
+	move *sessionMove
 	// partial: frame streams mark their header (and a key frame's parameter
 	// sets) reliable, so a cancelled frame still delivers them (GUIDE 2.4:
 	// the client's QUIC endpoint negotiated RESET_STREAM_AT); resetStreamAt:
@@ -268,9 +272,13 @@ var errClosed = errors.New("session closed")
 var errFrameCancelled = errors.New("frame stream cancelled")
 
 func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
+	// The session's connection is one that a move to the direct path can
+	// replace (move.go).
+	move := newSessionMove(c, meta.Path)
+	c = move.conn
 	ctx, cancel := context.WithCancel(c.Context())
 	s := &Session{
-		a: a, c: c, meta: meta, id: auth.RandomToken(6),
+		a: a, c: c, meta: meta, id: auth.RandomToken(6), move: move,
 		ctx: ctx, cancel: cancel,
 		frameQ:      make(chan *media.Frame, frameQueueMax),
 		pipeSwap:    make(chan struct{}, 1),
@@ -283,7 +291,7 @@ func (a *Agent) newSession(c transport.Conn, meta SessionMeta) *Session {
 		rateChanges: make(chan rateChange, 16),
 		fecNacks:    make(chan proto.FECNack, 64),
 	}
-	s.log = a.log.With("session", s.id, "path", meta.Path)
+	s.log = slog.New(pathHandler{a.log.With("session", s.id).Handler(), &move.path}) // path=: the path now (move.go)
 	// The direct path and the UDP relay end at the client; the splice relay
 	// (relay-splice, also WebSocket) ends at the gateway.
 	atClient := meta.Path == "direct" || meta.Path == "relay"
@@ -345,7 +353,7 @@ func (s *Session) run() error {
 	case <-s.ctx.Done():
 		return errClosed
 	}
-	s.ctrl = ctrl
+	s.ctrl = s.moveCtrl(ctrl)
 	_ = ctrl.SetReadDeadline(time.Now().Add(10 * time.Second))
 	b, err := proto.ReadMsg(ctrl, proto.MaxControlMsg)
 	if err != nil {
@@ -376,8 +384,13 @@ func (s *Session) run() error {
 			s.onAuth()
 		}
 	}
+	if s.hello.Resume != "" {
+		// A connection on the direct path that takes a running session over.
+		return s.resumeInto()
+	}
 	s.log.Info("session started", "user", s.meta.User, "remote", s.c.RemoteAddr().String(), "ua", trunc(s.hello.Client.UA, 80),
 		"decoders", decoderSummary(s.hello.Decoders), "reset_stream_at", s.resetStreamAt)
+	s.logDirectReport(s.hello.Direct) // direct.go: why this session is (not) on the direct path
 
 	// One active session per host: a new connection takes over, unless the
 	// gateway revoked the user's access since it authorised this one.
@@ -669,6 +682,7 @@ func (s *Session) sendWelcome() error {
 		w.Features = append(w.Features, proto.FeatureBarcodeSeq)
 	}
 	w.WallOffsetUs = media.WallOffset(s.a.clock)
+	w.Resume = s.resumeToken() // move.go: the client may move the session to the direct path
 	return s.sendJSON(w)
 }
 
@@ -2896,21 +2910,27 @@ func (s *Session) inputAllowed() bool {
 	return !s.closing
 }
 
+// inputLoop reads one input stream of s's connection. After a move the
+// connection carries another session (move.go inputTarget): t, resolved per
+// message, is the session the input is for, and every per-session call
+// below goes to t, not s.
 func (s *Session) inputLoop(st transport.BidiStream) {
 	defer st.CancelRead()
+	defer s.inputStream()() // move.go: the order of input across a move
 	inj := s.a.inj
 	for {
 		// A message above the limit is skipped: ending the stream would end
 		// the session's keyboard and mouse buttons (clients split long text).
 		b, err := proto.ReadMsgSkip(st, proto.MaxInputMsg)
 		if errors.Is(err, proto.ErrTooLarge) {
-			s.log.Warn("input message skipped", "err", err)
+			s.inputSession().log.Warn("input message skipped", "err", err)
 			continue
 		}
 		if err != nil {
 			return
 		}
-		if !s.inputAllowed() {
+		t, ok := s.inputTarget() // move.go: the session this connection carries, and its inputAllowed
+		if !ok {
 			return
 		}
 		ev, err := proto.ParseInput(b)
@@ -2930,7 +2950,7 @@ func (s *Session) inputLoop(st transport.BidiStream) {
 			err = inj.Text(ev.Text)
 		}
 		if err != nil {
-			s.log.Debug("inject", "err", err)
+			t.log.Debug("inject", "err", err)
 		}
 	}
 }
@@ -3256,6 +3276,8 @@ func (s *Session) controlLoop() error {
 					s.notice("error", err.Error())
 				}
 			}
+		case "direct":
+			s.logBackgroundDirect(m.Direct) // move.go
 		case "bye":
 			return errClosed
 		}

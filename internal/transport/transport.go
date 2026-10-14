@@ -318,12 +318,31 @@ func MediaControl(c Conn) *cc.Media {
 		qc = c.c
 	case wtConn:
 		qc = c.qc
+	case interface{ MediaControl() *cc.Media }: // a connection that wraps others (the host's moving session connection)
+		return c.MediaControl()
 	}
 	if qc == nil {
 		return nil
 	}
 	m, _ := qc.CongestionControl().(*cc.Media)
 	return m
+}
+
+// CloseConnection closes c's QUIC connection, not only its WebTransport
+// session (a browser keeps a connection up on keep-alives after its session
+// ended): the carrying connection where it is known (FromWebTransportOver),
+// else the session.
+func CloseConnection(c Conn, code uint32, msg string) error {
+	switch c := c.(type) {
+	case quicConn:
+		return c.c.CloseWithError(quic.ApplicationErrorCode(code), msg)
+	case wtConn:
+		if c.qc != nil {
+			_ = c.s.CloseWithError(webtransport.SessionErrorCode(code), msg)
+			return c.qc.CloseWithError(quic.ApplicationErrorCode(code), msg)
+		}
+	}
+	return c.Close(code, msg)
 }
 
 type quicConnKey struct{}

@@ -1447,16 +1447,47 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
 ## Direct path
 
 1. The host runs a WebTransport server on UDP 48100 (`directPort`; outside the 47984–48010 that
-   Sunshine and Apollo use). It advertises the direct path to the gateway only while it holds
-   that port: when another program has it, the host retries every 30 s, and it sends a tunnel
-   `direct` message whenever that changes. Its certificate is self-signed ECDSA P-256, valid for
-   less than 14 days and rotated every 5 days. The host reports the current and previous SHA-256
-   hashes to the gateway over its tunnel.
+   Sunshine and Apollo use), on **one socket per address of the PC** a browser could reach
+   (`internal/host/direct.go` `directAddrs`: the LAN, IPv6, Tailscale, VPNs, virtual switches, a
+   Hyper-V external switch that carries the route to the gateway or the gateway's network counted
+   as the LAN; never loopback, link-local or Teredo; 32 sockets at most), not on the wildcard
+   address. quic-go has no packet information on Windows, so a wildcard socket answers from
+   whatever address the route back to the browser picks; a socket bound to an address answers
+   from it, out of its own interface (Windows sends with the strong host model). It listens on
+   every such address, also the ones it does not announce, and on a loopback route to the gateway
+   (a gateway on the PC), so any address of the PC a browser reaches answers. It looks for
+   addresses that came or went every 30 s and closes only the sockets of addresses gone from the
+   interfaces (a live session may be on one the caps leave out); without an address of its own it
+   falls back to the wildcard socket. It advertises the direct path to the gateway only while it
+   holds the port (when another program has it, it retries every 30 s), and sends a tunnel
+   `direct` message whenever that or its addresses change: `DirectInfo.Addrs` (`directAnnounced`:
+   at most two IPv6 addresses per interface and eight in all, the route to the gateway always
+   among them), each with its kind, prefix length, interface and whether it is the PC's route to
+   the gateway, after the host config `directAddr` list (addresses or names, comma-separated: port
+   forwards, a tailnet name). Its certificate is self-signed ECDSA P-256, valid for 13 days from an
+   hour before it is made and renewed every 5 days. The host reports the current and previous
+   SHA-256 hashes to the gateway over its tunnel; the gateway hands them to browsers as they are.
 2. On `POST /api/hosts/{id}/connect`, the gateway returns relay tickets and a **direct ticket**:
    HMAC-SHA256 under a per-tunnel random key, containing host ID, user, 60 s expiry, a nonce and
-   the requesting **page origin**.
-3. The browser opens `new WebTransport("https://<pc-ip>:48100/wt", {serverCertificateHashes})`,
-   which verifies the PC's certificate by hash. Its first control message carries the ticket.
+   the requesting **page origin**; with it `direct.candidates`, every address of the direct path
+   in the order this browser should try them (`internal/gateway/direct.go`, `orderDirect`): the
+   PC's addresses on the browser's own network (its prefix contains the browser's address;
+   Tailscale addresses for a browser on the tailnet), `directAddr`, the PC's route to the
+   gateway, the address the gateway sees the tunnel come from, then the rest (LAN, IPv6,
+   Tailscale, VPN, virtual), each with a note why it is there, eight at most. `direct.url` is the
+   first, for older clients. The stream page's and its worker's CSP allow every address any
+   browser may be offered (`directSources`, without the cap). A worker keeps its CSP for the
+   page's life: an address the PC gains later is refused for the background tries below until
+   the page is reloaded.
+3. The browser starts `new WebTransport("https://<address>:48100/wt", {serverCertificateHashes})`
+   to every candidate, the first at once and each next one 100 ms later (or at once when every
+   started one has failed: happy eyeballs), keeps the first that comes up and closes every other
+   attempt, also the ones still under way at the 2.5 s deadline. Its first control message
+   carries the ticket, and `direct`: how each address went (connected, no answer, refused,
+   abandoned, not tried), why the connection is not direct, and the client's wall clock; the host
+   logs it at the session's start (`direct path: connected` or `direct path: not used by this
+   session, it streams through the gateway`, with `why=`, `tried=`, and `client_clock=` when the
+   client's clock is a minute or more off the PC's or outside the certificate's validity).
 4. The host verifies the HMAC, expiry, host ID and nonce (single use), and checks that the ticket's
    origin equals the WebTransport `Origin` header. Unauthenticated sessions are capped at 8 and
    time out after 10 s. The expiry is the gateway's time, so the host checks it against the
@@ -1472,16 +1503,67 @@ it sends `{"t":"error","msg":"unauthorized"}`, waits up to 0.5 s for the client 
 session (so the refusal is not reset in flight) and closes it with code 4 (`CodeAuth`). The
 client's next attempts then leave out both paths for 10 minutes and go on to the splice relay,
 whose ticket the gateway checks. The direct path is always tried first: on a LAN, or over Tailscale /
-WireGuard (subnet routing to the PC's address, or `directAddr` set to the PC's tailnet address),
-the browser reaches the PC without the gateway in the media path. The relay is the last resort.
-The overlay's Transport row says why a connection is not on the direct path (`direct: no answer in
-2.5 s: UDP 48100 blocked ...`, `refused after N ms: ...`, no direct endpoint, the settings). At
-start the agent checks whether Windows Firewall lets the direct port in on each connected network
+WireGuard (subnet routing to the PC's address, the PC's tailnet address among its addresses, or
+`directAddr`), the browser reaches the PC without the gateway in the media path. The relay is the
+last resort.
+
+**Moving to the direct path** (`internal/host/move.go`, `stream-worker.js` `tryMove`). A session
+on the UDP relay or the splice gets a resume token in its welcome (`Welcome.resume`, while the PC
+has a direct endpoint; it travels on the session's control stream, end to end encrypted on the
+UDP relay and seen by the gateway on the splice, which ends there). With Network path Auto over
+WebTransport the client goes on trying the direct path in the background, 2, 8, 20 and 60 s after
+the welcome and then every 2 minutes: each try takes a fresh connect answer from the page, races
+the addresses as above and opens a session there whose hello carries the token and the fresh
+direct ticket. The host checks the ticket as for any direct session, then that the token, user
+and page origin are the running session's, and moves that session onto the new connection in two
+steps. `adopt` writes `resumed` as the first message of the new control stream, reads that stream
+after the current one and the new connection's datagrams with the current one's, and goes on
+sending over the current connection; `commitMove` switches frames, datagrams and control messages
+to the new connection once the client shows it moved: its first datagram there (it sends a ping
+at once) or the end of its old control stream (the session's connection and control stream are a
+`moveConn` and `moveStream`; datagrams of every connection are read until it closes, and the
+control stream is read whole messages at a time, from the old stream until it ends). A new
+connection that ends before that (the client waits 5 s for `resumed`, then closes it), or 10 s
+without a sign, is let go (`abandonMove`) and the session stays on its connection; the current
+connection's end while a move waits lets the move go ahead. Input read on the new connection's
+streams goes to the moved session (`inputTarget`), never to the placeholder session the
+connection came with. The pipeline, encoder, audio, rate controller and loss state stay: no new
+session, generation or key frame; a frame lost in the switch is a loss like any other. The client
+closes its old control and input streams at the switch (the host takes the new connection's input
+once the old input stream has ended, 1 s at most, so a key released right after the move is not
+pressed again by a late press) and the old connection after 1 s; the host closes it (its QUIC
+connection, which releases a UDP relay port) 2 s after the commit. A refused move (another token,
+the session ended, a revoked user) gets an `error` and the session goes on where it was. The host
+logs `session moved to the direct path ... from=relay ... taken_ms=N` (or `the move to the direct
+path was not taken`), and the session's lines say `path=direct` from then on; a failed try is
+reported by the client when its outcome changes (`direct path: the client's attempt in the
+background failed`). The overlay's Transport row says `direct <address> (moved from relay)`.
+
+**Diagnostics.** The overlay's Transport row says why a connection is not on the direct path
+(`direct: no answer in 2.5 s: UDP 48100 blocked, or the PC's answers lost on the way (...)`,
+`refused after N ms by ...: ...`, no direct endpoint, the settings), and host.log has the same at
+each session's start. The agent logs every handshake on the direct port that fails, with what its
+end says: the browser refused the certificate (a TLS alert: the client's clock outside the
+certificate's validity, or a connect answer from before the agent's last start), or the PC's
+answers never reached the browser (the browser's handshake times out, or Chromium gives up after
+4 s; the page itself closed the attempt at its 2.5 s deadline: a route back through a VPN or
+Tailscale, an outbound filter); packets that never reach
+the PC (a firewall on the way, a wrong address) leave no line. A close the browser sends within
+2 s, with no error or as `APPLICATION_ERROR` (an application's close in Initial or Handshake
+packets, RFC 9000 10.2.3), is a parallel attempt it dropped: Debug. Anyone who can reach the port
+can fail a handshake, so these lines are Info only for browsers on the PC's own networks
+(private, CGNAT, unique local, link-local, the PC's prefixes), one per address and reason per
+5 minutes and 20 per 10 minutes in all, the rest Debug with a count; more than 32 connection
+attempts a second must prove their address first (QUIC Retry). At start, and when the routes change, it
+warns when the PC reaches the gateway through a tunnel although the gateway is on its own LAN (a
+Tailscale or VPN subnet route covering the LAN; `fix=`). At start the agent also checks whether
+Windows Firewall lets the direct port in on each connected network
 (the network's profile, the firewall's state and the inbound rules for the port or the agent's
 program) and warns with the fix where it does not: the installer's rule covers Private and Domain
 networks, so on a network Windows set to Public the browser's handshake gets no answer and Auto
 streams through the relay (`direct path blocked by Windows Firewall on this network`, `fix=`;
-`recon-host probe` prints the same; VENDOR_NOTES "First hardware run: the direct path on the LAN").
+`recon-host probe` prints the same; VENDOR_NOTES "First hardware run: the direct path on the LAN"
+and "Second hardware run: direct path on the LAN").
 
 Packet size: every QUIC endpoint (`transport.QUICConfig`: the host's direct and UDP-relay servers,
 its tunnels, the gateway's HTTP/3 and splice listeners) starts at 1232-byte UDP payloads

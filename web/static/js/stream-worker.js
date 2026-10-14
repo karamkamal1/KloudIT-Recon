@@ -437,12 +437,20 @@ function telemetrySender(w, prio, isClosed) {
   };
 }
 
-async function openWebTransport(url, hashes, label, timeoutMs) {
+// The options of every WebTransport: datagrams required, the browser's
+// low-latency congestion control where it has one, the server's certificate
+// pinned by hash (the PC's is self-signed: the direct path and the UDP relay
+// end at it).
+function wtOptions(hashes) {
   const opts = { requireUnreliable: true, congestionControl: 'low-latency' };
   if (hashes && hashes.length) {
     opts.serverCertificateHashes = hashes.map((h) => ({ algorithm: 'sha-256', value: b64(h) }));
   }
-  const wt = new WebTransport(url, opts);
+  return opts;
+}
+
+async function openWebTransport(url, hashes, label, timeoutMs) {
+  const wt = new WebTransport(url, wtOptions(hashes));
   wt.closed.catch(() => {});
   try {
     await withTimeout(wt.ready, timeoutMs, `WebTransport ${label}`);
@@ -450,6 +458,12 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
     try { wt.close(); } catch {}
     throw e;
   }
+  return wrapWebTransport(wt, label);
+}
+
+// The transport over a WebTransport that is up: its control and input
+// streams, datagram writers, and run(), which reads it until it closes.
+async function wrapWebTransport(wt, label) {
   const { ctrl, input, dgInput, dgTelemetry, prio } = await openSendChannels(wt);
   const cw = ctrl.writable.getWriter();
   const iw = input.writable.getWriter();
@@ -457,7 +471,7 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
   cw.write(Uint8Array.of(P.KIND_CONTROL)).catch(swallow);
   iw.write(Uint8Array.of(P.KIND_INPUT)).catch(swallow);
   let closed = false;
-  return {
+  const self = {
     kind: 'webtransport',
     path: label,
     prio,
@@ -466,6 +480,12 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
     sendInputDatagram: (b) => { if (!closed) dgInput.write(b).catch(swallow); },
     sendDatagram: telemetrySender(dgTelemetry, prio, () => closed), // acks, rate reports, pings
     close: () => { closed = true; try { wt.close({ closeCode: 0, reason: 'bye' }); } catch {} },
+    // The session moved to another connection: this one's control and input
+    // streams end (the host reads the new connection's input after this
+    // one's, so a key released right after the move is not pressed again by
+    // a press still on its way here); frames and datagrams in flight on it
+    // still arrive until it closes.
+    endStreams: () => { closed = true; cw.close().catch(swallow); iw.close().catch(swallow); },
     async run(h) {
       // A control message that does not parse (a torn stream: a host that
       // went on writing after a write that failed part-way) leaves nothing
@@ -515,7 +535,7 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
       uniLoop.catch(() => {});
       try {
         const info = await wt.closed;
-        if (info?.closeCode === P.CLOSE_AUTH) authRefused = true;
+        if (info?.closeCode === P.CLOSE_AUTH && transport === self) authRefused = true;
         return info?.reason || 'connection closed';
       } catch (e) {
         return e?.message || 'connection lost';
@@ -524,6 +544,7 @@ async function openWebTransport(url, hashes, label, timeoutMs) {
       }
     },
   };
+  return self;
 }
 
 async function openWebSocket(url) {
@@ -595,14 +616,24 @@ async function connect(ep) {
   const wtOK = typeof WebTransport !== 'undefined' && prefs.transport !== 'websocket';
   // directWhy: why a connection that is not on the direct path is not (the
   // overlay's Transport row): the settings, a direct endpoint the PC does not
-  // offer, or how its attempt failed (directFailure).
+  // offer, or how its attempt failed (directFailure). tried: each of the
+  // direct path's addresses and how its attempt went (raceDirect). Both go
+  // to the host in the hello, which logs them (host.log says why a session
+  // streams through the gateway).
   let directWhy = prefs.path === 'relay' ? 'Network path is "Relay via gateway"' : !wtOK ? 'needs WebTransport' : '';
+  let tried = [];
   // skipTicketed: the host refused a ticket a moment ago (its clock or key
   // disagrees with the gateway's): the paths the host authorises are left
   // out for a while, so Auto and Relay reach the splice relay, which the
   // gateway authorises. Direct only has nothing else to try.
   if (wtOK && ep.direct && prefs.path !== 'relay' && !(prefs.skipTicketed && prefs.path !== 'direct')) {
-    attempts.push(['direct', async () => ({ t: await openWebTransport(ep.direct.url, ep.direct.hashes, 'direct', DIRECT_TIMEOUT_MS), ticket: ep.direct.ticket })]);
+    attempts.push(['direct', async () => {
+      const r = await raceDirect(directCandidates(ep.direct), ep.direct.hashes, DIRECT_TIMEOUT_MS);
+      tried = r.tried;
+      const t = await wrapWebTransport(r.wt, 'direct');
+      t.addr = hostOf(r.cand.url);
+      return { t, ticket: ep.direct.ticket };
+    }]);
   } else if (!directWhy) {
     directWhy = !ep.direct ? 'the PC offers no direct endpoint (its agent has none up: host.log)' : 'skipped: the PC refused a ticket a moment ago';
   }
@@ -632,10 +663,14 @@ async function connect(ep) {
       post('status', { text: `Connecting (${label})…` });
       const c = await fn();
       c.directWhy = label === 'direct' ? '' : directWhy;
+      c.direct = { why: c.directWhy, tried };
       return c;
     } catch (e) {
       lastErr = e;
-      if (label === 'direct') directWhy = directFailure(e, performance.now() - t0, ep.direct.url);
+      if (label === 'direct') {
+        tried = e.tried || tried;
+        directWhy = directFailure(e, performance.now() - t0, ep.direct);
+      }
       post('log', { text: `${label} failed: ${e.message}` });
     }
   }
@@ -645,21 +680,310 @@ async function connect(ep) {
 // How long the direct path may take to come up before Auto moves on.
 const DIRECT_TIMEOUT_MS = 2500;
 
-// How the direct path's attempt failed, for the Transport row (the first
-// hardware run streamed through the relay on the PC's own network without a
-// word why). No answer within DIRECT_TIMEOUT_MS: the PC's UDP port is closed
-// on the way (Windows Firewall on a network whose profile is Public, which
-// the installer's rule does not cover; a router between the networks; away
-// from home without a port forward). A quicker failure: something answered
-// and refused it (nothing listens on the port, a certificate that does not
-// match, the PC refused the ticket).
-function directFailure(e, ms, url) {
-  const port = /:(\d+)\/wt$/.exec(url || '')?.[1] || '';
-  const m = e?.message || String(e);
-  if (/timed out/.test(m)) {
-    return `no answer in ${(ms / 1000).toFixed(1)} s: UDP ${port} blocked (PC firewall: a Public network? host.log says)`;
+// The direct path's addresses, in the order the gateway gives them (the
+// connect answer's direct.candidates: the PC's address on this browser's
+// network first; gateways before it give one URL).
+function directCandidates(d) {
+  const c = Array.isArray(d?.candidates) ? d.candidates.filter((x) => typeof x?.url === 'string') : [];
+  return c.length ? c : d?.url ? [{ url: d.url }] : [];
+}
+
+const hostOf = (url) => /^https:\/\/([^/]+)\//.exec(url || '')?.[1] || url;
+
+// How long after the previous address the next one starts (happy eyeballs,
+// RFC 8305's connection attempt delay): the gateway's first choice wins when
+// several answer, and one that fails early lets the next start at once.
+const DIRECT_STAGGER_MS = 100;
+
+// raceDirect starts a WebTransport to every address of the direct path, the
+// first at once and each next one DIRECT_STAGGER_MS after the one before (or
+// as soon as every one started has failed), and resolves with the first that
+// comes up within timeoutMs ({ wt, cand, tried }); the others are closed. It
+// rejects when none does, with tried on the error. tried: per address its
+// url, kind and note (the gateway's), the time to its outcome and the
+// outcome ("connected", "no answer", "refused: ...", "abandoned": another
+// came up first, "not tried").
+function raceDirect(cands, hashes, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const tried = cands.map((c) => ({ url: c.url, kind: c.kind || '', note: c.note || '', ms: 0, result: 'not tried' }));
+    const wts = [];
+    const live = []; // started, neither up nor failed yet
+    const starts = [];
+    let next = 0;
+    let pending = 0;
+    let done = false;
+    let timer = 0;
+    // end closes every attempt still under way, the ones the deadline just
+    // marked "no answer" too: left open, an attempt goes on in the browser
+    // until its own handshake timeout (Chrome: 4 s), and one that comes up
+    // late opens a session on the PC that nobody uses.
+    const end = () => {
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(deadline);
+      for (let j = 0; j < wts.length; j++) {
+        if (!live[j]) continue;
+        live[j] = false;
+        if (tried[j].result === 'pending') {
+          tried[j].result = 'abandoned';
+          tried[j].ms = Math.round(performance.now() - starts[j]);
+        }
+        try { wts[j].close(); } catch {}
+      }
+    };
+    const failed = () => {
+      if (done || pending > 0 || next < cands.length) return;
+      end();
+      reject(Object.assign(new Error(`direct path: ${tried.map((a) => `${hostOf(a.url)} ${a.result}`).join(', ') || 'no address'}`), { tried }));
+    };
+    const start = () => {
+      if (done || next >= cands.length) return;
+      const i = next++;
+      const a = tried[i];
+      starts[i] = performance.now();
+      let wt;
+      try {
+        wt = new WebTransport(cands[i].url, wtOptions(hashes));
+      } catch (e) {
+        a.result = `refused: ${e?.message || e}`;
+        start();
+        failed();
+        return;
+      }
+      wts[i] = wt;
+      live[i] = true;
+      a.result = 'pending';
+      pending++;
+      wt.closed.catch(() => {});
+      wt.ready.then(() => {
+        pending--;
+        live[i] = false;
+        a.ms = Math.round(performance.now() - starts[i]);
+        if (done) {
+          a.result = 'connected, not needed';
+          try { wt.close(); } catch {}
+          return;
+        }
+        a.result = 'connected';
+        end();
+        resolve({ wt, cand: cands[i], tried });
+      }, (e) => {
+        pending--;
+        live[i] = false;
+        if (a.result !== 'pending') return; // closed here (no answer, abandoned)
+        a.ms = Math.round(performance.now() - starts[i]);
+        a.result = `refused: ${e?.message || e}`;
+        // Every one started has failed: the next one now.
+        if (!done && pending === 0) {
+          clearTimeout(timer);
+          tick();
+        }
+        failed();
+      });
+    };
+    const tick = () => {
+      start();
+      if (!done && next < cands.length) timer = setTimeout(tick, DIRECT_STAGGER_MS);
+    };
+    const deadline = setTimeout(() => {
+      if (done) return;
+      for (let j = 0; j < wts.length; j++) {
+        if (tried[j].result !== 'pending') continue;
+        tried[j].result = 'no answer';
+        tried[j].ms = Math.round(performance.now() - starts[j]);
+      }
+      end();
+      reject(Object.assign(new Error(`WebTransport direct timed out after ${timeoutMs} ms`), { tried }));
+    }, timeoutMs);
+    if (!cands.length) {
+      done = true;
+      clearTimeout(deadline);
+      reject(Object.assign(new Error('the PC offers no direct address'), { tried }));
+      return;
+    }
+    tick();
+  });
+}
+
+// How the direct path's attempt failed, for the Transport row and the host
+// log (the first hardware run streamed through the relay on the PC's own
+// network without a word why). No answer within DIRECT_TIMEOUT_MS from any
+// address: the browser's packets do not reach the PC (Windows Firewall on a
+// network whose profile is Public, which the installer's rule does not
+// cover; a router between the networks; away from home without a port
+// forward), or the PC's answers do not reach the browser (a route back
+// through a VPN): the PC's host.log tells these apart (a line per failed
+// handshake, none for packets that never came). A quicker failure:
+// something answered and refused it (nothing listens on the port, a
+// certificate that does not match, the content security policy).
+function directFailure(e, ms, direct) {
+  const tried = e?.tried || [];
+  const port = /:(\d+)\/wt$/.exec(tried[0]?.url || direct?.url || '')?.[1] || '';
+  const silent = tried.filter((a) => a.result === 'no answer');
+  const refused = tried.filter((a) => a.result.startsWith('refused'));
+  const list = (as) => as.map((a) => hostOf(a.url)).join(', ');
+  if (silent.length || (!refused.length && /timed out/.test(e?.message || ''))) {
+    const also = refused.length ? `; refused by ${list(refused)}: ${refused[0].result.slice(9)}` : '';
+    return `no answer in ${(ms / 1000).toFixed(1)} s: UDP ${port} blocked, or the PC's answers lost on the way (${list(silent) || 'the PC'}; ` +
+      `the PC's host.log says which)${also}`;
   }
-  return `refused after ${Math.round(ms)} ms: ${m}`;
+  if (refused.length) {
+    return `refused after ${refused[0].ms} ms by ${list(refused)}: ${refused[0].result.slice(9)}`;
+  }
+  return `refused after ${Math.round(ms)} ms: ${e?.message || e}`;
+}
+
+// Moving to the direct path (VENDOR_NOTES "Second hardware run: direct path
+// on the LAN"). A session that came up on a relay (the direct path did not
+// answer in time, or not at all) goes on trying the direct path in the
+// background: after MOVE_DELAYS_MS, then every MOVE_EVERY_MS. Each attempt
+// asks the page for a fresh connect answer (a new direct ticket and the
+// PC's addresses now), races the addresses as connect() does, and opens a
+// session there whose hello carries the host's resume token (Welcome.resume)
+// and the ticket. The host moves the running session onto it and answers
+// "resumed": from then on input, control and telemetry go out on the new
+// connection, frames and datagrams arrive on both until the old one closes
+// (after MOVE_OLD_MS; the host closes it too), and nothing restarts: the
+// decoder, the picture and the audio go on. A failed attempt keeps the
+// relay; its outcome goes to the host (a "direct" control message) when it
+// differs from the last one, which the host logs. Only with Network path
+// Auto, on WebTransport, with a host that sends a resume token. A move the
+// host answers too late (after MOVE_ANSWER_MS the new connection is closed)
+// is one the host lets go: it switches only once this client has (a
+// datagram on the new connection, or the old control stream's end).
+const MOVE_DELAYS_MS = [2000, 8000, 20000, 60000];
+const MOVE_EVERY_MS = 120000;
+const MOVE_ANSWER_MS = 5000; // for the host's "resumed"
+const MOVE_OLD_MS = 1000; // the old connection's frames in flight
+const move = {
+  token: '', // Welcome.resume
+  tries: 0,
+  timer: 0,
+  busy: false,
+  pending: null, // the new connection while the host has not answered
+  told: '', // the outcome last sent to the host
+  handlers: null, // the session's transport handlers (start)
+  client: null, // the hello's client info
+  epWait: null, // resolves with the page's connect answer
+};
+
+function scheduleMove() {
+  clearTimeout(move.timer);
+  move.timer = 0;
+  if (!move.token || !transport || transport.kind !== 'webtransport' || transport.path === 'direct' || prefs.path !== 'auto' ||
+    prefs.skipTicketed || typeof WebTransport === 'undefined') return;
+  const delay = MOVE_DELAYS_MS[move.tries] ?? MOVE_EVERY_MS;
+  move.timer = setTimeout(tryMove, delay);
+}
+
+// The page's connect answer (it holds the CSRF token the gateway's API wants).
+function freshEndpoints() {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { move.epWait = null; reject(new Error('no connect answer from the page in 10 s')); }, 10000);
+    move.epWait = (m) => {
+      clearTimeout(t);
+      move.epWait = null;
+      if (m.error) reject(new Error(m.error));
+      else resolve(m.ep);
+    };
+    post('needEndpoints', {});
+  });
+}
+
+async function tryMove() {
+  if (move.busy || !transport || transport.path === 'direct') return;
+  move.busy = true;
+  move.tries++;
+  const t0 = performance.now();
+  let ep = null;
+  let tried = [];
+  try {
+    ep = await freshEndpoints();
+    if (!ep?.direct) throw new Error('the PC offers no direct endpoint (its agent has none up: host.log)');
+    const r = await raceDirect(directCandidates(ep.direct), ep.direct.hashes, DIRECT_TIMEOUT_MS);
+    tried = r.tried;
+    let nt;
+    try {
+      nt = await wrapWebTransport(r.wt, 'direct');
+    } catch (e) {
+      try { r.wt.close(); } catch {}
+      throw e;
+    }
+    nt.addr = hostOf(r.cand.url);
+    await moveTo(nt, ep.direct.ticket, tried);
+  } catch (e) {
+    tried = e.tried || tried;
+    const why = ep?.direct && e.tried ? directFailure(e, performance.now() - t0, ep.direct) : e.message;
+    post('log', { text: `direct path in the background: ${why}` });
+    post('directWhy', { why });
+    // The host logs it (once per outcome).
+    if (why !== move.told && transport) {
+      move.told = why;
+      transport.sendControl({ t: 'direct', direct: { why, tried, clock: Date.now() } });
+    }
+  } finally {
+    move.busy = false;
+    scheduleMove();
+  }
+}
+
+// moveTo opens the session on nt with the resume token and moves to it when
+// the host answers "resumed".
+function moveTo(nt, ticket, tried) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      move.pending = null;
+      nt.close();
+      reject(e);
+    };
+    const timer = setTimeout(() => fail(new Error(`the PC did not answer the move in ${MOVE_ANSWER_MS / 1000} s`)), MOVE_ANSWER_MS);
+    const h = move.handlers;
+    move.pending = nt;
+    nt.done = nt.run({
+      ...h,
+      control: (m) => {
+        if (!settled) {
+          if (m?.t === 'resumed') {
+            if (!transport || move.handlers !== h) {
+              fail(new Error('the session ended meanwhile'));
+              return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            move.pending = null;
+            switchTransport(nt, tried);
+            resolve();
+            return;
+          }
+          if (m?.t === 'error' || m?.t === 'bye') {
+            fail(new Error(`the PC refused the move: ${m.msg}`));
+            return;
+          }
+        }
+        h.control(m);
+      },
+    });
+    nt.done.then((reason) => fail(new Error(`the new connection closed: ${reason}`)));
+    nt.sendControl({ t: 'hello', v: P.HELLO_VERSION, ticket, resume: move.token, client: move.client, direct: { why: '', tried, clock: Date.now() } });
+  });
+}
+
+// The host moved the session to nt: input, control and telemetry go there
+// now. The host goes on sending over the old connection until it sees the
+// switch (a datagram on nt, or the end of the old control stream): a ping
+// at once tells it.
+function switchTransport(nt, tried) {
+  const old = transport;
+  transport = nt;
+  sendPing();
+  old.endStreams?.();
+  setTimeout(() => old.close(), MOVE_OLD_MS);
+  post('log', { text: `moved the session from the ${old.path} path to the direct path (${nt.addr}) without a restart` });
+  post('moved', { path: nt.path, addr: nt.addr, from: old.path, tried });
 }
 
 // Network path "Direct to PC only" (the one setting that can leave nothing
@@ -2380,6 +2704,8 @@ function onControl(m) {
       hdr.hostOffers = hostFeatures.includes(P.FEATURE_HDR);
       updateProbeMode();
       post('welcome', { info: m });
+      move.token = m.resume || ''; // the session may move to the direct path (hosts since the second hardware run)
+      scheduleMove();
       break;
     case 'clock': if (Number.isFinite(m.wallOffsetUs)) probe.wallOffsetUs = m.wallOffsetUs; updateProbeMode(); break;
     case 'video': onVideoConfig(m); break;
@@ -2610,7 +2936,7 @@ async function start(msg) {
     return;
   }
   transport = conn.t;
-  post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name, directWhy: conn.directWhy || '' });
+  post('connected', { transport: transport.kind, path: transport.path, renderer: renderer.name, directWhy: conn.directWhy || '', addr: transport.addr || '' });
   const opusOK = typeof AudioDecoder !== 'undefined' &&
     (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }).then((r) => r.supported).catch(() => false));
   const helloDecoders = await tested;
@@ -2624,6 +2950,7 @@ async function start(msg) {
     client: msg.client, decoders: helloDecoders, audio: { opus: opusOK, pcm: true }, prefs: { ...msg.hostPrefs, hdr: hdrPrefs() },
     // Video frames as datagram shards (GUIDE 2.5): WebTransport only.
     ...(transport.kind === 'webtransport' && prefs.fec !== 'off' ? { fec: P.HELLO_FEC_VERSION } : {}),
+    direct: { ...conn.direct, clock: Date.now() }, // how the direct path went, and this PC's clock (the host logs them)
   });
   post('hello', { decoders: helloDecoders }); // what the host chose the codec from (overlay, tests)
   openPageControl();
@@ -2631,10 +2958,22 @@ async function start(msg) {
   const pingTimer = setInterval(sendPing, 1000);
   const watchdogTimer = setInterval(videoWatchdog, 250);
   const statsTimer = setInterval(postStats, 500);
-  const reason = await transport.run({ control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset });
+  // The session's connection may change (a move to the direct path):
+  // the session ends when the connection it is on ends.
+  move.handlers = { control: onControl, datagram: onDatagram, frame: onFrameBytes, frameReset: onFrameReset };
+  move.client = msg.client;
+  let on = transport;
+  let reason = await (on.done = on.run(move.handlers));
+  while (transport && transport !== on) {
+    on = transport;
+    reason = await on.done;
+  }
+  clearTimeout(move.timer);
+  move.token = '';
+  move.pending?.close();
   if (authRefused && conn.ticket) {
-    post('log', { text: `the host refused the ${transport.path} path's ticket: the next attempts skip the paths it authorises for 10 minutes` });
-    post('ticketRefused', { path: transport.path });
+    post('log', { text: `the host refused the ${on.path} path's ticket: the next attempts skip the paths it authorises for 10 minutes` });
+    post('ticketRefused', { path: on.path });
   }
   clearInterval(pingTimer);
   clearInterval(statsTimer);
@@ -2656,6 +2995,7 @@ self.onmessage = (ev) => {
     case 'in': if (pageCtl.input) transport?.sendInput(m.b); break;
     case 'dg': if (pageCtl.input) transport?.sendInputDatagram(m.b); break;
     case 'ctl': pageControl(m.m); break;
+    case 'endpoints': move.epWait?.(m); break; // the page's connect answer for a move to the direct path
     case 'prefs':
       prefs = { ...prefs, ...m.prefs };
       updateProbeMode();
@@ -2680,6 +3020,9 @@ self.onmessage = (ev) => {
     case 'loseContext': renderer?.loseContext(); break; // test hook: the active path's GPU context is lost
     case 'stageDump': post('stageDump', { recs: lat.recs.map((r) => ({ ...r.raw, stages: r.s, e2e: r.e2e, fromCapture: r.fromCapture })) }); break;
     case 'close':
+      clearTimeout(move.timer);
+      move.token = '';
+      move.pending?.close();
       if (transport) {
         if (pageCtl.open) transport.sendControl({ t: 'bye' }); // (not in place of the hello)
         setTimeout(() => transport?.close(), 50);

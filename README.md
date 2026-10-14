@@ -78,7 +78,10 @@ hardware follow **[docs/HARDWARE_TEST_PLAN.md](docs/HARDWARE_TEST_PLAN.md)**, an
 - **One QUIC stream per video frame (WebTransport).** A lost packet delays only its own frame.
   WebSocket is the fallback.
 - **Direct path on the LAN.** WebTransport straight to the PC, with certificate-hash pinning
-  and a single-use, origin-bound gateway ticket. Without it:
+  and a single-use, origin-bound gateway ticket. The PC listens on each of its addresses (LAN,
+  IPv6, Tailscale, ...) and the browser tries them all at once, the one on its own network
+  first. With Network path *Auto* over WebTransport, a session that had to start on a relay
+  moves to the direct path by itself when it answers, without a restart. Without it:
   1. The gateway's **UDP relay**, which forwards the datagrams of the same end-to-end QUIC
      connection.
   2. A QUIC splice on the gateway's main port.
@@ -549,7 +552,7 @@ PC yourself (your session takes it over) or restart `recon-host` on it.
 | `defaultKbps` / `maxKbps` | 30000 / 250000 | `maxKbps` caps the bitrate. `defaultKbps` is only for a client that names no bitrate: the browser always sends its own Bitrate setting (30 Mbit/s until you change it in the stream's settings drawer), so changing `defaultKbps` does not change a browser's stream |
 | `defaultFps` / `maxFps` | 60 / 240 | `maxFps` caps the frame rate (also capped at the display refresh rate). `defaultFps` is only for a client that names no frame rate: the browser always sends its own Frame rate setting (60 fps until you change it), so changing `defaultFps` does not change a browser's stream |
 | `directPort` | 48100 | UDP port for the direct path (0 = relay only). Keep it out of 47984–48010, which Sunshine and Apollo use |
-| `directAddr` | auto | Address to advertise for the direct path |
+| `directAddr` | auto | Addresses or names to offer for the direct path first, comma-separated (a port forward, the PC's tailnet name). The PC's own addresses are offered anyway, the one on the browser's network first |
 | `congestion` | `media` | QUIC congestion control of the host's video connections (the direct path and the UDP relay, both end to end with the browser, and the QUIC splice relay's host → gateway data connection, whose gateway → browser leg stays `reno`): `media` (paces at 1.2 × the session's bitrate, video + audio + 200 kbit/s, and does not halve its window on a single loss: the rate controller backs off instead) or `reno` (quic-go's NewReno, the default before the rate controller) |
 | `svc` | `auto` | Temporal SVC thinning: under congestion the agent leaves out the frames no other frame references, before they are sent (the frame rate drops for the moment, the picture is not damaged, no key frame), and the browser skips them without counting a loss; lasting congestion still lowers the bitrate. `auto` streams the native helper's encoder with two temporal layers where it has them (the enhancement layer is what is left out; on the FFmpeg path only an encoder's own non-reference frames qualify) for browsers that understand it; `off` neither. host.log: `thinning: leaving out discardable frames under congestion`, `thinning ended`, `temporal SVC not used` (why), `stream stats` `thinned`. Unverified on hardware: see `docs/VENDOR_NOTES.md`, Phase 5 wiring A |
 | `staticBitrate` / `staticKbps` | `auto` / 0 | On a static desktop (the native helper's dirty rects and idle repeats: for 3 s at most 0.2 % of the picture changed per frame and at most five new images a second; never a game or a video, whatever the encoder makes) lower the encoder's bitrate to `staticKbps` (0: a quarter of the current target, at least 2000 kbit/s), and raise it again with the first frame that changes: the full bitrate from 5 % of the picture changed (a scrolled window, a video) or more than five new images a second, linearly between 0.2 % and 5 % (a small window update: about 37 % of the target at 1 %); a cut that ends within 10 s doubles the 3 s before the next one (at most 30 s). Only on encoders that change their bitrate seamlessly. `off` never. host.log: `static desktop: lowering the bitrate` (with `images`, `output_kbps`, `still_ms`), `desktop changes: full bitrate back` (with `next_hold_ms`) |
@@ -666,7 +669,17 @@ lists its options; see `docs/HELPER_PROTOCOL.md` ("Live-bitrate qualification") 
   of HTTPS, pass the proxy's address with `-trust-proxy`; otherwise the client's network uses
   different addresses for TCP and UDP (IPv6 and IPv4, some carrier-grade NATs), which the relay
   cannot follow (`docs/SECURITY.md`, Known limitations).
-- **The direct path is never used.** The overlay's Transport row says why after `direct:`. Allow
+- **The direct path is never used.** `host.log` says why at each session's start
+  (`direct path: not used by this session, it streams through the gateway`, with `why=` and every
+  address the browser tried and how it went in `tried=`), and the overlay's Transport row says
+  it after `direct:`. A `no answer` with a line `direct path: a browser's connection failed in
+  its handshake ... the PC's answers did not reach it` means the PC's answers take another route
+  (a VPN or Tailscale route that covers the LAN: `host.log` warns at start `the PC reaches the
+  gateway through a tunnel`, with `fix=`); `refused the PC's certificate` means the client PC's
+  clock is off (the session's line says by how much in `client_clock=`: the certificate is not
+  valid yet for a clock more than an hour behind the PC's, nor for one days ahead; turn on
+  Windows time sync on the client) or a connect answer older than the agent's last start (reload
+  the page); a `no answer` with no such line means the browser's packets never reach the PC. Allow
   UDP 48100 on the PC: the installer adds a rule for Private and Domain networks, so a network
   Windows set to *Public* (the first hardware run's) keeps the port closed. `host.log` warns at
   start (`direct path blocked by Windows Firewall on this network`, with `fix=`) and

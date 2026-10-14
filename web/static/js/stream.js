@@ -504,6 +504,19 @@ function onWorker(m) {
       if (S.logs.length > 200) S.logs.shift();
       break;
     case 'udpRelayFailed': S.udpRelayFailedAt = performance.now(); break;
+    // The worker tries the direct path in the background while the session
+    // streams through a relay, with a fresh connect answer each time (this
+    // page holds the CSRF token); a move keeps the session (no reconnect).
+    case 'needEndpoints': {
+      const w = S.worker;
+      api('POST', `/api/hosts/${encodeURIComponent(hostId)}/connect`, {}, { redirect: false })
+        .then((ep) => w?.postMessage({ type: 'endpoints', ep }), (e) => w?.postMessage({ type: 'endpoints', error: e.message }));
+      break;
+    }
+    case 'moved': // (the overlay's Transport row says so; nothing over the picture)
+      if (S.conn) S.conn = { ...S.conn, path: m.path, addr: m.addr, directWhy: '', movedFrom: m.from, movedAt: new Date().toISOString() };
+      break;
+    case 'directWhy': if (S.conn) S.conn = { ...S.conn, directWhy: m.why }; break;
     case 'ticketRefused': S.ticketRefusedAt = performance.now(); break;
     case 'connected':
       S.conn = m;
@@ -1057,7 +1070,8 @@ function onStats(st) {
     row('Loss recovery', recoveryText(v.recovery, st)),
     // Not on the direct path: why not (the attempt's failure, a direct
     // endpoint the PC does not offer, the settings).
-    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${st.fecNow ? ' · datagrams + FEC' : ''}` +
+    row('Transport', S.conn ? `${S.conn.transport} · ${S.conn.path}${S.conn.addr ? ` ${S.conn.addr}` : ''}${S.conn.movedFrom ? ` (moved from ${S.conn.movedFrom})` : ''}` +
+      `${st.fecNow ? ' · datagrams + FEC' : ''}` +
       `${S.conn.path !== 'direct' && S.conn.directWhy ? ` · direct: ${S.conn.directWhy}` : ''}` : '—'),
     st.prio ? row('  send priority', prioText(st.prio)) : null,
     st.fec ? fecRow(st.fec, row) : null,

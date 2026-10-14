@@ -320,11 +320,37 @@ On any device on your home network (laptop, another PC, tablet), open
 - Controllers: press a button after the stream starts. A "Controller connected" message appears.
 
 **The direct path is not used at home.** On the PC's own network the browser should reach the
-PC directly on UDP 48100. When the overlay's Transport row reads a relay
-(`webtransport · relay` or `relay-splice`) at home, it says why after `direct:`:
+PC directly on UDP 48100: it tries every address of the PC at once (the agent lists them at
+start: `direct WebTransport endpoint listening ... addrs=`), and with Network path *Auto* over
+WebTransport a session that had to start on a relay moves to the direct path by itself once it
+answers (`session moved to the direct path` in `host.log`; the overlay's Transport row then reads
+`direct <address> (moved from relay)`). When
+the row reads a relay (`webtransport · relay` or `relay-splice`) at home, it says why after
+`direct:`, and `host.log` says the same at each session's start, with every address the browser
+tried and how it went:
 
-- `direct: no answer in 2.5 s: UDP 48100 blocked ...`: the port is closed on the way, almost
-  always by Windows Firewall because Windows set the network to **Public**: the installer's rule
+```powershell
+Select-String "$env:ProgramData\KlouditRecon\$env:USERNAME\host.log" -Pattern 'direct path|endpoint listening|reaches the gateway through a tunnel' | Select-Object -Last 20
+```
+
+- `no answer ...` together with `direct path: a browser's connection failed in its handshake ...
+  the PC's answers did not reach it`: the browser's packets reach the PC, its answers do not
+  reach the browser. They take another route, almost always a VPN or Tailscale route that covers
+  the LAN; the agent warns at start `the PC reaches the gateway through a tunnel although the
+  gateway is on the PC's own network` with the fix (Tailscale: turn off *Use Tailscale subnets* on
+  the PC, or `tailscale set --accept-routes=false`). `Find-NetRoute -RemoteIPAddress <the
+  browser's PC's address>` shows which interface the PC answers through.
+- `refused ...` together with `the browser refused the PC's certificate`: the client PC's clock is
+  off. The certificate is valid from an hour before the agent made it (at its start, and every 5
+  days) for 13 days, and Chrome checks it against its own clock: a client more than an hour
+  behind the PC, or days ahead, refuses it. The session's `direct path` line says how far off the
+  client is (`client_clock=`); turn on time sync on the client (Windows: Settings → Time &
+  language → Date & time → *Set time automatically*, then *Sync now*). Less often the page used a
+  connect answer from before the agent's last start (a new certificate): reload it. (The gateway
+  passes the agent's hashes on as they are: different versions do not cause this.)
+- `direct: no answer in 2.5 s: UDP 48100 blocked ...` with no handshake line in `host.log`: the
+  browser's packets never reach the PC. Almost
+  always Windows Firewall because Windows set the network to **Public**: the installer's rule
   covers Private and Domain networks only. The first hardware run streamed every session through
   the relay this way. `host.log` says so when the agent starts:
   `direct path blocked by Windows Firewall on this network: browsers on it stream through the
@@ -341,7 +367,9 @@ PC directly on UDP 48100. When the overlay's Transport row reads a relay
   (or Settings → Network & internet → your connection → *Private network*). Only do this on your
   own network. If the rule is missing (`no inbound firewall rule allows UDP 48100`), run the
   installer again or add it with the `New-NetFirewallRule` command `host.log` prints. Reconnect
-  the stream afterwards: no agent restart is needed.
+  the stream afterwards: no agent restart is needed. With the firewall open (`direct path: Windows
+  Firewall lets it in on this network`), something else drops UDP between the two PCs: a third
+  party firewall or antivirus on either PC, Wi-Fi client isolation, a VLAN between them.
 - `direct: refused after N ms: ...`: something answered and refused: nothing listens on the port
   (`host.log`: `direct endpoint unavailable`, another program holds it, see README,
   Troubleshooting) or the PC refused the browser's ticket.

@@ -62,7 +62,39 @@ type DirectInfo struct {
 	Port   int      `json:"port"`
 	Addr   string   `json:"addr,omitempty"`   // advertised host/IP (else: tunnel peer address)
 	Hashes []string `json:"hashes,omitempty"` // base64 SHA-256 certificate hashes
+	// Addrs are every address the direct endpoint can be reached at, in the
+	// host's order: the rest of the host config's directAddr list (kind
+	// DirectKindOverride), then the PC's own addresses it listens on. The
+	// gateway offers the browser all of them (directCandidates), the ones on
+	// the browser's own network first. Absent from hosts before it: the
+	// gateway then offers Addr or the tunnel's peer address alone.
+	Addrs []DirectAddr `json:"addrs,omitempty"`
 }
+
+// DirectAddr is one address of the host's direct endpoint.
+type DirectAddr struct {
+	IP string `json:"ip"` // an IP address, or a name (DirectKindOverride)
+	// Bits is the prefix length of the address's network on its interface
+	// (0: unknown): the gateway puts an address on the browser's network
+	// first.
+	Bits  int    `json:"bits,omitempty"`
+	Kind  string `json:"kind"`         // DirectKind*
+	Iface string `json:"if,omitempty"` // the interface's name, for the logs
+	// Route: the address the PC reaches the gateway from (its route to it).
+	Route bool `json:"route,omitempty"`
+}
+
+// DirectAddr.Kind values, in the order the gateway offers addresses of no
+// better rank (directCandidates).
+const (
+	DirectKindOverride  = "override"  // host config directAddr (not necessarily the PC's own: a port forward, a name)
+	DirectKindLAN       = "lan"       // private IPv4 (RFC 1918)
+	DirectKindPublic    = "public"    // a public IPv4 on the PC itself
+	DirectKindIPv6      = "ipv6"      // global or unique local IPv6
+	DirectKindTailscale = "tailscale" // 100.64.0.0/10 (also carrier-grade NAT), fd7a:115c:a1e0::/48
+	DirectKindVPN       = "vpn"       // an interface named like a VPN's (WireGuard, ZeroTier, OpenVPN, ...)
+	DirectKindVirtual   = "virtual"   // an interface named like a virtual switch's (Hyper-V, WSL, VirtualBox, VMware, Docker)
+)
 
 // RelayInfo describes the host's end of the UDP relay: the WebTransport server
 // behind its outbound relay socket, with the direct path's certificate.

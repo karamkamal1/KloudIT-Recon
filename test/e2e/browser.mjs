@@ -55,7 +55,7 @@
 // an HDR display: a 10-bit PQ AV1 stream presented with extended range,
 // checked to the pixel, then HDR Off live (tone-mapped, then an SDR stream).
 // E2E_ONLY=<regex> runs the scenarios and sections whose names match
-// (development).
+// (development); E2E_CHROME=<path> runs the main page in another Chromium.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -2502,6 +2502,194 @@ async function checkTicketRefused() {
   await endStream();
 }
 
+// The direct path's addresses (VENDOR_NOTES "Second hardware run: direct path
+// on the LAN"): the second hardware run streamed every session through the
+// gateway's relay on the PC's own network, and nothing said why. The gateway
+// offered one address and the browser tried that one. Now the gateway offers
+// every address of the PC (the host's directAddr list here), the browser
+// starts them all, each DIRECT_STAGGER_MS after the one before, keeps the
+// first that answers and tells the host how each went, which the host logs at
+// the session's start; the host also logs every handshake that fails on its
+// side. Three causes, reproduced:
+//  - the first address does not answer (as a Tailscale address does for a
+//    browser off the tailnet; here 127.0.0.3, where a socket swallows every
+//    datagram): the second, 127.0.0.1, connects, with no 2.5 s wait;
+//  - a certificate the browser refuses (the connect answer's hashes do not
+//    match the PC's certificate): every address fails at once, the stream
+//    goes through the relay, and the overlay, the host's session line and
+//    its handshake line say the certificate was refused;
+//  - the PC's answers lost on the way back (a proxy that passes the
+//    browser's datagrams to the PC and drops the PC's, as a route back
+//    through a VPN does): no answer, and the host log says the answers did
+//    not reach the browser.
+async function checkDirectCandidates() {
+  const sink = dgram.createSocket('udp4');
+  await new Promise((res, rej) => { sink.once('error', rej); sink.bind(directPort, '127.0.0.3', res); });
+  let route = null;
+  const answer = (edit) => async (r) => {
+    const resp = await r.fetch();
+    const body = await resp.json();
+    if (body.direct) edit(body.direct);
+    await r.fulfill({ response: resp, json: body });
+  };
+  const setRoute = async (edit) => {
+    if (route) await ctx.unroute('**/api/hosts/*/connect', route);
+    route = edit ? answer(edit) : null;
+    if (route) await ctx.route('**/api/hosts/*/connect', route);
+  };
+  const sessionLine = (log) => /msg="direct path: (connected|not used by this session)[^\n]*/.exec(log)?.[0] || '';
+  try {
+    await withHostConfig({ directAddr: '127.0.0.3, 127.0.0.1' }, async () => {
+      const host = await restartHost({}, 'host-direct-addrs');
+      const listening = /msg="direct WebTransport endpoint listening"[^\n]*/.exec(host.log)?.[0] || '';
+      let log0 = host.log.length;
+      await startStream({ path: 'auto', transport: 'auto' });
+      const conn = await page.evaluate(() => window.__recon.conn);
+      let line = sessionLine(host.log.slice(log0));
+      const first = new RegExp(`127\\.0\\.0\\.3:${directPort} \\(override, host config directAddr\\): (abandoned|no answer) after (\\d+) ms`).exec(line);
+      const second = new RegExp(`127\\.0\\.0\\.1:${directPort} \\(override, host config directAddr\\): connected after (\\d+) ms`).exec(line);
+      check('direct path addresses: the first does not answer, the next one connects at once (the browser starts them all) and the host log says how each went',
+        conn?.path === 'direct' && conn.addr === `127.0.0.1:${directPort}` && /addrs=/.test(listening) && !!first && !!second && +second[1] < 2000 && /msg="direct path: connected"/.test(line),
+        `streaming over ${conn?.path} ${conn?.addr || ''}; host: ${line.replace(/^.*?tried=/, 'tried=').slice(0, 300) || 'no direct path line'}; ${listening.replace(/^.*?addrs=/, 'listening on ').slice(0, 160)}`);
+      await endStream();
+
+      // A certificate the browser refuses.
+      // (The addresses that answer: the swallowed one would add "no answer".)
+      await setRoute((d) => {
+        d.hashes = [Buffer.alloc(32, 7).toString('base64')];
+        d.candidates = (d.candidates || []).filter((c) => !c.url.includes('127.0.0.3'));
+      });
+      log0 = host.log.length;
+      await startStream({ path: 'auto', transport: 'auto' });
+      const c2 = await page.evaluate(() => window.__recon.conn);
+      line = sessionLine(host.log.slice(log0));
+      const hs = await until(() => /[^\n]*msg="direct path: a browser's connection failed in its handshake"[^\n]*refused the PC's certificate[^\n]*/.exec(host.log.slice(log0))?.[0], 8000, 'the handshake line').catch(() => '');
+      check('direct path addresses: a certificate the browser refuses sends the stream through the relay at once, and the overlay and the host log say so',
+        c2?.path === 'relay' && /^refused after \d+ ms by /.test(c2.directWhy || '') && /not used by this session/.test(line) && /why="refused after/.test(line) &&
+          /level=INFO/.test(hs),
+        `streaming over ${c2?.path} (direct: ${c2?.directWhy}); host: ${line.replace(/^.*?why=/, 'why=').slice(0, 260) || 'no direct path line'}; handshake: ${hs.replace(/^.*?from=/, 'from=').slice(0, 200) || 'no line'}`);
+      await setRoute(null);
+      await endStream();
+
+      // The PC's answers lost on the way back.
+      fecImpair.h2cOff = true;
+      fecImpair.delayMs = 0;
+      fecImpair.loss = 0;
+      await setRoute((d) => { d.candidates = [{ url: `https://127.0.0.1:${fecProxyPort}/wt`, kind: 'lan', note: 'e2e one-way proxy' }]; d.url = d.candidates[0].url; });
+      log0 = host.log.length;
+      await startStream({ path: 'auto', transport: 'auto' });
+      const c3 = await page.evaluate(() => window.__recon.conn);
+      line = sessionLine(host.log.slice(log0));
+      const lost = await until(() => /[^\n]*msg="direct path: a browser's connection failed in its handshake"[^\n]*answers did not reach it[^\n]*/.exec(host.log.slice(log0))?.[0], 15000, 'the handshake line').catch(() => '');
+      // The page closes its attempt at the race's deadline (2.5 s; the
+      // direct path race unit check), but Chromium sends nothing for a
+      // handshake that never had an answer: its QUIC connection ends at its
+      // own 4 s timeout, which is when the host's line comes (after_ms).
+      check('direct path addresses: answers lost on the way back: no answer, the stream goes through the relay, and the host log says the PC\'s answers did not reach the browser',
+        c3?.path === 'relay' && /^no answer in 2\.\d s/.test(c3.directWhy || '') && /not used by this session/.test(line) && /level=INFO/.test(lost),
+        `streaming over ${c3?.path} (direct: ${c3?.directWhy}); host: ${line.replace(/^.*?why=/, 'why=').slice(0, 200) || 'no direct path line'}; handshake: ${lost.replace(/^.*?from=/, 'from=').slice(0, 260) || 'no line'}; proxy dropped ${fecImpair.lostH2c} datagrams from the host`);
+      await endStream();
+    });
+  } finally {
+    fecImpair.h2cOff = false;
+    await setRoute(null).catch(() => {});
+    sink.close();
+  }
+  await restartHost({}, 'host-default-addrs');
+}
+
+// A live session moves to the direct path (VENDOR_NOTES "Second hardware run:
+// direct path on the LAN"): it starts on the relay because the browser
+// refuses the direct path's certificate (the connect answer's hashes do not
+// match), the browser goes on trying the direct path in the background (2 s
+// after the welcome, then 8 s, ...; the first try fails the same way, which
+// the host logs), and once the hashes are right the next try moves the
+// running session onto the direct path. The same host session goes on: no
+// new session, no reconnect, no freeze or key frame request in the second
+// after the move, the host logs the move and path=direct from then on, and
+// keys reach the host over the direct path.
+async function checkDirectMove() {
+  const host = procs.find((p) => p.spawnargs.includes('run') && p.exitCode === null);
+  const bad = async (r) => {
+    const resp = await r.fetch();
+    const body = await resp.json();
+    if (body.direct) body.direct.hashes = [Buffer.alloc(32, 9).toString('base64')];
+    await r.fulfill({ response: resp, json: body });
+  };
+  await ctx.route('**/api/hosts/*/connect', bad);
+  let routed = true;
+  const log0 = host.log.length;
+  const con0 = consoleLines.length;
+  try {
+    // 30 fps at 8 Mbit/s: the software decoder keeps up on a shared CPU (a
+    // decoder backlog restarts the FFmpeg test encoder, which says nothing
+    // about the move).
+    await startStream({ path: 'auto', transport: 'auto', fps: 30, bitrate: 8 });
+    const c0 = await page.evaluate(() => window.__recon.conn);
+    const bg = await until(() => /[^\n]*msg="direct path: the client's attempt in the background failed[^\n]*/.exec(host.log.slice(log0))?.[0], 20000, 'the background attempt').catch(() => '');
+    await ctx.unroute('**/api/hosts/*/connect', bad);
+    routed = false;
+    const t0 = Date.now();
+    const moved = await until(() => page.evaluate(() => (window.__recon.conn?.path === 'direct' && window.__recon.conn.movedFrom) || null), 30000, 'the move').catch(() => null);
+    const movedAfter = Date.now() - t0;
+    const w = await rateWindow(3000);
+    const wr = starvedRate(w.fps, 30, 0.5, w);
+    let keys = 'not checked (no input log)';
+    if (nativeInputLog && moved) {
+      writeFileSync(inputLog, '');
+      await page.focus('#stage').catch(() => {});
+      await page.keyboard.press('KeyW');
+      keys = await until(() => readFileSync(inputLog, 'utf8').includes('"sc":17'), 5000, 'the key on the host').then(() => 'W reached the host').catch(() => 'no key on the host');
+    }
+    // The session's next line after the move (its stream stats come every
+    // 10 s; a rate change can come sooner) must say path=direct: wait for it.
+    if (moved) {
+      await until(() => {
+        const l = host.log.slice(log0);
+        const m = /[^\n]*msg="session moved to the direct path[^\n]*/.exec(l)?.[0];
+        const id = m && / session=(\S+)/.exec(m)?.[1];
+        return id && l.slice(l.indexOf(m) + m.length).includes(` session=${id} path=`);
+      }, 12000, "the session's next line after the move").catch(() => {});
+    }
+    const log = host.log.slice(log0);
+    const st = await page.evaluate(() => ({ attempts: window.__recon.attempts, streaming: window.__recon.streaming }));
+    const sessions = (log.match(/msg="session started"/g) || []).length;
+    const moveLine = /[^\n]*msg="session moved to the direct path[^\n]*/.exec(log)?.[0] || '';
+    const sid = / session=(\S+)/.exec(moveLine)?.[1];
+    const afterMove = moveLine ? log.slice(log.indexOf(moveLine) + moveLine.length) : '';
+    // The move restarts nothing (the host starts no encoder for it; the
+    // rate controller's changes restart the FFmpeg test encoder, reported),
+    // and the picture goes on: no freeze and no key frame request in the
+    // page's log in the second after it, unless the CPU had none to spare.
+    const restarts = (afterMove.match(/msg="starting encoder"/g) || []).length;
+    const causes = [...afterMove.matchAll(/restarting video[^\n]*reason="([^"]+)"|congestion: lowering bitrate[^\n]*why=(\w+)/g)].map((m) => m[1] || m[2]);
+    const starved = w.idle != null && w.idle < STARVED_IDLE;
+    const pageLog = await page.evaluate(() => window.__recon.logs.slice());
+    const movedAt = pageLog.find((l) => l.includes('moved the session from the relay path'))?.slice(0, 24);
+    const atMove = movedAt ? pageLog.filter((l) => {
+      const d = Date.parse(l.slice(0, 24)) - Date.parse(movedAt);
+      return d >= 0 && d <= 1000 && /freeze:|requesting key frame/.test(l);
+    }) : ['no move in the page log'];
+    const smooth = atMove.length === 0 || (starved && movedAt);
+    const laterPaths = [...afterMove.matchAll(new RegExp(`session=${sid} path=(\\S+)`, 'g'))].map((m) => m[1]);
+    const page0 = consoleLines.slice(con0);
+    const keyReq = page0.filter((l) => /requesting key frame/.test(l)).length;
+    check('direct path move: a session on the relay moves to the direct path when it answers: same session, no reconnect, no freeze at the move, keys reach the host over it',
+      c0?.path === 'relay' && /refused after/.test(bg) && moved === 'relay' && sessions === 1 && /from=relay/.test(moveLine) && smooth &&
+        laterPaths.length > 0 && laterPaths.every((p) => p === 'direct') && st.attempts === 0 && st.streaming && (w.fps >= 20 || wr.ok) &&
+        (!nativeInputLog || keys === 'W reached the host'),
+      `started over ${c0?.path} (direct: ${c0?.directWhy || '-'}); background try: ${bg.replace(/^.*?why=/, 'why=').slice(0, 140) || 'no line'}; ` +
+        `moved ${moved ? `from ${moved} ${movedAfter} ms after the hashes were right` : 'never'}; host: ${sessions} session start(s), ${restarts} encoder start(s) after the move` +
+        `${causes.length ? ` (${causes.join(', ')})` : ''}, ` +
+        `later lines path=${[...new Set(laterPaths)].join('/') || 'none'}; ${moveLine.replace(/^.*?msg=/, 'msg=').slice(0, 200) || 'no move line'}; ` +
+        `client retries ${st.attempts}, ${w.fps.toFixed(1)} fps after${wr.note}; in the second after the move: ${atMove.map((l) => l.slice(25, 90)).join(' | ') || 'no freeze, no key frame request'}; ` +
+        `${keyReq} key frame request(s) in the scenario; ${keys}`);
+  } finally {
+    if (routed) await ctx.unroute('**/api/hosts/*/connect', bad).catch(() => {});
+    await endStream();
+  }
+}
+
 // Torn control stream (final review): the host writes a control message in
 // part (test hook torn-control: its first clock message, 5 s in) and goes
 // on, as hosts did before the final review after a control write that hit
@@ -2867,7 +3055,10 @@ async function checkSettingsAfterFailedConnect() {
     const r = await route.fetch();
     const body = await r.json();
     if (mode === 'none') delete body.direct;
-    else if (body.direct) body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+    else if (body.direct) {
+      body.direct.url = body.direct.url.replace(/:\d+\/wt$/, `:${blockedPort}/wt`);
+      body.direct.candidates = [{ url: body.direct.url }];
+    }
     await route.fulfill({ response: r, json: body });
   };
   await ctx.route('**/api/hosts/*/connect', rewrite);
@@ -3555,6 +3746,69 @@ return { full: await run(true), none: await run(false) };
   } finally {
     await ctx2.close();
   }
+}
+
+// The direct path's race (raceDirect, extracted from stream-worker.js and
+// run here on fake WebTransports, review of the second hardware run): every
+// attempt the race leaves is closed, also the ones its deadline marks "no
+// answer" (before, they stayed open in the browser until its own 4 s
+// handshake timeout, at every fallback to the relay and every background
+// try); an address that answers wins over earlier ones that do not.
+async function checkRaceDirectUnit() {
+  const src = readFileSync(join(root, 'web', 'static', 'js', 'stream-worker.js'), 'utf8');
+  const piece = (from, to) => {
+    const a = src.indexOf(from);
+    const b = src.indexOf(to, a);
+    if (a < 0 || b < 0) throw new Error(`${from} not found in stream-worker.js`);
+    return src.slice(a, b);
+  };
+  const code = piece('const hostOf =', '\n\n') + '\n' + piece('const DIRECT_STAGGER_MS', '\n') + '\n' +
+    piece('function raceDirect(', '\n// How the direct path') + '\nraceDirect;';
+  const run = async (behaviours, budget) => {
+    const made = [];
+    // A fake WebTransport: "silent" never answers, "ok@N" comes up after N ms,
+    // "refuse" fails at once; close() rejects a pending ready, as Chrome does.
+    class FakeWT {
+      constructor(url) {
+        const how = behaviours[made.length];
+        this.url = url;
+        this.closedByRace = false;
+        made.push(this);
+        let ok;
+        let no;
+        this.ready = new Promise((res, rej) => { ok = res; no = rej; });
+        this.closed = new Promise(() => {});
+        this.fail = no;
+        this.refused = how === 'refuse';
+        if (this.refused) setTimeout(() => no(new Error('Opening handshake failed.')), 1);
+        const m = /^ok@(\d+)$/.exec(how);
+        if (m) setTimeout(() => { if (!this.closedByRace) ok(); }, +m[1]);
+      }
+      close() { this.closedByRace = true; this.fail(new Error('closed')); }
+    }
+    const sandbox = { WebTransport: FakeWT, wtOptions: () => ({}), performance, setTimeout, clearTimeout, Promise, Math, Error, Object };
+    const raceDirect = vm.runInNewContext(code, sandbox);
+    const cands = behaviours.map((b, i) => ({ url: `https://10.0.0.${i + 1}:48100/wt`, kind: 'lan' }));
+    let out;
+    try {
+      const r = await raceDirect(cands, [], budget);
+      out = { won: r.cand.url, tried: r.tried.map((t) => t.result) };
+    } catch (e) {
+      out = { err: e.message, tried: (e.tried || []).map((t) => t.result) };
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    out.open = made.filter((w) => !w.closedByRace && !w.refused && (!out.won || w.url !== out.won)).length;
+    return out;
+  };
+  const silent = await run(['silent', 'silent'], 400);
+  check('direct path race (unit): no answer from any address: every attempt is closed at the deadline',
+    /timed out after 400 ms/.test(silent.err || '') && silent.tried.join() === 'no answer,no answer' && silent.open === 0, JSON.stringify(silent));
+  const second = await run(['silent', 'ok@20', 'silent'], 1000);
+  check('direct path race (unit): the second address answers: it wins, the others are closed',
+    second.won === 'https://10.0.0.2:48100/wt' && second.tried[0] === 'abandoned' && second.tried[1] === 'connected' && second.open === 0, JSON.stringify(second));
+  const refused = await run(['refuse', 'ok@5'], 1000);
+  check('direct path race (unit): the first address refuses: the next starts at once and wins',
+    refused.won === 'https://10.0.0.2:48100/wt' && /^refused: /.test(refused.tried[0]) && refused.open === 0, JSON.stringify(refused));
 }
 
 async function checkWallclockProbe() {
@@ -4476,7 +4730,8 @@ async function checkFec() {
 function impairProxy(sock, targetPort) {
   const up = dgram.createSocket('udp4');
   up.bind(0, '127.0.0.1');
-  const st = { delayMs: 0, loss: 0, c2h: 0, h2c: 0, lostC2h: 0, lostH2c: 0 };
+  // h2cOff: drop every datagram from the host (its answers lost on the way back).
+  const st = { delayMs: 0, loss: 0, h2cOff: false, c2h: 0, h2c: 0, lostC2h: 0, lostH2c: 0 };
   let client = null;
   sock.on('message', (m, r) => {
     client = r;
@@ -4487,7 +4742,7 @@ function impairProxy(sock, targetPort) {
   up.on('message', (m) => {
     st.h2c++;
     if (!client) return;
-    if (Math.random() < st.loss) { st.lostH2c++; return; }
+    if (st.h2cOff || Math.random() < st.loss) { st.lostH2c++; return; }
     const c = client;
     setTimeout(() => sock.send(m, c.port, c.address), st.delayMs);
   });
@@ -4628,8 +4883,12 @@ const gw = run('recon-gateway', ['-listen', `127.0.0.1:${port}`, '-data', join(d
 await until(() => existsSync(join(dir, 'gw', 'setup-token.txt')), 10000, 'gateway setup token');
 const setupToken = readFileSync(join(dir, 'gw', 'setup-token.txt'), 'utf8').trim();
 
+// E2E_CHROME=<path>: another Chromium build for the main (headless) page,
+// e.g. an older Chrome for Testing (the owner's Chrome 122 for the direct
+// path sections: VENDOR_NOTES "Second hardware run: direct path on the LAN").
 const browser = await chromium.launch({
   headless: true,
+  ...(process.env.E2E_CHROME ? { executablePath: process.env.E2E_CHROME } : {}),
   args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
 });
 const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
@@ -5125,6 +5384,8 @@ try {
   if (want('takeover')) await checkTakeover().catch((e) => check('takeover scenario', false, e.message));
   if (want('control before hello')) await checkControlBeforeHello().catch((e) => check('control before the hello scenario', false, e.message));
   if (want('ticket refused')) await checkTicketRefused().catch((e) => check('ticket refused scenario', false, e.message));
+  if (want('direct candidates')) await checkDirectCandidates().catch((e) => check('direct path addresses scenario', false, e.message));
+  if (want('direct move')) await checkDirectMove().catch((e) => check('direct path move scenario', false, e.message));
   if (want('torn control')) await checkTornControl().catch((e) => check('torn control stream scenario', false, e.message));
   if (want('vm without a gpu')) await checkVM().catch((e) => check('VM without a GPU scenario', false, e.message));
   if (want('hardware decoder failure')) await checkHardwareDecoderFailure().catch((e) => check('hardware decoder failure scenario', false, e.message));
@@ -5143,6 +5404,7 @@ try {
   if (want('jitter unit')) await checkJitterRule().catch((e) => check('jitter buffer (unit)', false, e.message));
   if (want('self-test logic unit')) await checkSelfTestLogic().catch((e) => check('decoder self-test logic (unit)', false, e.message));
   if (want('send priorities unit')) await checkSendPriorities().catch((e) => check('send priorities (unit)', false, e.message));
+  if (want('race direct unit')) await checkRaceDirectUnit().catch((e) => check('direct path race (unit)', false, e.message));
 
   // 3d. Latency probe, wallclock mode -----------------------------------------
   // The host captures an X display (x11grab) that shows tools/latency-test in a
