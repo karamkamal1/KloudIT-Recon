@@ -1,6 +1,7 @@
 #include "capture/pacer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <limits>
 #include <vector>
@@ -16,30 +17,88 @@ void FramePacer::reset(int64_t qpcFrequency, int fps, int idleRepeatMs, int64_t 
     setFps(fps);
     nextDue_ = now;
     lastDelivered_ = now;
+    pendingAt_ = lastArrival_ = 0;
+    nIntervals_ = nextInterval_ = 0;
+    interval_ = predict_ = 0;
+    regular_ = false;
 }
 
 void FramePacer::setFps(int fps) {
     if (fps <= 0) return;
     period_ = (freq_ + fps - 1) / fps;
-    early_ = period_ / 4;
+    early_ = period_ * 3 / 8;
+    late_ = period_ / 8;
+}
+
+void FramePacer::arrived(int64_t presentQpc, int presents) {
+    // The interval since the previous image, per present it stands for.
+    // Only intervals up to two frame intervals say how fast the source
+    // presents for rule 3; a longer one (a pause, a slow game) starts over.
+    const int64_t gap = lastArrival_ ? presentQpc - lastArrival_ : 0;
+    if (gap > 0) {
+        const int64_t each = gap / std::max(1, presents);
+        if (each <= 2 * period_) {
+            intervals_[nextInterval_] = each;
+            nextInterval_ = (nextInterval_ + 1) % kIntervals;
+            nIntervals_ = std::min(nIntervals_ + 1, kIntervals);
+        } else {
+            nIntervals_ = nextInterval_ = 0;
+        }
+    }
+    if (presentQpc > lastArrival_) lastArrival_ = presentQpc;
+    pendingAt_ = presentQpc;
+    interval_ = predict_ = 0;
+    regular_ = false;
+    if (nIntervals_ >= 3) {
+        const int n = nIntervals_;
+        int64_t v[kIntervals];
+        std::copy(intervals_, intervals_ + n, v);
+        std::sort(v, v + n);
+        interval_ = v[n / 2];
+        predict_ = v[n - 1 - n / 8];
+        // A game on the display's vblank grid that misses some refreshes
+        // presents one or two refreshes apart: not regular, its next present
+        // cannot be predicted (rule 3 keeps out).
+        regular_ = v[n - 1] * 2 <= interval_ * 3;
+    }
 }
 
 FramePacer::Decision FramePacer::decide(int64_t now, bool havePending, bool haveLast) const {
     const int64_t slot = nextDue_ - early_;
     if (havePending) {
-        if (now >= slot) return {Decision::DeliverPending, 0};
-        return {Decision::Wait, slot};
+        if (now < slot) return {Decision::Wait, slot, false};
+        // Rule 3: the image came before its slot opened and the source
+        // presents regularly and faster than fps. If its next present is due
+        // less than half an interval after the slot (by the 7/8 quantile of
+        // the source's present intervals), wait for that one instead of
+        // sending this one late (it would make the next one wait for the
+        // following slot, and so on: the beat of the two rates). The waiting
+        // image still goes out should that present not come: a little after
+        // it was due (a quarter of its interval, at most 2 ms), never later
+        // than one interval after its own present, and never so late that
+        // the slot schedule is lost (late_ after the slot).
+        if (pendingAt_ < slot && presentsFaster()) {
+            const int64_t due = pendingAt_ + predict_;
+            if (due > slot && due - slot < period_ / 2) {
+                const int64_t until = std::min({due + std::min(interval_ / 4, freq_ * 2 / 1000), pendingAt_ + period_, nextDue_ + late_});
+                if (now < until) return {Decision::Wait, until, true};
+            }
+        }
+        return {Decision::DeliverPending, 0, false};
     }
     if (haveLast) {
         const int64_t repeatAt = std::max(lastDelivered_ + std::max(idle_, period_), slot);
-        if (now >= repeatAt) return {Decision::DeliverRepeat, 0};
-        return {Decision::Wait, repeatAt};
+        if (now >= repeatAt) return {Decision::DeliverRepeat, 0, false};
+        return {Decision::Wait, repeatAt, false};
     }
-    return {Decision::Wait, std::numeric_limits<int64_t>::max()};
+    return {Decision::Wait, std::numeric_limits<int64_t>::max(), false};
 }
 
 void FramePacer::delivered(int64_t now, bool repeat) {
-    if (!repeat) nextDue_ = std::max(nextDue_, now) + period_;  // repeats take no slot (policy 4)
+    // Repeats take no slot (policy 4). A new image at most late_ after its
+    // slot keeps the schedule (policy 2: a held image of rule 3, or a present
+    // that came just after the slot was due, costs no output slot).
+    if (!repeat) nextDue_ = now > nextDue_ && now - nextDue_ <= late_ ? nextDue_ + period_ : std::max(nextDue_, now) + period_;
     lastDelivered_ = now;
 }
 
@@ -63,6 +122,62 @@ int64_t FirstImageWatchdog::image(int64_t now) {
     return reported_ ? std::max<int64_t>(1, (now - start_) * 1000 / freq_) : 0;
 }
 
+void CaptureLoss::reset(int64_t qpcFrequency) {
+    freq_ = qpcFrequency > 0 ? qpcFrequency : 1;
+    since_ = duplicatedAt_ = 0;
+    why_.clear();
+    attempts_ = 0;
+    failed_ = reported_ = false;
+}
+
+int64_t CaptureLoss::pause(int64_t now) {
+    const int ms = std::min(kRetryMs, kFirstRetryMs << std::min(attempts_++, 4));
+    return now + int64_t(ms) * freq_ / 1000;
+}
+
+int64_t CaptureLoss::lost(int64_t now, const std::string& why) {
+    if (!since_) {
+        since_ = now;
+        why_ = why;
+        attempts_ = 0;
+        duplicatedAt_ = 0;
+        failed_ = reported_ = false;
+        return now;
+    }
+    if (!duplicatedAt_) return now;
+    // Duplicated again and lost again before an image: a loss that keeps
+    // repeating; the next attempt waits like after a failed one.
+    duplicatedAt_ = 0;
+    return pause(now);
+}
+
+int64_t CaptureLoss::failed(int64_t now) {
+    failed_ = true;
+    return pause(now);
+}
+
+void CaptureLoss::duplicated(int64_t now) {
+    if (since_) duplicatedAt_ = now;
+}
+
+bool CaptureLoss::reportDue(int64_t now) {
+    if (!since_ || reported_) return false;
+    if (!failed_ && now - since_ < int64_t(kReportMs) * freq_ / 1000) return false;
+    reported_ = true;
+    return true;
+}
+
+CaptureLoss::End CaptureLoss::image(int64_t now) {
+    End e;
+    if (!since_) return e;
+    e.imageMs = (now - since_) * 1000 / freq_;
+    e.duplicateMs = ((duplicatedAt_ ? duplicatedAt_ : now) - since_) * 1000 / freq_;
+    e.attempts = attempts_;
+    e.reported = reported_;
+    reset(freq_);
+    return e;
+}
+
 // --- self-test ----------------------------------------------------------------------
 
 namespace {
@@ -74,8 +189,11 @@ struct Delivery {
 };
 
 // Drives the pacer like PacedCapture::next() does, on a simulated clock (1 tick
-// = 1 us): presents arrive at the given times; while a pending image waits for
-// its slot, newer presents replace it.
+// = 1 us): presents arrive at the given times. While a pending image waits
+// asleep for its slot, the presents meanwhile are taken when it wakes up (the
+// newest wins, standing for all of them: DDA's AccumulatedFrames); in a
+// watching wait (rule 3) and with nothing pending, each present is taken the
+// moment it comes.
 std::vector<Delivery> simulate(const std::vector<int64_t>& presents, int fps, int idleMs, int64_t end) {
     FramePacer p;
     p.reset(1000000, fps, idleMs, 0);
@@ -97,15 +215,41 @@ std::vector<Delivery> simulate(const std::vector<int64_t>& presents, int fps, in
             p.delivered(t, true);
             continue;
         }
+        if (pending && !d.watch) {
+            t = d.until;
+            int n = 0;
+            while (next < presents.size() && presents[next] <= t) pendingPresent = presents[next++], ++n;
+            if (n) p.arrived(pendingPresent, n);
+            continue;
+        }
         const int64_t nextPresent = next < presents.size() ? presents[next] : std::numeric_limits<int64_t>::max();
         if (nextPresent <= d.until) {
             t = std::max(t, nextPresent);
             pending = true;
             pendingPresent = nextPresent;
             ++next;
+            p.arrived(nextPresent, 1);
         } else {
             t = d.until;
         }
+    }
+    return out;
+}
+
+// The rule before the second hardware run, for comparison: slots one
+// interval apart with a quarter interval of slack, an image presented before
+// its slot waits for it and goes out when it opens (the newest presented by
+// then). No idle repeats (the comparisons are of steady presents).
+std::vector<Delivery> simulateSlotRule(const std::vector<int64_t>& presents, int fps, int64_t end) {
+    const int64_t period = (1000000 + fps - 1) / fps, early = period / 4;
+    std::vector<Delivery> out;
+    int64_t nextDue = 0;
+    for (size_t i = 0; i < presents.size() && presents[i] <= end;) {
+        const int64_t at = std::max(presents[i], nextDue - early);
+        while (i + 1 < presents.size() && presents[i + 1] <= at) ++i;  // newest wins
+        out.push_back({at, presents[i], false});
+        nextDue = std::max(nextDue, at) + period;
+        ++i;
     }
     return out;
 }
@@ -135,15 +279,56 @@ void expect(bool ok, const char* name, const char* what) {
     }
 }
 
+// How long delivered new images waited between their present and going out
+// (us), and how many went out: what rule 3 cuts is the second hardware run's
+// 9 ms p50 / 15.5 ms p95 at 60 fps on a 75 Hz display, without fewer frames.
+struct Waits {
+    int64_t mean = 0, p50 = 0, p95 = 0, p99 = 0;
+    size_t frames = 0;  // new images delivered
+};
+
+Waits waits(const std::vector<Delivery>& d) {
+    std::vector<int64_t> w;
+    for (const auto& x : d) {
+        if (!x.repeat) w.push_back(x.at - x.present);
+    }
+    if (w.empty()) return {};
+    std::sort(w.begin(), w.end());
+    int64_t sum = 0;
+    for (const int64_t v : w) sum += v;
+    const auto at = [&w](size_t pct) { return w[std::min(w.size() - 1, w.size() * pct / 100)]; };
+    return {sum / int64_t(w.size()), at(50), at(95), at(99), w.size()};
+}
+
+// The share (percent) of steps between consecutive new images that advance
+// the source by exactly `step` presents: at twice the stream's rate every
+// step should be 2 (one present left out each time); a 1 or a 3 is a visible
+// judder.
+int stepShare(const std::vector<int64_t>& presents, const std::vector<Delivery>& d, int64_t step) {
+    size_t steps = 0, hits = 0;
+    int64_t last = -1;
+    for (const auto& x : d) {
+        if (x.repeat) continue;
+        const int64_t i = std::lower_bound(presents.begin(), presents.end(), x.present) - presents.begin();
+        if (last >= 0) {
+            ++steps;
+            if (i - last == step) ++hits;
+        }
+        last = i;
+    }
+    return steps ? int(hits * 100 / steps) : 0;
+}
+
 // Common properties: in any stretch of time no more new images than fps
-// allows (plus the one frame the early allowance can add), new images at
-// least 3/4 of an interval apart, a repeat only after max(idle, interval)
+// allows (plus the one frame the early allowance can add: 3/8 of an interval
+// early, 1/8 late keeping the schedule), new images at least half an interval
+// apart, a repeat only after max(idle, interval)
 // without any delivery, every delivered image the newest one presented at that
 // time and never older than one frame interval. (A new image right after a
 // repeat is allowed: repeats take no slot.)
-void common(const char* name, const std::vector<int64_t>& presents, const std::vector<Delivery>& d, int fps,
-            int64_t duration, int idleMs = 100) {
-    const int64_t period = (1000000 + fps - 1) / fps, early = period / 4;
+Waits common(const char* name, const std::vector<int64_t>& presents, const std::vector<Delivery>& d, int fps,
+             int64_t duration, int idleMs = 100) {
+    const int64_t period = (1000000 + fps - 1) / fps, early = period / 2;
     const int64_t idle = std::max<int64_t>(int64_t(idleMs) * 1000, period);
     size_t n = 0;
     int64_t minGap = std::numeric_limits<int64_t>::max(), lastNew = -1;
@@ -162,13 +347,81 @@ void common(const char* name, const std::vector<int64_t>& presents, const std::v
     }
     expect(int64_t(n) <= (duration + early) / period + 1, name, "more new images than fps allows");
     if (minGap != std::numeric_limits<int64_t>::max()) {
-        expect(minGap >= period - period / 4, name, "new images closer than 3/4 of a frame interval");
+        expect(minGap >= period - early, name, "new images closer than half a frame interval");
     } else {
         minGap = 0;
     }
-    std::printf("  %-36s %zu frames (%zu repeats), min gap %lld us\n", name, d.size(),
-                size_t(std::count_if(d.begin(), d.end(), [](const Delivery& x) { return x.repeat; })),
-                static_cast<long long>(minGap));
+    const Waits w = waits(d);
+    std::printf("  %-44s %zu frames (%zu repeats), min gap %lld us, wait mean %lld us p50 %lld p95 %lld p99 %lld\n", name,
+                d.size(), size_t(std::count_if(d.begin(), d.end(), [](const Delivery& x) { return x.repeat; })),
+                static_cast<long long>(minGap), static_cast<long long>(w.mean), static_cast<long long>(w.p50),
+                static_cast<long long>(w.p95), static_cast<long long>(w.p99));
+    return w;
+}
+
+// The slot rule's waits on the same presents (simulateSlotRule), printed for
+// comparison.
+Waits slotRule(const std::vector<int64_t>& presents, int fps, int64_t end) {
+    const Waits w = waits(simulateSlotRule(presents, fps, end));
+    std::printf("  %-44s %zu frames with the slot rule alone: wait mean %lld us p50 %lld p95 %lld p99 %lld\n", "", w.frames,
+                static_cast<long long>(w.mean), static_cast<long long>(w.p50), static_cast<long long>(w.p95),
+                static_cast<long long>(w.p99));
+    return w;
+}
+
+// A game's presents: frame times of meanUs +- about spreadUs (the sum of three
+// uniform draws, roughly normal), at least 2 ms.
+std::vector<int64_t> game(int64_t meanUs, int64_t spreadUs, int64_t to) {
+    std::vector<int64_t> v;
+    uint32_t seed = 11;
+    const auto draw = [&seed, spreadUs] {
+        seed = seed * 1664525u + 1013904223u;
+        return int64_t(seed >> 8) % (2 * spreadUs + 1) - spreadUs;
+    };
+    for (int64_t t = 0; t <= to;) {
+        v.push_back(t);
+        t += std::max<int64_t>(2000, meanUs + (draw() + draw() + draw()) / 3);
+    }
+    return v;
+}
+
+// A game rendering at gameFps (+- jitterUs per frame) on a display refreshing
+// at gridHz with vsync or through the compositor: each frame is presented at
+// the next refresh after it is done (at least one refresh after the last), so
+// the intervals are one or two refreshes (a game slower than the display
+// misses some), plus up to 0.2 ms of capture latency.
+std::vector<int64_t> grid(double gameFps, double gridHz, int jitterUs, int64_t to) {
+    std::vector<int64_t> v;
+    uint32_t seed = 3;
+    const double refresh = 1e6 / gridHz;
+    int64_t last = -1;
+    for (int64_t i = 0;; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        const double done = double(i) * 1e6 / gameFps + double(int64_t(seed >> 8) % (2 * jitterUs + 1) - jitterUs);
+        int64_t t = int64_t(std::ceil(done / refresh) * refresh);
+        if (t <= last) t = int64_t((double(std::llround(double(last) / refresh)) + 1) * refresh);
+        if (t > to) break;
+        seed = seed * 1664525u + 1013904223u;
+        v.push_back(t + int64_t(seed >> 8) % 200);
+        last = t;
+    }
+    return v;
+}
+
+// A game vsynced to a gridHz display that misses `missPct` percent of the
+// refreshes (each missed one makes an interval of two refreshes).
+std::vector<int64_t> missedRefreshes(double gridHz, int missPct, int64_t to) {
+    std::vector<int64_t> v;
+    uint32_t seed = 5;
+    for (int64_t i = 0;; ++i) {
+        const int64_t t = int64_t(double(i) * 1e6 / gridHz);
+        if (t > to) break;
+        seed = seed * 1664525u + 1013904223u;
+        if (i && int64_t(seed >> 8) % 100 < missPct) continue;
+        seed = seed * 1664525u + 1013904223u;
+        v.push_back(t + int64_t(seed >> 8) % 200);
+    }
+    return v;
 }
 
 // The dirty-area share of capture/dirty.hpp (GUIDE 5: the rate controller
@@ -237,12 +490,73 @@ void testFirstImage() {
     std::printf("  %-36s ok\n", name);
 }
 
+// A lost capture source (DDA): a loss over at the first new duplication is
+// not reported; a failing attempt is, with pauses of 16, 32, 64, 128, 250 ms;
+// so is a loss that comes back before every new duplication's first image
+// (each one then waits too), once 250 ms passed without an image.
+void testCaptureLoss() {
+    const char* name = "capture loss (DDA)";
+    const int64_t ms = 1000;  // ticks per millisecond (1 tick = 1 us)
+    CaptureLoss l;
+    l.reset(1000000);
+    // The second run's case: over 22 ms later, the first attempt worked.
+    expect(l.lost(100 * ms, "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST") == 100 * ms, name, "a new loss not duplicated again at once");
+    l.duplicated(120 * ms);
+    expect(!l.reportDue(121 * ms) && !l.reportDue(122 * ms), name, "a loss over at once reported");
+    CaptureLoss::End e = l.image(122 * ms);
+    expect(e.imageMs == 22 && e.duplicateMs == 20 && e.attempts == 0 && !e.reported && !l.active(), name, "a loss over at once: wrong end");
+    // Failing attempts: reported at the first failure, once; pauses double.
+    l.lost(1000 * ms, "ReleaseFrame: DXGI_ERROR_ACCESS_LOST");
+    std::vector<int64_t> pauses;
+    int64_t t = 1000 * ms;
+    for (int i = 0; i < 6; ++i) {
+        const int64_t next = l.failed(t);
+        pauses.push_back((next - t) / ms);
+        expect(l.reportDue(t) == (i == 0), name, "a failed attempt not reported exactly once");
+        t = next;
+    }
+    expect(pauses == std::vector<int64_t>{16, 32, 64, 128, 250, 250}, name, "pauses after failed attempts not 16, 32, 64, 128, 250, 250 ms");
+    l.duplicated(t);
+    e = l.image(t + 5 * ms);
+    expect(e.reported && e.attempts == 6 && l.lost(5000 * ms, "again") == 5000 * ms, name,
+           "a reported loss not ended by its first image, or the next loss not a new one");
+    // Every new duplication works but is lost again before its first image:
+    // the attempts pause as if they failed, and recon-host hears of it once
+    // 250 ms passed without an image.
+    l.reset(1000000);
+    t = 10000 * ms;
+    expect(l.lost(t, "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST") == t, name, "a new loss not duplicated again at once");
+    pauses.clear();
+    bool reported = false;
+    int64_t reportedAt = 0;
+    for (int i = 0; i < 6; ++i) {
+        l.duplicated(t + ms);
+        const int64_t next = l.lost(t + 2 * ms, "AcquireNextFrame: DXGI_ERROR_ACCESS_LOST");
+        pauses.push_back((next - t - 2 * ms) / ms);
+        for (int64_t u = t + 2 * ms; u < next; u += ms) {
+            if (l.reportDue(u)) {
+                expect(!reported, name, "a repeating loss reported twice");
+                reported = true;
+                reportedAt = u;
+            }
+        }
+        t = next;
+    }
+    expect(pauses == std::vector<int64_t>{16, 32, 64, 128, 250, 250}, name, "a loss lost again before an image: no pauses 16 ... 250 ms");
+    expect(reported && reportedAt == 10250 * ms, name, "a repeating loss not reported 250 ms after it began");
+    l.duplicated(t);
+    e = l.image(t + ms);
+    expect(e.reported && e.attempts == 6, name, "the first image after a reported repeating loss: not reported as restored");
+    std::printf("  %-36s ok\n", name);
+}
+
 }  // namespace
 
 int runPacerSelfTest() {
     failures = 0;
     testDirty();
     testFirstImage();
+    testCaptureLoss();
     const int64_t sec = 1000000;
     {
         const char* name = "144 Hz game at 120 fps";
@@ -314,6 +628,121 @@ int runPacerSelfTest() {
         }
         expect(sawRepeat, name, "no idle repeat before the late present");
         expect(ok, name, "the present after a repeat was not delivered at once");
+    }
+    {
+        // The second hardware run: a 75 Hz display (game or desktop) streamed
+        // at 60 fps. With the slot rule alone every image waited for the beat
+        // of the two rates (9 ms p50, 15.5 ms p95 between capture and encoder
+        // in the log); rule 3 sends four of five presents on arrival.
+        const char* name = "75 Hz display at 60 fps (rule 3)";
+        auto pr = steady(75, 0, 10 * sec, 300);
+        auto d = simulate(pr, 60, 100, 10 * sec);
+        const Waits w = common(name, pr, d, 60, 10 * sec), old = slotRule(pr, 60, 10 * sec);
+        expect(w.frames >= 590, name, "fewer than ~60 fps delivered");
+        expect(w.mean <= 1500 && w.p95 <= 5000 && w.mean * 4 <= old.mean, name,
+               "images still wait for their slots (mean > 1.5 ms or a quarter of the slot rule's, or p95 > 5 ms)");
+    }
+    {
+        // Games that do not wait for the display (no vsync, or a variable
+        // refresh rate) at 62-70 fps streamed at 60: their frame times jitter,
+        // the next present is predicted from the last 16.
+        struct Game {
+            const char* name;
+            int64_t meanUs, spreadUs;
+        };
+        for (const Game& g : {Game{"game at ~70 fps (14.3 +- 3 ms) at 60 fps", 14300, 3000},
+                              Game{"game at ~65 fps (15.4 +- 2 ms) at 60 fps", 15400, 2000},
+                              Game{"game at ~62 fps (16.1 +- 2 ms) at 60 fps", 16100, 2000}}) {
+            auto pr = game(g.meanUs, g.spreadUs, 10 * sec);
+            auto d = simulate(pr, 60, 100, 10 * sec);
+            const Waits w = common(g.name, pr, d, 60, 10 * sec), old = slotRule(pr, 60, 10 * sec);
+            expect(w.frames * 100 >= old.frames * 99, g.name, "fewer frames than the slot rule");
+            expect(w.mean <= 3000 && w.p95 <= 8500 && w.p95 + 5000 <= old.p95, g.name,
+                   "images wait more than 3 ms on average, p95 above 8.5 ms or not 5 ms below the slot rule's");
+        }
+    }
+    {
+        const char* name = "144 Hz display at 60 fps";
+        auto pr = steady(144, 0, 10 * sec, 300);
+        auto d = simulate(pr, 60, 100, 10 * sec);
+        const Waits w = common(name, pr, d, 60, 10 * sec), old = slotRule(pr, 60, 10 * sec);
+        expect(w.frames >= 595, name, "fewer than ~60 fps delivered");
+        expect(w.mean <= 1000 && w.mean * 2 <= old.mean, name, "images wait more than 1 ms or half the slot rule's on average");
+    }
+    {
+        // A source at twice the stream's rate (the fps ladder's 30 on a 60 Hz
+        // display, 120 Hz at 60): every other present, always the same ones.
+        // Half an interval of slack put the slot on the left-out presents, and
+        // jitter flipped which one went out: steps of 1 and 3, a judder. With
+        // 1 ms of present jitter (12% of a 120 Hz interval; a compositor's
+        // presents jitter far less) a few steps still flip.
+        struct Twice {
+            const char* name;
+            double hz;
+            int fps, jitterUs, minShare;
+        };
+        for (const Twice& c : {Twice{"120 Hz +- 0.3 ms at 60 fps", 120, 60, 300, 98}, Twice{"120 Hz +- 1 ms at 60 fps", 120, 60, 1000, 95},
+                               Twice{"60 Hz +- 0.3 ms at 30 fps", 60, 30, 300, 98}, Twice{"144 Hz +- 0.3 ms at 72 fps", 144, 72, 300, 98},
+                               Twice{"240 Hz +- 0.3 ms at 120 fps", 240, 120, 300, 98}}) {
+            auto pr = steady(c.hz, 0, 10 * sec, c.jitterUs);
+            auto d = simulate(pr, c.fps, 100, 10 * sec);
+            common(c.name, pr, d, c.fps, 10 * sec);
+            const int share = stepShare(pr, d, 2);
+            std::printf("  %-44s %d%% of the steps 2 presents\n", "", share);
+            expect(share >= c.minShare, c.name, "too few steps between images are 2 presents (judder)");
+            expect(waits(d).frames * 100 >= size_t(c.fps) * 10 * 98, c.name, "fewer than 98% of fps delivered");
+        }
+    }
+    {
+        // Games on the display's refresh grid (vsync or the compositor) that
+        // miss some refreshes: intervals of one and two refreshes, the next
+        // present unpredictable. The second run's game at 60 fps on 75 Hz
+        // likely looked like this. No fewer frames than min(fps, game) allows
+        // (98%), and no image waits longer than with the slot rule (p95).
+        struct Grid {
+            const char* name;
+            double gameFps, hz;
+            int fps;
+        };
+        for (const Grid& g : {Grid{"60 fps game on a 75 Hz grid at 60 fps", 60, 75, 60}, Grid{"62 fps game on a 75 Hz grid at 60 fps", 62, 75, 60},
+                              Grid{"64 fps game on a 75 Hz grid at 60 fps", 64, 75, 60}, Grid{"66 fps game on a 75 Hz grid at 60 fps", 66, 75, 60},
+                              Grid{"68 fps game on a 75 Hz grid at 60 fps", 68, 75, 60}, Grid{"70 fps game on a 75 Hz grid at 60 fps", 70, 75, 60},
+                              Grid{"72 fps game on a 75 Hz grid at 60 fps", 72, 75, 60}, Grid{"120 fps game on a 144 Hz grid at 120", 120, 144, 120}}) {
+            auto pr = grid(g.gameFps, g.hz, g.hz > 100 ? 500 : 1000, 10 * sec);
+            auto d = simulate(pr, g.fps, 100, 10 * sec);
+            const Waits w = common(g.name, pr, d, g.fps, 10 * sec), old = slotRule(pr, g.fps, 10 * sec);
+            expect(double(w.frames) >= 0.98 * 10 * std::min<double>(g.fps, g.gameFps), g.name, "fewer than 98% of min(fps, game) delivered");
+            expect(w.p95 <= old.p95, g.name, "p95 wait above the slot rule's");
+        }
+        for (const int miss : {5, 8, 12}) {
+            char name[64];
+            std::snprintf(name, sizeof name, "75 Hz vsync missing %d%% at 60 fps", miss);
+            auto pr = missedRefreshes(75, miss, 10 * sec);
+            auto d = simulate(pr, 60, 100, 10 * sec);
+            const Waits w = common(name, pr, d, 60, 10 * sec), old = slotRule(pr, 60, 10 * sec);
+            expect(w.frames * 100 >= old.frames * 98, name, "fewer than 98% of the slot rule's frames");
+            expect(w.p95 + 1500 <= old.p95 && w.mean * 3 <= old.mean * 2, name,
+                   "p95 wait not 1.5 ms below the slot rule's, or mean above 2/3 of it");
+        }
+    }
+    {
+        // Rule 3 waits for a present that is due; when the source stops (the
+        // last image of a movement), the waiting image still goes out, at
+        // most one interval after its present (common checks that).
+        const char* name = "75 Hz that stops, at 60 fps";
+        for (int64_t stop = sec / 2; stop < sec / 2 + 40000; stop += 1000) {
+            auto pr = steady(75, 0, stop);
+            auto d = simulate(pr, 60, 100, sec);
+            bool last = false;
+            for (const auto& x : d) last = last || (!x.repeat && x.present == pr.back());
+            expect(last, name, "the last present never went out");
+            if (stop == sec / 2) common(name, pr, d, 60, sec);
+            else {
+                for (const auto& x : d) {
+                    if (!x.repeat && x.at - x.present > 16667) expect(false, name, "an image went out more than one interval late");
+                }
+            }
+        }
     }
     {
         const char* name = "1000 Hz burst at 60 fps";

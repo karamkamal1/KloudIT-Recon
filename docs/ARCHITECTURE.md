@@ -1448,9 +1448,11 @@ audio:   datagram ─► AudioDecoder(opus) ─► SharedArrayBuffer ring ─►
   `window.__recon.lastStats.stages`, and every 10 s the client sends them to the host
   (`{"t":"stages"}`), which logs them next to the encoder name and vendor, together with its own
   capture→encoded and queue times of the frames the client acknowledged (`0x40`) in the same
-  10 s (`host_capture`, `host_queue`; with the native helper's sub-frame output also
-  `host_encode_first_slice` and `host_encode_rest`, see "Regions of interest and the encoder
-  options"). Hosts announce `stage-hold` in `welcome.features` when
+  10 s (`host_capture`, `host_queue`; with the native helper's per-frame timing
+  `host_capture` split into `host_copy`, `host_pace`, `host_lock`, `host_convert`,
+  `host_submit_call`, `host_gpu` and `host_encoder`: docs/HELPER_PROTOCOL.md "Per-frame
+  timing"; with its sub-frame output also `host_encode_first_slice` and `host_encode_rest`,
+  see "Regions of interest and the encoder options"). Hosts announce `stage-hold` in `welcome.features` when
   they take the hold row; to older hosts (no hold row; at most nine rows before step 3.1b,
   twelve since) the client reports hold and draw as one draw row (decoder output→drawn), as
   before step 4.4.

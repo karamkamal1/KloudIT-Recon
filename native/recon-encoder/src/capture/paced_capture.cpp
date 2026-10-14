@@ -71,6 +71,15 @@ void PacedCapture::shutdown() {
     if (stop_) SetEvent(stop_);
 }
 
+void PacedCapture::take(Acquired& a) {
+    a.readyQpc = qpcNow();
+    if (pending_) a.dirty = mergeDirty(pendingInfo_.dirty, a.dirty);
+    pendingInfo_ = a;
+    pending_ = true;
+    std::lock_guard<std::mutex> lock(mu_);
+    pacer_.arrived(a.presentQpc ? a.presentQpc : a.captureQpc, a.presents);
+}
+
 Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
     if (!awake_) {
         // Keep the display on while streaming: a display that goes to sleep
@@ -81,7 +90,6 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
     }
     const int64_t freq = qpcFrequency();
     const int64_t deadline = qpcNow() + int64_t(timeoutMs) * freq / 1000;
-    bool waitedForSlot = false;
     for (;;) {
         if (stopping()) {
             SetThreadExecutionState(ES_CONTINUOUS);
@@ -98,24 +106,13 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             d = pacer_.decide(now, pending_, haveLast_);
         }
         if (d.kind == FramePacer::Decision::DeliverPending) {
-            if (waitedForSlot) {
-                // The image waited for its slot: take a newer one if the
-                // source presented again meanwhile (newest wins).
-                Acquired a;
-                const Next r = acquire(0, a, err);
-                if (r == Next::Error || r == Next::Stopped) return r;
-                if (r == Next::Frame) {
-                    const float dirty = mergeDirty(pendingInfo_.dirty, a.dirty);
-                    pendingInfo_ = a;
-                    pendingInfo_.dirty = dirty;
-                }
-            }
             promote();
             out = CapturedFrame{};
             describe(out);
             out.index = index_++;
             out.presentQpc = pendingInfo_.presentQpc;
             out.captureQpc = pendingInfo_.captureQpc;
+            out.readyQpc = pendingInfo_.readyQpc;
             out.dirty = pendingInfo_.dirty;
             pending_ = false;
             if (!haveLast_) {
@@ -130,8 +127,9 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
                 }
             }
             haveLast_ = true;
+            out.deliverQpc = qpcNow();
             std::lock_guard<std::mutex> lock(mu_);
-            pacer_.delivered(qpcNow(), false);
+            pacer_.delivered(out.deliverQpc, false);
             return Next::Frame;
         }
         if (d.kind == FramePacer::Decision::DeliverRepeat) {
@@ -142,7 +140,7 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
             describe(out);
             out.index = index_++;
             out.repeat = true;
-            out.captureQpc = now;
+            out.captureQpc = out.readyQpc = out.deliverQpc = now;
             out.dirty = 0;
             std::lock_guard<std::mutex> lock(mu_);
             pacer_.delivered(now, true);
@@ -150,20 +148,24 @@ Next PacedCapture::next(CapturedFrame& out, int timeoutMs, Status& err) {
         }
         if (now >= deadline) return deviceLost(err) ? Next::Error : Next::Timeout;
         const int64_t until = std::min(d.until, deadline);
-        if (pending_) {
+        Acquired a;
+        if (pending_ && !d.watch) {
             // Only the slot is missing: sleep precisely, without sitting in
-            // the capture API (AcquireNextFrame holds the device lock).
+            // the capture API (AcquireNextFrame holds the device lock, and
+            // every image taken now would only be replaced). Then take the
+            // newest image the source presented meanwhile, if any (newest
+            // wins), and decide again with it (rule 3 looks at its present).
             sleepUntil(until);
-            waitedForSlot = true;
+            const Next r = acquire(0, a, err);
+            if (r == Next::Error || r == Next::Stopped) return r;
+            if (r == Next::Frame) take(a);
             continue;
         }
+        // Nothing pending, or a watching wait (rule 3): an image is taken the
+        // moment it comes.
         const int ms = int(std::max<int64_t>(1, ((until - now) * 1000 + freq - 1) / freq));
-        Acquired a;
         switch (acquire(ms, a, err)) {
-        case Next::Frame:
-            pending_ = true;
-            pendingInfo_ = a;
-            continue;
+        case Next::Frame: take(a); continue;
         case Next::Timeout: continue;
         case Next::Stopped: return Next::Stopped;
         case Next::Error: return Next::Error;

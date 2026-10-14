@@ -3,14 +3,40 @@
 // Policy (docs/HELPER_PROTOCOL.md "Frame pacing"):
 //  1. Capture follows presents: an image is taken when the desktop or the game
 //     presents, never on a timer of our own (GUIDE B7).
-//  2. Never more than `fps` new images per second: output slots are one frame
-//     interval apart and every delivered new image uses one (the next slot is
-//     max(slot, now) + interval). A frame may go out up to a quarter interval
-//     before its slot, so present jitter around a matching refresh rate adds no
-//     delay, while the long-run rate still cannot exceed `fps`.
-//  3. Presents faster than `fps` (a 144 Hz game streamed at 120): the newest
-//     image wins and goes out when its slot opens; older ones are dropped
-//     before encoding.
+//  2. Never more than `fps` new images per second in the long run: output slots
+//     are one frame interval apart and every delivered new image uses one (the
+//     next slot is max(slot, now) + interval). A frame may go out up to 3/8 of
+//     an interval before its slot, and one going out at most 1/8 of an interval
+//     after it (a held image of rule 3, a present that came just then) keeps the
+//     schedule (the next slot is slot + interval), so present jitter around a
+//     matching refresh rate adds no delay and a source presenting a little
+//     faster than `fps` keeps its rhythm; still at most one new image more than
+//     `fps` allows over any stretch, new images at least half an interval apart.
+//     (Half an interval of slack, as the first fix after the second hardware
+//     run had, puts the slot exactly on every other present of a source at
+//     twice the stream's rate, 120 Hz at 60 or 60 Hz at 30 fps: which present
+//     goes out then flips with the jitter, a visible judder.)
+//  3. Presents faster than `fps` (a 75 Hz display streamed at 60, a 144 Hz game
+//     at 120): an image that comes before its slot waits for it, and a newer
+//     one replaces it meanwhile (newest wins; older ones are dropped before
+//     encoding). When the slot opens, the source presents regularly (none of
+//     its last 16 present intervals longer than 1.5 times their median, which
+//     is shorter than a frame interval) and its next present is due less than
+//     half an interval later (predicted with the 7/8 quantile of those
+//     intervals), the waiting image is not sent late: the next present goes out
+//     the moment it comes, and the waiting one only if that present does not
+//     come in time (a quarter of the present interval, at most 2 ms, after it
+//     was due; at most one interval after its own present and 1/8 of an
+//     interval after its slot). Up to the second hardware run the waiting image
+//     went out when the slot opened, so at 60 fps on a 75 Hz display every image
+//     waited for the beat of the two rates: 9 ms p50 / 15.5 ms p95 between
+//     capture and encoder (docs/VENDOR_NOTES.md "Second hardware run: in-game
+//     capture and encoder latency"); with this rule four of five presents go
+//     out on arrival and the fifth is left out, as before at 60 per second. A
+//     source whose present intervals are not regular (a game on the display's
+//     vblank grid that misses some: intervals of one and two refreshes) keeps
+//     the slot rule: its next present cannot be predicted, and waiting for one
+//     that comes a refresh later cost frames (fewer than `fps`) and latency.
 //  4. Nothing new for idleRepeatMs (default 100 ms: Sunshine's default minimum
 //     of 10 fps, video.cpp min_fps_factor): the last image is submitted again,
 //     and again every idleRepeatMs, so the encoder's rate control, the network
@@ -19,7 +45,7 @@
 //     A repeat takes no output slot: the first new image after it goes out at
 //     once. That image is the latency-critical one (the first change after an
 //     idle period: a click or a keystroke on a static desktop); holding it for
-//     the slot a repeat used would cost up to 3/4 of an interval. Sunshine
+//     the slot a repeat used would cost up to half an interval. Sunshine
 //     likewise re-encodes the last image for its minimum fps without gating
 //     the next captured frame on it. Repeats only come after
 //     max(idleRepeatMs, one interval) without any delivery, so they cannot
@@ -27,6 +53,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace recon {
 
@@ -35,24 +62,52 @@ public:
     struct Decision {
         enum Kind { DeliverPending, DeliverRepeat, Wait } kind = Wait;
         int64_t until = 0;  // Wait: when to decide again at the latest (QPC)
+        // Wait with a pending image whose slot is open (rule 3): the source's
+        // next present is due before `until`. Wait for it in the capture API
+        // (a newer image is taken the moment it comes and goes out at once),
+        // not asleep as for a slot that is not open yet.
+        bool watch = false;
     };
 
     void reset(int64_t qpcFrequency, int fps, int idleRepeatMs, int64_t now);
     void setFps(int fps);
+    // A new image came: presented at presentQpc (the capture time where the
+    // present time is unknown), standing for `presents` presents of the source
+    // (DDA's AccumulatedFrames: images the capture skipped since the last
+    // one; 1 if unknown). It is the pending image now (replacing an older
+    // pending one). Feeds the present-interval estimate of rule 3.
+    void arrived(int64_t presentQpc, int presents = 1);
     // havePending: a new image is waiting; haveLast: an image was delivered before.
     Decision decide(int64_t now, bool havePending, bool haveLast) const;
     // An image went out at `now`; repeat: an idle re-submit (takes no slot).
     void delivered(int64_t now, bool repeat);
 
     int64_t period() const { return period_; }
+    // The source's present interval (median of the last kIntervals, each up
+    // to two frame intervals; a longer one starts the measurement again),
+    // 0 = not known yet (fewer than three).
+    int64_t presentInterval() const { return interval_; }
+    // Rule 3 applies: the last intervals are regular (none longer than 1.5
+    // times their median) and their median is shorter than a frame interval.
+    bool presentsFaster() const { return regular_ && interval_ > 0 && interval_ < period_; }
 
 private:
+    static constexpr int kIntervals = 16;
+
     int64_t freq_ = 1;
     int64_t period_ = 1;  // QPC ticks per frame, rounded up (never faster than fps)
-    int64_t early_ = 0;   // how early a frame may use its slot
+    int64_t early_ = 0;   // how early a frame may use its slot (3/8 interval)
+    int64_t late_ = 0;    // how late a delivery still keeps the slot schedule (1/8 interval)
     int64_t idle_ = 0;    // repeat interval
     int64_t nextDue_ = 0;
     int64_t lastDelivered_ = 0;
+    int64_t pendingAt_ = 0;    // present time of the pending image
+    int64_t lastArrival_ = 0;  // present time of the image before it, 0 = none
+    int64_t intervals_[kIntervals] = {};
+    int nIntervals_ = 0, nextInterval_ = 0;
+    int64_t interval_ = 0;  // median
+    int64_t predict_ = 0;   // 7/8 quantile: when the next present is due (rule 3)
+    bool regular_ = false;  // no interval longer than 1.5 times the median
 };
 
 // FirstImageWatchdog: a capture that has handed out no image at all since it
@@ -77,6 +132,56 @@ public:
 private:
     int64_t freq_ = 1, start_ = 0, next_ = 0;
     bool reported_ = false, done_ = false;
+};
+
+// CaptureLoss: a capture whose source went away (DDA's ACCESS_LOST at a
+// game's full-screen switch, a mode change, the secure desktop) and that
+// duplicates it again. The second hardware run had 15 such losses, each over
+// 10-61 ms later; a notice for each ("Screen capture is paused") was noise.
+// So a loss is reported to recon-host (captureChanged "lost", and "restored"
+// with the first image) only when an attempt to duplicate again fails, or when
+// kReportMs pass without an image: also when every new duplication works but
+// is lost again before its first image (DDA during some mode transitions),
+// which without this went on unreported and without a pause between attempts.
+// Attempts: at once after a loss, then after 16, 32, 64, 128 and every 250 ms
+// while they fail or the new duplication is lost again before an image.
+// --self-test-pacer checks it.
+class CaptureLoss {
+public:
+    static constexpr int kFirstRetryMs = 16, kRetryMs = 250, kReportMs = 250;
+
+    void reset(int64_t qpcFrequency);
+    bool active() const { return since_ != 0; }
+    const std::string& why() const { return why_; }
+    int attempts() const { return attempts_; }
+    // The source was lost at now (why). Returns when to duplicate again: at
+    // once for a new loss, after the next pause when a duplication that
+    // worked is lost again before its first image.
+    int64_t lost(int64_t now, const std::string& why);
+    // An attempt to duplicate again failed at now: when to try again.
+    int64_t failed(int64_t now);
+    // Duplicating again worked at now (no image yet).
+    void duplicated(int64_t now);
+    // recon-host is to be told "lost" now: an attempt failed, or kReportMs
+    // passed without an image. True once per loss.
+    bool reportDue(int64_t now);
+    // The first image after the loss came at now; ends the loss. reported:
+    // recon-host was told "lost" (it gets "restored" now).
+    struct End {
+        int64_t imageMs = 0;      // without an image since the loss
+        int64_t duplicateMs = 0;  // until the duplication that delivered it worked
+        int attempts = 0;         // failed attempts and duplications lost again before it
+        bool reported = false;
+    };
+    End image(int64_t now);
+
+private:
+    int64_t pause(int64_t now);
+
+    int64_t freq_ = 1, since_ = 0, duplicatedAt_ = 0;
+    std::string why_;
+    int attempts_ = 0;
+    bool failed_ = false, reported_ = false;
 };
 
 }  // namespace recon

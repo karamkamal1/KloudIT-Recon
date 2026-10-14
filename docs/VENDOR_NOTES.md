@@ -14074,3 +14074,315 @@ re-run here, with the same results) and fixed:
   what the screen shows: the bake-off's display row is the page's next animation frame, not the
   display. With the updated Chrome on the UHD 630, 200 rig samples per renderer decide whether
   Auto's pick is within 1 ms of the fastest.
+
+## Second hardware run: in-game capture and encoder latency
+
+The owner's second run (host build `20a5043`, RX 7900 XT, 2026-10-13 21:56-22:42, sessions
+`AzrZQwHx`, `wfOsNRHr`, `PEdroDHR`, `va4zyjIu`, `NMLlzRSB`, `gF35iYTL`, all on the UDP relay):
+"definitely better but still pretty laggy". In game the native helper's capture -> encoder submit
+(client row `submit`) was 9.2 ms p50 / 15.5 ms p95 and capture -> encoded (`capture`) 13.5 / 19.7
+ms, against 0.1 and 2.4 ms on the idle desktop: about 11 of the 36 ms end to end (gF35iYTL
+22:40:59). This section is where that time went, what was changed (a first fix, then its
+review), and what the next run must show. The network rows (`network`, `transfer`, the relay)
+are not covered here.
+
+### What the log shows: the frame pacer, not the GPU
+
+- **It follows the stream's frame rate, not the game.** By the stream's fps, in game (500-595
+  frames per 10 s): at **60 fps** `submit` is 3.5-10.1 ms p50 and 11.4-16.2 ms p95 (p99
+  11.6-16.6, at most one frame interval) over wfOsNRHr 22:33:29-22:36:13, NMLlzRSB and
+  gF35iYTL; gF35iYTL alone 7.8-9.4 / 15.0-15.7. The lower windows (wfOsNRHr 22:35:12-22:35:43:
+  p50 3.5-6.1, p95 13.0-14.8) are the ones with the heaviest GPU load (`encode` p95 11.1-11.6
+  ms), i.e. a slower game: fewer presents per output slot, a shorter beat, which fits the pacer
+  explanation below. At **75 fps** in the same game it is **0.1 ms p50, 0.1-0.2 ms p95**
+  (PEdroDHR 22:37:23-22:39:17 and va4zyjIu 22:39:37-22:39:48: 670-725 frames per 10 s, so the
+  game ran at about 67-72 fps; `encode` p95 6-10 ms, the GPU was busy). va4zyjIu went from 75
+  to 60 fps at 22:39:58 (a settings restart) and its `submit` p95 went from 0.1 to 13.9 ms
+  with the same game running. The host display runs at 75 Hz (the agent caps a 90/120 fps
+  setting at the display's rate, `fps=75`; the client's Frame rate was 60 in the other
+  sessions).
+- **Why.** The pacer (`src/capture/pacer.hpp`) gave every delivered image an output slot one
+  interval after the last, with a quarter interval of slack, and an image presented before its
+  slot waited for it. Presents every 13.3 ms against slots every 16.7 ms beat: the waits run 0,
+  2.5, 5.8, 9.2, 12.5 ms and over again, up to a whole interval when a game's frame times jitter.
+  The self-test's simulation of that rule gives 7.7 ms mean / 12.9 ms p95 at a steady 75 Hz,
+  7.7 / 14.7-14.9 ms (p99 15.6-16.0) for a 62-65 fps game with ±2 ms frame times (the pattern
+  closest to the log's 9.2 / 15.5 / 16.1), and 6.1-7.0 / 12.6-15.8 ms for a game on the 75 Hz
+  refresh grid that misses refreshes (vsync or borderless at 62-72 fps); it adds nothing at
+  75 fps, where every present has its own slot. Sunshine's capture loop paces the same way
+  (`display_base.cpp`: a frame pacing group sleeps to `start + n / fps`, then takes the newest
+  image with a 0 ms timeout), so the same delay is there at 60 fps on a 75 Hz display; it is
+  inherent to sampling at fixed slots, not to DDA.
+- **The GPU queue is at most part of `encode`.** `submit` is measured on the CPU before
+  `Backend::submit`: the colour conversion's draws, `Map(WRITE_DISCARD)` of its constant buffer
+  and `Flush` return without waiting for the GPU (no `GetData` spin anywhere on the path; the
+  readback is only for `--dump-nv12` and the self-test), so work queued behind the game's
+  shows up after the submit, in `encode` (submit -> encoded: AMF waits for its input texture).
+  `encode` in game: 2.6-3.2 ms p50 (idle 2.3-2.5), p95 8-12 ms at 60 fps and 6-10 ms at 75
+  (idle 2.9-3.1). So the conversion's wait behind the game costs at most ~0.5 ms at p50 and up to
+  ~6-9 ms at p95, shared with VCN's own time; the log cannot split them (now measured, below).
+- **GPU priority took effect as far as Windows says.** Every helper start logged `gpu priority:
+  realtime (amd, hags on)` and no `SetGPUThreadPriority` warning. The helper logs `realtime` only
+  when `D3DKMTSetProcessSchedulingPriorityClass` returned STATUS_SUCCESS (else it tries HIGH, else
+  `failed`), so the line cannot appear for a refused call. The agent is not a plain user-session
+  process: install-host.ps1's logon task runs it with highest privileges, an elevated admin token
+  that holds SeIncreaseBasePriorityPrivilege (Sunshine logs "run as administrator" exactly when
+  this call or `SetGPUThreadPriority(7)` fails). Whether the GPU's own scheduler (HAGS on) puts
+  the helper's 3D-queue work ahead of the game's is not visible in any log so far.
+- **AMF and BGRA input: where AMF converts is not known.** The AMF encoders take BGRA/RGBA
+  surfaces (the AMD Direct Capture zero-copy path already submits them). Where AMF turns them
+  into YUV is not documented: `*_CAP_COLOR_CONVERSION` is an `AMF_ACCELERATION_TYPE` whose header
+  comment gives the default `AMF_ACCEL_GPU` for H.264 (`VideoEncoderVCE.h`) and HEVC
+  (`VideoEncoderHEVC.h`) and "N/A" for AV1 (`VideoEncoderAV1.h`); neither the headers nor
+  AMF_Video_Encode_API.md / _HEVC_API.md say which engine or GPU queue `AMF_ACCEL_GPU` means.
+  VCN itself has an RGB -> YUV unit: Mesa 22.1 uses it on VCN 2.0 and newer ("Encoder Format
+  Conversion", EFC, which skips the shader pass; Phoronix, "AMD EFC Support Added To Mesa
+  22.1"), and FFmpeg's amfenc notes that "the RGB->YUV color conversion hardware available on
+  current AMD GPUs only supports BT.709 and BT.2020+PQ" (patchwork 20241010000834.1909-1; a
+  2025 commit on AMF HEVC/AV1 RGB input says the same of "AMF VCN color conversion"). So
+  handing AMF the captured image may avoid the conversion's wait behind the game, or may not:
+  until the `amf: ... RGB input converted by:` line is read on the RX 7900 XT and `host_gpu`
+  is measured, "DDA's BGRA texture straight into AMF (BT.709, 8-bit)" is a real candidate,
+  not one the documentation rules out. (The first fix's notes and its commit message said the
+  conversion runs "on the same queues the helper's NV12 conversion uses"; nothing supports
+  that.)
+- **AMD Direct Capture** uses the same pacer (the fixes apply to it), has no DWM duplication
+  (no `ACCESS_LOST`), and with zero-copy no conversion in the helper (AMF converts RGB itself,
+  where: above). It stays opt-in (`capture` `amf`) until the measurements below say it is
+  faster.
+- **Capture losses.** 15 in the new run: 13 `DXGI_ERROR_ACCESS_LOST` and 2
+  `DXGI_ERROR_INVALID_CALL` from `AcquireNextFrame`, in bursts when the game switched between
+  full screen and the compositor (wfOsNRHr 22:33:16-22:33:17: five within 1.4 s). Each was over
+  10-61 ms after it was lost (`capture lost` -> `capture restored`: median 22 ms; 10, 10, 18,
+  20, 21, 21, 21, 22, 27, 29, 34, 34, 36, 53, 61): the re-duplication worked at the first
+  attempt every time, so the gap was finding the output again (`d3d::findOutput`: a new DXGI
+  factory, every adapter and output enumerated) plus `DuplicateOutput`, both between the two
+  log lines. Each still sent `lost` and `restored` to recon-host, and the browser showed
+  "Screen capture is paused" for every one.
+
+### What changed: the first fix (commits fdb2204-51927b4)
+
+- **Pacing** (`src/capture/pacer.hpp` rule 3, first version): half an interval of slack, and
+  when the slot opened while an image waited and the source's next present was due less than
+  half an interval later (the median of its last 8 present intervals), the helper waited in the
+  capture API for that present and sent it on arrival; the waiting image only if it did not
+  come by a quarter of its interval (at most 2 ms) after it was due, at most one interval after
+  its own present. `--self-test-pacer`: a steady 75 Hz source at 60 fps 0.7 ms mean / 2.3 ms
+  p95 (the old rule 7.7 / 12.9); that p95 is a steady source's: for a ~70 fps game with ±3 ms
+  frame times it was 5.6 ms, and for game patterns the p99 stayed near one frame interval.
+  Its review found two flaws (below), so this version is replaced.
+- **Per-frame timing** (docs/HELPER_PROTOCOL.md "Per-frame timing"): the helper stamps when
+  the capture had copied the image, when the pacer handed it out, when the conversion had the
+  D3D11 device lock and flushed its draws, when the encoder's submit call returned and (an
+  `ID3D11Fence` the converter signals after its draws, a helper thread waiting on it) when the
+  GPU had finished the copy and conversion. Stats and the ring slot (flag TIMING, 6 x u16 µs
+  after capture in the reserved bytes 112-123; older helpers leave it 0) carry them; recon-host
+  logs them in every `latency stages` line as `host_copy`, `host_pace`, `host_lock`,
+  `host_convert`, `host_submit_call`, `host_gpu` and `host_encoder`, next to `host_capture`. The
+  next run's lines say how much of `capture` is waiting for the slot, for the device lock (AMF's
+  threads), in `SubmitInput`, behind the game on the GPU (`host_gpu`), and in VCN.
+- **GPU priority read back.** The `gpu priority:` line adds what Windows holds afterwards
+  (`D3DKMTGetProcessSchedulingPriorityClass`: `the OS reports realtime`; a warning if not the
+  class set); `SetGPUThreadPriority(7)` is read back with `GetGPUThreadPriority` (a warning if it
+  differs).
+- **AMF's conversion cap logged**: `amf: input formats NV12 ... (native: ...); RGB input
+  converted by: ...` at every encoder init (labels since the review: the AMF enum's own names,
+  `hardware (AMF_ACCEL_HARDWARE)`, `GPU (AMF_ACCEL_GPU)`, ...; the first fix printed "hardware
+  (VCN)" and "GPU shader", readings the documentation does not give).
+- **Capture losses** (`src/capture/dda_capture.cpp`): every loss logs `dda: capture lost (why),
+  first image N ms later (duplicating again: M ms ...)` and `dda: duplicating ... again:
+  DuplicateOutput took N ms`. While the DXGI factory is current DuplicateOutput is tried on the
+  output object the duplication had, before enumerating the adapters and outputs again; a
+  failing `ReleaseFrame` (ACCESS_LOST) re-duplicates at once instead of waiting for the next
+  `AcquireNextFrame`; a failed attempt is repeated after 16, 32, 64, 128 ms, then every 250 ms
+  (was 250 ms from the first failure). The first fix reported a loss only if the first new
+  duplication failed; the review changed that rule (below). Not done: switching to AMD Direct
+  Capture or WGC when DDA keeps losing: a loss cost 10-60 ms, a helper restart on another
+  capture costs more (a new encoder and a key frame, 100+ ms) and AMD Direct Capture is
+  experimental; the next run's `first image N ms later` lines say whether that changes.
+- **Advice**: README (Frame rate): pick the PC display's refresh rate or more (on a 75 Hz
+  display 90, which streams 75): 60 on 75 Hz leaves out one present in five, and only at the
+  display's rate does the pacer add nothing at all.
+
+### The review of the first fix
+
+Eight findings, all confirmed (the pacer ones by simulation: the review's harness and one of
+our own, `FramePacer` driven as the self-test's `simulate()` does, 30 s per pattern):
+
+- **The pacer made two common setups worse.** (a) A source at exactly twice the stream's rate
+  (120 Hz at 60, 60 Hz at 30 through the fps ladder, 144 Hz at 72, 240 Hz at 120): half an
+  interval of slack put the slot exactly on every other present, and present jitter flipped
+  which one went out: 4.6% (120 Hz at 60), 5.8% (60 Hz at 30) and 8.3% (144 Hz at 72) of the
+  steps between images were 1 or 3 presents instead of 2, a judder the old rule did not have
+  (0.0%). (b) A game on the display's refresh grid (vsync, or borderless through the
+  compositor: the usual case for DDA) at or a little above the stream's rate presents one or
+  two refreshes apart; the median predicted one refresh, the hold for the present that came a
+  refresh later cost up to a frame (a 60 fps game on 75 Hz at 60 fps: p95 15.4 ms, the old
+  rule 9.6) and frames (62-66 fps games: 57.4-57.9 fps delivered, the old rule 59.5-59.6).
+- **The rule now** (docs/HELPER_PROTOCOL.md "Frame pacing", `pacer.hpp` policies 2 and 3):
+  - 3/8 of an interval of slack (between the old quarter and the first fix's half: the slot
+    opens a quarter of a present interval away from both presents of a 2:1 source, so jitter
+    up to that no longer flips it), and a delivery at most 1/8 of an interval after its slot
+    keeps the slot schedule (the next slot is one interval after this one), so a held image
+    or a present that came just after its slot costs no output slot. The guarantees are the
+    first fix's: at most one image more than `fps` over any stretch, new images at least half
+    an interval apart, none older than one interval.
+  - Rule 3 only for a regular source: none of the last 16 present intervals longer than 1.5
+    times their median (a game that misses refreshes has intervals of one and two refreshes:
+    not regular, it keeps the slot rule with the larger slack); the next present is predicted
+    with the 7/8 quantile of those intervals (the third longest), and the hold ends at most
+    1/8 of an interval after the slot.
+  - The review suggested turning rule 3 and the larger slack off for sources faster than 1.67
+    times `fps` instead (quarter slack there). Not taken: with quarter slack and rule 3 a 75
+    Hz source at 60 fps lost frames (56.3 fps: a skipped image's slot expired before the next
+    present), and a 2:1 source would wait the old rule's 4.6 ms; with the slot at 3/8 it is
+    sent on arrival (0.0 ms) without judder.
+- **The self-test now** (`--self-test-pacer`, 10 s per pattern, the old rule on the same
+  presents in brackets; mean / p50 / p95 / p99 wait between present and delivery, ms):
+
+  | Presents, stream fps | Frames | Wait | Old rule |
+  |---|---|---|---|
+  | 75 Hz ±0.3 ms, 60 | 600 | 1.1 / 0.2 / 4.0 / 4.1 | 601, 7.7 / 6.4 / 12.9 / 13.0 |
+  | game ~70 fps ±3 ms (free-running), 60 | 601 | 1.9 / 0.0 / 6.4 / 7.5 | 602, 7.1 / 7.2 / 13.6 / 14.8 |
+  | game ~65 fps ±2 ms, 60 | 601 | 1.9 / 0.0 / 7.0 / 7.6 | 601, 7.7 / 7.8 / 14.7 / 15.6 |
+  | game ~62 fps ±2 ms, 60 | 601 | 2.2 / 0.3 / 7.6 / 9.1 | 601, 7.7 / 7.6 / 14.9 / 16.0 |
+  | 144 Hz, 60 | 600 | 0.0 / 0 / 0 / 0 | 601, 3.2 / 3.1 / 6.0 / 7.2 |
+  | 60 fps game on a 75 Hz grid, 60 | 600 | 1.9 / 0.5 / 7.2 / 7.3 | 600, 3.3 / 2.7 / 9.4 / 9.5 |
+  | 62 fps game on a 75 Hz grid, 60 | 596 | 4.7 / 3.8 / 13.7 / 13.8 | 596, 6.5 / 5.9 / 15.8 / 16.0 |
+  | 64-70 fps games on a 75 Hz grid, 60 | 595-600 | 4.4-5.0 / 3.8 / 10.5-10.6 / 10.5-13.9 | 595-600, 6.1-6.9 / 5.9 / 12.6-12.7 / 12.7-16.0 |
+  | 72 fps game on a 75 Hz grid, 60 | 593 | 3.7 / 3.7 / 10.5 / 10.6 | 600, 7.0 / 5.9 / 12.6 / 12.7 |
+  | 75 Hz vsync missing 5 / 8 / 12% of refreshes, 60 | 593 / 591 / 579 | 3.1-3.6 / 0.5-3.6 / 10.5 / 10.6-13.8 | 597 / 596 / 583, 6.2-6.7 / 5.9 / 12.6 / 12.7-15.8 |
+  | 120 fps game on a 144 Hz grid, 120 | 1200 | 1.3 / 0.5 / 4.3 / 4.6 | 1200, 2.0 / 1.6 / 5.3 / 5.6 |
+  | 120 Hz ±0.3 ms / ±1 ms, 60; 60 Hz, 30; 144 Hz, 72; 240 Hz, 120 | 601 / 601 / 301 / 720 / 1201 | ~0; 99% of the steps 2 presents (97% with ±1 ms) | 100% |
+
+  Checked: frames ≥ 98% of min(fps, the game's) and p95 ≤ the old rule's on the refresh grids;
+  98% of the old rule's frames and p95 at least 1.5 ms lower with missed vsync; ≥ 98% of 2:1
+  steps (95% with ±1 ms jitter); waits bounded for the steady and free-running sources; and the
+  common properties of every case (rate, gap, newest image, age, repeats). The time-weighted age
+  of the image a display shows (a 30 s simulation): 75 Hz at 60 fps 16.1 -> 10.3 ms, 75 Hz
+  vsync missing 8% 15.1 -> 12.5 ms, ~70 fps ±3 ms game 15.4 -> 10.7 ms.
+- **What the owner's next run should show at 60 fps on 75 Hz** (HARDWARE_TEST_PLAN 7.9):
+  `host_pace` p50 ≤ 0.5 ms and p95 ≤ 8 ms if the game does not wait for the display (no vsync,
+  FreeSync), p50 0.5-3.9 and p95 10.5-13.7 ms if it presents on the 75 Hz refresh grid and
+  misses some refreshes (the second run, likely the latter: 9.2 / 15.5); the first fix's
+  "`host_pace` p95 ≤ 4 ms" and "`fps` ≥ 58" (after the network's thinning) did not fit those
+  games. Streaming at the display's rate
+  (Frame rate 90 -> 75 fps) leaves no wait at all (0.1 ms in the second run) and stays the
+  advice.
+- **`gpuPriority` `off` was not "no priority".** It only skipped
+  `D3DKMTSetProcessSchedulingPriorityClass`; `d3d::createDevice` set `SetGPUThreadPriority(7)`
+  on every hardware device regardless. Now `off` also leaves the devices' GPU thread priority at
+  0 (`d3d::gpuThreadPriority(false)` before the capture creates its device; log `gpu priority:
+  off (...; GPU thread priority left at 0)`), so 7.9's `auto` vs `off` comparison compares
+  priority against none. Test: `TestHelperIntegrationGPUPriorityOff` (Wine: `auto` logs Wine's
+  failed `SetGPUThreadPriority(7)`, E_NOTIMPL; `off` makes no such call and says so).
+- **A DDA loss that keeps coming back went unreported and unpaced.** With the first fix's
+  rule, a duplication that worked but was lost again before its first image (DDA does this
+  during some mode transitions) re-duplicated in a tight loop, reported nothing and logged no
+  `first image` line while the stream repeated the last image. Now (`CaptureLoss`,
+  `capture/pacer.hpp`): a new duplication lost before its first image waits like a failed
+  attempt (16, 32, 64, 128, then 250 ms), and a loss is reported (`lost`) when an attempt fails
+  or no image came 250 ms after it, with `restored` "after N ms" at its first image (in the
+  second run all 15 losses had their first image within 61 ms: no notice). `--self-test-pacer`
+  checks the three cases (over at once, failing attempts, lost again before every first image).
+- **A stale output size after a resolution change.** The first fix duplicated on the old
+  `IDXGIOutput` while `IDXGIFactory1::IsCurrent` is TRUE, and took the size from that object;
+  IsCurrent only tracks adapters ("FALSE, if a new adapter is becoming available or the current
+  adapter is going away"), not display modes, so an object reporting its old size would hide a
+  `resized` (session restart, input mapping). Now the new duplication's own mode
+  (`DXGI_OUTDUPL_DESC.ModeDesc`, turned by its rotation) is compared with the object's desktop
+  size, and on a mismatch the output is found again (`dda: the duplication's mode does not
+  match the output's desktop ...: finding the output again`). Sunshine relies on IsCurrent the
+  same way; whether Windows ever hands out such a stale size is for the hardware run (7.9 step
+  4, 4.5 step 1).
+- **Statements stronger than the evidence**, corrected above and in docs/HELPER_PROTOCOL.md:
+  the 60 fps `submit` ranges (were "7.8-10.1 p50 / 15.0-16.6 p95 in every in-game window"), the
+  first fix's p95 (a steady source's), the old loss gap (findOutput plus DuplicateOutput, not
+  DuplicateOutput alone), and AMF's conversion (unknown, not "the same queues").
+
+### Not done, and when to do it
+
+- **A conversion that does not queue behind the game.** If `host_gpu` p95 is several ms in
+  game with `gpuPriority` `auto` and about the same with `off` (now truly without priority: the
+  GPU's scheduler does not let these queues ahead of the game), two candidates, to be measured
+  rather than chosen from documentation: DDA's BGRA texture straight into AMF (a zero-copy path
+  for DDA as AMD Direct Capture has; BT.709 8-bit only, no barcode or scaling; it helps if AMF
+  converts on VCN, which the `RGB input converted by:` line and an AMD Direct Capture zero-copy
+  run's `host_gpu` against DDA + NV12 would show), or the conversion on a D3D12 compute queue
+  created with `D3D12_COMMAND_QUEUE_PRIORITY_HIGH` (async compute beside the game's 3D work;
+  textures shared with the D3D11 device, synchronised with shared fences). Neither is worth
+  building blind: the log has no evidence yet that the GPU queue is the problem at p50.
+- **A game on the refresh grid at a stream rate below the display's** still waits (p95 ~10.5
+  ms at 60 on 75 Hz): its presents cannot be predicted, and taking every present that comes
+  would send more than `fps`. The client's Frame rate setting could default to the PC
+  display's refresh rate (client area).
+
+### Verified here
+
+- `--self-test-pacer`, native (g++ -Wall -Wextra, also with ASan/UBSan) and the mingw build
+  under Wine, identical output: every case passes, numbers in the table above.
+- `TestHelperIntegrationGPUPriorityOff` and the other helper integration tests under Wine
+  (below).
+- Go: `TestRingTiming` (the slot's timing, saturation at 65534 µs, a slot without the flag),
+  `TestHelperVideoTiming` (host clock, stamps out of order left out), `TestHostStagesSplit` (the
+  seven rows and the encoder row from the later of submit return and GPU done),
+  `TestDecodeMessages` (the stats fields).
+- `TestHelperIntegrationGPUPipeline` (mingw build, Wine with xvfb, mock encoder, synthetic GPU
+  source): every frame carries its timing in order (ready <= deliver <= lock <= convert <=
+  submit; the submit call's return for most frames: the mock encodes inside the call and
+  sometimes hands the frame out first), at most 31 frames in a second at 30 fps. Wine's D3D11 has
+  no `ID3D11Device5` (`conversion: no D3D11 fence (E_NOINTERFACE)`), so `gpuDoneQpc` and the GPU
+  timing thread run only on Windows: `--self-test-convert` checks the fence plumbing where the
+  device has one (CI's WARP: the frame's fence value reached after the readback, its completion
+  event set), and skips that check under Wine.
+- Not verifiable here: everything on the GPU (no AMD or NVIDIA GPU, no DDA in Wine, no AMF),
+  so the DDA loss and stale-size paths run only on hardware; their rule is the self-tested
+  `CaptureLoss`.
+
+### Hardware re-check
+
+- AMD RDNA3 (RX 7900 XT): unverified. Test: `docs/HARDWARE_TEST_PLAN.md` 7.9: HEVC 1080p in the
+  same game at Frame rate 60 on the 75 Hz display, then 90 (streams 75), then 90 with
+  `"gpuPriority": "off"`, 2 minutes each, then a resolution change. Look at the `latency
+  stages` lines: at 60 fps `host_pace` p50 ≤ 4.5 ms and p95 ≤ 14 ms, `submit` p95 at least 2 ms
+  below the second run's (by the game's presents: ≤ 0.5 / ≤ 8 ms without vsync, 0.5-3.9 /
+  10.5-13.7 ms on the refresh grid); `stream stats` `fps` + `thinned`/10 ≥ 57 in at least 9 of
+  10 in-game windows; at 75 fps `host_pace` p95 ≤ 1 ms; `host_copy`, `host_lock`,
+  `host_convert`, `host_submit_call` p95 ≤ 1 ms; record `host_gpu` and `host_encoder` p50/p95 at
+  `auto` and `off` (that decides the step above); the `gpu priority: ... the OS reports
+  realtime` line (and `GPU thread priority left at 0` in the `off` run), no `conversion: no
+  D3D11 fence` line, the `amf: input formats ... RGB input converted by:` line; `dda: capture
+  lost (...), first image N ms later` lines at full-screen switches, no "Screen capture is
+  paused" notice for those under 250 ms, any `dda: lost again before the first image` lines;
+  `capture changed reason=resized` for the resolution change.
+- NVIDIA: unverified (no NVIDIA host available). Test: the same steps with `hevc_nvenc_helper`
+  on an RTX 40/50 host at Frame rate 60 on a display faster than 60 Hz (the pacer and the timing
+  are vendor-neutral; NVENC's `host_submit_call` is `nvEncEncodePicture`, its
+  `host_encoder` includes the output thread's `NvEncLockBitstream`). Pass: the same `host_pace`
+  bounds for the display's rate; record `host_gpu` with `gpuPriority` `auto` (HIGH with HAGS on)
+  and `off`.
+
+### Runs with these changes
+
+- First fix (51927b4): `gofmt -l` printed nothing for the changed files; `go vet ./...` and
+  `GOOS=windows go vet ./...` passed; `go test` passed for every package but `internal/e2e`,
+  and under the shared lock `go test ./internal/e2e/...` passed (207 s); `make build` and
+  `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64`: 82 top-level tests passed, 9 skipped.
+- The review's fixes (5a470d4, 3699d05, a47914a and the docs): `gofmt -l` prints nothing;
+  `go vet ./...` and `GOOS=windows go vet ./...` pass; `go test -count=1` passes for all 18
+  packages but `internal/e2e` (internal/host 121 s, internal/host/media 120 s); `go test -race
+  -count=1` under the lock passes for `internal/host/encoder`, `internal/host/media` and
+  `internal/host` (339 s); `go test ./internal/e2e/...` under the lock failed once with the
+  load-sensitive `TestStreamingBitrateRecovery` (two client overflow cuts, 4000 -> 3400 and
+  3570 -> 2788, where it wants one: the FFmpeg path's rate control, which nothing here touches;
+  the same test failed under load before, see "2.5 Datagram + FEC video (optional)") and passed
+  on the re-run
+  (207 s); `node --check` on the 16 files in web/static/js and test/e2e/browser.mjs; `make
+  build`; `make helper` (mingw-w64, no warnings); under the lock `xvfb-run -a make helper-test
+  WINE=/usr/lib/wine/wine64`: 83 top-level tests pass (the new
+  `TestHelperIntegrationGPUPriorityOff` among them), 9 skip (no AMF, AMD Direct Capture, WGC
+  or libavcodec in the sandbox), `--self-test-pacer` ok with the capture-loss cases.
+- No browser code or E2E section changed (the pacer and the capture run only in the native
+  helper on Windows; the browser E2E streams FFmpeg's test source), so the browser E2E was not
+  run for this; it runs in full after the merge.

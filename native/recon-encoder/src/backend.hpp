@@ -33,6 +33,10 @@ struct CapturedFrame {
     uint64_t index = 0;      // capture counter
     int64_t presentQpc = 0;  // when the content was presented (DDA LastPresentTime, AMD flip timestamp); 0 = unknown / repeat
     int64_t captureQpc = 0;  // when the capture API returned the frame (for a repeat: when it was re-submitted)
+    // Per-frame timing (stats readyQpc / deliverQpc): the capture had the
+    // image copied and its metadata read, and the pacer handed it out (the
+    // wait for its output slot in between, capture/pacer.hpp).
+    int64_t readyQpc = 0, deliverQpc = 0;
     uint32_t width = 0, height = 0;  // as displayed (after rotation)
     // Idle re-submit of the previous image: nothing new was presented for
     // StartParams::idleRepeatMs (see the pacing policy in capture/pacer.hpp).
@@ -142,6 +146,11 @@ struct EncoderFrame {
 struct SubmitInfo {
     uint64_t frameId = 0;
     int64_t presentQpc = 0, captureQpc = 0, submitQpc = 0;
+    // Where the time between capture and submit went (stats, docs/HELPER_PROTOCOL.md
+    // "Per-frame timing"): CapturedFrame::readyQpc / deliverQpc, then the
+    // colour conversion's device lock taken and its work flushed to the GPU
+    // (d3d::ConvertedFrame::lockQpc / flushQpc); 0 = not measured.
+    int64_t readyQpc = 0, deliverQpc = 0, lockQpc = 0, convertQpc = 0;
     bool repeat = false;
     float dirty = -1;
     // The frame starts a new sequence (ring flag SEQ_START): the stream's first
@@ -168,6 +177,10 @@ struct EncodedFrame {
     size_t oversizeBytes = 0;
     int slices = 0;            // sliceOutput: parts it came out in
     int64_t firstSliceQpc = 0;
+    // Set by the pipeline from its own stamps (stats submittedQpc /
+    // gpuDoneQpc), not by the backend: Backend::submit returned, the GPU had
+    // finished the frame's conversion.
+    int64_t submittedQpc = 0, gpuDoneQpc = 0;
     uint32_t width = 0, height = 0;
     const uint8_t* data = nullptr;
     size_t size = 0;

@@ -1,6 +1,7 @@
 #include "stream.hpp"
 
 #include "d3d/convert.hpp"
+#include "d3d/device.hpp"
 #include "nvenc/nvenc_runtime.hpp"
 #include "platform/platform.hpp"
 
@@ -14,6 +15,10 @@ Status startStream(const StartParams& p, BackendChoice& choice, RingWriter& ring
         capName = (p.window || !p.windowTitle.empty()) ? "wgc" : choice.caps.capture.empty() ? "dda" : choice.caps.capture.front();
     }
     Status s;
+    // gpuPriority "off" leaves the devices' GPU thread priority at 0 too (the
+    // capture creates its device in init): an "off" run is then one with no
+    // GPU priority at all, the comparison HARDWARE_TEST_PLAN 7.9 makes.
+    d3d::gpuThreadPriority(p.gpuPriority != "off");
     std::unique_ptr<Capture> capture = createCapture(capName, s);
     if (capture) s = capture->init(p);
     if (!capture || !s.ok) {

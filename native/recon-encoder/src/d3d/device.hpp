@@ -57,10 +57,17 @@ struct Device {
 // Creates the D3D11 device on `adapter` (capture must run on the adapter that
 // owns the output, and the encoder uses the same device), with BGRA support,
 // multithread protection (the encoder's threads share it), GPU thread priority
-// 7 and maximum frame latency 1 (Sunshine display_base.cpp). warp = true
-// creates a WARP device and adapter = nullptr the default hardware device
-// (self-test). The debug layer is only requested in debug builds.
+// 7 (unless gpuThreadPriority(false) came first) and maximum frame latency 1
+// (Sunshine display_base.cpp). warp = true creates a WARP device and adapter =
+// nullptr the default hardware device (self-test). The debug layer is only
+// requested in debug builds.
 Status createDevice(IDXGIAdapter1* adapter, Device& out, bool warp = false);
+
+// Whether devices created from now on get GPU thread priority 7 (default true).
+// start's gpuPriority "off" turns it off before the capture creates its
+// device, so that an "off" run leaves both GPU priorities at Windows' default
+// (HARDWARE_TEST_PLAN 7.9 compares it with "auto").
+void gpuThreadPriority(bool raise);
 
 // True when the device was removed (driver reset / TDR, driver update, GPU
 // gone: ID3D11Device::GetDeviceRemovedReason fails); out is then the fatal

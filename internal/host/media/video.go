@@ -63,7 +63,24 @@ type Frame struct {
 	// Reencoded: the encoder encoded this frame a second time at a higher QP
 	// because the first encode was oversized (StartParams.ReencodeOversized).
 	Reencoded bool
-	Data      []byte
+	// Timing splits the native helper's capture -> encoded time (the
+	// session's host_* latency rows).
+	Timing HelperTiming
+	Data   []byte
+}
+
+// HelperTiming is where a native-helper frame spent its time between capture
+// (Frame.CaptureUs) and the encoded frame (EncodeDoneUs), host clock in µs, 0
+// = not measured (FFmpeg frames, older helpers, a stamp out of order;
+// docs/HELPER_PROTOCOL.md "Per-frame timing"): the capture had the image
+// copied (ReadyUs), the frame pacer handed it out (DeliverUs: the wait for
+// its output slot in between), the colour conversion had the D3D11 device
+// lock (LockUs) and flushed its work to the GPU (ConvertUs), the encoder's
+// submit call (from Frame.SubmitUs) returned (SubmittedUs), and the GPU had
+// finished the frame's copy and conversion (GPUDoneUs: what queues behind a
+// game's GPU work).
+type HelperTiming struct {
+	ReadyUs, DeliverUs, LockUs, ConvertUs, SubmittedUs, GPUDoneUs uint64
 }
 
 // maxCaptureToEncoded bounds plausible capture->encoded times; anything else

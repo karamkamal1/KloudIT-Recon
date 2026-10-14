@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -377,6 +378,14 @@ std::string encodeStats(const FrameStats& s) {
     if (s.slices > 0) {
         j["slices"] = s.slices;
         j["firstSliceQpc"] = s.firstSliceQpc;
+    }
+    // Per-frame timing: only the stamps this frame has (helpers before the
+    // second hardware run sent none).
+    const std::pair<const char*, int64_t> stamps[] = {{"readyQpc", s.readyQpc},   {"deliverQpc", s.deliverQpc},
+                                                     {"lockQpc", s.lockQpc},     {"convertQpc", s.convertQpc},
+                                                     {"submittedQpc", s.submittedQpc}, {"gpuDoneQpc", s.gpuDoneQpc}};
+    for (const auto& [name, qpc] : stamps) {
+        if (qpc) j[name] = qpc;
     }
     return j.dump();
 }

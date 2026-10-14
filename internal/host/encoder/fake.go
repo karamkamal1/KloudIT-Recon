@@ -97,6 +97,12 @@ func (w *ringWriter) writeMangled(f *Frame, mangle func(slot []byte)) bool {
 	if f.Reencoded {
 		flags |= FlagReencoded
 	}
+	if f.Timing != nil {
+		flags |= FlagTiming
+		for i, p := range f.Timing.stamps() {
+			le.PutUint16(s[slotTiming+2*i:], uint16(min(max(*p, -1), 65534)+1))
+		}
+	}
 	le.PutUint64(s[slotSeq:], w.written)
 	le.PutUint64(s[slotFrameID:], f.FrameID)
 	le.PutUint32(s[slotFlags:], flags)

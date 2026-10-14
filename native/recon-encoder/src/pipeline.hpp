@@ -3,6 +3,8 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -72,10 +74,27 @@ public:
     void setBeforeSubmit(std::function<void(uint64_t)> fn) { opt_.beforeSubmit = std::move(fn); }
 
 private:
+    // Per-frame stamps that come after Backend::submit took the frame's
+    // SubmitInfo: when submit returned (capture thread) and when the GPU had
+    // finished the frame's copy and conversion (GPU timing thread), read by
+    // the output thread for the frame's stats. By frame id; fence: the
+    // converter's fence value of this submission (a frame id is used again
+    // when the encoder refused the frame as busy).
+    struct Stamp {
+        uint64_t frameId = 0, fence = 0;
+        int64_t submitted = 0, gpuDone = 0;
+    };
+    static constexpr size_t kStamps = 256;
+
     void captureLoop();
     void outputLoop();
+    // The GPU timing thread: waits for the converter's fence (gpuFence) to
+    // reach each converted frame's value and stamps when it did. Only with a
+    // converter that has a fence.
+    void gpuLoop();
     RateParams rate();
     void dump(const d3d::ConvertedFrame& f, uint64_t frameId);
+    Stamp& stamp(uint64_t frameId) { return stamps_[frameId % kStamps]; }
 
     Backend& enc_;
     Capture& cap_;
@@ -91,6 +110,13 @@ private:
     std::atomic<bool> stop_{false};
     std::thread capture_;
     std::thread output_;
+
+    std::mutex stampMu_;  // stamps_
+    Stamp stamps_[kStamps];
+    std::mutex gpuMu_;  // gpuQueue_
+    std::condition_variable gpuCv_;
+    std::deque<std::pair<uint64_t, uint64_t>> gpuQueue_;  // (frame id, fence value) to wait for, oldest first
+    std::thread gpu_;
 };
 
 }  // namespace recon

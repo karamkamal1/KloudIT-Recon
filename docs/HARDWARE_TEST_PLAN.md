@@ -898,6 +898,68 @@ connect and kept moving until the overlay's Renderer row no longer reads `auto: 
   overlay was open (it redraws every 0.5 s on the page's main thread) and the CPU load on the
   client.
 
+**7.9 In-game capture and encoder latency** (VENDOR_NOTES "Second hardware run: in-game capture
+and encoder latency")
+
+- **Do**:
+  1. On the 75 Hz host display, stream HEVC 1920×1080 with Frame rate **60** and play the same
+     game as in the second run for 2 minutes (moving the camera, not in a menu). Leave the
+     overlay closed. Note whether the game runs with vsync (or borderless/windowed, which
+     shows its frames at the display's refresh) or without (tearing, or FreeSync), and its
+     own frame rate counter (or PresentMon).
+  2. Then Frame rate **90** (the agent streams the display's 75) and play 2 more minutes.
+  3. Then stop the agent, set `"gpuPriority": "off"` in host.json, start it, play 2 minutes at
+     90 again; afterwards remove the line (back to `auto`). `off` now means no GPU priority at
+     all: neither the process class nor the D3D11 device's GPU thread priority (before this
+     build `off` still had thread priority 7).
+  4. Change the desktop resolution while streaming, and back (4.5 step 1 again: this build
+     changed how the capture finds its output after a loss).
+- **Look at** host.log:
+  - At each helper start: `encoder helper: gpu priority: realtime (amd, hags on; the OS reports
+    realtime)` (a Warn line or another class there means Windows did not keep it), no
+    `SetGPUThreadPriority` warning, no `conversion: no D3D11 fence` line, and `encoder helper:
+    amf: input formats ... RGB input converted by: ...` (copy the whole line: `hardware
+    (AMF_ACCEL_HARDWARE)`, `GPU (AMF_ACCEL_GPU)` or another value). In the `off` run: `gpu
+    priority: off (...; GPU thread priority left at 0)` and no `SetGPUThreadPriority` line.
+  - The `latency stages` lines while playing: the client rows `capture`, `submit`, `encode`
+    and the host rows `host_copy`, `host_pace`, `host_lock`, `host_convert`,
+    `host_submit_call`, `host_gpu`, `host_encoder`; and the `stream stats` lines (`fps`,
+    `thinned`).
+  - `encoder helper: dda: capture lost (...), first image N ms later (...)` lines, any `dda:
+    lost again before the first image` lines, and whether the browser showed "Screen capture
+    is paused" when the game switched to or from full screen.
+  - Step 4: `capture changed reason=resized` for each change (and any `dda: the duplication's
+    mode does not match the output's desktop` line before it).
+- **Pass** (limits from `--self-test-pacer`'s simulation of the patterns the owner's game
+  likely has; the second run at 60 fps in game: `submit` p50 3.5-10.1 ms, p95 11.4-16.2 ms,
+  9.2 / 15.5 in gF35iYTL):
+  - At 60 fps on 75 Hz: `host_pace` p50 ≤ 4.5 ms and p95 ≤ 14 ms, and `submit` p95 at least 2
+    ms below the second run's in the same game. What to expect by the game's presents: one
+    that does not wait for the display (no vsync, FreeSync) at 62-70 fps: p50 ≤ 0.5 ms, p95
+    ≤ 8 ms (the old rule: 7-8 / 13.6-14.9 in the simulation); one on the 75 Hz refresh grid
+    that misses some refreshes (vsync or borderless at 62-72 fps): p50 0.5-3.9 ms, p95
+    10.5-13.7 ms (old: 5.9-6.0 / 12.6-15.8). `host_pace` is the pacer's wait alone; `submit` adds the copy
+    and the conversion's CPU side.
+  - Frames: `fps` + `thinned`/10 in `stream stats` (what the helper delivered, before the
+    network's thinning) ≥ 57 in at least 9 of 10 in-game windows at 60 fps (the second run:
+    55.7-60.1, mostly 59-60; the simulation: at most 1-2% fewer than the old rule for a game
+    on the refresh grid, as many otherwise).
+  - At 75 fps: `host_pace` p95 ≤ 1 ms.
+  - `host_copy`, `host_lock`, `host_convert` and `host_submit_call` p95 ≤ 1 ms each.
+  - `host_gpu` is recorded, not judged: it is the time the capture copy and the colour
+    conversion wait for the game's GPU work (and run). With p95 above 4 ms at `auto` the
+    conversion queues behind the game: compare it with the `gpuPriority` off run (much higher
+    there: the priority works but not enough; about the same: the GPU's scheduler does not
+    let these queues ahead of the game, with or without priority).
+  - No "Screen capture is paused" notice for a full-screen switch whose `first image` came
+    within 250 ms; a loss that lasts longer gives the notice once, and `capture restored
+    ... after N ms` with its first image.
+  - Step 4: each change gives `capture changed reason=resized` and a new helper at the new
+    size; the picture is not squeezed and the mouse lands where clicked.
+- **If not, send**: the `latency stages` and `stream stats` lines of each run, the `gpu
+  priority`, `amf: input formats` and `dda: ...` lines, and which game at which in-game frame
+  rate, with or without vsync.
+
 ### Stage 8: Relay, WAN and rate control (T4, T6)
 
 All runs use Network path *Relay via gateway* and `"logLevel": "debug"`, after stage 6.

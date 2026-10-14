@@ -172,6 +172,24 @@ func TestRingSlicesAndReencoded(t *testing.T) {
 	}
 }
 
+// TestRingTiming: the per-frame timing in the slot header (FlagTiming):
+// offsets in µs with -1 for a stamp not measured, saturated at 65534, and no
+// timing at all from a slot without the flag (older helpers).
+func TestRingTiming(t *testing.T) {
+	r, w := newTestRing(t, 4, 64<<10)
+	tm := &FrameTiming{Ready: 0, Deliver: 9100, Lock: -1, Convert: 9400, Submitted: 70000, GPUDone: 11000}
+	w.write(&Frame{FrameID: 1, Dirty: -1, Timing: tm, Data: []byte{1}})
+	w.write(&Frame{FrameID: 2, Dirty: -1, Data: []byte{2}})
+	f, err := r.Next()
+	want := FrameTiming{Ready: 0, Deliver: 9100, Lock: -1, Convert: 9400, Submitted: 65534, GPUDone: 11000}
+	if err != nil || f.Timing == nil || *f.Timing != want {
+		t.Fatalf("frame 1: timing %+v %v, want %+v", f.Timing, err, want)
+	}
+	if f, err := r.Next(); err != nil || f.Timing != nil {
+		t.Fatalf("frame 2 without timing: %+v %v", f.Timing, err)
+	}
+}
+
 func TestRingCopiesData(t *testing.T) {
 	r, w := newTestRing(t, 2, 64<<10)
 	w.write(&Frame{FrameID: 1, Data: []byte{1, 2, 3}})

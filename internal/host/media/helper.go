@@ -951,7 +951,47 @@ func (v *HelperVideo) convert(pr *helperProc, f *encoder.Frame, data []byte, cap
 		}
 	}
 	fr.Reencoded = f.Reencoded
+	fr.Timing = helperTiming(fr, f.Timing)
 	return fr
+}
+
+// helperTiming places a helper frame's per-frame timing (µs after its
+// capture) on the host clock. The stamps that must run in order between
+// capture and encoded (capture <= ready <= deliver <= lock <= convert <=
+// submit <= submitted <= encoded; the GPU done after the conversion) are kept
+// only where they do; a stamp out of order is not reported.
+func helperTiming(fr *Frame, t *encoder.FrameTiming) HelperTiming {
+	if t == nil || fr.CaptureUs == 0 {
+		return HelperTiming{}
+	}
+	at := func(off int32) uint64 {
+		if off < 0 {
+			return 0
+		}
+		return fr.CaptureUs + uint64(off)
+	}
+	h := HelperTiming{ReadyUs: at(t.Ready), DeliverUs: at(t.Deliver), LockUs: at(t.Lock), ConvertUs: at(t.Convert),
+		SubmittedUs: at(t.Submitted), GPUDoneUs: at(t.GPUDone)}
+	end := fr.EncodeDoneUs
+	if fr.SubmitUs != 0 {
+		end = fr.SubmitUs
+	}
+	last := fr.CaptureUs
+	for _, p := range []*uint64{&h.ReadyUs, &h.DeliverUs, &h.LockUs, &h.ConvertUs} {
+		if *p != 0 && (*p < last || *p > end) {
+			*p = 0
+		}
+		if *p != 0 {
+			last = *p
+		}
+	}
+	if h.SubmittedUs != 0 && (fr.SubmitUs == 0 || h.SubmittedUs < fr.SubmitUs || h.SubmittedUs > fr.EncodeDoneUs) {
+		h.SubmittedUs = 0
+	}
+	if h.GPUDoneUs != 0 && (h.ConvertUs == 0 || h.GPUDoneUs < h.ConvertUs) {
+		h.GPUDoneUs = 0
+	}
+	return h
 }
 
 // config is the VideoConfig of a proc's generation: codec string from the key

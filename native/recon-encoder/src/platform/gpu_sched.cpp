@@ -45,10 +45,16 @@ static_assert(sizeof(KmtWddm27Caps) == 4, "D3DKMT_WDDM_2_7_CAPS layout");
 constexpr int kPriorityHigh = 4;
 constexpr int kPriorityRealtime = 5;
 
+const char* priorityClassName(int c) {
+    static const char* const names[] = {"idle", "below normal", "normal", "above normal", "high", "realtime"};
+    return c >= 0 && c <= kPriorityRealtime ? names[c] : "unknown";
+}
+
 using OpenAdapterFromLuidFn = NtStatus(WINAPI*)(KmtOpenAdapterFromLuid*);
 using QueryAdapterInfoFn = NtStatus(WINAPI*)(KmtQueryAdapterInfo*);
 using CloseAdapterFn = NtStatus(WINAPI*)(const KmtCloseAdapter*);
 using SetProcessSchedulingPriorityClassFn = NtStatus(WINAPI*)(HANDLE, int);
+using GetProcessSchedulingPriorityClassFn = NtStatus(WINAPI*)(HANDLE, int*);
 
 template <typename Fn>
 Fn gdiProc(const char* name) {
@@ -122,7 +128,7 @@ void printGpuPriorityTable() {
 std::string applyGpuPriority(const std::string& mode, const AdapterInfo& adapter) {
     const std::string decision = gpuPriorityFor(mode, adapter.vendor, adapter.hags);
     if (decision == "off") {
-        logf(LogLevel::Info, "gpu priority: off (%s, %s)", adapter.vendor.c_str(), hagsText(adapter.hags));
+        logf(LogLevel::Info, "gpu priority: off (%s, %s; GPU thread priority left at 0)", adapter.vendor.c_str(), hagsText(adapter.hags));
         return "off";
     }
     const int prio = decision == "high" ? kPriorityHigh : kPriorityRealtime;
@@ -145,7 +151,15 @@ std::string applyGpuPriority(const std::string& mode, const AdapterInfo& adapter
              !set ? "D3DKMTSetProcessSchedulingPriorityClass not available"
                   : privilege ? "refused" : "refused (SeIncreaseBasePriorityPrivilege not held: run recon-host elevated)");
     } else {
-        logf(LogLevel::Info, "gpu priority: %s (%s, %s)", result.c_str(), adapter.vendor.c_str(), hagsText(adapter.hags));
+        // What the OS holds for the process now (D3DKMTGetProcessSchedulingPriorityClass):
+        // the set call's STATUS_SUCCESS is not taken on trust.
+        auto get = gdiProc<GetProcessSchedulingPriorityClassFn>("D3DKMTGetProcessSchedulingPriorityClass");
+        int now = -1;
+        const bool read = get && get(GetCurrentProcess(), &now) == 0;
+        const bool matches = read && now == (result == "realtime" ? kPriorityRealtime : kPriorityHigh);
+        logf(matches || !read ? LogLevel::Info : LogLevel::Warn, "gpu priority: %s (%s, %s; %s%s)", result.c_str(), adapter.vendor.c_str(),
+             hagsText(adapter.hags), read ? "the OS reports " : "the OS's class could not be read back",
+             read ? priorityClassName(now) : "");
     }
     return result;
 }

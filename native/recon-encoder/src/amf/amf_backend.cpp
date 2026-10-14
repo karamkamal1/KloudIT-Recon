@@ -56,6 +56,7 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -156,7 +157,34 @@ struct CodecDetails {
     int maxRefs = 16;
     int64_t maxBitrate = 0;
     std::vector<int> inputFormats;  // amf::AMF_SURFACE_FORMAT
+    std::vector<int> nativeFormats;  // those the encoder reads without converting them first
+    int64_t colorConversion = -2;    // CAP_COLOR_CONVERSION (amf::AMF_ACCELERATION_TYPE), -2 = not reported
 };
+
+// "NV12 BGRA P010" for a list of amf::AMF_SURFACE_FORMAT values (others by number).
+std::string formatList(const std::vector<int>& formats) {
+    static const char* const names[] = {"unknown", "NV12", "YV12", "BGRA", "ARGB", "RGBA", "GRAY8", "YUV420P", "U8V8", "YUY2",
+                                        "P010", "RGBA_F16", "UYVY", "R10G10B10A2", "Y210", "AYUV", "Y410", "Y416"};
+    std::string out;
+    for (const int f : formats) {
+        if (!out.empty()) out += ' ';
+        out += f >= 0 && f < int(std::size(names)) ? names[f] : std::to_string(f);
+    }
+    return out.empty() ? "none" : out;
+}
+
+// CAP_COLOR_CONVERSION (amf::AMF_ACCELERATION_TYPE), as the enum names it:
+// AMF documents neither where HARDWARE converts (VCN's own RGB -> YUV unit,
+// EFC, is one candidate) nor which GPU queue GPU uses.
+const char* accelerationName(int64_t v) {
+    switch (v) {
+    case amf::AMF_ACCEL_NOT_SUPPORTED: return "not supported";
+    case amf::AMF_ACCEL_HARDWARE: return "hardware (AMF_ACCEL_HARDWARE)";
+    case amf::AMF_ACCEL_GPU: return "GPU (AMF_ACCEL_GPU)";
+    case amf::AMF_ACCEL_SOFTWARE: return "software (AMF_ACCEL_SOFTWARE)";
+    default: return "not reported";
+    }
+}
 
 bool hasFormat(const CodecDetails& d, int f) { return std::find(d.inputFormats.begin(), d.inputFormats.end(), f) != d.inputFormats.end(); }
 
@@ -216,7 +244,10 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P, int svc
         for (amf_int32 i = 0; i < in->GetNumOfFormats(); ++i) {
             amf::AMF_SURFACE_FORMAT f{};
             amf_bool native = false;
-            if (in->GetFormatAt(i, &f, &native) == AMF_OK) d.inputFormats.push_back(int(f));
+            if (in->GetFormatAt(i, &f, &native) == AMF_OK) {
+                d.inputFormats.push_back(int(f));
+                if (native) d.nativeFormats.push_back(int(f));
+            }
         }
     }
     amf_int64 v = 0;
@@ -226,6 +257,7 @@ CodecDetails readDetails(amf::AMFComponent* enc, const AmfCodecProps& P, int svc
     if (getProp(caps.GetPtr(), P.capMaxRefs, v) && v > 0) d.maxRefs = int(std::min<amf_int64>(v, P.maxRefsLimit));
     else d.maxRefs = P.maxRefsLimit;
     getProp(caps.GetPtr(), P.capMaxBitrate, d.maxBitrate);
+    if (P.capColorConversion && getProp(caps.GetPtr(), P.capColorConversion, v)) d.colorConversion = v;
     // AV1 has no ROI cap; "For some reason there's no specific CAP for AV1, but
     // should always be supported" (OBS texture-amf.cpp). Reported, but marked
     // as assumed.
@@ -1110,6 +1142,14 @@ Status AmfEncoder::init(const StartParams& p, const SourceInfo& src, InputSpec& 
          : hdr_                                    ? "P010 (HDR10: BT.2020 PQ, 10-bit)"
                                                    : "NV12",
          rt.versionText.c_str());
+    // Whether the encoder could take the captured BGRA image itself, and
+    // what it says about converting it (docs/VENDOR_NOTES.md "Second hardware
+    // run: in-game capture and encoder latency"): CAP_COLOR_CONVERSION as the
+    // driver reports it. Whether that conversion would wait behind a game
+    // like the helper's NV12 shader is for a measurement (host_gpu), not this
+    // line.
+    logf(LogLevel::Info, "amf: input formats %s (native: %s); RGB input converted by: %s", formatList(det_.inputFormats).c_str(),
+         formatList(det_.nativeFormats).c_str(), accelerationName(det_.colorConversion));
     if (hdr_) {
         logf(LogLevel::Info, "amf: HDR10 metadata: mastering display %.0f / %.4f cd/m2, MaxCLL %d, MaxFALL %d%s", hdr_->maxLuminance,
              hdr_->minLuminance, hdr_->maxCll, hdr_->maxFall, hdrBuffer_ ? "" : " (not passed: no buffer)");

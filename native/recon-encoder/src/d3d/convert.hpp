@@ -37,6 +37,7 @@
 
 #include <d3d10.h>  // ID3D10Multithread
 #include <d3d11.h>
+#include <d3d11_4.h>  // ID3D11Fence, ID3D11DeviceContext4 (d3d11_3.h), ID3D11Device5
 #include <wrl/client.h>
 
 #include <cstdint>
@@ -95,6 +96,12 @@ struct ConvertedFrame {
     ID3D11Texture2D* uv = nullptr;     // Output::Planar: R8G8 (R16G16) chroma plane (half size)
     std::shared_ptr<void> hold;        // keeps the pool texture reserved
     int index = -1;                    // pool index (stable per texture)
+    // Per-frame timing (stats lockQpc / convertQpc / gpuDoneQpc): the device
+    // lock was taken, the work was flushed to the GPU, and the value the
+    // converter's fence reaches when the GPU has finished it (0 = no fence:
+    // gpuFence() is null).
+    int64_t lockQpc = 0, flushQpc = 0;
+    uint64_t fenceValue = 0;
 };
 
 class Nv12Converter {
@@ -140,6 +147,14 @@ public:
     // (VERIFY on hardware, docs/VENDOR_NOTES.md). Set before convert, on its
     // thread (the pipeline: at the start and on every capture event).
     void setHdrDisplay(bool hdr) { hdrDisplay_ = hdr; }
+    // A fence the immediate context signals after every conversion
+    // (ConvertedFrame::fenceValue), so a thread can learn when the GPU has
+    // finished a frame's capture copy and conversion without stalling
+    // anything (ID3D11Fence::SetEventOnCompletion; Pipeline's GPU timing
+    // thread). Null where the device has none (before Windows 10 1703,
+    // drivers without monitored fences, Wine): the timing is then not
+    // measured.
+    ID3D11Fence* gpuFence() const { return fence_.Get(); }
     // Copies a converted frame to the CPU as tightly packed NV12 (Y plane, then
     // interleaved CbCr), or P010 (the same with 16-bit little-endian samples).
     // Stalls until the GPU is done: tests and dumps only.
@@ -176,6 +191,9 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<ID3D10Multithread> mt_;  // the device's critical section (null if not exposed)
+    ComPtr<ID3D11DeviceContext4> ctx4_;  // Signal (gpuFence)
+    ComPtr<ID3D11Fence> fence_;
+    uint64_t fenceValue_ = 0;
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> psY_, psUV_;
     ComPtr<ID3D11SamplerState> sampler_;

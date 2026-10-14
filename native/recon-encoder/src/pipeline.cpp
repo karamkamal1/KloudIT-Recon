@@ -1,5 +1,7 @@
 #include "pipeline.hpp"
 
+#include <chrono>
+
 #include "capture/dirty.hpp"
 #include "platform/platform.hpp"
 
@@ -42,6 +44,7 @@ void Pipeline::dump(const d3d::ConvertedFrame& f, uint64_t frameId) {
 
 void Pipeline::start() {
     stop_ = false;
+    if (opt_.converter && opt_.converter->gpuFence()) gpu_ = std::thread([this] { gpuLoop(); });
     output_ = std::thread([this] { outputLoop(); });
     capture_ = std::thread([this] { captureLoop(); });
 }
@@ -51,8 +54,45 @@ void Pipeline::stop() {
     // Only wakes the threads; nothing is freed until they have been joined.
     cap_.shutdown();
     enc_.shutdown();
+    {
+        std::lock_guard<std::mutex> lock(gpuMu_);
+        gpuCv_.notify_all();
+    }
     if (capture_.joinable()) capture_.join();
     if (output_.joinable()) output_.join();
+    if (gpu_.joinable()) gpu_.join();
+}
+
+void Pipeline::gpuLoop() {
+    ID3D11Fence* fence = opt_.converter->gpuFence();
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!done) return;
+    // The stamp is this thread's wake-up: it should not wait for a CPU.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    while (!stop_) {
+        std::pair<uint64_t, uint64_t> job;
+        {
+            std::unique_lock<std::mutex> lock(gpuMu_);
+            gpuCv_.wait_for(lock, std::chrono::milliseconds(kPollMs), [this] { return stop_ || !gpuQueue_.empty(); });
+            if (gpuQueue_.empty()) continue;
+            job = gpuQueue_.front();
+            gpuQueue_.pop_front();
+        }
+        // Fence values complete in order, so one wait at a time stamps each
+        // frame when its own value is reached (a frame whose value was
+        // reached while this thread was still waking up for the one before
+        // gets that wake-up time, a little late).
+        if (FAILED(fence->SetEventOnCompletion(job.second, done))) continue;
+        while (!stop_) {
+            if (WaitForSingleObject(done, kPollMs) != WAIT_OBJECT_0) continue;
+            const int64_t now = qpcNow();
+            std::lock_guard<std::mutex> lock(stampMu_);
+            Stamp& st = stamp(job.first);
+            if (st.frameId == job.first && st.fence == job.second) st.gpuDone = now;
+            break;
+        }
+    }
+    CloseHandle(done);
 }
 
 RateParams Pipeline::rate() {
@@ -118,6 +158,8 @@ void Pipeline::captureLoop() {
         info.frameId = nextId;
         info.presentQpc = frame.presentQpc;
         info.captureQpc = frame.captureQpc;
+        info.readyQpc = frame.readyQpc;
+        info.deliverQpc = frame.deliverQpc;
         info.repeat = frame.repeat;
         info.dirty = mergeDirty(droppedDirty, frame.dirty);
         droppedDirty = info.dirty;  // until the encoder takes the frame
@@ -138,6 +180,7 @@ void Pipeline::captureLoop() {
         const uint64_t base = info.seqStart ? info.frameId : seqBase;
         EncoderFrame ef;
         ef.captured = &frame;
+        uint64_t fence = 0;  // the converter's fence value of this frame, 0 = none
         if (opt_.converter && frame.texture) {
             d3d::ConvertedFrame cf;
             Status cs = opt_.converter->convert(frame.texture, frame.rotation, uint16_t(info.frameId - base), cf);
@@ -184,11 +227,29 @@ void Pipeline::captureLoop() {
             if (!ef.nv12 && opt_.lumaStandsIn) ef.nv12 = cf.y;
             ef.hold = cf.hold;
             ef.poolIndex = cf.index;
+            info.lockQpc = cf.lockQpc;
+            info.convertQpc = cf.flushQpc;
+            fence = cf.fenceValue;
             if (!opt_.dumpPath.empty() && !dumped_ && info.frameId >= kDumpFrameId) dump(cf, info.frameId);
         }
         if (opt_.beforeSubmit) opt_.beforeSubmit(info.frameId);
+        {
+            std::lock_guard<std::mutex> lock(stampMu_);
+            stamp(info.frameId) = Stamp{info.frameId, fence, 0, 0};
+        }
+        if (fence && gpu_.joinable()) {
+            std::lock_guard<std::mutex> lock(gpuMu_);
+            if (gpuQueue_.size() >= kStamps) gpuQueue_.pop_front();  // the GPU is that far behind: those go unmeasured
+            gpuQueue_.emplace_back(info.frameId, fence);
+            gpuCv_.notify_all();
+        }
         info.submitQpc = qpcNow();
         Status s = enc_.submit(ef, info);
+        if (s.ok) {
+            const int64_t now = qpcNow();
+            std::lock_guard<std::mutex> lock(stampMu_);
+            if (stamp(info.frameId).frameId == info.frameId) stamp(info.frameId).submitted = now;
+        }
         ef = EncoderFrame{};  // the backend kept its own reference if it needs one
         cap_.release(frame);
         if (s.code == "encoder_busy") {
@@ -240,6 +301,14 @@ void Pipeline::outputLoop() {
             break;
         }
         if (!f.outputQpc) f.outputQpc = qpcNow();
+        {
+            std::lock_guard<std::mutex> lock(stampMu_);
+            const Stamp& sp = stamp(f.info.frameId);
+            if (sp.frameId == f.info.frameId) {
+                f.submittedQpc = sp.submitted;
+                f.gpuDoneQpc = sp.gpuDone;
+            }
+        }
         const WriteResult wr = ring_.write(f);
         enc_.releaseOutput(f);
         if (wr == WriteResult::Corrupt) {
@@ -266,6 +335,12 @@ void Pipeline::outputLoop() {
         st.captureQpc = f.info.captureQpc;
         st.submitQpc = f.info.submitQpc;
         st.outputQpc = f.outputQpc;
+        st.readyQpc = f.info.readyQpc;
+        st.deliverQpc = f.info.deliverQpc;
+        st.lockQpc = f.info.lockQpc;
+        st.convertQpc = f.info.convertQpc;
+        st.submittedQpc = f.submittedQpc;
+        st.gpuDoneQpc = f.gpuDoneQpc;
         st.refFloor = f.refFloor;
         st.ltrSlot = f.ltrSlot;
         st.temporalLayer = f.temporalLayer;
