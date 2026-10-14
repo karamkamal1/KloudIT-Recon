@@ -105,12 +105,16 @@ type udpRelay struct {
 
 	// Lifetimes (tests shorten them).
 	bindWait, lockWait, idle time.Duration
+	// The limit towards the browser, bytes per second and bytes
+	// (relayDownRate, relayDownBurst; tests lower it).
+	downRate, downBurst float64
 }
 
 func newUDPRelay(log *slog.Logger, ip net.IP, ports []int) *udpRelay {
 	return &udpRelay{
 		log: log, ip: ip, ports: ports, allocs: map[int]*allocation{},
 		bindWait: relayBindWait, lockWait: relayLockWait, idle: relayIdle,
+		downRate: relayDownRate, downBurst: relayDownBurst,
 	}
 }
 
@@ -256,7 +260,7 @@ func (a *allocation) serve() {
 	last := time.Now()
 	heard := last
 	up := tokenBucket{rate: relayUpRate, burst: relayUpBurst, tokens: relayUpBurst, ts: last}
-	down := tokenBucket{rate: relayDownRate, burst: relayDownBurst, tokens: relayDownBurst, ts: last}
+	down := tokenBucket{rate: r.downRate, burst: r.downBurst, tokens: r.downBurst, ts: last}
 	defer func() {
 		// Out of the table before the allocation reports its end (a.done).
 		r.mu.Lock()

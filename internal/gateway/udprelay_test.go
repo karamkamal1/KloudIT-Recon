@@ -752,12 +752,13 @@ func rttSamples(ctx context.Context, c *quic.Conn, n int) ([]time.Duration, erro
 func pct(s []time.Duration, p float64) time.Duration { return s[int(p*float64(len(s)-1))] }
 
 // goodputSeries runs a bulk transfer from the host end (send) to the browser
-// end (recv) for d and returns the received rate per 100 ms (bit/s), without
-// the first second. A stream or connection that ends before d (the sender
-// ends the stream at d of its own clock, which starts a little earlier) is
-// an error, not a rate of 0 for the rest of the run: a quic-go receiver,
-// for one, closes a connection whose stream holds more than 1000 gaps.
-func goodputSeries(ctx context.Context, send, recv *quic.Conn, target int64, d time.Duration) ([]float64, error) {
+// end (recv) for d and returns the received rate per 100 ms (bit/s) from
+// the stream's first byte, without the first skip. A stream or connection
+// that ends before d (the sender ends the stream at d of its own clock,
+// which starts a little earlier) is an error, not a rate of 0 for the rest
+// of the run: a quic-go receiver, for one, closes a connection whose stream
+// holds more than 1000 gaps.
+func goodputSeries(ctx context.Context, send, recv *quic.Conn, target int64, d, skip time.Duration) ([]float64, error) {
 	if m := transport.MediaControl(transport.FromQUIC(send)); m != nil && target > 0 {
 		m.SetTarget(target, time.Second/60)
 	}
@@ -806,7 +807,7 @@ func goodputSeries(ctx context.Context, send, recv *quic.Conn, target int64, d t
 		return nil, early
 	}
 	var out []float64
-	for _, c := range counts[int(time.Second/bucket) : len(counts)-1] {
+	for _, c := range counts[int(skip/bucket) : len(counts)-1] {
 		out = append(out, float64(c)*8/bucket.Seconds())
 	}
 	return out, nil
@@ -913,9 +914,17 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 	// a quic-go receiver closes a connection whose one stream holds more
 	// than 1000 gaps within a second (docs/VENDOR_NOTES.md "Merged second
 	// hardware run: the UDP relay under overload"). TestUDPRelayOverrun has
-	// the overrun.
+	// the overrun. Measured from the stream's first byte (cc.Media has no
+	// slow start: its first 100 ms are as fast as the rest), so a stall
+	// anywhere in the transfer, its start included, shows: the relay's
+	// average over the whole transfer within 20 % of the direct path's, and
+	// no 300 ms of it under half the direct path's median 100 ms (a stall
+	// of more than about 150 ms; on a loaded machine the scheduler alone
+	// takes a single 100 ms window of either path down by up to two thirds
+	// now and then).
 	const bulkTarget = 500_000_000
 	var bulk [2]float64
+	var median, slowest float64
 	for i, path := range []string{"direct", "udp relay"} {
 		addr := direct
 		var a *allocation
@@ -924,17 +933,23 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 			addr = a.addr()
 		}
 		b, h := dial(t, addr)
-		s, err := goodputSeries(ctx, h, b, bulkTarget, 2*time.Second)
+		s, err := goodputSeries(ctx, h, b, bulkTarget, 2*time.Second, 0)
 		if err != nil {
 			t.Fatalf("loopback bulk, %s: %v", path, err)
 		}
 		bulk[i] = summarize(s).mean
+		low := math.Inf(1)
+		for k := range len(s) - 2 {
+			low = min(low, (s[k]+s[k+1]+s[k+2])/3)
+		}
 		if a == nil {
-			t.Logf("loopback bulk, %s: %.0f Mbit/s", path, bulk[i]/1e6)
+			median = slices.Sorted(slices.Values(s))[len(s)/2]
+			t.Logf("loopback bulk, %s: %.0f Mbit/s (the slowest 300 ms %.0f, the first 100 ms %.0f)", path, bulk[i]/1e6, low/1e6, s[0]/1e6)
 			continue
 		}
-		t.Logf("loopback bulk, %s: %.0f Mbit/s (%d datagrams to the browser, %d dropped, %d dropped by the kernel)",
-			path, bulk[i]/1e6, a.stats.PktToBrowser.Load(), a.stats.Dropped.Load(), a.stats.SocketDrops.Load())
+		slowest = low
+		t.Logf("loopback bulk, %s: %.0f Mbit/s (the slowest 300 ms %.0f, the first 100 ms %.0f; %d datagrams to the browser, %d dropped, %d dropped by the kernel)",
+			path, bulk[i]/1e6, low/1e6, s[0]/1e6, a.stats.PktToBrowser.Load(), a.stats.Dropped.Load(), a.stats.SocketDrops.Load())
 		if n := a.stats.Dropped.Load(); n > 0 {
 			t.Errorf("the relay dropped %d datagrams at %d Mbit/s of pacing, under its limit of %d", n, bulkTarget*6/5/1_000_000, relayDownRate*8/1_000_000)
 		}
@@ -942,6 +957,10 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 	if bulk[1] < 0.8*bulk[0] || bulk[0] < 50e6 {
 		t.Errorf("loopback bulk at a %d Mbit/s target: udp relay %.0f Mbit/s, direct %.0f Mbit/s: want the relay within 20 %% of the direct path",
 			bulkTarget/1_000_000, bulk[1]/1e6, bulk[0]/1e6)
+	}
+	if slowest < 0.5*median {
+		t.Errorf("loopback bulk at a %d Mbit/s target: the relay's slowest 300 ms %.0f Mbit/s, the direct path's median 100 ms %.0f Mbit/s: want no stall (none under half of it)",
+			bulkTarget/1_000_000, slowest/1e6, median/1e6)
 	}
 
 	// 3. A lossy browser leg (20 ms each way, 1 % loss each way, like the netem
@@ -995,7 +1014,7 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 			}
 			// The browser leg's uni stream is opened by the gateway when the
 			// host opens one: goodputSeries accepts it on the browser end.
-			s, err := goodputSeries(ctx, hostEnd, b, target, 4*time.Second)
+			s, err := goodputSeries(ctx, hostEnd, b, target, 4*time.Second, time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1004,7 +1023,7 @@ func TestUDPRelayLatencyAndThroughput(t *testing.T) {
 		}
 		link := newLossyLink(t, addr, 20*time.Millisecond, 0.01)
 		b, h := dial(t, link.addr())
-		s, err := goodputSeries(ctx, h, b, target, 4*time.Second)
+		s, err := goodputSeries(ctx, h, b, target, 4*time.Second, time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1240,16 +1259,40 @@ func TestUDPRelayOverrun(t *testing.T) {
 	}
 }
 
-// TestUDPRelayFlood: a host that sends far past the forwarder's limit
-// (relayDownRate, after the burst its token bucket allows) has the excess
-// dropped, by the forwarder or by the kernel at the allocation's socket
-// while the forwarder cannot keep up, and the rest forwarded; once the
-// flood ends the forwarder is current again within the time it takes to
-// read what its socket buffer held: nothing stalls or wedges
-// (docs/VENDOR_NOTES.md "Merged second hardware run: the UDP relay under
-// overload").
+// TestUDPRelayFlood: a host that sends far past the forwarder's limit has
+// the excess dropped, by the forwarder's token bucket or by the kernel at
+// the allocation's socket while the forwarder cannot keep up, and the rest
+// forwarded as far as the limit allows: no more than its burst and its rate
+// over the time, and no less (within a tenth) than the lesser of that and
+// what the forwarder read; once the flood ends the forwarder is current
+// again within the time it takes to read what its socket buffer held:
+// nothing stalls or wedges (docs/VENDOR_NOTES.md "Merged second hardware
+// run: the UDP relay under overload"). The flood goes as fast as the
+// host's socket takes it, which is the machine's: 0.3-1.4 Gbit/s on two
+// CPUs shared with internal/host's simulations (as `go test ./...` on a
+// two-CPU runner), 1.2-2.4 Gbit/s on four, of which the forwarder reads
+// 0.3-1.2 Gbit/s. Against the forwarder's own limit (relayDownRate, after
+// relayDownBurst) that often leaves its bucket nothing to drop, so the
+// same flood runs against a limit of 100 Mbit/s after a 1 MB burst too,
+// which any machine overruns.
 func TestUDPRelayFlood(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		rate, burst float64 // bytes per second, bytes
+	}{
+		{"the forwarder's limit", relayDownRate, relayDownBurst},
+		{"a 100 Mbit/s limit", 100_000_000 / 8, 1 << 20},
+	} {
+		t.Run(c.name, func(t *testing.T) { floodRelay(t, c.rate, c.burst, c.rate < relayDownRate) })
+	}
+}
+
+// floodRelay floods an allocation whose limit towards the browser is rate
+// (bytes per second) after burst (bytes) and judges it; overrun: the flood
+// must have the bucket drop datagrams.
+func floodRelay(t *testing.T, rate, burst float64, overrun bool) {
 	r := newTestRelay(t, 1)
+	r.downRate, r.downBurst = rate, burst
 	a := allocate(t, r, "u")
 	udp := func() *net.UDPConn {
 		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -1306,20 +1349,35 @@ func TestUDPRelayFlood(t *testing.T) {
 		}
 	}()
 	// The flood: 300 ms of datagrams as fast as the host's socket takes
-	// them (1.7-2.2 Gbit/s on the sandbox's loopback: past the bucket's
-	// 8 MB within 50 ms, then at about twice its rate).
+	// them, each write's time noted.
 	pkt := make([]byte, 1200)
 	pkt[0] = 0x40
-	sent := 0
+	size := float64(len(pkt))
+	var sent []time.Duration
 	t0 := time.Now()
 	for time.Since(t0) < 300*time.Millisecond {
 		for range 64 {
 			if _, err := host.WriteTo(pkt, a.addr()); err == nil {
-				sent++
+				sent = append(sent, time.Since(t0))
 			}
 		}
 	}
 	flood := time.Since(t0)
+	// What the limit allows of the flood as the host sent it: a bucket of
+	// burst bytes, full at the start, refilled at rate. It leaves out what
+	// the host's own pauses cost (the machine's: the bucket fills to its
+	// burst at most, and tokens left over at the flood's end go unused),
+	// which are not the forwarder's to make up.
+	allowed, tokens := 0, burst
+	for i, at := range sent {
+		if i > 0 {
+			tokens = min(burst, tokens+rate*(at-sent[i-1]).Seconds())
+		}
+		if tokens >= size {
+			tokens -= size
+			allowed++
+		}
+	}
 	// Probes from 100 ms after the flood, one a millisecond.
 	time.Sleep(100 * time.Millisecond)
 	for i := range probes {
@@ -1343,14 +1401,36 @@ func TestUDPRelayFlood(t *testing.T) {
 	if len(l) > 0 {
 		p95 = l[len(l)*95/100]
 	}
-	t.Logf("flood: %d datagrams in %v (%.0f Mbit/s); the relay forwarded %d of them in %v (%.0f Mbit/s) and dropped %d (%d more by the kernel); "+
-		"%d of %d probes after it arrived, latency p95 %v",
-		sent, flood.Round(time.Millisecond), float64(sent*len(pkt)*8)/flood.Seconds()/1e6, through, last.Round(time.Millisecond),
-		float64(through*len(pkt)*8)/last.Seconds()/1e6, a.stats.Dropped.Load(), a.stats.SocketDrops.Load(), len(l), probes, p95)
-	if limit := relayDownBurst + relayDownRate*last.Seconds() + 64<<10; float64(through*len(pkt)) > limit {
-		t.Errorf("the relay forwarded %d bytes in %v: want no more than its limit, %.0f", through*len(pkt), last, limit)
+	// What the forwarder did with the flood, by its counters: forwarded (to
+	// the browser, less the probes), dropped by its bucket, and read: what
+	// the host sent less what the kernel dropped at the forwarder's socket
+	// (its own count, independent of the forwarder's; the forwarder's
+	// counters where the kernel's is not known).
+	forwarded, dropped, kernel := a.stats.PktToBrowser.Load()-probes, a.stats.Dropped.Load(), a.stats.SocketDrops.Load()
+	read := int64(len(sent)) - kernel
+	if kernel < 0 {
+		read = forwarded + dropped
+	}
+	t.Logf("flood: %d datagrams in %v (%.0f Mbit/s), %d of them within the limit; the relay read %d, forwarded %d (%.0f Mbit/s, the browser's last at %v), "+
+		"dropped %d (and the kernel %d); %d of %d probes after it arrived, latency p95 %v",
+		len(sent), flood.Round(time.Millisecond), float64(len(sent))*size*8/flood.Seconds()/1e6, allowed, read, forwarded,
+		float64(through)*size*8/last.Seconds()/1e6, last.Round(time.Millisecond), dropped, kernel, len(l), probes, p95)
+	if limit := burst + rate*last.Seconds() + 64<<10; float64(through)*size > limit {
+		t.Errorf("the relay forwarded %.0f bytes in %v: want no more than its limit, %.0f", float64(through)*size, last, limit)
+	}
+	if want := min(read, int64(allowed)); forwarded < want*9/10 {
+		t.Errorf("the relay forwarded %d datagrams of the %d it read: want at least 90 %% of what its limit allows of them, %d", forwarded, read, want)
 	}
 	if len(l) < probes*95/100 || p95 > 50*time.Millisecond {
 		t.Errorf("after the flood %d of %d probes arrived, latency p95 %v: want 95 %% within 50 ms", len(l), probes, p95)
+	}
+	// A forwarder that reads no more than its limit allows has nothing for
+	// its bucket to drop (one that forwards more than its limit fails the
+	// check above).
+	if dropped == 0 {
+		if overrun {
+			t.Skipf("the forwarder read %d datagrams, its limit allows %d of the flood: this machine did not overrun it", read, allowed)
+		}
+		t.Logf("the forwarder read no more than its limit allows: this flood tested the kernel's drops and the forwarder's speed, not its bucket")
 	}
 }
