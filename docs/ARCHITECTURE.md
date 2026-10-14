@@ -696,10 +696,16 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
     round trips confirm a queue: the quickest round trip since the previous report over the
     quickest of the last 10 s (`cc.Media.QueueDelay`) is at least half the report's delay over
     its base, or the congestion window or the video window held the sender back meanwhile (their
-    queue is in the host, not in the round trips). A delay the round trips do not show is the
-    client's own (its worker or socket stalled, its clock stepped): `stream stats`
-    `delay_unconfirmed` counts those reports, `ack_queue_p50_ms` / `ack_queue_p95_ms` the queue the
-    round trips showed, and a decrease's log line has `ack_queue_ms`. The target is the minimum of
+    queue is in the host, not in the round trips). A delay the round trips do not show is
+    either the client's own (its worker or socket stalled, its clock stepped) or a queue inside
+    each frame that drains before the next: a frame sent faster than a link carries it queues
+    behind its own first packets, which meet no queue themselves, so the quickest round trip
+    misses it, and a lower target does not shorten it while the encoder makes less than the link
+    carries (the second hardware run at its 250 Mbit/s setting, paced at 300 Mbit/s, behind a
+    link that carried ~75-95 Mbit/s). `stream stats` `delay_unconfirmed` counts those reports;
+    together with a `transfer` stage of about frame bytes / `burst_est_mbps` it is such a link,
+    not the browser. `ack_queue_p50_ms` / `ack_queue_p95_ms` are the queue the round trips
+    showed, and a decrease's log line has `ack_queue_ms`. The target is the minimum of
     the last 2 s plus 8 ms, wider on a jittery path (4 × the mean change between reports, at most 50 ms: Wi-Fi's
     bursts are not a queue). Frames that stop arriving altogether (a capacity drop: the queue
     fills, the frames wait for retransmissions, nothing completes) are seen from the oldest
@@ -905,22 +911,42 @@ gdigrab (no GPU)      ──system memory──►  CPU scale + convert ──�
   starts as a **burst** (`cc.Media.Pacing`, a second token bucket): while a credit lasts (1.5
   frame intervals' worth at the pacing rate, earned at the pacing rate while the pacer had
   nothing to send) the packets go out at the burst rate, the rest at the pacing rate, so a frame
-  of the target's size leaves in a fraction of its interval instead of 0.83 of it (on a LAN at
-  80 Mbit/s 1.4 ms instead of 8 ms; the second hardware run's `transfer` stage p50 of 5-13 ms
-  was that), and nothing goes faster than the pacing rate for longer than the credit. The burst
-  rate follows the path: 1.25 × the highest delivery rate the ACKs of the frames' packet trains
-  measured over 2 s (a train: packets sent less than 2 ms apart; its rate is its bytes over the
-  longer of its ACK span and its send span, from 8 packets on), never under the pacing rate,
-  never over 1 Gbit/s, and 2 × the pacing rate before the first measure. Only a path that
-  delivered at least twice the pacing rate gets bursts: on one not much faster than the pacing
-  rate a frame would save a millisecond or two but queue a share of itself at the bottleneck
-  (a 20-25 Mbit/s path at a 16-20 Mbit/s target: one-way delay p95 4-8 ms higher in the relay
-  simulation), so it is paced at the pacing rate, but for one frame a second that still goes at
-  2 × the pacing rate to find a path that got faster. It is the pacing rate
-  (no bursts) while a queue stands on the path (the quickest round trip of the last 50-100 ms
-  more than 5 ms over the quickest of the last 10 s: the path is the bottleneck now) and for 5 s
-  after a train lost 5 % of its packets (at least 3: a queue the burst overflowed; again within
-  twice that hold doubles it, up to 80 s); random losses do not count. `stream stats` has
+  of the target's size leaves in a fraction of its interval instead of 0.83 of it where the path
+  is much faster than the pacing rate (a gigabit LAN at 80 Mbit/s: 1.4 ms instead of 8 ms in the
+  relay simulation), and nothing goes faster than the pacing rate for longer than the credit. On
+  a path not much faster than the pacing rate the frame takes as long either way: the second
+  hardware run's `transfer` p50 of 11-12 ms was pacing only where the target was near the
+  encoder's output (60-90 Mbit/s); at the 250 Mbit/s setting (300 Mbit/s of pacing) the frames
+  took as long through a link that carried ~75-95 Mbit/s. The burst rate is 1.25 × the path's
+  delivery rate as the ACKs measured it: each packet train (packets sent less than 2 ms apart)
+  that went out faster than the pacing rate is measured once, over the whole train (the bytes of
+  that part acknowledged after its first ACK over the longer of their ACK span and their send
+  span, at least 250 µs, from 8 packets on; its last ACK only where it acknowledged as many
+  packets as the train's largest before it: a receiver's delayed-ACK timer says nothing about
+  the path), and the estimate is the lower median of the last 2 s's trains, at least two of
+  them (not the highest: ACKs that bunch on the way back make single trains look several times
+  as fast as the path). A train whose ACKs came over 2 ms later than its sending allows outran
+  the path and queued at its bottleneck: no train of the last 2 s counts for more than it. The
+  burst rate is never under the pacing rate nor over 1 Gbit/s, and only a path measured at
+  twice the pacing rate or more gets bursts: on one not much faster a frame would save a
+  millisecond or two but queue a share of itself at the bottleneck (a 20-25 Mbit/s path at a
+  16-20 Mbit/s target: one-way delay p95 4-8 ms higher in the relay simulation). Nothing is
+  burst on a path not measured yet (a session's start, after a backoff, after 2 s without two
+  measured trains): it is paced at the pacing rate, and one train a second is a probe, its
+  first 20 packets (or the pacer's own clump at the pacing rate, 2 ms of it, where that is
+  more) at 2.5 × the pacing rate in clumps no larger than the pacing rate's; never a key or
+  recovery frame (the session marks them: `cc.Media.SkipProbe`), not while a queue of 2 ms
+  stands. Jitter makes the measure conservative on fast paths: in the relay simulation with up
+  to 1 ms of it each way a gigabit path reads 330-660 Mbit/s, enough for bursts at an 80 Mbit/s
+  target (pacing 96, twice that 192) but not at the 250 Mbit/s setting (600 needed), where the
+  frames are then paced as before bursts. On a slow path two probes whose few ACKs came bunched
+  by chance can still read high: that costs one frame burst into the path, whose growth then
+  takes the estimate down.
+  It is the pacing rate (no bursts) while a queue stands on the path (the quickest round trip of
+  the last 50-100 ms more than 5 ms over the quickest of the last 10 s: the path is the
+  bottleneck now) and for 5 s after a train lost 5 % of its packets (at least 3: a queue the
+  burst overflowed; again within twice that hold doubles it, up to 80 s; no probe meanwhile,
+  and the path is measured again after it); random losses do not count. `stream stats` has
   `pace_mbps`, `burst_mbps`, `burst_est_mbps` and `burst_backoffs`. Window = pacing ×
   (min RTT + 2 frame intervals: the session's, or the
   interval of the frames the encoder produced over the last second where that is longer, at

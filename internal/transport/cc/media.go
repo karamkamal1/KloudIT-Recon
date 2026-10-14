@@ -49,11 +49,11 @@ const (
 	// controller still sends no more than the pacing rate plus that credit.
 	//
 	// The burst rate is burstProbe x the path's delivery rate (bwEstimate:
-	// the median of the delivery rates of the recent trains that went out
-	// faster than the pacing rate, each measured over the whole train:
-	// trainSample), never under the pacing rate nor over maxBurstRate, and
-	// only on a path whose estimate is at least burstMinGain x the pacing
-	// rate. Nothing is burst on a path not measured yet (a session's start,
+	// the lower median of the delivery rates of the recent trains, at least
+	// burstMinSamples, that went out faster than the pacing rate, each
+	// measured over the whole train: commitTrain), never under the pacing
+	// rate nor over maxBurstRate, and only on a path whose estimate is at
+	// least burstMinGain x the pacing rate. Nothing is burst on a path not measured yet (a session's start,
 	// after a backoff, after burstWindow without a measure): there one
 	// train a second (burstProbeEvery, never one the application marked
 	// with SkipProbe: a key or recovery frame) sends its first

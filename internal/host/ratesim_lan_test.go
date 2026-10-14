@@ -194,10 +194,10 @@ func TestRelaySimLAN(t *testing.T) {
 		// lowered: 300 Mbit/s of pacing), ~75-95 Mbit/s carried: a
 		// 100 Mbit/s link somewhere on the way (an inference; HARDWARE_TEST_PLAN
 		// 8.1c measures it), a 100 ms queue at it. Each frame paced at 1.2 x
-		// 250 Mbit/s queues ~8-10 ms there. Before: 5-6 delay decreases a
+		// 250 Mbit/s queues ~8-10 ms there. Before: 5-7 delay decreases a
 		// run, the target 176-234 Mbit/s on average over the last 30 s,
-		// 776-881 frames held by the window and 10-15 thinning episodes in
-		// that time, end to end 24.9-25.5 / 36.7-38.1 ms (25.1-25.8 /
+		// 776-859 frames held by the window and 10-16 thinning episodes in
+		// that time, end to end 24.9-25.5 / 36.7-37.8 ms (25.1-25.8 /
 		// 40.0-40.2 with the client's stalls): the pumping and the judder of
 		// the log. Its first second (the 2.5 MB key frame of a 250 Mbit/s
 		// start into the link's 1.2 MB queue: a loss and an overflow
